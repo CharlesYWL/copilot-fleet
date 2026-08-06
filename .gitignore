@@ -1,0 +1,11 @@
+
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store
+.env
+apps/host/data/
+coverage/
+dist/
+node_modules/

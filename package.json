@@ -1,0 +1,21 @@
+{
+  "name": "copilot-fleet",
+  "private": true,
+  "type": "module",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev": "npm run build -w @fleet/protocol && concurrently -n host,node \"npm run dev -w @fleet/host\" \"npm run dev -w @fleet/node\"",
+    "build": "npm run build -w @fleet/protocol && npm run build -w @fleet/host && npm run build -w @fleet/node",
+    "test": "npm run build -w @fleet/protocol && vitest run",
+    "typecheck": "npm run build -w @fleet/protocol && npm run typecheck -w @fleet/host && npm run typecheck -w @fleet/node && npm run typecheck -w @fleet/protocol"
+  },
+  "engines": {
+    "node": ">=22.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "concurrently": "^9.2.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
