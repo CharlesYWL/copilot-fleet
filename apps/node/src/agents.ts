@@ -82,11 +82,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     const executable = process.env.FLEET_COPILOT_COMMAND ?? "copilot";
     const args = ["--acp", "--stdio"];
     if (process.env.FLEET_ALLOW_ALL_TOOLS === "1") args.push("--allow-all-tools");
-    const child = spawn(executable, args, {
+    // npm installs a CLI on Windows as a .cmd shim, which CreateProcess cannot
+    // launch directly; the shell can, but then the path has to be quoted.
+    const viaShell = process.platform === "win32";
+    const command = viaShell && executable.includes(" ") ? `"${executable}"` : executable;
+    const child = spawn(command, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-      shell: false,
+      shell: viaShell,
     });
     this.child = child;
     child.stderr.setEncoding("utf8");

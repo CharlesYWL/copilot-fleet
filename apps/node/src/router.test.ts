@@ -8,6 +8,24 @@ import {
   type SessionAgent,
 } from "./agents.js";
 
+/** Waiting on the condition rather than a fixed span survives a loaded machine. */
+async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error("Timed out waiting for sessions");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+function hasSettled(events: SessionEvent[], sessionId: string): boolean {
+  return events.some(
+    (event) =>
+      event.sessionId === sessionId &&
+      event.type === "state" &&
+      event.payload.state === "idle",
+  );
+}
+
 describe("CommandRouter", () => {
   it("streams two sessions independently and deduplicates commands", async () => {
     const events: SessionEvent[] = [];
@@ -33,7 +51,7 @@ describe("CommandRouter", () => {
     };
     await Promise.all([router.route(first), router.route(second)]);
     expect(await router.route(first)).toEqual({ commandId: "c1", ok: true });
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    await waitFor(() => ["s1", "s2"].every((id) => hasSettled(events, id)));
     const s1 = events.filter((event) => event.sessionId === "s1");
     const s2 = events.filter((event) => event.sessionId === "s2");
     expect(s1.some((event) => event.type === "agent_text")).toBe(true);
