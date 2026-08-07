@@ -11,7 +11,7 @@ const CredentialsSchema = z.object({
 });
 export type Credentials = z.infer<typeof CredentialsSchema>;
 
-function configDirectory(): string {
+export function configDirectory(): string {
   if (process.platform === "win32") {
     return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "CopilotFleet");
   }

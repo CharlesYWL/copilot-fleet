@@ -1,4 +1,4 @@
-import "dotenv/config";
+import { config as loadEnv } from "dotenv";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -31,6 +31,8 @@ import {
   nodeMessageBelongsTo,
 } from "./node-messages.js";
 import { FleetStore } from "./store.js";
+
+loadEnv({ path: fileURLToPath(new URL("../../../.env", import.meta.url)), quiet: true });
 
 const VERSION = "0.1.0";
 

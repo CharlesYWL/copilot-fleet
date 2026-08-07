@@ -1,5 +1,6 @@
-import "dotenv/config";
+import { config as loadEnv } from "dotenv";
 import { arch, platform } from "node:os";
+import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import {
   HostToNodeMessageSchema,
@@ -9,13 +10,33 @@ import {
   type NodeToHostMessage,
 } from "@fleet/protocol";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
-import { loadCredentials, saveCredentials, type Credentials } from "./config.js";
+import {
+  configDirectory,
+  loadCredentials,
+  saveCredentials,
+  type Credentials,
+} from "./config.js";
+import {
+  SUPERSEDED_CLOSE_CODE,
+  acquireInstanceLock,
+  shouldReconnectAfterClose,
+} from "./instance-lock.js";
 import { CommandRouter } from "./router.js";
+
+loadEnv({ path: fileURLToPath(new URL("../../../.env", import.meta.url)), quiet: true });
 
 const VERSION = "0.1.0";
 const hostUrl = process.env.FLEET_HOST_URL ?? "http://127.0.0.1:8787";
 const nodeName = process.env.FLEET_NODE_NAME ?? platform() + "-node";
 const maxSessions = Number(process.env.FLEET_MAX_SESSIONS ?? 4);
+
+const instanceLock = acquireInstanceLock(configDirectory());
+if (!instanceLock.ok) {
+  console.error(instanceLock.reason);
+  process.exit(1);
+}
+const releaseInstanceLock = instanceLock.release;
+process.once("exit", () => releaseInstanceLock());
 
 let credentials = await loadCredentials();
 if (!credentials || credentials.hostUrl !== hostUrl || credentials.name !== nodeName) {
@@ -72,10 +93,20 @@ function connect(auth: Credentials): void {
       ...(result.error ? { error: result.error } : {}),
     });
   });
-  socket.on("close", async () => {
+  socket.on("close", async (code) => {
     router.denyPendingPermissions();
     await router.stopAll();
-    if (!shuttingDown) setTimeout(() => connect(auth), 2_000);
+    if (!shouldReconnectAfterClose(code, shuttingDown)) {
+      if (code === SUPERSEDED_CLOSE_CODE) {
+        console.error(
+          "Connection superseded by another node instance; not reconnecting",
+        );
+        releaseInstanceLock();
+        process.exit(1);
+      }
+      return;
+    }
+    setTimeout(() => connect(auth), 2_000);
   });
   socket.on("error", (error) => {
     console.error("Host connection error:", error.message);

@@ -80,7 +80,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   async start(cwd: string): Promise<void> {
     this.emit("state", { state: "starting", activity: "Starting Copilot ACP" });
     const executable = process.env.FLEET_COPILOT_COMMAND ?? "copilot";
-    const child = spawn(executable, ["--acp", "--stdio"], {
+    const args = ["--acp", "--stdio"];
+    if (process.env.FLEET_ALLOW_ALL_TOOLS === "1") args.push("--allow-all-tools");
+    const child = spawn(executable, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
