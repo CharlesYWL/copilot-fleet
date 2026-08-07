@@ -11,6 +11,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import type { FleetNode } from "@fleet/protocol";
+import { ConnectNodeCard } from "./ConnectNodeCard";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -51,6 +52,7 @@ export const NodesPanel = ({ nodes }: { nodes: FleetNode[] }) => {
         <br />
         <Text className={styles.caption}>Connected machines and available session capacity.</Text>
       </div>
+      <ConnectNodeCard />
       <div className={styles.surface}>
         <Table aria-label="Registered nodes">
           <TableHeader>

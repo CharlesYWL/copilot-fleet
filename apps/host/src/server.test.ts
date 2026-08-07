@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { resolveEnrollmentToken } from "./server.js";
+import { resolveEnrollmentToken, resolvePublicHostUrl } from "./server.js";
 
 describe("production enrollment token", () => {
   it("rejects missing and default production tokens", () => {
@@ -16,5 +16,28 @@ describe("production enrollment token", () => {
       "production-secret",
     );
     expect(resolveEnrollmentToken(undefined, "test")).toBe("change-me");
+  });
+});
+
+describe("public host url", () => {
+  it("prefers the configured public url without a trailing slash", () => {
+    expect(
+      resolvePublicHostUrl("https://fleet.example.com/", "0.0.0.0", "8787"),
+    ).toBe("https://fleet.example.com");
+  });
+
+  it("falls back to loopback because wildcard binds are not dialable", () => {
+    expect(resolvePublicHostUrl(undefined, "0.0.0.0", "8787")).toBe(
+      "http://127.0.0.1:8787",
+    );
+    expect(resolvePublicHostUrl(undefined, "::", "9000")).toBe(
+      "http://127.0.0.1:9000",
+    );
+  });
+
+  it("keeps a concrete bind address", () => {
+    expect(resolvePublicHostUrl(undefined, "192.168.1.5", "8787")).toBe(
+      "http://192.168.1.5:8787",
+    );
   });
 });

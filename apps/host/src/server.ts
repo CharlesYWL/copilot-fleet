@@ -82,6 +82,14 @@ export async function buildServer(options: {
   };
 
   app.get("/api/health", async () => ({ ok: true, version: VERSION }));
+  app.get("/api/enrollment", async () => ({
+    hostUrl: resolvePublicHostUrl(
+      process.env.FLEET_PUBLIC_URL,
+      process.env.HOST,
+      process.env.PORT,
+    ),
+    enrollmentToken,
+  }));
   app.get("/api/snapshot", async () => ({
     nodes: store.listNodes(),
     workspaces: store.listWorkspaces(),
@@ -455,6 +463,21 @@ export async function buildServer(options: {
     store.close();
   });
   return app;
+}
+
+/**
+ * The URL a node on another machine should dial. Wildcard bind addresses are
+ * not dialable, so they fall back to loopback and the operator is expected to
+ * set FLEET_PUBLIC_URL once the Host is reachable from outside.
+ */
+export function resolvePublicHostUrl(
+  publicUrl: string | undefined,
+  host: string | undefined,
+  port: string | undefined,
+): string {
+  if (publicUrl) return publicUrl.replace(/\/+$/, "");
+  const wildcard = !host || host === "0.0.0.0" || host === "::";
+  return `http://${wildcard ? "127.0.0.1" : host}:${port ?? "8787"}`;
 }
 
 export function resolveEnrollmentToken(
