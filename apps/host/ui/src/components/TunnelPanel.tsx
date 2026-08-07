@@ -1,0 +1,224 @@
+import { useCallback, useEffect, useState } from "react";
+import {
+  Button,
+  MessageBar,
+  MessageBarBody,
+  Spinner,
+  Switch,
+  Text,
+  Title3,
+  makeStyles,
+  tokens,
+} from "@fluentui/react-components";
+import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
+import type { TunnelInfo } from "@fleet/protocol";
+import { api } from "../hooks/useFleet";
+
+const useStyles = makeStyles({
+  panel: {
+    flexGrow: 1,
+    overflowY: "auto",
+    padding: "28px 32px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "16px",
+    maxWidth: "720px",
+  },
+  caption: {
+    color: tokens.colorNeutralForeground3,
+  },
+  card: {
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: tokens.borderRadiusLarge,
+    background: tokens.colorNeutralBackground1,
+    padding: "20px 24px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "14px",
+  },
+  row: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "16px",
+  },
+  status: {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+  },
+  urlRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+  },
+  mono: {
+    fontFamily: '"JetBrains Mono", ui-monospace, monospace',
+    fontSize: "13px",
+    wordBreak: "break-all",
+  },
+});
+
+const statusLabel = (info: TunnelInfo): string => {
+  switch (info.status) {
+    case "off":
+      return "Off";
+    case "starting":
+      return "Starting…";
+    case "on":
+      return "Online";
+    case "stopping":
+      return "Stopping…";
+    case "error":
+      return "Error";
+  }
+};
+
+export const TunnelPanel = () => {
+  const styles = useStyles();
+  const [info, setInfo] = useState<TunnelInfo>();
+  const [busy, setBusy] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [actionError, setActionError] = useState<string>();
+
+  const refresh = useCallback(async () => {
+    try {
+      setInfo(await api<TunnelInfo>("/api/tunnel"));
+    } catch {
+      // Keep the last good snapshot; the next poll retries.
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    const timer = setInterval(() => void refresh(), 2_000);
+    return () => clearInterval(timer);
+  }, [refresh]);
+
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 2_000);
+    return () => clearTimeout(timer);
+  }, [copied]);
+
+  const handleToggle = async (_event: unknown, data: { checked: boolean }) => {
+    setBusy(true);
+    setActionError(undefined);
+    try {
+      setInfo(
+        await api<TunnelInfo>("/api/tunnel", {
+          method: "POST",
+          body: JSON.stringify({ enabled: data.checked }),
+        }),
+      );
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : String(reason));
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleRetry = () => void handleToggle(undefined, { checked: true });
+
+  if (!info) {
+    return (
+      <div className={styles.panel}>
+        <Spinner label="Loading tunnel status…" />
+      </div>
+    );
+  }
+
+  const switching = busy || info.status === "starting" || info.status === "stopping";
+  const showTunnelUrl = info.status === "on";
+
+  return (
+    <div className={styles.panel}>
+      <div>
+        <Title3 as="h1">Cloudflare Tunnel</Title3>
+        <br />
+        <Text className={styles.caption}>
+          Expose this Host so remote nodes can enroll over the public internet. Quick
+          tunnels are free and temporary.
+        </Text>
+      </div>
+
+      {!info.binaryPresent && (
+        <MessageBar intent="warning">
+          <MessageBarBody>
+            <code>cloudflared</code> was not found on PATH. Install it from{" "}
+            <a href="https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/">
+              Cloudflare&apos;s docs
+            </a>{" "}
+            and restart the Host.
+          </MessageBarBody>
+        </MessageBar>
+      )}
+
+      {(actionError || info.error) && (
+        <MessageBar intent="error">
+          <MessageBarBody>{actionError ?? info.error}</MessageBarBody>
+        </MessageBar>
+      )}
+
+      {showTunnelUrl && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            Quick tunnel URLs change every time you start. Remote nodes must update{" "}
+            <code>FLEET_HOST_URL</code> and restart after a new URL appears.
+          </MessageBarBody>
+        </MessageBar>
+      )}
+
+      <section className={styles.card}>
+        <div className={styles.row}>
+          <div>
+            <Text weight="semibold">Remote access</Text>
+            <br />
+            <Text className={styles.caption}>Provider: Cloudflare</Text>
+          </div>
+          <Switch
+            checked={info.enabled || info.status === "starting" || info.status === "on"}
+            disabled={!info.binaryPresent || switching}
+            label={info.enabled || info.status === "on" ? "On" : "Off"}
+            onChange={handleToggle}
+          />
+        </div>
+
+        <div className={styles.status}>
+          {(info.status === "starting" || info.status === "stopping") && (
+            <Spinner size="tiny" />
+          )}
+          <Text>Status: {statusLabel(info)}</Text>
+          {info.status === "error" && info.binaryPresent && (
+            <Button size="small" appearance="secondary" onClick={handleRetry} disabled={busy}>
+              Retry
+            </Button>
+          )}
+        </div>
+
+        {showTunnelUrl && (
+          <div className={styles.urlRow}>
+            <code className={styles.mono}>{info.publicUrl}</code>
+            <Button
+              size="small"
+              appearance="secondary"
+              icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
+              onClick={() => {
+                void navigator.clipboard.writeText(info.publicUrl).then(() => setCopied(true));
+              }}
+            >
+              {copied ? "Copied" : "Copy"}
+            </Button>
+          </div>
+        )}
+
+        {!showTunnelUrl && (
+          <Text className={styles.caption}>
+            Public URL when off: <code className={styles.mono}>{info.publicUrl}</code>
+          </Text>
+        )}
+      </section>
+    </div>
+  );
+};

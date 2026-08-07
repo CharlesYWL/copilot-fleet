@@ -10,6 +10,7 @@ import {
   type SessionState,
   type Workspace,
   canTransition,
+  terminalSessionStates,
 } from "@fleet/protocol";
 
 type Row = Record<string, unknown>;
@@ -50,7 +51,42 @@ export class FleetStore {
         sequence INTEGER NOT NULL, type TEXT NOT NULL, payload TEXT NOT NULL,
         created_at TEXT NOT NULL, UNIQUE(session_id, sequence)
       );
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
     `);
+    this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
+  }
+
+  getSetting(key: string): string | undefined {
+    const row = this.db.prepare("SELECT value FROM settings WHERE key=?").get(key) as
+      | Row
+      | undefined;
+    return row ? String(row.value) : undefined;
+  }
+
+  setSetting(key: string, value: string): void {
+    this.db
+      .prepare(
+        "INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      )
+      .run(key, value);
+  }
+
+  getTunnelEnabled(): boolean {
+    return this.getSetting("tunnel.enabled") === "1";
+  }
+
+  setTunnelEnabled(enabled: boolean): void {
+    this.setSetting("tunnel.enabled", enabled ? "1" : "0");
+  }
+
+  /** Keeps databases created before a column was introduced usable. */
+  private addColumnIfMissing(table: string, column: string, definition: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
+    if (columns.some((row) => String(row.name) === column)) return;
+    this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 
   close(): void {
@@ -67,18 +103,20 @@ export class FleetStore {
       .run(new Date().toISOString());
   }
 
-  registerNode(input: Omit<FleetNode, "id" | "activeSessions" | "lastHeartbeat" | "online">): {
-    node: FleetNode;
-    secret: string;
-  } {
+  registerNode(
+    input: Omit<
+      FleetNode,
+      "id" | "activeSessions" | "lastHeartbeat" | "online" | "homeDir"
+    > & { homeDir?: string },
+  ): { node: FleetNode; secret: string } {
     const id = randomUUID();
     const secret = randomUUID() + randomUUID();
     const now = new Date().toISOString();
     this.db
       .prepare(
         `INSERT INTO nodes
-          (id,name,secret_hash,os,arch,version,capabilities,max_sessions,last_heartbeat,online)
-         VALUES (?,?,?,?,?,?,?,?,?,0)`,
+          (id,name,secret_hash,os,arch,version,capabilities,max_sessions,last_heartbeat,online,home_dir)
+         VALUES (?,?,?,?,?,?,?,?,?,0,?)`,
       )
       .run(
         id,
@@ -90,8 +128,20 @@ export class FleetStore {
         JSON.stringify(input.capabilities),
         input.maxSessions,
         now,
+        input.homeDir ?? "",
       );
     return { node: this.getNode(id)!, secret };
+  }
+
+  renameNode(id: string, name: string): FleetNode | undefined {
+    this.db.prepare("UPDATE nodes SET name=? WHERE id=?").run(name, id);
+    return this.getNode(id);
+  }
+
+  /** A reconnecting node may have moved home directory or upgraded. */
+  setNodeHomeDir(id: string, homeDir: string): void {
+    if (!homeDir) return;
+    this.db.prepare("UPDATE nodes SET home_dir=? WHERE id=?").run(homeDir, id);
   }
 
   authenticateNode(id: string, secret: string): boolean {
@@ -137,6 +187,28 @@ export class FleetStore {
     return workspace;
   }
 
+  getWorkspace(id: string): Workspace | undefined {
+    return this.listWorkspaces().find((workspace) => workspace.id === id);
+  }
+
+  updateWorkspace(id: string, name: string, description: string): Workspace | undefined {
+    this.db
+      .prepare("UPDATE workspaces SET name=?,description=? WHERE id=?")
+      .run(name, description, id);
+    return this.getWorkspace(id);
+  }
+
+  /**
+   * Removes a workspace and its placements / historical sessions. Refuses when
+   * any non-terminal session is still attached so we never yank a live agent.
+   */
+  deleteWorkspace(id: string): void {
+    this.assertNoLiveSessions("workspace_id", id, "workspace");
+    this.deleteSessionsWhere("workspace_id", id);
+    this.db.prepare("DELETE FROM placements WHERE workspace_id=?").run(id);
+    this.db.prepare("DELETE FROM workspaces WHERE id=?").run(id);
+  }
+
   listWorkspaces(): Workspace[] {
     return (
       this.db.prepare("SELECT * FROM workspaces ORDER BY name").all() as Row[]
@@ -156,6 +228,28 @@ export class FleetStore {
       )
       .run(placement.id, workspaceId, nodeId, localPath);
     return this.getPlacement(placement.id)!;
+  }
+
+  updatePlacement(id: string, localPath: string): Placement | undefined {
+    this.db.prepare("UPDATE placements SET local_path=? WHERE id=?").run(localPath, id);
+    return this.getPlacement(id);
+  }
+
+  deletePlacement(id: string): void {
+    this.assertNoLiveSessions("placement_id", id, "placement");
+    this.deleteSessionsWhere("placement_id", id);
+    this.db.prepare("DELETE FROM placements WHERE id=?").run(id);
+  }
+
+  /**
+   * Drops a registered node and everything that pointed at it. Callers should
+   * disconnect the WebSocket first if the node is currently online.
+   */
+  deleteNode(id: string): void {
+    this.assertNoLiveSessions("node_id", id, "node");
+    this.deleteSessionsWhere("node_id", id);
+    this.db.prepare("DELETE FROM placements WHERE node_id=?").run(id);
+    this.db.prepare("DELETE FROM nodes WHERE id=?").run(id);
   }
 
   getPlacement(id: string): Placement | undefined {
@@ -321,6 +415,37 @@ export class FleetStore {
       createdAt: String(row.created_at),
     }));
   }
+
+  private assertNoLiveSessions(
+    column: "workspace_id" | "placement_id" | "node_id",
+    id: string,
+    label: string,
+  ): void {
+    // Offline rows are leftover after a host/node restart; cascade-delete is fine.
+    const settled = new Set<string>([...terminalSessionStates, "offline"]);
+    const live = (
+      this.db
+        .prepare(`SELECT state FROM sessions WHERE ${column}=?`)
+        .all(id) as Row[]
+    ).filter((row) => !settled.has(String(row.state)));
+    if (live.length > 0) {
+      throw new Error(
+        `Cannot delete ${label} while ${live.length} session(s) are still active`,
+      );
+    }
+  }
+
+  private deleteSessionsWhere(
+    column: "workspace_id" | "placement_id" | "node_id",
+    id: string,
+  ): void {
+    this.db
+      .prepare(
+        `DELETE FROM events WHERE session_id IN (SELECT id FROM sessions WHERE ${column}=?)`,
+      )
+      .run(id);
+    this.db.prepare(`DELETE FROM sessions WHERE ${column}=?`).run(id);
+  }
 }
 
 function hash(value: string): string {
@@ -339,6 +464,7 @@ function nodeFromRow(row: Row): FleetNode {
     activeSessions: Number(row.active_sessions),
     lastHeartbeat: String(row.last_heartbeat),
     online: Boolean(row.online),
+    homeDir: String(row.home_dir ?? ""),
   };
 }
 

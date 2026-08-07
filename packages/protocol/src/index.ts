@@ -31,6 +31,8 @@ export const NodeSchema = z.object({
   activeSessions: z.number().int().nonnegative(),
   lastHeartbeat: z.string().datetime(),
   online: z.boolean(),
+  /** The node's home directory, used to seed placement paths in the UI. */
+  homeDir: z.string().default(""),
 });
 export type FleetNode = z.infer<typeof NodeSchema>;
 
@@ -139,6 +141,7 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     version: z.string().min(1),
     capabilities: z.array(z.string()),
     maxSessions: z.number().int().positive(),
+    homeDir: z.string().default(""),
   }),
   z.object({
     type: z.literal("heartbeat"),
@@ -181,16 +184,26 @@ export const RegisterNodeSchema = z.object({
   version: z.string().min(1),
   capabilities: z.array(z.string()),
   maxSessions: z.number().int().min(1).max(64),
+  homeDir: z.string().max(4096).default(""),
+});
+
+export const RenameNodeSchema = z.object({
+  name: z.string().min(1).max(100),
 });
 
 export const CreateWorkspaceSchema = z.object({
   name: z.string().min(1).max(100),
   description: z.string().max(500).default(""),
 });
+export const UpdateWorkspaceSchema = CreateWorkspaceSchema;
 
 export const CreatePlacementSchema = z.object({
   workspaceId: z.string().min(1),
   nodeId: z.string().min(1),
+  localPath: z.string().min(1).max(4096),
+});
+
+export const UpdatePlacementSchema = z.object({
   localPath: z.string().min(1).max(4096),
 });
 
@@ -207,6 +220,29 @@ export const PermissionResponseSchema = z.object({
   requestId: z.string().min(1),
   outcome: z.enum(["allow_once", "deny"]),
   optionId: z.string().optional(),
+});
+
+export const TunnelStatusSchema = z.enum([
+  "off",
+  "starting",
+  "on",
+  "stopping",
+  "error",
+]);
+export type TunnelStatus = z.infer<typeof TunnelStatusSchema>;
+
+export const TunnelInfoSchema = z.object({
+  provider: z.literal("cloudflare"),
+  enabled: z.boolean(),
+  status: TunnelStatusSchema,
+  publicUrl: z.string().min(1),
+  error: z.string().nullable(),
+  binaryPresent: z.boolean(),
+});
+export type TunnelInfo = z.infer<typeof TunnelInfoSchema>;
+
+export const UpdateTunnelSchema = z.object({
+  enabled: z.boolean(),
 });
 
 const transitions: Record<SessionState, ReadonlySet<SessionState>> = {

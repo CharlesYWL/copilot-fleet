@@ -14,8 +14,8 @@ export const nodeShells: { key: NodeShell; label: string }[] = [
 
 /**
  * A first-run command for a machine that already has a Fleet checkout, Node.js
- * and an authenticated Copilot CLI. The node name resolves to the machine's own
- * hostname because the Host rejects a duplicate name outright.
+ * and an authenticated Copilot CLI. The node name defaults to the machine
+ * hostname; rename it later from the Host's Nodes tab.
  */
 export function enrollCommand(
   shell: NodeShell,
@@ -25,19 +25,17 @@ export function enrollCommand(
   if (shell === "powershell") {
     return [
       "npm install",
-      "npm run build -w @fleet/protocol",
+      "npm run build:node",
       `$env:FLEET_HOST_URL="${hostUrl}"`,
       `$env:FLEET_ENROLLMENT_TOKEN="${enrollmentToken}"`,
-      "$env:FLEET_NODE_NAME=$env:COMPUTERNAME",
-      "npm run dev -w @fleet/node",
+      "npm run start:node",
     ].join("\n");
   }
   return [
     "npm install",
-    "npm run build -w @fleet/protocol",
+    "npm run build:node",
     `FLEET_HOST_URL="${hostUrl}" \\`,
     `  FLEET_ENROLLMENT_TOKEN="${enrollmentToken}" \\`,
-    '  FLEET_NODE_NAME="$(hostname)" \\',
-    "  npm run dev -w @fleet/node",
+    "  npm run start:node",
   ].join("\n");
 }

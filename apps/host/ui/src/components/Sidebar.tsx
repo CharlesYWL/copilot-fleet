@@ -12,9 +12,9 @@ import {
 } from "@fluentui/react-components";
 import {
   Add20Regular,
-  Desktop20Regular,
   Folder20Regular,
   Server20Regular,
+  Settings20Regular,
 } from "@fluentui/react-icons";
 import type { FleetNode, FleetSession } from "@fleet/protocol";
 import { StatusDot } from "./StatusDot";
@@ -98,7 +98,7 @@ type NodeGroup = {
   workspaces: WorkspaceGroup[];
 };
 
-export type SidebarView = "session" | "workspaces" | "nodes";
+export type SidebarView = "session" | "settings";
 
 type SidebarProps = {
   nodes: FleetNode[];
@@ -236,20 +236,12 @@ export const Sidebar = ({
           New session
         </Button>
         <Button
-          appearance={view === "workspaces" ? "secondary" : "subtle"}
+          appearance={view === "settings" ? "secondary" : "subtle"}
           className={styles.navButton}
-          icon={<Folder20Regular />}
-          onClick={() => onSelectView("workspaces")}
+          icon={<Settings20Regular />}
+          onClick={() => onSelectView("settings")}
         >
-          Workspaces
-        </Button>
-        <Button
-          appearance={view === "nodes" ? "secondary" : "subtle"}
-          className={styles.navButton}
-          icon={<Desktop20Regular />}
-          onClick={() => onSelectView("nodes")}
-        >
-          Nodes
+          Settings
         </Button>
       </div>
     </nav>

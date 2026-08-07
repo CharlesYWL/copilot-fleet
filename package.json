@@ -4,8 +4,14 @@
   "type": "module",
   "workspaces": ["apps/*", "packages/*"],
   "scripts": {
-    "dev": "npm run build -w @fleet/protocol && concurrently -n host,node \"npm run dev -w @fleet/host\" \"npm run dev -w @fleet/node\"",
+    "dev": "npm run build -w @fleet/protocol && concurrently -n host,node \"npm run host\" \"npm run node\"",
+    "host": "npm run dev -w @fleet/host",
+    "node": "npm run dev -w @fleet/node",
     "build": "npm run build -w @fleet/protocol && npm run build -w @fleet/host && npm run build -w @fleet/node",
+    "build:node": "npm run build -w @fleet/protocol && npm run build -w @fleet/node",
+    "start": "concurrently -n host,node \"npm run start:host\" \"npm run start:node\"",
+    "start:host": "NODE_ENV=production npm run start -w @fleet/host",
+    "start:node": "npm run start -w @fleet/node",
     "test": "npm run build -w @fleet/protocol && vitest run",
     "typecheck": "npm run build -w @fleet/protocol && npm run typecheck -w @fleet/host && npm run typecheck -w @fleet/node && npm run typecheck -w @fleet/protocol"
   },

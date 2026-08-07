@@ -30,30 +30,37 @@ This single command runs the Fastify API on `http://127.0.0.1:8787`, Vite on
 `http://127.0.0.1:5173`, and the local Node service. The Node reads its
 `FLEET_*` settings from `.env`.
 
-For a production Host:
+Open the UI → **Settings**:
+
+- **Tunnel** — toggle a Cloudflare quick tunnel (requires `cloudflared` on PATH).
+- **Nodes** — rename/delete machines and copy the enroll command.
+- **Workspaces** — map projects to per-machine paths.
+
+For production (built Host + local Node together):
 
 ```bash
 npm run build
-NODE_ENV=production npm run start -w @fleet/host
+npm start
 ```
 
-Open `http://127.0.0.1:8787`. Fastify serves the built UI in production.
+Or just the Host: `npm run start:host`. Open `http://127.0.0.1:8787` —
+Fastify serves the built UI.
 
 ## Windows Node (PowerShell)
 
 Install Node.js and authenticate Copilot CLI first. From a checked-out Fleet
-directory:
+directory (or paste the command from the Host's Nodes → Connect card):
 
 ```powershell
 npm install
+npm run build:node
 $env:FLEET_HOST_URL = "https://fleet.example.com"
 $env:FLEET_ENROLLMENT_TOKEN = "replace-with-host-token"
-$env:FLEET_NODE_NAME = "windows-workstation"
-$env:FLEET_MAX_SESSIONS = "4"
-npm run build -w @fleet/protocol
-npm run build -w @fleet/node
-npm run start -w @fleet/node
+npm run start:node
 ```
+
+The node name defaults to the machine hostname; rename it later from the Host's
+Nodes tab. Set `$env:FLEET_MAX_SESSIONS` if you want a capacity other than 4.
 
 First registration exchanges the enrollment token for a unique node secret.
 Credentials are persisted at
@@ -68,8 +75,7 @@ Run the Host in terminal 1:
 ```bash
 cp .env.example .env
 npm install
-npm run build -w @fleet/protocol
-npm run dev -w @fleet/host
+npm run host
 ```
 
 Run a deterministic no-login Node in terminal 2:
@@ -80,7 +86,7 @@ FLEET_ENROLLMENT_TOKEN=change-me \
 FLEET_NODE_NAME=mock-node \
 FLEET_MAX_SESSIONS=2 \
 FLEET_MOCK_AGENT=1 \
-npm run dev -w @fleet/node
+npm run node
 ```
 
 Then open `http://127.0.0.1:5173`:

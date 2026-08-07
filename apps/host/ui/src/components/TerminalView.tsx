@@ -11,6 +11,7 @@ import {
   Text,
   Textarea,
   makeStyles,
+  mergeClasses,
   tokens,
 } from "@fluentui/react-components";
 import { RecordStop20Regular, Send20Regular, Stop20Regular } from "@fluentui/react-icons";
@@ -22,6 +23,7 @@ import {
   type TerminalBlock,
   type TerminalBlockKind,
 } from "../lib/terminal-blocks";
+import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner, type PermissionOption } from "./PermissionBanner";
 import { StatusDot } from "./StatusDot";
 
@@ -67,49 +69,63 @@ const useStyles = makeStyles({
     flexGrow: 1,
     overflowY: "auto",
     padding: "18px 20px 24px",
-    fontFamily: terminal.font,
-    fontSize: "12.5px",
-    lineHeight: "1.65",
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px",
   },
   line: {
     display: "grid",
-    gridTemplateColumns: "64px 14px 1fr",
+    gridTemplateColumns: "56px 14px minmax(0, 1fr)",
     gap: "8px",
-    padding: "1px 0",
+    alignItems: "start",
+  },
+  message: {
+    borderRadius: tokens.borderRadiusMedium,
+    padding: "10px 14px",
+    background: "rgba(255, 255, 255, 0.03)",
+    border: `1px solid ${tokens.colorNeutralStroke3}`,
+    minWidth: 0,
+  },
+  userMessage: {
+    background: "rgba(127, 160, 255, 0.08)",
+    border: "1px solid rgba(127, 160, 255, 0.18)",
   },
   time: {
     color: terminal.dim,
+    fontFamily: terminal.font,
     fontSize: "10px",
-    paddingTop: "3px",
+    paddingTop: "12px",
     userSelect: "none",
   },
   glyph: {
     userSelect: "none",
     textAlign: "center",
+    fontFamily: terminal.font,
+    paddingTop: "12px",
   },
-  text: {
+  plain: {
+    fontFamily: terminal.font,
+    fontSize: "12.5px",
+    lineHeight: "1.65",
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
     margin: 0,
-  },
-  thought: {
-    fontStyle: "italic",
-  },
-  divider: {
-    color: terminal.dim,
+    paddingTop: "10px",
   },
   working: {
     display: "flex",
     alignItems: "center",
     gap: "8px",
-    padding: "6px 0 0 86px",
+    padding: "6px 0 0 78px",
     color: terminal.tool,
+    fontFamily: terminal.font,
     fontSize: "11px",
   },
   emptyStream: {
     color: terminal.dim,
     textAlign: "center",
     marginTop: "80px",
+    fontFamily: terminal.font,
   },
   composer: {
     flexShrink: 0,
@@ -306,6 +322,8 @@ export const TerminalView = ({
   );
 };
 
+const markdownKinds = new Set<TerminalBlockKind>(["agent", "user", "thought"]);
+
 const TerminalLine = ({ block }: { block: TerminalBlock }) => {
   const styles = useStyles();
   const color = colors[block.kind];
@@ -315,6 +333,7 @@ const TerminalLine = ({ block }: { block: TerminalBlock }) => {
       : block.kind === "tool" && block.status
         ? `${block.text} · ${block.status}`
         : block.text;
+  const asMarkdown = markdownKinds.has(block.kind);
 
   return (
     <div className={styles.line}>
@@ -322,12 +341,25 @@ const TerminalLine = ({ block }: { block: TerminalBlock }) => {
       <span className={styles.glyph} style={{ color }} aria-hidden="true">
         {glyphs[block.kind]}
       </span>
-      <p
-        className={block.kind === "thought" ? `${styles.text} ${styles.thought}` : styles.text}
-        style={{ color }}
-      >
-        {text}
-      </p>
+      {asMarkdown ? (
+        <div
+          className={mergeClasses(
+            styles.message,
+            block.kind === "user" && styles.userMessage,
+          )}
+          style={{ color }}
+        >
+          <MarkdownBody
+            text={text}
+            muted={block.kind === "thought"}
+            copyable={block.kind !== "thought"}
+          />
+        </div>
+      ) : (
+        <p className={styles.plain} style={{ color }}>
+          {text}
+        </p>
+      )}
     </div>
   );
 };

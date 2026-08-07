@@ -66,22 +66,29 @@ export const ConnectNodeCard = () => {
   const styles = useStyles();
   const [enrollment, setEnrollment] = useState<Enrollment>();
   const [hostUrl, setHostUrl] = useState("");
+  const [urlDirty, setUrlDirty] = useState(false);
   const [shell, setShell] = useState<NodeShell>("bash");
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    void api<Enrollment>("/api/enrollment")
-      .then((result) => {
-        if (cancelled) return;
-        setEnrollment(result);
-        setHostUrl(result.hostUrl);
-      })
-      .catch(() => undefined);
+    const pull = () => {
+      void api<Enrollment>("/api/enrollment")
+        .then((result) => {
+          if (cancelled) return;
+          setEnrollment(result);
+          setHostUrl((current) => (urlDirty ? current : result.hostUrl));
+        })
+        .catch(() => undefined);
+    };
+    pull();
+    // Tunnel URLs can rotate while this card is open; keep the default in sync.
+    const timer = setInterval(pull, 3_000);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
-  }, []);
+  }, [urlDirty]);
 
   useEffect(() => {
     if (!copied) return;
@@ -112,7 +119,10 @@ export const ConnectNodeCard = () => {
       <Field label="Host URL the node should dial" className={styles.urlField}>
         <Input
           value={hostUrl}
-          onChange={(_, data) => setHostUrl(data.value)}
+          onChange={(_, data) => {
+            setUrlDirty(true);
+            setHostUrl(data.value);
+          }}
           aria-label="Host URL the node should dial"
         />
       </Field>

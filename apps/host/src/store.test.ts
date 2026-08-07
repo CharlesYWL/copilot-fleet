@@ -111,4 +111,62 @@ describe("FleetStore", () => {
     expect(store.reconcileOfflineSessions(node.id, [disconnected.id])).toHaveLength(1);
     expect(store.getSession(restarted.id)?.state).toBe("failed");
   });
+
+  it("renames nodes and tracks the home directory reported on reconnect", () => {
+    const { store, node } = setup();
+    expect(node.homeDir).toBe("");
+
+    expect(store.renameNode(node.id, "windows-vm")?.name).toBe("windows-vm");
+    store.setNodeHomeDir(node.id, "C:\\Users\\dev");
+    expect(store.getNode(node.id)?.homeDir).toBe("C:\\Users\\dev");
+
+    store.setNodeHomeDir(node.id, "");
+    expect(store.getNode(node.id)?.homeDir).toBe("C:\\Users\\dev");
+    expect(() => store.renameNode(node.id, "windows-vm")).not.toThrow();
+  });
+
+  it("persists tunnel enabled setting", () => {
+    const store = new FleetStore(":memory:");
+    stores.push(store);
+    expect(store.getTunnelEnabled()).toBe(false);
+    store.setTunnelEnabled(true);
+    expect(store.getTunnelEnabled()).toBe(true);
+    store.setTunnelEnabled(false);
+    expect(store.getTunnelEnabled()).toBe(false);
+  });
+
+  it("updates and deletes workspaces, placements, and idle nodes", () => {
+    const { store, node, placement } = setup();
+    const workspace = store.listWorkspaces()[0]!;
+
+    expect(
+      store.updateWorkspace(workspace.id, "renamed", "updated")?.name,
+    ).toBe("renamed");
+    expect(store.updatePlacement(placement.id, "D:\\other")?.localPath).toBe(
+      "D:\\other",
+    );
+
+    const live = store.createSession(placement, "still running");
+    expect(() => store.deletePlacement(placement.id)).toThrow(/still active/);
+    expect(() => store.deleteWorkspace(workspace.id)).toThrow(/still active/);
+    expect(() => store.deleteNode(node.id)).toThrow(/still active/);
+
+    store.transitionSession(live.id, "starting", "boot");
+    store.transitionSession(live.id, "running", "go");
+    store.transitionSession(live.id, "stopped", "done");
+
+    store.deletePlacement(placement.id);
+    expect(store.listPlacements()).toHaveLength(0);
+    expect(store.getSession(live.id)).toBeUndefined();
+
+    const replacement = store.createPlacement(workspace.id, node.id, "E:\\repo");
+    const archived = store.createSession(replacement, "archive me");
+    store.transitionSession(archived.id, "stopped", "done");
+    store.deleteWorkspace(workspace.id);
+    expect(store.listWorkspaces()).toHaveLength(0);
+    expect(store.listPlacements()).toHaveLength(0);
+
+    store.deleteNode(node.id);
+    expect(store.getNode(node.id)).toBeUndefined();
+  });
 });

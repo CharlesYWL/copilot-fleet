@@ -17,7 +17,11 @@ import {
   PermissionResponseSchema,
   PromptSchema,
   RegisterNodeSchema,
+  RenameNodeSchema,
   SessionStateSchema,
+  UpdatePlacementSchema,
+  UpdateTunnelSchema,
+  UpdateWorkspaceSchema,
   terminalSessionStates,
   tryParseJson,
   type BrowserMessage,
@@ -31,6 +35,7 @@ import {
   nodeMessageBelongsTo,
 } from "./node-messages.js";
 import { FleetStore } from "./store.js";
+import { TunnelManager } from "./tunnel.js";
 
 loadEnv({ path: fileURLToPath(new URL("../../../.env", import.meta.url)), quiet: true });
 
@@ -52,7 +57,23 @@ export async function buildServer(options: {
   const nodeSockets = new Map<string, WebSocket>();
   const browserSockets = new Set<WebSocket>();
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
+  const listenPort = process.env.PORT ?? "8787";
   let closing = false;
+
+  const tunnel = new TunnelManager({
+    localTarget: `http://127.0.0.1:${listenPort}`,
+    onEnabledCleared: () => store.setTunnelEnabled(false),
+  });
+
+  const fallbackPublicUrl = () =>
+    resolvePublicHostUrl(
+      process.env.FLEET_PUBLIC_URL,
+      process.env.HOST,
+      process.env.PORT,
+    );
+
+  const enrollmentHostUrl = () =>
+    resolveEnrollmentHostUrl(tunnel.activeTunnelUrl(), fallbackPublicUrl());
 
   await app.register(websocket);
 
@@ -83,13 +104,24 @@ export async function buildServer(options: {
 
   app.get("/api/health", async () => ({ ok: true, version: VERSION }));
   app.get("/api/enrollment", async () => ({
-    hostUrl: resolvePublicHostUrl(
-      process.env.FLEET_PUBLIC_URL,
-      process.env.HOST,
-      process.env.PORT,
-    ),
+    hostUrl: enrollmentHostUrl(),
     enrollmentToken,
   }));
+  app.get("/api/tunnel", async () => tunnel.info(fallbackPublicUrl()));
+  app.post("/api/tunnel", async (request, reply) => {
+    const input = UpdateTunnelSchema.parse(request.body);
+    store.setTunnelEnabled(input.enabled);
+    try {
+      await tunnel.setEnabled(input.enabled);
+    } catch (error) {
+      store.setTunnelEnabled(false);
+      return reply.code(503).send({
+        error: error instanceof Error ? error.message : "Tunnel failed to start",
+        tunnel: tunnel.info(fallbackPublicUrl()),
+      });
+    }
+    return tunnel.info(fallbackPublicUrl());
+  });
   app.get("/api/snapshot", async () => ({
     nodes: store.listNodes(),
     workspaces: store.listWorkspaces(),
@@ -114,6 +146,7 @@ export async function buildServer(options: {
         version: input.version,
         capabilities: input.capabilities,
         maxSessions: input.maxSessions,
+        homeDir: input.homeDir,
       });
       return reply.code(201).send({ nodeId: node.id, secret });
     } catch (error) {
@@ -121,6 +154,37 @@ export async function buildServer(options: {
         .code(409)
         .send({ error: error instanceof Error ? error.message : "Registration failed" });
     }
+  });
+
+  app.patch("/api/nodes/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = RenameNodeSchema.parse(request.body);
+    if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
+    try {
+      const node = store.renameNode(id, input.name);
+      if (node) broadcast({ type: "node", node });
+      return node;
+    } catch {
+      return reply.code(409).send({ error: `A node named "${input.name}" already exists` });
+    }
+  });
+
+  app.delete("/api/nodes/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
+    try {
+      store.deleteNode(id);
+    } catch (error) {
+      return reply
+        .code(409)
+        .send({ error: error instanceof Error ? error.message : "Cannot delete node" });
+    }
+    const socket = nodeSockets.get(id);
+    if (socket) {
+      nodeSockets.delete(id);
+      socket.close(4002, "Node deleted");
+    }
+    return reply.code(204).send();
   });
 
   app.post("/api/workspaces", async (request, reply) => {
@@ -134,6 +198,30 @@ export async function buildServer(options: {
     }
   });
 
+  app.patch("/api/workspaces/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = UpdateWorkspaceSchema.parse(request.body);
+    if (!store.getWorkspace(id)) return reply.code(404).send({ error: "Unknown workspace" });
+    try {
+      return store.updateWorkspace(id, input.name, input.description);
+    } catch {
+      return reply.code(409).send({ error: `A workspace named "${input.name}" already exists` });
+    }
+  });
+
+  app.delete("/api/workspaces/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getWorkspace(id)) return reply.code(404).send({ error: "Unknown workspace" });
+    try {
+      store.deleteWorkspace(id);
+      return reply.code(204).send();
+    } catch (error) {
+      return reply
+        .code(409)
+        .send({ error: error instanceof Error ? error.message : "Cannot delete workspace" });
+    }
+  });
+
   app.post("/api/placements", async (request, reply) => {
     const input = CreatePlacementSchema.parse(request.body);
     try {
@@ -144,6 +232,26 @@ export async function buildServer(options: {
       return reply
         .code(409)
         .send({ error: error instanceof Error ? error.message : "Invalid placement" });
+    }
+  });
+
+  app.patch("/api/placements/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = UpdatePlacementSchema.parse(request.body);
+    if (!store.getPlacement(id)) return reply.code(404).send({ error: "Unknown placement" });
+    return store.updatePlacement(id, input.localPath);
+  });
+
+  app.delete("/api/placements/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getPlacement(id)) return reply.code(404).send({ error: "Unknown placement" });
+    try {
+      store.deletePlacement(id);
+      return reply.code(204).send();
+    } catch (error) {
+      return reply
+        .code(409)
+        .send({ error: error instanceof Error ? error.message : "Cannot delete placement" });
     }
   });
 
@@ -313,6 +421,7 @@ export async function buildServer(options: {
         );
       }
       nodeSockets.set(hello.nodeId, socket);
+      store.setNodeHomeDir(hello.nodeId, hello.homeDir);
       const node = store.setNodeOnline(hello.nodeId, true, 0);
       if (node) broadcast({ type: "node", node });
       publishReconciled(store.reconcileOfflineSessions(hello.nodeId, []));
@@ -450,9 +559,18 @@ export async function buildServer(options: {
     });
   }
 
+  app.addHook("onReady", () => {
+    if (!store.getTunnelEnabled()) return;
+    void tunnel.setEnabled(true).catch((error) => {
+      store.setTunnelEnabled(false);
+      app.log.error({ err: error }, "Failed to restore Cloudflare tunnel");
+    });
+  });
+
   app.addHook("onClose", async () => {
     closing = true;
     clearInterval(heartbeatTimer);
+    await tunnel.stop();
     for (const nodeId of nodeSockets.keys()) {
       publishReconciled(
         store.markNodeSessionsFailed(nodeId, "Host stopped; Node execution was terminated"),
@@ -478,6 +596,15 @@ export function resolvePublicHostUrl(
   if (publicUrl) return publicUrl.replace(/\/+$/, "");
   const wildcard = !host || host === "0.0.0.0" || host === "::";
   return `http://${wildcard ? "127.0.0.1" : host}:${port ?? "8787"}`;
+}
+
+/** Enrollment / Connect commands prefer a live tunnel URL over env / bind fallbacks. */
+export function resolveEnrollmentHostUrl(
+  tunnelUrl: string | undefined,
+  fallbackPublicUrl: string,
+): string {
+  if (tunnelUrl) return tunnelUrl.replace(/\/+$/, "");
+  return fallbackPublicUrl.replace(/\/+$/, "");
 }
 
 export function resolveEnrollmentToken(

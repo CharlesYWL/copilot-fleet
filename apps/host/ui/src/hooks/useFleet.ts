@@ -150,15 +150,21 @@ export async function api<T = unknown>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    headers: { "content-type": "application/json", ...init?.headers },
-  });
+  const headers = new Headers(init?.headers);
+  // Fastify rejects an empty body when Content-Type is application/json, so
+  // only advertise JSON when we are actually sending a payload.
+  if (init?.body !== undefined && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  const response = await fetch(path, { ...init, headers });
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as {
       error?: string;
     };
     throw new Error(body.error ?? `${response.status} ${response.statusText}`);
   }
-  return (await response.json()) as T;
+  if (response.status === 204) return undefined as T;
+  const text = await response.text();
+  if (!text) return undefined as T;
+  return JSON.parse(text) as T;
 }

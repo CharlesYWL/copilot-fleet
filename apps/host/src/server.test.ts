@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { resolveEnrollmentToken, resolvePublicHostUrl } from "./server.js";
+import {
+  resolveEnrollmentHostUrl,
+  resolveEnrollmentToken,
+  resolvePublicHostUrl,
+} from "./server.js";
 
 describe("production enrollment token", () => {
   it("rejects missing and default production tokens", () => {
@@ -37,6 +41,23 @@ describe("public host url", () => {
 
   it("keeps a concrete bind address", () => {
     expect(resolvePublicHostUrl(undefined, "192.168.1.5", "8787")).toBe(
+      "http://192.168.1.5:8787",
+    );
+  });
+});
+
+describe("enrollment host url", () => {
+  it("prefers the live tunnel url over the fallback", () => {
+    expect(
+      resolveEnrollmentHostUrl(
+        "https://abc.trycloudflare.com/",
+        "http://127.0.0.1:8787",
+      ),
+    ).toBe("https://abc.trycloudflare.com");
+  });
+
+  it("uses the fallback when the tunnel is down", () => {
+    expect(resolveEnrollmentHostUrl(undefined, "http://192.168.1.5:8787")).toBe(
       "http://192.168.1.5:8787",
     );
   });

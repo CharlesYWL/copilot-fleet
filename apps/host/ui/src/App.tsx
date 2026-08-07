@@ -16,11 +16,10 @@ import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import { NewSessionDialog } from "./components/NewSessionDialog";
-import { NodesPanel } from "./components/NodesPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { Sidebar, type SidebarView } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
 import { TopBar } from "./components/TopBar";
-import { WorkspacesPanel } from "./components/WorkspacesPanel";
 
 const terminalStates = new Set(["stopped", "completed", "failed"]);
 const FAILED_VISIBLE_MS = 120_000;
@@ -129,10 +128,63 @@ export function App() {
     }
   };
 
+  const handleRenameNode = async (nodeId: string, name: string) => {
+    try {
+      await api(`/api/nodes/${nodeId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name }),
+      });
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  };
+
+  const handleDeleteNode = async (nodeId: string) => {
+    try {
+      await api(`/api/nodes/${nodeId}`, { method: "DELETE" });
+      await refresh();
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  };
+
   const handleCreateWorkspace = async (name: string, description: string) => {
     const created = await command("/api/workspaces", { name, description });
     if (created) await refresh();
     return created;
+  };
+
+  const handleUpdateWorkspace = async (
+    workspaceId: string,
+    name: string,
+    description: string,
+  ) => {
+    try {
+      await api(`/api/workspaces/${workspaceId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ name, description }),
+      });
+      await refresh();
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  };
+
+  const handleDeleteWorkspace = async (workspaceId: string) => {
+    try {
+      await api(`/api/workspaces/${workspaceId}`, { method: "DELETE" });
+      await refresh();
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
   };
 
   const handleCreatePlacement = async (
@@ -143,6 +195,31 @@ export function App() {
     const created = await command("/api/placements", { workspaceId, nodeId, localPath });
     if (created) await refresh();
     return created;
+  };
+
+  const handleUpdatePlacement = async (placementId: string, localPath: string) => {
+    try {
+      await api(`/api/placements/${placementId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ localPath }),
+      });
+      await refresh();
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  };
+
+  const handleDeletePlacement = async (placementId: string) => {
+    try {
+      await api(`/api/placements/${placementId}`, { method: "DELETE" });
+      await refresh();
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
   };
 
   return (
@@ -164,17 +241,21 @@ export function App() {
           onSelectView={setView}
         />
 
-        {view === "workspaces" && (
-          <WorkspacesPanel
+        {view === "settings" && (
+          <SettingsPanel
             workspaces={snapshot.workspaces}
             placements={snapshot.placements}
             nodes={snapshot.nodes}
+            onRenameNode={handleRenameNode}
+            onDeleteNode={handleDeleteNode}
             onCreateWorkspace={handleCreateWorkspace}
+            onUpdateWorkspace={handleUpdateWorkspace}
+            onDeleteWorkspace={handleDeleteWorkspace}
             onCreatePlacement={handleCreatePlacement}
+            onUpdatePlacement={handleUpdatePlacement}
+            onDeletePlacement={handleDeletePlacement}
           />
         )}
-
-        {view === "nodes" && <NodesPanel nodes={snapshot.nodes} />}
 
         {view === "session" &&
           (activeSession ? (

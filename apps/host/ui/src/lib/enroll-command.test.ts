@@ -5,21 +5,15 @@ const URL = "https://fleet.example.com";
 const TOKEN = "abc123";
 
 describe("enrollCommand", () => {
-  it("derives the node name from the machine so names cannot collide", () => {
-    expect(enrollCommand("bash", URL, TOKEN)).toContain(
-      'FLEET_NODE_NAME="$(hostname)"',
-    );
-    expect(enrollCommand("powershell", URL, TOKEN)).toContain(
-      "$env:FLEET_NODE_NAME=$env:COMPUTERNAME",
-    );
-  });
-
-  it("carries the host url and token into both shells", () => {
+  it("uses the short root aliases and carries host url + token", () => {
     for (const shell of ["bash", "powershell"] as const) {
       const command = enrollCommand(shell, URL, TOKEN);
       expect(command).toContain(URL);
       expect(command).toContain(TOKEN);
-      expect(command).toContain("npm run dev -w @fleet/node");
+      expect(command).toContain("npm run build:node");
+      expect(command).toContain("npm run start:node");
+      expect(command).not.toContain("@fleet/node");
+      expect(command).not.toContain("FLEET_NODE_NAME");
     }
   });
 

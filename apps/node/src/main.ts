@@ -1,5 +1,5 @@
 import { config as loadEnv } from "dotenv";
-import { arch, platform } from "node:os";
+import { arch, homedir, hostname, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import {
@@ -27,8 +27,20 @@ loadEnv({ path: fileURLToPath(new URL("../../../.env", import.meta.url)), quiet:
 
 const VERSION = "0.1.0";
 const hostUrl = process.env.FLEET_HOST_URL ?? "http://127.0.0.1:8787";
-const nodeName = process.env.FLEET_NODE_NAME ?? platform() + "-node";
+const nodeName = process.env.FLEET_NODE_NAME ?? hostname();
 const maxSessions = Number(process.env.FLEET_MAX_SESSIONS ?? 4);
+const mockAgent = process.env.FLEET_MOCK_AGENT === "1";
+
+function log(message: string): void {
+  console.log(`${new Date().toISOString()} [node] ${message}`);
+}
+
+log(`copilot-fleet node ${VERSION} starting`);
+log(`  name        ${nodeName}`);
+log(`  host        ${hostUrl}`);
+log(`  agent       ${mockAgent ? "mock" : "copilot --acp"}`);
+log(`  capacity    ${maxSessions} concurrent sessions`);
+log(`  config      ${configDirectory()}`);
 
 const instanceLock = acquireInstanceLock(configDirectory());
 if (!instanceLock.ok) {
@@ -40,12 +52,15 @@ process.once("exit", () => releaseInstanceLock());
 
 let credentials = await loadCredentials();
 if (!credentials || credentials.hostUrl !== hostUrl || credentials.name !== nodeName) {
+  log(credentials ? "Identity changed, registering again" : "No stored credentials, registering");
   credentials = await register();
   await saveCredentials(credentials);
+  log(`Registered as node ${credentials.nodeId}`);
+} else {
+  log(`Reusing stored credentials for node ${credentials.nodeId}`);
 }
 
-const factory =
-  process.env.FLEET_MOCK_AGENT === "1" ? new MockAgentFactory() : new AcpAgentFactory();
+const factory = mockAgent ? new MockAgentFactory() : new AcpAgentFactory();
 let socket: WebSocket | undefined;
 let shuttingDown = false;
 const router = new CommandRouter(factory, maxSessions, (event) => {
@@ -57,6 +72,7 @@ connect(credentials);
 function connect(auth: Credentials): void {
   const url = new URL("/ws/node", auth.hostUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  log(`Connecting to ${url}`);
   socket = new WebSocket(url);
   socket.on("open", () => {
     send({
@@ -66,8 +82,9 @@ function connect(auth: Credentials): void {
       os: platform(),
       arch: arch(),
       version: VERSION,
-      capabilities: ["copilot-acp", process.env.FLEET_MOCK_AGENT === "1" ? "mock" : "real"],
+      capabilities: ["copilot-acp", mockAgent ? "mock" : "real"],
       maxSessions,
+      homeDir: homedir(),
     });
   });
   socket.on("message", async (raw) => {
@@ -83,12 +100,23 @@ function connect(auth: Credentials): void {
       socket?.close(1008, "Invalid Host message");
       return;
     }
+    if (parsed.data.type === "welcome") {
+      log(`Authenticated with Host, waiting for commands`);
+      return;
+    }
     if (parsed.data.type !== "command") return;
-    const result = await router.route(parsed.data.command);
+    const { command } = parsed.data;
+    log(`< ${command.type} session=${command.sessionId.slice(0, 8)}`);
+    const result = await router.route(command);
+    log(
+      result.ok
+        ? `> ${command.type} ok session=${command.sessionId.slice(0, 8)}`
+        : `> ${command.type} FAILED session=${command.sessionId.slice(0, 8)}: ${result.error}`,
+    );
     send({
       type: "command_result",
       commandId: result.commandId,
-      sessionId: parsed.data.command.sessionId,
+      sessionId: command.sessionId,
       ok: result.ok,
       ...(result.error ? { error: result.error } : {}),
     });
@@ -104,8 +132,10 @@ function connect(auth: Credentials): void {
         releaseInstanceLock();
         process.exit(1);
       }
+      log(`Disconnected (code ${code}); shutting down`);
       return;
     }
+    log(`Disconnected (code ${code}); reconnecting in 2s`);
     setTimeout(() => connect(auth), 2_000);
   });
   socket.on("error", (error) => {
@@ -139,6 +169,7 @@ async function register(): Promise<Credentials> {
     version: VERSION,
     capabilities: ["copilot-acp"],
     maxSessions,
+    homeDir: homedir(),
   });
   const response = await fetch(new URL("/api/nodes/register", hostUrl), {
     method: "POST",
