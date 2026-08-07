@@ -42,8 +42,18 @@ export const NewSessionDialog = ({
 
   useEffect(() => {
     if (!open) return;
-    setPlacementId(placements[0]?.id ?? "");
     setPrompt("");
+  }, [open]);
+
+  // Node heartbeats hand down a fresh placements array every few seconds, so
+  // only correct the selection when it actually stopped being valid.
+  useEffect(() => {
+    if (!open) return;
+    setPlacementId((current) =>
+      placements.some((placement) => placement.id === current)
+        ? current
+        : (placements[0]?.id ?? ""),
+    );
   }, [open, placements]);
 
   const handleSubmit = async (event: FormEvent) => {
