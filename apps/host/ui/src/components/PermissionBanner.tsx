@@ -1,4 +1,4 @@
-import { Button, Text, makeStyles, tokens } from "@fluentui/react-components";
+import { Button, Text, makeStyles, mergeClasses } from "@fluentui/react-components";
 import { Warning20Regular } from "@fluentui/react-icons";
 
 const useStyles = makeStyles({
@@ -10,6 +10,14 @@ const useStyles = makeStyles({
     borderBottom: "1px solid #7c653b",
     background: "#241d10",
     color: "#f2dcae",
+  },
+  // In a monitor tile the banner sits at the bottom of the card, so the rule
+  // moves to the top edge and the controls shrink to fit a narrow column.
+  compact: {
+    gap: "8px",
+    padding: "6px 10px",
+    borderBottom: "none",
+    borderTop: "1px solid #7c653b",
   },
   body: {
     flexGrow: 1,
@@ -29,6 +37,9 @@ const useStyles = makeStyles({
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
   },
+  compactDetail: {
+    fontSize: "11px",
+  },
   allow: {
     background: "#f7bf61",
     color: "#20180a",
@@ -36,36 +47,38 @@ const useStyles = makeStyles({
   },
 });
 
-export type PermissionOption = {
-  optionId: string;
-  name: string;
-  kind: string;
-};
-
 type PermissionBannerProps = {
   title: string;
-  options: PermissionOption[];
+  allowOptionId?: string | undefined;
+  compact?: boolean;
   onDecide: (outcome: "allow_once" | "deny", optionId?: string) => void;
 };
 
-export const PermissionBanner = ({ title, options, onDecide }: PermissionBannerProps) => {
+export const PermissionBanner = ({
+  title,
+  allowOptionId,
+  compact = false,
+  onDecide,
+}: PermissionBannerProps) => {
   const styles = useStyles();
-  const allowOption = options.find((option) => option.kind === "allow_once");
+  const size = compact ? "small" : "medium";
 
-  const handleAllow = () => onDecide("allow_once", allowOption?.optionId);
+  const handleAllow = () => onDecide("allow_once", allowOptionId);
   const handleDeny = () => onDecide("deny");
 
   return (
-    <div className={styles.banner} role="alert">
-      <Warning20Regular aria-hidden="true" />
+    <div className={mergeClasses(styles.banner, compact && styles.compact)} role="alert">
+      {!compact && <Warning20Regular aria-hidden="true" />}
       <div className={styles.body}>
-        <Text className={styles.title}>Permission required</Text>
-        <Text className={styles.detail}>{title}</Text>
+        {!compact && <Text className={styles.title}>Permission required</Text>}
+        <Text className={mergeClasses(styles.detail, compact && styles.compactDetail)}>
+          {title}
+        </Text>
       </div>
-      <Button className={styles.allow} onClick={handleAllow}>
+      <Button className={styles.allow} size={size} onClick={handleAllow}>
         Allow once
       </Button>
-      <Button appearance="secondary" onClick={handleDeny}>
+      <Button appearance="secondary" size={size} onClick={handleDeny}>
         Deny
       </Button>
     </div>

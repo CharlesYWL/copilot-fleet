@@ -171,6 +171,30 @@ export function pendingPermissionCount(events: SessionEvent[]): number {
   return pendingPermissionRequests(events).length;
 }
 
+/** Human-readable summary of what the agent is asking to do. */
+export function permissionTitle(event: SessionEvent): string {
+  return asText(event.payload.title) || "Tool request";
+}
+
+/** Id a decision must be posted against, absent on a malformed request. */
+export function permissionRequestId(event: SessionEvent): string | undefined {
+  return asText(event.payload.requestId) || undefined;
+}
+
+/** The agent's own "allow once" choice, when it offered one. */
+export function allowOnceOptionId(event: SessionEvent): string | undefined {
+  const { options } = event.payload;
+  if (!Array.isArray(options)) return undefined;
+  const allow = options.find(
+    (option) => isRecord(option) && asText(option.kind) === "allow_once",
+  );
+  return isRecord(allow) ? asText(allow.optionId) || undefined : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 function asText(value: unknown): string {
   return typeof value === "string" ? value : "";
 }

@@ -1,7 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Button,
-  Text,
   Toast,
   ToastTitle,
   Toaster,
@@ -10,19 +8,22 @@ import {
   useId,
   useToastController,
 } from "@fluentui/react-components";
-import { Add20Regular } from "@fluentui/react-icons";
-import type { FleetSession } from "@fleet/protocol";
+import type { FleetSession, SessionEvent } from "@fleet/protocol";
 import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
+import { EmptySessions } from "./components/EmptySessions";
 import { NewSessionDialog } from "./components/NewSessionDialog";
+import { SessionFocusDialog } from "./components/SessionFocusDialog";
+import { SessionGrid } from "./components/SessionGrid";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { Sidebar, type SidebarView } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
-import { TopBar } from "./components/TopBar";
+import { TopBar, type LayoutMode } from "./components/TopBar";
 
 const terminalStates = new Set(["stopped", "completed", "failed"]);
 const FAILED_VISIBLE_MS = 120_000;
+const noEvents: SessionEvent[] = [];
 
 const useStyles = makeStyles({
   app: {
@@ -36,19 +37,6 @@ const useStyles = makeStyles({
     flexGrow: 1,
     display: "flex",
     minHeight: 0,
-  },
-  empty: {
-    flexGrow: 1,
-    display: "grid",
-    placeContent: "center",
-    justifyItems: "center",
-    gap: "10px",
-    background: tokens.colorNeutralBackground1,
-  },
-  emptyCaption: {
-    color: tokens.colorNeutralForeground3,
-    maxWidth: "360px",
-    textAlign: "center",
   },
 });
 
@@ -71,8 +59,11 @@ export function App() {
 
   const { snapshot, events, connected, refresh, loadEvents, command } = useFleet(notify);
   const [view, setView] = useState<SidebarView>("session");
+  const [layout, setLayout] = useState<LayoutMode>("tree");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
+  const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const backfilled = useRef(new Set<string>());
 
   const visibleSessions = useMemo(
     () => filterVisibleSessions(snapshot.sessions, selectedSessionId),
@@ -106,10 +97,41 @@ export function App() {
     void loadEvents(selectedSessionId);
   }, [selectedSessionId, loadEvents]);
 
+  // Live updates only cover what streams while this tab is open, so every tile
+  // needs its history once before the monitor wall can preview it.
+  useEffect(() => {
+    if (layout !== "grid") return;
+    for (const session of visibleSessions) {
+      if (backfilled.current.has(session.id)) continue;
+      backfilled.current.add(session.id);
+      void loadEvents(session.id);
+    }
+  }, [layout, visibleSessions, loadEvents]);
+
   const handleSelectSession = (sessionId: string) => {
     setSelectedSessionId(sessionId);
     setView("session");
+    if (layout === "grid") setFocusOpen(true);
   };
+
+  const handleLayoutChange = (next: LayoutMode) => {
+    setLayout(next);
+    setFocusOpen(false);
+    // Settings only exists beside the tree, so grid always lands on sessions.
+    if (next === "grid") setView("session");
+  };
+
+  const handlePermission = (
+    sessionId: string,
+    requestId: string,
+    outcome: "allow_once" | "deny",
+    optionId?: string,
+  ) =>
+    void command(`/api/sessions/${sessionId}/permission`, {
+      requestId,
+      outcome,
+      ...(optionId ? { optionId } : {}),
+    });
 
   usePermissionAlerts(waitingPermissions, handleSelectSession);
 
@@ -229,71 +251,83 @@ export function App() {
         liveSessions={liveSessions.length}
         waitingPermissions={waitingPermissions.length}
         connected={connected}
+        layout={layout}
+        onLayoutChange={handleLayoutChange}
       />
       <div className={styles.body}>
-        <Sidebar
-          nodes={snapshot.nodes}
-          sessions={visibleSessions}
-          selectedSessionId={selectedSessionId}
-          view={view}
-          onSelectSession={handleSelectSession}
-          onNewSession={() => setDialogOpen(true)}
-          onSelectView={setView}
-        />
-
-        {view === "settings" && (
-          <SettingsPanel
-            workspaces={snapshot.workspaces}
-            placements={snapshot.placements}
-            nodes={snapshot.nodes}
-            onRenameNode={handleRenameNode}
-            onDeleteNode={handleDeleteNode}
-            onCreateWorkspace={handleCreateWorkspace}
-            onUpdateWorkspace={handleUpdateWorkspace}
-            onDeleteWorkspace={handleDeleteWorkspace}
-            onCreatePlacement={handleCreatePlacement}
-            onUpdatePlacement={handleUpdatePlacement}
-            onDeletePlacement={handleDeletePlacement}
+        {layout === "grid" ? (
+          <SessionGrid
+            sessions={visibleSessions}
+            events={events}
+            onOpen={handleSelectSession}
+            onPermission={handlePermission}
+            onNewSession={() => setDialogOpen(true)}
           />
-        )}
-
-        {view === "session" &&
-          (activeSession ? (
-            <TerminalView
-              session={activeSession}
-              events={events[activeSession.id] ?? []}
-              onPrompt={(prompt) =>
-                void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
-              }
-              onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
-              onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
-              onPermission={(requestId, outcome, optionId) =>
-                void command(`/api/sessions/${activeSession.id}/permission`, {
-                  requestId,
-                  outcome,
-                  ...(optionId ? { optionId } : {}),
-                })
-              }
+        ) : (
+          <>
+            <Sidebar
+              nodes={snapshot.nodes}
+              sessions={visibleSessions}
+              selectedSessionId={selectedSessionId}
+              view={view}
+              onSelectSession={handleSelectSession}
+              onNewSession={() => setDialogOpen(true)}
+              onSelectView={setView}
             />
-          ) : (
-            <div className={styles.empty}>
-              <Text size={500} weight="semibold">
-                No live sessions
-              </Text>
-              <Text className={styles.emptyCaption}>
-                Register a node, add a workspace placement, then launch an agent to watch its
-                stream here.
-              </Text>
-              <Button
-                appearance="primary"
-                icon={<Add20Regular />}
-                onClick={() => setDialogOpen(true)}
-              >
-                New session
-              </Button>
-            </div>
-          ))}
+
+            {view === "settings" && (
+              <SettingsPanel
+                workspaces={snapshot.workspaces}
+                placements={snapshot.placements}
+                nodes={snapshot.nodes}
+                onRenameNode={handleRenameNode}
+                onDeleteNode={handleDeleteNode}
+                onCreateWorkspace={handleCreateWorkspace}
+                onUpdateWorkspace={handleUpdateWorkspace}
+                onDeleteWorkspace={handleDeleteWorkspace}
+                onCreatePlacement={handleCreatePlacement}
+                onUpdatePlacement={handleUpdatePlacement}
+                onDeletePlacement={handleDeletePlacement}
+              />
+            )}
+
+            {view === "session" &&
+              (activeSession ? (
+                <TerminalView
+                  session={activeSession}
+                  events={events[activeSession.id] ?? noEvents}
+                  onPrompt={(prompt) =>
+                    void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
+                  }
+                  onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
+                  onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
+                  onPermission={(requestId, outcome, optionId) =>
+                    handlePermission(activeSession.id, requestId, outcome, optionId)
+                  }
+                />
+              ) : (
+                <EmptySessions onNewSession={() => setDialogOpen(true)} />
+              ))}
+          </>
+        )}
       </div>
+
+      {layout === "grid" && activeSession && (
+        <SessionFocusDialog
+          session={activeSession}
+          events={events[activeSession.id] ?? noEvents}
+          open={focusOpen}
+          onOpenChange={setFocusOpen}
+          onPrompt={(prompt) =>
+            void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
+          }
+          onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
+          onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
+          onPermission={(requestId, outcome, optionId) =>
+            handlePermission(activeSession.id, requestId, outcome, optionId)
+          }
+        />
+      )}
 
       <NewSessionDialog
         open={dialogOpen}

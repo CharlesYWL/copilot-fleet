@@ -1,4 +1,11 @@
-import { Text, makeStyles, mergeClasses, tokens } from "@fluentui/react-components";
+import {
+  Text,
+  ToggleButton,
+  makeStyles,
+  mergeClasses,
+  tokens,
+} from "@fluentui/react-components";
+import { Grid20Regular, TextBulletListTree20Regular } from "@fluentui/react-icons";
 
 const useStyles = makeStyles({
   bar: {
@@ -28,6 +35,14 @@ const useStyles = makeStyles({
     color: "#ffffff",
     background: "linear-gradient(145deg,#6c8cff,#8d67e8)",
     boxShadow: "0 6px 20px #6c8cff40",
+  },
+  modes: {
+    display: "flex",
+    alignItems: "center",
+    gap: "4px",
+    padding: "3px",
+    borderRadius: tokens.borderRadiusMedium,
+    background: tokens.colorNeutralBackground3,
   },
   stats: {
     display: "flex",
@@ -68,11 +83,16 @@ const Stat = ({ label, value, warn = false }: StatProps) => {
   );
 };
 
+/** Tree pairs the session list with one terminal; grid tiles every session. */
+export type LayoutMode = "tree" | "grid";
+
 type TopBarProps = {
   nodesOnline: number;
   liveSessions: number;
   waitingPermissions: number;
   connected: boolean;
+  layout: LayoutMode;
+  onLayoutChange: (layout: LayoutMode) => void;
 };
 
 export const TopBar = ({
@@ -80,6 +100,8 @@ export const TopBar = ({
   liveSessions,
   waitingPermissions,
   connected,
+  layout,
+  onLayoutChange,
 }: TopBarProps) => {
   const styles = useStyles();
   return (
@@ -89,6 +111,26 @@ export const TopBar = ({
           CF
         </div>
         <Text weight="semibold">Copilot Fleet</Text>
+      </div>
+      <div className={styles.modes} role="group" aria-label="Layout mode">
+        <ToggleButton
+          appearance="subtle"
+          size="small"
+          checked={layout === "tree"}
+          icon={<TextBulletListTree20Regular />}
+          onClick={() => onLayoutChange("tree")}
+        >
+          Tree
+        </ToggleButton>
+        <ToggleButton
+          appearance="subtle"
+          size="small"
+          checked={layout === "grid"}
+          icon={<Grid20Regular />}
+          onClick={() => onLayoutChange("grid")}
+        >
+          View
+        </ToggleButton>
       </div>
       <div className={styles.stats}>
         <Stat label="nodes online" value={nodesOnline} />

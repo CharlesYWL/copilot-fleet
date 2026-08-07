@@ -14,17 +14,25 @@ import {
   mergeClasses,
   tokens,
 } from "@fluentui/react-components";
-import { RecordStop20Regular, Send20Regular, Stop20Regular } from "@fluentui/react-icons";
-import type { FleetSession, SessionEvent } from "@fleet/protocol";
-import { stateAccent, terminal } from "../theme";
 import {
+  Dismiss20Regular,
+  RecordStop20Regular,
+  Send20Regular,
+  Stop20Regular,
+} from "@fluentui/react-icons";
+import type { FleetSession, SessionEvent } from "@fleet/protocol";
+import { blockColor, stateAccent, terminal } from "../theme";
+import {
+  allowOnceOptionId,
   pendingPermission,
+  permissionRequestId,
+  permissionTitle,
   toTerminalBlocks,
   type TerminalBlock,
   type TerminalBlockKind,
 } from "../lib/terminal-blocks";
 import { MarkdownBody } from "./MarkdownBody";
-import { PermissionBanner, type PermissionOption } from "./PermissionBanner";
+import { PermissionBanner } from "./PermissionBanner";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -160,19 +168,6 @@ const glyphs: Record<TerminalBlockKind, string> = {
   system: "\u203a",
 };
 
-const colors: Record<TerminalBlockKind, string> = {
-  user: terminal.user,
-  agent: terminal.agent,
-  thought: terminal.thought,
-  tool: terminal.tool,
-  permission: terminal.permission,
-  permission_result: terminal.dim,
-  turn: terminal.dim,
-  state: terminal.dim,
-  error: terminal.error,
-  system: terminal.dim,
-};
-
 type TerminalViewProps = {
   session: FleetSession;
   events: SessionEvent[];
@@ -184,6 +179,7 @@ type TerminalViewProps = {
     outcome: "allow_once" | "deny",
     optionId?: string,
   ) => void;
+  onClose?: () => void;
 };
 
 export const TerminalView = ({
@@ -193,6 +189,7 @@ export const TerminalView = ({
   onCancel,
   onStop,
   onPermission,
+  onClose,
 }: TerminalViewProps) => {
   const styles = useStyles();
   const [prompt, setPrompt] = useState("");
@@ -242,8 +239,8 @@ export const TerminalView = ({
   };
 
   const handleDecide = (outcome: "allow_once" | "deny", optionId?: string) => {
-    const requestId = permission?.payload.requestId;
-    if (typeof requestId !== "string") return;
+    const requestId = permission && permissionRequestId(permission);
+    if (!requestId) return;
     onPermission(requestId, outcome, optionId);
   };
 
@@ -276,12 +273,21 @@ export const TerminalView = ({
         <Button appearance="secondary" icon={<Stop20Regular />} onClick={onStop}>
           Stop
         </Button>
+        {onClose && (
+          <Button
+            appearance="subtle"
+            icon={<Dismiss20Regular />}
+            onClick={onClose}
+            aria-label="Close session"
+            title="Close"
+          />
+        )}
       </div>
 
       {permission && (
         <PermissionBanner
-          title={asTitle(permission.payload.title)}
-          options={asOptions(permission.payload.options)}
+          title={permissionTitle(permission)}
+          allowOptionId={allowOnceOptionId(permission)}
           onDecide={handleDecide}
         />
       )}
@@ -326,7 +332,7 @@ const markdownKinds = new Set<TerminalBlockKind>(["agent", "user", "thought"]);
 
 const TerminalLine = ({ block }: { block: TerminalBlock }) => {
   const styles = useStyles();
-  const color = colors[block.kind];
+  const color = blockColor[block.kind];
   const text =
     block.kind === "turn"
       ? `turn complete (${block.text})`
@@ -368,19 +374,4 @@ function formatTime(value: string): string {
   const parsed = Date.parse(value);
   if (Number.isNaN(parsed)) return "";
   return new Date(parsed).toLocaleTimeString(undefined, { hour12: false });
-}
-
-function asTitle(value: unknown): string {
-  return typeof value === "string" ? value : "Tool request";
-}
-
-function asOptions(value: unknown): PermissionOption[] {
-  if (!Array.isArray(value)) return [];
-  return value.filter(
-    (item): item is PermissionOption =>
-      typeof item === "object" &&
-      item !== null &&
-      typeof (item as PermissionOption).optionId === "string" &&
-      typeof (item as PermissionOption).kind === "string",
-  );
 }

@@ -3,6 +3,7 @@ import {
   type BrandVariants,
   type Theme,
 } from "@fluentui/react-components";
+import type { TerminalBlockKind } from "./lib/terminal-blocks";
 
 const fleetBrand: BrandVariants = {
   10: "#020305",
@@ -53,6 +54,19 @@ export const terminal = {
   error: "#ff6b7a",
   dim: "#4d576d",
 } as const;
+
+export const blockColor: Record<TerminalBlockKind, string> = {
+  user: terminal.user,
+  agent: terminal.agent,
+  thought: terminal.thought,
+  tool: terminal.tool,
+  permission: terminal.permission,
+  permission_result: terminal.dim,
+  turn: terminal.dim,
+  state: terminal.dim,
+  error: terminal.error,
+  system: terminal.dim,
+};
 
 export const stateAccent: Record<string, string> = {
   queued: "#8994ab",
