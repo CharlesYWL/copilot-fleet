@@ -41,6 +41,11 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     minWidth: 0,
+    // Stacked inside the focus dialog this is a column flex item, where the
+    // default min-height:auto would grow past the surface and leave the
+    // stream unscrollable. Beside the sidebar it is a row item, so this is a
+    // no-op there.
+    minHeight: 0,
     background: terminal.background,
   },
   header: {
