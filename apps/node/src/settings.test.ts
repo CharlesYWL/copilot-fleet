@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { needsReconnect, settingsFromEnv } from "./settings.js";
+import {
+  DEFAULT_PERMISSION_TIMEOUT_MS,
+  needsReconnect,
+  settingsFromEnv,
+} from "./settings.js";
 import { configServerPort } from "./config-server.js";
 
 describe("settingsFromEnv", () => {
@@ -8,6 +12,9 @@ describe("settingsFromEnv", () => {
     expect(settings.hostUrl).toBe("http://127.0.0.1:8787");
     expect(settings.nodeName.length).toBeGreaterThan(0);
     expect(settings.maxSessions).toBe(4);
+    // The documented default, so a node without the variable does not deny
+    // permissions long before the operator's .env says it should.
+    expect(settings.permissionTimeoutMs).toBe(DEFAULT_PERMISSION_TIMEOUT_MS);
   });
 
   it("reads the fleet environment variables", () => {
@@ -40,9 +47,7 @@ describe("needsReconnect", () => {
 
   it("applies agent tuning in place, without dropping the socket", () => {
     expect(needsReconnect(base, { ...base, permissionTimeoutMs: 90_000 })).toBe(false);
-    expect(needsReconnect(base, { ...base, copilotCommand: "/opt/copilot" })).toBe(
-      false,
-    );
+    expect(needsReconnect(base, { ...base, copilotCommand: "/opt/copilot" })).toBe(false);
   });
 });
 

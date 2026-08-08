@@ -67,14 +67,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     binary: "ngrok",
     versionArgs: ["version"],
     // `--log stdout` keeps the URL in a pipe-friendly stream instead of the TUI.
-    args: (target) => [
-      "http",
-      target.url,
-      "--log",
-      "stdout",
-      "--log-format",
-      "logfmt",
-    ],
+    args: (target) => ["http", target.url, "--log", "stdout", "--log-format", "logfmt"],
     extractUrl: matcher(NGROK_URL_RE),
     installHint: "brew install ngrok, then run `ngrok config add-authtoken <token>`.",
     caveat: "Free ngrok domains change on every restart.",

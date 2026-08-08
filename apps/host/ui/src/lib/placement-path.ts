@@ -13,8 +13,7 @@ export function nextPlacementPath(
   previousHomeDir: string | undefined,
   nextHomeDir: string,
 ): string {
-  const ours =
-    currentPath.trim().length === 0 || currentPath === previousHomeDir;
+  const ours = currentPath.trim().length === 0 || currentPath === previousHomeDir;
   if (!ours) return currentPath;
   return nextHomeDir;
 }

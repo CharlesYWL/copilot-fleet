@@ -1,8 +1,4 @@
-import {
-  isValidElement,
-  type ReactNode,
-  type ComponentPropsWithoutRef,
-} from "react";
+import { isValidElement, type ReactNode, type ComponentPropsWithoutRef } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { makeStyles, mergeClasses, tokens } from "@fluentui/react-components";
@@ -147,12 +143,7 @@ type MarkdownBodyProps = {
   className?: string;
 };
 
-export const MarkdownBody = ({
-  text,
-  muted,
-  copyable,
-  className,
-}: MarkdownBodyProps) => {
+export const MarkdownBody = ({ text, muted, copyable, className }: MarkdownBodyProps) => {
   const styles = useStyles();
   return (
     <div

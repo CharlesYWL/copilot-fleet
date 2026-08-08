@@ -1,9 +1,10 @@
-import { existsSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { z } from "zod";
 import type { TunnelProvider } from "@fleet/protocol";
 import { TunnelProviderSchema } from "@fleet/protocol";
+import { isProcessAlive } from "@fleet/protocol/runtime";
+import { packageRoot } from "./paths.js";
 
 const StateSchema = z.object({
   provider: TunnelProviderSchema,
@@ -21,27 +22,10 @@ export type ExternalTunnel = {
  * Anchored to the package rather than the working directory: the Host and the
  * tunnel process are launched from different cwds (workspace scripts run inside
  * apps/host), so a relative path had them writing and reading different files.
- * Walking up to package.json keeps source and built output, which sits one
- * directory deeper, resolving to the same file.
  */
 export function externalTunnelPath(): string {
   if (process.env.FLEET_TUNNEL_STATE_FILE) return process.env.FLEET_TUNNEL_STATE_FILE;
-  let directory = dirname(fileURLToPath(import.meta.url));
-  while (!existsSync(join(directory, "package.json"))) {
-    const parent = dirname(directory);
-    if (parent === directory) break;
-    directory = parent;
-  }
-  return join(directory, "data", "tunnel.json");
-}
-
-export function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return join(packageRoot(), "data", "tunnel.json");
 }
 
 /**

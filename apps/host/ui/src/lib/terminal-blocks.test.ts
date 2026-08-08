@@ -85,6 +85,18 @@ describe("toTerminalBlocks", () => {
     ]);
   });
 
+  it("skips a payload that lost its shape instead of printing a blank line", () => {
+    const blocks = toTerminalBlocks([
+      event("agent_text", { text: 42 }),
+      event("state", { state: "elsewhere", activity: "who knows" }),
+      event("agent_text", { text: "still here" }),
+    ]);
+
+    expect(blocks.map((block) => [block.kind, block.text])).toEqual([
+      ["agent", "still here"],
+    ]);
+  });
+
   it("hides per-turn state churn but keeps terminal states", () => {
     const blocks = toTerminalBlocks([
       event("state", { state: "starting", activity: "Starting Copilot ACP" }),
@@ -120,8 +132,9 @@ describe("pendingPermissionRequests", () => {
       event("permission", { requestId: "r3", title: "fetch url" }),
     ];
 
-    expect(
-      pendingPermissionRequests(events).map((item) => item.payload.title),
-    ).toEqual(["delete file", "fetch url"]);
+    expect(pendingPermissionRequests(events).map((item) => item.payload.title)).toEqual([
+      "delete file",
+      "fetch url",
+    ]);
   });
 });

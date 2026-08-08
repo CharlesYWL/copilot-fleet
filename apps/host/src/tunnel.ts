@@ -1,9 +1,7 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { promisify } from "node:util";
 import type { TunnelInfo, TunnelProvider, TunnelStatus } from "@fleet/protocol";
-import {
-  readExternalTunnel,
-  type ExternalTunnel,
-} from "./external-tunnel.js";
+import { readExternalTunnel, type ExternalTunnel } from "./external-tunnel.js";
 import {
   parseLocalTarget,
   providerList,
@@ -12,18 +10,67 @@ import {
   type ProviderSpec,
 } from "./tunnel-providers.js";
 
-export { TRYCLOUDFLARE_URL_RE, extractTunnelUrl } from "./tunnel-providers.js";
+const run = promisify(execFile);
 
-export function binaryPresent(spec: ProviderSpec): boolean {
-  const result = spawnSync(spec.binary, spec.versionArgs, {
-    encoding: "utf8",
-    windowsHide: true,
-  });
-  return result.status === 0;
+/** Long enough that a Settings page polling every 2s never re-probes. */
+export const BINARY_PROBE_TTL_MS = 300_000;
+
+/**
+ * Remembers which provider CLIs are installed.
+ *
+ * Probing is a process spawn, and describing the tunnel needs one probe per
+ * supported provider. The Settings page polls that description every two
+ * seconds, so an uncached probe meant five synchronous spawns per poll —
+ * enough to stall the Host's event loop for as long as the page stayed open.
+ * Installing a CLI while the Host runs is rare and always accompanied by
+ * toggling the tunnel, which invalidates the cache anyway.
+ */
+export class BinaryProbe {
+  private readonly cache = new Map<string, { present: boolean; expiresAt: number }>();
+  private readonly inFlight = new Map<string, Promise<boolean>>();
+
+  constructor(
+    private readonly probe: (spec: ProviderSpec) => Promise<boolean> = runVersionProbe,
+    private readonly ttlMs = BINARY_PROBE_TTL_MS,
+    private readonly now: () => number = () => Date.now(),
+  ) {}
+
+  async present(spec: ProviderSpec): Promise<boolean> {
+    const cached = this.cache.get(spec.binary);
+    if (cached && cached.expiresAt > this.now()) return cached.present;
+    // Callers arrive in bursts (one per provider, plus the active one), so
+    // sharing a single in-flight probe keeps that burst to one spawn each.
+    const pending = this.inFlight.get(spec.binary);
+    if (pending) return pending;
+    const probe = this.probe(spec)
+      .then((present) => {
+        this.cache.set(spec.binary, {
+          present,
+          expiresAt: this.now() + this.ttlMs,
+        });
+        return present;
+      })
+      .finally(() => this.inFlight.delete(spec.binary));
+    this.inFlight.set(spec.binary, probe);
+    return probe;
+  }
+
+  /** Called when the operator switches provider or asks for a fresh start. */
+  invalidate(): void {
+    this.cache.clear();
+  }
 }
 
-export function cloudflaredBinaryPresent(): boolean {
-  return binaryPresent(providerSpecs.cloudflare);
+async function runVersionProbe(spec: ProviderSpec): Promise<boolean> {
+  try {
+    await run(spec.binary, spec.versionArgs, {
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Backoff for unattended restarts; caps so a dead provider stops hammering. */
@@ -44,6 +91,8 @@ type TunnelManagerOptions = {
   clearTimer?: (timer: NodeJS.Timeout) => void;
   /** Detects a tunnel running as its own process; injected for tests. */
   readExternal?: () => ExternalTunnel | undefined;
+  /** Injected so tests never spawn a real CLI. */
+  probe?: BinaryProbe;
 };
 
 export class TunnelManager {
@@ -62,6 +111,7 @@ export class TunnelManager {
   private restartAttempt = 0;
   private restartTimer: NodeJS.Timeout | undefined;
   private readonly readExternal: () => ExternalTunnel | undefined;
+  private readonly probe: BinaryProbe;
 
   constructor(options: TunnelManagerOptions) {
     this.target = parseLocalTarget(options.localTarget);
@@ -69,19 +119,30 @@ export class TunnelManager {
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
     this.readExternal = options.readExternal ?? (() => readExternalTunnel());
+    this.probe = options.probe ?? new BinaryProbe();
   }
 
   get activeProvider(): TunnelProvider {
     return this.provider;
   }
 
-  info(fallbackPublicUrl: string): TunnelInfo {
+  async info(fallbackPublicUrl: string): Promise<TunnelInfo> {
     const external = this.readExternal();
     const online = external
       ? Boolean(external.url)
       : this.status === "on" && this.tunnelUrl;
     const url = external ? external.url : this.tunnelUrl;
     const provider = external?.provider ?? this.provider;
+    const providers = await Promise.all(
+      providerList.map(async (spec) => ({
+        id: spec.id,
+        label: spec.label,
+        binary: spec.binary,
+        binaryPresent: await this.probe.present(spec),
+        installHint: spec.installHint,
+        ...(spec.caveat ? { caveat: spec.caveat } : {}),
+      })),
+    );
     return {
       provider,
       enabled: external
@@ -90,15 +151,9 @@ export class TunnelManager {
       status: external ? (external.url ? "on" : "starting") : this.status,
       publicUrl: online && url ? url : fallbackPublicUrl,
       error: external ? null : (this.error ?? null),
-      binaryPresent: binaryPresent(providerSpecs[provider]),
-      providers: providerList.map((spec) => ({
-        id: spec.id,
-        label: spec.label,
-        binary: spec.binary,
-        binaryPresent: binaryPresent(spec),
-        installHint: spec.installHint,
-        ...(spec.caveat ? { caveat: spec.caveat } : {}),
-      })),
+      binaryPresent:
+        providers.find((entry) => entry.id === provider)?.binaryPresent ?? false,
+      providers,
       external: Boolean(external),
     };
   }
@@ -117,6 +172,7 @@ export class TunnelManager {
     if (this.readExternal()) return;
     // Switching providers while running has to tear the old process down first.
     if (provider && provider !== this.provider && this.child) await this.stop();
+    if (provider && provider !== this.provider) this.probe.invalidate();
     if (provider) this.provider = provider;
     this.wantEnabled = enabled;
     if (enabled) await this.start();
@@ -128,10 +184,13 @@ export class TunnelManager {
     this.cancelRestart();
 
     const spec = providerSpecs[this.provider];
-    if (!binaryPresent(spec)) {
+    if (!(await this.probe.present(spec))) {
       this.status = "error";
       this.error = `${spec.binary} is not installed or not on PATH`;
       this.wantEnabled = false;
+      // The operator's likely next move is to install it, so do not let a
+      // remembered "missing" answer make the retry fail without looking.
+      this.probe.invalidate();
       this.onEnabledCleared?.();
       throw new Error(this.error);
     }

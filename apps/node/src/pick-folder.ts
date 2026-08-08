@@ -62,13 +62,7 @@ export function nativePickerCommand(
   if (platform === "win32") {
     return {
       file: "powershell.exe",
-      args: [
-        "-NoProfile",
-        "-NonInteractive",
-        "-STA",
-        "-Command",
-        WINDOWS_SCRIPT,
-      ],
+      args: ["-NoProfile", "-NonInteractive", "-STA", "-Command", WINDOWS_SCRIPT],
       env: { FLEET_PICKER_START: startPath },
     };
   }
@@ -123,7 +117,7 @@ export function pickFolder(
       (error, stdout) => {
         const code =
           error && typeof (error as { code?: unknown }).code === "number"
-            ? ((error as { code: number }).code)
+            ? (error as { code: number }).code
             : error
               ? -1
               : 0;

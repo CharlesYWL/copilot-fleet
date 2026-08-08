@@ -1,7 +1,7 @@
 import { isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import {
-  SessionStateSchema,
+  eventPayload,
   terminalSessionStates,
   type NodeCommand,
   type SessionEvent,
@@ -19,10 +19,7 @@ type SessionSlot = {
   ready: Promise<void>;
 };
 
-type LaunchCommand = Extract<
-  NodeCommand,
-  { type: "start_session" | "resume_session" }
->;
+type LaunchCommand = Extract<NodeCommand, { type: "start_session" | "resume_session" }>;
 
 export class CommandRouter {
   private readonly slots = new Map<string, SessionSlot>();
@@ -32,7 +29,9 @@ export class CommandRouter {
     private readonly factory: AgentFactory,
     private maxSessions: number,
     private readonly emit: (event: SessionEvent) => void,
-    private readonly validatePath: (path: string) => Promise<string> = validateWorkspacePath,
+    private readonly validatePath: (
+      path: string,
+    ) => Promise<string> = validateWorkspacePath,
   ) {}
 
   /**
@@ -130,11 +129,8 @@ export class CommandRouter {
       const cwd = await this.validatePath(command.localPath);
       const sink = (event: SessionEvent) => {
         this.emit(event);
-        if (
-          event.type === "state" &&
-          SessionStateSchema.safeParse(event.payload.state).success &&
-          terminalSessionStates.has(SessionStateSchema.parse(event.payload.state))
-        ) {
+        const state = eventPayload(event, "state")?.state;
+        if (state && terminalSessionStates.has(state)) {
           this.release(command.sessionId, slot);
         }
       };

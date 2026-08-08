@@ -12,10 +12,7 @@ describe("ownPlacements", () => {
     // The page edits absolute paths, and a path is only meaningful on the
     // machine it belongs to; showing another node's rows invites pointing it
     // at a directory that does not exist there.
-    expect(ownPlacements(placements, "me").map((item) => item.id)).toEqual([
-      "p1",
-      "p3",
-    ]);
+    expect(ownPlacements(placements, "me").map((item) => item.id)).toEqual(["p1", "p3"]);
   });
 
   it("returns nothing when this node owns no placement", () => {

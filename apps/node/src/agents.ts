@@ -171,10 +171,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.agentSessionId = resumeAgentSessionId;
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
     } else {
-      const created = await this.connection.agent.request(
-        acp.methods.agent.session.new,
-        { cwd, mcpServers: [] },
-      );
+      const created = await this.connection.agent.request(acp.methods.agent.session.new, {
+        cwd,
+        mcpServers: [],
+      });
       this.agentSessionId = created.sessionId;
     }
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
@@ -317,9 +317,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
 }
 
 export class AcpAgentFactory implements AgentFactory {
+  /** Values are injected: settings.ts is the only place that reads the env. */
   constructor(
-    private permissionTimeoutMs = Number(process.env.PERMISSION_TIMEOUT_MS ?? 30_000),
-    private copilotCommand = process.env.FLEET_COPILOT_COMMAND ?? "",
+    private permissionTimeoutMs: number,
+    private copilotCommand: string,
   ) {}
 
   /** Lets the local config UI retune the agent without a process restart. */
@@ -370,7 +371,11 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     this.cancelled = false;
     this.emit("state", { state: "running", activity: "Mock agent is streaming" });
     this.emit("system", { text: `User: ${text}` });
-    for (const chunk of [`Mock response for "${text}": `, "stream one, ", "stream two."]) {
+    for (const chunk of [
+      `Mock response for "${text}": `,
+      "stream one, ",
+      "stream two.",
+    ]) {
       await delay(25);
       if (this.cancelled) {
         this.emit("turn_complete", { stopReason: "cancelled" });

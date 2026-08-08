@@ -45,6 +45,12 @@ describe("authenticated node message ownership", () => {
   it("rejects foreign heartbeat inventory and detects stale nodes", () => {
     expect(heartbeatSessionsBelongTo("node-a", ["owned"], lookup)).toBe(true);
     expect(heartbeatSessionsBelongTo("node-a", ["foreign"], lookup)).toBe(false);
-    expect(isHeartbeatStale("2026-01-01T00:00:00.000Z", Date.parse("2026-01-01T00:00:16.000Z"), 15_000)).toBe(true);
+    expect(
+      isHeartbeatStale(
+        "2026-01-01T00:00:00.000Z",
+        Date.parse("2026-01-01T00:00:16.000Z"),
+        15_000,
+      ),
+    ).toBe(true);
   });
 });

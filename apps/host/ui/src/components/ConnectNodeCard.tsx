@@ -13,7 +13,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
-import { api } from "../hooks/useFleet";
+import { useEnrollment } from "../hooks/useEnrollment";
 import {
   enrollCommand,
   isLocalOnlyHostUrl,
@@ -21,8 +21,6 @@ import {
   type NodeShell,
 } from "../lib/enroll-command";
 import { terminal } from "../theme";
-
-type Enrollment = { hostUrl: string; enrollmentToken: string };
 
 const useStyles = makeStyles({
   card: {
@@ -64,31 +62,14 @@ const useStyles = makeStyles({
 
 export const ConnectNodeCard = () => {
   const styles = useStyles();
-  const [enrollment, setEnrollment] = useState<Enrollment>();
-  const [hostUrl, setHostUrl] = useState("");
-  const [urlDirty, setUrlDirty] = useState(false);
+  const enrollment = useEnrollment();
+  const [editedUrl, setEditedUrl] = useState<string>();
   const [shell, setShell] = useState<NodeShell>("bash");
   const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    const pull = () => {
-      void api<Enrollment>("/api/enrollment")
-        .then((result) => {
-          if (cancelled) return;
-          setEnrollment(result);
-          setHostUrl((current) => (urlDirty ? current : result.hostUrl));
-        })
-        .catch(() => undefined);
-    };
-    pull();
-    // Tunnel URLs can rotate while this card is open; keep the default in sync.
-    const timer = setInterval(pull, 3_000);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [urlDirty]);
+  // Until the field is touched it tracks the polled value, so a rotated tunnel
+  // URL reaches the command without wiping out whatever was typed over it.
+  const hostUrl = editedUrl ?? enrollment?.hostUrl ?? "";
 
   useEffect(() => {
     if (!copied) return;
@@ -119,10 +100,7 @@ export const ConnectNodeCard = () => {
       <Field label="Host URL the node should dial" className={styles.urlField}>
         <Input
           value={hostUrl}
-          onChange={(_, data) => {
-            setUrlDirty(true);
-            setHostUrl(data.value);
-          }}
+          onChange={(_, data) => setEditedUrl(data.value)}
           aria-label="Host URL the node should dial"
         />
       </Field>

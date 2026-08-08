@@ -8,8 +8,13 @@ import {
   useId,
   useToastController,
 } from "@fluentui/react-components";
-import type { FleetSession, SessionEvent } from "@fleet/protocol";
+import {
+  terminalSessionStates,
+  type FleetSession,
+  type SessionEvent,
+} from "@fleet/protocol";
 import { api, useFleet, type Notify } from "./hooks/useFleet";
+import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import { EmptySessions } from "./components/EmptySessions";
@@ -21,7 +26,6 @@ import { Sidebar, type SidebarView } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
 import { TopBar, type LayoutMode } from "./components/TopBar";
 
-const terminalStates = new Set(["stopped", "completed", "failed"]);
 const noEvents: SessionEvent[] = [];
 
 const useStyles = makeStyles({
@@ -56,7 +60,9 @@ export function App() {
     [dispatchToast],
   );
 
-  const { snapshot, events, connected, refresh, loadEvents, command } = useFleet(notify);
+  const { snapshot, events, connected, refresh, loadEvents, command, request } =
+    useFleet(notify);
+  const catalog = useCatalogOperations({ request, refresh });
   const [view, setView] = useState<SidebarView>("session");
   const [layout, setLayout] = useState<LayoutMode>("tree");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
@@ -78,11 +84,14 @@ export function App() {
     [snapshot.sessions, selectedSessionId],
   );
   const liveSessions = useMemo(
-    () => snapshot.sessions.filter((session) => !terminalStates.has(session.state)),
+    () =>
+      snapshot.sessions.filter((session) => !terminalSessionStates.has(session.state)),
     [snapshot.sessions],
   );
   const endedCount = useMemo(
-    () => snapshot.sessions.filter((session) => terminalStates.has(session.state)).length,
+    () =>
+      snapshot.sessions.filter((session) => terminalSessionStates.has(session.state))
+        .length,
     [snapshot.sessions],
   );
   const waitingPermissions = useMemo(
@@ -96,7 +105,9 @@ export function App() {
       ),
     [snapshot.placements, snapshot.nodes],
   );
-  const activeSession = snapshot.sessions.find((session) => session.id === selectedSessionId);
+  const activeSession = snapshot.sessions.find(
+    (session) => session.id === selectedSessionId,
+  );
 
   useEffect(() => {
     const first = visibleSessions[0];
@@ -146,35 +157,27 @@ export function App() {
     });
 
   const handleDismissSession = async (sessionId: string) => {
-    try {
-      await api(`/api/sessions/${sessionId}`, { method: "DELETE" });
-      if (selectedSessionId === sessionId) {
-        setSelectedSessionId(undefined);
-        setFocusOpen(false);
-      }
-      await refresh();
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
+    const result = await request(`/api/sessions/${sessionId}`, { method: "DELETE" });
+    if (!result.ok) return false;
+    if (selectedSessionId === sessionId) {
+      setSelectedSessionId(undefined);
+      setFocusOpen(false);
     }
+    await refresh();
+    return true;
   };
 
   const handleClearEnded = async () => {
     const selectedWasEnded =
-      Boolean(activeSession) && terminalStates.has(activeSession!.state);
-    try {
-      await api<{ removed: number }>("/api/sessions", { method: "DELETE" });
-      if (selectedWasEnded) {
-        setSelectedSessionId(undefined);
-        setFocusOpen(false);
-      }
-      await refresh();
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
+      Boolean(activeSession) && terminalSessionStates.has(activeSession!.state);
+    const result = await request("/api/sessions", { method: "DELETE" });
+    if (!result.ok) return false;
+    if (selectedWasEnded) {
+      setSelectedSessionId(undefined);
+      setFocusOpen(false);
     }
+    await refresh();
+    return true;
   };
 
   usePermissionAlerts(waitingPermissions, handleSelectSession);
@@ -184,218 +187,116 @@ export function App() {
     prompt: string,
     yolo: boolean,
   ) => {
-    try {
-      const session = await api<FleetSession>("/api/sessions", {
-        method: "POST",
-        body: JSON.stringify({ placementId, prompt, yolo }),
-      });
-      setSelectedSessionId(session.id);
-      setView("session");
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
-  };
-
-  const handleRenameNode = async (nodeId: string, name: string) => {
-    try {
-      await api(`/api/nodes/${nodeId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ name }),
-      });
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
-  };
-
-  const handleDeleteNode = async (nodeId: string) => {
-    try {
-      await api(`/api/nodes/${nodeId}`, { method: "DELETE" });
-      await refresh();
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
-  };
-
-  const handleCreateWorkspace = async (name: string, description: string) => {
-    const created = await command("/api/workspaces", { name, description });
-    if (created) await refresh();
-    return created;
-  };
-
-  const handleUpdateWorkspace = async (
-    workspaceId: string,
-    name: string,
-    description: string,
-  ) => {
-    try {
-      await api(`/api/workspaces/${workspaceId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ name, description }),
-      });
-      await refresh();
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
-  };
-
-  const handleDeleteWorkspace = async (workspaceId: string) => {
-    try {
-      await api(`/api/workspaces/${workspaceId}`, { method: "DELETE" });
-      await refresh();
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
-  };
-
-  const handleCreatePlacement = async (
-    workspaceId: string,
-    nodeId: string,
-    localPath: string,
-  ) => {
-    const created = await command("/api/placements", { workspaceId, nodeId, localPath });
-    if (created) await refresh();
-    return created;
-  };
-
-  const handleUpdatePlacement = async (placementId: string, localPath: string) => {
-    try {
-      await api(`/api/placements/${placementId}`, {
-        method: "PATCH",
-        body: JSON.stringify({ localPath }),
-      });
-      await refresh();
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
-  };
-
-  const handleDeletePlacement = async (placementId: string) => {
-    try {
-      await api(`/api/placements/${placementId}`, { method: "DELETE" });
-      await refresh();
-      return true;
-    } catch (reason) {
-      notify(reason instanceof Error ? reason.message : String(reason));
-      return false;
-    }
+    const result = await request<FleetSession>("/api/sessions", {
+      method: "POST",
+      body: JSON.stringify({ placementId, prompt, yolo }),
+    });
+    if (!result.ok) return false;
+    setSelectedSessionId(result.data.id);
+    setView("session");
+    return true;
   };
 
   return (
-    <div className={styles.app}>
-      <TopBar
-        nodesOnline={snapshot.nodes.filter((node) => node.online).length}
-        liveSessions={liveSessions.length}
-        waitingPermissions={waitingPermissions.length}
-        connected={connected}
-        layout={layout}
-        onLayoutChange={handleLayoutChange}
-      />
-      <div className={styles.body}>
-        {layout === "grid" ? (
-          <SessionGrid
-            sessions={visibleSessions}
-            nodes={snapshot.nodes}
-            events={events}
-            onOpen={handleSelectSession}
-            onPermission={handlePermission}
-            onNewSession={() => setDialogOpen(true)}
-          />
-        ) : (
-          <>
-            <Sidebar
-              nodes={snapshot.nodes}
-              workspaces={snapshot.workspaces}
-              sessions={visibleSessions}
-              selectedSessionId={selectedSessionId}
-              view={view}
-              endedCount={endedCount}
-              onSelectSession={handleSelectSession}
-              onNewSession={() => setDialogOpen(true)}
-              onSelectView={setView}
-              onClearEnded={() => void handleClearEnded()}
-            />
-
-            {view === "settings" && (
-              <SettingsPanel
-                workspaces={snapshot.workspaces}
-                placements={snapshot.placements}
-                nodes={snapshot.nodes}
-                onRenameNode={handleRenameNode}
-                onDeleteNode={handleDeleteNode}
-                onCreateWorkspace={handleCreateWorkspace}
-                onUpdateWorkspace={handleUpdateWorkspace}
-                onDeleteWorkspace={handleDeleteWorkspace}
-                onCreatePlacement={handleCreatePlacement}
-                onUpdatePlacement={handleUpdatePlacement}
-                onDeletePlacement={handleDeletePlacement}
-              />
-            )}
-
-            {view === "session" &&
-              (activeSession ? (
-                <TerminalView
-                  session={activeSession}
-                  events={events[activeSession.id] ?? noEvents}
-                  onPrompt={(prompt) =>
-                    void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
-                  }
-                  onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
-                  onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
-                  onDismiss={() => void handleDismissSession(activeSession.id)}
-                  onResume={() =>
-                    void command(`/api/sessions/${activeSession.id}/resume`)
-                  }
-                  onPermission={(requestId, outcome, optionId) =>
-                    handlePermission(activeSession.id, requestId, outcome, optionId)
-                  }
-                />
-              ) : (
-                <EmptySessions onNewSession={() => setDialogOpen(true)} />
-              ))}
-          </>
-        )}
-      </div>
-
-      {layout === "grid" && activeSession && (
-        <SessionFocusDialog
-          session={activeSession}
-          events={events[activeSession.id] ?? noEvents}
-          open={focusOpen}
-          onOpenChange={setFocusOpen}
-          onPrompt={(prompt) =>
-            void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
-          }
-          onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
-          onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
-          onDismiss={() => void handleDismissSession(activeSession.id)}
-          onResume={() => void command(`/api/sessions/${activeSession.id}/resume`)}
-          onPermission={(requestId, outcome, optionId) =>
-            handlePermission(activeSession.id, requestId, outcome, optionId)
-          }
+    <CatalogProvider value={catalog}>
+      <div className={styles.app}>
+        <TopBar
+          nodesOnline={snapshot.nodes.filter((node) => node.online).length}
+          liveSessions={liveSessions.length}
+          waitingPermissions={waitingPermissions.length}
+          connected={connected}
+          layout={layout}
+          onLayoutChange={handleLayoutChange}
         />
-      )}
+        <div className={styles.body}>
+          {layout === "grid" ? (
+            <SessionGrid
+              sessions={visibleSessions}
+              nodes={snapshot.nodes}
+              events={events}
+              onOpen={handleSelectSession}
+              onPermission={handlePermission}
+              onNewSession={() => setDialogOpen(true)}
+            />
+          ) : (
+            <>
+              <Sidebar
+                nodes={snapshot.nodes}
+                workspaces={snapshot.workspaces}
+                sessions={visibleSessions}
+                selectedSessionId={selectedSessionId}
+                view={view}
+                endedCount={endedCount}
+                onSelectSession={handleSelectSession}
+                onNewSession={() => setDialogOpen(true)}
+                onSelectView={setView}
+                onClearEnded={() => void handleClearEnded()}
+              />
 
-      <NewSessionDialog
-        open={dialogOpen}
-        placements={eligiblePlacements}
-        defaultYolo={defaultYolo}
-        onOpenChange={setDialogOpen}
-        onCreate={handleCreateSession}
-      />
-      <Toaster toasterId={toasterId} />
-    </div>
+              {view === "settings" && (
+                <SettingsPanel
+                  workspaces={snapshot.workspaces}
+                  placements={snapshot.placements}
+                  nodes={snapshot.nodes}
+                />
+              )}
+
+              {view === "session" &&
+                (activeSession ? (
+                  <TerminalView
+                    session={activeSession}
+                    events={events[activeSession.id] ?? noEvents}
+                    onPrompt={(prompt) =>
+                      void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
+                    }
+                    onCancel={() =>
+                      void command(`/api/sessions/${activeSession.id}/cancel`)
+                    }
+                    onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
+                    onDismiss={() => void handleDismissSession(activeSession.id)}
+                    onResume={() =>
+                      void command(`/api/sessions/${activeSession.id}/resume`)
+                    }
+                    onPermission={(requestId, outcome, optionId) =>
+                      handlePermission(activeSession.id, requestId, outcome, optionId)
+                    }
+                  />
+                ) : (
+                  <EmptySessions onNewSession={() => setDialogOpen(true)} />
+                ))}
+            </>
+          )}
+        </div>
+
+        {layout === "grid" && activeSession && (
+          <SessionFocusDialog
+            session={activeSession}
+            events={events[activeSession.id] ?? noEvents}
+            open={focusOpen}
+            onOpenChange={setFocusOpen}
+            onPrompt={(prompt) =>
+              void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
+            }
+            onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
+            onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
+            onDismiss={() => void handleDismissSession(activeSession.id)}
+            onResume={() => void command(`/api/sessions/${activeSession.id}/resume`)}
+            onPermission={(requestId, outcome, optionId) =>
+              handlePermission(activeSession.id, requestId, outcome, optionId)
+            }
+          />
+        )}
+
+        <NewSessionDialog
+          open={dialogOpen}
+          placements={eligiblePlacements}
+          defaultYolo={defaultYolo}
+          onOpenChange={setDialogOpen}
+          onCreate={handleCreateSession}
+        />
+        <Toaster toasterId={toasterId} />
+      </div>
+    </CatalogProvider>
   );
 }
 
@@ -407,6 +308,6 @@ function filterVisibleSessions(
   // does not yank the transcript; Dismiss / Clear ended remove them for good.
   return sessions.filter(
     (session) =>
-      !terminalStates.has(session.state) || session.id === selectedSessionId,
+      !terminalSessionStates.has(session.state) || session.id === selectedSessionId,
   );
 }

@@ -73,18 +73,16 @@ describe("production enrollment token", () => {
 
 describe("public host url", () => {
   it("prefers the configured public url without a trailing slash", () => {
-    expect(
-      resolvePublicHostUrl("https://fleet.example.com/", "0.0.0.0", "8787"),
-    ).toBe("https://fleet.example.com");
+    expect(resolvePublicHostUrl("https://fleet.example.com/", "0.0.0.0", "8787")).toBe(
+      "https://fleet.example.com",
+    );
   });
 
   it("falls back to loopback because wildcard binds are not dialable", () => {
     expect(resolvePublicHostUrl(undefined, "0.0.0.0", "8787")).toBe(
       "http://127.0.0.1:8787",
     );
-    expect(resolvePublicHostUrl(undefined, "::", "9000")).toBe(
-      "http://127.0.0.1:9000",
-    );
+    expect(resolvePublicHostUrl(undefined, "::", "9000")).toBe("http://127.0.0.1:9000");
   });
 
   it("keeps a concrete bind address", () => {
@@ -97,10 +95,7 @@ describe("public host url", () => {
 describe("enrollment host url", () => {
   it("prefers the live tunnel url over the fallback", () => {
     expect(
-      resolveEnrollmentHostUrl(
-        "https://abc.trycloudflare.com/",
-        "http://127.0.0.1:8787",
-      ),
+      resolveEnrollmentHostUrl("https://abc.trycloudflare.com/", "http://127.0.0.1:8787"),
     ).toBe("https://abc.trycloudflare.com");
   });
 

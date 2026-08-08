@@ -61,13 +61,23 @@ describe("adoptOrKillStale", () => {
     // This is the SIGKILL case: the wrapper died without cleaning up, leaving
     // its provider running and untracked.
     const killed: number[] = [];
-    adoptOrKillStale(state(), () => {}, alive, (pid) => killed.push(pid));
+    adoptOrKillStale(
+      state(),
+      () => {},
+      alive,
+      (pid) => killed.push(pid),
+    );
     expect(killed).toEqual([42]);
   });
 
   it("does nothing when the recorded process is already gone", () => {
     const killed: number[] = [];
-    adoptOrKillStale(state(), () => {}, dead, (pid) => killed.push(pid));
+    adoptOrKillStale(
+      state(),
+      () => {},
+      dead,
+      (pid) => killed.push(pid),
+    );
     expect(killed).toEqual([]);
   });
 
@@ -81,9 +91,14 @@ describe("adoptOrKillStale", () => {
 
   it("survives a kill that throws because the process vanished mid-check", () => {
     expect(() =>
-      adoptOrKillStale(state(), () => {}, alive, () => {
-        throw new Error("ESRCH");
-      }),
+      adoptOrKillStale(
+        state(),
+        () => {},
+        alive,
+        () => {
+          throw new Error("ESRCH");
+        },
+      ),
     ).not.toThrow();
   });
 });

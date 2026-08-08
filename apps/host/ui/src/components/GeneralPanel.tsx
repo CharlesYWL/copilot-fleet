@@ -91,8 +91,8 @@ export const GeneralPanel = () => {
         <Title3 as="h1">Session defaults</Title3>
         <br />
         <Text className={styles.caption}>
-          Applied when you open the new-session dialog. Each session keeps the value
-          it was created with, so changing this never affects a running agent.
+          Applied when you open the new-session dialog. Each session keeps the value it
+          was created with, so changing this never affects a running agent.
         </Text>
       </div>
 
@@ -108,8 +108,8 @@ export const GeneralPanel = () => {
             <Text weight="semibold">YOLO mode</Text>
             <br />
             <Text className={styles.caption}>
-              Starts Copilot with --allow-all so it runs tools, reads paths, and
-              fetches URLs without asking.
+              Starts Copilot with --allow-all so it runs tools, reads paths, and fetches
+              URLs without asking.
             </Text>
           </div>
           <Switch

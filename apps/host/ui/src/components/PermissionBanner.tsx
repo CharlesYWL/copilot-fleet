@@ -1,5 +1,6 @@
 import { Button, Text, makeStyles, mergeClasses } from "@fluentui/react-components";
 import { Warning20Regular } from "@fluentui/react-icons";
+import { permissionSurface } from "../theme";
 
 const useStyles = makeStyles({
   banner: {
@@ -7,9 +8,9 @@ const useStyles = makeStyles({
     alignItems: "center",
     gap: "12px",
     padding: "10px 16px",
-    borderBottom: "1px solid #7c653b",
-    background: "#241d10",
-    color: "#f2dcae",
+    borderBottom: `1px solid ${permissionSurface.border}`,
+    background: permissionSurface.background,
+    color: permissionSurface.foreground,
   },
   // In a monitor tile the banner sits at the bottom of the card, so the rule
   // moves to the top edge and the controls shrink to fit a narrow column.
@@ -17,7 +18,7 @@ const useStyles = makeStyles({
     gap: "8px",
     padding: "6px 10px",
     borderBottom: "none",
-    borderTop: "1px solid #7c653b",
+    borderTop: `1px solid ${permissionSurface.border}`,
   },
   body: {
     flexGrow: 1,
@@ -26,13 +27,13 @@ const useStyles = makeStyles({
     minWidth: 0,
   },
   title: {
-    color: "#f7bf61",
+    color: permissionSurface.accent,
     fontSize: "10px",
     letterSpacing: "1.2px",
     textTransform: "uppercase",
   },
   detail: {
-    color: "#e2d3b2",
+    color: permissionSurface.detail,
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
@@ -41,8 +42,8 @@ const useStyles = makeStyles({
     fontSize: "11px",
   },
   allow: {
-    background: "#f7bf61",
-    color: "#20180a",
+    background: permissionSurface.accent,
+    color: permissionSurface.onAccent,
     border: "none",
   },
 });

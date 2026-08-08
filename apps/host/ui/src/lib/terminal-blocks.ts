@@ -1,4 +1,4 @@
-import type { SessionEvent } from "@fleet/protocol";
+import { eventPayload, type SessionEvent } from "@fleet/protocol";
 
 export type TerminalBlockKind =
   | "user"
@@ -44,7 +44,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
 
   for (const event of events) {
     if (event.type === "agent_text" || event.type === "agent_thought") {
-      const text = asText(event.payload.text);
+      const text = eventPayload(event, event.type)?.text ?? "";
       if (text) {
         appendMerged(event.type === "agent_text" ? "agent" : "thought", event, text);
       }
@@ -52,9 +52,10 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
     }
 
     if (event.type === "tool") {
-      const toolCallId = asText(event.payload.toolCallId);
-      const status = asText(event.payload.status);
-      const title = asText(event.payload.title);
+      const payload = eventPayload(event, "tool");
+      const toolCallId = payload?.toolCallId ?? "";
+      const status = payload?.status ?? "";
+      const title = payload?.title ?? "";
       const existing = toolCallId ? toolBlockIndex.get(toolCallId) : undefined;
       const previous = existing === undefined ? undefined : blocks[existing];
       if (previous) {
@@ -74,12 +75,13 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
     }
 
     if (event.type === "state") {
-      const state = asText(event.payload.state);
+      const payload = eventPayload(event, "state");
+      const state = payload?.state ?? "";
       if (!state || noisyStates.has(state)) continue;
       blocks.push({
         key: event.eventId,
         kind: "state",
-        text: asText(event.payload.activity) || state,
+        text: payload?.activity || state,
         createdAt: event.createdAt,
         status: state,
       });
@@ -87,7 +89,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
     }
 
     if (event.type === "system") {
-      const text = asText(event.payload.text);
+      const text = eventPayload(event, "system")?.text ?? "";
       if (!text) continue;
       const isUser = text.startsWith(USER_PREFIX);
       blocks.push({
@@ -103,7 +105,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       blocks.push({
         key: event.eventId,
         kind: "permission",
-        text: asText(event.payload.title) || "Tool permission requested",
+        text: eventPayload(event, "permission")?.title || "Tool permission requested",
         createdAt: event.createdAt,
       });
       continue;
@@ -113,7 +115,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       blocks.push({
         key: event.eventId,
         kind: "permission_result",
-        text: `Permission ${asText(event.payload.outcome) || "resolved"}`,
+        text: `Permission ${eventPayload(event, "permission_result")?.outcome || "resolved"}`,
         createdAt: event.createdAt,
       });
       continue;
@@ -123,7 +125,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       blocks.push({
         key: event.eventId,
         kind: "turn",
-        text: asText(event.payload.stopReason) || "end_turn",
+        text: eventPayload(event, "turn_complete")?.stopReason || "end_turn",
         createdAt: event.createdAt,
       });
       continue;
@@ -136,7 +138,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       blocks.push({
         key: event.eventId,
         kind: "error",
-        text: asText(event.payload.message) || "Unknown error",
+        text: eventPayload(event, "error")?.message || "Unknown error",
         createdAt: event.createdAt,
       });
     }
@@ -147,24 +149,17 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
 
 /** The permission request still waiting on a browser decision, if any. */
 export function pendingPermission(events: SessionEvent[]): SessionEvent | undefined {
-  const handled = new Set(
-    events
-      .filter((event) => event.type === "permission_result")
-      .map((event) => asText(event.payload.requestId)),
-  );
-  return [...events]
-    .reverse()
-    .find(
-      (event) =>
-        event.type === "permission" && !handled.has(asText(event.payload.requestId)),
-    );
+  const pending = pendingPermissionRequests(events);
+  return pending[pending.length - 1];
 }
 
 /** Every permission request, across any session, still awaiting a decision. */
 export function pendingPermissionRequests(events: SessionEvent[]): SessionEvent[] {
   const pending = new Map<string, SessionEvent>();
   for (const event of events) {
-    const requestId = asText(event.payload.requestId);
+    const requestId =
+      eventPayload(event, "permission")?.requestId ??
+      eventPayload(event, "permission_result")?.requestId;
     if (!requestId) continue;
     if (event.type === "permission") pending.set(requestId, event);
     if (event.type === "permission_result") pending.delete(requestId);
@@ -178,28 +173,16 @@ export function pendingPermissionCount(events: SessionEvent[]): number {
 
 /** Human-readable summary of what the agent is asking to do. */
 export function permissionTitle(event: SessionEvent): string {
-  return asText(event.payload.title) || "Tool request";
+  return eventPayload(event, "permission")?.title || "Tool request";
 }
 
 /** Id a decision must be posted against, absent on a malformed request. */
 export function permissionRequestId(event: SessionEvent): string | undefined {
-  return asText(event.payload.requestId) || undefined;
+  return eventPayload(event, "permission")?.requestId || undefined;
 }
 
 /** The agent's own "allow once" choice, when it offered one. */
 export function allowOnceOptionId(event: SessionEvent): string | undefined {
-  const { options } = event.payload;
-  if (!Array.isArray(options)) return undefined;
-  const allow = options.find(
-    (option) => isRecord(option) && asText(option.kind) === "allow_once",
-  );
-  return isRecord(allow) ? asText(allow.optionId) || undefined : undefined;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function asText(value: unknown): string {
-  return typeof value === "string" ? value : "";
+  const options = eventPayload(event, "permission")?.options ?? [];
+  return options.find((option) => option.kind === "allow_once")?.optionId;
 }

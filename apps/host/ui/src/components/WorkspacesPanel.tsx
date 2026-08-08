@@ -18,6 +18,7 @@ import {
 } from "@fluentui/react-icons";
 import type { FleetNode, Placement, Workspace } from "@fleet/protocol";
 import { nextPlacementPath } from "../lib/placement-path.js";
+import { useCatalog } from "../hooks/useCatalog";
 
 const useStyles = makeStyles({
   panel: {
@@ -141,34 +142,15 @@ type WorkspacesPanelProps = {
   workspaces: Workspace[];
   placements: Placement[];
   nodes: FleetNode[];
-  onCreateWorkspace: (name: string, description: string) => Promise<boolean>;
-  onUpdateWorkspace: (
-    workspaceId: string,
-    name: string,
-    description: string,
-  ) => Promise<boolean>;
-  onDeleteWorkspace: (workspaceId: string) => Promise<boolean>;
-  onCreatePlacement: (
-    workspaceId: string,
-    nodeId: string,
-    localPath: string,
-  ) => Promise<boolean>;
-  onUpdatePlacement: (placementId: string, localPath: string) => Promise<boolean>;
-  onDeletePlacement: (placementId: string) => Promise<boolean>;
 };
 
 export const WorkspacesPanel = ({
   workspaces,
   placements,
   nodes,
-  onCreateWorkspace,
-  onUpdateWorkspace,
-  onDeleteWorkspace,
-  onCreatePlacement,
-  onUpdatePlacement,
-  onDeletePlacement,
 }: WorkspacesPanelProps) => {
   const styles = useStyles();
+  const { createWorkspace, createPlacement } = useCatalog();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [workspaceId, setWorkspaceId] = useState("");
@@ -179,15 +161,13 @@ export const WorkspacesPanel = ({
     const previousHome = nodes.find((node) => node.id === nodeId)?.homeDir;
     const nextHome = nodes.find((node) => node.id === nextNodeId)?.homeDir ?? "";
     setNodeId(nextNodeId);
-    setLocalPath((current) =>
-      nextPlacementPath(current, previousHome, nextHome),
-    );
+    setLocalPath((current) => nextPlacementPath(current, previousHome, nextHome));
   };
 
   const handleCreateWorkspace = async (event: FormEvent) => {
     event.preventDefault();
     if (!name.trim()) return;
-    const created = await onCreateWorkspace(name.trim(), description.trim());
+    const created = await createWorkspace(name.trim(), description.trim());
     if (!created) return;
     setName("");
     setDescription("");
@@ -196,7 +176,7 @@ export const WorkspacesPanel = ({
   const handleCreatePlacement = async (event: FormEvent) => {
     event.preventDefault();
     if (!workspaceId || !nodeId || !localPath.trim()) return;
-    const created = await onCreatePlacement(workspaceId, nodeId, localPath.trim());
+    const created = await createPlacement(workspaceId, nodeId, localPath.trim());
     if (!created) return;
     // The node stays selected, so reset to its home rather than to blank: the
     // next placement on the same machine starts from a usable path again.
@@ -302,10 +282,6 @@ export const WorkspacesPanel = ({
             placements={placements.filter(
               (placement) => placement.workspaceId === workspace.id,
             )}
-            onUpdateWorkspace={onUpdateWorkspace}
-            onDeleteWorkspace={onDeleteWorkspace}
-            onUpdatePlacement={onUpdatePlacement}
-            onDeletePlacement={onDeletePlacement}
           />
         ))}
       </div>
@@ -316,25 +292,12 @@ export const WorkspacesPanel = ({
 type WorkspaceCardProps = {
   workspace: Workspace;
   placements: Placement[];
-  onUpdateWorkspace: (
-    workspaceId: string,
-    name: string,
-    description: string,
-  ) => Promise<boolean>;
-  onDeleteWorkspace: (workspaceId: string) => Promise<boolean>;
-  onUpdatePlacement: (placementId: string, localPath: string) => Promise<boolean>;
-  onDeletePlacement: (placementId: string) => Promise<boolean>;
 };
 
-const WorkspaceCard = ({
-  workspace,
-  placements,
-  onUpdateWorkspace,
-  onDeleteWorkspace,
-  onUpdatePlacement,
-  onDeletePlacement,
-}: WorkspaceCardProps) => {
+const WorkspaceCard = ({ workspace, placements }: WorkspaceCardProps) => {
   const styles = useStyles();
+  const { updateWorkspace, deleteWorkspace, updatePlacement, deletePlacement } =
+    useCatalog();
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState(workspace.name);
   const [draftDescription, setDraftDescription] = useState(workspace.description);
@@ -348,14 +311,11 @@ const WorkspaceCard = ({
   const handleSave = async () => {
     const name = draftName.trim();
     if (!name) return;
-    if (
-      name === workspace.name &&
-      draftDescription === workspace.description
-    ) {
+    if (name === workspace.name && draftDescription === workspace.description) {
       setEditing(false);
       return;
     }
-    if (await onUpdateWorkspace(workspace.id, name, draftDescription)) {
+    if (await updateWorkspace(workspace.id, name, draftDescription)) {
       setEditing(false);
     }
   };
@@ -368,7 +328,7 @@ const WorkspaceCard = ({
     ) {
       return;
     }
-    void onDeleteWorkspace(workspace.id);
+    void deleteWorkspace(workspace.id);
   };
 
   return (
@@ -445,8 +405,8 @@ const WorkspaceCard = ({
             <PlacementRow
               key={placement.id}
               placement={placement}
-              onUpdate={onUpdatePlacement}
-              onDelete={onDeletePlacement}
+              onUpdate={updatePlacement}
+              onDelete={deletePlacement}
             />
           ))
         )}

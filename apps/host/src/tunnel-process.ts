@@ -11,9 +11,7 @@ import { parseLocalTarget, providerSpecs } from "./tunnel-providers.js";
  * ownership stays here, which keeps the process a child of the terminal rather
  * than an orphan nobody is tracking.
  */
-const provider = TunnelProviderSchema.parse(
-  process.env.FLEET_TUNNEL_PROVIDER ?? "bore",
-);
+const provider = TunnelProviderSchema.parse(process.env.FLEET_TUNNEL_PROVIDER ?? "bore");
 const spec = providerSpecs[provider];
 const target = parseLocalTarget(
   process.env.FLEET_TUNNEL_TARGET ?? `http://127.0.0.1:${process.env.PORT ?? "8787"}`,
@@ -25,10 +23,7 @@ const log = (message: string) =>
 
 const writeState = (pid: number, url: string | undefined): void => {
   mkdirSync(dirname(statePath), { recursive: true });
-  writeFileSync(
-    statePath,
-    JSON.stringify({ provider, url: url ?? "", pid }, null, 2),
-  );
+  writeFileSync(statePath, JSON.stringify({ provider, url: url ?? "", pid }, null, 2));
 };
 
 const clearState = (): void => {

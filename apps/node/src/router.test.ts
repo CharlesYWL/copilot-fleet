@@ -57,16 +57,10 @@ describe("CommandRouter", () => {
     expect(s1.some((event) => event.type === "agent_text")).toBe(true);
     expect(s2.some((event) => event.type === "agent_text")).toBe(true);
     expect(
-      s1
-        .filter((event) => event.type === "state")
-        .map((event) => event.payload.state),
+      s1.filter((event) => event.type === "state").map((event) => event.payload.state),
     ).toEqual(["starting", "running", "idle"]);
-    expect(s1.map((event) => event.sequence)).toEqual(
-      s1.map((_, index) => index + 1),
-    );
-    expect(s2.map((event) => event.sequence)).toEqual(
-      s2.map((_, index) => index + 1),
-    );
+    expect(s1.map((event) => event.sequence)).toEqual(s1.map((_, index) => index + 1));
+    expect(s2.map((event) => event.sequence)).toEqual(s2.map((_, index) => index + 1));
   });
 
   it("enforces configured capacity", async () => {
@@ -107,7 +101,12 @@ describe("CommandRouter", () => {
         return inertAgent(sessionId, sink);
       },
     };
-    const router = new CommandRouter(factory, 1, () => undefined, async (path) => path);
+    const router = new CommandRouter(
+      factory,
+      1,
+      () => undefined,
+      async (path) => path,
+    );
     const first = router.route({
       type: "start_session",
       commandId: "first",
@@ -137,7 +136,12 @@ describe("CommandRouter", () => {
         return inertAgent(sessionId, sink);
       },
     };
-    const router = new CommandRouter(factory, 1, () => undefined, async (path) => path);
+    const router = new CommandRouter(
+      factory,
+      1,
+      () => undefined,
+      async (path) => path,
+    );
     const results = await Promise.all([
       router.route({
         type: "start_session",
@@ -166,7 +170,12 @@ describe("CommandRouter", () => {
         return failingAgent(sessionId, sink);
       },
     };
-    const router = new CommandRouter(factory, 1, () => undefined, async (path) => path);
+    const router = new CommandRouter(
+      factory,
+      1,
+      () => undefined,
+      async (path) => path,
+    );
     expect(
       (
         await router.route({
@@ -201,7 +210,12 @@ describe("CommandRouter", () => {
         return inertAgent(sessionId, sink);
       },
     };
-    const router = new CommandRouter(factory, 1, () => undefined, async (path) => path);
+    const router = new CommandRouter(
+      factory,
+      1,
+      () => undefined,
+      async (path) => path,
+    );
     const result = await router.route({
       type: "start_session",
       commandId: "first",

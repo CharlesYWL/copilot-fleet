@@ -79,3 +79,20 @@ export const stateAccent: Record<string, string> = {
   completed: "#4ad6a7",
   failed: "#ff6b7a",
 };
+
+/**
+ * The amber surface the permission prompt is drawn on.
+ *
+ * A pending permission has to read as "the agent is blocked on you" at a glance,
+ * which no neutral token conveys, so it gets its own small palette built around
+ * `terminal.permission` — kept here rather than inline in the component so the
+ * whole app's colour still has one home.
+ */
+export const permissionSurface = {
+  accent: terminal.permission,
+  background: "#241d10",
+  border: "#7c653b",
+  foreground: "#f2dcae",
+  detail: "#e2d3b2",
+  onAccent: "#20180a",
+} as const;

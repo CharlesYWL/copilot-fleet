@@ -100,6 +100,62 @@ export const SessionEventSchema = z.object({
   createdAt: z.string().datetime(),
 });
 export type SessionEvent = z.infer<typeof SessionEventSchema>;
+export type SessionEventType = SessionEvent["type"];
+
+/**
+ * What each event type carries.
+ *
+ * `payload` stays an open record on the wire on purpose: a node running a newer
+ * build must not have its socket closed over a field this Host has not heard of
+ * yet. These schemas describe the same payloads for whoever *reads* them, so a
+ * consumer can say which field it wants and be told when it is not there,
+ * instead of coercing a missing value to an empty string and rendering nothing.
+ *
+ * Every field is optional because producers legitimately omit them — a tool
+ * update carries no title until the tool has one.
+ */
+const text = z.string().optional();
+
+export const sessionEventPayloadSchemas = {
+  state: z.object({ state: SessionStateSchema.optional(), activity: text }),
+  agent_text: z.object({ text }),
+  agent_thought: z.object({ text }),
+  tool: z.object({ toolCallId: text, title: text, status: text }),
+  permission: z.object({
+    requestId: text,
+    title: text,
+    toolCallId: text,
+    // A malformed option list must not cost the reader the title as well.
+    options: z.array(PermissionOptionSchema).optional().catch(undefined),
+  }),
+  permission_result: z.object({ requestId: text, outcome: text }),
+  turn_complete: z.object({ stopReason: text }),
+  error: z.object({ message: text }),
+  system: z.object({ text }),
+  agent_session: z.object({ agentSessionId: text }),
+} as const;
+
+export type SessionEventPayload<T extends SessionEventType> = z.infer<
+  (typeof sessionEventPayloadSchemas)[T]
+>;
+
+/**
+ * The payload of `event`, if it is of `type` and its payload is well formed.
+ *
+ * Returning `undefined` rather than a half-filled object means a payload that
+ * changed shape shows up as a missing block, not as a block that quietly lost
+ * its text.
+ */
+export function eventPayload<T extends SessionEventType>(
+  event: SessionEvent,
+  type: T,
+): SessionEventPayload<T> | undefined {
+  if (event.type !== type) return undefined;
+  const parsed = sessionEventPayloadSchemas[type].safeParse(event.payload);
+  // The lookup type widens to the union of all payloads once `type` is a type
+  // parameter; the value came from that exact key, so it is the narrower one.
+  return parsed.success ? (parsed.data as SessionEventPayload<T>) : undefined;
+}
 
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
@@ -187,8 +243,22 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
 ]);
 export type HostToNodeMessage = z.infer<typeof HostToNodeMessageSchema>;
 
+/**
+ * Everything a freshly connected browser needs to render the fleet.
+ *
+ * Spelled out rather than left as an open record so the UI can consume it
+ * without asserting its way from `unknown` to the four lists it actually gets.
+ */
+export const SnapshotSchema = z.object({
+  nodes: z.array(NodeSchema),
+  workspaces: z.array(WorkspaceSchema),
+  placements: z.array(PlacementSchema),
+  sessions: z.array(SessionSchema),
+});
+export type Snapshot = z.infer<typeof SnapshotSchema>;
+
 export const BrowserMessageSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("snapshot"), data: z.record(z.string(), z.unknown()) }),
+  z.object({ type: z.literal("snapshot"), data: SnapshotSchema }),
   z.object({ type: z.literal("node"), node: NodeSchema }),
   z.object({ type: z.literal("session"), session: SessionSchema }),
   z.object({ type: z.literal("event"), event: SessionEventSchema }),
@@ -261,22 +331,11 @@ export const PermissionResponseSchema = z.object({
   optionId: z.string().optional(),
 });
 
-export const tunnelProviders = [
-  "cloudflare",
-  "tailscale",
-  "ngrok",
-  "bore",
-] as const;
+export const tunnelProviders = ["cloudflare", "tailscale", "ngrok", "bore"] as const;
 export const TunnelProviderSchema = z.enum(tunnelProviders);
 export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
 
-export const TunnelStatusSchema = z.enum([
-  "off",
-  "starting",
-  "on",
-  "stopping",
-  "error",
-]);
+export const TunnelStatusSchema = z.enum(["off", "starting", "on", "stopping", "error"]);
 export type TunnelStatus = z.infer<typeof TunnelStatusSchema>;
 
 export const TunnelProviderInfoSchema = z.object({
@@ -344,17 +403,75 @@ export const SUPERSEDED_CLOSE_CODE = 4001;
 /** The presented secret is unknown; the Node must enroll again to recover. */
 export const AUTH_FAILED_CLOSE_CODE = 4003;
 
-export type JsonParseResult =
-  | { ok: true; value: unknown }
-  | { ok: false; error: string };
+export type JsonParseResult = { ok: true; value: unknown } | { ok: false; error: string };
 
 export function tryParseJson(text: string): JsonParseResult {
   try {
     return { ok: true, value: JSON.parse(text) as unknown };
   } catch (error) {
+    return { ok: false, error: errorMessage(error, "Invalid JSON") };
+  }
+}
+
+/** A peer sent bytes that are not JSON at all. */
+export const MALFORMED_JSON_CLOSE_CODE = 1007;
+
+/** A peer sent JSON that does not match the agreed schema. */
+export const INVALID_MESSAGE_CLOSE_CODE = 1008;
+
+export type FrameDecodeFailure = {
+  ok: false;
+  /** Close code to hang up with. */
+  code: typeof MALFORMED_JSON_CLOSE_CODE | typeof INVALID_MESSAGE_CLOSE_CODE;
+  /** Short close reason; goes on the wire, so it stays generic. */
+  reason: string;
+  /** Full diagnostic for the local log. */
+  detail: string;
+};
+
+export type DecodedFrame<T> = { ok: true; value: T } | FrameDecodeFailure;
+
+/**
+ * Parses and validates one WebSocket frame.
+ *
+ * Host and Node ran identical "parse, validate, close 1007/1008" ladders on
+ * every inbound frame; keeping the two in step by hand meant a fix on one side
+ * silently left the other accepting frames the peer had stopped sending.
+ */
+export function decodeFrame<Schema extends z.ZodType>(
+  raw: string,
+  schema: Schema,
+): DecodedFrame<z.infer<Schema>> {
+  const parsed = tryParseJson(raw);
+  if (!parsed.ok) {
     return {
       ok: false,
-      error: error instanceof Error ? error.message : "Invalid JSON",
+      code: MALFORMED_JSON_CLOSE_CODE,
+      reason: "Malformed JSON",
+      detail: parsed.error,
     };
   }
+  const result = schema.safeParse(parsed.value);
+  if (!result.success) {
+    return {
+      ok: false,
+      code: INVALID_MESSAGE_CLOSE_CODE,
+      reason: "Invalid message",
+      detail: result.error.message,
+    };
+  }
+  return { ok: true, value: result.data as z.infer<Schema> };
+}
+
+/**
+ * The message to show for a thrown value.
+ *
+ * Both services and the UI hand-rolled `error instanceof Error ? ... : ...`,
+ * which drifted: some spots stringified an object into "[object Object]" while
+ * others dropped the cause entirely.
+ */
+export function errorMessage(error: unknown, fallback?: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error) return error;
+  return fallback ?? String(error);
 }

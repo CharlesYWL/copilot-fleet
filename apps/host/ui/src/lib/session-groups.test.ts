@@ -34,8 +34,8 @@ const session = (
   workspaceId,
   workspaceName,
   placementId: "p1",
-    agentSessionId: "",
-    yolo: false,
+  agentSessionId: "",
+  yolo: false,
   nodeId,
   nodeName,
   state: "idle",
@@ -71,7 +71,9 @@ describe("groupSessionsByWorkspace", () => {
       [["mac", true, 1]],
     ]);
     expect(
-      groups.map((group) => group.nodes.flatMap((item) => item.sessions.map((s) => s.id))),
+      groups.map((group) =>
+        group.nodes.flatMap((item) => item.sessions.map((s) => s.id)),
+      ),
     ).toEqual([["s1", "s2"], ["s3"]]);
   });
 
@@ -82,8 +84,6 @@ describe("groupSessionsByWorkspace", () => {
       [workspace("w1", "Empty")],
     );
 
-    expect(groups).toEqual([
-      { workspaceId: "w1", workspaceName: "Empty", nodes: [] },
-    ]);
+    expect(groups).toEqual([{ workspaceId: "w1", workspaceName: "Empty", nodes: [] }]);
   });
 });

@@ -178,8 +178,13 @@ export const Sidebar = ({
                 </TreeItemLayout>
                 <Tree>
                   {group.nodes.length === 0 ? (
-                    <TreeItem itemType="leaf" value={`${workspaceKey(group.workspaceId)}:empty`}>
-                      <TreeItemLayout className={styles.offline}>No sessions</TreeItemLayout>
+                    <TreeItem
+                      itemType="leaf"
+                      value={`${workspaceKey(group.workspaceId)}:empty`}
+                    >
+                      <TreeItemLayout className={styles.offline}>
+                        No sessions
+                      </TreeItemLayout>
                     </TreeItem>
                   ) : (
                     group.nodes.map((nodeGroup) => (

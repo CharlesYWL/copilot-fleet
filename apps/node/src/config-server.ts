@@ -1,10 +1,11 @@
 import { createServer, type Server } from "node:http";
 import { z } from "zod";
+import { errorMessage } from "@fleet/protocol";
 import { SettingsSchema, type Settings } from "./settings.js";
-import { CONFIG_PAGE } from "./config-page.js";
-import { FleetClient } from "./fleet-client.js";
-import { pickFolder } from "./pick-folder.js";
-import { inspectPath } from "./path-check.js";
+import { configAsset } from "./config-assets.js";
+import { FleetClient, type PlacementLike, type WorkspaceLike } from "./fleet-client.js";
+import { pickFolder as pickFolderDefault, type PickerResult } from "./pick-folder.js";
+import { inspectPath as inspectPathDefault, type PathCheck } from "./path-check.js";
 
 /** An id turns create into update; the page uses one form for both. */
 const WorkspaceInputSchema = z.object({
@@ -27,12 +28,41 @@ export type ConfigStatus = {
   mockAgent: boolean;
 };
 
+/** The slice of {@link FleetClient} the config endpoints use, so tests can
+ * stand in for it without a Host to talk to. */
+export type FleetApi = {
+  listWorkspaces: () => Promise<WorkspaceLike[]>;
+  listOwnPlacements: () => Promise<PlacementLike[]>;
+  createWorkspace: (name: string, description: string) => Promise<WorkspaceLike>;
+  updateWorkspace: (
+    id: string,
+    name: string,
+    description: string,
+  ) => Promise<WorkspaceLike>;
+  createOwnPlacement: (workspaceId: string, localPath: string) => Promise<PlacementLike>;
+  updateOwnPlacementPath: (id: string, localPath: string) => Promise<PlacementLike>;
+};
+
 export type ConfigServerOptions = {
   getSettings: () => Settings;
   getStatus: () => ConfigStatus;
   applySettings: (settings: Settings) => Promise<void>;
   log: (message: string) => void;
+  fleet?: FleetApi;
+  pickFolder?: (start: string) => Promise<PickerResult>;
+  inspectPath?: (path: string) => PathCheck;
 };
+
+export type ConfigReply = { status: number; body: unknown };
+
+/** A handler answers one method+path; the body arrives already read. */
+type Handler = (body: string) => Promise<ConfigReply>;
+
+export type ConfigRouter = (
+  method: string,
+  url: string,
+  body: string,
+) => Promise<ConfigReply>;
 
 /**
  * A node executes arbitrary commands, so anything that can repoint it at a
@@ -47,156 +77,157 @@ export function configServerPort(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isInteger(parsed) && parsed > 0 && parsed < 65_536 ? parsed : 8788;
 }
 
-export function startConfigServer(options: ConfigServerOptions): Server {
-  const fleet = new FleetClient({
-    hostUrl: () => options.getSettings().hostUrl,
-    nodeId: () => options.getStatus().nodeId,
-  });
+const ok = (body: unknown): ConfigReply => ({ status: 200, body });
+const badRequest = (error: string): ConfigReply => ({ status: 400, body: { error } });
 
-  const server = createServer((request, response) => {
-    const send = (status: number, body: unknown): void => {
-      const payload = JSON.stringify(body);
-      response.writeHead(status, {
-        "content-type": "application/json",
-        // The page is same-origin only; no browser should embed or frame it.
-        "cache-control": "no-store",
-      });
-      response.end(payload);
-    };
+/** Host calls fail for ordinary reasons (offline, stale URL), so they are
+ * reported as a message the page can show rather than a 500. */
+async function relay(work: () => Promise<unknown>): Promise<ConfigReply> {
+  try {
+    return ok(await work());
+  } catch (error) {
+    return { status: 502, body: { error: errorMessage(error) } };
+  }
+}
 
-    const readBody = (handle: (body: string) => Promise<void>): void => {
-      let body = "";
-      request.on("data", (chunk: Buffer) => {
-        body += chunk;
-        // Nothing legitimate approaches this size; stop reading rather than
-        // buffering whatever a runaway client decides to send.
-        if (body.length > 64_000) request.destroy();
-      });
-      request.on("end", () => {
-        void handle(body).catch((error: unknown) => {
-          const message = error instanceof Error ? error.message : String(error);
-          options.log(`Config request failed: ${message}`);
-          send(500, { error: message });
-        });
-      });
-    };
+function pathFrom(body: string): string {
+  const input: unknown = JSON.parse(body);
+  return input && typeof input === "object" && "path" in input
+    ? String((input as { path: unknown }).path)
+    : "";
+}
 
-    /** Host calls fail for ordinary reasons (offline, stale URL), so they are
-     * reported as a message the page can show rather than a 500. */
-    const relay = async (work: () => Promise<unknown>): Promise<void> => {
-      try {
-        send(200, await work());
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        send(502, { error: message });
-      }
-    };
+/**
+ * The config endpoints as a table, separate from the HTTP plumbing.
+ *
+ * Every dependency that reaches off this process — the Host, the folder dialog,
+ * the filesystem — arrives as an option, so the endpoints can be exercised
+ * without a Host to talk to or a display to open a dialog on.
+ */
+export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
+  const fleet: FleetApi =
+    options.fleet ??
+    new FleetClient({
+      hostUrl: () => options.getSettings().hostUrl,
+      nodeId: () => options.getStatus().nodeId,
+    });
+  const pickFolder = options.pickFolder ?? pickFolderDefault;
+  const inspectPath = options.inspectPath ?? inspectPathDefault;
+  const state = (): ConfigReply =>
+    ok({ settings: options.getSettings(), status: options.getStatus() });
 
-    const url = request.url ?? "/";
-
-    if (request.method === "GET" && (url === "/" || url.startsWith("/?"))) {
-      response.writeHead(200, {
-        "content-type": "text/html; charset=utf-8",
-        "cache-control": "no-store",
-      });
-      response.end(CONFIG_PAGE);
-      return;
-    }
-
-    if (request.method === "GET" && url === "/api/config") {
-      send(200, { settings: options.getSettings(), status: options.getStatus() });
-      return;
-    }
-
-    if (request.method === "POST" && url === "/api/config") {
-      readBody(async (body) => {
+  const routes = new Map<string, Handler>([
+    ["GET /api/config", async () => state()],
+    [
+      "POST /api/config",
+      async (body) => {
         const parsed = SettingsSchema.safeParse(JSON.parse(body));
         if (!parsed.success) {
-          send(400, { error: parsed.error.issues[0]?.message ?? "Invalid settings" });
-          return;
+          return badRequest(parsed.error.issues[0]?.message ?? "Invalid settings");
         }
         await options.applySettings(parsed.data);
-        send(200, { settings: options.getSettings(), status: options.getStatus() });
-      });
-      return;
-    }
-
-    if (request.method === "GET" && url === "/api/fleet") {
-      void relay(async () => ({
-        workspaces: await fleet.listWorkspaces(),
-        placements: await fleet.listOwnPlacements(),
-      }));
-      return;
-    }
-
-    if (request.method === "POST" && url === "/api/check-path") {
-      readBody(async (body) => {
-        const input: unknown = JSON.parse(body);
-        const path =
-          input && typeof input === "object" && "path" in input
-            ? String((input as { path: unknown }).path)
-            : "";
-        send(200, inspectPath(path));
-      });
-      return;
-    }
-
-    if (request.method === "POST" && url === "/api/pick-folder") {
-      readBody(async (body) => {
-        const input: unknown = JSON.parse(body);
-        const start =
-          input && typeof input === "object" && "path" in input
-            ? String((input as { path: unknown }).path)
-            : "";
-        // The dialog opens on this machine's display, so this only resolves
-        // once whoever is sitting there answers it.
-        send(200, await pickFolder(start));
-      });
-      return;
-    }
-
-    if (request.method === "POST" && url === "/api/workspaces") {
-      readBody(async (body) => {
+        return state();
+      },
+    ],
+    [
+      "GET /api/fleet",
+      async () =>
+        relay(async () => ({
+          workspaces: await fleet.listWorkspaces(),
+          placements: await fleet.listOwnPlacements(),
+        })),
+    ],
+    ["POST /api/check-path", async (body) => ok(inspectPath(pathFrom(body)))],
+    [
+      "POST /api/pick-folder",
+      // The dialog opens on this machine's display, so this only resolves once
+      // whoever is sitting there answers it.
+      async (body) => ok(await pickFolder(pathFrom(body))),
+    ],
+    [
+      "POST /api/workspaces",
+      async (body) => {
         const input = WorkspaceInputSchema.safeParse(JSON.parse(body));
         if (!input.success) {
-          send(400, { error: input.error.issues[0]?.message ?? "Invalid workspace" });
-          return;
+          return badRequest(input.error.issues[0]?.message ?? "Invalid workspace");
         }
         const { id, name, description } = input.data;
-        await relay(async () =>
+        return relay(async () =>
           id
             ? fleet.updateWorkspace(id, name, description)
             : fleet.createWorkspace(name, description),
         );
-      });
-      return;
-    }
-
-    if (request.method === "POST" && url === "/api/placements") {
-      readBody(async (body) => {
+      },
+    ],
+    [
+      "POST /api/placements",
+      async (body) => {
         const input = PlacementInputSchema.safeParse(JSON.parse(body));
         if (!input.success) {
-          send(400, { error: input.error.issues[0]?.message ?? "Invalid placement" });
-          return;
+          return badRequest(input.error.issues[0]?.message ?? "Invalid placement");
         }
         const { id, workspaceId, localPath } = input.data;
         // Refusing a path this machine cannot open keeps the mistake here,
         // instead of surfacing later as a session that will not start.
         const check = inspectPath(localPath);
-        if (!check.ok) {
-          send(400, { error: check.reason });
-          return;
-        }
-        await relay(async () =>
+        if (!check.ok) return badRequest(check.reason);
+        return relay(async () =>
           id
             ? fleet.updateOwnPlacementPath(id, localPath.trim())
             : fleet.createOwnPlacement(workspaceId, localPath.trim()),
         );
+      },
+    ],
+  ]);
+
+  return async (method, url, body) => {
+    // Query strings belong to the page, not to the route key.
+    const pathname = url.split("?")[0] ?? url;
+    const handler = routes.get(`${method} ${pathname}`);
+    if (!handler) return { status: 404, body: { error: "Not found" } };
+    try {
+      return await handler(body);
+    } catch (error) {
+      const message = errorMessage(error);
+      options.log(`Config request failed: ${message}`);
+      return { status: 500, body: { error: message } };
+    }
+  };
+}
+
+export function startConfigServer(options: ConfigServerOptions): Server {
+  const route = createConfigRouter(options);
+
+  const server = createServer((request, response) => {
+    const url = request.url ?? "/";
+    const pathname = url.split("?")[0] ?? url;
+    const asset = request.method === "GET" ? configAsset(pathname) : undefined;
+    if (asset) {
+      response.writeHead(200, {
+        "content-type": asset.contentType,
+        // The page is same-origin only; no browser should embed or frame it.
+        "cache-control": "no-store",
       });
+      response.end(asset.body);
       return;
     }
 
-    send(404, { error: "Not found" });
+    let body = "";
+    request.on("data", (chunk: Buffer) => {
+      body += chunk;
+      // Nothing legitimate approaches this size; stop reading rather than
+      // buffering whatever a runaway client decides to send.
+      if (body.length > 64_000) request.destroy();
+    });
+    request.on("end", () => {
+      void route(request.method ?? "GET", url, body).then((reply) => {
+        response.writeHead(reply.status, {
+          "content-type": "application/json",
+          "cache-control": "no-store",
+        });
+        response.end(JSON.stringify(reply.body));
+      });
+    });
   });
 
   const port = configServerPort();

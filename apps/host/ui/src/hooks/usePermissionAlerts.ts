@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { SessionEvent } from "@fleet/protocol";
+import { eventPayload, type SessionEvent } from "@fleet/protocol";
 
 const BASE_TITLE = "Copilot Fleet";
 
@@ -18,18 +18,14 @@ export function usePermissionAlerts(
   selectRef.current = onSelectSession;
 
   useEffect(() => {
-    document.title = pending.length
-      ? `(${pending.length}) ${BASE_TITLE}`
-      : BASE_TITLE;
+    document.title = pending.length ? `(${pending.length}) ${BASE_TITLE}` : BASE_TITLE;
   }, [pending.length]);
 
   useEffect(() => {
     const ids = new Set(pending.map((event) => requestIdOf(event)));
     // Resolved requests can never come back, so forgetting them keeps the set
     // bounded without risking a duplicate notification.
-    announced.current = new Set(
-      [...announced.current].filter((id) => ids.has(id)),
-    );
+    announced.current = new Set([...announced.current].filter((id) => ids.has(id)));
 
     if (pending.length === 0 || typeof Notification === "undefined") return;
     if (Notification.permission === "default") void Notification.requestPermission();
@@ -50,7 +46,8 @@ function notifyDesktop(
   onSelectSession: (sessionId: string) => void,
 ): void {
   const notification = new Notification("Copilot needs approval", {
-    body: asText(event.payload.title) || "A tool call is waiting for a decision",
+    body:
+      eventPayload(event, "permission")?.title || "A tool call is waiting for a decision",
     tag: requestId,
     requireInteraction: true,
   });
@@ -62,9 +59,5 @@ function notifyDesktop(
 }
 
 function requestIdOf(event: SessionEvent): string {
-  return asText(event.payload.requestId);
-}
-
-function asText(value: unknown): string {
-  return typeof value === "string" ? value : "";
+  return eventPayload(event, "permission")?.requestId ?? "";
 }

@@ -1,15 +1,7 @@
-import {
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import {
-  AUTH_FAILED_CLOSE_CODE,
-  SUPERSEDED_CLOSE_CODE,
-} from "@fleet/protocol";
+import { AUTH_FAILED_CLOSE_CODE, SUPERSEDED_CLOSE_CODE } from "@fleet/protocol";
+import { isProcessAlive } from "@fleet/protocol/runtime";
 
 export { AUTH_FAILED_CLOSE_CODE, SUPERSEDED_CLOSE_CODE };
 
@@ -23,8 +15,7 @@ export function shouldReconnectAfterClose(
 }
 
 export type InstanceLock =
-  | { ok: true; release: () => void }
-  | { ok: false; reason: string };
+  { ok: true; release: () => void } | { ok: false; reason: string };
 
 export function acquireInstanceLock(directory: string): InstanceLock {
   mkdirSync(directory, { recursive: true });
@@ -65,13 +56,4 @@ export function acquireInstanceLock(directory: string): InstanceLock {
     }
   };
   return { ok: true, release };
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
