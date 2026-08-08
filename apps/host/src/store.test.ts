@@ -32,6 +32,17 @@ function setup() {
 }
 
 describe("FleetStore", () => {
+  it("learns new capabilities when an upgraded node reconnects", () => {
+    // Registration happens once, but agents are upgraded in place; without this
+    // the Host keeps rejecting a feature the machine has already gained.
+    const { store, node } = setup();
+    expect(store.getNode(node.id)?.capabilities).toEqual(["copilot-acp"]);
+    store.setNodeIdentity(node.id, "0.2.0", ["copilot-acp", "host-yolo"]);
+    const updated = store.getNode(node.id);
+    expect(updated?.capabilities).toEqual(["copilot-acp", "host-yolo"]);
+    expect(updated?.version).toBe("0.2.0");
+  });
+
   it("re-enrolling under an existing name reclaims the node and rotates its secret", () => {
     const { store, node, placement } = setup();
     const reclaimed = store.registerNode({

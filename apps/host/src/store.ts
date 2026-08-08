@@ -193,6 +193,19 @@ export class FleetStore {
     this.db.prepare("UPDATE nodes SET home_dir=? WHERE id=?").run(homeDir, id);
   }
 
+  /**
+   * Refreshes what a Node reports about itself on every reconnect.
+   *
+   * Capabilities were previously only recorded at registration, so upgrading a
+   * Node in place left the Host acting on whatever the machine could do months
+   * ago — an updated agent kept being rejected for lacking a feature it had.
+   */
+  setNodeIdentity(id: string, version: string, capabilities: string[]): void {
+    this.db
+      .prepare("UPDATE nodes SET version=?, capabilities=? WHERE id=?")
+      .run(version, JSON.stringify(capabilities), id);
+  }
+
   authenticateNode(id: string, secret: string): boolean {
     const row = this.db.prepare("SELECT secret_hash FROM nodes WHERE id=?").get(id) as
       | Row

@@ -21,6 +21,13 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     gap: "14px",
+    // A placement option spells out a full path, and the Select sizes itself to
+    // that text; without this the dialog grows a horizontal scrollbar instead of
+    // letting the control shrink to the surface.
+    minWidth: 0,
+  },
+  placementField: {
+    minWidth: 0,
   },
   yoloHint: {
     color: tokens.colorNeutralForeground3,
@@ -86,6 +93,7 @@ export const NewSessionDialog = ({
               <Field
                 label="Workspace placement"
                 required
+                className={styles.placementField}
                 {...(placements.length === 0
                   ? { hint: "No online node has a placement yet. Add one under Workspaces." }
                   : {})}

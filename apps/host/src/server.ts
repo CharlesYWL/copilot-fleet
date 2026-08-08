@@ -488,6 +488,7 @@ export async function buildServer(options: {
       }
       nodeSockets.set(hello.nodeId, socket);
       store.setNodeHomeDir(hello.nodeId, hello.homeDir);
+      store.setNodeIdentity(hello.nodeId, hello.version, hello.capabilities);
       const activeSessionIds = hello.activeSessionIds ?? [];
       const node = store.setNodeOnline(hello.nodeId, true, activeSessionIds.length);
       if (node) broadcast({ type: "node", node });
