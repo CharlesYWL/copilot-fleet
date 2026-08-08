@@ -1,10 +1,37 @@
 import { describe, expect, it } from "vitest";
 import {
+  resolveDatabasePath,
   resolveEnrollmentHostUrl,
   resolveEnrollmentToken,
   resolvePublicHostUrl,
   yoloUnsupportedReason,
 } from "./server.js";
+
+describe("resolveDatabasePath", () => {
+  const root = "/repo/apps/host";
+
+  it("keeps every entry point on one file regardless of cwd", () => {
+    // The dev script runs the Host from apps/host and other entry points run
+    // from the repo root; a cwd-relative path split these into two databases,
+    // and the empty one rejected every Node's credentials.
+    expect(resolveDatabasePath("./apps/host/data/fleet.db", root)).toBe(
+      "/repo/apps/host/data/fleet.db",
+    );
+    expect(resolveDatabasePath(undefined, root)).toBe("/repo/apps/host/data/fleet.db");
+  });
+
+  it("still honours an explicit absolute path", () => {
+    expect(resolveDatabasePath("/var/lib/fleet/custom.db", root)).toBe(
+      "/var/lib/fleet/custom.db",
+    );
+  });
+
+  it("keeps a relative file name chosen by the operator", () => {
+    expect(resolveDatabasePath("./staging.db", root)).toBe(
+      "/repo/apps/host/data/staging.db",
+    );
+  });
+});
 
 describe("yolo capability guard", () => {
   const node = (capabilities: string[]) => ({ name: "WEILI-PC", capabilities });

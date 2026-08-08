@@ -1,7 +1,7 @@
 import { config as loadEnv } from "dotenv";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, resolve, isAbsolute, basename } from "node:path";
 import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
@@ -44,6 +44,40 @@ loadEnv({ path: fileURLToPath(new URL("../../../.env", import.meta.url)), quiet:
 
 const VERSION = "0.1.0";
 
+/**
+ * Anchored to the package rather than the working directory. The dev script
+ * runs the Host from apps/host while other entry points run from the repo
+ * root, so a relative path silently pointed at two different databases — the
+ * second one empty, which reads as every Node failing authentication.
+ *
+ * Walking up to package.json keeps source and built output (which sits one
+ * directory deeper) resolving to the same file.
+ */
+function packageRoot(): string {
+  let directory = dirname(fileURLToPath(import.meta.url));
+  while (!existsSync(resolve(directory, "package.json"))) {
+    const parent = dirname(directory);
+    if (parent === directory) break;
+    directory = parent;
+  }
+  return directory;
+}
+
+/**
+ * Existing .env files carry a repo-root-relative DATABASE_PATH, so a bare
+ * resolve() against cwd would keep creating nested apps/host/apps/host trees.
+ * Relative values are therefore interpreted against the package, and only the
+ * trailing file name is honoured.
+ */
+export function resolveDatabasePath(
+  configured: string | undefined,
+  root = packageRoot(),
+): string {
+  if (!configured) return resolve(root, "data", "fleet.db");
+  if (isAbsolute(configured)) return configured;
+  return resolve(root, "data", basename(configured));
+}
+
 export async function buildServer(options: {
   databasePath?: string;
   enrollmentToken?: string;
@@ -54,7 +88,7 @@ export async function buildServer(options: {
     process.env.NODE_ENV,
   );
   const store = new FleetStore(
-    options.databasePath ?? process.env.DATABASE_PATH ?? "./apps/host/data/fleet.db",
+    options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH),
   );
   store.resetConnectivity();
   const nodeSockets = new Map<string, WebSocket>();
