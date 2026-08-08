@@ -9,3 +9,4 @@ apps/host/data/
 coverage/
 dist/
 node_modules/
+data/

@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { TunnelProvider } from "@fleet/protocol";
 import { TunnelProviderSchema } from "@fleet/protocol";
@@ -16,10 +17,15 @@ export type ExternalTunnel = {
   url: string | undefined;
 };
 
+/**
+ * Anchored to this module rather than the working directory: the Host and the
+ * tunnel process are launched from different cwds (workspace scripts run inside
+ * apps/host), so a relative path had them writing and reading different files.
+ */
 export function externalTunnelPath(): string {
   return (
     process.env.FLEET_TUNNEL_STATE_FILE ??
-    join(process.cwd(), "apps", "host", "data", "tunnel.json")
+    join(dirname(fileURLToPath(import.meta.url)), "..", "data", "tunnel.json")
   );
 }
 
