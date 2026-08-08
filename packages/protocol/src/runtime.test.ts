@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { envFilePath, packageRoot, repoRoot } from "./paths.js";
+import { envFilePath, packageRoot, repoRoot } from "./runtime.js";
 
 describe("filesystem anchors", () => {
   let checkout: string;

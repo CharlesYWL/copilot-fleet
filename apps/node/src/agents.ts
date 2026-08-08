@@ -317,9 +317,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
 }
 
 export class AcpAgentFactory implements AgentFactory {
+  /** Values are injected: settings.ts is the only place that reads the env. */
   constructor(
-    private permissionTimeoutMs = Number(process.env.PERMISSION_TIMEOUT_MS ?? 30_000),
-    private copilotCommand = process.env.FLEET_COPILOT_COMMAND ?? "",
+    private permissionTimeoutMs: number,
+    private copilotCommand: string,
   ) {}
 
   /** Lets the local config UI retune the agent without a process restart. */

@@ -26,6 +26,15 @@ export function needsReconnect(before: Settings, after: Settings): boolean {
 }
 
 /**
+ * How long an agent waits for a human decision before denying.
+ *
+ * Settings own this number: `agents.ts` used to read PERMISSION_TIMEOUT_MS a
+ * second time with its own 30s default, so a node started without the variable
+ * denied permissions half an hour earlier than .env.example promised.
+ */
+export const DEFAULT_PERMISSION_TIMEOUT_MS = 1_800_000;
+
+/**
  * Environment variables seed the first run; once settings.json exists it wins,
  * because otherwise an edit made in the UI would silently revert to whatever
  * the .env file still says on the next restart.
@@ -36,7 +45,9 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): Settings 
     nodeName: env.FLEET_NODE_NAME ?? hostname(),
     maxSessions: Number(env.FLEET_MAX_SESSIONS ?? 4),
     copilotCommand: env.FLEET_COPILOT_COMMAND ?? "",
-    permissionTimeoutMs: Number(env.PERMISSION_TIMEOUT_MS ?? 30_000),
+    permissionTimeoutMs: Number(
+      env.PERMISSION_TIMEOUT_MS ?? DEFAULT_PERMISSION_TIMEOUT_MS,
+    ),
   });
 }
 
