@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Copilot Fleet node</title>
+    <link rel="stylesheet" href="/config.css" />
+    <script src="/config.js" type="module" defer></script>
+  </head>
+  <body>
+    <main>
+      <h1>Copilot Fleet node</h1>
+      <p class="sub">Local configuration. Reachable from this machine only.</p>
+
+      <div class="card">
+        <div class="status">
+          <span class="dot" id="dot" aria-hidden="true"></span>
+          <strong id="conn">Loading…</strong>
+        </div>
+        <div class="meta" id="meta"></div>
+      </div>
+
+      <form class="card" id="form">
+        <div class="warn">
+          Pointing this node at a different Host lets that Host run commands on this machine. Only
+          enter a URL you control.
+        </div>
+
+        <label>
+          <span class="label">Host URL</span>
+          <input
+            id="hostUrl"
+            name="hostUrl"
+            type="url"
+            required
+            placeholder="https://example.trycloudflare.com"
+          />
+          <span class="hint">Saving reconnects immediately. Running sessions keep going.</span>
+        </label>
+
+        <label>
+          <span class="label">Node name</span>
+          <input id="nodeName" name="nodeName" required maxlength="120" />
+          <span class="hint">Changing this re-registers the node with the Host.</span>
+        </label>
+
+        <label>
+          <span class="label">Max concurrent sessions</span>
+          <input id="maxSessions" name="maxSessions" type="number" min="1" max="64" required />
+        </label>
+
+        <label>
+          <span class="label">Copilot command</span>
+          <input id="copilotCommand" name="copilotCommand" placeholder="copilot" />
+          <span class="hint">Leave empty to use <code>copilot</code> from PATH.</span>
+        </label>
+
+        <label>
+          <span class="label">Permission timeout (ms)</span>
+          <input
+            id="permissionTimeoutMs"
+            name="permissionTimeoutMs"
+            type="number"
+            min="1000"
+            max="3600000"
+            required
+          />
+          <span class="hint">How long a non-YOLO session waits for your approval.</span>
+        </label>
+
+        <button type="submit" id="save">Save</button>
+        <div id="msg"></div>
+      </form>
+
+      <div class="card">
+        <h2>Workspaces</h2>
+        <p class="sub spaced">Shared across the fleet.</p>
+        <div id="workspaces"></div>
+        <div class="item">
+          <label>
+            <span class="label">New workspace</span>
+            <div class="row">
+              <input id="wsName" maxlength="100" placeholder="Project name" />
+              <button type="button" id="wsAdd">Create</button>
+            </div>
+          </label>
+        </div>
+        <div id="wsMsg"></div>
+      </div>
+
+      <div class="card">
+        <h2>Placements on this machine</h2>
+        <p class="sub spaced">
+          Where each workspace lives locally. Paths are checked against this machine before they are
+          saved.
+        </p>
+        <div id="placements"></div>
+        <div class="item">
+          <span class="label">Add a placement here</span>
+          <label>
+            <select id="plWorkspace">
+              <option value="">Select a workspace</option>
+            </select>
+          </label>
+          <div class="row">
+            <input id="plPath" placeholder="/Users/me/project" />
+            <button type="button" id="plBrowse">Browse…</button>
+            <button type="button" id="plAdd">Add</button>
+          </div>
+          <div class="hint">Browse opens a folder dialog on this node's own screen.</div>
+          <div class="check" id="plCheck"></div>
+        </div>
+        <div id="plMsg"></div>
+      </div>
+    </main>
+  </body>
+</html>
