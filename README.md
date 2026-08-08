@@ -151,8 +151,10 @@ Browser -- REST + WebSocket --> Fastify Host -- authenticated WebSocket --> Node
   existing absolute directory and resolve it before process creation.
 - Copilot is spawned directly with argument arrays, `shell: false`, and the
   selected placement as `cwd`.
-- Permissions are explicit and auditable. Allow-always is intentionally absent;
-  unanswered and disconnected requests fail closed.
+- Permissions are explicit and auditable in the UI (allow-once / deny only).
+  For unattended runs, set `FLEET_YOLO=1` on the Node so Copilot starts with
+  `--allow-all` (tools, paths, and URLs). Unanswered and disconnected requests
+  still fail closed when YOLO is off.
 - The MVP has no user authentication. Put an internet-exposed Host behind an
   authenticated reverse proxy or access policy (for example Cloudflare Access)
   and use HTTPS/WSS.

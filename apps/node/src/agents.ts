@@ -80,8 +80,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   async start(cwd: string): Promise<void> {
     this.emit("state", { state: "starting", activity: "Starting Copilot ACP" });
     const executable = process.env.FLEET_COPILOT_COMMAND ?? "copilot";
-    const args = ["--acp", "--stdio"];
-    if (process.env.FLEET_ALLOW_ALL_TOOLS === "1") args.push("--allow-all-tools");
+    const args = copilotLaunchArgs();
     // npm installs a CLI on Windows as a .cmd shim, which CreateProcess cannot
     // launch directly; the shell can, but then the path has to be quoted.
     const viaShell = process.platform === "win32";
@@ -332,6 +331,28 @@ export class MockAgentFactory implements AgentFactory {
     agent.start();
     return agent;
   }
+}
+
+/**
+ * Copilot's --allow-all / --yolo: tools, paths, and URLs all run without
+ * prompts. FLEET_ALLOW_ALL_TOOLS remains as a synonym for older .env files.
+ */
+export function isYoloEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    env.FLEET_YOLO === "1" ||
+    env.FLEET_ALLOW_ALL === "1" ||
+    env.FLEET_ALLOW_ALL_TOOLS === "1"
+  );
+}
+
+export function copilotLaunchArgs(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const args = ["--acp", "--stdio"];
+  if (isYoloEnabled(env)) args.push("--allow-all");
+  return args;
 }
 
 function delay(ms: number): Promise<void> {

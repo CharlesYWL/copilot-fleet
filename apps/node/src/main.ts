@@ -9,7 +9,7 @@ import {
   tryParseJson,
   type NodeToHostMessage,
 } from "@fleet/protocol";
-import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
+import { AcpAgentFactory, MockAgentFactory, isYoloEnabled } from "./agents.js";
 import {
   configDirectory,
   loadCredentials,
@@ -39,6 +39,7 @@ log(`copilot-fleet node ${VERSION} starting`);
 log(`  name        ${nodeName}`);
 log(`  host        ${hostUrl}`);
 log(`  agent       ${mockAgent ? "mock" : "copilot --acp"}`);
+log(`  permissions ${mockAgent ? "n/a" : isYoloEnabled() ? "yolo (--allow-all)" : "prompt"}`);
 log(`  capacity    ${maxSessions} concurrent sessions`);
 log(`  config      ${configDirectory()}`);
 
