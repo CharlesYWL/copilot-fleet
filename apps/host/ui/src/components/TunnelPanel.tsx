@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Button,
+  Dropdown,
   MessageBar,
   MessageBarBody,
+  Option,
   Spinner,
   Switch,
   Text,
@@ -11,7 +13,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
-import type { TunnelInfo } from "@fleet/protocol";
+import type { TunnelInfo, TunnelProvider } from "@fleet/protocol";
 import { api } from "../hooks/useFleet";
 
 const useStyles = makeStyles({
@@ -101,14 +103,14 @@ export const TunnelPanel = () => {
     return () => clearTimeout(timer);
   }, [copied]);
 
-  const handleToggle = async (_event: unknown, data: { checked: boolean }) => {
+  const handleToggle = async (enabled: boolean, provider?: TunnelProvider) => {
     setBusy(true);
     setActionError(undefined);
     try {
       setInfo(
         await api<TunnelInfo>("/api/tunnel", {
           method: "POST",
-          body: JSON.stringify({ enabled: data.checked }),
+          body: JSON.stringify({ enabled, ...(provider ? { provider } : {}) }),
         }),
       );
     } catch (reason) {
@@ -119,7 +121,7 @@ export const TunnelPanel = () => {
     }
   };
 
-  const handleRetry = () => void handleToggle(undefined, { checked: true });
+  const handleRetry = () => void handleToggle(true);
 
   if (!info) {
     return (
@@ -131,26 +133,25 @@ export const TunnelPanel = () => {
 
   const switching = busy || info.status === "starting" || info.status === "stopping";
   const showTunnelUrl = info.status === "on";
+  const isOn = info.enabled || info.status === "on";
+  const current = info.providers.find((entry) => entry.id === info.provider);
 
   return (
     <div className={styles.panel}>
       <div>
-        <Title3 as="h1">Cloudflare Tunnel</Title3>
+        <Title3 as="h1">Remote access tunnel</Title3>
         <br />
         <Text className={styles.caption}>
-          Expose this Host so remote nodes can enroll over the public internet. Quick
-          tunnels are free and temporary.
+          Expose this Host so remote nodes can enroll over the public internet. Pick
+          whichever provider you already have installed.
         </Text>
       </div>
 
-      {!info.binaryPresent && (
+      {current && !current.binaryPresent && (
         <MessageBar intent="warning">
           <MessageBarBody>
-            <code>cloudflared</code> was not found on PATH. Install it from{" "}
-            <a href="https://developers.cloudflare.com/cloudflare-one/connections/connect-apps/install-and-setup/installation/">
-              Cloudflare&apos;s docs
-            </a>{" "}
-            and restart the Host.
+            <code>{current.binary}</code> was not found on PATH. Install it with{" "}
+            <code>{current.installHint}</code>.
           </MessageBarBody>
         </MessageBar>
       )}
@@ -161,11 +162,11 @@ export const TunnelPanel = () => {
         </MessageBar>
       )}
 
-      {showTunnelUrl && (
+      {showTunnelUrl && current?.caveat && (
         <MessageBar intent="info">
           <MessageBarBody>
-            Quick tunnel URLs change every time you start. Remote nodes must update{" "}
-            <code>FLEET_HOST_URL</code> and restart after a new URL appears.
+            {current.caveat} Remote nodes must update <code>FLEET_HOST_URL</code> and
+            restart after a new URL appears.
           </MessageBarBody>
         </MessageBar>
       )}
@@ -173,15 +174,44 @@ export const TunnelPanel = () => {
       <section className={styles.card}>
         <div className={styles.row}>
           <div>
+            <Text weight="semibold">Provider</Text>
+            <br />
+            <Text className={styles.caption}>
+              Switching providers restarts the tunnel.
+            </Text>
+          </div>
+          <Dropdown
+            aria-label="Tunnel provider"
+            disabled={switching}
+            selectedOptions={[info.provider]}
+            value={current?.label ?? info.provider}
+            onOptionSelect={(_event, data) => {
+              const next = data.optionValue as TunnelProvider | undefined;
+              if (!next || next === info.provider) return;
+              void handleToggle(isOn, next);
+            }}
+          >
+            {info.providers.map((entry) => (
+              <Option key={entry.id} value={entry.id} text={entry.label}>
+                {entry.binaryPresent ? entry.label : `${entry.label} (not installed)`}
+              </Option>
+            ))}
+          </Dropdown>
+        </div>
+
+        <div className={styles.row}>
+          <div>
             <Text weight="semibold">Remote access</Text>
             <br />
-            <Text className={styles.caption}>Provider: Cloudflare</Text>
+            <Text className={styles.caption}>
+              Reconnects automatically if the tunnel drops.
+            </Text>
           </div>
           <Switch
-            checked={info.enabled || info.status === "starting" || info.status === "on"}
+            checked={isOn || info.status === "starting"}
             disabled={!info.binaryPresent || switching}
-            label={info.enabled || info.status === "on" ? "On" : "Off"}
-            onChange={handleToggle}
+            label={isOn ? "On" : "Off"}
+            onChange={(_event, data) => void handleToggle(data.checked)}
           />
         </div>
 

@@ -8,7 +8,9 @@ import {
   type Placement,
   type SessionEvent,
   type SessionState,
+  type TunnelProvider,
   type Workspace,
+  TunnelProviderSchema,
   canTransition,
   terminalSessionStates,
 } from "@fleet/protocol";
@@ -83,6 +85,16 @@ export class FleetStore {
     this.setSetting("tunnel.enabled", enabled ? "1" : "0");
   }
 
+  getTunnelProvider(): TunnelProvider {
+    const stored = this.getSetting("tunnel.provider");
+    const parsed = TunnelProviderSchema.safeParse(stored);
+    return parsed.success ? parsed.data : "cloudflare";
+  }
+
+  setTunnelProvider(provider: TunnelProvider): void {
+    this.setSetting("tunnel.provider", provider);
+  }
+
   /** Keeps databases created before a column was introduced usable. */
   private addColumnIfMissing(table: string, column: string, definition: string): void {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
@@ -110,9 +122,35 @@ export class FleetStore {
       "id" | "activeSessions" | "lastHeartbeat" | "online" | "homeDir"
     > & { homeDir?: string },
   ): { node: FleetNode; secret: string } {
-    const id = randomUUID();
     const secret = randomUUID() + randomUUID();
     const now = new Date().toISOString();
+    // Re-enrolling under an existing name reclaims that node instead of
+    // colliding with the unique index. The enrollment token already gates this,
+    // and it keeps placements/sessions attached to a rebuilt machine.
+    const existing = this.db
+      .prepare("SELECT id FROM nodes WHERE name=?")
+      .get(input.name) as { id: string } | undefined;
+    if (existing) {
+      this.db
+        .prepare(
+          `UPDATE nodes SET secret_hash=?, os=?, arch=?, version=?, capabilities=?,
+             max_sessions=?, last_heartbeat=?, home_dir=? WHERE id=?`,
+        )
+        .run(
+          hash(secret),
+          input.os,
+          input.arch,
+          input.version,
+          JSON.stringify(input.capabilities),
+          input.maxSessions,
+          now,
+          input.homeDir ?? "",
+          existing.id,
+        );
+      return { node: this.getNode(existing.id)!, secret };
+    }
+
+    const id = randomUUID();
     this.db
       .prepare(
         `INSERT INTO nodes

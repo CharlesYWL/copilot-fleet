@@ -52,12 +52,20 @@ const releaseInstanceLock = instanceLock.release;
 process.once("exit", () => releaseInstanceLock());
 
 let credentials = await loadCredentials();
-if (!credentials || credentials.hostUrl !== hostUrl || credentials.name !== nodeName) {
-  log(credentials ? "Identity changed, registering again" : "No stored credentials, registering");
+// The host URL is just where to reach the Host, not part of this node's
+// identity: tunnel providers hand out a fresh URL on every restart, and
+// re-registering under the same name collides with the unique name index.
+if (!credentials || credentials.name !== nodeName) {
+  log(credentials ? "Node name changed, registering again" : "No stored credentials, registering");
   credentials = await register();
   await saveCredentials(credentials);
   log(`Registered as node ${credentials.nodeId}`);
 } else {
+  if (credentials.hostUrl !== hostUrl) {
+    log(`Host URL changed to ${hostUrl}, reusing node ${credentials.nodeId}`);
+    credentials = { ...credentials, hostUrl };
+    await saveCredentials(credentials);
+  }
   log(`Reusing stored credentials for node ${credentials.nodeId}`);
 }
 

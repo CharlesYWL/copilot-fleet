@@ -236,6 +236,15 @@ export const PermissionResponseSchema = z.object({
   optionId: z.string().optional(),
 });
 
+export const tunnelProviders = [
+  "cloudflare",
+  "tailscale",
+  "ngrok",
+  "bore",
+] as const;
+export const TunnelProviderSchema = z.enum(tunnelProviders);
+export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
+
 export const TunnelStatusSchema = z.enum([
   "off",
   "starting",
@@ -245,18 +254,31 @@ export const TunnelStatusSchema = z.enum([
 ]);
 export type TunnelStatus = z.infer<typeof TunnelStatusSchema>;
 
+export const TunnelProviderInfoSchema = z.object({
+  id: TunnelProviderSchema,
+  label: z.string().min(1),
+  binary: z.string().min(1),
+  binaryPresent: z.boolean(),
+  installHint: z.string(),
+  caveat: z.string().optional(),
+});
+export type TunnelProviderInfo = z.infer<typeof TunnelProviderInfoSchema>;
+
 export const TunnelInfoSchema = z.object({
-  provider: z.literal("cloudflare"),
+  provider: TunnelProviderSchema,
   enabled: z.boolean(),
   status: TunnelStatusSchema,
   publicUrl: z.string().min(1),
   error: z.string().nullable(),
   binaryPresent: z.boolean(),
+  /** Every supported provider plus whether its CLI is installed. */
+  providers: z.array(TunnelProviderInfoSchema),
 });
 export type TunnelInfo = z.infer<typeof TunnelInfoSchema>;
 
 export const UpdateTunnelSchema = z.object({
   enabled: z.boolean(),
+  provider: TunnelProviderSchema.optional(),
 });
 
 const transitions: Record<SessionState, ReadonlySet<SessionState>> = {

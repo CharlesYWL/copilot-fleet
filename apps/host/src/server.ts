@@ -65,6 +65,7 @@ export async function buildServer(options: {
     localTarget: `http://127.0.0.1:${listenPort}`,
     onEnabledCleared: () => store.setTunnelEnabled(false),
   });
+  void tunnel.setEnabled(false, store.getTunnelProvider());
 
   const fallbackPublicUrl = () =>
     resolvePublicHostUrl(
@@ -113,9 +114,11 @@ export async function buildServer(options: {
   app.get("/api/tunnel", async () => tunnel.info(fallbackPublicUrl()));
   app.post("/api/tunnel", async (request, reply) => {
     const input = UpdateTunnelSchema.parse(request.body);
+    const provider = input.provider ?? store.getTunnelProvider();
+    store.setTunnelProvider(provider);
     store.setTunnelEnabled(input.enabled);
     try {
-      await tunnel.setEnabled(input.enabled);
+      await tunnel.setEnabled(input.enabled, provider);
     } catch (error) {
       store.setTunnelEnabled(false);
       return reply.code(503).send({
@@ -611,9 +614,9 @@ export async function buildServer(options: {
 
   app.addHook("onReady", () => {
     if (!store.getTunnelEnabled()) return;
-    void tunnel.setEnabled(true).catch((error) => {
+    void tunnel.setEnabled(true, store.getTunnelProvider()).catch((error) => {
       store.setTunnelEnabled(false);
-      app.log.error({ err: error }, "Failed to restore Cloudflare tunnel");
+      app.log.error({ err: error }, "Failed to restore tunnel");
     });
   });
 

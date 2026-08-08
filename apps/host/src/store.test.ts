@@ -31,6 +31,26 @@ function setup() {
 }
 
 describe("FleetStore", () => {
+  it("re-enrolling under an existing name reclaims the node and rotates its secret", () => {
+    const { store, node, placement } = setup();
+    const reclaimed = store.registerNode({
+      name: "node",
+      os: "win32",
+      arch: "x64",
+      version: "0.2.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 4,
+    });
+
+    expect(reclaimed.node.id).toBe(node.id);
+    expect(reclaimed.node.version).toBe("0.2.0");
+    expect(reclaimed.node.maxSessions).toBe(4);
+    expect(store.listNodes()).toHaveLength(1);
+    // Placements survive so a rebuilt machine keeps its workspace mapping.
+    expect(store.listPlacements().map((entry) => entry.id)).toContain(placement.id);
+    expect(store.authenticateNode(node.id, reclaimed.secret)).toBe(true);
+  });
+
   it("persists sessions and ordered events", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");
