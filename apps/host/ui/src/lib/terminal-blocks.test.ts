@@ -24,6 +24,27 @@ function event(
 }
 
 describe("toTerminalBlocks", () => {
+  it("hides agent_session bookkeeping instead of reporting it as an error", () => {
+    const blocks = toTerminalBlocks([
+      event("agent_session", { agentSessionId: "copilot-abc" }),
+      event("agent_text", { text: "hi" }),
+    ]);
+
+    expect(blocks.map((block) => block.kind)).toEqual(["agent"]);
+  });
+
+  it("still renders real errors, falling back when the message is empty", () => {
+    const blocks = toTerminalBlocks([
+      event("error", { message: "boom" }),
+      event("error", {}),
+    ]);
+
+    expect(blocks.map((block) => [block.kind, block.text])).toEqual([
+      ["error", "boom"],
+      ["error", "Unknown error"],
+    ]);
+  });
+
   it("merges consecutive streamed chunks into one block", () => {
     const blocks = toTerminalBlocks([
       event("agent_text", { text: "Looking " }),

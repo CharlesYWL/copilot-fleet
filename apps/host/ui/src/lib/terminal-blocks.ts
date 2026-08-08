@@ -129,12 +129,17 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       continue;
     }
 
-    blocks.push({
-      key: event.eventId,
-      kind: "error",
-      text: asText(event.payload.message) || "Unknown error",
-      createdAt: event.createdAt,
-    });
+    // Bookkeeping for resume; it carries no text worth showing in the stream.
+    if (event.type === "agent_session") continue;
+
+    if (event.type === "error") {
+      blocks.push({
+        key: event.eventId,
+        kind: "error",
+        text: asText(event.payload.message) || "Unknown error",
+        createdAt: event.createdAt,
+      });
+    }
   }
 
   return blocks;
