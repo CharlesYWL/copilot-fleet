@@ -7,6 +7,7 @@ import type {
   SessionEvent,
   Workspace,
 } from "@fleet/protocol";
+import { reconnectDelay } from "./reconnect-delay";
 
 export type Snapshot = {
   nodes: FleetNode[];
@@ -80,58 +81,85 @@ export function useFleet(notify: Notify) {
   );
 
   useEffect(() => {
-    void refresh();
-    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${location.host}/ws/browser`);
-    socket.onopen = () => setConnected(true);
-    socket.onclose = () => setConnected(false);
-    socket.onmessage = ({ data }) => {
-      const message = parseBrowserMessage(String(data));
-      if (!message) {
-        notifyRef.current("Malformed live update", "error");
-        socket.close(1007, "Malformed JSON");
-        return;
-      }
-      if (message.type === "snapshot") {
-        setSnapshot(message.data as unknown as Snapshot);
-        return;
-      }
-      if (message.type === "node") {
-        const { node } = message;
-        setSnapshot((value) => ({ ...value, nodes: upsert(value.nodes, node) }));
-        return;
-      }
-      if (message.type === "catalog") {
-        const { workspaces, placements } = message;
-        setSnapshot((value) => ({ ...value, workspaces, placements }));
-        return;
-      }
-      if (message.type === "session") {
-        const { session } = message;
-        if (session.state === "failed") {
-          notifyRef.current(
-            session.currentActivity || "Session failed",
-            "error",
-          );
+    let socket: WebSocket | undefined;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let attempt = 0;
+    let closed = false;
+
+    const connect = () => {
+      if (closed) return;
+      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+      socket = new WebSocket(`${protocol}//${location.host}/ws/browser`);
+      socket.onopen = () => {
+        attempt = 0;
+        setConnected(true);
+        // Anything that changed while the socket was down was never delivered,
+        // so start again from the Host's current truth rather than from state
+        // that stopped being updated at an arbitrary moment.
+        void refresh();
+      };
+      socket.onclose = () => {
+        setConnected(false);
+        if (closed) return;
+        // Without this the page goes permanently deaf after any restart of the
+        // Host and only a manual reload brings it back.
+        retryTimer = setTimeout(connect, reconnectDelay(attempt));
+        attempt += 1;
+      };
+      socket.onmessage = ({ data }) => {
+        const message = parseBrowserMessage(String(data));
+        if (!message) {
+          notifyRef.current("Malformed live update", "error");
+          socket?.close(1007, "Malformed JSON");
+          return;
         }
-        setSnapshot((value) => ({
+        if (message.type === "snapshot") {
+          setSnapshot(message.data as unknown as Snapshot);
+          return;
+        }
+        if (message.type === "node") {
+          const { node } = message;
+          setSnapshot((value) => ({ ...value, nodes: upsert(value.nodes, node) }));
+          return;
+        }
+        if (message.type === "catalog") {
+          const { workspaces, placements } = message;
+          setSnapshot((value) => ({ ...value, workspaces, placements }));
+          return;
+        }
+        if (message.type === "session") {
+          const { session } = message;
+          if (session.state === "failed") {
+            notifyRef.current(
+              session.currentActivity || "Session failed",
+              "error",
+            );
+          }
+          setSnapshot((value) => ({
+            ...value,
+            sessions: upsert(value.sessions, session),
+          }));
+          return;
+        }
+        const { event } = message;
+        setEvents((value) => ({
           ...value,
-          sessions: upsert(value.sessions, session),
+          [event.sessionId]: [
+            ...(value[event.sessionId] ?? []).filter(
+              (item) => item.eventId !== event.eventId,
+            ),
+            event,
+          ].sort((a, b) => a.sequence - b.sequence),
         }));
-        return;
-      }
-      const { event } = message;
-      setEvents((value) => ({
-        ...value,
-        [event.sessionId]: [
-          ...(value[event.sessionId] ?? []).filter(
-            (item) => item.eventId !== event.eventId,
-          ),
-          event,
-        ].sort((a, b) => a.sequence - b.sequence),
-      }));
+      };
     };
-    return () => socket.close();
+
+    connect();
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      socket?.close();
+    };
   }, [refresh]);
 
   return { snapshot, events, connected, refresh, loadEvents, command };
