@@ -10,6 +10,7 @@ import {
   AUTH_FAILED_CLOSE_CODE,
   SUPERSEDED_CLOSE_CODE,
 } from "@fleet/protocol";
+import { isProcessAlive } from "@fleet/protocol/runtime";
 
 export { AUTH_FAILED_CLOSE_CODE, SUPERSEDED_CLOSE_CODE };
 
@@ -65,13 +66,4 @@ export function acquireInstanceLock(directory: string): InstanceLock {
     }
   };
   return { ok: true, release };
-}
-
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }

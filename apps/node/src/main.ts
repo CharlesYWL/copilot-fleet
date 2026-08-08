@@ -244,13 +244,14 @@ function send(message: NodeToHostMessage): void {
   if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
 }
 
-setInterval(() => {
+const heartbeatTimer = setInterval(() => {
   send({
     type: "heartbeat",
     activeSessionIds: router.activeSessionIds,
     sentAt: new Date().toISOString(),
   });
-}, 5_000).unref();
+}, 5_000);
+heartbeatTimer.unref();
 
 async function register(): Promise<Credentials> {
   const enrollmentToken = process.env.FLEET_ENROLLMENT_TOKEN;
@@ -287,6 +288,9 @@ async function register(): Promise<Credentials> {
 async function shutdown(): Promise<void> {
   shuttingDown = true;
   if (reconnectTimer) clearTimeout(reconnectTimer);
+  // An unref'd timer does not hold the loop open, but it does keep firing while
+  // the process winds down, which resurrects a socket we are trying to close.
+  clearInterval(heartbeatTimer);
   configServer.close();
   socket?.close();
   await router.stopAll();

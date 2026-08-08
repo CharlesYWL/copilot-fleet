@@ -1,29 +1,40 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
-  extractTunnelUrl,
+  BinaryProbe,
   restartDelay,
   RESTART_DELAYS_MS,
   TunnelManager,
 } from "./tunnel.js";
-import { parseLocalTarget, providerSpecs } from "./tunnel-providers.js";
+import {
+  extractTunnelUrl,
+  parseLocalTarget,
+  providerSpecs,
+} from "./tunnel-providers.js";
+
+/** Never spawns anything, so tests do not depend on what the box has installed. */
+const fakeProbe = (present = true) =>
+  new BinaryProbe(async () => present);
 
 describe("external tunnel handover", () => {
   const managerWithExternal = (url: string | undefined) =>
     new TunnelManager({
       localTarget: "http://127.0.0.1:8787",
       readExternal: () => ({ provider: "bore" as const, url }),
+      probe: fakeProbe(),
     });
 
-  it("reports the external url and flags that the Host does not own it", () => {
-    const info = managerWithExternal("http://bore.pub:1234").info("http://127.0.0.1:8787");
+  it("reports the external url and flags that the Host does not own it", async () => {
+    const info = await managerWithExternal("http://bore.pub:1234").info(
+      "http://127.0.0.1:8787",
+    );
     expect(info.external).toBe(true);
     expect(info.publicUrl).toBe("http://bore.pub:1234");
     expect(info.status).toBe("on");
     expect(info.provider).toBe("bore");
   });
 
-  it("shows a tunnel that has not published its url yet as starting", () => {
-    const info = managerWithExternal(undefined).info("http://127.0.0.1:8787");
+  it("shows a tunnel that has not published its url yet as starting", async () => {
+    const info = await managerWithExternal(undefined).info("http://127.0.0.1:8787");
     expect(info.status).toBe("starting");
     expect(info.publicUrl).toBe("http://127.0.0.1:8787");
   });
@@ -37,14 +48,68 @@ describe("external tunnel handover", () => {
     expect(manager.activeTunnelUrl()).toBe("http://bore.pub:1234");
   });
 
-  it("falls back to its own lifecycle when no external tunnel is running", () => {
+  it("falls back to its own lifecycle when no external tunnel is running", async () => {
     const manager = new TunnelManager({
       localTarget: "http://127.0.0.1:8787",
       readExternal: () => undefined,
+      probe: fakeProbe(false),
     });
-    const info = manager.info("http://127.0.0.1:8787");
+    const info = await manager.info("http://127.0.0.1:8787");
     expect(info.external).toBe(false);
     expect(info.status).toBe("off");
+    expect(info.binaryPresent).toBe(false);
+  });
+});
+
+describe("BinaryProbe", () => {
+  const spec = providerSpecs.cloudflare;
+
+  it("probes once and serves the rest of the poll storm from cache", async () => {
+    const probe = vi.fn().mockResolvedValue(true);
+    const cache = new BinaryProbe(probe, 1_000, () => 0);
+    // The Settings page polls /api/tunnel every 2s and each response describes
+    // every provider, which used to mean five process spawns per poll.
+    await Promise.all([cache.present(spec), cache.present(spec)]);
+    await cache.present(spec);
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-probes after the entry expires", async () => {
+    const probe = vi.fn().mockResolvedValue(true);
+    let now = 0;
+    const cache = new BinaryProbe(probe, 1_000, () => now);
+    await cache.present(spec);
+    now = 1_001;
+    await cache.present(spec);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-probes after an explicit invalidation, so a fresh install is seen", async () => {
+    const probe = vi.fn().mockResolvedValue(false);
+    const cache = new BinaryProbe(probe, 60_000, () => 0);
+    await cache.present(spec);
+    cache.invalidate();
+    await cache.present(spec);
+    expect(probe).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("tunnel manager binary guard", () => {
+  it("refuses to start when the provider CLI is missing and clears enabled", async () => {
+    let cleared = false;
+    const manager = new TunnelManager({
+      localTarget: "http://127.0.0.1:8787",
+      readExternal: () => undefined,
+      probe: fakeProbe(false),
+      onEnabledCleared: () => {
+        cleared = true;
+      },
+    });
+    await expect(manager.setEnabled(true)).rejects.toThrow(/not installed/);
+    expect(cleared).toBe(true);
+    const info = await manager.info("http://127.0.0.1:8787");
+    expect(info.status).toBe("error");
+    expect(info.enabled).toBe(false);
   });
 });
 

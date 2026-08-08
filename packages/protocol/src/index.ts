@@ -187,8 +187,22 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
 ]);
 export type HostToNodeMessage = z.infer<typeof HostToNodeMessageSchema>;
 
+/**
+ * Everything a freshly connected browser needs to render the fleet.
+ *
+ * Spelled out rather than left as an open record so the UI can consume it
+ * without asserting its way from `unknown` to the four lists it actually gets.
+ */
+export const SnapshotSchema = z.object({
+  nodes: z.array(NodeSchema),
+  workspaces: z.array(WorkspaceSchema),
+  placements: z.array(PlacementSchema),
+  sessions: z.array(SessionSchema),
+});
+export type Snapshot = z.infer<typeof SnapshotSchema>;
+
 export const BrowserMessageSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("snapshot"), data: z.record(z.string(), z.unknown()) }),
+  z.object({ type: z.literal("snapshot"), data: SnapshotSchema }),
   z.object({ type: z.literal("node"), node: NodeSchema }),
   z.object({ type: z.literal("session"), session: SessionSchema }),
   z.object({ type: z.literal("event"), event: SessionEventSchema }),
@@ -352,9 +366,69 @@ export function tryParseJson(text: string): JsonParseResult {
   try {
     return { ok: true, value: JSON.parse(text) as unknown };
   } catch (error) {
+    return { ok: false, error: errorMessage(error, "Invalid JSON") };
+  }
+}
+
+/** A peer sent bytes that are not JSON at all. */
+export const MALFORMED_JSON_CLOSE_CODE = 1007;
+
+/** A peer sent JSON that does not match the agreed schema. */
+export const INVALID_MESSAGE_CLOSE_CODE = 1008;
+
+export type FrameDecodeFailure = {
+  ok: false;
+  /** Close code to hang up with. */
+  code: typeof MALFORMED_JSON_CLOSE_CODE | typeof INVALID_MESSAGE_CLOSE_CODE;
+  /** Short close reason; goes on the wire, so it stays generic. */
+  reason: string;
+  /** Full diagnostic for the local log. */
+  detail: string;
+};
+
+export type DecodedFrame<T> = { ok: true; value: T } | FrameDecodeFailure;
+
+/**
+ * Parses and validates one WebSocket frame.
+ *
+ * Host and Node ran identical "parse, validate, close 1007/1008" ladders on
+ * every inbound frame; keeping the two in step by hand meant a fix on one side
+ * silently left the other accepting frames the peer had stopped sending.
+ */
+export function decodeFrame<Schema extends z.ZodType>(
+  raw: string,
+  schema: Schema,
+): DecodedFrame<z.infer<Schema>> {
+  const parsed = tryParseJson(raw);
+  if (!parsed.ok) {
     return {
       ok: false,
-      error: error instanceof Error ? error.message : "Invalid JSON",
+      code: MALFORMED_JSON_CLOSE_CODE,
+      reason: "Malformed JSON",
+      detail: parsed.error,
     };
   }
+  const result = schema.safeParse(parsed.value);
+  if (!result.success) {
+    return {
+      ok: false,
+      code: INVALID_MESSAGE_CLOSE_CODE,
+      reason: "Invalid message",
+      detail: result.error.message,
+    };
+  }
+  return { ok: true, value: result.data as z.infer<Schema> };
+}
+
+/**
+ * The message to show for a thrown value.
+ *
+ * Both services and the UI hand-rolled `error instanceof Error ? ... : ...`,
+ * which drifted: some spots stringified an object into "[object Object]" while
+ * others dropped the cause entirely.
+ */
+export function errorMessage(error: unknown, fallback?: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error) return error;
+  return fallback ?? String(error);
 }
