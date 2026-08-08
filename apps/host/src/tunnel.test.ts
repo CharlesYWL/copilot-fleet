@@ -1,6 +1,52 @@
 import { describe, expect, it } from "vitest";
-import { extractTunnelUrl, restartDelay, RESTART_DELAYS_MS } from "./tunnel.js";
+import {
+  extractTunnelUrl,
+  restartDelay,
+  RESTART_DELAYS_MS,
+  TunnelManager,
+} from "./tunnel.js";
 import { parseLocalTarget, providerSpecs } from "./tunnel-providers.js";
+
+describe("external tunnel handover", () => {
+  const managerWithExternal = (url: string | undefined) =>
+    new TunnelManager({
+      localTarget: "http://127.0.0.1:8787",
+      readExternal: () => ({ provider: "bore" as const, url }),
+    });
+
+  it("reports the external url and flags that the Host does not own it", () => {
+    const info = managerWithExternal("http://bore.pub:1234").info("http://127.0.0.1:8787");
+    expect(info.external).toBe(true);
+    expect(info.publicUrl).toBe("http://bore.pub:1234");
+    expect(info.status).toBe("on");
+    expect(info.provider).toBe("bore");
+  });
+
+  it("shows a tunnel that has not published its url yet as starting", () => {
+    const info = managerWithExternal(undefined).info("http://127.0.0.1:8787");
+    expect(info.status).toBe("starting");
+    expect(info.publicUrl).toBe("http://127.0.0.1:8787");
+  });
+
+  it("refuses to start or stop a process it never spawned", async () => {
+    const manager = managerWithExternal("http://bore.pub:1234");
+    // Both calls must be inert: stopping would kill a tunnel owned by another
+    // terminal, and starting would race a second binary onto the same port.
+    await manager.setEnabled(false);
+    await manager.stop();
+    expect(manager.activeTunnelUrl()).toBe("http://bore.pub:1234");
+  });
+
+  it("falls back to its own lifecycle when no external tunnel is running", () => {
+    const manager = new TunnelManager({
+      localTarget: "http://127.0.0.1:8787",
+      readExternal: () => undefined,
+    });
+    const info = manager.info("http://127.0.0.1:8787");
+    expect(info.external).toBe(false);
+    expect(info.status).toBe("off");
+  });
+});
 
 describe("extractTunnelUrl", () => {
   it("pulls the trycloudflare URL out of cloudflared banner text", () => {

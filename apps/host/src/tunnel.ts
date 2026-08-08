@@ -1,6 +1,10 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import type { TunnelInfo, TunnelProvider, TunnelStatus } from "@fleet/protocol";
 import {
+  readExternalTunnel,
+  type ExternalTunnel,
+} from "./external-tunnel.js";
+import {
   parseLocalTarget,
   providerList,
   providerSpecs,
@@ -38,6 +42,8 @@ type TunnelManagerOptions = {
   /** Injected so tests can run without real timers. */
   setTimer?: (fn: () => void, ms: number) => NodeJS.Timeout;
   clearTimer?: (timer: NodeJS.Timeout) => void;
+  /** Detects a tunnel running as its own process; injected for tests. */
+  readExternal?: () => ExternalTunnel | undefined;
 };
 
 export class TunnelManager {
@@ -55,12 +61,14 @@ export class TunnelManager {
   private wantEnabled = false;
   private restartAttempt = 0;
   private restartTimer: NodeJS.Timeout | undefined;
+  private readonly readExternal: () => ExternalTunnel | undefined;
 
   constructor(options: TunnelManagerOptions) {
     this.target = parseLocalTarget(options.localTarget);
     this.onEnabledCleared = options.onEnabledCleared;
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
+    this.readExternal = options.readExternal ?? (() => readExternalTunnel());
   }
 
   get activeProvider(): TunnelProvider {
@@ -68,14 +76,21 @@ export class TunnelManager {
   }
 
   info(fallbackPublicUrl: string): TunnelInfo {
-    const online = this.status === "on" && this.tunnelUrl;
+    const external = this.readExternal();
+    const online = external
+      ? Boolean(external.url)
+      : this.status === "on" && this.tunnelUrl;
+    const url = external ? external.url : this.tunnelUrl;
+    const provider = external?.provider ?? this.provider;
     return {
-      provider: this.provider,
-      enabled: this.wantEnabled || this.status === "starting" || this.status === "on",
-      status: this.status,
-      publicUrl: online ? this.tunnelUrl! : fallbackPublicUrl,
-      error: this.error ?? null,
-      binaryPresent: binaryPresent(providerSpecs[this.provider]),
+      provider,
+      enabled: external
+        ? true
+        : this.wantEnabled || this.status === "starting" || this.status === "on",
+      status: external ? (external.url ? "on" : "starting") : this.status,
+      publicUrl: online && url ? url : fallbackPublicUrl,
+      error: external ? null : (this.error ?? null),
+      binaryPresent: binaryPresent(providerSpecs[provider]),
       providers: providerList.map((spec) => ({
         id: spec.id,
         label: spec.label,
@@ -84,15 +99,22 @@ export class TunnelManager {
         installHint: spec.installHint,
         ...(spec.caveat ? { caveat: spec.caveat } : {}),
       })),
+      external: Boolean(external),
     };
   }
 
   /** Live tunnel URL when online; otherwise undefined so callers use fallbacks. */
   activeTunnelUrl(): string | undefined {
+    const external = this.readExternal();
+    if (external) return external.url;
     return this.status === "on" ? this.tunnelUrl : undefined;
   }
 
   async setEnabled(enabled: boolean, provider?: TunnelProvider): Promise<void> {
+    // A separately running tunnel owns its own lifecycle; toggling here would
+    // either kill a process this manager never started or start a second one
+    // competing for the same local port.
+    if (this.readExternal()) return;
     // Switching providers while running has to tear the old process down first.
     if (provider && provider !== this.provider && this.child) await this.stop();
     if (provider) this.provider = provider;
@@ -188,6 +210,8 @@ export class TunnelManager {
   }
 
   async stop(): Promise<void> {
+    // Never signal a process this manager did not spawn.
+    if (this.readExternal()) return;
     this.wantEnabled = false;
     this.cancelRestart();
     this.restartAttempt = 0;

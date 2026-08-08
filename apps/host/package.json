@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "concurrently -n api,ui \"tsx watch src/server.ts\" \"vite --host 127.0.0.1\"",
+    "tunnel": "tsx src/tunnel-process.ts",
     "build": "tsc -p tsconfig.server.json && vite build",
     "typecheck": "tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.ui.json --noEmit",
     "start": "node dist/server/server.js"

@@ -30,6 +30,18 @@ This single command runs the Fastify API on `http://127.0.0.1:8787`, Vite on
 `http://127.0.0.1:5173`, and the local Node service. The Node reads its
 `FLEET_*` settings from `.env`.
 
+To keep a tunnel URL stable while you edit code, start the tunnel as its own
+process instead:
+
+```bash
+npm run dev:tunnel
+```
+
+The tunnel then survives `tsx watch` reloads, so the public URL stops rotating
+every time the Host restarts and remote nodes stay connected. The Host detects
+it and leaves its lifecycle alone; the Settings toggle is disabled while it
+runs. Stop everything with Ctrl+C as usual.
+
 Open the UI → **Settings**:
 
 - **Tunnel** — toggle a Cloudflare quick tunnel (requires `cloudflared` on PATH).
@@ -67,6 +79,22 @@ Credentials are persisted at
 `$env:APPDATA\CopilotFleet\node.json`; subsequent starts do not need the
 enrollment token. The service uses an outbound WSS connection, so no inbound
 Node port is required.
+
+### Node config page
+
+Each node serves a small settings page at `http://127.0.0.1:8788` (override the
+port with `FLEET_NODE_CONFIG_PORT`). Use it to retarget the node when a tunnel
+hands out a new URL — the node reconnects in place, so no restart is needed and
+running sessions survive.
+
+It also edits the node name, session capacity, Copilot executable path, and
+permission timeout. Values are stored in `settings.json` beside the credentials
+and take precedence over the environment variables, so an edit here is not
+undone by a stale `.env` on the next start.
+
+The listener binds to loopback only and is deliberately not exposed: anything
+that can repoint a node at a different Host can run commands on that machine.
+Reach a remote node's page over SSH port forwarding rather than binding wider.
 
 ## Exact proof of concept
 
@@ -163,6 +191,7 @@ Browser -- REST + WebSocket --> Fastify Host -- authenticated WebSocket --> Node
 
 ```bash
 npm run dev
+npm run dev:tunnel
 npm test
 npm run typecheck
 npm run build

@@ -172,6 +172,14 @@ export const TunnelPanel = () => {
       )}
 
       <section className={styles.card}>
+        {info.external && (
+          <MessageBar intent="info">
+            <MessageBarBody>
+              This tunnel runs as its own process, so its URL survives Host
+              restarts. Stop it in the terminal that started it.
+            </MessageBarBody>
+          </MessageBar>
+        )}
         <div className={styles.row}>
           <div>
             <Text weight="semibold">Provider</Text>
@@ -182,7 +190,7 @@ export const TunnelPanel = () => {
           </div>
           <Dropdown
             aria-label="Tunnel provider"
-            disabled={switching}
+            disabled={switching || info.external}
             selectedOptions={[info.provider]}
             value={current?.label ?? info.provider}
             onOptionSelect={(_event, data) => {
@@ -204,12 +212,14 @@ export const TunnelPanel = () => {
             <Text weight="semibold">Remote access</Text>
             <br />
             <Text className={styles.caption}>
-              Reconnects automatically if the tunnel drops.
+              {info.external
+                ? "Managed by the tunnel process, not the Host."
+                : "Reconnects automatically if the tunnel drops."}
             </Text>
           </div>
           <Switch
             checked={isOn || info.status === "starting"}
-            disabled={!info.binaryPresent || switching}
+            disabled={!info.binaryPresent || switching || info.external}
             label={isOn ? "On" : "Off"}
             onChange={(_event, data) => void handleToggle(data.checked)}
           />
