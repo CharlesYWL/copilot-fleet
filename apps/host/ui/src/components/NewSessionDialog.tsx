@@ -29,6 +29,18 @@ const useStyles = makeStyles({
   placementField: {
     minWidth: 0,
   },
+  // The Select's own wrapper defaults to min-width:auto, so it sizes to the
+  // longest option — a full placement path — and pushes past the dialog no
+  // matter how narrow its Field is. Constraining the Field alone is not enough
+  // because the overflow happens one level deeper.
+  placementSelect: {
+    minWidth: 0,
+    maxWidth: "100%",
+    "& select": {
+      minWidth: 0,
+      width: "100%",
+    },
+  },
   yoloHint: {
     color: tokens.colorNeutralForeground3,
     fontSize: tokens.fontSizeBase200,
@@ -99,6 +111,7 @@ export const NewSessionDialog = ({
                   : {})}
               >
                 <Select
+                  className={styles.placementSelect}
                   value={placementId}
                   disabled={placements.length === 0}
                   onChange={(_event, data) => setPlacementId(data.value)}
