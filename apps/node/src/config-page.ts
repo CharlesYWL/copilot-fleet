@@ -46,6 +46,21 @@ export const CONFIG_PAGE = `<!doctype html>
   .msg.err { background: #35201f; border: 1px solid #7d3a37; }
   .warn { background: #33291a; border: 1px solid #7a5c2a; border-radius: 6px;
           padding: 10px 12px; font-size: 13px; margin-bottom: 18px; }
+  h2 { font-size: 15px; margin: 0 0 4px; }
+  .row { display: flex; gap: 8px; align-items: flex-start; margin-bottom: 10px; }
+  .row input { flex: 1; min-width: 0; }
+  .row button { flex: 0 0 auto; background: #2a3140; }
+  .empty { color: #9aa1ad; font-size: 13px; margin: 8px 0 0; }
+  .ws-name { font-weight: 600; margin-bottom: 4px; }
+  .item { border-top: 1px solid #2c313a; padding-top: 14px; margin-top: 14px; }
+  .item:first-of-type { border-top: 0; padding-top: 0; margin-top: 0; }
+  select {
+    width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px;
+    border: 1px solid #39404b; background: #12141a; color: #e6e8ec; font: inherit;
+  }
+  .check { font-size: 12px; margin-top: 4px; min-height: 16px; }
+  .check.ok { color: #6bcf7f; }
+  .check.err { color: #f08c8c; }
 </style>
 </head>
 <body>
@@ -101,6 +116,43 @@ export const CONFIG_PAGE = `<!doctype html>
     <button type="submit" id="save">Save</button>
     <div id="msg"></div>
   </form>
+
+  <div class="card">
+    <h2>Workspaces</h2>
+    <p class="sub" style="margin-bottom:14px">Shared across the fleet.</p>
+    <div id="workspaces"></div>
+    <div class="item">
+      <label>
+        <span class="label">New workspace</span>
+        <div class="row">
+          <input id="wsName" maxlength="100" placeholder="Project name" />
+          <button type="button" id="wsAdd">Create</button>
+        </div>
+      </label>
+    </div>
+    <div id="wsMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>Placements on this machine</h2>
+    <p class="sub" style="margin-bottom:14px">
+      Where each workspace lives locally. Paths are checked against this
+      machine before they are saved.
+    </p>
+    <div id="placements"></div>
+    <div class="item">
+      <span class="label">Add a placement here</span>
+      <label>
+        <select id="plWorkspace"><option value="">Select a workspace</option></select>
+      </label>
+      <div class="row">
+        <input id="plPath" placeholder="/Users/me/project" />
+        <button type="button" id="plAdd">Add</button>
+      </div>
+      <div class="check" id="plCheck"></div>
+    </div>
+    <div id="plMsg"></div>
+  </div>
 </main>
 
 <script>
@@ -160,6 +212,169 @@ export const CONFIG_PAGE = `<!doctype html>
   void load();
   // The connection state changes without any interaction here, so poll it.
   setInterval(load, 5000);
+
+  // ---- Workspaces and placements (proxied through this node to the Host) ----
+
+  let workspaces = [];
+  let placements = [];
+
+  // Names come from anyone on the fleet, so they are never interpolated raw.
+  const esc = (value) => {
+    const el = document.createElement("div");
+    el.textContent = value == null ? "" : String(value);
+    return el.innerHTML;
+  };
+
+  const note = (id, text, ok) => {
+    const el = $(id);
+    el.className = text ? "msg " + (ok ? "ok" : "err") : "";
+    el.textContent = text;
+  };
+
+  const post = async (path, body) => {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Request failed");
+    return data;
+  };
+
+  const renderFleet = () => {
+    $("workspaces").innerHTML = workspaces.length
+      ? workspaces
+          .map(
+            (w) =>
+              '<div class="item"><div class="ws-name">' + esc(w.name) +
+              '</div><div class="row"><input data-ws="' + esc(w.id) +
+              '" value="' + esc(w.name) + '" maxlength="100" />' +
+              '<button type="button" data-ws-save="' + esc(w.id) +
+              '">Rename</button></div></div>',
+          )
+          .join("")
+      : '<p class="empty">No workspaces yet.</p>';
+
+    $("placements").innerHTML = placements.length
+      ? placements
+          .map(
+            (p) =>
+              '<div class="item"><div class="ws-name">' +
+              esc(p.workspaceName || p.workspaceId) +
+              '</div><div class="row"><input data-pl="' + esc(p.id) +
+              '" value="' + esc(p.localPath) + '" />' +
+              '<button type="button" data-pl-save="' + esc(p.id) +
+              '">Save</button></div>' +
+              '<div class="check" data-check="' + esc(p.id) + '"></div></div>',
+          )
+          .join("")
+      : '<p class="empty">This machine has no placement yet.</p>';
+
+    const select = $("plWorkspace");
+    const keep = select.value;
+    select.innerHTML =
+      '<option value="">Select a workspace</option>' +
+      workspaces
+        .map((w) => '<option value="' + esc(w.id) + '">' + esc(w.name) + "</option>")
+        .join("");
+    select.value = keep;
+  };
+
+  const loadFleet = async () => {
+    try {
+      const response = await fetch("/api/fleet");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not reach the Host");
+      workspaces = data.workspaces;
+      placements = data.placements;
+      renderFleet();
+      note("wsMsg", "", true);
+    } catch (error) {
+      note("wsMsg", error.message, false);
+    }
+  };
+
+  const checkPath = async (path, target) => {
+    if (!path.trim()) {
+      target.className = "check";
+      target.textContent = "";
+      return false;
+    }
+    const result = await post("/api/check-path", { path });
+    target.className = "check " + (result.ok ? "ok" : "err");
+    target.textContent = result.ok ? "Folder found on this machine" : result.reason;
+    return result.ok;
+  };
+
+  $("wsAdd").addEventListener("click", async () => {
+    const name = $("wsName").value.trim();
+    if (!name) return;
+    try {
+      await post("/api/workspaces", { name, description: "" });
+      $("wsName").value = "";
+      await loadFleet();
+      note("wsMsg", "Workspace created.", true);
+    } catch (error) {
+      note("wsMsg", error.message, false);
+    }
+  });
+
+  $("workspaces").addEventListener("click", async (event) => {
+    const id = event.target.dataset ? event.target.dataset.wsSave : undefined;
+    if (!id) return;
+    const input = document.querySelector('[data-ws="' + id + '"]');
+    try {
+      await post("/api/workspaces", { id, name: input.value.trim(), description: "" });
+      await loadFleet();
+      note("wsMsg", "Workspace renamed.", true);
+    } catch (error) {
+      note("wsMsg", error.message, false);
+    }
+  });
+
+  $("placements").addEventListener("input", async (event) => {
+    const id = event.target.dataset ? event.target.dataset.pl : undefined;
+    if (!id) return;
+    await checkPath(event.target.value, document.querySelector('[data-check="' + id + '"]'));
+  });
+
+  $("placements").addEventListener("click", async (event) => {
+    const id = event.target.dataset ? event.target.dataset.plSave : undefined;
+    if (!id) return;
+    const input = document.querySelector('[data-pl="' + id + '"]');
+    try {
+      await post("/api/placements", { id, localPath: input.value.trim() });
+      await loadFleet();
+      note("plMsg", "Path updated.", true);
+    } catch (error) {
+      note("plMsg", error.message, false);
+    }
+  });
+
+  $("plPath").addEventListener("input", async (event) => {
+    await checkPath(event.target.value, $("plCheck"));
+  });
+
+  $("plAdd").addEventListener("click", async () => {
+    const workspaceId = $("plWorkspace").value;
+    const localPath = $("plPath").value.trim();
+    if (!workspaceId) {
+      note("plMsg", "Pick a workspace first.", false);
+      return;
+    }
+    try {
+      await post("/api/placements", { workspaceId, localPath });
+      $("plPath").value = "";
+      $("plCheck").textContent = "";
+      await loadFleet();
+      note("plMsg", "Placement added.", true);
+    } catch (error) {
+      note("plMsg", error.message, false);
+    }
+  });
+
+  void loadFleet();
 </script>
 </body>
 </html>`;
