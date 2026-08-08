@@ -58,6 +58,9 @@ describe("session transitions", () => {
     expect(canTransition("running", "idle")).toBe(true);
     expect(canTransition("idle", "running")).toBe(true);
     expect(canTransition("offline", "idle")).toBe(true);
+    // Resume lands in starting and then waits for the next prompt.
+    expect(canTransition("stopped", "starting")).toBe(true);
+    expect(canTransition("starting", "idle")).toBe(true);
     expect(canTransition("stopped", "running")).toBe(false);
   });
 });

@@ -283,7 +283,9 @@ export const UpdateTunnelSchema = z.object({
 
 const transitions: Record<SessionState, ReadonlySet<SessionState>> = {
   queued: new Set(["starting", "failed", "offline", "stopped"]),
-  starting: new Set(["running", "failed", "offline", "stopped"]),
+  // Idle is reachable because a resumed session lands in starting and then
+  // waits for the operator's next prompt instead of running one immediately.
+  starting: new Set(["running", "idle", "failed", "offline", "stopped"]),
   running: new Set(["idle", "cancelling", "failed", "offline", "stopped", "completed"]),
   idle: new Set(["running", "failed", "offline", "stopped", "completed"]),
   cancelling: new Set(["idle", "failed", "offline", "stopped"]),

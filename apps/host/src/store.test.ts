@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { canTransition } from "@fleet/protocol";
 import { FleetStore } from "./store.js";
 
 const stores: FleetStore[] = [];
@@ -49,6 +50,37 @@ describe("FleetStore", () => {
     // Placements survive so a rebuilt machine keeps its workspace mapping.
     expect(store.listPlacements().map((entry) => entry.id)).toContain(placement.id);
     expect(store.authenticateNode(node.id, reclaimed.secret)).toBe(true);
+  });
+
+  it("resumes a stopped session all the way to idle", () => {
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "hello");
+    const event = (sequence: number, state: string) => ({
+      eventId: `e${sequence}`,
+      sessionId: session.id,
+      sequence,
+      type: "state" as const,
+      payload: { state },
+      createdAt: "2026-08-08T09:00:00.000Z",
+    });
+
+    store.transitionSession(session.id, "starting");
+    store.appendEvent(event(1, "starting"));
+    store.transitionSession(session.id, "running");
+    store.appendEvent(event(2, "running"));
+    store.transitionSession(session.id, "stopped");
+    store.appendEvent(event(3, "stopped"));
+
+    const offset = store.maxEventSequence(session.id);
+    expect(offset).toBe(3);
+
+    // The node re-attaches and reports idle because a resumed session waits
+    // for the next prompt rather than replaying the original one.
+    store.transitionSession(session.id, "starting");
+    expect(store.appendEvent(event(offset + 1, "starting"))).toBe(true);
+    expect(store.appendEvent(event(offset + 2, "idle"))).toBe(true);
+    expect(canTransition("starting", "idle")).toBe(true);
+    expect(store.transitionSession(session.id, "idle").state).toBe("idle");
   });
 
   it("persists sessions and ordered events", () => {

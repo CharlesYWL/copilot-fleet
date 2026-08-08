@@ -577,6 +577,15 @@ export async function buildServer(options: {
       if (event.type === "state") {
         const state = SessionStateSchema.safeParse(event.payload.state);
         if (state.success) {
+          // A rejected transition would otherwise strand the session in its old
+          // state with nothing but a log line to explain it.
+          if (!canTransition(session.state, state.data)) {
+            app.log.error(
+              { sessionId: session.id, from: session.state, to: state.data },
+              "Dropped session state event the transition table forbids",
+            );
+            return;
+          }
           publishSession(
             store.transitionSession(
               session.id,
