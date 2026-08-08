@@ -1,19 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  BinaryProbe,
-  restartDelay,
-  RESTART_DELAYS_MS,
-  TunnelManager,
-} from "./tunnel.js";
-import {
-  extractTunnelUrl,
-  parseLocalTarget,
-  providerSpecs,
-} from "./tunnel-providers.js";
+import { BinaryProbe, restartDelay, RESTART_DELAYS_MS, TunnelManager } from "./tunnel.js";
+import { extractTunnelUrl, parseLocalTarget, providerSpecs } from "./tunnel-providers.js";
 
 /** Never spawns anything, so tests do not depend on what the box has installed. */
-const fakeProbe = (present = true) =>
-  new BinaryProbe(async () => present);
+const fakeProbe = (present = true) => new BinaryProbe(async () => present);
 
 describe("external tunnel handover", () => {
   const managerWithExternal = (url: string | undefined) =>
@@ -127,7 +117,9 @@ INF +---------------------------------------------------------------------------
 
   it("strips a trailing slash and ignores unrelated https links", () => {
     expect(
-      extractTunnelUrl("see https://developers.cloudflare.com and https://abc-def.trycloudflare.com/"),
+      extractTunnelUrl(
+        "see https://developers.cloudflare.com and https://abc-def.trycloudflare.com/",
+      ),
     ).toBe("https://abc-def.trycloudflare.com");
   });
 

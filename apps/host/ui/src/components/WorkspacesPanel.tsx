@@ -179,9 +179,7 @@ export const WorkspacesPanel = ({
     const previousHome = nodes.find((node) => node.id === nodeId)?.homeDir;
     const nextHome = nodes.find((node) => node.id === nextNodeId)?.homeDir ?? "";
     setNodeId(nextNodeId);
-    setLocalPath((current) =>
-      nextPlacementPath(current, previousHome, nextHome),
-    );
+    setLocalPath((current) => nextPlacementPath(current, previousHome, nextHome));
   };
 
   const handleCreateWorkspace = async (event: FormEvent) => {
@@ -348,10 +346,7 @@ const WorkspaceCard = ({
   const handleSave = async () => {
     const name = draftName.trim();
     if (!name) return;
-    if (
-      name === workspace.name &&
-      draftDescription === workspace.description
-    ) {
+    if (name === workspace.name && draftDescription === workspace.description) {
       setEditing(false);
       return;
     }

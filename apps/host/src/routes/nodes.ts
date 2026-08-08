@@ -1,9 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
-import {
-  RegisterNodeSchema,
-  RenameNodeSchema,
-  errorMessage,
-} from "@fleet/protocol";
+import { RegisterNodeSchema, RenameNodeSchema, errorMessage } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 
 export type NodeRouteOptions = {
@@ -37,9 +33,7 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
       });
       return reply.code(201).send({ nodeId: node.id, secret });
     } catch (error) {
-      return reply
-        .code(409)
-        .send({ error: errorMessage(error, "Registration failed") });
+      return reply.code(409).send({ error: errorMessage(error, "Registration failed") });
     }
   });
 

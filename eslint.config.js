@@ -11,7 +11,12 @@ import tseslint from "typescript-eslint";
  */
 export default tseslint.config(
   {
-    ignores: ["**/dist/**", "**/node_modules/**", "apps/host/ui/dist/**", "apps/node/public/**"],
+    ignores: [
+      "**/dist/**",
+      "**/node_modules/**",
+      "apps/host/ui/dist/**",
+      "apps/node/public/**",
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -25,7 +30,10 @@ export default tseslint.config(
         "error",
         { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
       ],
-      "@typescript-eslint/consistent-type-imports": ["error", { fixStyle: "inline-type-imports" }],
+      "@typescript-eslint/consistent-type-imports": [
+        "error",
+        { fixStyle: "inline-type-imports" },
+      ],
       "no-console": ["warn", { allow: ["error", "warn"] }],
       eqeqeq: ["error", "smart"],
     },

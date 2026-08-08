@@ -18,6 +18,7 @@
     "start:host": "NODE_ENV=production npm run start -w @fleet/host",
     "start:node": "npm run start -w @fleet/node",
     "test": "npm run build -w @fleet/protocol && vitest run",
+    "test:coverage": "npm run build -w @fleet/protocol && vitest run --coverage",
     "typecheck": "npm run build -w @fleet/protocol && npm run typecheck -w @fleet/host && npm run typecheck -w @fleet/node && npm run typecheck -w @fleet/protocol",
     "lint": "eslint .",
     "format": "prettier --write .",

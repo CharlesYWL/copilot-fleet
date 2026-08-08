@@ -18,9 +18,7 @@ import {
 import type { FleetStore } from "./store.js";
 
 /** `Omit` over a union has to be distributed, or the discriminant collapses. */
-type DistributiveOmit<T, K extends keyof never> = T extends unknown
-  ? Omit<T, K>
-  : never;
+type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
 
 /** The service stamps the command id, so no caller can forget one. */
 export type CommandRequest = DistributiveOmit<NodeCommand, "commandId">;
@@ -157,9 +155,7 @@ export class FleetService {
       activeSessionIds.length,
     );
     if (node && changed) this.publishNode(node);
-    this.publishSessions(
-      this.store.reconcileOfflineSessions(nodeId, activeSessionIds),
-    );
+    this.publishSessions(this.store.reconcileOfflineSessions(nodeId, activeSessionIds));
   }
 
   disconnectNode(nodeId: string, activity: string): void {

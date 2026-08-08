@@ -29,8 +29,8 @@ export const EmptySessions = ({ onNewSession }: EmptySessionsProps) => {
         No live sessions
       </Text>
       <Text className={styles.caption}>
-        Register a node, add a workspace placement, then launch an agent to watch its stream
-        here.
+        Register a node, add a workspace placement, then launch an agent to watch its
+        stream here.
       </Text>
       <Button appearance="primary" icon={<Add20Regular />} onClick={onNewSession}>
         New session

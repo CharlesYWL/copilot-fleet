@@ -8,7 +8,13 @@
  */
 
 const $ = (id) => document.getElementById(id);
-const fields = ["hostUrl", "nodeName", "maxSessions", "copilotCommand", "permissionTimeoutMs"];
+const fields = [
+  "hostUrl",
+  "nodeName",
+  "maxSessions",
+  "copilotCommand",
+  "permissionTimeoutMs",
+];
 const numeric = new Set(["maxSessions", "permissionTimeoutMs"]);
 
 const el = (tag, { dataset = {}, ...props } = {}, children = []) => {
@@ -213,7 +219,10 @@ $("workspaces").addEventListener("click", async (event) => {
 $("placements").addEventListener("input", async (event) => {
   const id = event.target.dataset ? event.target.dataset.pl : undefined;
   if (!id) return;
-  await checkPath(event.target.value, document.querySelector('[data-check="' + id + '"]'));
+  await checkPath(
+    event.target.value,
+    document.querySelector('[data-check="' + id + '"]'),
+  );
 });
 
 $("placements").addEventListener("click", async (event) => {

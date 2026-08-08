@@ -1,4 +1,8 @@
-import { terminalSessionStates, type FleetNode, type FleetSession } from "@fleet/protocol";
+import {
+  terminalSessionStates,
+  type FleetNode,
+  type FleetSession,
+} from "@fleet/protocol";
 
 /**
  * Older node agents ignore the yolo flag and always launch Copilot with

@@ -1,10 +1,7 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
 import type { TunnelInfo, TunnelProvider, TunnelStatus } from "@fleet/protocol";
-import {
-  readExternalTunnel,
-  type ExternalTunnel,
-} from "./external-tunnel.js";
+import { readExternalTunnel, type ExternalTunnel } from "./external-tunnel.js";
 import {
   parseLocalTarget,
   providerList,

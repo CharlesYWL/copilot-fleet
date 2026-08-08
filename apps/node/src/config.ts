@@ -13,7 +13,10 @@ export type Credentials = z.infer<typeof CredentialsSchema>;
 
 export function configDirectory(): string {
   if (process.platform === "win32") {
-    return join(process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "CopilotFleet");
+    return join(
+      process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"),
+      "CopilotFleet",
+    );
   }
   return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "copilot-fleet");
 }

@@ -29,6 +29,9 @@ describe("planCredentials", () => {
   });
 
   it("reuses an unchanged identity", () => {
-    expect(planCredentials(stored, settings)).toEqual({ action: "reuse", credentials: stored });
+    expect(planCredentials(stored, settings)).toEqual({
+      action: "reuse",
+      credentials: stored,
+    });
   });
 });

@@ -171,10 +171,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.agentSessionId = resumeAgentSessionId;
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
     } else {
-      const created = await this.connection.agent.request(
-        acp.methods.agent.session.new,
-        { cwd, mcpServers: [] },
-      );
+      const created = await this.connection.agent.request(acp.methods.agent.session.new, {
+        cwd,
+        mcpServers: [],
+      });
       this.agentSessionId = created.sessionId;
     }
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
@@ -371,7 +371,11 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     this.cancelled = false;
     this.emit("state", { state: "running", activity: "Mock agent is streaming" });
     this.emit("system", { text: `User: ${text}` });
-    for (const chunk of [`Mock response for "${text}": `, "stream one, ", "stream two."]) {
+    for (const chunk of [
+      `Mock response for "${text}": `,
+      "stream one, ",
+      "stream two.",
+    ]) {
       await delay(25);
       if (this.cancelled) {
         this.emit("turn_complete", { stopReason: "cancelled" });

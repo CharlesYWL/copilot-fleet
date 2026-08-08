@@ -22,7 +22,11 @@ import {
   Send20Regular,
   Stop20Regular,
 } from "@fluentui/react-icons";
-import { terminalSessionStates, type FleetSession, type SessionEvent } from "@fleet/protocol";
+import {
+  terminalSessionStates,
+  type FleetSession,
+  type SessionEvent,
+} from "@fleet/protocol";
 import { blockColor, stateAccent, terminal } from "../theme";
 import {
   allowOnceOptionId,

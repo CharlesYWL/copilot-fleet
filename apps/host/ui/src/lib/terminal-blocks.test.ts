@@ -120,8 +120,9 @@ describe("pendingPermissionRequests", () => {
       event("permission", { requestId: "r3", title: "fetch url" }),
     ];
 
-    expect(
-      pendingPermissionRequests(events).map((item) => item.payload.title),
-    ).toEqual(["delete file", "fetch url"]);
+    expect(pendingPermissionRequests(events).map((item) => item.payload.title)).toEqual([
+      "delete file",
+      "fetch url",
+    ]);
   });
 });

@@ -6,10 +6,7 @@ import {
   SUPERSEDED_CLOSE_CODE,
   decodeFrame,
 } from "@fleet/protocol";
-import {
-  heartbeatSessionsBelongTo,
-  nodeMessageBelongsTo,
-} from "../node-messages.js";
+import { heartbeatSessionsBelongTo, nodeMessageBelongsTo } from "../node-messages.js";
 import type { FleetService } from "../fleet-service.js";
 
 /**
@@ -19,10 +16,7 @@ import type { FleetService } from "../fleet-service.js";
  * the operator enrolled — so every frame is schema-checked and every session id
  * it names is verified to belong to the node that sent it.
  */
-export function registerNodeGateway(
-  app: FastifyInstance,
-  service: FleetService,
-): void {
+export function registerNodeGateway(app: FastifyInstance, service: FleetService): void {
   app.get("/ws/node", { websocket: true }, (socket: WebSocket) => {
     let authenticatedNodeId: string | undefined;
 

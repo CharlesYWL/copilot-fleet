@@ -47,9 +47,7 @@ describe("needsReconnect", () => {
 
   it("applies agent tuning in place, without dropping the socket", () => {
     expect(needsReconnect(base, { ...base, permissionTimeoutMs: 90_000 })).toBe(false);
-    expect(needsReconnect(base, { ...base, copilotCommand: "/opt/copilot" })).toBe(
-      false,
-    );
+    expect(needsReconnect(base, { ...base, copilotCommand: "/opt/copilot" })).toBe(false);
   });
 });
 

@@ -96,7 +96,9 @@ export function App() {
       ),
     [snapshot.placements, snapshot.nodes],
   );
-  const activeSession = snapshot.sessions.find((session) => session.id === selectedSessionId);
+  const activeSession = snapshot.sessions.find(
+    (session) => session.id === selectedSessionId,
+  );
 
   useEffect(() => {
     const first = visibleSessions[0];
@@ -351,7 +353,9 @@ export function App() {
                   onPrompt={(prompt) =>
                     void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
                   }
-                  onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
+                  onCancel={() =>
+                    void command(`/api/sessions/${activeSession.id}/cancel`)
+                  }
                   onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
                   onDismiss={() => void handleDismissSession(activeSession.id)}
                   onResume={() =>
@@ -406,7 +410,6 @@ function filterVisibleSessions(
   // Ended sessions stay visible only while selected, so a failure mid-watch
   // does not yank the transcript; Dismiss / Clear ended remove them for good.
   return sessions.filter(
-    (session) =>
-      !terminalStates.has(session.state) || session.id === selectedSessionId,
+    (session) => !terminalStates.has(session.state) || session.id === selectedSessionId,
   );
 }

@@ -1,9 +1,7 @@
 import { statSync } from "node:fs";
 import { isAbsolute } from "node:path";
 
-export type PathCheck =
-  | { ok: true; kind: "directory" }
-  | { ok: false; reason: string };
+export type PathCheck = { ok: true; kind: "directory" } | { ok: false; reason: string };
 
 /**
  * Checks a placement path against this machine's filesystem.

@@ -200,12 +200,10 @@ describe("FleetStore", () => {
   it("soft-disconnects sessions and resurrects ones the Node still owns", () => {
     const { store, node, placement } = setup();
     const dropped = store.createSession(placement, "drop");
-    expect(
-      store.markNodeSessionsOffline(node.id, "Node disconnected")[0]?.state,
-    ).toBe("offline");
-    expect(
-      store.reconcileOfflineSessions(node.id, [])[0]?.state,
-    ).toBe("failed");
+    expect(store.markNodeSessionsOffline(node.id, "Node disconnected")[0]?.state).toBe(
+      "offline",
+    );
+    expect(store.reconcileOfflineSessions(node.id, [])[0]?.state).toBe("failed");
     expect(store.getSession(dropped.id)?.state).toBe("failed");
 
     const kept = store.createSession(placement, "keep");
@@ -263,12 +261,10 @@ describe("FleetStore", () => {
     const { store, node, placement } = setup();
     const workspace = store.listWorkspaces()[0]!;
 
-    expect(
-      store.updateWorkspace(workspace.id, "renamed", "updated")?.name,
-    ).toBe("renamed");
-    expect(store.updatePlacement(placement.id, "D:\\other")?.localPath).toBe(
-      "D:\\other",
+    expect(store.updateWorkspace(workspace.id, "renamed", "updated")?.name).toBe(
+      "renamed",
     );
+    expect(store.updatePlacement(placement.id, "D:\\other")?.localPath).toBe("D:\\other");
 
     const live = store.createSession(placement, "still running");
     expect(() => store.deletePlacement(placement.id)).toThrow(/still active/);

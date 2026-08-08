@@ -36,10 +36,7 @@ export function useFleet(notify: Notify) {
   notifyRef.current = notify;
 
   const report = useCallback((reason: unknown) => {
-    notifyRef.current(
-      reason instanceof Error ? reason.message : String(reason),
-      "error",
-    );
+    notifyRef.current(reason instanceof Error ? reason.message : String(reason), "error");
   }, []);
 
   const refresh = useCallback(async () => {
@@ -53,9 +50,7 @@ export function useFleet(notify: Notify) {
   const loadEvents = useCallback(
     async (sessionId: string) => {
       try {
-        const items = await api<SessionEvent[]>(
-          `/api/sessions/${sessionId}/events`,
-        );
+        const items = await api<SessionEvent[]>(`/api/sessions/${sessionId}/events`);
         setEvents((value) => ({ ...value, [sessionId]: items }));
       } catch (reason) {
         report(reason);
@@ -130,10 +125,7 @@ export function useFleet(notify: Notify) {
         if (message.type === "session") {
           const { session } = message;
           if (session.state === "failed") {
-            notifyRef.current(
-              session.currentActivity || "Session failed",
-              "error",
-            );
+            notifyRef.current(session.currentActivity || "Session failed", "error");
           }
           setSnapshot((value) => ({
             ...value,
@@ -179,10 +171,7 @@ function parseBrowserMessage(text: string): BrowserMessage | undefined {
   }
 }
 
-export async function api<T = unknown>(
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
+export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   // Fastify rejects an empty body when Content-Type is application/json, so
   // only advertise JSON when we are actually sending a payload.

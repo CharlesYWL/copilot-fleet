@@ -107,7 +107,9 @@ export const NewSessionDialog = ({
                 required
                 className={styles.placementField}
                 {...(placements.length === 0
-                  ? { hint: "No online node has a placement yet. Add one under Workspaces." }
+                  ? {
+                      hint: "No online node has a placement yet. Add one under Workspaces.",
+                    }
                   : {})}
               >
                 <Select
@@ -118,7 +120,8 @@ export const NewSessionDialog = ({
                 >
                   {placements.map((placement) => (
                     <option key={placement.id} value={placement.id}>
-                      {placement.workspaceName} · {placement.nodeName} · {placement.localPath}
+                      {placement.workspaceName} · {placement.nodeName} ·{" "}
+                      {placement.localPath}
                     </option>
                   ))}
                 </Select>
@@ -146,7 +149,11 @@ export const NewSessionDialog = ({
               </Field>
             </DialogContent>
             <DialogActions>
-              <Button appearance="secondary" type="button" onClick={() => onOpenChange(false)}>
+              <Button
+                appearance="secondary"
+                type="button"
+                onClick={() => onOpenChange(false)}
+              >
                 Cancel
               </Button>
               <Button

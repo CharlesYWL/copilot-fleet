@@ -31,9 +31,7 @@ describe("filesystem anchors", () => {
     // DATABASE_PATH onto an empty database.
     const expected = join(checkout, ".env");
     expect(envFilePath(join(checkout, "apps", "host", "src"))).toBe(expected);
-    expect(envFilePath(join(checkout, "apps", "host", "dist", "server"))).toBe(
-      expected,
-    );
+    expect(envFilePath(join(checkout, "apps", "host", "dist", "server"))).toBe(expected);
   });
 
   it("anchors package-scoped data to the package, not the checkout", () => {

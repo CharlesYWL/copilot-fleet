@@ -102,12 +102,10 @@ export class FleetClient {
   }
 
   async createWorkspace(name: string, description: string): Promise<WorkspaceLike> {
-    return request(
-      this.options.hostUrl(),
-      "/api/workspaces",
-      WorkspaceLikeSchema,
-      { method: "POST", body: JSON.stringify({ name, description }) },
-    );
+    return request(this.options.hostUrl(), "/api/workspaces", WorkspaceLikeSchema, {
+      method: "POST",
+      body: JSON.stringify({ name, description }),
+    });
   }
 
   async updateWorkspace(
@@ -145,18 +143,13 @@ export class FleetClient {
     workspaceId: string,
     localPath: string,
   ): Promise<PlacementLike> {
-    return request(
-      this.options.hostUrl(),
-      "/api/placements",
-      PlacementLikeSchema,
-      {
-        method: "POST",
-        body: JSON.stringify({
-          workspaceId,
-          nodeId: this.options.nodeId(),
-          localPath,
-        }),
-      },
-    );
+    return request(this.options.hostUrl(), "/api/placements", PlacementLikeSchema, {
+      method: "POST",
+      body: JSON.stringify({
+        workspaceId,
+        nodeId: this.options.nodeId(),
+        localPath,
+      }),
+    });
   }
 }

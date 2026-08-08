@@ -275,22 +275,11 @@ export const PermissionResponseSchema = z.object({
   optionId: z.string().optional(),
 });
 
-export const tunnelProviders = [
-  "cloudflare",
-  "tailscale",
-  "ngrok",
-  "bore",
-] as const;
+export const tunnelProviders = ["cloudflare", "tailscale", "ngrok", "bore"] as const;
 export const TunnelProviderSchema = z.enum(tunnelProviders);
 export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
 
-export const TunnelStatusSchema = z.enum([
-  "off",
-  "starting",
-  "on",
-  "stopping",
-  "error",
-]);
+export const TunnelStatusSchema = z.enum(["off", "starting", "on", "stopping", "error"]);
 export type TunnelStatus = z.infer<typeof TunnelStatusSchema>;
 
 export const TunnelProviderInfoSchema = z.object({
@@ -358,9 +347,7 @@ export const SUPERSEDED_CLOSE_CODE = 4001;
 /** The presented secret is unknown; the Node must enroll again to recover. */
 export const AUTH_FAILED_CLOSE_CODE = 4003;
 
-export type JsonParseResult =
-  | { ok: true; value: unknown }
-  | { ok: false; error: string };
+export type JsonParseResult = { ok: true; value: unknown } | { ok: false; error: string };
 
 export function tryParseJson(text: string): JsonParseResult {
   try {

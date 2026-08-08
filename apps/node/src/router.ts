@@ -19,10 +19,7 @@ type SessionSlot = {
   ready: Promise<void>;
 };
 
-type LaunchCommand = Extract<
-  NodeCommand,
-  { type: "start_session" | "resume_session" }
->;
+type LaunchCommand = Extract<NodeCommand, { type: "start_session" | "resume_session" }>;
 
 export class CommandRouter {
   private readonly slots = new Map<string, SessionSlot>();
@@ -32,7 +29,9 @@ export class CommandRouter {
     private readonly factory: AgentFactory,
     private maxSessions: number,
     private readonly emit: (event: SessionEvent) => void,
-    private readonly validatePath: (path: string) => Promise<string> = validateWorkspacePath,
+    private readonly validatePath: (
+      path: string,
+    ) => Promise<string> = validateWorkspacePath,
   ) {}
 
   /**

@@ -161,7 +161,9 @@ export const SessionTile = ({
         </Text>
         <div className={styles.preview}>
           {lines.length === 0 ? (
-            <p className={mergeClasses(styles.line, styles.waiting)}>waiting for output…</p>
+            <p className={mergeClasses(styles.line, styles.waiting)}>
+              waiting for output…
+            </p>
           ) : (
             lines.map((line) => (
               <p

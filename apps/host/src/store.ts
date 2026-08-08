@@ -111,8 +111,7 @@ export class FleetStore {
 
   getSetting(key: string): string | undefined {
     const row = this.statement("SELECT value FROM settings WHERE key=?").get(key) as
-      | Row
-      | undefined;
+      Row | undefined;
     return row ? String(row.value) : undefined;
   }
 
@@ -188,16 +187,16 @@ export class FleetStore {
         `UPDATE nodes SET secret_hash=?, os=?, arch=?, version=?, capabilities=?,
            max_sessions=?, last_heartbeat=?, home_dir=? WHERE id=?`,
       ).run(
-          hash(secret),
-          input.os,
-          input.arch,
-          input.version,
-          JSON.stringify(input.capabilities),
-          input.maxSessions,
-          now,
-          input.homeDir ?? "",
-          existing.id,
-        );
+        hash(secret),
+        input.os,
+        input.arch,
+        input.version,
+        JSON.stringify(input.capabilities),
+        input.maxSessions,
+        now,
+        input.homeDir ?? "",
+        existing.id,
+      );
       return { node: this.getNode(existing.id)!, secret };
     }
 
@@ -207,17 +206,17 @@ export class FleetStore {
         (id,name,secret_hash,os,arch,version,capabilities,max_sessions,last_heartbeat,online,home_dir)
        VALUES (?,?,?,?,?,?,?,?,?,0,?)`,
     ).run(
-        id,
-        input.name,
-        hash(secret),
-        input.os,
-        input.arch,
-        input.version,
-        JSON.stringify(input.capabilities),
-        input.maxSessions,
-        now,
-        input.homeDir ?? "",
-      );
+      id,
+      input.name,
+      hash(secret),
+      input.os,
+      input.arch,
+      input.version,
+      JSON.stringify(input.capabilities),
+      input.maxSessions,
+      now,
+      input.homeDir ?? "",
+    );
     return { node: this.getNode(id)!, secret };
   }
 
@@ -249,8 +248,7 @@ export class FleetStore {
 
   authenticateNode(id: string, secret: string): boolean {
     const row = this.statement("SELECT secret_hash FROM nodes WHERE id=?").get(id) as
-      | Row
-      | undefined;
+      Row | undefined;
     if (!row) return false;
     const supplied = Buffer.from(hash(secret));
     const expected = Buffer.from(String(row.secret_hash));
@@ -287,8 +285,7 @@ export class FleetStore {
 
   getNode(id: string): FleetNode | undefined {
     const row = this.statement("SELECT * FROM nodes WHERE id=?").get(id) as
-      | Row
-      | undefined;
+      Row | undefined;
     return row ? nodeFromRow(row) : undefined;
   }
 
@@ -313,8 +310,7 @@ export class FleetStore {
 
   getWorkspace(id: string): Workspace | undefined {
     const row = this.statement("SELECT * FROM workspaces WHERE id=?").get(id) as
-      | Row
-      | undefined;
+      Row | undefined;
     return row ? workspaceFromRow(row) : undefined;
   }
 
@@ -341,9 +337,9 @@ export class FleetStore {
   }
 
   listWorkspaces(): Workspace[] {
-    return (
-      this.statement("SELECT * FROM workspaces ORDER BY name").all() as Row[]
-    ).map(workspaceFromRow);
+    return (this.statement("SELECT * FROM workspaces ORDER BY name").all() as Row[]).map(
+      workspaceFromRow,
+    );
   }
 
   createPlacement(workspaceId: string, nodeId: string, localPath: string): Placement {
@@ -407,18 +403,18 @@ export class FleetStore {
        (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo)
        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
-        id,
-        placement.workspaceId,
-        placement.id,
-        placement.nodeId,
-        "queued",
-        prompt,
-        "Waiting for node",
-        "",
-        now,
-        now,
-        yolo ? 1 : 0,
-      );
+      id,
+      placement.workspaceId,
+      placement.id,
+      placement.nodeId,
+      "queued",
+      prompt,
+      "Waiting for node",
+      "",
+      now,
+      now,
+      yolo ? 1 : 0,
+    );
     return this.getSession(id)!;
   }
 
@@ -449,11 +445,7 @@ export class FleetStore {
     ).map((row) => String(row.id));
   }
 
-  transitionSession(
-    id: string,
-    state: SessionState,
-    activity?: string,
-  ): FleetSession {
+  transitionSession(id: string, state: SessionState, activity?: string): FleetSession {
     const current = this.getSession(id);
     if (!current) throw new Error("Session not found");
     if (!canTransition(current.state, state)) {
@@ -532,9 +524,11 @@ export class FleetStore {
       const text =
         typeof event.payload.text === "string" ? event.payload.text : undefined;
       if (text) {
-        this.statement(
-          "UPDATE sessions SET last_text=?,updated_at=? WHERE id=?",
-        ).run(text.slice(-500), event.createdAt, event.sessionId);
+        this.statement("UPDATE sessions SET last_text=?,updated_at=? WHERE id=?").run(
+          text.slice(-500),
+          event.createdAt,
+          event.sessionId,
+        );
       }
       if (
         event.type === "agent_session" &&
@@ -558,9 +552,9 @@ export class FleetStore {
 
   listEvents(sessionId: string): SessionEvent[] {
     return (
-      this.statement(
-        "SELECT * FROM events WHERE session_id=? ORDER BY sequence",
-      ).all(sessionId) as Row[]
+      this.statement("SELECT * FROM events WHERE session_id=? ORDER BY sequence").all(
+        sessionId,
+      ) as Row[]
     ).map(eventFromRow);
   }
 
@@ -576,9 +570,7 @@ export class FleetStore {
     ).get(id, ...settledStateList) as Row;
     const live = Number(row.live ?? 0);
     if (live > 0) {
-      throw new Error(
-        `Cannot delete ${label} while ${live} session(s) are still active`,
-      );
+      throw new Error(`Cannot delete ${label} while ${live} session(s) are still active`);
     }
   }
 
@@ -603,9 +595,9 @@ export class FleetStore {
         `DELETE FROM events WHERE session_id IN
            (SELECT id FROM sessions WHERE state IN (${list}))`,
       ).run(...terminalStateList);
-      const result = this.statement(
-        `DELETE FROM sessions WHERE state IN (${list})`,
-      ).run(...terminalStateList);
+      const result = this.statement(`DELETE FROM sessions WHERE state IN (${list})`).run(
+        ...terminalStateList,
+      );
       return Number(result.changes);
     });
   }

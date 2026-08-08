@@ -22,8 +22,8 @@
 
       <form class="card" id="form">
         <div class="warn">
-          Pointing this node at a different Host lets that Host run commands on this machine. Only
-          enter a URL you control.
+          Pointing this node at a different Host lets that Host run commands on this
+          machine. Only enter a URL you control.
         </div>
 
         <label>
@@ -35,7 +35,9 @@
             required
             placeholder="https://example.trycloudflare.com"
           />
-          <span class="hint">Saving reconnects immediately. Running sessions keep going.</span>
+          <span class="hint"
+            >Saving reconnects immediately. Running sessions keep going.</span
+          >
         </label>
 
         <label>
@@ -46,7 +48,14 @@
 
         <label>
           <span class="label">Max concurrent sessions</span>
-          <input id="maxSessions" name="maxSessions" type="number" min="1" max="64" required />
+          <input
+            id="maxSessions"
+            name="maxSessions"
+            type="number"
+            min="1"
+            max="64"
+            required
+          />
         </label>
 
         <label>
@@ -91,8 +100,8 @@
       <div class="card">
         <h2>Placements on this machine</h2>
         <p class="sub spaced">
-          Where each workspace lives locally. Paths are checked against this machine before they are
-          saved.
+          Where each workspace lives locally. Paths are checked against this machine
+          before they are saved.
         </p>
         <div id="placements"></div>
         <div class="item">

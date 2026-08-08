@@ -18,18 +18,14 @@ export function usePermissionAlerts(
   selectRef.current = onSelectSession;
 
   useEffect(() => {
-    document.title = pending.length
-      ? `(${pending.length}) ${BASE_TITLE}`
-      : BASE_TITLE;
+    document.title = pending.length ? `(${pending.length}) ${BASE_TITLE}` : BASE_TITLE;
   }, [pending.length]);
 
   useEffect(() => {
     const ids = new Set(pending.map((event) => requestIdOf(event)));
     // Resolved requests can never come back, so forgetting them keeps the set
     // bounded without risking a duplicate notification.
-    announced.current = new Set(
-      [...announced.current].filter((id) => ids.has(id)),
-    );
+    announced.current = new Set([...announced.current].filter((id) => ids.has(id)));
 
     if (pending.length === 0 || typeof Notification === "undefined") return;
     if (Notification.permission === "default") void Notification.requestPermission();

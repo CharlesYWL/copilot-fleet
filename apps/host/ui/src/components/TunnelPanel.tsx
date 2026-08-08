@@ -175,8 +175,8 @@ export const TunnelPanel = () => {
         {info.external && (
           <MessageBar intent="info">
             <MessageBarBody>
-              This tunnel runs as its own process, so its URL survives Host
-              restarts. Stop it in the terminal that started it.
+              This tunnel runs as its own process, so its URL survives Host restarts. Stop
+              it in the terminal that started it.
             </MessageBarBody>
           </MessageBar>
         )}
@@ -231,7 +231,12 @@ export const TunnelPanel = () => {
           )}
           <Text>Status: {statusLabel(info)}</Text>
           {info.status === "error" && info.binaryPresent && (
-            <Button size="small" appearance="secondary" onClick={handleRetry} disabled={busy}>
+            <Button
+              size="small"
+              appearance="secondary"
+              onClick={handleRetry}
+              disabled={busy}
+            >
               Retry
             </Button>
           )}
@@ -245,7 +250,9 @@ export const TunnelPanel = () => {
               appearance="secondary"
               icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
               onClick={() => {
-                void navigator.clipboard.writeText(info.publicUrl).then(() => setCopied(true));
+                void navigator.clipboard
+                  .writeText(info.publicUrl)
+                  .then(() => setCopied(true));
               }}
             >
               {copied ? "Copied" : "Copy"}

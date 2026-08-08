@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { createConfigRouter, type ConfigServerOptions, type FleetApi } from "./config-server.js";
+import {
+  createConfigRouter,
+  type ConfigServerOptions,
+  type FleetApi,
+} from "./config-server.js";
 import { settingsFromEnv } from "./settings.js";
 
 const workspace = { id: "ws-1", name: "fleet", description: "" };
@@ -51,7 +55,11 @@ describe("config router", () => {
   it("rejects settings the schema refuses without calling applySettings", async () => {
     const applySettings = vi.fn(async () => {});
     const { route } = router({ applySettings });
-    const response = await route("POST", "/api/config", JSON.stringify({ hostUrl: "nope" }));
+    const response = await route(
+      "POST",
+      "/api/config",
+      JSON.stringify({ hostUrl: "nope" }),
+    );
     expect(response.status).toBe(400);
     expect(applySettings).not.toHaveBeenCalled();
   });
@@ -100,7 +108,11 @@ describe("config router", () => {
 
   it("routes a workspace id to update instead of create", async () => {
     const { route, fleet } = router();
-    await route("POST", "/api/workspaces", JSON.stringify({ id: "ws-1", name: "renamed" }));
+    await route(
+      "POST",
+      "/api/workspaces",
+      JSON.stringify({ id: "ws-1", name: "renamed" }),
+    );
     expect(fleet.updateWorkspace).toHaveBeenCalledWith("ws-1", "renamed", "");
     expect(fleet.createWorkspace).not.toHaveBeenCalled();
   });

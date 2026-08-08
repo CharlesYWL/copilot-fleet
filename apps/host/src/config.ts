@@ -46,9 +46,7 @@ export function resolveEnrollmentToken(
 ): string {
   const resolved = token ?? "change-me";
   if (nodeEnv === "production" && (!token || token === "change-me")) {
-    throw new Error(
-      "ENROLLMENT_TOKEN must be set to a non-default value in production",
-    );
+    throw new Error("ENROLLMENT_TOKEN must be set to a non-default value in production");
   }
   return resolved;
 }

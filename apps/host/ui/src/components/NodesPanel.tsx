@@ -101,7 +101,9 @@ export const NodesPanel = ({ nodes, onRenameNode, onDeleteNode }: NodesPanelProp
       <div className={styles.head}>
         <Title3 as="h1">Nodes</Title3>
         <br />
-        <Text className={styles.caption}>Connected machines and available session capacity.</Text>
+        <Text className={styles.caption}>
+          Connected machines and available session capacity.
+        </Text>
       </div>
       <ConnectNodeCard />
       <div className={styles.surface}>
