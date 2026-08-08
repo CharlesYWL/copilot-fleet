@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Button,
   Dropdown,
@@ -14,7 +14,7 @@ import {
 } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
 import type { TunnelInfo, TunnelProvider } from "@fleet/protocol";
-import { api } from "../hooks/useFleet";
+import { useTunnel } from "../hooks/useTunnel";
 
 const useStyles = makeStyles({
   panel: {
@@ -78,24 +78,8 @@ const statusLabel = (info: TunnelInfo): string => {
 
 export const TunnelPanel = () => {
   const styles = useStyles();
-  const [info, setInfo] = useState<TunnelInfo>();
-  const [busy, setBusy] = useState(false);
+  const { info, busy, error: actionError, setEnabled } = useTunnel();
   const [copied, setCopied] = useState(false);
-  const [actionError, setActionError] = useState<string>();
-
-  const refresh = useCallback(async () => {
-    try {
-      setInfo(await api<TunnelInfo>("/api/tunnel"));
-    } catch {
-      // Keep the last good snapshot; the next poll retries.
-    }
-  }, []);
-
-  useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => void refresh(), 2_000);
-    return () => clearInterval(timer);
-  }, [refresh]);
 
   useEffect(() => {
     if (!copied) return;
@@ -103,25 +87,10 @@ export const TunnelPanel = () => {
     return () => clearTimeout(timer);
   }, [copied]);
 
-  const handleToggle = async (enabled: boolean, provider?: TunnelProvider) => {
-    setBusy(true);
-    setActionError(undefined);
-    try {
-      setInfo(
-        await api<TunnelInfo>("/api/tunnel", {
-          method: "POST",
-          body: JSON.stringify({ enabled, ...(provider ? { provider } : {}) }),
-        }),
-      );
-    } catch (reason) {
-      setActionError(reason instanceof Error ? reason.message : String(reason));
-      await refresh();
-    } finally {
-      setBusy(false);
-    }
-  };
+  const handleToggle = (enabled: boolean, provider?: TunnelProvider) =>
+    void setEnabled(enabled, provider);
 
-  const handleRetry = () => void handleToggle(true);
+  const handleRetry = () => handleToggle(true);
 
   if (!info) {
     return (
@@ -196,7 +165,7 @@ export const TunnelPanel = () => {
             onOptionSelect={(_event, data) => {
               const next = data.optionValue as TunnelProvider | undefined;
               if (!next || next === info.provider) return;
-              void handleToggle(isOn, next);
+              handleToggle(isOn, next);
             }}
           >
             {info.providers.map((entry) => (
@@ -221,7 +190,7 @@ export const TunnelPanel = () => {
             checked={isOn || info.status === "starting"}
             disabled={!info.binaryPresent || switching || info.external}
             label={isOn ? "On" : "Off"}
-            onChange={(_event, data) => void handleToggle(data.checked)}
+            onChange={(_event, data) => handleToggle(data.checked)}
           />
         </div>
 

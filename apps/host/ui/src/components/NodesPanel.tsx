@@ -21,6 +21,7 @@ import {
   Rename20Regular,
 } from "@fluentui/react-icons";
 import type { FleetNode } from "@fleet/protocol";
+import { useCatalog } from "../hooks/useCatalog";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { StatusDot } from "./StatusDot";
 
@@ -90,12 +91,11 @@ const useStyles = makeStyles({
 
 type NodesPanelProps = {
   nodes: FleetNode[];
-  onRenameNode: (nodeId: string, name: string) => Promise<boolean>;
-  onDeleteNode: (nodeId: string) => Promise<boolean>;
 };
 
-export const NodesPanel = ({ nodes, onRenameNode, onDeleteNode }: NodesPanelProps) => {
+export const NodesPanel = ({ nodes }: NodesPanelProps) => {
   const styles = useStyles();
+  const { renameNode, deleteNode } = useCatalog();
   return (
     <div className={styles.panel}>
       <div className={styles.head}>
@@ -124,8 +124,8 @@ export const NodesPanel = ({ nodes, onRenameNode, onDeleteNode }: NodesPanelProp
               <NodeRow
                 key={node.id}
                 node={node}
-                onRename={onRenameNode}
-                onDelete={onDeleteNode}
+                onRename={renameNode}
+                onDelete={deleteNode}
               />
             ))}
           </TableBody>

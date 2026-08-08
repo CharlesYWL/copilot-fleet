@@ -22,10 +22,14 @@ export default defineConfig({
         },
       },
       {
+        // Components are compiled with the automatic runtime here, the same as
+        // Vite does for the app, so tests do not have to import React.
+        esbuild: { jsx: "automatic" },
         test: {
           name: "ui",
           environment: "jsdom",
           include: ["apps/host/ui/src/**/*.test.{ts,tsx}"],
+          setupFiles: ["apps/host/ui/src/test-setup.ts"],
         },
       },
     ],
@@ -36,7 +40,7 @@ export default defineConfig({
         "apps/host/ui/src/**/*.{ts,tsx}",
         "packages/*/src/**/*.ts",
       ],
-      exclude: ["**/*.test.*", "**/dist/**"],
+      exclude: ["**/*.test.*", "**/test-setup.ts", "**/dist/**"],
       // A floor to keep from sliding backwards, not a target. Statement cover
       // is low because the UI components have none yet; the branch and function
       // numbers are what the service tests actually hold up.

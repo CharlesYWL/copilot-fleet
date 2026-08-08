@@ -34,24 +34,13 @@ type SettingsPanelProps = {
   workspaces: Workspace[];
   placements: Placement[];
   nodes: FleetNode[];
-  onRenameNode: (nodeId: string, name: string) => Promise<boolean>;
-  onDeleteNode: (nodeId: string) => Promise<boolean>;
-  onCreateWorkspace: (name: string, description: string) => Promise<boolean>;
-  onUpdateWorkspace: (
-    workspaceId: string,
-    name: string,
-    description: string,
-  ) => Promise<boolean>;
-  onDeleteWorkspace: (workspaceId: string) => Promise<boolean>;
-  onCreatePlacement: (
-    workspaceId: string,
-    nodeId: string,
-    localPath: string,
-  ) => Promise<boolean>;
-  onUpdatePlacement: (placementId: string, localPath: string) => Promise<boolean>;
-  onDeletePlacement: (placementId: string) => Promise<boolean>;
 };
 
+/**
+ * The Settings screens read what they render from props and reach for their own
+ * write operations through {@link useCatalog}, so this stays a tab strip rather
+ * than a relay for a dozen callbacks it never calls itself.
+ */
 export const SettingsPanel = (props: SettingsPanelProps) => {
   const styles = useStyles();
   const [tab, setTab] = useState<SettingsTab>("general");
@@ -73,24 +62,12 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
       <div className={styles.body}>
         {tab === "general" && <GeneralPanel />}
         {tab === "tunnel" && <TunnelPanel />}
-        {tab === "nodes" && (
-          <NodesPanel
-            nodes={props.nodes}
-            onRenameNode={props.onRenameNode}
-            onDeleteNode={props.onDeleteNode}
-          />
-        )}
+        {tab === "nodes" && <NodesPanel nodes={props.nodes} />}
         {tab === "workspaces" && (
           <WorkspacesPanel
             workspaces={props.workspaces}
             placements={props.placements}
             nodes={props.nodes}
-            onCreateWorkspace={props.onCreateWorkspace}
-            onUpdateWorkspace={props.onUpdateWorkspace}
-            onDeleteWorkspace={props.onDeleteWorkspace}
-            onCreatePlacement={props.onCreatePlacement}
-            onUpdatePlacement={props.onUpdatePlacement}
-            onDeletePlacement={props.onDeletePlacement}
           />
         )}
       </div>

@@ -1,22 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import type {
-  BrowserMessage,
-  FleetNode,
-  FleetSession,
-  Placement,
-  SessionEvent,
-  Workspace,
+import {
+  errorMessage,
+  type BrowserMessage,
+  type SessionEvent,
+  type Snapshot,
 } from "@fleet/protocol";
 import { reconnectDelay } from "./reconnect-delay";
 
-export type Snapshot = {
-  nodes: FleetNode[];
-  workspaces: Workspace[];
-  placements: Placement[];
-  sessions: FleetSession[];
-};
+export type { Snapshot };
 
 export type Notify = (message: string, intent?: "error" | "success") => void;
+
+/**
+ * The outcome of one call, so a caller can tell "succeeded with no body" from
+ * "failed" — a DELETE answers 204, which is indistinguishable from a thrown
+ * request once both have been reduced to `undefined`.
+ */
+export type ApiResult<T> = { ok: true; data: T } | { ok: false; error: string };
 
 const emptySnapshot: Snapshot = {
   nodes: [],
@@ -36,8 +36,25 @@ export function useFleet(notify: Notify) {
   notifyRef.current = notify;
 
   const report = useCallback((reason: unknown) => {
-    notifyRef.current(reason instanceof Error ? reason.message : String(reason), "error");
+    notifyRef.current(errorMessage(reason), "error");
   }, []);
+
+  /**
+   * Every write the UI makes goes through here: one call, one toast on failure,
+   * a result the caller can branch on. Without it each handler grew its own
+   * identical try/catch, and they drifted.
+   */
+  const request = useCallback(
+    async <T>(path: string, init?: RequestInit): Promise<ApiResult<T>> => {
+      try {
+        return { ok: true, data: await api<T>(path, init) };
+      } catch (reason) {
+        report(reason);
+        return { ok: false, error: errorMessage(reason) };
+      }
+    },
+    [report],
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -47,10 +64,18 @@ export function useFleet(notify: Notify) {
     }
   }, [report]);
 
+  // Which fetch is the current one per session. Switching sessions quickly
+  // leaves earlier requests in flight, and the slowest to answer would
+  // otherwise be the one that wins and paint another session's transcript.
+  const eventRequests = useRef(new Map<string, number>());
+
   const loadEvents = useCallback(
     async (sessionId: string) => {
+      const ticket = (eventRequests.current.get(sessionId) ?? 0) + 1;
+      eventRequests.current.set(sessionId, ticket);
       try {
         const items = await api<SessionEvent[]>(`/api/sessions/${sessionId}/events`);
+        if (eventRequests.current.get(sessionId) !== ticket) return;
         setEvents((value) => ({ ...value, [sessionId]: items }));
       } catch (reason) {
         report(reason);
@@ -61,18 +86,13 @@ export function useFleet(notify: Notify) {
 
   const command = useCallback(
     async (path: string, body?: unknown) => {
-      try {
-        await api(path, {
-          method: "POST",
-          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-        });
-        return true;
-      } catch (reason) {
-        report(reason);
-        return false;
-      }
+      const result = await request(path, {
+        method: "POST",
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      });
+      return result.ok;
     },
-    [report],
+    [request],
   );
 
   useEffect(() => {
@@ -109,7 +129,7 @@ export function useFleet(notify: Notify) {
           return;
         }
         if (message.type === "snapshot") {
-          setSnapshot(message.data as unknown as Snapshot);
+          setSnapshot(message.data);
           return;
         }
         if (message.type === "node") {
@@ -154,7 +174,7 @@ export function useFleet(notify: Notify) {
     };
   }, [refresh]);
 
-  return { snapshot, events, connected, refresh, loadEvents, command };
+  return { snapshot, events, connected, refresh, loadEvents, command, request };
 }
 
 function upsert<T extends { id: string }>(items: T[], next: T): T[] {
