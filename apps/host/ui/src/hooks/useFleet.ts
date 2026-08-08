@@ -6,6 +6,7 @@ import {
   type Snapshot,
 } from "@fleet/protocol";
 import { reconnectDelay } from "./reconnect-delay";
+import { mergeEvents } from "../lib/merge-events";
 
 export type { Snapshot };
 
@@ -67,6 +68,8 @@ export function useFleet(notify: Notify) {
   // Which fetch is the current one per session. Switching sessions quickly
   // leaves earlier requests in flight, and the slowest to answer would
   // otherwise be the one that wins and paint another session's transcript.
+  // The ticket settles races between fetches; mergeEvents settles the race
+  // between a fetch and the socket that kept appending while it travelled.
   const eventRequests = useRef(new Map<string, number>());
 
   const loadEvents = useCallback(
@@ -76,7 +79,10 @@ export function useFleet(notify: Notify) {
       try {
         const items = await api<SessionEvent[]>(`/api/sessions/${sessionId}/events`);
         if (eventRequests.current.get(sessionId) !== ticket) return;
-        setEvents((value) => ({ ...value, [sessionId]: items }));
+        setEvents((value) => ({
+          ...value,
+          [sessionId]: mergeEvents(items, value[sessionId] ?? []),
+        }));
       } catch (reason) {
         report(reason);
       }
@@ -156,12 +162,7 @@ export function useFleet(notify: Notify) {
         const { event } = message;
         setEvents((value) => ({
           ...value,
-          [event.sessionId]: [
-            ...(value[event.sessionId] ?? []).filter(
-              (item) => item.eventId !== event.eventId,
-            ),
-            event,
-          ].sort((a, b) => a.sequence - b.sequence),
+          [event.sessionId]: mergeEvents([event], value[event.sessionId] ?? []),
         }));
       };
     };
