@@ -4,8 +4,8 @@ import type { WebSocket } from "ws";
 import {
   BrowserMessageSchema,
   HostToNodeMessageSchema,
-  SessionStateSchema,
   canTransition,
+  eventPayload,
   terminalSessionStates,
   type BrowserMessage,
   type FleetNode,
@@ -182,13 +182,13 @@ export class FleetService {
         this.publishSession(this.store.getSession(session.id)!);
         return;
       }
-      const state = SessionStateSchema.safeParse(event.payload.state);
-      if (!state.success) return;
+      const payload = eventPayload(event, "state");
+      if (!payload?.state) return;
       // A rejected transition would otherwise strand the session in its old
       // state with nothing but a log line to explain it.
-      if (!canTransition(session.state, state.data)) {
+      if (!canTransition(session.state, payload.state)) {
         this.log.error(
-          { sessionId: session.id, from: session.state, to: state.data },
+          { sessionId: session.id, from: session.state, to: payload.state },
           "Dropped session state event the transition table forbids",
         );
         return;
@@ -196,10 +196,8 @@ export class FleetService {
       this.publishSession(
         this.store.transitionSession(
           session.id,
-          state.data,
-          typeof event.payload.activity === "string"
-            ? event.payload.activity
-            : session.currentActivity,
+          payload.state,
+          payload.activity ?? session.currentActivity,
         ),
       );
     } catch (error) {

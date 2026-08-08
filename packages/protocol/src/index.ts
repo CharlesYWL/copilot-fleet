@@ -100,6 +100,62 @@ export const SessionEventSchema = z.object({
   createdAt: z.string().datetime(),
 });
 export type SessionEvent = z.infer<typeof SessionEventSchema>;
+export type SessionEventType = SessionEvent["type"];
+
+/**
+ * What each event type carries.
+ *
+ * `payload` stays an open record on the wire on purpose: a node running a newer
+ * build must not have its socket closed over a field this Host has not heard of
+ * yet. These schemas describe the same payloads for whoever *reads* them, so a
+ * consumer can say which field it wants and be told when it is not there,
+ * instead of coercing a missing value to an empty string and rendering nothing.
+ *
+ * Every field is optional because producers legitimately omit them — a tool
+ * update carries no title until the tool has one.
+ */
+const text = z.string().optional();
+
+export const sessionEventPayloadSchemas = {
+  state: z.object({ state: SessionStateSchema.optional(), activity: text }),
+  agent_text: z.object({ text }),
+  agent_thought: z.object({ text }),
+  tool: z.object({ toolCallId: text, title: text, status: text }),
+  permission: z.object({
+    requestId: text,
+    title: text,
+    toolCallId: text,
+    // A malformed option list must not cost the reader the title as well.
+    options: z.array(PermissionOptionSchema).optional().catch(undefined),
+  }),
+  permission_result: z.object({ requestId: text, outcome: text }),
+  turn_complete: z.object({ stopReason: text }),
+  error: z.object({ message: text }),
+  system: z.object({ text }),
+  agent_session: z.object({ agentSessionId: text }),
+} as const;
+
+export type SessionEventPayload<T extends SessionEventType> = z.infer<
+  (typeof sessionEventPayloadSchemas)[T]
+>;
+
+/**
+ * The payload of `event`, if it is of `type` and its payload is well formed.
+ *
+ * Returning `undefined` rather than a half-filled object means a payload that
+ * changed shape shows up as a missing block, not as a block that quietly lost
+ * its text.
+ */
+export function eventPayload<T extends SessionEventType>(
+  event: SessionEvent,
+  type: T,
+): SessionEventPayload<T> | undefined {
+  if (event.type !== type) return undefined;
+  const parsed = sessionEventPayloadSchemas[type].safeParse(event.payload);
+  // The lookup type widens to the union of all payloads once `type` is a type
+  // parameter; the value came from that exact key, so it is the narrower one.
+  return parsed.success ? (parsed.data as SessionEventPayload<T>) : undefined;
+}
 
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({

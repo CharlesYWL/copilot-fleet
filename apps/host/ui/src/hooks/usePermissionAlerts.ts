@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import type { SessionEvent } from "@fleet/protocol";
+import { eventPayload, type SessionEvent } from "@fleet/protocol";
 
 const BASE_TITLE = "Copilot Fleet";
 
@@ -46,7 +46,8 @@ function notifyDesktop(
   onSelectSession: (sessionId: string) => void,
 ): void {
   const notification = new Notification("Copilot needs approval", {
-    body: asText(event.payload.title) || "A tool call is waiting for a decision",
+    body:
+      eventPayload(event, "permission")?.title || "A tool call is waiting for a decision",
     tag: requestId,
     requireInteraction: true,
   });
@@ -58,9 +59,5 @@ function notifyDesktop(
 }
 
 function requestIdOf(event: SessionEvent): string {
-  return asText(event.payload.requestId);
-}
-
-function asText(value: unknown): string {
-  return typeof value === "string" ? value : "";
+  return eventPayload(event, "permission")?.requestId ?? "";
 }

@@ -16,6 +16,7 @@ import {
   SessionSchema,
   TunnelProviderSchema,
   WorkspaceSchema,
+  eventPayload,
   canTransition,
   terminalSessionStates,
 } from "@fleet/protocol";
@@ -521,8 +522,12 @@ export class FleetStore {
         JSON.stringify(event.payload),
         event.createdAt,
       );
+      // Streamed text is what a tile previews, so the newest chunk is kept on
+      // the session row rather than re-read from the event log every render.
       const text =
-        typeof event.payload.text === "string" ? event.payload.text : undefined;
+        eventPayload(event, "agent_text")?.text ??
+        eventPayload(event, "agent_thought")?.text ??
+        eventPayload(event, "system")?.text;
       if (text) {
         this.statement("UPDATE sessions SET last_text=?,updated_at=? WHERE id=?").run(
           text.slice(-500),
@@ -530,13 +535,11 @@ export class FleetStore {
           event.sessionId,
         );
       }
-      if (
-        event.type === "agent_session" &&
-        typeof event.payload.agentSessionId === "string"
-      ) {
+      const agentSessionId = eventPayload(event, "agent_session")?.agentSessionId;
+      if (agentSessionId) {
         this.statement(
           "UPDATE sessions SET agent_session_id=?,updated_at=? WHERE id=?",
-        ).run(event.payload.agentSessionId, event.createdAt, event.sessionId);
+        ).run(agentSessionId, event.createdAt, event.sessionId);
       }
       return true;
     });
