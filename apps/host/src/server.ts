@@ -8,6 +8,7 @@ import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import type { WebSocket } from "ws";
 import {
+  AUTH_FAILED_CLOSE_CODE,
   BrowserMessageSchema,
   CreatePlacementSchema,
   CreateSessionSchema,
@@ -508,7 +509,9 @@ export async function buildServer(options: {
       }
       const hello = parsed.data;
       if (!store.authenticateNode(hello.nodeId, hello.secret)) {
-        socket.close(1008, "Authentication failed");
+        // A dedicated code lets the Node tell "your secret is stale, enroll
+        // again" apart from a protocol error worth retrying as-is.
+        socket.close(AUTH_FAILED_CLOSE_CODE, "Authentication failed");
         return;
       }
       authenticatedNodeId = hello.nodeId;

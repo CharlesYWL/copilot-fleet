@@ -317,6 +317,19 @@ export function canTransition(from: SessionState, to: SessionState): boolean {
   return from === to || transitions[from].has(to);
 }
 
+/*
+ * WebSocket close codes the Host uses to explain itself to a Node. They live
+ * here because both sides must agree on them: the Host picks the code and the
+ * Node decides whether to retry, re-enroll, or give up. Generic 1008 stays
+ * reserved for protocol violations, which carry no such instruction.
+ */
+
+/** Another Node connection took over this identity. */
+export const SUPERSEDED_CLOSE_CODE = 4001;
+
+/** The presented secret is unknown; the Node must enroll again to recover. */
+export const AUTH_FAILED_CLOSE_CODE = 4003;
+
 export type JsonParseResult =
   | { ok: true; value: unknown }
   | { ok: false; error: string };

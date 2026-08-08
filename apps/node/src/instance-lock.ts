@@ -6,9 +6,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import {
+  AUTH_FAILED_CLOSE_CODE,
+  SUPERSEDED_CLOSE_CODE,
+} from "@fleet/protocol";
 
-/** Host close code when another Node connection takes over this identity. */
-export const SUPERSEDED_CLOSE_CODE = 4001;
+export { AUTH_FAILED_CLOSE_CODE, SUPERSEDED_CLOSE_CODE };
 
 export function shouldReconnectAfterClose(
   code: number | undefined,

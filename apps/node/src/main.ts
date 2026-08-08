@@ -17,6 +17,7 @@ import {
   type Credentials,
 } from "./config.js";
 import {
+  AUTH_FAILED_CLOSE_CODE,
   SUPERSEDED_CLOSE_CODE,
   acquireInstanceLock,
   shouldReconnectAfterClose,
@@ -195,6 +196,24 @@ function connect(): void {
     // A settings change swaps the socket out; the stale one must not tear down
     // agents or schedule a retry against the URL we just left.
     if (socket !== active) return;
+    if (code === AUTH_FAILED_CLOSE_CODE) {
+      // The stored secret will never be accepted again, so retrying it is an
+      // infinite loop. Registering reclaims this node by name, which keeps its
+      // id and therefore its placements and session history.
+      log("Host rejected our credentials; enrolling again");
+      try {
+        credentials = await register();
+        await saveCredentials(credentials);
+        log(`Re-enrolled as node ${credentials.nodeId}`);
+      } catch (error) {
+        console.error(
+          "Re-enrollment failed:",
+          error instanceof Error ? error.message : error,
+        );
+      }
+      reconnectTimer = setTimeout(connect, 2_000);
+      return;
+    }
     if (!shouldReconnectAfterClose(code, shuttingDown)) {
       // Only tear agents down when this process is done; a Host bounce must
       // not wipe live sessions that we are about to re-announce on hello.
