@@ -17,6 +17,7 @@ import {
   Rename20Regular,
 } from "@fluentui/react-icons";
 import type { FleetNode, Placement, Workspace } from "@fleet/protocol";
+import { nextPlacementPath } from "../lib/placement-path.js";
 
 const useStyles = makeStyles({
   panel: {
@@ -175,9 +176,12 @@ export const WorkspacesPanel = ({
   const [localPath, setLocalPath] = useState("");
 
   const handleSelectNode = (nextNodeId: string) => {
+    const previousHome = nodes.find((node) => node.id === nodeId)?.homeDir;
+    const nextHome = nodes.find((node) => node.id === nextNodeId)?.homeDir ?? "";
     setNodeId(nextNodeId);
-    const home = nodes.find((node) => node.id === nextNodeId)?.homeDir;
-    if (home && localPath.trim().length === 0) setLocalPath(home);
+    setLocalPath((current) =>
+      nextPlacementPath(current, previousHome, nextHome),
+    );
   };
 
   const handleCreateWorkspace = async (event: FormEvent) => {
@@ -194,7 +198,9 @@ export const WorkspacesPanel = ({
     if (!workspaceId || !nodeId || !localPath.trim()) return;
     const created = await onCreatePlacement(workspaceId, nodeId, localPath.trim());
     if (!created) return;
-    setLocalPath("");
+    // The node stays selected, so reset to its home rather than to blank: the
+    // next placement on the same machine starts from a usable path again.
+    setLocalPath(nodes.find((node) => node.id === nodeId)?.homeDir ?? "");
   };
 
   return (
