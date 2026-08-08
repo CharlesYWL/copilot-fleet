@@ -57,6 +57,7 @@ describe("session transitions", () => {
     expect(canTransition("queued", "starting")).toBe(true);
     expect(canTransition("running", "idle")).toBe(true);
     expect(canTransition("idle", "running")).toBe(true);
+    expect(canTransition("offline", "idle")).toBe(true);
     expect(canTransition("stopped", "running")).toBe(false);
   });
 });

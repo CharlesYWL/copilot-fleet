@@ -19,8 +19,20 @@ export interface SessionAgent {
 
 export type EventSink = (event: SessionEvent) => void;
 
+export type StartAgentOptions = {
+  /** Copilot session id to re-attach to via ACP `session/load`. */
+  resumeAgentSessionId?: string;
+  /** First event sequence number to use, so resumed runs keep ordering. */
+  sequenceOffset?: number;
+};
+
 export interface AgentFactory {
-  start(sessionId: string, cwd: string, sink: EventSink): Promise<SessionAgent>;
+  start(
+    sessionId: string,
+    cwd: string,
+    sink: EventSink,
+    options?: StartAgentOptions,
+  ): Promise<SessionAgent>;
 }
 
 abstract class SequencedAgent {
@@ -30,7 +42,10 @@ abstract class SequencedAgent {
   constructor(
     protected readonly fleetSessionId: string,
     protected readonly sink: EventSink,
-  ) {}
+    sequenceOffset = 0,
+  ) {
+    this.sequence = sequenceOffset;
+  }
 
   protected emit(type: SessionEvent["type"], payload: Record<string, unknown>): void {
     if (
@@ -63,22 +78,28 @@ type PendingPermission = {
 
 class AcpAgent extends SequencedAgent implements SessionAgent {
   private readonly pending = new Map<string, PendingPermission>();
-  private active: acp.ActiveSession | undefined;
+  private agentSessionId: string | undefined;
   private connection: acp.ClientConnection | undefined;
   private child: ChildProcessWithoutNullStreams | undefined;
   private prompting = false;
   private stopping = false;
+  /** `session/load` replays the whole history; the host already stored it. */
+  private replaying = false;
 
   constructor(
     fleetSessionId: string,
     sink: EventSink,
     private readonly permissionTimeoutMs: number,
+    sequenceOffset = 0,
   ) {
-    super(fleetSessionId, sink);
+    super(fleetSessionId, sink, sequenceOffset);
   }
 
-  async start(cwd: string): Promise<void> {
-    this.emit("state", { state: "starting", activity: "Starting Copilot ACP" });
+  async start(cwd: string, resumeAgentSessionId?: string): Promise<void> {
+    this.emit("state", {
+      state: "starting",
+      activity: resumeAgentSessionId ? "Resuming Copilot ACP" : "Starting Copilot ACP",
+    });
     const executable = process.env.FLEET_COPILOT_COMMAND ?? "copilot";
     const args = copilotLaunchArgs();
     // npm installs a CLI on Windows as a .cmd shim, which CreateProcess cannot
@@ -116,7 +137,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       .client({ name: "copilot-fleet-node" })
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) =>
         this.requestPermission(params),
-      );
+      )
+      .onNotification(acp.methods.client.session.update, ({ params }) => {
+        if (!this.replaying) this.forwardUpdate(params.update);
+      });
     const stream = acp.ndJsonStream(
       Writable.toWeb(child.stdin),
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
@@ -128,26 +152,47 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         fs: { readTextFile: false, writeTextFile: false },
       },
     });
-    this.active = await this.connection.agent.buildSession(cwd).start();
+    if (resumeAgentSessionId) {
+      this.replaying = true;
+      try {
+        await this.connection.agent.request(acp.methods.agent.session.load, {
+          sessionId: resumeAgentSessionId,
+          cwd,
+          mcpServers: [],
+        });
+      } finally {
+        this.replaying = false;
+      }
+      this.agentSessionId = resumeAgentSessionId;
+      this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
+    } else {
+      const created = await this.connection.agent.request(
+        acp.methods.agent.session.new,
+        { cwd, mcpServers: [] },
+      );
+      this.agentSessionId = created.sessionId;
+    }
+    this.emit("agent_session", { agentSessionId: this.agentSessionId });
   }
 
   async prompt(text: string): Promise<void> {
-    if (!this.active) throw new Error("ACP session is not initialized");
+    if (!this.agentSessionId || !this.connection) {
+      throw new Error("ACP session is not initialized");
+    }
     if (this.prompting) throw new Error("A prompt is already active");
     this.prompting = true;
     this.emit("state", { state: "running", activity: "Copilot is working" });
     this.emit("system", { text: `User: ${text}` });
-    void this.active.prompt(text).catch(() => undefined);
     try {
-      for (;;) {
-        const message = await this.active.nextUpdate();
-        if (message.kind === "stop") {
-          this.emit("turn_complete", { stopReason: message.stopReason });
-          this.emit("state", { state: "idle", activity: "Ready for follow-up" });
-          return;
-        }
-        this.forwardUpdate(message.update);
-      }
+      const response = await this.connection.agent.request(
+        acp.methods.agent.session.prompt,
+        {
+          sessionId: this.agentSessionId,
+          prompt: [{ type: "text", text }],
+        },
+      );
+      this.emit("turn_complete", { stopReason: response.stopReason });
+      this.emit("state", { state: "idle", activity: "Ready for follow-up" });
     } catch (error) {
       this.emit("error", {
         message: error instanceof Error ? error.message : "ACP prompt failed",
@@ -161,10 +206,12 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   }
 
   async cancel(): Promise<void> {
-    if (!this.active || !this.connection) throw new Error("ACP session is not initialized");
+    if (!this.agentSessionId || !this.connection) {
+      throw new Error("ACP session is not initialized");
+    }
     this.denyPendingPermissions();
     await this.connection.agent.notify(acp.methods.agent.session.cancel, {
-      sessionId: this.active.sessionId,
+      sessionId: this.agentSessionId,
     });
   }
 
@@ -172,7 +219,6 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (this.stopping) return;
     this.stopping = true;
     this.denyPendingPermissions();
-    this.active?.dispose();
     this.connection?.close();
     if (this.child && this.child.exitCode === null) {
       this.child.kill();
@@ -272,10 +318,20 @@ export class AcpAgentFactory implements AgentFactory {
     ),
   ) {}
 
-  async start(sessionId: string, cwd: string, sink: EventSink): Promise<SessionAgent> {
-    const agent = new AcpAgent(sessionId, sink, this.permissionTimeoutMs);
+  async start(
+    sessionId: string,
+    cwd: string,
+    sink: EventSink,
+    options: StartAgentOptions = {},
+  ): Promise<SessionAgent> {
+    const agent = new AcpAgent(
+      sessionId,
+      sink,
+      this.permissionTimeoutMs,
+      options.sequenceOffset ?? 0,
+    );
     try {
-      await agent.start(cwd);
+      await agent.start(cwd, options.resumeAgentSessionId);
       return agent;
     } catch (error) {
       await agent.stop();
@@ -288,8 +344,13 @@ class MockAgent extends SequencedAgent implements SessionAgent {
   private cancelled = false;
   private stopped = false;
 
+  constructor(fleetSessionId: string, sink: EventSink, sequenceOffset = 0) {
+    super(fleetSessionId, sink, sequenceOffset);
+  }
+
   start(): void {
     this.emit("state", { state: "starting", activity: "Starting mock agent" });
+    this.emit("agent_session", { agentSessionId: `mock-${this.fleetSessionId}` });
   }
 
   async prompt(text: string): Promise<void> {
@@ -326,8 +387,13 @@ class MockAgent extends SequencedAgent implements SessionAgent {
 }
 
 export class MockAgentFactory implements AgentFactory {
-  async start(sessionId: string, _cwd: string, sink: EventSink): Promise<SessionAgent> {
-    const agent = new MockAgent(sessionId, sink);
+  async start(
+    sessionId: string,
+    _cwd: string,
+    sink: EventSink,
+    options: StartAgentOptions = {},
+  ): Promise<SessionAgent> {
+    const agent = new MockAgent(sessionId, sink, options.sequenceOffset ?? 0);
     agent.start();
     return agent;
   }

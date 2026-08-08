@@ -57,6 +57,7 @@ export class FleetStore {
       );
     `);
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
   }
 
   getSetting(key: string): string | undefined {
@@ -345,6 +346,23 @@ export class FleetStore {
     return changed;
   }
 
+  /** Soft disconnect: sessions stay recoverable if the Node still has them. */
+  markNodeSessionsOffline(nodeId: string, activity: string): FleetSession[] {
+    const changed: FleetSession[] = [];
+    for (const session of this.listSessions().filter(
+      (item) =>
+        item.nodeId === nodeId &&
+        !["stopped", "completed", "failed", "offline"].includes(item.state),
+    )) {
+      changed.push(this.transitionSession(session.id, "offline", activity));
+    }
+    return changed;
+  }
+
+  /**
+   * After a Node hello/heartbeat: resurrect offline sessions the Node still
+   * owns, and fail the ones that did not come back.
+   */
   reconcileOfflineSessions(
     nodeId: string,
     activeSessionIds: readonly string[],
@@ -352,11 +370,14 @@ export class FleetStore {
     const active = new Set(activeSessionIds);
     const changed: FleetSession[] = [];
     for (const session of this.listSessions().filter(
-      (item) =>
-        item.nodeId === nodeId &&
-        item.state === "offline" &&
-        !active.has(item.id),
+      (item) => item.nodeId === nodeId && item.state === "offline",
     )) {
+      if (active.has(session.id)) {
+        changed.push(
+          this.transitionSession(session.id, "idle", "Reconnected to node"),
+        );
+        continue;
+      }
       changed.push(
         this.transitionSession(
           session.id,
@@ -398,7 +419,20 @@ export class FleetStore {
         .prepare("UPDATE sessions SET last_text=?,updated_at=? WHERE id=?")
         .run(text.slice(-500), event.createdAt, event.sessionId);
     }
+    if (event.type === "agent_session" && typeof event.payload.agentSessionId === "string") {
+      this.db
+        .prepare("UPDATE sessions SET agent_session_id=?,updated_at=? WHERE id=?")
+        .run(event.payload.agentSessionId, event.createdAt, event.sessionId);
+    }
     return true;
+  }
+
+  /** Highest event sequence recorded so a resumed agent can continue from it. */
+  maxEventSequence(sessionId: string): number {
+    const row = this.db
+      .prepare("SELECT MAX(sequence) max FROM events WHERE session_id=?")
+      .get(sessionId) as Row | undefined;
+    return Number(row?.max ?? 0);
   }
 
   listEvents(sessionId: string): SessionEvent[] {
@@ -433,6 +467,26 @@ export class FleetStore {
         `Cannot delete ${label} while ${live.length} session(s) are still active`,
       );
     }
+  }
+
+  /** Removes a finished session and its event log. Live sessions are refused. */
+  deleteSession(id: string): void {
+    const session = this.getSession(id);
+    if (!session) throw new Error("Session not found");
+    if (!terminalSessionStates.has(session.state)) {
+      throw new Error("Can only dismiss ended sessions");
+    }
+    this.db.prepare("DELETE FROM events WHERE session_id=?").run(id);
+    this.db.prepare("DELETE FROM sessions WHERE id=?").run(id);
+  }
+
+  /** Purge every stopped / completed / failed session. Returns how many went. */
+  deleteEndedSessions(): number {
+    const ended = this.listSessions().filter((session) =>
+      terminalSessionStates.has(session.state),
+    );
+    for (const session of ended) this.deleteSession(session.id);
+    return ended.length;
   }
 
   private deleteSessionsWhere(
@@ -493,5 +547,6 @@ function sessionFromRow(row: Row): FleetSession {
     lastText: String(row.last_text),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
+    agentSessionId: String(row.agent_session_id ?? ""),
   };
 }

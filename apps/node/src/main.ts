@@ -86,6 +86,7 @@ function connect(auth: Credentials): void {
       capabilities: ["copilot-acp", mockAgent ? "mock" : "real"],
       maxSessions,
       homeDir: homedir(),
+      activeSessionIds: router.activeSessionIds,
     });
   });
   socket.on("message", async (raw) => {
@@ -123,9 +124,11 @@ function connect(auth: Credentials): void {
     });
   });
   socket.on("close", async (code) => {
-    router.denyPendingPermissions();
-    await router.stopAll();
     if (!shouldReconnectAfterClose(code, shuttingDown)) {
+      // Only tear agents down when this process is done; a Host bounce must
+      // not wipe live sessions that we are about to re-announce on hello.
+      router.denyPendingPermissions();
+      await router.stopAll();
       if (code === SUPERSEDED_CLOSE_CODE) {
         console.error(
           "Connection superseded by another node instance; not reconnecting",
@@ -136,7 +139,9 @@ function connect(auth: Credentials): void {
       log(`Disconnected (code ${code}); shutting down`);
       return;
     }
-    log(`Disconnected (code ${code}); reconnecting in 2s`);
+    log(
+      `Disconnected (code ${code}); keeping ${router.activeSessionIds.length} session(s), reconnecting in 2s`,
+    );
     setTimeout(() => connect(auth), 2_000);
   });
   socket.on("error", (error) => {

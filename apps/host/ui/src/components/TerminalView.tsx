@@ -15,12 +15,13 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import {
+  ArrowClockwise20Regular,
   Dismiss20Regular,
   RecordStop20Regular,
   Send20Regular,
   Stop20Regular,
 } from "@fluentui/react-icons";
-import type { FleetSession, SessionEvent } from "@fleet/protocol";
+import { terminalSessionStates, type FleetSession, type SessionEvent } from "@fleet/protocol";
 import { blockColor, stateAccent, terminal } from "../theme";
 import {
   allowOnceOptionId,
@@ -184,6 +185,8 @@ type TerminalViewProps = {
     outcome: "allow_once" | "deny",
     optionId?: string,
   ) => void;
+  onDismiss?: () => void;
+  onResume?: () => void;
   onClose?: () => void;
 };
 
@@ -194,6 +197,8 @@ export const TerminalView = ({
   onCancel,
   onStop,
   onPermission,
+  onDismiss,
+  onResume,
   onClose,
 }: TerminalViewProps) => {
   const styles = useStyles();
@@ -217,6 +222,12 @@ export const TerminalView = ({
   }, [session.id]);
 
   const canPrompt = session.state === "idle";
+  const isEnded = terminalSessionStates.has(session.state);
+  // Offline and terminal sessions can be re-attached via Copilot's session/load.
+  const canResume =
+    Boolean(onResume) &&
+    Boolean(session.agentSessionId) &&
+    (isEnded || session.state === "offline");
 
   const submitPrompt = () => {
     const text = prompt.trim();
@@ -275,9 +286,29 @@ export const TerminalView = ({
         >
           Cancel turn
         </Button>
-        <Button appearance="secondary" icon={<Stop20Regular />} onClick={onStop}>
-          Stop
-        </Button>
+        {canResume && (
+          <Button
+            appearance="primary"
+            icon={<ArrowClockwise20Regular />}
+            onClick={onResume}
+          >
+            Resume
+          </Button>
+        )}
+        {isEnded ? (
+          <Button
+            appearance="secondary"
+            icon={<Dismiss20Regular />}
+            onClick={onDismiss}
+            disabled={!onDismiss}
+          >
+            Dismiss
+          </Button>
+        ) : (
+          <Button appearance="secondary" icon={<Stop20Regular />} onClick={onStop}>
+            Stop
+          </Button>
+        )}
         {onClose && (
           <Button
             appearance="subtle"

@@ -49,6 +49,21 @@ describe("FleetStore", () => {
     expect(store.listEvents(session.id)).toHaveLength(1);
   });
 
+  it("records the agent session id and event high-water mark for resume", () => {
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "hello");
+    store.appendEvent({
+      eventId: "e1",
+      sessionId: session.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "copilot-abc" },
+      createdAt: new Date().toISOString(),
+    });
+    expect(store.getSession(session.id)?.agentSessionId).toBe("copilot-abc");
+    expect(store.maxEventSequence(session.id)).toBe(1);
+  });
+
   it("rejects event gaps and invalid state transitions", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");
@@ -98,18 +113,43 @@ describe("FleetStore", () => {
     expect(reopened.listEvents(session.id)[0]?.payload.text).toBe("saved");
   });
 
-  it("fails disconnected sessions and reconciles host-restart offline rows", () => {
+  it("soft-disconnects sessions and resurrects ones the Node still owns", () => {
     const { store, node, placement } = setup();
-    const disconnected = store.createSession(placement, "disconnect");
+    const dropped = store.createSession(placement, "drop");
     expect(
-      store.markNodeSessionsFailed(node.id, "Node disconnected")[0]?.state,
+      store.markNodeSessionsOffline(node.id, "Node disconnected")[0]?.state,
+    ).toBe("offline");
+    expect(
+      store.reconcileOfflineSessions(node.id, [])[0]?.state,
     ).toBe("failed");
+    expect(store.getSession(dropped.id)?.state).toBe("failed");
 
-    const restarted = store.createSession(placement, "restart");
+    const kept = store.createSession(placement, "keep");
+    const lost = store.createSession(placement, "lose");
     store.resetConnectivity();
-    expect(store.getSession(restarted.id)?.state).toBe("offline");
-    expect(store.reconcileOfflineSessions(node.id, [disconnected.id])).toHaveLength(1);
-    expect(store.getSession(restarted.id)?.state).toBe("failed");
+    expect(store.getSession(kept.id)?.state).toBe("offline");
+    expect(store.getSession(lost.id)?.state).toBe("offline");
+
+    const changed = store.reconcileOfflineSessions(node.id, [kept.id]);
+    expect(changed).toHaveLength(2);
+    expect(store.getSession(kept.id)?.state).toBe("idle");
+    expect(store.getSession(lost.id)?.state).toBe("failed");
+  });
+
+  it("dismisses ended sessions but refuses to delete live ones", () => {
+    const { store, placement } = setup();
+    const live = store.createSession(placement, "live");
+    const dead = store.createSession(placement, "dead");
+    store.transitionSession(dead.id, "failed", "gone");
+
+    expect(() => store.deleteSession(live.id)).toThrow(/ended sessions/);
+    store.deleteSession(dead.id);
+    expect(store.getSession(dead.id)).toBeUndefined();
+    expect(store.deleteEndedSessions()).toBe(0);
+
+    store.transitionSession(live.id, "failed", "later");
+    expect(store.deleteEndedSessions()).toBe(1);
+    expect(store.listSessions()).toHaveLength(0);
   });
 
   it("renames nodes and tracks the home directory reported on reconnect", () => {

@@ -12,11 +12,13 @@ import {
 } from "@fluentui/react-components";
 import {
   Add20Regular,
+  Delete20Regular,
   Folder20Regular,
   Server20Regular,
   Settings20Regular,
 } from "@fluentui/react-icons";
-import type { FleetNode, FleetSession } from "@fleet/protocol";
+import type { FleetNode, FleetSession, Workspace } from "@fleet/protocol";
+import { groupSessionsByWorkspace } from "../lib/session-groups";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -87,48 +89,46 @@ const useStyles = makeStyles({
   },
 });
 
-type WorkspaceGroup = {
-  workspaceId: string;
-  workspaceName: string;
-  sessions: FleetSession[];
-};
-
-type NodeGroup = {
-  node: FleetNode;
-  workspaces: WorkspaceGroup[];
-};
-
 export type SidebarView = "session" | "settings";
 
 type SidebarProps = {
   nodes: FleetNode[];
+  workspaces: Workspace[];
   sessions: FleetSession[];
   selectedSessionId: string | undefined;
   view: SidebarView;
+  endedCount: number;
   onSelectSession: (sessionId: string) => void;
   onNewSession: () => void;
   onSelectView: (view: Exclude<SidebarView, "session">) => void;
+  onClearEnded: () => void;
 };
 
 export const Sidebar = ({
   nodes,
+  workspaces,
   sessions,
   selectedSessionId,
   view,
+  endedCount,
   onSelectSession,
   onNewSession,
   onSelectView,
+  onClearEnded,
 }: SidebarProps) => {
   const styles = useStyles();
   const [closedItems, setClosedItems] = useState<Set<string>>(new Set());
 
-  const groups = useMemo(() => groupSessions(nodes, sessions), [nodes, sessions]);
+  const groups = useMemo(
+    () => groupSessionsByWorkspace(sessions, nodes, workspaces),
+    [sessions, nodes, workspaces],
+  );
   const openItems = useMemo(
     () =>
       groups
         .flatMap((group) => [
-          nodeKey(group.node.id),
-          ...group.workspaces.map((item) => workspaceKey(group.node.id, item.workspaceId)),
+          workspaceKey(group.workspaceId),
+          ...group.nodes.map((item) => nodeKey(group.workspaceId, item.nodeId)),
         ])
         .filter((key) => !closedItems.has(key)),
     [groups, closedItems],
@@ -160,36 +160,42 @@ export const Sidebar = ({
           Agents
         </Text>
         {groups.length === 0 ? (
-          <p className={styles.empty}>No nodes registered yet.</p>
+          <p className={styles.empty}>No workspaces yet.</p>
         ) : (
-          <Tree aria-label="Sessions by node" openItems={openItems} onOpenChange={handleOpenChange}>
+          <Tree
+            aria-label="Sessions by workspace"
+            openItems={openItems}
+            onOpenChange={handleOpenChange}
+          >
             {groups.map((group) => (
-              <TreeItem itemType="branch" value={nodeKey(group.node.id)} key={group.node.id}>
-                <TreeItemLayout
-                  iconBefore={<Server20Regular />}
-                  className={group.node.online ? undefined : styles.offline}
-                >
-                  {group.node.name}
+              <TreeItem
+                itemType="branch"
+                value={workspaceKey(group.workspaceId)}
+                key={group.workspaceId}
+              >
+                <TreeItemLayout iconBefore={<Folder20Regular />}>
+                  {group.workspaceName}
                 </TreeItemLayout>
                 <Tree>
-                  {group.workspaces.length === 0 ? (
-                    <TreeItem itemType="leaf" value={`${nodeKey(group.node.id)}:empty`}>
-                      <TreeItemLayout className={styles.offline}>
-                        {group.node.online ? "No sessions" : "Offline"}
-                      </TreeItemLayout>
+                  {group.nodes.length === 0 ? (
+                    <TreeItem itemType="leaf" value={`${workspaceKey(group.workspaceId)}:empty`}>
+                      <TreeItemLayout className={styles.offline}>No sessions</TreeItemLayout>
                     </TreeItem>
                   ) : (
-                    group.workspaces.map((workspace) => (
+                    group.nodes.map((nodeGroup) => (
                       <TreeItem
                         itemType="branch"
-                        value={workspaceKey(group.node.id, workspace.workspaceId)}
-                        key={workspace.workspaceId}
+                        value={nodeKey(group.workspaceId, nodeGroup.nodeId)}
+                        key={nodeGroup.nodeId}
                       >
-                        <TreeItemLayout iconBefore={<Folder20Regular />}>
-                          {workspace.workspaceName}
+                        <TreeItemLayout
+                          iconBefore={<Server20Regular />}
+                          className={nodeGroup.online ? undefined : styles.offline}
+                        >
+                          {nodeGroup.nodeName}
                         </TreeItemLayout>
                         <Tree>
-                          {workspace.sessions.map((session) => {
+                          {nodeGroup.sessions.map((session) => {
                             const isSelected =
                               view === "session" && session.id === selectedSessionId;
                             return (
@@ -235,6 +241,16 @@ export const Sidebar = ({
         <Button appearance="primary" icon={<Add20Regular />} onClick={onNewSession}>
           New session
         </Button>
+        {endedCount > 0 && (
+          <Button
+            appearance="subtle"
+            className={styles.navButton}
+            icon={<Delete20Regular />}
+            onClick={onClearEnded}
+          >
+            Clear ended ({endedCount})
+          </Button>
+        )}
         <Button
           appearance={view === "settings" ? "secondary" : "subtle"}
           className={styles.navButton}
@@ -248,25 +264,5 @@ export const Sidebar = ({
   );
 };
 
-function groupSessions(nodes: FleetNode[], sessions: FleetSession[]): NodeGroup[] {
-  return nodes.map((node) => {
-    const nodeSessions = sessions.filter((session) => session.nodeId === node.id);
-    const workspaces: WorkspaceGroup[] = [];
-    for (const session of nodeSessions) {
-      const existing = workspaces.find((item) => item.workspaceId === session.workspaceId);
-      if (existing) {
-        existing.sessions.push(session);
-        continue;
-      }
-      workspaces.push({
-        workspaceId: session.workspaceId,
-        workspaceName: session.workspaceName,
-        sessions: [session],
-      });
-    }
-    return { node, workspaces };
-  });
-}
-
-const nodeKey = (nodeId: string) => `node:${nodeId}`;
-const workspaceKey = (nodeId: string, workspaceId: string) => `ws:${nodeId}:${workspaceId}`;
+const workspaceKey = (workspaceId: string) => `ws:${workspaceId}`;
+const nodeKey = (workspaceId: string, nodeId: string) => `node:${workspaceId}:${nodeId}`;

@@ -19,6 +19,11 @@ type SessionSlot = {
   ready: Promise<void>;
 };
 
+type LaunchCommand = Extract<
+  NodeCommand,
+  { type: "start_session" | "resume_session" }
+>;
+
 export class CommandRouter {
   private readonly slots = new Map<string, SessionSlot>();
   private readonly handled = new Map<string, Promise<CommandResult>>();
@@ -71,7 +76,7 @@ export class CommandRouter {
   }
 
   private async execute(command: NodeCommand): Promise<void> {
-    if (command.type === "start_session") {
+    if (command.type === "start_session" || command.type === "resume_session") {
       return this.startSession(command);
     }
 
@@ -96,9 +101,7 @@ export class CommandRouter {
     }
   }
 
-  private startSession(
-    command: Extract<NodeCommand, { type: "start_session" }>,
-  ): Promise<void> {
+  private startSession(command: LaunchCommand): Promise<void> {
     const existing = this.slots.get(command.sessionId);
     if (existing) return existing.ready;
     if (this.slots.size >= this.maxSessions) {
@@ -112,7 +115,7 @@ export class CommandRouter {
   }
 
   private async initializeSession(
-    command: Extract<NodeCommand, { type: "start_session" }>,
+    command: LaunchCommand,
     slot: SessionSlot,
   ): Promise<void> {
     try {
@@ -127,15 +130,28 @@ export class CommandRouter {
           this.release(command.sessionId, slot);
         }
       };
-      const agent = await this.factory.start(command.sessionId, cwd, sink);
+      const agent = await this.factory.start(
+        command.sessionId,
+        cwd,
+        sink,
+        command.type === "resume_session"
+          ? {
+              resumeAgentSessionId: command.agentSessionId,
+              sequenceOffset: command.sequenceOffset,
+            }
+          : {},
+      );
       slot.agent = agent;
       if (this.slots.get(command.sessionId) !== slot) {
         await agent.stop();
         throw new Error("Session terminated during startup");
       }
-      void agent
-        .prompt(command.prompt)
-        .catch(() => this.release(command.sessionId, slot));
+      // A resumed session waits for the operator's next prompt.
+      if (command.type === "start_session") {
+        void agent
+          .prompt(command.prompt)
+          .catch(() => this.release(command.sessionId, slot));
+      }
     } catch (error) {
       this.release(command.sessionId, slot);
       throw error;

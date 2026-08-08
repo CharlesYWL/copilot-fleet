@@ -142,7 +142,7 @@ export const SessionTile = ({
         className={styles.open}
         role="button"
         tabIndex={0}
-        aria-label={`Open session ${session.workspaceName} on ${session.nodeName}`}
+        aria-label={`Open session on ${session.nodeName}`}
         title={session.initialPrompt}
         onClick={handleOpen}
         onKeyDown={handleKeyDown}
@@ -153,11 +153,11 @@ export const SessionTile = ({
             {session.state}
           </span>
           <Text weight="semibold" className={styles.name}>
-            {session.workspaceName}
+            {session.nodeName}
           </Text>
         </div>
         <Text className={styles.subtitle}>
-          {session.nodeName} · {session.currentActivity || session.initialPrompt}
+          {session.currentActivity || session.initialPrompt}
         </Text>
         <div className={styles.preview}>
           {lines.length === 0 ? (

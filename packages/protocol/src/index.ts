@@ -67,6 +67,8 @@ export const SessionSchema = z.object({
   lastText: z.string(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
+  /** Copilot's own ACP session id, needed to resume the conversation. */
+  agentSessionId: z.string().default(""),
 });
 export type FleetSession = z.infer<typeof SessionSchema>;
 
@@ -90,6 +92,7 @@ export const SessionEventSchema = z.object({
     "turn_complete",
     "error",
     "system",
+    "agent_session",
   ]),
   payload: z.record(z.string(), z.unknown()),
   createdAt: z.string().datetime(),
@@ -103,6 +106,15 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
     prompt: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal("resume_session"),
+    commandId: z.string().min(1),
+    sessionId: z.string().min(1),
+    localPath: z.string().min(1),
+    agentSessionId: z.string().min(1),
+    /** Continues the host's event sequence so replayed rows stay ordered. */
+    sequenceOffset: z.number().int().nonnegative().default(0),
   }),
   z.object({
     type: z.literal("prompt"),
@@ -142,6 +154,8 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     capabilities: z.array(z.string()),
     maxSessions: z.number().int().positive(),
     homeDir: z.string().default(""),
+    /** Sessions still running on this Node; used to resurrect offline rows. */
+    activeSessionIds: z.array(z.string()).default([]),
   }),
   z.object({
     type: z.literal("heartbeat"),
@@ -251,10 +265,12 @@ const transitions: Record<SessionState, ReadonlySet<SessionState>> = {
   running: new Set(["idle", "cancelling", "failed", "offline", "stopped", "completed"]),
   idle: new Set(["running", "failed", "offline", "stopped", "completed"]),
   cancelling: new Set(["idle", "failed", "offline", "stopped"]),
-  offline: new Set(["stopped", "failed"]),
-  stopped: new Set(),
-  completed: new Set(),
-  failed: new Set(),
+  // Idle is the reconnect landing state; the next agent event can move it on.
+  // Starting is the resume landing state; session/load re-attaches the agent.
+  offline: new Set(["stopped", "failed", "idle", "starting"]),
+  stopped: new Set(["starting"]),
+  completed: new Set(["starting"]),
+  failed: new Set(["starting"]),
 };
 
 export function canTransition(from: SessionState, to: SessionState): boolean {

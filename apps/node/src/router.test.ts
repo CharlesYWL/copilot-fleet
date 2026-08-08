@@ -212,6 +212,55 @@ describe("CommandRouter", () => {
     expect(result.ok).toBe(false);
     expect(router.activeSessionIds).toEqual([]);
   });
+
+  it("resumes without prompting and continues the event sequence", async () => {
+    const events: SessionEvent[] = [];
+    let received: { resume?: string; offset?: number } = {};
+    let prompts = 0;
+    const factory: AgentFactory = {
+      async start(sessionId, _cwd, sink, options) {
+        received = {
+          resume: options?.resumeAgentSessionId,
+          offset: options?.sequenceOffset,
+        };
+        sink({
+          eventId: `${sessionId}-resumed`,
+          sessionId,
+          sequence: (options?.sequenceOffset ?? 0) + 1,
+          type: "state",
+          payload: { state: "idle" },
+          createdAt: new Date().toISOString(),
+        });
+        return {
+          async prompt() {
+            prompts += 1;
+          },
+          async cancel() {},
+          async stop() {},
+          resolvePermission() {},
+          denyPendingPermissions() {},
+        };
+      },
+    };
+    const router = new CommandRouter(
+      factory,
+      1,
+      (event) => events.push(event),
+      async (path) => path,
+    );
+    const result = await router.route({
+      type: "resume_session",
+      commandId: "r1",
+      sessionId: "s1",
+      localPath: "/one",
+      agentSessionId: "copilot-abc",
+      sequenceOffset: 7,
+    });
+    expect(result.ok).toBe(true);
+    expect(received).toEqual({ resume: "copilot-abc", offset: 7 });
+    expect(prompts).toBe(0);
+    expect(events[0]?.sequence).toBe(8);
+  });
 });
 
 function inertAgent(_sessionId: string, _sink: EventSink): SessionAgent {

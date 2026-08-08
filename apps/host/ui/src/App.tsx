@@ -22,7 +22,6 @@ import { TerminalView } from "./components/TerminalView";
 import { TopBar, type LayoutMode } from "./components/TopBar";
 
 const terminalStates = new Set(["stopped", "completed", "failed"]);
-const FAILED_VISIBLE_MS = 120_000;
 const noEvents: SessionEvent[] = [];
 
 const useStyles = makeStyles({
@@ -71,6 +70,10 @@ export function App() {
   );
   const liveSessions = useMemo(
     () => snapshot.sessions.filter((session) => !terminalStates.has(session.state)),
+    [snapshot.sessions],
+  );
+  const endedCount = useMemo(
+    () => snapshot.sessions.filter((session) => terminalStates.has(session.state)).length,
     [snapshot.sessions],
   );
   const waitingPermissions = useMemo(
@@ -132,6 +135,38 @@ export function App() {
       outcome,
       ...(optionId ? { optionId } : {}),
     });
+
+  const handleDismissSession = async (sessionId: string) => {
+    try {
+      await api(`/api/sessions/${sessionId}`, { method: "DELETE" });
+      if (selectedSessionId === sessionId) {
+        setSelectedSessionId(undefined);
+        setFocusOpen(false);
+      }
+      await refresh();
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  };
+
+  const handleClearEnded = async () => {
+    const selectedWasEnded =
+      Boolean(activeSession) && terminalStates.has(activeSession!.state);
+    try {
+      await api<{ removed: number }>("/api/sessions", { method: "DELETE" });
+      if (selectedWasEnded) {
+        setSelectedSessionId(undefined);
+        setFocusOpen(false);
+      }
+      await refresh();
+      return true;
+    } catch (reason) {
+      notify(reason instanceof Error ? reason.message : String(reason));
+      return false;
+    }
+  };
 
   usePermissionAlerts(waitingPermissions, handleSelectSession);
 
@@ -258,6 +293,7 @@ export function App() {
         {layout === "grid" ? (
           <SessionGrid
             sessions={visibleSessions}
+            nodes={snapshot.nodes}
             events={events}
             onOpen={handleSelectSession}
             onPermission={handlePermission}
@@ -267,12 +303,15 @@ export function App() {
           <>
             <Sidebar
               nodes={snapshot.nodes}
+              workspaces={snapshot.workspaces}
               sessions={visibleSessions}
               selectedSessionId={selectedSessionId}
               view={view}
+              endedCount={endedCount}
               onSelectSession={handleSelectSession}
               onNewSession={() => setDialogOpen(true)}
               onSelectView={setView}
+              onClearEnded={() => void handleClearEnded()}
             />
 
             {view === "settings" && (
@@ -301,6 +340,10 @@ export function App() {
                   }
                   onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
                   onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
+                  onDismiss={() => void handleDismissSession(activeSession.id)}
+                  onResume={() =>
+                    void command(`/api/sessions/${activeSession.id}/resume`)
+                  }
                   onPermission={(requestId, outcome, optionId) =>
                     handlePermission(activeSession.id, requestId, outcome, optionId)
                   }
@@ -323,6 +366,8 @@ export function App() {
           }
           onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
           onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
+          onDismiss={() => void handleDismissSession(activeSession.id)}
+          onResume={() => void command(`/api/sessions/${activeSession.id}/resume`)}
           onPermission={(requestId, outcome, optionId) =>
             handlePermission(activeSession.id, requestId, outcome, optionId)
           }
@@ -344,12 +389,10 @@ function filterVisibleSessions(
   sessions: FleetSession[],
   selectedSessionId: string | undefined,
 ): FleetSession[] {
-  const now = Date.now();
+  // Ended sessions stay visible only while selected, so a failure mid-watch
+  // does not yank the transcript; Dismiss / Clear ended remove them for good.
   return sessions.filter(
     (session) =>
-      !terminalStates.has(session.state) ||
-      session.id === selectedSessionId ||
-      (session.state === "failed" &&
-        now - Date.parse(session.updatedAt) < FAILED_VISIBLE_MS),
+      !terminalStates.has(session.state) || session.id === selectedSessionId,
   );
 }

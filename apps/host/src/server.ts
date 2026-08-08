@@ -22,6 +22,7 @@ import {
   UpdatePlacementSchema,
   UpdateTunnelSchema,
   UpdateWorkspaceSchema,
+  canTransition,
   terminalSessionStates,
   tryParseJson,
   type BrowserMessage,
@@ -99,7 +100,9 @@ export async function buildServer(options: {
     nodeSockets.delete(nodeId);
     const node = store.setNodeOnline(nodeId, false, 0);
     if (node) broadcast({ type: "node", node });
-    publishReconciled(store.markNodeSessionsFailed(nodeId, activity));
+    // Soft-fail: the Node may still be running agents and will resurrect
+    // them on the next hello that lists those session ids.
+    publishReconciled(store.markNodeSessionsOffline(nodeId, activity));
   };
 
   app.get("/api/health", async () => ({ ok: true, version: VERSION }));
@@ -321,6 +324,31 @@ export async function buildServer(options: {
     return reply.code(202).send({ ok: true });
   });
 
+  app.post("/api/sessions/:id/resume", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = store.getSession(id);
+    if (!session) return reply.code(404).send({ error: "Session not found" });
+    if (!canTransition(session.state, "starting")) {
+      return reply.code(409).send({ error: "Session is already live" });
+    }
+    if (!session.agentSessionId) {
+      return reply.code(409).send({ error: "Session has no resumable agent id" });
+    }
+    const placement = store.getPlacement(session.placementId);
+    if (!placement) return reply.code(409).send({ error: "Placement was removed" });
+    const sent = commandFor(session.nodeId, {
+      type: "resume_session",
+      commandId: randomUUID(),
+      sessionId: id,
+      localPath: placement.localPath,
+      agentSessionId: session.agentSessionId,
+      sequenceOffset: store.maxEventSequence(id),
+    });
+    if (!sent) return reply.code(503).send({ error: "Node is offline" });
+    publishSession(store.transitionSession(id, "starting", "Resuming Copilot session"));
+    return reply.code(202).send({ ok: true });
+  });
+
   app.post("/api/sessions/:id/cancel", async (request, reply) => {
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
@@ -347,8 +375,9 @@ export async function buildServer(options: {
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
     if (!session) return reply.code(404).send({ error: "Session not found" });
+    // Idempotent: dismissing a corpse from the UI should not toast an error.
     if (terminalSessionStates.has(session.state)) {
-      return reply.code(409).send({ error: "Session is already terminal" });
+      return reply.code(200).send({ ok: true, alreadyTerminal: true });
     }
     const sent = commandFor(session.nodeId, {
       type: "stop",
@@ -360,6 +389,24 @@ export async function buildServer(options: {
       publishSession(stopped);
     }
     return reply.code(sent ? 202 : 200).send({ ok: true });
+  });
+
+  app.delete("/api/sessions/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getSession(id)) return reply.code(404).send({ error: "Session not found" });
+    try {
+      store.deleteSession(id);
+    } catch (error) {
+      return reply
+        .code(409)
+        .send({ error: error instanceof Error ? error.message : "Cannot dismiss session" });
+    }
+    return reply.code(204).send();
+  });
+
+  app.delete("/api/sessions", async (_request, reply) => {
+    const removed = store.deleteEndedSessions();
+    return { removed };
   });
 
   app.post("/api/sessions/:id/permission", async (request, reply) => {
@@ -422,9 +469,12 @@ export async function buildServer(options: {
       }
       nodeSockets.set(hello.nodeId, socket);
       store.setNodeHomeDir(hello.nodeId, hello.homeDir);
-      const node = store.setNodeOnline(hello.nodeId, true, 0);
+      const activeSessionIds = hello.activeSessionIds ?? [];
+      const node = store.setNodeOnline(hello.nodeId, true, activeSessionIds.length);
       if (node) broadcast({ type: "node", node });
-      publishReconciled(store.reconcileOfflineSessions(hello.nodeId, []));
+      publishReconciled(
+        store.reconcileOfflineSessions(hello.nodeId, activeSessionIds),
+      );
       send(socket, { type: "welcome", nodeId: hello.nodeId });
 
       socket.on("message", (raw) => {
@@ -571,12 +621,12 @@ export async function buildServer(options: {
     closing = true;
     clearInterval(heartbeatTimer);
     await tunnel.stop();
-    for (const nodeId of nodeSockets.keys()) {
-      publishReconciled(
-        store.markNodeSessionsFailed(nodeId, "Host stopped; Node execution was terminated"),
-      );
+    // Mark offline rather than failed so a quick Host restart (tsx watch,
+    // deploy bounce) can resurrect agents the Node kept alive.
+    for (const [nodeId, socket] of [...nodeSockets.entries()]) {
+      disconnectNode(nodeId, "Host stopped; waiting for Node reconnect");
+      socket.close();
     }
-    for (const socket of nodeSockets.values()) socket.close();
     for (const socket of browserSockets) socket.close();
     store.close();
   });

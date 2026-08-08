@@ -25,6 +25,8 @@ type SessionFocusDialogProps = {
   onPrompt: (prompt: string) => void;
   onCancel: () => void;
   onStop: () => void;
+  onDismiss: () => void;
+  onResume: () => void;
   onPermission: (
     requestId: string,
     outcome: "allow_once" | "deny",
@@ -40,6 +42,8 @@ export const SessionFocusDialog = ({
   onPrompt,
   onCancel,
   onStop,
+  onDismiss,
+  onResume,
   onPermission,
 }: SessionFocusDialogProps) => {
   const styles = useStyles();
@@ -58,6 +62,8 @@ export const SessionFocusDialog = ({
           onPrompt={onPrompt}
           onCancel={onCancel}
           onStop={onStop}
+          onDismiss={onDismiss}
+          onResume={onResume}
           onPermission={onPermission}
           onClose={handleClose}
         />
