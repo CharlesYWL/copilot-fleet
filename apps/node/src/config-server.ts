@@ -3,6 +3,7 @@ import { z } from "zod";
 import { SettingsSchema, type Settings } from "./settings.js";
 import { CONFIG_PAGE } from "./config-page.js";
 import { FleetClient } from "./fleet-client.js";
+import { pickFolder } from "./pick-folder.js";
 import { inspectPath } from "./path-check.js";
 
 /** An id turns create into update; the page uses one form for both. */
@@ -136,6 +137,20 @@ export function startConfigServer(options: ConfigServerOptions): Server {
             ? String((input as { path: unknown }).path)
             : "";
         send(200, inspectPath(path));
+      });
+      return;
+    }
+
+    if (request.method === "POST" && url === "/api/pick-folder") {
+      readBody(async (body) => {
+        const input: unknown = JSON.parse(body);
+        const start =
+          input && typeof input === "object" && "path" in input
+            ? String((input as { path: unknown }).path)
+            : "";
+        // The dialog opens on this machine's display, so this only resolves
+        // once whoever is sitting there answers it.
+        send(200, await pickFolder(start));
       });
       return;
     }

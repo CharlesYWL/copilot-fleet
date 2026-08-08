@@ -147,8 +147,10 @@ export const CONFIG_PAGE = `<!doctype html>
       </label>
       <div class="row">
         <input id="plPath" placeholder="/Users/me/project" />
+        <button type="button" id="plBrowse">Browse…</button>
         <button type="button" id="plAdd">Add</button>
       </div>
+      <div class="hint">Browse opens a folder dialog on this node's own screen.</div>
       <div class="check" id="plCheck"></div>
     </div>
     <div id="plMsg"></div>
@@ -264,6 +266,8 @@ export const CONFIG_PAGE = `<!doctype html>
               esc(p.workspaceName || p.workspaceId) +
               '</div><div class="row"><input data-pl="' + esc(p.id) +
               '" value="' + esc(p.localPath) + '" />' +
+              '<button type="button" data-pl-browse="' + esc(p.id) +
+              '">Browse…</button>' +
               '<button type="button" data-pl-save="' + esc(p.id) +
               '">Save</button></div>' +
               '<div class="check" data-check="' + esc(p.id) + '"></div></div>',
@@ -375,6 +379,47 @@ export const CONFIG_PAGE = `<!doctype html>
   });
 
   void loadFleet();
+
+  // ---- Native folder picker ----
+  // The dialog opens on the node's own display, so this waits for someone
+  // sitting at that machine. The button says so while it waits, otherwise a
+  // remote operator just sees it hang.
+
+  const openPicker = async (targetInput, button, check) => {
+    const label = button.textContent;
+    button.disabled = true;
+    button.textContent = "Waiting…";
+    try {
+      const result = await post("/api/pick-folder", {
+        path: targetInput.value.trim(),
+      });
+      if (result.ok) {
+        targetInput.value = result.path;
+        await checkPath(result.path, check);
+      } else if (!result.canceled) {
+        note("plMsg", result.reason, false);
+      }
+    } catch (error) {
+      note("plMsg", error.message, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = label;
+    }
+  };
+
+  $("plBrowse").addEventListener("click", (event) => {
+    void openPicker($("plPath"), event.target, $("plCheck"));
+  });
+
+  $("placements").addEventListener("click", (event) => {
+    const id = event.target.dataset ? event.target.dataset.plBrowse : undefined;
+    if (!id) return;
+    void openPicker(
+      document.querySelector('[data-pl="' + id + '"]'),
+      event.target,
+      document.querySelector('[data-check="' + id + '"]'),
+    );
+  });
 </script>
 </body>
 </html>`;
