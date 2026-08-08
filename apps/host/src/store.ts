@@ -60,6 +60,7 @@ export class FleetStore {
     `);
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "yolo", "INTEGER NOT NULL DEFAULT 0");
   }
 
   getSetting(key: string): string | undefined {
@@ -89,6 +90,15 @@ export class FleetStore {
     const stored = this.getSetting("tunnel.provider");
     const parsed = TunnelProviderSchema.safeParse(stored);
     return parsed.success ? parsed.data : "cloudflare";
+  }
+
+  /** Preselected in the new-session dialog; each session stores its own copy. */
+  getDefaultYolo(): boolean {
+    return this.getSetting("defaults.yolo") !== "0";
+  }
+
+  setDefaultYolo(yolo: boolean): void {
+    this.setSetting("defaults.yolo", yolo ? "1" : "0");
   }
 
   setTunnelProvider(provider: TunnelProvider): void {
@@ -314,14 +324,14 @@ export class FleetStore {
     ).map(placementFromRow);
   }
 
-  createSession(placement: Placement, prompt: string): FleetSession {
+  createSession(placement: Placement, prompt: string, yolo = false): FleetSession {
     const now = new Date().toISOString();
     const id = randomUUID();
     this.db
       .prepare(
         `INSERT INTO sessions
-         (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+         (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -334,6 +344,7 @@ export class FleetStore {
         "",
         now,
         now,
+        yolo ? 1 : 0,
       );
     return this.getSession(id)!;
   }
@@ -586,5 +597,6 @@ function sessionFromRow(row: Row): FleetSession {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     agentSessionId: String(row.agent_session_id ?? ""),
+    yolo: Number(row.yolo ?? 0) === 1,
   };
 }

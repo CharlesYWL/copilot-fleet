@@ -52,6 +52,27 @@ describe("FleetStore", () => {
     expect(store.authenticateNode(node.id, reclaimed.secret)).toBe(true);
   });
 
+  it("keeps each session's yolo choice independent of the current default", () => {
+    const { store, placement } = setup();
+    const yolo = store.createSession(placement, "hello", true);
+    const safe = store.createSession(placement, "hello", false);
+
+    // Flipping the default must not rewrite sessions that already exist,
+    // otherwise a running agent would silently change permission behaviour.
+    store.setDefaultYolo(false);
+
+    expect(store.getSession(yolo.id)?.yolo).toBe(true);
+    expect(store.getSession(safe.id)?.yolo).toBe(false);
+    expect(store.getDefaultYolo()).toBe(false);
+  });
+
+  it("defaults yolo on until it is explicitly turned off", () => {
+    const { store } = setup();
+    expect(store.getDefaultYolo()).toBe(true);
+    store.setDefaultYolo(false);
+    expect(store.getDefaultYolo()).toBe(false);
+  });
+
   it("resumes a stopped session all the way to idle", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");

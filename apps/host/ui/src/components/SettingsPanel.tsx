@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Tab, TabList, makeStyles, tokens } from "@fluentui/react-components";
 import type { FleetNode, Placement, Workspace } from "@fleet/protocol";
 import { NodesPanel } from "./NodesPanel";
+import { GeneralPanel } from "./GeneralPanel";
 import { TunnelPanel } from "./TunnelPanel";
 import { WorkspacesPanel } from "./WorkspacesPanel";
 
@@ -27,7 +28,7 @@ const useStyles = makeStyles({
   },
 });
 
-type SettingsTab = "tunnel" | "nodes" | "workspaces";
+type SettingsTab = "general" | "tunnel" | "nodes" | "workspaces";
 
 type SettingsPanelProps = {
   workspaces: Workspace[];
@@ -53,7 +54,7 @@ type SettingsPanelProps = {
 
 export const SettingsPanel = (props: SettingsPanelProps) => {
   const styles = useStyles();
-  const [tab, setTab] = useState<SettingsTab>("tunnel");
+  const [tab, setTab] = useState<SettingsTab>("general");
 
   return (
     <div className={styles.root}>
@@ -63,12 +64,14 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
           onTabSelect={(_event, data) => setTab(data.value as SettingsTab)}
           aria-label="Settings sections"
         >
+          <Tab value="general">General</Tab>
           <Tab value="tunnel">Tunnel</Tab>
           <Tab value="nodes">Nodes</Tab>
           <Tab value="workspaces">Workspaces</Tab>
         </TabList>
       </div>
       <div className={styles.body}>
+        {tab === "general" && <GeneralPanel />}
         {tab === "tunnel" && <TunnelPanel />}
         {tab === "nodes" && (
           <NodesPanel

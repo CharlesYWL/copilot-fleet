@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import {
+  Badge,
   Button,
   Text,
   Textarea,
@@ -273,6 +274,11 @@ export const TerminalView = ({
               {session.state}
             </span>
             <Text weight="semibold">{session.workspaceName}</Text>
+            {session.yolo && (
+              <Badge appearance="tint" color="warning" size="small">
+                YOLO
+              </Badge>
+            )}
           </span>
           <Text className={styles.subtitle}>
             {session.nodeName} · {session.id.slice(0, 8)} · {session.currentActivity}

@@ -30,10 +30,18 @@ export class CommandRouter {
 
   constructor(
     private readonly factory: AgentFactory,
-    private readonly maxSessions: number,
+    private maxSessions: number,
     private readonly emit: (event: SessionEvent) => void,
     private readonly validatePath: (path: string) => Promise<string> = validateWorkspacePath,
   ) {}
+
+  /**
+   * Capacity edits apply to future launches only; sessions already running
+   * above the new limit keep going rather than being killed mid-task.
+   */
+  setMaxSessions(maxSessions: number): void {
+    this.maxSessions = maxSessions;
+  }
 
   get activeSessionIds(): string[] {
     return [...this.slots.keys()];
@@ -138,8 +146,9 @@ export class CommandRouter {
           ? {
               resumeAgentSessionId: command.agentSessionId,
               sequenceOffset: command.sequenceOffset,
+              yolo: command.yolo,
             }
-          : {},
+          : { yolo: command.yolo },
       );
       slot.agent = agent;
       if (this.slots.get(command.sessionId) !== slot) {

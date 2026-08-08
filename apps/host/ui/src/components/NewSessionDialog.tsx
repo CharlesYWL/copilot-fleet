@@ -9,8 +9,10 @@ import {
   DialogTitle,
   Field,
   Select,
+  Switch,
   Textarea,
   makeStyles,
+  tokens,
 } from "@fluentui/react-components";
 import type { Placement } from "@fleet/protocol";
 
@@ -20,30 +22,39 @@ const useStyles = makeStyles({
     flexDirection: "column",
     gap: "14px",
   },
+  yoloHint: {
+    color: tokens.colorNeutralForeground3,
+    fontSize: tokens.fontSizeBase200,
+    marginTop: "2px",
+  },
 });
 
 type NewSessionDialogProps = {
   open: boolean;
   placements: Placement[];
+  defaultYolo: boolean;
   onOpenChange: (open: boolean) => void;
-  onCreate: (placementId: string, prompt: string) => Promise<boolean>;
+  onCreate: (placementId: string, prompt: string, yolo: boolean) => Promise<boolean>;
 };
 
 export const NewSessionDialog = ({
   open,
   placements,
+  defaultYolo,
   onOpenChange,
   onCreate,
 }: NewSessionDialogProps) => {
   const styles = useStyles();
   const [placementId, setPlacementId] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [yolo, setYolo] = useState(defaultYolo);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setPrompt("");
-  }, [open]);
+    setYolo(defaultYolo);
+  }, [open, defaultYolo]);
 
   // Node heartbeats hand down a fresh placements array every few seconds, so
   // only correct the selection when it actually stopped being valid.
@@ -60,7 +71,7 @@ export const NewSessionDialog = ({
     event.preventDefault();
     if (!placementId || prompt.trim().length === 0) return;
     setSubmitting(true);
-    const created = await onCreate(placementId, prompt.trim());
+    const created = await onCreate(placementId, prompt.trim(), yolo);
     setSubmitting(false);
     if (created) onOpenChange(false);
   };
@@ -98,6 +109,19 @@ export const NewSessionDialog = ({
                   placeholder="Describe the first task for this agent…"
                   resize="vertical"
                 />
+              </Field>
+              <Field label="YOLO mode">
+                <Switch
+                  checked={yolo}
+                  label={yolo ? "Allow all tools without asking" : "Ask before each tool"}
+                  onChange={(_event, data) => setYolo(data.checked)}
+                />
+                <span className={styles.yoloHint}>
+                  Runs Copilot with --allow-all, so it executes commands on{" "}
+                  {placements.find((item) => item.id === placementId)?.nodeName ??
+                    "the node"}{" "}
+                  without waiting for approval.
+                </span>
               </Field>
             </DialogContent>
             <DialogActions>

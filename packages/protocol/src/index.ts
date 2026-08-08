@@ -69,6 +69,8 @@ export const SessionSchema = z.object({
   updatedAt: z.string().datetime(),
   /** Copilot's own ACP session id, needed to resume the conversation. */
   agentSessionId: z.string().default(""),
+  /** Runs Copilot with --allow-all: no permission prompts for this session. */
+  yolo: z.boolean().default(false),
 });
 export type FleetSession = z.infer<typeof SessionSchema>;
 
@@ -106,6 +108,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
     prompt: z.string().min(1),
+    /** Launches Copilot with --allow-all; decided by the Host. */
+    yolo: z.boolean().default(false),
   }),
   z.object({
     type: z.literal("resume_session"),
@@ -115,6 +119,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     agentSessionId: z.string().min(1),
     /** Continues the host's event sequence so replayed rows stay ordered. */
     sequenceOffset: z.number().int().nonnegative().default(0),
+    yolo: z.boolean().default(false),
   }),
   z.object({
     type: z.literal("prompt"),
@@ -224,6 +229,12 @@ export const UpdatePlacementSchema = z.object({
 export const CreateSessionSchema = z.object({
   placementId: z.string().min(1),
   prompt: z.string().min(1).max(100_000),
+  /** Omitted means "use the Host default". */
+  yolo: z.boolean().optional(),
+});
+
+export const UpdateDefaultsSchema = z.object({
+  yolo: z.boolean(),
 });
 
 export const PromptSchema = z.object({
@@ -273,6 +284,11 @@ export const TunnelInfoSchema = z.object({
   binaryPresent: z.boolean(),
   /** Every supported provider plus whether its CLI is installed. */
   providers: z.array(TunnelProviderInfoSchema),
+  /**
+   * True when the tunnel runs as its own process outside the Host, so the URL
+   * survives Host restarts and the Host must not try to start or stop it.
+   */
+  external: z.boolean().default(false),
 });
 export type TunnelInfo = z.infer<typeof TunnelInfoSchema>;
 

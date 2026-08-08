@@ -20,6 +20,7 @@ import {
   RenameNodeSchema,
   SessionStateSchema,
   UpdatePlacementSchema,
+  UpdateDefaultsSchema,
   UpdateTunnelSchema,
   UpdateWorkspaceSchema,
   canTransition,
@@ -27,6 +28,7 @@ import {
   tryParseJson,
   type BrowserMessage,
   type FleetSession,
+  type FleetNode,
   type NodeCommand,
   type SessionEvent,
 } from "@fleet/protocol";
@@ -127,6 +129,12 @@ export async function buildServer(options: {
       });
     }
     return tunnel.info(fallbackPublicUrl());
+  });
+  app.get("/api/defaults", async () => ({ yolo: store.getDefaultYolo() }));
+  app.post("/api/defaults", async (request) => {
+    const input = UpdateDefaultsSchema.parse(request.body);
+    store.setDefaultYolo(input.yolo);
+    return { yolo: store.getDefaultYolo() };
   });
   app.get("/api/snapshot", async () => ({
     nodes: store.listNodes(),
@@ -276,7 +284,10 @@ export async function buildServer(options: {
     if (reserved >= node.maxSessions) {
       return reply.code(409).send({ error: "Node is at capacity" });
     }
-    const session = store.createSession(placement, input.prompt);
+    const yolo = input.yolo ?? store.getDefaultYolo();
+    const unsupported = yoloUnsupportedReason(node, yolo);
+    if (unsupported) return reply.code(409).send({ error: unsupported });
+    const session = store.createSession(placement, input.prompt, yolo);
     publishSession(session);
     const command: NodeCommand = {
       type: "start_session",
@@ -284,6 +295,7 @@ export async function buildServer(options: {
       sessionId: session.id,
       localPath: placement.localPath,
       prompt: input.prompt,
+      yolo,
     };
     if (!commandFor(node.id, command)) {
       const failed = store.transitionSession(
@@ -339,6 +351,9 @@ export async function buildServer(options: {
     }
     const placement = store.getPlacement(session.placementId);
     if (!placement) return reply.code(409).send({ error: "Placement was removed" });
+    const node = store.getNode(session.nodeId);
+    const unsupported = node && yoloUnsupportedReason(node, session.yolo);
+    if (unsupported) return reply.code(409).send({ error: unsupported });
     const sent = commandFor(session.nodeId, {
       type: "resume_session",
       commandId: randomUUID(),
@@ -346,6 +361,7 @@ export async function buildServer(options: {
       localPath: placement.localPath,
       agentSessionId: session.agentSessionId,
       sequenceOffset: store.maxEventSequence(id),
+      yolo: session.yolo,
     });
     if (!sent) return reply.code(503).send({ error: "Node is offline" });
     publishSession(store.transitionSession(id, "starting", "Resuming Copilot session"));
@@ -650,6 +666,19 @@ export async function buildServer(options: {
  * not dialable, so they fall back to loopback and the operator is expected to
  * set FLEET_PUBLIC_URL once the Host is reachable from outside.
  */
+/**
+ * Older node agents ignore the yolo flag and always launch Copilot with
+ * prompts enabled. The Host must refuse rather than downgrade, because the UI
+ * badge would otherwise promise unattended execution that never happens.
+ */
+export function yoloUnsupportedReason(
+  node: Pick<FleetNode, "name" | "capabilities">,
+  yolo: boolean,
+): string | undefined {
+  if (!yolo || node.capabilities.includes("host-yolo")) return undefined;
+  return `Node "${node.name}" runs an older agent that cannot apply YOLO mode. Update and restart it, or turn YOLO off for this session.`;
+}
+
 export function resolvePublicHostUrl(
   publicUrl: string | undefined,
   host: string | undefined,

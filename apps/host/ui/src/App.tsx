@@ -62,7 +62,16 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [defaultYolo, setDefaultYolo] = useState(true);
   const backfilled = useRef(new Set<string>());
+
+  // Read the Host default when the dialog opens so it reflects Settings edits.
+  useEffect(() => {
+    if (!dialogOpen) return;
+    void api<{ yolo: boolean }>("/api/defaults")
+      .then((defaults) => setDefaultYolo(defaults.yolo))
+      .catch(() => undefined);
+  }, [dialogOpen]);
 
   const visibleSessions = useMemo(
     () => filterVisibleSessions(snapshot.sessions, selectedSessionId),
@@ -170,11 +179,15 @@ export function App() {
 
   usePermissionAlerts(waitingPermissions, handleSelectSession);
 
-  const handleCreateSession = async (placementId: string, prompt: string) => {
+  const handleCreateSession = async (
+    placementId: string,
+    prompt: string,
+    yolo: boolean,
+  ) => {
     try {
       const session = await api<FleetSession>("/api/sessions", {
         method: "POST",
-        body: JSON.stringify({ placementId, prompt }),
+        body: JSON.stringify({ placementId, prompt, yolo }),
       });
       setSelectedSessionId(session.id);
       setView("session");
@@ -377,6 +390,7 @@ export function App() {
       <NewSessionDialog
         open={dialogOpen}
         placements={eligiblePlacements}
+        defaultYolo={defaultYolo}
         onOpenChange={setDialogOpen}
         onCreate={handleCreateSession}
       />

@@ -24,6 +24,8 @@ export type StartAgentOptions = {
   resumeAgentSessionId?: string;
   /** First event sequence number to use, so resumed runs keep ordering. */
   sequenceOffset?: number;
+  /** Launch Copilot with --allow-all. The Host owns this decision. */
+  yolo?: boolean;
 };
 
 export interface AgentFactory {
@@ -91,6 +93,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     sink: EventSink,
     private readonly permissionTimeoutMs: number,
     sequenceOffset = 0,
+    private readonly yolo = false,
+    private readonly copilotCommand = "",
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -100,8 +104,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       state: "starting",
       activity: resumeAgentSessionId ? "Resuming Copilot ACP" : "Starting Copilot ACP",
     });
-    const executable = process.env.FLEET_COPILOT_COMMAND ?? "copilot";
-    const args = copilotLaunchArgs();
+    const executable =
+      this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot";
+    const args = copilotLaunchArgs(this.yolo);
     // npm installs a CLI on Windows as a .cmd shim, which CreateProcess cannot
     // launch directly; the shell can, but then the path has to be quoted.
     const viaShell = process.platform === "win32";
@@ -313,10 +318,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
 
 export class AcpAgentFactory implements AgentFactory {
   constructor(
-    private readonly permissionTimeoutMs = Number(
-      process.env.PERMISSION_TIMEOUT_MS ?? 30_000,
-    ),
+    private permissionTimeoutMs = Number(process.env.PERMISSION_TIMEOUT_MS ?? 30_000),
+    private copilotCommand = process.env.FLEET_COPILOT_COMMAND ?? "",
   ) {}
+
+  /** Lets the local config UI retune the agent without a process restart. */
+  configure(permissionTimeoutMs: number, copilotCommand: string): void {
+    this.permissionTimeoutMs = permissionTimeoutMs;
+    this.copilotCommand = copilotCommand;
+  }
 
   async start(
     sessionId: string,
@@ -329,6 +339,8 @@ export class AcpAgentFactory implements AgentFactory {
       sink,
       this.permissionTimeoutMs,
       options.sequenceOffset ?? 0,
+      options.yolo ?? false,
+      this.copilotCommand,
     );
     try {
       await agent.start(cwd, options.resumeAgentSessionId);
@@ -401,23 +413,12 @@ export class MockAgentFactory implements AgentFactory {
 
 /**
  * Copilot's --allow-all / --yolo: tools, paths, and URLs all run without
- * prompts. FLEET_ALLOW_ALL_TOOLS remains as a synonym for older .env files.
+ * prompts. The Host decides this per session, so the node no longer reads the
+ * environment and one machine cannot silently diverge from what the UI shows.
  */
-export function isYoloEnabled(
-  env: NodeJS.ProcessEnv = process.env,
-): boolean {
-  return (
-    env.FLEET_YOLO === "1" ||
-    env.FLEET_ALLOW_ALL === "1" ||
-    env.FLEET_ALLOW_ALL_TOOLS === "1"
-  );
-}
-
-export function copilotLaunchArgs(
-  env: NodeJS.ProcessEnv = process.env,
-): string[] {
+export function copilotLaunchArgs(yolo: boolean): string[] {
   const args = ["--acp", "--stdio"];
-  if (isYoloEnabled(env)) args.push("--allow-all");
+  if (yolo) args.push("--allow-all");
   return args;
 }
 

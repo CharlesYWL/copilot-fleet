@@ -3,7 +3,28 @@ import {
   resolveEnrollmentHostUrl,
   resolveEnrollmentToken,
   resolvePublicHostUrl,
+  yoloUnsupportedReason,
 } from "./server.js";
+
+describe("yolo capability guard", () => {
+  const node = (capabilities: string[]) => ({ name: "WEILI-PC", capabilities });
+
+  it("allows yolo on a node that reports the capability", () => {
+    expect(
+      yoloUnsupportedReason(node(["copilot-acp", "host-yolo"]), true),
+    ).toBeUndefined();
+  });
+
+  it("refuses yolo on an older node instead of downgrading silently", () => {
+    const reason = yoloUnsupportedReason(node(["copilot-acp"]), true);
+    expect(reason).toMatch(/WEILI-PC/);
+    expect(reason).toMatch(/YOLO/);
+  });
+
+  it("leaves non-yolo sessions alone on older nodes", () => {
+    expect(yoloUnsupportedReason(node(["copilot-acp"]), false)).toBeUndefined();
+  });
+});
 
 describe("production enrollment token", () => {
   it("rejects missing and default production tokens", () => {
