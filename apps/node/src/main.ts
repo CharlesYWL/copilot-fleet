@@ -1,5 +1,5 @@
 import { config as loadEnv } from "dotenv";
-import { arch, homedir, hostname, platform } from "node:os";
+import { arch, homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import {
@@ -9,7 +9,7 @@ import {
   tryParseJson,
   type NodeToHostMessage,
 } from "@fleet/protocol";
-import { AcpAgentFactory, MockAgentFactory, isYoloEnabled } from "./agents.js";
+import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
 import {
   configDirectory,
   loadCredentials,
@@ -22,13 +22,13 @@ import {
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
 import { CommandRouter } from "./router.js";
+import { startConfigServer } from "./config-server.js";
+import { loadSettings, needsReconnect, saveSettings, type Settings } from "./settings.js";
 
 loadEnv({ path: fileURLToPath(new URL("../../../.env", import.meta.url)), quiet: true });
 
 const VERSION = "0.1.0";
-const hostUrl = process.env.FLEET_HOST_URL ?? "http://127.0.0.1:8787";
-const nodeName = process.env.FLEET_NODE_NAME ?? hostname();
-const maxSessions = Number(process.env.FLEET_MAX_SESSIONS ?? 4);
+let settings = await loadSettings();
 const mockAgent = process.env.FLEET_MOCK_AGENT === "1";
 
 function log(message: string): void {
@@ -36,11 +36,11 @@ function log(message: string): void {
 }
 
 log(`copilot-fleet node ${VERSION} starting`);
-log(`  name        ${nodeName}`);
-log(`  host        ${hostUrl}`);
+log(`  name        ${settings.nodeName}`);
+log(`  host        ${settings.hostUrl}`);
 log(`  agent       ${mockAgent ? "mock" : "copilot --acp"}`);
-log(`  permissions ${mockAgent ? "n/a" : isYoloEnabled() ? "yolo (--allow-all)" : "prompt"}`);
-log(`  capacity    ${maxSessions} concurrent sessions`);
+log(`  permissions ${mockAgent ? "n/a" : "per session (Host decides)"}`);
+log(`  capacity    ${settings.maxSessions} concurrent sessions`);
 log(`  config      ${configDirectory()}`);
 
 const instanceLock = acquireInstanceLock(configDirectory());
@@ -51,39 +51,99 @@ if (!instanceLock.ok) {
 const releaseInstanceLock = instanceLock.release;
 process.once("exit", () => releaseInstanceLock());
 
-let credentials = await loadCredentials();
-// The host URL is just where to reach the Host, not part of this node's
-// identity: tunnel providers hand out a fresh URL on every restart, and
-// re-registering under the same name collides with the unique name index.
-if (!credentials || credentials.name !== nodeName) {
-  log(credentials ? "Node name changed, registering again" : "No stored credentials, registering");
-  credentials = await register();
-  await saveCredentials(credentials);
-  log(`Registered as node ${credentials.nodeId}`);
-} else {
-  if (credentials.hostUrl !== hostUrl) {
-    log(`Host URL changed to ${hostUrl}, reusing node ${credentials.nodeId}`);
-    credentials = { ...credentials, hostUrl };
-    await saveCredentials(credentials);
-  }
-  log(`Reusing stored credentials for node ${credentials.nodeId}`);
-}
+let credentials = await ensureCredentials();
 
-const factory = mockAgent ? new MockAgentFactory() : new AcpAgentFactory();
+const factory = mockAgent
+  ? new MockAgentFactory()
+  : new AcpAgentFactory(settings.permissionTimeoutMs, settings.copilotCommand);
 let socket: WebSocket | undefined;
 let shuttingDown = false;
-const router = new CommandRouter(factory, maxSessions, (event) => {
+let reconnectTimer: NodeJS.Timeout | undefined;
+const router = new CommandRouter(factory, settings.maxSessions, (event) => {
   send({ type: "event", event });
 });
 
-connect(credentials);
+/**
+ * Registers when the stored identity is missing or the operator renamed this
+ * node. The host URL is deliberately not part of the identity: tunnel providers
+ * hand out a fresh URL constantly, and re-registering under the same name
+ * collides with the unique name index.
+ */
+async function ensureCredentials(): Promise<Credentials> {
+  const stored = await loadCredentials();
+  if (!stored || stored.name !== settings.nodeName) {
+    log(stored ? "Node name changed, registering again" : "No stored credentials, registering");
+    const registered = await register();
+    await saveCredentials(registered);
+    log(`Registered as node ${registered.nodeId}`);
+    return registered;
+  }
+  if (stored.hostUrl !== settings.hostUrl) {
+    log(`Host URL changed to ${settings.hostUrl}, reusing node ${stored.nodeId}`);
+    const moved = { ...stored, hostUrl: settings.hostUrl };
+    await saveCredentials(moved);
+    return moved;
+  }
+  log(`Reusing stored credentials for node ${stored.nodeId}`);
+  return stored;
+}
 
-function connect(auth: Credentials): void {
+/**
+ * Applies edits from the local config UI without restarting the process, so a
+ * rotated tunnel URL no longer costs a manual restart on every node.
+ */
+async function applySettings(next: Settings): Promise<void> {
+  const previous = settings;
+  settings = next;
+  await saveSettings(next);
+  router.setMaxSessions(next.maxSessions);
+  if (factory instanceof AcpAgentFactory) {
+    factory.configure(next.permissionTimeoutMs, next.copilotCommand);
+  }
+  if (!needsReconnect(previous, next)) {
+    log("Settings updated; no reconnect needed");
+    return;
+  }
+  log(`Settings changed; reconnecting to ${next.hostUrl}`);
+  credentials = await ensureCredentials();
+  reconnect();
+}
+
+/** Drops the current socket so the next connect uses the latest credentials. */
+function reconnect(): void {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  const current = socket;
+  socket = undefined;
+  // Removing listeners first stops the close handler from scheduling its own
+  // retry against the URL we are moving away from.
+  current?.removeAllListeners();
+  current?.close();
+  connect();
+}
+
+const configServer = startConfigServer({
+  getSettings: () => settings,
+  getStatus: () => ({
+    nodeId: credentials.nodeId,
+    version: VERSION,
+    connected: socket?.readyState === WebSocket.OPEN,
+    activeSessions: router.activeSessionIds.length,
+    mockAgent,
+  }),
+  applySettings,
+  log,
+});
+
+connect();
+
+function connect(): void {
+  const auth = credentials;
   const url = new URL("/ws/node", auth.hostUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   log(`Connecting to ${url}`);
-  socket = new WebSocket(url);
-  socket.on("open", () => {
+  const active = new WebSocket(url);
+  socket = active;
+  active.on("open", () => {
     send({
       type: "hello",
       nodeId: auth.nodeId,
@@ -91,23 +151,23 @@ function connect(auth: Credentials): void {
       os: platform(),
       arch: arch(),
       version: VERSION,
-      capabilities: ["copilot-acp", mockAgent ? "mock" : "real"],
-      maxSessions,
+      capabilities: ["copilot-acp", "host-yolo", mockAgent ? "mock" : "real"],
+      maxSessions: settings.maxSessions,
       homeDir: homedir(),
       activeSessionIds: router.activeSessionIds,
     });
   });
-  socket.on("message", async (raw) => {
+  active.on("message", async (raw) => {
     const frame = tryParseJson(raw.toString());
     if (!frame.ok) {
       console.error("Rejected malformed Host message:", frame.error);
-      socket?.close(1007, "Malformed JSON");
+      active.close(1007, "Malformed JSON");
       return;
     }
     const parsed = HostToNodeMessageSchema.safeParse(frame.value);
     if (!parsed.success) {
       console.error("Rejected invalid Host message:", parsed.error.message);
-      socket?.close(1008, "Invalid Host message");
+      active.close(1008, "Invalid Host message");
       return;
     }
     if (parsed.data.type === "welcome") {
@@ -131,7 +191,10 @@ function connect(auth: Credentials): void {
       ...(result.error ? { error: result.error } : {}),
     });
   });
-  socket.on("close", async (code) => {
+  active.on("close", async (code) => {
+    // A settings change swaps the socket out; the stale one must not tear down
+    // agents or schedule a retry against the URL we just left.
+    if (socket !== active) return;
     if (!shouldReconnectAfterClose(code, shuttingDown)) {
       // Only tear agents down when this process is done; a Host bounce must
       // not wipe live sessions that we are about to re-announce on hello.
@@ -150,9 +213,9 @@ function connect(auth: Credentials): void {
     log(
       `Disconnected (code ${code}); keeping ${router.activeSessionIds.length} session(s), reconnecting in 2s`,
     );
-    setTimeout(() => connect(auth), 2_000);
+    reconnectTimer = setTimeout(connect, 2_000);
   });
-  socket.on("error", (error) => {
+  active.on("error", (error) => {
     console.error("Host connection error:", error.message);
   });
 }
@@ -177,15 +240,15 @@ async function register(): Promise<Credentials> {
   }
   const body = RegisterNodeSchema.parse({
     enrollmentToken,
-    name: nodeName,
+    name: settings.nodeName,
     os: platform(),
     arch: arch(),
     version: VERSION,
-    capabilities: ["copilot-acp"],
-    maxSessions,
+    capabilities: ["copilot-acp", "host-yolo"],
+    maxSessions: settings.maxSessions,
     homeDir: homedir(),
   });
-  const response = await fetch(new URL("/api/nodes/register", hostUrl), {
+  const response = await fetch(new URL("/api/nodes/register", settings.hostUrl), {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -194,11 +257,18 @@ async function register(): Promise<Credentials> {
     throw new Error(`Node registration failed (${response.status}): ${await response.text()}`);
   }
   const result = (await response.json()) as { nodeId: string; secret: string };
-  return { hostUrl, nodeId: result.nodeId, secret: result.secret, name: nodeName };
+  return {
+    hostUrl: settings.hostUrl,
+    nodeId: result.nodeId,
+    secret: result.secret,
+    name: settings.nodeName,
+  };
 }
 
 async function shutdown(): Promise<void> {
   shuttingDown = true;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  configServer.close();
   socket?.close();
   await router.stopAll();
 }
