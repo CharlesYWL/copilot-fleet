@@ -125,6 +125,19 @@ export async function buildServer(options: {
   };
   const publishSession = (session: FleetSession) =>
     broadcast({ type: "session", session });
+  /**
+   * Announces the workspace/placement catalog after any edit to it.
+   *
+   * Called from every mutating route rather than derived from the store,
+   * because these are now edited from node config pages too, and a browser that
+   * only updated on its own writes would quietly show stale paths.
+   */
+  const publishCatalog = () =>
+    broadcast({
+      type: "catalog",
+      workspaces: store.listWorkspaces(),
+      placements: store.listPlacements(),
+    });
   const commandFor = (nodeId: string, command: NodeCommand): boolean => {
     const socket = nodeSockets.get(nodeId);
     if (!socket || socket.readyState !== socket.OPEN) return false;
@@ -223,6 +236,8 @@ export async function buildServer(options: {
     if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
     try {
       store.deleteNode(id);
+      // Deleting a node takes its placements with it, so the catalog moved too.
+      publishCatalog();
     } catch (error) {
       return reply
         .code(409)
@@ -239,7 +254,9 @@ export async function buildServer(options: {
   app.post("/api/workspaces", async (request, reply) => {
     const input = CreateWorkspaceSchema.parse(request.body);
     try {
-      return reply.code(201).send(store.createWorkspace(input.name, input.description));
+      const workspace = store.createWorkspace(input.name, input.description);
+      publishCatalog();
+      return reply.code(201).send(workspace);
     } catch (error) {
       return reply
         .code(409)
@@ -252,7 +269,9 @@ export async function buildServer(options: {
     const input = UpdateWorkspaceSchema.parse(request.body);
     if (!store.getWorkspace(id)) return reply.code(404).send({ error: "Unknown workspace" });
     try {
-      return store.updateWorkspace(id, input.name, input.description);
+      const workspace = store.updateWorkspace(id, input.name, input.description);
+      publishCatalog();
+      return workspace;
     } catch {
       return reply.code(409).send({ error: `A workspace named "${input.name}" already exists` });
     }
@@ -263,6 +282,7 @@ export async function buildServer(options: {
     if (!store.getWorkspace(id)) return reply.code(404).send({ error: "Unknown workspace" });
     try {
       store.deleteWorkspace(id);
+      publishCatalog();
       return reply.code(204).send();
     } catch (error) {
       return reply
@@ -274,9 +294,13 @@ export async function buildServer(options: {
   app.post("/api/placements", async (request, reply) => {
     const input = CreatePlacementSchema.parse(request.body);
     try {
-      return reply
-        .code(201)
-        .send(store.createPlacement(input.workspaceId, input.nodeId, input.localPath));
+      const placement = store.createPlacement(
+        input.workspaceId,
+        input.nodeId,
+        input.localPath,
+      );
+      publishCatalog();
+      return reply.code(201).send(placement);
     } catch (error) {
       return reply
         .code(409)
@@ -288,7 +312,9 @@ export async function buildServer(options: {
     const { id } = request.params as { id: string };
     const input = UpdatePlacementSchema.parse(request.body);
     if (!store.getPlacement(id)) return reply.code(404).send({ error: "Unknown placement" });
-    return store.updatePlacement(id, input.localPath);
+    const placement = store.updatePlacement(id, input.localPath);
+    publishCatalog();
+    return placement;
   });
 
   app.delete("/api/placements/:id", async (request, reply) => {
@@ -296,6 +322,7 @@ export async function buildServer(options: {
     if (!store.getPlacement(id)) return reply.code(404).send({ error: "Unknown placement" });
     try {
       store.deletePlacement(id);
+      publishCatalog();
       return reply.code(204).send();
     } catch (error) {
       return reply

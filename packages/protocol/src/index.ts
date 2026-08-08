@@ -192,6 +192,20 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("node"), node: NodeSchema }),
   z.object({ type: z.literal("session"), session: SessionSchema }),
   z.object({ type: z.literal("event"), event: SessionEventSchema }),
+  /**
+   * Workspaces and placements after any change to either.
+   *
+   * Sent whole rather than per-entity because a deletion has no entity left to
+   * describe, and because the two are edited together often enough that
+   * reconciling separate messages would cost more than resending two short
+   * lists. Nodes may now edit these from their own config page, so a browser
+   * that only refreshed on its own writes would show stale paths.
+   */
+  z.object({
+    type: z.literal("catalog"),
+    workspaces: z.array(WorkspaceSchema),
+    placements: z.array(PlacementSchema),
+  }),
 ]);
 export type BrowserMessage = z.infer<typeof BrowserMessageSchema>;
 

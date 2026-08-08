@@ -101,6 +101,11 @@ export function useFleet(notify: Notify) {
         setSnapshot((value) => ({ ...value, nodes: upsert(value.nodes, node) }));
         return;
       }
+      if (message.type === "catalog") {
+        const { workspaces, placements } = message;
+        setSnapshot((value) => ({ ...value, workspaces, placements }));
+        return;
+      }
       if (message.type === "session") {
         const { session } = message;
         if (session.state === "failed") {
