@@ -1,9 +1,15 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   DEFAULT_PERMISSION_TIMEOUT_MS,
+  loadSettings,
   needsReconnect,
   settingsFromEnv,
+  settingsOverridesFromEnv,
 } from "./settings.js";
+import { configDirectory } from "./config.js";
 import { configServerPort } from "./config-server.js";
 
 describe("settingsFromEnv", () => {
@@ -28,6 +34,94 @@ describe("settingsFromEnv", () => {
     expect(settings.nodeName).toBe("WEILI-PC");
     expect(settings.maxSessions).toBe(8);
     expect(settings.permissionTimeoutMs).toBe(60_000);
+  });
+});
+
+describe("settingsOverridesFromEnv", () => {
+  it("stays empty when nothing was specified", () => {
+    expect(settingsOverridesFromEnv({})).toEqual({});
+  });
+
+  it("carries only the fields it was given, and none of the defaults", () => {
+    // Defaulting the rest here would silently reset the settings an operator
+    // saved from the config page every time one flag is passed.
+    expect(
+      settingsOverridesFromEnv({ FLEET_HOST_URL: "https://one.example.com" }),
+    ).toEqual({ hostUrl: "https://one.example.com" });
+    expect(settingsOverridesFromEnv({ FLEET_MAX_SESSIONS: "8" })).toEqual({
+      maxSessions: 8,
+    });
+    expect(settingsOverridesFromEnv({ FLEET_COPILOT_COMMAND: "" })).toEqual({
+      copilotCommand: "",
+    });
+  });
+});
+
+describe("loadSettings", () => {
+  const directories: string[] = [];
+  const previousXdg = process.env.XDG_CONFIG_HOME;
+  const previousAppData = process.env.APPDATA;
+
+  function isolatedConfigDirectory(): string {
+    const root = mkdtempSync(join(tmpdir(), "fleet-settings-"));
+    directories.push(root);
+    process.env.XDG_CONFIG_HOME = root;
+    process.env.APPDATA = root;
+    const directory = configDirectory();
+    mkdirSync(directory, { recursive: true });
+    return directory;
+  }
+
+  function writeStoredSettings(values: Record<string, unknown>): void {
+    writeFileSync(
+      join(isolatedConfigDirectory(), "settings.json"),
+      JSON.stringify(values),
+    );
+  }
+
+  afterEach(() => {
+    process.env.XDG_CONFIG_HOME = previousXdg;
+    process.env.APPDATA = previousAppData;
+    if (previousXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    if (previousAppData === undefined) delete process.env.APPDATA;
+    for (const directory of directories.splice(0)) {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers the stored file over the environment", async () => {
+    writeStoredSettings({ hostUrl: "https://stored.example.com", maxSessions: 2 });
+    const settings = await loadSettings({
+      FLEET_HOST_URL: "https://from-env.example.com",
+      FLEET_MAX_SESSIONS: "6",
+    });
+    expect(settings.hostUrl).toBe("https://stored.example.com");
+    expect(settings.maxSessions).toBe(2);
+  });
+
+  it("lets command-line overrides beat the stored file", async () => {
+    // The whole point of a flag: repointing one run at a different Host must
+    // not require editing settings.json on the machine first.
+    writeStoredSettings({ hostUrl: "https://stored.example.com", maxSessions: 2 });
+    const settings = await loadSettings(
+      { FLEET_HOST_URL: "https://from-env.example.com" },
+      { hostUrl: "https://from-flag.example.com" },
+    );
+    expect(settings.hostUrl).toBe("https://from-flag.example.com");
+    expect(settings.maxSessions).toBe(2);
+  });
+
+  it("applies overrides on a machine that has never been configured", async () => {
+    isolatedConfigDirectory();
+    const settings = await loadSettings({}, { nodeName: "from-flag", maxSessions: 9 });
+    expect(settings.nodeName).toBe("from-flag");
+    expect(settings.maxSessions).toBe(9);
+    expect(settings.hostUrl).toBe("http://127.0.0.1:8787");
+  });
+
+  it("rejects an override the settings schema cannot accept", async () => {
+    isolatedConfigDirectory();
+    await expect(loadSettings({}, { maxSessions: Number("many") })).rejects.toThrow();
   });
 });
 

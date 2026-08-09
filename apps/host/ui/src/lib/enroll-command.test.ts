@@ -6,20 +6,22 @@ const TOKEN = "abc123";
 
 describe("enrollCommand", () => {
   it("uses the short root aliases and carries host url + token", () => {
-    for (const shell of ["bash", "powershell"] as const) {
-      const command = enrollCommand(shell, URL, TOKEN);
-      expect(command).toContain(URL);
-      expect(command).toContain(TOKEN);
-      expect(command).toContain("npm run build:node");
-      expect(command).toContain("npm run start:node");
-      expect(command).not.toContain("@fleet/node");
-      expect(command).not.toContain("FLEET_NODE_NAME");
-    }
+    const command = enrollCommand(URL, TOKEN);
+    expect(command).toContain(URL);
+    expect(command).toContain(TOKEN);
+    expect(command).toContain("npm run build:node");
+    expect(command).toContain("npm run start:node");
+    expect(command).not.toContain("@fleet/node");
+    expect(command).not.toContain("FLEET_NODE_NAME");
   });
 
-  it("continues bash lines but keeps powershell statements standalone", () => {
-    expect(enrollCommand("bash", URL, TOKEN)).toContain("\\");
-    expect(enrollCommand("powershell", URL, TOKEN)).not.toContain("\\");
+  it("passes flags, so one paste works in every shell", () => {
+    const command = enrollCommand(URL, TOKEN);
+    expect(command).toContain(`npm run start:node -- --url="${URL}" --token="${TOKEN}"`);
+    // Neither a `$env:` prefix nor a bash line continuation, both of which are
+    // syntax errors in the other shell.
+    expect(command).not.toContain("$env:");
+    expect(command).not.toContain("\\");
   });
 });
 

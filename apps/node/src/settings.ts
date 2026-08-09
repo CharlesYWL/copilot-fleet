@@ -37,7 +37,8 @@ export const DEFAULT_PERMISSION_TIMEOUT_MS = 1_800_000;
 /**
  * Environment variables seed the first run; once settings.json exists it wins,
  * because otherwise an edit made in the UI would silently revert to whatever
- * the .env file still says on the next restart.
+ * the .env file still says on the next restart. Command-line flags outrank
+ * both — see {@link settingsOverridesFromEnv}.
  */
 export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): Settings {
   return SettingsSchema.parse({
@@ -51,21 +52,51 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): Settings 
   });
 }
 
+/**
+ * Only the settings the caller actually specified.
+ *
+ * Command-line flags have to beat settings.json, and {@link settingsFromEnv}
+ * cannot express that: it fills every field with a default, so merging its
+ * result over the file would reset the settings the operator never mentioned.
+ */
+export function settingsOverridesFromEnv(env: NodeJS.ProcessEnv): Partial<Settings> {
+  const overrides: Partial<Settings> = {};
+  if (env.FLEET_HOST_URL !== undefined) overrides.hostUrl = env.FLEET_HOST_URL;
+  if (env.FLEET_NODE_NAME !== undefined) overrides.nodeName = env.FLEET_NODE_NAME;
+  if (env.FLEET_MAX_SESSIONS !== undefined) {
+    overrides.maxSessions = Number(env.FLEET_MAX_SESSIONS);
+  }
+  if (env.FLEET_COPILOT_COMMAND !== undefined) {
+    overrides.copilotCommand = env.FLEET_COPILOT_COMMAND;
+  }
+  if (env.PERMISSION_TIMEOUT_MS !== undefined) {
+    overrides.permissionTimeoutMs = Number(env.PERMISSION_TIMEOUT_MS);
+  }
+  return overrides;
+}
+
 function settingsPath(): string {
   return join(configDirectory(), "settings.json");
 }
 
+/**
+ * Effective settings, lowest precedence first: built-in defaults, environment,
+ * settings.json, then `overrides` (command-line flags).
+ */
 export async function loadSettings(
   env: NodeJS.ProcessEnv = process.env,
+  overrides: Partial<Settings> = {},
 ): Promise<Settings> {
   const defaults = settingsFromEnv(env);
   try {
     const content = await readFile(settingsPath(), "utf8");
     // Merging over the defaults keeps older files readable after a new field
     // is introduced, instead of failing to parse and losing every setting.
-    return SettingsSchema.parse({ ...defaults, ...JSON.parse(content) });
+    return SettingsSchema.parse({ ...defaults, ...JSON.parse(content), ...overrides });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return defaults;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return SettingsSchema.parse({ ...defaults, ...overrides });
+    }
     throw error;
   }
 }

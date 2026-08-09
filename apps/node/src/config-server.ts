@@ -48,6 +48,8 @@ export type ConfigServerOptions = {
   getStatus: () => ConfigStatus;
   applySettings: (settings: Settings) => Promise<void>;
   log: (message: string) => void;
+  /** Resolved by the caller so a command-line flag can outrank the variable. */
+  port?: number;
   fleet?: FleetApi;
   pickFolder?: (start: string) => Promise<PickerResult>;
   inspectPath?: (path: string) => PathCheck;
@@ -230,7 +232,7 @@ export function startConfigServer(options: ConfigServerOptions): Server {
     });
   });
 
-  const port = configServerPort();
+  const port = options.port ?? configServerPort();
   server.listen(port, HOST, () => {
     options.log(`  config UI   http://${HOST}:${port}`);
   });

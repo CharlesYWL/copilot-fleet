@@ -10,6 +10,7 @@ import {
   type NodeToHostMessage,
 } from "@fleet/protocol";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
+import { CliError, USAGE, parseNodeArgs } from "./cli.js";
 import {
   configDirectory,
   loadCredentials,
@@ -25,8 +26,14 @@ import {
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
 import { CommandRouter } from "./router.js";
-import { startConfigServer } from "./config-server.js";
-import { loadSettings, needsReconnect, saveSettings, type Settings } from "./settings.js";
+import { configServerPort, startConfigServer } from "./config-server.js";
+import {
+  loadSettings,
+  needsReconnect,
+  saveSettings,
+  settingsOverridesFromEnv,
+  type Settings,
+} from "./settings.js";
 
 const VERSION = "0.1.0";
 const RECONNECT_DELAY_MS = 2_000;
@@ -41,11 +48,14 @@ export type NodeRuntime = { shutdown: () => Promise<void> };
  * server — which is why none of the reconnect or credential-rotation behaviour
  * could be covered by a test.
  */
-export async function main(): Promise<NodeRuntime> {
+export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
+  const flags = parseNodeArgs(argv);
   loadEnv({ path: envFilePath(), quiet: true });
+  // One lookup path for both sources; the flags are already the last word.
+  const env: NodeJS.ProcessEnv = { ...process.env, ...flags.env };
 
-  let settings = await loadSettings();
-  const mockAgent = process.env.FLEET_MOCK_AGENT === "1";
+  let settings = await loadSettings(env, settingsOverridesFromEnv(flags.env));
+  const mockAgent = env.FLEET_MOCK_AGENT === "1";
 
   const log = (message: string): void => {
     console.log(`${new Date().toISOString()} [node] ${message}`);
@@ -58,6 +68,10 @@ export async function main(): Promise<NodeRuntime> {
   log(`  permissions ${mockAgent ? "n/a" : "per session (Host decides)"}`);
   log(`  capacity    ${settings.maxSessions} concurrent sessions`);
   log(`  config      ${configDirectory()}`);
+  const overridden = Object.keys(flags.env);
+  // Naming the keys (never the values — one of them is a token) explains why
+  // this run disagrees with the config page.
+  if (overridden.length > 0) log(`  overrides   ${overridden.join(", ")} (command line)`);
 
   const instanceLock = acquireInstanceLock(configDirectory());
   if (!instanceLock.ok) {
@@ -144,6 +158,7 @@ export async function main(): Promise<NodeRuntime> {
     }),
     applySettings,
     log,
+    port: configServerPort(env),
   });
 
   function connect(): void {
@@ -245,9 +260,11 @@ export async function main(): Promise<NodeRuntime> {
   }
 
   async function register(): Promise<Credentials> {
-    const enrollmentToken = process.env.FLEET_ENROLLMENT_TOKEN;
+    const enrollmentToken = env.FLEET_ENROLLMENT_TOKEN;
     if (!enrollmentToken) {
-      throw new Error("FLEET_ENROLLMENT_TOKEN is required for first registration");
+      throw new Error(
+        "An enrollment token is required for first registration: pass --token=<token> or set FLEET_ENROLLMENT_TOKEN",
+      );
     }
     const body = RegisterNodeSchema.parse({
       enrollmentToken,
@@ -304,7 +321,20 @@ export async function main(): Promise<NodeRuntime> {
 }
 
 if (process.env.NODE_ENV !== "test") {
-  const runtime = await main();
+  const argv = process.argv.slice(2);
+  // Usage and argument errors belong to the entry point: main() is also called
+  // by tests, which must not have the process exit under them.
+  try {
+    if (parseNodeArgs(argv).wantsHelp) {
+      console.log(USAGE);
+      process.exit(0);
+    }
+  } catch (error) {
+    if (!(error instanceof CliError)) throw error;
+    console.error(`${error.message}\n\n${USAGE}`);
+    process.exit(2);
+  }
+  const runtime = await main(argv);
   process.once("SIGINT", () => void runtime.shutdown().finally(() => process.exit(0)));
   process.once("SIGTERM", () => void runtime.shutdown().finally(() => process.exit(0)));
 }

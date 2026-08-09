@@ -5,8 +5,6 @@ import {
   Input,
   MessageBar,
   MessageBarBody,
-  Tab,
-  TabList,
   Text,
   Title3,
   makeStyles,
@@ -14,12 +12,7 @@ import {
 } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
 import { useEnrollment } from "../hooks/useEnrollment";
-import {
-  enrollCommand,
-  isLocalOnlyHostUrl,
-  nodeShells,
-  type NodeShell,
-} from "../lib/enroll-command";
+import { enrollCommand, isLocalOnlyHostUrl } from "../lib/enroll-command";
 import { terminal } from "../theme";
 
 const useStyles = makeStyles({
@@ -64,7 +57,6 @@ export const ConnectNodeCard = () => {
   const styles = useStyles();
   const enrollment = useEnrollment();
   const [editedUrl, setEditedUrl] = useState<string>();
-  const [shell, setShell] = useState<NodeShell>("bash");
   const [copied, setCopied] = useState(false);
 
   // Until the field is touched it tracks the polled value, so a rotated tunnel
@@ -79,7 +71,7 @@ export const ConnectNodeCard = () => {
 
   if (!enrollment) return null;
 
-  const command = enrollCommand(shell, hostUrl, enrollment.enrollmentToken);
+  const command = enrollCommand(hostUrl, enrollment.enrollmentToken);
 
   const handleCopy = async () => {
     await navigator.clipboard.writeText(command);
@@ -93,7 +85,8 @@ export const ConnectNodeCard = () => {
         <br />
         <Text className={styles.caption}>
           Run this from a Copilot Fleet checkout that has Node.js and a signed-in Copilot
-          CLI. The node registers itself under the machine&apos;s own hostname.
+          CLI — the same three lines work in bash and PowerShell. The node registers
+          itself under the machine&apos;s own hostname.
         </Text>
       </div>
 
@@ -113,18 +106,6 @@ export const ConnectNodeCard = () => {
           </MessageBarBody>
         </MessageBar>
       )}
-
-      <TabList
-        selectedValue={shell}
-        onTabSelect={(_, data) => setShell(data.value as NodeShell)}
-        size="small"
-      >
-        {nodeShells.map(({ key, label }) => (
-          <Tab key={key} value={key}>
-            {label}
-          </Tab>
-        ))}
-      </TabList>
 
       <div className={styles.commandRow}>
         <pre className={styles.command}>{command}</pre>

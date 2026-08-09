@@ -66,19 +66,50 @@ directory (or paste the command from the Host's Nodes → Connect card):
 ```powershell
 npm install
 npm run build:node
-$env:FLEET_HOST_URL = "https://fleet.example.com"
-$env:FLEET_ENROLLMENT_TOKEN = "replace-with-host-token"
-npm run start:node
+npm run start:node -- --url="https://fleet.example.com" --token="replace-with-host-token"
 ```
 
+The same three lines work in bash — flags avoid the `$env:` / `VAR=value`
+split between shells.
+
 The node name defaults to the machine hostname; rename it later from the Host's
-Nodes tab. Set `$env:FLEET_MAX_SESSIONS` if you want a capacity other than 4.
+Nodes tab. Pass `--max-sessions 8` if you want a capacity other than 4.
 
 First registration exchanges the enrollment token for a unique node secret.
 Credentials are persisted at
 `$env:APPDATA\CopilotFleet\node.json`; subsequent starts do not need the
 enrollment token. The service uses an outbound WSS connection, so no inbound
 Node port is required.
+
+### Node command-line flags
+
+Anything the node reads from the environment can be given as a flag instead, and
+a flag wins over both `.env` and the saved `settings.json` — which is what makes
+it usable to point one run at a different Host without editing files on that
+machine. Run `npm run start:node -- --help` for the current list.
+
+| Flag                              | Replaces                 |
+| --------------------------------- | ------------------------ |
+| `--url`, `--host-url`             | `FLEET_HOST_URL`         |
+| `--name`, `--node-name`           | `FLEET_NODE_NAME`        |
+| `--token`, `--enrollment-token`   | `FLEET_ENROLLMENT_TOKEN` |
+| `--max-sessions`                  | `FLEET_MAX_SESSIONS`     |
+| `--copilot-command`               | `FLEET_COPILOT_COMMAND`  |
+| `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`  |
+| `--config-port`                   | `FLEET_NODE_CONFIG_PORT` |
+| `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`       |
+
+Both `--flag value` and `--flag=value` are accepted. The `--` after the npm
+script name is npm's own separator; without it npm eats the flags. The same
+flags work on `npm run node` (watch mode), `npm run dev` and `npm start`, where
+they are forwarded to the node process only:
+
+```bash
+npm start -- --url=https://fleet.example.com
+```
+
+Flags apply to that run; edits made later in the config page win until the
+process restarts.
 
 ### Node config page
 
@@ -90,7 +121,7 @@ running sessions survive.
 It also edits the node name, session capacity, Copilot executable path, and
 permission timeout. Values are stored in `settings.json` beside the credentials
 and take precedence over the environment variables, so an edit here is not
-undone by a stale `.env` on the next start.
+undone by a stale `.env` on the next start. Command-line flags outrank both.
 
 The listener binds to loopback only and is deliberately not exposed: anything
 that can repoint a node at a different Host can run commands on that machine.
@@ -109,12 +140,11 @@ npm run host
 Run a deterministic no-login Node in terminal 2:
 
 ```bash
-FLEET_HOST_URL=http://127.0.0.1:8787 \
-FLEET_ENROLLMENT_TOKEN=change-me \
-FLEET_NODE_NAME=mock-node \
-FLEET_MAX_SESSIONS=2 \
-FLEET_MOCK_AGENT=1 \
-npm run node
+npm run node -- --url=http://127.0.0.1:8787 \
+  --token=change-me \
+  --name=mock-node \
+  --max-sessions=2 \
+  --mock-agent
 ```
 
 Then open `http://127.0.0.1:5173`:
