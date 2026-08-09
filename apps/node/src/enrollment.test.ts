@@ -15,9 +15,16 @@ describe("planCredentials", () => {
   });
 
   it("registers again after a rename, because the name is the identity", () => {
-    expect(planCredentials({ ...stored, name: "old-name" }, settings).action).toBe(
-      "register",
-    );
+    const plan = planCredentials({ ...stored, name: "old-name" }, settings);
+    expect(plan.action).toBe("register");
+    // A rename strands the old node's placements and sessions, so the reason
+    // has to name both sides and the way back.
+    expect(plan).toMatchObject({
+      reason: expect.stringContaining('"old-name" -> "WEILI-PC"') as unknown as string,
+    });
+    if (plan.action === "register") {
+      expect(plan.reason).toContain("switch back");
+    }
   });
 
   it("keeps the node id when only the host url rotated", () => {

@@ -117,6 +117,28 @@ anything that reached the agent can be picked up again with **Resume**. To
 follow a rotated tunnel URL without losing live sessions, retarget from the node
 config page instead: it reconnects in place.
 
+`--name` is not a display detail: the Host keys a node by name, so starting under
+a different one enrolls a _new_ machine and leaves the old node's placements and
+sessions behind. Starting again under the previous name reclaims the same node
+id and brings them back.
+
+### Recovering sessions after a restart
+
+Sessions survive both processes going down. The Host keeps them in its SQLite
+file and the node keeps its identity in `node.json`, so after both come back:
+
+1. The Host marks everything it had running `offline` ("Host restarted").
+2. The reconnecting node reports which sessions it still has. A restarted node
+   has none, so the rest settle as "Node reconnected without this session".
+3. **Resume** re-attaches through Copilot's `session/load`, and the transcript
+   continues where it stopped rather than starting over.
+
+Three things have to hold for that to work: the Host's `DATABASE_PATH` file is
+intact, the node starts under the same name, and Copilot on that machine still
+has the agent session on disk. A session that died before its agent ever started
+has nothing to re-attach to — it settles as "it never reached the agent" and
+offers no Resume.
+
 ### Node config page
 
 Each node serves a small settings page at `http://127.0.0.1:8788` (override the
