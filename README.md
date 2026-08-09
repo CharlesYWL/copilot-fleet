@@ -111,6 +111,12 @@ npm start -- --url=https://fleet.example.com
 Flags apply to that run; edits made later in the config page win until the
 process restarts.
 
+Note that `--url` takes effect by restarting the node, which ends the sessions
+running on it — they settle as "Node reconnected without this session", and
+anything that reached the agent can be picked up again with **Resume**. To
+follow a rotated tunnel URL without losing live sessions, retarget from the node
+config page instead: it reconnects in place.
+
 ### Node config page
 
 Each node serves a small settings page at `http://127.0.0.1:8788` (override the

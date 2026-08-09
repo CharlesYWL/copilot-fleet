@@ -361,9 +361,20 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     super(fleetSessionId, sink, sequenceOffset);
   }
 
-  start(): void {
-    this.emit("state", { state: "starting", activity: "Starting mock agent" });
-    this.emit("agent_session", { agentSessionId: `mock-${this.fleetSessionId}` });
+  start(resumeAgentSessionId?: string): void {
+    this.emit("state", {
+      state: "starting",
+      activity: resumeAgentSessionId ? "Resuming mock agent" : "Starting mock agent",
+    });
+    this.emit("agent_session", {
+      agentSessionId: resumeAgentSessionId ?? `mock-${this.fleetSessionId}`,
+    });
+    // A resumed session is never prompted by the router, so without this the
+    // mock stayed in `starting` forever and Resume looked broken — the ACP
+    // adapter settles on idle the same way once session/load returns.
+    if (resumeAgentSessionId) {
+      this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
+    }
   }
 
   async prompt(text: string): Promise<void> {
@@ -411,7 +422,7 @@ export class MockAgentFactory implements AgentFactory {
     options: StartAgentOptions = {},
   ): Promise<SessionAgent> {
     const agent = new MockAgent(sessionId, sink, options.sequenceOffset ?? 0);
-    agent.start();
+    agent.start(options.resumeAgentSessionId);
     return agent;
   }
 }

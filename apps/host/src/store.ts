@@ -470,7 +470,13 @@ export class FleetStore {
 
   /**
    * After a Node hello/heartbeat: resurrect offline sessions the Node still
-   * owns, and fail the ones that did not come back.
+   * owns, and settle the ones that did not come back.
+   *
+   * The Node reporting an empty inventory is the *recovery* path, not a second
+   * failure, so the activity has to say what was observed — the Node is back
+   * and no longer has this session — instead of blaming the connection a second
+   * time. Copilot keeps the agent session on disk, so anything with an agent id
+   * is one Resume away from continuing where it stopped.
    */
   reconcileOfflineSessions(
     nodeId: string,
@@ -479,16 +485,21 @@ export class FleetStore {
     const active = new Set(activeSessionIds);
     // Runs on every heartbeat, so it must not walk the session table: the
     // filter is an indexed lookup and the common answer is an empty list.
-    const ids = this.sessionIdsWhere("WHERE node_id=? AND state=?", nodeId, "offline");
-    return ids.map((id) =>
-      active.has(id)
-        ? this.transitionSession(id, "idle", "Reconnected to node")
-        : this.transitionSession(
-            id,
-            "failed",
-            "Execution ended when the Node connection was lost",
-          ),
-    );
+    const rows = this.statement(
+      "SELECT id,agent_session_id FROM sessions WHERE node_id=? AND state=?",
+    ).all(nodeId, "offline") as Row[];
+    return rows.map((row) => {
+      const id = String(row.id);
+      if (active.has(id))
+        return this.transitionSession(id, "idle", "Reconnected to node");
+      return this.transitionSession(
+        id,
+        "failed",
+        row.agent_session_id
+          ? "Node reconnected without this session; Resume re-attaches it"
+          : "Node reconnected without this session; it never reached the agent",
+      );
+    });
   }
 
   /**

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { copilotLaunchArgs } from "./agents.js";
+import type { SessionEvent } from "@fleet/protocol";
+import { MockAgentFactory, copilotLaunchArgs } from "./agents.js";
 
 describe("copilotLaunchArgs", () => {
   it("starts ACP over stdio", () => {
@@ -8,5 +9,32 @@ describe("copilotLaunchArgs", () => {
 
   it("adds Copilot's yolo flag when the Host asks for it", () => {
     expect(copilotLaunchArgs(true)).toEqual(["--acp", "--stdio", "--allow-all"]);
+  });
+});
+
+describe("MockAgentFactory", () => {
+  const collect = async (options?: { resumeAgentSessionId?: string }) => {
+    const events: SessionEvent[] = [];
+    await new MockAgentFactory().start(
+      "session-1",
+      "/workspace",
+      (event) => events.push(event),
+      options,
+    );
+    return events;
+  };
+
+  it("waits to be prompted after a fresh start", async () => {
+    const events = await collect();
+    expect(events.map((event) => event.type)).toEqual(["state", "agent_session"]);
+    expect(events[0]?.payload).toMatchObject({ state: "starting" });
+  });
+
+  it("lands a resumed session on idle, so it can be prompted again", async () => {
+    // The router never prompts a resumed session, so an adapter that stops at
+    // `starting` leaves Resume looking like it hung.
+    const events = await collect({ resumeAgentSessionId: "mock-earlier-run" });
+    expect(events.at(-1)?.payload).toMatchObject({ state: "idle" });
+    expect(events[1]?.payload).toMatchObject({ agentSessionId: "mock-earlier-run" });
   });
 });

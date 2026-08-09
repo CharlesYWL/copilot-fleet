@@ -218,6 +218,33 @@ describe("FleetStore", () => {
     expect(store.getSession(lost.id)?.state).toBe("failed");
   });
 
+  it("says the Node came back without the session, and whether Resume can help", () => {
+    // This runs when the Node reconnects, so repeating "the connection was
+    // lost" described the wrong moment and hid the fact that a session with an
+    // agent id is one Resume away from continuing.
+    const { store, node, placement } = setup();
+    const resumable = store.createSession(placement, "resumable");
+    const never = store.createSession(placement, "never started");
+    store.appendEvent({
+      eventId: "agent-session-event",
+      sessionId: resumable.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "acp-1" },
+      createdAt: new Date().toISOString(),
+    });
+    store.markNodeSessionsOffline(node.id, "Node disconnected");
+
+    const settled = store.reconcileOfflineSessions(node.id, []);
+    const byId = new Map(settled.map((session) => [session.id, session]));
+    expect(byId.get(resumable.id)?.currentActivity).toBe(
+      "Node reconnected without this session; Resume re-attaches it",
+    );
+    expect(byId.get(never.id)?.currentActivity).toBe(
+      "Node reconnected without this session; it never reached the agent",
+    );
+  });
+
   it("dismisses ended sessions but refuses to delete live ones", () => {
     const { store, placement } = setup();
     const live = store.createSession(placement, "live");
