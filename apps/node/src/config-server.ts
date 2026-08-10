@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import { z } from "zod";
 import { errorMessage } from "@fleet/protocol";
-import { SettingsSchema, type Settings } from "./settings.js";
+import { EditableSettingsSchema, type Settings } from "./settings.js";
 import { configAsset } from "./config-assets.js";
 import { FleetClient, type PlacementLike, type WorkspaceLike } from "./fleet-client.js";
 import { pickFolder as pickFolderDefault, type PickerResult } from "./pick-folder.js";
@@ -123,11 +123,14 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
     [
       "POST /api/config",
       async (body) => {
-        const parsed = SettingsSchema.safeParse(JSON.parse(body));
+        const parsed = EditableSettingsSchema.safeParse(JSON.parse(body));
         if (!parsed.success) {
           return badRequest(parsed.error.issues[0]?.message ?? "Invalid settings");
         }
-        await options.applySettings(parsed.data);
+        // Merged rather than replaced: the page posts back the fields it shows,
+        // and the rest of the settings are bookkeeping this process maintains —
+        // a save must not be able to erase them.
+        await options.applySettings({ ...options.getSettings(), ...parsed.data });
         return state();
       },
     ],

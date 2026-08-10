@@ -186,16 +186,25 @@ export function App() {
     placementId: string,
     prompt: string,
     yolo: boolean,
+    name: string,
   ) => {
     const result = await request<FleetSession>("/api/sessions", {
       method: "POST",
-      body: JSON.stringify({ placementId, prompt, yolo }),
+      body: JSON.stringify({ placementId, prompt, yolo, name }),
     });
     if (!result.ok) return false;
     setSelectedSessionId(result.data.id);
     setView("session");
     return true;
   };
+
+  // The rename is broadcast back as a session update, so there is nothing to
+  // re-read here.
+  const handleRenameSession = (sessionId: string, name: string) =>
+    void request(`/api/sessions/${sessionId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    });
 
   return (
     <CatalogProvider value={catalog}>
@@ -257,6 +266,7 @@ export function App() {
                     onResume={() =>
                       void command(`/api/sessions/${activeSession.id}/resume`)
                     }
+                    onRename={(name) => handleRenameSession(activeSession.id, name)}
                     onPermission={(requestId, outcome, optionId) =>
                       handlePermission(activeSession.id, requestId, outcome, optionId)
                     }
@@ -281,6 +291,7 @@ export function App() {
             onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
             onDismiss={() => void handleDismissSession(activeSession.id)}
             onResume={() => void command(`/api/sessions/${activeSession.id}/resume`)}
+            onRename={(name) => handleRenameSession(activeSession.id, name)}
             onPermission={(requestId, outcome, optionId) =>
               handlePermission(activeSession.id, requestId, outcome, optionId)
             }

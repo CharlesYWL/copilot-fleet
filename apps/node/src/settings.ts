@@ -15,8 +15,28 @@ export const SettingsSchema = z.object({
   /** Empty means "find `copilot` on PATH". */
   copilotCommand: z.string(),
   permissionTimeoutMs: z.number().int().min(1_000).max(3_600_000),
+  /**
+   * Addresses this node has reached the Host on before, newest first.
+   *
+   * Filled in when the Host announces that it moved: the address being replaced
+   * is kept so a dial that never gets a welcome can fall back to it. Without
+   * that, one announcement of a URL that turns out not to work from here — a
+   * tunnel this machine's network blocks, a hostname it cannot resolve — would
+   * strand the node with no way back except editing files on it by hand.
+   */
+  knownHostUrls: z.array(z.string()).default([]),
 });
 export type Settings = z.infer<typeof SettingsSchema>;
+
+/**
+ * The settings the config page owns.
+ *
+ * `knownHostUrls` is bookkeeping this process maintains, not a field anyone
+ * types, and the page posts the whole form back — so leaving it in the schema
+ * the page is parsed against would let every save wipe the fallbacks.
+ */
+export const EditableSettingsSchema = SettingsSchema.omit({ knownHostUrls: true });
+export type EditableSettings = z.infer<typeof EditableSettingsSchema>;
 
 /** Changing any of these requires a fresh hello frame to take effect. */
 const RECONNECT_KEYS = ["hostUrl", "nodeName", "maxSessions"] as const;

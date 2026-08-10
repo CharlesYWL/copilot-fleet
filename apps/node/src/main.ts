@@ -2,11 +2,13 @@ import { config as loadEnv } from "dotenv";
 import { arch, homedir, platform } from "node:os";
 import WebSocket from "ws";
 import {
+  HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
   NodeToHostMessageSchema,
   RegisterNodeSchema,
   decodeFrame,
   errorMessage,
+  sameHostUrl,
   type NodeToHostMessage,
 } from "@fleet/protocol";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
@@ -18,6 +20,13 @@ import {
   type Credentials,
 } from "./config.js";
 import { planCredentials } from "./enrollment.js";
+import {
+  adoptHostUrl,
+  endpointsAfterOperatorEdit,
+  nextHostUrl,
+  promoteHostUrl,
+  type HostEndpoints,
+} from "./host-endpoints.js";
 import { envFilePath } from "./paths.js";
 import {
   AUTH_FAILED_CLOSE_CODE,
@@ -82,6 +91,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   process.once("exit", () => releaseInstanceLock());
 
   let credentials = await ensureCredentials();
+  /**
+   * The address this attempt is dialing.
+   *
+   * Separate from the stored primary because a dial that fails rotates through
+   * the fallbacks without rewriting settings.json on every retry — only the
+   * address that actually produces a welcome is written back.
+   */
+  let dialUrl = credentials.hostUrl;
 
   const factory = mockAgent
     ? new MockAgentFactory()
@@ -120,17 +137,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    */
   async function applySettings(next: Settings): Promise<void> {
     const previous = settings;
-    settings = next;
-    await saveSettings(next);
-    router.setMaxSessions(next.maxSessions);
+    const settled = endpointsAfterOperatorEdit(previous, next);
+    settings = settled;
+    await saveSettings(settled);
+    router.setMaxSessions(settled.maxSessions);
     if (factory instanceof AcpAgentFactory) {
-      factory.configure(next.permissionTimeoutMs, next.copilotCommand);
+      factory.configure(settled.permissionTimeoutMs, settled.copilotCommand);
     }
-    if (!needsReconnect(previous, next)) {
+    if (!needsReconnect(previous, settled)) {
       log("Settings updated; no reconnect needed");
       return;
     }
-    log(`Settings changed; reconnecting to ${next.hostUrl}`);
+    log(`Settings changed; reconnecting to ${settled.hostUrl}`);
     credentials = await ensureCredentials();
     reconnect();
   }
@@ -138,6 +156,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /** Drops the current socket so the next connect uses the latest credentials. */
   function reconnect(): void {
     if (reconnectTimer) clearTimeout(reconnectTimer);
+    dialUrl = credentials.hostUrl;
     const current = socket;
     socket = undefined;
     // Removing listeners first stops the close handler from scheduling its own
@@ -145,6 +164,41 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     current?.removeAllListeners();
     current?.close();
     connect();
+  }
+
+  /** Writes a change of Host address to both files that remember one. */
+  async function persistEndpoints(endpoints: HostEndpoints): Promise<void> {
+    settings = { ...settings, ...endpoints };
+    await saveSettings(settings);
+    if (sameHostUrl(credentials.hostUrl, settings.hostUrl)) return;
+    credentials = { ...credentials, hostUrl: settings.hostUrl };
+    await saveCredentials(credentials);
+  }
+
+  /**
+   * Follows the Host to the address it just announced.
+   *
+   * The socket carrying the announcement is deliberately left alone: it is
+   * working, and the whole point of being told in advance is that this node does
+   * not have to lose a connection — and the sessions on it — to learn where the
+   * Host went. The new address is what the next dial uses.
+   */
+  async function applyAnnouncedHostUrl(hostUrl: string): Promise<void> {
+    if (sameHostUrl(hostUrl, settings.hostUrl)) return;
+    const moved = adoptHostUrl(settings, hostUrl);
+    await persistEndpoints(moved);
+    dialUrl = moved.hostUrl;
+    log(
+      `Host moved to ${moved.hostUrl}; this connection stays up and the next one uses it`,
+    );
+  }
+
+  /** Remembers the address that worked, so the next start leads with it. */
+  async function promoteDialUrl(): Promise<void> {
+    const promoted = promoteHostUrl(settings, dialUrl);
+    if (!promoted) return;
+    await persistEndpoints(promoted);
+    log(`Reached the Host at ${promoted.hostUrl}; dialing it first from now on`);
   }
 
   const configServer = startConfigServer({
@@ -163,10 +217,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   function connect(): void {
     const auth = credentials;
-    const url = new URL("/ws/node", auth.hostUrl);
+    const url = new URL("/ws/node", dialUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     log(`Connecting to ${url}`);
     const active = new WebSocket(url);
+    const attemptUrl = dialUrl;
+    // Distinguishes "this address does not reach the Host" from "the Host hung
+    // up on us", which is what decides whether to try a different address.
+    let welcomed = false;
     socket = active;
     active.on("open", () => {
       send({
@@ -176,7 +234,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         os: platform(),
         arch: arch(),
         version: VERSION,
-        capabilities: ["copilot-acp", "host-yolo", mockAgent ? "mock" : "real"],
+        capabilities: [
+          "copilot-acp",
+          "host-yolo",
+          HOST_URL_SYNC_CAPABILITY,
+          mockAgent ? "mock" : "real",
+        ],
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
         activeSessionIds: router.activeSessionIds,
@@ -190,7 +253,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         return;
       }
       if (frame.value.type === "welcome") {
+        welcomed = true;
         log(`Authenticated with Host, waiting for commands`);
+        await promoteDialUrl();
+        return;
+      }
+      if (frame.value.type === "host_url") {
+        await applyAnnouncedHostUrl(frame.value.hostUrl);
         return;
       }
       if (frame.value.type !== "command") return;
@@ -247,6 +316,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       log(
         `Disconnected (code ${code}); keeping ${router.activeSessionIds.length} session(s), reconnecting in 2s`,
       );
+      // A dial that never got a welcome says nothing about the credentials and
+      // everything about the address, so the next attempt tries another one.
+      // Rotating only here — and not after an auth failure, which proves the
+      // Host was reached — keeps a working address from being blamed for a
+      // problem that is not its own.
+      if (!welcomed) {
+        const candidate = nextHostUrl(settings, attemptUrl);
+        if (!sameHostUrl(candidate, attemptUrl)) {
+          log(`No Host at ${attemptUrl}; trying ${candidate} next`);
+          dialUrl = candidate;
+        }
+      }
       reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
     });
     active.on("error", (error) => {
@@ -272,7 +353,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       os: platform(),
       arch: arch(),
       version: VERSION,
-      capabilities: ["copilot-acp", "host-yolo"],
+      capabilities: ["copilot-acp", "host-yolo", HOST_URL_SYNC_CAPABILITY],
       maxSessions: settings.maxSessions,
       homeDir: homedir(),
     });

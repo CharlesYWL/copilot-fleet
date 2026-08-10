@@ -8,13 +8,14 @@ import {
   DialogSurface,
   DialogTitle,
   Field,
+  Input,
   Select,
   Switch,
   Textarea,
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import type { Placement } from "@fleet/protocol";
+import { SESSION_NAME_MAX_LENGTH, type Placement } from "@fleet/protocol";
 
 const useStyles = makeStyles({
   form: {
@@ -53,7 +54,12 @@ type NewSessionDialogProps = {
   placements: Placement[];
   defaultYolo: boolean;
   onOpenChange: (open: boolean) => void;
-  onCreate: (placementId: string, prompt: string, yolo: boolean) => Promise<boolean>;
+  onCreate: (
+    placementId: string,
+    prompt: string,
+    yolo: boolean,
+    name: string,
+  ) => Promise<boolean>;
 };
 
 export const NewSessionDialog = ({
@@ -66,12 +72,14 @@ export const NewSessionDialog = ({
   const styles = useStyles();
   const [placementId, setPlacementId] = useState("");
   const [prompt, setPrompt] = useState("");
+  const [name, setName] = useState("");
   const [yolo, setYolo] = useState(defaultYolo);
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setPrompt("");
+    setName("");
     setYolo(defaultYolo);
   }, [open, defaultYolo]);
 
@@ -90,7 +98,7 @@ export const NewSessionDialog = ({
     event.preventDefault();
     if (!placementId || prompt.trim().length === 0) return;
     setSubmitting(true);
-    const created = await onCreate(placementId, prompt.trim(), yolo);
+    const created = await onCreate(placementId, prompt.trim(), yolo, name.trim());
     setSubmitting(false);
     if (created) onOpenChange(false);
   };
@@ -125,6 +133,17 @@ export const NewSessionDialog = ({
                     </option>
                   ))}
                 </Select>
+              </Field>
+              <Field
+                label="Session name"
+                hint="Optional. Without one the session is listed by its prompt."
+              >
+                <Input
+                  value={name}
+                  maxLength={SESSION_NAME_MAX_LENGTH}
+                  placeholder="Router cleanup"
+                  onChange={(_event, data) => setName(data.value)}
+                />
               </Field>
               <Field label="Initial prompt" required>
                 <Textarea

@@ -9,6 +9,7 @@ import {
 import {
   Badge,
   Button,
+  Input,
   Text,
   Textarea,
   makeStyles,
@@ -18,16 +19,19 @@ import {
 import {
   ArrowClockwise20Regular,
   Dismiss20Regular,
+  Rename20Regular,
   RecordStop20Regular,
   Send20Regular,
   Stop20Regular,
 } from "@fluentui/react-icons";
 import {
+  SESSION_NAME_MAX_LENGTH,
   terminalSessionStates,
   type FleetSession,
   type SessionEvent,
 } from "@fleet/protocol";
 import { blockColor, stateAccent, terminal } from "../theme";
+import { sessionLabel } from "../lib/session-label";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -73,6 +77,21 @@ const useStyles = makeStyles({
     display: "flex",
     alignItems: "center",
     gap: "8px",
+    minWidth: 0,
+  },
+  name: {
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  nameForm: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    minWidth: 0,
+  },
+  nameInput: {
+    minWidth: "220px",
   },
   subtitle: {
     color: tokens.colorNeutralForeground4,
@@ -190,6 +209,7 @@ type TerminalViewProps = {
     outcome: "allow_once" | "deny",
     optionId?: string,
   ) => void;
+  onRename?: (name: string) => void;
   onDismiss?: () => void;
   onResume?: () => void;
   onClose?: () => void;
@@ -202,12 +222,14 @@ export const TerminalView = ({
   onCancel,
   onStop,
   onPermission,
+  onRename,
   onDismiss,
   onResume,
   onClose,
 }: TerminalViewProps) => {
   const styles = useStyles();
   const [prompt, setPrompt] = useState("");
+  const [draftName, setDraftName] = useState<string>();
   const streamRef = useRef<HTMLDivElement>(null);
   const pinnedRef = useRef(true);
 
@@ -224,6 +246,12 @@ export const TerminalView = ({
     pinnedRef.current = true;
     const element = streamRef.current;
     if (element) element.scrollTop = element.scrollHeight;
+  }, [session.id]);
+
+  // Switching sessions with the editor open would otherwise offer one session's
+  // name as an edit to another's.
+  useEffect(() => {
+    setDraftName(undefined);
   }, [session.id]);
 
   const canPrompt = session.state === "idle";
@@ -265,6 +293,23 @@ export const TerminalView = ({
     onPermission(requestId, outcome, optionId);
   };
 
+  const isEditingName = draftName !== undefined;
+
+  const submitName = (event: FormEvent) => {
+    event.preventDefault();
+    if (draftName === undefined) return;
+    // An unchanged value is a no-op rather than a write, so closing the editor
+    // without touching it does not bump the session's updated time.
+    if (draftName.trim() !== session.name) onRename?.(draftName.trim());
+    setDraftName(undefined);
+  };
+
+  const handleNameKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+    if (event.key !== "Escape") return;
+    event.preventDefault();
+    setDraftName(undefined);
+  };
+
   return (
     <section className={styles.view} aria-label="Session terminal">
       <div className={styles.header}>
@@ -277,7 +322,48 @@ export const TerminalView = ({
             >
               {session.state}
             </span>
-            <Text weight="semibold">{session.workspaceName}</Text>
+            {isEditingName ? (
+              <form className={styles.nameForm} onSubmit={submitName}>
+                <Input
+                  className={styles.nameInput}
+                  value={draftName}
+                  autoFocus
+                  size="small"
+                  maxLength={SESSION_NAME_MAX_LENGTH}
+                  aria-label="Session name"
+                  placeholder="Name this session"
+                  onChange={(_event, data) => setDraftName(data.value)}
+                  onKeyDown={handleNameKeyDown}
+                />
+                <Button size="small" appearance="primary" type="submit">
+                  Save
+                </Button>
+                <Button
+                  size="small"
+                  appearance="subtle"
+                  type="button"
+                  onClick={() => setDraftName(undefined)}
+                >
+                  Cancel
+                </Button>
+              </form>
+            ) : (
+              <>
+                <Text weight="semibold" className={styles.name}>
+                  {sessionLabel(session)}
+                </Text>
+                {onRename && (
+                  <Button
+                    size="small"
+                    appearance="subtle"
+                    icon={<Rename20Regular />}
+                    aria-label="Rename session"
+                    title="Rename session"
+                    onClick={() => setDraftName(session.name)}
+                  />
+                )}
+              </>
+            )}
             {session.yolo && (
               <Badge appearance="tint" color="warning" size="small">
                 YOLO
@@ -285,7 +371,8 @@ export const TerminalView = ({
             )}
           </span>
           <Text className={styles.subtitle}>
-            {session.nodeName} · {session.id.slice(0, 8)} · {session.currentActivity}
+            {session.workspaceName} · {session.nodeName} · {session.id.slice(0, 8)} ·{" "}
+            {session.currentActivity}
           </Text>
         </div>
         <Button

@@ -112,6 +112,7 @@ describe("host routes", () => {
         payload: { localPath: "/tmp" },
       },
       { method: "GET" as const, url: "/api/sessions/missing/events" },
+      { method: "PATCH" as const, url: "/api/sessions/missing", payload: { name: "x" } },
       { method: "DELETE" as const, url: "/api/sessions/missing" },
     ];
     for (const route of routes) {

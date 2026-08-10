@@ -134,8 +134,10 @@ export const TunnelPanel = () => {
       {showTunnelUrl && current?.caveat && (
         <MessageBar intent="info">
           <MessageBarBody>
-            {current.caveat} Remote nodes must update <code>FLEET_HOST_URL</code> and
-            restart after a new URL appears.
+            {current.caveat} Nodes still connected are told the new URL and follow it
+            without dropping their sessions; any that were reached through the old URL
+            need <code>FLEET_HOST_URL</code> updated, or a retarget from their config
+            page.
           </MessageBarBody>
         </MessageBar>
       )}

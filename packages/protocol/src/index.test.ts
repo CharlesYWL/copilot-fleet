@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
+  HostToNodeMessageSchema,
   NodeCommandSchema,
   NodeToHostMessageSchema,
+  RenameSessionSchema,
   SessionEventSchema,
+  SessionSchema,
   canTransition,
   eventPayload,
+  normalizeHostUrl,
+  sameHostUrl,
   tryParseJson,
   type SessionEvent,
 } from "./index.js";
@@ -51,6 +56,62 @@ describe("protocol validation", () => {
   it("guards malformed WebSocket JSON frames", () => {
     expect(tryParseJson('{"type":"heartbeat"}').ok).toBe(true);
     expect(tryParseJson("{not-json").ok).toBe(false);
+  });
+
+  it("reads a session row written before names existed", () => {
+    // Older Hosts have rows with no name column; parsing must not fail, and the
+    // absent name has to arrive as "" so readers fall back to the prompt.
+    const session = SessionSchema.parse({
+      id: "s1",
+      workspaceId: "w1",
+      workspaceName: "repo",
+      placementId: "p1",
+      nodeId: "n1",
+      nodeName: "node",
+      state: "idle",
+      initialPrompt: "go",
+      currentActivity: "",
+      lastText: "",
+      createdAt: "2026-08-08T09:00:00.000Z",
+      updatedAt: "2026-08-08T09:00:00.000Z",
+    });
+    expect(session.name).toBe("");
+  });
+
+  it("accepts a rename that clears the name", () => {
+    expect(RenameSessionSchema.parse({ name: "" }).name).toBe("");
+    expect(() => RenameSessionSchema.parse({ name: "x".repeat(121) })).toThrow();
+  });
+
+  it("carries a new Host address to the node", () => {
+    const message = HostToNodeMessageSchema.parse({
+      type: "host_url",
+      hostUrl: "https://new.trycloudflare.com",
+    });
+    expect(message).toEqual({
+      type: "host_url",
+      hostUrl: "https://new.trycloudflare.com",
+    });
+    expect(() =>
+      HostToNodeMessageSchema.parse({ type: "host_url", hostUrl: "" }),
+    ).toThrow();
+  });
+});
+
+describe("normalizeHostUrl", () => {
+  it("ignores the spellings that name the same Host", () => {
+    // All of these dial the same socket, so treating them as different would
+    // announce moves that move nobody.
+    expect(sameHostUrl("https://Fleet.Example.com/", "https://fleet.example.com")).toBe(
+      true,
+    );
+    expect(sameHostUrl("http://127.0.0.1:8787", "http://127.0.0.1:8787/")).toBe(true);
+    expect(sameHostUrl("http://127.0.0.1:8787", "http://127.0.0.1:8788")).toBe(false);
+  });
+
+  it("keeps a value it cannot parse rather than blanking it", () => {
+    expect(normalizeHostUrl("not a url/")).toBe("not a url");
+    expect(normalizeHostUrl("  ")).toBe("");
   });
 });
 

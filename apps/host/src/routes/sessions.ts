@@ -3,6 +3,7 @@ import {
   CreateSessionSchema,
   PermissionResponseSchema,
   PromptSchema,
+  RenameSessionSchema,
   canTransition,
   errorMessage,
   terminalSessionStates,
@@ -34,7 +35,7 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const unsupported = yoloUnsupportedReason(node, yolo);
     if (unsupported) return reply.code(409).send({ error: unsupported });
 
-    const session = store.createSession(placement, input.prompt, yolo);
+    const session = store.createSession(placement, input.prompt, yolo, input.name);
     service.publishSession(session);
     const dispatched = service.dispatch(
       node.id,
@@ -61,6 +62,19 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       return reply.code(404).send({ error: "Session not found" });
     }
     return store.listEvents(id);
+  });
+
+  /**
+   * Renames a session. Allowed in every state, including terminal ones: naming
+   * a finished run is how it stays findable in the history the UI keeps.
+   */
+  app.patch("/api/sessions/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = RenameSessionSchema.parse(request.body);
+    const session = store.renameSession(id, input.name);
+    if (!session) return reply.code(404).send({ error: "Session not found" });
+    service.publishSession(session);
+    return session;
   });
 
   app.post("/api/sessions/:id/prompt", async (request, reply) => {

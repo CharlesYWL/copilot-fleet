@@ -27,6 +27,7 @@ type SessionFocusDialogProps = {
   onStop: () => void;
   onDismiss: () => void;
   onResume: () => void;
+  onRename: (name: string) => void;
   onPermission: (
     requestId: string,
     outcome: "allow_once" | "deny",
@@ -44,6 +45,7 @@ export const SessionFocusDialog = ({
   onStop,
   onDismiss,
   onResume,
+  onRename,
   onPermission,
 }: SessionFocusDialogProps) => {
   const styles = useStyles();
@@ -64,6 +66,7 @@ export const SessionFocusDialog = ({
           onStop={onStop}
           onDismiss={onDismiss}
           onResume={onResume}
+          onRename={onRename}
           onPermission={onPermission}
           onClose={handleClose}
         />

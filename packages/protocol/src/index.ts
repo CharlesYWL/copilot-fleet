@@ -62,6 +62,12 @@ export const SessionSchema = z.object({
   nodeId: z.string().min(1),
   nodeName: z.string().min(1),
   state: SessionStateSchema,
+  /**
+   * Operator-chosen label. Empty means "no name yet", and readers fall back to
+   * the initial prompt — a default copied from the prompt at creation would
+   * freeze the first sentence of a long prompt as a name nobody chose.
+   */
+  name: z.string().default(""),
   initialPrompt: z.string().min(1),
   currentActivity: z.string(),
   lastText: z.string(),
@@ -73,6 +79,9 @@ export const SessionSchema = z.object({
   yolo: z.boolean().default(false),
 });
 export type FleetSession = z.infer<typeof SessionSchema>;
+
+/** Long enough for a descriptive label, short enough to render in a tree row. */
+export const SESSION_NAME_MAX_LENGTH = 120;
 
 export const PermissionOptionSchema = z.object({
   optionId: z.string().min(1),
@@ -240,8 +249,45 @@ export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("welcome"), nodeId: z.string().min(1) }),
   z.object({ type: z.literal("command"), command: NodeCommandSchema }),
+  /**
+   * The Host's address changed and this is where to find it next time.
+   *
+   * Sent over the connection the Node already has, so a rotated tunnel URL no
+   * longer strands every machine behind the URL it enrolled with. Only Nodes
+   * advertising {@link HOST_URL_SYNC_CAPABILITY} may be sent this: an older
+   * agent validates every frame against its own copy of this union and hangs up
+   * on anything it does not recognise, so announcing to one would cost it the
+   * connection it was told to keep.
+   */
+  z.object({ type: z.literal("host_url"), hostUrl: z.string().min(1) }),
 ]);
 export type HostToNodeMessage = z.infer<typeof HostToNodeMessageSchema>;
+
+/** A Node that understands `host_url` and can follow the Host to a new address. */
+export const HOST_URL_SYNC_CAPABILITY = "host-url-sync";
+
+/**
+ * A Host URL reduced to what actually decides where a Node dials.
+ *
+ * Nodes build `new URL("/ws/node", hostUrl)`, so a trailing slash, a stray
+ * uppercase host, or an explicit default port all name the same Host — and
+ * comparing the raw strings would announce a "change" that moves nobody, or
+ * store the same address twice in a fallback list.
+ */
+export function normalizeHostUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return "";
+  try {
+    const parsed = new URL(trimmed);
+    return `${parsed.protocol}//${parsed.host}${parsed.pathname.replace(/\/+$/, "")}`;
+  } catch {
+    return trimmed.replace(/\/+$/, "");
+  }
+}
+
+export function sameHostUrl(left: string, right: string): boolean {
+  return normalizeHostUrl(left) === normalizeHostUrl(right);
+}
 
 /**
  * Everything a freshly connected browser needs to render the fleet.
@@ -315,6 +361,12 @@ export const CreateSessionSchema = z.object({
   prompt: z.string().min(1).max(100_000),
   /** Omitted means "use the Host default". */
   yolo: z.boolean().optional(),
+  name: z.string().max(SESSION_NAME_MAX_LENGTH).default(""),
+});
+
+/** Empty clears the name, so the label falls back to the initial prompt. */
+export const RenameSessionSchema = z.object({
+  name: z.string().max(SESSION_NAME_MAX_LENGTH),
 });
 
 export const UpdateDefaultsSchema = z.object({

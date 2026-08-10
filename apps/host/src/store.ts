@@ -87,6 +87,7 @@ export class FleetStore {
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "yolo", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("sessions", "name", "TEXT NOT NULL DEFAULT ''");
   }
 
   private statement(sql: string): StatementSync {
@@ -396,13 +397,18 @@ export class FleetStore {
     ).map(placementFromRow);
   }
 
-  createSession(placement: Placement, prompt: string, yolo = false): FleetSession {
+  createSession(
+    placement: Placement,
+    prompt: string,
+    yolo = false,
+    name = "",
+  ): FleetSession {
     const now = new Date().toISOString();
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -415,8 +421,26 @@ export class FleetStore {
       now,
       now,
       yolo ? 1 : 0,
+      name.trim(),
     );
     return this.getSession(id)!;
+  }
+
+  /**
+   * Renames a session, or clears the name when given an empty one so the label
+   * falls back to the initial prompt.
+   *
+   * `updated_at` deliberately moves: the tile ordering and the "last touched"
+   * reading both come from it, and a rename is an operator touching this row.
+   */
+  renameSession(id: string, name: string): FleetSession | undefined {
+    if (!this.getSession(id)) return undefined;
+    this.statement("UPDATE sessions SET name=?,updated_at=? WHERE id=?").run(
+      name.trim(),
+      new Date().toISOString(),
+      id,
+    );
+    return this.getSession(id);
   }
 
   getSession(id: string): FleetSession | undefined {
@@ -683,6 +707,7 @@ function sessionFromRow(row: Row): FleetSession {
     nodeId: String(row.node_id),
     nodeName: String(row.node_name),
     state: String(row.state),
+    name: String(row.name ?? ""),
     initialPrompt: String(row.initial_prompt),
     currentActivity: String(row.current_activity),
     lastText: String(row.last_text),

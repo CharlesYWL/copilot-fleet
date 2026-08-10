@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import {
   BrowserMessageSchema,
+  HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
   canTransition,
   eventPayload,
@@ -145,6 +146,34 @@ export class FleetService {
     );
     this.publishSession(session);
     return { sent: false, session };
+  }
+
+  /**
+   * Tells every connected Node where this Host moved to.
+   *
+   * Skips Nodes that do not advertise the capability: their copy of the message
+   * union has no `host_url` in it, so the frame would fail validation and cost
+   * them the connection this exists to preserve. They keep dialing the address
+   * they enrolled with, exactly as before — the operator retargets those from
+   * the node config page.
+   *
+   * Nothing is sent to the Node that is *reached through* the old URL and would
+   * therefore never see it: that socket is already gone by the time its tunnel
+   * is. This reaches the Nodes on a path that outlives the change — a LAN
+   * address, a named tunnel — which is precisely the set that can act on it.
+   */
+  broadcastHostUrl(hostUrl: string): number {
+    let notified = 0;
+    for (const [nodeId, socket] of this.nodeSockets) {
+      const node = this.store.getNode(nodeId);
+      if (!node?.capabilities.includes(HOST_URL_SYNC_CAPABILITY)) continue;
+      this.send(socket, HostToNodeMessageSchema.parse({ type: "host_url", hostUrl }));
+      notified += 1;
+    }
+    if (notified > 0) {
+      this.log.info({ hostUrl, notified }, "Announced new Host URL to nodes");
+    }
+    return notified;
   }
 
   /** Records a heartbeat, publishing only when a browser would render it. */

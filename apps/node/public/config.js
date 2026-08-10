@@ -46,6 +46,13 @@ const note = (id, text, ok) => {
 
 const render = (data) => {
   for (const key of fields) $(key).value = data.settings[key];
+  // The Host announces its address when it moves, so this node may be dialing
+  // somewhere nobody typed here. Naming the addresses it would fall back to
+  // explains that, and explains why it still connects after a tunnel rotates.
+  const fallbacks = data.settings.knownHostUrls || [];
+  $("hostUrlFallbacks").textContent = fallbacks.length
+    ? "Falls back to " + fallbacks.join(", ") + " if this address stops answering."
+    : "";
   const status = data.status;
   $("dot").className = "dot " + (status.connected ? "on" : "off");
   $("conn").textContent = status.connected ? "Connected to Host" : "Not connected";

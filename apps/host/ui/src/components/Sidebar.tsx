@@ -19,6 +19,7 @@ import {
 } from "@fluentui/react-icons";
 import type { FleetNode, FleetSession, Workspace } from "@fleet/protocol";
 import { groupSessionsByWorkspace } from "../lib/session-groups";
+import { sessionLabel } from "../lib/session-label";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -224,7 +225,7 @@ export const Sidebar = ({
                                       className={styles.sessionName}
                                       title={session.initialPrompt}
                                     >
-                                      {session.initialPrompt}
+                                      {sessionLabel(session)}
                                     </span>
                                   </span>
                                 </TreeItemLayout>

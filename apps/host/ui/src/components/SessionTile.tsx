@@ -3,6 +3,7 @@ import { Text, makeStyles, mergeClasses, tokens } from "@fluentui/react-componen
 import type { FleetSession, SessionEvent } from "@fleet/protocol";
 import { blockColor, stateAccent, terminal } from "../theme";
 import { toPreviewLines } from "../lib/session-preview";
+import { sessionLabel } from "../lib/session-label";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -142,7 +143,7 @@ export const SessionTile = ({
         className={styles.open}
         role="button"
         tabIndex={0}
-        aria-label={`Open session on ${session.nodeName}`}
+        aria-label={`Open ${sessionLabel(session)} on ${session.nodeName}`}
         title={session.initialPrompt}
         onClick={handleOpen}
         onKeyDown={handleKeyDown}
@@ -153,11 +154,11 @@ export const SessionTile = ({
             {session.state}
           </span>
           <Text weight="semibold" className={styles.name}>
-            {session.nodeName}
+            {sessionLabel(session)}
           </Text>
         </div>
         <Text className={styles.subtitle}>
-          {session.currentActivity || session.initialPrompt}
+          {session.nodeName} · {session.currentActivity || session.initialPrompt}
         </Text>
         <div className={styles.preview}>
           {lines.length === 0 ? (

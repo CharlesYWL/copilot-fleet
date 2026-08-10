@@ -15,6 +15,7 @@ import {
 import { FleetService } from "./fleet-service.js";
 import { registerBrowserGateway } from "./gateway/browser-socket.js";
 import { registerNodeGateway } from "./gateway/node-socket.js";
+import { startHostUrlMonitor } from "./host-url.js";
 import { envFilePath } from "./paths.js";
 import { startPresenceMonitor } from "./presence.js";
 import { catalogRoutes } from "./routes/catalog.js";
@@ -77,6 +78,12 @@ export async function buildServer(
   const enrollmentHostUrl = () =>
     resolveEnrollmentHostUrl(tunnel.activeTunnelUrl(), fallbackPublicUrl());
 
+  // Nodes reached over a path that outlives a tunnel rotation — a LAN address,
+  // a named tunnel — are told where the Host moved to, so they follow it
+  // instead of dialing an address that stopped existing.
+  const hostUrlMonitor = startHostUrlMonitor(enrollmentHostUrl, (hostUrl) =>
+    service.broadcastHostUrl(hostUrl),
+  );
   // Registered before the routes: a child plugin context inherits the error
   // handler that was in place when it was created, so setting it afterwards
   // would leave every route on Fastify's default 500.
@@ -123,6 +130,7 @@ export async function buildServer(
 
   app.addHook("onClose", async () => {
     clearInterval(presenceTimer);
+    clearInterval(hostUrlMonitor);
     await tunnel.stop();
     service.shutdown();
     store.close();

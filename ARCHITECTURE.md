@@ -38,7 +38,8 @@ copilot --acp --stdio
 - **Node**: registered machine, capabilities, capacity, active count, and liveness.
 - **Workspace**: logical project visible in the UI.
 - **Placement**: `(workspaceId, nodeId, localPath)`. It is the only source of a Session working directory.
-- **Session**: one long-lived Copilot process bound to one Placement.
+- **Session**: one long-lived Copilot process bound to one Placement. Carries an
+  optional operator-chosen name; empty means the UI labels it by its initial prompt.
 - **Turn**: one initial or follow-up prompt. MVP permits one active Turn per Session.
 - **SessionEvent**: ordered append-only normalized ACP output/state/tool/permission event.
 - **Permission request**: ACP request waiting for an allow-once or deny browser decision; timeout/disconnect denies it.
@@ -90,12 +91,34 @@ The Node WebSocket carries:
 - authenticated hello and welcome
 - heartbeat with active Session IDs
 - Host commands: start, prompt, cancel, stop, permission response
+- Host address announcements when the Host's public URL changes
 - Node command results and ordered Session Events
 
 Commands use unique IDs for deduplication. Events use an event UUID and a monotonically increasing per-Session sequence.
 Host accepts Session Events and command results only when their Session belongs
 to the authenticated Node. Malformed or cross-Node frames close the connection.
 Missing heartbeats also close the connection and trigger terminal reconciliation.
+
+### Host address changes
+
+Both sides validate every frame against the message union, so a Node closes the
+connection on a message type it does not know. New message types are therefore
+gated on a capability the Node advertises in its hello: `host_url` is sent only
+to Nodes reporting `host-url-sync`, which keeps a mixed-version fleet working.
+
+The Host polls its own public URL — a tunnel it started, a tunnel running as its
+own process, or `FLEET_PUBLIC_URL` — and announces a change to connected Nodes.
+Loopback fallbacks are never announced, since they name the recipient's own
+machine rather than the Host.
+
+A Node adopts the announced address, keeps the one it was using as a fallback,
+and leaves the live socket alone: it learns where the Host went without losing
+the sessions running on that connection. A dial that never reaches `welcome`
+rotates to the next known address, and whichever one authenticates becomes the
+primary, so an announcement that is wrong for a particular machine cannot strand
+it. This helps every Node whose path to the Host outlives the change; a Node
+reached through the tunnel that just rotated loses that socket with it and
+recovers through the same rotation on reconnect.
 
 ### Node to Copilot
 

@@ -115,6 +115,28 @@ describe("FleetStore", () => {
     expect(store.transitionSession(session.id, "idle").state).toBe("idle");
   });
 
+  it("names a session, and clears the name back to the prompt fallback", () => {
+    const { store, placement } = setup();
+    const unnamed = store.createSession(placement, "refactor the router");
+    expect(unnamed.name).toBe("");
+
+    // Surrounding whitespace would render as a blank label that still counts as
+    // a name, so it is trimmed on the way in.
+    expect(store.renameSession(unnamed.id, "  Router cleanup  ")?.name).toBe(
+      "Router cleanup",
+    );
+    // Empty is not a rejected rename: it is how an operator gets the
+    // prompt-derived label back.
+    expect(store.renameSession(unnamed.id, "")?.name).toBe("");
+    expect(store.renameSession("missing", "x")).toBeUndefined();
+  });
+
+  it("keeps a name given at creation", () => {
+    const { store, placement } = setup();
+    const named = store.createSession(placement, "hello", false, "Nightly build");
+    expect(store.getSession(named.id)?.name).toBe("Nightly build");
+  });
+
   it("persists sessions and ordered events", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");

@@ -76,6 +76,30 @@ describe("config router", () => {
     expect(applySettings).toHaveBeenCalledOnce();
   });
 
+  it("keeps the fallback Host addresses a save never mentions", async () => {
+    // The page posts back only the fields it shows. Parsing that as the whole
+    // settings object would drop the addresses the Host announced, which are
+    // the only way back if the current one stops resolving.
+    const applySettings = vi.fn(async () => {});
+    const { route } = router({
+      applySettings,
+      getSettings: () => ({
+        ...settingsFromEnv({}),
+        knownHostUrls: ["https://previous.trycloudflare.com"],
+      }),
+    });
+    const form = settingsFromEnv({ FLEET_HOST_URL: "https://typed-by-hand.example" });
+    const response = await route("POST", "/api/config", JSON.stringify(form));
+
+    expect(response.status).toBe(200);
+    expect(applySettings).toHaveBeenCalledWith(
+      expect.objectContaining({
+        hostUrl: "https://typed-by-hand.example",
+        knownHostUrls: ["https://previous.trycloudflare.com"],
+      }),
+    );
+  });
+
   it("reports a Host that cannot be reached as 502, not 500", async () => {
     const { route, fleet } = router();
     vi.mocked(fleet.listWorkspaces).mockRejectedValueOnce(new Error("fetch failed"));

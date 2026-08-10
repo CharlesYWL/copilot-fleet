@@ -48,6 +48,10 @@ Open the UI → **Settings**:
 - **Nodes** — rename/delete machines and copy the enroll command.
 - **Workspaces** — map projects to per-machine paths.
 
+Connected nodes are told when the Host's public URL changes, so a rotated tunnel
+does not strand them — see
+[Following the Host to a new URL](#following-the-host-to-a-new-url).
+
 For production (built Host + local Node together):
 
 ```bash
@@ -155,6 +159,38 @@ The listener binds to loopback only and is deliberately not exposed: anything
 that can repoint a node at a different Host can run commands on that machine.
 Reach a remote node's page over SSH port forwarding rather than binding wider.
 
+### Following the Host to a new URL
+
+When the Host's public address changes — a tunnel comes up, rotates, or is
+switched to another provider — it tells the nodes that are still connected. Each
+one records the new address, keeps the old one as a fallback, and **does not drop
+the connection it already has**: the running sessions on it are unaffected, and
+the new address is what the next reconnect dials.
+
+This closes the gap where a rotated tunnel URL left every node dialing an
+address that had stopped existing, with no way back except editing
+`settings.json` on each machine.
+
+What it does and does not cover:
+
+- A node reached over an address that outlives the change — a LAN address, a
+  named tunnel — is told and follows along.
+- A node reached _through_ the tunnel that just rotated cannot be told: that
+  socket died with the tunnel. It keeps retrying its known addresses, so it
+  recovers on its own if one of them still answers.
+- Loopback is never announced. When no tunnel is up and no `FLEET_PUBLIC_URL` is
+  set, the Host's idea of its own address is `http://127.0.0.1:8787`, which on
+  another machine points at that machine. Nodes are left on the address they
+  have instead.
+- A node running an older agent is skipped rather than sent a message it would
+  reject, so a mixed fleet keeps working.
+
+If an announced address turns out to be unreachable from a particular machine,
+that node dials it, fails, and rotates to the previous address on the next
+attempt — so an announcement can never strand a machine. Whichever address
+answers becomes the one it leads with. The node config page lists the fallbacks
+under the Host URL field.
+
 ## Exact proof of concept
 
 Run the Host in terminal 1:
@@ -179,7 +215,8 @@ Then open `http://127.0.0.1:5173`:
 
 1. Create a workspace under **Workspaces**.
 2. Add a placement for `mock-node` using an existing absolute directory.
-3. Start two sessions from **Dashboard**.
+3. Start two sessions from **Dashboard**. Give one a name in the dialog; the
+   other is listed by its prompt until you rename it from the session header.
 4. Open either card to observe independent streamed events, send a follow-up,
    cancel a turn, or stop the process.
 
