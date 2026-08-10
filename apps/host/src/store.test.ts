@@ -109,8 +109,8 @@ describe("FleetStore", () => {
     // The node re-attaches and reports idle because a resumed session waits
     // for the next prompt rather than replaying the original one.
     store.transitionSession(session.id, "starting");
-    expect(store.appendEvent(event(offset + 1, "starting"))).toBe(true);
-    expect(store.appendEvent(event(offset + 2, "idle"))).toBe(true);
+    expect(store.appendEvent(event(offset + 1, "starting")).stored).toBe(true);
+    expect(store.appendEvent(event(offset + 2, "idle")).stored).toBe(true);
     expect(canTransition("starting", "idle")).toBe(true);
     expect(store.transitionSession(session.id, "idle").state).toBe("idle");
   });
@@ -195,9 +195,9 @@ describe("FleetStore", () => {
         type: "state",
         payload: { state: "starting" },
         createdAt: new Date().toISOString(),
-      }),
+      }).stored,
     ).toBe(true);
-    expect(store.appendEvent(store.listEvents(session.id)[0]!)).toBe(false);
+    expect(store.appendEvent(store.listEvents(session.id)[0]!).stored).toBe(false);
     expect(store.listEvents(session.id)).toHaveLength(1);
   });
 
@@ -216,20 +216,62 @@ describe("FleetStore", () => {
     expect(store.maxEventSequence(session.id)).toBe(1);
   });
 
-  it("rejects event gaps and invalid state transitions", () => {
+  it("rejects invalid state transitions", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");
     expect(() => store.transitionSession(session.id, "idle")).toThrow();
-    expect(() =>
-      store.appendEvent({
-        eventId: "e2",
-        sessionId: session.id,
-        sequence: 2,
-        type: "agent_text",
-        payload: { text: "gap" },
-        createdAt: new Date().toISOString(),
-      }),
-    ).toThrow(/Expected event sequence 1/);
+  });
+
+  it("keeps recording after events were lost while the Host was down", () => {
+    // The Node keeps working through a Host restart and its sequence keeps
+    // climbing, so the first event afterwards is numbered past what the Host
+    // expects. Refusing it refused every event after it too — the gap could
+    // never close — which left the session's transcript stopped and its state
+    // frozen wherever it happened to be, with no way back but restarting it.
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "hello");
+    const event = (sequence: number, text: string) => ({
+      eventId: `e${sequence}`,
+      sessionId: session.id,
+      sequence,
+      type: "agent_text" as const,
+      payload: { text },
+      createdAt: new Date().toISOString(),
+    });
+
+    expect(store.appendEvent(event(1, "before"))).toEqual({ stored: true, skipped: 0 });
+    // Events 2-8 happened while the Host was unreachable and are simply gone.
+    expect(store.appendEvent(event(9, "after"))).toEqual({ stored: true, skipped: 7 });
+    // The session keeps streaming rather than going deaf.
+    expect(store.appendEvent(event(10, "still here"))).toEqual({
+      stored: true,
+      skipped: 0,
+    });
+    expect(store.getSession(session.id)?.lastText).toBe("still here");
+    expect(store.maxEventSequence(session.id)).toBe(10);
+  });
+
+  it("still refuses a duplicate, and keeps the preview on the newest event", () => {
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "hello");
+    const event = (sequence: number, text: string) => ({
+      eventId: `e${sequence}`,
+      sessionId: session.id,
+      sequence,
+      type: "agent_text" as const,
+      payload: { text },
+      createdAt: new Date().toISOString(),
+    });
+
+    store.appendEvent(event(1, "first"));
+    store.appendEvent(event(5, "newest"));
+    expect(store.appendEvent(event(5, "newest")).stored).toBe(false);
+
+    // A straggler that fills an earlier hole belongs in the transcript, but must
+    // not drag the tile preview back to something the agent has moved past.
+    expect(store.appendEvent(event(3, "late arrival")).stored).toBe(true);
+    expect(store.getSession(session.id)?.lastText).toBe("newest");
+    expect(store.listEvents(session.id).map((item) => item.sequence)).toEqual([1, 3, 5]);
   });
 
   it("retains inventory and event history across a database reopen", () => {

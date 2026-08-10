@@ -148,6 +148,12 @@ has the agent session on disk. A session that died before its agent ever started
 has nothing to re-attach to — it settles as "it never reached the agent" and
 offers no Resume.
 
+A node keeps its agents running while the Host is away and buffers the events
+they produce, so a Host restart mid-turn no longer costs that part of the
+transcript. If the outage outlasts the buffer the Host records the gap and keeps
+going; it never refuses the events that follow, because a session that cannot
+report its own state again is a session nobody can use.
+
 ### Node config page
 
 Each node serves a small settings page at `http://127.0.0.1:8788` (override the

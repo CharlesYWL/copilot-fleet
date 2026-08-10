@@ -10,6 +10,7 @@ import {
   errorMessage,
   sameHostUrl,
   type NodeToHostMessage,
+  type SessionEvent,
 } from "@fleet/protocol";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
 import { CliError, USAGE, parseNodeArgs } from "./cli.js";
@@ -35,6 +36,7 @@ import {
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
 import { CommandRouter } from "./router.js";
+import { EventOutbox } from "./outbox.js";
 import { configServerPort, startConfigServer } from "./config-server.js";
 import {
   loadSettings,
@@ -106,8 +108,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let socket: WebSocket | undefined;
   let shuttingDown = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
+  const outbox = new EventOutbox();
   const router = new CommandRouter(factory, settings.maxSessions, (event) => {
-    send({ type: "event", event });
+    // Held rather than dropped when the Host is unreachable: the agent keeps
+    // working through a Host restart, and these are the only record of it.
+    if (!sendEvent(event)) outbox.add(event);
   });
 
   /** Registers when the stored identity is missing or the operator renamed this node. */
@@ -256,6 +261,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         welcomed = true;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
+        flushOutbox();
         return;
       }
       if (frame.value.type === "host_url") {
@@ -338,6 +344,29 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   function send(message: NodeToHostMessage): void {
     NodeToHostMessageSchema.parse(message);
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+  }
+
+  /** Reports whether the event actually left, so the caller can hold it if not. */
+  function sendEvent(event: SessionEvent): boolean {
+    if (socket?.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(NodeToHostMessageSchema.parse({ type: "event", event })));
+    return true;
+  }
+
+  /**
+   * Delivers what the agents produced while the Host was away.
+   *
+   * Runs on `welcome` rather than on `open`, because the Host discards anything
+   * that arrives before it has authenticated the hello.
+   */
+  function flushOutbox(): void {
+    if (outbox.size === 0) return;
+    const held = outbox.size;
+    const { sent, dropped } = outbox.flush(sendEvent);
+    log(
+      `Delivered ${sent}/${held} event(s) buffered while the Host was unreachable` +
+        (dropped > 0 ? `; ${dropped} older one(s) were dropped for capacity` : ""),
+    );
   }
 
   async function register(): Promise<Credentials> {

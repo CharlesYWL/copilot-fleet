@@ -23,6 +23,15 @@ import {
 
 type Row = Record<string, unknown>;
 
+/**
+ * What happened to an event offered to the log.
+ *
+ * `skipped` counts the events that never arrived before this one — the Host was
+ * down while the Node kept working — so a caller can say so once instead of
+ * treating a hole as corruption.
+ */
+export type AppendResult = { stored: boolean; skipped: number };
+
 const terminalStateList = [...terminalSessionStates];
 /** Terminal plus offline: settled enough that a cascade delete is safe. */
 const settledStateList = [...terminalStateList, "offline"];
@@ -533,20 +542,26 @@ export class FleetStore {
    * gap between the sequence check and the insert was wide enough for a second
    * event to claim the same number, and a crash between the insert and the
    * derived updates left `last_text` describing an event that never landed.
+   *
+   * A sequence ahead of the next expected one is stored rather than refused.
+   * Events are produced by a Node that keeps working while the Host is down, and
+   * the ones raised during the outage are simply gone — so demanding the exact
+   * next number meant the first event after a Host restart was rejected, and
+   * every event after it too, because the gap could never close. The session
+   * went deaf: its transcript stopped, its state froze wherever it happened to
+   * be, and nothing short of restarting the Node recovered it.
    */
-  appendEvent(event: SessionEvent): boolean {
+  appendEvent(event: SessionEvent): AppendResult {
     return this.transaction(() => {
       const duplicate = this.statement(
         "SELECT 1 found FROM events WHERE event_id=? OR (session_id=? AND sequence=?)",
       ).get(event.eventId, event.sessionId, event.sequence);
-      if (duplicate) return false;
+      if (duplicate) return { stored: false, skipped: 0 };
       const previous = this.statement(
         "SELECT MAX(sequence) sequence FROM events WHERE session_id=?",
       ).get(event.sessionId) as Row;
       const max = Number(previous.sequence ?? 0);
-      if (event.sequence !== max + 1) {
-        throw new Error(`Expected event sequence ${max + 1}, got ${event.sequence}`);
-      }
+      const skipped = Math.max(0, event.sequence - (max + 1));
       this.statement(
         "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at) VALUES (?,?,?,?,?,?)",
       ).run(
@@ -557,18 +572,22 @@ export class FleetStore {
         JSON.stringify(event.payload),
         event.createdAt,
       );
-      // Streamed text is what a tile previews, so the newest chunk is kept on
-      // the session row rather than re-read from the event log every render.
-      const text =
-        eventPayload(event, "agent_text")?.text ??
-        eventPayload(event, "agent_thought")?.text ??
-        eventPayload(event, "system")?.text;
-      if (text) {
-        this.statement("UPDATE sessions SET last_text=?,updated_at=? WHERE id=?").run(
-          text.slice(-500),
-          event.createdAt,
-          event.sessionId,
-        );
+      // Only the newest event describes the session now: an event that arrives
+      // late and fills a hole must not drag the preview backwards.
+      if (event.sequence > max) {
+        // Streamed text is what a tile previews, so the newest chunk is kept on
+        // the session row rather than re-read from the event log every render.
+        const text =
+          eventPayload(event, "agent_text")?.text ??
+          eventPayload(event, "agent_thought")?.text ??
+          eventPayload(event, "system")?.text;
+        if (text) {
+          this.statement("UPDATE sessions SET last_text=?,updated_at=? WHERE id=?").run(
+            text.slice(-500),
+            event.createdAt,
+            event.sessionId,
+          );
+        }
       }
       const agentSessionId = eventPayload(event, "agent_session")?.agentSessionId;
       if (agentSessionId) {
@@ -576,7 +595,7 @@ export class FleetStore {
           "UPDATE sessions SET agent_session_id=?,updated_at=? WHERE id=?",
         ).run(agentSessionId, event.createdAt, event.sessionId);
       }
-      return true;
+      return { stored: true, skipped };
     });
   }
 

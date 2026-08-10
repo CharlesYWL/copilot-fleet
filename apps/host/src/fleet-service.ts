@@ -203,7 +203,14 @@ export class FleetService {
 
   handleEvent(event: SessionEvent): void {
     try {
-      if (!this.store.appendEvent(event)) return;
+      const appended = this.store.appendEvent(event);
+      if (!appended.stored) return;
+      if (appended.skipped > 0) {
+        this.log.warn(
+          { sessionId: event.sessionId, skipped: appended.skipped },
+          "Session events were lost while the Host was unreachable",
+        );
+      }
       this.broadcast({ type: "event", event });
       const session = this.store.getSession(event.sessionId);
       if (!session) return;

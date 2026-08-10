@@ -43,6 +43,59 @@ function setup() {
   return { store, service, enroll };
 }
 
+describe("handleEvent after a Host restart", () => {
+  const event = (sessionId: string, sequence: number, payload: object, type = "state") =>
+    ({
+      eventId: `e${sequence}`,
+      sessionId,
+      sequence,
+      type,
+      payload,
+      createdAt: new Date().toISOString(),
+    }) as Parameters<FleetService["handleEvent"]>[0];
+
+  it("keeps applying events whose predecessors were lost", () => {
+    // The exact freeze: the Host restarted mid-turn, the Node kept working and
+    // kept numbering, and the first event afterwards was ahead of what the Host
+    // expected. Refusing it refused everything after it, so the session sat at
+    // whatever state the reconnect had guessed — accepting no output and no
+    // state change — while its agent was alive and well on the Node.
+    const { store, service } = setup();
+    const { node } = store.registerNode({
+      name: "devbox",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 4,
+    });
+    const workspace = store.createWorkspace("repo", "");
+    const placement = store.createPlacement(workspace.id, node.id, "C:\\repo");
+    const session = store.createSession(placement, "long task");
+
+    service.handleEvent(event(session.id, 1, { state: "starting" }));
+    service.handleEvent(event(session.id, 2, { state: "running" }));
+    expect(store.getSession(session.id)?.state).toBe("running");
+
+    // Host restarts: everything live is parked, and the Node that still owns the
+    // session brings it back as idle on reconnect.
+    store.resetConnectivity();
+    store.reconcileOfflineSessions(node.id, [session.id]);
+    expect(store.getSession(session.id)?.state).toBe("idle");
+
+    // Events 3-11 were raised while nothing was listening.
+    service.handleEvent(event(session.id, 12, { text: "back" }, "agent_text"));
+    service.handleEvent(event(session.id, 13, { state: "running" }));
+
+    expect(store.getSession(session.id)?.lastText).toBe("back");
+    expect(store.getSession(session.id)?.state).toBe("running");
+
+    // And the session keeps moving, rather than being deaf from here on.
+    service.handleEvent(event(session.id, 14, { state: "idle", activity: "Done" }));
+    expect(store.getSession(session.id)?.state).toBe("idle");
+  });
+});
+
 describe("broadcastHostUrl", () => {
   it("tells a node that can follow the Host where it went", () => {
     const { service, enroll } = setup();

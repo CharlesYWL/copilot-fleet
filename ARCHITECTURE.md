@@ -99,6 +99,14 @@ Host accepts Session Events and command results only when their Session belongs
 to the authenticated Node. Malformed or cross-Node frames close the connection.
 Missing heartbeats also close the connection and trigger terminal reconciliation.
 
+A Node holds events it raises while the Host is unreachable and replays them once
+authenticated, so an agent that keeps working through a Host restart still has
+its output recorded. The buffer is bounded, and the Host stores an event whose
+sequence runs ahead of the next expected one rather than refusing it: the missing
+events are gone with the outage, and a Host that insists on them refuses
+everything after them too, which leaves the Session unable to report its own
+state ever again.
+
 ### Host address changes
 
 Both sides validate every frame against the message union, so a Node closes the
