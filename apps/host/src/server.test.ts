@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { resolve } from "node:path";
 import {
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
@@ -8,16 +9,17 @@ import {
 } from "./server.js";
 
 describe("resolveDatabasePath", () => {
-  const root = "/repo/apps/host";
+  const root = resolve("repo", "apps", "host");
+  const dataPath = (fileName: string) => resolve(root, "data", fileName);
 
   it("keeps every entry point on one file regardless of cwd", () => {
     // The dev script runs the Host from apps/host and other entry points run
     // from the repo root; a cwd-relative path split these into two databases,
     // and the empty one rejected every Node's credentials.
     expect(resolveDatabasePath("./apps/host/data/fleet.db", root)).toBe(
-      "/repo/apps/host/data/fleet.db",
+      dataPath("fleet.db"),
     );
-    expect(resolveDatabasePath(undefined, root)).toBe("/repo/apps/host/data/fleet.db");
+    expect(resolveDatabasePath(undefined, root)).toBe(dataPath("fleet.db"));
   });
 
   it("still honours an explicit absolute path", () => {
@@ -27,9 +29,7 @@ describe("resolveDatabasePath", () => {
   });
 
   it("keeps a relative file name chosen by the operator", () => {
-    expect(resolveDatabasePath("./staging.db", root)).toBe(
-      "/repo/apps/host/data/staging.db",
-    );
+    expect(resolveDatabasePath("./staging.db", root)).toBe(dataPath("staging.db"));
   });
 });
 
