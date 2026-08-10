@@ -1,0 +1,12 @@
+# Line endings are LF in the repository and LF in the working tree, on every
+# platform.
+#
+# Without this a Windows clone checks out CRLF, and since Prettier's endOfLine
+# default is "lf", `npm run format:check` then fails on every file in the repo —
+# including files nobody has touched. That is the same command CI runs on Linux,
+# where the checkout is LF and it passes, so the two disagree for reasons that
+# have nothing to do with the code.
+#
+# `text=auto` still leaves anything Git detects as binary alone; every tracked
+# file here is text today.
+* text=auto eol=lf
