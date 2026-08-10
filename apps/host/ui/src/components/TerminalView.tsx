@@ -26,12 +26,14 @@ import {
 } from "@fluentui/react-icons";
 import {
   SESSION_NAME_MAX_LENGTH,
+  isResumableSession,
   terminalSessionStates,
   type FleetSession,
   type SessionEvent,
 } from "@fleet/protocol";
-import { blockColor, stateAccent, terminal } from "../theme";
+import { blockColor, terminal } from "../theme";
 import { sessionLabel } from "../lib/session-label";
+import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -257,10 +259,7 @@ export const TerminalView = ({
   const canPrompt = session.state === "idle";
   const isEnded = terminalSessionStates.has(session.state);
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
-  const canResume =
-    Boolean(onResume) &&
-    Boolean(session.agentSessionId) &&
-    (isEnded || session.state === "offline");
+  const canResume = Boolean(onResume) && isResumableSession(session);
 
   const submitPrompt = () => {
     const text = prompt.trim();
@@ -315,12 +314,9 @@ export const TerminalView = ({
       <div className={styles.header}>
         <div className={styles.headerText}>
           <span className={styles.title}>
-            <StatusDot state={session.state} />
-            <span
-              className={styles.state}
-              style={{ color: stateAccent[session.state] ?? terminal.dim }}
-            >
-              {session.state}
+            <StatusDot state={session.state} color={sessionAccent(session)} />
+            <span className={styles.state} style={{ color: sessionAccent(session) }}>
+              {sessionStatusLabel(session)}
             </span>
             {isEditingName ? (
               <form className={styles.nameForm} onSubmit={submitName}>

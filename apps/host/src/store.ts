@@ -625,15 +625,27 @@ export class FleetStore {
     });
   }
 
-  /** Purge every stopped / completed / failed session. Returns how many went. */
+  /**
+   * Purges finished sessions, but keeps the ones Resume can still re-attach.
+   *
+   * A Node reboot settles its sessions as `failed` while Copilot still holds the
+   * conversation, so "ended" and "gone" are not the same thing. Clearing swept
+   * both away, which meant the single visible button after a restart was the one
+   * that destroyed the transcripts the operator had just come back for. Those
+   * rows can still be removed one at a time with {@link deleteSession}, which is
+   * a deliberate act on a session someone is looking at.
+   *
+   * Returns how many went.
+   */
   deleteEndedSessions(): number {
     const list = placeholders(terminalStateList);
+    const disposable = `state IN (${list}) AND agent_session_id = ''`;
     return this.transaction(() => {
       this.statement(
         `DELETE FROM events WHERE session_id IN
-           (SELECT id FROM sessions WHERE state IN (${list}))`,
+           (SELECT id FROM sessions WHERE ${disposable})`,
       ).run(...terminalStateList);
-      const result = this.statement(`DELETE FROM sessions WHERE state IN (${list})`).run(
+      const result = this.statement(`DELETE FROM sessions WHERE ${disposable}`).run(
         ...terminalStateList,
       );
       return Number(result.changes);

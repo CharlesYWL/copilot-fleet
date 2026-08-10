@@ -137,6 +137,52 @@ describe("FleetStore", () => {
     expect(store.getSession(named.id)?.name).toBe("Nightly build");
   });
 
+  it("keeps a resumable session when clearing ended ones", () => {
+    // A node reboot settles its sessions as failed while Copilot still holds the
+    // conversation. Sweeping those away made Clear ended — the one button left
+    // on screen after a restart — destroy exactly what Resume exists to recover.
+    const { store, placement } = setup();
+    const resumable = store.createSession(placement, "keep me");
+    store.appendEvent({
+      eventId: "e1",
+      sessionId: resumable.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "copilot-abc" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(resumable.id, "failed", "Node reconnected without this");
+
+    const spent = store.createSession(placement, "clear me");
+    store.transitionSession(spent.id, "failed", "Never reached the agent");
+
+    expect(store.deleteEndedSessions()).toBe(1);
+    expect(store.getSession(spent.id)).toBeUndefined();
+    const kept = store.getSession(resumable.id);
+    expect(kept?.agentSessionId).toBe("copilot-abc");
+    // The transcript is the point of keeping it, so it must survive too.
+    expect(store.listEvents(resumable.id)).toHaveLength(1);
+  });
+
+  it("still dismisses a resumable session one at a time", () => {
+    // Sparing them in bulk must not make them permanent; Dismiss is a deliberate
+    // act on a session someone is looking at.
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "hello");
+    store.appendEvent({
+      eventId: "e1",
+      sessionId: session.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "copilot-abc" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(session.id, "failed", "Node reconnected without this");
+
+    store.deleteSession(session.id);
+    expect(store.getSession(session.id)).toBeUndefined();
+  });
+
   it("persists sessions and ordered events", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");

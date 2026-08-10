@@ -16,18 +16,20 @@ const useStyles = makeStyles({
 
 type StatusDotProps = {
   state: string;
+  /** Overrides the state colour, for a status the state alone misreports. */
+  color?: string;
   className?: string;
 };
 
-export const StatusDot = ({ state, className }: StatusDotProps) => {
+export const StatusDot = ({ state, color, className }: StatusDotProps) => {
   const styles = useStyles();
-  const color = stateAccent[state] ?? stateAccent.queued;
+  const resolved = color ?? stateAccent[state] ?? stateAccent.queued;
   const isLive = state === "running" || state === "starting";
   return (
     <span
       aria-hidden="true"
       className={mergeClasses(styles.dot, isLive && styles.glow, className)}
-      style={{ background: color, color }}
+      style={{ background: resolved, color: resolved }}
     />
   );
 };

@@ -1,9 +1,10 @@
 import { useMemo, type KeyboardEvent } from "react";
 import { Text, makeStyles, mergeClasses, tokens } from "@fluentui/react-components";
 import type { FleetSession, SessionEvent } from "@fleet/protocol";
-import { blockColor, stateAccent, terminal } from "../theme";
+import { blockColor, terminal } from "../theme";
 import { toPreviewLines } from "../lib/session-preview";
 import { sessionLabel } from "../lib/session-label";
+import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -119,9 +120,7 @@ export const SessionTile = ({
 
   // A waiting request outranks the run state: it is the only tile the operator
   // has to act on, so it gets the alert colour.
-  const accent = permission
-    ? terminal.permission
-    : (stateAccent[session.state] ?? terminal.dim);
+  const accent = permission ? terminal.permission : sessionAccent(session);
 
   const handleOpen = () => onOpen(session.id);
 
@@ -149,9 +148,9 @@ export const SessionTile = ({
         onKeyDown={handleKeyDown}
       >
         <div className={styles.head}>
-          <StatusDot state={session.state} />
+          <StatusDot state={session.state} color={accent} />
           <span className={styles.state} style={{ color: accent }}>
-            {session.state}
+            {sessionStatusLabel(session)}
           </span>
           <Text weight="semibold" className={styles.name}>
             {sessionLabel(session)}

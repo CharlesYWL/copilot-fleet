@@ -17,6 +17,7 @@ import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
+import { isDisposableSession, filterVisibleSessions } from "./lib/session-status";
 import { EmptySessions } from "./components/EmptySessions";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { SessionFocusDialog } from "./components/SessionFocusDialog";
@@ -88,10 +89,10 @@ export function App() {
       snapshot.sessions.filter((session) => !terminalSessionStates.has(session.state)),
     [snapshot.sessions],
   );
+  // Only what Clear ended will actually remove: resumable sessions are kept, so
+  // counting them here would promise a purge that does not happen.
   const endedCount = useMemo(
-    () =>
-      snapshot.sessions.filter((session) => terminalSessionStates.has(session.state))
-        .length,
+    () => snapshot.sessions.filter(isDisposableSession).length,
     [snapshot.sessions],
   );
   const waitingPermissions = useMemo(
@@ -308,17 +309,5 @@ export function App() {
         <Toaster toasterId={toasterId} />
       </div>
     </CatalogProvider>
-  );
-}
-
-function filterVisibleSessions(
-  sessions: FleetSession[],
-  selectedSessionId: string | undefined,
-): FleetSession[] {
-  // Ended sessions stay visible only while selected, so a failure mid-watch
-  // does not yank the transcript; Dismiss / Clear ended remove them for good.
-  return sessions.filter(
-    (session) =>
-      !terminalSessionStates.has(session.state) || session.id === selectedSessionId,
   );
 }

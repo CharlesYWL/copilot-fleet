@@ -20,6 +20,7 @@ import {
 import type { FleetNode, FleetSession, Workspace } from "@fleet/protocol";
 import { groupSessionsByWorkspace } from "../lib/session-groups";
 import { sessionLabel } from "../lib/session-label";
+import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -220,10 +221,13 @@ export const Sidebar = ({
                                   )}
                                 >
                                   <span className={styles.sessionLabel}>
-                                    <StatusDot state={session.state} />
+                                    <StatusDot
+                                      state={session.state}
+                                      color={sessionAccent(session)}
+                                    />
                                     <span
                                       className={styles.sessionName}
-                                      title={session.initialPrompt}
+                                      title={`${sessionStatusLabel(session)} · ${session.initialPrompt}`}
                                     >
                                       {sessionLabel(session)}
                                     </span>

@@ -442,6 +442,27 @@ export function canTransition(from: SessionState, to: SessionState): boolean {
   return from === to || transitions[from].has(to);
 }
 
+/**
+ * States a session can be re-attached from: it is no longer running here, but
+ * nothing has ruled out picking it back up.
+ */
+const resumableStates = new Set<SessionState>([...terminalSessionStates, "offline"]);
+
+/**
+ * Whether **Resume** can bring this session back.
+ *
+ * The Host settles a session as `failed` when a Node reconnects without it —
+ * which is what a Node reboot looks like — but Copilot keeps the conversation on
+ * disk, so `session/load` re-attaches it and the transcript continues. Such a
+ * session is dormant, not lost, and callers use this to avoid treating the two
+ * the same: one is worth showing and keeping, the other is only worth clearing.
+ */
+export function isResumableSession(
+  session: Pick<FleetSession, "state" | "agentSessionId">,
+): boolean {
+  return Boolean(session.agentSessionId) && resumableStates.has(session.state);
+}
+
 /*
  * WebSocket close codes the Host uses to explain itself to a Node. They live
  * here because both sides must agree on them: the Host picks the code and the

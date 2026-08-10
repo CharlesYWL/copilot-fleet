@@ -137,6 +137,11 @@ file and the node keeps its identity in `node.json`, so after both come back:
 3. **Resume** re-attaches through Copilot's `session/load`, and the transcript
    continues where it stopped rather than starting over.
 
+A session in that state is shown as **resumable** rather than failed, stays in
+the sidebar, and is skipped by **Clear ended** — that button only removes
+sessions with nothing left to re-attach to. Use **Dismiss** on a session to drop
+a resumable one deliberately.
+
 Three things have to hold for that to work: the Host's `DATABASE_PATH` file is
 intact, the node starts under the same name, and Copilot on that machine still
 has the agent session on disk. A session that died before its agent ever started
