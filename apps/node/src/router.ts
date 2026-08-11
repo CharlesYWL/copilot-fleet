@@ -12,7 +12,17 @@ export type CommandResult = {
   commandId: string;
   ok: boolean;
   error?: string;
+  /** False when the command was refused but the session is still healthy. */
+  fatal?: boolean;
 };
+
+/**
+ * A command the agent declined without anything being wrong with it.
+ *
+ * Distinguished from a real failure so the Host can tell the operator "not
+ * now" instead of tearing down a session that is working perfectly well.
+ */
+export class PromptRefused extends Error {}
 
 type SessionSlot = {
   agent?: SessionAgent;
@@ -63,8 +73,17 @@ export class CommandRouter {
         commandId: command.commandId,
         ok: false,
         error: error instanceof Error ? error.message : "Command failed",
+        // A refusal leaves the session healthy, so the Host must not bury it.
+        fatal: !(error instanceof PromptRefused),
       };
     }
+  }
+
+  /** Sessions with a turn still in flight, for the Host's reconnect bookkeeping. */
+  get busySessionIds(): string[] {
+    return [...this.slots.entries()]
+      .filter(([, slot]) => slot.agent?.busy)
+      .map(([sessionId]) => sessionId);
   }
 
   denyPendingPermissions(): void {
@@ -92,6 +111,19 @@ export class CommandRouter {
     const agent = slot?.agent;
     if (!agent) throw new Error("Session is not active on this node");
     if (command.type === "prompt") {
+      // Refused rather than dropped. This used to be `.catch(() => undefined)`
+      // over a promise that rejects immediately when a turn is already in
+      // flight, so a follow-up sent while the agent was still working vanished:
+      // the Host had already been told the command succeeded, no event was
+      // raised, and the operator watched an agent that never answered. The
+      // resync corrects whatever state the Host guessed while disconnected,
+      // which is how the composer came to be open over a busy agent at all.
+      if (agent.busy) {
+        agent.resync();
+        throw new PromptRefused(
+          "Copilot is still working on the previous turn; wait for it to finish or cancel it",
+        );
+      }
       void agent.prompt(command.prompt).catch(() => undefined);
     } else if (command.type === "cancel") {
       await agent.cancel();

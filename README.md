@@ -76,8 +76,12 @@ npm run start:node -- --url="https://fleet.example.com" --token="replace-with-ho
 The same three lines work in bash — flags avoid the `$env:` / `VAR=value`
 split between shells.
 
-The node name defaults to the machine hostname; rename it later from the Host's
-Nodes tab. Pass `--max-sessions 8` if you want a capacity other than 4.
+The node name defaults to the machine hostname, and can be changed from either
+end — the Host's Nodes tab or the node's own config page. Renaming keeps the
+machine's identity, so its placements and sessions come with it; the Host owns
+the name, so if both ends changed while the node was offline, the Host's name
+wins and is pushed back down. Pass `--max-sessions 8` if you want a capacity
+other than 4.
 
 First registration exchanges the enrollment token for a unique node secret.
 Credentials are persisted at
@@ -201,6 +205,39 @@ that node dials it, fails, and rotates to the previous address on the next
 attempt — so an announcement can never strand a machine. Whichever address
 answers becomes the one it leads with. The node config page lists the fallbacks
 under the Host URL field.
+
+## Keeping nodes up to date
+
+The Nodes tab compares each machine's commit with the Host's and marks it **Up
+to date**, **Update available**, or **Manual update**. **Update** on a row — or
+**Update all** above the table — tells those machines to `git pull --ff-only`,
+`npm install`, `npm run build:node`, and restart into the new build. Progress
+appears in the row as it happens.
+
+The commit is compared, not the package version: `0.1.0` never moves between
+deploys, so comparing it would report every machine as current no matter how far
+behind it was.
+
+What it will not do:
+
+- **Update a machine that is running sessions.** A restart takes every agent on
+  that node with it, so a busy node is refused with a reason rather than
+  silently costing someone their turn. Stop its sessions and click again.
+- **Move a checkout that has diverged.** `--ff-only` means a machine with local
+  commits, or a dirty tree in the way, stops and reports it instead of inventing
+  a merge nobody asked for.
+- **Restart into a build that does not compile.** `npm run build:node` runs
+  before anything is torn down; if it fails the node stays up on the code it
+  already had and reports the error.
+- **Update a node whose agent predates this feature.** It has no `update_node`
+  in its copy of the message union and would close the connection on receiving
+  one, so it is marked _Manual update_ and skipped. Update those machines by
+  hand once — with the three commands under Windows Node — and every update
+  after that can be done from the Host.
+
+A node reports `""` for its commit when its directory is not a git checkout — a
+tarball deploy, say. Those show as **Unknown** rather than being guessed at, and
+are left out of **Update all**.
 
 ## Exact proof of concept
 

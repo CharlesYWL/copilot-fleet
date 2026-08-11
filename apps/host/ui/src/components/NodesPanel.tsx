@@ -1,7 +1,9 @@
 import { useState } from "react";
 import {
+  Badge,
   Button,
   Input,
+  Spinner,
   Table,
   TableBody,
   TableCell,
@@ -15,13 +17,20 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import {
+  ArrowSync20Regular,
   Checkmark20Regular,
   Delete20Regular,
   Dismiss20Regular,
   Rename20Regular,
 } from "@fluentui/react-icons";
-import type { FleetNode } from "@fleet/protocol";
+import {
+  nodeUpdateState,
+  type FleetNode,
+  type NodeUpdateStage,
+  type NodeUpdateState,
+} from "@fleet/protocol";
 import { useCatalog } from "../hooks/useCatalog";
+import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { StatusDot } from "./StatusDot";
 
@@ -81,21 +90,74 @@ const useStyles = makeStyles({
     flexShrink: 0,
   },
   colStatus: { width: "110px" },
-  colName: { width: "22%" },
-  colPlatform: { width: "16%" },
-  colCapacity: { width: "100px" },
-  colVersion: { width: "80px" },
-  colSeen: { width: "18%" },
-  colActions: { width: "96px" },
+  colName: { width: "20%" },
+  colPlatform: { width: "14%" },
+  colCapacity: { width: "90px" },
+  colVersion: { width: "170px" },
+  colSeen: { width: "16%" },
+  colActions: { width: "128px" },
+  versionCell: {
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-start",
+    gap: "2px",
+  },
+  updateAll: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "12px",
+    margin: "0 0 16px",
+    padding: "10px 14px",
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: tokens.borderRadiusLarge,
+    background: tokens.colorNeutralBackground1,
+  },
 });
 
 type NodesPanelProps = {
   nodes: FleetNode[];
+  hostRevision: string;
+  nodeUpdates: NodeUpdateProgress;
 };
 
-export const NodesPanel = ({ nodes }: NodesPanelProps) => {
+/** What the Version cell says, and whether its Update button does anything. */
+const updateLabels: Record<NodeUpdateState, { text: string; hint: string }> = {
+  current: { text: "Up to date", hint: "Running the same commit as the Host" },
+  stale: { text: "Update available", hint: "Behind the Host's commit" },
+  unknown: {
+    text: "Unknown",
+    hint: "Not a git checkout on the Host or the Node, so there is nothing to compare",
+  },
+  unsupported: {
+    text: "Manual update",
+    hint: "This build predates remote updates; update it by hand once to enable them",
+  },
+};
+
+const stageLabels: Record<NodeUpdateStage, string> = {
+  checking: "Checking…",
+  pulling: "Pulling…",
+  installing: "Installing…",
+  building: "Building…",
+  restarting: "Restarting…",
+  up_to_date: "Already up to date",
+  failed: "Update failed",
+};
+
+/** Stages during which the Node is still working, so the row shows a spinner. */
+const busyStages = new Set<NodeUpdateStage>([
+  "checking",
+  "pulling",
+  "installing",
+  "building",
+  "restarting",
+]);
+
+export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps) => {
   const styles = useStyles();
-  const { renameNode, deleteNode } = useCatalog();
+  const { renameNode, deleteNode, updateNode, updateAllNodes } = useCatalog();
+  const stale = nodes.filter((node) => nodeUpdateState(node, hostRevision) === "stale");
   return (
     <div className={styles.panel}>
       <div className={styles.head}>
@@ -103,9 +165,25 @@ export const NodesPanel = ({ nodes }: NodesPanelProps) => {
         <br />
         <Text className={styles.caption}>
           Connected machines and available session capacity.
+          {hostRevision ? ` Host is on ${hostRevision}.` : ""}
         </Text>
       </div>
       <ConnectNodeCard />
+      {stale.length > 0 && (
+        <div className={styles.updateAll}>
+          <Text>
+            {stale.length} node{stale.length === 1 ? " is" : "s are"} behind the Host.
+          </Text>
+          <Button
+            appearance="primary"
+            size="small"
+            icon={<ArrowSync20Regular />}
+            onClick={() => void updateAllNodes()}
+          >
+            Update all
+          </Button>
+        </div>
+      )}
       <div className={styles.surface}>
         <Table className={styles.table} aria-label="Registered nodes">
           <TableHeader>
@@ -124,8 +202,11 @@ export const NodesPanel = ({ nodes }: NodesPanelProps) => {
               <NodeRow
                 key={node.id}
                 node={node}
+                hostRevision={hostRevision}
+                progress={nodeUpdates[node.id]}
                 onRename={renameNode}
                 onDelete={deleteNode}
+                onUpdate={updateNode}
               />
             ))}
           </TableBody>
@@ -137,13 +218,28 @@ export const NodesPanel = ({ nodes }: NodesPanelProps) => {
 
 type NodeRowProps = {
   node: FleetNode;
+  hostRevision: string;
+  progress?: { stage: NodeUpdateStage; detail: string } | undefined;
   onRename: (nodeId: string, name: string) => Promise<boolean>;
   onDelete: (nodeId: string) => Promise<boolean>;
+  onUpdate: (nodeId: string) => Promise<boolean>;
 };
 
-const NodeRow = ({ node, onRename, onDelete }: NodeRowProps) => {
+const NodeRow = ({
+  node,
+  hostRevision,
+  progress,
+  onRename,
+  onDelete,
+  onUpdate,
+}: NodeRowProps) => {
   const styles = useStyles();
   const [draft, setDraft] = useState<string>();
+  const state = nodeUpdateState(node, hostRevision);
+  const label = updateLabels[state];
+  // A restart takes the socket with it, so the node goes offline mid-update;
+  // treating that as "no longer busy" would flicker the spinner away and back.
+  const busy = progress ? busyStages.has(progress.stage) : false;
 
   const handleCommit = async () => {
     if (draft === undefined) return;
@@ -202,12 +298,43 @@ const NodeRow = ({ node, onRename, onDelete }: NodeRowProps) => {
       <TableCell className={styles.colCapacity}>
         {node.activeSessions} / {node.maxSessions}
       </TableCell>
-      <TableCell className={styles.colVersion}>{node.version}</TableCell>
+      <TableCell className={styles.colVersion}>
+        <span className={styles.versionCell} title={progress?.detail || label.hint}>
+          <Badge
+            appearance="tint"
+            size="small"
+            color={
+              state === "current"
+                ? "success"
+                : state === "stale"
+                  ? "warning"
+                  : "informative"
+            }
+          >
+            {progress && busy ? stageLabels[progress.stage] : label.text}
+          </Badge>
+          <Text className={styles.mono}>{node.revision || node.version}</Text>
+        </span>
+      </TableCell>
       <TableCell className={mergeClasses(styles.colSeen, styles.mono)}>
         {new Date(node.lastHeartbeat).toLocaleString()}
       </TableCell>
       <TableCell className={styles.colActions}>
         <span className={styles.actions}>
+          {busy ? (
+            <Spinner size="tiny" aria-label={`Updating ${node.name}`} />
+          ) : (
+            state === "stale" && (
+              <Button
+                appearance="subtle"
+                size="small"
+                icon={<ArrowSync20Regular />}
+                aria-label={`Update ${node.name}`}
+                title="Pull, rebuild and restart this node"
+                onClick={() => void onUpdate(node.id)}
+              />
+            )
+          )}
           {draft === undefined && (
             <Button
               appearance="subtle"

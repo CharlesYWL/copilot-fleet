@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
-import { HOST_URL_SYNC_CAPABILITY } from "@fleet/protocol";
+import {
+  HOST_URL_SYNC_CAPABILITY,
+  NODE_NAME_SYNC_CAPABILITY,
+  SELF_UPDATE_CAPABILITY,
+} from "@fleet/protocol";
 import { FleetService } from "./fleet-service.js";
 import { FleetStore } from "./store.js";
 
-type SentFrame = { type: string; hostUrl?: string };
+type SentFrame = { type: string; hostUrl?: string; name?: string };
 
 /** Just enough socket for the service to consider it writable and record sends. */
 function fakeSocket() {
@@ -24,21 +28,22 @@ const silentLog = {
   warn: () => {},
 } as unknown as FastifyBaseLogger;
 
-function setup() {
+function setup(hostRevision = "") {
   const store = new FleetStore(":memory:");
-  const service = new FleetService(store, silentLog);
-  const enroll = (name: string, capabilities: string[]) => {
+  const service = new FleetService(store, silentLog, hostRevision);
+  const enroll = (name: string, capabilities: string[], revision = "") => {
     const { node } = store.registerNode({
       name,
       os: "win32",
       arch: "x64",
       version: "0.1.0",
+      revision,
       capabilities,
       maxSessions: 1,
     });
     const wire = fakeSocket();
     service.attachNode(node.id, wire.socket);
-    return wire;
+    return { ...wire, nodeId: node.id };
   };
   return { store, service, enroll };
 }
@@ -127,5 +132,85 @@ describe("broadcastHostUrl", () => {
     expect(service.broadcastHostUrl("https://two.trycloudflare.com")).toBe(1);
     expect(older.sent).toEqual([]);
     expect(newer.sent).toHaveLength(1);
+  });
+});
+
+describe("announceNodeName", () => {
+  it("tells a node the name a browser gave it", () => {
+    const { store, service, enroll } = setup();
+    const node = enroll("weili-pc", ["copilot-acp", NODE_NAME_SYNC_CAPABILITY]);
+    store.renameNode(node.nodeId, "build-01");
+
+    expect(service.announceNodeName(node.nodeId, "build-01")).toBe(true);
+    expect(node.sent).toEqual([{ type: "node_name", name: "build-01" }]);
+  });
+
+  it("says nothing to a node whose agent predates the message", () => {
+    // Same hazard as `host_url`: an older agent hangs up on a frame its copy of
+    // the union does not have, so a label change would cost it its connection.
+    const { service, enroll } = setup();
+    const older = enroll("weili-pc", ["copilot-acp"]);
+
+    expect(service.announceNodeName(older.nodeId, "build-01")).toBe(false);
+    expect(older.sent).toEqual([]);
+  });
+
+  it("reports nothing sent when the node is offline", () => {
+    const { store, service } = setup();
+    const { node } = store.registerNode({
+      name: "offline-node",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: [NODE_NAME_SYNC_CAPABILITY],
+      maxSessions: 1,
+    });
+
+    expect(service.announceNodeName(node.id, "build-01")).toBe(false);
+  });
+});
+
+describe("requestUpdate", () => {
+  it("asks a stale node to update itself", () => {
+    const { service, enroll } = setup("host2222");
+    const node = enroll("devbox", ["copilot-acp", SELF_UPDATE_CAPABILITY], "node1111");
+
+    expect(service.requestUpdate(node.nodeId)).toEqual({ started: true });
+    expect(node.sent.map((frame) => frame.type)).toEqual(["update_node"]);
+  });
+
+  it("refuses a node whose build cannot be updated remotely", () => {
+    // The frame is not in that agent's copy of the message union, so sending it
+    // would close the socket instead of updating the machine.
+    const { service, enroll } = setup("host2222");
+    const older = enroll("older", ["copilot-acp"], "node1111");
+
+    const result = service.requestUpdate(older.nodeId);
+    expect(result.started).toBe(false);
+    expect(result.reason).toContain("by hand");
+    expect(older.sent).toEqual([]);
+  });
+
+  it("refuses to restart a node out from under a running session", () => {
+    // An update restarts the process and every agent it hosts dies with it, so
+    // one click on "Update all" must not cost a colleague their running turn.
+    const { store, service, enroll } = setup("host2222");
+    const node = enroll("busy", ["copilot-acp", SELF_UPDATE_CAPABILITY], "node1111");
+    store.recordPresence(node.nodeId, true, 1);
+
+    const result = service.requestUpdate(node.nodeId);
+    expect(result.started).toBe(false);
+    expect(result.reason).toContain("session");
+    expect(node.sent).toEqual([]);
+  });
+
+  it("lists only the nodes that are actually behind", () => {
+    const { service, enroll } = setup("host2222");
+    const stale = enroll("stale", [SELF_UPDATE_CAPABILITY], "node1111");
+    enroll("current", [SELF_UPDATE_CAPABILITY], "host2222");
+    // No revision on either side is not evidence of being behind.
+    enroll("unknown", [SELF_UPDATE_CAPABILITY], "");
+
+    expect(service.staleNodeIds()).toEqual([stale.nodeId]);
   });
 });

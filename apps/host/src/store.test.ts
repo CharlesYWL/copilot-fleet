@@ -37,10 +37,40 @@ describe("FleetStore", () => {
     // the Host keeps rejecting a feature the machine has already gained.
     const { store, node } = setup();
     expect(store.getNode(node.id)?.capabilities).toEqual(["copilot-acp"]);
-    store.setNodeIdentity(node.id, "0.2.0", ["copilot-acp", "host-yolo"]);
+    store.setNodeIdentity(node.id, {
+      version: "0.2.0",
+      capabilities: ["copilot-acp", "host-yolo"],
+    });
     const updated = store.getNode(node.id);
     expect(updated?.capabilities).toEqual(["copilot-acp", "host-yolo"]);
     expect(updated?.version).toBe("0.2.0");
+  });
+
+  it("adopts the capacity a reconnecting node reports", () => {
+    // Editing Max Sessions in the Node UI reconnects rather than re-registers,
+    // so without this the Host keeps scheduling against the enrollment value.
+    const { store, node } = setup();
+    expect(store.getNode(node.id)?.maxSessions).toBe(2);
+    store.setNodeIdentity(node.id, { maxSessions: 10 });
+    expect(store.getNode(node.id)?.maxSessions).toBe(10);
+  });
+
+  it("adopts the platform a rebuilt node reports", () => {
+    const { store, node } = setup();
+    store.setNodeIdentity(node.id, { os: "linux", arch: "arm64" });
+    const updated = store.getNode(node.id);
+    expect(updated?.os).toBe("linux");
+    expect(updated?.arch).toBe("arm64");
+  });
+
+  it("keeps what a reconnecting node does not report", () => {
+    // A Node older than a protocol field must not blank the column for it.
+    const { store, node } = setup();
+    store.setNodeIdentity(node.id, { version: "0.2.0" });
+    const updated = store.getNode(node.id);
+    expect(updated?.maxSessions).toBe(2);
+    expect(updated?.capabilities).toEqual(["copilot-acp"]);
+    expect(updated?.os).toBe("win32");
   });
 
   it("re-enrolling under an existing name reclaims the node and rotates its secret", () => {
@@ -328,6 +358,33 @@ describe("FleetStore", () => {
     expect(store.getSession(lost.id)?.state).toBe("failed");
   });
 
+  it("brings a session whose turn never stopped back as running, not idle", () => {
+    // Landing every reconnected session on `idle` was a guess, and a socket
+    // that dropped mid-turn made it the wrong one: the UI unlocked its
+    // composer over an agent that still had a prompt in flight, and every
+    // follow-up typed into it was refused by the Node and silently dropped.
+    const { store, node, placement } = setup();
+    const working = store.createSession(placement, "still working");
+    const waiting = store.createSession(placement, "waiting");
+    store.transitionSession(working.id, "starting", "start");
+    store.transitionSession(working.id, "running", "Copilot is working");
+    store.markNodeSessionsOffline(node.id, "Node disconnected");
+
+    const restored = store.reconcileOfflineSessions(
+      node.id,
+      [working.id, waiting.id],
+      [working.id],
+    );
+    expect(restored).toHaveLength(2);
+    expect(store.getSession(working.id)?.state).toBe("running");
+    expect(store.getSession(working.id)?.currentActivity).toBe(
+      "Reconnected to node; still working",
+    );
+    // A node too old to report business sends no busy ids, so a quiet session
+    // keeps the original landing state.
+    expect(store.getSession(waiting.id)?.state).toBe("idle");
+  });
+
   it("says the Node came back without the session, and whether Resume can help", () => {
     // This runs when the Node reconnects, so repeating "the connection was
     // lost" described the wrong moment and hid the fact that a session with an
@@ -376,12 +433,32 @@ describe("FleetStore", () => {
     expect(node.homeDir).toBe("");
 
     expect(store.renameNode(node.id, "windows-vm")?.name).toBe("windows-vm");
-    store.setNodeHomeDir(node.id, "C:\\Users\\dev");
+    store.setNodeIdentity(node.id, { homeDir: "C:\\Users\\dev" });
     expect(store.getNode(node.id)?.homeDir).toBe("C:\\Users\\dev");
 
-    store.setNodeHomeDir(node.id, "");
+    store.setNodeIdentity(node.id, { homeDir: "" });
     expect(store.getNode(node.id)?.homeDir).toBe("C:\\Users\\dev");
     expect(() => store.renameNode(node.id, "windows-vm")).not.toThrow();
+  });
+
+  it("reports a name already in use instead of throwing at a reconnecting node", () => {
+    // A rename arriving over `hello` has nobody watching for a 409, so the
+    // collision has to come back as an answer the gateway can act on.
+    const { store, node } = setup();
+    store.registerNode({
+      name: "taken",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 1,
+    });
+
+    expect(store.tryRenameNode(node.id, "taken")).toBeUndefined();
+    expect(store.getNode(node.id)?.name).toBe("node");
+    expect(store.tryRenameNode(node.id, "build-01")?.name).toBe("build-01");
+    // Renaming to the name it already has is not a collision with itself.
+    expect(store.tryRenameNode(node.id, "build-01")?.name).toBe("build-01");
   });
 
   it("persists tunnel enabled setting", () => {

@@ -15,6 +15,16 @@ export interface SessionAgent {
   stop(): Promise<void>;
   resolvePermission(requestId: string, decision: PermissionDecision): void;
   denyPendingPermissions(): void;
+  /** True while a turn is in flight, so a second prompt cannot be accepted. */
+  readonly busy: boolean;
+  /**
+   * Re-announces the state this agent is actually in.
+   *
+   * The Host has to guess when a socket drops mid-turn, and a wrong guess is
+   * only correctable by the side that knows — nothing else here observes the
+   * agent, so without this the guess stands until the turn happens to end.
+   */
+  resync(): void;
 }
 
 export type EventSink = (event: SessionEvent) => void;
@@ -210,6 +220,27 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
   }
 
+  get busy(): boolean {
+    return this.prompting;
+  }
+
+  /**
+   * Restates where this agent is, for a Host that had to guess.
+   *
+   * Only meaningful while the agent is alive: a terminated one has already
+   * emitted the state that settles it, and re-announcing over that would walk
+   * a finished session backwards.
+   */
+  resync(): void {
+    if (this.hasTerminated || this.stopping) return;
+    this.emit(
+      "state",
+      this.prompting
+        ? { state: "running", activity: "Copilot is working" }
+        : { state: "idle", activity: "Ready for follow-up" },
+    );
+  }
+
   async cancel(): Promise<void> {
     if (!this.agentSessionId || !this.connection) {
       throw new Error("ACP session is not initialized");
@@ -356,6 +387,7 @@ export class AcpAgentFactory implements AgentFactory {
 class MockAgent extends SequencedAgent implements SessionAgent {
   private cancelled = false;
   private stopped = false;
+  private prompting = false;
 
   constructor(fleetSessionId: string, sink: EventSink, sequenceOffset = 0) {
     super(fleetSessionId, sink, sequenceOffset);
@@ -379,24 +411,44 @@ class MockAgent extends SequencedAgent implements SessionAgent {
 
   async prompt(text: string): Promise<void> {
     if (this.stopped) throw new Error("Mock agent is stopped");
+    if (this.prompting) throw new Error("A prompt is already active");
+    this.prompting = true;
     this.cancelled = false;
     this.emit("state", { state: "running", activity: "Mock agent is streaming" });
     this.emit("system", { text: `User: ${text}` });
-    for (const chunk of [
-      `Mock response for "${text}": `,
-      "stream one, ",
-      "stream two.",
-    ]) {
-      await delay(25);
-      if (this.cancelled) {
-        this.emit("turn_complete", { stopReason: "cancelled" });
-        this.emit("state", { state: "idle", activity: "Cancelled; ready" });
-        return;
+    try {
+      for (const chunk of [
+        `Mock response for "${text}": `,
+        "stream one, ",
+        "stream two.",
+      ]) {
+        await delay(25);
+        if (this.cancelled) {
+          this.emit("turn_complete", { stopReason: "cancelled" });
+          this.emit("state", { state: "idle", activity: "Cancelled; ready" });
+          return;
+        }
+        this.emit("agent_text", { text: chunk });
       }
-      this.emit("agent_text", { text: chunk });
+      this.emit("turn_complete", { stopReason: "end_turn" });
+      this.emit("state", { state: "idle", activity: "Ready for follow-up" });
+    } finally {
+      this.prompting = false;
     }
-    this.emit("turn_complete", { stopReason: "end_turn" });
-    this.emit("state", { state: "idle", activity: "Ready for follow-up" });
+  }
+
+  get busy(): boolean {
+    return this.prompting;
+  }
+
+  resync(): void {
+    if (this.hasTerminated || this.stopped) return;
+    this.emit(
+      "state",
+      this.prompting
+        ? { state: "running", activity: "Mock agent is streaming" }
+        : { state: "idle", activity: "Ready for follow-up" },
+    );
   }
 
   async cancel(): Promise<void> {

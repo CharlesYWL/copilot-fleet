@@ -4,14 +4,19 @@ import WebSocket from "ws";
 import {
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
+  NODE_NAME_SYNC_CAPABILITY,
   NodeToHostMessageSchema,
   RegisterNodeSchema,
+  SELF_UPDATE_CAPABILITY,
+  SESSION_ACTIVITY_CAPABILITY,
   decodeFrame,
   errorMessage,
   sameHostUrl,
   type NodeToHostMessage,
+  type NodeUpdateStage,
   type SessionEvent,
 } from "@fleet/protocol";
+import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
 import { CliError, USAGE, parseNodeArgs } from "./cli.js";
 import {
@@ -45,8 +50,23 @@ import {
   settingsOverridesFromEnv,
   type Settings,
 } from "./settings.js";
+import {
+  UPDATE_PARENT_PID_ENV,
+  respawn,
+  updateCheckout,
+  waitForParentExit,
+} from "./updater.js";
 
 const VERSION = "0.1.0";
+const REVISION = gitRevision();
+const NODE_CAPABILITIES = [
+  "copilot-acp",
+  "host-yolo",
+  HOST_URL_SYNC_CAPABILITY,
+  SELF_UPDATE_CAPABILITY,
+  NODE_NAME_SYNC_CAPABILITY,
+  SESSION_ACTIVITY_CAPABILITY,
+];
 const RECONNECT_DELAY_MS = 2_000;
 
 export type NodeRuntime = { shutdown: () => Promise<void> };
@@ -72,7 +92,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     console.log(`${new Date().toISOString()} [node] ${message}`);
   };
 
-  log(`copilot-fleet node ${VERSION} starting`);
+  log(`copilot-fleet node ${VERSION}${REVISION ? ` (${REVISION})` : ""} starting`);
   log(`  name        ${settings.nodeName}`);
   log(`  host        ${settings.hostUrl}`);
   log(`  agent       ${mockAgent ? "mock" : "copilot --acp"}`);
@@ -83,6 +103,21 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   // Naming the keys (never the values — one of them is a token) explains why
   // this run disagrees with the config page.
   if (overridden.length > 0) log(`  overrides   ${overridden.join(", ")} (command line)`);
+
+  // A process started by an update inherits the lock from the one it replaces,
+  // so it has to let that one finish exiting first. Without this the successor
+  // loses the race it was guaranteed to win and the machine ends up with no
+  // Node running at all.
+  const parentPid = Number(env[UPDATE_PARENT_PID_ENV]);
+  if (Number.isInteger(parentPid) && parentPid > 0) {
+    log(`Waiting for the process this update replaces (pid ${parentPid}) to exit`);
+    const exited = await waitForParentExit(parentPid);
+    log(
+      exited
+        ? "Predecessor exited; taking over"
+        : "Predecessor outlived its grace period; continuing",
+    );
+  }
 
   const instanceLock = acquireInstanceLock(configDirectory());
   if (!instanceLock.ok) {
@@ -107,6 +142,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     : new AcpAgentFactory(settings.permissionTimeoutMs, settings.copilotCommand);
   let socket: WebSocket | undefined;
   let shuttingDown = false;
+  let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
   const router = new CommandRouter(factory, settings.maxSessions, (event) => {
@@ -181,6 +217,25 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   }
 
   /**
+   * Adopts the name the Host says it has for this node.
+   *
+   * Sent when a browser renames the machine, and when the Host refuses a rename
+   * proposed from here because another node already answers to it. Both files
+   * are written: settings.json is what the config page shows, and node.json is
+   * what the next `hello` reports as the last name synced with the Host —
+   * leaving that stale would make the next reconnect propose the rename again.
+   */
+  async function applyAnnouncedName(name: string): Promise<void> {
+    if (name === settings.nodeName && name === credentials.name) return;
+    const previous = settings.nodeName;
+    settings = { ...settings, nodeName: name };
+    await saveSettings(settings);
+    credentials = { ...credentials, name };
+    await saveCredentials(credentials);
+    if (previous !== name) log(`Host renamed this node "${previous}" -> "${name}"`);
+  }
+
+  /**
    * Follows the Host to the address it just announced.
    *
    * The socket carrying the announcement is deliberately left alone: it is
@@ -198,8 +253,63 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     );
   }
 
-  /** Remembers the address that worked, so the next start leads with it. */
-  async function promoteDialUrl(): Promise<void> {
+  /**
+   * Pulls, rebuilds and restarts this Node on the Host's instruction.
+   *
+   * The build runs before anything is torn down, so a checkout that fails to
+   * compile leaves the machine exactly as it was — connected and running the
+   * code it already had — instead of exiting into a broken tree that nobody is
+   * there to fix.
+   */
+  async function runSelfUpdate(updateId: string): Promise<void> {
+    if (updating) {
+      report("failed", "An update is already running");
+      return;
+    }
+    updating = true;
+    const root = repoRoot();
+    log(`Self-update requested; using checkout ${root}`);
+    try {
+      const outcome = updateCheckout({ repoRoot: root, report });
+      if (outcome.action === "failed") {
+        log(`Self-update failed: ${outcome.reason}`);
+        report("failed", outcome.reason);
+        return;
+      }
+      if (outcome.action === "none") {
+        log(`Self-update: ${outcome.reason}`);
+        report("up_to_date", outcome.reason);
+        return;
+      }
+      log(`Updated to ${outcome.revision}; restarting`);
+      const scriptPath = process.argv[1];
+      if (!scriptPath) {
+        // Nothing to re-launch: the new build is on disk but this process
+        // cannot name itself, so staying up is better than exiting into a
+        // machine with no Node on it.
+        report(
+          "failed",
+          "Updated, but this process could not identify its own entry point; restart it by hand",
+        );
+        return;
+      }
+      // Sent before the process goes, because nothing can be reported from the
+      // other side of an exit.
+      report("restarting", `Updated to ${outcome.revision}; restarting`);
+      respawn(root, scriptPath);
+      await shutdown();
+      releaseInstanceLock();
+      process.exit(0);
+    } finally {
+      updating = false;
+    }
+
+    function report(stage: NodeUpdateStage, detail: string): void {
+      send({ type: "update_status", updateId, stage, detail });
+    }
+  }
+
+  /** Remembers the address that worked, so the next start leads with it. */ async function promoteDialUrl(): Promise<void> {
     const promoted = promoteHostUrl(settings, dialUrl);
     if (!promoted) return;
     await persistEndpoints(promoted);
@@ -239,15 +349,20 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         os: platform(),
         arch: arch(),
         version: VERSION,
-        capabilities: [
-          "copilot-acp",
-          "host-yolo",
-          HOST_URL_SYNC_CAPABILITY,
-          mockAgent ? "mock" : "real",
-        ],
+        revision: REVISION,
+        capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
+        name: settings.nodeName,
+        // What the Host last told us it has. A difference from `name` is an
+        // operator edit here; a difference from the Host's row means the Host
+        // was renamed while this node was away, and the Host wins.
+        knownName: auth.name,
         activeSessionIds: router.activeSessionIds,
+        // What each of those is doing. Without it the Host assumes idle, and a
+        // socket that drops mid-turn leaves the UI offering a composer over an
+        // agent that cannot take another prompt.
+        busySessionIds: router.busySessionIds,
       });
     });
     active.on("message", async (raw: unknown) => {
@@ -268,6 +383,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         await applyAnnouncedHostUrl(frame.value.hostUrl);
         return;
       }
+      if (frame.value.type === "node_name") {
+        await applyAnnouncedName(frame.value.name);
+        return;
+      }
+      if (frame.value.type === "update_node") {
+        await runSelfUpdate(frame.value.updateId);
+        return;
+      }
       if (frame.value.type !== "command") return;
       const { command } = frame.value;
       log(`< ${command.type} session=${command.sessionId.slice(0, 8)}`);
@@ -282,6 +405,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         commandId: result.commandId,
         sessionId: command.sessionId,
         ok: result.ok,
+        fatal: result.fatal ?? true,
         ...(result.error ? { error: result.error } : {}),
       });
     });
@@ -382,7 +506,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       os: platform(),
       arch: arch(),
       version: VERSION,
-      capabilities: ["copilot-acp", "host-yolo", HOST_URL_SYNC_CAPABILITY],
+      revision: REVISION,
+      capabilities: NODE_CAPABILITIES,
       maxSessions: settings.maxSessions,
       homeDir: homedir(),
     });
@@ -411,6 +536,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     send({
       type: "heartbeat",
       activeSessionIds: router.activeSessionIds,
+      busySessionIds: router.busySessionIds,
       sentAt: new Date().toISOString(),
     });
   }, 5_000);

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Tab, TabList, makeStyles, tokens } from "@fluentui/react-components";
 import type { FleetNode, Placement, Workspace } from "@fleet/protocol";
+import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { NodesPanel } from "./NodesPanel";
 import { GeneralPanel } from "./GeneralPanel";
 import { TunnelPanel } from "./TunnelPanel";
@@ -34,6 +35,8 @@ type SettingsPanelProps = {
   workspaces: Workspace[];
   placements: Placement[];
   nodes: FleetNode[];
+  hostRevision: string;
+  nodeUpdates: NodeUpdateProgress;
 };
 
 /**
@@ -62,7 +65,13 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
       <div className={styles.body}>
         {tab === "general" && <GeneralPanel />}
         {tab === "tunnel" && <TunnelPanel />}
-        {tab === "nodes" && <NodesPanel nodes={props.nodes} />}
+        {tab === "nodes" && (
+          <NodesPanel
+            nodes={props.nodes}
+            hostRevision={props.hostRevision}
+            nodeUpdates={props.nodeUpdates}
+          />
+        )}
         {tab === "workspaces" && (
           <WorkspacesPanel
             workspaces={props.workspaces}

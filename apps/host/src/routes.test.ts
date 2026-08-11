@@ -45,12 +45,15 @@ describe("host routes", () => {
     expect(health.json()).toMatchObject({ ok: true });
 
     const snapshot = await app.inject({ method: "GET", url: "/api/snapshot" });
-    expect(snapshot.json()).toEqual({
+    expect(snapshot.json()).toMatchObject({
       nodes: [],
       workspaces: [],
       placements: [],
       sessions: [],
     });
+    // Whatever commit the suite runs from, the snapshot has to carry one, or
+    // the browser has nothing to compare a node's revision against.
+    expect(snapshot.json()).toHaveProperty("hostRevision");
   });
 
   it("refuses enrollment with the wrong token", async () => {

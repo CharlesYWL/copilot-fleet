@@ -32,6 +32,22 @@ type Row = Record<string, unknown>;
  */
 export type AppendResult = { stored: boolean; skipped: number };
 
+/**
+ * What a Node tells the Host about itself in its `hello` frame.
+ *
+ * Every field is optional so that {@link FleetStore.setNodeIdentity} only
+ * touches what was actually reported.
+ */
+export type ReportedNodeIdentity = {
+  version?: string;
+  revision?: string;
+  capabilities?: string[];
+  maxSessions?: number;
+  os?: string;
+  arch?: string;
+  homeDir?: string;
+};
+
 const terminalStateList = [...terminalSessionStates];
 /** Terminal plus offline: settled enough that a cascade delete is safe. */
 const settledStateList = [...terminalStateList, "offline"];
@@ -94,6 +110,7 @@ export class FleetStore {
       CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
     `);
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("nodes", "revision", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "yolo", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "name", "TEXT NOT NULL DEFAULT ''");
@@ -182,8 +199,8 @@ export class FleetStore {
   registerNode(
     input: Omit<
       FleetNode,
-      "id" | "activeSessions" | "lastHeartbeat" | "online" | "homeDir"
-    > & { homeDir?: string },
+      "id" | "activeSessions" | "lastHeartbeat" | "online" | "homeDir" | "revision"
+    > & { homeDir?: string; revision?: string },
   ): { node: FleetNode; secret: string } {
     const secret = randomUUID() + randomUUID();
     const now = new Date().toISOString();
@@ -195,13 +212,14 @@ export class FleetStore {
     ) as { id: string } | undefined;
     if (existing) {
       this.statement(
-        `UPDATE nodes SET secret_hash=?, os=?, arch=?, version=?, capabilities=?,
+        `UPDATE nodes SET secret_hash=?, os=?, arch=?, version=?, revision=?, capabilities=?,
            max_sessions=?, last_heartbeat=?, home_dir=? WHERE id=?`,
       ).run(
         hash(secret),
         input.os,
         input.arch,
         input.version,
+        input.revision ?? "",
         JSON.stringify(input.capabilities),
         input.maxSessions,
         now,
@@ -214,8 +232,8 @@ export class FleetStore {
     const id = randomUUID();
     this.statement(
       `INSERT INTO nodes
-        (id,name,secret_hash,os,arch,version,capabilities,max_sessions,last_heartbeat,online,home_dir)
-       VALUES (?,?,?,?,?,?,?,?,?,0,?)`,
+        (id,name,secret_hash,os,arch,version,revision,capabilities,max_sessions,last_heartbeat,online,home_dir)
+       VALUES (?,?,?,?,?,?,?,?,?,?,0,?)`,
     ).run(
       id,
       input.name,
@@ -223,6 +241,7 @@ export class FleetStore {
       input.os,
       input.arch,
       input.version,
+      input.revision ?? "",
       JSON.stringify(input.capabilities),
       input.maxSessions,
       now,
@@ -236,25 +255,67 @@ export class FleetStore {
     return this.getNode(id);
   }
 
-  /** A reconnecting node may have moved home directory or upgraded. */
-  setNodeHomeDir(id: string, homeDir: string): void {
-    if (!homeDir) return;
-    this.statement("UPDATE nodes SET home_dir=? WHERE id=?").run(homeDir, id);
+  /**
+   * Renames a Node, reporting a name already in use rather than throwing.
+   *
+   * A rename arriving over `hello` cannot be handled the way the browser's is —
+   * with a 409 for the operator to read — because there is nobody watching the
+   * socket. Taking the collision as an answer lets the reconnect continue and
+   * the Node be told which name it actually has.
+   */
+  tryRenameNode(id: string, name: string): FleetNode | undefined {
+    const taken = this.statement("SELECT id FROM nodes WHERE name=? AND id<>?").get(
+      name,
+      id,
+    ) as { id: string } | undefined;
+    if (taken) return undefined;
+    return this.renameNode(id, name);
   }
 
   /**
-   * Refreshes what a Node reports about itself on every reconnect.
+   * Refreshes everything a Node reports about itself on every reconnect.
    *
-   * Capabilities were previously only recorded at registration, so upgrading a
-   * Node in place left the Host acting on whatever the machine could do months
-   * ago — an updated agent kept being rejected for lacking a feature it had.
+   * Registration used to be the only writer of these columns, so a machine that
+   * changed after enrollment kept being described — and scheduled — by what it
+   * was on the day it enrolled:
+   *
+   * - capabilities: an agent upgraded in place kept being rejected for lacking
+   *   a feature it had already gained;
+   * - maxSessions: raising Max Sessions in the local Node UI saved and
+   *   reconnected, but the Host kept scheduling against the enrollment value,
+   *   so the new slots were never usable;
+   * - os/arch/homeDir: a rebuilt or migrated machine kept displaying, and
+   *   seeding placement paths from, the platform it no longer runs.
+   *
+   * Fields the caller leaves out are kept, so a Node that reports less than the
+   * current protocol cannot blank a column it simply does not know about.
    */
-  setNodeIdentity(id: string, version: string, capabilities: string[]): void {
-    this.statement("UPDATE nodes SET version=?, capabilities=? WHERE id=?").run(
-      version,
-      JSON.stringify(capabilities),
-      id,
+  setNodeIdentity(id: string, identity: ReportedNodeIdentity): void {
+    const columns: string[] = [];
+    const values: (string | number)[] = [];
+    const set = (column: string, value: string | number | undefined): void => {
+      if (value === undefined) return;
+      columns.push(`${column}=?`);
+      values.push(value);
+    };
+    set("version", identity.version);
+    // Unlike home_dir, an empty revision is a real answer — "this checkout is
+    // not a git repository" — and must be able to replace a stale commit, or a
+    // machine that moved to a tarball deploy would keep claiming the last
+    // commit it ever reported.
+    set("revision", identity.revision);
+    set(
+      "capabilities",
+      identity.capabilities ? JSON.stringify(identity.capabilities) : undefined,
     );
+    set("max_sessions", identity.maxSessions);
+    set("os", identity.os);
+    set("arch", identity.arch);
+    // An empty string is what a Node sends when it does not know its home
+    // directory; overwriting a good value with it would lose the placement seed.
+    set("home_dir", identity.homeDir ? identity.homeDir : undefined);
+    if (columns.length === 0) return;
+    this.statement(`UPDATE nodes SET ${columns.join(",")} WHERE id=?`).run(...values, id);
   }
 
   authenticateNode(id: string, secret: string): boolean {
@@ -510,12 +571,21 @@ export class FleetStore {
    * and no longer has this session — instead of blaming the connection a second
    * time. Copilot keeps the agent session on disk, so anything with an agent id
    * is one Resume away from continuing where it stopped.
+   *
+   * A session the Node reports as busy comes back as `running`, not `idle`.
+   * Landing everything on `idle` was a guess, and when the socket dropped
+   * mid-turn it was the wrong one: the UI unlocked its composer over an agent
+   * that still had a prompt in flight, and every follow-up the operator typed
+   * was refused by the Node and silently dropped. Nodes too old to report
+   * business send no ids, so they keep the old landing state.
    */
   reconcileOfflineSessions(
     nodeId: string,
     activeSessionIds: readonly string[],
+    busySessionIds: readonly string[] = [],
   ): FleetSession[] {
     const active = new Set(activeSessionIds);
+    const busy = new Set(busySessionIds);
     // Runs on every heartbeat, so it must not walk the session table: the
     // filter is an indexed lookup and the common answer is an empty list.
     const rows = this.statement(
@@ -523,8 +593,11 @@ export class FleetStore {
     ).all(nodeId, "offline") as Row[];
     return rows.map((row) => {
       const id = String(row.id);
-      if (active.has(id))
-        return this.transitionSession(id, "idle", "Reconnected to node");
+      if (active.has(id)) {
+        return busy.has(id)
+          ? this.transitionSession(id, "running", "Reconnected to node; still working")
+          : this.transitionSession(id, "idle", "Reconnected to node");
+      }
       return this.transitionSession(
         id,
         "failed",
@@ -700,6 +773,7 @@ function nodeFromRow(row: Row): FleetNode {
     os: String(row.os),
     arch: String(row.arch),
     version: String(row.version),
+    revision: String(row.revision ?? ""),
     capabilities: JSON.parse(String(row.capabilities)) as string[],
     maxSessions: Number(row.max_sessions),
     activeSessions: Number(row.active_sessions),

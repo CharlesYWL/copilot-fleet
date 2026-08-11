@@ -61,8 +61,16 @@ export function App() {
     [dispatchToast],
   );
 
-  const { snapshot, events, connected, refresh, loadEvents, command, request } =
-    useFleet(notify);
+  const {
+    snapshot,
+    events,
+    connected,
+    nodeUpdates,
+    refresh,
+    loadEvents,
+    command,
+    request,
+  } = useFleet(notify);
   const catalog = useCatalogOperations({ request, refresh });
   const [view, setView] = useState<SidebarView>("session");
   const [layout, setLayout] = useState<LayoutMode>("tree");
@@ -248,6 +256,8 @@ export function App() {
                   workspaces={snapshot.workspaces}
                   placements={snapshot.placements}
                   nodes={snapshot.nodes}
+                  hostRevision={snapshot.hostRevision}
+                  nodeUpdates={nodeUpdates}
                 />
               )}
 

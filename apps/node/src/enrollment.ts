@@ -7,6 +7,12 @@ import type { Settings } from "./settings.js";
  * The host URL is deliberately not part of the identity: tunnel providers hand
  * out a fresh URL constantly, and re-registering under the same name collides
  * with the Host's unique name index.
+ *
+ * Neither is the name, any more. A rename used to mean registering again, which
+ * quietly abandoned this machine's placements and sessions on a node row that
+ * would never come back online. The `nodeId` is the identity; the name travels
+ * as a proposal in the `hello` frame and the Host answers with the one it
+ * recorded.
  */
 export type CredentialPlan =
   | { action: "register"; reason: string }
@@ -19,17 +25,6 @@ export function planCredentials(
 ): CredentialPlan {
   if (!stored) {
     return { action: "register", reason: "No stored credentials, registering" };
-  }
-  if (stored.name !== settings.nodeName) {
-    // Worth spelling out: the Host keys a node by name, so a rename is a new
-    // identity unless it already knows the new one. The placements and
-    // sessions of the old name stay where they are, and the way back is to
-    // start again under the old name — which is hard to guess from
-    // "registering again" alone.
-    return {
-      action: "register",
-      reason: `Node renamed "${stored.name}" -> "${settings.nodeName}"; registering. Placements and sessions stay with the old name until you switch back.`,
-    };
   }
   if (stored.hostUrl !== settings.hostUrl) {
     return { action: "move", credentials: { ...stored, hostUrl: settings.hostUrl } };

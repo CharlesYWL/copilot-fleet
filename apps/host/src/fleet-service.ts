@@ -5,13 +5,17 @@ import {
   BrowserMessageSchema,
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
+  NODE_NAME_SYNC_CAPABILITY,
+  SELF_UPDATE_CAPABILITY,
   canTransition,
   eventPayload,
+  nodeUpdateState,
   terminalSessionStates,
   type BrowserMessage,
   type FleetNode,
   type FleetSession,
   type NodeCommand,
+  type NodeUpdateStage,
   type SessionEvent,
   type SessionState,
   type Snapshot,
@@ -52,6 +56,8 @@ export class FleetService {
   constructor(
     readonly store: FleetStore,
     private readonly log: FastifyBaseLogger,
+    /** The commit this Host runs, which is what Nodes are compared against. */
+    private readonly revision = "",
   ) {}
 
   snapshot(): Snapshot {
@@ -60,7 +66,12 @@ export class FleetService {
       workspaces: this.store.listWorkspaces(),
       placements: this.store.listPlacements(),
       sessions: this.store.listSessions(),
+      hostRevision: this.revision,
     };
+  }
+
+  get hostRevision(): string {
+    return this.revision;
   }
 
   addBrowser(socket: WebSocket): void {
@@ -176,15 +187,83 @@ export class FleetService {
     return notified;
   }
 
-  /** Records a heartbeat, publishing only when a browser would render it. */
-  recordPresence(nodeId: string, activeSessionIds: readonly string[]): void {
+  /**
+   * Tells one Node the name the Host has for it.
+   *
+   * Skipped for Nodes that predate the capability, which validate every frame
+   * against their own copy of the message union and hang up on anything they do
+   * not recognise — costing the connection instead of syncing a label.
+   */
+  announceNodeName(nodeId: string, name: string): boolean {
+    const socket = this.nodeSockets.get(nodeId);
+    if (!socket) return false;
+    const node = this.store.getNode(nodeId);
+    if (!node?.capabilities.includes(NODE_NAME_SYNC_CAPABILITY)) return false;
+    this.send(socket, HostToNodeMessageSchema.parse({ type: "node_name", name }));
+    this.log.info({ nodeId, name }, "Told node the name the Host has for it");
+    return true;
+  }
+
+  /**
+   * Tells one Node to pull, rebuild and restart itself.
+   *
+   * Refused rather than queued when the Node is busy: an update restarts the
+   * process, and every agent it is hosting dies with it. Losing a colleague's
+   * running turn to someone else's click on "Update all" is a worse outcome
+   * than being told to wait, so the caller is given the reason to show.
+   */
+  requestUpdate(nodeId: string): { started: boolean; reason?: string } {
+    const node = this.store.getNode(nodeId);
+    if (!node) return { started: false, reason: "Unknown node" };
+    if (!node.capabilities.includes(SELF_UPDATE_CAPABILITY)) {
+      return {
+        started: false,
+        reason: `${node.name} runs a build that predates remote updates; update it by hand once`,
+      };
+    }
+    const socket = this.nodeSockets.get(nodeId);
+    if (!socket || socket.readyState !== socket.OPEN) {
+      return { started: false, reason: `${node.name} is offline` };
+    }
+    if (node.activeSessions > 0) {
+      return {
+        started: false,
+        reason: `${node.name} is running ${node.activeSessions} session(s); updating would stop them`,
+      };
+    }
+    const updateId = randomUUID();
+    this.send(socket, HostToNodeMessageSchema.parse({ type: "update_node", updateId }));
+    this.log.info({ nodeId, updateId }, "Asked node to update itself");
+    this.publishNodeUpdate(nodeId, "checking", "Update requested");
+    return { started: true };
+  }
+
+  /** Every Node that is behind this Host and can be told to catch up. */
+  staleNodeIds(): string[] {
+    return this.store
+      .listNodes()
+      .filter((node) => nodeUpdateState(node, this.revision) === "stale")
+      .map((node) => node.id);
+  }
+
+  publishNodeUpdate(nodeId: string, stage: NodeUpdateStage, detail: string): void {
+    this.broadcast({ type: "node_update", nodeId, stage, detail });
+  }
+
+  /** Records a heartbeat, publishing only when a browser would render it. */ recordPresence(
+    nodeId: string,
+    activeSessionIds: readonly string[],
+    busySessionIds: readonly string[] = [],
+  ): void {
     const { node, changed } = this.store.recordPresence(
       nodeId,
       true,
       activeSessionIds.length,
     );
     if (node && changed) this.publishNode(node);
-    this.publishSessions(this.store.reconcileOfflineSessions(nodeId, activeSessionIds));
+    this.publishSessions(
+      this.store.reconcileOfflineSessions(nodeId, activeSessionIds, busySessionIds),
+    );
   }
 
   disconnectNode(nodeId: string, activity: string): void {
@@ -246,6 +325,16 @@ export class FleetService {
     const session = this.store.getSession(sessionId);
     if (!session || terminalSessionStates.has(session.state)) return;
     this.publishSession(this.store.transitionSession(session.id, "failed", reason));
+  }
+
+  /**
+   * Tells browsers a command was refused without ending the session.
+   *
+   * The alternative was silence, and silence is what made a refused prompt
+   * indistinguishable from an agent that had stopped answering.
+   */
+  reportSessionNotice(sessionId: string, message: string): void {
+    this.broadcast({ type: "session_notice", sessionId, message });
   }
 
   /**

@@ -5,9 +5,53 @@ import {
   NodeToHostMessageSchema,
   SUPERSEDED_CLOSE_CODE,
   decodeFrame,
+  resolveNodeName,
 } from "@fleet/protocol";
 import { heartbeatSessionsBelongTo, nodeMessageBelongsTo } from "../node-messages.js";
 import type { FleetService } from "../fleet-service.js";
+import type { FleetNode } from "@fleet/protocol";
+
+/**
+ * Reconciles the name a Node calls itself with the one the Host has for it.
+ *
+ * A rename used to cost the machine its identity: the Node re-registered under
+ * the new name, and the placements and sessions of the old one stayed behind on
+ * a row that would never come back online. The name is a label on the `nodeId`
+ * instead, so the only question left here is which label wins — and whoever
+ * lost has to be told, or the two ends disagree until someone restarts one.
+ */
+function settleNodeName(
+  service: FleetService,
+  app: FastifyInstance,
+  node: FleetNode,
+  reported: string | undefined,
+  knownName: string | undefined,
+): FleetNode {
+  const outcome = resolveNodeName({ stored: node.name, reported, knownName });
+  if (outcome.renameStored) {
+    const renamed = service.store.tryRenameNode(node.id, outcome.name);
+    if (renamed) {
+      app.log.info(
+        { nodeId: node.id, from: node.name, to: outcome.name },
+        "Node renamed itself",
+      );
+      // Confirmed even though the Node already calls itself this: what it has
+      // to catch up on is the record of what the Host holds.
+      if (outcome.tellNode) service.announceNodeName(node.id, renamed.name);
+      return renamed;
+    }
+    // The name went to another machine while this one was away. Keeping the
+    // stored name and saying so beats failing the connection over a label.
+    app.log.warn(
+      { nodeId: node.id, requested: outcome.name },
+      "Node requested a name already in use; keeping the stored name",
+    );
+    service.announceNodeName(node.id, node.name);
+    return node;
+  }
+  if (outcome.tellNode) service.announceNodeName(node.id, outcome.name);
+  return node;
+}
 
 /**
  * The Node-facing WebSocket: authenticate, then relay events and heartbeats.
@@ -49,17 +93,34 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
         );
       }
       service.attachNode(hello.nodeId, socket);
-      service.store.setNodeHomeDir(hello.nodeId, hello.homeDir);
-      service.store.setNodeIdentity(hello.nodeId, hello.version, hello.capabilities);
+      service.store.setNodeIdentity(hello.nodeId, {
+        version: hello.version,
+        revision: hello.revision,
+        capabilities: hello.capabilities,
+        maxSessions: hello.maxSessions,
+        os: hello.os,
+        arch: hello.arch,
+        homeDir: hello.homeDir,
+      });
       const activeSessionIds = hello.activeSessionIds ?? [];
       const node = service.store.setNodeOnline(
         hello.nodeId,
         true,
         activeSessionIds.length,
       );
-      if (node) service.publishNode(node);
+      // Settled after the socket is attached, so the Node can be told the name
+      // it did not get, and before publishing, so browsers see one node with
+      // one name rather than the rename arriving as a second update.
+      const named = node
+        ? settleNodeName(service, app, node, hello.name, hello.knownName)
+        : undefined;
+      if (named) service.publishNode(named);
       service.publishSessions(
-        service.store.reconcileOfflineSessions(hello.nodeId, activeSessionIds),
+        service.store.reconcileOfflineSessions(
+          hello.nodeId,
+          activeSessionIds,
+          hello.busySessionIds,
+        ),
       );
       service.send(socket, { type: "welcome", nodeId: hello.nodeId });
 
@@ -99,22 +160,48 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
             socket.close(1008, "Session ownership mismatch");
             return;
           }
-          service.recordPresence(hello.nodeId, message.activeSessionIds);
+          service.recordPresence(
+            hello.nodeId,
+            message.activeSessionIds,
+            message.busySessionIds,
+          );
           return;
         }
         if (message.type === "event") {
           service.handleEvent(message.event);
           return;
         }
+        if (message.type === "update_status") {
+          app.log.info(
+            {
+              nodeId: hello.nodeId,
+              updateId: message.updateId,
+              stage: message.stage,
+              detail: message.detail,
+            },
+            "Node self-update progress",
+          );
+          service.publishNodeUpdate(hello.nodeId, message.stage, message.detail);
+          return;
+        }
         if (message.type === "command_result" && !message.ok) {
           app.log.warn(
-            { commandId: message.commandId, error: message.error },
+            { commandId: message.commandId, error: message.error, fatal: message.fatal },
             "Node command failed",
           );
-          service.failFromCommandResult(
-            message.sessionId,
-            message.error ?? "Node command failed",
-          );
+          if (message.fatal) {
+            service.failFromCommandResult(
+              message.sessionId,
+              message.error ?? "Node command failed",
+            );
+          } else {
+            // Refused, not broken. The Node re-announces the session's real
+            // state right behind this, so all that is owed is the reason.
+            service.reportSessionNotice(
+              message.sessionId,
+              message.error ?? "Node refused the command",
+            );
+          }
         }
       });
     });

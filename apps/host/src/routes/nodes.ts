@@ -16,6 +16,35 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
 
   app.get("/api/nodes", async () => store.listNodes());
 
+  /**
+   * Updates one Node, or every Node that is behind this Host.
+   *
+   * "Update all" is deliberately not all-or-nothing: with four machines, one
+   * being busy or offline must not stop the other three from catching up, so
+   * each is attempted and the refusals are reported alongside the successes.
+   */
+  app.post("/api/nodes/update", async () => {
+    const results = service
+      .staleNodeIds()
+      .map((nodeId) => ({ nodeId, ...service.requestUpdate(nodeId) }));
+    return {
+      started: results.filter((result) => result.started).length,
+      skipped: results
+        .filter((result) => !result.started)
+        .map((result) => result.reason ?? "Update refused"),
+    };
+  });
+
+  app.post("/api/nodes/:id/update", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
+    const result = service.requestUpdate(id);
+    if (!result.started) {
+      return reply.code(409).send({ error: result.reason ?? "Update refused" });
+    }
+    return { started: true };
+  });
+
   app.post("/api/nodes/register", async (request, reply) => {
     const input = RegisterNodeSchema.parse(request.body);
     if (input.enrollmentToken !== enrollmentToken) {
@@ -27,6 +56,7 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
         os: input.os,
         arch: input.arch,
         version: input.version,
+        revision: input.revision,
         capabilities: input.capabilities,
         maxSessions: input.maxSessions,
         homeDir: input.homeDir,
@@ -43,7 +73,13 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
     if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
     try {
       const node = store.renameNode(id, input.name);
-      if (node) service.publishNode(node);
+      if (node) {
+        service.publishNode(node);
+        // Without this the machine keeps calling itself the old name on its own
+        // config page, and re-registering under it if it ever loses its
+        // credentials — which would split one machine into two nodes.
+        service.announceNodeName(node.id, node.name);
+      }
       return node;
     } catch {
       return reply

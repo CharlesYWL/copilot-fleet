@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -82,4 +83,28 @@ export function repoRoot(startDirectory = moduleDirectory()): string {
 /** Absolute path of the repo-root `.env` both services read on startup. */
 export function envFilePath(startDirectory = moduleDirectory()): string {
   return resolve(repoRoot(startDirectory), ".env");
+}
+
+/**
+ * The commit this checkout is built from, or `""` when that cannot be known.
+ *
+ * The package version is a constant nobody bumps between deploys, so comparing
+ * it across machines reports every Node as current no matter how far behind it
+ * is. The commit is what actually differs after a `git pull`, which makes it
+ * the only honest answer to "is this machine running my latest code".
+ *
+ * An empty string is returned rather than a thrown error for the checkout that
+ * is not a git repository — a tarball deploy is still a working Node, and it
+ * should show up as "unknown", not take the caller down with it.
+ */
+export function gitRevision(directory = repoRoot()): string {
+  try {
+    return execFileSync("git", ["rev-parse", "--short=12", "HEAD"], {
+      cwd: directory,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return "";
+  }
 }

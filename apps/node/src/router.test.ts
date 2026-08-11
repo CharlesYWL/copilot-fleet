@@ -253,6 +253,8 @@ describe("CommandRouter", () => {
           async stop() {},
           resolvePermission() {},
           denyPendingPermissions() {},
+          busy: false,
+          resync() {},
         };
       },
     };
@@ -275,6 +277,61 @@ describe("CommandRouter", () => {
     expect(prompts).toBe(0);
     expect(events[0]?.sequence).toBe(8);
   });
+
+  it("refuses a prompt while a turn is in flight instead of dropping it", async () => {
+    // The bug: a socket that dropped mid-turn left the Host believing the
+    // session was idle, so it forwarded follow-up prompts the agent could not
+    // accept. The rejection was swallowed by `.catch(() => undefined)` after
+    // the command had already been acknowledged, so the operator's message
+    // disappeared with no event, no error, and no state change.
+    const events: SessionEvent[] = [];
+    const router = new CommandRouter(
+      new MockAgentFactory(),
+      1,
+      (event) => events.push(event),
+      async (path) => path,
+    );
+    await router.route({
+      type: "start_session",
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "first",
+    });
+    // The mock streams over several ticks, so the turn is still in flight here.
+    expect(router.busySessionIds).toEqual(["s1"]);
+
+    const refused = await router.route({
+      type: "prompt",
+      commandId: "c2",
+      sessionId: "s1",
+      prompt: "second",
+    });
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toMatch(/still working/);
+    // Refused, not broken: failing the session would destroy the live turn.
+    expect(refused.fatal).toBe(false);
+    // And the Host is told what the session is really doing, so a composer
+    // opened over a wrong guess closes again.
+    expect(
+      events.filter(
+        (event) => event.type === "state" && event.payload.state === "running",
+      ).length,
+    ).toBeGreaterThanOrEqual(2);
+
+    await waitFor(() => hasSettled(events, "s1"));
+    expect(router.busySessionIds).toEqual([]);
+    expect(
+      (
+        await router.route({
+          type: "prompt",
+          commandId: "c3",
+          sessionId: "s1",
+          prompt: "third",
+        })
+      ).ok,
+    ).toBe(true);
+  });
 });
 
 function inertAgent(_sessionId: string, _sink: EventSink): SessionAgent {
@@ -284,6 +341,8 @@ function inertAgent(_sessionId: string, _sink: EventSink): SessionAgent {
     async stop() {},
     resolvePermission() {},
     denyPendingPermissions() {},
+    busy: false,
+    resync() {},
   };
 }
 
@@ -296,6 +355,8 @@ function failingAgent(sessionId: string, sink: EventSink): SessionAgent {
     async stop() {},
     resolvePermission() {},
     denyPendingPermissions() {},
+    busy: false,
+    resync() {},
   };
 }
 

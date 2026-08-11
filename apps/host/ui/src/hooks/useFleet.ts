@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
   type BrowserMessage,
+  type NodeUpdateStage,
   type SessionEvent,
   type Snapshot,
 } from "@fleet/protocol";
@@ -24,12 +25,20 @@ const emptySnapshot: Snapshot = {
   workspaces: [],
   placements: [],
   sessions: [],
+  hostRevision: "",
 };
+
+/** The latest self-update progress per node, cleared once it settles. */
+export type NodeUpdateProgress = Record<
+  string,
+  { stage: NodeUpdateStage; detail: string }
+>;
 
 export function useFleet(notify: Notify) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [events, setEvents] = useState<Record<string, SessionEvent[]>>({});
   const [connected, setConnected] = useState(false);
+  const [nodeUpdates, setNodeUpdates] = useState<NodeUpdateProgress>({});
 
   // Kept in a ref so the socket subscription never re-runs when the caller
   // re-creates its notify callback.
@@ -159,6 +168,22 @@ export function useFleet(notify: Notify) {
           }));
           return;
         }
+        if (message.type === "node_update") {
+          const { nodeId, stage, detail } = message;
+          setNodeUpdates((value) => ({ ...value, [nodeId]: { stage, detail } }));
+          if (stage === "failed")
+            notifyRef.current(detail || "Node update failed", "error");
+          if (stage === "up_to_date")
+            notifyRef.current(detail || "Already up to date", "success");
+          return;
+        }
+        if (message.type === "session_notice") {
+          // The session is fine; the command was refused. Saying so is the
+          // whole point — a prompt dropped in silence is indistinguishable
+          // from an agent that has stopped responding.
+          notifyRef.current(message.message, "error");
+          return;
+        }
         const { event } = message;
         setEvents((value) => ({
           ...value,
@@ -175,7 +200,16 @@ export function useFleet(notify: Notify) {
     };
   }, [refresh]);
 
-  return { snapshot, events, connected, refresh, loadEvents, command, request };
+  return {
+    snapshot,
+    events,
+    connected,
+    nodeUpdates,
+    refresh,
+    loadEvents,
+    command,
+    request,
+  };
 }
 
 function upsert<T extends { id: string }>(items: T[], next: T): T[] {

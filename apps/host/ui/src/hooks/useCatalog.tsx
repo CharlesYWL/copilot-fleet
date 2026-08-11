@@ -11,6 +11,8 @@ import type { ApiResult } from "./useFleet";
 export type CatalogOperations = {
   renameNode: (nodeId: string, name: string) => Promise<boolean>;
   deleteNode: (nodeId: string) => Promise<boolean>;
+  updateNode: (nodeId: string) => Promise<boolean>;
+  updateAllNodes: () => Promise<boolean>;
   createWorkspace: (name: string, description: string) => Promise<boolean>;
   updateWorkspace: (
     workspaceId: string,
@@ -58,6 +60,12 @@ export function useCatalogOperations({
       renameNode: async (nodeId, name) =>
         (await request(`/api/nodes/${nodeId}`, json({ name }, "PATCH"))).ok,
       deleteNode: (nodeId) => write(`/api/nodes/${nodeId}`, { method: "DELETE" }),
+      // Progress arrives over the socket as `node_update`, and the new revision
+      // on the `hello` that follows the restart, so neither forces a re-read.
+      updateNode: async (nodeId) =>
+        (await request(`/api/nodes/${nodeId}/update`, { method: "POST" })).ok,
+      updateAllNodes: async () =>
+        (await request("/api/nodes/update", { method: "POST" })).ok,
       createWorkspace: (name, description) =>
         write("/api/workspaces", json({ name, description }, "POST")),
       updateWorkspace: (workspaceId, name, description) =>

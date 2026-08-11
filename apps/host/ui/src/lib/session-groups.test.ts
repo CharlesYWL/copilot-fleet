@@ -8,6 +8,7 @@ const node = (id: string, name: string, online = true): FleetNode => ({
   os: "darwin",
   arch: "arm64",
   version: "0.1.0",
+  revision: "",
   capabilities: [],
   maxSessions: 4,
   activeSessions: 0,

@@ -26,6 +26,12 @@ export const NodeSchema = z.object({
   os: z.string().min(1),
   arch: z.string().min(1),
   version: z.string().min(1),
+  /**
+   * The commit the Node is running, or `""` from a build that predates this
+   * field. Compared against the Host's own commit to decide staleness, because
+   * `version` is a constant that never moves between deploys.
+   */
+  revision: z.string().default(""),
   capabilities: z.array(z.string()),
   maxSessions: z.number().int().positive(),
   activeSessions: z.number().int().nonnegative(),
@@ -166,6 +172,25 @@ export function eventPayload<T extends SessionEventType>(
   return parsed.success ? (parsed.data as SessionEventPayload<T>) : undefined;
 }
 
+/**
+ * How far a self-update has got, in the order the stages occur.
+ *
+ * Named stages rather than free text because the browser renders them and the
+ * Host logs them; a message the Node phrased slightly differently on Windows
+ * would otherwise be a different thing to everyone reading it.
+ */
+export const nodeUpdateStages = [
+  "checking",
+  "pulling",
+  "installing",
+  "building",
+  "restarting",
+  "up_to_date",
+  "failed",
+] as const;
+export const NodeUpdateStageSchema = z.enum(nodeUpdateStages);
+export type NodeUpdateStage = z.infer<typeof NodeUpdateStageSchema>;
+
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start_session"),
@@ -221,15 +246,44 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     os: z.string().min(1),
     arch: z.string().min(1),
     version: z.string().min(1),
+    revision: z.string().default(""),
     capabilities: z.array(z.string()),
     maxSessions: z.number().int().positive(),
     homeDir: z.string().default(""),
+    /**
+     * What this Node currently calls itself.
+     *
+     * A rename used to be a new identity: the Node re-registered under the new
+     * name and left its placements and sessions behind on the old one. Carrying
+     * the name here instead makes it a label on an identity the `nodeId`
+     * already establishes, so renaming keeps the machine's history.
+     */
+    name: z.string().min(1).max(120).optional(),
+    /**
+     * The name this Node believes the Host has for it.
+     *
+     * Settles the case where both ends were renamed while the Node was offline.
+     * Equal to `name` unless the operator edited it locally, so a difference
+     * from what the Host holds tells the two apart: the Node is proposing a
+     * rename only when the Host still has the name the Node last synced.
+     */
+    knownName: z.string().max(120).optional(),
     /** Sessions still running on this Node; used to resurrect offline rows. */
     activeSessionIds: z.array(z.string()).default([]),
+    /**
+     * The subset of `activeSessionIds` with a turn still in flight.
+     *
+     * Without it the Host has to guess what a reconnecting Node was doing, and
+     * it guessed `idle` — which unlocks the composer over an agent that is
+     * still working and cannot accept a second prompt.
+     */
+    busySessionIds: z.array(z.string()).default([]),
   }),
   z.object({
     type: z.literal("heartbeat"),
     activeSessionIds: z.array(z.string()),
+    /** As on `hello`: which of those are mid-turn. */
+    busySessionIds: z.array(z.string()).default([]),
     sentAt: z.string().datetime(),
   }),
   z.object({
@@ -242,6 +296,26 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     ok: z.boolean(),
     error: z.string().optional(),
+    /**
+     * Whether a failure ends the session.
+     *
+     * A command can be refused without anything being broken — prompting a
+     * session that is already mid-turn is the operator being early, not the
+     * agent dying — and failing the session over it destroys a live run. Older
+     * Nodes never set this, so the default preserves their behaviour.
+     */
+    fatal: z.boolean().default(true),
+  }),
+  /**
+   * Progress of a self-update, which belongs to the machine rather than to any
+   * session — so it cannot travel as a `command_result`, whose every field is
+   * about one session.
+   */
+  z.object({
+    type: z.literal("update_status"),
+    updateId: z.string().min(1),
+    stage: NodeUpdateStageSchema,
+    detail: z.string().default(""),
   }),
 ]);
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
@@ -260,11 +334,109 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
    * connection it was told to keep.
    */
   z.object({ type: z.literal("host_url"), hostUrl: z.string().min(1) }),
+  /**
+   * Pull, rebuild and restart from the checkout this Node runs from.
+   *
+   * Node-scoped rather than a {@link NodeCommandSchema} variant because every
+   * command there names the session it acts on, and an update acts on the
+   * machine. Gated on {@link SELF_UPDATE_CAPABILITY} for the same reason
+   * `host_url` is: a Node validates every frame against its own copy of this
+   * union and hangs up on anything it does not recognise, so announcing this to
+   * an older machine would cost it the connection instead of updating it.
+   */
+  z.object({ type: z.literal("update_node"), updateId: z.string().min(1) }),
+  /**
+   * The name the Host holds for this Node, which is the one that counts.
+   *
+   * Sent after a rename from either end: the Host owns the fleet-wide unique
+   * name, so it answers a Node's proposal with the name that was actually
+   * recorded — which is not the proposed one when another machine already had
+   * it. Also pushed when a browser renames the Node, so the local config page
+   * stops disagreeing with the fleet about what this machine is called. Gated
+   * on {@link NODE_NAME_SYNC_CAPABILITY} for the same reason `host_url` is.
+   */
+  z.object({ type: z.literal("node_name"), name: z.string().min(1) }),
 ]);
 export type HostToNodeMessage = z.infer<typeof HostToNodeMessageSchema>;
 
 /** A Node that understands `host_url` and can follow the Host to a new address. */
 export const HOST_URL_SYNC_CAPABILITY = "host-url-sync";
+
+/** A Node that can pull, rebuild and restart itself on `update_node`. */
+export const SELF_UPDATE_CAPABILITY = "self-update";
+
+/**
+ * A Node that treats its name as a label on its `nodeId` rather than as its
+ * identity: it proposes renames over `hello` and accepts `node_name` back.
+ */
+export const NODE_NAME_SYNC_CAPABILITY = "node-name-sync";
+
+/**
+ * A Node that reports which of its sessions are mid-turn, so the Host can
+ * restore a reconnecting session to what it is actually doing instead of
+ * assuming it is idle and waiting for a prompt.
+ */
+export const SESSION_ACTIVITY_CAPABILITY = "session-activity";
+
+/**
+ * Which name wins when a Node reconnects, and whether anyone has to be told.
+ *
+ * Names are unique fleet-wide and a browser can change one while the machine is
+ * offline, so the two ends can disagree in both directions at once. The Node's
+ * `knownName` — the last name it synced with the Host — is what separates them:
+ * the Node is proposing a rename only when the Host still holds that name.
+ * Anything else means the Host was renamed since, and the Host wins, because it
+ * is the end that enforces uniqueness and the end an operator is looking at
+ * when they rename a machine they cannot see.
+ */
+export function resolveNodeName(input: {
+  /** The name the Host currently has recorded. */
+  stored: string;
+  /** What the Node calls itself now; absent from Nodes too old to send it. */
+  reported?: string | undefined;
+  /** The name the Node believes the Host has. */
+  knownName?: string | undefined;
+}): { name: string; renameStored: boolean; tellNode: boolean } {
+  const reported = input.reported?.trim();
+  // A Node too old to report a name cannot be told one either; it would hang up
+  // on a message its copy of the union does not have.
+  if (!reported) return { name: input.stored, renameStored: false, tellNode: false };
+  const known = input.knownName?.trim() ?? "";
+  // A Node that has never synced a name cannot claim the Host's is stale.
+  const proposing = Boolean(known) && known === input.stored && reported !== input.stored;
+  const name = proposing ? reported : input.stored;
+  return {
+    name,
+    renameStored: name !== input.stored,
+    // Told whenever either of the Node's two records is out of date: what it
+    // calls itself, and what it believes the Host calls it. The second matters
+    // as much as the first — `knownName` is how the next reconnect tells an
+    // operator's rename apart from a stale copy of the Host's, so leaving it
+    // behind would make the following local rename look like the stale one and
+    // be refused.
+    tellNode: name !== reported || name !== known,
+  };
+}
+
+/**
+ * Whether a Node is running the Host's code, and whether it can be told to.
+ *
+ * `unsupported` is deliberately distinct from `stale`: both need updating, but
+ * only one can be updated from this screen, and offering a button that would
+ * disconnect the machine is worse than saying so. `unknown` covers a checkout
+ * that is not a git repository on either end, where any verdict would be a
+ * guess dressed up as a fact.
+ */
+export type NodeUpdateState = "current" | "stale" | "unknown" | "unsupported";
+
+export function nodeUpdateState(
+  node: Pick<FleetNode, "revision" | "capabilities">,
+  hostRevision: string,
+): NodeUpdateState {
+  if (!node.capabilities.includes(SELF_UPDATE_CAPABILITY)) return "unsupported";
+  if (!hostRevision || !node.revision) return "unknown";
+  return node.revision === hostRevision ? "current" : "stale";
+}
 
 /**
  * A Host URL reduced to what actually decides where a Node dials.
@@ -300,6 +472,13 @@ export const SnapshotSchema = z.object({
   workspaces: z.array(WorkspaceSchema),
   placements: z.array(PlacementSchema),
   sessions: z.array(SessionSchema),
+  /**
+   * The commit the Host is running, so a browser can mark Nodes that are behind
+   * it. Sent with the fleet rather than fetched separately because the two are
+   * only meaningful together — a node revision with nothing to compare it to
+   * says nothing an operator can act on.
+   */
+  hostRevision: z.string().default(""),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
@@ -322,6 +501,32 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     workspaces: z.array(WorkspaceSchema),
     placements: z.array(PlacementSchema),
   }),
+  /**
+   * Progress of a Node's self-update.
+   *
+   * Broadcast rather than stored on the node row because it describes a few
+   * seconds of work, not a property of the machine: persisting it would leave
+   * "building" on screen forever if the Host restarted mid-update.
+   */
+  z.object({
+    type: z.literal("node_update"),
+    nodeId: z.string().min(1),
+    stage: NodeUpdateStageSchema,
+    detail: z.string().default(""),
+  }),
+  /**
+   * Something went wrong with one session without ending it.
+   *
+   * A prompt refused because the session is already mid-turn is the case this
+   * exists for: the session is fine, the command was not, and the operator has
+   * to be told — otherwise the message they typed disappears without a trace
+   * and the only symptom is an agent that never answers.
+   */
+  z.object({
+    type: z.literal("session_notice"),
+    sessionId: z.string().min(1),
+    message: z.string().min(1),
+  }),
 ]);
 export type BrowserMessage = z.infer<typeof BrowserMessageSchema>;
 
@@ -331,6 +536,7 @@ export const RegisterNodeSchema = z.object({
   os: z.string().min(1),
   arch: z.string().min(1),
   version: z.string().min(1),
+  revision: z.string().default(""),
   capabilities: z.array(z.string()),
   maxSessions: z.number().int().min(1).max(64),
   homeDir: z.string().max(4096).default(""),
@@ -432,7 +638,9 @@ const transitions: Record<SessionState, ReadonlySet<SessionState>> = {
   cancelling: new Set(["idle", "failed", "offline", "stopped"]),
   // Idle is the reconnect landing state; the next agent event can move it on.
   // Starting is the resume landing state; session/load re-attaches the agent.
-  offline: new Set(["stopped", "failed", "idle", "starting"]),
+  // Running is the reconnect landing state for a session whose turn never
+  // stopped: the socket dropped, not the agent, and the Node says so.
+  offline: new Set(["stopped", "failed", "idle", "starting", "running"]),
   stopped: new Set(["starting"]),
   completed: new Set(["starting"]),
   failed: new Set(["starting"]),

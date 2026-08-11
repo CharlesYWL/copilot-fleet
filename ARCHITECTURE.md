@@ -78,6 +78,31 @@ the reconnecting Node's empty inventory converts stale rows to `failed`.
 - Cancel denies every pending permission request before sending
   `session/cancel`, preventing the ACP turn from hanging on a permission promise.
 
+### Reconnecting mid-turn
+
+A dropped transport says nothing about the agent behind it. The Copilot process
+keeps working, so a Node that reconnects two seconds later still owns a Turn the
+Host stopped hearing about.
+
+The Host therefore cannot infer what a returning Session is doing, and it must
+not guess: assuming `idle` unlocks the browser composer over an agent that is
+still mid-Turn, and ACP permits only one active prompt per Session. Every
+follow-up sent into that window was refused by the Node and — because the
+command had already been acknowledged and the rejection discarded — vanished
+without an event, an error, or a state change.
+
+So the Node reports which Sessions are busy alongside the ones it holds, on both
+hello and heartbeat, and the Host restores those to `running` rather than
+`idle`. Nodes that predate the `session-activity` capability report none, and
+keep the old landing state.
+
+Refusal is also made visible rather than silent. A command the Node declines
+without anything being broken — a prompt arriving mid-Turn — comes back as a
+non-fatal `command_result`, which tells the operator why while leaving the
+Session alone; failing it would destroy a healthy run over a mistimed message.
+The Node re-announces the Session's true state behind the refusal, so a composer
+opened over a wrong guess closes on its own.
+
 ## Protocols
 
 ### Browser to Host
@@ -89,9 +114,10 @@ REST performs CRUD and commands. WebSocket pushes snapshots, Node status, Sessio
 The Node WebSocket carries:
 
 - authenticated hello and welcome
-- heartbeat with active Session IDs
+- heartbeat with active Session IDs, and which of them are mid-turn
 - Host commands: start, prompt, cancel, stop, permission response
 - Host address announcements when the Host's public URL changes
+- Self-update instructions, and the progress a Node reports back
 - Node command results and ordered Session Events
 
 Commands use unique IDs for deduplication. Events use an event UUID and a monotonically increasing per-Session sequence.
@@ -127,6 +153,27 @@ primary, so an announcement that is wrong for a particular machine cannot strand
 it. This helps every Node whose path to the Host outlives the change; a Node
 reached through the tunnel that just rotated loses that socket with it and
 recovers through the same rotation on reconnect.
+
+### Keeping Nodes current
+
+A Node reports the git revision of the checkout it runs from, and the Host
+reports its own. Semver never moves between deploys, so the commit is the only
+value honest enough to compare, and the Nodes view marks a Node stale when its
+revision differs from the Host's. A Node built from a tarball reports no
+revision at all and is simply never called stale, since there is nothing to
+compare and no checkout to pull into.
+
+An update pulls fast-forward only, installs, and builds _before_ anything is
+torn down, so a checkout that has diverged, or that no longer compiles, leaves
+the machine running the code it already had. Only once the build succeeds does
+the Node spawn its successor and exit; the successor waits for that exit before
+taking the instance lock, because two live processes for one Node make the Host
+supersede one of them. A pull that changes nothing skips the restart entirely
+rather than dropping every connection to arrive back where it started.
+
+Nodes running Sessions are refused rather than queued. An update restarts the
+process and every agent it hosts dies with it, so the choice of when to lose
+that work belongs to a person, not to a retry loop.
 
 ### Node to Copilot
 
