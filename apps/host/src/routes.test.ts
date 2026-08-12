@@ -179,15 +179,23 @@ describe("host routes", () => {
     expect(response.statusCode).toBe(409);
   });
 
-  it("round-trips the yolo default", async () => {
-    // Unset means yolo, so the toggle has to be able to turn it off.
-    expect((await app.inject({ method: "GET", url: "/api/defaults" })).json()).toEqual({
-      yolo: true,
-    });
+  it("round-trips the session defaults", async () => {
+    // Both are on when unset, so each toggle has to be able to turn its own off.
+    const read = async () =>
+      (await app.inject({ method: "GET", url: "/api/defaults" })).json();
+    expect(await read()).toEqual({ yolo: true, autoResume: true });
+
     await app.inject({ method: "POST", url: "/api/defaults", payload: { yolo: false } });
-    expect((await app.inject({ method: "GET", url: "/api/defaults" })).json()).toEqual({
-      yolo: false,
+    // A client that knows about one setting must not reset the other simply by
+    // not mentioning it.
+    expect(await read()).toEqual({ yolo: false, autoResume: true });
+
+    await app.inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { autoResume: false },
     });
+    expect(await read()).toEqual({ yolo: false, autoResume: false });
   });
 
   it("serves the enrollment command inputs", async () => {

@@ -29,12 +29,18 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
 
   app.get("/api/snapshot", async () => service.snapshot());
 
-  app.get("/api/defaults", async () => ({ yolo: store.getDefaultYolo() }));
+  app.get("/api/defaults", async () => ({
+    yolo: store.getDefaultYolo(),
+    autoResume: store.getAutoResume(),
+  }));
 
   app.post("/api/defaults", async (request) => {
     const input = UpdateDefaultsSchema.parse(request.body);
-    store.setDefaultYolo(input.yolo);
-    return { yolo: store.getDefaultYolo() };
+    // Each field is optional so a client that knows about one setting cannot
+    // reset the others merely by not mentioning them.
+    if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
+    if (input.autoResume !== undefined) store.setAutoResume(input.autoResume);
+    return { yolo: store.getDefaultYolo(), autoResume: store.getAutoResume() };
   });
 
   app.get("/api/tunnel", async () => tunnel.info(fallbackPublicUrl()));

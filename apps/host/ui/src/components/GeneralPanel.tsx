@@ -41,16 +41,17 @@ const useStyles = makeStyles({
   },
 });
 
+type Defaults = { yolo: boolean; autoResume: boolean };
+
 export const GeneralPanel = () => {
   const styles = useStyles();
-  const [yolo, setYolo] = useState<boolean>();
+  const [defaults, setDefaults] = useState<Defaults>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
 
   const refresh = useCallback(async () => {
     try {
-      const defaults = await api<{ yolo: boolean }>("/api/defaults");
-      setYolo(defaults.yolo);
+      setDefaults(await api<Defaults>("/api/defaults"));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -60,15 +61,16 @@ export const GeneralPanel = () => {
     void refresh();
   }, [refresh]);
 
-  const handleToggle = async (checked: boolean) => {
+  const update = async (patch: Partial<Defaults>) => {
     setBusy(true);
     setError(undefined);
     try {
-      const defaults = await api<{ yolo: boolean }>("/api/defaults", {
-        method: "POST",
-        body: JSON.stringify({ yolo: checked }),
-      });
-      setYolo(defaults.yolo);
+      setDefaults(
+        await api<Defaults>("/api/defaults", {
+          method: "POST",
+          body: JSON.stringify(patch),
+        }),
+      );
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       await refresh();
@@ -77,13 +79,15 @@ export const GeneralPanel = () => {
     }
   };
 
-  if (yolo === undefined) {
+  if (!defaults) {
     return (
       <div className={styles.panel}>
         <Spinner label="Loading defaults…" />
       </div>
     );
   }
+
+  const { yolo, autoResume } = defaults;
 
   return (
     <div className={styles.panel}>
@@ -116,7 +120,7 @@ export const GeneralPanel = () => {
             checked={yolo}
             disabled={busy}
             label={yolo ? "On" : "Off"}
-            onChange={(_event, data) => void handleToggle(data.checked)}
+            onChange={(_event, data) => void update({ yolo: data.checked })}
           />
         </div>
       </section>
@@ -129,6 +133,26 @@ export const GeneralPanel = () => {
           </MessageBarBody>
         </MessageBar>
       )}
+
+      <section className={styles.card}>
+        <div className={styles.row}>
+          <div>
+            <Text weight="semibold">Reconnect sessions automatically</Text>
+            <br />
+            <Text className={styles.caption}>
+              After a Host or node restart, re-attaches the sessions the node came back
+              without, up to its capacity. Re-attaching reopens the conversation and waits
+              — it sends no prompt, so nothing runs until you say so.
+            </Text>
+          </div>
+          <Switch
+            checked={autoResume}
+            disabled={busy}
+            label={autoResume ? "On" : "Off"}
+            onChange={(_event, data) => void update({ autoResume: data.checked })}
+          />
+        </div>
+      </section>
     </div>
   );
 };

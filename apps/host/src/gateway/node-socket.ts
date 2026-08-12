@@ -115,14 +115,13 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
         ? settleNodeName(service, app, node, hello.name, hello.knownName)
         : undefined;
       if (named) service.publishNode(named);
-      service.publishSessions(
-        service.store.reconcileOfflineSessions(
-          hello.nodeId,
-          activeSessionIds,
-          hello.busySessionIds,
-        ),
-      );
+      // Welcome precedes reconciliation because reconciliation can dispatch
+      // commands, and a Node should not be told to resume a session before it
+      // has been told its hello was accepted.
       service.send(socket, { type: "welcome", nodeId: hello.nodeId });
+      service.publishSessions(
+        service.reconcile(hello.nodeId, activeSessionIds, hello.busySessionIds),
+      );
 
       socket.on("message", (raw: unknown) => {
         const next = decodeFrame(String(raw), NodeToHostMessageSchema);

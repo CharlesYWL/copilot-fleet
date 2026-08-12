@@ -177,6 +177,21 @@ export class FleetStore {
     this.setSetting("defaults.yolo", yolo ? "1" : "0");
   }
 
+  /**
+   * Whether a session a Node lost is re-attached without being asked.
+   *
+   * On by default: the sessions this applies to were interrupted by a restart
+   * rather than ended by anyone, and re-attaching only reopens the conversation
+   * — it sends no prompt, so nothing runs until an operator says so.
+   */
+  getAutoResume(): boolean {
+    return this.getSetting("defaults.autoResume") !== "0";
+  }
+
+  setAutoResume(enabled: boolean): void {
+    this.setSetting("defaults.autoResume", enabled ? "1" : "0");
+  }
+
   setTunnelProvider(provider: TunnelProvider): void {
     this.setSetting("tunnel.provider", provider);
   }

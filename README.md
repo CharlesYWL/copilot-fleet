@@ -273,6 +273,15 @@ the sidebar, and is skipped by **Clear ended** — that button only removes
 sessions with nothing left to re-attach to. Use **Dismiss** on a session to drop
 a resumable one deliberately.
 
+By default the Host re-attaches those sessions itself as soon as the node is
+back, so a restart does not leave a row of buttons to click. It takes only the
+sessions settled by _that_ reconnect, newest first, and stops at the node's
+capacity — so a restart never resurrects conversations abandoned days ago, and a
+resume that fails is left for a person instead of retried every heartbeat.
+Re-attaching sends no prompt: the agent lands on idle waiting for input, so
+nothing runs until you ask it to. Turn it off under **Settings → General** if
+you would rather press Resume yourself.
+
 Three things have to hold for that to work: the Host's `DATABASE_PATH` file is
 intact, the node starts under the same name, and Copilot on that machine still
 has the agent session on disk. A session that died before its agent ever started

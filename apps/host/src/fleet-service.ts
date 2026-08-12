@@ -21,6 +21,7 @@ import {
   type Snapshot,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
+import { reservedSessionCount, yoloUnsupportedReason } from "./session-policy.js";
 
 /** `Omit` over a union has to be distributed, or the discriminant collapses. */
 type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
@@ -250,7 +251,8 @@ export class FleetService {
     this.broadcast({ type: "node_update", nodeId, stage, detail });
   }
 
-  /** Records a heartbeat, publishing only when a browser would render it. */ recordPresence(
+  /** Records a heartbeat, publishing only when a browser would render it. */
+  recordPresence(
     nodeId: string,
     activeSessionIds: readonly string[],
     busySessionIds: readonly string[] = [],
@@ -261,9 +263,93 @@ export class FleetService {
       activeSessionIds.length,
     );
     if (node && changed) this.publishNode(node);
-    this.publishSessions(
-      this.store.reconcileOfflineSessions(nodeId, activeSessionIds, busySessionIds),
+    this.publishSessions(this.reconcile(nodeId, activeSessionIds, busySessionIds));
+  }
+
+  /**
+   * Settles the sessions a Node did not bring back, and re-attaches the ones
+   * that can be. Shared by the hello and the heartbeat, which both arrive with
+   * the Node's current inventory.
+   */
+  reconcile(
+    nodeId: string,
+    activeSessionIds: readonly string[],
+    busySessionIds: readonly string[] = [],
+  ): FleetSession[] {
+    const settled = this.store.reconcileOfflineSessions(
+      nodeId,
+      activeSessionIds,
+      busySessionIds,
     );
+    this.autoResume(nodeId, settled);
+    return settled;
+  }
+
+  /**
+   * Re-attaches sessions a reconnecting Node no longer has.
+   *
+   * Reconciliation settles those as `failed` with a Resume button, which is
+   * accurate but leaves an operator clicking through them one at a time after
+   * every Host or Node restart — the two events that produce them in bulk.
+   *
+   * Only sessions that settled during *this* reconnect are taken. That keeps a
+   * restart from resurrecting conversations abandoned days ago, and means a
+   * resume that fails is not retried on the next heartbeat: it settles as
+   * failed and waits for a person, instead of looping.
+   *
+   * Resuming is not prompting. `session/load` re-attaches the conversation and
+   * the agent lands on idle waiting for input, so nothing here starts work or
+   * spends tokens on the operator's behalf — the cost is one Copilot process per
+   * session, which is why capacity is still enforced.
+   */
+  private autoResume(nodeId: string, settled: readonly FleetSession[]): void {
+    if (!this.store.getAutoResume()) return;
+    const node = this.store.getNode(nodeId);
+    if (!node) return;
+    const candidates = settled
+      .filter((session) => session.state === "failed" && session.agentSessionId)
+      // Newest first, by creation: when capacity cannot cover them all, the
+      // most recently started work is the likeliest to still matter. Last
+      // activity would be the better signal, but reconciliation has just
+      // stamped every one of these rows with the same instant, so it no longer
+      // distinguishes them.
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    if (candidates.length === 0) return;
+
+    let reserved = reservedSessionCount(this.store.listSessions(), nodeId);
+    let resumed = 0;
+    for (const session of candidates) {
+      if (reserved >= node.maxSessions) break;
+      const placement = this.store.getPlacement(session.placementId);
+      if (!placement) continue;
+      if (yoloUnsupportedReason(node, session.yolo)) continue;
+      const dispatched = this.dispatch(nodeId, {
+        type: "resume_session",
+        sessionId: session.id,
+        localPath: placement.localPath,
+        agentSessionId: session.agentSessionId,
+        sequenceOffset: this.store.maxEventSequence(session.id),
+        yolo: session.yolo,
+      });
+      // The socket went away mid-sweep; the rest are settled and resumable by
+      // hand, and the next reconnect will not pick them up again.
+      if (!dispatched.sent) break;
+      this.publishSession(
+        this.store.transitionSession(
+          session.id,
+          "starting",
+          "Reconnecting automatically",
+        ),
+      );
+      reserved += 1;
+      resumed += 1;
+    }
+    if (resumed > 0) {
+      this.log.info(
+        { nodeId, resumed, skipped: candidates.length - resumed },
+        "Re-attached sessions after a node reconnect",
+      );
+    }
   }
 
   disconnectNode(nodeId: string, activity: string): void {

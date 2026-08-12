@@ -749,7 +749,9 @@ export const RenameSessionSchema = z.object({
 });
 
 export const UpdateDefaultsSchema = z.object({
-  yolo: z.boolean(),
+  yolo: z.boolean().optional(),
+  /** Re-attach a session its Node lost, without waiting to be asked. */
+  autoResume: z.boolean().optional(),
 });
 
 export const PromptSchema = z.object({
