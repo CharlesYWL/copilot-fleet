@@ -4,7 +4,11 @@ import { resolveNodeName } from "./index.js";
 describe("resolveNodeName", () => {
   it("does nothing when both ends agree", () => {
     expect(
-      resolveNodeName({ stored: "weili-pc", reported: "weili-pc", knownName: "weili-pc" }),
+      resolveNodeName({
+        stored: "weili-pc",
+        reported: "weili-pc",
+        knownName: "weili-pc",
+      }),
     ).toEqual({ name: "weili-pc", renameStored: false, tellNode: false });
   });
 
@@ -12,7 +16,11 @@ describe("resolveNodeName", () => {
     // The node last synced "weili-pc" and the Host still has it, so the change
     // can only have come from the operator editing it locally.
     expect(
-      resolveNodeName({ stored: "weili-pc", reported: "build-01", knownName: "weili-pc" }),
+      resolveNodeName({
+        stored: "weili-pc",
+        reported: "build-01",
+        knownName: "weili-pc",
+      }),
     ).toEqual({ name: "build-01", renameStored: true, tellNode: true });
   });
 
@@ -20,7 +28,11 @@ describe("resolveNodeName", () => {
     // The Host no longer holds what the node last synced, so the node is not
     // proposing anything — it is behind, and gets told.
     expect(
-      resolveNodeName({ stored: "build-01", reported: "weili-pc", knownName: "weili-pc" }),
+      resolveNodeName({
+        stored: "build-01",
+        reported: "weili-pc",
+        knownName: "weili-pc",
+      }),
     ).toEqual({ name: "build-01", renameStored: false, tellNode: true });
   });
 
@@ -51,7 +63,11 @@ describe("resolveNodeName", () => {
     // Its own name is right but `knownName` is not, which is what the next
     // reconnect uses to tell a local rename from a stale copy.
     expect(
-      resolveNodeName({ stored: "build-01", reported: "build-01", knownName: "weili-pc" }),
+      resolveNodeName({
+        stored: "build-01",
+        reported: "build-01",
+        knownName: "weili-pc",
+      }),
     ).toEqual({ name: "build-01", renameStored: false, tellNode: true });
   });
 
