@@ -3,6 +3,7 @@ import { render, screen } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { FleetSession } from "@fleet/protocol";
 import { TerminalView } from "./TerminalView";
+import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { fleetDarkTheme } from "../theme";
 
 const session = (values: Partial<FleetSession> = {}): FleetSession => ({
@@ -38,7 +39,7 @@ const session = (values: Partial<FleetSession> = {}): FleetSession => ({
   ...values,
 });
 
-const show = (overrides: Partial<FleetSession> = {}) =>
+const show = (overrides: Partial<FleetSession> = {}, draft: SessionDraft = EMPTY_DRAFT) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
       <TerminalView
@@ -49,6 +50,8 @@ const show = (overrides: Partial<FleetSession> = {}) =>
         onStop={vi.fn()}
         onPermission={vi.fn()}
         onConfigChange={vi.fn()}
+        draft={draft}
+        onDraftChange={vi.fn()}
       />
     </FluentProvider>,
   );
@@ -84,5 +87,15 @@ describe("TerminalView composer", () => {
     expect(screen.getByRole("button", { name: "Model" }).hasAttribute("disabled")).toBe(
       false,
     );
+  });
+
+  it("shows the draft it was handed rather than an empty box", () => {
+    // The composer no longer owns the text. Switching sessions unmounts this
+    // view, so anything it kept to itself was gone the moment an operator
+    // looked at another session — which is what made a half-written prompt
+    // disappear on a click.
+    show({}, { prompt: "half-written thought", attachments: [] });
+    const box = screen.getByLabelText("Follow-up prompt") as HTMLTextAreaElement;
+    expect(box.value).toBe("half-written thought");
   });
 });

@@ -58,6 +58,7 @@ import {
   toWireAttachments,
   type DraftAttachment,
 } from "../lib/attachments";
+import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
@@ -296,6 +297,8 @@ type TerminalViewProps = {
   onResume?: () => void;
   onClose?: () => void;
   onConfigChange?: (configId: string, value: string) => void;
+  draft: SessionDraft;
+  onDraftChange: (update: (current: SessionDraft) => SessionDraft) => void;
 };
 
 export const TerminalView = ({
@@ -310,20 +313,31 @@ export const TerminalView = ({
   onResume,
   onClose,
   onConfigChange,
+  draft,
+  onDraftChange,
 }: TerminalViewProps) => {
   const styles = useStyles();
-  const [prompt, setPrompt] = useState("");
   const [draftName, setDraftName] = useState<string>();
   // Dismissal is remembered per keystroke, not per session: Escape closes the
   // menu, and typing another character is what asks for it back.
   const [menuDismissed, setMenuDismissed] = useState(false);
   const [highlight, setHighlight] = useState(0);
-  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
   const [attachError, setAttachError] = useState<string>();
   const streamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pinnedRef = useRef(true);
+
+  const { prompt, attachments } = draft;
+  const setPrompt = (value: string) =>
+    onDraftChange((current) => ({ ...current, prompt: value }));
+  const setAttachments = (
+    update: (current: DraftAttachment[]) => DraftAttachment[],
+  ): void =>
+    onDraftChange((current) => ({
+      ...current,
+      attachments: update(current.attachments),
+    }));
 
   const blocks = useMemo(() => toTerminalBlocks(events), [events]);
   const permission = useMemo(() => pendingPermission(events), [events]);
@@ -341,14 +355,11 @@ export const TerminalView = ({
   }, [session.id]);
 
   // Switching sessions with the editor open would otherwise offer one session's
-  // name as an edit to another's.
+  // name as an edit to another's. The composer draft is deliberately not reset
+  // here: it belongs to the session being left, and is restored on return.
   useEffect(() => {
     setDraftName(undefined);
-    setPrompt("");
     setMenuDismissed(false);
-    // Attachments belong to the message being written, and that message does
-    // not follow the operator to another session.
-    setAttachments([]);
     setAttachError(undefined);
   }, [session.id]);
 
@@ -374,8 +385,7 @@ export const TerminalView = ({
     // refusing to send it would strand the attachment the operator just added.
     if ((!text && attachments.length === 0) || !canPrompt) return;
     onPrompt(text || "(see attachment)", toWireAttachments(attachments));
-    setPrompt("");
-    setAttachments([]);
+    onDraftChange(() => EMPTY_DRAFT);
     setAttachError(undefined);
     setMenuDismissed(false);
   };
@@ -437,7 +447,7 @@ export const TerminalView = ({
       // The state update has not landed yet, so the text is passed rather than
       // read back off `prompt`.
       onPrompt(choice.text);
-      setPrompt("");
+      onDraftChange(() => EMPTY_DRAFT);
       return;
     }
     inputRef.current?.focus();

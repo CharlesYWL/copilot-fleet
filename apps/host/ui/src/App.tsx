@@ -19,6 +19,13 @@ import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
 import { useSessionChimes } from "./hooks/useSessionChimes";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import { isDisposableSession, filterVisibleSessions } from "./lib/session-status";
+import {
+  draftFor,
+  pruneDrafts,
+  withDraft,
+  type DraftsBySession,
+  type SessionDraft,
+} from "./lib/session-drafts";
 import { EmptySessions } from "./components/EmptySessions";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { SessionFocusDialog } from "./components/SessionFocusDialog";
@@ -79,6 +86,14 @@ export function App() {
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [defaultYolo, setDefaultYolo] = useState(true);
+  /**
+   * Unsent composer text, per session.
+   *
+   * Owned here because the terminal view is unmounted by half the things an
+   * operator does — switching sessions, opening Settings, moving between the
+   * tree and the wall — and a draft that lives inside it disappears with it.
+   */
+  const [drafts, setDrafts] = useState<DraftsBySession>({});
   const backfilled = useRef(new Set<string>());
 
   // Read the Host default when the dialog opens so it reflects Settings edits.
@@ -117,6 +132,19 @@ export function App() {
   );
   const activeSession = snapshot.sessions.find(
     (session) => session.id === selectedSessionId,
+  );
+
+  // A dismissed or cleared session takes its unsent draft with it.
+  useEffect(() => {
+    const live = new Set(snapshot.sessions.map((session) => session.id));
+    setDrafts((current) => pruneDrafts(current, live));
+  }, [snapshot.sessions]);
+
+  const changeDraft = useCallback(
+    (sessionId: string, update: (current: SessionDraft) => SessionDraft) => {
+      setDrafts((current) => withDraft(current, sessionId, update));
+    },
+    [],
   );
 
   useEffect(() => {
@@ -296,6 +324,8 @@ export function App() {
                         value,
                       })
                     }
+                    draft={draftFor(drafts, activeSession.id)}
+                    onDraftChange={(update) => changeDraft(activeSession.id, update)}
                   />
                 ) : (
                   <EmptySessions onNewSession={() => setDialogOpen(true)} />
@@ -330,6 +360,8 @@ export function App() {
                 value,
               })
             }
+            draft={draftFor(drafts, activeSession.id)}
+            onDraftChange={(update) => changeDraft(activeSession.id, update)}
           />
         )}
 
