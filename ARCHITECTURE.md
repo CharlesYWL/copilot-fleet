@@ -154,6 +154,16 @@ it. This helps every Node whose path to the Host outlives the change; a Node
 reached through the tunnel that just rotated loses that socket with it and
 recovers through the same rotation on reconnect.
 
+Announcement only reaches Nodes that are connected when the address changes,
+which is exactly the set that is empty across a Host restart. A Host that comes
+back on a new quick-tunnel hostname is therefore unreachable and unable to say
+so: every Node dials the addresses it knows, all of them stale, and the fleet
+has to be repointed by hand. That is a property of the tunnel, not of this
+protocol — `cloudflared tunnel --url` and free ngrok domains are documented as
+rotating on every restart. A fleet that restarts its Host needs an address that
+survives it: a named Cloudflare tunnel, a Tailscale Funnel hostname, or
+`FLEET_PUBLIC_URL` in front of a stable reverse proxy.
+
 ### Keeping Nodes current
 
 A Node reports the git revision of the checkout it runs from, and the Host
@@ -174,6 +184,17 @@ rather than dropping every connection to arrive back where it started.
 Nodes running Sessions are refused rather than queued. An update restarts the
 process and every agent it hosts dies with it, so the choice of when to lose
 that work belongs to a person, not to a retry loop.
+
+The successor is launched from saved settings rather than from the flags its
+predecessor was started with. A flag outranks settings.json, which is what the
+operator wants on the run they typed it on and the opposite of what they want
+afterwards: a Node started with `--url=<quick tunnel>` persists that address,
+and when the tunnel rotates the operator moves it from the config page. Replaying
+the original flag into the successor reverted that edit, so the Node came back on
+an address that no longer existed — unreachable, and therefore impossible to
+tell where the Host had gone. Settings-backed flags are dropped and the current
+settings are written to disk before the successor is spawned; flags with no home
+in settings, such as the enrollment token and the config port, are passed through.
 
 ### Node to Copilot
 

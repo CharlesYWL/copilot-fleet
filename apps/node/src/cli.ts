@@ -16,6 +16,16 @@ type FlagSpec = {
   boolean?: boolean;
   placeholder?: string;
   help: string;
+  /**
+   * Whether settings.json ends up owning this value.
+   *
+   * A flag outranks the saved settings, which is right for the run the operator
+   * typed it on and wrong for every run after it: the node persists what it is
+   * using, so by the time it restarts itself the file already holds this value —
+   * or a newer one the operator set from the config page. Replaying the original
+   * flag then silently reverts that edit. See {@link argvForRestart}.
+   */
+  persisted?: boolean;
 };
 
 const FLAGS: { names: string[]; spec: FlagSpec }[] = [
@@ -25,6 +35,7 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
       env: "FLEET_HOST_URL",
       placeholder: "<url>",
       help: "Host to connect to (FLEET_HOST_URL)",
+      persisted: true,
     },
   },
   {
@@ -33,6 +44,7 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
       env: "FLEET_NODE_NAME",
       placeholder: "<name>",
       help: "Node name shown in the Host UI (FLEET_NODE_NAME)",
+      persisted: true,
     },
   },
   {
@@ -49,6 +61,7 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
       env: "FLEET_MAX_SESSIONS",
       placeholder: "<n>",
       help: "Concurrent session capacity (FLEET_MAX_SESSIONS)",
+      persisted: true,
     },
   },
   {
@@ -57,6 +70,7 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
       env: "FLEET_COPILOT_COMMAND",
       placeholder: "<path>",
       help: "Copilot executable; empty means look on PATH (FLEET_COPILOT_COMMAND)",
+      persisted: true,
     },
   },
   {
@@ -65,6 +79,7 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
       env: "PERMISSION_TIMEOUT_MS",
       placeholder: "<ms>",
       help: "How long an agent waits for a decision (PERMISSION_TIMEOUT_MS)",
+      persisted: true,
     },
   },
   {
@@ -170,4 +185,48 @@ export function parseNodeArgs(argv: readonly string[]): CliOverrides {
   }
 
   return { wantsHelp, env };
+}
+
+/**
+ * The arguments a self-update should re-launch this node with.
+ *
+ * Flags outrank settings.json, which is correct for the run the operator typed
+ * them on and wrong for the ones that follow. A node started with
+ * `--url=<tunnel>` persists that address, and the operator may later move it
+ * from the config page when the tunnel rotates; replaying the original flag
+ * into the successor reverts that edit and sends the machine back to a dead
+ * address, where nothing can reach it and it cannot be told about the new one.
+ *
+ * Settings-backed flags are therefore dropped: the file already holds this
+ * value, or a newer one that is now the operator's actual intent. Flags with no
+ * home in settings — the enrollment token, the config port, the mock adapter —
+ * survive, because dropping those would change how the successor runs.
+ */
+export function argvForRestart(argv: readonly string[]): string[] {
+  const kept: string[] = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index] ?? "";
+    if (!argument.startsWith("--")) {
+      kept.push(argument);
+      continue;
+    }
+    const separator = argument.indexOf("=");
+    const name = separator === -1 ? argument : argument.slice(0, separator);
+    const negated = name.startsWith("--no-");
+    const spec = findFlag(negated ? `--${name.slice("--no-".length)}` : name);
+    if (!spec?.persisted) {
+      kept.push(argument);
+      continue;
+    }
+    // A value-taking flag written as `--url <value>` carries the value in the
+    // next argument, which has to go with it or it is read as a bare argument
+    // and the successor refuses to start.
+    if (separator === -1 && !spec.boolean && !negated) {
+      const next = argv[index + 1];
+      if (next !== undefined && !next.startsWith("--")) index += 1;
+    }
+  }
+
+  return kept;
 }

@@ -107,8 +107,12 @@ export function updateCheckout({
  * the Host would see the newcomer as a superseding connection and the machine
  * would end up with no Node at all.
  */
-export function respawn(repoRoot: string, scriptPath: string): void {
-  const child = spawn(process.execPath, [scriptPath, ...process.argv.slice(2)], {
+export function respawn(
+  repoRoot: string,
+  scriptPath: string,
+  args: readonly string[] = process.argv.slice(2),
+): void {
+  const child = spawn(process.execPath, [scriptPath, ...args], {
     cwd: repoRoot,
     detached: true,
     stdio: "inherit",

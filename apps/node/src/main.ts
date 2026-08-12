@@ -19,7 +19,7 @@ import {
 } from "@fleet/protocol";
 import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
-import { CliError, USAGE, parseNodeArgs } from "./cli.js";
+import { CliError, USAGE, argvForRestart, parseNodeArgs } from "./cli.js";
 import {
   configDirectory,
   loadCredentials,
@@ -299,7 +299,19 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // Sent before the process goes, because nothing can be reported from the
       // other side of an exit.
       report("restarting", `Updated to ${outcome.revision}; restarting`);
-      respawn(root, scriptPath);
+      // The successor reads settings.json rather than inheriting the flags this
+      // process was started with, so what is in memory now has to be on disk
+      // before it looks. Without this a node whose address was corrected from
+      // the config page comes back on the address it was launched with.
+      await saveSettings(settings);
+      const restartArgs = argvForRestart(argv);
+      const dropped = argv.length - restartArgs.length;
+      if (dropped > 0) {
+        log(
+          `Restarting from saved settings; ${dropped} launch flag(s) superseded by settings.json`,
+        );
+      }
+      respawn(root, scriptPath, restartArgs);
       await shutdown();
       releaseInstanceLock();
       process.exit(0);
