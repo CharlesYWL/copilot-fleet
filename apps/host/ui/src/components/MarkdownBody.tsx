@@ -1,4 +1,9 @@
-import { isValidElement, type ReactNode, type ComponentPropsWithoutRef } from "react";
+import {
+  isValidElement,
+  memo,
+  type ReactNode,
+  type ComponentPropsWithoutRef,
+} from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { makeStyles, mergeClasses, tokens } from "@fluentui/react-components";
@@ -143,7 +148,21 @@ type MarkdownBodyProps = {
   className?: string;
 };
 
-export const MarkdownBody = ({ text, muted, copyable, className }: MarkdownBodyProps) => {
+/**
+ * Rendered markdown, memoised.
+ *
+ * Parsing runs remark over the text on every render, and a transcript holds
+ * hundreds of these. Anything that re-rendered the terminal — a keystroke in
+ * the composer, most of all — re-parsed all of them, so typing cost grew with
+ * the length of the conversation. The props are plain values, so the default
+ * comparison is exactly right.
+ */
+export const MarkdownBody = memo(function MarkdownBody({
+  text,
+  muted,
+  copyable,
+  className,
+}: MarkdownBodyProps) {
   const styles = useStyles();
   return (
     <div
@@ -169,7 +188,7 @@ export const MarkdownBody = ({ text, muted, copyable, className }: MarkdownBodyP
       </ReactMarkdown>
     </div>
   );
-};
+});
 
 const CodeBlock = ({ children }: { children?: ReactNode }) => {
   const styles = useStyles();

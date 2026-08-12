@@ -1,4 +1,5 @@
 import {
+  memo,
   useEffect,
   useMemo,
   useRef,
@@ -718,7 +719,18 @@ export const TerminalView = ({
 
 const markdownKinds = new Set<TerminalBlockKind>(["agent", "user", "thought"]);
 
-const TerminalLine = ({ block }: { block: TerminalBlock }) => {
+/**
+ * One line of the transcript, memoised.
+ *
+ * A transcript runs to hundreds of these, and each markdown line re-parses its
+ * text when it renders. Without this, every keystroke in the composer re-rendered
+ * the entire conversation, so typing got measurably slower the longer an
+ * operator had been working — the exact opposite of what a long session needs.
+ *
+ * `block` comes from a memo over the event list, so its identity only changes
+ * when the event it describes does.
+ */
+const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBlock }) {
   const styles = useStyles();
   const color = blockColor[block.kind];
   const text =
@@ -766,7 +778,7 @@ const TerminalLine = ({ block }: { block: TerminalBlock }) => {
       )}
     </div>
   );
-};
+});
 
 function formatTime(value: string): string {
   const parsed = Date.parse(value);
