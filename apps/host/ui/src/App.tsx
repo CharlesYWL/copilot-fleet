@@ -16,6 +16,7 @@ import {
 import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
+import { useSessionChimes } from "./hooks/useSessionChimes";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import { isDisposableSession, filterVisibleSessions } from "./lib/session-status";
 import { EmptySessions } from "./components/EmptySessions";
@@ -190,6 +191,7 @@ export function App() {
   };
 
   usePermissionAlerts(waitingPermissions, handleSelectSession);
+  const sound = useSessionChimes(snapshot.sessions, waitingPermissions);
 
   const handleCreateSession = async (
     placementId: string,
@@ -225,11 +227,14 @@ export function App() {
           connected={connected}
           layout={layout}
           onLayoutChange={handleLayoutChange}
+          soundEnabled={sound.enabled}
+          onToggleSound={sound.toggle}
         />
         <div className={styles.body}>
           {layout === "grid" ? (
             <SessionGrid
               sessions={visibleSessions}
+              workspaces={snapshot.workspaces}
               nodes={snapshot.nodes}
               events={events}
               onOpen={handleSelectSession}
@@ -242,6 +247,7 @@ export function App() {
                 nodes={snapshot.nodes}
                 workspaces={snapshot.workspaces}
                 sessions={visibleSessions}
+                placements={snapshot.placements}
                 selectedSessionId={selectedSessionId}
                 view={view}
                 endedCount={endedCount}
@@ -266,8 +272,11 @@ export function App() {
                   <TerminalView
                     session={activeSession}
                     events={events[activeSession.id] ?? noEvents}
-                    onPrompt={(prompt) =>
-                      void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
+                    onPrompt={(prompt, attachments) =>
+                      void command(`/api/sessions/${activeSession.id}/prompt`, {
+                        prompt,
+                        attachments,
+                      })
                     }
                     onCancel={() =>
                       void command(`/api/sessions/${activeSession.id}/cancel`)
@@ -280,6 +289,12 @@ export function App() {
                     onRename={(name) => handleRenameSession(activeSession.id, name)}
                     onPermission={(requestId, outcome, optionId) =>
                       handlePermission(activeSession.id, requestId, outcome, optionId)
+                    }
+                    onConfigChange={(configId, value) =>
+                      void command(`/api/sessions/${activeSession.id}/config`, {
+                        configId,
+                        value,
+                      })
                     }
                   />
                 ) : (
@@ -295,8 +310,11 @@ export function App() {
             events={events[activeSession.id] ?? noEvents}
             open={focusOpen}
             onOpenChange={setFocusOpen}
-            onPrompt={(prompt) =>
-              void command(`/api/sessions/${activeSession.id}/prompt`, { prompt })
+            onPrompt={(prompt, attachments) =>
+              void command(`/api/sessions/${activeSession.id}/prompt`, {
+                prompt,
+                attachments,
+              })
             }
             onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
             onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
@@ -305,6 +323,12 @@ export function App() {
             onRename={(name) => handleRenameSession(activeSession.id, name)}
             onPermission={(requestId, outcome, optionId) =>
               handlePermission(activeSession.id, requestId, outcome, optionId)
+            }
+            onConfigChange={(configId, value) =>
+              void command(`/api/sessions/${activeSession.id}/config`, {
+                configId,
+                value,
+              })
             }
           />
         )}

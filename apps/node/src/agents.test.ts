@@ -26,8 +26,49 @@ describe("MockAgentFactory", () => {
 
   it("waits to be prompted after a fresh start", async () => {
     const events = await collect();
-    expect(events.map((event) => event.type)).toEqual(["state", "agent_session"]);
+    expect(events.map((event) => event.type)).toEqual([
+      "state",
+      "agent_session",
+      "commands",
+      "config",
+    ]);
     expect(events[0]?.payload).toMatchObject({ state: "starting" });
+  });
+
+  it("reports its commands and pickers so a browser has something to drive", () => {
+    // The mock exists to exercise the UI without Copilot installed, so the
+    // slash menu and the model chooser have to have content here too.
+    return collect().then((events) => {
+      const commands = events.find((event) => event.type === "commands");
+      expect(commands?.payload.commands).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: "model" })]),
+      );
+      const config = events.find((event) => event.type === "config");
+      expect(config?.payload.options).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: "model" })]),
+      );
+    });
+  });
+
+  it("re-reports pickers when one is changed", async () => {
+    const events: SessionEvent[] = [];
+    const agent = await new MockAgentFactory().start("session-1", "/workspace", (event) =>
+      events.push(event),
+    );
+    await agent.setConfigOption("model", "mock-deep");
+    const latest = events.filter((event) => event.type === "config").at(-1);
+    expect(latest?.payload.options).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "model", currentValue: "mock-deep" }),
+      ]),
+    );
+  });
+
+  it("refuses an option it does not have", async () => {
+    const agent = await new MockAgentFactory().start("session-1", "/workspace", () => {});
+    await expect(agent.setConfigOption("nonsense", "x")).rejects.toThrow(
+      "Unknown option",
+    );
   });
 
   it("lands a resumed session on idle, so it can be prompted again", async () => {

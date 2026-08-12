@@ -1,4 +1,4 @@
-import { eventPayload, type SessionEvent } from "@fleet/protocol";
+import { eventPayload, type AttachmentSummary, type SessionEvent } from "@fleet/protocol";
 
 export type TerminalBlockKind =
   | "user"
@@ -18,6 +18,8 @@ export type TerminalBlock = {
   text: string;
   createdAt: string;
   status?: string;
+  /** Files that went with this message, by name; their bytes are never kept. */
+  attachments?: AttachmentSummary[];
 };
 
 const USER_PREFIX = "User: ";
@@ -89,7 +91,8 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
     }
 
     if (event.type === "system") {
-      const text = eventPayload(event, "system")?.text ?? "";
+      const payload = eventPayload(event, "system");
+      const text = payload?.text ?? "";
       if (!text) continue;
       const isUser = text.startsWith(USER_PREFIX);
       blocks.push({
@@ -97,6 +100,10 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
         kind: isUser ? "user" : "system",
         text: isUser ? text.slice(USER_PREFIX.length) : text,
         createdAt: event.createdAt,
+        // The bytes are never stored, so this list is the only trace a prompt
+        // carried files at all. Without it a transcript reads as though the
+        // agent answered a question about a screenshot nobody sent.
+        ...(payload?.attachments?.length ? { attachments: payload.attachments } : {}),
       });
       continue;
     }

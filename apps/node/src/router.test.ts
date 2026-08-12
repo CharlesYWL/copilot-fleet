@@ -63,6 +63,70 @@ describe("CommandRouter", () => {
     expect(s2.map((event) => event.sequence)).toEqual(s2.map((_, index) => index + 1));
   });
 
+  it("changes a session picker and reports the new value", async () => {
+    const events: SessionEvent[] = [];
+    const router = new CommandRouter(
+      new MockAgentFactory(),
+      1,
+      (event) => events.push(event),
+      async (path) => path,
+    );
+    await router.route({
+      type: "start_session",
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "alpha",
+    });
+
+    const result = await router.route({
+      type: "set_config_option",
+      commandId: "c2",
+      sessionId: "s1",
+      configId: "model",
+      value: "mock-deep",
+    });
+
+    expect(result).toEqual({ commandId: "c2", ok: true });
+    const latest = events.filter((event) => event.type === "config").at(-1);
+    expect(latest?.payload.options).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "model", currentValue: "mock-deep" }),
+      ]),
+    );
+  });
+
+  it("refuses an impossible option without failing the session", async () => {
+    // Copilot rejects a mistyped model by name. Reporting that as fatal used to
+    // fail the whole session, so choosing the wrong entry from a dropdown ended
+    // the run the operator was in the middle of.
+    const router = new CommandRouter(
+      new MockAgentFactory(),
+      1,
+      () => undefined,
+      async (path) => path,
+    );
+    await router.route({
+      type: "start_session",
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "alpha",
+    });
+
+    const result = await router.route({
+      type: "set_config_option",
+      commandId: "c2",
+      sessionId: "s1",
+      configId: "nonsense",
+      value: "x",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.fatal).toBe(false);
+    expect(result.error).toContain("Unknown option");
+  });
+
   it("enforces configured capacity", async () => {
     const router = new CommandRouter(
       new MockAgentFactory(),

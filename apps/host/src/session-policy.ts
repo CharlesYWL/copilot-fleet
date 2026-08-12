@@ -1,4 +1,5 @@
 import {
+  SESSION_CONFIG_CAPABILITY,
   terminalSessionStates,
   type FleetNode,
   type FleetSession,
@@ -15,6 +16,21 @@ export function yoloUnsupportedReason(
 ): string | undefined {
   if (!yolo || node.capabilities.includes("host-yolo")) return undefined;
   return `Node "${node.name}" runs an older agent that cannot apply YOLO mode. Update and restart it, or turn YOLO off for this session.`;
+}
+
+/**
+ * Why this node cannot be asked to change a session picker, if it cannot.
+ *
+ * An older agent validates every frame against its own copy of the command
+ * union and closes the socket on anything unfamiliar, so an unsupported
+ * `set_config_option` would cost the node its connection rather than fail the
+ * request. Refusing here keeps the damage to one 409.
+ */
+export function configUnsupportedReason(
+  node: Pick<FleetNode, "name" | "capabilities">,
+): string | undefined {
+  if (node.capabilities.includes(SESSION_CONFIG_CAPABILITY)) return undefined;
+  return `Node "${node.name}" runs an older agent that cannot change session options. Update and restart it.`;
 }
 
 /**

@@ -1,11 +1,17 @@
 import {
+  Button,
   Text,
   ToggleButton,
   makeStyles,
   mergeClasses,
   tokens,
 } from "@fluentui/react-components";
-import { Grid20Regular, TextBulletListTree20Regular } from "@fluentui/react-icons";
+import {
+  Grid20Regular,
+  Speaker220Regular,
+  SpeakerMute20Regular,
+  TextBulletListTree20Regular,
+} from "@fluentui/react-icons";
 
 const useStyles = makeStyles({
   bar: {
@@ -93,6 +99,8 @@ type TopBarProps = {
   connected: boolean;
   layout: LayoutMode;
   onLayoutChange: (layout: LayoutMode) => void;
+  soundEnabled: boolean;
+  onToggleSound: () => void;
 };
 
 export const TopBar = ({
@@ -102,6 +110,8 @@ export const TopBar = ({
   connected,
   layout,
   onLayoutChange,
+  soundEnabled,
+  onToggleSound,
 }: TopBarProps) => {
   const styles = useStyles();
   return (
@@ -139,6 +149,15 @@ export const TopBar = ({
           label="permissions"
           value={waitingPermissions}
           warn={waitingPermissions > 0}
+        />
+        <Button
+          appearance="subtle"
+          size="small"
+          icon={soundEnabled ? <Speaker220Regular /> : <SpeakerMute20Regular />}
+          title={soundEnabled ? "Mute alerts" : "Play a sound on alerts"}
+          aria-label={soundEnabled ? "Mute alerts" : "Play a sound on alerts"}
+          aria-pressed={soundEnabled}
+          onClick={onToggleSound}
         />
         <Text className={styles.caption}>{connected ? "live" : "reconnecting…"}</Text>
       </div>

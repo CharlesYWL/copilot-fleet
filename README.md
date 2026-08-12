@@ -130,6 +130,133 @@ a different one enrolls a _new_ machine and leaves the old node's placements and
 sessions behind. Starting again under the previous name reclaims the same node
 id and brings them back.
 
+### Ordering and filing by dragging
+
+The sidebar tree can be rearranged by hand at every level: workspace rows, node
+rows, and the sessions under them. Drag a row above or below a sibling — the
+pointer's half of the target row decides which, and a line appears at that edge —
+and the order is stored, so it survives a reload and is the same in every browser
+watching the Host.
+
+Dropping _onto_ a row would only ever mean "take its place", which leaves no way
+to say "put it last": there is no row after the last one to aim at. The
+above/below distinction is what makes the end of a list reachable.
+
+New workspaces, placements and sessions are added at the end rather than sorted
+in by name or date, so an arrangement made by hand is not undone by the next
+machine or run added. A fleet nobody has rearranged keeps the order it always
+had.
+
+Dropping a node row onto a _different_ workspace files that checkout under it
+instead of reordering, taking its sessions along: they carry their own workspace
+id so the sidebar can group history without a join, and leaving that behind
+would file every past run under the project the checkout no longer belongs to.
+That move is refused if the target workspace already has a placement on the same
+machine, since a workspace can only be in one place on a given node.
+
+In **Workspaces & placements**, the same drags work on the cards: placement rows
+reorder within a card, node chips at the top can be dropped on a card to place
+that machine there, and a card that cannot take what is being dragged says why on
+the card rather than silently refusing.
+
+Sessions only reorder among their own node's list. A session is a live agent
+process on one machine, holding that machine's files, so there is nowhere else
+for it to go.
+
+### Alerts
+
+A finished turn plays a short rising tone; an agent blocked on a permission
+plays a lower one, twice. They are different on purpose: a fleet is watched out
+of the corner of an eye, and "it needs you" should be distinguishable from "it
+is done" without looking at the screen. The speaker button in the top bar mutes
+them, and the choice is remembered.
+
+Both are synthesised in the browser rather than shipped as audio files, so they
+work on a Host that has never been online. Nothing sounds on the first view of
+the fleet — opening a page onto ten finished sessions is not the same as
+watching ten agents finish — and several sessions finishing together produce one
+tone rather than a pile of them. A permission that is still waiting is announced
+once, not on every refresh.
+
+Permissions are also announced outside the page, with a tab-title count and a
+desktop notification that survives until it is clicked, because a request blocks
+its agent until the node's timeout expires.
+
+### Attaching files and images
+
+The composer takes files: paste a screenshot straight into the box, or use the
+paperclip to pick some. Each one appears as a chip that can be removed until the
+message is sent, and a prompt can carry up to six of them at 10 MB each.
+
+How a file reaches the agent depends on what it is. Images go over as ACP image
+blocks; everything else is embedded as text, so the agent reads the contents
+without needing the file to exist on its own disk — which matters because the
+machine running the agent is usually not the machine the file came from. A
+binary that is neither, like a zip, is named in the prompt rather than embedded:
+decoding it as text would spend the context window on replacement characters and
+can read as instructions.
+
+Bytes travel with the prompt in one piece rather than through an upload endpoint.
+The agent is often behind a tunnel, and handing it a URL to fetch would mean
+giving the Node credentials and a route back to the Host for something already in
+the operator's hand. The size ceilings are what keep that from becoming a
+WebSocket frame large enough to stall the other sessions sharing the connection.
+
+Only the name, type and size are recorded in the transcript. The event log is
+stored on the Host and replayed to every browser watching a session, so keeping
+the bytes there would turn a few pasted screenshots into a liability; the
+attachment chips under a sent message are the trace that remains.
+
+### Slash commands and session pickers
+
+The composer offers Copilot's own slash commands: type `/` and a list appears,
+filtered as you type. Arrow keys move the selection, Enter or Tab picks one, and
+Escape closes the menu. A command that takes an argument (`/review`, `/research`)
+leaves the caret waiting after it; one that does not (`/usage`, `/context`) runs
+straight away. The list is whatever the agent reports for that session, including
+skills and plugins, so a machine with extra skills installed shows them without
+any change here.
+
+Along the bottom of the composer sit the session's pickers — **Model**, **Mode**,
+**Reasoning Effort** — as the agent reports them. Each shows only its current
+value and opens a menu upwards; the setting's name lives in that menu rather
+than on the strip, so the composer stays one compact object instead of a band of
+labelled dropdowns. These are the settings a terminal Copilot opens a chooser
+for, which is why `/model` on its own answers "no model is currently selected"
+over a wire protocol: there is no terminal to open a chooser in. Changing one
+takes effect on the live session without spending a turn, and works while the
+agent is mid-run.
+
+Copilot also reports an **Allow All** picker, and the strip leaves it out.
+Permission policy is decided once when the session is launched, with or without
+`--allow-all`, and is already shown as the session's YOLO badge. Offering it
+again as a dropdown can only disagree with that badge — and on a session already
+started with `--allow-all`, setting it back to "off" is answered with success and
+then ignored, so the control moves and snaps back. Note that YOLO does not imply
+Copilot's Autopilot **Mode**: a session launched with `--allow-all` still reports
+mode `agent`, so Mode stays on the strip as the only way to reach Plan or
+Autopilot.
+
+Picking a value the agent rejects is reported as a notice and leaves the session
+alone; it does not end the run. Nodes advertise `session-config`, and the Host
+refuses the request rather than sending it to an older node that would not
+understand the frame.
+
+**Copilot owns the defaults.** A session is started with nothing but a working
+directory, so the model, mode and effort a new session opens on are whatever
+Copilot itself resolves for that machine and account — the fleet never sends one.
+Changing a picker is scoped to that one session: a second session on the same
+node, and the next `copilot` run in a terminal, both still start on Copilot's own
+default. Resuming re-reads the live values through `session/load` rather than
+trusting what was stored, so a session that comes back shows what it is actually
+running on.
+
+Choosing a model can change the other pickers, because not every model offers
+every setting — switching to a model without reasoning levels removes the
+Reasoning Effort control. The agent's whole option list is republished on every
+change for that reason, so the bar never keeps a control the current model has
+stopped offering.
+
 ### Recovering sessions after a restart
 
 Sessions survive both processes going down. The Host keeps them in its SQLite

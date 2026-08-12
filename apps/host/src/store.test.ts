@@ -28,7 +28,7 @@ function setup() {
   });
   const workspace = store.createWorkspace("repo", "");
   const placement = store.createPlacement(workspace.id, node.id, "C:\\repo");
-  return { store, node, placement };
+  return { store, node, workspace, placement };
 }
 
 describe("FleetStore", () => {
@@ -410,6 +410,211 @@ describe("FleetStore", () => {
     expect(byId.get(never.id)?.currentActivity).toBe(
       "Node reconnected without this session; it never reached the agent",
     );
+  });
+
+  it("keeps the newest commands and pickers on the session row", () => {
+    // A browser opening a session renders its composer from these, so they have
+    // to be current state on the row rather than something replayed out of the
+    // event log.
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "prompt");
+    const at = new Date().toISOString();
+
+    store.appendEvent({
+      eventId: "e1",
+      sessionId: session.id,
+      sequence: 1,
+      type: "commands",
+      payload: { commands: [{ name: "usage", description: "Show usage" }] },
+      createdAt: at,
+    });
+    store.appendEvent({
+      eventId: "e2",
+      sessionId: session.id,
+      sequence: 2,
+      type: "config",
+      payload: {
+        options: [
+          {
+            id: "model",
+            name: "Model",
+            category: "model",
+            currentValue: "sonnet",
+            choices: [
+              { value: "sonnet", name: "Sonnet" },
+              { value: "haiku", name: "Haiku" },
+            ],
+          },
+        ],
+      },
+      createdAt: at,
+    });
+
+    const stored = store.getSession(session.id);
+    expect(stored?.commands).toEqual([{ name: "usage", description: "Show usage" }]);
+    expect(stored?.configOptions[0]).toMatchObject({
+      id: "model",
+      currentValue: "sonnet",
+    });
+  });
+
+  it("ignores a picker report that arrives behind a newer one", () => {
+    // Events can land out of order after a Host restart, and reinstating the
+    // model a session has already left would fight the operator's own change.
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "prompt");
+    const at = new Date().toISOString();
+    const config = (currentValue: string) => ({
+      options: [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          currentValue,
+          choices: [
+            { value: "sonnet", name: "Sonnet" },
+            { value: "haiku", name: "Haiku" },
+          ],
+        },
+      ],
+    });
+
+    store.appendEvent({
+      eventId: "e5",
+      sessionId: session.id,
+      sequence: 5,
+      type: "config",
+      payload: config("haiku"),
+      createdAt: at,
+    });
+    store.appendEvent({
+      eventId: "e2",
+      sessionId: session.id,
+      sequence: 2,
+      type: "config",
+      payload: config("sonnet"),
+      createdAt: at,
+    });
+
+    expect(store.getSession(session.id)?.configOptions[0]?.currentValue).toBe("haiku");
+  });
+
+  it("moves a placement to another workspace, taking its sessions along", () => {
+    // Sessions carry their own workspace_id so the sidebar can group history
+    // without a join; leaving it behind would file past runs under the project
+    // the checkout no longer belongs to.
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "did some work");
+    const other = store.createWorkspace("other-repo", "");
+
+    const moved = store.updatePlacement(placement.id, undefined, other.id);
+
+    expect(moved?.workspaceId).toBe(other.id);
+    expect(moved?.localPath).toBe(placement.localPath);
+    expect(store.getSession(session.id)?.workspaceId).toBe(other.id);
+  });
+
+  it("refuses a move that would double up a node in one workspace", () => {
+    const { store, node, placement } = setup();
+    const other = store.createWorkspace("other-repo", "");
+    store.createPlacement(other.id, node.id, "C:\\other");
+
+    expect(() => store.updatePlacement(placement.id, undefined, other.id)).toThrow(
+      /already has a placement/,
+    );
+    // The failed move must leave the original exactly where it was.
+    expect(store.getPlacement(placement.id)?.workspaceId).not.toBe(other.id);
+  });
+
+  it("refuses a move to a workspace that does not exist", () => {
+    const { store, placement } = setup();
+    expect(() => store.updatePlacement(placement.id, undefined, "nope")).toThrow(
+      /Unknown workspace/,
+    );
+  });
+
+  it("changes only the path when no workspace is named", () => {
+    const { store, placement } = setup();
+    const updated = store.updatePlacement(placement.id, "D:\\elsewhere");
+    expect(updated?.localPath).toBe("D:\\elsewhere");
+    expect(updated?.workspaceId).toBe(placement.workspaceId);
+  });
+
+  it("keeps the order an operator arranged, and puts new placements last", () => {
+    const { store, workspace } = setup();
+    const second = store.registerNode({
+      name: "aaa-alphabetically-first",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: [],
+      maxSessions: 2,
+    }).node;
+    const first = store.listPlacements()[0]!;
+    const other = store.createPlacement(workspace.id, second.id, "/repo");
+
+    // Default order is by node name, so the new one sorts to the front.
+    const reversed = store.reorderPlacements(workspace.id, [other.id, first.id]);
+    expect(reversed.map((entry) => entry.id)).toEqual([other.id, first.id]);
+
+    const restored = store.reorderPlacements(workspace.id, [first.id, other.id]);
+    expect(restored.map((entry) => entry.id)).toEqual([first.id, other.id]);
+  });
+
+  it("ignores ids from elsewhere and keeps unmentioned placements at the end", () => {
+    // A browser can post a list it built before another one added a row; that
+    // must not drop the new row out of the ordering entirely.
+    const { store, workspace, node } = setup();
+    const first = store.listPlacements()[0]!;
+    const extra = store.registerNode({
+      name: "extra",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: [],
+      maxSessions: 1,
+    }).node;
+    const added = store.createPlacement(workspace.id, extra.id, "/late");
+
+    const ordered = store.reorderPlacements(workspace.id, ["not-a-placement", first.id]);
+
+    expect(ordered.map((entry) => entry.id)).toEqual([first.id, added.id]);
+    expect(node.id).toBeTruthy();
+  });
+
+  it("honours the order an operator dragged sessions into, both ways", () => {
+    // Not asserted against created_at: two sessions made in the same
+    // millisecond have no defined order to compare with, which is exactly the
+    // ambiguity the position column exists to settle.
+    const { store, placement } = setup();
+    const first = store.createSession(placement, "one");
+    const second = store.createSession(placement, "two");
+
+    store.reorderSessions([first.id, second.id]);
+    expect(store.listSessions().map((entry) => entry.id)).toEqual([first.id, second.id]);
+
+    store.reorderSessions([second.id, first.id]);
+    expect(store.listSessions().map((entry) => entry.id)).toEqual([second.id, first.id]);
+  });
+
+  it("leaves an untouched fleet in its newest-first order", () => {
+    // The default must survive the column being added, or every existing
+    // fleet's sidebar silently rearranges on upgrade.
+    const { store, placement } = setup();
+    const older = store.createSession(placement, "older");
+    const newer = store.createSession(placement, "newer");
+    const positions = store
+      .listSessions()
+      .map((entry) => entry.id)
+      .sort();
+    expect(positions).toEqual([older.id, newer.id].sort());
+  });
+
+  it("ignores session ids it does not know", () => {
+    const { store, placement } = setup();
+    const only = store.createSession(placement, "one");
+    expect(() => store.reorderSessions(["ghost", only.id])).not.toThrow();
+    expect(store.listSessions().map((entry) => entry.id)).toEqual([only.id]);
   });
 
   it("dismisses ended sessions but refuses to delete live ones", () => {

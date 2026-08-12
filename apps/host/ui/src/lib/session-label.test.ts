@@ -18,6 +18,8 @@ const session = (values: Partial<FleetSession>): FleetSession => ({
   updatedAt: "2026-08-08T00:00:00.000Z",
   agentSessionId: "",
   yolo: false,
+  commands: [],
+  configOptions: [],
   ...values,
 });
 

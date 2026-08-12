@@ -1,15 +1,24 @@
 import type { FastifyPluginAsync } from "fastify";
 import {
   CreateSessionSchema,
+  MAX_ATTACHMENTS_PER_PROMPT,
+  MAX_ATTACHMENT_BYTES,
   PermissionResponseSchema,
   PromptSchema,
   RenameSessionSchema,
+  ReorderSessionsSchema,
+  SetSessionConfigSchema,
+  base64Bytes,
   canTransition,
   errorMessage,
   terminalSessionStates,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
-import { reservedSessionCount, yoloUnsupportedReason } from "../session-policy.js";
+import {
+  configUnsupportedReason,
+  reservedSessionCount,
+  yoloUnsupportedReason,
+} from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
 
@@ -56,6 +65,24 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     return reply.code(202).send(session);
   });
 
+  /**
+   * The order an operator dragged sessions into.
+   *
+   * Registered before `/api/sessions/:id` so "reorder" is not read as a
+   * session id — Fastify matches static segments first, but the neighbouring
+   * routes make that easy to break by moving one.
+   */
+  app.post("/api/sessions/reorder", async (request) => {
+    const input = ReorderSessionsSchema.parse(request.body);
+    store.reorderSessions(input.sessionIds);
+    // A whole snapshot, not a session-by-session update: browsers patch a
+    // session in place when one arrives, keeping its slot in the array, so
+    // announcing a new order one session at a time would change nothing on
+    // screen until the page was reloaded.
+    service.broadcast({ type: "snapshot", data: service.snapshot() });
+    return { ok: true };
+  });
+
   app.get("/api/sessions/:id/events", async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!store.getSession(id)) {
@@ -77,22 +104,47 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     return session;
   });
 
-  app.post("/api/sessions/:id/prompt", async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const input = PromptSchema.parse(request.body);
-    const session = store.getSession(id);
-    if (!session) return reply.code(404).send({ error: "Session not found" });
-    if (session.state !== "idle") {
-      return reply.code(409).send({ error: "Session must be idle" });
-    }
-    const dispatched = service.dispatch(
-      session.nodeId,
-      { type: "prompt", sessionId: id, prompt: input.prompt },
-      { state: "failed", activity: "Node disconnected before prompt" },
-    );
-    if (!dispatched.sent) return reply.code(503).send({ error: "Node disconnected" });
-    return reply.code(202).send({ ok: true });
-  });
+  app.post(
+    "/api/sessions/:id/prompt",
+    {
+      // Fastify's default body ceiling is a megabyte, which a single pasted
+      // screenshot clears before it has finished being base64. The limit is
+      // raised only on this route, and only far enough for the per-attachment
+      // ceilings the schema already enforces.
+      bodyLimit: (MAX_ATTACHMENT_BYTES * MAX_ATTACHMENTS_PER_PROMPT * 4) / 3 + 1_000_000,
+    },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const input = PromptSchema.parse(request.body);
+      const oversized = input.attachments.find(
+        (attachment) => base64Bytes(attachment.data) > MAX_ATTACHMENT_BYTES,
+      );
+      if (oversized) {
+        return reply.code(413).send({
+          error: `"${oversized.name}" is larger than the ${Math.round(
+            MAX_ATTACHMENT_BYTES / (1024 * 1024),
+          )} MB limit for one attachment`,
+        });
+      }
+      const session = store.getSession(id);
+      if (!session) return reply.code(404).send({ error: "Session not found" });
+      if (session.state !== "idle") {
+        return reply.code(409).send({ error: "Session must be idle" });
+      }
+      const dispatched = service.dispatch(
+        session.nodeId,
+        {
+          type: "prompt",
+          sessionId: id,
+          prompt: input.prompt,
+          attachments: input.attachments,
+        },
+        { state: "failed", activity: "Node disconnected before prompt" },
+      );
+      if (!dispatched.sent) return reply.code(503).send({ error: "Node disconnected" });
+      return reply.code(202).send({ ok: true });
+    },
+  );
 
   app.post("/api/sessions/:id/resume", async (request, reply) => {
     const { id } = request.params as { id: string };
@@ -124,6 +176,36 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     service.publishSession(
       store.transitionSession(id, "starting", "Resuming Copilot session"),
     );
+    return reply.code(202).send({ ok: true });
+  });
+
+  /**
+   * Changes a session picker: the model, the mode, the reasoning effort.
+   *
+   * Allowed while the agent is working as well as when it is idle. These are
+   * settings on the live ACP session rather than turns, and the moment an
+   * operator most wants to switch models is usually mid-run.
+   */
+  app.post("/api/sessions/:id/config", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = SetSessionConfigSchema.parse(request.body);
+    const session = store.getSession(id);
+    if (!session) return reply.code(404).send({ error: "Session not found" });
+    if (terminalSessionStates.has(session.state)) {
+      return reply.code(409).send({ error: "Session has ended" });
+    }
+    const node = store.getNode(session.nodeId);
+    const unsupported = node && configUnsupportedReason(node);
+    if (unsupported) return reply.code(409).send({ error: unsupported });
+    // No fallback transition: failing to change a model must not be able to
+    // fail the session the operator is in the middle of using.
+    const dispatched = service.dispatch(session.nodeId, {
+      type: "set_config_option",
+      sessionId: id,
+      configId: input.configId,
+      value: input.value,
+    });
+    if (!dispatched.sent) return reply.code(503).send({ error: "Node is offline" });
     return reply.code(202).send({ ok: true });
   });
 

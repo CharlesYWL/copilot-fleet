@@ -1,6 +1,8 @@
 import type { FastifyPluginAsync } from "fastify";
 import {
   CreatePlacementSchema,
+  ReorderPlacementsSchema,
+  ReorderWorkspacesSchema,
   CreateWorkspaceSchema,
   UpdatePlacementSchema,
   UpdateWorkspaceSchema,
@@ -85,15 +87,40 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
     }
   });
 
+  app.post("/api/workspaces/reorder", async (request) => {
+    const input = ReorderWorkspacesSchema.parse(request.body);
+    const workspaces = store.reorderWorkspaces(input.workspaceIds);
+    service.publishCatalog();
+    return workspaces;
+  });
+
+  app.post("/api/placements/reorder", async (request, reply) => {
+    const input = ReorderPlacementsSchema.parse(request.body);
+    if (!store.getWorkspace(input.workspaceId)) {
+      return reply.code(404).send({ error: "Unknown workspace" });
+    }
+    const placements = store.reorderPlacements(input.workspaceId, input.placementIds);
+    service.publishCatalog();
+    return placements;
+  });
+
   app.patch("/api/placements/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
     const input = UpdatePlacementSchema.parse(request.body);
     if (!store.getPlacement(id)) {
       return reply.code(404).send({ error: "Unknown placement" });
     }
-    const placement = store.updatePlacement(id, input.localPath);
-    service.publishCatalog();
-    return placement;
+    try {
+      const placement = store.updatePlacement(id, input.localPath, input.workspaceId);
+      service.publishCatalog();
+      return placement;
+    } catch (error) {
+      // A move can collide with a placement the target workspace already has,
+      // which is a thing the operator can fix rather than a broken request.
+      return reply
+        .code(409)
+        .send({ error: errorMessage(error, "Cannot move placement") });
+    }
   });
 
   app.delete("/api/placements/:id", async (request, reply) => {

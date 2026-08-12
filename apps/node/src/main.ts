@@ -9,6 +9,7 @@ import {
   RegisterNodeSchema,
   SELF_UPDATE_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
+  SESSION_CONFIG_CAPABILITY,
   decodeFrame,
   errorMessage,
   sameHostUrl,
@@ -42,6 +43,7 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter } from "./router.js";
 import { EventOutbox } from "./outbox.js";
+import { closeQuietly } from "./socket.js";
 import { configServerPort, startConfigServer } from "./config-server.js";
 import {
   loadSettings,
@@ -66,6 +68,7 @@ const NODE_CAPABILITIES = [
   SELF_UPDATE_CAPABILITY,
   NODE_NAME_SYNC_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
+  SESSION_CONFIG_CAPABILITY,
 ];
 const RECONNECT_DELAY_MS = 2_000;
 
@@ -203,7 +206,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // Removing listeners first stops the close handler from scheduling its own
     // retry against the URL we are moving away from.
     current?.removeAllListeners();
-    current?.close();
+    if (current) closeQuietly(current);
     connect();
   }
 

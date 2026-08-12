@@ -114,6 +114,11 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "yolo", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "name", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "commands", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "config_options", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("placements", "position", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("workspaces", "position", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("sessions", "position", "INTEGER NOT NULL DEFAULT 0");
   }
 
   private statement(sql: string): StatementSync {
@@ -374,9 +379,19 @@ export class FleetStore {
       description,
       createdAt: new Date().toISOString(),
     };
+    // New workspaces go to the end, so an order arranged by hand survives the
+    // next project being added.
+    const last = this.statement("SELECT MAX(position) position FROM workspaces").get() as
+      Row | undefined;
     this.statement(
-      "INSERT INTO workspaces (id,name,description,created_at) VALUES (?,?,?,?)",
-    ).run(workspace.id, name, description, workspace.createdAt);
+      "INSERT INTO workspaces (id,name,description,created_at,position) VALUES (?,?,?,?,?)",
+    ).run(
+      workspace.id,
+      name,
+      description,
+      workspace.createdAt,
+      Number(last?.position ?? -1) + 1,
+    );
     return workspace;
   }
 
@@ -409,22 +424,121 @@ export class FleetStore {
   }
 
   listWorkspaces(): Workspace[] {
-    return (this.statement("SELECT * FROM workspaces ORDER BY name").all() as Row[]).map(
-      workspaceFromRow,
+    return (
+      this.statement("SELECT * FROM workspaces ORDER BY position,name").all() as Row[]
+    ).map(workspaceFromRow);
+  }
+
+  /** See {@link reorderPlacements}: the whole list travels, for the same reason. */
+  reorderWorkspaces(orderedIds: readonly string[]): Workspace[] {
+    const own = (this.statement("SELECT id FROM workspaces").all() as Row[]).map((row) =>
+      String(row.id),
     );
+    const known = new Set(own);
+    const ordered = orderedIds.filter((id) => known.has(id));
+    const missing = own.filter((id) => !ordered.includes(id));
+    this.transaction(() => {
+      [...ordered, ...missing].forEach((id, index) => {
+        this.statement("UPDATE workspaces SET position=? WHERE id=?").run(index, id);
+      });
+    });
+    return this.listWorkspaces();
   }
 
   createPlacement(workspaceId: string, nodeId: string, localPath: string): Placement {
     const placement = { id: randomUUID(), workspaceId, nodeId, localPath };
+    // New placements land at the end of their workspace's list rather than
+    // wherever `name` happens to put them, so an order the operator arranged by
+    // hand is not rearranged by the next machine they add.
+    const last = this.statement(
+      "SELECT MAX(position) position FROM placements WHERE workspace_id=?",
+    ).get(workspaceId) as Row | undefined;
     this.statement(
-      "INSERT INTO placements (id,workspace_id,node_id,local_path) VALUES (?,?,?,?)",
-    ).run(placement.id, workspaceId, nodeId, localPath);
+      "INSERT INTO placements (id,workspace_id,node_id,local_path,position) VALUES (?,?,?,?,?)",
+    ).run(placement.id, workspaceId, nodeId, localPath, Number(last?.position ?? -1) + 1);
     return this.getPlacement(placement.id)!;
   }
 
-  updatePlacement(id: string, localPath: string): Placement | undefined {
-    this.statement("UPDATE placements SET local_path=? WHERE id=?").run(localPath, id);
+  /**
+   * Writes the order an operator arranged by hand.
+   *
+   * Takes the whole list rather than one placement and an index: a move is two
+   * edits in a sequence, and applying them one at a time leaves the list in a
+   * state where two rows claim the same position — briefly, but visibly, and
+   * permanently if the second write never lands. Ids that do not belong to the
+   * workspace are ignored rather than rejected, because a browser can be
+   * holding a list from before another one deleted a row.
+   */
+  reorderPlacements(workspaceId: string, orderedIds: readonly string[]): Placement[] {
+    const own = (
+      this.statement("SELECT id FROM placements WHERE workspace_id=?").all(
+        workspaceId,
+      ) as Row[]
+    ).map((row) => String(row.id));
+    const known = new Set(own);
+    const ordered = orderedIds.filter((id) => known.has(id));
+    // Anything the caller did not mention keeps its place at the end, so a
+    // stale list cannot silently drop a placement out of the ordering.
+    const missing = own.filter((id) => !ordered.includes(id));
+    this.transaction(() => {
+      [...ordered, ...missing].forEach((id, index) => {
+        this.statement("UPDATE placements SET position=? WHERE id=?").run(index, id);
+      });
+    });
+    return this.listPlacements().filter(
+      (placement) => placement.workspaceId === workspaceId,
+    );
+  }
+
+  updatePlacement(
+    id: string,
+    localPath?: string,
+    workspaceId?: string,
+  ): Placement | undefined {
+    if (localPath !== undefined) {
+      this.statement("UPDATE placements SET local_path=? WHERE id=?").run(localPath, id);
+    }
+    if (workspaceId !== undefined) {
+      this.movePlacement(id, workspaceId);
+    }
     return this.getPlacement(id);
+  }
+
+  /**
+   * Files a placement under a different workspace, sessions and all.
+   *
+   * The sessions carry their own `workspace_id` so the sidebar can group history
+   * without a join; leaving that behind would strand every past run of this
+   * checkout under the project it used to belong to, while the checkout itself
+   * moved. They are updated in the same transaction for that reason.
+   *
+   * Refused when the target already has this node: the table's own uniqueness
+   * rule says a workspace can only be in one place on a given machine, and the
+   * raw constraint error names a column rather than either project.
+   */
+  private movePlacement(id: string, workspaceId: string): void {
+    const placement = this.getPlacement(id);
+    if (!placement) return;
+    if (placement.workspaceId === workspaceId) return;
+    if (!this.getWorkspace(workspaceId)) {
+      throw new Error("Unknown workspace");
+    }
+    const clash = this.statement(
+      "SELECT id FROM placements WHERE workspace_id=? AND node_id=? AND id<>?",
+    ).get(workspaceId, placement.nodeId, id) as Row | undefined;
+    if (clash) {
+      throw new Error("That workspace already has a placement on this node");
+    }
+    this.transaction(() => {
+      this.statement("UPDATE placements SET workspace_id=? WHERE id=?").run(
+        workspaceId,
+        id,
+      );
+      this.statement("UPDATE sessions SET workspace_id=? WHERE placement_id=?").run(
+        workspaceId,
+        id,
+      );
+    });
   }
 
   deletePlacement(id: string): void {
@@ -462,7 +576,7 @@ export class FleetStore {
       this.statement(
         `SELECT p.*,w.name workspace_name,n.name node_name FROM placements p
          JOIN workspaces w ON w.id=p.workspace_id JOIN nodes n ON n.id=p.node_id
-         ORDER BY w.name,n.name`,
+         ORDER BY w.name,p.position,n.name`,
       ).all() as Row[]
     ).map(placementFromRow);
   }
@@ -519,9 +633,36 @@ export class FleetStore {
   }
 
   listSessions(): FleetSession[] {
-    return (this.sessionQuery("ORDER BY s.created_at DESC").all() as Row[]).map(
-      sessionFromRow,
+    // `position` defaults to 0, so a fleet nobody has rearranged keeps the
+    // newest-first order it always had; only sessions an operator dragged
+    // carry a number that overrides it.
+    return (
+      this.sessionQuery("ORDER BY s.position,s.created_at DESC").all() as Row[]
+    ).map(sessionFromRow);
+  }
+
+  /**
+   * Writes the order an operator dragged sessions into.
+   *
+   * Positions are only ever compared between siblings — the tree groups by
+   * workspace and node before it sorts — so numbering each dragged group from
+   * zero is enough, and saves having to renumber the whole table to insert one
+   * row. See {@link reorderPlacements} for why the whole list travels.
+   */
+  reorderSessions(orderedIds: readonly string[]): FleetSession[] {
+    const known = new Set(
+      (this.statement("SELECT id FROM sessions").all() as Row[]).map((row) =>
+        String(row.id),
+      ),
     );
+    this.transaction(() => {
+      orderedIds
+        .filter((id) => known.has(id))
+        .forEach((id, index) => {
+          this.statement("UPDATE sessions SET position=? WHERE id=?").run(index, id);
+        });
+    });
+    return this.listSessions();
   }
 
   private sessionQuery(suffix: string): StatementSync {
@@ -660,6 +801,23 @@ export class FleetStore {
             event.createdAt,
             event.sessionId,
           );
+        }
+        // The pickers and the slash menu are current state, so only the newest
+        // report may set them: an event that arrives late and fills a hole
+        // would otherwise reinstate the model the session has already left.
+        const commands = eventPayload(event, "commands")?.commands;
+        if (commands) {
+          this.statement("UPDATE sessions SET commands=?,updated_at=? WHERE id=?").run(
+            JSON.stringify(commands),
+            event.createdAt,
+            event.sessionId,
+          );
+        }
+        const options = eventPayload(event, "config")?.options;
+        if (options) {
+          this.statement(
+            "UPDATE sessions SET config_options=?,updated_at=? WHERE id=?",
+          ).run(JSON.stringify(options), event.createdAt, event.sessionId);
         }
       }
       const agentSessionId = eventPayload(event, "agent_session")?.agentSessionId;
@@ -820,7 +978,27 @@ function sessionFromRow(row: Row): FleetSession {
     updatedAt: String(row.updated_at),
     agentSessionId: String(row.agent_session_id ?? ""),
     yolo: Number(row.yolo ?? 0) === 1,
+    commands: parseJsonList(row.commands),
+    configOptions: parseJsonList(row.config_options),
   });
+}
+
+/**
+ * A stored JSON list, or an empty one.
+ *
+ * These columns hold what a node last reported, so anything unreadable is a
+ * row written by a build that shaped them differently. An empty list renders as
+ * "this agent offers no commands", which is the same thing a client sees before
+ * the first report arrives — and far better than failing to parse the session.
+ */
+function parseJsonList(value: unknown): unknown[] {
+  if (typeof value !== "string" || value === "") return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function eventFromRow(row: Row): SessionEvent {

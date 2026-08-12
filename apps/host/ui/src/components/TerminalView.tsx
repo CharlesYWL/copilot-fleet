@@ -5,6 +5,7 @@ import {
   useState,
   type FormEvent,
   type KeyboardEvent,
+  type ClipboardEvent,
 } from "react";
 import {
   Badge,
@@ -18,6 +19,7 @@ import {
 } from "@fluentui/react-components";
 import {
   ArrowClockwise20Regular,
+  Attach20Regular,
   Dismiss20Regular,
   Rename20Regular,
   RecordStop20Regular,
@@ -30,6 +32,7 @@ import {
   terminalSessionStates,
   type FleetSession,
   type SessionEvent,
+  type PromptAttachment,
 } from "@fleet/protocol";
 import { blockColor, terminal } from "../theme";
 import { sessionLabel } from "../lib/session-label";
@@ -43,8 +46,23 @@ import {
   type TerminalBlock,
   type TerminalBlockKind,
 } from "../lib/terminal-blocks";
+import {
+  applyCommand,
+  matchCommands,
+  moveHighlight,
+  slashQuery,
+} from "../lib/slash-commands";
+import {
+  acceptAttachment,
+  base64FromDataUrl,
+  toWireAttachments,
+  type DraftAttachment,
+} from "../lib/attachments";
+import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
+import { SessionConfigBar } from "./SessionConfigBar";
+import { SlashMenu } from "./SlashMenu";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -169,21 +187,83 @@ const useStyles = makeStyles({
   },
   composer: {
     flexShrink: 0,
+    position: "relative",
     display: "flex",
-    alignItems: "flex-end",
-    gap: "10px",
-    padding: "12px 16px",
-    borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
-    background: tokens.colorNeutralBackground2,
+    flexDirection: "column",
+    gap: "2px",
+    margin: "10px 16px 14px",
+    padding: "6px 8px 6px 10px",
+    borderRadius: tokens.borderRadiusLarge,
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    background: tokens.colorNeutralBackground1,
+    // The box, not the textarea inside it, is what should look focused.
+    ":focus-within": {
+      border: `1px solid ${tokens.colorBrandStroke1}`,
+    },
   },
   input: {
+    width: "100%",
+    maxWidth: "100%",
+    // Fluent's Textarea draws its own border and background; inside the box
+    // those would be a second frame around the first.
+    "& textarea": {
+      minHeight: "44px",
+      maxHeight: "220px",
+      padding: "4px 2px",
+      background: "transparent",
+      fontSize: "13px",
+      lineHeight: "18px",
+    },
+    "&::after": { display: "none" },
+    "&::before": { display: "none" },
+  },
+  toolbar: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    minWidth: 0,
+  },
+  toolbarSpacer: {
     flexGrow: 1,
   },
-  hint: {
-    color: tokens.colorNeutralForeground4,
-    fontSize: "10px",
-    padding: "0 16px 10px",
-    background: tokens.colorNeutralBackground2,
+  send: {
+    flexShrink: 0,
+    minWidth: "28px",
+    width: "28px",
+    height: "28px",
+    padding: 0,
+    borderRadius: tokens.borderRadiusCircular,
+  },
+  attach: {
+    flexShrink: 0,
+    minWidth: "26px",
+    width: "26px",
+    height: "26px",
+    padding: 0,
+  },
+  attachError: {
+    padding: "0 2px 2px",
+    color: tokens.colorPaletteRedForeground1,
+    fontSize: "11px",
+  },
+  blockAttachments: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "6px",
+    marginTop: "6px",
+  },
+  blockAttachment: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "4px",
+    padding: "2px 7px",
+    borderRadius: tokens.borderRadiusMedium,
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    color: tokens.colorNeutralForeground3,
+    fontSize: "11px",
+  },
+  blockAttachmentIcon: {
+    fontSize: "12px",
   },
 });
 
@@ -203,7 +283,7 @@ const glyphs: Record<TerminalBlockKind, string> = {
 type TerminalViewProps = {
   session: FleetSession;
   events: SessionEvent[];
-  onPrompt: (prompt: string) => void;
+  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => void;
   onCancel: () => void;
   onStop: () => void;
   onPermission: (
@@ -215,6 +295,7 @@ type TerminalViewProps = {
   onDismiss?: () => void;
   onResume?: () => void;
   onClose?: () => void;
+  onConfigChange?: (configId: string, value: string) => void;
 };
 
 export const TerminalView = ({
@@ -228,11 +309,20 @@ export const TerminalView = ({
   onDismiss,
   onResume,
   onClose,
+  onConfigChange,
 }: TerminalViewProps) => {
   const styles = useStyles();
   const [prompt, setPrompt] = useState("");
   const [draftName, setDraftName] = useState<string>();
+  // Dismissal is remembered per keystroke, not per session: Escape closes the
+  // menu, and typing another character is what asks for it back.
+  const [menuDismissed, setMenuDismissed] = useState(false);
+  const [highlight, setHighlight] = useState(0);
+  const [attachments, setAttachments] = useState<DraftAttachment[]>([]);
+  const [attachError, setAttachError] = useState<string>();
   const streamRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const pinnedRef = useRef(true);
 
   const blocks = useMemo(() => toTerminalBlocks(events), [events]);
@@ -254,6 +344,12 @@ export const TerminalView = ({
   // name as an edit to another's.
   useEffect(() => {
     setDraftName(undefined);
+    setPrompt("");
+    setMenuDismissed(false);
+    // Attachments belong to the message being written, and that message does
+    // not follow the operator to another session.
+    setAttachments([]);
+    setAttachError(undefined);
   }, [session.id]);
 
   const canPrompt = session.state === "idle";
@@ -261,11 +357,62 @@ export const TerminalView = ({
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
   const canResume = Boolean(onResume) && isResumableSession(session);
 
+  const query = slashQuery(prompt);
+  const matches = useMemo(
+    () => (query.open ? matchCommands(session.commands, query.term) : []),
+    [query.open, query.term, session.commands],
+  );
+  // An agent that reports no commands gets no menu at all, rather than an empty
+  // box over the composer telling the operator nothing matched.
+  const menuOpen =
+    query.open && canPrompt && !menuDismissed && session.commands.length > 0;
+  const activeIndex = Math.min(highlight, Math.max(0, matches.length - 1));
+
   const submitPrompt = () => {
     const text = prompt.trim();
-    if (!text || !canPrompt) return;
-    onPrompt(text);
+    // A file with no words is still a message: "look at this" is implied, and
+    // refusing to send it would strand the attachment the operator just added.
+    if ((!text && attachments.length === 0) || !canPrompt) return;
+    onPrompt(text || "(see attachment)", toWireAttachments(attachments));
     setPrompt("");
+    setAttachments([]);
+    setAttachError(undefined);
+    setMenuDismissed(false);
+  };
+
+  const addFiles = async (files: readonly File[]) => {
+    if (files.length === 0) return;
+    setAttachError(undefined);
+    for (const file of files) {
+      const dataUrl = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onerror = () => resolve("");
+        reader.onload = () => resolve(String(reader.result ?? ""));
+        reader.readAsDataURL(file);
+      });
+      // Read one at a time and re-check against the list as it grows, so the
+      // count and size limits hold for a multi-file drop as well as for adding
+      // files one by one.
+      let rejected: string | undefined;
+      setAttachments((current) => {
+        const result = acceptAttachment(file, base64FromDataUrl(dataUrl), current);
+        if (!result.ok) {
+          rejected = result.error;
+          return current;
+        }
+        return [...current, result.attachment];
+      });
+      if (rejected) setAttachError(rejected);
+    }
+  };
+
+  const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const files = [...event.clipboardData.files];
+    if (files.length === 0) return;
+    // Pasted text keeps its normal behaviour; only files are intercepted, or
+    // copying an image out of a document would stop pasting its caption too.
+    event.preventDefault();
+    void addFiles(files);
   };
 
   const handleSubmit = (event: FormEvent) => {
@@ -273,7 +420,49 @@ export const TerminalView = ({
     submitPrompt();
   };
 
+  const changePrompt = (value: string) => {
+    setPrompt(value);
+    // Any edit re-offers the menu: dismissing it is about the text as it stood,
+    // and the next keystroke is a new question.
+    setMenuDismissed(false);
+    setHighlight(0);
+  };
+
+  const pickCommand = (command: (typeof matches)[number]) => {
+    const choice = applyCommand(command);
+    setPrompt(choice.text);
+    setMenuDismissed(true);
+    setHighlight(0);
+    if (choice.submit) {
+      // The state update has not landed yet, so the text is passed rather than
+      // read back off `prompt`.
+      onPrompt(choice.text);
+      setPrompt("");
+      return;
+    }
+    inputRef.current?.focus();
+  };
+
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (menuOpen && matches.length > 0) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        setHighlight(
+          moveHighlight(activeIndex, event.key === "ArrowDown" ? 1 : -1, matches.length),
+        );
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        pickCommand(matches[activeIndex]!);
+        return;
+      }
+    }
+    if (event.key === "Escape" && menuOpen) {
+      event.preventDefault();
+      setMenuDismissed(true);
+      return;
+    }
     if (event.key !== "Enter" || event.shiftKey) return;
     event.preventDefault();
     submitPrompt();
@@ -431,28 +620,88 @@ export const TerminalView = ({
       </div>
 
       <form className={styles.composer} onSubmit={handleSubmit}>
-        <Textarea
-          className={styles.input}
-          value={prompt}
-          onChange={(_event, data) => setPrompt(data.value)}
-          onKeyDown={handleKeyDown}
-          disabled={!canPrompt}
-          resize="vertical"
-          aria-label="Follow-up prompt"
-          placeholder={
-            canPrompt ? "Send a follow-up prompt…" : "Available when the session is idle"
+        {menuOpen ? (
+          <SlashMenu
+            commands={matches}
+            activeIndex={activeIndex}
+            onPick={pickCommand}
+            onHover={setHighlight}
+          />
+        ) : null}
+        <AttachmentStrip
+          attachments={attachments}
+          onRemove={(id) =>
+            setAttachments((current) => current.filter((entry) => entry.id !== id))
           }
         />
-        <Button
-          appearance="primary"
-          type="submit"
-          icon={<Send20Regular />}
-          disabled={!canPrompt || prompt.trim().length === 0}
-        >
-          Send
-        </Button>
+        <Textarea
+          className={styles.input}
+          textarea={{ ref: inputRef }}
+          value={prompt}
+          onChange={(_event, data) => changePrompt(data.value)}
+          onKeyDown={handleKeyDown}
+          onPaste={handlePaste}
+          onBlur={() => setMenuDismissed(true)}
+          disabled={!canPrompt}
+          appearance="filled-lighter"
+          resize="none"
+          aria-label="Follow-up prompt"
+          placeholder={
+            canPrompt
+              ? "Send a follow-up prompt. Type / for commands, paste or attach files · Enter sends"
+              : "Available when the session is idle"
+          }
+        />
+        {attachError ? (
+          <Text className={styles.attachError} role="alert">
+            {attachError}
+          </Text>
+        ) : null}
+        <div className={styles.toolbar}>
+          <input
+            ref={fileRef}
+            type="file"
+            multiple
+            hidden
+            onChange={(event) => {
+              void addFiles([...(event.target.files ?? [])]);
+              // Clearing it means picking the same file twice in a row still
+              // raises a change event the second time.
+              event.target.value = "";
+            }}
+          />
+          <Button
+            className={styles.attach}
+            appearance="subtle"
+            size="small"
+            shape="circular"
+            type="button"
+            icon={<Attach20Regular />}
+            title="Attach files"
+            aria-label="Attach files"
+            disabled={!canPrompt}
+            onClick={() => fileRef.current?.click()}
+          />
+          <SessionConfigBar
+            options={session.configOptions}
+            disabled={!onConfigChange || isEnded}
+            onChange={(configId, value) => onConfigChange?.(configId, value)}
+          />
+          <span className={styles.toolbarSpacer} />
+          <Button
+            className={styles.send}
+            appearance="primary"
+            shape="circular"
+            type="submit"
+            title="Send"
+            aria-label="Send"
+            icon={<Send20Regular />}
+            disabled={
+              !canPrompt || (prompt.trim().length === 0 && attachments.length === 0)
+            }
+          />
+        </div>
       </form>
-      <Text className={styles.hint}>Enter sends · Shift+Enter adds a newline</Text>
     </section>
   );
 };
@@ -489,6 +738,16 @@ const TerminalLine = ({ block }: { block: TerminalBlock }) => {
             muted={block.kind === "thought"}
             copyable={block.kind !== "thought"}
           />
+          {block.attachments?.length ? (
+            <div className={styles.blockAttachments}>
+              {block.attachments.map((attachment) => (
+                <span className={styles.blockAttachment} key={attachment.name}>
+                  <Attach20Regular className={styles.blockAttachmentIcon} />
+                  {attachment.name}
+                </span>
+              ))}
+            </div>
+          ) : null}
         </div>
       ) : (
         <p className={styles.plain} style={{ color }}>

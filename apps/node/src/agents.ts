@@ -2,7 +2,14 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import type { SessionEvent } from "@fleet/protocol";
+import type { PromptAttachment, SessionEvent } from "@fleet/protocol";
+import { attachmentSummary } from "@fleet/protocol";
+import {
+  configValueFor,
+  toSessionCommands,
+  toSessionConfigOptions,
+} from "./acp-config.js";
+import { toPromptBlocks } from "./prompt-content.js";
 
 export type PermissionDecision = {
   outcome: "allow_once" | "deny";
@@ -10,11 +17,13 @@ export type PermissionDecision = {
 };
 
 export interface SessionAgent {
-  prompt(text: string): Promise<void>;
+  prompt(text: string, attachments?: readonly PromptAttachment[]): Promise<void>;
   cancel(): Promise<void>;
   stop(): Promise<void>;
   resolvePermission(requestId: string, decision: PermissionDecision): void;
   denyPendingPermissions(): void;
+  /** Changes a session picker (model, mode, reasoning effort) by option id. */
+  setConfigOption(configId: string, value: string): Promise<void>;
   /** True while a turn is in flight, so a second prompt cannot be accepted. */
   readonly busy: boolean;
   /**
@@ -97,6 +106,14 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private stopping = false;
   /** `session/load` replays the whole history; the host already stored it. */
   private replaying = false;
+  /**
+   * The agent's own option list, kept as ACP sent it.
+   *
+   * `set_config_option` is a union whose branch depends on the option's type,
+   * and the flattened copy the fleet passes around cannot tell a boolean from a
+   * two-value select — so the raw list is what types an outgoing change.
+   */
+  private configOptions: acp.SessionConfigOption[] = [];
 
   constructor(
     fleetSessionId: string,
@@ -154,6 +171,14 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         this.requestPermission(params),
       )
       .onNotification(acp.methods.client.session.update, ({ params }) => {
+        // Commands and pickers describe what the session can do now, not what
+        // it did, so they are the one thing a replay must not swallow: a
+        // resumed session would otherwise come back with an empty slash menu
+        // and no model until the agent happened to change one.
+        if (this.isCurrentStateUpdate(params.update)) {
+          this.forwardUpdate(params.update);
+          return;
+        }
         if (!this.replaying) this.forwardUpdate(params.update);
       });
     const stream = acp.ndJsonStream(
@@ -170,11 +195,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (resumeAgentSessionId) {
       this.replaying = true;
       try {
-        await this.connection.agent.request(acp.methods.agent.session.load, {
-          sessionId: resumeAgentSessionId,
-          cwd,
-          mcpServers: [],
-        });
+        const loaded = await this.connection.agent.request(
+          acp.methods.agent.session.load,
+          {
+            sessionId: resumeAgentSessionId,
+            cwd,
+            mcpServers: [],
+          },
+        );
+        this.captureConfigOptions(loaded.configOptions);
       } finally {
         this.replaying = false;
       }
@@ -186,24 +215,55 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         mcpServers: [],
       });
       this.agentSessionId = created.sessionId;
+      this.captureConfigOptions(created.configOptions);
     }
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
   }
 
-  async prompt(text: string): Promise<void> {
+  /**
+   * Records the pickers the agent offers and passes them on.
+   *
+   * `session/new` answers with them once and then only reports changes, so a
+   * client that joined later has no way to ask again — the Host keeps the last
+   * copy, and this is what feeds it.
+   *
+   * Replaying a loaded session suppresses ordinary updates because the Host
+   * already stored that history, but the option list is current state rather
+   * than history, and a resumed session that skipped it would show no model.
+   */
+  private captureConfigOptions(
+    options: acp.SessionConfigOption[] | null | undefined,
+  ): void {
+    if (!options) return;
+    this.configOptions = options;
+    this.emit("config", { options: toSessionConfigOptions(options) });
+  }
+
+  async prompt(
+    text: string,
+    attachments: readonly PromptAttachment[] = [],
+  ): Promise<void> {
     if (!this.agentSessionId || !this.connection) {
       throw new Error("ACP session is not initialized");
     }
     if (this.prompting) throw new Error("A prompt is already active");
     this.prompting = true;
     this.emit("state", { state: "running", activity: "Copilot is working" });
-    this.emit("system", { text: `User: ${text}` });
+    // Only the file's name and size are recorded: the transcript is stored on
+    // the Host and replayed to every browser watching, which a few megabytes of
+    // base64 per prompt would turn into a liability.
+    this.emit("system", {
+      text: `User: ${text}`,
+      ...(attachments.length > 0
+        ? { attachments: attachments.map(attachmentSummary) }
+        : {}),
+    });
     try {
       const response = await this.connection.agent.request(
         acp.methods.agent.session.prompt,
         {
           sessionId: this.agentSessionId,
-          prompt: [{ type: "text", text }],
+          prompt: toPromptBlocks(text, attachments),
         },
       );
       this.emit("turn_complete", { stopReason: response.stopReason });
@@ -249,6 +309,28 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     await this.connection.agent.notify(acp.methods.agent.session.cancel, {
       sessionId: this.agentSessionId,
     });
+  }
+
+  /**
+   * Switches a picker, and reports where it landed.
+   *
+   * The agent answers with the settled option list, which is emitted rather
+   * than assumed: a request to select a model can change the reasoning levels
+   * on offer too, and the caller only asked about one of them.
+   */
+  async setConfigOption(configId: string, value: string): Promise<void> {
+    if (!this.agentSessionId || !this.connection) {
+      throw new Error("ACP session is not initialized");
+    }
+    const response = await this.connection.agent.request(
+      acp.methods.agent.session.setConfigOption,
+      {
+        sessionId: this.agentSessionId,
+        configId,
+        value: configValueFor(this.configOptions, configId, value),
+      } as acp.SetSessionConfigOptionRequest,
+    );
+    this.captureConfigOptions(response.configOptions);
   }
 
   async stop(): Promise<void> {
@@ -315,7 +397,23 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     });
   }
 
+  /** Updates that state what the session offers now, rather than what it did. */
+  private isCurrentStateUpdate(update: acp.SessionUpdate): boolean {
+    return (
+      update.sessionUpdate === "available_commands_update" ||
+      update.sessionUpdate === "config_option_update"
+    );
+  }
+
   private forwardUpdate(update: acp.SessionUpdate): void {
+    if (update.sessionUpdate === "available_commands_update") {
+      this.emit("commands", { commands: toSessionCommands(update.availableCommands) });
+      return;
+    }
+    if (update.sessionUpdate === "config_option_update") {
+      this.captureConfigOptions(update.configOptions);
+      return;
+    }
     if (
       (update.sessionUpdate === "agent_message_chunk" ||
         update.sessionUpdate === "agent_thought_chunk") &&
@@ -388,6 +486,11 @@ class MockAgent extends SequencedAgent implements SessionAgent {
   private cancelled = false;
   private stopped = false;
   private prompting = false;
+  /** A small stand-in for what Copilot reports, so the UI has pickers to drive. */
+  private readonly config = new Map<string, string>([
+    ["model", "mock-fast"],
+    ["mode", "agent"],
+  ]);
 
   constructor(fleetSessionId: string, sink: EventSink, sequenceOffset = 0) {
     super(fleetSessionId, sink, sequenceOffset);
@@ -401,6 +504,14 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     this.emit("agent_session", {
       agentSessionId: resumeAgentSessionId ?? `mock-${this.fleetSessionId}`,
     });
+    this.emit("commands", {
+      commands: [
+        { name: "usage", description: "Display session usage metrics" },
+        { name: "model", description: "Select AI model to use", hint: "model" },
+        { name: "review", description: "Review changes", hint: "instructions" },
+      ],
+    });
+    this.publishConfig();
     // A resumed session is never prompted by the router, so without this the
     // mock stayed in `starting` forever and Resume looked broken — the ACP
     // adapter settles on idle the same way once session/load returns.
@@ -409,13 +520,21 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     }
   }
 
-  async prompt(text: string): Promise<void> {
+  async prompt(
+    text: string,
+    attachments: readonly PromptAttachment[] = [],
+  ): Promise<void> {
     if (this.stopped) throw new Error("Mock agent is stopped");
     if (this.prompting) throw new Error("A prompt is already active");
     this.prompting = true;
     this.cancelled = false;
     this.emit("state", { state: "running", activity: "Mock agent is streaming" });
-    this.emit("system", { text: `User: ${text}` });
+    this.emit("system", {
+      text: `User: ${text}`,
+      ...(attachments.length > 0
+        ? { attachments: attachments.map(attachmentSummary) }
+        : {}),
+    });
     try {
       for (const chunk of [
         `Mock response for "${text}": `,
@@ -464,6 +583,41 @@ class MockAgent extends SequencedAgent implements SessionAgent {
 
   resolvePermission(): void {}
   denyPendingPermissions(): void {}
+
+  async setConfigOption(configId: string, value: string): Promise<void> {
+    if (!this.config.has(configId)) throw new Error(`Unknown option '${configId}'`);
+    this.config.set(configId, value);
+    this.publishConfig();
+  }
+
+  private publishConfig(): void {
+    this.emit("config", {
+      options: [
+        {
+          id: "model",
+          name: "Model",
+          description: "Mock model selector",
+          category: "model",
+          currentValue: this.config.get("model"),
+          choices: [
+            { value: "mock-fast", name: "Mock Fast", description: "" },
+            { value: "mock-deep", name: "Mock Deep", description: "" },
+          ],
+        },
+        {
+          id: "mode",
+          name: "Mode",
+          description: "Mock mode selector",
+          category: "mode",
+          currentValue: this.config.get("mode"),
+          choices: [
+            { value: "agent", name: "Agent", description: "" },
+            { value: "plan", name: "Plan", description: "" },
+          ],
+        },
+      ],
+    });
+  }
 }
 
 export class MockAgentFactory implements AgentFactory {

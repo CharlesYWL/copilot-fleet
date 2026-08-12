@@ -37,6 +37,8 @@ const session = (
   placementId: "p1",
   agentSessionId: "",
   yolo: false,
+  commands: [],
+  configOptions: [],
   name: "",
   nodeId,
   nodeName,

@@ -45,8 +45,16 @@ describe("useCatalogOperations", () => {
 
   it("sends a placement update to the placement, not the workspace", async () => {
     const { catalog, calls } = operations();
-    await catalog.updatePlacement("pl-1", "/srv/fleet");
+    await catalog.updatePlacement("pl-1", { localPath: "/srv/fleet" });
     expect(calls[0]?.[0]).toBe("/api/placements/pl-1");
     expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual({ localPath: "/srv/fleet" });
+  });
+
+  it("sends only the workspace when a placement is dragged to another one", async () => {
+    // The path is a fact about the machine and must survive the move; sending
+    // it back would let a stale copy overwrite an edit made elsewhere.
+    const { catalog, calls } = operations();
+    await catalog.updatePlacement("pl-1", { workspaceId: "w-2" });
+    expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual({ workspaceId: "w-2" });
   });
 });

@@ -25,8 +25,14 @@ export type CatalogOperations = {
     nodeId: string,
     localPath: string,
   ) => Promise<boolean>;
-  updatePlacement: (placementId: string, localPath: string) => Promise<boolean>;
+  updatePlacement: (
+    placementId: string,
+    changes: { localPath?: string; workspaceId?: string },
+  ) => Promise<boolean>;
   deletePlacement: (placementId: string) => Promise<boolean>;
+  reorderPlacements: (workspaceId: string, placementIds: string[]) => Promise<boolean>;
+  reorderWorkspaces: (workspaceIds: string[]) => Promise<boolean>;
+  reorderSessions: (sessionIds: string[]) => Promise<boolean>;
 };
 
 type CatalogDeps = {
@@ -74,8 +80,14 @@ export function useCatalogOperations({
         write(`/api/workspaces/${workspaceId}`, { method: "DELETE" }),
       createPlacement: (workspaceId, nodeId, localPath) =>
         write("/api/placements", json({ workspaceId, nodeId, localPath }, "POST")),
-      updatePlacement: (placementId, localPath) =>
-        write(`/api/placements/${placementId}`, json({ localPath }, "PATCH")),
+      updatePlacement: (placementId, changes) =>
+        write(`/api/placements/${placementId}`, json(changes, "PATCH")),
+      reorderSessions: (sessionIds) =>
+        write("/api/sessions/reorder", json({ sessionIds }, "POST")),
+      reorderWorkspaces: (workspaceIds) =>
+        write("/api/workspaces/reorder", json({ workspaceIds }, "POST")),
+      reorderPlacements: (workspaceId, placementIds) =>
+        write("/api/placements/reorder", json({ workspaceId, placementIds }, "POST")),
       deletePlacement: (placementId) =>
         write(`/api/placements/${placementId}`, { method: "DELETE" }),
     };

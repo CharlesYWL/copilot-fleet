@@ -60,6 +60,102 @@ export const PlacementSchema = z.object({
 });
 export type Placement = z.infer<typeof PlacementSchema>;
 
+/**
+ * A slash command the agent offers, as reported over ACP.
+ *
+ * `hint` mirrors ACP's `input.hint`: present when the command takes arguments
+ * ("model", "additional instructions"), absent for bare commands like
+ * `/usage`. Clients use it to decide whether selecting the command should run
+ * it or leave the caret waiting for an argument.
+ */
+export const SessionCommandSchema = z.object({
+  name: z.string().min(1),
+  description: z.string().default(""),
+  hint: z.string().optional(),
+});
+export type SessionCommand = z.infer<typeof SessionCommandSchema>;
+
+export const SessionConfigChoiceSchema = z.object({
+  value: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string().default(""),
+});
+export type SessionConfigChoice = z.infer<typeof SessionConfigChoiceSchema>;
+
+/**
+ * A picker the agent exposes for the session: model, mode, reasoning effort.
+ *
+ * ACP calls these session config options and reports them with `session/new`
+ * and again whenever one changes. They are the half of the slash-command story
+ * that cannot be typed: `/model` with no argument opens a chooser in a terminal
+ * UI, and over ACP that chooser is this list.
+ *
+ * `category` is ACP's own hint ("model", "mode", "thought_level") and is only
+ * used to decide placement in the UI — an unknown one still renders.
+ */
+export const SessionConfigOptionSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().min(1),
+  description: z.string().default(""),
+  category: z.string().default(""),
+  currentValue: z.string().default(""),
+  choices: z.array(SessionConfigChoiceSchema).default([]),
+});
+export type SessionConfigOption = z.infer<typeof SessionConfigOptionSchema>;
+
+/**
+ * A file riding along with a prompt.
+ *
+ * Bytes travel base64 in one piece rather than through an upload endpoint: the
+ * agent is on another machine, often behind a tunnel, and giving it a URL to
+ * fetch would mean the Node needs credentials and reachability back to the Host
+ * for something that is already in the operator's hand. The size ceilings below
+ * are what keep that honest.
+ *
+ * The Node decides how to present each one from `mimeType`: images become ACP
+ * image blocks, everything else is embedded as text. Copilot reports both
+ * `image` and `embeddedContext` support, and both are verified working.
+ */
+export const PromptAttachmentSchema = z.object({
+  name: z.string().min(1).max(255),
+  mimeType: z.string().min(1).max(200),
+  /** Base64, for text files too, so one field carries every kind. */
+  data: z.string().min(1),
+});
+export type PromptAttachment = z.infer<typeof PromptAttachmentSchema>;
+
+/**
+ * What a prompt may carry, before base64 turns each byte into about 1.37.
+ *
+ * A screenshot is the common case and lands well under this; the ceiling exists
+ * so one paste cannot sit in a WebSocket frame big enough to stall every other
+ * session sharing that connection.
+ */
+export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+export const MAX_ATTACHMENTS_PER_PROMPT = 6;
+
+/** Decoded size of base64, without allocating the bytes to find out. */
+export function base64Bytes(data: string): number {
+  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
+}
+
+/** What the transcript keeps: enough to show the file, never its bytes. */
+export const AttachmentSummarySchema = z.object({
+  name: z.string(),
+  mimeType: z.string(),
+  bytes: z.number().int().nonnegative(),
+});
+export type AttachmentSummary = z.infer<typeof AttachmentSummarySchema>;
+
+export function attachmentSummary(attachment: PromptAttachment): AttachmentSummary {
+  return {
+    name: attachment.name,
+    mimeType: attachment.mimeType,
+    bytes: base64Bytes(attachment.data),
+  };
+}
+
 export const SessionSchema = z.object({
   id: z.string().min(1),
   workspaceId: z.string().min(1),
@@ -83,6 +179,16 @@ export const SessionSchema = z.object({
   agentSessionId: z.string().default(""),
   /** Runs Copilot with --allow-all: no permission prompts for this session. */
   yolo: z.boolean().default(false),
+  /**
+   * The slash commands and pickers this session's agent currently offers.
+   *
+   * Carried on the session rather than left in the event log because a browser
+   * that opens a session has to render its composer immediately, and replaying
+   * every event to find the last `commands` frame is work for something that
+   * only ever has one current answer.
+   */
+  commands: z.array(SessionCommandSchema).default([]),
+  configOptions: z.array(SessionConfigOptionSchema).default([]),
 });
 export type FleetSession = z.infer<typeof SessionSchema>;
 
@@ -110,6 +216,8 @@ export const SessionEventSchema = z.object({
     "error",
     "system",
     "agent_session",
+    "commands",
+    "config",
   ]),
   payload: z.record(z.string(), z.unknown()),
   createdAt: z.string().datetime(),
@@ -146,8 +254,20 @@ export const sessionEventPayloadSchemas = {
   permission_result: z.object({ requestId: text, outcome: text }),
   turn_complete: z.object({ stopReason: text }),
   error: z.object({ message: text }),
-  system: z.object({ text }),
+  system: z.object({
+    text,
+    attachments: z.array(AttachmentSummarySchema).optional().catch(undefined),
+  }),
   agent_session: z.object({ agentSessionId: text }),
+  // A single malformed entry must not cost the reader the whole list, and an
+  // absent list is meaningfully different from an empty one: "this agent never
+  // said" versus "this agent offers none".
+  commands: z.object({
+    commands: z.array(SessionCommandSchema).optional().catch(undefined),
+  }),
+  config: z.object({
+    options: z.array(SessionConfigOptionSchema).optional().catch(undefined),
+  }),
 } as const;
 
 export type SessionEventPayload<T extends SessionEventType> = z.infer<
@@ -216,6 +336,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     prompt: z.string().min(1),
+    attachments: z.array(PromptAttachmentSchema).default([]),
   }),
   z.object({
     type: z.literal("cancel"),
@@ -234,6 +355,21 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     requestId: z.string().min(1),
     outcome: z.enum(["allow_once", "deny"]),
     optionId: z.string().optional(),
+  }),
+  /**
+   * Change a session picker — the model, the mode, the reasoning effort.
+   *
+   * Separate from `prompt` even though Copilot also accepts `/model <id>` as
+   * text: a prompt spends a turn and depends on the agent parsing prose, while
+   * this is the typed ACP call that answers with the settled option list, so
+   * the UI can show the change instead of inferring it from a reply.
+   */
+  z.object({
+    type: z.literal("set_config_option"),
+    commandId: z.string().min(1),
+    sessionId: z.string().min(1),
+    configId: z.string().min(1),
+    value: z.string().min(1),
   }),
 ]);
 export type NodeCommand = z.infer<typeof NodeCommandSchema>;
@@ -377,6 +513,16 @@ export const NODE_NAME_SYNC_CAPABILITY = "node-name-sync";
  * assuming it is idle and waiting for a prompt.
  */
 export const SESSION_ACTIVITY_CAPABILITY = "session-activity";
+
+/**
+ * A Node that reports the agent's slash commands and pickers, and accepts
+ * `set_config_option` to change one.
+ *
+ * The Host checks this before offering a model chooser: an older Node validates
+ * every frame against its own copy of {@link NodeCommandSchema} and hangs up on
+ * anything it does not recognise, so sending one blindly costs the connection.
+ */
+export const SESSION_CONFIG_CAPABILITY = "session-config";
 
 /**
  * Which name wins when a Node reconnects, and whether anyone has to be told.
@@ -559,7 +705,34 @@ export const CreatePlacementSchema = z.object({
 });
 
 export const UpdatePlacementSchema = z.object({
-  localPath: z.string().min(1).max(4096),
+  localPath: z.string().min(1).max(4096).optional(),
+  /**
+   * Moves the placement to a different workspace.
+   *
+   * The node and the path stay put: what changes is which project this checkout
+   * is filed under, which is the only part of a placement that is a filing
+   * decision rather than a fact about a machine.
+   */
+  workspaceId: z.string().min(1).optional(),
+});
+
+/**
+ * The order an operator arranged placements into, for one workspace.
+ *
+ * The whole list travels rather than one id and an index: a move is two edits,
+ * and sending them separately leaves a moment where two rows claim one slot.
+ */
+export const ReorderSessionsSchema = z.object({
+  sessionIds: z.array(z.string().min(1)).max(2000),
+});
+
+export const ReorderWorkspacesSchema = z.object({
+  workspaceIds: z.array(z.string().min(1)).max(500),
+});
+
+export const ReorderPlacementsSchema = z.object({
+  workspaceId: z.string().min(1),
+  placementIds: z.array(z.string().min(1)).max(500),
 });
 
 export const CreateSessionSchema = z.object({
@@ -581,12 +754,22 @@ export const UpdateDefaultsSchema = z.object({
 
 export const PromptSchema = z.object({
   prompt: z.string().min(1).max(100_000),
+  attachments: z
+    .array(PromptAttachmentSchema)
+    .max(MAX_ATTACHMENTS_PER_PROMPT)
+    .default([]),
 });
 
 export const PermissionResponseSchema = z.object({
   requestId: z.string().min(1),
   outcome: z.enum(["allow_once", "deny"]),
   optionId: z.string().optional(),
+});
+
+/** What a browser sends to move a session picker to a different value. */
+export const SetSessionConfigSchema = z.object({
+  configId: z.string().min(1).max(200),
+  value: z.string().min(1).max(500),
 });
 
 export const tunnelProviders = ["cloudflare", "tailscale", "ngrok", "bore"] as const;

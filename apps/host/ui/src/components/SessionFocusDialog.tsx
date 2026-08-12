@@ -1,5 +1,5 @@
 import { Dialog, DialogSurface, makeStyles, tokens } from "@fluentui/react-components";
-import type { FleetSession, SessionEvent } from "@fleet/protocol";
+import type { FleetSession, PromptAttachment, SessionEvent } from "@fleet/protocol";
 import { TerminalView } from "./TerminalView";
 
 const useStyles = makeStyles({
@@ -22,7 +22,7 @@ type SessionFocusDialogProps = {
   events: SessionEvent[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onPrompt: (prompt: string) => void;
+  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => void;
   onCancel: () => void;
   onStop: () => void;
   onDismiss: () => void;
@@ -33,6 +33,7 @@ type SessionFocusDialogProps = {
     outcome: "allow_once" | "deny",
     optionId?: string,
   ) => void;
+  onConfigChange: (configId: string, value: string) => void;
 };
 
 export const SessionFocusDialog = ({
@@ -47,6 +48,7 @@ export const SessionFocusDialog = ({
   onResume,
   onRename,
   onPermission,
+  onConfigChange,
 }: SessionFocusDialogProps) => {
   const styles = useStyles();
   const handleClose = () => onOpenChange(false);
@@ -68,6 +70,7 @@ export const SessionFocusDialog = ({
           onResume={onResume}
           onRename={onRename}
           onPermission={onPermission}
+          onConfigChange={onConfigChange}
           onClose={handleClose}
         />
       </DialogSurface>

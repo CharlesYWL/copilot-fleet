@@ -8,6 +8,7 @@ import {
   Textarea,
   Title3,
   makeStyles,
+  mergeClasses,
   tokens,
 } from "@fluentui/react-components";
 import {
@@ -18,7 +19,20 @@ import {
 } from "@fluentui/react-icons";
 import type { FleetNode, Placement, Workspace } from "@fleet/protocol";
 import { nextPlacementPath } from "../lib/placement-path.js";
+import {
+  DRAG_MIME,
+  decodeDrag,
+  dropVerdict,
+  edgeFromPointer,
+  encodeDrag,
+  reorder,
+  suggestedPath,
+  type DropEdge,
+  type DragPayload,
+  type DropVerdict,
+} from "../lib/drag-drop";
 import { useCatalog } from "../hooks/useCatalog";
+import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
   panel: {
@@ -135,6 +149,70 @@ const useStyles = makeStyles({
   pathInput: {
     minWidth: "180px",
     width: "100%",
+  },
+  nodeTray: {
+    display: "grid",
+    gap: "8px",
+    padding: "12px 14px",
+    borderRadius: tokens.borderRadiusMedium,
+    border: `1px dashed ${tokens.colorNeutralStroke2}`,
+  },
+  nodeChips: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "8px",
+  },
+  nodeChip: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "6px",
+    padding: "4px 10px",
+    borderRadius: tokens.borderRadiusCircular,
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    background: tokens.colorNeutralBackground4,
+    fontSize: "12px",
+    cursor: "grab",
+    ":active": { cursor: "grabbing" },
+  },
+  dropAccept: {
+    outline: `2px solid ${tokens.colorBrandStroke1}`,
+    outlineOffset: "-1px",
+  },
+  dropReject: {
+    outline: `2px solid ${tokens.colorPaletteRedBorder2}`,
+    outlineOffset: "-1px",
+  },
+  dropHint: {
+    color: tokens.colorPaletteRedForeground1,
+    fontSize: "11px",
+  },
+  rowBefore: {
+    position: "relative",
+    "::after": {
+      content: '""',
+      position: "absolute",
+      left: 0,
+      right: 0,
+      top: 0,
+      height: "3px",
+      borderRadius: "2px",
+      background: tokens.colorBrandStroke1,
+      zIndex: 2,
+    },
+  },
+  rowAfter: {
+    position: "relative",
+    "::after": {
+      content: '""',
+      position: "absolute",
+      left: 0,
+      right: 0,
+      bottom: 0,
+      height: "3px",
+      borderRadius: "2px",
+      background: tokens.colorBrandStroke1,
+      zIndex: 2,
+    },
   },
 });
 
@@ -275,6 +353,32 @@ export const WorkspacesPanel = ({
       </div>
 
       <div className={styles.list}>
+        <section className={styles.nodeTray} aria-label="Nodes">
+          <Text className={styles.caption}>
+            Drag a node onto a workspace to place it, or drag a placement between
+            workspaces to move it.
+          </Text>
+          <div className={styles.nodeChips}>
+            {nodes.map((node) => (
+              <span
+                key={node.id}
+                className={styles.nodeChip}
+                draggable
+                onDragStart={(event) => {
+                  event.dataTransfer.setData(
+                    DRAG_MIME,
+                    encodeDrag({ kind: "node", id: node.id }),
+                  );
+                  event.dataTransfer.effectAllowed = "copy";
+                }}
+                title={`${node.name} — drag onto a workspace`}
+              >
+                <StatusDot state={node.online ? "idle" : "offline"} />
+                {node.name}
+              </span>
+            ))}
+          </div>
+        </section>
         {workspaces.map((workspace) => (
           <WorkspaceCard
             key={workspace.id}
@@ -282,6 +386,8 @@ export const WorkspacesPanel = ({
             placements={placements.filter(
               (placement) => placement.workspaceId === workspace.id,
             )}
+            allPlacements={placements}
+            nodes={nodes}
           />
         ))}
       </div>
@@ -292,12 +398,28 @@ export const WorkspacesPanel = ({
 type WorkspaceCardProps = {
   workspace: Workspace;
   placements: Placement[];
+  /** Every placement, not just this card's: the rules need the whole picture. */
+  allPlacements: Placement[];
+  nodes: FleetNode[];
 };
 
-const WorkspaceCard = ({ workspace, placements }: WorkspaceCardProps) => {
+const WorkspaceCard = ({
+  workspace,
+  placements,
+  allPlacements,
+  nodes,
+}: WorkspaceCardProps) => {
   const styles = useStyles();
-  const { updateWorkspace, deleteWorkspace, updatePlacement, deletePlacement } =
-    useCatalog();
+  const [dropState, setDropState] = useState<"accept" | "reject">();
+  const [dropHint, setDropHint] = useState<string>();
+  const {
+    updateWorkspace,
+    deleteWorkspace,
+    updatePlacement,
+    deletePlacement,
+    createPlacement,
+    reorderPlacements,
+  } = useCatalog();
   const [editing, setEditing] = useState(false);
   const [draftName, setDraftName] = useState(workspace.name);
   const [draftDescription, setDraftDescription] = useState(workspace.description);
@@ -331,8 +453,71 @@ const WorkspaceCard = ({ workspace, placements }: WorkspaceCardProps) => {
     void deleteWorkspace(workspace.id);
   };
 
+  const clearDrop = () => {
+    setDropState(undefined);
+    setDropHint(undefined);
+  };
+
+  /** The rules, applied to whatever the browser says is being dragged. */
+  const verdictFor = (event: { dataTransfer: DataTransfer }): DropVerdict | undefined => {
+    // `getData` is empty during dragover in every browser, by design, so the
+    // check has to be that our own type is on the list.
+    if (!event.dataTransfer.types.includes(DRAG_MIME)) return undefined;
+    const payload = decodeDrag(event.dataTransfer.getData(DRAG_MIME));
+    // During dragover the payload is unreadable; the card still has to say
+    // something, and "this target takes fleet items" is the honest answer until
+    // the drop makes the details available.
+    if (!payload) return { allowed: true, action: "move" };
+    return dropVerdict(payload, workspace, allPlacements, nodes);
+  };
+
+  const handleDrop = async (payload: DragPayload) => {
+    if (payload.kind === "placement") {
+      await updatePlacement(payload.id, { workspaceId: workspace.id });
+      return;
+    }
+    const node = nodes.find((entry) => entry.id === payload.id);
+    if (!node) return;
+    await createPlacement(workspace.id, node.id, suggestedPath(node));
+  };
+
   return (
-    <article className={styles.workspaceCard}>
+    <article
+      className={mergeClasses(
+        styles.workspaceCard,
+        dropState === "accept" && styles.dropAccept,
+        dropState === "reject" && styles.dropReject,
+      )}
+      onDragOver={(event) => {
+        const verdict = verdictFor(event);
+        if (!verdict) return;
+        // Both outcomes preventDefault: a rejected drop has to land here to be
+        // explained, rather than falling through to the browser's own handler.
+        event.preventDefault();
+        event.dataTransfer.dropEffect = verdict.allowed ? "move" : "none";
+        setDropState(verdict.allowed ? "accept" : "reject");
+        setDropHint(verdict.allowed ? undefined : verdict.reason);
+      }}
+      onDragLeave={(event) => {
+        // Moving across a child fires dragleave on the card; only a pointer
+        // that has actually left the card should clear the highlight.
+        if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+        clearDrop();
+      }}
+      onDrop={(event) => {
+        const verdict = verdictFor(event);
+        clearDrop();
+        if (!verdict) return;
+        event.preventDefault();
+        if (!verdict.allowed) return;
+        void handleDrop(decodeDrag(event.dataTransfer.getData(DRAG_MIME))!);
+      }}
+    >
+      {dropHint ? (
+        <Text className={styles.dropHint} role="status">
+          {dropHint}
+        </Text>
+      ) : null}
       <div className={styles.workspaceMeta}>
         {editing ? (
           <div className={styles.editFields}>
@@ -407,6 +592,17 @@ const WorkspaceCard = ({ workspace, placements }: WorkspaceCardProps) => {
               placement={placement}
               onUpdate={updatePlacement}
               onDelete={deletePlacement}
+              onReorderOnto={(draggedId, edge) =>
+                void reorderPlacements(
+                  workspace.id,
+                  reorder(
+                    placements.map((entry) => entry.id),
+                    draggedId,
+                    placement.id,
+                    edge,
+                  ),
+                )
+              }
             />
           ))
         )}
@@ -417,17 +613,64 @@ const WorkspaceCard = ({ workspace, placements }: WorkspaceCardProps) => {
 
 type PlacementRowProps = {
   placement: Placement;
-  onUpdate: (placementId: string, localPath: string) => Promise<boolean>;
+  onUpdate: (
+    placementId: string,
+    changes: { localPath?: string; workspaceId?: string },
+  ) => Promise<boolean>;
   onDelete: (placementId: string) => Promise<boolean>;
+  /** Called when a sibling is dropped on this row, to put it here. */
+  onReorderOnto: (draggedPlacementId: string, edge: DropEdge) => void;
 };
 
-const PlacementRow = ({ placement, onUpdate, onDelete }: PlacementRowProps) => {
+const PlacementRow = ({
+  placement,
+  onUpdate,
+  onDelete,
+  onReorderOnto,
+}: PlacementRowProps) => {
   const styles = useStyles();
   const [draft, setDraft] = useState<string>();
+  const [over, setOver] = useState<DropEdge>();
 
   if (draft === undefined) {
     return (
-      <div className={styles.placementRow}>
+      <div
+        className={mergeClasses(
+          styles.placementRow,
+          over === "before" && styles.rowBefore,
+          over === "after" && styles.rowAfter,
+        )}
+        draggable
+        onDragStart={(event) => {
+          event.dataTransfer.setData(
+            DRAG_MIME,
+            encodeDrag({ kind: "placement", id: placement.id }),
+          );
+          event.dataTransfer.effectAllowed = "move";
+        }}
+        onDragOver={(event) => {
+          if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = "move";
+          // Without this the card behind also treats the drag as a drop onto
+          // the workspace, and the row's own reorder never happens.
+          event.stopPropagation();
+          setOver(
+            edgeFromPointer(event.currentTarget.getBoundingClientRect(), event.clientY),
+          );
+        }}
+        onDragLeave={() => setOver(undefined)}
+        onDrop={(event) => {
+          const edge = over ?? "before";
+          setOver(undefined);
+          const payload = decodeDrag(event.dataTransfer.getData(DRAG_MIME));
+          if (payload?.kind !== "placement" || payload.id === placement.id) return;
+          event.preventDefault();
+          event.stopPropagation();
+          onReorderOnto(payload.id, edge);
+        }}
+        title={`${placement.nodeName} — drag onto another row to reorder`}
+      >
         <div className={styles.placementInfo}>
           <Text weight="semibold">{placement.nodeName}</Text>
           <code className={styles.mono}>{placement.localPath}</code>
@@ -466,7 +709,10 @@ const PlacementRow = ({ placement, onUpdate, onDelete }: PlacementRowProps) => {
   const commit = async () => {
     const localPath = draft.trim();
     if (!localPath) return;
-    if (localPath !== placement.localPath && !(await onUpdate(placement.id, localPath))) {
+    if (
+      localPath !== placement.localPath &&
+      !(await onUpdate(placement.id, { localPath }))
+    ) {
       return;
     }
     setDraft(undefined);

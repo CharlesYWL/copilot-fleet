@@ -19,3 +19,65 @@ body {
   font-family: "DM Sans", system-ui, sans-serif;
   font-synthesis: none;
 }
+
+/*
+ * Scrollbars, in the style VS Code uses.
+ *
+ * The platform default draws a light track and a pair of stepper arrows, which
+ * on a dark app reads as a bright stripe pinned to the right of every panel —
+ * the loudest thing on screen, next to content that is deliberately quiet.
+ *
+ * The rules below keep the track transparent so the panel's own background runs
+ * edge to edge, and let the thumb carry the whole affordance: barely there at
+ * rest, clearer under the pointer.
+ */
+::-webkit-scrollbar {
+  width: 14px;
+  height: 14px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(121, 121, 121, 0.4);
+  /* Square, like the editor's: a pill reads as a control to grab, and this is
+     meant to be an indicator that happens to be draggable. */
+  border-radius: 0;
+  /* Padding drawn as a transparent border, so the thumb is a 10px bar inside a
+     14px gutter and never touches the content it sits beside. */
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 100, 100, 0.7);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:active {
+  background: rgba(191, 191, 191, 0.4);
+  background-clip: padding-box;
+}
+
+/* The steppers are the boxy arrows at each end; nothing here needs them. */
+::-webkit-scrollbar-button {
+  display: none;
+}
+
+/*
+ * Firefox has no scrollbar pseudo-elements and needs the standard properties.
+ *
+ * They cannot simply be set alongside the rules above: from Chrome 121 the
+ * standard properties win outright, and declaring either of them anywhere makes
+ * Chromium drop every `::-webkit-scrollbar` rule for that scroller — so a line
+ * added for Firefox would quietly undo all of the styling above.
+ */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(121, 121, 121, 0.4) transparent;
+  }
+}

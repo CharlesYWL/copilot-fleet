@@ -22,7 +22,7 @@ export type CommandResult = {
  * Distinguished from a real failure so the Host can tell the operator "not
  * now" instead of tearing down a session that is working perfectly well.
  */
-export class PromptRefused extends Error {}
+export class CommandRefused extends Error {}
 
 type SessionSlot = {
   agent?: SessionAgent;
@@ -74,7 +74,7 @@ export class CommandRouter {
         ok: false,
         error: error instanceof Error ? error.message : "Command failed",
         // A refusal leaves the session healthy, so the Host must not bury it.
-        fatal: !(error instanceof PromptRefused),
+        fatal: !(error instanceof CommandRefused),
       };
     }
   }
@@ -120,17 +120,28 @@ export class CommandRouter {
       // which is how the composer came to be open over a busy agent at all.
       if (agent.busy) {
         agent.resync();
-        throw new PromptRefused(
+        throw new CommandRefused(
           "Copilot is still working on the previous turn; wait for it to finish or cancel it",
         );
       }
-      void agent.prompt(command.prompt).catch(() => undefined);
+      void agent.prompt(command.prompt, command.attachments).catch(() => undefined);
     } else if (command.type === "cancel") {
       await agent.cancel();
     } else if (command.type === "stop") {
       await agent.stop();
       if (this.slots.get(command.sessionId) === slot) {
         this.slots.delete(command.sessionId);
+      }
+    } else if (command.type === "set_config_option") {
+      // Awaited, unlike a prompt, and refused rather than failed: the agent
+      // rejects an unknown value with a message naming the ones it takes, and
+      // a mistyped model must not tear down a session that is working fine.
+      try {
+        await agent.setConfigOption(command.configId, command.value);
+      } catch (error) {
+        throw new CommandRefused(
+          error instanceof Error ? error.message : "Could not change that option",
+        );
       }
     } else {
       agent.resolvePermission(command.requestId, {
