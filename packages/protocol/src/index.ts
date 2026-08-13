@@ -692,6 +692,11 @@ export const RenameNodeSchema = z.object({
   name: z.string().min(1).max(100),
 });
 
+/** Updating a busy Node is a deliberate act, so stopping its work is opt-in. */
+export const UpdateNodeSchema = z.object({
+  stopSessions: z.boolean().default(false),
+});
+
 export const CreateWorkspaceSchema = z.object({
   name: z.string().min(1).max(100),
   description: z.string().max(500).default(""),

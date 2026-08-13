@@ -211,9 +211,17 @@ export class FleetService {
    * Refused rather than queued when the Node is busy: an update restarts the
    * process, and every agent it is hosting dies with it. Losing a colleague's
    * running turn to someone else's click on "Update all" is a worse outcome
-   * than being told to wait, so the caller is given the reason to show.
+   * than being told to wait, so the caller is given the reason to show — along
+   * with what is in the way, so an operator who does own those sessions can
+   * decide to stop them rather than being told only that they cannot proceed.
+   *
+   * `stopSessions` is that decision, taken deliberately about one named Node.
+   * "Update all" never sets it.
    */
-  requestUpdate(nodeId: string): { started: boolean; reason?: string } {
+  requestUpdate(
+    nodeId: string,
+    { stopSessions = false }: { stopSessions?: boolean } = {},
+  ): { started: boolean; reason?: string; blockedBy?: FleetSession[] } {
     const node = this.store.getNode(nodeId);
     if (!node) return { started: false, reason: "Unknown node" };
     if (!node.capabilities.includes(SELF_UPDATE_CAPABILITY)) {
@@ -226,11 +234,34 @@ export class FleetService {
     if (!socket || socket.readyState !== socket.OPEN) {
       return { started: false, reason: `${node.name} is offline` };
     }
-    if (node.activeSessions > 0) {
-      return {
-        started: false,
-        reason: `${node.name} is running ${node.activeSessions} session(s); updating would stop them`,
-      };
+    const live = this.store
+      .listSessions()
+      .filter(
+        (session) =>
+          session.nodeId === nodeId && !terminalSessionStates.has(session.state),
+      );
+    if (live.length > 0) {
+      if (!stopSessions) {
+        return {
+          started: false,
+          reason: `${node.name} is running ${live.length} session(s); updating would stop them`,
+          blockedBy: live,
+        };
+      }
+      // Stopped before the update rather than left to die with the process, so
+      // each one ends as something an operator asked for and its agent is given
+      // the chance to shut down rather than being killed mid-write.
+      for (const session of live) {
+        this.dispatch(
+          nodeId,
+          { type: "stop", sessionId: session.id },
+          { state: "stopped", activity: "Stopped to update the node" },
+        );
+      }
+      this.log.info(
+        { nodeId, stopped: live.length },
+        "Stopping sessions so the node can update",
+      );
     }
     const updateId = randomUUID();
     this.send(socket, HostToNodeMessageSchema.parse({ type: "update_node", updateId }));

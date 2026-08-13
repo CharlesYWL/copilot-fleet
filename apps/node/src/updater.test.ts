@@ -1,9 +1,16 @@
 import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NodeUpdateStage } from "@fleet/protocol";
-import { updateCheckout, waitForParentExit, type CommandResult } from "./updater.js";
+import {
+  NODE_ENTRY_POINT,
+  restartHandledBySupervisor,
+  restartTarget,
+  updateCheckout,
+  waitForParentExit,
+  type CommandResult,
+} from "./updater.js";
 
 const roots: string[] = [];
 
@@ -21,11 +28,11 @@ afterEach(() => {
 /** Answers each command in order, so a test can fail whichever step it means to. */
 function scriptedRun(answers: Record<string, CommandResult[]>) {
   const calls: string[] = [];
-  const run = (command: string, args: readonly string[]): CommandResult => {
+  const run = (command: string, args: readonly string[]): Promise<CommandResult> => {
     const key = `${command} ${args.join(" ")}`;
     calls.push(key);
     const queued = answers[key]?.shift();
-    return queued ?? { ok: true, output: "" };
+    return Promise.resolve(queued ?? { ok: true, output: "" });
   };
   return { run, calls };
 }
@@ -38,12 +45,12 @@ describe("updateCheckout", () => {
     stages.push(stage);
   };
 
-  it("installs and builds before asking for a restart", () => {
+  it("installs and builds before asking for a restart", async () => {
     stages.length = 0;
     const { run, calls } = scriptedRun({
       "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
     });
-    const outcome = updateCheckout({ repoRoot: gitCheckout(), report, run });
+    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
 
     expect(outcome).toEqual({ action: "restart", revision: "new222222222" });
     // Building before the restart is the whole safety property: a checkout that
@@ -58,12 +65,12 @@ describe("updateCheckout", () => {
     expect(stages).toEqual(["checking", "pulling", "installing", "building"]);
   });
 
-  it("does not restart a node that was already current", () => {
+  it("does not restart a node that was already current", async () => {
     stages.length = 0;
     const { run, calls } = scriptedRun({
       "git rev-parse HEAD": [ok("same11111111"), ok("same11111111")],
     });
-    const outcome = updateCheckout({ repoRoot: gitCheckout(), report, run });
+    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
 
     expect(outcome).toEqual({ action: "none", reason: "Already up to date" });
     // Restarting anyway would drop the connection for no gain — and on "Update
@@ -71,12 +78,12 @@ describe("updateCheckout", () => {
     expect(calls).not.toContain("npm install");
   });
 
-  it("stops at a pull that would need a merge, leaving the build alone", () => {
+  it("stops at a pull that would need a merge, leaving the build alone", async () => {
     stages.length = 0;
     const { run, calls } = scriptedRun({
       "git pull --ff-only": [{ ok: false, output: "Not possible to fast-forward" }],
     });
-    const outcome = updateCheckout({ repoRoot: gitCheckout(), report, run });
+    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
 
     expect(outcome).toEqual({
       action: "failed",
@@ -85,13 +92,13 @@ describe("updateCheckout", () => {
     expect(calls).not.toContain("npm run build:node");
   });
 
-  it("keeps running the old build when the new one does not compile", () => {
+  it("keeps running the old build when the new one does not compile", async () => {
     stages.length = 0;
     const { run } = scriptedRun({
       "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
       "npm run build:node": [{ ok: false, output: "TS2345" }],
     });
-    const outcome = updateCheckout({ repoRoot: gitCheckout(), report, run });
+    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
 
     expect(outcome).toEqual({
       action: "failed",
@@ -99,14 +106,49 @@ describe("updateCheckout", () => {
     });
   });
 
-  it("refuses a directory that is not a git checkout", () => {
+  it("refuses a directory that is not a git checkout", async () => {
     stages.length = 0;
     const root = mkdtempSync(join(tmpdir(), "fleet-plain-"));
     roots.push(root);
     const { run, calls } = scriptedRun({});
 
-    expect(updateCheckout({ repoRoot: root, report, run }).action).toBe("failed");
+    expect((await updateCheckout({ repoRoot: root, report, run })).action).toBe("failed");
     expect(calls).toEqual([]);
+  });
+});
+
+describe("restartTarget", () => {
+  it("prefers the build the update just produced", () => {
+    // Re-running argv[1] looked equivalent and was not: under `tsx` that names
+    // a TypeScript file, and `node` cannot load one — so the successor died on
+    // startup the instant its parent stopped, leaving the machine with no Node
+    // and nothing in the log to say why.
+    const target = restartTarget(
+      "/repo",
+      "/repo/apps/node/src/main.ts",
+      (path) => path === resolve("/repo", NODE_ENTRY_POINT),
+    );
+    expect(target).toBe(resolve("/repo", NODE_ENTRY_POINT));
+  });
+
+  it("falls back to the entry point this process was given", () => {
+    const target = restartTarget("/repo", "/elsewhere/main.js", () => false);
+    expect(target).toBe("/elsewhere/main.js");
+  });
+
+  it("reports nothing to launch rather than guessing", () => {
+    expect(restartTarget("/repo", undefined, () => false)).toBeUndefined();
+  });
+});
+
+describe("restartHandledBySupervisor", () => {
+  it("lets a supervised node exit instead of launching its own successor", () => {
+    expect(restartHandledBySupervisor({ FLEET_RESTART_MODE: "exit" })).toBe(true);
+  });
+
+  it("takes responsibility itself by default", () => {
+    expect(restartHandledBySupervisor({})).toBe(false);
+    expect(restartHandledBySupervisor({ FLEET_RESTART_MODE: "respawn" })).toBe(false);
   });
 });
 

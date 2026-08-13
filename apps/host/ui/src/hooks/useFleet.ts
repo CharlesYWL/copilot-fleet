@@ -238,10 +238,33 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     const body = (await response.json().catch(() => ({}))) as {
       error?: string;
     };
-    throw new Error(body.error ?? `${response.status} ${response.statusText}`);
+    throw new ApiError(
+      body.error ?? `${response.status} ${response.statusText}`,
+      response.status,
+      body,
+    );
   }
   if (response.status === 204) return undefined as T;
   const text = await response.text();
   if (!text) return undefined as T;
   return JSON.parse(text) as T;
+}
+
+/**
+ * A failed call that still carries what the Host said.
+ *
+ * Reducing a refusal to its message threw away the rest of the body, which is
+ * where the Host explains itself — the sessions standing in the way of an
+ * update, for instance, which a caller needs if it is going to offer to do
+ * something about them rather than just repeat the complaint.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly body: Record<string, unknown>,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
 }

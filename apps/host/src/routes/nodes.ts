@@ -1,5 +1,10 @@
 import type { FastifyPluginAsync } from "fastify";
-import { RegisterNodeSchema, RenameNodeSchema, errorMessage } from "@fleet/protocol";
+import {
+  RegisterNodeSchema,
+  RenameNodeSchema,
+  UpdateNodeSchema,
+  errorMessage,
+} from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 
 export type NodeRouteOptions = {
@@ -38,9 +43,15 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
   app.post("/api/nodes/:id/update", async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
-    const result = service.requestUpdate(id);
+    const input = UpdateNodeSchema.parse(request.body ?? {});
+    const result = service.requestUpdate(id, { stopSessions: input.stopSessions });
     if (!result.started) {
-      return reply.code(409).send({ error: result.reason ?? "Update refused" });
+      // The sessions in the way travel with the refusal so the browser can name
+      // them, rather than making the operator go and look for what it meant.
+      return reply.code(409).send({
+        error: result.reason ?? "Update refused",
+        ...(result.blockedBy ? { blockedBy: result.blockedBy } : {}),
+      });
     }
     return { started: true };
   });

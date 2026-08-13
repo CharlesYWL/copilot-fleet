@@ -356,9 +356,12 @@ behind it was.
 
 What it will not do:
 
-- **Update a machine that is running sessions.** A restart takes every agent on
-  that node with it, so a busy node is refused with a reason rather than
-  silently costing someone their turn. Stop its sessions and click again.
+- **Update a machine that is running sessions without being told to.** A restart
+  takes every agent on that node with it, so a busy node is refused — but the
+  refusal names the sessions in the way, and **Update** then offers to stop them
+  and go ahead. Each keeps its transcript and can be resumed afterwards.
+  **Update all** never does this: it skips busy machines rather than deciding
+  for you across the fleet.
 - **Move a checkout that has diverged.** `--ff-only` means a machine with local
   commits, or a dirty tree in the way, stops and reports it instead of inventing
   a merge nobody asked for.
@@ -374,6 +377,34 @@ What it will not do:
 A node reports `""` for its commit when its directory is not a git checkout — a
 tarball deploy, say. Those show as **Unknown** rather than being guessed at, and
 are left out of **Update all**.
+
+### Restarting under a process supervisor
+
+By default a node launches its own successor and exits. That works, but nothing
+brings the node back if the machine reboots or the process dies for any other
+reason, so a machine you rely on is better run under something that supervises
+it — PM2, NSSM, a systemd unit.
+
+Set `FLEET_RESTART_MODE=exit` and an update stops the process instead of
+launching a successor, leaving the restart to the supervisor:
+
+```bash
+# PM2, on any platform
+FLEET_RESTART_MODE=exit pm2 start apps/node/dist/main.js --name copilot-fleet-node -- --url=https://fleet.example.com
+pm2 save
+```
+
+```powershell
+# Windows, as a service, with NSSM
+nssm install copilot-fleet-node "C:\Program Files\nodejs\node.exe" "Q:\Repos\copilot-fleet\apps\node\dist\main.js"
+nssm set copilot-fleet-node AppDirectory Q:\Repos\copilot-fleet
+nssm set copilot-fleet-node AppEnvironmentExtra FLEET_RESTART_MODE=exit
+nssm start copilot-fleet-node
+```
+
+Run the node from `apps/node/dist/main.js` rather than through `tsx` when it is
+supervised: the restart after an update relaunches the built entry point, and a
+supervisor restarting a watch-mode process fights the watcher.
 
 ## Exact proof of concept
 

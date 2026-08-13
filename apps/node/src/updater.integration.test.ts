@@ -33,7 +33,11 @@ afterAll(() => {
 
 /** Real git, stubbed npm: a temp checkout has no dependencies to install. */
 function gitOnly(record: string[]) {
-  return (command: string, args: readonly string[], cwd: string): CommandResult => {
+  return async (
+    command: string,
+    args: readonly string[],
+    cwd: string,
+  ): Promise<CommandResult> => {
     if (command !== "git") {
       record.push(`${command} ${args.join(" ")}`);
       return { ok: true, output: "" };
@@ -54,7 +58,7 @@ describe("updateCheckout against a real repository", () => {
 
   it(
     "fast-forwards a clone and reports the commit it landed on",
-    () => {
+    async () => {
       const origin = makeTemp("fleet-origin-");
       git(origin, "init", "--initial-branch=main");
       git(origin, "config", "user.email", "fleet@example.com");
@@ -66,7 +70,7 @@ describe("updateCheckout against a real repository", () => {
 
       // Nothing new upstream yet: the node must stay up rather than restart.
       const npmCalls: string[] = [];
-      const unchanged = updateCheckout({
+      const unchanged = await updateCheckout({
         repoRoot: clone,
         report: () => {},
         run: gitOnly(npmCalls),
@@ -76,7 +80,7 @@ describe("updateCheckout against a real repository", () => {
 
       commit(origin, "second.txt", "two");
 
-      const updated = updateCheckout({
+      const updated = await updateCheckout({
         repoRoot: clone,
         report: () => {},
         run: gitOnly(npmCalls),
@@ -96,7 +100,7 @@ describe("updateCheckout against a real repository", () => {
 
   it(
     "refuses to move a checkout that has diverged",
-    () => {
+    async () => {
       const origin = makeTemp("fleet-origin2-");
       git(origin, "init", "--initial-branch=main");
       git(origin, "config", "user.email", "fleet@example.com");
@@ -114,7 +118,7 @@ describe("updateCheckout against a real repository", () => {
       // A machine someone has been hacking on locally must say so rather than
       // invent a merge nobody asked for while nobody is watching.
       const npmCalls: string[] = [];
-      const outcome = updateCheckout({
+      const outcome = await updateCheckout({
         repoRoot: clone,
         report: () => {},
         run: gitOnly(npmCalls),

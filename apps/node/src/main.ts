@@ -53,8 +53,11 @@ import {
   type Settings,
 } from "./settings.js";
 import {
+  RESTART_MODE_ENV,
   UPDATE_PARENT_PID_ENV,
   respawn,
+  restartHandledBySupervisor,
+  restartTarget,
   updateCheckout,
   waitForParentExit,
 } from "./updater.js";
@@ -273,7 +276,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     const root = repoRoot();
     log(`Self-update requested; using checkout ${root}`);
     try {
-      const outcome = updateCheckout({ repoRoot: root, report });
+      const outcome = await updateCheckout({ repoRoot: root, report });
       if (outcome.action === "failed") {
         log(`Self-update failed: ${outcome.reason}`);
         report("failed", outcome.reason);
@@ -285,8 +288,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         return;
       }
       log(`Updated to ${outcome.revision}; restarting`);
-      const scriptPath = process.argv[1];
-      if (!scriptPath) {
+      const supervised = restartHandledBySupervisor(env);
+      const scriptPath = supervised ? undefined : restartTarget(root, process.argv[1]);
+      if (!supervised && !scriptPath) {
         // Nothing to re-launch: the new build is on disk but this process
         // cannot name itself, so staying up is better than exiting into a
         // machine with no Node on it.
@@ -304,14 +308,19 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // before it looks. Without this a node whose address was corrected from
       // the config page comes back on the address it was launched with.
       await saveSettings(settings);
-      const restartArgs = argvForRestart(argv);
-      const dropped = argv.length - restartArgs.length;
-      if (dropped > 0) {
-        log(
-          `Restarting from saved settings; ${dropped} launch flag(s) superseded by settings.json`,
-        );
+      if (supervised) {
+        log(`Exiting for the supervisor to restart (${RESTART_MODE_ENV}=exit)`);
+      } else {
+        const restartArgs = argvForRestart(argv);
+        const dropped = argv.length - restartArgs.length;
+        if (dropped > 0) {
+          log(
+            `Restarting from saved settings; ${dropped} launch flag(s) superseded by settings.json`,
+          );
+        }
+        log(`Launching ${scriptPath}`);
+        respawn(root, scriptPath!, restartArgs);
       }
-      respawn(root, scriptPath, restartArgs);
       await shutdown();
       releaseInstanceLock();
       process.exit(0);

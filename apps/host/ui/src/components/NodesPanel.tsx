@@ -2,6 +2,12 @@ import { useState } from "react";
 import {
   Badge,
   Button,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
   Input,
   Spinner,
   Table,
@@ -26,15 +32,29 @@ import {
 import {
   nodeUpdateState,
   type FleetNode,
+  type FleetSession,
   type NodeUpdateStage,
   type NodeUpdateState,
 } from "@fleet/protocol";
 import { useCatalog } from "../hooks/useCatalog";
 import type { NodeUpdateProgress } from "../hooks/useFleet";
+import { sessionLabel } from "../lib/session-label";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
+  dialogBody: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px",
+  },
+  sessionList: {
+    margin: 0,
+    paddingLeft: "20px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px",
+  },
   panel: {
     flexGrow: 1,
     overflowY: "auto",
@@ -157,7 +177,31 @@ const busyStages = new Set<NodeUpdateStage>([
 export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps) => {
   const styles = useStyles();
   const { renameNode, deleteNode, updateNode, updateAllNodes } = useCatalog();
+  /** The node whose update is waiting on a decision about its live sessions. */
+  const [blocked, setBlocked] = useState<{
+    node: FleetNode;
+    sessions: FleetSession[];
+  }>();
+  const [stopping, setStopping] = useState(false);
   const stale = nodes.filter((node) => nodeUpdateState(node, hostRevision) === "stale");
+
+  const startUpdate = async (node: FleetNode) => {
+    const refusal = await updateNode(node.id);
+    // Only a refusal that names sessions is worth asking about; anything else
+    // has already been reported.
+    if (refusal && refusal.blockedBy.length > 0) {
+      setBlocked({ node, sessions: refusal.blockedBy });
+    }
+  };
+
+  const stopAndUpdate = async () => {
+    if (!blocked) return;
+    setStopping(true);
+    const refusal = await updateNode(blocked.node.id, { stopSessions: true });
+    setStopping(false);
+    if (!refusal) setBlocked(undefined);
+  };
+
   return (
     <div className={styles.panel}>
       <div className={styles.head}>
@@ -206,12 +250,63 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
                 progress={nodeUpdates[node.id]}
                 onRename={renameNode}
                 onDelete={deleteNode}
-                onUpdate={updateNode}
+                onUpdate={startUpdate}
               />
             ))}
           </TableBody>
         </Table>
       </div>
+
+      <Dialog
+        open={Boolean(blocked)}
+        onOpenChange={(_event, data) => {
+          if (!data.open) setBlocked(undefined);
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>
+              Stop {blocked?.sessions.length} session(s) to update?
+            </DialogTitle>
+            <DialogContent className={styles.dialogBody}>
+              <Text>
+                Updating {blocked?.node.name} restarts it, and the agents it is hosting
+                stop with it. These sessions are running there now:
+              </Text>
+              <ul className={styles.sessionList}>
+                {blocked?.sessions.map((session) => (
+                  <li key={session.id}>
+                    <Text weight="semibold">{sessionLabel(session)}</Text>
+                    <Text className={styles.caption}>
+                      {" "}
+                      · {session.workspaceName} · {session.state}
+                    </Text>
+                  </li>
+                ))}
+              </ul>
+              <Text className={styles.caption}>
+                Each one keeps its transcript and can be resumed afterwards.
+              </Text>
+            </DialogContent>
+            <DialogActions>
+              <Button
+                appearance="secondary"
+                onClick={() => setBlocked(undefined)}
+                disabled={stopping}
+              >
+                Cancel
+              </Button>
+              <Button
+                appearance="primary"
+                onClick={() => void stopAndUpdate()}
+                disabled={stopping}
+              >
+                {stopping ? "Stopping…" : "Stop and update"}
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
     </div>
   );
 };
@@ -222,7 +317,7 @@ type NodeRowProps = {
   progress?: { stage: NodeUpdateStage; detail: string } | undefined;
   onRename: (nodeId: string, name: string) => Promise<boolean>;
   onDelete: (nodeId: string) => Promise<boolean>;
-  onUpdate: (nodeId: string) => Promise<boolean>;
+  onUpdate: (node: FleetNode) => Promise<void>;
 };
 
 const NodeRow = ({
@@ -331,7 +426,7 @@ const NodeRow = ({
                 icon={<ArrowSync20Regular />}
                 aria-label={`Update ${node.name}`}
                 title="Pull, rebuild and restart this node"
-                onClick={() => void onUpdate(node.id)}
+                onClick={() => void onUpdate(node)}
               />
             )
           )}

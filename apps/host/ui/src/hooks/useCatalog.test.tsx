@@ -12,8 +12,9 @@ function operations(ok = true) {
     return ok ? { ok: true, data: undefined as T } : { ok: false, error: "nope" };
   };
   const refresh = vi.fn(async () => {});
-  const { result } = renderHook(() => useCatalogOperations({ request, refresh }));
-  return { catalog: result.current, calls, refresh };
+  const notify = vi.fn();
+  const { result } = renderHook(() => useCatalogOperations({ request, refresh, notify }));
+  return { catalog: result.current, calls, refresh, notify };
 }
 
 describe("useCatalogOperations", () => {

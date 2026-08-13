@@ -9,7 +9,12 @@ import {
 import { FleetService } from "./fleet-service.js";
 import { FleetStore } from "./store.js";
 
-type SentFrame = { type: string; hostUrl?: string; name?: string };
+type SentFrame = {
+  type: string;
+  hostUrl?: string;
+  name?: string;
+  command?: { type: string; sessionId: string };
+};
 
 /** Just enough socket for the service to consider it writable and record sends. */
 function fakeSocket() {
@@ -196,12 +201,34 @@ describe("requestUpdate", () => {
     // one click on "Update all" must not cost a colleague their running turn.
     const { store, service, enroll } = setup("host2222");
     const node = enroll("busy", ["copilot-acp", SELF_UPDATE_CAPABILITY], "node1111");
-    store.recordPresence(node.nodeId, true, 1);
+    const workspace = store.createWorkspace("repo", "");
+    const placement = store.createPlacement(workspace.id, node.nodeId, "C:\\repo");
+    store.createSession(placement, "mid-flight");
 
     const result = service.requestUpdate(node.nodeId);
     expect(result.started).toBe(false);
     expect(result.reason).toContain("session");
+    // Named, so a browser can offer to stop them rather than only complaining.
+    expect(result.blockedBy?.map((session) => session.initialPrompt)).toEqual([
+      "mid-flight",
+    ]);
     expect(node.sent).toEqual([]);
+  });
+
+  it("stops the sessions in the way when told to", () => {
+    // The operator has seen what is running and decided; the stop goes first so
+    // each agent ends deliberately rather than dying with the process.
+    const { store, service, enroll } = setup("host2222");
+    const node = enroll("busy", ["copilot-acp", SELF_UPDATE_CAPABILITY], "node1111");
+    const workspace = store.createWorkspace("repo", "");
+    const placement = store.createPlacement(workspace.id, node.nodeId, "C:\\repo");
+    store.createSession(placement, "mid-flight");
+
+    expect(service.requestUpdate(node.nodeId, { stopSessions: true })).toEqual({
+      started: true,
+    });
+    const sent = node.sent.map((frame) => frame.command?.type ?? frame.type);
+    expect(sent).toEqual(["stop", "update_node"]);
   });
 
   it("lists only the nodes that are actually behind", () => {

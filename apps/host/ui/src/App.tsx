@@ -79,7 +79,7 @@ export function App() {
     command,
     request,
   } = useFleet(notify);
-  const catalog = useCatalogOperations({ request, refresh });
+  const catalog = useCatalogOperations({ request, refresh, notify });
   const [view, setView] = useState<SidebarView>("session");
   const [layout, setLayout] = useState<LayoutMode>("tree");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
