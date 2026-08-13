@@ -23,6 +23,16 @@ export const UPDATE_PARENT_PID_ENV = "FLEET_UPDATE_PARENT_PID";
  */
 export const RESTART_MODE_ENV = "FLEET_RESTART_MODE";
 
+/**
+ * The status a supervised Node exits with when it wants to come back.
+ *
+ * Distinct from 0 so a supervisor can tell "update me" apart from "I was asked
+ * to stop", and restart only the first. 75 is `EX_TEMPFAIL` from sysexits.h,
+ * which is close enough in spirit and unlikely to collide with anything the
+ * process exits with on its own.
+ */
+export const RESTART_EXIT_CODE = 75;
+
 export type UpdateReport = (stage: NodeUpdateStage, detail: string) => void;
 
 export type CommandResult = { ok: boolean; output: string };
@@ -49,12 +59,15 @@ function platformCommand(command: string): string {
 export const runCommand: RunCommand = (command, args, cwd) =>
   new Promise((done) => {
     const executable = command === "npm" ? platformCommand(command) : command;
-    const child = spawn(executable, [...args], {
-      cwd,
-      // `npm.cmd` is a batch file; without a shell Windows refuses to execute it.
-      shell: process.platform === "win32",
-      windowsHide: true,
-    });
+    // `npm.cmd` is a batch file; without a shell Windows refuses to execute it.
+    // The arguments are joined into the command rather than passed alongside it
+    // because Node deprecates the combination (DEP0190) — it cannot know that
+    // every argument here is a literal spelled out in this file, so it warns on
+    // every update. They are, and none of them contains a space.
+    const child =
+      process.platform === "win32"
+        ? spawn([executable, ...args].join(" "), { cwd, shell: true, windowsHide: true })
+        : spawn(executable, [...args], { cwd, windowsHide: true });
     let output = "";
     const collect = (chunk: Buffer) => {
       output += chunk.toString("utf8");
@@ -172,6 +185,11 @@ export function restartHandledBySupervisor(
  * handles belong to a console that goes away with the process being replaced,
  * and the first line the successor logged afterwards killed it with EPIPE. The
  * update reported success and left the machine with nothing running on it.
+ *
+ * Prefer running under the supervisor (`npm run node`) to any of this: a
+ * detached successor on Windows gets its own console window, and a Node started
+ * by a watcher has a second process racing it for the instance lock. This path
+ * remains for a Node launched directly, with no supervisor to come back to.
  */
 export function respawn(
   repoRoot: string,
@@ -183,6 +201,10 @@ export function respawn(
   const child = spawn(process.execPath, [scriptPath, ...args], {
     cwd: repoRoot,
     detached: true,
+    // Detaching on Windows hands the successor a console of its own, which
+    // appears as a terminal that flashes open and shuts again the moment
+    // anything goes wrong. Hiding it keeps the restart silent either way.
+    windowsHide: true,
     stdio: ["ignore", output, output],
     env: { ...process.env, [UPDATE_PARENT_PID_ENV]: String(process.pid) },
   });

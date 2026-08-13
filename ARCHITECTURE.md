@@ -176,10 +176,27 @@ compare and no checkout to pull into.
 An update pulls fast-forward only, installs, and builds _before_ anything is
 torn down, so a checkout that has diverged, or that no longer compiles, leaves
 the machine running the code it already had. Only once the build succeeds does
-the Node spawn its successor and exit; the successor waits for that exit before
-taking the instance lock, because two live processes for one Node make the Host
-supersede one of them. A pull that changes nothing skips the restart entirely
-rather than dropping every connection to arrive back where it started.
+the Node give up its place. A pull that changes nothing skips the restart
+entirely rather than dropping every connection to arrive back where it started.
+
+A Node does not replace itself. It exits with status 75 and a supervisor
+(`apps/node/supervisor.mjs`, or PM2/NSSM/systemd) starts the new build. The
+version that did replace itself spawned a detached successor, which is only
+sound if the successor reliably wins the instance lock — and on Windows it also
+arrives with a console window of its own. Under `tsx watch` it lost that race
+every time: the pull changed the source, the watcher restarted its own child
+first, and the successor found the lock taken and exited. The Node came back,
+but by the watcher's accident rather than by the update's design, so the failure
+was invisible until the watcher was not there. Doing the restart from a process
+that took no part in the update removes the race, the window, and the guesswork
+about which entry point to relaunch. The self-replacing path survives for a Node
+launched with no supervisor at all, and waits for its predecessor's exit before
+taking the lock.
+
+Status 75 rather than 0 is what lets a supervisor tell an update apart from a
+stop; without the distinction, Ctrl-C would bring the Node straight back. The
+built-in supervisor restarts on that status and forwards every other exit, so a
+crash stays a crash instead of becoming a loop.
 
 Nodes running Sessions are refused rather than queued. An update restarts the
 process and every agent it hosts dies with it, so the choice of when to lose
@@ -193,8 +210,8 @@ and when the tunnel rotates the operator moves it from the config page. Replayin
 the original flag into the successor reverted that edit, so the Node came back on
 an address that no longer existed — unreachable, and therefore impossible to
 tell where the Host had gone. Settings-backed flags are dropped and the current
-settings are written to disk before the successor is spawned; flags with no home
-in settings, such as the enrollment token and the config port, are passed through.
+settings are written to disk before the Node exits; flags with no home in
+settings, such as the enrollment token and the config port, are passed through.
 
 ### Node to Copilot
 

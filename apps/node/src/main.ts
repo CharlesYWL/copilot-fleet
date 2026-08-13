@@ -54,6 +54,7 @@ import {
   type Settings,
 } from "./settings.js";
 import {
+  RESTART_EXIT_CODE,
   RESTART_MODE_ENV,
   UPDATE_PARENT_PID_ENV,
   respawn,
@@ -326,7 +327,10 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       }
       await shutdown();
       releaseInstanceLock();
-      process.exit(0);
+      // A supervisor has to be able to tell an update apart from a stop, or
+      // Ctrl-C would bring the Node straight back. The successor of an
+      // unsupervised restart is already running, so this one just leaves.
+      process.exit(supervised ? RESTART_EXIT_CODE : 0);
     } finally {
       updating = false;
     }

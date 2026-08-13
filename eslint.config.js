@@ -56,6 +56,17 @@ export default tseslint.config(
     rules: { "no-console": "off" },
   },
   {
+    // The supervisor is plain JavaScript on purpose — it has to start when the
+    // build it supervises does not — so it needs the Node globals the TypeScript
+    // block above grants, and printing is the only reporting it has.
+    files: ["apps/node/supervisor.mjs"],
+    languageOptions: {
+      globals: { ...globals.node },
+      sourceType: "module",
+    },
+    rules: { "no-console": "off" },
+  },
+  {
     files: ["**/*.test.{ts,tsx}"],
     rules: { "@typescript-eslint/no-explicit-any": "off" },
   },

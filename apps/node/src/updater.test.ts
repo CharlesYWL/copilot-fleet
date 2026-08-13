@@ -1,10 +1,11 @@
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NodeUpdateStage } from "@fleet/protocol";
 import {
   NODE_ENTRY_POINT,
+  RESTART_EXIT_CODE,
   restartHandledBySupervisor,
   restartTarget,
   updateCheckout,
@@ -149,6 +150,25 @@ describe("restartHandledBySupervisor", () => {
   it("takes responsibility itself by default", () => {
     expect(restartHandledBySupervisor({})).toBe(false);
     expect(restartHandledBySupervisor({ FLEET_RESTART_MODE: "respawn" })).toBe(false);
+  });
+});
+
+describe("RESTART_EXIT_CODE", () => {
+  it("matches the value the supervisor watches for", () => {
+    // The supervisor is plain JavaScript so it can start when the build it
+    // supervises cannot, which means it cannot import this constant. If the two
+    // ever disagree, an update looks like a crash: the supervisor forwards the
+    // exit instead of restarting, and the machine is left with no Node.
+    const supervisor = readFileSync(
+      resolve(import.meta.dirname, "..", "supervisor.mjs"),
+      "utf8",
+    );
+    const declared = supervisor.match(/const RESTART_EXIT_CODE = (\d+);/);
+    expect(declared?.[1]).toBe(String(RESTART_EXIT_CODE));
+  });
+
+  it("is distinct from a clean exit, so stopping is not mistaken for updating", () => {
+    expect(RESTART_EXIT_CODE).not.toBe(0);
   });
 });
 

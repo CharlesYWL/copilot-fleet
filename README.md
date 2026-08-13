@@ -109,8 +109,8 @@ machine. Run `npm run start:node -- --help` for the current list.
 
 Both `--flag value` and `--flag=value` are accepted. The `--` after the npm
 script name is npm's own separator; without it npm eats the flags. The same
-flags work on `npm run node` (watch mode), `npm run dev` and `npm start`, where
-they are forwarded to the node process only:
+flags work on `npm run node`, `npm run dev` and `npm start`, where they are
+forwarded to the node process only:
 
 ```bash
 npm start -- --url=https://fleet.example.com
@@ -378,15 +378,42 @@ A node reports `""` for its commit when its directory is not a git checkout — 
 tarball deploy, say. Those show as **Unknown** rather than being guessed at, and
 are left out of **Update all**.
 
+### How a node restarts itself
+
+`npm run node` and `npm run start:node` both put a small supervisor in front of
+the node (`apps/node/supervisor.mjs`). The node never replaces itself: it exits
+with status 75 to ask for a restart, and the supervisor — which had nothing to
+do with the update and is therefore still alive — starts the new build in the
+same terminal. Nothing is detached and no window appears.
+
+This exists because a process cannot reliably replace itself on Windows. The
+version that tried spawned a detached successor, which arrives with a console
+window of its own and has to win a race for the instance lock. Under `tsx watch`
+it lost that race every time: the pull changed the source, the watcher restarted
+its own child, and the successor found the lock taken and exited — which looked
+like a terminal flashing open and vanishing, with the node coming back only by
+the watcher's accident.
+
+`npm run dev:watch` still runs the node under `tsx watch` for iterating on node
+code. Do not use it for a machine you rely on: **a watcher does not restart a
+child that exits**, so an update under one leaves the machine with nothing
+running.
+
+The supervisor restarts on status 75 and nothing else — a node that crashes
+exits with the code it crashed with, so a broken build is visible instead of
+looping. It also gives up if the node asks to restart five times in twenty
+seconds.
+
 ### Restarting under a process supervisor
 
-By default a node launches its own successor and exits. That works, but nothing
-brings the node back if the machine reboots or the process dies for any other
-reason, so a machine you rely on is better run under something that supervises
-it — PM2, NSSM, a systemd unit.
+The built-in supervisor does not survive a reboot and will not restart a node
+that crashes. A machine you rely on is better run under something that does —
+PM2, NSSM, a systemd unit.
 
 Set `FLEET_RESTART_MODE=exit` and an update stops the process instead of
-launching a successor, leaving the restart to the supervisor:
+launching a successor, leaving the restart to the supervisor. Point it at
+`apps/node/dist/main.js` directly, not at `supervisor.mjs`; two supervisors is
+one more than the job needs.
 
 ```bash
 # PM2, on any platform
@@ -402,9 +429,9 @@ nssm set copilot-fleet-node AppEnvironmentExtra FLEET_RESTART_MODE=exit
 nssm start copilot-fleet-node
 ```
 
-Run the node from `apps/node/dist/main.js` rather than through `tsx` when it is
-supervised: the restart after an update relaunches the built entry point, and a
-supervisor restarting a watch-mode process fights the watcher.
+An update exits 75 in this mode too. PM2 and NSSM restart on any exit, so that
+is already what you want; a unit file that restarts only on failure needs
+`RestartForceExitStatus=75` or `Restart=always`.
 
 ## Exact proof of concept
 
