@@ -21,7 +21,7 @@
  * Usage:
  *   node supervisor.mjs [--dev] [-- <node args>]
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,11 +77,59 @@ if (target.error) {
   process.exit(1);
 }
 
+/**
+ * The commit the checkout is on, or undefined if that cannot be established.
+ *
+ * Undefined is treated as "unchanged" everywhere it is used: a checkout this
+ * cannot read is one the updater could not have moved either, so the safe
+ * reading is that nothing happened.
+ */
+function headRevision() {
+  try {
+    const result = spawnSync("git", ["rev-parse", "HEAD"], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      windowsHide: true,
+    });
+    if (result.status !== 0) return undefined;
+    return result.stdout.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a clean exit was actually an update by a build too old to say so.
+ *
+ * The exit code contract is carried by the Node being supervised, so the very
+ * first update on a machine is always performed by a build that predates it:
+ * that build updates itself, logs that it is leaving for the supervisor, and
+ * exits 0 because 0 is all it knows. Taking that at face value would read an
+ * update as a clean stop and leave the machine with nothing running — silently,
+ * which is worse than the crash this supervisor exists to prevent.
+ *
+ * A moved HEAD is the evidence that distinguishes the two, and it is only
+ * consulted for exit code 0, so a crash stays a crash.
+ */
+function updatedWithoutSayingSo(code, revisionAtStart) {
+  if (code !== 0 || !revisionAtStart) return false;
+  const now = headRevision();
+  if (!now || now === revisionAtStart) return false;
+  log(
+    `node exited cleanly but the checkout moved to ${now.slice(0, 12)}; ` +
+      `treating that as an update from a build that predates the restart contract`,
+  );
+  return true;
+}
+
 let child;
 let stopping = false;
 const restarts = [];
 
 function start() {
+  // Read before the child runs, so an update it performs is a change against
+  // this value rather than against whatever the checkout settled on later.
+  const revisionAtStart = headRevision();
   child = spawn(process.execPath, [...target.args, ...childArgs], {
     cwd: repoRoot,
     // The supervisor owns the console, so the child can inherit it safely: the
@@ -110,7 +158,7 @@ function start() {
       log(`node stopped on ${signal}`);
       process.exit(0);
     }
-    if (code !== RESTART_EXIT_CODE) {
+    if (code !== RESTART_EXIT_CODE && !updatedWithoutSayingSo(code, revisionAtStart)) {
       // Anything other than a restart request is the child's business, not
       // this process's: crash recovery belongs to PM2 or a service manager,
       // which can also survive a reboot. Looping here would only hide the exit.

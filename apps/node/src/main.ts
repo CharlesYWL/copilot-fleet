@@ -60,6 +60,7 @@ import {
   respawn,
   restartHandledBySupervisor,
   restartTarget,
+  restartWouldRaceAWatcher,
   updateCheckout,
   waitForParentExit,
 } from "./updater.js";
@@ -291,6 +292,20 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       }
       log(`Updated to ${outcome.revision}; restarting`);
       const supervised = restartHandledBySupervisor(env);
+      if (restartWouldRaceAWatcher(env)) {
+        // The new build is on disk and compiles; only the restart is declined.
+        // Launching a successor here would hand it to a race it cannot win
+        // against the watcher's own child, which reports success and leaves the
+        // machine running the build the update just replaced. Saying so plainly
+        // costs one manual restart and is true.
+        log("Updated, but a file watcher owns this process; not restarting");
+        report(
+          "failed",
+          `Updated to ${outcome.revision}, but this Node runs under a file watcher, which cannot restart it. ` +
+            `Stop this terminal and start it again with "npm run node" to run the new build under the supervisor.`,
+        );
+        return;
+      }
       const scriptPath = supervised ? undefined : restartTarget(root, process.argv[1]);
       if (!supervised && !scriptPath) {
         // Nothing to re-launch: the new build is on disk but this process

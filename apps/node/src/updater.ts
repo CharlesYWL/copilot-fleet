@@ -172,6 +172,38 @@ export function restartHandledBySupervisor(
 }
 
 /**
+ * Whether this process is running through `tsx`.
+ *
+ * `tsx` puts its loader on the command line, so it is visible here whether it
+ * was reached through `tsx watch` or a bare `tsx`. Under the supervisor this is
+ * true as well — development runs through `tsx` — which is why callers pair it
+ * with {@link restartHandledBySupervisor} rather than using it alone.
+ */
+export function runningUnderTsx(execArgv: readonly string[] = process.execArgv): boolean {
+  return execArgv.some((argument) => argument.includes("tsx"));
+}
+
+/**
+ * Whether replacing this process would fight a watcher for the instance lock.
+ *
+ * A Node started by `tsx watch` has a second process interested in the same
+ * source: the update rewrites the files being watched, the watcher starts its
+ * own child, and that child takes the instance lock while the successor is
+ * still coming up. The successor then loses, reports that another node is
+ * already running, and exits — the terminal that flashes open and vanishes.
+ *
+ * There is no version of a self-replacing restart that wins that race, so the
+ * honest move is to decline it and say so. Running under the supervisor avoids
+ * the situation entirely, which is why it is the supported way to do this.
+ */
+export function restartWouldRaceAWatcher(
+  env: NodeJS.ProcessEnv = process.env,
+  execArgv: readonly string[] = process.execArgv,
+): boolean {
+  return !restartHandledBySupervisor(env) && runningUnderTsx(execArgv);
+}
+
+/**
  * Starts the replacement process and detaches it.
  *
  * It has to outlive this one — the whole point is that nobody is at the

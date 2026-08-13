@@ -8,6 +8,8 @@ import {
   RESTART_EXIT_CODE,
   restartHandledBySupervisor,
   restartTarget,
+  restartWouldRaceAWatcher,
+  runningUnderTsx,
   updateCheckout,
   waitForParentExit,
   type CommandResult,
@@ -150,6 +152,43 @@ describe("restartHandledBySupervisor", () => {
   it("takes responsibility itself by default", () => {
     expect(restartHandledBySupervisor({})).toBe(false);
     expect(restartHandledBySupervisor({ FLEET_RESTART_MODE: "respawn" })).toBe(false);
+  });
+});
+
+describe("runningUnderTsx", () => {
+  it("sees the loader tsx puts on the command line", () => {
+    expect(
+      runningUnderTsx(["--require", "/repo/node_modules/tsx/dist/preflight.cjs"]),
+    ).toBe(true);
+  });
+
+  it("is false for a plain node", () => {
+    expect(runningUnderTsx([])).toBe(false);
+    expect(runningUnderTsx(["--enable-source-maps"])).toBe(false);
+  });
+});
+
+describe("restartWouldRaceAWatcher", () => {
+  it("declines to replace a process a watcher is also restarting", () => {
+    // The watcher's own child takes the instance lock while the successor is
+    // still starting, so the successor loses and exits — an update that reports
+    // success and leaves the machine on the build it just replaced.
+    expect(restartWouldRaceAWatcher({}, ["--require", "/x/tsx/dist/preflight.cjs"])).toBe(
+      true,
+    );
+  });
+
+  it("leaves a supervised node alone, which also runs through tsx", () => {
+    expect(
+      restartWouldRaceAWatcher({ FLEET_RESTART_MODE: "exit" }, [
+        "--require",
+        "/x/tsx/dist/preflight.cjs",
+      ]),
+    ).toBe(false);
+  });
+
+  it("does not stand in the way of a plain unsupervised node", () => {
+    expect(restartWouldRaceAWatcher({}, [])).toBe(false);
   });
 });
 
