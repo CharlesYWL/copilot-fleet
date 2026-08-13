@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, openSync } from "node:fs";
 import { resolve } from "node:path";
 import type { NodeUpdateStage } from "@fleet/protocol";
 import { isProcessAlive } from "@fleet/protocol/runtime";
@@ -166,19 +166,37 @@ export function restartHandledBySupervisor(
  * the environment because the successor must not race it for the instance lock:
  * the Host would see the newcomer as a superseding connection and the machine
  * would end up with no Node at all.
+ *
+ * Its output goes to a file rather than being inherited. Inheriting looked
+ * friendlier — the new process kept logging into the same terminal — but those
+ * handles belong to a console that goes away with the process being replaced,
+ * and the first line the successor logged afterwards killed it with EPIPE. The
+ * update reported success and left the machine with nothing running on it.
  */
 export function respawn(
   repoRoot: string,
   scriptPath: string,
   args: readonly string[] = process.argv.slice(2),
+  logPath?: string,
 ): void {
+  const output = logPath ? openLogFile(logPath) : "ignore";
   const child = spawn(process.execPath, [scriptPath, ...args], {
     cwd: repoRoot,
     detached: true,
-    stdio: "inherit",
+    stdio: ["ignore", output, output],
     env: { ...process.env, [UPDATE_PARENT_PID_ENV]: String(process.pid) },
   });
   child.unref();
+}
+
+/** Truncating keeps the file to the run it describes rather than every run. */
+function openLogFile(path: string): number | "ignore" {
+  try {
+    return openSync(path, "w");
+  } catch {
+    // A log nobody can write is not worth refusing to restart over.
+    return "ignore";
+  }
 }
 
 /**

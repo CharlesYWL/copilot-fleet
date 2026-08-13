@@ -1,5 +1,6 @@
 import { config as loadEnv } from "dotenv";
 import { arch, homedir, platform } from "node:os";
+import { join } from "node:path";
 import WebSocket from "ws";
 import {
   HOST_URL_SYNC_CAPABILITY,
@@ -319,7 +320,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           );
         }
         log(`Launching ${scriptPath}`);
-        respawn(root, scriptPath!, restartArgs);
+        const logPath = join(configDirectory(), "node.log");
+        log(`Its output goes to ${logPath}; this terminal stops here`);
+        respawn(root, scriptPath!, restartArgs, logPath);
       }
       await shutdown();
       releaseInstanceLock();
