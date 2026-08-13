@@ -115,6 +115,9 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
         ? settleNodeName(service, app, node, hello.name, hello.knownName)
         : undefined;
       if (named) service.publishNode(named);
+      // After the node is published, so the row already shows the revision it
+      // came back on when the update it was waiting for is marked finished.
+      service.settleUpdateOnReconnect(hello.nodeId, hello.revision);
       // Welcome precedes reconciliation because reconciliation can dispatch
       // commands, and a Node should not be told to resume a session before it
       // has been told its hello was accepted.

@@ -170,7 +170,16 @@ export function useFleet(notify: Notify) {
         }
         if (message.type === "node_update") {
           const { nodeId, stage, detail } = message;
-          setNodeUpdates((value) => ({ ...value, [nodeId]: { stage, detail } }));
+          setNodeUpdates((value) => {
+            // A finished update is not a state the row should go on describing:
+            // the toast carries the news, and dropping it lets the badge and its
+            // tooltip go back to explaining what the node is. A failure stays,
+            // because its reason is worth reading after the toast has gone.
+            if (stage !== "up_to_date") return { ...value, [nodeId]: { stage, detail } };
+            const next = { ...value };
+            delete next[nodeId];
+            return next;
+          });
           if (stage === "failed")
             notifyRef.current(detail || "Node update failed", "error");
           if (stage === "up_to_date")

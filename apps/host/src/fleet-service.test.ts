@@ -13,6 +13,9 @@ type SentFrame = {
   type: string;
   hostUrl?: string;
   name?: string;
+  nodeId?: string;
+  stage?: string;
+  detail?: string;
   command?: { type: string; sessionId: string };
 };
 
@@ -239,5 +242,75 @@ describe("requestUpdate", () => {
     enroll("unknown", [SELF_UPDATE_CAPABILITY], "");
 
     expect(service.staleNodeIds()).toEqual([stale.nodeId]);
+  });
+});
+
+describe("settleUpdateOnReconnect", () => {
+  /** Enrols a node with an update already in flight and a browser watching. */
+  function updating() {
+    const { service, enroll } = setup("host2222");
+    const node = enroll("devbox", ["copilot-acp", SELF_UPDATE_CAPABILITY], "node1111");
+    const browser = fakeSocket();
+    service.addBrowser(browser.socket);
+    service.requestUpdate(node.nodeId);
+    const stages = () =>
+      browser.sent.filter((frame) => frame.type === "node_update").map((f) => f.stage);
+    return { service, node, browser, stages };
+  }
+
+  it("finishes the update the node was never able to report on", () => {
+    const { service, node, browser, stages } = updating();
+    // "restarting" is the node's last word — it exits on the next line, so
+    // without the Host noticing the return, the browser renders it forever.
+    service.publishNodeUpdate(node.nodeId, "restarting", "Updated to abcdef123456");
+
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+
+    expect(stages()).toEqual(["checking", "restarting", "up_to_date"]);
+    // The revision it came back on is what the operator wanted to know.
+    expect(browser.sent.at(-1)?.detail).toBe("Updated to abcdef123456");
+  });
+
+  it("stays silent when a node reconnects for any other reason", () => {
+    // Tunnels drop and machines wake up; neither is an update finishing.
+    const { service, enroll } = setup("host2222");
+    const node = enroll("devbox", ["copilot-acp", SELF_UPDATE_CAPABILITY], "node1111");
+    const browser = fakeSocket();
+    service.addBrowser(browser.socket);
+
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+
+    expect(browser.sent).toEqual([]);
+  });
+
+  it("settles an update once, however often the node reconnects", () => {
+    const { service, node, browser } = updating();
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+    browser.sent.length = 0;
+
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+
+    expect(browser.sent).toEqual([]);
+  });
+
+  it("does not reopen an update that already failed", () => {
+    // A failure is a conclusion. The node still comes back — it never left —
+    // and that return must not overwrite the reason with a success.
+    const { service, node, browser } = updating();
+    service.publishNodeUpdate(node.nodeId, "failed", "A watcher owns this process");
+    browser.sent.length = 0;
+
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+
+    expect(browser.sent).toEqual([]);
+  });
+
+  it("still concludes when the node cannot name a revision", () => {
+    const { service, node, browser, stages } = updating();
+
+    service.settleUpdateOnReconnect(node.nodeId, undefined);
+
+    expect(stages()).toEqual(["checking", "up_to_date"]);
+    expect(browser.sent.at(-1)?.detail).toBe("Update finished");
   });
 });

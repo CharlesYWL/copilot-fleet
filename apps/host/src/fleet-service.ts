@@ -51,6 +51,14 @@ export type DispatchResult = {
 export class FleetService {
   private readonly nodeSockets = new Map<string, WebSocket>();
   private readonly browserSockets = new Set<WebSocket>();
+  /**
+   * Nodes told to update that have not yet reported how it went.
+   *
+   * A Node's last word before an update is "restarting", sent immediately
+   * before it exits: there is nobody left to send anything after that. The Host
+   * has to notice the return itself, so it remembers which Nodes owe it one.
+   */
+  private readonly updatesInFlight = new Set<string>();
   /** Suppresses disconnect bookkeeping while the Host itself is shutting down. */
   private closing = false;
 
@@ -266,6 +274,7 @@ export class FleetService {
     const updateId = randomUUID();
     this.send(socket, HostToNodeMessageSchema.parse({ type: "update_node", updateId }));
     this.log.info({ nodeId, updateId }, "Asked node to update itself");
+    this.updatesInFlight.add(nodeId);
     this.publishNodeUpdate(nodeId, "checking", "Update requested");
     return { started: true };
   }
@@ -279,7 +288,35 @@ export class FleetService {
   }
 
   publishNodeUpdate(nodeId: string, stage: NodeUpdateStage, detail: string): void {
+    // Only these two end an update. Every other stage is progress, and leaving
+    // the Node on the books through them is what lets the return be recognised.
+    if (stage === "up_to_date" || stage === "failed") {
+      this.updatesInFlight.delete(nodeId);
+    }
     this.broadcast({ type: "node_update", nodeId, stage, detail });
+  }
+
+  /**
+   * Files the report a restarting Node could not send for itself.
+   *
+   * "restarting" is the last thing a Node says before it exits, so nothing ever
+   * followed it: browsers kept rendering that stage forever, and a Node that had
+   * been back for minutes still showed as restarting until someone reloaded the
+   * page. The Node reconnecting is the missing report, and the revision it
+   * returns on is what the operator actually wants to see.
+   *
+   * Only Nodes with an update outstanding are settled, so an ordinary reconnect
+   * — a dropped tunnel, a machine waking up — stays silent.
+   */
+  settleUpdateOnReconnect(nodeId: string, revision: string | undefined): void {
+    if (!this.updatesInFlight.has(nodeId)) return;
+    const landed = revision?.trim();
+    this.log.info({ nodeId, revision: landed }, "Node returned from its update");
+    this.publishNodeUpdate(
+      nodeId,
+      "up_to_date",
+      landed ? `Updated to ${landed.slice(0, 12)}` : "Update finished",
+    );
   }
 
   /** Records a heartbeat, publishing only when a browser would render it. */
