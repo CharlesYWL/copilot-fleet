@@ -21,10 +21,9 @@ describe("settingsFromEnv", () => {
     // The documented default, so a node without the variable does not deny
     // permissions long before the operator's .env says it should.
     expect(settings.permissionTimeoutMs).toBe(DEFAULT_PERMISSION_TIMEOUT_MS);
-    // The static half of a session — system prompt, tool definitions, MCP
-    // servers — is charged before a single message is sent, so the wider
-    // window is the better default even though today's models mostly ignore
-    // the ask. See the note on the field for what was measured.
+    // Otherwise a node inherits whatever per-model tier the app on that machine
+    // happens to have been switched to, which is how two nodes end up running
+    // the same session on different windows. See the note on the field.
     expect(settings.contextTier).toBe("long_context");
   });
 

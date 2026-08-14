@@ -18,20 +18,24 @@ export const SettingsSchema = z.object({
   /**
    * Which context window agents on this machine are started with.
    *
-   * Copilot persists a tier of its own in ~/.copilot/settings.json, which the
-   * `--context` flag overrides. This setting is that flag, for the same reason
-   * `--allow-all` is passed explicitly rather than left to the environment: a
-   * fleet where one machine quietly runs a different window than the rest is
-   * one where the same session behaves differently depending on where it
-   * landed, with nothing on screen to say why.
+   * The long window is a setting on a model rather than a model of its own:
+   * Copilot's catalog puts claude-opus-5, claude-sonnet-5 and the Gemini models
+   * at 1,000,000 tokens (936,000 of them usable for the prompt) and the GPT-5.6
+   * family at 1,050,000, all under the same ids the model picker already shows.
+   * Which tier a model actually runs on is persisted per model, in the app's
+   * own store rather than a file the fleet can read — `copilot-context-tier`
+   * holds something like {"claude-opus-5":"long_context"} — and only covers the
+   * models someone has switched over by hand. A node that does not ask for a
+   * tier therefore inherits that map, so the same session gets a different
+   * window depending on which machine it landed on and what was clicked there.
+   * Asking every time is what makes that consistent, the same way `--allow-all`
+   * is passed explicitly rather than left to the environment.
    *
-   * Long by default, but the tier only ever widens a window Copilot has a
-   * wider variant for: measured against Copilot 1.0.80 the window a session
-   * gets is the model's own — 264k on claude-opus-5, claude-sonnet-5 and
-   * gemini-3.1-pro-preview, 400k on gpt-5.6-sol — and asking for the long tier
-   * moved none of them. Asking costs nothing and is right when a model that
-   * honours it appears, but the model picker is what actually decides how much
-   * room a session has today.
+   * Do not use `/context` to check whether this worked: in ACP mode it reports
+   * 264k for models the catalog puts at 1,000,000, and that figure is not the
+   * budget being enforced — a 435k-token prompt was accepted and answered from
+   * its first line. It appears to be a default-tier constant, and reading it as
+   * the real limit is how this setting first came to be documented as useless.
    *
    * Applies to agents started from now on; sessions already running keep the
    * tier they were launched with, since it is fixed at spawn.
