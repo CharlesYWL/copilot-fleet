@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { SessionEvent } from "@fleet/protocol";
 import {
   MockAgentFactory,
+  configRecoveryRequest,
   copilotLaunchArgs,
   copilotSupportsContextTier,
 } from "./agents.js";
@@ -65,6 +66,34 @@ describe("copilotSupportsContextTier", () => {
       throw new Error("ENOENT");
     };
     expect(await copilotSupportsContextTier("copilot", help)).toBe(false);
+  });
+});
+
+describe("configRecoveryRequest", () => {
+  const option = (id: string) =>
+    ({ id, name: id, category: "model", currentValue: "x", choices: [] }) as never;
+
+  it("asks for the permissions option when a resume brought back nothing", () => {
+    // session/load returns no option list and nothing later volunteers one, so
+    // a session that has never had pickers would never get them: setting an
+    // option is the only call that answers with the whole list.
+    expect(configRecoveryRequest([], false)).toEqual({
+      configId: "allow_all",
+      value: "off",
+    });
+  });
+
+  it("re-asserts the permission the Host already chose, rather than a guess", () => {
+    // The process was just launched with the matching --allow-all, so this
+    // changes nothing about the session — it only makes the pickers say so.
+    expect(configRecoveryRequest([], true)).toEqual({
+      configId: "allow_all",
+      value: "on",
+    });
+  });
+
+  it("leaves a session that reported its own options alone", () => {
+    expect(configRecoveryRequest([option("model")], true)).toBeUndefined();
   });
 });
 

@@ -24,6 +24,43 @@ export type PermissionDecision = {
  */
 export type ContextTier = "default" | "long_context";
 
+/**
+ * The permissions picker, whose value the Host already knows.
+ *
+ * Named here because it is the lever {@link configRecoveryRequest} pulls to get
+ * the option list back on a resumed session.
+ */
+const ALLOW_ALL_OPTION = "allow_all";
+
+/**
+ * What to set, if anything, to get a resumed session's pickers back.
+ *
+ * `session/new` reports the option list; `session/load` does not, and neither
+ * does any notification that follows it — there is no method to ask, either, so
+ * a resumed session has no idea what its own model or mode is. The Host papers
+ * over this by keeping the last list it was told, which works until a session
+ * has never had one: created by a fleet build too old to capture them, or by
+ * anything else that left the record empty. From then on every resume is a
+ * load, and the session stays pickerless permanently — a composer with nothing
+ * on it and no way to ask for anything.
+ *
+ * `session/set_config_option` answers with the whole list, so setting one
+ * breaks the deadlock. `allow_all` is the only option whose correct value is
+ * known without having read the list first: the Host decides it per session and
+ * the process was just launched with the matching `--allow-all`. Re-asserting
+ * it therefore changes nothing about the session and makes the pickers agree
+ * with what is already true of it.
+ */
+export function configRecoveryRequest(
+  options: readonly acp.SessionConfigOption[],
+  yolo: boolean,
+): { configId: string; value: string } | undefined {
+  // Anything already in hand came from the agent itself and is better than
+  // anything that could be asked for here.
+  if (options.length > 0) return undefined;
+  return { configId: ALLOW_ALL_OPTION, value: yolo ? "on" : "off" };
+}
+
 export interface SessionAgent {
   prompt(text: string, attachments?: readonly PromptAttachment[]): Promise<void>;
   cancel(): Promise<void>;
@@ -217,6 +254,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         this.replaying = false;
       }
       this.agentSessionId = resumeAgentSessionId;
+      await this.recoverConfigOptions();
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
@@ -227,6 +265,18 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.captureConfigOptions(created.configOptions);
     }
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
+  }
+
+  /** Gets the pickers back after a load that arrived without them. */
+  private async recoverConfigOptions(): Promise<void> {
+    const request = configRecoveryRequest(this.configOptions, this.yolo);
+    if (!request) return;
+    try {
+      await this.setConfigOption(request.configId, request.value);
+    } catch {
+      // An agent without this option is one that was never going to offer
+      // pickers, and a resumed session is worth more than the pickers on it.
+    }
   }
 
   /**
