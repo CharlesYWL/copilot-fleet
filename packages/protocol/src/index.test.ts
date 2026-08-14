@@ -1,15 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
+  HOST_BACKUP_KIND,
+  HostBackupSchema,
   HostToNodeMessageSchema,
+  NODE_BACKUP_KIND,
+  NodeBackupSchema,
   NodeCommandSchema,
   NodeToHostMessageSchema,
   RenameSessionSchema,
   SessionEventSchema,
   SessionSchema,
+  backupKind,
   canTransition,
   eventPayload,
+  isRotatingTunnelUrl,
   normalizeHostUrl,
   sameHostUrl,
+  sessionFieldsForHostImport,
   tryParseJson,
   type SessionEvent,
 } from "./index.js";
@@ -166,5 +173,78 @@ describe("eventPayload", () => {
     expect(eventPayload(event("tool", { toolCallId: "t1" }), "tool")).toEqual({
       toolCallId: "t1",
     });
+  });
+});
+
+describe("backup archives", () => {
+  it("names rotating tunnel hostnames so a Host move will not restore them", () => {
+    expect(isRotatingTunnelUrl("https://calm-sky.trycloudflare.com")).toBe(true);
+    expect(isRotatingTunnelUrl("https://abc.ngrok-free.app")).toBe(true);
+    expect(isRotatingTunnelUrl("https://abc.ngrok.io")).toBe(true);
+    expect(isRotatingTunnelUrl("http://bore.pub:45871")).toBe(true);
+    expect(isRotatingTunnelUrl("https://fleet.example.com")).toBe(false);
+    expect(isRotatingTunnelUrl("https://machine.ts.net")).toBe(false);
+    expect(isRotatingTunnelUrl("not-a-url")).toBe(true);
+  });
+
+  it("parks live sessions as offline on Host import and leaves settled ones alone", () => {
+    expect(sessionFieldsForHostImport({ state: "running", currentActivity: "coding" })).toEqual({
+      state: "offline",
+      currentActivity: "Imported onto this Host",
+    });
+    expect(
+      sessionFieldsForHostImport({ state: "failed", currentActivity: "Node gone" }),
+    ).toEqual({ state: "failed", currentActivity: "Node gone" });
+    expect(
+      sessionFieldsForHostImport({ state: "offline", currentActivity: "Host restarted" }),
+    ).toEqual({ state: "offline", currentActivity: "Host restarted" });
+  });
+
+  it("distinguishes a Host archive from a Node archive", () => {
+    expect(backupKind({ kind: HOST_BACKUP_KIND })).toBe(HOST_BACKUP_KIND);
+    expect(backupKind({ kind: NODE_BACKUP_KIND })).toBe(NODE_BACKUP_KIND);
+    expect(backupKind({ kind: "nope" })).toBeUndefined();
+    expect(backupKind(null)).toBeUndefined();
+  });
+
+  it("rejects a Node file parsed as a Host archive", () => {
+    expect(
+      HostBackupSchema.safeParse({
+        kind: NODE_BACKUP_KIND,
+        version: 1,
+        exportedAt: "2026-08-14T12:00:00.000Z",
+        enrollmentToken: "x",
+        tunnel: { enabled: false, provider: "cloudflare" },
+        defaults: { yolo: false, autoResume: true },
+        nodes: [],
+        workspaces: [],
+        placements: [],
+        sessions: [],
+        events: [],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("accepts a minimal Node archive", () => {
+    const parsed = NodeBackupSchema.parse({
+      kind: NODE_BACKUP_KIND,
+      version: 1,
+      exportedAt: "2026-08-14T12:00:00.000Z",
+      credentials: {
+        hostUrl: "https://fleet.example.com",
+        nodeId: "n1",
+        secret: "s",
+        name: "box",
+      },
+      settings: {
+        hostUrl: "https://fleet.example.com",
+        nodeName: "box",
+        maxSessions: 4,
+        copilotCommand: "",
+        permissionTimeoutMs: 30_000,
+      },
+    });
+    expect(parsed.settings.contextTier).toBe("long_context");
+    expect(parsed.settings.knownHostUrls).toEqual([]);
   });
 });

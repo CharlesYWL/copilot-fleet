@@ -204,6 +204,70 @@ describe("host routes", () => {
     expect((response.json() as { hostUrl: string }).hostUrl).toMatch(/^http/);
   });
 
+  it("exports and replaces the fleet from a Host archive", async () => {
+    const enrolled = await enroll("box");
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/workspaces",
+      payload: { name: "repo", description: "" },
+    });
+    expect(created.statusCode).toBe(201);
+
+    const exported = await app.inject({ method: "GET", url: "/api/backup" });
+    expect(exported.statusCode).toBe(200);
+    const backup = exported.json() as { kind: string; enrollmentToken: string; publicUrl?: string };
+    expect(backup.kind).toBe("copilot-fleet-host");
+    expect(backup.enrollmentToken).toBe("test-token");
+    expect(backup.publicUrl).toBeUndefined();
+
+    backup.enrollmentToken = "restored-token";
+    const imported = await app.inject({
+      method: "POST",
+      url: "/api/backup",
+      payload: backup,
+    });
+    expect(imported.statusCode).toBe(200);
+
+    const snapshot = (await app.inject({ method: "GET", url: "/api/snapshot" })).json() as {
+      nodes: { id: string }[];
+      workspaces: { name: string }[];
+    };
+    expect(snapshot.nodes.map((node) => node.id)).toContain(enrolled.nodeId);
+    expect(snapshot.workspaces.map((workspace) => workspace.name)).toContain("repo");
+    expect((await app.inject({ method: "GET", url: "/api/enrollment" })).json()).toMatchObject({
+      enrollmentToken: "restored-token",
+    });
+  });
+
+  it("refuses a Node identity file on the Host import endpoint", async () => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/backup",
+      payload: {
+        kind: "copilot-fleet-node",
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        credentials: {
+          hostUrl: "https://fleet.example.com",
+          nodeId: "n1",
+          secret: "s",
+          name: "box",
+        },
+        settings: {
+          hostUrl: "https://fleet.example.com",
+          nodeName: "box",
+          maxSessions: 4,
+          copilotCommand: "",
+          permissionTimeoutMs: 30_000,
+        },
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({
+      error: expect.stringContaining("node's config page"),
+    });
+  });
+
   it("keeps unknown API paths as JSON 404s", async () => {
     const response = await app.inject({ method: "GET", url: "/api/nope" });
     expect(response.statusCode).toBe(404);

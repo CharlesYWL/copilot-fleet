@@ -1,5 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Button,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
   MessageBar,
   MessageBarBody,
   Spinner,
@@ -39,15 +46,36 @@ const useStyles = makeStyles({
     justifyContent: "space-between",
     gap: "16px",
   },
+  actions: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "8px",
+  },
+  hidden: {
+    display: "none",
+  },
 });
 
 type Defaults = { yolo: boolean; autoResume: boolean };
+
+const downloadJson = (value: unknown, filename: string) => {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+};
 
 export const GeneralPanel = () => {
   const styles = useStyles();
   const [defaults, setDefaults] = useState<Defaults>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [pendingArchive, setPendingArchive] = useState<unknown>();
+  const fileInput = useRef<HTMLInputElement>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -76,6 +104,50 @@ export const GeneralPanel = () => {
       await refresh();
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleExport = async () => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      const backup = await api<unknown>("/api/backup");
+      const stamp = new Date().toISOString().slice(0, 10);
+      downloadJson(backup, `copilot-fleet-host-${stamp}.json`);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handlePickFile = async (file: File | undefined) => {
+    if (!file) return;
+    setError(undefined);
+    try {
+      const parsed: unknown = JSON.parse(await file.text());
+      setPendingArchive(parsed);
+      setConfirmOpen(true);
+    } catch {
+      setError("That file is not valid JSON.");
+    }
+  };
+
+  const handleImport = async () => {
+    if (pendingArchive === undefined) return;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await api("/api/backup", {
+        method: "POST",
+        body: JSON.stringify(pendingArchive),
+      });
+      window.location.reload();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setBusy(false);
+      setConfirmOpen(false);
+      setPendingArchive(undefined);
     }
   };
 
@@ -153,6 +225,82 @@ export const GeneralPanel = () => {
           />
         </div>
       </section>
+
+      <section className={styles.card}>
+        <div>
+          <Text weight="semibold">Move this Host</Text>
+          <br />
+          <Text className={styles.caption}>
+            Download a file with workspaces, nodes, sessions, transcripts, and settings.
+            Importing on another machine replaces everything there. The file includes the
+            enrollment token — treat it like a secret. Quick-tunnel URLs are left out;
+            a named hostname is kept. Node identities stay valid so existing machines can
+            reconnect, but Copilot conversations still live on those machines.
+          </Text>
+        </div>
+        <div className={styles.actions}>
+          <Button appearance="primary" disabled={busy} onClick={() => void handleExport()}>
+            Export fleet
+          </Button>
+          <Button
+            appearance="secondary"
+            disabled={busy}
+            onClick={() => fileInput.current?.click()}
+          >
+            Import fleet…
+          </Button>
+        </div>
+        <input
+          ref={fileInput}
+          className={styles.hidden}
+          type="file"
+          accept="application/json,.json"
+          aria-label="Choose a Host archive to import"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            event.target.value = "";
+            void handlePickFile(file);
+          }}
+        />
+      </section>
+
+      <Dialog
+        open={confirmOpen}
+        onOpenChange={(_event, data) => {
+          if (!data.open) {
+            setConfirmOpen(false);
+            setPendingArchive(undefined);
+          }
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Replace this Host?</DialogTitle>
+            <DialogContent>
+              <Text>
+                Importing wipes workspaces, nodes, sessions, and settings on this machine
+                and restores the archive. Connected nodes will drop and reconnect if their
+                secrets still match.
+              </Text>
+            </DialogContent>
+            <DialogActions>
+              <Button
+                appearance="secondary"
+                disabled={busy}
+                onClick={() => {
+                  setConfirmOpen(false);
+                  setPendingArchive(undefined);
+                }}
+              >
+                Cancel
+              </Button>
+              <Button appearance="primary" disabled={busy} onClick={() => void handleImport()}>
+                {busy ? "Importing…" : "Replace and import"}
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
     </div>
   );
 };

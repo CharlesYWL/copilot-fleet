@@ -1,4 +1,4 @@
-import { normalizeHostUrl } from "@fleet/protocol";
+import { isRotatingTunnelUrl, normalizeHostUrl } from "@fleet/protocol";
 
 /**
  * Whether a URL is worth announcing to a machine that is not this one.
@@ -22,6 +22,17 @@ export function isDialableHostUrl(url: string): boolean {
   if (bare === "localhost" || bare.endsWith(".localhost")) return false;
   if (bare === "::1" || bare === "::" || bare === "0.0.0.0") return false;
   return !/^127\./.test(bare);
+}
+
+/**
+ * Whether a public URL is worth copying onto another machine.
+ *
+ * Dialable is necessary but not sufficient: a trycloudflare hostname is
+ * reachable right now and gone after the next restart, so restoring it would
+ * point every Node at an address that will never answer.
+ */
+export function isTransferableHostUrl(url: string): boolean {
+  return isDialableHostUrl(url) && !isRotatingTunnelUrl(url);
 }
 
 export type HostUrlChange = { previous: string; next: string };

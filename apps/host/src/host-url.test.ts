@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HostUrlWatcher, isDialableHostUrl } from "./host-url.js";
+import { HostUrlWatcher, isDialableHostUrl, isTransferableHostUrl } from "./host-url.js";
 
 describe("isDialableHostUrl", () => {
   it("accepts an address another machine can reach", () => {
@@ -17,6 +17,20 @@ describe("isDialableHostUrl", () => {
     expect(isDialableHostUrl("http://0.0.0.0:8787")).toBe(false);
     expect(isDialableHostUrl("http://[::1]:8787")).toBe(false);
     expect(isDialableHostUrl("not-a-url")).toBe(false);
+  });
+});
+
+describe("isTransferableHostUrl", () => {
+  it("accepts a hostname that will still answer after the Host moves", () => {
+    expect(isTransferableHostUrl("https://fleet.example.com")).toBe(true);
+    expect(isTransferableHostUrl("https://machine.ts.net")).toBe(true);
+    expect(isTransferableHostUrl("http://192.168.1.20:8787")).toBe(true);
+  });
+
+  it("refuses loopback and rotating tunnel URLs", () => {
+    expect(isTransferableHostUrl("http://127.0.0.1:8787")).toBe(false);
+    expect(isTransferableHostUrl("https://calm-sky.trycloudflare.com")).toBe(false);
+    expect(isTransferableHostUrl("https://abc.ngrok-free.app")).toBe(false);
   });
 });
 

@@ -95,6 +95,27 @@
       </form>
 
       <div class="card">
+        <h2>Move this node</h2>
+        <p class="sub spaced">
+          Download this machine's identity and settings, then import the file on another
+          box. The file contains the node secret — treat it like a password. Running
+          agents on this process are stopped when you import.
+        </p>
+        <div class="row">
+          <button type="button" id="exportNode">Export identity</button>
+          <button type="button" class="secondary" id="importNode">Import identity…</button>
+        </div>
+        <input
+          id="backupFile"
+          class="hidden"
+          type="file"
+          accept="application/json,.json"
+          aria-label="Choose a node identity archive to import"
+        />
+        <div id="backupMsg"></div>
+      </div>
+
+      <div class="card">
         <h2>Workspaces</h2>
         <p class="sub spaced">Shared across the fleet.</p>
         <div id="workspaces"></div>

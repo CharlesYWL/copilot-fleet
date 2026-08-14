@@ -33,6 +33,13 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
       mockAgent: false,
     }),
     applySettings: vi.fn(async () => {}),
+    getCredentials: () => ({
+      hostUrl: "http://127.0.0.1:8787",
+      nodeId: "node-1",
+      secret: "secret",
+      name: "node",
+    }),
+    applyBackup: vi.fn(async () => {}),
     log: () => {},
     fleet,
     inspectPath: (path) =>
@@ -147,6 +154,77 @@ describe("config router", () => {
     const response = await route("POST", "/api/config", "not json");
     expect(response.status).toBe(500);
     expect(log).toHaveBeenCalled();
+  });
+
+  it("exports the stored identity", async () => {
+    const { route } = router();
+    const response = await route("GET", "/api/backup", "");
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      kind: "copilot-fleet-node",
+      version: 1,
+      credentials: { nodeId: "node-1", secret: "secret" },
+    });
+  });
+
+  it("refuses to export before the node has credentials", async () => {
+    const { route } = router({ getCredentials: () => undefined });
+    const response = await route("GET", "/api/backup", "");
+    expect(response.status).toBe(409);
+  });
+
+  it("imports a node archive", async () => {
+    const applyBackup = vi.fn(async () => {});
+    const { route } = router({ applyBackup });
+    const archive = {
+      kind: "copilot-fleet-node",
+      version: 1,
+      exportedAt: "2026-08-14T12:00:00.000Z",
+      credentials: {
+        hostUrl: "https://fleet.example.com",
+        nodeId: "moved",
+        secret: "other-secret",
+        name: "moved-box",
+      },
+      settings: {
+        hostUrl: "https://fleet.example.com",
+        nodeName: "moved-box",
+        maxSessions: 8,
+        copilotCommand: "",
+        permissionTimeoutMs: 30_000,
+      },
+    };
+    const response = await route("POST", "/api/backup", JSON.stringify(archive));
+    expect(response.status).toBe(200);
+    expect(applyBackup).toHaveBeenCalledOnce();
+    expect(applyBackup.mock.calls[0]?.[0].credentials.nodeId).toBe("moved");
+  });
+
+  it("refuses a Host archive on the node import endpoint", async () => {
+    const applyBackup = vi.fn(async () => {});
+    const { route } = router({ applyBackup });
+    const response = await route(
+      "POST",
+      "/api/backup",
+      JSON.stringify({
+        kind: "copilot-fleet-host",
+        version: 1,
+        exportedAt: "2026-08-14T12:00:00.000Z",
+        enrollmentToken: "x",
+        tunnel: { enabled: false, provider: "cloudflare" },
+        defaults: { yolo: true, autoResume: true },
+        nodes: [],
+        workspaces: [],
+        placements: [],
+        sessions: [],
+        events: [],
+      }),
+    );
+    expect(response.status).toBe(400);
+    expect(response.body).toMatchObject({
+      error: expect.stringContaining("Settings → General"),
+    });
+    expect(applyBackup).not.toHaveBeenCalled();
   });
 
   it("answers 404 for anything else", async () => {

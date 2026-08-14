@@ -52,14 +52,13 @@ export async function buildServer(
   } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
-  const enrollmentToken = resolveEnrollmentToken(
-    options.enrollmentToken ?? process.env.ENROLLMENT_TOKEN,
-    process.env.NODE_ENV,
-  );
   const store = new FleetStore(
     options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH),
   );
   store.resetConnectivity();
+  const enrollment = {
+    token: resolveRuntimeEnrollmentToken(store, options.enrollmentToken),
+  };
   const service = new FleetService(store, app.log, gitRevision());
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
   const listenPort = process.env.PORT ?? "8787";
@@ -72,7 +71,7 @@ export async function buildServer(
 
   const fallbackPublicUrl = () =>
     resolvePublicHostUrl(
-      process.env.FLEET_PUBLIC_URL,
+      process.env.FLEET_PUBLIC_URL || store.getSetting("host.publicUrl"),
       process.env.HOST,
       process.env.PORT,
     );
@@ -98,11 +97,11 @@ export async function buildServer(
     service,
     tunnel,
     version: VERSION,
-    enrollmentToken,
+    enrollment,
     fallbackPublicUrl,
     enrollmentHostUrl,
   });
-  await app.register(nodeRoutes, { service, enrollmentToken });
+  await app.register(nodeRoutes, { service, enrollment });
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
 
@@ -146,6 +145,20 @@ function hasIssues(value: unknown): value is { issues: unknown[] } {
     "issues" in value &&
     Array.isArray(value.issues)
   );
+}
+
+/**
+ * Tests pass a token explicitly; a moved Host reads the one restored into the
+ * database; a first boot falls through to the environment.
+ */
+function resolveRuntimeEnrollmentToken(
+  store: FleetStore,
+  optionsToken: string | undefined,
+): string {
+  if (optionsToken) return resolveEnrollmentToken(optionsToken, process.env.NODE_ENV);
+  const stored = store.getSetting("enrollment.token");
+  if (stored) return stored;
+  return resolveEnrollmentToken(process.env.ENROLLMENT_TOKEN, process.env.NODE_ENV);
 }
 
 function getStatusCode(value: unknown): number {

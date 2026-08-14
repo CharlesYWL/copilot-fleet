@@ -5,11 +5,15 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 import {
   type FleetNode,
   type FleetSession,
+  type HostBackup,
   type Placement,
   type SessionEvent,
   type SessionState,
   type TunnelProvider,
   type Workspace,
+  HOST_BACKUP_KIND,
+  BACKUP_VERSION,
+  HostBackupSchema,
   NodeSchema,
   PlacementSchema,
   SessionEventSchema,
@@ -18,6 +22,7 @@ import {
   WorkspaceSchema,
   eventPayload,
   canTransition,
+  sessionFieldsForHostImport,
   terminalSessionStates,
 } from "@fleet/protocol";
 
@@ -194,6 +199,164 @@ export class FleetStore {
 
   setTunnelProvider(provider: TunnelProvider): void {
     this.setSetting("tunnel.provider", provider);
+  }
+
+  /**
+   * A portable snapshot of this Host: catalog, transcripts, settings, and the
+   * hashes Nodes authenticate with. The caller supplies the enrollment token
+   * and (optionally) a public URL because those live outside the catalog tables.
+   */
+  exportHostBackup(input: { enrollmentToken: string; publicUrl?: string }): HostBackup {
+    const backup = {
+      kind: HOST_BACKUP_KIND,
+      version: BACKUP_VERSION,
+      exportedAt: new Date().toISOString(),
+      enrollmentToken: input.enrollmentToken,
+      ...(input.publicUrl ? { publicUrl: input.publicUrl } : {}),
+      tunnel: {
+        enabled: this.getTunnelEnabled(),
+        provider: this.getTunnelProvider(),
+      },
+      defaults: {
+        yolo: this.getDefaultYolo(),
+        autoResume: this.getAutoResume(),
+      },
+      nodes: (this.statement("SELECT * FROM nodes ORDER BY name").all() as Row[]).map(
+        (row) => ({
+          ...nodeFromRow(row),
+          secretHash: String(row.secret_hash),
+        }),
+      ),
+      workspaces: (
+        this.statement("SELECT * FROM workspaces ORDER BY position,name").all() as Row[]
+      ).map((row) => ({
+        ...workspaceFromRow(row),
+        position: Number(row.position ?? 0),
+      })),
+      placements: (
+        this.statement(
+          `SELECT p.*,w.name workspace_name,n.name node_name FROM placements p
+           JOIN workspaces w ON w.id=p.workspace_id JOIN nodes n ON n.id=p.node_id
+           ORDER BY w.name,p.position,n.name`,
+        ).all() as Row[]
+      ).map((row) => ({
+        ...placementFromRow(row),
+        position: Number(row.position ?? 0),
+      })),
+      sessions: (this.sessionQuery("ORDER BY s.position,s.created_at DESC").all() as Row[]).map(
+        (row) => ({
+          ...sessionFromRow(row),
+          position: Number(row.position ?? 0),
+        }),
+      ),
+      events: (
+        this.statement("SELECT * FROM events ORDER BY session_id,sequence").all() as Row[]
+      ).map(eventFromRow),
+    };
+    return HostBackupSchema.parse(backup);
+  }
+
+  /**
+   * Replaces every catalog row and settings key with the archive.
+   *
+   * Live session states become `offline` so a moved Host does not claim agents
+   * that are still on the old process. Node secret hashes are restored as-is,
+   * so machines that still have `node.json` can authenticate without re-enrolling.
+   */
+  replaceHostBackup(backup: HostBackup): void {
+    const parsed = HostBackupSchema.parse(backup);
+    this.transaction(() => {
+      this.db.exec(
+        "DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes; DELETE FROM settings",
+      );
+      this.setTunnelEnabled(parsed.tunnel.enabled);
+      this.setTunnelProvider(parsed.tunnel.provider);
+      this.setDefaultYolo(parsed.defaults.yolo);
+      this.setAutoResume(parsed.defaults.autoResume);
+      this.setSetting("enrollment.token", parsed.enrollmentToken);
+      if (parsed.publicUrl) this.setSetting("host.publicUrl", parsed.publicUrl);
+      for (const node of parsed.nodes) {
+        this.statement(
+          `INSERT INTO nodes
+            (id,name,secret_hash,os,arch,version,revision,capabilities,max_sessions,
+             active_sessions,last_heartbeat,online,home_dir)
+           VALUES (?,?,?,?,?,?,?,?,?,0,?,0,?)`,
+        ).run(
+          node.id,
+          node.name,
+          node.secretHash,
+          node.os,
+          node.arch,
+          node.version,
+          node.revision,
+          JSON.stringify(node.capabilities),
+          node.maxSessions,
+          node.lastHeartbeat,
+          node.homeDir,
+        );
+      }
+      for (const workspace of parsed.workspaces) {
+        this.statement(
+          "INSERT INTO workspaces (id,name,description,created_at,position) VALUES (?,?,?,?,?)",
+        ).run(
+          workspace.id,
+          workspace.name,
+          workspace.description,
+          workspace.createdAt,
+          workspace.position,
+        );
+      }
+      for (const placement of parsed.placements) {
+        this.statement(
+          "INSERT INTO placements (id,workspace_id,node_id,local_path,position) VALUES (?,?,?,?,?)",
+        ).run(
+          placement.id,
+          placement.workspaceId,
+          placement.nodeId,
+          placement.localPath,
+          placement.position,
+        );
+      }
+      for (const session of parsed.sessions) {
+        const imported = sessionFieldsForHostImport(session);
+        this.statement(
+          `INSERT INTO sessions
+            (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
+             last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
+             config_options,position)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          session.id,
+          session.workspaceId,
+          session.placementId,
+          session.nodeId,
+          imported.state,
+          session.initialPrompt,
+          imported.currentActivity,
+          session.lastText,
+          session.createdAt,
+          session.updatedAt,
+          session.agentSessionId,
+          session.yolo ? 1 : 0,
+          session.name,
+          JSON.stringify(session.commands),
+          JSON.stringify(session.configOptions),
+          session.position,
+        );
+      }
+      for (const event of parsed.events) {
+        this.statement(
+          "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at) VALUES (?,?,?,?,?,?)",
+        ).run(
+          event.eventId,
+          event.sessionId,
+          event.sequence,
+          event.type,
+          JSON.stringify(event.payload),
+          event.createdAt,
+        );
+      }
+    });
   }
 
   /** Keeps databases created before a column was introduced usable. */

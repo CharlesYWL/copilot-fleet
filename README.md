@@ -44,6 +44,7 @@ runs. Stop everything with Ctrl+C as usual.
 
 Open the UI → **Settings**:
 
+- **General** — session defaults, plus export/import to move this Host.
 - **Tunnel** — toggle a Cloudflare quick tunnel (requires `cloudflared` on PATH).
 - **Nodes** — rename/delete machines and copy the enroll command.
 - **Workspaces** — map projects to per-machine paths.
@@ -257,6 +258,29 @@ every setting — switching to a model without reasoning levels removes the
 Reasoning Effort control. The agent's whole option list is republished on every
 change for that reason, so the bar never keeps a control the current model has
 stopped offering.
+
+### Moving a Host or a Node to another machine
+
+The fleet is two kinds of state, so there are two files.
+
+**Host** — Settings → General → **Export fleet**. The JSON file holds workspaces,
+placements, nodes (identity hashes, not plaintext secrets), sessions, transcripts,
+defaults, the enrollment token, and tunnel provider/enabled. Import on the new
+machine **replaces** whatever is already there.
+
+Existing nodes reconnect with the `node.json` they already have, as long as they
+can still reach the Host. A named hostname / `FLEET_PUBLIC_URL` / Tailscale Funnel
+address is copied into the archive; a rotating quick-tunnel URL (`*.trycloudflare.com`,
+free ngrok, bore) is not — those nodes would have to be retargeted by hand.
+
+**Node** — the local config page (`http://127.0.0.1:8788`) → **Export identity**.
+That file is `node.json` plus `settings.json` for this machine. Import on the new
+box replaces this process's identity and reconnects. Placement paths stay whatever
+the Host already stored for that node id; update them if the checkout lives
+somewhere else. Copilot's own session files are not in the archive, so **Resume**
+only works if those files are on the machine that runs the agent.
+
+Both files contain secrets. Do not commit them.
 
 ### Recovering sessions after a restart
 

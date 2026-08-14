@@ -14,6 +14,7 @@ import {
   type BrowserMessage,
   type FleetNode,
   type FleetSession,
+  type HostBackup,
   type NodeCommand,
   type NodeUpdateStage,
   type SessionEvent,
@@ -105,6 +106,32 @@ export class FleetService {
     if (!socket) return;
     this.nodeSockets.delete(nodeId);
     socket.close(code, reason);
+  }
+
+  /**
+   * Drops every Node socket without touching session rows.
+   *
+   * Used before a backup replace: the catalog is about to be wiped, so marking
+   * the old sessions offline would only race the delete. Removing the socket
+   * from the map first means the close handler will not call disconnectNode.
+   */
+  evictAllNodes(code: number, reason: string): void {
+    for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
+      this.nodeSockets.delete(nodeId);
+      socket.close(code, reason);
+    }
+  }
+
+  /**
+   * Replaces the catalog with a Host archive and tells every browser.
+   *
+   * Nodes are hung up first so they cannot append events into the new rows
+   * under ids that no longer mean what they did a moment ago.
+   */
+  importHostBackup(backup: HostBackup): void {
+    this.evictAllNodes(4002, "Host restored from backup");
+    this.store.replaceHostBackup(backup);
+    this.broadcast({ type: "snapshot", data: this.snapshot() });
   }
 
   send(socket: WebSocket, message: unknown): void {

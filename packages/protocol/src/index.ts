@@ -818,6 +818,130 @@ export const UpdateTunnelSchema = z.object({
   provider: TunnelProviderSchema.optional(),
 });
 
+/**
+ * Versioned archives for moving a Host or a Node to another machine.
+ *
+ * Two kinds on purpose: the Host never sees a Node's plaintext secret, and a
+ * Node has no business ingesting another fleet's catalog. The `kind` field is
+ * what lets each side refuse the other's file with a useful error.
+ */
+export const HOST_BACKUP_KIND = "copilot-fleet-host" as const;
+export const NODE_BACKUP_KIND = "copilot-fleet-node" as const;
+export const BACKUP_VERSION = 1 as const;
+
+export const HostBackupNodeSchema = NodeSchema.extend({
+  /** SHA-256 hex of the Node secret; enough to authenticate, never to impersonate. */
+  secretHash: z.string().regex(/^[a-f0-9]{64}$/),
+});
+export type HostBackupNode = z.infer<typeof HostBackupNodeSchema>;
+
+export const HostBackupWorkspaceSchema = WorkspaceSchema.extend({
+  position: z.number().int(),
+});
+export type HostBackupWorkspace = z.infer<typeof HostBackupWorkspaceSchema>;
+
+export const HostBackupPlacementSchema = PlacementSchema.extend({
+  position: z.number().int(),
+});
+export type HostBackupPlacement = z.infer<typeof HostBackupPlacementSchema>;
+
+export const HostBackupSessionSchema = SessionSchema.extend({
+  position: z.number().int(),
+});
+export type HostBackupSession = z.infer<typeof HostBackupSessionSchema>;
+
+export const HostBackupSchema = z.object({
+  kind: z.literal(HOST_BACKUP_KIND),
+  version: z.literal(BACKUP_VERSION),
+  exportedAt: z.string().datetime(),
+  enrollmentToken: z.string().min(1),
+  /** Omitted when the live URL would not survive a move (loopback / quick tunnel). */
+  publicUrl: z.string().url().optional(),
+  tunnel: z.object({
+    enabled: z.boolean(),
+    provider: TunnelProviderSchema,
+  }),
+  defaults: z.object({
+    yolo: z.boolean(),
+    autoResume: z.boolean(),
+  }),
+  nodes: z.array(HostBackupNodeSchema),
+  workspaces: z.array(HostBackupWorkspaceSchema),
+  placements: z.array(HostBackupPlacementSchema),
+  sessions: z.array(HostBackupSessionSchema),
+  events: z.array(SessionEventSchema),
+});
+export type HostBackup = z.infer<typeof HostBackupSchema>;
+
+export const NodeBackupCredentialsSchema = z.object({
+  hostUrl: z.string().url(),
+  nodeId: z.string().min(1),
+  secret: z.string().min(1),
+  name: z.string().min(1),
+});
+export type NodeBackupCredentials = z.infer<typeof NodeBackupCredentialsSchema>;
+
+export const NodeBackupSettingsSchema = z.object({
+  hostUrl: z.string().url(),
+  nodeName: z.string().min(1).max(120),
+  maxSessions: z.number().int().min(1).max(64),
+  copilotCommand: z.string(),
+  permissionTimeoutMs: z.number().int().min(1_000).max(3_600_000),
+  contextTier: z.enum(["default", "long_context"]).default("long_context"),
+  knownHostUrls: z.array(z.string()).default([]),
+});
+export type NodeBackupSettings = z.infer<typeof NodeBackupSettingsSchema>;
+
+export const NodeBackupSchema = z.object({
+  kind: z.literal(NODE_BACKUP_KIND),
+  version: z.literal(BACKUP_VERSION),
+  exportedAt: z.string().datetime(),
+  credentials: NodeBackupCredentialsSchema,
+  settings: NodeBackupSettingsSchema,
+});
+export type NodeBackup = z.infer<typeof NodeBackupSchema>;
+
+/** Hostnames that are issued per process and die when that process does. */
+export function isRotatingTunnelUrl(url: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return true;
+  }
+  return (
+    hostname.endsWith(".trycloudflare.com") ||
+    hostname.endsWith(".ngrok-free.app") ||
+    hostname.endsWith(".ngrok.io") ||
+    hostname === "bore.pub" ||
+    hostname.endsWith(".bore.pub")
+  );
+}
+
+/**
+ * Live sessions cannot move with the Host process, so import parks them in
+ * `offline` — the same landing a Host restart uses — and Resume can re-attach
+ * once the original Node is back.
+ */
+export function sessionFieldsForHostImport(
+  session: Pick<FleetSession, "state" | "currentActivity">,
+): { state: SessionState; currentActivity: string } {
+  if (terminalSessionStates.has(session.state) || session.state === "offline") {
+    return { state: session.state, currentActivity: session.currentActivity };
+  }
+  return { state: "offline", currentActivity: "Imported onto this Host" };
+}
+
+/** Reads `kind` off an unknown JSON value so a mismatched file can be named. */
+export function backupKind(
+  value: unknown,
+): typeof HOST_BACKUP_KIND | typeof NODE_BACKUP_KIND | undefined {
+  if (!value || typeof value !== "object" || !("kind" in value)) return undefined;
+  const kind = (value as { kind: unknown }).kind;
+  if (kind === HOST_BACKUP_KIND || kind === NODE_BACKUP_KIND) return kind;
+  return undefined;
+}
+
 const transitions: Record<SessionState, ReadonlySet<SessionState>> = {
   queued: new Set(["starting", "failed", "offline", "stopped"]),
   // Idle is reachable because a resumed session lands in starting and then

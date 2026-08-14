@@ -709,3 +709,88 @@ describe("FleetStore", () => {
     expect(store.getNode(node.id)).toBeUndefined();
   });
 });
+
+describe("Host backup", () => {
+  it("round-trips catalog, transcripts, hashes, and parks live sessions", () => {
+    const { store, node, workspace, placement } = setup();
+    const { secret } = store.registerNode({
+      name: "other",
+      os: "linux",
+      arch: "arm64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 3,
+    });
+    store.setDefaultYolo(false);
+    store.setAutoResume(false);
+    store.setTunnelEnabled(true);
+    store.setTunnelProvider("tailscale");
+    store.reorderWorkspaces([workspace.id]);
+    const live = store.createSession(placement, "keep going", true, "alpha");
+    store.transitionSession(live.id, "starting");
+    store.transitionSession(live.id, "running", "coding");
+    store.appendEvent({
+      eventId: "e1",
+      sessionId: live.id,
+      sequence: 1,
+      type: "agent_text",
+      payload: { text: "hello from the agent" },
+      createdAt: new Date().toISOString(),
+    });
+    store.appendEvent({
+      eventId: "e2",
+      sessionId: live.id,
+      sequence: 2,
+      type: "agent_session",
+      payload: { agentSessionId: "acp-keep" },
+      createdAt: new Date().toISOString(),
+    });
+    const stopped = store.createSession(placement, "already done");
+    store.transitionSession(stopped.id, "stopped", "done");
+
+    const backup = store.exportHostBackup({
+      enrollmentToken: "move-me",
+      publicUrl: "https://fleet.example.com",
+    });
+    expect(backup.kind).toBe("copilot-fleet-host");
+    expect(backup.nodes).toHaveLength(2);
+    expect(backup.events).toHaveLength(2);
+
+    const restored = new FleetStore(":memory:");
+    stores.push(restored);
+    restored.replaceHostBackup(backup);
+
+    expect(restored.authenticateNode(node.id, secret)).toBe(false);
+    const other = restored.listNodes().find((entry) => entry.name === "other")!;
+    expect(restored.authenticateNode(other.id, secret)).toBe(true);
+    expect(restored.getDefaultYolo()).toBe(false);
+    expect(restored.getAutoResume()).toBe(false);
+    expect(restored.getTunnelEnabled()).toBe(true);
+    expect(restored.getTunnelProvider()).toBe("tailscale");
+    expect(restored.getSetting("enrollment.token")).toBe("move-me");
+    expect(restored.getSetting("host.publicUrl")).toBe("https://fleet.example.com");
+    expect(restored.listWorkspaces()[0]?.id).toBe(workspace.id);
+    expect(restored.listPlacements()[0]?.localPath).toBe("C:\\repo");
+
+    const importedLive = restored.getSession(live.id)!;
+    expect(importedLive.state).toBe("offline");
+    expect(importedLive.currentActivity).toBe("Imported onto this Host");
+    expect(importedLive.agentSessionId).toBe("acp-keep");
+    expect(importedLive.name).toBe("alpha");
+    expect(importedLive.yolo).toBe(true);
+    expect(restored.listEvents(live.id)).toHaveLength(2);
+    expect(restored.getSession(stopped.id)?.state).toBe("stopped");
+  });
+
+  it("replaces whatever was already on the destination Host", () => {
+    const { store, workspace } = setup();
+    const backup = store.exportHostBackup({ enrollmentToken: "token" });
+
+    const other = new FleetStore(":memory:");
+    stores.push(other);
+    other.createWorkspace("pre-existing", "");
+    other.replaceHostBackup(backup);
+    expect(other.listWorkspaces().map((entry) => entry.name)).toEqual([workspace.name]);
+    expect(other.listWorkspaces()).toHaveLength(1);
+  });
+});

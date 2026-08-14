@@ -1,7 +1,16 @@
 import { createServer, type Server } from "node:http";
 import { z } from "zod";
-import { errorMessage } from "@fleet/protocol";
+import {
+  BACKUP_VERSION,
+  HOST_BACKUP_KIND,
+  NODE_BACKUP_KIND,
+  NodeBackupSchema,
+  backupKind,
+  errorMessage,
+  type NodeBackup,
+} from "@fleet/protocol";
 import { EditableSettingsSchema, type Settings } from "./settings.js";
+import type { Credentials } from "./config.js";
 import { configAsset } from "./config-assets.js";
 import { FleetClient, type PlacementLike, type WorkspaceLike } from "./fleet-client.js";
 import { pickFolder as pickFolderDefault, type PickerResult } from "./pick-folder.js";
@@ -47,6 +56,8 @@ export type ConfigServerOptions = {
   getSettings: () => Settings;
   getStatus: () => ConfigStatus;
   applySettings: (settings: Settings) => Promise<void>;
+  getCredentials: () => Credentials | undefined;
+  applyBackup: (archive: NodeBackup) => Promise<void>;
   log: (message: string) => void;
   /** Resolved by the caller so a command-line flag can outrank the variable. */
   port?: number;
@@ -120,6 +131,47 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
 
   const routes = new Map<string, Handler>([
     ["GET /api/config", async () => state()],
+    [
+      "GET /api/backup",
+      async () => {
+        const credentials = options.getCredentials();
+        if (!credentials) {
+          return {
+            status: 409,
+            body: { error: "Enroll this node before exporting its identity." },
+          };
+        }
+        return ok({
+          kind: NODE_BACKUP_KIND,
+          version: BACKUP_VERSION,
+          exportedAt: new Date().toISOString(),
+          credentials,
+          settings: options.getSettings(),
+        });
+      },
+    ],
+    [
+      "POST /api/backup",
+      async (body) => {
+        let parsedBody: unknown;
+        try {
+          parsedBody = JSON.parse(body);
+        } catch {
+          return badRequest("Not valid JSON.");
+        }
+        if (backupKind(parsedBody) === HOST_BACKUP_KIND) {
+          return badRequest(
+            "This file is a Host archive. Import it under Settings → General on the Host.",
+          );
+        }
+        const parsed = NodeBackupSchema.safeParse(parsedBody);
+        if (!parsed.success) {
+          return badRequest("Not a Copilot Fleet node identity archive.");
+        }
+        await options.applyBackup(parsed.data);
+        return state();
+      },
+    ],
     [
       "POST /api/config",
       async (body) => {

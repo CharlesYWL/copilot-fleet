@@ -14,6 +14,7 @@ import {
   decodeFrame,
   errorMessage,
   sameHostUrl,
+  type NodeBackup,
   type NodeToHostMessage,
   type NodeUpdateStage,
   type SessionEvent,
@@ -51,6 +52,7 @@ import {
   needsReconnect,
   saveSettings,
   settingsOverridesFromEnv,
+  SettingsSchema,
   type Settings,
 } from "./settings.js";
 import {
@@ -209,6 +211,28 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     }
     log(`Settings changed; reconnecting to ${settled.hostUrl}`);
     credentials = await ensureCredentials();
+    reconnect();
+  }
+
+  /**
+   * Takes over this process as the imported machine: stop local agents, write
+   * both identity files, and dial the Host as that node.
+   */
+  async function applyBackup(archive: NodeBackup): Promise<void> {
+    await router.stopAll();
+    credentials = archive.credentials;
+    settings = SettingsSchema.parse(archive.settings);
+    await saveCredentials(credentials);
+    await saveSettings(settings);
+    router.setMaxSessions(settings.maxSessions);
+    if (factory instanceof AcpAgentFactory) {
+      factory.configure(
+        settings.permissionTimeoutMs,
+        settings.copilotCommand,
+        settings.contextTier,
+      );
+    }
+    log(`Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`);
     reconnect();
   }
 
@@ -381,6 +405,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       mockAgent,
     }),
     applySettings,
+    getCredentials: () => credentials,
+    applyBackup,
     log,
     port: configServerPort(env),
   });

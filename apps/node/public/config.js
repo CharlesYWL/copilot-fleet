@@ -98,6 +98,50 @@ void load();
 // The connection state changes without any interaction here, so poll it.
 setInterval(load, 5000);
 
+const downloadJson = (value, filename) => {
+  const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+};
+
+$("exportNode").addEventListener("click", async () => {
+  try {
+    const response = await fetch("/api/backup");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Export failed");
+    downloadJson(data, "copilot-fleet-node-" + new Date().toISOString().slice(0, 10) + ".json");
+    note("backupMsg", "Downloaded.", true);
+  } catch (error) {
+    note("backupMsg", error.message, false);
+  }
+});
+
+$("importNode").addEventListener("click", () => $("backupFile").click());
+
+$("backupFile").addEventListener("change", async (event) => {
+  const file = event.target.files && event.target.files[0];
+  event.target.value = "";
+  if (!file) return;
+  if (
+    !window.confirm(
+      "Importing replaces this machine's identity and stops running agents. Continue?",
+    )
+  ) {
+    return;
+  }
+  try {
+    const archive = JSON.parse(await file.text());
+    render(await post("/api/backup", archive));
+    note("backupMsg", "Imported. Reconnecting…", true);
+  } catch (error) {
+    note("backupMsg", error.message, false);
+  }
+});
+
 // ---- Workspaces and placements (proxied through this node to the Host) ----
 
 let workspaces = [];

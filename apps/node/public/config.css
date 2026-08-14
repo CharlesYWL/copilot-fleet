@@ -101,9 +101,11 @@ button:disabled {
   opacity: 0.55;
   cursor: default;
 }
-button:focus-visible {
-  outline: 2px solid #9dc0ff;
-  outline-offset: 2px;
+button.secondary {
+  background: #2a3140;
+}
+.hidden {
+  display: none;
 }
 .msg {
   margin-top: 14px;

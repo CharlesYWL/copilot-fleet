@@ -9,13 +9,13 @@ import type { FleetService } from "../fleet-service.js";
 
 export type NodeRouteOptions = {
   service: FleetService;
-  enrollmentToken: string;
+  enrollment: { token: string };
 };
 
 /** Node enrollment plus the rename/delete a browser drives from Settings. */
 export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
   app,
-  { service, enrollmentToken },
+  { service, enrollment },
 ) => {
   const { store } = service;
 
@@ -58,7 +58,7 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
 
   app.post("/api/nodes/register", async (request, reply) => {
     const input = RegisterNodeSchema.parse(request.body);
-    if (input.enrollmentToken !== enrollmentToken) {
+    if (input.enrollmentToken !== enrollment.token) {
       return reply.code(401).send({ error: "Invalid enrollment token" });
     }
     try {
