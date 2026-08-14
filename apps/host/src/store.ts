@@ -243,12 +243,12 @@ export class FleetStore {
         ...placementFromRow(row),
         position: Number(row.position ?? 0),
       })),
-      sessions: (this.sessionQuery("ORDER BY s.position,s.created_at DESC").all() as Row[]).map(
-        (row) => ({
-          ...sessionFromRow(row),
-          position: Number(row.position ?? 0),
-        }),
-      ),
+      sessions: (
+        this.sessionQuery("ORDER BY s.position,s.created_at DESC").all() as Row[]
+      ).map((row) => ({
+        ...sessionFromRow(row),
+        position: Number(row.position ?? 0),
+      })),
       events: (
         this.statement("SELECT * FROM events ORDER BY session_id,sequence").all() as Row[]
       ).map(eventFromRow),

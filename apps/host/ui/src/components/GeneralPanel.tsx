@@ -233,13 +233,17 @@ export const GeneralPanel = () => {
           <Text className={styles.caption}>
             Download a file with workspaces, nodes, sessions, transcripts, and settings.
             Importing on another machine replaces everything there. The file includes the
-            enrollment token — treat it like a secret. Quick-tunnel URLs are left out;
-            a named hostname is kept. Node identities stay valid so existing machines can
+            enrollment token — treat it like a secret. Quick-tunnel URLs are left out; a
+            named hostname is kept. Node identities stay valid so existing machines can
             reconnect, but Copilot conversations still live on those machines.
           </Text>
         </div>
         <div className={styles.actions}>
-          <Button appearance="primary" disabled={busy} onClick={() => void handleExport()}>
+          <Button
+            appearance="primary"
+            disabled={busy}
+            onClick={() => void handleExport()}
+          >
             Export fleet
           </Button>
           <Button
@@ -294,7 +298,11 @@ export const GeneralPanel = () => {
               >
                 Cancel
               </Button>
-              <Button appearance="primary" disabled={busy} onClick={() => void handleImport()}>
+              <Button
+                appearance="primary"
+                disabled={busy}
+                onClick={() => void handleImport()}
+              >
                 {busy ? "Importing…" : "Replace and import"}
               </Button>
             </DialogActions>

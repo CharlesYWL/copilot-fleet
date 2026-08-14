@@ -215,7 +215,11 @@ describe("host routes", () => {
 
     const exported = await app.inject({ method: "GET", url: "/api/backup" });
     expect(exported.statusCode).toBe(200);
-    const backup = exported.json() as { kind: string; enrollmentToken: string; publicUrl?: string };
+    const backup = exported.json() as {
+      kind: string;
+      enrollmentToken: string;
+      publicUrl?: string;
+    };
     expect(backup.kind).toBe("copilot-fleet-host");
     expect(backup.enrollmentToken).toBe("test-token");
     expect(backup.publicUrl).toBeUndefined();
@@ -228,13 +232,17 @@ describe("host routes", () => {
     });
     expect(imported.statusCode).toBe(200);
 
-    const snapshot = (await app.inject({ method: "GET", url: "/api/snapshot" })).json() as {
+    const snapshot = (
+      await app.inject({ method: "GET", url: "/api/snapshot" })
+    ).json() as {
       nodes: { id: string }[];
       workspaces: { name: string }[];
     };
     expect(snapshot.nodes.map((node) => node.id)).toContain(enrolled.nodeId);
     expect(snapshot.workspaces.map((workspace) => workspace.name)).toContain("repo");
-    expect((await app.inject({ method: "GET", url: "/api/enrollment" })).json()).toMatchObject({
+    expect(
+      (await app.inject({ method: "GET", url: "/api/enrollment" })).json(),
+    ).toMatchObject({
       enrollmentToken: "restored-token",
     });
   });

@@ -232,7 +232,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         settings.contextTier,
       );
     }
-    log(`Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`);
+    log(
+      `Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`,
+    );
     reconnect();
   }
 
