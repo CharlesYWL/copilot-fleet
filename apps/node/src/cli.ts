@@ -83,6 +83,15 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
     },
   },
   {
+    names: ["--context-tier"],
+    spec: {
+      env: "FLEET_CONTEXT_TIER",
+      placeholder: "<default|long_context>",
+      help: "Context window agents are started with (FLEET_CONTEXT_TIER)",
+      persisted: true,
+    },
+  },
+  {
     names: ["--config-port"],
     spec: {
       env: "FLEET_NODE_CONFIG_PORT",

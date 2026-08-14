@@ -104,6 +104,7 @@ machine. Run `npm run start:node -- --help` for the current list.
 | `--max-sessions`                  | `FLEET_MAX_SESSIONS`     |
 | `--copilot-command`               | `FLEET_COPILOT_COMMAND`  |
 | `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`  |
+| `--context-tier`                  | `FLEET_CONTEXT_TIER`     |
 | `--config-port`                   | `FLEET_NODE_CONFIG_PORT` |
 | `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`       |
 

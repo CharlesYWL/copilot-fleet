@@ -16,6 +16,25 @@ export const SettingsSchema = z.object({
   copilotCommand: z.string(),
   permissionTimeoutMs: z.number().int().min(1_000).max(3_600_000),
   /**
+   * Which context window agents on this machine are started with.
+   *
+   * Copilot persists a tier of its own in ~/.copilot/settings.json, which the
+   * `--context` flag overrides. This setting is that flag, for the same reason
+   * `--allow-all` is passed explicitly rather than left to the environment: a
+   * fleet where one machine quietly runs a smaller window than the rest is one
+   * where the same session behaves differently depending on where it landed,
+   * with nothing on screen to say why.
+   *
+   * Long by default. The static half of a session — system prompt, tool
+   * definitions, MCP servers — is charged before a single message is sent, and
+   * a fleet node carrying a few MCP servers can spend most of a default window
+   * on that alone.
+   *
+   * Applies to agents started from now on; sessions already running keep the
+   * tier they were launched with, since it is fixed at spawn.
+   */
+  contextTier: z.enum(["default", "long_context"]).default("long_context"),
+  /**
    * Addresses this node has reached the Host on before, newest first.
    *
    * Filled in when the Host announces that it moved: the address being replaced
@@ -69,6 +88,7 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): Settings 
     permissionTimeoutMs: Number(
       env.PERMISSION_TIMEOUT_MS ?? DEFAULT_PERMISSION_TIMEOUT_MS,
     ),
+    contextTier: env.FLEET_CONTEXT_TIER ?? undefined,
   });
 }
 
@@ -91,6 +111,13 @@ export function settingsOverridesFromEnv(env: NodeJS.ProcessEnv): Partial<Settin
   }
   if (env.PERMISSION_TIMEOUT_MS !== undefined) {
     overrides.permissionTimeoutMs = Number(env.PERMISSION_TIMEOUT_MS);
+  }
+  if (env.FLEET_CONTEXT_TIER !== undefined) {
+    // Cast rather than validated here: every path into settings ends at
+    // SettingsSchema.parse, which rejects an unrecognised tier with a message
+    // naming the field. Quietly dropping it would start the node on a window
+    // the operator did not ask for and say nothing.
+    overrides.contextTier = env.FLEET_CONTEXT_TIER as Settings["contextTier"];
   }
   return overrides;
 }

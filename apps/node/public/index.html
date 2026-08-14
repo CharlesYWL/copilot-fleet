@@ -78,6 +78,18 @@
           <span class="hint">How long a non-YOLO session waits for your approval.</span>
         </label>
 
+        <label>
+          <span class="label">Context window</span>
+          <select id="contextTier" name="contextTier">
+            <option value="long_context">Long</option>
+            <option value="default">Default</option>
+          </select>
+          <span class="hint">
+            Applies to sessions started from here on. Ignored if this machine's Copilot is
+            too old to accept <code>--context</code>.
+          </span>
+        </label>
+
         <button type="submit" id="save">Save</button>
         <div id="msg"></div>
       </form>

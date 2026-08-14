@@ -107,6 +107,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   log(`  agent       ${mockAgent ? "mock" : "copilot --acp"}`);
   log(`  permissions ${mockAgent ? "n/a" : "per session (Host decides)"}`);
   log(`  capacity    ${settings.maxSessions} concurrent sessions`);
+  if (!mockAgent) log(`  context     ${settings.contextTier}`);
   log(`  config      ${configDirectory()}`);
   const overridden = Object.keys(flags.env);
   // Naming the keys (never the values — one of them is a token) explains why
@@ -148,7 +149,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   const factory = mockAgent
     ? new MockAgentFactory()
-    : new AcpAgentFactory(settings.permissionTimeoutMs, settings.copilotCommand);
+    : new AcpAgentFactory(
+        settings.permissionTimeoutMs,
+        settings.copilotCommand,
+        settings.contextTier,
+      );
   let socket: WebSocket | undefined;
   let shuttingDown = false;
   let updating = false;
@@ -192,7 +197,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     await saveSettings(settled);
     router.setMaxSessions(settled.maxSessions);
     if (factory instanceof AcpAgentFactory) {
-      factory.configure(settled.permissionTimeoutMs, settled.copilotCommand);
+      factory.configure(
+        settled.permissionTimeoutMs,
+        settled.copilotCommand,
+        settled.contextTier,
+      );
     }
     if (!needsReconnect(previous, settled)) {
       log("Settings updated; no reconnect needed");

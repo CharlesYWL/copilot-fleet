@@ -14,6 +14,7 @@ const fields = [
   "maxSessions",
   "copilotCommand",
   "permissionTimeoutMs",
+  "contextTier",
 ];
 const numeric = new Set(["maxSessions", "permissionTimeoutMs"]);
 

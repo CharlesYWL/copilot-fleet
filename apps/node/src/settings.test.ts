@@ -21,6 +21,10 @@ describe("settingsFromEnv", () => {
     // The documented default, so a node without the variable does not deny
     // permissions long before the operator's .env says it should.
     expect(settings.permissionTimeoutMs).toBe(DEFAULT_PERMISSION_TIMEOUT_MS);
+    // The static half of a session — system prompt, tool definitions, MCP
+    // servers — is charged before a single message is sent, and on a node
+    // carrying a few MCP servers that alone can fill a default window.
+    expect(settings.contextTier).toBe("long_context");
   });
 
   it("reads the fleet environment variables", () => {
@@ -29,11 +33,19 @@ describe("settingsFromEnv", () => {
       FLEET_NODE_NAME: "WEILI-PC",
       FLEET_MAX_SESSIONS: "8",
       PERMISSION_TIMEOUT_MS: "60000",
+      FLEET_CONTEXT_TIER: "default",
     });
     expect(settings.hostUrl).toBe("https://example.trycloudflare.com");
     expect(settings.nodeName).toBe("WEILI-PC");
     expect(settings.maxSessions).toBe(8);
     expect(settings.permissionTimeoutMs).toBe(60_000);
+    expect(settings.contextTier).toBe("default");
+  });
+
+  it("refuses a context tier Copilot would reject on the command line", () => {
+    // Failing here names the field. Passing it through would fail inside a
+    // child process instead, as a session that never starts.
+    expect(() => settingsFromEnv({ FLEET_CONTEXT_TIER: "enormous" })).toThrow();
   });
 });
 

@@ -16,6 +16,14 @@ export type PermissionDecision = {
   optionId?: string;
 };
 
+/**
+ * Which context window Copilot is launched with.
+ *
+ * Mirrors the choices `copilot --context` accepts; kept in step with the enum
+ * in settings.ts, which is what the config page writes.
+ */
+export type ContextTier = "default" | "long_context";
+
 export interface SessionAgent {
   prompt(text: string, attachments?: readonly PromptAttachment[]): Promise<void>;
   cancel(): Promise<void>;
@@ -122,6 +130,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     sequenceOffset = 0,
     private readonly yolo = false,
     private readonly copilotCommand = "",
+    private readonly contextTier: ContextTier | undefined = undefined,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -133,7 +142,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     });
     const executable =
       this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot";
-    const args = copilotLaunchArgs(this.yolo);
+    const args = copilotLaunchArgs(this.yolo, this.contextTier);
     // npm installs a CLI on Windows as a .cmd shim, which CreateProcess cannot
     // launch directly; the shell can, but then the path has to be quoted.
     const viaShell = process.platform === "win32";
@@ -446,16 +455,33 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
 }
 
 export class AcpAgentFactory implements AgentFactory {
+  /**
+   * Whether this Copilot takes `--context`, asked once and remembered.
+   *
+   * A promise rather than a boolean so that sessions starting at the same
+   * moment share one `copilot --help` instead of racing to run their own.
+   * Cleared whenever the command changes, since the answer belongs to the
+   * binary that was asked.
+   */
+  private contextTierSupport: Promise<boolean> | undefined;
+
   /** Values are injected: settings.ts is the only place that reads the env. */
   constructor(
     private permissionTimeoutMs: number,
     private copilotCommand: string,
+    private contextTier: ContextTier = "long_context",
   ) {}
 
   /** Lets the local config UI retune the agent without a process restart. */
-  configure(permissionTimeoutMs: number, copilotCommand: string): void {
+  configure(
+    permissionTimeoutMs: number,
+    copilotCommand: string,
+    contextTier: ContextTier = this.contextTier,
+  ): void {
+    if (copilotCommand !== this.copilotCommand) this.contextTierSupport = undefined;
     this.permissionTimeoutMs = permissionTimeoutMs;
     this.copilotCommand = copilotCommand;
+    this.contextTier = contextTier;
   }
 
   async start(
@@ -471,6 +497,7 @@ export class AcpAgentFactory implements AgentFactory {
       options.sequenceOffset ?? 0,
       options.yolo ?? false,
       this.copilotCommand,
+      (await this.acceptsContextTier()) ? this.contextTier : undefined,
     );
     try {
       await agent.start(cwd, options.resumeAgentSessionId);
@@ -479,6 +506,13 @@ export class AcpAgentFactory implements AgentFactory {
       await agent.stop();
       throw error;
     }
+  }
+
+  private acceptsContextTier(): Promise<boolean> {
+    this.contextTierSupport ??= copilotSupportsContextTier(
+      this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot",
+    );
+    return this.contextTierSupport;
   }
 }
 
@@ -637,11 +671,66 @@ export class MockAgentFactory implements AgentFactory {
  * Copilot's --allow-all / --yolo: tools, paths, and URLs all run without
  * prompts. The Host decides this per session, so the node no longer reads the
  * environment and one machine cannot silently diverge from what the UI shows.
+ *
+ * The context tier is passed for the same reason, and is passed even when it is
+ * "default": Copilot keeps a tier of its own in ~/.copilot/settings.json, and
+ * omitting the flag would let that file decide, which is exactly the silent
+ * per-machine divergence this argument list exists to prevent. Omitted only
+ * when the installed Copilot is too old to accept it — see
+ * {@link copilotSupportsContextTier}.
  */
-export function copilotLaunchArgs(yolo: boolean): string[] {
+export function copilotLaunchArgs(yolo: boolean, contextTier?: ContextTier): string[] {
   const args = ["--acp", "--stdio"];
   if (yolo) args.push("--allow-all");
+  if (contextTier) args.push("--context", contextTier);
   return args;
+}
+
+/**
+ * Whether the installed Copilot understands `--context`.
+ *
+ * Asked rather than assumed because Copilot is installed per machine and the
+ * fleet does not update it: a node can be running the current fleet build
+ * against a Copilot from months ago. Commander rejects an unknown option by
+ * exiting 1 before it reads a byte of ACP, so passing the flag blindly would
+ * not degrade the session — it would stop every session on that machine from
+ * starting, with the reason buried in a child process's stderr.
+ */
+export async function copilotSupportsContextTier(
+  command: string,
+  help: (command: string) => Promise<string> = copilotHelp,
+): Promise<boolean> {
+  try {
+    return (await help(command)).includes("--context");
+  } catch {
+    // A Copilot that cannot even be asked is one the launch is about to fail
+    // on anyway, and it will fail with its own error rather than this one.
+    return false;
+  }
+}
+
+/** `copilot --help`, or a rejection if it cannot be run at all. */
+function copilotHelp(command: string): Promise<string> {
+  return new Promise((done, fail) => {
+    const viaShell = process.platform === "win32";
+    const executable = viaShell && command.includes(" ") ? `"${command}"` : command;
+    const child = spawn(executable, ["--help"], {
+      shell: viaShell,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stdout?.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
+    child.stderr?.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
+    child.once("error", fail);
+    child.once("close", () => done(output));
+    // A help screen that has not arrived in this long is not going to, and the
+    // session waiting behind it should not be held up over an optional flag.
+    setTimeout(() => {
+      child.kill();
+      fail(new Error("copilot --help timed out"));
+    }, 15_000).unref();
+  });
 }
 
 function delay(ms: number): Promise<void> {

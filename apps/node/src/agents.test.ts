@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { SessionEvent } from "@fleet/protocol";
-import { MockAgentFactory, copilotLaunchArgs } from "./agents.js";
+import {
+  MockAgentFactory,
+  copilotLaunchArgs,
+  copilotSupportsContextTier,
+} from "./agents.js";
 
 describe("copilotLaunchArgs", () => {
   it("starts ACP over stdio", () => {
@@ -9,6 +13,58 @@ describe("copilotLaunchArgs", () => {
 
   it("adds Copilot's yolo flag when the Host asks for it", () => {
     expect(copilotLaunchArgs(true)).toEqual(["--acp", "--stdio", "--allow-all"]);
+  });
+
+  it("asks for the context window the operator chose", () => {
+    expect(copilotLaunchArgs(false, "long_context")).toEqual([
+      "--acp",
+      "--stdio",
+      "--context",
+      "long_context",
+    ]);
+  });
+
+  it("says 'default' out loud rather than letting Copilot's own file decide", () => {
+    // Copilot persists a tier of its own. Omitting the flag would hand the
+    // decision to whatever that file says, which is the per-machine drift the
+    // explicit flags exist to prevent.
+    expect(copilotLaunchArgs(false, "default")).toEqual([
+      "--acp",
+      "--stdio",
+      "--context",
+      "default",
+    ]);
+  });
+
+  it("leaves the flag off entirely when Copilot cannot take it", () => {
+    expect(copilotLaunchArgs(true, undefined)).toEqual([
+      "--acp",
+      "--stdio",
+      "--allow-all",
+    ]);
+  });
+});
+
+describe("copilotSupportsContextTier", () => {
+  it("accepts a Copilot whose help lists the option", async () => {
+    const help = async () => "  --context <tier>  Set the context window tier";
+    expect(await copilotSupportsContextTier("copilot", help)).toBe(true);
+  });
+
+  it("refuses one that has never heard of it", async () => {
+    // Copilot is installed per machine and the fleet does not update it, so a
+    // current node can be driving a months-old binary. Commander exits 1 on an
+    // unknown option before reading any ACP, which would stop every session on
+    // that machine rather than merely costing it the larger window.
+    const help = async () => "  --allow-all  Enable all permissions";
+    expect(await copilotSupportsContextTier("copilot", help)).toBe(false);
+  });
+
+  it("refuses one it cannot ask at all", async () => {
+    const help = async () => {
+      throw new Error("ENOENT");
+    };
+    expect(await copilotSupportsContextTier("copilot", help)).toBe(false);
   });
 });
 
