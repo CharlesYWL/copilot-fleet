@@ -73,10 +73,10 @@ describe("configRecoveryRequest", () => {
   const option = (id: string) =>
     ({ id, name: id, category: "model", currentValue: "x", choices: [] }) as never;
 
-  it("asks for the permissions option when a resume brought back nothing", () => {
-    // session/load returns no option list and nothing later volunteers one, so
-    // a session that has never had pickers would never get them: setting an
-    // option is the only call that answers with the whole list.
+  it("asks for the permissions option when a start brought back nothing", () => {
+    // session/load never returns an option list, and session/new has been seen
+    // not to either, so a session that has never had pickers would never get
+    // them: setting an option is the only call that answers with the whole list.
     expect(configRecoveryRequest([], false)).toEqual({
       configId: "allow_all",
       value: "off",

@@ -33,23 +33,24 @@ export type ContextTier = "default" | "long_context";
 const ALLOW_ALL_OPTION = "allow_all";
 
 /**
- * What to set, if anything, to get a resumed session's pickers back.
+ * What to set, if anything, to get a session's pickers back.
  *
- * `session/new` reports the option list; `session/load` does not, and neither
- * does any notification that follows it — there is no method to ask, either, so
- * a resumed session has no idea what its own model or mode is. The Host papers
- * over this by keeping the last list it was told, which works until a session
- * has never had one: created by a fleet build too old to capture them, or by
- * anything else that left the record empty. From then on every resume is a
- * load, and the session stays pickerless permanently — a composer with nothing
- * on it and no way to ask for anything.
+ * `session/new` reports the option list and `session/load` does not, so a
+ * resumed session has no idea what its own model or mode is: no notification
+ * follows the load, and there is no method to ask. The Host papers over that by
+ * keeping the last list it was told, which works until a session has never had
+ * one — and one machine in this fleet produces exactly that from a *fresh*
+ * session too, on the same Copilot build and the same fleet build as its
+ * neighbours that are fine. Whatever the cause there, the result is identical
+ * and permanent: every later resume is a load, so the composer stays bare with
+ * no control on it to press and nothing to say why.
  *
  * `session/set_config_option` answers with the whole list, so setting one
  * breaks the deadlock. `allow_all` is the only option whose correct value is
- * known without having read the list first: the Host decides it per session and
- * the process was just launched with the matching `--allow-all`. Re-asserting
- * it therefore changes nothing about the session and makes the pickers agree
- * with what is already true of it.
+ * known without having read that list first: the Host decides it per session
+ * and the process was launched moments earlier with the matching `--allow-all`.
+ * Re-asserting it therefore changes nothing about the session and makes the
+ * pickers agree with what is already true of it.
  */
 export function configRecoveryRequest(
   options: readonly acp.SessionConfigOption[],
@@ -254,7 +255,6 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         this.replaying = false;
       }
       this.agentSessionId = resumeAgentSessionId;
-      await this.recoverConfigOptions();
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
@@ -264,10 +264,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.agentSessionId = created.sessionId;
       this.captureConfigOptions(created.configOptions);
     }
+    // Both paths, because both can arrive without pickers: `session/load` never
+    // reports them, and `session/new` has been seen not to on at least one
+    // machine in this fleet — same Copilot build, same fleet build, same agent
+    // otherwise working, and a composer with nothing on it.
+    await this.recoverConfigOptions();
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
   }
 
-  /** Gets the pickers back after a load that arrived without them. */
+  /** Gets the pickers back when a start — of either kind — brought none. */
   private async recoverConfigOptions(): Promise<void> {
     const request = configRecoveryRequest(this.configOptions, this.yolo);
     if (!request) return;
