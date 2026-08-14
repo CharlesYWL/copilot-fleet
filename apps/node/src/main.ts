@@ -79,6 +79,12 @@ const NODE_CAPABILITIES = [
   SESSION_CONFIG_CAPABILITY,
 ];
 const RECONNECT_DELAY_MS = 2_000;
+/**
+ * How long first registration waits for the Host to start accepting
+ * connections. `npm run dev` launches the Host and this Node concurrently, so
+ * on a clean checkout the registration POST usually beats the API to the port.
+ */
+const REGISTRATION_WAIT_MS = 60_000;
 
 export type NodeRuntime = { shutdown: () => Promise<void> };
 
@@ -232,7 +238,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         settings.contextTier,
       );
     }
-    log(`Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`);
+    log(
+      `Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`,
+    );
     reconnect();
   }
 
@@ -592,11 +600,39 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       maxSessions: settings.maxSessions,
       homeDir: homedir(),
     });
-    const response = await fetch(new URL("/api/nodes/register", settings.hostUrl), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
+    const registerUrl = new URL("/api/nodes/register", settings.hostUrl);
+    // Only a refused/dropped connection is worth waiting on. An HTTP response —
+    // including a rejected enrollment token — is an answer, so it falls through
+    // to the status check below and fails immediately with its own message.
+    const deadline = Date.now() + REGISTRATION_WAIT_MS;
+    let announcedWait = false;
+    let response: Response;
+    while (true) {
+      try {
+        response = await fetch(registerUrl, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        break;
+      } catch (cause) {
+        if (Date.now() >= deadline) {
+          throw new Error(
+            `Could not reach the Host at ${settings.hostUrl} to register within ` +
+              `${Math.round(REGISTRATION_WAIT_MS / 1000)}s. Check that it is running and that ` +
+              `FLEET_HOST_URL points at it.`,
+            { cause },
+          );
+        }
+        if (!announcedWait) {
+          announcedWait = true;
+          log(
+            `Host at ${settings.hostUrl} is not accepting connections yet; waiting to register`,
+          );
+        }
+        await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY_MS));
+      }
+    }
     if (!response.ok) {
       throw new Error(
         `Node registration failed (${response.status}): ${await response.text()}`,
