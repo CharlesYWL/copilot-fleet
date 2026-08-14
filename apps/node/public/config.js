@@ -113,7 +113,10 @@ $("exportNode").addEventListener("click", async () => {
     const response = await fetch("/api/backup");
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "Export failed");
-    downloadJson(data, "copilot-fleet-node-" + new Date().toISOString().slice(0, 10) + ".json");
+    downloadJson(
+      data,
+      "copilot-fleet-node-" + new Date().toISOString().slice(0, 10) + ".json",
+    );
     note("backupMsg", "Downloaded.", true);
   } catch (error) {
     note("backupMsg", error.message, false);

@@ -188,7 +188,9 @@ describe("backup archives", () => {
   });
 
   it("parks live sessions as offline on Host import and leaves settled ones alone", () => {
-    expect(sessionFieldsForHostImport({ state: "running", currentActivity: "coding" })).toEqual({
+    expect(
+      sessionFieldsForHostImport({ state: "running", currentActivity: "coding" }),
+    ).toEqual({
       state: "offline",
       currentActivity: "Imported onto this Host",
     });

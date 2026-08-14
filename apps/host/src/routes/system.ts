@@ -49,34 +49,38 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     });
   });
 
-  app.post("/api/backup", { bodyLimit: HOST_BACKUP_BODY_LIMIT }, async (request, reply) => {
-    if (backupKind(request.body) === NODE_BACKUP_KIND) {
-      return reply.code(400).send({
-        error:
-          "This file is a node identity archive. Import it on the node's config page at http://127.0.0.1:8788.",
-      });
-    }
-    const parsed = HostBackupSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.code(400).send({ error: "Not a Copilot Fleet Host archive." });
-    }
-    const backup = parsed.data;
-    const { publicUrl: archivedUrl, ...rest } = backup;
-    const publicUrl =
-      archivedUrl && isTransferableHostUrl(archivedUrl) ? archivedUrl : undefined;
-    service.importHostBackup(publicUrl ? { ...rest, publicUrl } : rest);
-    enrollment.token = backup.enrollmentToken;
-    try {
-      await tunnel.setEnabled(backup.tunnel.enabled, backup.tunnel.provider);
-    } catch (error) {
-      store.setTunnelEnabled(false);
-      return reply.code(503).send({
-        error: errorMessage(error, "Fleet restored, but the tunnel failed to start"),
-        kind: HOST_BACKUP_KIND,
-      });
-    }
-    return { ok: true };
-  });
+  app.post(
+    "/api/backup",
+    { bodyLimit: HOST_BACKUP_BODY_LIMIT },
+    async (request, reply) => {
+      if (backupKind(request.body) === NODE_BACKUP_KIND) {
+        return reply.code(400).send({
+          error:
+            "This file is a node identity archive. Import it on the node's config page at http://127.0.0.1:8788.",
+        });
+      }
+      const parsed = HostBackupSchema.safeParse(request.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: "Not a Copilot Fleet Host archive." });
+      }
+      const backup = parsed.data;
+      const { publicUrl: archivedUrl, ...rest } = backup;
+      const publicUrl =
+        archivedUrl && isTransferableHostUrl(archivedUrl) ? archivedUrl : undefined;
+      service.importHostBackup(publicUrl ? { ...rest, publicUrl } : rest);
+      enrollment.token = backup.enrollmentToken;
+      try {
+        await tunnel.setEnabled(backup.tunnel.enabled, backup.tunnel.provider);
+      } catch (error) {
+        store.setTunnelEnabled(false);
+        return reply.code(503).send({
+          error: errorMessage(error, "Fleet restored, but the tunnel failed to start"),
+          kind: HOST_BACKUP_KIND,
+        });
+      }
+      return { ok: true };
+    },
+  );
 
   app.get("/api/defaults", async () => ({
     yolo: store.getDefaultYolo(),
