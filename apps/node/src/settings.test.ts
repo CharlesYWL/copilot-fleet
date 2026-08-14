@@ -22,8 +22,9 @@ describe("settingsFromEnv", () => {
     // permissions long before the operator's .env says it should.
     expect(settings.permissionTimeoutMs).toBe(DEFAULT_PERMISSION_TIMEOUT_MS);
     // The static half of a session — system prompt, tool definitions, MCP
-    // servers — is charged before a single message is sent, and on a node
-    // carrying a few MCP servers that alone can fill a default window.
+    // servers — is charged before a single message is sent, so the wider
+    // window is the better default even though today's models mostly ignore
+    // the ask. See the note on the field for what was measured.
     expect(settings.contextTier).toBe("long_context");
   });
 

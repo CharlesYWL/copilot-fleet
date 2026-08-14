@@ -21,14 +21,17 @@ export const SettingsSchema = z.object({
    * Copilot persists a tier of its own in ~/.copilot/settings.json, which the
    * `--context` flag overrides. This setting is that flag, for the same reason
    * `--allow-all` is passed explicitly rather than left to the environment: a
-   * fleet where one machine quietly runs a smaller window than the rest is one
-   * where the same session behaves differently depending on where it landed,
-   * with nothing on screen to say why.
+   * fleet where one machine quietly runs a different window than the rest is
+   * one where the same session behaves differently depending on where it
+   * landed, with nothing on screen to say why.
    *
-   * Long by default. The static half of a session — system prompt, tool
-   * definitions, MCP servers — is charged before a single message is sent, and
-   * a fleet node carrying a few MCP servers can spend most of a default window
-   * on that alone.
+   * Long by default, but the tier only ever widens a window Copilot has a
+   * wider variant for: measured against Copilot 1.0.80 the window a session
+   * gets is the model's own — 264k on claude-opus-5, claude-sonnet-5 and
+   * gemini-3.1-pro-preview, 400k on gpt-5.6-sol — and asking for the long tier
+   * moved none of them. Asking costs nothing and is right when a model that
+   * honours it appears, but the model picker is what actually decides how much
+   * room a session has today.
    *
    * Applies to agents started from now on; sessions already running keep the
    * tier they were launched with, since it is fixed at spawn.
