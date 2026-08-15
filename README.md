@@ -498,13 +498,11 @@ that each receives its own ordered event stream without Copilot authentication.
 
 ## Architecture and message flow
 
-```text
-Browser -- REST + WebSocket --> Fastify Host -- authenticated WebSocket --> Node
-                                      |                               |
-                                   SQLite                    ACP NDJSON/stdio
-                                                                      |
-                                                        copilot --acp --stdio
-```
+![Copilot Fleet architecture: a browser drives the Fleet Host, which owns SQLite state and sends commands over a Node-initiated WebSocket; each Node buffers events in an outbox, runs one Copilot ACP process per session, and is restarted by a supervisor after it updates itself.](docs/architecture.png)
+
+The vertical split is the whole design: the Host owns desired state and history,
+the Node owns execution. Copilot credentials, child processes, and local paths
+never cross it, and the Node is the side that dials out.
 
 1. The Node registers once with the enrollment token and receives a node ID and
    secret.

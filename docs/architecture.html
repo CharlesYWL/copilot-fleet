@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Copilot Fleet · Architecture</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1200px; width: 100%; padding: 0 1.25rem; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · Diagram Design</p>
+    <h1>Copilot Fleet — one control plane, many machines</h1>
+
+    <svg viewBox="0 150 1000 400" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="fleet-title fleet-desc">
+      <title id="fleet-title">Copilot Fleet — one control plane, many machines</title>
+      <desc id="fleet-desc">Architecture diagram: a browser drives the Fleet Host, which owns SQLite state and sends commands over a Node-initiated WebSocket; each Node buffers events in an outbox, runs one Copilot ACP process per session, and is restarted by a supervisor after it updates itself.</desc>
+      <defs>
+        <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+          <circle cx="1" cy="1" r="0.9" fill="rgba(45,49,66,0.10)"/>
+        </pattern>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+      </defs>
+
+      <rect x="0" y="150" width="1000" height="400" fill="#f5f5f5"/>
+      <rect x="0" y="150" width="1000" height="400" fill="url(#dots)" opacity="0.55"/>
+
+      <!-- Zones (drawn before arrows and nodes) -->
+      <rect x="232" y="172" width="216" height="252" rx="8"
+            fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="300" y="176" width="80" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="340" y="185" fill="rgba(45,49,66,0.72)" font-size="7.5" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">HOST · STATE</text>
+
+      <rect x="536" y="172" width="432" height="252" rx="8"
+            fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="708" y="176" width="88" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="752" y="185" fill="rgba(45,49,66,0.72)" font-size="7.5" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">NODE · EXECUTION</text>
+
+      <!-- Arrows first (behind boxes) -->
+      <line x1="184" y1="220" x2="240" y2="220" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <path d="M 240,248 H 184" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+      <line x1="416" y1="220" x2="580" y2="220" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <path d="M 580,248 H 416" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+      <line x1="332" y1="264" x2="332" y2="352" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="620" y1="264" x2="620" y2="352" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 708,264 V 328 Q 708,336 716,336 H 800 Q 808,336 808,344 V 352"
+            fill="none" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <line x1="852" y1="224" x2="748" y2="224" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 748,240 H 852" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+      <!-- Arrow labels -->
+      <rect x="180" y="200" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="212" y="209" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">REST + WS</text>
+
+      <rect x="464" y="200" width="72" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="500" y="209" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">COMMANDS</text>
+
+      <rect x="452" y="254" width="96" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="500" y="263" fill="#7a8399" font-size="7.5" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NODE DIALS OUT</text>
+
+      <rect x="340" y="298" width="60" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="370" y="307" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">APPEND</text>
+
+      <rect x="628" y="298" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="654" y="307" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">QUEUE</text>
+
+      <rect x="836" y="292" width="76" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="874" y="301" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ACP · STDIO</text>
+
+      <rect x="770" y="206" width="60" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="800" y="215" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RESTART</text>
+
+      <rect x="772" y="250" width="56" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="800" y="259" fill="#7a8399" font-size="7.5" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">EXIT 75</text>
+
+      <!-- Node: Browser (external) -->
+      <rect x="48" y="200" width="136" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="48" y="200" width="136" height="64" rx="6" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <rect x="56" y="208" width="28" height="12" rx="2" fill="transparent" stroke="rgba(122,131,153,0.40)" stroke-width="0.8"/>
+      <text x="70" y="217" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">EXT</text>
+      <text x="116" y="236" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Browser</text>
+      <text x="116" y="252" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">live session UI</text>
+
+      <!-- Node: Fleet Host (focal) -->
+      <rect x="248" y="200" width="168" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="248" y="200" width="168" height="64" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="256" y="208" width="32" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="272" y="217" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
+      <text x="408" y="260" fill="rgba(235,108,54,0.10)" font-size="32" font-weight="600" font-family="'Geist Mono', monospace" text-anchor="end">01</text>
+      <text x="332" y="236" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fleet Host</text>
+      <text x="332" y="252" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">fastify · :8787</text>
+
+      <!-- Node: Fleet Node -->
+      <rect x="580" y="200" width="168" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="580" y="200" width="168" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="588" y="208" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="604" y="217" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NODE</text>
+      <text x="740" y="260" fill="rgba(45,49,66,0.06)" font-size="32" font-weight="600" font-family="'Geist Mono', monospace" text-anchor="end">02</text>
+      <text x="664" y="236" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fleet Node</text>
+      <text x="664" y="252" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">router · cap 4</text>
+
+      <!-- Node: Supervisor -->
+      <rect x="852" y="200" width="108" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="852" y="200" width="108" height="64" rx="6" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+      <rect x="860" y="208" width="36" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.22)" stroke-width="0.8"/>
+      <text x="878" y="217" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">SUPER</text>
+      <text x="906" y="238" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Supervisor</text>
+      <text x="906" y="253" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">self-update</text>
+
+      <!-- Node: Event store -->
+      <rect x="248" y="352" width="168" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="248" y="352" width="168" height="56" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="332" y="378" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Event store</text>
+      <text x="332" y="393" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">sqlite · append-only</text>
+
+      <!-- Node: Outbox -->
+      <rect x="550" y="352" width="140" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="550" y="352" width="140" height="56" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="620" y="378" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Outbox</text>
+      <text x="620" y="393" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">replay on reconnect</text>
+
+      <!-- Node: Copilot CLI -->
+      <rect x="728" y="352" width="160" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="728" y="352" width="160" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="808" y="378" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Copilot CLI</text>
+      <text x="808" y="393" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">1 proc / session</text>
+
+      <!-- Legend strip -->
+      <line x1="48" y1="452" x2="952" y2="452" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="48" y="468" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <rect x="48" y="484" width="14" height="10" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="68" y="492" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Focal / host</text>
+
+      <rect x="172" y="484" width="14" height="10" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="192" y="492" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Runtime process</text>
+
+      <rect x="316" y="484" width="14" height="10" rx="2" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="336" y="492" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Store / buffer</text>
+
+      <rect x="448" y="484" width="14" height="10" rx="2" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <text x="468" y="492" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">External</text>
+
+      <line x1="560" y1="490" x2="588" y2="490" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <text x="596" y="492" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Command path</text>
+
+      <line x1="712" y1="490" x2="740" y2="490" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="748" y="492" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">HTTP</text>
+
+      <line x1="820" y1="490" x2="848" y2="490" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <text x="856" y="492" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Events / heartbeat</text>
+    </svg>
+  </div>
+</body>
+</html>
