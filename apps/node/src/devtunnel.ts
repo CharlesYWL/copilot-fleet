@@ -13,9 +13,16 @@ const FORWARDING_RE = /Forwarding from 127\.0\.0\.1:(\d+)/i;
 /** Long enough to cover an interactive relay handshake on a cold start. */
 const READY_TIMEOUT_MS = 60_000;
 
+/** Backoff for respawning a connect that died; caps so it stops hammering. */
+export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+
+export function reconnectDelay(attempt: number): number {
+  return RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)]!;
+}
+
 export type DevTunnelConnection = {
-  /** Loopback URL the node should dial. */
-  url: string;
+  /** Loopback URL the node should dial; changes if a respawn lands elsewhere. */
+  readonly url: string;
   stop: () => void;
 };
 
@@ -23,6 +30,13 @@ export type ConnectOptions = {
   spawnProcess?: typeof spawn;
   timeoutMs?: number;
   log?: (message: string) => void;
+  /**
+   * Called when a respawned tunnel comes back on a different port, so the node
+   * can move its dial address instead of retrying one nothing is listening on.
+   */
+  onUrlChanged?: (url: string) => void;
+  setTimer?: (fn: () => void, ms: number) => NodeJS.Timeout;
+  clearTimer?: (timer: NodeJS.Timeout) => void;
 };
 
 /**
@@ -33,6 +47,19 @@ export type ConnectOptions = {
  * this forwarded loopback port instead, authenticated by the CLI's own login.
  * Running it here rather than in a second terminal keeps the node a single
  * command, and means the forwarded port is discovered rather than transcribed.
+ *
+ * The child is supervised for the whole run, not only until it first reports a
+ * port. Restarting the Host replaces its tunnel host and with it the SSH host
+ * key, which the client can only answer by tearing the session down and
+ * refreshing it:
+ *
+ *   reconnection failed: The server host key is different
+ *   Connection to client tunnel relay closed. Protocol error.
+ *   Refreshing tunnel.
+ *
+ * Usually it recovers on its own. When it does not, an unsupervised child left
+ * the node dialing a dead port forever — indistinguishable from the Host being
+ * down, and the reason the node had to be restarted by hand.
  */
 export function connectDevTunnel(
   tunnelId: string,
@@ -41,30 +68,40 @@ export function connectDevTunnel(
   const spawnProcess = options.spawnProcess ?? spawn;
   const timeoutMs = options.timeoutMs ?? READY_TIMEOUT_MS;
   const log = options.log ?? (() => {});
+  const setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+  const clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
 
-  const child = spawnProcess("devtunnel", ["connect", tunnelId], {
-    stdio: ["ignore", "pipe", "pipe"],
-    windowsHide: true,
-  });
+  let child: ChildProcess | undefined;
+  let currentUrl: string | undefined;
+  let stopped = false;
+  let attempt = 0;
+  let respawnTimer: NodeJS.Timeout | undefined;
 
-  const stop = () => {
-    if (!child.killed) child.kill();
+  const connection: DevTunnelConnection = {
+    get url() {
+      return currentUrl ?? "";
+    },
+    stop: () => {
+      stopped = true;
+      if (respawnTimer) clearTimer(respawnTimer);
+      respawnTimer = undefined;
+      if (child && !child.killed) child.kill();
+    },
   };
 
   return new Promise<DevTunnelConnection>((resolve, reject) => {
-    let buffer = "";
     let settled = false;
 
-    const finish = (outcome: () => void) => {
+    const settle = (outcome: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearTimer(timer);
       outcome();
     };
 
-    const timer = setTimeout(() => {
-      finish(() => {
-        stop();
+    const timer = setTimer(() => {
+      settle(() => {
+        connection.stop();
         reject(
           new Error(
             `devtunnel connect ${tunnelId} did not report a forwarded port within ${Math.round(
@@ -75,42 +112,88 @@ export function connectDevTunnel(
       });
     }, timeoutMs);
 
-    const onChunk = (chunk: Buffer) => {
-      buffer += chunk.toString("utf8");
-      if (buffer.length > 64_000) buffer = buffer.slice(-32_000);
-      const match = buffer.match(FORWARDING_RE);
-      if (!match) return;
-      const url = `http://127.0.0.1:${match[1]}`;
-      finish(() => {
-        log(`devtunnel connect ${tunnelId} forwarding ${url}`);
-        resolve({ url, stop });
+    const scheduleRespawn = (code?: number | null): void => {
+      // Nothing to recover once the first attempt has already been rejected —
+      // that failure is reported to the caller, which decides what to do.
+      if (stopped || !settled || currentUrl === undefined) return;
+      const delay = reconnectDelay(attempt);
+      attempt += 1;
+      log(
+        `devtunnel connect ${tunnelId} ended (code=${
+          code ?? "null"
+        }); restarting in ${Math.round(delay / 1000)}s`,
+      );
+      respawnTimer = setTimer(() => {
+        respawnTimer = undefined;
+        if (!stopped) start();
+      }, delay);
+    };
+
+    const start = (): void => {
+      const active = spawnProcess("devtunnel", ["connect", tunnelId], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      child = active;
+      let buffer = "";
+      // Reset per spawn: a respawn may land on a different port, and noticing
+      // that is the whole point of watching.
+      let reportedThisRun: string | undefined;
+
+      const onChunk = (chunk: Buffer) => {
+        buffer += chunk.toString("utf8");
+        if (buffer.length > 64_000) buffer = buffer.slice(-32_000);
+        const match = buffer.match(FORWARDING_RE);
+        if (!match) return;
+        const url = `http://127.0.0.1:${match[1]}`;
+        if (url === reportedThisRun) return;
+        reportedThisRun = url;
+        attempt = 0;
+        const moved = currentUrl !== undefined && currentUrl !== url;
+        currentUrl = url;
+        settle(() => {
+          log(`devtunnel connect ${tunnelId} forwarding ${url}`);
+          resolve(connection);
+        });
+        if (moved) {
+          log(`devtunnel connect ${tunnelId} moved to ${url}`);
+          options.onUrlChanged?.(url);
+        }
+      };
+
+      active.stdout?.on("data", onChunk);
+      active.stderr?.on("data", onChunk);
+
+      active.on("error", (error) => {
+        if (child !== active) return;
+        child = undefined;
+        settle(() =>
+          reject(
+            new Error(
+              `Could not start devtunnel: ${error.message}. Install it with \`winget install Microsoft.devtunnel\`.`,
+            ),
+          ),
+        );
+        scheduleRespawn();
+      });
+
+      // A connect that exits before forwarding is almost always a signed-out CLI
+      // or a tunnel this account cannot see; either way the node cannot proceed.
+      active.on("exit", (code) => {
+        if (child !== active) return;
+        child = undefined;
+        settle(() =>
+          reject(
+            new Error(
+              `devtunnel connect ${tunnelId} exited (code=${code ?? "null"}) before forwarding a port. Check \`devtunnel user login\` and that this account can reach the tunnel.`,
+            ),
+          ),
+        );
+        scheduleRespawn(code);
       });
     };
 
-    child.stdout?.on("data", onChunk);
-    child.stderr?.on("data", onChunk);
-
-    child.on("error", (error) => {
-      finish(() =>
-        reject(
-          new Error(
-            `Could not start devtunnel: ${error.message}. Install it with \`winget install Microsoft.devtunnel\`.`,
-          ),
-        ),
-      );
-    });
-
-    // A connect that exits before forwarding is almost always a signed-out CLI
-    // or a tunnel this account cannot see; either way the node cannot proceed.
-    child.on("exit", (code) => {
-      finish(() =>
-        reject(
-          new Error(
-            `devtunnel connect ${tunnelId} exited (code=${code ?? "null"}) before forwarding a port. Check \`devtunnel user login\` and that this account can reach the tunnel.`,
-          ),
-        ),
-      );
-    });
+    start();
   });
 }
 

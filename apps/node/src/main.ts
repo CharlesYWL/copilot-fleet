@@ -109,16 +109,34 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * still hold whatever port a previous run happened to get.
    */
   let devTunnel: DevTunnelConnection | undefined;
+  /**
+   * Installed once settings exist. The tunnel is started before them — its
+   * forwarded port is what the host URL has to be — so the handler cannot
+   * close over `settings` at construction time.
+   */
+  let onTunnelUrlChanged: (url: string) => void = () => {};
   const devTunnelId = env.FLEET_DEVTUNNEL_ID;
   if (devTunnelId) {
     startupLog(`Connecting to dev tunnel ${devTunnelId}`);
-    devTunnel = await connectDevTunnel(devTunnelId, { log: startupLog });
+    devTunnel = await connectDevTunnel(devTunnelId, {
+      log: startupLog,
+      onUrlChanged: (url) => onTunnelUrlChanged(url),
+    });
     env.FLEET_HOST_URL = devTunnel.url;
     flags.env.FLEET_HOST_URL = devTunnel.url;
     process.once("exit", () => devTunnel?.stop());
   }
 
   let settings = await loadSettings(env, settingsOverridesFromEnv(flags.env));
+
+  // A respawned tunnel can land on a different port. Without following it the
+  // node keeps dialing the old one, which nothing is listening on any more.
+  onTunnelUrlChanged = (url) => {
+    void applySettings({ ...settings, hostUrl: url }).catch((error: unknown) => {
+      console.error("Failed to follow the dev tunnel:", errorMessage(error));
+    });
+  };
+
   const mockAgent = env.FLEET_MOCK_AGENT === "1";
 
   const log = (message: string): void => {

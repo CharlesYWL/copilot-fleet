@@ -86,3 +86,107 @@ describe("connectDevTunnel", () => {
 });
 
 export { spawnFake };
+
+describe("connectDevTunnel supervision", () => {
+  /**
+   * Restarting the Host replaces its tunnel host and its SSH host key, which
+   * the client answers by tearing the session down. When that teardown ends the
+   * process instead of refreshing, an unsupervised child left the node dialing
+   * a dead port forever — the reason it had to be restarted by hand.
+   */
+  it("restarts a connect that dies after it was already forwarding", async () => {
+    const first = fakeChild();
+    const second = fakeChild();
+    const spawned: ReturnType<typeof fakeChild>[] = [];
+    const timers: (() => void)[] = [];
+
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => {
+        const next = spawned.length === 0 ? first : second;
+        spawned.push(next);
+        return next;
+      }) as never,
+      setTimer: ((fn: () => void) => {
+        timers.push(fn);
+        return 0 as unknown as NodeJS.Timeout;
+      }) as never,
+      clearTimer: (() => {}) as never,
+    });
+    first.stdout.emit("data", Buffer.from("Forwarding from 127.0.0.1:8791 to host\n"));
+    const conn = await pending;
+    expect(conn.url).toBe("http://127.0.0.1:8791");
+
+    first.emit("exit", 1);
+    // The backoff timer is the last one scheduled; running it respawns.
+    timers[timers.length - 1]!();
+    expect(spawned).toHaveLength(2);
+  });
+
+  it("reports a moved port so the node can follow it", async () => {
+    const first = fakeChild();
+    const second = fakeChild();
+    const spawned: ReturnType<typeof fakeChild>[] = [];
+    const timers: (() => void)[] = [];
+    const moves: string[] = [];
+
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => {
+        const next = spawned.length === 0 ? first : second;
+        spawned.push(next);
+        return next;
+      }) as never,
+      setTimer: ((fn: () => void) => {
+        timers.push(fn);
+        return 0 as unknown as NodeJS.Timeout;
+      }) as never,
+      clearTimer: (() => {}) as never,
+      onUrlChanged: (url) => moves.push(url),
+    });
+    first.stdout.emit("data", Buffer.from("Forwarding from 127.0.0.1:8791 to host\n"));
+    const conn = await pending;
+
+    first.emit("exit", 1);
+    timers[timers.length - 1]!();
+    second.stdout.emit("data", Buffer.from("Forwarding from 127.0.0.1:9002 to host\n"));
+
+    expect(moves).toEqual(["http://127.0.0.1:9002"]);
+    expect(conn.url).toBe("http://127.0.0.1:9002");
+  });
+
+  it("does not respawn a connect that never forwarded, so a real failure surfaces", async () => {
+    const child = fakeChild();
+    const spawned: ReturnType<typeof fakeChild>[] = [];
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => {
+        spawned.push(child);
+        return child;
+      }) as never,
+    });
+    child.emit("exit", 1);
+    await expect(pending).rejects.toThrow(/devtunnel user login/);
+    expect(spawned).toHaveLength(1);
+  });
+
+  it("stops supervising once the node asks it to stop", async () => {
+    const child = fakeChild();
+    const timers: (() => void)[] = [];
+    const spawned: ReturnType<typeof fakeChild>[] = [];
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => {
+        spawned.push(child);
+        return child;
+      }) as never,
+      setTimer: ((fn: () => void) => {
+        timers.push(fn);
+        return 0 as unknown as NodeJS.Timeout;
+      }) as never,
+      clearTimer: (() => {}) as never,
+    });
+    child.stdout.emit("data", Buffer.from("Forwarding from 127.0.0.1:8791 to host\n"));
+    const conn = await pending;
+    conn.stop();
+    child.emit("exit", 0);
+    for (const run of timers) run();
+    expect(spawned).toHaveLength(1);
+  });
+});
