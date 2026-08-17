@@ -224,8 +224,7 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     extractUrl: matcher(DEVTUNNEL_URL_RE),
     extractInspectUrl: matcher(DEVTUNNEL_INSPECT_URL_RE),
     extractId: matcher(DEVTUNNEL_ID_RE),
-    installHint:
-      "winget install Microsoft.devtunnel, then run `devtunnel user login`.",
+    installHint: "winget install Microsoft.devtunnel, then run `devtunnel user login`.",
     setupSteps: [
       "Install the CLI: `winget install Microsoft.devtunnel` (or `brew install --cask devtunnel`).",
       "Run `devtunnel user login` once on this machine — hosting requires a signed-in account.",

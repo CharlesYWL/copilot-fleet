@@ -255,8 +255,7 @@ export class TunnelManager {
     // setup problem rather than as a tunnel that starts and immediately dies.
     let reusedId: string | undefined;
     if (spec.prepare && spec.newTunnelId && this.persistedTunnelId) {
-      reusedId =
-        this.persistedTunnelId.get(this.provider) ?? spec.newTunnelId();
+      reusedId = this.persistedTunnelId.get(this.provider) ?? spec.newTunnelId();
       try {
         await spec.prepare(this.target, reusedId);
         this.persistedTunnelId.set(this.provider, reusedId);

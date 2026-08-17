@@ -308,10 +308,7 @@ describe("what a live node may be told to dial", () => {
    * URL is still fine to advertise for enrollment, which ships a command.
    */
   it("never broadcasts a tunnel a node cannot authenticate to", async () => {
-    const supervisor = withExternal(
-      "devtunnel",
-      "https://abc-8790.usw2.devtunnels.ms",
-    );
+    const supervisor = withExternal("devtunnel", "https://abc-8790.usw2.devtunnels.ms");
     // Touch info() so the manager for the external provider exists.
     await supervisor.info("http://fallback.example");
     expect(supervisor.activeTunnelUrl()).toBe("https://abc-8790.usw2.devtunnels.ms");

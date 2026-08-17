@@ -122,8 +122,8 @@ export const ConnectNodeCard = () => {
           <MessageBarBody>
             This tunnel is private, so a node cannot dial the URL directly — it would be
             redirected to a Microsoft login it has no way to answer. Sign the machine in
-            once, then start the node: it opens the tunnel itself and finds the
-            forwarded port, so no second terminal is needed.
+            once, then start the node: it opens the tunnel itself and finds the forwarded
+            port, so no second terminal is needed.
           </MessageBarBody>
         </MessageBar>
       )}

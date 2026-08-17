@@ -20,9 +20,7 @@ function fakeChild() {
 }
 
 const spawnFake = (child: ReturnType<typeof fakeChild>) =>
-  vi.fn(() => child) as unknown as Parameters<
-    typeof connectDevTunnel
-  >[1] extends never
+  vi.fn(() => child) as unknown as Parameters<typeof connectDevTunnel>[1] extends never
     ? never
     : never;
 
