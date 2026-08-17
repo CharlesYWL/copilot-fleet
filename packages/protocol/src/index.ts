@@ -779,7 +779,13 @@ export const SetSessionConfigSchema = z.object({
   value: z.string().min(1).max(500),
 });
 
-export const tunnelProviders = ["cloudflare", "tailscale", "ngrok", "bore"] as const;
+export const tunnelProviders = [
+  "cloudflare",
+  "tailscale",
+  "ngrok",
+  "bore",
+  "devtunnel",
+] as const;
 export const TunnelProviderSchema = z.enum(tunnelProviders);
 export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
 
@@ -805,6 +811,12 @@ export const TunnelInfoSchema = z.object({
   binaryPresent: z.boolean(),
   /** Every supported provider plus whether its CLI is installed. */
   providers: z.array(TunnelProviderInfoSchema),
+  /**
+   * Provider-side identifier for the running tunnel, when it has one that the
+   * public URL does not encode. Dev Tunnels needs this: the URL subdomain is an
+   * opaque routing token, so `devtunnel connect` cannot be derived from it.
+   */
+  tunnelId: z.string().optional(),
   /**
    * True when the tunnel runs as its own process outside the Host, so the URL
    * survives Host restarts and the Host must not try to start or stop it.

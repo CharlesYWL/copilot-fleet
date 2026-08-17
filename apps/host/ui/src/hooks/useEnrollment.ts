@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { api } from "./useFleet";
 
-export type Enrollment = { hostUrl: string; enrollmentToken: string };
+export type Enrollment = {
+  hostUrl: string;
+  enrollmentToken: string;
+  /** Present for providers whose public URL does not encode the tunnel id. */
+  tunnelId?: string;
+};
 
 /**
  * The current enrollment command inputs, re-read on a timer.

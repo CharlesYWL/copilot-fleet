@@ -34,10 +34,14 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
 
   app.get("/api/health", async () => ({ ok: true, version }));
 
-  app.get("/api/enrollment", async () => ({
-    hostUrl: enrollmentHostUrl(),
-    enrollmentToken: enrollment.token,
-  }));
+  app.get("/api/enrollment", async () => {
+    const tunnelId = tunnel.activeTunnelId();
+    return {
+      hostUrl: enrollmentHostUrl(),
+      enrollmentToken: enrollment.token,
+      ...(tunnelId ? { tunnelId } : {}),
+    };
+  });
 
   app.get("/api/snapshot", async () => service.snapshot());
 

@@ -21,9 +21,20 @@ const statePath = externalTunnelPath();
 const log = (message: string) =>
   console.log(`${new Date().toISOString()} [tunnel] ${message}`);
 
-const writeState = (pid: number, url: string | undefined): void => {
+const writeState = (
+  pid: number,
+  url: string | undefined,
+  tunnelId: string | undefined,
+): void => {
   mkdirSync(dirname(statePath), { recursive: true });
-  writeFileSync(statePath, JSON.stringify({ provider, url: url ?? "", pid }, null, 2));
+  writeFileSync(
+    statePath,
+    JSON.stringify(
+      { provider, url: url ?? "", ...(tunnelId ? { tunnelId } : {}), pid },
+      null,
+      2,
+    ),
+  );
 };
 
 const clearState = (): void => {
@@ -47,21 +58,26 @@ const child = spawn(spec.binary, spec.args(target), {
  * actually forwards traffic, so if this wrapper is SIGKILLed and leaves the
  * file behind, the Host's liveness probe still tracks whether the tunnel works.
  */
-if (child.pid) writeState(child.pid, undefined);
+if (child.pid) writeState(child.pid, undefined, undefined);
 
 let buffer = "";
 let url: string | undefined;
+let tunnelId: string | undefined;
 const onChunk = (chunk: Buffer) => {
   const text = chunk.toString("utf8");
   process.stdout.write(text);
-  if (url) return;
+  // Not `if (url) return`: providers that report an id do so after the URL, so
+  // bailing on the first URL would lose the id the enrollment command needs.
+  if (url && (tunnelId || !spec.extractId)) return;
   buffer += text;
   if (buffer.length > 64_000) buffer = buffer.slice(-32_000);
-  const found = spec.extractUrl(buffer);
-  if (!found) return;
+  const foundId = tunnelId ?? spec.extractId?.(buffer);
+  const found = url ?? spec.extractUrl(buffer);
+  if (found === url && foundId === tunnelId) return;
   url = found;
-  if (child.pid) writeState(child.pid, url);
-  log(`public URL ${url}`);
+  tunnelId = foundId;
+  if (child.pid) writeState(child.pid, url, tunnelId);
+  if (url) log(`public URL ${url}${tunnelId ? ` (tunnel ${tunnelId})` : ""}`);
 };
 
 child.stdout.on("data", onChunk);

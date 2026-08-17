@@ -98,6 +98,7 @@ type TunnelManagerOptions = {
 export class TunnelManager {
   private status: TunnelStatus = "off";
   private tunnelUrl: string | undefined;
+  private tunnelId: string | undefined;
   private error: string | undefined;
   private child: ChildProcess | undefined;
   private buffer = "";
@@ -133,6 +134,7 @@ export class TunnelManager {
       : this.status === "on" && this.tunnelUrl;
     const url = external ? external.url : this.tunnelUrl;
     const provider = external?.provider ?? this.provider;
+    const tunnelId = external ? external.tunnelId : this.tunnelId;
     const providers = await Promise.all(
       providerList.map(async (spec) => ({
         id: spec.id,
@@ -155,6 +157,7 @@ export class TunnelManager {
         providers.find((entry) => entry.id === provider)?.binaryPresent ?? false,
       providers,
       external: Boolean(external),
+      ...(online && tunnelId ? { tunnelId } : {}),
     };
   }
 
@@ -163,6 +166,13 @@ export class TunnelManager {
     const external = this.readExternal();
     if (external) return external.url;
     return this.status === "on" ? this.tunnelUrl : undefined;
+  }
+
+  /** Provider-side tunnel id when online, for providers that expose one. */
+  activeTunnelId(): string | undefined {
+    const external = this.readExternal();
+    if (external) return external.tunnelId;
+    return this.status === "on" ? this.tunnelId : undefined;
   }
 
   async setEnabled(enabled: boolean, provider?: TunnelProvider): Promise<void> {
@@ -198,6 +208,7 @@ export class TunnelManager {
     this.status = "starting";
     this.error = undefined;
     this.tunnelUrl = undefined;
+    this.tunnelId = undefined;
     this.buffer = "";
 
     const child = spawn(spec.binary, spec.args(this.target), {
@@ -209,6 +220,9 @@ export class TunnelManager {
     const onChunk = (chunk: Buffer) => {
       this.buffer += chunk.toString("utf8");
       if (this.buffer.length > 64_000) this.buffer = this.buffer.slice(-32_000);
+      // The id can be printed after the URL, so it is parsed on its own
+      // schedule rather than being folded into the URL branch below.
+      if (!this.tunnelId) this.tunnelId = spec.extractId?.(this.buffer);
       if (this.tunnelUrl) return;
       const url = spec.extractUrl(this.buffer);
       if (!url) return;
@@ -226,6 +240,7 @@ export class TunnelManager {
       if (this.child !== child) return;
       this.child = undefined;
       this.tunnelUrl = undefined;
+      this.tunnelId = undefined;
       this.status = "error";
       this.error = err.message;
       this.wantEnabled = false;
@@ -236,6 +251,7 @@ export class TunnelManager {
       if (this.child !== child) return;
       this.child = undefined;
       this.tunnelUrl = undefined;
+      this.tunnelId = undefined;
       if (this.status === "stopping") {
         this.status = "off";
         this.error = undefined;
@@ -278,6 +294,7 @@ export class TunnelManager {
     if (!child) {
       this.status = "off";
       this.tunnelUrl = undefined;
+      this.tunnelId = undefined;
       this.error = undefined;
       return;
     }
@@ -298,6 +315,7 @@ export class TunnelManager {
 
     this.child = undefined;
     this.tunnelUrl = undefined;
+    this.tunnelId = undefined;
     this.status = "off";
     this.error = undefined;
   }

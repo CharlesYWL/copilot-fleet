@@ -10,12 +10,15 @@ const StateSchema = z.object({
   provider: TunnelProviderSchema,
   /** Empty while the provider has not printed its URL yet. */
   url: z.string(),
+  /** Provider-side tunnel id, for providers whose URL does not encode one. */
+  tunnelId: z.string().optional(),
   pid: z.number().int().positive(),
 });
 
 export type ExternalTunnel = {
   provider: TunnelProvider;
   url: string | undefined;
+  tunnelId: string | undefined;
 };
 
 /**
@@ -57,6 +60,7 @@ export function readExternalTunnel(
   return {
     provider: state.data.provider,
     url: state.data.url || undefined,
+    tunnelId: state.data.tunnelId || undefined,
   };
 }
 

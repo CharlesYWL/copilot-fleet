@@ -12,7 +12,7 @@ import {
 } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
 import { useEnrollment } from "../hooks/useEnrollment";
-import { enrollCommand, isLocalOnlyHostUrl } from "../lib/enroll-command";
+import { enrollCommand, isDevTunnelUrl, isLocalOnlyHostUrl } from "../lib/enroll-command";
 import { terminal } from "../theme";
 
 const useStyles = makeStyles({
@@ -71,7 +71,8 @@ export const ConnectNodeCard = () => {
 
   if (!enrollment) return null;
 
-  const command = enrollCommand(hostUrl, enrollment.enrollmentToken);
+  const devTunnel = isDevTunnelUrl(hostUrl);
+  const command = enrollCommand(hostUrl, enrollment.enrollmentToken, enrollment.tunnelId);
 
   const handleCopy = async () => {
     await navigator.clipboard.writeText(command);
@@ -98,7 +99,18 @@ export const ConnectNodeCard = () => {
         />
       </Field>
 
-      {isLocalOnlyHostUrl(hostUrl) && (
+      {devTunnel && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            This tunnel is private, so a node cannot dial the URL directly — it would
+            be redirected to a Microsoft login it has no way to answer. The commands
+            below sign the node&apos;s machine in with <code>devtunnel</code> and reach
+            the Host over a forwarded local port instead.
+          </MessageBarBody>
+        </MessageBar>
+      )}
+
+      {!devTunnel && isLocalOnlyHostUrl(hostUrl) && (
         <MessageBar intent="warning">
           <MessageBarBody>
             This address only resolves on the Host itself. Point it at a tunnel or LAN

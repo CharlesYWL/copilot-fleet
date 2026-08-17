@@ -151,6 +151,52 @@ INF +---------------------------------------------------------------------------
   });
 });
 
+/** Captured from a real `devtunnel host -p 8790` run. */
+const DEVTUNNEL_LOG = [
+  "Connection to host tunnel relay restored.",
+  "Hosting port: 8790",
+  "Connect via browser: https://7m667npm-8790.usw2.devtunnels.ms",
+  "Inspect network activity: https://7m667npm-8790-inspect.usw2.devtunnels.ms",
+  "",
+  "Ready to accept connections for tunnel: neat-lake-7x8gj9s.usw2",
+].join("\n");
+
+describe("devtunnel output parsing", () => {
+  it("takes the forwarding URL from a full session banner", () => {
+    expect(extractTunnelUrl(DEVTUNNEL_LOG, "devtunnel")).toBe(
+      "https://7m667npm-8790.usw2.devtunnels.ms",
+    );
+  });
+
+  /**
+   * Checked in isolation on purpose. Both URLs end in devtunnels.ms and the
+   * forwarding one merely happens to be printed first, so a test that only
+   * looks at the full banner would still pass with a pattern that cannot tell
+   * them apart — and the manager latches the first URL it parses for the life
+   * of the process.
+   */
+  it("refuses the inspector URL rather than merely ranking it second", () => {
+    const inspectOnly =
+      "Inspect network activity: https://7m667npm-8790-inspect.usw2.devtunnels.ms";
+    expect(extractTunnelUrl(inspectOnly, "devtunnel")).toBeUndefined();
+  });
+
+  it("reads back the tunnel id, which the URL does not encode", () => {
+    expect(providerSpecs.devtunnel.extractId?.(DEVTUNNEL_LOG)).toBe(
+      "neat-lake-7x8gj9s.usw2",
+    );
+  });
+
+  it("has no id to report before the tunnel is ready", () => {
+    expect(providerSpecs.devtunnel.extractId?.("Hosting port: 8790")).toBeUndefined();
+  });
+
+  it("forwards the loopback port as an explicit http origin", () => {
+    const args = providerSpecs.devtunnel.args(parseLocalTarget("http://127.0.0.1:8790"));
+    expect(args).toEqual(["host", "-p", "8790", "--protocol", "http"]);
+  });
+});
+
 describe("parseLocalTarget", () => {
   it("splits a loopback URL into host and port for port-only providers", () => {
     expect(parseLocalTarget("http://127.0.0.1:8787")).toEqual({

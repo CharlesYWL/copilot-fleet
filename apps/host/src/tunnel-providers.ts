@@ -11,6 +11,11 @@ export type ProviderSpec = {
   args: (target: LocalTarget) => string[];
   /** Extracts the public URL from a line of CLI output. */
   extractUrl: (text: string) => string | undefined;
+  /**
+   * Extracts the provider's own tunnel identifier, for providers whose public
+   * URL does not encode it. Only Dev Tunnels needs this today.
+   */
+  extractId?: (text: string) => string | undefined;
   /** Shown in the UI when the binary is missing. */
   installHint: string;
   /** Warning surfaced while the tunnel is online, if any. */
@@ -39,6 +44,16 @@ const NGROK_URL_RE = /https:\/\/[a-z0-9-]+\.ngrok(?:-free)?\.(?:app|io|dev)/i;
 const TAILSCALE_URL_RE = /https:\/\/[a-z0-9-]+(?:\.[a-z0-9-]+)*\.ts\.net(?::\d+)?/i;
 /** bore reports `listening at bore.pub:45871` and forwards plain TCP. */
 const BORE_HOSTPORT_RE = /listening at ([a-z0-9.-]+:\d+)/i;
+/**
+ * `devtunnel host` prints two devtunnels.ms URLs: the forwarding one, then an
+ * `-inspect` sibling for its traffic inspector. The lookbehind rejects the
+ * inspector, because the first URL parsed is latched for the life of the
+ * process — a single mis-parse would point every enrollment at a debugging UI.
+ */
+export const DEVTUNNEL_URL_RE =
+  /https:\/\/[a-z0-9-]+(?<!-inspect)\.[a-z0-9]+\.devtunnels\.ms/i;
+/** `Ready to accept connections for tunnel: neat-lake-7x8gj9s.usw2` */
+export const DEVTUNNEL_ID_RE = /(?<=for tunnel:\s)[a-z0-9-]+\.[a-z0-9]+/i;
 
 export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
   cloudflare: {
@@ -92,6 +107,21 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     },
     installHint: "brew install bore-cli",
     caveat: "bore relays plain TCP, so traffic is not encrypted in transit.",
+  },
+  devtunnel: {
+    id: "devtunnel",
+    label: "Dev Tunnels",
+    binary: "devtunnel",
+    versionArgs: ["--version"],
+    // `--protocol http` because the Host serves plain HTTP on loopback; left on
+    // `auto` the relay can decide the origin is https and fail every request.
+    args: (target) => ["host", "-p", String(target.port), "--protocol", "http"],
+    extractUrl: matcher(DEVTUNNEL_URL_RE),
+    extractId: matcher(DEVTUNNEL_ID_RE),
+    installHint:
+      "winget install Microsoft.devtunnel, then run `devtunnel user login`.",
+    caveat:
+      "Private by default: the URL prompts for a Microsoft login, so nodes cannot dial it directly. Run `devtunnel connect` on each node and point it at the forwarded localhost port.",
   },
 };
 
