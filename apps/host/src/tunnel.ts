@@ -1,6 +1,12 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import type { TunnelInfo, TunnelProvider, TunnelStatus } from "@fleet/protocol";
+import type {
+  TunnelInfo,
+  TunnelProvider,
+  TunnelProviderInfo,
+  TunnelState,
+  TunnelStatus,
+} from "@fleet/protocol";
 import { readExternalTunnel, type ExternalTunnel } from "./external-tunnel.js";
 import {
   parseLocalTarget,
@@ -84,6 +90,15 @@ export function restartDelay(attempt: number): number {
 type TunnelManagerOptions = {
   /** Loopback target the tunnel should forward to, e.g. http://127.0.0.1:8787 */
   localTarget: string;
+  /**
+   * Which provider this manager owns.
+   *
+   * Set at construction because the supervisor runs one manager per provider,
+   * and ownership decides whose external state a manager may claim. Deferring
+   * it to the first `setEnabled` left every manager answering as the default,
+   * so all of them reported the same tunnel.
+   */
+  provider?: TunnelProvider;
   /** Called when enabled is cleared after an unrecoverable failure. */
   onEnabledCleared?: () => void;
   /** Injected so tests can run without real timers. */
@@ -93,6 +108,15 @@ type TunnelManagerOptions = {
   readExternal?: () => ExternalTunnel | undefined;
   /** Injected so tests never spawn a real CLI. */
   probe?: BinaryProbe;
+  /**
+   * Reads and writes the reusable tunnel id for providers that support one.
+   * Persisting it is what keeps the public URL stable across Host restarts, so
+   * a node's connect command does not have to be reissued every time.
+   */
+  persistedTunnelId?: {
+    get: (provider: TunnelProvider) => string | undefined;
+    set: (provider: TunnelProvider, id: string) => void;
+  };
 };
 
 export class TunnelManager {
@@ -113,6 +137,7 @@ export class TunnelManager {
   private restartTimer: NodeJS.Timeout | undefined;
   private readonly readExternal: () => ExternalTunnel | undefined;
   private readonly probe: BinaryProbe;
+  private readonly persistedTunnelId: TunnelManagerOptions["persistedTunnelId"];
 
   constructor(options: TunnelManagerOptions) {
     this.target = parseLocalTarget(options.localTarget);
@@ -121,21 +146,23 @@ export class TunnelManager {
     this.clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
     this.readExternal = options.readExternal ?? (() => readExternalTunnel());
     this.probe = options.probe ?? new BinaryProbe();
+    this.persistedTunnelId = options.persistedTunnelId;
+    if (options.provider) this.provider = options.provider;
+  }
+
+  /** External state only counts when it belongs to the provider this owns. */
+  private ownExternal(): ExternalTunnel | undefined {
+    const external = this.readExternal();
+    return external?.provider === this.provider ? external : undefined;
   }
 
   get activeProvider(): TunnelProvider {
     return this.provider;
   }
 
-  async info(fallbackPublicUrl: string): Promise<TunnelInfo> {
-    const external = this.readExternal();
-    const online = external
-      ? Boolean(external.url)
-      : this.status === "on" && this.tunnelUrl;
-    const url = external ? external.url : this.tunnelUrl;
-    const provider = external?.provider ?? this.provider;
-    const tunnelId = external ? external.tunnelId : this.tunnelId;
-    const providers = await Promise.all(
+  /** The provider catalog, shared by every manager through one probe cache. */
+  async providerCatalog(): Promise<TunnelProviderInfo[]> {
+    return Promise.all(
       providerList.map(async (spec) => ({
         id: spec.id,
         label: spec.label,
@@ -145,34 +172,39 @@ export class TunnelManager {
         ...(spec.caveat ? { caveat: spec.caveat } : {}),
       })),
     );
-    return {
-      provider,
-      enabled: external
-        ? true
-        : this.wantEnabled || this.status === "starting" || this.status === "on",
-      status: external ? (external.url ? "on" : "starting") : this.status,
-      publicUrl: online && url ? url : fallbackPublicUrl,
-      error: external ? null : (this.error ?? null),
-      binaryPresent:
-        providers.find((entry) => entry.id === provider)?.binaryPresent ?? false,
-      providers,
-      external: Boolean(external),
-      ...(online && tunnelId ? { tunnelId } : {}),
-    };
   }
 
   /** Live tunnel URL when online; otherwise undefined so callers use fallbacks. */
   activeTunnelUrl(): string | undefined {
-    const external = this.readExternal();
+    const external = this.ownExternal();
     if (external) return external.url;
     return this.status === "on" ? this.tunnelUrl : undefined;
   }
 
   /** Provider-side tunnel id when online, for providers that expose one. */
   activeTunnelId(): string | undefined {
-    const external = this.readExternal();
+    const external = this.ownExternal();
     if (external) return external.tunnelId;
     return this.status === "on" ? this.tunnelId : undefined;
+  }
+
+  /** This provider's live state, without the shared provider catalog. */
+  state(): TunnelState {
+    const externalMine = this.ownExternal();
+    const url = externalMine ? externalMine.url : this.tunnelUrl;
+    const online = externalMine ? Boolean(externalMine.url) : this.status === "on";
+    const tunnelId = externalMine ? externalMine.tunnelId : this.tunnelId;
+    return {
+      provider: this.provider,
+      enabled: externalMine
+        ? true
+        : this.wantEnabled || this.status === "starting" || this.status === "on",
+      status: externalMine ? (externalMine.url ? "on" : "starting") : this.status,
+      error: externalMine ? null : (this.error ?? null),
+      external: Boolean(externalMine),
+      ...(online && url ? { url } : {}),
+      ...(tunnelId ? { tunnelId } : {}),
+    };
   }
 
   async setEnabled(enabled: boolean, provider?: TunnelProvider): Promise<void> {
@@ -211,7 +243,28 @@ export class TunnelManager {
     this.tunnelId = undefined;
     this.buffer = "";
 
-    const child = spawn(spec.binary, spec.args(this.target), {
+    // Resolved before the spawn so a failed registration reports itself as a
+    // setup problem rather than as a tunnel that starts and immediately dies.
+    let reusedId: string | undefined;
+    if (spec.prepare && spec.newTunnelId && this.persistedTunnelId) {
+      reusedId =
+        this.persistedTunnelId.get(this.provider) ?? spec.newTunnelId();
+      try {
+        await spec.prepare(this.target, reusedId);
+        this.persistedTunnelId.set(this.provider, reusedId);
+      } catch (error) {
+        this.status = "error";
+        this.error = error instanceof Error ? error.message : String(error);
+        this.wantEnabled = false;
+        this.onEnabledCleared?.();
+        throw error;
+      }
+      // Reported straight away: the connect command depends on it, and for a
+      // reused tunnel it is already true before the CLI prints anything.
+      this.tunnelId = reusedId;
+    }
+
+    const child = spawn(spec.binary, spec.args(this.target, reusedId), {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -318,5 +371,136 @@ export class TunnelManager {
     this.tunnelId = undefined;
     this.status = "off";
     this.error = undefined;
+  }
+}
+
+/**
+ * Runs every provider that the operator has switched on.
+ *
+ * Providers are not alternatives to each other: a fixed Cloudflare hostname is
+ * the address a teammate can reach, while a private Dev Tunnel is the one only
+ * this account can, and both are worth having up at once. Each provider gets
+ * its own manager and its own switch; the supervisor only decides which of the
+ * live URLs enrollment should hand out.
+ */
+export class TunnelSupervisor {
+  private readonly managers = new Map<TunnelProvider, TunnelManager>();
+  /** One probe cache across providers, so a poll costs at most one spawn each. */
+  private readonly probe: BinaryProbe;
+  private primaryProvider: TunnelProvider | undefined;
+
+  constructor(private readonly options: TunnelManagerOptions) {
+    this.probe = options.probe ?? new BinaryProbe();
+  }
+
+  private manager(provider: TunnelProvider): TunnelManager {
+    const existing = this.managers.get(provider);
+    if (existing) return existing;
+    const manager = new TunnelManager({
+      ...this.options,
+      provider,
+      probe: this.probe,
+    });
+    this.managers.set(provider, manager);
+    return manager;
+  }
+
+  get primary(): TunnelProvider | undefined {
+    return this.primaryProvider;
+  }
+
+  setPrimary(provider: TunnelProvider | undefined): void {
+    this.primaryProvider = provider;
+  }
+
+  async setEnabled(
+    provider: TunnelProvider,
+    enabled: boolean,
+    makePrimary = true,
+  ): Promise<void> {
+    await this.manager(provider).setEnabled(enabled, provider);
+    if (enabled && makePrimary) this.primaryProvider = provider;
+    else if (!enabled && this.primaryProvider === provider) {
+      this.primaryProvider = this.onlineProviders()[0];
+    }
+  }
+
+  /** Providers currently serving a URL, in the order they were declared. */
+  private onlineProviders(): TunnelProvider[] {
+    return providerList
+      .map((spec) => spec.id)
+      .filter((id) => this.managers.get(id)?.activeTunnelUrl());
+  }
+
+  /**
+   * The manager whose URL enrollment advertises.
+   *
+   * An explicit choice wins so the operator can point nodes at the address they
+   * mean; otherwise the first provider that is actually serving one is used,
+   * which keeps enrollment working after a primary is switched off.
+   */
+  private primaryManager(): TunnelManager | undefined {
+    const explicit = this.primaryProvider
+      ? this.managers.get(this.primaryProvider)
+      : undefined;
+    if (explicit?.activeTunnelUrl()) return explicit;
+    const fallback = this.onlineProviders()[0];
+    return fallback ? this.managers.get(fallback) : undefined;
+  }
+
+  activeTunnelUrl(): string | undefined {
+    return this.primaryManager()?.activeTunnelUrl();
+  }
+
+  /**
+   * The URL that may be pushed to nodes that are already running.
+   *
+   * Deliberately not the same as the enrollment URL. Enrollment can advertise a
+   * private tunnel because the operator gets a command to go with it, but a
+   * live node told to move somewhere it cannot authenticate is stranded: it
+   * cannot reach the Host, so it cannot be told where to go instead. Only
+   * providers a node can dial unaided are eligible.
+   */
+  broadcastTunnelUrl(): string | undefined {
+    const dialable = providerList
+      .filter((spec) => spec.nodeDialable !== false)
+      .map((spec) => spec.id);
+    const preferred = this.primaryProvider;
+    const ordered =
+      preferred && dialable.includes(preferred)
+        ? [preferred, ...dialable.filter((id) => id !== preferred)]
+        : dialable;
+    for (const id of ordered) {
+      const url = this.managers.get(id)?.activeTunnelUrl();
+      if (url) return url;
+    }
+    return undefined;
+  }
+
+  activeTunnelId(): string | undefined {
+    return this.primaryManager()?.activeTunnelId();
+  }
+
+  async info(fallbackPublicUrl: string): Promise<TunnelInfo> {
+    // Touch every provider so a switched-off one still reports its state and
+    // the UI can offer it, rather than only listing what has already run.
+    const tunnels = providerList.map((spec) => this.manager(spec.id).state());
+    const providers = await this.manager(providerList[0]!.id).providerCatalog();
+    const url = this.activeTunnelUrl();
+    const primaryUrlOwner = providerList
+      .map((spec) => spec.id)
+      .find((id) => this.managers.get(id)?.activeTunnelUrl() === url && url);
+    const tunnelId = this.activeTunnelId();
+    return {
+      primary: primaryUrlOwner ?? null,
+      publicUrl: url ?? fallbackPublicUrl,
+      providers,
+      tunnels,
+      ...(tunnelId ? { tunnelId } : {}),
+    };
+  }
+
+  async stop(): Promise<void> {
+    await Promise.all([...this.managers.values()].map((manager) => manager.stop()));
   }
 }

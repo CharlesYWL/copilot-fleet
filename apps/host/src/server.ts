@@ -24,7 +24,7 @@ import { nodeRoutes } from "./routes/nodes.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { systemRoutes } from "./routes/system.js";
 import { FleetStore } from "./store.js";
-import { TunnelManager } from "./tunnel.js";
+import { TunnelSupervisor } from "./tunnel.js";
 
 loadEnv({ path: envFilePath(), quiet: true });
 
@@ -63,11 +63,15 @@ export async function buildServer(
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
   const listenPort = process.env.PORT ?? "8787";
 
-  const tunnel = new TunnelManager({
+  const tunnel = new TunnelSupervisor({
     localTarget: `http://127.0.0.1:${listenPort}`,
     onEnabledCleared: () => store.setTunnelEnabled(false),
+    persistedTunnelId: {
+      get: (provider) => store.getSetting(`tunnel.${provider}.id`),
+      set: (provider, id) => store.setSetting(`tunnel.${provider}.id`, id),
+    },
   });
-  void tunnel.setEnabled(false, store.getTunnelProvider());
+  tunnel.setPrimary(store.getTunnelProvider());
 
   const fallbackPublicUrl = () =>
     resolvePublicHostUrl(
@@ -77,11 +81,21 @@ export async function buildServer(
     );
   const enrollmentHostUrl = () =>
     resolveEnrollmentHostUrl(tunnel.activeTunnelUrl(), fallbackPublicUrl());
+  /**
+   * What a node already running should be told to dial.
+   *
+   * Narrower than the enrollment URL on purpose: a private tunnel is a fine
+   * thing to advertise on the Connect card, which comes with the command to
+   * reach it, and a catastrophic thing to push to a live node, which would
+   * follow it into a login it cannot answer and go silent.
+   */
+  const broadcastHostUrl = () =>
+    resolveEnrollmentHostUrl(tunnel.broadcastTunnelUrl(), fallbackPublicUrl());
 
   // Nodes reached over a path that outlives a tunnel rotation — a LAN address,
   // a named tunnel — are told where the Host moved to, so they follow it
   // instead of dialing an address that stopped existing.
-  const hostUrlMonitor = startHostUrlMonitor(enrollmentHostUrl, (hostUrl) =>
+  const hostUrlMonitor = startHostUrlMonitor(broadcastHostUrl, (hostUrl) =>
     service.broadcastHostUrl(hostUrl),
   );
   // Registered before the routes: a child plugin context inherits the error
@@ -121,11 +135,17 @@ export async function buildServer(
   }
 
   app.addHook("onReady", () => {
-    if (!store.getTunnelEnabled()) return;
-    void tunnel.setEnabled(true, store.getTunnelProvider()).catch((error) => {
-      store.setTunnelEnabled(false);
-      app.log.error({ err: error }, "Failed to restore tunnel");
-    });
+    // Restores every provider the operator left switched on, not just one: they
+    // run concurrently, so bringing back a single "current" tunnel would
+    // silently drop the others across a restart.
+    for (const provider of store.getEnabledTunnelProviders()) {
+      void tunnel
+        .setEnabled(provider, true, provider === store.getTunnelProvider())
+        .catch((error) => {
+          store.setTunnelProviderEnabled(provider, false);
+          app.log.error({ err: error, provider }, "Failed to restore tunnel");
+        });
+    }
   });
 
   app.addHook("onClose", async () => {

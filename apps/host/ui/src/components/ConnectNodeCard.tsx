@@ -12,7 +12,12 @@ import {
 } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
 import { useEnrollment } from "../hooks/useEnrollment";
-import { enrollCommand, isDevTunnelUrl, isLocalOnlyHostUrl } from "../lib/enroll-command";
+import {
+  devTunnelLoginCommand,
+  enrollCommand,
+  isDevTunnelUrl,
+  isLocalOnlyHostUrl,
+} from "../lib/enroll-command";
 import { terminal } from "../theme";
 
 const useStyles = makeStyles({
@@ -57,7 +62,7 @@ export const ConnectNodeCard = () => {
   const styles = useStyles();
   const enrollment = useEnrollment();
   const [editedUrl, setEditedUrl] = useState<string>();
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<string>();
 
   // Until the field is touched it tracks the polled value, so a rotated tunnel
   // URL reaches the command without wiping out whatever was typed over it.
@@ -65,7 +70,7 @@ export const ConnectNodeCard = () => {
 
   useEffect(() => {
     if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 2000);
+    const timer = setTimeout(() => setCopied(undefined), 2000);
     return () => clearTimeout(timer);
   }, [copied]);
 
@@ -74,10 +79,23 @@ export const ConnectNodeCard = () => {
   const devTunnel = isDevTunnelUrl(hostUrl);
   const command = enrollCommand(hostUrl, enrollment.enrollmentToken, enrollment.tunnelId);
 
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(command);
-    setCopied(true);
+  const copy = async (key: string, text: string) => {
+    await navigator.clipboard.writeText(text);
+    setCopied(key);
   };
+
+  const commandBox = (key: string, text: string) => (
+    <div className={styles.commandRow}>
+      <pre className={styles.command}>{text}</pre>
+      <Button
+        appearance={copied === key ? "subtle" : "primary"}
+        icon={copied === key ? <Checkmark20Regular /> : <Copy20Regular />}
+        onClick={() => void copy(key, text)}
+      >
+        {copied === key ? "Copied" : "Copy"}
+      </Button>
+    </div>
+  );
 
   return (
     <section className={styles.card} aria-label="Connect a machine">
@@ -86,8 +104,8 @@ export const ConnectNodeCard = () => {
         <br />
         <Text className={styles.caption}>
           Run this from a Copilot Fleet checkout that has Node.js and a signed-in Copilot
-          CLI — the same three lines work in bash and PowerShell. The node registers
-          itself under the machine&apos;s own hostname.
+          CLI — the same lines work in bash and PowerShell. The node registers itself
+          under the machine&apos;s own hostname.
         </Text>
       </div>
 
@@ -102,10 +120,10 @@ export const ConnectNodeCard = () => {
       {devTunnel && (
         <MessageBar intent="info">
           <MessageBarBody>
-            This tunnel is private, so a node cannot dial the URL directly — it would
-            be redirected to a Microsoft login it has no way to answer. The commands
-            below sign the node&apos;s machine in with <code>devtunnel</code> and reach
-            the Host over a forwarded local port instead.
+            This tunnel is private, so a node cannot dial the URL directly — it would be
+            redirected to a Microsoft login it has no way to answer. Sign the machine in
+            once, then start the node: it opens the tunnel itself and finds the
+            forwarded port, so no second terminal is needed.
           </MessageBarBody>
         </MessageBar>
       )}
@@ -119,15 +137,16 @@ export const ConnectNodeCard = () => {
         </MessageBar>
       )}
 
-      <div className={styles.commandRow}>
-        <pre className={styles.command}>{command}</pre>
-        <Button
-          appearance={copied ? "subtle" : "primary"}
-          icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
-          onClick={() => void handleCopy()}
-        >
-          {copied ? "Copied" : "Copy"}
-        </Button>
+      {devTunnel && (
+        <div>
+          <Text weight="semibold">1. Sign this machine in (once)</Text>
+          {commandBox("login", devTunnelLoginCommand())}
+        </div>
+      )}
+
+      <div>
+        {devTunnel && <Text weight="semibold">2. Start the node</Text>}
+        {commandBox("enroll", command)}
       </div>
     </section>
   );

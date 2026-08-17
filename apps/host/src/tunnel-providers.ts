@@ -1,4 +1,28 @@
+import { execFile } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { promisify } from "node:util";
 import type { TunnelProvider } from "@fleet/protocol";
+
+const execFileAsync = promisify(execFile);
+
+const runDevTunnel = (args: string[]): Promise<unknown> =>
+  execFileAsync("devtunnel", args, { windowsHide: true, timeout: 30_000 });
+
+/**
+ * Registering a tunnel or a port that already exists is the steady state, not a
+ * failure: the Host re-runs setup on every start so a half-configured tunnel
+ * repairs itself. Only a conflict is swallowed — a missing binary or a signed-out
+ * CLI still has to surface, or the operator gets a silent no-op.
+ */
+async function tolerateConflict(work: Promise<unknown>): Promise<void> {
+  try {
+    await work;
+  } catch (error) {
+    const text = error instanceof Error ? `${error.message}` : String(error);
+    if (/conflict/i.test(text)) return;
+    throw error;
+  }
+}
 
 export type ProviderSpec = {
   id: TunnelProvider;
@@ -8,7 +32,15 @@ export type ProviderSpec = {
   /** Arguments used to probe whether the binary is installed. */
   versionArgs: string[];
   /** Builds the argv that starts the tunnel for a loopback target. */
-  args: (target: LocalTarget) => string[];
+  args: (target: LocalTarget, tunnelId?: string) => string[];
+  /**
+   * Registers whatever the provider needs before `args` can be spawned, and
+   * returns the id to host. Providers that need no setup omit this and get a
+   * fresh anonymous tunnel each start.
+   */
+  prepare?: (target: LocalTarget, tunnelId: string) => Promise<void>;
+  /** A stable id this provider can reuse so its URL survives restarts. */
+  newTunnelId?: () => string;
   /** Extracts the public URL from a line of CLI output. */
   extractUrl: (text: string) => string | undefined;
   /**
@@ -20,6 +52,15 @@ export type ProviderSpec = {
   installHint: string;
   /** Warning surfaced while the tunnel is online, if any. */
   caveat?: string;
+  /**
+   * Whether a node can dial this provider's URL directly.
+   *
+   * False for tunnels that demand an interactive login: a running node told to
+   * move to one cannot authenticate, cannot reach the Host to be told anything
+   * else, and has to be repointed by hand. Such a URL is still worth showing —
+   * enrollment has a command for it — but must never be pushed to live nodes.
+   */
+  nodeDialable?: boolean;
 };
 
 export type LocalTarget = {
@@ -113,15 +154,41 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     label: "Dev Tunnels",
     binary: "devtunnel",
     versionArgs: ["--version"],
-    // `--protocol http` because the Host serves plain HTTP on loopback; left on
-    // `auto` the relay can decide the origin is https and fail every request.
-    args: (target) => ["host", "-p", String(target.port), "--protocol", "http"],
+    // Hosting a named tunnel keeps the URL stable across restarts, which is
+    // what lets a node keep one `devtunnel connect <id>` command forever.
+    // Without an id the service mints a throwaway tunnel and a new URL.
+    args: (target, tunnelId) =>
+      tunnelId
+        ? ["host", tunnelId]
+        : ["host", "-p", String(target.port), "--protocol", "http"],
+    // The port cannot be passed to `host` alongside an existing id — the
+    // service rejects that as a batch port update — so both the tunnel and its
+    // port are registered first. Each call conflicts once the entity exists,
+    // which is the normal steady state and not an error.
+    prepare: async (target, tunnelId) => {
+      await tolerateConflict(runDevTunnel(["create", tunnelId]));
+      await tolerateConflict(
+        runDevTunnel([
+          "port",
+          "create",
+          tunnelId,
+          "-p",
+          String(target.port),
+          "--protocol",
+          "http",
+        ]),
+      );
+    },
+    newTunnelId: () => `fleet-${randomBytes(4).toString("hex")}`,
     extractUrl: matcher(DEVTUNNEL_URL_RE),
     extractId: matcher(DEVTUNNEL_ID_RE),
     installHint:
       "winget install Microsoft.devtunnel, then run `devtunnel user login`.",
     caveat:
-      "Private by default: the URL prompts for a Microsoft login, so nodes cannot dial it directly. Run `devtunnel connect` on each node and point it at the forwarded localhost port.",
+      "Private by default: the URL prompts for a Microsoft login, so nodes cannot dial it directly. Nodes reach it through `devtunnel connect`.",
+    // A node handed this URL would be redirected to a login it cannot answer,
+    // and would then be unreachable for a correction.
+    nodeDialable: false,
   },
 };
 

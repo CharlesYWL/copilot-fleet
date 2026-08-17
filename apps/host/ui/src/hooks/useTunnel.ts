@@ -4,9 +4,13 @@ import { api } from "./useFleet";
 
 export type TunnelControls = {
   info: TunnelInfo | undefined;
-  busy: boolean;
+  busy: TunnelProvider | undefined;
   error: string | undefined;
-  setEnabled: (enabled: boolean, provider?: TunnelProvider) => Promise<void>;
+  setEnabled: (
+    provider: TunnelProvider,
+    enabled: boolean,
+    primary?: boolean,
+  ) => Promise<void>;
 };
 
 /**
@@ -19,7 +23,9 @@ export type TunnelControls = {
  */
 export function useTunnel(intervalMs = 2_000): TunnelControls {
   const [info, setInfo] = useState<TunnelInfo>();
-  const [busy, setBusy] = useState(false);
+  // Tracks which provider is mid-flight rather than a single flag, so toggling
+  // one tunnel does not disable the switches of the others.
+  const [busy, setBusy] = useState<TunnelProvider>();
   const [error, setError] = useState<string>();
 
   const refresh = useCallback(async () => {
@@ -37,21 +43,25 @@ export function useTunnel(intervalMs = 2_000): TunnelControls {
   }, [refresh, intervalMs]);
 
   const setEnabled = useCallback(
-    async (enabled: boolean, provider?: TunnelProvider) => {
-      setBusy(true);
+    async (provider: TunnelProvider, enabled: boolean, primary?: boolean) => {
+      setBusy(provider);
       setError(undefined);
       try {
         setInfo(
           await api<TunnelInfo>("/api/tunnel", {
             method: "POST",
-            body: JSON.stringify({ enabled, ...(provider ? { provider } : {}) }),
+            body: JSON.stringify({
+              enabled,
+              provider,
+              ...(primary === undefined ? {} : { primary }),
+            }),
           }),
         );
       } catch (reason) {
         setError(errorMessage(reason));
         await refresh();
       } finally {
-        setBusy(false);
+        setBusy(undefined);
       }
     },
     [refresh],

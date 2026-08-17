@@ -18,7 +18,7 @@ identity by default, which puts an identity gate in front of an app that has non
 
 - **Replacing Host authentication.** This is defense in depth, not the fix. See "Relationship to Host auth".
 - `--allow-anonymous` tunnels. Explicitly rejected; see "Decisions".
-- Persistent/named tunnels with stable URLs (possible later; not needed for v1 — see "URL rotation is a non-issue here").
+- Operator-named tunnel ids. The Host generates and reuses one; see "Persistence".
 - Changing how Nodes authenticate to the Host (unique Node secret is unchanged).
 
 ## Verification performed
@@ -105,30 +105,58 @@ falls back silently. Observed on a machine where 8790 was taken:
 SSH: Forwarding from 127.0.0.1:8791 to host port 8790.
 ```
 
-So generated instructions must tell the operator to read the CLI's actual
-`Forwarding from` line rather than assuming the port. Do not hard-code it.
+The node therefore reads the port back from that line rather than being handed
+a guess. Nothing transcribes it.
 
 ## Decisions (locked)
 
 | Topic | Choice |
 |---|---|
 | Provider id | `devtunnel` |
-| Tunnel kind | Temporary (`devtunnel host`), deleted on exit |
+| Tunnel kind | Persistent named tunnel, so the URL and id survive restarts |
 | Anonymous access | Never; no flag exposed in the UI |
-| Node connectivity | `devtunnel connect` on the Node machine |
-| Node code changes | None in v1 |
+| Node connectivity | The node runs `devtunnel connect` itself via `--devtunnel <id>` |
+| Concurrency | Providers run side by side; each has its own switch |
+| Broadcast safety | A private tunnel is advertised for enrollment but never pushed to live nodes |
 | Tunnel ID capture | New optional `extractId` on `ProviderSpec` |
 | Connect card | Provider-aware; devtunnel gets its own command block |
 
-## URL rotation is a non-issue here
+## Persistence: named tunnels, not throwaway ones
 
-`tunnel-providers.ts` carries `caveat: "Quick tunnel URLs change on every restart."`
-for Cloudflare, and `host-url.ts` / `knownHostUrls` exist to chase that rotation.
+An anonymous `devtunnel host` mints a **new tunnel and a new URL on every
+start**, and deletes it on exit. Measured across two runs of a named tunnel, the
+URL is instead identical:
 
-Under this design the **Node's dial URL is `http://127.0.0.1:<forwarded>`, which
-never changes.** Only the browser-facing URL rotates, and a human re-reads that
-anyway. So temporary tunnels are acceptable for v1 and persistent named tunnels
-buy little.
+```
+run 1  https://k9wzx0nq-8790.usw2.devtunnels.ms
+run 2  https://k9wzx0nq-8790.usw2.devtunnels.ms
+```
+
+It even survives deleting and recreating the port, so the routing token belongs
+to the tunnel rather than to the port.
+
+Two consequences make this the default rather than a nicety:
+
+- A rotating id would break the node's `devtunnel connect <id>` on every Host
+  restart, which is the whole reason the id is surfaced.
+- Throwaway tunnels accumulate. Eight orphans were left behind by ordinary
+  dev-server restarts before persistence landed.
+
+The Host generates an id once (`fleet-<random>`), stores it under
+`tunnel.<provider>.id`, and reuses it. Registration is a three-step sequence,
+discovered by experiment rather than from the docs:
+
+```
+devtunnel create <id>                                  # Conflict once it exists
+devtunnel port create <id> -p <port> --protocol http   # Conflict once it exists
+devtunnel host <id>
+```
+
+`devtunnel host <id> -p <port>` is rejected outright — *"Batch update of ports is
+not supported"* — so the port cannot be passed inline alongside an existing id.
+Both `create` calls conflict in the steady state, so a conflict is swallowed
+while any other failure still surfaces; otherwise a signed-out CLI would look
+like success.
 
 ## Provider spec entry
 
@@ -138,9 +166,13 @@ devtunnel: {
   label: "Dev Tunnels",
   binary: "devtunnel",
   versionArgs: ["--version"],
-  args: (target) => ["host", "-p", String(target.port), "--protocol", "http"],
+  args: (target, tunnelId) =>
+    tunnelId ? ["host", tunnelId] : ["host", "-p", String(target.port), "--protocol", "http"],
+  prepare: async (target, tunnelId) => { /* create + port create, conflicts tolerated */ },
+  newTunnelId: () => `fleet-${randomBytes(4).toString("hex")}`,
   extractUrl: matcher(DEVTUNNEL_URL_RE),
   extractId: matcher(DEVTUNNEL_ID_RE),
+  nodeDialable: false,
   installHint: "winget install Microsoft.devtunnel, then run `devtunnel user login`.",
   caveat: "Private by default: remote nodes must run `devtunnel connect` and dial the forwarded localhost port.",
 },
@@ -206,27 +238,60 @@ field, so a separately-run tunnel can still drive correct instructions.
 export function isDevTunnelUrl(hostUrl: string): boolean;
 ```
 
-When the active provider is `devtunnel` (or `hostUrl` matches), the card renders:
+When the active provider is `devtunnel` (or `hostUrl` matches), the card renders
+two blocks — the interactive one-time login is kept apart from the command that
+gets re-run:
 
 ```
-# On the node machine, once:
+# 1. Sign this machine in (once)
 devtunnel user login
-devtunnel connect <tunnelId>
 
-# Read the "Forwarding from 127.0.0.1:<port>" line the CLI prints,
-# then use that port below.
+# 2. Start the node
 npm install
 npm run build:node
-npm run start:node -- --url="http://127.0.0.1:<port>" --token="<token>"
+npm run start:node -- --devtunnel="<tunnelId>" --token="<token>"
 ```
 
-Two existing behaviors need care:
+The node opens the tunnel itself, so there is no second terminal and no port to
+transcribe: `--devtunnel` spawns `devtunnel connect`, waits for its
+`Forwarding from 127.0.0.1:<port>` line, and uses that as the host URL. A
+`connect` that exits first is reported as a signed-out CLI rather than a hang.
+
+One existing behavior needs care:
 
 - **Suppress the local-only warning.** `isLocalOnlyHostUrl("http://127.0.0.1:...")`
   is true, but for devtunnel that address is *correct*. Showing "this only
   resolves on the Host itself" would actively mislead.
-- **Keep the URL field showing the public tunnel URL**, since that is what a
-  human opens in a browser. Only the generated command uses loopback.
+
+## Concurrent providers
+
+Providers are not alternatives. A fixed Cloudflare hostname is the address a
+teammate can reach; a private Dev Tunnel is the address only this account can.
+Both are useful at once, and the old single-`provider` shape could not say so.
+
+`TunnelSupervisor` runs one `TunnelManager` per provider over a shared binary
+probe, and `TunnelInfo` carries a `tunnels[]` array of per-provider state plus a
+`primary` marking whose URL enrollment advertises. Each manager is pinned to its
+provider at construction: deferring that to the first `setEnabled` left every
+manager answering as the default, so all of them reported the same tunnel.
+
+## Never broadcast a tunnel a node cannot dial
+
+The Host tells running nodes when its address changes, so they follow it. With a
+private tunnel as primary that is actively destructive: the node adopts a URL it
+cannot authenticate to, and having lost the Host it cannot be told to go
+anywhere else. Observed in practice — a live node went offline and had to be
+repointed by hand.
+
+So two questions are kept separate:
+
+| Question | Answer |
+|---|---|
+| What does enrollment advertise? | Any provider, private included — the card ships the command for it. |
+| What may a running node be told to dial? | Only providers marked `nodeDialable` (default true; `devtunnel` is false). |
+
+`broadcastTunnelUrl()` skips non-dialable providers and falls back to the
+configured public URL, while `activeTunnelUrl()` keeps advertising the primary.
 
 ## Relationship to Host auth
 
@@ -245,10 +310,13 @@ Host-side auth stays the real fix and is tracked separately.
 - Unit: `DEVTUNNEL_ID_RE` against `Ready to accept connections for tunnel: neat-lake-7x8gj9s.usw2`.
 - Unit: `DEVTUNNEL_URL_RE` must return **no match** for the inspect host in isolation (`https://7m667npm-8790-inspect.usw2.devtunnels.ms`), not merely rank it second.
 - Unit: `isDevTunnelUrl` true for `*.devtunnels.ms`, false for trycloudflare/ngrok/loopback.
-- Unit: `enrollCommand` emits the connect form for a devtunnel URL.
-- Unit: local-only warning suppressed for devtunnel loopback commands.
+- Unit: `enrollCommand` emits `--devtunnel`, and never the private URL or a hard-coded port.
+- Unit: the login command stays out of the start command.
+- Unit: supervisor lists every provider, keeps non-serving ones `off`, and picks the serving one as primary.
+- Unit: `broadcastTunnelUrl()` is undefined for a private tunnel that `activeTunnelUrl()` still advertises.
+- Unit: node `connectDevTunnel` reads the forwarded port back, tolerates a split line, and reports a signed-out CLI rather than hanging.
 - Manual: select provider → URL appears → browser prompts Entra login → UI loads.
-- Manual: remote node via `devtunnel connect` → registers → `connected: true`.
+- Manual: restart the Host and confirm the URL is unchanged.
 
 The inspect-URL case is a real trap rather than a hypothetical: both URLs share
 the `devtunnels.ms` suffix, differ only by an infix, and `tunnel.ts` latches the
@@ -277,35 +345,52 @@ merely because the transcript happens to be ordered favorably.
 
 Shipped:
 
-- `tunnelProviders` gains `devtunnel`; `TunnelInfoSchema` gains optional `tunnelId`.
-- `ProviderSpec.extractId` (optional) plus the `devtunnel` entry with the guarded URL pattern.
-- `TunnelManager` parses and clears `tunnelId` alongside the URL, and exposes `activeTunnelId()`.
-- `tunnel-process.ts` keeps scanning after the URL is found, because the id line arrives later — the old `if (url) return` would have discarded it.
-- `external-tunnel.ts` state carries `tunnelId`, so a hand-run tunnel still yields correct instructions.
-- `/api/enrollment` returns `tunnelId` when one exists.
-- `enrollCommand` forks on `isDevTunnelUrl`; the Connect card swaps the misleading
-  local-only warning for an explanation of why loopback is correct here.
+- `tunnelProviders` gains `devtunnel`; `TunnelInfo` becomes a per-provider
+  `tunnels[]` array with a `primary`, replacing the single-provider shape.
+- `ProviderSpec` gains `extractId`, `prepare`, `newTunnelId` and `nodeDialable`.
+- `TunnelSupervisor` runs one manager per provider over a shared probe cache.
+- Persistent named tunnels, with the id stored under `tunnel.<provider>.id`.
+- Per-provider enabled flags (`tunnel.<provider>.enabled`), falling back to the
+  legacy single-provider keys so an existing install keeps what it had running.
+- `tunnel-process.ts` keeps scanning after the URL is found, because the id line
+  arrives later — the old `if (url) return` would have discarded it.
+- Node `--devtunnel <id>`: spawns `devtunnel connect`, discovers the forwarded
+  port, and uses it as the host URL.
+- Connect card splits into a one-time login block and a start block.
 
 Deferred, with reasons:
 
 - **Login readiness check.** Spec proposed probing `devtunnel user show` to
-  distinguish "not logged in" from "binary missing". Not implemented: it adds a
-  second probe to a code path shared by every provider, and the failure is
-  already surfaced (`status: error` with the CLI's exit code) rather than silent.
-  The install hint names `devtunnel user login`. Worth revisiting if operators
-  actually trip on it.
-- **Persistent named tunnels.** Unnecessary while nodes dial loopback; see
-  "URL rotation is a non-issue here".
+  distinguish "not logged in" from "binary missing" on the Host. Not implemented
+  there: it adds a second probe to a path shared by every provider, and the
+  failure already surfaces as `status: error` with the CLI's exit code. The node
+  side *does* special-case it, because a node has no UI to read an error from.
+- **Operator-chosen tunnel id.** The generated `fleet-<random>` is stable and
+  needs no UI; a custom name would only matter for sharing one tunnel across
+  Hosts, which nothing asks for yet.
+
+### Bugs this design walked into
+
+Recorded because each was found by testing rather than reasoning, and each would
+have been quiet in production:
+
+1. **Broadcasting a private URL stranded a live node.** Fixed by `nodeDialable`.
+2. **Provider pinning was asynchronous**, so every manager still answered as the
+   default and reported the same tunnel. Fixed by pinning at construction.
+3. **`activeTunnelUrl()` claimed any external tunnel** regardless of which
+   provider owned it, so one external tunnel appeared under every provider.
+4. **The inspect URL parsed as the forwarding URL** when seen alone.
 
 ### Operational gotcha: PATH staleness
 
 A newly installed CLI is invisible to an already-running Host. Observed here:
-`devtunnel` installs to a WinGet package directory that is appended to the user
-PATH at install time, but the Host process inherited its PATH at launch, so
-`/api/tunnel` reported `binaryPresent: false` while `devtunnel --version`
-succeeded in a fresh shell. The probe logic is correct — a fresh Node process
-resolves the binary in ~1s, well inside the 5s timeout.
+`devtunnel` installs to a WinGet package directory appended to the user PATH at
+install time, but a process inherits its PATH at launch, so `/api/tunnel`
+reported `binaryPresent: false` while `devtunnel --version` succeeded in a fresh
+shell. The probe itself is correct — a fresh Node process resolves the binary in
+~1s, well inside the 5s timeout.
 
-**Restart the Host after installing a provider CLI.** This is pre-existing
-behavior affecting every provider, not specific to Dev Tunnels, but Dev Tunnels
-is the most likely one to be installed while the Host is already running.
+Restarting the Host is not sufficient if its *parent* also predates the install;
+the shell that launches it has to be new. This is pre-existing behavior
+affecting every provider, but Dev Tunnels is the most likely one to be installed
+while the Host is already running.

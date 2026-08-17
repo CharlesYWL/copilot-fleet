@@ -1,6 +1,17 @@
 import { describe, expect, it, vi } from "vitest";
-import { BinaryProbe, restartDelay, RESTART_DELAYS_MS, TunnelManager } from "./tunnel.js";
-import { extractTunnelUrl, parseLocalTarget, providerSpecs } from "./tunnel-providers.js";
+import {
+  BinaryProbe,
+  restartDelay,
+  RESTART_DELAYS_MS,
+  TunnelManager,
+  TunnelSupervisor,
+} from "./tunnel.js";
+import {
+  extractTunnelUrl,
+  parseLocalTarget,
+  providerList,
+  providerSpecs,
+} from "./tunnel-providers.js";
 
 /** Never spawns anything, so tests do not depend on what the box has installed. */
 const fakeProbe = (present = true) => new BinaryProbe(async () => present);
@@ -9,24 +20,23 @@ describe("external tunnel handover", () => {
   const managerWithExternal = (url: string | undefined) =>
     new TunnelManager({
       localTarget: "http://127.0.0.1:8787",
-      readExternal: () => ({ provider: "bore" as const, url }),
+      provider: "bore",
+      readExternal: () => ({ provider: "bore" as const, url, tunnelId: undefined }),
       probe: fakeProbe(),
     });
 
   it("reports the external url and flags that the Host does not own it", async () => {
-    const info = await managerWithExternal("http://bore.pub:1234").info(
-      "http://127.0.0.1:8787",
-    );
-    expect(info.external).toBe(true);
-    expect(info.publicUrl).toBe("http://bore.pub:1234");
-    expect(info.status).toBe("on");
-    expect(info.provider).toBe("bore");
+    const state = managerWithExternal("http://bore.pub:1234").state();
+    expect(state.external).toBe(true);
+    expect(state.url).toBe("http://bore.pub:1234");
+    expect(state.status).toBe("on");
+    expect(state.provider).toBe("bore");
   });
 
-  it("shows a tunnel that has not published its url yet as starting", async () => {
-    const info = await managerWithExternal(undefined).info("http://127.0.0.1:8787");
-    expect(info.status).toBe("starting");
-    expect(info.publicUrl).toBe("http://127.0.0.1:8787");
+  it("shows a tunnel that has not published its url yet as starting", () => {
+    const state = managerWithExternal(undefined).state();
+    expect(state.status).toBe("starting");
+    expect(state.url).toBeUndefined();
   });
 
   it("refuses to start or stop a process it never spawned", async () => {
@@ -44,10 +54,11 @@ describe("external tunnel handover", () => {
       readExternal: () => undefined,
       probe: fakeProbe(false),
     });
-    const info = await manager.info("http://127.0.0.1:8787");
-    expect(info.external).toBe(false);
-    expect(info.status).toBe("off");
-    expect(info.binaryPresent).toBe(false);
+    const state = manager.state();
+    expect(state.external).toBe(false);
+    expect(state.status).toBe("off");
+    const catalog = await manager.providerCatalog();
+    expect(catalog.every((entry) => !entry.binaryPresent)).toBe(true);
   });
 });
 
@@ -97,9 +108,9 @@ describe("tunnel manager binary guard", () => {
     });
     await expect(manager.setEnabled(true)).rejects.toThrow(/not installed/);
     expect(cleared).toBe(true);
-    const info = await manager.info("http://127.0.0.1:8787");
-    expect(info.status).toBe("error");
-    expect(info.enabled).toBe(false);
+    const state = manager.state();
+    expect(state.status).toBe("error");
+    expect(state.enabled).toBe(false);
   });
 });
 
@@ -218,5 +229,81 @@ describe("restartDelay", () => {
     expect(restartDelay(0)).toBe(RESTART_DELAYS_MS[0]);
     expect(restartDelay(2)).toBe(RESTART_DELAYS_MS[2]);
     expect(restartDelay(99)).toBe(RESTART_DELAYS_MS[RESTART_DELAYS_MS.length - 1]);
+  });
+});
+
+describe("TunnelSupervisor", () => {
+  const supervisor = (external?: { provider: "bore"; url?: string }) =>
+    new TunnelSupervisor({
+      localTarget: "http://127.0.0.1:8787",
+      readExternal: () => (external ? { tunnelId: undefined, ...external } : undefined),
+      probe: fakeProbe(),
+    });
+
+  it("offers every provider so one that never ran can still be switched on", async () => {
+    const info = await supervisor().info("http://127.0.0.1:8787");
+    expect(info.tunnels.map((entry) => entry.provider)).toEqual(
+      providerList.map((spec) => spec.id),
+    );
+    expect(info.providers).toHaveLength(providerList.length);
+  });
+
+  it("advertises the fallback while nothing is serving", async () => {
+    const info = await supervisor().info("http://fallback.example");
+    expect(info.primary).toBeNull();
+    expect(info.publicUrl).toBe("http://fallback.example");
+  });
+
+  /**
+   * The point of the supervisor: a second provider coming up must not read as
+   * the first one being replaced, which is what the single-manager shape did.
+   */
+  it("keeps other providers untouched when one reports a url", async () => {
+    const managed = supervisor({ provider: "bore", url: "http://bore.pub:1234" });
+    const info = await managed.info("http://fallback.example");
+    const bore = info.tunnels.find((entry) => entry.provider === "bore");
+    const cloudflare = info.tunnels.find((entry) => entry.provider === "cloudflare");
+    expect(bore?.status).toBe("on");
+    expect(bore?.url).toBe("http://bore.pub:1234");
+    expect(cloudflare?.status).toBe("off");
+    expect(cloudflare?.url).toBeUndefined();
+  });
+
+  it("hands enrollment the serving provider rather than the fallback", async () => {
+    const info = await supervisor({ provider: "bore", url: "http://bore.pub:1234" }).info(
+      "http://fallback.example",
+    );
+    expect(info.primary).toBe("bore");
+    expect(info.publicUrl).toBe("http://bore.pub:1234");
+  });
+});
+describe("what a live node may be told to dial", () => {
+  const withExternal = (provider: "bore" | "devtunnel", url: string) =>
+    new TunnelSupervisor({
+      localTarget: "http://127.0.0.1:8787",
+      readExternal: () => ({ provider, url, tunnelId: undefined }),
+      probe: fakeProbe(),
+    });
+
+  /**
+   * A node that follows a private tunnel is stranded: it cannot authenticate,
+   * so it cannot reach the Host, so it cannot be told to go anywhere else. The
+   * URL is still fine to advertise for enrollment, which ships a command.
+   */
+  it("never broadcasts a tunnel a node cannot authenticate to", async () => {
+    const supervisor = withExternal(
+      "devtunnel",
+      "https://abc-8790.usw2.devtunnels.ms",
+    );
+    // Touch info() so the manager for the external provider exists.
+    await supervisor.info("http://fallback.example");
+    expect(supervisor.activeTunnelUrl()).toBe("https://abc-8790.usw2.devtunnels.ms");
+    expect(supervisor.broadcastTunnelUrl()).toBeUndefined();
+  });
+
+  it("still broadcasts providers a node can dial unaided", async () => {
+    const supervisor = withExternal("bore", "http://bore.pub:1234");
+    await supervisor.info("http://fallback.example");
+    expect(supervisor.broadcastTunnelUrl()).toBe("http://bore.pub:1234");
   });
 });

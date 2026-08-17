@@ -1,10 +1,9 @@
 import { useEffect, useState } from "react";
 import {
+  Badge,
   Button,
-  Dropdown,
   MessageBar,
   MessageBarBody,
-  Option,
   Spinner,
   Switch,
   Text,
@@ -13,8 +12,14 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
-import type { TunnelInfo, TunnelProvider } from "@fleet/protocol";
+import type {
+  TunnelInfo,
+  TunnelProvider,
+  TunnelProviderInfo,
+  TunnelState,
+} from "@fleet/protocol";
 import { useTunnel } from "../hooks/useTunnel";
+import { orderTunnelProviders } from "../lib/tunnel-order";
 
 const useStyles = makeStyles({
   panel: {
@@ -24,7 +29,7 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     gap: "16px",
-    maxWidth: "720px",
+    maxWidth: "760px",
   },
   caption: {
     color: tokens.colorNeutralForeground3,
@@ -33,16 +38,25 @@ const useStyles = makeStyles({
     border: `1px solid ${tokens.colorNeutralStroke2}`,
     borderRadius: tokens.borderRadiusLarge,
     background: tokens.colorNeutralBackground1,
-    padding: "20px 24px",
+    padding: "18px 22px",
     display: "flex",
     flexDirection: "column",
-    gap: "14px",
+    gap: "12px",
+  },
+  primaryCard: {
+    border: `1px solid ${tokens.colorBrandStroke1}`,
   },
   row: {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
     gap: "16px",
+  },
+  heading: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flexWrap: "wrap",
   },
   status: {
     display: "flex",
@@ -53,6 +67,7 @@ const useStyles = makeStyles({
     display: "flex",
     alignItems: "center",
     gap: "10px",
+    flexWrap: "wrap",
   },
   mono: {
     fontFamily: '"JetBrains Mono", ui-monospace, monospace',
@@ -61,8 +76,8 @@ const useStyles = makeStyles({
   },
 });
 
-const statusLabel = (info: TunnelInfo): string => {
-  switch (info.status) {
+const statusLabel = (status: TunnelState["status"]): string => {
+  switch (status) {
     case "off":
       return "Off";
     case "starting":
@@ -76,9 +91,24 @@ const statusLabel = (info: TunnelInfo): string => {
   }
 };
 
-export const TunnelPanel = () => {
+type CardProps = {
+  spec: TunnelProviderInfo;
+  state: TunnelState;
+  isPrimary: boolean;
+  busy: boolean;
+  onToggle: (enabled: boolean) => void;
+  onMakePrimary: () => void;
+};
+
+const ProviderCard = ({
+  spec,
+  state,
+  isPrimary,
+  busy,
+  onToggle,
+  onMakePrimary,
+}: CardProps) => {
   const styles = useStyles();
-  const { info, busy, error: actionError, setEnabled } = useTunnel();
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
@@ -87,10 +117,117 @@ export const TunnelPanel = () => {
     return () => clearTimeout(timer);
   }, [copied]);
 
-  const handleToggle = (enabled: boolean, provider?: TunnelProvider) =>
-    void setEnabled(enabled, provider);
+  const switching = busy || state.status === "starting" || state.status === "stopping";
+  const url = state.url;
+  const online = state.status === "on" && Boolean(url);
 
-  const handleRetry = () => handleToggle(true);
+  return (
+    <section
+      className={`${styles.card} ${isPrimary ? styles.primaryCard : ""}`}
+      aria-label={spec.label}
+    >
+      <div className={styles.row}>
+        <div>
+          <div className={styles.heading}>
+            <Text weight="semibold">{spec.label}</Text>
+            {isPrimary && (
+              <Badge appearance="filled" color="brand">
+                Used for enrollment
+              </Badge>
+            )}
+            {state.external && <Badge appearance="outline">External process</Badge>}
+          </div>
+          <Text className={styles.caption}>
+            {spec.binaryPresent ? (
+              <code>{spec.binary}</code>
+            ) : (
+              <>
+                Not installed — <code>{spec.installHint}</code>
+              </>
+            )}
+          </Text>
+        </div>
+        <Switch
+          checked={state.enabled || state.status === "on"}
+          disabled={!spec.binaryPresent || switching || state.external}
+          label={state.enabled ? "On" : "Off"}
+          onChange={(_event, data) => onToggle(data.checked)}
+        />
+      </div>
+
+      {state.error && (
+        <MessageBar intent="error">
+          <MessageBarBody>{state.error}</MessageBarBody>
+        </MessageBar>
+      )}
+
+      {online && spec.caveat && (
+        <MessageBar intent="info">
+          <MessageBarBody>{spec.caveat}</MessageBarBody>
+        </MessageBar>
+      )}
+
+      <div className={styles.status}>
+        {(state.status === "starting" || state.status === "stopping") && (
+          <Spinner size="tiny" />
+        )}
+        <Text className={styles.caption}>Status: {statusLabel(state.status)}</Text>
+        {state.status === "error" && spec.binaryPresent && !busy && (
+          <Button size="small" appearance="secondary" onClick={() => onToggle(true)}>
+            Retry
+          </Button>
+        )}
+      </div>
+
+      {online && url && (
+        <div className={styles.urlRow}>
+          <code className={styles.mono}>{url}</code>
+          <Button
+            size="small"
+            appearance="secondary"
+            icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
+            onClick={() => {
+              void navigator.clipboard.writeText(url).then(() => setCopied(true));
+            }}
+          >
+            {copied ? "Copied" : "Copy"}
+          </Button>
+          {!isPrimary && (
+            <Button size="small" appearance="subtle" onClick={onMakePrimary}>
+              Use for enrollment
+            </Button>
+          )}
+        </div>
+      )}
+
+      {online && state.tunnelId && (
+        <Text className={styles.caption}>
+          Tunnel id: <code className={styles.mono}>{state.tunnelId}</code>
+        </Text>
+      )}
+    </section>
+  );
+};
+
+const TunnelSummary = ({ info }: { info: TunnelInfo }) => {
+  const styles = useStyles();
+  const online = info.tunnels.filter((entry) => entry.status === "on");
+  return (
+    <MessageBar intent={online.length > 0 ? "success" : "info"}>
+      <MessageBarBody>
+        {online.length === 0
+          ? "No tunnel is running. Nodes are told "
+          : `${online.length} tunnel${online.length === 1 ? "" : "s"} online. Nodes are told `}
+        <code className={styles.mono}>{info.publicUrl}</code>
+        {info.primary ? "." : " — the configured fallback, since no tunnel is serving."}
+      </MessageBarBody>
+    </MessageBar>
+  );
+};
+
+export const TunnelPanel = () => {
+  const styles = useStyles();
+  const { info, busy, error: actionError, setEnabled } = useTunnel();
 
   if (!info) {
     return (
@@ -100,143 +237,55 @@ export const TunnelPanel = () => {
     );
   }
 
-  const switching = busy || info.status === "starting" || info.status === "stopping";
-  const showTunnelUrl = info.status === "on";
-  const isOn = info.enabled || info.status === "on";
-  const current = info.providers.find((entry) => entry.id === info.provider);
+  // A provider the Host has never started still needs a row, or the operator
+  // cannot switch it on in the first place.
+  const stateFor = (provider: TunnelProvider): TunnelState =>
+    info.tunnels.find((entry) => entry.provider === provider) ?? {
+      provider,
+      enabled: false,
+      status: "off",
+      error: null,
+      external: false,
+    };
+
+  /**
+   * Active first, then installed, then the rest — see {@link orderTunnelProviders}.
+   */
+  const ordered = orderTunnelProviders(info.providers, (id) =>
+    info.tunnels.find((entry) => entry.provider === id),
+  );
 
   return (
     <div className={styles.panel}>
       <div>
-        <Title3 as="h1">Remote access tunnel</Title3>
+        <Title3 as="h1">Remote access tunnels</Title3>
         <br />
         <Text className={styles.caption}>
-          Expose this Host so remote nodes can enroll over the public internet. Pick
-          whichever provider you already have installed.
+          Each provider runs on its own, so more than one can be up at a time — a fixed
+          public hostname for teammates, a private tunnel for just this account. The one
+          marked for enrollment is the address handed to new nodes.
         </Text>
       </div>
 
-      {current && !current.binaryPresent && (
-        <MessageBar intent="warning">
-          <MessageBarBody>
-            <code>{current.binary}</code> was not found on PATH. Install it with{" "}
-            <code>{current.installHint}</code>.
-          </MessageBarBody>
-        </MessageBar>
-      )}
-
-      {(actionError || info.error) && (
+      {actionError && (
         <MessageBar intent="error">
-          <MessageBarBody>{actionError ?? info.error}</MessageBarBody>
+          <MessageBarBody>{actionError}</MessageBarBody>
         </MessageBar>
       )}
 
-      {showTunnelUrl && current?.caveat && (
-        <MessageBar intent="info">
-          <MessageBarBody>
-            {current.caveat} Nodes still connected are told the new URL and follow it
-            without dropping their sessions; any that were reached through the old URL
-            need <code>FLEET_HOST_URL</code> updated, or a retarget from their config
-            page.
-          </MessageBarBody>
-        </MessageBar>
-      )}
+      <TunnelSummary info={info} />
 
-      <section className={styles.card}>
-        {info.external && (
-          <MessageBar intent="info">
-            <MessageBarBody>
-              This tunnel runs as its own process, so its URL survives Host restarts. Stop
-              it in the terminal that started it.
-            </MessageBarBody>
-          </MessageBar>
-        )}
-        <div className={styles.row}>
-          <div>
-            <Text weight="semibold">Provider</Text>
-            <br />
-            <Text className={styles.caption}>
-              Switching providers restarts the tunnel.
-            </Text>
-          </div>
-          <Dropdown
-            aria-label="Tunnel provider"
-            disabled={switching || info.external}
-            selectedOptions={[info.provider]}
-            value={current?.label ?? info.provider}
-            onOptionSelect={(_event, data) => {
-              const next = data.optionValue as TunnelProvider | undefined;
-              if (!next || next === info.provider) return;
-              handleToggle(isOn, next);
-            }}
-          >
-            {info.providers.map((entry) => (
-              <Option key={entry.id} value={entry.id} text={entry.label}>
-                {entry.binaryPresent ? entry.label : `${entry.label} (not installed)`}
-              </Option>
-            ))}
-          </Dropdown>
-        </div>
-
-        <div className={styles.row}>
-          <div>
-            <Text weight="semibold">Remote access</Text>
-            <br />
-            <Text className={styles.caption}>
-              {info.external
-                ? "Managed by the tunnel process, not the Host."
-                : "Reconnects automatically if the tunnel drops."}
-            </Text>
-          </div>
-          <Switch
-            checked={isOn || info.status === "starting"}
-            disabled={!info.binaryPresent || switching || info.external}
-            label={isOn ? "On" : "Off"}
-            onChange={(_event, data) => handleToggle(data.checked)}
-          />
-        </div>
-
-        <div className={styles.status}>
-          {(info.status === "starting" || info.status === "stopping") && (
-            <Spinner size="tiny" />
-          )}
-          <Text>Status: {statusLabel(info)}</Text>
-          {info.status === "error" && info.binaryPresent && (
-            <Button
-              size="small"
-              appearance="secondary"
-              onClick={handleRetry}
-              disabled={busy}
-            >
-              Retry
-            </Button>
-          )}
-        </div>
-
-        {showTunnelUrl && (
-          <div className={styles.urlRow}>
-            <code className={styles.mono}>{info.publicUrl}</code>
-            <Button
-              size="small"
-              appearance="secondary"
-              icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
-              onClick={() => {
-                void navigator.clipboard
-                  .writeText(info.publicUrl)
-                  .then(() => setCopied(true));
-              }}
-            >
-              {copied ? "Copied" : "Copy"}
-            </Button>
-          </div>
-        )}
-
-        {!showTunnelUrl && (
-          <Text className={styles.caption}>
-            Public URL when off: <code className={styles.mono}>{info.publicUrl}</code>
-          </Text>
-        )}
-      </section>
+      {ordered.map((spec) => (
+        <ProviderCard
+          key={spec.id}
+          spec={spec}
+          state={stateFor(spec.id)}
+          isPrimary={info.primary === spec.id}
+          busy={busy === spec.id}
+          onToggle={(enabled) => void setEnabled(spec.id, enabled)}
+          onMakePrimary={() => void setEnabled(spec.id, true, true)}
+        />
+      ))}
     </div>
   );
 };

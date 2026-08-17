@@ -92,6 +92,14 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
     },
   },
   {
+    names: ["--devtunnel"],
+    spec: {
+      env: "FLEET_DEVTUNNEL_ID",
+      placeholder: "<tunnel-id>",
+      help: "Reach the Host through `devtunnel connect <id>` (FLEET_DEVTUNNEL_ID)",
+    },
+  },
+  {
     names: ["--config-port"],
     spec: {
       env: "FLEET_NODE_CONFIG_PORT",

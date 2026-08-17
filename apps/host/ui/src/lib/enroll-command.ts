@@ -15,38 +15,15 @@ export function isDevTunnelUrl(hostUrl: string): boolean {
   return /^https:\/\/[a-z0-9-]+\.[a-z0-9]+\.devtunnels\.ms(:|\/|$)/i.test(hostUrl);
 }
 
-/** Port the node should dial once `devtunnel connect` is forwarding locally. */
-function forwardedPortFrom(hostUrl: string): string {
-  // The port is the trailing segment of the URL's first label, e.g.
-  // https://7m667npm-8790.usw2.devtunnels.ms -> 8790.
-  const match = hostUrl.match(/^https:\/\/[a-z0-9-]*?-(\d+)\./i);
-  return match?.[1] ?? "8787";
-}
-
 /**
- * Enrollment for a private Dev Tunnel, where the public URL is unusable to a
- * node. The node reaches the Host through a locally forwarded port instead, so
- * the CLI's own login does the authenticating and the node needs no token.
+ * The one-time step that authenticates this machine against the tunnel.
  *
- * The forwarded port is only usually the same number as the Host's: the CLI
- * picks the next free one when it is taken, which is why the operator is told
- * to read it back rather than being handed a guess.
+ * Kept separate from the start command because it is interactive — it opens a
+ * browser — and because it only has to be done once per machine, while the
+ * command below is what gets re-run.
  */
-function devTunnelEnrollCommand(
-  hostUrl: string,
-  enrollmentToken: string,
-  tunnelId: string | undefined,
-): string {
-  const port = forwardedPortFrom(hostUrl);
-  return [
-    "devtunnel user login",
-    `devtunnel connect ${tunnelId ?? "<tunnel-id>"}`,
-    "",
-    `# Use the port from the CLI's "Forwarding from 127.0.0.1:<port>" line below.`,
-    "npm install",
-    "npm run build:node",
-    `npm run start:node -- --url="http://127.0.0.1:${port}" --token="${enrollmentToken}"`,
-  ].join("\n");
+export function devTunnelLoginCommand(): string {
+  return "devtunnel user login";
 }
 
 /**
@@ -64,12 +41,14 @@ export function enrollCommand(
   enrollmentToken: string,
   tunnelId?: string,
 ): string {
-  if (isDevTunnelUrl(hostUrl)) {
-    return devTunnelEnrollCommand(hostUrl, enrollmentToken, tunnelId);
-  }
+  // The node opens the tunnel itself and discovers the forwarded port, so a
+  // dev tunnel needs no second terminal and no transcribed port number.
+  const target = isDevTunnelUrl(hostUrl)
+    ? `--devtunnel="${tunnelId ?? "<tunnel-id>"}"`
+    : `--url="${hostUrl}"`;
   return [
     "npm install",
     "npm run build:node",
-    `npm run start:node -- --url="${hostUrl}" --token="${enrollmentToken}"`,
+    `npm run start:node -- ${target} --token="${enrollmentToken}"`,
   ].join("\n");
 }

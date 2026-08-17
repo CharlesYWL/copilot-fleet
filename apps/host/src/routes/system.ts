@@ -10,14 +10,14 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { isTransferableHostUrl } from "../host-url.js";
-import type { TunnelManager } from "../tunnel.js";
+import type { TunnelSupervisor } from "../tunnel.js";
 
 /** Large enough for a personal fleet's event log; not a license to dump binaries. */
 export const HOST_BACKUP_BODY_LIMIT = 50 * 1024 * 1024;
 
 export type SystemRouteOptions = {
   service: FleetService;
-  tunnel: TunnelManager;
+  tunnel: TunnelSupervisor;
   version: string;
   enrollment: { token: string };
   /** The URL to hand a Node when no tunnel is up. */
@@ -74,9 +74,9 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       service.importHostBackup(publicUrl ? { ...rest, publicUrl } : rest);
       enrollment.token = backup.enrollmentToken;
       try {
-        await tunnel.setEnabled(backup.tunnel.enabled, backup.tunnel.provider);
+        await tunnel.setEnabled(backup.tunnel.provider, backup.tunnel.enabled);
       } catch (error) {
-        store.setTunnelEnabled(false);
+        store.setTunnelProviderEnabled(backup.tunnel.provider, false);
         return reply.code(503).send({
           error: errorMessage(error, "Fleet restored, but the tunnel failed to start"),
           kind: HOST_BACKUP_KIND,
@@ -105,12 +105,13 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   app.post("/api/tunnel", async (request, reply) => {
     const input = UpdateTunnelSchema.parse(request.body);
     const provider = input.provider ?? store.getTunnelProvider();
-    store.setTunnelProvider(provider);
-    store.setTunnelEnabled(input.enabled);
+    // Providers run side by side, so switching one never implies switching the
+    // others off; only this provider's own flag moves.
+    store.setTunnelProviderEnabled(provider, input.enabled);
     try {
-      await tunnel.setEnabled(input.enabled, provider);
+      await tunnel.setEnabled(provider, input.enabled, input.primary ?? true);
     } catch (error) {
-      store.setTunnelEnabled(false);
+      store.setTunnelProviderEnabled(provider, false);
       return reply.code(503).send({
         error: errorMessage(error, "Tunnel failed to start"),
         tunnel: await tunnel.info(fallbackPublicUrl()),

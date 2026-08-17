@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { enrollCommand, isDevTunnelUrl, isLocalOnlyHostUrl } from "./enroll-command";
+import {
+  devTunnelLoginCommand,
+  enrollCommand,
+  isDevTunnelUrl,
+  isLocalOnlyHostUrl,
+} from "./enroll-command";
 
 const URL = "https://fleet.example.com";
 const TOKEN = "abc123";
@@ -76,19 +81,21 @@ describe("enrollCommand for dev tunnels", () => {
     expect(command).not.toContain("devtunnels.ms");
   });
 
-  it("signs the node's machine in and dials the forwarded loopback port", () => {
-    expect(command).toContain("devtunnel user login");
-    expect(command).toContain(`devtunnel connect ${TUNNEL_ID}`);
-    expect(command).toContain('--url="http://127.0.0.1:8790"');
+  it("lets the node open the tunnel itself instead of a second terminal", () => {
+    expect(command).toContain(`--devtunnel="${TUNNEL_ID}"`);
     expect(command).toContain(TOKEN);
+    // The forwarded port is discovered at runtime, so nothing should be
+    // transcribed into the command.
+    expect(command).not.toContain("127.0.0.1");
+    expect(command).not.toContain("devtunnel connect");
   });
 
-  it("tells the operator to read the port back, since the CLI may pick another", () => {
-    expect(command).toContain("Forwarding from");
+  it("keeps the interactive login out of the start command", () => {
+    expect(command).not.toContain("devtunnel user login");
+    expect(devTunnelLoginCommand()).toBe("devtunnel user login");
   });
 
   it("degrades to a placeholder rather than a wrong id when none was parsed", () => {
-    const withoutId = enrollCommand(DEVTUNNEL_URL, TOKEN);
-    expect(withoutId).toContain("devtunnel connect <tunnel-id>");
+    expect(enrollCommand(DEVTUNNEL_URL, TOKEN)).toContain('--devtunnel="<tunnel-id>"');
   });
 });

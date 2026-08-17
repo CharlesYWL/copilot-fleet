@@ -802,32 +802,51 @@ export const TunnelProviderInfoSchema = z.object({
 });
 export type TunnelProviderInfo = z.infer<typeof TunnelProviderInfoSchema>;
 
-export const TunnelInfoSchema = z.object({
+/**
+ * Live state of one provider.
+ *
+ * Providers run independently — a fixed Cloudflare hostname and a private Dev
+ * Tunnel are useful at the same time, for different audiences — so each one
+ * carries its own switch, status and URL rather than the UI inferring them from
+ * a single "current provider".
+ */
+export const TunnelStateSchema = z.object({
   provider: TunnelProviderSchema,
   enabled: z.boolean(),
   status: TunnelStatusSchema,
-  publicUrl: z.string().min(1),
+  /** Absent until the provider reports one. */
+  url: z.string().optional(),
   error: z.string().nullable(),
-  binaryPresent: z.boolean(),
+  tunnelId: z.string().optional(),
+  /** True when this provider runs as its own process outside the Host. */
+  external: z.boolean().default(false),
+});
+export type TunnelState = z.infer<typeof TunnelStateSchema>;
+
+export const TunnelInfoSchema = z.object({
+  /** Whose URL enrollment currently advertises; null when none is online. */
+  primary: TunnelProviderSchema.nullable(),
+  /** What enrollment would hand a node right now, including fallbacks. */
+  publicUrl: z.string().min(1),
   /** Every supported provider plus whether its CLI is installed. */
   providers: z.array(TunnelProviderInfoSchema),
+  /** Live state for every provider, whether enabled or not. */
+  tunnels: z.array(TunnelStateSchema),
   /**
-   * Provider-side identifier for the running tunnel, when it has one that the
+   * Provider-side identifier for the primary tunnel, when it has one that the
    * public URL does not encode. Dev Tunnels needs this: the URL subdomain is an
    * opaque routing token, so `devtunnel connect` cannot be derived from it.
    */
   tunnelId: z.string().optional(),
-  /**
-   * True when the tunnel runs as its own process outside the Host, so the URL
-   * survives Host restarts and the Host must not try to start or stop it.
-   */
-  external: z.boolean().default(false),
 });
 export type TunnelInfo = z.infer<typeof TunnelInfoSchema>;
 
 export const UpdateTunnelSchema = z.object({
   enabled: z.boolean(),
+  /** Which provider to switch; omitted means the current primary. */
   provider: TunnelProviderSchema.optional(),
+  /** Make this provider the one enrollment advertises. */
+  primary: z.boolean().optional(),
 });
 
 /**

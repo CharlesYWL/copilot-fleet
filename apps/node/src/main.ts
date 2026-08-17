@@ -2,6 +2,7 @@ import { config as loadEnv } from "dotenv";
 import { arch, homedir, platform } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
+import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
 import {
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
@@ -95,6 +96,27 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   loadEnv({ path: envFilePath(), quiet: true });
   // One lookup path for both sources; the flags are already the last word.
   const env: NodeJS.ProcessEnv = { ...process.env, ...flags.env };
+
+  const startupLog = (message: string): void => {
+    console.log(`${new Date().toISOString()} [node] ${message}`);
+  };
+
+  /**
+   * A private Dev Tunnel has to be dialed through a local forward, so the
+   * tunnel comes up before settings are read: the forwarded port is what the
+   * host URL has to be, and it is only known once the CLI reports it. Writing
+   * it into the flag overrides keeps it ahead of the stored settings, which
+   * still hold whatever port a previous run happened to get.
+   */
+  let devTunnel: DevTunnelConnection | undefined;
+  const devTunnelId = env.FLEET_DEVTUNNEL_ID;
+  if (devTunnelId) {
+    startupLog(`Connecting to dev tunnel ${devTunnelId}`);
+    devTunnel = await connectDevTunnel(devTunnelId, { log: startupLog });
+    env.FLEET_HOST_URL = devTunnel.url;
+    flags.env.FLEET_HOST_URL = devTunnel.url;
+    process.once("exit", () => devTunnel?.stop());
+  }
 
   let settings = await loadSettings(env, settingsOverridesFromEnv(flags.env));
   const mockAgent = env.FLEET_MOCK_AGENT === "1";

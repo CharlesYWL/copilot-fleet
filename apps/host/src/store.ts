@@ -24,6 +24,7 @@ import {
   canTransition,
   sessionFieldsForHostImport,
   terminalSessionStates,
+  tunnelProviders,
 } from "@fleet/protocol";
 
 type Row = Record<string, unknown>;
@@ -165,6 +166,32 @@ export class FleetStore {
 
   setTunnelEnabled(enabled: boolean): void {
     this.setSetting("tunnel.enabled", enabled ? "1" : "0");
+  }
+
+  /**
+   * Which providers the operator has switched on.
+   *
+   * Stored per provider because they run concurrently. The legacy single-provider
+   * keys are still read as a fallback so an existing install keeps whatever it
+   * had running instead of coming back up with every tunnel off.
+   */
+  getEnabledTunnelProviders(): TunnelProvider[] {
+    const explicit = tunnelProviders.filter(
+      (provider) => this.getSetting(`tunnel.${provider}.enabled`) === "1",
+    );
+    if (explicit.length > 0) return [...explicit];
+    return this.getTunnelEnabled() ? [this.getTunnelProvider()] : [];
+  }
+
+  setTunnelProviderEnabled(provider: TunnelProvider, enabled: boolean): void {
+    this.setSetting(`tunnel.${provider}.enabled`, enabled ? "1" : "0");
+    // Kept in step so a downgrade, a backup, or the legacy reader still sees a
+    // coherent answer rather than a tunnel that claims to be off while running.
+    const anyEnabled = tunnelProviders.some(
+      (id) => this.getSetting(`tunnel.${id}.enabled`) === "1",
+    );
+    this.setTunnelEnabled(anyEnabled);
+    if (enabled) this.setTunnelProvider(provider);
   }
 
   getTunnelProvider(): TunnelProvider {
