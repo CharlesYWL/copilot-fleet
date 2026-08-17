@@ -2,6 +2,14 @@ import { useEffect, useState } from "react";
 import {
   Badge,
   Button,
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogSurface,
+  DialogTitle,
+  DialogTrigger,
+  Link,
   MessageBar,
   MessageBarBody,
   Spinner,
@@ -11,7 +19,11 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
+import {
+  Checkmark20Regular,
+  Copy20Regular,
+  QuestionCircle20Regular,
+} from "@fluentui/react-icons";
 import type {
   TunnelInfo,
   TunnelProvider,
@@ -74,7 +86,67 @@ const useStyles = makeStyles({
     fontSize: "13px",
     wordBreak: "break-all",
   },
+  steps: {
+    margin: "0 0 12px",
+    paddingLeft: "20px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+  },
+  headingRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    flexWrap: "wrap",
+  },
 });
+
+/** Setup steps and a link out, so a provider can be adopted without leaving. */
+const ProviderHelpDialog = ({ spec }: { spec: TunnelProviderInfo }) => {
+  const styles = useStyles();
+  return (
+    <Dialog>
+      <DialogTrigger disableButtonEnhancement>
+        <Button
+          size="small"
+          appearance="transparent"
+          icon={<QuestionCircle20Regular />}
+          aria-label={`How to set up ${spec.label}`}
+          title={`How to set up ${spec.label}`}
+        />
+      </DialogTrigger>
+      <DialogSurface>
+        <DialogBody>
+          <DialogTitle>{spec.label}</DialogTitle>
+          <DialogContent>
+            <ol className={styles.steps}>
+              {spec.setupSteps.map((step) => (
+                <li key={step}>
+                  <Text>{step}</Text>
+                </li>
+              ))}
+            </ol>
+            {spec.caveat && (
+              <MessageBar intent="warning">
+                <MessageBarBody>{spec.caveat}</MessageBarBody>
+              </MessageBar>
+            )}
+          </DialogContent>
+          <DialogActions>
+            {spec.docsUrl && (
+              <Link href={spec.docsUrl} target="_blank" rel="noreferrer">
+                Provider documentation
+              </Link>
+            )}
+            <DialogTrigger disableButtonEnhancement>
+              <Button appearance="secondary">Close</Button>
+            </DialogTrigger>
+          </DialogActions>
+        </DialogBody>
+      </DialogSurface>
+    </Dialog>
+  );
+};
 
 const statusLabel = (status: TunnelState["status"]): string => {
   switch (status) {
@@ -130,6 +202,7 @@ const ProviderCard = ({
         <div>
           <div className={styles.heading}>
             <Text weight="semibold">{spec.label}</Text>
+            <ProviderHelpDialog spec={spec} />
             {isPrimary && (
               <Badge appearance="filled" color="brand">
                 Used for enrollment
@@ -198,6 +271,16 @@ const ProviderCard = ({
             </Button>
           )}
         </div>
+      )}
+
+      {online && state.inspectUrl && (
+        <Text className={styles.caption}>
+          Inspect traffic:{" "}
+          <Link href={state.inspectUrl} target="_blank" rel="noreferrer">
+            <span className={styles.mono}>{state.inspectUrl}</span>
+          </Link>{" "}
+          — opens the provider&apos;s request inspector; sign in with the same account.
+        </Text>
       )}
 
       {online && state.tunnelId && (

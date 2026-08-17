@@ -798,6 +798,10 @@ export const TunnelProviderInfoSchema = z.object({
   binary: z.string().min(1),
   binaryPresent: z.boolean(),
   installHint: z.string(),
+  /** Ordered setup steps for this provider's help dialog. */
+  setupSteps: z.array(z.string()).default([]),
+  /** Upstream documentation link. */
+  docsUrl: z.string().optional(),
   caveat: z.string().optional(),
 });
 export type TunnelProviderInfo = z.infer<typeof TunnelProviderInfoSchema>;
@@ -816,6 +820,8 @@ export const TunnelStateSchema = z.object({
   status: TunnelStatusSchema,
   /** Absent until the provider reports one. */
   url: z.string().optional(),
+  /** Traffic inspector for this tunnel, for providers that publish one. */
+  inspectUrl: z.string().optional(),
   error: z.string().nullable(),
   tunnelId: z.string().optional(),
   /** True when this provider runs as its own process outside the Host. */

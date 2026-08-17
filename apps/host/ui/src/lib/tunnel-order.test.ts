@@ -8,6 +8,7 @@ const spec = (id: TunnelProvider, binaryPresent: boolean): TunnelProviderInfo =>
   binary: id,
   binaryPresent,
   installHint: "",
+  setupSteps: [],
 });
 
 const state = (

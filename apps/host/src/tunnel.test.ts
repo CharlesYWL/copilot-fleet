@@ -198,6 +198,23 @@ describe("devtunnel output parsing", () => {
     );
   });
 
+  it("picks up the inspector URL the forwarding pattern deliberately rejects", () => {
+    expect(providerSpecs.devtunnel.extractInspectUrl?.(DEVTUNNEL_LOG)).toBe(
+      "https://7m667npm-8790-inspect.usw2.devtunnels.ms",
+    );
+  });
+
+  /**
+   * The two patterns must not be able to return each other's host, or the panel
+   * links the inspector at the tunnel and enrollment at the inspector.
+   */
+  it("keeps the forwarding and inspector URLs from crossing over", () => {
+    const forwarding = "https://7m667npm-8790.usw2.devtunnels.ms";
+    const inspect = "https://7m667npm-8790-inspect.usw2.devtunnels.ms";
+    expect(extractTunnelUrl(inspect, "devtunnel")).toBeUndefined();
+    expect(providerSpecs.devtunnel.extractInspectUrl?.(forwarding)).toBeUndefined();
+  });
+
   it("has no id to report before the tunnel is ready", () => {
     expect(providerSpecs.devtunnel.extractId?.("Hosting port: 8790")).toBeUndefined();
   });
@@ -305,5 +322,24 @@ describe("what a live node may be told to dial", () => {
     const supervisor = withExternal("bore", "http://bore.pub:1234");
     await supervisor.info("http://fallback.example");
     expect(supervisor.broadcastTunnelUrl()).toBe("http://bore.pub:1234");
+  });
+});
+describe("provider help content", () => {
+  it("gives every provider setup steps and a documentation link", () => {
+    for (const spec of providerList) {
+      expect(spec.setupSteps.length, `${spec.id} setup steps`).toBeGreaterThan(0);
+      expect(spec.docsUrl, `${spec.id} docs`).toMatch(/^https:\/\//);
+    }
+  });
+
+  /**
+   * The dialog is where an operator decides whether a provider is safe to use,
+   * so the two that are unsafe in different ways have to say so there — not
+   * only in a caveat that appears once the tunnel is already running.
+   */
+  it("spells out the risk for providers that carry one", () => {
+    expect(providerSpecs.bore.setupSteps.join(" ")).toMatch(/no TLS|not encrypted/i);
+    expect(providerSpecs.devtunnel.setupSteps.join(" ")).toMatch(/--devtunnel/);
+    expect(providerSpecs.cloudflare.setupSteps.join(" ")).toMatch(/anyone with the URL/i);
   });
 });

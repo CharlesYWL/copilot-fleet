@@ -44,12 +44,21 @@ export type ProviderSpec = {
   /** Extracts the public URL from a line of CLI output. */
   extractUrl: (text: string) => string | undefined;
   /**
+   * Extracts a secondary URL for inspecting traffic, when the provider offers
+   * one. Deliberately separate from `extractUrl`, which must reject it.
+   */
+  extractInspectUrl?: (text: string) => string | undefined;
+  /**
    * Extracts the provider's own tunnel identifier, for providers whose public
    * URL does not encode it. Only Dev Tunnels needs this today.
    */
   extractId?: (text: string) => string | undefined;
   /** Shown in the UI when the binary is missing. */
   installHint: string;
+  /** Ordered setup steps shown in the provider's help dialog. */
+  setupSteps: string[];
+  /** Upstream documentation for this provider. */
+  docsUrl: string;
   /** Warning surfaced while the tunnel is online, if any. */
   caveat?: string;
   /**
@@ -93,6 +102,9 @@ const BORE_HOSTPORT_RE = /listening at ([a-z0-9.-]+:\d+)/i;
  */
 export const DEVTUNNEL_URL_RE =
   /https:\/\/[a-z0-9-]+(?<!-inspect)\.[a-z0-9]+\.devtunnels\.ms/i;
+/** The sibling host that serves the traffic inspector for the same tunnel. */
+export const DEVTUNNEL_INSPECT_URL_RE =
+  /https:\/\/[a-z0-9-]+-inspect\.[a-z0-9]+\.devtunnels\.ms/i;
 /** `Ready to accept connections for tunnel: neat-lake-7x8gj9s.usw2` */
 export const DEVTUNNEL_ID_RE = /(?<=for tunnel:\s)[a-z0-9-]+\.[a-z0-9]+/i;
 
@@ -105,6 +117,14 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     args: (target) => ["tunnel", "--url", target.url, "--no-autoupdate"],
     extractUrl: matcher(TRYCLOUDFLARE_URL_RE),
     installHint: "brew install cloudflared",
+    setupSteps: [
+      "Install the CLI: `brew install cloudflared` (or `winget install Cloudflare.cloudflared`).",
+      "No account or login is needed — quick tunnels are anonymous.",
+      "Switch this on; the Host runs `cloudflared` and reads the URL it prints.",
+      "Anyone with the URL can reach this Host, so treat it as a secret.",
+    ],
+    docsUrl:
+      "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/",
     caveat: "Quick tunnel URLs change on every restart.",
   },
   tailscale: {
@@ -116,6 +136,13 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     extractUrl: matcher(TAILSCALE_URL_RE),
     installHint:
       "brew install tailscale, then run `tailscale up` and enable Funnel for this machine.",
+    setupSteps: [
+      "Install Tailscale and run `tailscale up` to join your tailnet.",
+      "Enable Funnel for this machine in the admin console — it is off by default.",
+      "Switch this on; the Host runs `tailscale funnel` against its own port.",
+      "The URL is a stable name on your tailnet, so it survives restarts.",
+    ],
+    docsUrl: "https://tailscale.com/kb/1223/funnel",
   },
   ngrok: {
     id: "ngrok",
@@ -126,6 +153,13 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     args: (target) => ["http", target.url, "--log", "stdout", "--log-format", "logfmt"],
     extractUrl: matcher(NGROK_URL_RE),
     installHint: "brew install ngrok, then run `ngrok config add-authtoken <token>`.",
+    setupSteps: [
+      "Install the CLI: `brew install ngrok` (or `winget install ngrok.ngrok`).",
+      "Create a free ngrok account and run `ngrok config add-authtoken <token>` once.",
+      "Switch this on; the Host runs `ngrok http` against its own port.",
+      "A free domain is public and rotates — a paid reserved domain keeps it fixed.",
+    ],
+    docsUrl: "https://ngrok.com/docs/getting-started/",
     caveat: "Free ngrok domains change on every restart.",
   },
   bore: {
@@ -147,6 +181,13 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
       return match ? `http://${match[1]}` : undefined;
     },
     installHint: "brew install bore-cli",
+    setupSteps: [
+      "Install the CLI: `brew install bore-cli` (or `cargo install bore-cli`).",
+      "No account or login is needed.",
+      "Switch this on; the Host runs `bore local` against its own port.",
+      "The public endpoint is plain HTTP over a TCP relay — there is no TLS, so anything sent through it is readable in transit. Prefer another provider for real traffic.",
+    ],
+    docsUrl: "https://github.com/ekzhang/bore",
     caveat: "bore relays plain TCP, so traffic is not encrypted in transit.",
   },
   devtunnel: {
@@ -181,9 +222,18 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     },
     newTunnelId: () => `fleet-${randomBytes(4).toString("hex")}`,
     extractUrl: matcher(DEVTUNNEL_URL_RE),
+    extractInspectUrl: matcher(DEVTUNNEL_INSPECT_URL_RE),
     extractId: matcher(DEVTUNNEL_ID_RE),
     installHint:
       "winget install Microsoft.devtunnel, then run `devtunnel user login`.",
+    setupSteps: [
+      "Install the CLI: `winget install Microsoft.devtunnel` (or `brew install --cask devtunnel`).",
+      "Run `devtunnel user login` once on this machine — hosting requires a signed-in account.",
+      "Switch this on; the Host reuses a named tunnel, so the URL survives restarts.",
+      "Opening the URL in a browser prompts for a Microsoft login — that is the point, and it is why the URL alone grants nobody access.",
+      "Nodes cannot answer that login, so they use `--devtunnel <id>` instead: the node opens the tunnel itself and dials a forwarded local port. The Connect card generates the command.",
+    ],
+    docsUrl: "https://learn.microsoft.com/en-us/azure/developer/dev-tunnels/get-started",
     caveat:
       "Private by default: the URL prompts for a Microsoft login, so nodes cannot dial it directly. Nodes reach it through `devtunnel connect`.",
     // A node handed this URL would be redirected to a login it cannot answer,

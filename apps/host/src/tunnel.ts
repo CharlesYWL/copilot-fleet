@@ -122,6 +122,7 @@ type TunnelManagerOptions = {
 export class TunnelManager {
   private status: TunnelStatus = "off";
   private tunnelUrl: string | undefined;
+  private inspectUrl: string | undefined;
   private tunnelId: string | undefined;
   private error: string | undefined;
   private child: ChildProcess | undefined;
@@ -169,6 +170,8 @@ export class TunnelManager {
         binary: spec.binary,
         binaryPresent: await this.probe.present(spec),
         installHint: spec.installHint,
+        setupSteps: spec.setupSteps,
+        docsUrl: spec.docsUrl,
         ...(spec.caveat ? { caveat: spec.caveat } : {}),
       })),
     );
@@ -194,6 +197,9 @@ export class TunnelManager {
     const url = externalMine ? externalMine.url : this.tunnelUrl;
     const online = externalMine ? Boolean(externalMine.url) : this.status === "on";
     const tunnelId = externalMine ? externalMine.tunnelId : this.tunnelId;
+    // Only meaningful alongside a live tunnel; a stale inspector link points at
+    // a tunnel that no longer exists.
+    const inspectUrl = externalMine ? undefined : this.inspectUrl;
     return {
       provider: this.provider,
       enabled: externalMine
@@ -203,6 +209,7 @@ export class TunnelManager {
       error: externalMine ? null : (this.error ?? null),
       external: Boolean(externalMine),
       ...(online && url ? { url } : {}),
+      ...(online && inspectUrl ? { inspectUrl } : {}),
       ...(tunnelId ? { tunnelId } : {}),
     };
   }
@@ -240,6 +247,7 @@ export class TunnelManager {
     this.status = "starting";
     this.error = undefined;
     this.tunnelUrl = undefined;
+    this.inspectUrl = undefined;
     this.tunnelId = undefined;
     this.buffer = "";
 
@@ -276,6 +284,7 @@ export class TunnelManager {
       // The id can be printed after the URL, so it is parsed on its own
       // schedule rather than being folded into the URL branch below.
       if (!this.tunnelId) this.tunnelId = spec.extractId?.(this.buffer);
+      if (!this.inspectUrl) this.inspectUrl = spec.extractInspectUrl?.(this.buffer);
       if (this.tunnelUrl) return;
       const url = spec.extractUrl(this.buffer);
       if (!url) return;
@@ -293,6 +302,7 @@ export class TunnelManager {
       if (this.child !== child) return;
       this.child = undefined;
       this.tunnelUrl = undefined;
+      this.inspectUrl = undefined;
       this.tunnelId = undefined;
       this.status = "error";
       this.error = err.message;
@@ -304,6 +314,7 @@ export class TunnelManager {
       if (this.child !== child) return;
       this.child = undefined;
       this.tunnelUrl = undefined;
+      this.inspectUrl = undefined;
       this.tunnelId = undefined;
       if (this.status === "stopping") {
         this.status = "off";
@@ -347,6 +358,7 @@ export class TunnelManager {
     if (!child) {
       this.status = "off";
       this.tunnelUrl = undefined;
+      this.inspectUrl = undefined;
       this.tunnelId = undefined;
       this.error = undefined;
       return;
@@ -368,6 +380,7 @@ export class TunnelManager {
 
     this.child = undefined;
     this.tunnelUrl = undefined;
+    this.inspectUrl = undefined;
     this.tunnelId = undefined;
     this.status = "off";
     this.error = undefined;
