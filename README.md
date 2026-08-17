@@ -555,7 +555,12 @@ npm run dev:tunnel
 npm test
 npm run typecheck
 npm run build
+npm run verify   # everything CI runs, in CI's order
 ```
+
+`npm run verify` is the one to run before pushing: CI also checks formatting
+(`prettier --check`), which `lint` does not cover, and a red build there has
+more than once been nothing but unformatted source.
 
 Startup is seed-free. SQLite creates its schema and empty data file on first
 launch.
