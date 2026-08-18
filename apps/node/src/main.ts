@@ -129,6 +129,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   };
 
   /**
+   * A problem raised before the main `warn` exists.
+   *
+   * The tunnel comes up before settings are read, so its failures need somewhere
+   * to go while the rest of the process is still being assembled.
+   */
+  const startupWarn = (message: string): void => {
+    logs.record("warn", message);
+    console.log(`${new Date().toISOString()} [node] ${message}`);
+  };
+
+  /**
    * A private Dev Tunnel has to be dialed through a local forward, so the
    * tunnel comes up before settings are read: the forwarded port is what the
    * host URL has to be, and it is only known once the CLI reports it. Writing
@@ -147,6 +158,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     startupLog(`Connecting to dev tunnel ${devTunnelId}`);
     devTunnel = await connectDevTunnel(devTunnelId, {
       log: startupLog,
+      // A tunnel that will not come up is the thing being debugged, so its
+      // failures have to clear the page's problems-only filter.
+      warn: startupWarn,
       onUrlChanged: (url) => onTunnelUrlChanged(url),
     });
     // Seeds the first run only. The stored address is adopted below instead of

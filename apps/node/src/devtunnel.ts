@@ -53,6 +53,16 @@ export type ConnectOptions = {
   timeoutMs?: number;
   log?: (message: string) => void;
   /**
+   * Where the tunnel's failures go, when that is somewhere different.
+   *
+   * A tunnel that keeps failing to come up is the thing being debugged, so it
+   * must not arrive at the same level as "forwarding 127.0.0.1:8790" — a
+   * diagnostics view filtered to problems would hide the one sequence worth
+   * reading. Defaults to `log`, so a caller that does not separate the two
+   * still sees everything.
+   */
+  warn?: (message: string) => void;
+  /**
    * Called when a respawned tunnel comes back on a different port, so the node
    * can move its dial address instead of retrying one nothing is listening on.
    */
@@ -90,6 +100,7 @@ export function connectDevTunnel(
   const spawnProcess = options.spawnProcess ?? spawn;
   const timeoutMs = options.timeoutMs ?? READY_TIMEOUT_MS;
   const log = options.log ?? (() => {});
+  const warn = options.warn ?? log;
   const setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
 
@@ -113,7 +124,7 @@ export function connectDevTunnel(
       const doomed = child;
       child = undefined;
       if (doomed && !doomed.killed) {
-        log(`devtunnel connect ${tunnelId} is not reaching the Host; rebuilding it`);
+        warn(`devtunnel connect ${tunnelId} is not reaching the Host; rebuilding it`);
         // Clearing `child` first means the exit handler's `child !== active`
         // guard ignores this kill, so the respawn is scheduled here instead of
         // twice.
@@ -176,7 +187,7 @@ export function connectDevTunnel(
       if (stopped || !settled || currentUrl === undefined) return;
       const delay = reconnectDelay(attempt);
       attempt += 1;
-      log(
+      warn(
         `devtunnel connect ${tunnelId} ended (code=${
           code ?? "null"
         }); restarting in ${Math.round(delay / 1000)}s`,

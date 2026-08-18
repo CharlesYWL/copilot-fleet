@@ -351,4 +351,48 @@ describe("connectDevTunnel rebuildNow", () => {
     conn.rebuildNow();
     expect(h.children).toHaveLength(1);
   });
+
+  it("reports a tunnel that will not come up as a problem, not as chatter", async () => {
+    // The node page filters to problems by default, because a stuck node
+    // repeats one line every two seconds. A tunnel failing to start that logged
+    // at the same level as "forwarding 127.0.0.1:8790" would be hidden by the
+    // one view built to find it.
+    const notes: string[] = [];
+    const problems: string[] = [];
+    const h = harness();
+    const pending = connectDevTunnel("fleet-abc", {
+      ...h.options,
+      log: (message: string) => notes.push(message),
+      warn: (message: string) => problems.push(message),
+    });
+    h.children[0]!.stdout.emit(
+      "data",
+      Buffer.from("Forwarding from 127.0.0.1:8791 to x\n"),
+    );
+    const conn = await pending;
+
+    conn.recycle();
+    h.children[0]!.emit("exit", 1);
+
+    expect(problems.some((line) => line.includes("not reaching the Host"))).toBe(true);
+    expect(notes.some((line) => line.includes("forwarding"))).toBe(true);
+    expect(notes.some((line) => line.includes("not reaching the Host"))).toBe(false);
+  });
+
+  it("sends failures to the ordinary log when the caller keeps one channel", async () => {
+    const notes: string[] = [];
+    const h = harness();
+    const pending = connectDevTunnel("fleet-abc", {
+      ...h.options,
+      log: (message: string) => notes.push(message),
+    });
+    h.children[0]!.stdout.emit(
+      "data",
+      Buffer.from("Forwarding from 127.0.0.1:8791 to x\n"),
+    );
+    const conn = await pending;
+
+    conn.recycle();
+    expect(notes.some((line) => line.includes("not reaching the Host"))).toBe(true);
+  });
 });
