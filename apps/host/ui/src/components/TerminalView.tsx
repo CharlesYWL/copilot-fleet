@@ -9,6 +9,7 @@ import {
   type FormEvent,
   type KeyboardEvent,
   type ClipboardEvent,
+  type ReactNode,
 } from "react";
 import {
   Badge,
@@ -22,12 +23,28 @@ import {
 } from "@fluentui/react-components";
 import {
   ArrowClockwise20Regular,
+  ArrowSwap16Regular,
   Attach20Regular,
+  Brain16Regular,
+  Checkmark16Regular,
+  ChevronDown16Regular,
+  ChevronRight16Regular,
+  Delete16Regular,
   Dismiss20Regular,
+  Document16Regular,
+  Edit16Regular,
+  ErrorCircle16Regular,
+  Globe16Regular,
+  Info16Regular,
   Rename20Regular,
   RecordStop20Regular,
+  Search16Regular,
   Send20Regular,
+  SpinnerIos16Regular,
   Stop20Regular,
+  Warning16Regular,
+  Window16Regular,
+  Wrench16Regular,
 } from "@fluentui/react-icons";
 import {
   SESSION_NAME_MAX_LENGTH,
@@ -62,9 +79,11 @@ import {
   type DraftAttachment,
 } from "../lib/attachments";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
+import { toPromptMarks } from "../lib/prompt-marks";
 import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
+import { PromptRail } from "./PromptRail";
 import { SessionConfigBar } from "./SessionConfigBar";
 import { SlashMenu } from "./SlashMenu";
 import { StatusDot } from "./StatusDot";
@@ -127,58 +146,164 @@ const useStyles = makeStyles({
     fontSize: "10px",
     fontWeight: tokens.fontWeightBold,
   },
+  streamArea: {
+    position: "relative",
+    display: "flex",
+    flexGrow: 1,
+    minHeight: 0,
+    minWidth: 0,
+  },
   stream: {
     flexGrow: 1,
     overflowY: "auto",
-    padding: "18px 20px 24px",
+    // The right margin belongs to the prompt rail, which replaces the
+    // scrollbar: content stops short of the strip so nothing sits under the
+    // marks, and the native bar is hidden because two position indicators on
+    // one edge is one too many.
+    padding: "16px 40px 24px 22px",
     display: "flex",
     flexDirection: "column",
-    gap: "10px",
-  },
-  line: {
-    display: "grid",
-    gridTemplateColumns: "56px 14px minmax(0, 1fr)",
-    gap: "8px",
-    alignItems: "start",
+    scrollbarWidth: "none",
+    "::-webkit-scrollbar": {
+      width: 0,
+      height: 0,
+    },
+    // Steps carry their own (tiny) rhythm and messages their own margins, so
+    // the stream itself adds almost nothing: a run of tool calls reads as one
+    // quiet list rather than a stack of separated cards.
+    gap: "1px",
   },
   message: {
-    borderRadius: tokens.borderRadiusMedium,
-    padding: "10px 14px",
-    background: "rgba(255, 255, 255, 0.03)",
-    border: `1px solid ${tokens.colorNeutralStroke3}`,
+    margin: "10px 0 12px",
+    minWidth: 0,
+    color: terminal.agent,
+  },
+  // The operator's own words sit on the right, the way every chat window has
+  // taught people to read them; the agent's answer stays left and full width.
+  userRow: {
+    display: "flex",
+    justifyContent: "flex-end",
+    margin: "16px 0 10px",
     minWidth: 0,
   },
   userMessage: {
+    minWidth: 0,
+    maxWidth: "78%",
+    borderRadius: tokens.borderRadiusMedium,
+    padding: "8px 13px",
     background: "rgba(127, 160, 255, 0.08)",
     border: "1px solid rgba(127, 160, 255, 0.18)",
+    color: terminal.user,
   },
-  time: {
+  /**
+   * One middle step: a tool call, a thought, a state change.
+   *
+   * These outnumber the agent's own words several times over, so they are held
+   * to a single 22px line with no card, no border and no timestamp — the shape
+   * a reader skims past on the way to the prose, rather than the shape that
+   * pushes the prose off the screen.
+   */
+  step: {
+    display: "flex",
+    alignItems: "center",
+    gap: "9px",
+    minWidth: 0,
+    minHeight: "22px",
+    padding: 0,
+    background: "none",
+    border: "none",
+    textAlign: "left",
+    width: "100%",
+    fontFamily: '"DM Sans", system-ui, sans-serif',
+    fontSize: "12.5px",
+    lineHeight: "18px",
+    color: tokens.colorNeutralForeground3,
+  },
+  stepClickable: {
+    cursor: "pointer",
+    ":hover": {
+      color: tokens.colorNeutralForeground2,
+    },
+  },
+  stepIcon: {
+    flexShrink: 0,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "16px",
+    height: "16px",
+    color: tokens.colorNeutralForeground4,
+  },
+  stepTitle: {
+    flexShrink: 0,
+    // Capped so a long title cannot push the detail off the row entirely;
+    // lifted by `stepTitleWide` when there is no detail to protect.
+    maxWidth: "62%",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    color: tokens.colorNeutralForeground2,
+  },
+  stepTitleWide: {
+    maxWidth: "100%",
+  },
+  stepDetail: {
+    flexShrink: 1,
+    minWidth: 0,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
     color: terminal.dim,
     fontFamily: terminal.font,
-    fontSize: "10px",
-    paddingTop: "12px",
-    userSelect: "none",
+    fontSize: "11.5px",
   },
-  glyph: {
-    userSelect: "none",
-    textAlign: "center",
-    fontFamily: terminal.font,
-    paddingTop: "12px",
-  },
-  plain: {
-    fontFamily: terminal.font,
+  // A thought's preview is a sentence, not a command; the monospace face that
+  // suits a path or an argv reads as output when the text is prose.
+  stepDetailProse: {
+    fontFamily: '"DM Sans", system-ui, sans-serif',
     fontSize: "12.5px",
-    lineHeight: "1.65",
+    fontStyle: "italic",
+  },
+  stepFailed: {
+    flexShrink: 0,
+    color: terminal.error,
+    fontFamily: '"DM Sans", system-ui, sans-serif',
+    fontSize: "11.5px",
+  },
+  spin: {
+    animationName: {
+      from: { transform: "rotate(0deg)" },
+      to: { transform: "rotate(360deg)" },
+    },
+    animationDuration: "1.4s",
+    animationIterationCount: "infinite",
+    animationTimingFunction: "linear",
+  },
+  // Expanded reasoning and raw agent output: still quiet, still off to the
+  // side of the prose, but allowed to wrap because their whole value is text
+  // a single truncated line would have hidden.
+  stepBody: {
+    margin: "2px 0 8px 25px",
+    color: terminal.thought,
+  },
+  note: {
+    margin: "0 0 0 25px",
+    fontFamily: terminal.font,
+    fontSize: "11.5px",
+    lineHeight: "1.6",
     whiteSpace: "pre-wrap",
     wordBreak: "break-word",
-    margin: 0,
-    paddingTop: "10px",
+  },
+  divider: {
+    height: "1px",
+    margin: "10px 0",
+    background: tokens.colorNeutralStroke3,
   },
   working: {
     display: "flex",
     alignItems: "center",
     gap: "8px",
-    padding: "6px 0 0 78px",
+    padding: "6px 0 0 25px",
     color: terminal.tool,
     fontFamily: terminal.font,
     fontSize: "11px",
@@ -284,18 +409,42 @@ const useStyles = makeStyles({
  */
 const COMPOSER_MAX_HEIGHT = 220;
 
-const glyphs: Record<TerminalBlockKind, string> = {
-  user: "\u276f",
-  agent: "",
-  thought: "\u00b7",
-  tool: "\u23fa",
-  permission: "\u26a0",
-  permission_result: "\u2713",
-  turn: "\u2500",
-  state: "\u25a0",
-  error: "\u2716",
-  system: "\u203a",
+/**
+ * The icon a middle step is announced by, in place of its old text glyph.
+ *
+ * A 16px icon reads as "an event of this category happened" at a glance and
+ * costs one line; the categories come from ACP's own `ToolKind`, so the icon
+ * matches what the tool actually did rather than what its title happens to
+ * start with. Anything unrecognised falls back to a generic tool.
+ */
+const toolKindIcons: Record<string, ReactNode> = {
+  read: <Document16Regular />,
+  edit: <Edit16Regular />,
+  delete: <Delete16Regular />,
+  move: <ArrowSwap16Regular />,
+  search: <Search16Regular />,
+  execute: <Window16Regular />,
+  think: <Brain16Regular />,
+  fetch: <Globe16Regular />,
+  switch_mode: <ArrowSwap16Regular />,
+  other: <Wrench16Regular />,
 };
+
+const kindIcons: Partial<Record<TerminalBlockKind, ReactNode>> = {
+  thought: <Brain16Regular />,
+  tool: <Wrench16Regular />,
+  permission: <Warning16Regular />,
+  permission_result: <Checkmark16Regular />,
+  state: <Info16Regular />,
+  system: <Info16Regular />,
+  error: <ErrorCircle16Regular />,
+};
+
+/** Statuses that mean the call is still in flight, so it spins rather than sits. */
+const runningStatuses = new Set(["pending", "in_progress"]);
+
+/** How much of a thought is shown before the reader asks for the rest. */
+const THOUGHT_PREVIEW_LENGTH = 150;
 
 type TerminalViewProps = {
   session: FleetSession;
@@ -357,12 +506,68 @@ export const TerminalView = ({
 
   const blocks = useMemo(() => toTerminalBlocks(events), [events]);
   const permission = useMemo(() => pendingPermission(events), [events]);
+  const promptMarks = useMemo(() => toPromptMarks(blocks), [blocks]);
+  const [activePrompt, setActivePrompt] = useState<string>();
+
+  /** The prompt elements, in order, so the rail and the stream stay in step. */
+  const promptNodes = useCallback(
+    (): HTMLElement[] => [
+      ...(streamRef.current?.querySelectorAll<HTMLElement>("[data-prompt-key]") ?? []),
+    ],
+    [],
+  );
+
+  /**
+   * Which turn the reader is currently inside.
+   *
+   * The last prompt whose top has passed the top of the viewport: scrolling
+   * through an agent's answer keeps the mark for the prompt that asked for it
+   * lit, rather than jumping ahead the moment the next prompt peeks in.
+   */
+  const updateActivePrompt = useCallback(() => {
+    const element = streamRef.current;
+    if (!element) return;
+    const top = element.getBoundingClientRect().top;
+    const nodes = promptNodes();
+    let current: string | undefined;
+    for (const node of nodes) {
+      if (node.getBoundingClientRect().top - top <= 24) current = node.dataset.promptKey;
+    }
+    setActivePrompt(current ?? nodes[0]?.dataset.promptKey);
+  }, [promptNodes]);
+
+  const scrollToPrompt = useCallback(
+    (key: string) => {
+      const element = streamRef.current;
+      const node = promptNodes().find((candidate) => candidate.dataset.promptKey === key);
+      if (!element || !node) return;
+      // Left pinned, the next streamed chunk would yank the reader straight
+      // back to the bottom of the very transcript they just left.
+      pinnedRef.current = false;
+      const offset =
+        node.getBoundingClientRect().top - element.getBoundingClientRect().top;
+      const top = element.scrollTop + offset - 14;
+      // `scrollTo` is what animates; the assignment is the fallback for hosts
+      // that do not have it, which is also what keeps this testable.
+      if (typeof element.scrollTo === "function") {
+        element.scrollTo({ top, behavior: "smooth" });
+      } else {
+        element.scrollTop = top;
+      }
+      setActivePrompt(key);
+    },
+    [promptNodes],
+  );
 
   const scrollToEnd = useCallback(() => {
     const element = streamRef.current;
     if (!element) return;
     element.scrollTop = element.scrollHeight;
   }, []);
+
+  useEffect(() => {
+    updateActivePrompt();
+  }, [blocks, updateActivePrompt]);
 
   useEffect(() => {
     if (!pinnedRef.current) return;
@@ -532,6 +737,7 @@ export const TerminalView = ({
     if (!element) return;
     const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
     pinnedRef.current = distance < 48;
+    updateActivePrompt();
   };
 
   const handleDecide = (outcome: "allow_once" | "deny", optionId?: string) => {
@@ -669,13 +875,22 @@ export const TerminalView = ({
         />
       )}
 
-      <div className={styles.stream} ref={streamRef} onScroll={handleScroll}>
-        {blocks.length === 0 ? (
-          <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
-        ) : (
-          blocks.map((block) => <TerminalLine block={block} key={block.key} />)
+      <div className={styles.streamArea}>
+        <div className={styles.stream} ref={streamRef} onScroll={handleScroll}>
+          {blocks.length === 0 ? (
+            <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
+          ) : (
+            blocks.map((block) => <TerminalLine block={block} key={block.key} />)
+          )}
+          {session.state === "running" && <div className={styles.working}>working…</div>}
+        </div>
+        {promptMarks.length > 0 && (
+          <PromptRail
+            marks={promptMarks}
+            activeKey={activePrompt}
+            onSelect={scrollToPrompt}
+          />
         )}
-        {session.state === "running" && <div className={styles.working}>working…</div>}
       </div>
 
       <form className={styles.composer} onSubmit={handleSubmit}>
@@ -765,10 +980,8 @@ export const TerminalView = ({
   );
 };
 
-const markdownKinds = new Set<TerminalBlockKind>(["agent", "user", "thought"]);
-
 /**
- * One line of the transcript, memoised.
+ * One entry in the transcript, memoised.
  *
  * A transcript runs to hundreds of these, and each markdown line re-parses its
  * text when it renders. Without this, every keystroke in the composer re-rendered
@@ -777,56 +990,219 @@ const markdownKinds = new Set<TerminalBlockKind>(["agent", "user", "thought"]);
  *
  * `block` comes from a memo over the event list, so its identity only changes
  * when the event it describes does.
+ *
+ * What is said splits from what was done: the agent's words and the operator's
+ * prompts get prose treatment, and everything between them — tool calls,
+ * reasoning, state changes — gets one dim line each. The middle steps used to
+ * be bordered cards with a timestamp column, which meant a turn that ran ten
+ * tools pushed its own answer off the screen.
  */
 const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBlock }) {
   const styles = useStyles();
-  const color = blockColor[block.kind];
-  const text =
-    block.kind === "turn"
-      ? `turn complete (${block.text})`
-      : block.kind === "tool" && block.status
-        ? `${block.text} · ${block.status}`
-        : block.text;
-  const asMarkdown = markdownKinds.has(block.kind);
+  const time = formatTime(block.createdAt);
+
+  if (block.kind === "agent" || block.kind === "user") {
+    const body = (
+      <>
+        <MarkdownBody text={block.text} copyable />
+        {block.attachments?.length ? (
+          <div className={styles.blockAttachments}>
+            {block.attachments.map((attachment) => (
+              <span className={styles.blockAttachment} key={attachment.name}>
+                <Attach20Regular className={styles.blockAttachmentIcon} />
+                {attachment.name}
+              </span>
+            ))}
+          </div>
+        ) : null}
+      </>
+    );
+    if (block.kind === "agent") {
+      return (
+        <div className={styles.message} title={time}>
+          {body}
+        </div>
+      );
+    }
+    return (
+      <div className={styles.userRow} data-prompt-key={block.key}>
+        <div className={styles.userMessage} title={time}>
+          {body}
+        </div>
+      </div>
+    );
+  }
+
+  // An ordinary end of turn is the absence of news; only a stop reason worth
+  // explaining earns a line, and even then it is a rule rather than a message.
+  if (block.kind === "turn") {
+    return block.text && block.text !== "end_turn" ? (
+      <StepRow
+        icon={<Info16Regular />}
+        title={`Turn ended: ${block.text}`}
+        time={time}
+        color={terminal.dim}
+      />
+    ) : (
+      <div className={styles.divider} aria-hidden="true" />
+    );
+  }
+
+  if (block.kind === "thought") return <ThoughtLine block={block} time={time} />;
+
+  // Raw agent stderr and errors are the two things a truncated line would
+  // actively cost the reader, so they keep their full text under the row.
+  if (block.kind === "error" || block.kind === "system") {
+    const color = blockColor[block.kind];
+    return (
+      <div>
+        <StepRow
+          icon={kindIcons[block.kind]}
+          title={block.kind === "error" ? "Error" : "Output"}
+          time={time}
+          color={color}
+        />
+        <p className={styles.note} style={{ color }}>
+          {block.text}
+        </p>
+      </div>
+    );
+  }
+
+  if (block.kind === "tool") {
+    const failed = block.status === "failed";
+    const running = block.status ? runningStatuses.has(block.status) : false;
+    const icon = running ? (
+      <SpinnerIos16Regular className={styles.spin} />
+    ) : (
+      (toolKindIcons[block.toolKind ?? ""] ?? kindIcons.tool)
+    );
+    return (
+      <StepRow
+        icon={icon}
+        title={block.text}
+        detail={block.detail}
+        time={time}
+        color={failed ? terminal.error : running ? terminal.tool : undefined}
+        failed={failed}
+      />
+    );
+  }
 
   return (
-    <div className={styles.line}>
-      <span className={styles.time}>{formatTime(block.createdAt)}</span>
-      <span className={styles.glyph} style={{ color }} aria-hidden="true">
-        {glyphs[block.kind]}
-      </span>
-      {asMarkdown ? (
-        <div
-          className={mergeClasses(
-            styles.message,
-            block.kind === "user" && styles.userMessage,
-          )}
-          style={{ color }}
-        >
-          <MarkdownBody
-            text={text}
-            muted={block.kind === "thought"}
-            copyable={block.kind !== "thought"}
-          />
-          {block.attachments?.length ? (
-            <div className={styles.blockAttachments}>
-              {block.attachments.map((attachment) => (
-                <span className={styles.blockAttachment} key={attachment.name}>
-                  <Attach20Regular className={styles.blockAttachmentIcon} />
-                  {attachment.name}
-                </span>
-              ))}
-            </div>
-          ) : null}
-        </div>
-      ) : (
-        <p className={styles.plain} style={{ color }}>
-          {text}
-        </p>
-      )}
-    </div>
+    <StepRow
+      icon={kindIcons[block.kind]}
+      title={block.text}
+      time={time}
+      color={blockColor[block.kind]}
+    />
   );
 });
+
+/** A thought, folded to its first line until the reader asks for the rest. */
+const ThoughtLine = ({ block, time }: { block: TerminalBlock; time: string }) => {
+  const styles = useStyles();
+  const [expanded, setExpanded] = useState(false);
+  const preview = previewOf(block.text);
+
+  return (
+    <div>
+      <StepRow
+        icon={expanded ? <ChevronDown16Regular /> : <ChevronRight16Regular />}
+        title="Thinking"
+        detail={expanded ? undefined : preview}
+        proseDetail
+        time={time}
+        onClick={() => setExpanded((current) => !current)}
+        expanded={expanded}
+      />
+      {expanded ? (
+        <div className={styles.stepBody}>
+          <MarkdownBody text={block.text} muted />
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+type StepRowProps = {
+  icon: ReactNode;
+  title: string;
+  detail?: string | undefined;
+  /** Renders the detail as prose rather than as a command or a path. */
+  proseDetail?: boolean;
+  time: string;
+  color?: string | undefined;
+  /** Says so in words, because colour alone is not a state a reader can read. */
+  failed?: boolean;
+  onClick?: () => void;
+  expanded?: boolean;
+};
+
+/** The single dim line every middle step is drawn as. */
+const StepRow = ({
+  icon,
+  title,
+  detail,
+  proseDetail,
+  time,
+  color,
+  failed,
+  onClick,
+  expanded,
+}: StepRowProps) => {
+  const styles = useStyles();
+  const content = (
+    <>
+      <span className={styles.stepIcon} style={color ? { color } : undefined}>
+        {icon}
+      </span>
+      <span className={mergeClasses(styles.stepTitle, !detail && styles.stepTitleWide)}>
+        {title}
+      </span>
+      {detail ? (
+        <span
+          className={mergeClasses(
+            styles.stepDetail,
+            proseDetail && styles.stepDetailProse,
+          )}
+        >
+          {detail}
+        </span>
+      ) : null}
+      {failed ? <span className={styles.stepFailed}>failed</span> : null}
+    </>
+  );
+
+  // The timestamp lives in the tooltip rather than a column of its own: it is
+  // worth having and never worth 56px on every line of a long transcript.
+  if (!onClick) {
+    return (
+      <div className={styles.step} title={time}>
+        {content}
+      </div>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className={mergeClasses(styles.step, styles.stepClickable)}
+      title={time}
+      onClick={onClick}
+      aria-expanded={expanded}
+    >
+      {content}
+    </button>
+  );
+};
+
+/** First line of a block of reasoning, short enough to sit on one row. */
+function previewOf(text: string): string {
+  const flattened = text.replace(/\s+/g, " ").trim();
+  return flattened.length > THOUGHT_PREVIEW_LENGTH
+    ? `${flattened.slice(0, THOUGHT_PREVIEW_LENGTH)}…`
+    : flattened;
+}
 
 function formatTime(value: string): string {
   const parsed = Date.parse(value);

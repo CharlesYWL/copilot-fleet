@@ -18,6 +18,10 @@ export type TerminalBlock = {
   text: string;
   createdAt: string;
   status?: string;
+  /** ACP tool category (`read`, `edit`, `execute`, …), which picks the icon. */
+  toolKind?: string;
+  /** One-line summary of a tool's input, shown dimmed after its title. */
+  detail?: string;
   /** Files that went with this message, by name; their bytes are never kept. */
   attachments?: AttachmentSummary[];
 };
@@ -58,11 +62,18 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       const toolCallId = payload?.toolCallId ?? "";
       const status = payload?.status ?? "";
       const title = payload?.title ?? "";
+      const toolKind = payload?.kind ?? "";
+      const detail = payload?.detail ?? "";
       const existing = toolCallId ? toolBlockIndex.get(toolCallId) : undefined;
       const previous = existing === undefined ? undefined : blocks[existing];
       if (previous) {
+        // Only what an update actually restates is taken from it: a completion
+        // frame carries a status and nothing else, and must not blank the line
+        // the reader has been looking at since the call started.
         if (title) previous.text = title;
         if (status) previous.status = status;
+        if (toolKind) previous.toolKind = toolKind;
+        if (detail) previous.detail = detail;
         continue;
       }
       blocks.push({
@@ -71,6 +82,8 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
         text: title || "Tool call",
         createdAt: event.createdAt,
         ...(status ? { status } : {}),
+        ...(toolKind ? { toolKind } : {}),
+        ...(detail ? { detail } : {}),
       });
       if (toolCallId) toolBlockIndex.set(toolCallId, blocks.length - 1);
       continue;

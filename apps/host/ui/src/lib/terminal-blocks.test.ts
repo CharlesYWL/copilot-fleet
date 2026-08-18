@@ -72,6 +72,29 @@ describe("toTerminalBlocks", () => {
     expect(blocks[1]).toMatchObject({ text: "write_file", status: "pending" });
   });
 
+  it("keeps the icon and detail a later update no longer restates", () => {
+    // A completion frame carries a status and nothing else. Copying it wholesale
+    // would blank the line the reader has been watching since the call started,
+    // leaving a bare title where the command used to be.
+    const blocks = toTerminalBlocks([
+      event("tool", {
+        toolCallId: "t1",
+        title: "Run tests",
+        kind: "execute",
+        detail: "npm test",
+        status: "pending",
+      }),
+      event("tool", { toolCallId: "t1", status: "completed" }),
+    ]);
+
+    expect(blocks[0]).toMatchObject({
+      text: "Run tests",
+      toolKind: "execute",
+      detail: "npm test",
+      status: "completed",
+    });
+  });
+
   it("promotes user prompts and drops raw protocol noise", () => {
     const blocks = toTerminalBlocks([
       event("system", { text: "User: fix the bug" }),

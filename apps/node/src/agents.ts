@@ -494,6 +494,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         toolCallId: update.toolCallId,
         title: update.title,
         status: update.status,
+        ...(update.kind ? { kind: update.kind } : {}),
+        ...toolDetailPayload(update),
       });
       return;
     }
@@ -502,6 +504,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         toolCallId: update.toolCallId,
         status: update.status,
         title: update.title,
+        ...(update.kind ? { kind: update.kind } : {}),
+        ...toolDetailPayload(update),
       });
       return;
     }
@@ -720,6 +724,66 @@ export class MockAgentFactory implements AgentFactory {
     agent.start(options.resumeAgentSessionId);
     return agent;
   }
+}
+
+/**
+ * The one short input field a tool call is worth naming beside its title.
+ *
+ * A transcript reads as a list of steps, and "Run tests" says less than "Run
+ * tests · npm test -w @fleet/host". The fields are allow-listed rather than
+ * guessed at from whatever `rawInput` happens to hold: a tool's raw input also
+ * carries the *contents* it is about to write, which would put a whole file on
+ * one line of a transcript that is stored on the Host and replayed to every
+ * browser watching. A path from `locations` is the fallback, since a file tool
+ * that named nothing else still says which file.
+ */
+const DETAIL_FIELDS = [
+  "command",
+  "cmd",
+  "path",
+  "filePath",
+  "file",
+  "url",
+  "pattern",
+  "query",
+] as const;
+
+/** How much of a detail is worth carrying; the rest is ellipsis on one line. */
+const DETAIL_MAX_LENGTH = 200;
+
+export function toolDetail(update: {
+  rawInput?: unknown;
+  locations?: readonly { path?: string }[] | null;
+}): string | undefined {
+  const input =
+    update.rawInput && typeof update.rawInput === "object"
+      ? (update.rawInput as Record<string, unknown>)
+      : undefined;
+  const named = input
+    ? DETAIL_FIELDS.map((field) => input[field]).find(
+        (value) => typeof value === "string" && value.trim().length > 0,
+      )
+    : undefined;
+  const raw =
+    typeof named === "string" ? named : (update.locations?.[0]?.path ?? undefined);
+  if (!raw) return undefined;
+  // Newlines and runs of spaces are what a heredoc or a wrapped shell command
+  // arrives as; on a single-line row they would each be rendered as one space
+  // anyway, so they are collapsed before the length is judged.
+  const flattened = raw.replace(/\s+/g, " ").trim();
+  if (!flattened) return undefined;
+  return flattened.length > DETAIL_MAX_LENGTH
+    ? `${flattened.slice(0, DETAIL_MAX_LENGTH)}…`
+    : flattened;
+}
+
+/** `{ detail }` when there is one, so an update never blanks an earlier one. */
+function toolDetailPayload(update: {
+  rawInput?: unknown;
+  locations?: readonly { path?: string }[] | null;
+}): { detail?: string } {
+  const detail = toolDetail(update);
+  return detail ? { detail } : {};
 }
 
 /**

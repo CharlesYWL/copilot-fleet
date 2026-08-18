@@ -5,6 +5,7 @@ import {
   configRecoveryRequest,
   copilotLaunchArgs,
   copilotSupportsContextTier,
+  toolDetail,
 } from "./agents.js";
 
 describe("copilotLaunchArgs", () => {
@@ -94,6 +95,47 @@ describe("configRecoveryRequest", () => {
 
   it("leaves a session that reported its own options alone", () => {
     expect(configRecoveryRequest([option("model")], true)).toBeUndefined();
+  });
+});
+
+describe("toolDetail", () => {
+  it("names the command a shell tool is about to run", () => {
+    expect(toolDetail({ rawInput: { command: "npm test -w @fleet/host" } })).toBe(
+      "npm test -w @fleet/host",
+    );
+  });
+
+  it("flattens a wrapped command onto the one line it will be drawn on", () => {
+    expect(toolDetail({ rawInput: { command: "npm test \\\n  --silent" } })).toBe(
+      "npm test \\ --silent",
+    );
+  });
+
+  it("falls back to the file a tool named nothing else about", () => {
+    expect(toolDetail({ locations: [{ path: "apps/node/src/agents.ts" }] })).toBe(
+      "apps/node/src/agents.ts",
+    );
+  });
+
+  it("ignores fields that carry contents rather than a summary", () => {
+    // `rawInput` on a write also holds the bytes being written. A transcript is
+    // stored on the Host and replayed to every browser watching it, so a whole
+    // file on one line is a cost that outlives the render it broke.
+    expect(
+      toolDetail({ rawInput: { content: "a".repeat(5000), summary: "wrote a file" } }),
+    ).toBeUndefined();
+  });
+
+  it("truncates a detail too long to belong on a single line", () => {
+    const detail = toolDetail({ rawInput: { command: "x".repeat(500) } });
+    expect(detail?.length).toBe(201);
+    expect(detail?.endsWith("…")).toBe(true);
+  });
+
+  it("says nothing when the tool described neither input nor file", () => {
+    expect(toolDetail({})).toBeUndefined();
+    expect(toolDetail({ rawInput: "just a string" })).toBeUndefined();
+    expect(toolDetail({ rawInput: { command: "   " } })).toBeUndefined();
   });
 });
 

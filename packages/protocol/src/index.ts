@@ -284,7 +284,18 @@ export const sessionEventPayloadSchemas = {
   state: z.object({ state: SessionStateSchema.optional(), activity: text }),
   agent_text: z.object({ text }),
   agent_thought: z.object({ text }),
-  tool: z.object({ toolCallId: text, title: text, status: text }),
+  // `kind` and `detail` exist so a reader can render a tool call as one quiet
+  // line — an icon for the category and a dimmed summary of what it ran on —
+  // instead of a paragraph-sized block per step. `detail` is drawn from the
+  // few short input fields a tool names (a command, a path, a query); tool
+  // output and file contents are deliberately never carried here.
+  tool: z.object({
+    toolCallId: text,
+    title: text,
+    status: text,
+    kind: text,
+    detail: text,
+  }),
   permission: z.object({
     requestId: text,
     title: text,

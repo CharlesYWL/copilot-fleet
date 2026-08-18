@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
-import type { FleetSession } from "@fleet/protocol";
+import type { FleetSession, SessionEvent } from "@fleet/protocol";
 import { TerminalView } from "./TerminalView";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { fleetDarkTheme } from "../theme";
@@ -39,12 +39,16 @@ const session = (values: Partial<FleetSession> = {}): FleetSession => ({
   ...values,
 });
 
-const show = (overrides: Partial<FleetSession> = {}, draft: SessionDraft = EMPTY_DRAFT) =>
+const show = (
+  overrides: Partial<FleetSession> = {},
+  draft: SessionDraft = EMPTY_DRAFT,
+  events: SessionEvent[] = [],
+) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
       <TerminalView
         session={session(overrides)}
-        events={[]}
+        events={events}
         onPrompt={vi.fn()}
         onCancel={vi.fn()}
         onStop={vi.fn()}
@@ -55,6 +59,20 @@ const show = (overrides: Partial<FleetSession> = {}, draft: SessionDraft = EMPTY
       />
     </FluentProvider>,
   );
+
+let sequence = 0;
+
+const streamEvent = (
+  type: SessionEvent["type"],
+  payload: Record<string, unknown>,
+): SessionEvent => ({
+  eventId: `e${++sequence}`,
+  sessionId: "s1",
+  sequence,
+  type,
+  payload,
+  createdAt: "2026-08-08T09:15:00.000Z",
+});
 
 describe("TerminalView composer", () => {
   it("keeps the pickers inside the composer, under the text box", () => {
@@ -109,5 +127,82 @@ describe("TerminalView composer", () => {
     const height = Number.parseInt(box.style.height, 10);
     expect(Number.isNaN(height)).toBe(false);
     expect(height).toBeLessThanOrEqual(220);
+  });
+});
+
+describe("TerminalView transcript", () => {
+  it("draws a tool call as one line: what it did and what it ran on", () => {
+    // The steps between an operator's prompt and the agent's answer outnumber
+    // the answer several times over. Each used to be a bordered card with a
+    // timestamp column, so a turn that touched ten files pushed its own
+    // conclusion off the screen.
+    show({}, EMPTY_DRAFT, [
+      streamEvent("tool", {
+        toolCallId: "t1",
+        title: "Run node endpoint tests",
+        kind: "execute",
+        detail: "npx vitest run apps/node",
+        status: "completed",
+      }),
+    ]);
+
+    expect(screen.getByText("Run node endpoint tests")).toBeTruthy();
+    expect(screen.getByText("npx vitest run apps/node")).toBeTruthy();
+    // A status that means "it worked" is not news; only a failure is.
+    expect(screen.queryByText("completed")).toBeNull();
+  });
+
+  it("says a failed tool failed rather than leaving it to colour alone", () => {
+    show({}, EMPTY_DRAFT, [
+      streamEvent("tool", {
+        toolCallId: "t1",
+        title: "Typecheck",
+        kind: "execute",
+        detail: "npm run typecheck",
+        status: "failed",
+      }),
+    ]);
+
+    expect(screen.getByText("failed")).toBeTruthy();
+  });
+
+  it("folds reasoning to a preview the reader can open", async () => {
+    const thought = `${"deliberating ".repeat(40)}end`;
+    show({}, EMPTY_DRAFT, [streamEvent("agent_thought", { text: thought })]);
+
+    const toggle = screen.getByRole("button", { name: /Thinking/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(thought)).toBeNull();
+
+    toggle.click();
+    expect(await screen.findByText(thought, { exact: false })).toBeTruthy();
+  });
+
+  it("keeps the agent's own words as prose, not as a step", () => {
+    show({}, EMPTY_DRAFT, [
+      streamEvent("system", { text: "User: fix the flake" }),
+      streamEvent("agent_text", { text: "Fixed the flake in the retry helper." }),
+    ]);
+
+    expect(screen.getByText("fix the flake")).toBeTruthy();
+    expect(screen.getByText("Fixed the flake in the retry helper.")).toBeTruthy();
+  });
+
+  it("gives every prompt a mark on the rail, and a way back to it", () => {
+    // The rail replaces the scrollbar, so each prompt has to be addressable
+    // from it: the marks are what a reader navigates a long session by.
+    const { container } = show({}, EMPTY_DRAFT, [
+      streamEvent("system", { text: "User: first ask" }),
+      streamEvent("agent_text", { text: "done" }),
+      streamEvent("system", { text: "User: second ask" }),
+    ]);
+
+    expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(2);
+    expect(
+      screen.getByRole("button", { name: "Jump to prompt: first ask" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Jump to prompt: second ask" }),
+    ).toBeTruthy();
   });
 });
