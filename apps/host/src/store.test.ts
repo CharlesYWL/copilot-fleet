@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import { canTransition } from "@fleet/protocol";
 import { FleetStore } from "./store.js";
@@ -497,6 +498,112 @@ describe("FleetStore", () => {
     });
 
     expect(store.getSession(session.id)?.configOptions[0]?.currentValue).toBe("haiku");
+  });
+
+  it("keeps storing pickers after the agent adds one with an empty-value choice", () => {
+    // How a working picker became a frozen one. Copilot started reporting an
+    // `agent` option whose default choice is "", the whole list failed to parse,
+    // and the Host went on serving the last list that did — so every change the
+    // operator made was accepted by the agent and then snapped back in the UI.
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "prompt");
+    const at = new Date().toISOString();
+    const model = (currentValue: string) => ({
+      id: "model",
+      name: "Model",
+      category: "model",
+      currentValue,
+      choices: [
+        { value: "sonnet", name: "Sonnet" },
+        { value: "haiku", name: "Haiku" },
+      ],
+    });
+
+    store.appendEvent({
+      eventId: "e1",
+      sessionId: session.id,
+      sequence: 1,
+      type: "config",
+      payload: { options: [model("sonnet")] },
+      createdAt: at,
+    });
+    store.appendEvent({
+      eventId: "e2",
+      sessionId: session.id,
+      sequence: 2,
+      type: "config",
+      payload: {
+        options: [
+          model("haiku"),
+          {
+            id: "agent",
+            name: "Agent",
+            category: "_agent",
+            currentValue: "",
+            choices: [{ value: "", name: "Copilot" }],
+          },
+        ],
+      },
+      createdAt: at,
+    });
+
+    const stored = store.getSession(session.id);
+    expect(stored?.configOptions.map((option) => option.id)).toEqual(["model", "agent"]);
+    expect(stored?.configOptions[0]?.currentValue).toBe("haiku");
+  });
+
+  it("rebuilds pickers a previous build could not read when it reopens the file", () => {
+    // The deadlock this breaks: a session whose picker list was dropped has no
+    // control left to press, so nothing will ever produce the next `config`
+    // frame. The frames were stored whole, so a Host that now understands the
+    // payload re-reads what it already has rather than waiting for a change
+    // that cannot be made.
+    const file = join(mkdtempSync(join(tmpdir(), "fleet-rebuild-")), "fleet.db");
+    directories.push(dirname(file));
+    const first = new FleetStore(file);
+    const { node } = first.registerNode({
+      name: "box",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: [],
+      maxSessions: 2,
+    });
+    const workspace = first.createWorkspace("repo", "");
+    const placement = first.createPlacement(workspace.id, node.id, "/repo");
+    const session = first.createSession(placement, "prompt");
+    first.appendEvent({
+      eventId: "e1",
+      sessionId: session.id,
+      sequence: 1,
+      type: "config",
+      payload: {
+        options: [
+          { id: "model", name: "Model", currentValue: "opus", choices: [] },
+          {
+            id: "agent",
+            name: "Agent",
+            currentValue: "",
+            choices: [{ value: "", name: "Copilot" }],
+          },
+        ],
+      },
+      createdAt: new Date().toISOString(),
+    });
+    first.close();
+
+    // Exactly what the build that could not read the frame left on disk: the
+    // event stored whole, the session's cache of it empty. Written directly
+    // because no supported call can produce that state any more.
+    const raw = new DatabaseSync(file);
+    raw.prepare("UPDATE sessions SET config_options=''").run();
+    raw.close();
+
+    const reopened = new FleetStore(file);
+    stores.push(reopened);
+    expect(
+      reopened.getSession(session.id)?.configOptions.map((option) => option.id),
+    ).toEqual(["model", "agent"]);
   });
 
   it("moves a placement to another workspace, taking its sessions along", () => {

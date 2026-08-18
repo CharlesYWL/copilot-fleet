@@ -111,7 +111,10 @@ export const SessionConfigBar = ({
               checkedValues={{ [option.id]: [option.currentValue] }}
               onCheckedValueChange={(_event, data) => {
                 const next = data.checkedItems[0];
-                if (!next || next === option.currentValue) return;
+                // Compared against undefined rather than tested for truth: ""
+                // is a selectable value (Copilot's default `agent`), and a
+                // falsy check made that one choice impossible to pick.
+                if (next === undefined || next === option.currentValue) return;
                 onChange(option.id, next);
               }}
             >

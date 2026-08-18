@@ -82,4 +82,25 @@ describe("SessionConfigBar", () => {
       "gpt-9-unlisted",
     );
   });
+
+  it("reports a pick of the empty-string choice", () => {
+    // Copilot's `agent` picker names its default persona "". Guarding the
+    // handler with a falsy test made that choice the one option in the menu
+    // that could be clicked and do nothing.
+    const onChange = show([
+      option({
+        id: "agent",
+        name: "Agent",
+        category: "_agent",
+        currentValue: "feature-dev",
+        choices: [
+          { value: "", name: "Copilot", description: "" },
+          { value: "feature-dev", name: "feature-dev", description: "" },
+        ],
+      }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Agent" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Copilot" }));
+    expect(onChange).toHaveBeenCalledWith("agent", "");
+  });
 });

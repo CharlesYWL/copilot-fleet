@@ -10,6 +10,7 @@ import {
   RenameSessionSchema,
   SessionEventSchema,
   SessionSchema,
+  SetSessionConfigSchema,
   backupKind,
   canTransition,
   eventPayload,
@@ -63,6 +64,22 @@ describe("protocol validation", () => {
   it("guards malformed WebSocket JSON frames", () => {
     expect(tryParseJson('{"type":"heartbeat"}').ok).toBe(true);
     expect(tryParseJson("{not-json").ok).toBe(false);
+  });
+
+  it("carries a picker change to the empty-string choice", () => {
+    // Selecting Copilot's default `agent` sends "". Both hops used to demand a
+    // non-empty value, so that one choice was a 400 in the browser and an
+    // unparseable command on the node.
+    expect(SetSessionConfigSchema.parse({ configId: "agent", value: "" }).value).toBe("");
+    expect(
+      NodeCommandSchema.parse({
+        type: "set_config_option",
+        commandId: "c1",
+        sessionId: "s1",
+        configId: "agent",
+        value: "",
+      }),
+    ).toMatchObject({ configId: "agent", value: "" });
   });
 
   it("reads a session row written before names existed", () => {
@@ -173,6 +190,71 @@ describe("eventPayload", () => {
     expect(eventPayload(event("tool", { toolCallId: "t1" }), "tool")).toEqual({
       toolCallId: "t1",
     });
+  });
+
+  it("keeps a picker whose default choice is the empty string", () => {
+    // Copilot's `agent` option spells "no custom persona" as "". Demanding a
+    // non-empty value rejected that one choice, which rejected the option, which
+    // rejected the whole list — the composer lost its model and mode pickers on
+    // every node that had custom agents installed.
+    const payload = eventPayload(
+      event("config", {
+        options: [
+          {
+            id: "agent",
+            name: "Agent",
+            category: "_agent",
+            currentValue: "",
+            choices: [
+              { value: "", name: "Copilot" },
+              { value: "feature-dev", name: "feature-dev" },
+            ],
+          },
+        ],
+      }),
+      "config",
+    );
+
+    expect(payload?.options?.[0]?.choices.map((choice) => choice.value)).toEqual([
+      "",
+      "feature-dev",
+    ]);
+  });
+
+  it("drops only the unreadable entries of a list, not the list", () => {
+    // The whole point of tolerating a bad entry. Validating the array as a unit
+    // did the opposite, so one option Copilot added took three working ones with
+    // it, and a session that had a good list kept showing it while every later
+    // change was discarded.
+    const payload = eventPayload(
+      event("config", {
+        options: [
+          { id: "model", name: "Model", currentValue: "opus", choices: [] },
+          { nonsense: true },
+          { id: "mode", name: "Mode", currentValue: "agent", choices: [] },
+        ],
+      }),
+      "config",
+    );
+
+    expect(payload?.options?.map((option) => option.id)).toEqual(["model", "mode"]);
+  });
+
+  it("reports a list nothing survived as unread rather than as empty", () => {
+    // Readers persist an empty list as "this agent offers none" and clear what
+    // they had. A list that merely could not be read must not be able to do
+    // that, or one bad frame would wipe a working set of pickers.
+    const payload = eventPayload(
+      event("config", { options: [{ nonsense: true }] }),
+      "config",
+    );
+
+    expect(payload).toEqual({});
+  });
+
+  it("still tells an empty list apart from an absent one", () => {
+    expect(eventPayload(event("config", { options: [] }), "config")?.options).toEqual([]);
+    expect(eventPayload(event("config", {}), "config")?.options).toBeUndefined();
   });
 });
 

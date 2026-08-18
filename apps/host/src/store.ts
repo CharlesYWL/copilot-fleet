@@ -125,6 +125,73 @@ export class FleetStore {
     this.addColumnIfMissing("placements", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("workspaces", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "position", "INTEGER NOT NULL DEFAULT 0");
+    this.rebuildSessionStateFromEvents();
+  }
+
+  /**
+   * Re-derives each live session's pickers and slash menu from its event log.
+   *
+   * These two columns are a cache of the newest `config`/`commands` frame, and a
+   * reader that could not parse one left the cache holding an older answer — or
+   * no answer at all. That is not self-correcting: the pickers are how an
+   * operator changes a picker, so a session that lost them has no control left
+   * to press and no way back. The frames themselves were stored intact, so the
+   * repair is a re-read rather than a guess, and a Host that now understands a
+   * payload it previously rejected applies that understanding to what it
+   * already has instead of only to what arrives next.
+   *
+   * Runs on open, against every session that is not terminal. `offline` is
+   * included deliberately: it is the reconciliation state a disconnected
+   * session waits in, so those are precisely the ones about to come back and be
+   * rendered — skipping them would leave the repair for a session that never
+   * gets a second chance at it.
+   */
+  private rebuildSessionStateFromEvents(): void {
+    const sessions = this.db
+      .prepare(
+        `SELECT id FROM sessions WHERE state NOT IN (${placeholders(terminalStateList)})`,
+      )
+      .all(...(terminalStateList as never[])) as Row[];
+    if (sessions.length === 0) return;
+    const newest = this.db.prepare(
+      `SELECT payload FROM events WHERE session_id=? AND type=?
+       ORDER BY sequence DESC LIMIT 1`,
+    );
+    const update = this.db.prepare("UPDATE sessions SET commands=? WHERE id=?");
+    const updateConfig = this.db.prepare(
+      "UPDATE sessions SET config_options=? WHERE id=?",
+    );
+    this.transaction(() => {
+      for (const row of sessions) {
+        const id = String(row.id);
+        const commands = this.newestPayloadList(newest, id, "commands");
+        if (commands) update.run(JSON.stringify(commands), id);
+        const options = this.newestPayloadList(newest, id, "config");
+        if (options) updateConfig.run(JSON.stringify(options), id);
+      }
+    });
+  }
+
+  /** The list carried by a session's newest readable frame of `type`. */
+  private newestPayloadList(
+    statement: StatementSync,
+    sessionId: string,
+    type: "commands" | "config",
+  ): unknown[] | undefined {
+    const row = statement.get(sessionId, type) as Row | undefined;
+    if (!row) return undefined;
+    const parsed = SessionEventSchema.safeParse({
+      eventId: "rebuild",
+      sessionId,
+      sequence: 1,
+      type,
+      payload: JSON.parse(String(row.payload)) as unknown,
+      createdAt: new Date().toISOString(),
+    });
+    if (!parsed.success) return undefined;
+    return type === "commands"
+      ? eventPayload(parsed.data, "commands")?.commands
+      : eventPayload(parsed.data, "config")?.options;
   }
 
   private statement(sql: string): StatementSync {

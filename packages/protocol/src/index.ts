@@ -76,7 +76,14 @@ export const SessionCommandSchema = z.object({
 export type SessionCommand = z.infer<typeof SessionCommandSchema>;
 
 export const SessionConfigChoiceSchema = z.object({
-  value: z.string().min(1),
+  /*
+   * Not `min(1)`. The empty string is a value ACP genuinely uses: Copilot's
+   * `agent` picker spells "the default Copilot agent, no custom persona" as
+   * `""`, and rejecting it cost the whole option list — see
+   * {@link listOfOptional} for why one bad choice used to take four good
+   * options down with it.
+   */
+  value: z.string(),
   name: z.string().min(1),
   description: z.string().default(""),
 });
@@ -239,6 +246,40 @@ export type SessionEventType = SessionEvent["type"];
  */
 const text = z.string().optional();
 
+/**
+ * A list that drops only the entries it cannot read.
+ *
+ * `z.array(X).catch(undefined)` reads as "tolerate a bad entry" and does the
+ * opposite: the array is validated as a unit, so one unreadable element
+ * discards every good one beside it. That is not hypothetical. Copilot's
+ * `agent` picker offers "" for its default persona, `value` demanded a
+ * non-empty string, and the single rejected choice took the model, mode, and
+ * reasoning pickers with it — a composer with no controls at all on the nodes
+ * that had custom agents installed, and, on a node that had seen a good list
+ * first, controls frozen at that stale list which snapped back from every
+ * change the agent had in fact accepted.
+ *
+ * Parsing element by element keeps the readable ones. A non-array stays
+ * `undefined`, and so does a non-empty list nothing survived: "the agent never
+ * said" and "the agent offers none" have to stay distinguishable, because
+ * readers persist an empty list as a deliberate clearing.
+ */
+function listOfOptional<T extends z.ZodTypeAny>(schema: T) {
+  return z
+    .unknown()
+    .optional()
+    .transform((value): z.infer<T>[] | undefined => {
+      if (value === undefined) return undefined;
+      if (!Array.isArray(value)) return undefined;
+      const kept = value.flatMap((entry) => {
+        const parsed = schema.safeParse(entry);
+        return parsed.success ? [parsed.data as z.infer<T>] : [];
+      });
+      if (kept.length === 0 && value.length > 0) return undefined;
+      return kept;
+    });
+}
+
 export const sessionEventPayloadSchemas = {
   state: z.object({ state: SessionStateSchema.optional(), activity: text }),
   agent_text: z.object({ text }),
@@ -249,24 +290,24 @@ export const sessionEventPayloadSchemas = {
     title: text,
     toolCallId: text,
     // A malformed option list must not cost the reader the title as well.
-    options: z.array(PermissionOptionSchema).optional().catch(undefined),
+    options: listOfOptional(PermissionOptionSchema),
   }),
   permission_result: z.object({ requestId: text, outcome: text }),
   turn_complete: z.object({ stopReason: text }),
   error: z.object({ message: text }),
   system: z.object({
     text,
-    attachments: z.array(AttachmentSummarySchema).optional().catch(undefined),
+    attachments: listOfOptional(AttachmentSummarySchema),
   }),
   agent_session: z.object({ agentSessionId: text }),
   // A single malformed entry must not cost the reader the whole list, and an
   // absent list is meaningfully different from an empty one: "this agent never
   // said" versus "this agent offers none".
   commands: z.object({
-    commands: z.array(SessionCommandSchema).optional().catch(undefined),
+    commands: listOfOptional(SessionCommandSchema),
   }),
   config: z.object({
-    options: z.array(SessionConfigOptionSchema).optional().catch(undefined),
+    options: listOfOptional(SessionConfigOptionSchema),
   }),
 } as const;
 
@@ -369,7 +410,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     configId: z.string().min(1),
-    value: z.string().min(1),
+    // See SetSessionConfigSchema: "" is a real choice, not a missing one.
+    value: z.string(),
   }),
 ]);
 export type NodeCommand = z.infer<typeof NodeCommandSchema>;
@@ -776,7 +818,9 @@ export const PermissionResponseSchema = z.object({
 /** What a browser sends to move a session picker to a different value. */
 export const SetSessionConfigSchema = z.object({
   configId: z.string().min(1).max(200),
-  value: z.string().min(1).max(500),
+  // Not `min(1)`: "" is how ACP names the default choice of a picker, such as
+  // Copilot's `agent` option, so an operator selecting it is a real request.
+  value: z.string().max(500),
 });
 
 export const tunnelProviders = [
