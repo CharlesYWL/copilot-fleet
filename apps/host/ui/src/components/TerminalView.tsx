@@ -1,6 +1,8 @@
 import {
   memo,
+  useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -210,7 +212,11 @@ const useStyles = makeStyles({
     // those would be a second frame around the first.
     "& textarea": {
       minHeight: "44px",
+      // Matches COMPOSER_MAX_HEIGHT: the measured height is written inline, and
+      // this is the ceiling it is clamped to. Past it the box scrolls rather
+      // than eating the transcript above it.
       maxHeight: "220px",
+      overflowY: "auto",
       padding: "4px 2px",
       background: "transparent",
       fontSize: "13px",
@@ -268,6 +274,15 @@ const useStyles = makeStyles({
     fontSize: "12px",
   },
 });
+
+/**
+ * How tall the composer may grow before it starts scrolling instead.
+ *
+ * Kept beside the stylesheet's `max-height` on purpose: the measured height is
+ * written as an inline style, so the two have to agree or the box would either
+ * be clipped short of its own ceiling or never reach a scrollbar.
+ */
+const COMPOSER_MAX_HEIGHT = 220;
 
 const glyphs: Record<TerminalBlockKind, string> = {
   user: "\u276f",
@@ -343,17 +358,43 @@ export const TerminalView = ({
   const blocks = useMemo(() => toTerminalBlocks(events), [events]);
   const permission = useMemo(() => pendingPermission(events), [events]);
 
-  useEffect(() => {
+  const scrollToEnd = useCallback(() => {
     const element = streamRef.current;
-    if (!element || !pinnedRef.current) return;
+    if (!element) return;
     element.scrollTop = element.scrollHeight;
-  }, [blocks]);
+  }, []);
+
+  useEffect(() => {
+    if (!pinnedRef.current) return;
+    scrollToEnd();
+  }, [blocks, scrollToEnd]);
 
   useEffect(() => {
     pinnedRef.current = true;
-    const element = streamRef.current;
-    if (element) element.scrollTop = element.scrollHeight;
-  }, [session.id]);
+    scrollToEnd();
+  }, [session.id, scrollToEnd]);
+
+  /**
+   * The composer grows with what is typed, and scrolls once it has grown enough.
+   *
+   * A fixed box showed two lines of a long prompt with no way to see the rest:
+   * `resize="none"` means the operator cannot drag it open either, and Fluent's
+   * textarea takes its height from the `rows` attribute rather than from its
+   * content. The height is measured rather than counted, because wrapped lines,
+   * pasted text, and a draft restored on returning to a session all have to
+   * arrive at the same answer.
+   */
+  useLayoutEffect(() => {
+    const element = inputRef.current;
+    if (!element) return;
+    // Collapsing first is what lets the box shrink again; measured against its
+    // current height, `scrollHeight` can only ever grow.
+    element.style.height = "auto";
+    element.style.height = `${Math.min(element.scrollHeight, COMPOSER_MAX_HEIGHT)}px`;
+    // The composer takes its extra height from the transcript above it, so a
+    // reader sitting at the end would otherwise be pushed off it as they type.
+    if (pinnedRef.current) scrollToEnd();
+  }, [prompt, attachments.length, session.id, scrollToEnd]);
 
   // Switching sessions with the editor open would otherwise offer one session's
   // name as an edit to another's. The composer draft is deliberately not reset
@@ -389,6 +430,11 @@ export const TerminalView = ({
     onDraftChange(() => EMPTY_DRAFT);
     setAttachError(undefined);
     setMenuDismissed(false);
+    // Sending is a request to watch what happens next, so it re-pins the
+    // transcript. Scrolling back to read something older otherwise left the
+    // operator staring at old output while the answer arrived below the fold.
+    pinnedRef.current = true;
+    scrollToEnd();
   };
 
   const addFiles = async (files: readonly File[]) => {
@@ -449,6 +495,8 @@ export const TerminalView = ({
       // read back off `prompt`.
       onPrompt(choice.text);
       onDraftChange(() => EMPTY_DRAFT);
+      pinnedRef.current = true;
+      scrollToEnd();
       return;
     }
     inputRef.current?.focus();

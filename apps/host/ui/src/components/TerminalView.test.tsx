@@ -98,4 +98,16 @@ describe("TerminalView composer", () => {
     const box = screen.getByLabelText("Follow-up prompt") as HTMLTextAreaElement;
     expect(box.value).toBe("half-written thought");
   });
+
+  it("sizes the box to its content instead of leaving it fixed", () => {
+    // `resize="none"` means the operator cannot drag the box open, so a long
+    // prompt was only ever visible two lines at a time. The height is written
+    // inline from a measurement; what is checked here is that a height is set
+    // at all and that it stops at the ceiling the stylesheet also names.
+    show({}, { prompt: "one\ntwo\nthree\nfour\nfive", attachments: [] });
+    const box = screen.getByLabelText("Follow-up prompt") as HTMLTextAreaElement;
+    const height = Number.parseInt(box.style.height, 10);
+    expect(Number.isNaN(height)).toBe(false);
+    expect(height).toBeLessThanOrEqual(220);
+  });
 });
