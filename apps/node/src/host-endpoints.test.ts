@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   adoptHostUrl,
   endpointsAfterOperatorEdit,
+  endpointsBehindLocalForward,
   hostUrlCandidates,
   nextHostUrl,
   promoteHostUrl,
@@ -86,6 +87,53 @@ describe("promoteHostUrl", () => {
     expect(
       promoteHostUrl({ hostUrl: tunnel, knownHostUrls: [lan] }, `${tunnel}/`),
     ).toBeUndefined();
+  });
+});
+
+describe("endpointsBehindLocalForward", () => {
+  const forwarded = "http://127.0.0.1:8790";
+
+  it("keeps the public address when a tunnel forward takes over as primary", () => {
+    // The failure this prevents: the node reaches the Host only through a
+    // private tunnel's loopback port, the tunnel client dies, and every dial is
+    // refused by a port on its own machine while the Host is still answering at
+    // the address it used to know — which the forward had overwritten.
+    expect(
+      endpointsBehindLocalForward({ hostUrl: tunnel, knownHostUrls: [] }, forwarded),
+    ).toEqual({ hostUrl: forwarded, knownHostUrls: [tunnel] });
+  });
+
+  it("keeps the other settings on the object it was handed", () => {
+    const settings = { hostUrl: tunnel, knownHostUrls: [], maxSessions: 8 };
+    expect(endpointsBehindLocalForward(settings, forwarded)).toEqual({
+      hostUrl: forwarded,
+      knownHostUrls: [tunnel],
+      maxSessions: 8,
+    });
+  });
+
+  it("does not stack a fallback per restart when the port is unchanged", () => {
+    const once = endpointsBehindLocalForward(
+      { hostUrl: tunnel, knownHostUrls: [] },
+      forwarded,
+    );
+    expect(endpointsBehindLocalForward(once, forwarded)).toEqual(once);
+  });
+
+  it("moves the dead port to the fallbacks when the tunnel lands elsewhere", () => {
+    const first = endpointsBehindLocalForward(
+      { hostUrl: tunnel, knownHostUrls: [] },
+      forwarded,
+    );
+    expect(endpointsBehindLocalForward(first, "http://127.0.0.1:9001")).toEqual({
+      hostUrl: "http://127.0.0.1:9001",
+      knownHostUrls: [forwarded, tunnel],
+    });
+  });
+
+  it("changes nothing when the tunnel has not reported a port", () => {
+    const endpoints: HostEndpoints = { hostUrl: tunnel, knownHostUrls: [lan] };
+    expect(endpointsBehindLocalForward(endpoints, "")).toBe(endpoints);
   });
 });
 

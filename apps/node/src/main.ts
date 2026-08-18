@@ -33,6 +33,7 @@ import { planCredentials } from "./enrollment.js";
 import {
   adoptHostUrl,
   endpointsAfterOperatorEdit,
+  endpointsBehindLocalForward,
   nextHostUrl,
   promoteHostUrl,
   type HostEndpoints,
@@ -130,17 +131,26 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       log: startupLog,
       onUrlChanged: (url) => onTunnelUrlChanged(url),
     });
-    env.FLEET_HOST_URL = devTunnel.url;
-    flags.env.FLEET_HOST_URL = devTunnel.url;
+    // Seeds the first run only. The stored address is adopted below instead of
+    // being overwritten here, so the one this forward displaces survives as a
+    // fallback rather than being lost with the tunnel that replaced it.
+    env.FLEET_HOST_URL ??= devTunnel.url;
     process.once("exit", () => devTunnel?.stop());
   }
 
   let settings = await loadSettings(env, settingsOverridesFromEnv(flags.env));
+  if (devTunnel) {
+    settings = endpointsBehindLocalForward(settings, devTunnel.url);
+  }
 
   // A respawned tunnel can land on a different port. Without following it the
   // node keeps dialing the old one, which nothing is listening on any more.
   onTunnelUrlChanged = (url) => {
-    void applySettings({ ...settings, hostUrl: url }).catch((error: unknown) => {
+    // Not an operator edit: this is the same Host arriving on a new local port,
+    // so the addresses this node has reached it on before stay on the list.
+    void applySettings(endpointsBehindLocalForward(settings, url), {
+      operatorEdit: false,
+    }).catch((error: unknown) => {
       console.error("Failed to follow the dev tunnel:", errorMessage(error));
     });
   };
@@ -241,10 +251,20 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /**
    * Applies edits from the local config UI without restarting the process, so a
    * rotated tunnel URL no longer costs a manual restart on every node.
+   *
+   * `operatorEdit` is what decides whether the learned fallbacks survive. A
+   * person typing a new address is repointing this machine at a different Host,
+   * and every fallback was learned from the old one; a tunnel reporting a new
+   * local port is the same Host seen through a rebuilt forward, and dropping
+   * the addresses it can also be reached at is exactly how a node ends up with
+   * one dead port and nothing else to try.
    */
-  async function applySettings(next: Settings): Promise<void> {
+  async function applySettings(
+    next: Settings,
+    { operatorEdit = true }: { operatorEdit?: boolean } = {},
+  ): Promise<void> {
     const previous = settings;
-    const settled = endpointsAfterOperatorEdit(previous, next);
+    const settled = operatorEdit ? endpointsAfterOperatorEdit(previous, next) : next;
     settings = settled;
     await saveSettings(settled);
     router.setMaxSessions(settled.maxSessions);

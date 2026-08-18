@@ -71,6 +71,29 @@ export function promoteHostUrl(
 }
 
 /**
+ * The endpoints to dial when a local tunnel forward supplies the Host address.
+ *
+ * The forwarded port leads, because it is where the Host is reachable now. What
+ * matters is that the address it displaces is *demoted* rather than dropped: a
+ * private tunnel is one client process on one machine, and when it dies its
+ * loopback port refuses every dial while the Host carries on serving perfectly
+ * well at the public address this node already knew. Overwriting that address
+ * left the node cycling a dead port forever with the one route that would have
+ * worked erased from its own settings — reachable only by editing files on the
+ * machine by hand.
+ *
+ * A forward that reports nothing yet changes nothing, so a tunnel that has not
+ * come up cannot blank an address that works.
+ */
+export function endpointsBehindLocalForward<T extends HostEndpoints>(
+  endpoints: T,
+  forwardedUrl: string,
+): T {
+  if (!forwardedUrl.trim()) return endpoints;
+  return { ...endpoints, ...adoptHostUrl(endpoints, forwardedUrl) };
+}
+
+/**
  * The endpoints to keep after an operator edits the Host URL by hand.
  *
  * A typed address is authoritative. Pointing a node at a different Host is a
