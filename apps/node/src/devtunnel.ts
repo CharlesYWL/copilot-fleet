@@ -23,6 +23,16 @@ export function reconnectDelay(attempt: number): number {
 export type DevTunnelConnection = {
   /** Loopback URL the node should dial; changes if a respawn lands elsewhere. */
   readonly url: string;
+  /**
+   * Tears the current tunnel down so the supervisor rebuilds it.
+   *
+   * Needed because a dead tunnel does not always announce itself. The forwarded
+   * port is a local listener owned by the client process, so it keeps accepting
+   * connections after the far end is gone: the process does not exit, nothing
+   * is logged, and a port probe still succeeds. The only trustworthy evidence
+   * is the node failing to reach the Host through it, which only the node has.
+   */
+  recycle: () => void;
   stop: () => void;
 };
 
@@ -76,10 +86,26 @@ export function connectDevTunnel(
   let stopped = false;
   let attempt = 0;
   let respawnTimer: NodeJS.Timeout | undefined;
+  /** Assigned once the supervisor below is built; see `recycle`. */
+  let requestRespawn: (code?: number | null) => void = () => {};
 
   const connection: DevTunnelConnection = {
     get url() {
       return currentUrl ?? "";
+    },
+    recycle: () => {
+      // A rebuild is already queued; asking again would only reset the backoff.
+      if (stopped || respawnTimer) return;
+      const doomed = child;
+      child = undefined;
+      if (doomed && !doomed.killed) {
+        log(`devtunnel connect ${tunnelId} is not reaching the Host; rebuilding it`);
+        // Clearing `child` first means the exit handler's `child !== active`
+        // guard ignores this kill, so the respawn is scheduled here instead of
+        // twice.
+        doomed.kill();
+      }
+      requestRespawn();
     },
     stop: () => {
       stopped = true;
@@ -128,6 +154,7 @@ export function connectDevTunnel(
         if (!stopped) start();
       }, delay);
     };
+    requestRespawn = scheduleRespawn;
 
     const start = (): void => {
       const active = spawnProcess("devtunnel", ["connect", tunnelId], {

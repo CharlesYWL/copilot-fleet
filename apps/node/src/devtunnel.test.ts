@@ -188,3 +188,81 @@ describe("connectDevTunnel supervision", () => {
     expect(spawned).toHaveLength(1);
   });
 });
+
+describe("connectDevTunnel recycle", () => {
+  const harness = () => {
+    const children: ReturnType<typeof fakeChild>[] = [];
+    const timers: (() => void)[] = [];
+    const make = () => {
+      const next = fakeChild();
+      children.push(next);
+      return next;
+    };
+    return {
+      children,
+      timers,
+      options: {
+        spawnProcess: (() => make()) as never,
+        setTimer: ((fn: () => void) => {
+          timers.push(fn);
+          return 0 as unknown as NodeJS.Timeout;
+        }) as never,
+        clearTimer: (() => {}) as never,
+      },
+    };
+  };
+
+  /**
+   * The failure that survives exit-based supervision: the client keeps running
+   * and its local listener keeps accepting, so nothing reports a problem while
+   * the far end is gone. Only the node knows, so it has to be able to say so.
+   */
+  it("rebuilds a tunnel that never exited but stopped reaching the Host", async () => {
+    const h = harness();
+    const pending = connectDevTunnel("fleet-abc", h.options);
+    h.children[0]!.stdout.emit(
+      "data",
+      Buffer.from("Forwarding from 127.0.0.1:8791 to x\n"),
+    );
+    const conn = await pending;
+
+    expect(h.children).toHaveLength(1);
+    conn.recycle();
+    expect(h.children[0]!.kill).toHaveBeenCalled();
+    h.timers[h.timers.length - 1]!();
+    expect(h.children).toHaveLength(2);
+  });
+
+  it("ignores a second request while a rebuild is already queued", async () => {
+    const h = harness();
+    const pending = connectDevTunnel("fleet-abc", h.options);
+    h.children[0]!.stdout.emit(
+      "data",
+      Buffer.from("Forwarding from 127.0.0.1:8791 to x\n"),
+    );
+    const conn = await pending;
+
+    conn.recycle();
+    conn.recycle();
+    conn.recycle();
+    h.timers[h.timers.length - 1]!();
+    // One rebuild, not three: repeated asks must not stack spawns or reset the
+    // backoff that keeps a dead tunnel from being hammered.
+    expect(h.children).toHaveLength(2);
+  });
+
+  it("does nothing once the node has stopped the tunnel", async () => {
+    const h = harness();
+    const pending = connectDevTunnel("fleet-abc", h.options);
+    h.children[0]!.stdout.emit(
+      "data",
+      Buffer.from("Forwarding from 127.0.0.1:8791 to x\n"),
+    );
+    const conn = await pending;
+
+    conn.stop();
+    conn.recycle();
+    for (const run of h.timers) run();
+    expect(h.children).toHaveLength(1);
+  });
+});

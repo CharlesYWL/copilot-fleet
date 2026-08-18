@@ -80,6 +80,14 @@ const NODE_CAPABILITIES = [
   SESSION_CONFIG_CAPABILITY,
 ];
 const RECONNECT_DELAY_MS = 2_000;
+/**
+ * Dials that never reached the Host before the tunnel is assumed dead.
+ *
+ * Three is roughly six seconds — long enough to ride out a Host restart or a
+ * brief relay hiccup, short enough that a genuinely broken tunnel is rebuilt
+ * while the operator is still looking at the screen.
+ */
+const UNREACHABLE_DIALS_BEFORE_RECYCLE = 3;
 
 export type NodeRuntime = { shutdown: () => Promise<void> };
 
@@ -188,6 +196,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * address that actually produces a welcome is written back.
    */
   let dialUrl = credentials.hostUrl;
+  /** Consecutive dials that never produced a welcome; see the close handler. */
+  let unreachableDials = 0;
 
   const factory = mockAgent
     ? new MockAgentFactory()
@@ -580,6 +590,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           log(`No Host at ${attemptUrl}; trying ${candidate} next`);
           dialUrl = candidate;
         }
+        // Repeated silence from a dev tunnel's forwarded port is the only
+        // reliable sign that the tunnel died: its local listener keeps
+        // accepting connections after the far end is gone, so the client
+        // neither exits nor logs, and only this end can tell. Rebuilding it
+        // here is what stops an overnight outage from needing a manual restart.
+        unreachableDials += 1;
+        if (devTunnel && unreachableDials >= UNREACHABLE_DIALS_BEFORE_RECYCLE) {
+          unreachableDials = 0;
+          devTunnel.recycle();
+        }
+      } else {
+        unreachableDials = 0;
       }
       reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
     });
