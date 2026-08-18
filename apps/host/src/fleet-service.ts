@@ -66,8 +66,15 @@ export class FleetService {
   constructor(
     readonly store: FleetStore,
     private readonly log: FastifyBaseLogger,
-    /** The commit this Host runs, which is what Nodes are compared against. */
-    private readonly revision = "",
+    /**
+     * The commit this Host runs, which is what Nodes are compared against.
+     *
+     * A function is read at access time rather than frozen at construction: a
+     * commit moves HEAD without touching a file, so nothing restarts the Host,
+     * and a captured value would go on describing a commit the Host has left —
+     * marking every node that updated correctly as out of date.
+     */
+    private readonly revisionSource: string | (() => string) = "",
   ) {}
 
   snapshot(): Snapshot {
@@ -76,12 +83,14 @@ export class FleetService {
       workspaces: this.store.listWorkspaces(),
       placements: this.store.listPlacements(),
       sessions: this.store.listSessions(),
-      hostRevision: this.revision,
+      hostRevision: this.hostRevision,
     };
   }
 
   get hostRevision(): string {
-    return this.revision;
+    return typeof this.revisionSource === "function"
+      ? this.revisionSource()
+      : this.revisionSource;
   }
 
   addBrowser(socket: WebSocket): void {
@@ -310,7 +319,7 @@ export class FleetService {
   staleNodeIds(): string[] {
     return this.store
       .listNodes()
-      .filter((node) => nodeUpdateState(node, this.revision) === "stale")
+      .filter((node) => nodeUpdateState(node, this.hostRevision) === "stale")
       .map((node) => node.id);
   }
 

@@ -36,7 +36,7 @@ const silentLog = {
   warn: () => {},
 } as unknown as FastifyBaseLogger;
 
-function setup(hostRevision = "") {
+function setup(hostRevision: string | (() => string) = "") {
   const store = new FleetStore(":memory:");
   const service = new FleetService(store, silentLog, hostRevision);
   const enroll = (name: string, capabilities: string[], revision = "") => {
@@ -312,5 +312,28 @@ describe("settleUpdateOnReconnect", () => {
 
     expect(stages()).toEqual(["checking", "up_to_date"]);
     expect(browser.sent.at(-1)?.detail).toBe("Update finished");
+  });
+});
+
+describe("host revision", () => {
+  it("follows a commit made while the Host kept running", () => {
+    // The reported bug: an update that worked still showed "Update available".
+    // Committing moves HEAD without touching a file, so nothing restarts the
+    // Host; a revision captured at construction then disagreed with the node
+    // that had just landed on the real HEAD, and pressing update again re-landed
+    // the same commit — so the badge could never clear.
+    let head = "aaaaaaaaaaaa";
+    const { service, enroll } = setup(() => head);
+    enroll("box", [SELF_UPDATE_CAPABILITY], "bbbbbbbbbbbb");
+
+    expect(service.staleNodeIds()).toHaveLength(1);
+    head = "bbbbbbbbbbbb";
+    expect(service.staleNodeIds()).toEqual([]);
+    expect(service.snapshot().hostRevision).toBe("bbbbbbbbbbbb");
+  });
+
+  it("still accepts a fixed revision", () => {
+    const { service } = setup("cccccccccccc");
+    expect(service.snapshot().hostRevision).toBe("cccccccccccc");
   });
 });

@@ -6,7 +6,7 @@ import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { errorMessage } from "@fleet/protocol";
-import { gitRevision } from "@fleet/protocol/runtime";
+import { cachedGitRevision } from "./host-revision.js";
 import {
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
@@ -62,7 +62,7 @@ export async function buildServer(
   const enrollment = {
     token: resolveRuntimeEnrollmentToken(store, options.enrollmentToken),
   };
-  const service = new FleetService(store, app.log, gitRevision());
+  const service = new FleetService(store, app.log, cachedGitRevision());
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
   const listenPort = process.env.PORT ?? "8787";
 
