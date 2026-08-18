@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { FleetNode, FleetSession, Workspace } from "@fleet/protocol";
+import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
 import { groupSessionsByWorkspace } from "./session-groups";
 
 const node = (id: string, name: string, online = true): FleetNode => ({
@@ -50,6 +50,13 @@ const session = (
   updatedAt: "2026-08-08T00:00:00.000Z",
 });
 
+const placement = (id: string, workspaceId: string, nodeId: string): Placement => ({
+  id,
+  workspaceId,
+  nodeId,
+  localPath: `/${id}`,
+});
+
 describe("groupSessionsByWorkspace", () => {
   it("nests sessions under workspace then node", () => {
     const groups = groupSessionsByWorkspace(
@@ -89,5 +96,72 @@ describe("groupSessionsByWorkspace", () => {
     );
 
     expect(groups).toEqual([{ workspaceId: "w1", workspaceName: "Empty", nodes: [] }]);
+  });
+
+  it("orders the nodes under a workspace by its placements", () => {
+    // The node rows are the workspace's placements, so dragging one above
+    // another has to move the row. Before this, the order came from whichever
+    // machine's session appeared first and a reorder was written but unseen.
+    const groups = groupSessionsByWorkspace(
+      [
+        session("s1", "w1", "Alpha", "n2", "devbox2"),
+        session("s2", "w1", "Alpha", "n1", "devbox1"),
+      ],
+      [node("n1", "devbox1"), node("n2", "devbox2")],
+      [workspace("w1", "Alpha")],
+      [placement("p1", "w1", "n1"), placement("p2", "w1", "n2")],
+    );
+
+    expect(groups[0]!.nodes.map((item) => item.nodeName)).toEqual(["devbox1", "devbox2"]);
+  });
+
+  it("ranks placements per workspace rather than across the whole list", () => {
+    // The Host hands them out workspace by workspace, so a later workspace's
+    // placements carry higher indexes; comparing across workspaces would sort
+    // by that accident instead of by position.
+    const groups = groupSessionsByWorkspace(
+      [
+        session("s1", "w2", "Beta", "n1", "devbox1"),
+        session("s2", "w2", "Beta", "n2", "devbox2"),
+      ],
+      [node("n1", "devbox1"), node("n2", "devbox2")],
+      [workspace("w1", "Alpha"), workspace("w2", "Beta")],
+      [
+        placement("p1", "w1", "n1"),
+        placement("p2", "w2", "n2"),
+        placement("p3", "w2", "n1"),
+      ],
+    );
+
+    expect(groups[1]!.nodes.map((item) => item.nodeName)).toEqual(["devbox2", "devbox1"]);
+  });
+
+  it("leaves a node whose placement is gone at the end", () => {
+    // Sessions outlive the checkout they ran in, and a node with nothing left
+    // to drag has no rank; sorting it as zero would float it to the top.
+    const groups = groupSessionsByWorkspace(
+      [
+        session("s1", "w1", "Alpha", "n2", "devbox2"),
+        session("s2", "w1", "Alpha", "n1", "devbox1"),
+      ],
+      [node("n1", "devbox1"), node("n2", "devbox2")],
+      [workspace("w1", "Alpha")],
+      [placement("p1", "w1", "n1")],
+    );
+
+    expect(groups[0]!.nodes.map((item) => item.nodeName)).toEqual(["devbox1", "devbox2"]);
+  });
+
+  it("keeps the session order it was given when nothing is placed", () => {
+    const groups = groupSessionsByWorkspace(
+      [
+        session("s1", "w1", "Alpha", "n2", "devbox2"),
+        session("s2", "w1", "Alpha", "n1", "devbox1"),
+      ],
+      [node("n1", "devbox1"), node("n2", "devbox2")],
+      [workspace("w1", "Alpha")],
+    );
+
+    expect(groups[0]!.nodes.map((item) => item.nodeName)).toEqual(["devbox2", "devbox1"]);
   });
 });

@@ -187,8 +187,8 @@ export const Sidebar = ({
     );
 
   const groups = useMemo(
-    () => groupSessionsByWorkspace(sessions, nodes, workspaces),
-    [sessions, nodes, workspaces],
+    () => groupSessionsByWorkspace(sessions, nodes, workspaces, placements),
+    [sessions, nodes, workspaces, placements],
   );
   const openItems = useMemo(
     () =>

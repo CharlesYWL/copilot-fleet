@@ -264,6 +264,7 @@ export function App() {
               sessions={visibleSessions}
               workspaces={snapshot.workspaces}
               nodes={snapshot.nodes}
+              placements={snapshot.placements}
               events={events}
               onOpen={handleSelectSession}
               onPermission={handlePermission}

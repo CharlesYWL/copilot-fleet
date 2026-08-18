@@ -1,7 +1,13 @@
 import { useMemo, useState } from "react";
 import { Text, makeStyles, mergeClasses, tokens } from "@fluentui/react-components";
 import { Folder20Regular } from "@fluentui/react-icons";
-import type { FleetNode, FleetSession, SessionEvent, Workspace } from "@fleet/protocol";
+import type {
+  FleetNode,
+  FleetSession,
+  Placement,
+  SessionEvent,
+  Workspace,
+} from "@fleet/protocol";
 import { groupSessionsByWorkspace } from "../lib/session-groups";
 import {
   DRAG_MIME,
@@ -153,6 +159,7 @@ type SessionGridProps = {
   ) => void;
   onNewSession: () => void;
   workspaces: Workspace[];
+  placements: Placement[];
 };
 
 export const SessionGrid = ({
@@ -163,14 +170,20 @@ export const SessionGrid = ({
   onPermission,
   onNewSession,
   workspaces,
+  placements,
 }: SessionGridProps) => {
   const styles = useStyles();
   const [dropTarget, setDropTarget] = useState<{ key: string; edge: DropEdge }>();
   const { reorderSessions, reorderWorkspaces } = useCatalog();
+  // Grid mode is the same fleet seen a different way, so it is grouped from the
+  // same catalog order the tree uses. Left to infer the order from the sessions
+  // alone, it disagreed with the sidebar the moment either list was rearranged.
   const groups = useMemo(
     () =>
-      groupSessionsByWorkspace(sessions, nodes).filter((group) => group.nodes.length > 0),
-    [sessions, nodes],
+      groupSessionsByWorkspace(sessions, nodes, workspaces, placements).filter(
+        (group) => group.nodes.length > 0,
+      ),
+    [sessions, nodes, workspaces, placements],
   );
 
   /** The sessions a tile may be reordered among: its own node's, as in the tree. */
