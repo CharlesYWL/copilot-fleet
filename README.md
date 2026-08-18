@@ -1,9 +1,30 @@
 # Copilot Fleet
 
+**English** · [简体中文](README.zh-CN.md)
+
 Copilot Fleet is a self-hosted control plane for supervising GitHub Copilot CLI
 agents on multiple machines. The Host combines a Fastify API, WebSocket hub,
 SQLite database, and React UI. Each Node makes one outbound connection and owns
 an isolated ACP client and Copilot process per live session.
+
+## What it looks like
+
+Every agent in the fleet on one screen, grouped by the project it is working in.
+Cards stream their transcript live, so a wall of them is readable without opening
+anything.
+
+![The Copilot Fleet monitor wall: five sessions across three workspaces and two nodes, each card streaming its own transcript.](docs/screenshots/monitor-wall.png)
+
+Open one and you get the whole conversation, the node it runs on, a composer that
+takes slash commands and file attachments, and the agent's own Model and Mode
+pickers along the bottom.
+
+![A single session: prompts and responses in full, with the composer, model and mode pickers underneath.](docs/screenshots/session-detail.png)
+
+> Screenshots come from the deterministic `--mock-agent` demo described under
+> [Exact proof of concept](#exact-proof-of-concept), so they can be reproduced on
+> any machine without a Copilot login. A real node streams real Copilot output in
+> exactly the same surfaces.
 
 ## Requirements
 
@@ -49,6 +70,13 @@ Open the UI → **Settings**:
 - **Nodes** — rename/delete machines and copy the enroll command.
 - **Workspaces** — map projects to per-machine paths.
 
+![Settings → Workspaces & placements: three workspaces, each mapped to an absolute path on the machines that hold it.](docs/screenshots/workspaces.png)
+
+A workspace is logical; a placement is the physical `(workspace, node) → path`
+pair. The same project can sit at a different absolute path on every machine, and
+a session is always started from a stored placement — never from a path typed
+into a request.
+
 Connected nodes are told when the Host's public URL changes, so a rotated tunnel
 does not strand them — see
 [Following the Host to a new URL](#following-the-host-to-a-new-url).
@@ -67,6 +95,8 @@ Fastify serves the built UI.
 
 Install Node.js and authenticate Copilot CLI first. From a checked-out Fleet
 directory (or paste the command from the Host's Nodes → Connect card):
+
+![Settings → Nodes: the connect command for a new machine, and the two enrolled nodes with their capacity, platform, commit and last-seen time.](docs/screenshots/nodes.png)
 
 ```powershell
 npm install
@@ -284,6 +314,13 @@ Both files contain secrets. Do not commit them.
 
 ### Recovering sessions after a restart
 
+![Reconnect on reboot, as a sequence: the Host marks every unsettled session offline, the Node's hello reports which sessions it still holds and which are mid-turn, and only the ones it no longer has settle as failed-but-resumable and are re-attached through ACP session/load.](docs/reconnect-on-reboot.png)
+
+A dropped transport says nothing about the agent behind it, so the Host asks
+rather than assumes. The Node reports its inventory **and** which of those
+sessions are mid-turn, which is what stops a returning session from landing on
+`idle` while its agent still has a prompt in flight.
+
 Sessions survive both processes going down. The Host keeps them in its SQLite
 file and the node keeps its identity in `node.json`, so after both come back:
 
@@ -337,6 +374,11 @@ Reach a remote node's page over SSH port forwarding rather than binding wider.
 
 ### Following the Host to a new URL
 
+![Settings → Tunnel: five providers — Cloudflare, Dev Tunnels, Tailscale Funnel, ngrok and bore — each with its own toggle and status, and a banner naming the address nodes are currently told to dial.](docs/screenshots/tunnel.png)
+
+Each provider runs on its own, so more than one can be up at a time; the one
+marked for enrollment is the address handed to new nodes.
+
 When the Host's public address changes — a tunnel comes up, rotates, or is
 switched to another provider — it tells the nodes that are still connected. Each
 one records the new address, keeps the old one as a fallback, and **does not drop
@@ -368,6 +410,12 @@ answers becomes the one it leads with. The node config page lists the fallbacks
 under the Host URL field.
 
 ## Keeping nodes up to date
+
+![Updating a node, as a flowchart: a busy node is refused, the pull is fast-forward only, an unchanged HEAD skips the restart, install and build both run before anything is torn down, and only a successful build reaches exit 75 and a supervisor restart. Every other exit leaves the machine on the code it already had.](docs/update-node.png)
+
+The shape of that diagram is the whole feature: there is exactly one path that
+ends in a restart, and every guard that fails leaves the machine running what it
+was already running.
 
 The Nodes tab compares each machine's commit with the Host's and marks it **Up
 to date**, **Update available**, or **Manual update**. **Update** on a row — or
@@ -480,6 +528,8 @@ npm run node -- --url=http://127.0.0.1:8787 \
 
 Then open `http://127.0.0.1:5173`:
 
+![The Start a session dialog: a workspace placement, an optional session name, the initial prompt, and the YOLO toggle that decides whether the agent asks before running tools.](docs/screenshots/new-session.png)
+
 1. Create a workspace under **Workspaces**.
 2. Add a placement for `mock-node` using an existing absolute directory.
 3. Start two sessions from **Dashboard**. Give one a name in the dialog; the
@@ -527,6 +577,16 @@ never cross it, and the Node is the side that dials out.
    marks non-terminal sessions failed; there is no process resume in the MVP.
    After a Host restart, temporary `offline` rows are reconciled to failed when
    the Node reconnects with no matching active process.
+
+### The states a session moves through
+
+![The session state machine: queued, starting, running and idle form the live loop; cancel drops a turn and returns to idle with the process intact; stop is terminal; a Host restart parks everything in offline, from which a session either comes back or settles as failed-but-resumable.](docs/session-lifecycle.png)
+
+Two distinctions carry the model. **Cancel** ends the turn and keeps the process,
+so the session lands back on `idle` ready for a follow-up; **stop** ends the
+process and is terminal. And `failed` is not one thing: a session that reached
+the agent keeps its agent session id and is offered as **resumable**, while one
+that never got that far is simply over.
 
 ## Security notes
 

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Copilot Fleet · Reconnect on reboot</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-accent:  #eb6c36;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1100px; width: 100%; padding: 0 1.25rem; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+    svg { width: 100%; min-width: 900px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Sequence · Diagram Design</p>
+    <h1>Reconnect on reboot — the Host asks, it never assumes</h1>
+
+    <svg viewBox="0 0 960 700" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="reconnect-title reconnect-desc">
+      <title id="reconnect-title">Reconnect on reboot — the Host asks, it never assumes</title>
+      <desc id="reconnect-desc">Sequence diagram: after a restart the Host marks every unsettled session offline, then waits for the reconnecting Node to report which sessions it still holds and which are mid-turn. Sessions the Node still has are restored to running or idle; sessions it no longer has settle as failed but resumable, and auto-resume re-attaches them through ACP session/load without sending a prompt.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+        <marker id="arrow-open" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polyline points="0 0, 8 3, 0 6" fill="none" stroke="#4f5d75" stroke-width="1.2"/></marker>
+      </defs>
+
+      <rect width="960" height="700" fill="#f5f5f5"/>
+
+      <!-- Lifelines -->
+      <line x1="112" y1="112" x2="112" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="336" y1="112" x2="336" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="600" y1="112" x2="600" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+      <line x1="848" y1="112" x2="848" y2="616" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="3,3"/>
+
+      <!-- ALT fragment frame -->
+      <rect x="316" y="224" width="556" height="336" rx="4" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.22)" stroke-width="1"/>
+      <line x1="324" y1="316" x2="864" y2="316" stroke="rgba(45,49,66,0.20)" stroke-width="1" stroke-dasharray="4,3"/>
+      <rect x="316" y="224" width="40" height="16" rx="2" fill="#f5f5f5" stroke="rgba(45,49,66,0.22)" stroke-width="1"/>
+      <text x="336" y="236" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.12em">ALT</text>
+      <text x="352" y="262" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[node still holds the session]</text>
+      <text x="352" y="342" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.04em">[else · it came back without it]</text>
+
+      <!-- Activation bars -->
+      <rect x="332" y="138" width="8" height="466" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+      <rect x="596" y="188" width="8" height="28" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+      <rect x="596" y="408" width="8" height="140" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+      <rect x="844" y="450" width="8" height="52" fill="rgba(45,49,66,0.06)" stroke="#4f5d75" stroke-width="0.8"/>
+
+      <!-- 1. Host self-message: mark offline -->
+      <path d="M 340,146 H 370 Q 378,146 378,154 V 156 Q 378,164 370,164 H 340"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="392" y="150" fill="#2d3142" font-size="9" font-family="'Geist Mono', monospace">MARK EVERY UNSETTLED SESSION OFFLINE</text>
+      <text x="392" y="164" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">activity = "Host restarted"</text>
+
+      <!-- 2. Node -> Host: hello -->
+      <line x1="596" y1="202" x2="344" y2="202" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="396" y="182" width="152" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="472" y="191" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">HELLO · ACTIVE + BUSY IDS</text>
+
+      <!-- 3. Host self-message: restore -->
+      <path d="M 340,288 H 370 Q 378,288 378,296 V 298 Q 378,306 370,306 H 340"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="392" y="292" fill="#2d3142" font-size="9" font-family="'Geist Mono', monospace">RESTORE: BUSY &#8594; RUNNING, QUIET &#8594; IDLE</text>
+      <text x="392" y="306" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">never guessed idle over a live turn</text>
+
+      <!-- 4. Host self-message: settle failed -->
+      <path d="M 340,368 H 370 Q 378,368 378,376 V 378 Q 378,386 370,386 H 340"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="392" y="372" fill="#2d3142" font-size="9" font-family="'Geist Mono', monospace">SETTLE FAILED &#183; RESUMABLE</text>
+      <text x="392" y="386" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">only when an agent session id is on record</text>
+
+      <!-- 5. Host -> Node: resume_session -->
+      <line x1="344" y1="422" x2="592" y2="422" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="396" y="402" width="144" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="468" y="411" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RESUME_SESSION · NEWEST FIRST</text>
+
+      <!-- 6. Node -> Copilot: session/load -->
+      <line x1="604" y1="464" x2="840" y2="464" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <rect x="668" y="444" width="108" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="722" y="453" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">ACP SESSION/LOAD</text>
+
+      <!-- 7. Copilot -> Node: return -->
+      <path d="M 840,496 H 608" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <rect x="654" y="476" width="136" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="722" y="485" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">TRANSCRIPT RE-ATTACHED</text>
+
+      <!-- 8. Node -> Host: buffered events (async) -->
+      <path d="M 592,536 H 348" fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-open)"/>
+      <rect x="404" y="516" width="128" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="468" y="525" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">OUTBOX REPLAY</text>
+
+      <!-- 9. Host -> Browser: headline success -->
+      <line x1="328" y1="596" x2="120" y2="596" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <rect x="160" y="576" width="132" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="226" y="585" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">RESUMED · AWAITING INPUT</text>
+
+      <!-- Actors (drawn after messages) -->
+      <rect x="44" y="56" width="136" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="44" y="56" width="136" height="56" rx="6" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <rect x="52" y="64" width="28" height="12" rx="2" fill="transparent" stroke="rgba(122,131,153,0.40)" stroke-width="0.8"/>
+      <text x="66" y="73" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">EXT</text>
+      <text x="112" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Browser</text>
+      <text x="112" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">live session UI</text>
+
+      <rect x="252" y="56" width="168" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="252" y="56" width="168" height="56" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <rect x="260" y="64" width="32" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="276" y="73" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">HOST</text>
+      <text x="336" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fleet Host</text>
+      <text x="336" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">sqlite · desired state</text>
+
+      <rect x="520" y="56" width="160" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="520" y="56" width="160" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="528" y="64" width="32" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="544" y="73" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">NODE</text>
+      <text x="600" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fleet Node</text>
+      <text x="600" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">owns execution</text>
+
+      <rect x="780" y="56" width="136" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="780" y="56" width="136" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="788" y="64" width="28" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+      <text x="802" y="73" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ACP</text>
+      <text x="848" y="92" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Copilot CLI</text>
+      <text x="848" y="106" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">session on disk</text>
+
+      <!-- Editorial callout -->
+      <text x="916" y="168" fill="#2d3142" font-size="14" font-style="italic" font-family="'Instrument Serif', serif" text-anchor="end">the agent never stopped working</text>
+      <path d="M 780 176 Q 700 196 620 198" fill="none" stroke="rgba(45,49,66,0.40)" stroke-width="1" stroke-dasharray="4,3"/>
+      <circle cx="620" cy="198" r="2" fill="#2d3142"/>
+
+      <!-- Legend strip -->
+      <line x1="44" y1="640" x2="916" y2="640" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="44" y="656" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.18em">LEGEND</text>
+
+      <line x1="44" y1="678" x2="72" y2="678" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <text x="80" y="681" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Fleet command</text>
+
+      <line x1="204" y1="678" x2="232" y2="678" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <text x="240" y="681" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">ACP call</text>
+
+      <line x1="344" y1="678" x2="372" y2="678" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <text x="380" y="681" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Return</text>
+
+      <line x1="472" y1="678" x2="500" y2="678" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-open)"/>
+      <text x="508" y="681" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Buffered / async</text>
+
+      <line x1="640" y1="678" x2="668" y2="678" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <text x="676" y="681" fill="#4f5d75" font-size="8.5" font-family="'Geist', sans-serif">Outcome the operator sees</text>
+    </svg>
+  </div>
+</body>
+</html>
