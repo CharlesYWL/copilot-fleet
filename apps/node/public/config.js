@@ -66,6 +66,15 @@ const render = (data) => {
     status.activeSessions +
     " active session(s)" +
     (status.mockAgent ? " \u00b7 mock agent" : "");
+
+  // Only a node that goes through a tunnel has one to rebuild.
+  const tunnel = status.devTunnel;
+  $("tunnelCard").className = tunnel ? "card" : "card hidden";
+  if (tunnel) {
+    $("tunnelMeta").textContent =
+      tunnel.id +
+      (tunnel.url ? " \u00b7 forwarding " + tunnel.url : " \u00b7 no port yet");
+  }
 };
 
 const load = async () => {
@@ -97,6 +106,78 @@ $("form").addEventListener("submit", async (event) => {
 void load();
 // The connection state changes without any interaction here, so poll it.
 setInterval(load, 5000);
+
+// ---- Dev tunnel ----
+
+$("tunnelRebuild").addEventListener("click", async (event) => {
+  const button = event.target;
+  button.disabled = true;
+  const label = button.textContent;
+  button.textContent = "Rebuilding…";
+  try {
+    await post("/api/devtunnel/rebuild", {});
+    // Deliberately not "done": the CLI has to come back and report a port, and
+    // the node then needs a dial to succeed. The status line above is what says
+    // whether it worked, so the message points at it rather than guessing.
+    note("tunnelMsg", "Rebuilding. Watch the status above and the log below.", true);
+    await load();
+    await loadLogs();
+  } catch (error) {
+    note("tunnelMsg", error.message, false);
+  } finally {
+    button.disabled = false;
+    button.textContent = label;
+  }
+});
+
+// ---- Diagnostics ----
+
+const logLine = (entry) => {
+  const time = entry.at.length > 19 ? entry.at.slice(11, 19) : entry.at;
+  return el("div", { className: "lvl-" + entry.level }, [
+    el("span", { className: "at", textContent: time + "  " }),
+    document.createTextNode(entry.message),
+  ]);
+};
+
+const loadLogs = async () => {
+  const view = $("logs");
+  try {
+    const response = await fetch("/api/logs");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Could not read logs");
+    const entries = $("logProblemsOnly").checked
+      ? data.entries.filter((entry) => entry.level !== "info")
+      : data.entries;
+    if (!entries.length) {
+      view.replaceChildren(
+        el("div", {
+          className: "at",
+          textContent: $("logProblemsOnly").checked
+            ? "No warnings or errors recorded."
+            : "Nothing logged yet.",
+        }),
+      );
+      return;
+    }
+    // Whether the reader is pinned to the newest line decides whether the poll
+    // is allowed to scroll; otherwise every refresh yanks them off the line
+    // they were reading.
+    const pinned = view.scrollTop + view.clientHeight >= view.scrollHeight - 24;
+    view.replaceChildren(...entries.map(logLine));
+    if (pinned) view.scrollTop = view.scrollHeight;
+  } catch (error) {
+    view.replaceChildren(
+      el("div", { className: "lvl-error", textContent: error.message }),
+    );
+  }
+};
+
+$("logRefresh").addEventListener("click", () => void loadLogs());
+$("logProblemsOnly").addEventListener("change", () => void loadLogs());
+
+void loadLogs();
+setInterval(loadLogs, 5000);
 
 const downloadJson = (value, filename) => {
   const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });

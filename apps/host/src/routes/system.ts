@@ -8,6 +8,7 @@ import {
   backupKind,
   errorMessage,
 } from "@fleet/protocol";
+import type { LogEntry } from "@fleet/protocol/log-buffer";
 import type { FleetService } from "../fleet-service.js";
 import { isTransferableHostUrl } from "../host-url.js";
 import type { TunnelSupervisor } from "../tunnel.js";
@@ -23,16 +24,35 @@ export type SystemRouteOptions = {
   /** The URL to hand a Node when no tunnel is up. */
   fallbackPublicUrl: () => string;
   enrollmentHostUrl: () => string;
+  /** Recent warnings and errors, newest last, for the Diagnostics panel. */
+  recentLogs?: () => LogEntry[];
 };
 
 /** Health, enrollment, snapshot, defaults, backup and tunnel control. */
 export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   app,
-  { service, tunnel, version, enrollment, fallbackPublicUrl, enrollmentHostUrl },
+  {
+    service,
+    tunnel,
+    version,
+    enrollment,
+    fallbackPublicUrl,
+    enrollmentHostUrl,
+    recentLogs,
+  },
 ) => {
   const { store } = service;
 
   app.get("/api/health", async () => ({ ok: true, version }));
+
+  /**
+   * What the Host has complained about lately.
+   *
+   * Only warnings and errors are kept: the Host logs every request it serves,
+   * and a buffer holding those would evict the one line worth reading by the
+   * time anyone came looking for it.
+   */
+  app.get("/api/logs", async () => ({ entries: recentLogs ? recentLogs() : [] }));
 
   app.get("/api/enrollment", async () => {
     const tunnelId = tunnel.activeTunnelId();

@@ -56,6 +56,14 @@ describe("host routes", () => {
     expect(snapshot.json()).toHaveProperty("hostRevision");
   });
 
+  it("serves a log endpoint the browser can read the Host's problems from", async () => {
+    // The Host logs to a terminal that, on an unattended fleet, nobody is
+    // watching. This is how the operator sees it without one.
+    const response = await app.inject({ method: "GET", url: "/api/logs" });
+    expect(response.statusCode).toBe(200);
+    expect(Array.isArray(response.json().entries)).toBe(true);
+  });
+
   it("refuses enrollment with the wrong token", async () => {
     const response = await app.inject({
       method: "POST",

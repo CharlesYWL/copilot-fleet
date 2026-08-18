@@ -33,6 +33,18 @@ export type DevTunnelConnection = {
    * is the node failing to reach the Host through it, which only the node has.
    */
   recycle: () => void;
+  /**
+   * Rebuilds immediately, abandoning any backoff already counting down.
+   *
+   * {@link recycle} is the retry loop talking, and it defers to a rebuild
+   * already queued — asking twice would only reset the backoff and hammer a
+   * tunnel that is probably still dead. An operator pressing a button is not
+   * that loop. They have already watched it fail, they know something changed
+   * on the other end, and the wait they are trying to skip is a timer they
+   * cannot see and did not choose. Deferring to it here would make the button
+   * do nothing at the one moment it is worth pressing.
+   */
+  rebuildNow: () => void;
   stop: () => void;
 };
 
@@ -88,6 +100,8 @@ export function connectDevTunnel(
   let respawnTimer: NodeJS.Timeout | undefined;
   /** Assigned once the supervisor below is built; see `recycle`. */
   let requestRespawn: (code?: number | null) => void = () => {};
+  /** Assigned once `start` exists; see `rebuildNow`. */
+  let startNow: () => void = () => {};
 
   const connection: DevTunnelConnection = {
     get url() {
@@ -106,6 +120,24 @@ export function connectDevTunnel(
         doomed.kill();
       }
       requestRespawn();
+    },
+    rebuildNow: () => {
+      if (stopped) return;
+      // Unlike `recycle`, a queued rebuild is cancelled rather than deferred to:
+      // the backoff is there to pace an automatic retry, and this is not one.
+      if (respawnTimer) {
+        clearTimer(respawnTimer);
+        respawnTimer = undefined;
+      }
+      const doomed = child;
+      child = undefined;
+      if (doomed && !doomed.killed) doomed.kill();
+      // Clearing `child` first means the exit handler ignores this kill, so the
+      // spawn below is the only one; resetting the count gives the new tunnel
+      // the full backoff ladder rather than the tail of the old one's.
+      attempt = 0;
+      log(`devtunnel connect ${tunnelId} rebuilding now`);
+      startNow();
     },
     stop: () => {
       stopped = true;
@@ -150,6 +182,11 @@ export function connectDevTunnel(
         }); restarting in ${Math.round(delay / 1000)}s`,
       );
       respawnTimer = setTimer(() => {
+        // A rebuild that overtook this timer has already cleared the handle.
+        // Checking it here rather than trusting `clearTimer` alone is what
+        // stops a late callback spawning a second client that would fight the
+        // first one for the forwarded port.
+        if (respawnTimer === undefined) return;
         respawnTimer = undefined;
         if (!stopped) start();
       }, delay);
@@ -220,6 +257,7 @@ export function connectDevTunnel(
       });
     };
 
+    startNow = start;
     start();
   });
 }

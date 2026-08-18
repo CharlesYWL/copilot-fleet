@@ -25,6 +25,8 @@ import { sessionRoutes } from "./routes/sessions.js";
 import { systemRoutes } from "./routes/system.js";
 import { FleetStore } from "./store.js";
 import { TunnelSupervisor } from "./tunnel.js";
+import { recordingLogStream } from "./log-stream.js";
+import { createLogBuffer } from "@fleet/protocol/log-buffer";
 
 loadEnv({ path: envFilePath(), quiet: true });
 
@@ -51,7 +53,8 @@ export async function buildServer(
     enrollmentToken?: string;
   } = {},
 ): Promise<FastifyInstance> {
-  const app = Fastify({ logger: true });
+  const logs = createLogBuffer();
+  const app = Fastify({ logger: { stream: recordingLogStream(logs) } });
   const store = new FleetStore(
     options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH),
   );
@@ -114,6 +117,7 @@ export async function buildServer(
     enrollment,
     fallbackPublicUrl,
     enrollmentHostUrl,
+    recentLogs: () => logs.entries(),
   });
   await app.register(nodeRoutes, { service, enrollment });
   await app.register(catalogRoutes, { service });

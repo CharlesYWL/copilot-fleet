@@ -21,6 +21,7 @@ import {
   type SessionEvent,
 } from "@fleet/protocol";
 import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
+import { createLogBuffer } from "@fleet/protocol/log-buffer";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
 import { CliError, USAGE, argvForRestart, parseNodeArgs } from "./cli.js";
 import {
@@ -106,8 +107,25 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   // One lookup path for both sources; the flags are already the last word.
   const env: NodeJS.ProcessEnv = { ...process.env, ...flags.env };
 
+  /**
+   * What this process has been saying, kept so the config page can show it.
+   *
+   * A node's console is on a machine the operator is usually not sitting at —
+   * which is the whole problem with diagnosing one remotely. Everything that
+   * goes to the console goes here too, so the page served from this machine can
+   * answer "what happened just before it stopped working".
+   */
+  const logs = createLogBuffer();
+
   const startupLog = (message: string): void => {
+    logs.record("info", message);
     console.log(`${new Date().toISOString()} [node] ${message}`);
+  };
+
+  /** Failures worth surfacing on the page, not just on a console nobody reads. */
+  const errorLog = (message: string): void => {
+    logs.record("error", message);
+    console.error(message);
   };
 
   /**
@@ -151,13 +169,20 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     void applySettings(endpointsBehindLocalForward(settings, url), {
       operatorEdit: false,
     }).catch((error: unknown) => {
-      console.error("Failed to follow the dev tunnel:", errorMessage(error));
+      errorLog(`Failed to follow the dev tunnel: ${errorMessage(error)}`);
     });
   };
 
   const mockAgent = env.FLEET_MOCK_AGENT === "1";
 
   const log = (message: string): void => {
+    logs.record("info", message);
+    console.log(`${new Date().toISOString()} [node] ${message}`);
+  };
+
+  /** A problem the page should show without the operator opening a terminal. */
+  const warn = (message: string): void => {
+    logs.record("warn", message);
     console.log(`${new Date().toISOString()} [node] ${message}`);
   };
 
@@ -208,6 +233,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let dialUrl = credentials.hostUrl;
   /** Consecutive dials that never produced a welcome; see the close handler. */
   let unreachableDials = 0;
+  /** Whether this outage has already reported that there is nowhere to rotate. */
+  let strandedReported = false;
 
   const factory = mockAgent
     ? new MockAgentFactory()
@@ -475,11 +502,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       connected: socket?.readyState === WebSocket.OPEN,
       activeSessions: router.activeSessionIds.length,
       mockAgent,
+      ...(devTunnelId
+        ? { devTunnel: { id: devTunnelId, url: devTunnel?.url ?? "" } }
+        : {}),
     }),
     applySettings,
     getCredentials: () => credentials,
     applyBackup,
     log,
+    // Offered only when there is a tunnel to rebuild, so the page can hide a
+    // control that could not do anything on a node dialing the Host directly.
+    ...(devTunnel ? { rebuildDevTunnel: () => devTunnel?.rebuildNow() } : {}),
+    recentLogs: () => logs.entries(),
     port: configServerPort(env),
   });
 
@@ -521,7 +555,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     active.on("message", async (raw: unknown) => {
       const frame = decodeFrame(String(raw), HostToNodeMessageSchema);
       if (!frame.ok) {
-        console.error("Rejected Host message:", frame.detail);
+        errorLog(`Rejected Host message: ${frame.detail}`);
         active.close(frame.code, frame.reason);
         return;
       }
@@ -576,7 +610,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           await saveCredentials(credentials);
           log(`Re-enrolled as node ${credentials.nodeId}`);
         } catch (error) {
-          console.error("Re-enrollment failed:", errorMessage(error));
+          errorLog(`Re-enrollment failed: ${errorMessage(error)}`);
         }
         reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
         return;
@@ -609,6 +643,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         if (!sameHostUrl(candidate, attemptUrl)) {
           log(`No Host at ${attemptUrl}; trying ${candidate} next`);
           dialUrl = candidate;
+          strandedReported = false;
+        } else if (!strandedReported) {
+          // Rotation that has nowhere to go looks exactly like rotation that
+          // has not started yet: both print nothing. A node down to its last
+          // address then retries it every two seconds in silence, and the only
+          // way to tell that apart from an ordinary outage is to know that the
+          // "trying X next" line is missing — which is not something a log
+          // should ask of whoever is reading it at the time.
+          strandedReported = true;
+          warn(
+            `No Host at ${attemptUrl}, and it is the only address this node knows — retrying it until the Host returns. Add another Host URL on the node config page to give this node somewhere to fall back to.`,
+          );
         }
         // Repeated silence from a dev tunnel's forwarded port is the only
         // reliable sign that the tunnel died: its local listener keeps
@@ -622,11 +668,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         }
       } else {
         unreachableDials = 0;
+        strandedReported = false;
       }
       reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
     });
     active.on("error", (error) => {
-      console.error("Host connection error:", error.message);
+      errorLog(`Host connection error: ${error.message}`);
     });
   }
 

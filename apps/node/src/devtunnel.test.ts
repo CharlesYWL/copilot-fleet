@@ -266,3 +266,89 @@ describe("connectDevTunnel recycle", () => {
     expect(h.children).toHaveLength(1);
   });
 });
+
+describe("connectDevTunnel rebuildNow", () => {
+  const harness = () => {
+    const children: ReturnType<typeof fakeChild>[] = [];
+    const timers: (() => void)[] = [];
+    const cleared: number[] = [];
+    const make = () => {
+      const next = fakeChild();
+      children.push(next);
+      return next;
+    };
+    return {
+      children,
+      timers,
+      cleared,
+      options: {
+        spawnProcess: (() => make()) as never,
+        setTimer: ((fn: () => void) => {
+          timers.push(fn);
+          return timers.length as unknown as NodeJS.Timeout;
+        }) as never,
+        clearTimer: ((timer: number) => {
+          cleared.push(timer);
+        }) as never,
+      },
+    };
+  };
+
+  const ready = async (h: ReturnType<typeof harness>) => {
+    const pending = connectDevTunnel("fleet-abc", h.options);
+    h.children[0]!.stdout.emit(
+      "data",
+      Buffer.from("Forwarding from 127.0.0.1:8791 to x\n"),
+    );
+    return pending;
+  };
+
+  /**
+   * The whole reason the button exists. `recycle` defers to a queued rebuild,
+   * so a node already sitting on a 30s backoff would answer a click by doing
+   * nothing at all — at the one moment someone is watching and knows the far
+   * end just changed.
+   */
+  it("rebuilds immediately even when a backoff is already counting down", async () => {
+    const h = harness();
+    const conn = await ready(h);
+
+    conn.recycle();
+    expect(h.children).toHaveLength(1); // queued, not spawned
+
+    conn.rebuildNow();
+    // Spawned without anyone running the pending timer.
+    expect(h.children).toHaveLength(2);
+    expect(h.cleared.length).toBeGreaterThan(0);
+  });
+
+  it("does not let the cancelled backoff spawn a second tunnel later", async () => {
+    const h = harness();
+    const conn = await ready(h);
+
+    conn.recycle();
+    conn.rebuildNow();
+    const spawnedAfterRebuild = h.children.length;
+    // Whatever timers were left over must not add another child on top.
+    for (const run of h.timers) run();
+    expect(h.children).toHaveLength(spawnedAfterRebuild);
+  });
+
+  it("rebuilds a healthy tunnel too, since only the operator knows it is stale", async () => {
+    const h = harness();
+    const conn = await ready(h);
+
+    conn.rebuildNow();
+    expect(h.children[0]!.kill).toHaveBeenCalled();
+    expect(h.children).toHaveLength(2);
+  });
+
+  it("stays quiet after the node has stopped the tunnel", async () => {
+    const h = harness();
+    const conn = await ready(h);
+
+    conn.stop();
+    conn.rebuildNow();
+    expect(h.children).toHaveLength(1);
+  });
+});

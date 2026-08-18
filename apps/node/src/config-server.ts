@@ -9,6 +9,7 @@ import {
   errorMessage,
   type NodeBackup,
 } from "@fleet/protocol";
+import type { LogEntry } from "@fleet/protocol/log-buffer";
 import { EditableSettingsSchema, type Settings } from "./settings.js";
 import type { Credentials } from "./config.js";
 import { configAsset } from "./config-assets.js";
@@ -35,6 +36,14 @@ export type ConfigStatus = {
   connected: boolean;
   activeSessions: number;
   mockAgent: boolean;
+  /**
+   * The dev tunnel this node reaches the Host through, when it uses one.
+   *
+   * Present so the page can offer a rebuild only where one means something. A
+   * node dialing the Host directly has no tunnel to rebuild, and a button that
+   * cannot work is worse than no button.
+   */
+  devTunnel?: { id: string; url: string };
 };
 
 /** The slice of {@link FleetClient} the config endpoints use, so tests can
@@ -59,6 +68,17 @@ export type ConfigServerOptions = {
   getCredentials: () => Credentials | undefined;
   applyBackup: (archive: NodeBackup) => Promise<void>;
   log: (message: string) => void;
+  /**
+   * Rebuilds the dev tunnel forward. Absent when this node does not use one.
+   *
+   * The node's own page is the only place this can live. A node whose tunnel
+   * died cannot reach the Host, so the Host's UI cannot reach it either — the
+   * one screen guaranteed to still work is the one served from loopback on the
+   * machine with the problem.
+   */
+  rebuildDevTunnel?: () => void;
+  /** Recent log lines, newest last, for the page's diagnostics view. */
+  recentLogs?: () => LogEntry[];
   /** Resolved by the caller so a command-line flag can outrank the variable. */
   port?: number;
   fleet?: FleetApi;
@@ -195,6 +215,30 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
         })),
     ],
     ["POST /api/check-path", async (body) => ok(inspectPath(pathFrom(body)))],
+    [
+      "GET /api/logs",
+      async () => ok({ entries: options.recentLogs ? options.recentLogs() : [] }),
+    ],
+    [
+      "POST /api/devtunnel/rebuild",
+      async () => {
+        if (!options.rebuildDevTunnel) {
+          return {
+            status: 409,
+            body: {
+              error:
+                "This node does not use a dev tunnel; it dials the Host URL directly.",
+            },
+          };
+        }
+        options.rebuildDevTunnel();
+        // The new forward is not up yet and may land on a different port, so
+        // this reports that the work started rather than claiming a result it
+        // cannot have. The page polls the status for the outcome.
+        options.log("Dev tunnel rebuild requested from the config page");
+        return ok({ started: true });
+      },
+    ],
     [
       "POST /api/pick-folder",
       // The dialog opens on this machine's display, so this only resolves once

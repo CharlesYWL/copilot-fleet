@@ -4,6 +4,7 @@ import type { FleetNode, Placement, Workspace } from "@fleet/protocol";
 import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { NodesPanel } from "./NodesPanel";
 import { GeneralPanel } from "./GeneralPanel";
+import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { TunnelPanel } from "./TunnelPanel";
 import { WorkspacesPanel } from "./WorkspacesPanel";
 
@@ -29,7 +30,7 @@ const useStyles = makeStyles({
   },
 });
 
-type SettingsTab = "general" | "tunnel" | "nodes" | "workspaces";
+type SettingsTab = "general" | "tunnel" | "nodes" | "workspaces" | "diagnostics";
 
 type SettingsPanelProps = {
   workspaces: Workspace[];
@@ -60,10 +61,12 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
           <Tab value="tunnel">Tunnel</Tab>
           <Tab value="nodes">Nodes</Tab>
           <Tab value="workspaces">Workspaces</Tab>
+          <Tab value="diagnostics">Diagnostics</Tab>
         </TabList>
       </div>
       <div className={styles.body}>
         {tab === "general" && <GeneralPanel />}
+        {tab === "diagnostics" && <DiagnosticsPanel />}
         {tab === "tunnel" && <TunnelPanel />}
         {tab === "nodes" && (
           <NodesPanel

@@ -11,6 +11,10 @@
     "./runtime": {
       "types": "./dist/runtime.d.ts",
       "default": "./dist/runtime.js"
+    },
+    "./log-buffer": {
+      "types": "./dist/log-buffer.d.ts",
+      "default": "./dist/log-buffer.js"
     }
   },
   "scripts": {

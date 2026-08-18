@@ -187,3 +187,52 @@ select {
 .check.err {
   color: #f08c8c;
 }
+
+/* The primary action of its own card, so it is not the muted .row variant. */
+#tunnelRebuild {
+  background: #3b6fd4;
+}
+.inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  color: #9aa1ad;
+  font-size: 13px;
+  flex: 1;
+}
+.inline input {
+  width: auto;
+  flex: 0 0 auto;
+}
+/*
+ * A log view is only useful if it is bounded and stays put: an unbounded block
+ * pushes every control below it off the page, and a view that jumps to the
+ * bottom on each poll fights whoever is trying to read the line above.
+ */
+.logs {
+  margin: 0;
+  max-height: 260px;
+  overflow: auto;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid #2c313a;
+  background: #12141a;
+  color: #c8ccd4;
+  font:
+    12px/1.55 ui-monospace,
+    "Cascadia Mono",
+    Menlo,
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.logs .lvl-error {
+  color: #f08c8c;
+}
+.logs .lvl-warn {
+  color: #e8c07d;
+}
+.logs .at {
+  color: #7b828f;
+}

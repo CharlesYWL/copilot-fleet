@@ -233,3 +233,55 @@ describe("config router", () => {
     expect((await route("DELETE", "/api/config", "")).status).toBe(404);
   });
 });
+
+describe("config router · dev tunnel rebuild", () => {
+  it("rebuilds the tunnel when this node has one", async () => {
+    const rebuildDevTunnel = vi.fn();
+    const { route } = router({ rebuildDevTunnel });
+    const response = await route("POST", "/api/devtunnel/rebuild", "");
+    expect(response.status).toBe(200);
+    expect(rebuildDevTunnel).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses on a node that dials the Host directly", async () => {
+    // A node with no tunnel has nothing to rebuild, and a button that silently
+    // does nothing is indistinguishable from one that is broken.
+    const { route } = router();
+    const response = await route("POST", "/api/devtunnel/rebuild", "");
+    expect(response.status).toBe(409);
+    expect(response.body).toMatchObject({ error: expect.stringContaining("directly") });
+  });
+
+  it("reports that the rebuild started rather than that it succeeded", async () => {
+    // The CLI still has to come back with a port, and the node still has to
+    // dial through it; claiming success here would be a guess.
+    const { route } = router({ rebuildDevTunnel: vi.fn() });
+    expect((await route("POST", "/api/devtunnel/rebuild", "")).body).toEqual({
+      started: true,
+    });
+  });
+});
+
+describe("config router · logs", () => {
+  it("serves what the node has been saying", async () => {
+    const entries = [
+      {
+        at: "2026-08-18T21:04:22.000Z",
+        level: "error" as const,
+        message: "ECONNREFUSED",
+      },
+    ];
+    const { route } = router({ recentLogs: () => entries });
+    const response = await route("GET", "/api/logs", "");
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ entries });
+  });
+
+  it("answers with an empty list rather than failing when nothing records logs", async () => {
+    const { route } = router();
+    expect(await route("GET", "/api/logs", "")).toEqual({
+      status: 200,
+      body: { entries: [] },
+    });
+  });
+});

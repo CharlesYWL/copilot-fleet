@@ -94,6 +94,38 @@
         <div id="msg"></div>
       </form>
 
+      <div class="card hidden" id="tunnelCard">
+        <h2>Dev tunnel</h2>
+        <p class="sub spaced">
+          This node reaches the Host through a local forward opened by
+          <code>devtunnel connect</code>. Restarting the Host replaces its tunnel host and
+          the relay key with it, which this client cannot always recover from — the port
+          below then refuses every dial while the Host is fine. Rebuild it here instead of
+          killing the node and starting it again.
+        </p>
+        <div class="meta" id="tunnelMeta"></div>
+        <div class="row">
+          <button type="button" id="tunnelRebuild">Rebuild tunnel</button>
+        </div>
+        <div id="tunnelMsg"></div>
+      </div>
+
+      <div class="card">
+        <h2>Diagnostics</h2>
+        <p class="sub spaced">
+          What this node has been saying. Its console is on this machine, which is rarely
+          where the person debugging it is sitting.
+        </p>
+        <div class="row">
+          <label class="inline">
+            <input type="checkbox" id="logProblemsOnly" checked />
+            <span>Problems only</span>
+          </label>
+          <button type="button" class="secondary" id="logRefresh">Refresh</button>
+        </div>
+        <pre class="logs" id="logs" aria-live="polite">Loading…</pre>
+      </div>
+
       <div class="card">
         <h2>Move this node</h2>
         <p class="sub spaced">
