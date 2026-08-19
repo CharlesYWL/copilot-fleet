@@ -89,6 +89,16 @@ const show = (
   );
 
 describe("SessionGrid dragging", () => {
+  it("stretches every tile across its grid column", () => {
+    const { container } = show();
+    const tiles = container.querySelectorAll("article");
+
+    expect(tiles).toHaveLength(2);
+    for (const tile of tiles) {
+      expect(getComputedStyle(tile).width).toBe("100%");
+    }
+  });
+
   it("makes every tile draggable, not just the tree rows", () => {
     // View mode renders its own component; wiring the tree alone left this
     // half of the app unable to reorder anything.
