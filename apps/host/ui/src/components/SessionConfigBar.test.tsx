@@ -51,6 +51,45 @@ describe("SessionConfigBar", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
+  it("keeps a long list inside the window instead of running off the top", () => {
+    // The strip sits at the bottom of the screen and opens upwards, so an agent
+    // offering twenty models drew a list taller than the window: the choices at
+    // the top could not be reached, scrolled to, or seen at all.
+    show([
+      option({
+        choices: Array.from({ length: 21 }, (_, index) => ({
+          value: `m${index}`,
+          name: `Model ${index}`,
+          description: "",
+        })),
+      }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+
+    const list = screen.getByRole("menu");
+    const style = getComputedStyle(list);
+    // Not merely "set": an unset max-height computes to the string "none",
+    // which is truthy and would let this pass over the bug it exists for.
+    expect(style.maxHeight).not.toBe("none");
+    expect(style.maxHeight).toBeTruthy();
+    expect(style.overflowY).toBe("auto");
+  });
+
+  it("reaches a choice that only a scrolling list could show", () => {
+    const onChange = show([
+      option({
+        choices: Array.from({ length: 21 }, (_, index) => ({
+          value: `m${index}`,
+          name: `Model ${index}`,
+          description: "",
+        })),
+      }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Model" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Model 20" }));
+    expect(onChange).toHaveBeenCalledWith("model", "m20");
+  });
+
   it("leaves out the permission picker the fleet already owns", () => {
     show([
       option({}),

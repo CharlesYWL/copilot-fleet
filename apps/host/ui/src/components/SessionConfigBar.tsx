@@ -66,6 +66,23 @@ const useStyles = makeStyles({
     color: tokens.colorNeutralForeground4,
     fontSize: "11px",
   },
+  /**
+   * Keeps a long picker inside the window.
+   *
+   * An agent that offers twenty models rendered twenty items tall, and the strip
+   * it opens from sits at the bottom of the screen — so the list ran off the top
+   * edge and the choices up there could not be reached, scrolled to, or even
+   * seen. Capping the height turns that overflow into a scrollbar.
+   *
+   * Expressed against the viewport rather than as a fixed number of pixels
+   * because the constraint is the window, not the list: a short window has to
+   * clamp harder than a tall one, and the absolute cap only stops a very tall
+   * window from opening a menu the eye has to travel.
+   */
+  list: {
+    maxHeight: "min(60vh, 420px)",
+    overflowY: "auto",
+  },
 });
 
 export type SessionConfigBarProps = {
@@ -135,7 +152,7 @@ export const SessionConfigBar = ({
                 </button>
               </MenuTrigger>
               <MenuPopover>
-                <MenuList>
+                <MenuList className={styles.list}>
                   <Text className={styles.heading}>{option.name}</Text>
                   {option.choices.map((choice) => (
                     <MenuItemRadio
