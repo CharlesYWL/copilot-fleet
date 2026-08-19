@@ -20,6 +20,40 @@ export function reconnectDelay(attempt: number): number {
   return RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)]!;
 }
 
+/** The tail of the CLI's output, which is where it says what went wrong. */
+export function lastLines(output: string, count = 3): string {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-count)
+    .join(" / ");
+}
+
+/**
+ * Why a failed connect will not be helped by trying again, when that is knowable.
+ *
+ * Retrying is the default, deliberately: a node that has just rebooted races its
+ * own network, and the failure that costs a machine its whole session is the one
+ * treated as permanent when it was merely early. So only conditions that cannot
+ * improve on their own are named here, and each is recognised by what the CLI
+ * said rather than by its exit code alone — a code is reused across causes, and
+ * an unfamiliar message simply falls through to the retry loop, which is the
+ * safe way to be wrong.
+ */
+export function fatalConnectReason(
+  code: number | null | undefined,
+  said: string,
+): string | undefined {
+  if (code === 3 || /login required/i.test(said)) {
+    return "This machine is not signed in to Dev Tunnels: run `devtunnel user login` here, then start the node again.";
+  }
+  if (/tunnel not found/i.test(said)) {
+    return "A private tunnel is visible only to the account that owns it, so this is either a tunnel that no longer exists or a machine signed in as a different account. Compare `devtunnel list` on this machine against the tunnel id the Host reports.";
+  }
+  return undefined;
+}
+
 export type DevTunnelConnection = {
   /** Loopback URL the node should dial; changes if a respawn lands elsewhere. */
   readonly url: string;
@@ -160,6 +194,16 @@ export function connectDevTunnel(
 
   return new Promise<DevTunnelConnection>((resolve, reject) => {
     let settled = false;
+    /**
+     * The last thing the CLI said, kept across respawns.
+     *
+     * Every failure below used to be reported as an exit code and a guess, while
+     * the one line that actually explained it — `Tunnel not found`, `Login
+     * required` — was read into a buffer and dropped on the floor. The guess was
+     * not merely unhelpful, it was wrong often enough to send an operator to
+     * `devtunnel user login` on a machine that was already signed in.
+     */
+    let said = "";
 
     const settle = (outcome: () => void) => {
       if (settled) return;
@@ -168,6 +212,9 @@ export function connectDevTunnel(
       outcome();
     };
 
+    /** The CLI's own words, ready to append to a message. */
+    const detail = () => (said ? `: ${said}` : " with no output");
+
     const timer = setTimer(() => {
       settle(() => {
         connection.stop();
@@ -175,22 +222,22 @@ export function connectDevTunnel(
           new Error(
             `devtunnel connect ${tunnelId} did not report a forwarded port within ${Math.round(
               timeoutMs / 1000,
-            )}s. Run \`devtunnel user login\` on this machine and try again.`,
+            )}s${detail()}. Run \`devtunnel user login\` on this machine and check that this account can reach the tunnel.`,
           ),
         );
       });
     }, timeoutMs);
 
     const scheduleRespawn = (code?: number | null): void => {
-      // Nothing to recover once the first attempt has already been rejected —
-      // that failure is reported to the caller, which decides what to do.
-      if (stopped || !settled || currentUrl === undefined) return;
+      // A rejected attempt has already been reported to the caller, and the
+      // rejection paths stop the connection, so `stopped` is what ends the loop.
+      if (stopped) return;
       const delay = reconnectDelay(attempt);
       attempt += 1;
       warn(
         `devtunnel connect ${tunnelId} ended (code=${
           code ?? "null"
-        }); restarting in ${Math.round(delay / 1000)}s`,
+        })${detail()}; restarting in ${Math.round(delay / 1000)}s`,
       );
       respawnTimer = setTimer(() => {
         // A rebuild that overtook this timer has already cleared the handle.
@@ -218,6 +265,7 @@ export function connectDevTunnel(
       const onChunk = (chunk: Buffer) => {
         buffer += chunk.toString("utf8");
         if (buffer.length > 64_000) buffer = buffer.slice(-32_000);
+        said = lastLines(buffer);
         const match = buffer.match(FORWARDING_RE);
         if (!match) return;
         const url = `http://127.0.0.1:${match[1]}`;
@@ -242,28 +290,48 @@ export function connectDevTunnel(
       active.on("error", (error) => {
         if (child !== active) return;
         child = undefined;
-        settle(() =>
-          reject(
-            new Error(
-              `Could not start devtunnel: ${error.message}. Install it with \`winget install Microsoft.devtunnel\`.`,
-            ),
-          ),
-        );
+        // A binary that cannot be spawned at all will not appear by being asked
+        // again, so this ends the first attempt rather than looping on it. Once
+        // a tunnel has worked, the same failure is treated as any other death
+        // and goes back through the backoff.
+        if (!settled) {
+          settle(() => {
+            connection.stop();
+            reject(
+              new Error(
+                `Could not start devtunnel: ${error.message}. Install it with \`winget install Microsoft.devtunnel\`.`,
+              ),
+            );
+          });
+          return;
+        }
         scheduleRespawn();
       });
 
-      // A connect that exits before forwarding is almost always a signed-out CLI
-      // or a tunnel this account cannot see; either way the node cannot proceed.
+      // A connect that exits before forwarding is a node with no way to reach
+      // its Host, and until this point there is no working tunnel to fall back
+      // on — so the CLI's own words are the whole diagnosis.
       active.on("exit", (code) => {
         if (child !== active) return;
         child = undefined;
-        settle(() =>
-          reject(
-            new Error(
-              `devtunnel connect ${tunnelId} exited (code=${code ?? "null"}) before forwarding a port. Check \`devtunnel user login\` and that this account can reach the tunnel.`,
-            ),
-          ),
-        );
+        if (!settled) {
+          const fatal = fatalConnectReason(code, said);
+          // Anything that could be a machine still finding its network after a
+          // reboot is retried instead. One failed attempt used to end the node
+          // outright, which is why a rebooted box never came back while its
+          // already-connected neighbours carried on.
+          if (fatal) {
+            settle(() => {
+              connection.stop();
+              reject(
+                new Error(
+                  `devtunnel connect ${tunnelId} exited (code=${code ?? "null"})${detail()}. ${fatal}`,
+                ),
+              );
+            });
+            return;
+          }
+        }
         scheduleRespawn(code);
       });
     };

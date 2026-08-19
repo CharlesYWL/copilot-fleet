@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
-import { connectDevTunnel } from "./devtunnel.js";
+import { connectDevTunnel, fatalConnectReason, lastLines } from "./devtunnel.js";
 
 /** A stand-in for the CLI child so no test spawns a real tunnel. */
 function fakeChild() {
@@ -51,12 +51,71 @@ describe("connectDevTunnel", () => {
   });
 
   it("explains a signed-out CLI instead of hanging until the timeout", async () => {
+    // Verified against the real CLI: signing out makes `devtunnel connect` exit
+    // 3 saying "Login required." No amount of retrying installs a login, so
+    // this is one of the two failures reported straight away.
     const child = fakeChild();
     const pending = connectDevTunnel("fleet-abc", {
       spawnProcess: (() => child) as any,
     });
-    child.emit("exit", 1);
+    child.stderr.emit("data", Buffer.from("Login required.\n"));
+    child.emit("exit", 3);
     await expect(pending).rejects.toThrow(/devtunnel user login/);
+  });
+
+  it("quotes the CLI rather than guessing why a connect died", async () => {
+    // The failure that prompted this: a node exited reporting only `code=2` and
+    // a stock hint about signing in, on a machine that was signed in. The line
+    // that explained it had been read and thrown away.
+    const child = fakeChild();
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => child) as any,
+    });
+    child.stderr.emit("data", Buffer.from("Tunnel not found: fleet-abc\n"));
+    child.emit("exit", 2);
+    await expect(pending).rejects.toThrow(/Tunnel not found: fleet-abc/);
+  });
+
+  it("says a private tunnel is only visible to the account that owns it", async () => {
+    const child = fakeChild();
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => child) as any,
+    });
+    child.stderr.emit("data", Buffer.from("Tunnel not found: fleet-abc\n"));
+    child.emit("exit", 2);
+    await expect(pending).rejects.toThrow(/signed in as a different account/);
+  });
+
+  it("keeps trying when a first connect dies for a reason that may pass", async () => {
+    // A node that has just rebooted races its own network. Ending the process on
+    // the first failure is why a rebooted machine never came back while its
+    // already-connected neighbours carried on working.
+    const children: ReturnType<typeof fakeChild>[] = [];
+    const timers: (() => void)[] = [];
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => {
+        const next = fakeChild();
+        children.push(next);
+        return next;
+      }) as any,
+      setTimer: ((fn: () => void) => {
+        timers.push(fn);
+        return timers.length as unknown as NodeJS.Timeout;
+      }) as never,
+      clearTimer: (() => {}) as never,
+    });
+
+    children[0]!.stderr.emit("data", Buffer.from("connection reset by peer\n"));
+    children[0]!.emit("exit", 1);
+    // The backoff timer is the last one scheduled; running it retries.
+    timers[timers.length - 1]!();
+    expect(children).toHaveLength(2);
+
+    children[1]!.stdout.emit(
+      "data",
+      Buffer.from("Forwarding from 127.0.0.1:8791 to host port 8790.\n"),
+    );
+    await expect(pending).resolves.toMatchObject({ url: "http://127.0.0.1:8791" });
   });
 
   it("names the install step when the binary is missing", async () => {
@@ -80,6 +139,58 @@ describe("connectDevTunnel", () => {
     await assertion;
     expect(child.kill).toHaveBeenCalled();
     vi.useRealTimers();
+  });
+
+  it("carries what the CLI said into the timeout, not just the elapsed time", async () => {
+    vi.useFakeTimers();
+    const child = fakeChild();
+    const pending = connectDevTunnel("fleet-abc", {
+      spawnProcess: (() => child) as any,
+      timeoutMs: 1_000,
+    });
+    child.stderr.emit("data", Buffer.from("Refreshing tunnel.\n"));
+    const assertion = expect(pending).rejects.toThrow(/Refreshing tunnel/);
+    await vi.advanceTimersByTimeAsync(1_100);
+    await assertion;
+    vi.useRealTimers();
+  });
+});
+
+describe("fatalConnectReason", () => {
+  it("treats a missing login as settled, however the CLI phrased it", () => {
+    expect(fatalConnectReason(3, "")).toMatch(/devtunnel user login/);
+    expect(fatalConnectReason(1, "Login required.")).toMatch(/devtunnel user login/);
+  });
+
+  it("explains a tunnel this machine cannot see", () => {
+    expect(fatalConnectReason(2, "Tunnel not found: fleet-abc")).toMatch(
+      /only to the account that owns it/,
+    );
+  });
+
+  it("leaves anything it does not recognise to the retry loop", () => {
+    // Being wrong about a transient failure costs the node its whole run, so an
+    // unfamiliar message has to fall through to the side that recovers.
+    expect(fatalConnectReason(2, "connection reset by peer")).toBeUndefined();
+    expect(fatalConnectReason(1, "")).toBeUndefined();
+    expect(fatalConnectReason(null, "")).toBeUndefined();
+  });
+});
+
+describe("lastLines", () => {
+  it("keeps the tail, where the CLI puts the reason", () => {
+    expect(lastLines("Welcome\n\nConnecting\nTunnel not found: x\n")).toBe(
+      "Welcome / Connecting / Tunnel not found: x",
+    );
+  });
+
+  it("drops the banner a long run pushes ahead of the failure", () => {
+    const noisy = ["one", "two", "three", "four", "five"].join("\n");
+    expect(lastLines(noisy)).toBe("three / four / five");
+  });
+
+  it("has nothing to say about a CLI that printed nothing", () => {
+    expect(lastLines("   \n\n")).toBe("");
   });
 });
 
@@ -151,17 +262,29 @@ describe("connectDevTunnel supervision", () => {
     expect(conn.url).toBe("http://127.0.0.1:9002");
   });
 
-  it("does not respawn a connect that never forwarded, so a real failure surfaces", async () => {
+  it("does not respawn a first connect that failed for good, so it surfaces", async () => {
+    // Retrying is the default now, because a rebooted machine racing its own
+    // network used to lose its whole run to one early failure. A tunnel this
+    // account cannot see is the other kind: no wait improves it, so it is
+    // reported once instead of being retried until the deadline.
     const child = fakeChild();
     const spawned: ReturnType<typeof fakeChild>[] = [];
+    const timers: (() => void)[] = [];
     const pending = connectDevTunnel("fleet-abc", {
       spawnProcess: (() => {
         spawned.push(child);
         return child;
       }) as never,
+      setTimer: ((fn: () => void) => {
+        timers.push(fn);
+        return timers.length as unknown as NodeJS.Timeout;
+      }) as never,
+      clearTimer: (() => {}) as never,
     });
-    child.emit("exit", 1);
-    await expect(pending).rejects.toThrow(/devtunnel user login/);
+    child.stderr.emit("data", Buffer.from("Tunnel not found: fleet-abc\n"));
+    child.emit("exit", 2);
+    await expect(pending).rejects.toThrow(/Tunnel not found/);
+    for (const run of timers) run();
     expect(spawned).toHaveLength(1);
   });
 

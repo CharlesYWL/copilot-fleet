@@ -186,6 +186,36 @@ rotating on every restart. A fleet that restarts its Host needs an address that
 survives it: a named Cloudflare tunnel, a Tailscale Funnel hostname, or
 `FLEET_PUBLIC_URL` in front of a stable reverse proxy.
 
+### Reaching a private Dev Tunnel
+
+A private Dev Tunnel cannot be dialed directly, so a Node started with
+`--devtunnel=<id>` holds a `devtunnel connect` for its whole run and reaches the
+Host through the loopback port that forwards. The port is read back from the
+CLI's output rather than assumed, because the CLI quietly picks another when the
+one it wants is taken.
+
+That connect is retried, including the very first attempt. It used to be retried
+only after it had succeeded once, which drew the line in the worst possible
+place: a machine that had just rebooted raced its own network, lost that race,
+and exited — permanently, since the supervisor forwards a crash rather than
+looping on it. Its already-connected neighbours were never asked to resolve
+anything and carried on working, so the fleet looked healthy while the one
+machine that needed to come back was the one that could not. Retrying is now the
+default and the ready timeout is the deadline.
+
+Two failures are reported immediately instead, because no wait improves them: a
+CLI that is not signed in, and a tunnel this account cannot see. They are told
+apart by what the CLI said, not by its exit code alone — the codes are reused
+across causes, and an unrecognised message falls through to the retry loop,
+which is the safe way to be wrong.
+
+Whatever the CLI printed is quoted in every one of these errors. It used to be
+read into a buffer and dropped, leaving an exit code and a fixed suggestion to
+run `devtunnel user login` — which is a different failure with a different exit
+code, so the one line that explained the problem (`Tunnel not found: <id>`) was
+discarded in favour of a guess that sent operators to a machine that was already
+signed in.
+
 ### Keeping Nodes current
 
 A Node reports the git revision of the checkout it runs from, and the Host
