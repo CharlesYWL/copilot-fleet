@@ -103,6 +103,28 @@ Session alone; failing it would destroy a healthy run over a mistimed message.
 The Node re-announces the Session's true state behind the refusal, so a composer
 opened over a wrong guess closes on its own.
 
+### Turns Copilot starts on its own
+
+Not every Turn begins with a prompt. A backgrounded shell finishing wakes the
+Copilot process, which reads the output and carries on working — tool calls,
+reasoning, and a reply all arrive as ordinary `session/update` notifications
+with no `session/prompt` behind them.
+
+Session state was read off that request alone, so the fleet reported `idle`
+throughout and meant it: the composer stood open over an agent mid-Turn, Cancel
+was disabled for the whole of it, and the chime that announces a finished
+Session had already sounded — in one observed case fourteen minutes before the
+agent stopped.
+
+The Node therefore treats updates arriving while it is not prompting as a Turn
+of the agent's own, and reports `running` for it. ACP has no notification that
+starts or ends such a Turn, so its end is inferred from the stream going quiet
+(`UNPROMPTED_QUIET_MS`), with an unfinished tool call holding it open for a
+bounded while longer (`UNPROMPTED_TOOL_GRACE_MS`) — a tool says nothing between
+starting and ending, which is the one silence that means the opposite of
+finished. Cancel settles such a Turn directly, because there is no prompt
+response to carry a stop reason back.
+
 ## Protocols
 
 ### Browser to Host

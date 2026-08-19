@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import type { SessionEvent } from "@fleet/protocol";
 import {
   MockAgentFactory,
+  UnpromptedTurn,
   configRecoveryRequest,
   copilotLaunchArgs,
   copilotSupportsContextTier,
   toolDetail,
+  toolProgress,
 } from "./agents.js";
 
 describe("copilotLaunchArgs", () => {
@@ -136,6 +138,152 @@ describe("toolDetail", () => {
     expect(toolDetail({})).toBeUndefined();
     expect(toolDetail({ rawInput: "just a string" })).toBeUndefined();
     expect(toolDetail({ rawInput: { command: "   " } })).toBeUndefined();
+  });
+});
+
+describe("toolProgress", () => {
+  it("opens the call an agent has just started", () => {
+    expect(
+      toolProgress({
+        sessionUpdate: "tool_call",
+        toolCallId: "call-1",
+        status: "pending",
+      } as never),
+    ).toEqual({ id: "call-1", done: false });
+  });
+
+  it("closes one that reported an end, however it ended", () => {
+    for (const status of ["completed", "failed"]) {
+      expect(
+        toolProgress({
+          sessionUpdate: "tool_call_update",
+          toolCallId: "c",
+          status,
+        } as never),
+      ).toEqual({ id: "c", done: true });
+    }
+  });
+
+  it("leaves the call alone when an update only carries output", () => {
+    // Output streams in under the id of a call that has often already finished.
+    // Reading that as a fresh start would resurrect it, and an open call holds
+    // the turn it belongs to open behind it.
+    expect(
+      toolProgress({ sessionUpdate: "tool_call_update", toolCallId: "c" } as never),
+    ).toBeUndefined();
+  });
+
+  it("has nothing to say about updates that are not about tools", () => {
+    expect(
+      toolProgress({ sessionUpdate: "agent_message_chunk", content: {} } as never),
+    ).toBeUndefined();
+  });
+});
+
+describe("UnpromptedTurn", () => {
+  const setup = (options: { toolGraceMs?: number } = {}) => {
+    const events: string[] = [];
+    let clock = 0;
+    let pending: (() => void) | undefined;
+    const turn = new UnpromptedTurn(
+      () => events.push("start"),
+      () => events.push("settle"),
+      {
+        quietMs: 1_000,
+        toolGraceMs: options.toolGraceMs ?? 5_000,
+        now: () => clock,
+        setTimer: (fn) => {
+          pending = fn;
+          return fn;
+        },
+        clearTimer: () => {
+          pending = undefined;
+        },
+      },
+    );
+    /** Runs the pending quiet timer, with the clock moved to when it fires. */
+    const elapse = () => {
+      clock += 1_000;
+      const due = pending;
+      pending = undefined;
+      due?.();
+    };
+    return { turn, events, elapse };
+  };
+
+  it("reports a turn nobody prompted the moment work appears", () => {
+    // The bug this exists for: Copilot wakes itself when a backgrounded shell
+    // finishes, and the fleet went on calling the session idle while it worked.
+    const { turn, events } = setup();
+    turn.note();
+    expect(events).toEqual(["start"]);
+    expect(turn.active).toBe(true);
+  });
+
+  it("announces the turn once, not once per update", () => {
+    const { turn, events } = setup();
+    turn.note();
+    turn.note();
+    turn.note();
+    expect(events).toEqual(["start"]);
+  });
+
+  it("calls the turn finished once the stream goes quiet", () => {
+    const { turn, events, elapse } = setup();
+    turn.note();
+    elapse();
+    expect(events).toEqual(["start", "settle"]);
+    expect(turn.active).toBe(false);
+  });
+
+  it("holds the turn open while a tool call is still running", () => {
+    // A tool says nothing between starting and ending, so its silence is the
+    // one kind that means the agent is working rather than done.
+    const { turn, events, elapse } = setup();
+    turn.note({ id: "call-1", done: false });
+    elapse();
+    elapse();
+    expect(events).toEqual(["start"]);
+
+    turn.note({ id: "call-1", done: true });
+    elapse();
+    expect(events).toEqual(["start", "settle"]);
+  });
+
+  it("stops waiting on a tool call that never reports back", () => {
+    // Otherwise one lost ending owns the session: running for good, with the
+    // composer locked over an agent that stopped long ago.
+    const { turn, events, elapse } = setup({ toolGraceMs: 3_000 });
+    turn.note({ id: "call-1", done: false });
+    for (let attempt = 0; attempt < 5; attempt += 1) elapse();
+    expect(events).toEqual(["start", "settle"]);
+  });
+
+  it("stands down without a word when something else takes the session over", () => {
+    // A prompt arriving means the fleet is driving again, and it emits its own
+    // running state; a second one from here would only be noise.
+    const { turn, events, elapse } = setup();
+    turn.note();
+    turn.clear();
+    elapse();
+    expect(events).toEqual(["start"]);
+    expect(turn.active).toBe(false);
+  });
+
+  it("settles on demand, for a turn an operator cancelled", () => {
+    // Cancelling work nobody prompted produces no response to carry a stop
+    // reason, so this is the only end that turn will ever report.
+    const { turn, events } = setup();
+    turn.note();
+    turn.settle();
+    turn.settle();
+    expect(events).toEqual(["start", "settle"]);
+  });
+
+  it("says nothing about a turn that never started", () => {
+    const { turn, events } = setup();
+    turn.settle();
+    expect(events).toEqual([]);
   });
 });
 

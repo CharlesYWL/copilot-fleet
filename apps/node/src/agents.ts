@@ -33,6 +33,29 @@ export type ContextTier = "default" | "long_context";
 const ALLOW_ALL_OPTION = "allow_all";
 
 /**
+ * How long work nobody asked for may go quiet before it is called finished.
+ *
+ * Copilot starts turns of its own — a backgrounded shell finishing is the usual
+ * trigger — and nothing announces one in either direction: the stop reason
+ * comes back on a `session/prompt` this side never made. Silence is therefore
+ * the only end-of-turn signal there is, and the window has to clear the longest
+ * ordinary gap *inside* a turn, or a session would flap between running and
+ * idle and chime on every lap.
+ */
+export const UNPROMPTED_QUIET_MS = 45_000;
+
+/**
+ * How much longer an unfinished tool call may hold such a turn open.
+ *
+ * A tool call reports when it starts and when it ends and says nothing in
+ * between, so a long one is silence that means the opposite of finished. It is
+ * still only evidence: an ending that never arrives would pin the session as
+ * running for good and lock the composer over an agent doing nothing, so the
+ * benefit of the doubt is bounded rather than open.
+ */
+export const UNPROMPTED_TOOL_GRACE_MS = 10 * 60_000;
+
+/**
  * What to set, if anything, to get a session's pickers back.
  *
  * `session/new` reports the option list and `session/load` does not, so a
@@ -137,6 +160,150 @@ abstract class SequencedAgent {
   }
 }
 
+export type UnpromptedTurnOptions = {
+  quietMs?: number;
+  toolGraceMs?: number;
+  now?: () => number;
+  setTimer?: (fn: () => void, ms: number) => unknown;
+  clearTimer?: (timer: unknown) => void;
+};
+
+/**
+ * Notices Copilot working on a turn this node never asked for, so the fleet can
+ * still say so.
+ *
+ * Session state used to be read off the `session/prompt` request alone, which
+ * describes what the fleet asked for rather than what the agent is doing. The
+ * two part company whenever Copilot picks its own work back up — most often
+ * when a backgrounded shell finishes and wakes it — and the fleet reported
+ * `idle` throughout, and meant it: the composer stood open over an agent
+ * mid-turn, Cancel was disabled for the whole of it, and the chime that says a
+ * session has finished had already sounded, sometimes a quarter of an hour
+ * early.
+ *
+ * Nothing here can ask when such a turn ends, so it is inferred from the stream
+ * going quiet. That is a guess, and it is made deliberately late: being slow to
+ * call a turn finished costs a locked composer for a moment, while being quick
+ * about it costs a false chime and a session that flickers.
+ */
+export class UnpromptedTurn {
+  private started = false;
+  private lastSeen = 0;
+  private timer: unknown;
+  /** Tool calls that have reported a start but not an end. */
+  private readonly openTools = new Set<string>();
+  private readonly quietMs: number;
+  private readonly toolGraceMs: number;
+  private readonly now: () => number;
+  private readonly setTimer: (fn: () => void, ms: number) => unknown;
+  private readonly clearTimer: (timer: unknown) => void;
+
+  constructor(
+    private readonly onStart: () => void,
+    private readonly onSettle: () => void,
+    options: UnpromptedTurnOptions = {},
+  ) {
+    this.quietMs = options.quietMs ?? UNPROMPTED_QUIET_MS;
+    this.toolGraceMs = options.toolGraceMs ?? UNPROMPTED_TOOL_GRACE_MS;
+    this.now = options.now ?? Date.now;
+    this.setTimer =
+      options.setTimer ??
+      ((fn, ms) => {
+        const timer = setTimeout(fn, ms);
+        // A node waiting out a quiet window must still be able to exit.
+        timer.unref();
+        return timer;
+      });
+    this.clearTimer =
+      options.clearTimer ?? ((timer) => clearTimeout(timer as NodeJS.Timeout));
+  }
+
+  /** True while the agent is working on something nobody here prompted. */
+  get active(): boolean {
+    return this.started;
+  }
+
+  /**
+   * Records one update from an agent that was not prompted by this node.
+   *
+   * `tool` names the call the update concerns, when it names one at all: an
+   * update carrying only content leaves the outstanding calls alone, because
+   * output arriving for a call that has already finished must not reopen it and
+   * hold the turn open behind it.
+   */
+  note(tool?: { id: string; done: boolean }): void {
+    if (tool) {
+      if (tool.done) this.openTools.delete(tool.id);
+      else this.openTools.add(tool.id);
+    }
+    this.lastSeen = this.now();
+    if (!this.started) {
+      this.started = true;
+      this.onStart();
+    }
+    this.arm();
+  }
+
+  /** Calls the turn finished now and announces it. */
+  settle(): void {
+    if (!this.started) return;
+    this.reset();
+    this.onSettle();
+  }
+
+  /** Stands down without announcing anything: something else owns the state. */
+  clear(): void {
+    this.reset();
+  }
+
+  private reset(): void {
+    this.clearTimer(this.timer);
+    this.timer = undefined;
+    this.openTools.clear();
+    this.started = false;
+  }
+
+  private arm(): void {
+    this.clearTimer(this.timer);
+    this.timer = this.setTimer(() => this.check(), this.quietMs);
+  }
+
+  private check(): void {
+    if (!this.started) return;
+    // An unfinished tool call is an agent working with nothing to say about it,
+    // so the silence belongs to the tool rather than to the turn — up to the
+    // point where a call that is never coming back would own the session.
+    if (this.openTools.size > 0 && this.now() - this.lastSeen < this.toolGraceMs) {
+      this.timer = this.setTimer(() => this.check(), this.quietMs);
+      return;
+    }
+    this.settle();
+  }
+}
+
+/**
+ * Which tool call an update starts or finishes, when it says.
+ *
+ * Only a status settles that. Content updates arrive under the same call id
+ * with no status at all, and reading one as a fresh start would resurrect a
+ * call that had already reported its end.
+ */
+export function toolProgress(
+  update: acp.SessionUpdate,
+): { id: string; done: boolean } | undefined {
+  if (update.sessionUpdate === "tool_call") {
+    return { id: update.toolCallId, done: isFinishedTool(update.status) };
+  }
+  if (update.sessionUpdate === "tool_call_update" && update.status) {
+    return { id: update.toolCallId, done: isFinishedTool(update.status) };
+  }
+  return undefined;
+}
+
+function isFinishedTool(status: acp.ToolCallStatus | undefined): boolean {
+  return status === "completed" || status === "failed";
+}
+
 type PendingPermission = {
   options: acp.PermissionOption[];
   resolve: (value: acp.RequestPermissionResponse) => void;
@@ -160,6 +327,26 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
    * two-value select — so the raw list is what types an outgoing change.
    */
   private configOptions: acp.SessionConfigOption[] = [];
+  /**
+   * The turn Copilot started for itself, if it is in one.
+   *
+   * Its two ends are the whole point: `running` the moment work appears that no
+   * prompt here accounts for, and `idle` once it stops — which is what the
+   * composer, the Cancel button and the finished chime are all read off.
+   */
+  private readonly unprompted = new UnpromptedTurn(
+    () =>
+      this.emit("state", {
+        state: "running",
+        activity: "Copilot picked up work on its own",
+      }),
+    () => {
+      // A process that has already ended has emitted the state that settles it,
+      // and a queued timer must not walk that backwards.
+      if (this.stopping || this.hasTerminated) return;
+      this.emit("state", { state: "idle", activity: "Ready for follow-up" });
+    },
+  );
 
   constructor(
     fleetSessionId: string,
@@ -204,6 +391,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     });
     child.on("exit", (code, signal) => {
       this.denyPendingPermissions();
+      this.unprompted.clear();
       if (!this.stopping && !this.hasTerminated) {
         this.emit("state", {
           state: code === 0 ? "completed" : "failed",
@@ -226,7 +414,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           this.forwardUpdate(params.update);
           return;
         }
-        if (!this.replaying) this.forwardUpdate(params.update);
+        if (this.replaying) return;
+        this.watchUnpromptedWork(params.update);
+        this.forwardUpdate(params.update);
       });
     const stream = acp.ndJsonStream(
       Writable.toWeb(child.stdin),
@@ -312,6 +502,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
     if (this.prompting) throw new Error("A prompt is already active");
     this.prompting = true;
+    // The prompt owns the session's state from here, so whatever was inferred
+    // from a turn Copilot started for itself stands down without a word.
+    this.unprompted.clear();
     this.emit("state", { state: "running", activity: "Copilot is working" });
     // Only the file's name and size are recorded: the transcript is stored on
     // the Host and replayed to every browser watching, which a few megabytes of
@@ -345,7 +538,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   }
 
   get busy(): boolean {
-    return this.prompting;
+    return this.prompting || this.unprompted.active;
   }
 
   /**
@@ -359,7 +552,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (this.hasTerminated || this.stopping) return;
     this.emit(
       "state",
-      this.prompting
+      this.busy
         ? { state: "running", activity: "Copilot is working" }
         : { state: "idle", activity: "Ready for follow-up" },
     );
@@ -373,6 +566,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     await this.connection.agent.notify(acp.methods.agent.session.cancel, {
       sessionId: this.agentSessionId,
     });
+    // A turn nobody prompted has no response to carry a stop reason back, so
+    // the cancel itself is the only end it will ever report.
+    this.unprompted.settle();
   }
 
   /**
@@ -400,6 +596,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    this.unprompted.clear();
     this.denyPendingPermissions();
     this.connection?.close();
     if (this.child && this.child.exitCode === null) {
@@ -467,6 +664,19 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       update.sessionUpdate === "available_commands_update" ||
       update.sessionUpdate === "config_option_update"
     );
+  }
+
+  /**
+   * Reads work the fleet did not ask for off the update stream.
+   *
+   * Everything Copilot does arrives here, whether a `session/prompt` is in
+   * flight or not, and the difference is invisible in the updates themselves —
+   * so anything that turns up while this node is not prompting is a turn it
+   * started for itself, and the session is running whether or not it was asked.
+   */
+  private watchUnpromptedWork(update: acp.SessionUpdate): void {
+    if (this.prompting || this.stopping || this.hasTerminated) return;
+    this.unprompted.note(toolProgress(update));
   }
 
   private forwardUpdate(update: acp.SessionUpdate): void {
