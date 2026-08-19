@@ -1,8 +1,15 @@
 # Session relay: pairing a working agent with a reviewing agent
 
 **Date:** 2026-08-17
-**Status:** Draft — exploration
+**Status:** Superseded in part by `2026-08-18-fleet-orchestrator-design.md`
 **Scope:** Let one Session's output become another Session's prompt, so a worker/reviewer pair runs without an operator copying text between two cards.
+
+> **Read this for the transport analysis, not the design.** The finding that ACP
+> has no peer channel and that the Host is the only possible orchestrator still
+> holds, and the filesystem hazard below applies to any multi-session scheme.
+> The `SessionLink` mechanism — a fixed worker→reviewer edge — was rejected:
+> the decision to review, and with which model, is a judgement call that belongs
+> to a model rather than to a stored rule. See the orchestrator design.
 
 ## The question this answers
 
