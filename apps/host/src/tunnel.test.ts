@@ -3,6 +3,7 @@ import {
   BinaryProbe,
   restartDelay,
   RESTART_DELAYS_MS,
+  shouldAdoptTunnelId,
   TunnelManager,
   TunnelSupervisor,
 } from "./tunnel.js";
@@ -222,6 +223,54 @@ describe("devtunnel output parsing", () => {
   it("forwards the loopback port as an explicit http origin", () => {
     const args = providerSpecs.devtunnel.args(parseLocalTarget("http://127.0.0.1:8790"));
     expect(args).toEqual(["host", "-p", "8790", "--protocol", "http"]);
+  });
+
+  it("reads the cluster-qualified id out of what the CLI really prints", () => {
+    // Captured from `devtunnel host fleet-72f9a3f7.usw2`. The cluster suffix is
+    // the whole point: without it the name means a different tunnel depending
+    // on which cluster the asking machine resolves to.
+    const real = [
+      "Connection to host tunnel relay restored.",
+      "Hosting port: 8790",
+      "Connect via browser: https://hhjtkdn1-8790.usw2.devtunnels.ms",
+      "Inspect network activity: https://hhjtkdn1-8790-inspect.usw2.devtunnels.ms",
+      "",
+      "Ready to accept connections for tunnel: fleet-72f9a3f7.usw2",
+    ].join("\n");
+    expect(providerSpecs.devtunnel.extractId?.(real)).toBe("fleet-72f9a3f7.usw2");
+  });
+});
+
+describe("shouldAdoptTunnelId", () => {
+  /**
+   * The reboot that split the fleet. `devtunnel create fleet-abc` from a machine
+   * that resolves to a new cluster reports no conflict — the name is free there
+   * — so it mints a second tunnel, and the Host hosts one while every node dials
+   * the other.
+   */
+  it("upgrades a bare name to the cluster the CLI actually hosted", () => {
+    expect(shouldAdoptTunnelId("fleet-72f9a3f7", "fleet-72f9a3f7.usw2")).toBe(true);
+  });
+
+  it("follows the CLI when it lands in a different cluster than last time", () => {
+    // The Host must record where it really is, not where it meant to be; the
+    // recorded name is what the next start and every node command use.
+    expect(shouldAdoptTunnelId("fleet-72f9a3f7.usw2", "fleet-72f9a3f7.usw3")).toBe(true);
+  });
+
+  it("stays put once the stored name already matches", () => {
+    // The banner is re-parsed on every chunk, so a rewrite per chunk would be a
+    // settings write per line of output.
+    expect(shouldAdoptTunnelId("fleet-72f9a3f7.usw2", "fleet-72f9a3f7.usw2")).toBe(false);
+  });
+
+  it("keeps what it has when the CLI has not named a tunnel yet", () => {
+    expect(shouldAdoptTunnelId("fleet-72f9a3f7", undefined)).toBe(false);
+    expect(shouldAdoptTunnelId(undefined, undefined)).toBe(false);
+  });
+
+  it("takes the first id a provider reports when nothing was asked for", () => {
+    expect(shouldAdoptTunnelId(undefined, "neat-lake-7x8gj9s.usw2")).toBe(true);
   });
 });
 

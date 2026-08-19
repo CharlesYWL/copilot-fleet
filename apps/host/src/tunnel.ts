@@ -87,6 +87,31 @@ export function restartDelay(attempt: number): number {
   return RESTART_DELAYS_MS[index]!;
 }
 
+/**
+ * Whether the id the CLI reported should replace the one it was asked for.
+ *
+ * Dev Tunnels names a tunnel `<name>.<cluster>`, and the cluster is chosen by
+ * the service when the tunnel is created, from wherever the machine happened to
+ * be reaching it. A bare `fleet-abc` is therefore not an identifier at all: it
+ * is a name that exists once per cluster, and `devtunnel create fleet-abc` from
+ * a machine that now resolves elsewhere reports no conflict, because in that
+ * cluster the name is free — it quietly mints a *second* tunnel.
+ *
+ * That is what a reboot did here. The Host came back hosting `fleet-abc.usw3`
+ * while every node still dialed the `fleet-abc` that resolved to `.usw2`, and
+ * the fleet was split in half by a name both halves agreed on.
+ *
+ * The CLI prints the tunnel it actually hosted, cluster and all, so that is the
+ * name worth keeping: it names one tunnel from any machine, in any order, for
+ * good. Adopting it is what stops the next reboot from forking the fleet again.
+ */
+export function shouldAdoptTunnelId(
+  current: string | undefined,
+  reported: string | undefined,
+): reported is string {
+  return Boolean(reported) && reported !== current;
+}
+
 type TunnelManagerOptions = {
   /** Loopback target the tunnel should forward to, e.g. http://127.0.0.1:8787 */
   localTarget: string;
@@ -267,7 +292,10 @@ export class TunnelManager {
         throw error;
       }
       // Reported straight away: the connect command depends on it, and for a
-      // reused tunnel it is already true before the CLI prints anything.
+      // reused tunnel it is already true before the CLI prints anything. It is
+      // only provisional, though — see the adoption in `onChunk`, which trades
+      // it for the cluster-qualified name once the CLI says which tunnel it
+      // actually hosted.
       this.tunnelId = reusedId;
     }
 
@@ -282,7 +310,17 @@ export class TunnelManager {
       if (this.buffer.length > 64_000) this.buffer = this.buffer.slice(-32_000);
       // The id can be printed after the URL, so it is parsed on its own
       // schedule rather than being folded into the URL branch below.
-      if (!this.tunnelId) this.tunnelId = spec.extractId?.(this.buffer);
+      //
+      // Adopted rather than merely filled in when absent. The id this was
+      // started with can be a bare name that means a different tunnel from a
+      // different machine; what the CLI prints is the one it is hosting, and
+      // persisting that is what keeps every later start and every node pointed
+      // at the same tunnel.
+      const reported = spec.extractId?.(this.buffer);
+      if (shouldAdoptTunnelId(this.tunnelId, reported)) {
+        this.tunnelId = reported;
+        this.persistedTunnelId?.set(this.provider, reported);
+      }
       if (!this.inspectUrl) this.inspectUrl = spec.extractInspectUrl?.(this.buffer);
       if (this.tunnelUrl) return;
       const url = spec.extractUrl(this.buffer);

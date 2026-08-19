@@ -216,6 +216,30 @@ code, so the one line that explained the problem (`Tunnel not found: <id>`) was
 discarded in favour of a guess that sent operators to a machine that was already
 signed in.
 
+#### Naming one tunnel rather than one name
+
+A Dev Tunnel is identified by `<name>.<cluster>`, and the cluster is chosen by
+the service at creation time from wherever the creating machine reached it. A
+bare `fleet-abc` is therefore not an identifier: it is a name that can exist
+once in every cluster, and `devtunnel create fleet-abc` from a machine that now
+resolves elsewhere reports no conflict, because in that cluster the name is
+free. It quietly mints a second tunnel.
+
+That is what a Host reboot did. The Host came back hosting `fleet-abc.usw3`
+while every Node still dialed the `fleet-abc` that resolved to `.usw2`, and the
+fleet was split in half by a name both halves agreed on. Nothing failed loudly:
+the Nodes' tunnels came up and forwarded a port to a tunnel with no host behind
+it, which looks exactly like a Host that is down.
+
+The Host now records the name the CLI reports rather than the one it asked for.
+`devtunnel host` prints `Ready to accept connections for tunnel: <name>.<cluster>`
+— the tunnel it actually hosted — and that fully-qualified name is adopted and
+persisted, so every later start, and every `--devtunnel` command handed to a
+Node, names one tunnel from any machine in any cluster. The parsing already
+existed and was already correct; its result was thrown away, because the id was
+seeded from settings before the spawn and only filled in `if` it was still
+missing.
+
 ### Keeping Nodes current
 
 A Node reports the git revision of the checkout it runs from, and the Host
