@@ -344,7 +344,8 @@ grow one: it serves a browser where a human is the budget.
 There is also a security asymmetry worth naming. The Node transport is
 authenticated (enrollment token exchanged for a per-Node secret), but **the
 browser-facing REST API has no authentication at all** — a deliberate MVP
-position, stated in PRODUCT.md and unchanged in `routes/`. Pointing an
+position, stated in ARCHITECTURE.md's security boundary and unchanged in
+`routes/`. Pointing an
 autonomous agent at that API means handing it, and anything else that can reach
 the port, the whole fleet with no budget and no role. The MCP facade is the
 natural place to put the token, the role, and the ceiling that the API

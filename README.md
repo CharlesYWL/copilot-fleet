@@ -66,7 +66,8 @@ runs. Stop everything with Ctrl+C as usual.
 Open the UI → **Settings**:
 
 - **General** — session defaults, plus export/import to move this Host.
-- **Tunnel** — toggle a Cloudflare quick tunnel (requires `cloudflared` on PATH).
+- **Tunnel** — run Cloudflare, Dev Tunnels, Tailscale Funnel, ngrok, or bore;
+  each installed provider has its own switch and status.
 - **Nodes** — rename/delete machines and copy the enroll command.
 - **Workspaces** — map projects to per-machine paths.
 
@@ -136,6 +137,7 @@ machine. Run `npm run start:node -- --help` for the current list.
 | `--copilot-command`               | `FLEET_COPILOT_COMMAND`  |
 | `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`  |
 | `--context-tier`                  | `FLEET_CONTEXT_TIER`     |
+| `--devtunnel`                     | `FLEET_DEVTUNNEL_ID`     |
 | `--config-port`                   | `FLEET_NODE_CONFIG_PORT` |
 | `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`       |
 
@@ -157,10 +159,9 @@ anything that reached the agent can be picked up again with **Resume**. To
 follow a rotated tunnel URL without losing live sessions, retarget from the node
 config page instead: it reconnects in place.
 
-`--name` is not a display detail: the Host keys a node by name, so starting under
-a different one enrolls a _new_ machine and leaves the old node's placements and
-sessions behind. Starting again under the previous name reclaims the same node
-id and brings them back.
+The `nodeId` stored in `node.json` is the machine's identity. `--name` proposes a
+new label for that identity; it does not create a second node or abandon the
+existing node's placements and sessions.
 
 ### Rows that fold themselves away
 
@@ -357,10 +358,10 @@ nothing runs until you ask it to. Turn it off under **Settings → General** if
 you would rather press Resume yourself.
 
 Three things have to hold for that to work: the Host's `DATABASE_PATH` file is
-intact, the node starts under the same name, and Copilot on that machine still
-has the agent session on disk. A session that died before its agent ever started
-has nothing to re-attach to — it settles as "it never reached the agent" and
-offers no Resume.
+intact, the node starts with the same `node.json` identity, and Copilot on that
+machine still has the agent session on disk. A session that died before its agent
+ever started has nothing to re-attach to — it settles as "it never reached the
+agent" and offers no Resume.
 
 A node keeps its agents running while the Host is away and buffers the events
 they produce, so a Host restart mid-turn no longer costs that part of the
@@ -408,6 +409,9 @@ What it does and does not cover:
 - A node reached _through_ the tunnel that just rotated cannot be told: that
   socket died with the tunnel. It keeps retrying its known addresses, so it
   recovers on its own if one of them still answers.
+- A private Dev Tunnel is advertised for enrollment but never pushed as a public
+  Host URL. Its nodes use `--devtunnel=<id>`, keep a local `devtunnel connect`
+  forward alive, and dial the loopback port that client reports.
 - Loopback is never announced. When no tunnel is up and no `FLEET_PUBLIC_URL` is
   set, the Host's idea of its own address is `http://127.0.0.1:8787`, which on
   another machine points at that machine. Nodes are left on the address they
@@ -578,17 +582,19 @@ never cross it, and the Node is the side that dials out.
 5. The official `@agentclientprotocol/sdk` performs `initialize`,
    `session/new`, prompt/update streaming, follow-up prompts, and
    `session/cancel`. Stop closes ACP and terminates the child.
-6. Node events carry a UUID plus a per-session monotonic sequence. SQLite
-   rejects gaps and duplicates; normalized sessions/events are broadcast to
-   browsers and rebuild the transcript after refresh.
+6. Node events carry a UUID plus a per-session monotonic sequence. SQLite ignores
+   duplicates and records sequence gaps rather than rejecting everything after
+   an outage; normalized sessions/events are broadcast to browsers and rebuild
+   the transcript after refresh.
 7. ACP permission requests become persisted events. Browser allow-once/deny
    decisions round-trip to the waiting ACP request. Timeout or Node/Host
    disconnect denies pending requests. Cancel also denies pending requests before
    `session/cancel`.
-8. A WebSocket disconnect intentionally stops every local agent process. Host
-   marks non-terminal sessions failed; there is no process resume in the MVP.
-   After a Host restart, temporary `offline` rows are reconciled to failed when
-   the Node reconnects with no matching active process.
+8. A transient Host WebSocket disconnect leaves local agent processes running.
+   The Node buffers their events and re-announces active and busy sessions when it
+   reconnects. The Host keeps them `offline` meanwhile and settles only sessions
+   missing from the returning inventory as failed-but-resumable. An explicit Node
+   shutdown still stops its local agents.
 
 ### The states a session moves through
 

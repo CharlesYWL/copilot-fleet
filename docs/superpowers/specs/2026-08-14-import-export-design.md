@@ -1,7 +1,7 @@
 # Import / export Host and Node identity
 
 **Date:** 2026-08-14  
-**Status:** Approved — implementing  
+**Status:** Implemented
 **Scope:** Move a Host (catalog, sessions, transcripts, settings) or a Node (identity + local settings) between machines. Replace-on-import. Transfer a tunnel only when the Host address is stable.
 
 ## Goal

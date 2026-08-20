@@ -44,10 +44,10 @@ it.
 
 So agent-to-agent messaging is not a gap in the transport that can be patched at
 the Node. It is a property of the topology, and the only place with a view of
-more than one session is the Host. Both product documents already say so, as
-non-goals rather than oversights: "Agent-to-agent DAGs" in ARCHITECTURE.md, and
-"agent-to-agent messaging" in PRODUCT.md. This design fills in a seam the
-architecture anticipated, on the side of the boundary that owns desired state.
+more than one session is the Host. ARCHITECTURE.md already names
+"Agent-to-agent DAGs" as a non-goal rather than an overlooked transport feature.
+This design fills in a seam the architecture anticipated, on the side of the
+boundary that owns desired state.
 
 ## What the Host already has
 

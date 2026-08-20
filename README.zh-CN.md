@@ -59,7 +59,8 @@ npm run dev:tunnel
 打开界面 → **Settings**：
 
 - **General** —— 会话默认值，以及用于迁移 Host 的导出/导入。
-- **Tunnel** —— 开关 Cloudflare quick tunnel（需要 PATH 上有 `cloudflared`）。
+- **Tunnel** —— 运行 Cloudflare、Dev Tunnels、Tailscale Funnel、ngrok 或 bore；
+  每个已安装的 provider 都有自己的开关和状态。
 - **Nodes** —— 重命名/删除机器，复制注册命令。
 - **Workspaces** —— 把项目映射到每台机器上的路径。
 
@@ -122,6 +123,7 @@ npm run start:node -- --url="https://fleet.example.com" --token="replace-with-ho
 | `--copilot-command`               | `FLEET_COPILOT_COMMAND`  |
 | `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`  |
 | `--context-tier`                  | `FLEET_CONTEXT_TIER`     |
+| `--devtunnel`                     | `FLEET_DEVTUNNEL_ID`     |
 | `--config-port`                   | `FLEET_NODE_CONFIG_PORT` |
 | `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`       |
 
@@ -140,9 +142,8 @@ npm start -- --url=https://fleet.example.com
 接回来。想在不丢失在线会话的前提下跟随轮换后的隧道地址，请改用节点配置页：它会原地
 重连。
 
-`--name` 不只是显示用的：Host 以名字作为节点的键，用不同的名字启动会注册出一台**新**
-机器，把旧节点的放置和会话留在原处。用回原来的名字启动会重新取回同一个节点 id，并把
-它们带回来。
+`node.json` 中的 `nodeId` 才是机器身份。`--name` 只是为这个身份提出一个新标签，不会注册
+第二台机器，也不会丢下原有节点的放置和会话。
 
 ### 空闲分支会自动收起
 
@@ -290,9 +291,10 @@ fleet 有两类状态，所以有两个文件。
 重试。重新接上不会发送提示词：代理落在 idle 等待输入，在你开口之前什么都不会跑。如果
 你更希望自己按 Resume，可以在 **Settings → General** 里关掉它。
 
-要让这一切成立需要三个条件：Host 的 `DATABASE_PATH` 文件完好，节点以同样的名字启动，
-以及那台机器上的 Copilot 磁盘上还留着那个代理会话。一个在代理启动之前就死掉的会话没有
-任何东西可以接回 —— 它会落定为“从未抵达代理”，并且不提供 Resume。
+要让这一切成立需要三个条件：Host 的 `DATABASE_PATH` 文件完好，节点使用同一个
+`node.json` 身份启动，以及那台机器上的 Copilot 磁盘上还留着那个代理会话。一个在代理
+启动之前就死掉的会话没有任何东西可以接回 —— 它会落定为“从未抵达代理”，并且不提供
+Resume。
 
 节点在 Host 缺席期间会让代理继续跑，并缓冲它们产生的事件，所以回合进行中的 Host 重启
 不再让那一段对话记录消失。如果中断时间超过缓冲区，Host 会记录这段缺口并继续；它绝不会
@@ -331,6 +333,8 @@ fleet 有两类状态，所以有两个文件。
   并跟上。
 - 通过**刚刚轮换掉的那条隧道**访问的节点无法被告知：那条 socket 随隧道一起死了。它会
   继续重试自己已知的地址，所以只要其中一个还能应答，它就能自行恢复。
+- 私有 Dev Tunnel 会用于注册，但绝不会作为公网 Host URL 推送给在线节点。对应节点使用
+  `--devtunnel=<id>`，持续运行本地 `devtunnel connect` 转发，并拨号到客户端报告的回环端口。
 - 回环地址永远不会被广播。当没有隧道且没有设置 `FLEET_PUBLIC_URL` 时，Host 对自身地址的
   认知是 `http://127.0.0.1:8787`，而这在另一台机器上指向的是那台机器。此时节点会保留它
   们已有的地址。
@@ -471,14 +475,14 @@ npm test
    一个隔离的 ACP 连接。
 5. 官方的 `@agentclientprotocol/sdk` 执行 `initialize`、`session/new`、提示词/更新流式
    传输、追加提示词和 `session/cancel`。Stop 会关闭 ACP 并终止子进程。
-6. 节点事件带有 UUID 以及每会话单调递增的序号。SQLite 拒绝缺口与重复；规范化后的
-   会话/事件被广播给浏览器，用于在刷新后重建对话记录。
+6. 节点事件带有 UUID 以及每会话单调递增的序号。SQLite 忽略重复，并记录序号缺口，而不是
+   在中断后拒绝所有后续事件；规范化后的会话/事件被广播给浏览器，用于在刷新后重建对话记录。
 7. ACP 权限请求会成为持久化事件。浏览器的 allow-once/deny 决定会回到等待中的 ACP 请求。
    超时或 Node/Host 断连会拒绝待处理的请求。Cancel 也会在 `session/cancel` 之前拒绝待
    处理的请求。
-8. WebSocket 断开会有意地停止本地所有代理进程。Host 把非终态会话标记为 failed；MVP 中
-   没有进程级恢复。Host 重启后，临时的 `offline` 行会在 Node 重连且没有对应活跃进程时
-   被调和为 failed。
+8. Host WebSocket 的短暂断开不会停止本地代理进程。Node 会缓冲它们的事件，并在重连时
+   重新上报活跃会话以及其中正处于回合中的会话。Host 在此期间把它们保留为 `offline`，
+   只有返回清单中缺失的会话才会落定为可恢复的 failed。显式关闭 Node 仍会停止本地代理。
 
 ### 一个会话会经历的状态
 
