@@ -33,11 +33,15 @@ import {
 import { planCredentials } from "./enrollment.js";
 import {
   adoptHostUrl,
+  dialableInMode,
   endpointsAfterOperatorEdit,
   endpointsBehindLocalForward,
+  firstDialUrl,
   nextHostUrl,
   promoteHostUrl,
+  recordHostUrl,
   type HostEndpoints,
+  type TunnelMode,
 } from "./host-endpoints.js";
 import { envFilePath } from "./paths.js";
 import {
@@ -154,6 +158,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    */
   let onTunnelUrlChanged: (url: string) => void = () => {};
   const devTunnelId = env.FLEET_DEVTUNNEL_ID;
+  /**
+   * Which addresses this node is willing to dial, for the whole run.
+   *
+   * Started with `--devtunnel` means the Host is reachable through one local
+   * forward and nowhere else, so every other address on file — a public
+   * `*.devtunnels.ms` URL, a named tunnel this node once used — is not a
+   * fallback but a fast failure, and fast failures are what drive the recycler
+   * into killing the forward. Fixed here rather than inferred per dial so the
+   * rule cannot change under a reconnect.
+   */
+  const tunnelMode: TunnelMode = devTunnelId ? "devtunnel" : "direct";
   if (devTunnelId) {
     startupLog(`Connecting to dev tunnel ${devTunnelId}`);
     devTunnel = await connectDevTunnel(devTunnelId, {
@@ -203,6 +218,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   log(`copilot-fleet node ${VERSION}${REVISION ? ` (${REVISION})` : ""} starting`);
   log(`  name        ${settings.nodeName}`);
   log(`  host        ${settings.hostUrl}`);
+  if (devTunnelId) log(`  route       dev tunnel ${devTunnelId} (exclusive)`);
   log(`  agent       ${mockAgent ? "mock" : "copilot --acp"}`);
   log(`  permissions ${mockAgent ? "n/a" : "per session (Host decides)"}`);
   log(`  capacity    ${settings.maxSessions} concurrent sessions`);
@@ -244,7 +260,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * the fallbacks without rewriting settings.json on every retry — only the
    * address that actually produces a welcome is written back.
    */
-  let dialUrl = credentials.hostUrl;
+  let dialUrl = firstDialUrl(settings, credentials.hostUrl, tunnelMode);
   /** Consecutive dials that never produced a welcome; see the close handler. */
   let unreachableDials = 0;
   /** Whether this outage has already reported that there is nowhere to rotate. */
@@ -352,7 +368,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /** Drops the current socket so the next connect uses the latest credentials. */
   function reconnect(): void {
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    dialUrl = credentials.hostUrl;
+    dialUrl = firstDialUrl(settings, credentials.hostUrl, tunnelMode);
     const current = socket;
     socket = undefined;
     // Removing listeners first stops the close handler from scheduling its own
@@ -400,6 +416,19 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    */
   async function applyAnnouncedHostUrl(hostUrl: string): Promise<void> {
     if (sameHostUrl(hostUrl, settings.hostUrl)) return;
+    // Recorded but not followed when it belongs to the other tunnel mode. A
+    // node behind its own `devtunnel connect` reaches the Host on one loopback
+    // port; being moved to the public URL of that same tunnel would send it to
+    // a Microsoft login it cannot answer, and it would then be unreachable for
+    // a correction. Keeping the address means a node whose mode changes later
+    // still knows where the Host lives.
+    if (!dialableInMode(hostUrl, tunnelMode)) {
+      await persistEndpoints(recordHostUrl(settings, hostUrl));
+      log(
+        `Host announced ${hostUrl}; noted it, but this node reaches the Host over its own ${tunnelMode} route and stays on ${settings.hostUrl}`,
+      );
+      return;
+    }
     const moved = adoptHostUrl(settings, hostUrl);
     await persistEndpoints(moved);
     dialUrl = moved.hostUrl;
@@ -653,7 +682,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // Host was reached — keeps a working address from being blamed for a
       // problem that is not its own.
       if (!welcomed) {
-        const candidate = nextHostUrl(settings, attemptUrl);
+        const candidate = nextHostUrl(settings, attemptUrl, tunnelMode);
         if (!sameHostUrl(candidate, attemptUrl)) {
           log(`No Host at ${attemptUrl}; trying ${candidate} next`);
           dialUrl = candidate;
@@ -667,7 +696,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           // should ask of whoever is reading it at the time.
           strandedReported = true;
           warn(
-            `No Host at ${attemptUrl}, and it is the only address this node knows — retrying it until the Host returns. Add another Host URL on the node config page to give this node somewhere to fall back to.`,
+            tunnelMode === "devtunnel"
+              ? `No Host at ${attemptUrl}, which is the only address a node behind \`devtunnel connect ${devTunnelId}\` can use — retrying it while the tunnel is rebuilt. Check that the Host is hosting that tunnel.`
+              : `No Host at ${attemptUrl}, and it is the only address this node knows — retrying it until the Host returns. Add another Host URL on the node config page to give this node somewhere to fall back to.`,
           );
         }
         // Repeated silence from a dev tunnel's forwarded port is the only

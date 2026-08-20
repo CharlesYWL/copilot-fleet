@@ -519,3 +519,131 @@ describe("connectDevTunnel rebuildNow", () => {
     expect(notes.some((line) => line.includes("not reaching the Host"))).toBe(true);
   });
 });
+
+/**
+ * The livelock this window exists to break.
+ *
+ * `recycle` is driven by the node failing to reach the Host, and a refused
+ * loopback port is refused in about a millisecond — so while the forward is
+ * down the node reaches its recycle threshold every six seconds and never
+ * stops. Each rebuild was therefore killed a few seconds in, which is less
+ * time than the relay handshake needs after a Host restart, so the client
+ * never got as far as printing a port and the node stayed down until someone
+ * pressed the button by hand.
+ */
+describe("connectDevTunnel recycle grace", () => {
+  /**
+   * Timers with real handles.
+   *
+   * The other harnesses in this file hand back `0` for every timer, which is
+   * falsy — so a guard written as `if (timer) return` cannot be observed at
+   * all. Anything asserting that a pending timer suppresses work has to model
+   * handles properly or it passes without testing what it claims to.
+   */
+  const harness = (recycleGraceMs = 30_000) => {
+    const children: ReturnType<typeof fakeChild>[] = [];
+    const pending = new Map<number, () => void>();
+    let nextHandle = 1;
+    return {
+      children,
+      pending,
+      /** Fires the most recently scheduled timer that is still outstanding. */
+      fireLatest: () => {
+        const handle = Math.max(...pending.keys());
+        const fn = pending.get(handle);
+        pending.delete(handle);
+        fn?.();
+      },
+      options: {
+        spawnProcess: (() => {
+          const next = fakeChild();
+          children.push(next);
+          return next;
+        }) as never,
+        setTimer: ((fn: () => void) => {
+          const handle = nextHandle;
+          nextHandle += 1;
+          pending.set(handle, fn);
+          return handle as unknown as NodeJS.Timeout;
+        }) as never,
+        clearTimer: ((handle: number) => {
+          pending.delete(handle);
+        }) as never,
+        recycleGraceMs,
+      },
+    };
+  };
+
+  const forwarding = (child: ReturnType<typeof fakeChild>, port = 8790) =>
+    child.stdout.emit("data", Buffer.from(`Forwarding from 127.0.0.1:${port} to x\n`));
+
+  const rebuilt = async (h: ReturnType<typeof harness>) => {
+    const promise = connectDevTunnel("fleet-abc", h.options);
+    forwarding(h.children[0]!);
+    const conn = await promise;
+    // A healthy client is fair game, so this first ask goes through and the
+    // respawn it queues brings up the client the test is actually about.
+    conn.recycle();
+    h.fireLatest();
+    return conn;
+  };
+
+  it("leaves a rebuilt client alone while it is still handshaking", async () => {
+    const h = harness();
+    const conn = await rebuilt(h);
+    expect(h.children).toHaveLength(2);
+
+    conn.recycle();
+
+    // Without the window this is the kill that made the outage permanent: the
+    // replacement dies before it can report a port, so `attempt` never resets
+    // and the next one gets no longer.
+    expect(h.children[1]!.kill).not.toHaveBeenCalled();
+    expect(h.children).toHaveLength(2);
+  });
+
+  it("hands the recycler back its job once the port is reported", async () => {
+    const h = harness();
+    const conn = await rebuilt(h);
+    forwarding(h.children[1]!, 8791);
+
+    conn.recycle();
+
+    // Up and serving, so a failure to reach the Host really is evidence about
+    // the tunnel again.
+    expect(h.children[1]!.kill).toHaveBeenCalled();
+  });
+
+  it("still rebuilds a client that has wedged without ever reporting a port", async () => {
+    const h = harness();
+    const conn = await rebuilt(h);
+
+    conn.recycle();
+    expect(h.children[1]!.kill).not.toHaveBeenCalled();
+    // The window is a grace, not an amnesty: it runs out.
+    h.fireLatest();
+    conn.recycle();
+
+    expect(h.children[1]!.kill).toHaveBeenCalled();
+  });
+
+  it("does not let an expired window disarm the next client's", async () => {
+    const h = harness();
+    const conn = await rebuilt(h);
+    // Captured rather than looked up later: clearing a timer removes it from
+    // the map, but the callback a real runtime already queued still runs.
+    const staleWindow = h.pending.get(Math.max(...h.pending.keys()))!;
+
+    forwarding(h.children[1]!, 8791);
+    conn.recycle();
+    h.fireLatest();
+    expect(h.children).toHaveLength(3);
+
+    // A callback that outlived its window must not clear the handle belonging
+    // to the client that replaced it, or the recycler gets a brand new child.
+    staleWindow();
+    conn.recycle();
+
+    expect(h.children[2]!.kill).not.toHaveBeenCalled();
+  });
+});

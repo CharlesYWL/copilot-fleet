@@ -22,6 +22,7 @@ import {
   type Snapshot,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
+import { isBroadcastableHostUrl } from "./host-url.js";
 import { reservedSessionCount, yoloUnsupportedReason } from "./session-policy.js";
 
 /** `Omit` over a union has to be distributed, or the discriminant collapses. */
@@ -219,6 +220,18 @@ export class FleetService {
    * address, a named tunnel — which is precisely the set that can act on it.
    */
   broadcastHostUrl(hostUrl: string): number {
+    // Checked again at the point of sending, not only where the address was
+    // chosen. Every other mistake here costs a reconnect; this one costs the
+    // machine — a Node that follows an address it cannot authenticate to is
+    // beyond the reach of the correction, so the cheap check goes on both sides
+    // of the decision.
+    if (!isBroadcastableHostUrl(hostUrl)) {
+      this.log.warn(
+        { hostUrl },
+        "Refused to announce a Host URL that a Node could not authenticate to",
+      );
+      return 0;
+    }
     let notified = 0;
     for (const [nodeId, socket] of this.nodeSockets) {
       const node = this.store.getNode(nodeId);

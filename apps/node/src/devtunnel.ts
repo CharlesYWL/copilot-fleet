@@ -16,6 +16,26 @@ const READY_TIMEOUT_MS = 60_000;
 /** Backoff for respawning a connect that died; caps so it stops hammering. */
 export const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 
+/**
+ * How long a freshly spawned client is left alone to finish its handshake.
+ *
+ * {@link DevTunnelConnection.recycle} is driven by the node failing to reach the
+ * Host, and those failures do not stop while a rebuild is in progress — a
+ * refused loopback port is refused in about a millisecond, so the node reaches
+ * its recycle threshold every six seconds for as long as the forward is down.
+ * Without this window the retry loop killed each new client two to six seconds
+ * in, which is less time than a relay handshake takes: restarting the Host
+ * changes its tunnel host key, and the client answers that by tearing the
+ * session down and refreshing it, the slowest path it has. The client therefore
+ * never reached the point of printing a port, `attempt` never reset, and the
+ * node sat in a loop that could only be broken by hand — the tunnel was not
+ * failing to come up, it was being killed on the way.
+ *
+ * Bounded rather than indefinite: a client that has genuinely wedged still has
+ * to be rebuilt, so protection expires and the loop takes over again.
+ */
+export const RECYCLE_GRACE_MS = 30_000;
+
 export function reconnectDelay(attempt: number): number {
   return RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)]!;
 }
@@ -103,6 +123,8 @@ export type ConnectOptions = {
   onUrlChanged?: (url: string) => void;
   setTimer?: (fn: () => void, ms: number) => NodeJS.Timeout;
   clearTimer?: (timer: NodeJS.Timeout) => void;
+  /** How long a new client is protected from {@link RECYCLE_GRACE_MS}. */
+  recycleGraceMs?: number;
 };
 
 /**
@@ -137,16 +159,42 @@ export function connectDevTunnel(
   const warn = options.warn ?? log;
   const setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = options.clearTimer ?? ((timer) => clearTimeout(timer));
+  const recycleGraceMs = options.recycleGraceMs ?? RECYCLE_GRACE_MS;
 
   let child: ChildProcess | undefined;
   let currentUrl: string | undefined;
   let stopped = false;
   let attempt = 0;
   let respawnTimer: NodeJS.Timeout | undefined;
+  /** Set while the current child is still coming up; see {@link RECYCLE_GRACE_MS}. */
+  let graceTimer: NodeJS.Timeout | undefined;
+  /**
+   * Invalidates a grace callback that outlived the window it was armed for.
+   *
+   * `clearTimer` is not enough on its own: a callback already queued would
+   * still run and clear the handle of the *next* child's window, handing the
+   * recycler a client that had only just been spawned.
+   */
+  let graceToken = 0;
   /** Assigned once the supervisor below is built; see `recycle`. */
   let requestRespawn: (code?: number | null) => void = () => {};
   /** Assigned once `start` exists; see `rebuildNow`. */
   let startNow: () => void = () => {};
+
+  const endGrace = (): void => {
+    if (!graceTimer) return;
+    graceToken += 1;
+    clearTimer(graceTimer);
+    graceTimer = undefined;
+  };
+
+  const armGrace = (): void => {
+    endGrace();
+    const token = graceToken;
+    graceTimer = setTimer(() => {
+      if (token === graceToken) graceTimer = undefined;
+    }, recycleGraceMs);
+  };
 
   const connection: DevTunnelConnection = {
     get url() {
@@ -155,6 +203,11 @@ export function connectDevTunnel(
     recycle: () => {
       // A rebuild is already queued; asking again would only reset the backoff.
       if (stopped || respawnTimer) return;
+      // A client that has not reported a port yet is still handshaking. The
+      // node cannot tell that apart from a dead tunnel — both refuse its dials
+      // — so without this the rebuild it asks for kills the rebuild it already
+      // got, forever.
+      if (graceTimer) return;
       const doomed = child;
       child = undefined;
       if (doomed && !doomed.killed) {
@@ -188,6 +241,7 @@ export function connectDevTunnel(
       stopped = true;
       if (respawnTimer) clearTimer(respawnTimer);
       respawnTimer = undefined;
+      endGrace();
       if (child && !child.killed) child.kill();
     },
   };
@@ -257,6 +311,10 @@ export function connectDevTunnel(
         windowsHide: true,
       });
       child = active;
+      // Armed before any output can arrive: the window this protects is the one
+      // between spawning and the first "Forwarding from" line, which is exactly
+      // when the node is dialing a port that does not exist yet.
+      armGrace();
       let buffer = "";
       // Reset per spawn: a respawn may land on a different port, and noticing
       // that is the whole point of watching.
@@ -272,6 +330,9 @@ export function connectDevTunnel(
         if (url === reportedThisRun) return;
         reportedThisRun = url;
         attempt = 0;
+        // Up and serving: from here a failure to reach the Host really is
+        // evidence about the tunnel, so the recycler is handed back its job.
+        endGrace();
         const moved = currentUrl !== undefined && currentUrl !== url;
         currentUrl = url;
         settle(() => {
@@ -290,6 +351,7 @@ export function connectDevTunnel(
       active.on("error", (error) => {
         if (child !== active) return;
         child = undefined;
+        endGrace();
         // A binary that cannot be spawned at all will not appear by being asked
         // again, so this ends the first attempt rather than looping on it. Once
         // a tunnel has worked, the same failure is treated as any other death
@@ -314,6 +376,9 @@ export function connectDevTunnel(
       active.on("exit", (code) => {
         if (child !== active) return;
         child = undefined;
+        // The window belonged to this child; a dead one must not go on
+        // protecting whatever the loop does next.
+        endGrace();
         if (!settled) {
           const fatal = fatalConnectReason(code, said);
           // Anything that could be a machine still finding its network after a

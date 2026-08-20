@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { HostUrlWatcher, isDialableHostUrl, isTransferableHostUrl } from "./host-url.js";
+import {
+  HostUrlWatcher,
+  isBroadcastableHostUrl,
+  isDialableHostUrl,
+  isTransferableHostUrl,
+} from "./host-url.js";
+
+const DEVTUNNEL = "https://hqn74pr4-8790.usw2.devtunnels.ms";
 
 describe("isDialableHostUrl", () => {
   it("accepts an address another machine can reach", () => {
@@ -31,6 +38,34 @@ describe("isTransferableHostUrl", () => {
     expect(isTransferableHostUrl("http://127.0.0.1:8787")).toBe(false);
     expect(isTransferableHostUrl("https://calm-sky.trycloudflare.com")).toBe(false);
     expect(isTransferableHostUrl("https://abc.ngrok-free.app")).toBe(false);
+  });
+});
+
+describe("isBroadcastableHostUrl", () => {
+  it("refuses a Dev Tunnels URL whatever produced it", () => {
+    // `broadcastTunnelUrl()` already skips the devtunnel provider, but the
+    // announced address can also come from FLEET_PUBLIC_URL or the
+    // `host.publicUrl` setting — an operator can type this, and a Host backup
+    // can restore it. Both routed straight past the provider's own refusal.
+    expect(isBroadcastableHostUrl(DEVTUNNEL)).toBe(false);
+    expect(isBroadcastableHostUrl("https://abc-8790-inspect.usw2.devtunnels.ms")).toBe(
+      false,
+    );
+  });
+
+  it("still announces a rotating tunnel, which is the whole point of announcing", () => {
+    // A trycloudflare URL is a bad thing to restore from a backup and a fine
+    // thing to announce: the Node is connected right now and the address it
+    // holds has just expired, so this message is the only thing that can move
+    // it. Refusing would strand exactly the Nodes the feature exists for.
+    expect(isBroadcastableHostUrl("https://calm-sky.trycloudflare.com")).toBe(true);
+    expect(isBroadcastableHostUrl("https://fleet.example.com")).toBe(true);
+    expect(isBroadcastableHostUrl("http://192.168.1.20:8787")).toBe(true);
+  });
+
+  it("keeps refusing the addresses that only name the Host's own machine", () => {
+    expect(isBroadcastableHostUrl("http://127.0.0.1:8787")).toBe(false);
+    expect(isBroadcastableHostUrl("not-a-url")).toBe(false);
   });
 });
 
@@ -85,6 +120,30 @@ describe("HostUrlWatcher", () => {
     expect(watcher.check()).toEqual({
       previous: "http://127.0.0.1:8787",
       next: "https://three.trycloudflare.com",
+    });
+  });
+
+  it("says nothing when the public URL is set to a Dev Tunnels address", () => {
+    // The state that stranded two machines: the operator points FLEET_PUBLIC_URL
+    // at the tunnel the Host is hosting, which reads back as a perfectly
+    // dialable https address and is pushed to every Node — into a login none of
+    // them can answer, from which none of them can be recalled.
+    const watcher = watching("https://fleet.example.com", DEVTUNNEL);
+    watcher.check();
+    expect(watcher.check()).toBeUndefined();
+  });
+
+  it("moves the baseline past a refused address so the next real move is seen", () => {
+    const watcher = watching(
+      "https://fleet.example.com",
+      DEVTUNNEL,
+      "https://moved.example.com",
+    );
+    watcher.check();
+    watcher.check();
+    expect(watcher.check()).toEqual({
+      previous: DEVTUNNEL,
+      next: "https://moved.example.com",
     });
   });
 

@@ -1,17 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
   adoptHostUrl,
+  dialableInMode,
   endpointsAfterOperatorEdit,
   endpointsBehindLocalForward,
+  firstDialUrl,
   hostUrlCandidates,
   nextHostUrl,
   promoteHostUrl,
+  recordHostUrl,
   type HostEndpoints,
 } from "./host-endpoints.js";
 
 const lan = "http://192.168.1.20:8787";
 const tunnel = "https://one.trycloudflare.com";
 const rotated = "https://two.trycloudflare.com";
+const forward = "http://127.0.0.1:8790";
+const publicDevTunnel = "https://hqn74pr4-8790.usw2.devtunnels.ms";
 
 describe("adoptHostUrl", () => {
   it("takes the announced address and keeps the working one as a fallback", () => {
@@ -50,6 +55,115 @@ describe("hostUrlCandidates", () => {
     expect(
       hostUrlCandidates({ hostUrl: tunnel, knownHostUrls: [`${tunnel}/`, lan, ""] }),
     ).toEqual([tunnel, lan]);
+  });
+});
+
+describe("tunnel mode exclusivity", () => {
+  /**
+   * The list DevBox2 was stranded on: three tunnels the Host no longer hosts,
+   * the forward that actually worked, and a named tunnel that had been deleted.
+   */
+  const stranded: HostEndpoints = {
+    hostUrl: publicDevTunnel,
+    knownHostUrls: [
+      "https://k1ptp301-8790.usw2.devtunnels.ms",
+      "https://p75f5584-8790.usw2.devtunnels.ms",
+      forward,
+      "https://cf.example.com",
+    ],
+  };
+
+  it("dials only the local forward when the node opened the tunnel itself", () => {
+    // The three public URLs are refused in about 60ms each, which is what let
+    // the reconnect loop drive the tunnel recycler faster than the tunnel could
+    // come up. A node in this mode has exactly one address worth dialing.
+    expect(hostUrlCandidates(stranded, "devtunnel")).toEqual([forward]);
+  });
+
+  it("never rotates away from the forward, so the dial cannot fail fast", () => {
+    expect(nextHostUrl(stranded, forward, "devtunnel")).toBe(forward);
+  });
+
+  it("opens on the forward even when the stored primary is a dead tunnel", () => {
+    expect(firstDialUrl(stranded, publicDevTunnel, "devtunnel")).toBe(forward);
+  });
+
+  it("refuses a Dev Tunnels address for a node that dials the Host directly", () => {
+    // It answers a browser and only a browser: a node has no cookie and no
+    // tunnel header, so this can only ever be a fast failure.
+    expect(dialableInMode(publicDevTunnel, "direct")).toBe(false);
+    expect(hostUrlCandidates(stranded, "direct")).toEqual([
+      forward,
+      "https://cf.example.com",
+    ]);
+  });
+
+  it("keeps the remembered address when it suits the mode", () => {
+    expect(firstDialUrl(stranded, forward, "devtunnel")).toBe(forward);
+    expect(firstDialUrl({ hostUrl: tunnel, knownHostUrls: [lan] }, lan, "direct")).toBe(
+      lan,
+    );
+  });
+
+  it("offers the primary rather than nothing when no address fits the mode", () => {
+    // A node with no address at all cannot even report that it is stuck.
+    const noForward: HostEndpoints = { hostUrl: publicDevTunnel, knownHostUrls: [] };
+    expect(hostUrlCandidates(noForward, "devtunnel")).toEqual([publicDevTunnel]);
+  });
+
+  it("ignores the ports a rebuilt forward used to bind", () => {
+    // The CLI takes another port when its first choice is busy, so a node
+    // accumulates loopback addresses that are as dead as any other — and refuse
+    // a dial just as fast, which is what put the recycler on the clock.
+    const moved: HostEndpoints = {
+      hostUrl: "http://127.0.0.1:9001",
+      knownHostUrls: [forward, publicDevTunnel],
+    };
+    expect(hostUrlCandidates(moved, "devtunnel")).toEqual(["http://127.0.0.1:9001"]);
+    expect(nextHostUrl(moved, "http://127.0.0.1:9001", "devtunnel")).toBe(
+      "http://127.0.0.1:9001",
+    );
+  });
+
+  it("treats a direct node's ordinary addresses as dialable", () => {
+    expect(dialableInMode(lan, "direct")).toBe(true);
+    expect(dialableInMode(tunnel, "direct")).toBe(true);
+    // A forward is still fine to dial directly; it is the mode that is fixed,
+    // not the shape of the URL.
+    expect(dialableInMode(forward, "direct")).toBe(true);
+  });
+
+  it("rejects addresses that are not addresses", () => {
+    expect(dialableInMode("", "direct")).toBe(false);
+    expect(dialableInMode("   ", "devtunnel")).toBe(false);
+  });
+});
+
+describe("recordHostUrl", () => {
+  it("remembers an address this node cannot use without moving to it", () => {
+    // The Host is authoritative about where it lives, not about how this node
+    // gets there. Keeping the address is what lets the mode change later.
+    const endpoints: HostEndpoints = { hostUrl: forward, knownHostUrls: [lan] };
+    expect(recordHostUrl(endpoints, publicDevTunnel)).toEqual({
+      hostUrl: forward,
+      knownHostUrls: [publicDevTunnel, lan],
+    });
+  });
+
+  it("does not file the address it is already on", () => {
+    const endpoints: HostEndpoints = { hostUrl: forward, knownHostUrls: [lan] };
+    expect(recordHostUrl(endpoints, `${forward}/`)).toBe(endpoints);
+    expect(recordHostUrl(endpoints, "  ")).toBe(endpoints);
+  });
+
+  it("keeps one entry per address and stays bounded", () => {
+    let endpoints: HostEndpoints = { hostUrl: forward, knownHostUrls: [] };
+    for (let index = 0; index < 8; index += 1) {
+      endpoints = recordHostUrl(endpoints, `https://tunnel-${index}.example.com`);
+    }
+    expect(endpoints.hostUrl).toBe(forward);
+    expect(endpoints.knownHostUrls.length).toBeLessThanOrEqual(4);
+    expect(endpoints.knownHostUrls[0]).toBe("https://tunnel-7.example.com");
   });
 });
 

@@ -1,4 +1,8 @@
-import { isRotatingTunnelUrl, normalizeHostUrl } from "@fleet/protocol";
+import {
+  isLoginWalledTunnelUrl,
+  isRotatingTunnelUrl,
+  normalizeHostUrl,
+} from "@fleet/protocol";
 
 /**
  * Whether a URL is worth announcing to a machine that is not this one.
@@ -35,6 +39,28 @@ export function isTransferableHostUrl(url: string): boolean {
   return isDialableHostUrl(url) && !isRotatingTunnelUrl(url);
 }
 
+/**
+ * Whether a URL may be pushed to a Node that is already running.
+ *
+ * The provider catalog marks Dev Tunnels `nodeDialable: false`, and
+ * `broadcastTunnelUrl()` honours that — but only for URLs a *provider*
+ * produced. The announced address has another source: `FLEET_PUBLIC_URL`, or
+ * the `host.publicUrl` setting, which an operator can type and a Host backup
+ * can restore. Either can hold the very URL the catalog just refused to hand
+ * out, and it reaches Nodes having never passed the check that exists to stop
+ * it. Guarding the value rather than its provenance is what closes that.
+ *
+ * Deliberately not extended to rotating hostnames. A trycloudflare URL is a bad
+ * thing to *restore* from a backup, because by then it is dead — but a live
+ * announcement of one is the feature working: the Node is connected right now,
+ * the URL it holds has just expired, and this message is the only thing that
+ * can move it. Refusing to send it would strand exactly the Nodes it was built
+ * to rescue.
+ */
+export function isBroadcastableHostUrl(url: string): boolean {
+  return isDialableHostUrl(url) && !isLoginWalledTunnelUrl(url);
+}
+
 export type HostUrlChange = { previous: string; next: string };
 
 /**
@@ -62,7 +88,7 @@ export class HostUrlWatcher {
     const previous = this.current;
     this.current = next;
     if (previous === undefined) return undefined;
-    if (previous === next || !isDialableHostUrl(next)) return undefined;
+    if (previous === next || !isBroadcastableHostUrl(next)) return undefined;
     return { previous, next };
   }
 }
