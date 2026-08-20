@@ -112,8 +112,8 @@ export function nextClosedItems(
 
   // A branch that is gone — its last session cleared, or its workspace deleted
   // — should not leave a closed row behind for whatever takes its key next.
-  for (const key of next) {
-    if (current.has(key)) continue;
+  const stale = [...next].filter((key) => !current.has(key));
+  for (const key of stale) {
     next.delete(key);
     changed = true;
   }
