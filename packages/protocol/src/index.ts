@@ -1011,6 +1011,30 @@ export function isRotatingTunnelUrl(url: string): boolean {
 }
 
 /**
+ * Hostnames that answer a browser and only a browser.
+ *
+ * A Dev Tunnels URL is private by default: opening it prompts for a Microsoft
+ * login. A Node sends neither a browser cookie nor an `X-Tunnel-Authorization`
+ * header, so it cannot satisfy that prompt and cannot be told to try anywhere
+ * else afterwards — it has just been moved somewhere it cannot reach the Host
+ * from, which is the one failure that cannot be corrected remotely.
+ *
+ * Lives here rather than beside any one caller because it is a safety check in
+ * three places at once — what the Host may announce, what a Node may adopt, and
+ * which enrollment command the Connect card offers — and three copies of a rule
+ * like that only have to disagree once.
+ */
+export function isLoginWalledTunnelUrl(url: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return hostname === "devtunnels.ms" || hostname.endsWith(".devtunnels.ms");
+}
+
+/**
  * Live sessions cannot move with the Host process, so import parks them in
  * `offline` — the same landing a Host restart uses — and Resume can re-attach
  * once the original Node is back.

@@ -141,6 +141,26 @@ describe("broadcastHostUrl", () => {
     expect(older.sent).toEqual([]);
     expect(newer.sent).toHaveLength(1);
   });
+
+  it("refuses to send an address a node could never authenticate to", () => {
+    // Checked here as well as where the address is chosen, because this is the
+    // one mistake that cannot be taken back: a node that follows a Dev Tunnels
+    // URL meets a Microsoft login, cannot reach the Host, and so cannot be told
+    // to go anywhere else.
+    const { service, enroll } = setup();
+    const node = enroll("new-node", [HOST_URL_SYNC_CAPABILITY]);
+
+    expect(service.broadcastHostUrl("https://hqn74pr4-8790.usw2.devtunnels.ms")).toBe(0);
+    expect(node.sent).toEqual([]);
+  });
+
+  it("refuses an address that names the Host's own machine", () => {
+    const { service, enroll } = setup();
+    const node = enroll("new-node", [HOST_URL_SYNC_CAPABILITY]);
+
+    expect(service.broadcastHostUrl("http://127.0.0.1:8790")).toBe(0);
+    expect(node.sent).toEqual([]);
+  });
 });
 
 describe("announceNodeName", () => {
