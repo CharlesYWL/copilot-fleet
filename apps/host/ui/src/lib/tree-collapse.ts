@@ -58,6 +58,18 @@ export function treeActivity(groups: readonly SessionWorkspaceGroup[]): TreeActi
 }
 
 /**
+ * One reading of the tree: what each branch holds, and what is on screen.
+ *
+ * The selection travels with the activity because both decide whether a row
+ * moves, and both have to be compared against the reading before it.
+ */
+export type TreeReading = {
+  activity: TreeActivity;
+  /** The session whose transcript the operator is looking at, if any. */
+  selectedSessionId: string | undefined;
+};
+
+/**
  * The closed rows after the tree moved from `previous` to `current`.
  *
  * Only *changes* fold or unfold a row, never the standing state: a branch that
@@ -65,34 +77,38 @@ export function treeActivity(groups: readonly SessionWorkspaceGroup[]): TreeActi
  * dormant workspace opened by hand to read an old transcript does not snap shut
  * again on the next heartbeat.
  *
- * Three things move a row:
+ * Four things move a row:
  *  - first sight, which folds a branch away when nothing under it is running;
  *  - a session waking up — created here, or back from offline or stopped —
  *    which opens the branch so the operator sees where the work went;
- *  - the last active session under a branch settling, which folds it away.
+ *  - the last active session under a branch settling, which folds it away;
+ *  - the operator moving to another session, which opens the branch holding it,
+ *    since the selection can move from outside the tree — a tile on the monitor
+ *    wall, or the first session picked on a fresh page.
  *
- * A branch holding `selectedSessionId` is never folded away by any of those:
- * the transcript on screen would lose its row in the tree at the moment the
- * operator watched the run end. Collapsing by hand still folds it.
+ * A branch holding the selected session is never folded away: the transcript on
+ * screen would lose its row in the tree at the moment the operator watched the
+ * run end. Collapsing by hand still folds it, and nothing reopens it while the
+ * selection stays put.
  *
  * The same set is handed back when nothing moved, so a caller storing this in
  * state does not re-render on every snapshot the Host pushes.
  */
 export function nextClosedItems(
   closed: ReadonlySet<string>,
-  previous: TreeActivity | undefined,
-  current: TreeActivity,
-  selectedSessionId: string | undefined,
+  previous: TreeReading | undefined,
+  current: TreeReading,
 ): ReadonlySet<string> {
   const next = new Set(closed);
   let changed = false;
 
-  const holdsSelection = (key: string) =>
-    selectedSessionId !== undefined &&
-    (current.get(key)?.sessions.has(selectedSessionId) ?? false);
+  const selected = current.selectedSessionId;
+  const holdsSelection = (branch: BranchActivity) =>
+    selected !== undefined && branch.sessions.has(selected);
+  const selectionMoved = previous?.selectedSessionId !== selected;
 
   const close = (key: string) => {
-    if (next.has(key) || holdsSelection(key)) return;
+    if (next.has(key)) return;
     next.add(key);
     changed = true;
   };
@@ -102,8 +118,15 @@ export function nextClosedItems(
     changed = true;
   };
 
-  for (const [key, activity] of current) {
-    const before = previous?.get(key);
+  for (const [key, activity] of current.activity) {
+    const before = previous?.activity.get(key);
+    if (holdsSelection(activity)) {
+      // The row for the transcript on screen: kept out of every fold, and
+      // opened when the operator has just moved here from somewhere the tree
+      // does not show.
+      if (selectionMoved) open(key);
+      continue;
+    }
     if (!before) {
       // A branch the tree has not shown before — a fresh page, or a machine
       // that just enrolled. Nothing running under it means nothing to watch.
@@ -121,7 +144,7 @@ export function nextClosedItems(
 
   // A branch that is gone — its last session cleared, or its workspace deleted
   // — should not leave a closed row behind for whatever takes its key next.
-  const stale = [...next].filter((key) => !current.has(key));
+  const stale = [...next].filter((key) => !current.activity.has(key));
   for (const key of stale) {
     next.delete(key);
     changed = true;

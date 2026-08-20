@@ -42,7 +42,7 @@ import {
   nodeKey,
   treeActivity,
   workspaceKey,
-  type TreeActivity,
+  type TreeReading,
 } from "../lib/tree-collapse";
 import { StatusDot } from "./StatusDot";
 
@@ -220,16 +220,18 @@ export const Sidebar = ({
    * when work turns up there — a session created, or one back from offline or
    * stopped. Done in an effect against the previous reading, so only a change
    * moves a row and a branch the operator opened by hand stays open. The branch
-   * holding the session on screen is left alone either way.
+   * holding the session on screen is never folded, and opens when the operator
+   * moves to a session the tree was not showing.
    */
-  const activity = useMemo(() => treeActivity(groups), [groups]);
-  const lastActivity = useRef<TreeActivity | undefined>(undefined);
+  const reading = useMemo<TreeReading>(
+    () => ({ activity: treeActivity(groups), selectedSessionId }),
+    [groups, selectedSessionId],
+  );
+  const lastReading = useRef<TreeReading | undefined>(undefined);
   useEffect(() => {
-    setClosedItems((closed) =>
-      nextClosedItems(closed, lastActivity.current, activity, selectedSessionId),
-    );
-    lastActivity.current = activity;
-  }, [activity, selectedSessionId]);
+    setClosedItems((closed) => nextClosedItems(closed, lastReading.current, reading));
+    lastReading.current = reading;
+  }, [reading]);
 
   const handleOpenChange = (_event: unknown, data: TreeOpenChangeData) => {
     const key = String(data.value);

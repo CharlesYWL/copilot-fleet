@@ -7,6 +7,7 @@ import {
   nodeKey,
   treeActivity,
   workspaceKey,
+  type TreeReading,
 } from "./tree-collapse";
 
 const session = (id: string, state: SessionState): FleetSession =>
@@ -26,6 +27,12 @@ const groups = (
     })),
   },
 ];
+
+/** A reading of the tree: what each branch holds, plus the session on screen. */
+const reading = (
+  activity: ReturnType<typeof treeActivity>,
+  selectedSessionId?: string,
+): TreeReading => ({ activity, selectedSessionId });
 
 const ws = workspaceKey("w1");
 const n1 = nodeKey("w1", "n1");
@@ -65,7 +72,7 @@ describe("nextClosedItems", () => {
     const current = treeActivity(
       groups({ nodeId: "n1", sessions: [session("s1", "stopped")] }),
     );
-    expect([...nextClosedItems(new Set(), undefined, current, undefined)].sort()).toEqual(
+    expect([...nextClosedItems(new Set(), undefined, reading(current))].sort()).toEqual(
       [n1, ws].sort(),
     );
   });
@@ -74,9 +81,9 @@ describe("nextClosedItems", () => {
     const current = treeActivity(
       groups({ nodeId: "n1", sessions: [session("s1", "running")] }),
     );
-    expect([
-      ...nextClosedItems(new Set([n1, ws]), undefined, current, undefined),
-    ]).toEqual([]);
+    expect([...nextClosedItems(new Set([n1, ws]), undefined, reading(current))]).toEqual(
+      [],
+    );
   });
 
   it("folds a branch away when its last active session settles", () => {
@@ -86,9 +93,9 @@ describe("nextClosedItems", () => {
     const after = treeActivity(
       groups({ nodeId: "n1", sessions: [session("s1", "stopped")] }),
     );
-    expect([...nextClosedItems(new Set(), before, after, undefined)].sort()).toEqual(
-      [n1, ws].sort(),
-    );
+    expect(
+      [...nextClosedItems(new Set(), reading(before), reading(after))].sort(),
+    ).toEqual([n1, ws].sort());
   });
 
   it("opens a closed branch when a session goes live again", () => {
@@ -98,7 +105,9 @@ describe("nextClosedItems", () => {
     const after = treeActivity(
       groups({ nodeId: "n1", sessions: [session("s1", "idle")] }),
     );
-    expect([...nextClosedItems(new Set([n1, ws]), before, after, undefined)]).toEqual([]);
+    expect([
+      ...nextClosedItems(new Set([n1, ws]), reading(before), reading(after)),
+    ]).toEqual([]);
   });
 
   it("opens a closed branch when a session is created under it", () => {
@@ -113,7 +122,9 @@ describe("nextClosedItems", () => {
     );
     // Closed by hand while work was already running: a new session still has
     // to be visible, otherwise it starts somewhere the operator cannot see.
-    expect([...nextClosedItems(new Set([n1, ws]), before, after, undefined)]).toEqual([]);
+    expect([
+      ...nextClosedItems(new Set([n1, ws]), reading(before), reading(after)),
+    ]).toEqual([]);
   });
 
   it("keeps a quiet branch the operator opened by hand open", () => {
@@ -121,7 +132,7 @@ describe("nextClosedItems", () => {
       groups({ nodeId: "n1", sessions: [session("s1", "stopped")] }),
     );
     // Same reading twice: nothing changed, so nothing moves.
-    expect(nextClosedItems(new Set(), activity, activity, undefined).size).toBe(0);
+    expect(nextClosedItems(new Set(), reading(activity), reading(activity)).size).toBe(0);
   });
 
   it("hands back the same set when nothing moved", () => {
@@ -129,7 +140,7 @@ describe("nextClosedItems", () => {
     const activity = treeActivity(
       groups({ nodeId: "n1", sessions: [session("s1", "stopped")] }),
     );
-    expect(nextClosedItems(closed, activity, activity, undefined)).toBe(closed);
+    expect(nextClosedItems(closed, reading(activity), reading(activity))).toBe(closed);
   });
 
   it("folds only the node that went quiet, leaving its busy workspace open", () => {
@@ -145,7 +156,9 @@ describe("nextClosedItems", () => {
         { nodeId: "n2", sessions: [session("s2", "running")] },
       ),
     );
-    expect([...nextClosedItems(new Set(), before, after, undefined)]).toEqual([n1]);
+    expect([...nextClosedItems(new Set(), reading(before), reading(after))]).toEqual([
+      n1,
+    ]);
   });
 
   it("drops rows that no longer exist so a reused key starts fresh", () => {
@@ -158,7 +171,9 @@ describe("nextClosedItems", () => {
     const after = treeActivity(
       groups({ nodeId: "n2", sessions: [session("s2", "running")] }),
     );
-    expect([...nextClosedItems(new Set([n1]), before, after, undefined)]).toEqual([]);
+    expect([...nextClosedItems(new Set([n1]), reading(before), reading(after))]).toEqual(
+      [],
+    );
   });
 
   it("keeps the branch of the session on screen open when it finishes", () => {
@@ -170,14 +185,18 @@ describe("nextClosedItems", () => {
     );
     // The transcript being read stays reachable in the tree: folding it away
     // takes the row out from under the operator exactly when the run ends.
-    expect([...nextClosedItems(new Set(), before, after, "s1")]).toEqual([]);
+    expect([
+      ...nextClosedItems(new Set(), reading(before, "s1"), reading(after, "s1")),
+    ]).toEqual([]);
   });
 
   it("keeps the branch of the session on screen open the first time it is seen", () => {
     const current = treeActivity(
       groups({ nodeId: "n1", sessions: [session("s1", "stopped")] }),
     );
-    expect([...nextClosedItems(new Set(), undefined, current, "s1")]).toEqual([]);
+    expect([...nextClosedItems(new Set(), undefined, reading(current, "s1"))]).toEqual(
+      [],
+    );
   });
 
   it("still folds a quiet branch that does not hold the session on screen", () => {
@@ -193,7 +212,9 @@ describe("nextClosedItems", () => {
         { nodeId: "n2", sessions: [session("s2", "running")] },
       ),
     );
-    expect([...nextClosedItems(new Set(), before, after, "s2")]).toEqual([n1]);
+    expect([
+      ...nextClosedItems(new Set(), reading(before, "s2"), reading(after, "s2")),
+    ]).toEqual([n1]);
   });
 
   it("leaves a branch the operator collapsed by hand closed", () => {
@@ -204,7 +225,23 @@ describe("nextClosedItems", () => {
       groups({ nodeId: "n1", sessions: [session("s1", "completed")] }),
     );
     // Holding the selection only stops the automatic fold; it never reopens a
-    // row the operator shut.
-    expect(nextClosedItems(new Set([n1]), before, after, "s1")).toEqual(new Set([n1]));
+    // row the operator shut while the selection stays where it was.
+    expect(
+      nextClosedItems(new Set([n1]), reading(before, "s1"), reading(after, "s1")),
+    ).toEqual(new Set([n1]));
+  });
+
+  it("opens the folded branch of a session the operator has just moved to", () => {
+    const activity = treeActivity(
+      groups(
+        { nodeId: "n1", sessions: [session("s1", "stopped")] },
+        { nodeId: "n2", sessions: [session("s2", "running")] },
+      ),
+    );
+    // The selection can move from outside the tree — a monitor wall tile, or
+    // the first session picked on a fresh page — so the row has to come back.
+    expect([
+      ...nextClosedItems(new Set([n1]), reading(activity, "s2"), reading(activity, "s1")),
+    ]).toEqual([]);
   });
 });
