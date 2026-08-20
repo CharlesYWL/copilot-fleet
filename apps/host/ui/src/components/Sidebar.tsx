@@ -1,4 +1,11 @@
-import { useMemo, useState, type DragEvent, type KeyboardEvent } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type KeyboardEvent,
+} from "react";
 import {
   Button,
   Text,
@@ -30,6 +37,13 @@ import {
 import { useCatalog } from "../hooks/useCatalog";
 import { sessionLabel } from "../lib/session-label";
 import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
+import {
+  nextClosedItems,
+  nodeKey,
+  treeActivity,
+  workspaceKey,
+  type TreeReading,
+} from "../lib/tree-collapse";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -175,7 +189,7 @@ export const Sidebar = ({
   onClearEnded,
 }: SidebarProps) => {
   const styles = useStyles();
-  const [closedItems, setClosedItems] = useState<Set<string>>(new Set());
+  const [closedItems, setClosedItems] = useState<ReadonlySet<string>>(new Set());
   const [dropTarget, setDropTarget] = useState<{ key: string; edge: DropEdge }>();
   const { updatePlacement, reorderPlacements, reorderWorkspaces, reorderSessions } =
     useCatalog();
@@ -200,6 +214,24 @@ export const Sidebar = ({
         .filter((key) => !closedItems.has(key)),
     [groups, closedItems],
   );
+
+  /*
+   * A row folds itself away once nothing under it is running, and opens again
+   * when work turns up there — a session created, or one back from offline or
+   * stopped. Done in an effect against the previous reading, so only a change
+   * moves a row and a branch the operator opened by hand stays open. The branch
+   * holding the session on screen is never folded, and opens when the operator
+   * moves to a session the tree was not showing.
+   */
+  const reading = useMemo<TreeReading>(
+    () => ({ activity: treeActivity(groups), selectedSessionId }),
+    [groups, selectedSessionId],
+  );
+  const lastReading = useRef<TreeReading | undefined>(undefined);
+  useEffect(() => {
+    setClosedItems((closed) => nextClosedItems(closed, lastReading.current, reading));
+    lastReading.current = reading;
+  }, [reading]);
 
   const handleOpenChange = (_event: unknown, data: TreeOpenChangeData) => {
     const key = String(data.value);
@@ -527,6 +559,3 @@ export const Sidebar = ({
     </nav>
   );
 };
-
-const workspaceKey = (workspaceId: string) => `ws:${workspaceId}`;
-const nodeKey = (workspaceId: string, nodeId: string) => `node:${workspaceId}:${nodeId}`;

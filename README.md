@@ -162,6 +162,18 @@ a different one enrolls a _new_ machine and leaves the old node's placements and
 sessions behind. Starting again under the previous name reclaims the same node
 id and brings them back.
 
+### Rows that fold themselves away
+
+A workspace or node row folds shut once nothing under it is running — every
+session on it stopped, finished, or offline while its machine is away — so the
+tree stays as short as the work in front of you rather than growing with every
+transcript kept for **Resume**.
+
+It opens again the moment work turns up there: a session started on that machine,
+or one coming back to life as its node reconnects. Only those changes move a row,
+never the standing state, so a dormant branch opened by hand to read an old
+transcript stays open until something under it actually happens.
+
 ### Ordering and filing by dragging
 
 The sidebar tree can be rearranged by hand at every level: workspace rows, node
