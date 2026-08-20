@@ -71,6 +71,10 @@ export function treeActivity(groups: readonly SessionWorkspaceGroup[]): TreeActi
  *    which opens the branch so the operator sees where the work went;
  *  - the last active session under a branch settling, which folds it away.
  *
+ * A branch holding `selectedSessionId` is never folded away by any of those:
+ * the transcript on screen would lose its row in the tree at the moment the
+ * operator watched the run end. Collapsing by hand still folds it.
+ *
  * The same set is handed back when nothing moved, so a caller storing this in
  * state does not re-render on every snapshot the Host pushes.
  */
@@ -78,12 +82,17 @@ export function nextClosedItems(
   closed: ReadonlySet<string>,
   previous: TreeActivity | undefined,
   current: TreeActivity,
+  selectedSessionId: string | undefined,
 ): ReadonlySet<string> {
   const next = new Set(closed);
   let changed = false;
 
+  const holdsSelection = (key: string) =>
+    selectedSessionId !== undefined &&
+    (current.get(key)?.sessions.has(selectedSessionId) ?? false);
+
   const close = (key: string) => {
-    if (next.has(key)) return;
+    if (next.has(key) || holdsSelection(key)) return;
     next.add(key);
     changed = true;
   };

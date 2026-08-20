@@ -219,14 +219,17 @@ export const Sidebar = ({
    * A row folds itself away once nothing under it is running, and opens again
    * when work turns up there — a session created, or one back from offline or
    * stopped. Done in an effect against the previous reading, so only a change
-   * moves a row and a branch the operator opened by hand stays open.
+   * moves a row and a branch the operator opened by hand stays open. The branch
+   * holding the session on screen is left alone either way.
    */
   const activity = useMemo(() => treeActivity(groups), [groups]);
   const lastActivity = useRef<TreeActivity | undefined>(undefined);
   useEffect(() => {
-    setClosedItems((closed) => nextClosedItems(closed, lastActivity.current, activity));
+    setClosedItems((closed) =>
+      nextClosedItems(closed, lastActivity.current, activity, selectedSessionId),
+    );
     lastActivity.current = activity;
-  }, [activity]);
+  }, [activity, selectedSessionId]);
 
   const handleOpenChange = (_event: unknown, data: TreeOpenChangeData) => {
     const key = String(data.value);
