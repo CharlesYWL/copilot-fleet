@@ -12,7 +12,12 @@ const node = (id: string, name: string): FleetNode =>
 const workspace = (id: string, name: string): Workspace =>
   ({ id, name, description: "", createdAt: "2026-08-08T00:00:00.000Z" }) as Workspace;
 
-const session = (id: string, workspaceId: string, nodeId: string): FleetSession =>
+const session = (
+  id: string,
+  workspaceId: string,
+  nodeId: string,
+  state: FleetSession["state"] = "idle",
+): FleetSession =>
   ({
     id,
     workspaceId,
@@ -20,8 +25,8 @@ const session = (id: string, workspaceId: string, nodeId: string): FleetSession 
     placementId: "p1",
     nodeId,
     nodeName: "WEILI-PC",
-    state: "idle",
-    name: "",
+    state,
+    name: id,
     initialPrompt: "hello",
     currentActivity: "",
     lastText: "",
@@ -49,26 +54,28 @@ const catalog = {
   updateAllNodes: vi.fn(),
 };
 
-const show = (placements: Placement[]) =>
-  render(
-    <FluentProvider theme={fleetDarkTheme}>
-      <CatalogProvider value={catalog}>
-        <Sidebar
-          nodes={[node("n1", "WEILI-PC")]}
-          workspaces={[workspace("w1", "repo"), workspace("w2", "other")]}
-          sessions={[session("s1", "w1", "n1")]}
-          placements={placements}
-          selectedSessionId={undefined}
-          view="session"
-          endedCount={0}
-          onSelectSession={vi.fn()}
-          onNewSession={vi.fn()}
-          onSelectView={vi.fn()}
-          onClearEnded={vi.fn()}
-        />
-      </CatalogProvider>
-    </FluentProvider>,
-  );
+const show = (placements: Placement[], sessions = [session("s1", "w1", "n1")]) =>
+  render(tree(placements, sessions));
+
+const tree = (placements: Placement[], sessions: FleetSession[]) => (
+  <FluentProvider theme={fleetDarkTheme}>
+    <CatalogProvider value={catalog}>
+      <Sidebar
+        nodes={[node("n1", "WEILI-PC")]}
+        workspaces={[workspace("w1", "repo"), workspace("w2", "other")]}
+        sessions={sessions}
+        placements={placements}
+        selectedSessionId={undefined}
+        view="session"
+        endedCount={0}
+        onSelectSession={vi.fn()}
+        onNewSession={vi.fn()}
+        onSelectView={vi.fn()}
+        onClearEnded={vi.fn()}
+      />
+    </CatalogProvider>
+  </FluentProvider>
+);
 
 const placement: Placement = {
   id: "p1",
@@ -97,5 +104,36 @@ describe("Sidebar drag handles", () => {
     show([]);
     expect(screen.queryByTitle(/WEILI-PC — drag/i)).toBeNull();
     expect(screen.getByTitle("WEILI-PC").getAttribute("draggable")).not.toBe("true");
+  });
+});
+
+describe("Sidebar folding", () => {
+  it("folds a node away when nothing under it is running", () => {
+    show([placement], [session("s1", "w1", "n1", "stopped")]);
+    expect(screen.queryByText("s1")).toBeNull();
+  });
+
+  it("keeps a node open while a session is still running", () => {
+    show([placement], [session("s1", "w1", "n1", "running")]);
+    expect(screen.getByText("s1")).toBeTruthy();
+  });
+
+  it("opens a folded node when one of its sessions comes back to life", () => {
+    const { rerender } = show([placement], [session("s1", "w1", "n1", "offline")]);
+    expect(screen.queryByText("s1")).toBeNull();
+    rerender(tree([placement], [session("s1", "w1", "n1", "idle")]));
+    expect(screen.getByText("s1")).toBeTruthy();
+  });
+
+  it("opens a folded node when a session is created on it", () => {
+    const { rerender } = show([placement], [session("s1", "w1", "n1", "stopped")]);
+    expect(screen.queryByText("s1")).toBeNull();
+    rerender(
+      tree(
+        [placement],
+        [session("s1", "w1", "n1", "stopped"), session("s2", "w1", "n1", "queued")],
+      ),
+    );
+    expect(screen.getByText("s2")).toBeTruthy();
   });
 });
