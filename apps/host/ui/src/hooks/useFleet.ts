@@ -6,6 +6,7 @@ import {
   type SessionEvent,
   type Snapshot,
 } from "@fleet/protocol";
+import { announceSignedOut } from "../lib/auth";
 import { reconnectDelay } from "./reconnect-delay";
 import { mergeEvents } from "../lib/merge-events";
 
@@ -243,6 +244,12 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
     headers.set("content-type", "application/json");
   }
   const response = await fetch(path, { ...init, headers });
+  if (response.status === 401) {
+    // The session ended under us — expired, or the Host restarted and forgot
+    // it. Saying so once puts the sign-in screen back up rather than leaving
+    // every subsequent call to fail into a toast.
+    announceSignedOut();
+  }
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as {
       error?: string;

@@ -8,6 +8,7 @@ import {
 } from "@fluentui/react-components";
 import {
   Grid20Regular,
+  SignOut20Regular,
   Speaker220Regular,
   SpeakerMute20Regular,
   TextBulletListTree20Regular,
@@ -101,6 +102,7 @@ type TopBarProps = {
   onLayoutChange: (layout: LayoutMode) => void;
   soundEnabled: boolean;
   onToggleSound: () => void;
+  onSignOut: () => void;
 };
 
 export const TopBar = ({
@@ -112,6 +114,7 @@ export const TopBar = ({
   onLayoutChange,
   soundEnabled,
   onToggleSound,
+  onSignOut,
 }: TopBarProps) => {
   const styles = useStyles();
   return (
@@ -160,6 +163,14 @@ export const TopBar = ({
           onClick={onToggleSound}
         />
         <Text className={styles.caption}>{connected ? "live" : "reconnecting…"}</Text>
+        <Button
+          appearance="subtle"
+          size="small"
+          icon={<SignOut20Regular />}
+          title="Sign out"
+          aria-label="Sign out"
+          onClick={onSignOut}
+        />
       </div>
     </header>
   );

@@ -7,6 +7,7 @@ import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { errorMessage } from "@fleet/protocol";
 import { cachedGitRevision } from "./host-revision.js";
+import { OperatorAuth, PASSWORD_SETTING_KEY } from "./auth.js";
 import {
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
@@ -19,6 +20,8 @@ import { registerNodeGateway } from "./gateway/node-socket.js";
 import { startHostUrlMonitor } from "./host-url.js";
 import { envFilePath } from "./paths.js";
 import { startPresenceMonitor } from "./presence.js";
+import { registerRequestGuard } from "./request-guard.js";
+import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { nodeRoutes } from "./routes/nodes.js";
 import { sessionRoutes } from "./routes/sessions.js";
@@ -51,6 +54,11 @@ export async function buildServer(
   options: {
     databasePath?: string;
     enrollmentToken?: string;
+    /**
+     * The operator password. Defaults to `FLEET_OPERATOR_PASSWORD`, and to one
+     * generated on first boot when neither is set.
+     */
+    operatorPassword?: string;
   } = {},
 ): Promise<FastifyInstance> {
   const logs = createLogBuffer();
@@ -62,6 +70,17 @@ export async function buildServer(
   const enrollment = {
     token: resolveRuntimeEnrollmentToken(store, options.enrollmentToken),
   };
+  const auth = new OperatorAuth({
+    getStoredHash: () => store.getSetting(PASSWORD_SETTING_KEY),
+    setStoredHash: (hash) => store.setSetting(PASSWORD_SETTING_KEY, hash),
+    configuredPassword: options.operatorPassword ?? process.env.FLEET_OPERATOR_PASSWORD,
+    // Info rather than warn: the buffer behind /api/logs keeps warnings and
+    // errors, and this is the one line that must never be readable over HTTP.
+    announce: (password) =>
+      app.log.info(
+        `No FLEET_OPERATOR_PASSWORD set, so this Host generated one. Sign in with: ${password}`,
+      ),
+  });
   const service = new FleetService(store, app.log, cachedGitRevision());
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
   const listenPort = process.env.PORT ?? "8787";
@@ -110,6 +129,16 @@ export async function buildServer(
   });
 
   await app.register(websocket);
+  registerRequestGuard(app, {
+    store,
+    auth,
+    allowlist: {
+      extra: process.env.FLEET_ALLOWED_HOSTS,
+      publicUrl: () => process.env.FLEET_PUBLIC_URL || store.getSetting("host.publicUrl"),
+      tunnelUrls: () => tunnel.allTunnelUrls(),
+    },
+  });
+  await app.register(authRoutes, { auth });
   await app.register(systemRoutes, {
     service,
     tunnel,

@@ -267,9 +267,16 @@ export class FleetStore {
     return parsed.success ? parsed.data : "cloudflare";
   }
 
-  /** Preselected in the new-session dialog; each session stores its own copy. */
+  /**
+   * Preselected in the new-session dialog; each session stores its own copy.
+   *
+   * Off unless someone said otherwise. The opposite reading — anything but "0"
+   * is on — made `--allow-all` the default on a database nobody had touched,
+   * so a fresh Host ran agents with no human in the loop while the README said
+   * permissions were explicit.
+   */
   getDefaultYolo(): boolean {
-    return this.getSetting("defaults.yolo") !== "0";
+    return this.getSetting("defaults.yolo") === "1";
   }
 
   setDefaultYolo(yolo: boolean): void {

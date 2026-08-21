@@ -74,6 +74,12 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
 
   app.post("/api/placements", async (request, reply) => {
     const input = CreatePlacementSchema.parse(request.body);
+    // A node's own credentials only speak for that node. Without this, one
+    // machine's secret could bind a workspace to a path on another, which is
+    // the placement the Host later hands out as a working directory.
+    if (request.fleetNodeId && input.nodeId !== request.fleetNodeId) {
+      return reply.code(403).send({ error: "A node may only place its own paths" });
+    }
     try {
       const placement = store.createPlacement(
         input.workspaceId,
@@ -107,8 +113,12 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
   app.patch("/api/placements/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
     const input = UpdatePlacementSchema.parse(request.body);
-    if (!store.getPlacement(id)) {
+    const existing = store.getPlacement(id);
+    if (!existing) {
       return reply.code(404).send({ error: "Unknown placement" });
+    }
+    if (request.fleetNodeId && existing.nodeId !== request.fleetNodeId) {
+      return reply.code(403).send({ error: "A node may only move its own placements" });
     }
     try {
       const placement = store.updatePlacement(id, input.localPath, input.workspaceId);

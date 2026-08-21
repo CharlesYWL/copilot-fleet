@@ -1114,6 +1114,17 @@ export const SUPERSEDED_CLOSE_CODE = 4001;
 /** The presented secret is unknown; the Node must enroll again to recover. */
 export const AUTH_FAILED_CLOSE_CODE = 4003;
 
+/*
+ * How a Node authenticates an ordinary HTTP call to the Host.
+ *
+ * The Node's config page cannot reach the Host from the browser — different
+ * origin, no CORS — so the Node process relays those calls, and the relay needs
+ * a credential now that the Host's API is not open. The secret it already has
+ * is that credential; these header names are where both ends agree to put it.
+ */
+export const NODE_ID_HEADER = "x-fleet-node-id";
+export const NODE_SECRET_HEADER = "x-fleet-node-secret";
+
 export type JsonParseResult = { ok: true; value: unknown } | { ok: false; error: string };
 
 export function tryParseJson(text: string): JsonParseResult {
