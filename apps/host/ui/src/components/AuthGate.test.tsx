@@ -26,26 +26,35 @@ describe("AuthGate", () => {
   });
 
   it("shows the console to a session the Host recognises", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => answer({ authenticated: true })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => answer({ authenticated: true })),
+    );
     show();
     expect(await screen.findByText("console")).toBeTruthy();
   });
 
   it("shows a sign-in form instead of a console nobody can use", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => answer({ authenticated: false })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => answer({ authenticated: false })),
+    );
     show();
     expect(await screen.findByLabelText("Operator password")).toBeTruthy();
     expect(screen.queryByText("console")).toBeNull();
   });
 
   it("treats an unreachable Host as signed out rather than hanging", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(new Error("offline"))));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => Promise.reject(new Error("offline"))),
+    );
     show();
     expect(await screen.findByLabelText("Operator password")).toBeTruthy();
   });
 
   it("signs in with the password and reveals the console", async () => {
-    const fetchMock = vi.fn(async (input: URL | RequestInfo) =>
+    const fetchMock = vi.fn(async (input: URL | RequestInfo, _init?: RequestInit) =>
       String(input).endsWith("/api/auth/login")
         ? answer({ ok: true })
         : answer({ authenticated: false }),
@@ -59,8 +68,10 @@ describe("AuthGate", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
     expect(await screen.findByText("console")).toBeTruthy();
-    const login = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/api/auth/login"));
-    expect(JSON.parse(String((login?.[1] as RequestInit).body))).toEqual({
+    const login = fetchMock.mock.calls.find(([url]) =>
+      String(url).endsWith("/api/auth/login"),
+    );
+    expect(JSON.parse(String(login?.[1]?.body))).toEqual({
       password: "hunter2",
     });
   });
@@ -86,7 +97,10 @@ describe("AuthGate", () => {
   });
 
   it("takes the console away when a call comes back unauthenticated", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => answer({ authenticated: true })));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => answer({ authenticated: true })),
+    );
     show();
     expect(await screen.findByText("console")).toBeTruthy();
 

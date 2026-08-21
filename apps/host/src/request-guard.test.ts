@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
 import { buildServer } from "./server.js";
-import { allowedHostnames, hostnameOf, nameAllowed, nodeReachable } from "./request-guard.js";
+import {
+  allowedHostnames,
+  hostnameOf,
+  nameAllowed,
+  nodeReachable,
+} from "./request-guard.js";
 
 describe("nodeReachable", () => {
   it("lets a node reach the catalog it relays for its own config page", () => {
@@ -81,7 +86,9 @@ describe("nameAllowed", () => {
   });
 
   it("lets an operator opt out entirely with a star", () => {
-    expect(nameAllowed("anything.example.com", allowedHostnames({ extra: "*" }))).toBe(true);
+    expect(nameAllowed("anything.example.com", allowedHostnames({ extra: "*" }))).toBe(
+      true,
+    );
   });
 });
 
@@ -137,11 +144,15 @@ describe("guarded server", () => {
   });
 
   it("answers health and the sign-in question before anyone has signed in", async () => {
-    expect((await app.inject({ method: "GET", url: "/api/health" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "GET", url: "/api/health" })).statusCode).toBe(
+      200,
+    );
     const status = await app.inject({ method: "GET", url: "/api/auth/status" });
     expect(status.json()).toEqual({ authenticated: false });
     expect(
-      (await app.inject({ method: "GET", url: "/api/auth/status", headers: { cookie } })).json(),
+      (
+        await app.inject({ method: "GET", url: "/api/auth/status", headers: { cookie } })
+      ).json(),
     ).toEqual({ authenticated: true });
   });
 
@@ -172,9 +183,15 @@ describe("guarded server", () => {
   });
 
   it("stops honouring a session once it has been signed out", async () => {
-    expect((await app.inject({ method: "GET", url: "/api/snapshot", headers: { cookie } })).statusCode).toBe(200);
+    expect(
+      (await app.inject({ method: "GET", url: "/api/snapshot", headers: { cookie } }))
+        .statusCode,
+    ).toBe(200);
     await app.inject({ method: "POST", url: "/api/auth/logout", headers: { cookie } });
-    expect((await app.inject({ method: "GET", url: "/api/snapshot", headers: { cookie } })).statusCode).toBe(401);
+    expect(
+      (await app.inject({ method: "GET", url: "/api/snapshot", headers: { cookie } }))
+        .statusCode,
+    ).toBe(401);
   });
 
   it("refuses a name this Host does not answer to, session or not", async () => {
@@ -206,7 +223,9 @@ describe("guarded server", () => {
 
   it("marks every answer as not for framing and not for sniffing", async () => {
     const response = await app.inject({ method: "GET", url: "/api/health" });
-    expect(response.headers["content-security-policy"]).toContain("frame-ancestors 'none'");
+    expect(response.headers["content-security-policy"]).toContain(
+      "frame-ancestors 'none'",
+    );
     expect(response.headers["x-content-type-options"]).toBe("nosniff");
     expect(response.headers["referrer-policy"]).toBe("same-origin");
   });
@@ -217,11 +236,15 @@ describe("guarded server", () => {
       expect(
         (await app.inject({ method: "GET", url: "/api/workspaces", headers })).statusCode,
       ).toBe(200);
-      const forbidden = await app.inject({ method: "GET", url: "/api/snapshot", headers });
+      const forbidden = await app.inject({
+        method: "GET",
+        url: "/api/snapshot",
+        headers,
+      });
       expect(forbidden.statusCode).toBe(403);
-      expect((await app.inject({ method: "GET", url: "/api/enrollment", headers })).statusCode).toBe(
-        403,
-      );
+      expect(
+        (await app.inject({ method: "GET", url: "/api/enrollment", headers })).statusCode,
+      ).toBe(403);
     });
 
     it("are rejected when the secret is wrong", async () => {

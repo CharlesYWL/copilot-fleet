@@ -1,7 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
-import { OPERATOR_COOKIE, OperatorAuth, readCookie } from "./auth.js";
+import { OPERATOR_COOKIE, readCookie, type OperatorAuth } from "./auth.js";
 
 /** Names that always resolve to this machine, whatever the DNS says. */
 const LOOPBACK_NAMES = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0", "::"]);
@@ -120,7 +120,9 @@ function classify(url: string): Guarded {
   };
 }
 
-function nodeCredentials(request: FastifyRequest): { id: string; secret: string } | undefined {
+function nodeCredentials(
+  request: FastifyRequest,
+): { id: string; secret: string } | undefined {
   const id = request.headers[NODE_ID_HEADER];
   const secret = request.headers[NODE_SECRET_HEADER];
   if (typeof id !== "string" || typeof secret !== "string") return undefined;

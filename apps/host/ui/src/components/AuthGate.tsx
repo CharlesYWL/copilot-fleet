@@ -143,8 +143,8 @@ function SignInCard({ onSignedIn }: { onSignedIn: () => void }) {
         {busy ? "Signing in…" : "Sign in"}
       </Button>
       <Text className={styles.caption}>
-        Set FLEET_OPERATOR_PASSWORD to choose this password. A Host started
-        without one generates it and prints it to its console on first run.
+        Set FLEET_OPERATOR_PASSWORD to choose this password. A Host started without one
+        generates it and prints it to its console on first run.
       </Text>
     </form>
   );

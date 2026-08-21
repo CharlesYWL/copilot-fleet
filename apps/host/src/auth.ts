@@ -191,7 +191,13 @@ export function sessionCookie(token: string, secure: boolean, maxAgeMs: number):
 }
 
 export function clearedCookie(secure: boolean): string {
-  const parts = [`${OPERATOR_COOKIE}=`, "Path=/", "HttpOnly", "SameSite=Strict", "Max-Age=0"];
+  const parts = [
+    `${OPERATOR_COOKIE}=`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    "Max-Age=0",
+  ];
   if (secure) parts.push("Secure");
   return parts.join("; ");
 }

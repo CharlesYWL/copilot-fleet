@@ -82,7 +82,9 @@ describe("refuseRequest", () => {
     });
     expect(refuseRequest({ ...base, host: undefined })).toMatchObject({ status: 403 });
     // A loopback name on the wrong port is another server's page.
-    expect(refuseRequest({ ...base, host: "127.0.0.1:9999" })).toMatchObject({ status: 403 });
+    expect(refuseRequest({ ...base, host: "127.0.0.1:9999" })).toMatchObject({
+      status: 403,
+    });
   });
 
   it("refuses a request another page made", () => {
@@ -95,9 +97,17 @@ describe("refuseRequest", () => {
   });
 
   it("insists on a content type a cross-site form cannot send", () => {
-    for (const contentType of [undefined, "text/plain", "application/x-www-form-urlencoded"]) {
+    for (const contentType of [
+      undefined,
+      "text/plain",
+      "application/x-www-form-urlencoded",
+    ]) {
       expect(
-        refuseRequest({ ...base, method: "POST", ...(contentType ? { contentType } : {}) }),
+        refuseRequest({
+          ...base,
+          method: "POST",
+          ...(contentType ? { contentType } : {}),
+        }),
       ).toMatchObject({ status: 415 });
     }
     expect(

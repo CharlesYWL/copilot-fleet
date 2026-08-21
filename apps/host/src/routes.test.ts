@@ -213,7 +213,8 @@ describe("host routes", () => {
   it("round-trips the session defaults", async () => {
     // Auto-resume is on when unset; YOLO is not, because handing every new
     // session a permission-free agent is the operator's decision to make.
-    const read = async () => (await inject({ method: "GET", url: "/api/defaults" })).json();
+    const read = async () =>
+      (await inject({ method: "GET", url: "/api/defaults" })).json();
     expect(await read()).toEqual({ yolo: false, autoResume: true });
 
     await inject({ method: "POST", url: "/api/defaults", payload: { yolo: true } });
@@ -263,9 +264,7 @@ describe("host routes", () => {
     });
     expect(imported.statusCode).toBe(200);
 
-    const snapshot = (
-      await inject({ method: "GET", url: "/api/snapshot" })
-    ).json() as {
+    const snapshot = (await inject({ method: "GET", url: "/api/snapshot" })).json() as {
       nodes: { id: string }[];
       workspaces: { name: string }[];
     };

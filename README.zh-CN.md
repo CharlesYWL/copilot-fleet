@@ -46,6 +46,14 @@ npm run dev
 这一条命令会同时拉起 `http://127.0.0.1:8787` 上的 Fastify API、`http://127.0.0.1:5173`
 上的 Vite，以及本机的 Node 服务。Node 会从 `.env` 读取自己的 `FLEET_*` 配置。
 
+界面在显示任何内容之前会先要一个操作者密码。可以在 `.env` 里用
+`FLEET_OPERATOR_PASSWORD` 指定；不指定时，Host 会在首次启动时生成一个并打印到自己的
+控制台：
+
+```
+No FLEET_OPERATOR_PASSWORD set, so this Host generated one. Sign in with: …
+```
+
 如果希望在改代码时隧道地址保持稳定，就把隧道作为独立进程启动：
 
 ```bash
@@ -490,17 +498,31 @@ agent session id，会被作为**可恢复**提供出来；而从未走到那一
 
 ## 安全说明
 
+- 网页界面和整个 `/api` 面都在一个操作者密码之后。可以设置
+  `FLEET_OPERATOR_PASSWORD`；没有设置时，Host 会在首次启动时生成一个并打印到控制台。
+  登录会写入一个 `HttpOnly`、`SameSite=Strict` 的会话 Cookie，有效期 12 小时；连续
+  猜错多次会把登录锁上几分钟。
+- Host 只应答它认识的名字：回环地址、`FLEET_PUBLIC_URL`、当前在线的隧道地址，以及
+  `FLEET_ALLOWED_HOSTS` 中列出的名字。以其他 `Host` 头到达、或来自其他 `Origin` 的
+  请求会被拒绝——这正是让操作者随手打开的某个页面无法借助被重绑定的 DNS 名字操作
+  整个 fleet 的原因。`FLEET_ALLOWED_HOSTS=*` 会关掉这项检查。
+- 节点自己的凭据只能触及它的配置页需要中转的工作区与放置接口，并且一个节点只能为
+  自己创建或改写放置。
 - 生产模式启动时会拒绝缺失的或默认的 `change-me` 注册令牌。
 - 注册成功会创建一个高熵的专属节点密钥；Host 只存储它的 SHA-256 哈希。
 - Copilot 的认证与令牌留在 Node 上，绝不会出现在 Fleet 的消息中。
 - 会话请求引用的是预先配置好的放置 ID。节点还要求目录是存在的绝对路径，并在创建进程
   之前解析它。
 - Copilot 以参数数组、`shell: false` 和选定的放置作为 `cwd` 直接启动。
-- 权限在界面上是显式且可审计的（只有 allow-once / deny）。对于无人值守的运行，可在 Node
-  上设置 `FLEET_YOLO=1`，让 Copilot 以 `--allow-all` 启动（工具、路径和 URL）。在 YOLO
-  关闭时，未应答和断连的请求仍然按拒绝处理。
-- MVP 没有用户认证。把暴露在公网上的 Host 放在带认证的反向代理或访问策略之后（例如
-  Cloudflare Access），并使用 HTTPS/WSS。
+- 权限在界面上是显式且可审计的（只有 allow-once / deny）。YOLO 默认关闭，Host 层面和
+  每个新会话都是如此。对于无人值守的运行，可在 Node 上设置 `FLEET_YOLO=1`，让 Copilot
+  以 `--allow-all` 启动（工具、路径和 URL）。在 YOLO 关闭时，未应答和断连的请求仍然按
+  拒绝处理。
+- 节点本地的配置页绑定在回环地址上，并且还会拒绝这些请求：`Host` 不是本机对应端口上的
+  `127.0.0.1`（或 `localhost`）、来自其他来源、或写入时没有带
+  `content-type: application/json`。它无法防御登录到同一台机器上的其他用户。
+- 暴露在公网上的 Host 仍应使用 HTTPS/WSS；把它放在带认证的反向代理或访问策略之后
+  （例如 Cloudflare Access）依然是一层值得加的防护。
 
 ## 常用命令
 
