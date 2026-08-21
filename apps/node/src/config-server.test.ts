@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   createConfigRouter,
+  refuseRequest,
   type ConfigServerOptions,
   type FleetApi,
 } from "./config-server.js";
@@ -50,6 +51,66 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
   };
   return { route: createConfigRouter(options), fleet, options };
 }
+
+/**
+ * The page this server serves can repoint the node at a different Host, which
+ * on a machine that runs agents is a full compromise, so what a browser is
+ * allowed to reach it with is asserted directly.
+ */
+describe("refuseRequest", () => {
+  const base = { method: "GET", host: "127.0.0.1:8788", port: 8788 };
+
+  it("allows the page's own requests", () => {
+    expect(refuseRequest(base)).toBeUndefined();
+    expect(refuseRequest({ ...base, host: "localhost:8788" })).toBeUndefined();
+    expect(refuseRequest({ ...base, host: "[::1]:8788" })).toBeUndefined();
+    expect(
+      refuseRequest({
+        ...base,
+        method: "POST",
+        origin: "http://127.0.0.1:8788",
+        contentType: "application/json",
+      }),
+    ).toBeUndefined();
+  });
+
+  it("refuses a name that resolves here but is not here", () => {
+    // The shape of DNS rebinding: the attacker's own name, pointed at
+    // loopback, which makes their page same-origin with this server.
+    expect(refuseRequest({ ...base, host: "config.attacker.example" })).toMatchObject({
+      status: 403,
+    });
+    expect(refuseRequest({ ...base, host: undefined })).toMatchObject({ status: 403 });
+    // A loopback name on the wrong port is another server's page.
+    expect(refuseRequest({ ...base, host: "127.0.0.1:9999" })).toMatchObject({ status: 403 });
+  });
+
+  it("refuses a request another page made", () => {
+    expect(
+      refuseRequest({ ...base, method: "POST", origin: "https://attacker.example" }),
+    ).toMatchObject({ status: 403 });
+    expect(
+      refuseRequest({ ...base, method: "GET", origin: "http://127.0.0.1:8787" }),
+    ).toMatchObject({ status: 403 });
+  });
+
+  it("insists on a content type a cross-site form cannot send", () => {
+    for (const contentType of [undefined, "text/plain", "application/x-www-form-urlencoded"]) {
+      expect(
+        refuseRequest({ ...base, method: "POST", ...(contentType ? { contentType } : {}) }),
+      ).toMatchObject({ status: 415 });
+    }
+    expect(
+      refuseRequest({
+        ...base,
+        method: "POST",
+        contentType: "application/json; charset=utf-8",
+      }),
+    ).toBeUndefined();
+    // Reads are exempt: they carry no body to have declared.
+    expect(refuseRequest({ ...base, method: "HEAD" })).toBeUndefined();
+  });
+});
 
 describe("config router", () => {
   it("serves settings and status together", async () => {
