@@ -85,6 +85,13 @@ describe("nameAllowed", () => {
     expect(nameAllowed("", allowed)).toBe(false);
   });
 
+  it("refuses the unspecified addresses, which reach loopback without naming it", () => {
+    // A page fetching http://0.0.0.0:8787 gets this Host on most platforms;
+    // accepting the name would leave a hole beside the one being closed.
+    expect(nameAllowed("0.0.0.0:8787", allowed)).toBe(false);
+    expect(nameAllowed("[::]:8787", allowed)).toBe(false);
+  });
+
   it("lets an operator opt out entirely with a star", () => {
     expect(nameAllowed("anything.example.com", allowedHostnames({ extra: "*" }))).toBe(
       true,

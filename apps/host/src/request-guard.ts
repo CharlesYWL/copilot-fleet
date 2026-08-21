@@ -3,8 +3,15 @@ import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
 import { OPERATOR_COOKIE, readCookie, type OperatorAuth } from "./auth.js";
 
-/** Names that always resolve to this machine, whatever the DNS says. */
-const LOOPBACK_NAMES = new Set(["localhost", "127.0.0.1", "::1", "0.0.0.0", "::"]);
+/**
+ * Names that always mean this machine.
+ *
+ * The unspecified addresses (`0.0.0.0`, `::`) are deliberately not here: they
+ * are what a socket binds to, not a name a browser should be reaching us
+ * under, and on most platforms a page fetching `http://0.0.0.0:8787` lands on
+ * loopback anyway — which is exactly the request this check exists to refuse.
+ */
+const LOOPBACK_NAMES = new Set(["localhost", "127.0.0.1", "::1"]);
 
 /**
  * Routes that answer before anyone has signed in.
