@@ -1,7 +1,7 @@
 # Tunnel Plugin Decoupling Implementation Plan
 
 **Date:** 2026-08-20
-**Status:** Proposed (revised after contract review)
+**Status:** Proposed
 
 **Goal:** Separate tunnel-provider behavior from Fleet's Host and Node cores while
 preserving the current tunnel lifecycle, enrollment UX, reconnect behavior, and
@@ -15,18 +15,6 @@ runtime observation. A Node driver opens a route and returns the endpoint that
 the unchanged Fleet registration and WebSocket code should dial.
 
 **Tech stack:** TypeScript, Zod, Node child processes, Fastify, React, Vitest.
-
-## Global constraints
-
-- Compile-time plugins only; no runtime package loading.
-- Fleet `hello` / `welcome`, registration, and WebSocket auth stay in core.
-- `--url` and `--devtunnel` keep working; no generic CLI encoding in this refactor.
-- Do not change restart backoff, primary selection, external-process ownership, or
-  broadcast safety.
-- Do not add another tunnel provider in this work.
-- `NodeConnectionPlan` is derived each launch from CLI/env. Do not persist it in
-  `settings.json`.
-- `TunnelManager` restarts a session only on crash, never on operator stop.
 
 ## Proposed flow
 
@@ -64,7 +52,6 @@ runtime extension system that the product does not yet need.
 - Changing tunnel restart, primary-selection, external-process, or broadcast
   behavior.
 - Adding another tunnel provider as part of the abstraction work.
-- Persisting a connection plan in Node `settings.json`.
 
 ## Decisions
 
@@ -73,10 +60,15 @@ runtime extension system that the product does not yet need.
 Providers remain registered in source and shipped with Fleet. Do not load arbitrary
 JavaScript packages or executable manifests at runtime.
 
-Because plugins are closed at compile time, the connection plan is a closed
-discriminated union in `@fleet/protocol`, not `params: Record<string, unknown>`.
-Host enrollment and Node open() share that union. Adding an assisted provider
-already requires a `TunnelProvider` enum change; it also adds a union variant.
+Runtime third-party plugins would require:
+
+- versioned Host and Node plugin APIs,
+- installation and upgrade coordination across machines,
+- capability negotiation,
+- frontend metadata loading,
+- trust and sandboxing for arbitrary process execution.
+
+Those costs are not justified until an external provider must ship independently.
 
 ### 2. Host and Node use different interfaces
 
@@ -94,20 +86,21 @@ broadcast policy stay in `TunnelSupervisor` / `TunnelManager`.
 A provider must not independently decide whether it should be running. It only
 implements setup and returns a running session handle.
 
-`HostTunnelSession.closed` reports why the session ended. The manager restarts
-only when `wantEnabled` is still true and `reason` is `"exited"` or `"error"`.
-Operator `stop()` must resolve with `reason: "stopped"` and must not schedule a
-restart.
-
 ### 4. The Node driver opens a route; it does not handshake
 
 The terms `hello` and `welcome` already describe Fleet authentication. A tunnel
 driver must not own or wrap that handshake.
 
-Its responsibility ends after it returns a dialable endpoint. `recover()` is the
-reconnect recycler (today's `recycle()`). Operator rebuild is a named action on
-the session, not diagnostics metadata: the Node config page currently posts
-`POST /api/devtunnel/rebuild` and must keep a working button.
+Its responsibility ends after it returns a dialable endpoint:
+
+```ts
+interface NodeRouteSession {
+  readonly endpoint: string;
+  onEndpointChanged(listener: (endpoint: string) => void): () => void;
+  recover(): void;
+  stop(): Promise<void>;
+}
+```
 
 Fleet core then performs registration, opens `/ws/node`, sends `hello`, and waits
 for `welcome` exactly as it does today.
@@ -124,23 +117,19 @@ type NodeConnectionPlan =
     }
   | {
       kind: "provider";
-      provider: "devtunnel";
-      tunnelId: string;
+      provider: TunnelProvider;
+      params: Record<string, unknown>;
     };
 ```
 
-Cloudflare, Tailscale, ngrok, and bore produce a `direct` plan and share the
-built-in direct route. Dev Tunnels is the only assisted variant in this refactor.
+The provider's Node driver validates `params` with its own Zod schema. Dev Tunnels
+uses `{ tunnelId: string }`. Cloudflare, Tailscale, ngrok, and bore produce a
+`direct` plan and share the built-in direct route.
 
 ### 6. Preserve the existing CLI during migration
 
 Keep `--url` and `--devtunnel` working. The first refactor is internal, not a
 forced command-line migration for existing Nodes.
-
-`--devtunnel` stays a non-persisted flag. `argvForRestart` already keeps it;
-`settings.json` only stores the forwarded `hostUrl`. Derive `NodeConnectionPlan`
-each launch from CLI/env before loading settings. Do not write the plan into
-settings.
 
 The enrollment API should return structured bootstrap data so the UI no longer
 contains provider detection:
@@ -150,14 +139,12 @@ type NodeBootstrap = {
   connection: NodeConnectionPlan;
   prerequisites: Array<{ label: string; command: string }>;
   startArgs: string[];
-  /** Connect-card explanation for assisted routes; omit for direct. */
-  notice?: string;
 };
 ```
 
-For Dev Tunnels, `startArgs` continues to contain `--devtunnel=<qualified-id>`.
-A future generic CLI encoding is required before a second assisted provider can
-be enrolled from the Connect card; it is out of scope here.
+For Dev Tunnels, `startArgs` can continue to contain
+`--devtunnel=<qualified-id>`. A future generic CLI encoding can be introduced only
+if a second Node-side provider proves it useful.
 
 ### 7. Preserve public URL and live-node broadcast as separate decisions
 
@@ -165,48 +152,24 @@ The URL shown for enrollment is not necessarily safe to broadcast to a running
 Node.
 
 - `activeTunnelUrl()` continues to answer what enrollment displays.
-- Broadcast selection uses the **manifest** field `route: "direct" | "assisted"`,
-  which is static per provider. Do not infer it from `enrollment(snapshot)`.
-- An assisted route such as Dev Tunnels is enrollment-capable but not directly
+- Broadcast selection uses the connection plan: only a `direct` plan may be
+  announced as a Host URL.
+- A provider route such as Dev Tunnels is enrollment-capable but not directly
   broadcastable.
 
-This replaces `nodeDialable: boolean` on day one of the new contract, not in a
-later cleanup task.
-
-Fallback enrollment is core-owned. When no tunnel is up, `activeBootstrap()`
-emits `{ kind: "direct", url: fallbackPublicUrl() }` with empty prerequisites.
-When a tunnel is up, bootstrap comes from `primaryManager()`'s provider so a
-downed Dev Tunnels primary cannot keep advertising an assisted plan for another
-provider's URL.
+This replaces `nodeDialable: boolean` with an explicit behavior model.
 
 ### 8. Core owns the shared binary-probe cache
 
 Provider manifests declare the binary and version arguments. The Host core keeps
 the shared TTL and in-flight probe cache so polling `/api/tunnel` cannot regress to
-one process spawn per provider on every request. `BinaryProbe` keys on
-`{ binary, versionArgs }`, not on the old `ProviderSpec` type.
-
-### 9. The provider mints persistent ids; the manager stores them
-
-`newTunnelId` is not a manager concern. `prepare()` owns minting:
-
-- if `context.persistedId` is present, reuse it;
-- if this provider needs a stable id and none was persisted, mint `fleet-<hex>`
-  and return it;
-- providers that do not need an id return `{}`.
-
-The manager persists `prepared.tunnelId` and any later snapshot id that
-`shouldAdoptTunnelId()` accepts. That adoption stays in core so a bare
-`fleet-abc` is replaced by the cluster-qualified name the CLI actually hosted.
-The provider does not write Host settings.
+one process spawn per provider on every request.
 
 ## Target contracts
 
 ### Shared manifest
 
 ```ts
-type TunnelRouteKind = "direct" | "assisted";
-
 type TunnelPluginManifest = {
   id: TunnelProvider;
   label: string;
@@ -216,13 +179,10 @@ type TunnelPluginManifest = {
   setupSteps: string[];
   docsUrl?: string;
   caveat?: string;
-  route: TunnelRouteKind;
 };
 ```
 
-The manifest is serializable and safe to expose through `/api/tunnel`. `route`
-is required from the first provider module, so `broadcastTunnelUrl()` never
-depends on the deleted `nodeDialable` flag.
+The manifest is serializable and safe to expose through `/api/tunnel`.
 
 ### Host provider
 
@@ -235,21 +195,6 @@ type HostTunnelContext = {
 
 type PreparedTunnel = {
   tunnelId?: string;
-};
-
-type HostTunnelSnapshot = {
-  status: TunnelStatus;
-  url?: string;
-  inspectUrl?: string;
-  tunnelId?: string;
-  error?: string;
-};
-
-type TunnelExit = {
-  reason: "stopped" | "exited" | "error";
-  code?: number | null;
-  signal?: string | null;
-  message?: string;
 };
 
 interface HostTunnelProvider {
@@ -268,72 +213,25 @@ interface HostTunnelSession {
   readonly closed: Promise<TunnelExit>;
   stop(): Promise<void>;
 }
-
-type CliTunnelHooks = {
-  args: (target: LocalTarget, tunnelId?: string) => string[];
-  extractUrl: (text: string) => string | undefined;
-  extractInspectUrl?: (text: string) => string | undefined;
-  extractId?: (text: string) => string | undefined;
-};
-
-function createCliTunnelSession(
-  manifest: TunnelPluginManifest,
-  context: HostTunnelContext,
-  prepared: PreparedTunnel,
-  hooks: CliTunnelHooks,
-): Promise<HostTunnelSession>;
 ```
 
-All current providers use `createCliTunnelSession` for spawn, bounded output
-buffering, URL observation, SIGTERM-then-SIGKILL shutdown, and `closed`. Dev
-Tunnels supplies setup in `prepare()`, plus identifier and inspector parsers,
-rather than reimplementing process supervision.
-
-`stop()` waits for the child, then resolves `closed` with `reason: "stopped"`.
-An unexpected child exit resolves with `reason: "exited"` or `"error"`.
+All current providers should use a shared `createCliTunnelSession` helper. Dev
+Tunnels supplies setup hooks, identifier parsing, and inspector URL parsing rather
+than reimplementing process supervision. The manager persists the prepared or
+observed tunnel identifier; the provider does not write Host settings directly.
 
 ### Node route provider
 
 ```ts
-type NodeRouteContext = {
-  log(message: string): void;
-  warn(message: string): void;
-};
-
-type NodeRouteAction = {
-  id: string;
-  label: string;
-  run(): void;
-};
-
-interface NodeRouteSession {
-  readonly endpoint: string;
-  onEndpointChanged(listener: (endpoint: string) => void): () => void;
-  recover(): void;
-  readonly actions: readonly NodeRouteAction[];
-  stop(): Promise<void>;
+interface NodeRouteProvider<TParams> {
+  readonly id: TunnelProvider;
+  readonly paramsSchema: z.ZodType<TParams>;
+  open(params: TParams, context: NodeRouteContext): Promise<NodeRouteSession>;
 }
-
-interface NodeRouteProvider {
-  readonly id: "devtunnel";
-  open(
-    plan: Extract<NodeConnectionPlan, { kind: "provider"; provider: "devtunnel" }>,
-    context: NodeRouteContext,
-  ): Promise<NodeRouteSession>;
-}
-
-function openRoute(
-  plan: NodeConnectionPlan,
-  context: NodeRouteContext,
-): Promise<NodeRouteSession>;
 ```
 
-The registry contains the built-in direct route plus providers that require
-Node-side work. A direct plan is a session whose endpoint is the supplied URL
-and whose `recover`, `stop`, and `actions` are no-ops.
-
-Dev Tunnels exposes `actions: [{ id: "rebuild", label: "Rebuild tunnel", run }]`.
-That `run` is today's `rebuildNow()`. `recover()` remains today's `recycle()`.
+The registry contains only providers that require Node-side work. A direct plan is
+handled by a built-in no-process route.
 
 ## Task 1: Lock current behavior with characterization tests
 
@@ -343,6 +241,7 @@ That `run` is today's `rebuildNow()`. `recover()` remains today's `recycle()`.
 - Modify: `apps/node/src/devtunnel.test.ts`
 - Modify: `apps/node/src/host-endpoints.test.ts`
 - Modify: `apps/host/ui/src/lib/enroll-command.test.ts`
+- Modify: `packages/protocol/src/index.test.ts`
 
 **Steps:**
 
@@ -350,20 +249,17 @@ That `run` is today's `rebuildNow()`. `recover()` remains today's `recycle()`.
    - command and arguments,
    - URL extraction,
    - optional identifier and inspector URL,
-   - whether the provider is enrollment-direct or Node-assisted (`nodeDialable`
-     is the current signal; Task 3 replaces it with `route`).
+   - whether enrollment is direct or provider-assisted.
 2. Add tests proving the core lifecycle behavior that must not move into plugins:
    - idempotent enable/disable,
-   - disable does not restart,
-   - restart backoff after a crash,
+   - restart backoff,
    - primary fallback,
    - external-process ownership.
 3. Preserve the Dev Tunnels Node tests for:
    - forwarded-port discovery,
    - reconnect backoff,
    - fatal login and visibility failures,
-   - `recycle()` when the process is alive but the Host is unreachable,
-   - `rebuildNow()` as an operator action,
+   - `recover()` behavior when the process is alive but the Host is unreachable,
    - endpoint-change notification.
 4. Add a test proving a direct route requires no child process.
 5. Add a UI test proving enrollment rendering can use structured bootstrap data
@@ -374,10 +270,9 @@ That `run` is today's `rebuildNow()`. `recover()` remains today's `recycle()`.
    npx vitest run apps/host/src/tunnel.test.ts \
      apps/node/src/devtunnel.test.ts \
      apps/node/src/host-endpoints.test.ts \
-     apps/host/ui/src/lib/enroll-command.test.ts
+     apps/host/ui/src/lib/enroll-command.test.ts \
+     packages/protocol/src/index.test.ts
    ```
-
-Do not add protocol tests in this task. The schemas do not exist yet.
 
 ## Task 2: Add the shared connection-plan protocol
 
@@ -385,17 +280,22 @@ Do not add protocol tests in this task. The schemas do not exist yet.
 
 - Modify: `packages/protocol/src/index.ts`
 - Modify: `packages/protocol/src/index.test.ts`
+- Modify: `apps/host/ui/src/hooks/useEnrollment.ts`
 
 **Steps:**
 
-1. Add `NodeConnectionPlanSchema` as the closed union in Decision 5.
-2. Add `NodeBootstrapSchema` with connection, prerequisites, start arguments,
-   and optional `notice`.
-3. Add `EnrollmentSchema` with `enrollmentToken`, `bootstrap`, and deprecated
-   `hostUrl` / `tunnelId` for compatibility.
-4. Reject missing `tunnelId` on the Dev Tunnels variant, invalid URLs on the
-   direct variant, and unknown `provider` values.
-5. Do not change UI hooks in this task. `useEnrollment.ts` moves in Task 5.
+1. Add `NodeConnectionPlanSchema` with `direct` and `provider` variants.
+2. Add `NodeBootstrapSchema` containing the connection plan, prerequisite commands,
+   and structured start arguments.
+3. Add an `EnrollmentSchema` rather than maintaining a UI-local response type.
+4. Keep `hostUrl` and `tunnelId` as deprecated response fields for compatibility;
+   the new UI must use `bootstrap`.
+5. Test:
+   - valid direct plans,
+   - valid Dev Tunnels provider plans,
+   - rejection of missing provider parameters,
+   - strict validation of URLs and provider parameters before they become
+     command arguments.
 6. Build the protocol before touching Host or Node consumers:
 
    ```bash
@@ -419,27 +319,20 @@ Do not add protocol tests in this task. The schemas do not exist yet.
 
 **Steps:**
 
-1. Define the manifest, provider, session, snapshot, exit, and CLI-session
-   contracts from Target contracts, including `route` on every manifest.
+1. Define the manifest, provider, session, snapshot, and exit contracts.
 2. Keep one shared `BinaryProbe` in the supervisor and probe each provider from
    its manifest's `binary` and `versionArgs`.
 3. Move generic process spawning, bounded output buffering, URL observation, and
-   graceful shutdown into `createCliTunnelSession`. `stop()` must resolve
-   `closed` with `reason: "stopped"`.
+   graceful shutdown into `createCliTunnelSession`.
 4. Move each current provider's command, setup, parser, metadata, and enrollment
-   builder into its provider module. Dev Tunnels `prepare()` mints or reuses the
-   id; Cloudflare/Tailscale/ngrok/bore `prepare()` is a no-op.
+   builder into its provider module.
 5. Keep `tunnel-providers.ts` as a temporary compatibility re-export so the
-   manager and tests can migrate without a big-bang rename. Map leftover
-   `nodeDialable` reads to `manifest.route === "direct"` until Task 8 deletes
-   the alias.
+   manager and tests can migrate without a big-bang rename.
 6. Add registry conformance tests:
    - every `TunnelProvider` has exactly one Host provider,
    - manifest IDs match registry keys,
-   - every `route: "direct"` provider's `enrollment()` returns `kind: "direct"`,
-   - the Dev Tunnels provider returns `kind: "provider"` with a `tunnelId`,
-   - `prepare()` without `persistedId` returns a minted id only for assisted
-     providers.
+   - every provider returns a valid bootstrap plan,
+   - only registered Node-assisted providers emit `kind: "provider"`.
 
 ## Task 4: Make the Host manager depend only on the provider contract
 
@@ -464,19 +357,17 @@ Do not add protocol tests in this task. The schemas do not exist yet.
    - external-session ownership,
    - persistent provider identifier storage.
 3. Replace direct `spawn`, output parser, and `ProviderSpec` access with
-   `provider.prepare()` and `provider.start()`. Persist `prepared.tunnelId`,
-   then adopt a later snapshot id through `shouldAdoptTunnelId()`.
+   `provider.prepare()` and `provider.start()`.
 4. Make `TunnelSupervisor` construct managers from the registry.
-5. Drive manager updates from `onUpdate`. Schedule restart only when `closed`
-   resolves with `reason: "exited" | "error"` while `wantEnabled` is true.
-6. Point `broadcastTunnelUrl()` at managers whose `manifest.route === "direct"`.
-7. Make `tunnel-process.ts` call the same `prepare()` then `start()` path rather
-   than `spawn(spec.args(target))` with no id. Today's external Dev Tunnels
-   launch is `host -p <port>`, a throwaway tunnel; do not freeze that.
-   - `persistedId` comes from `FLEET_TUNNEL_ID` if set, otherwise from the
-     `tunnelId` already in the state file, otherwise `prepare()` mints one.
-   - Write the minted or adopted id to `tunnel.json` beside `url`.
-8. Preserve the current `/api/enrollment` response shape until Task 5.
+5. Make `tunnel-process.ts` use the same registry and CLI session helper rather
+   than duplicating launch and parsing behavior.
+6. Drive manager updates and restart scheduling from the session's update and
+   `closed` signals.
+7. Persist identifiers returned by preparation or later reported by the running
+   session, preserving the cluster-qualified Dev Tunnels behavior.
+8. Extend external tunnel state only if the structured enrollment plan needs data
+   beyond `provider`, `url`, and `tunnelId`.
+9. Preserve the current API response shape until Task 5 migrates the UI.
 
 ## Task 5: Make enrollment provider-neutral
 
@@ -492,27 +383,17 @@ Do not add protocol tests in this task. The schemas do not exist yet.
 
 **Steps:**
 
-1. Add `activeBootstrap()` beside `activeTunnelUrl()`:
-   - live primary → that provider's `enrollment(snapshot)`;
-   - no tunnel → core direct plan with `fallbackPublicUrl()`.
+1. Add `activeBootstrap()` beside `activeTunnelUrl()`.
 2. Return `EnrollmentSchema` from `/api/enrollment`.
-3. Switch `useEnrollment` to `EnrollmentSchema`. The new UI reads `bootstrap`;
-   it may still display deprecated `hostUrl` as the default field value.
-4. Change `enrollCommand` to accept `startArgs: string[]`; it only quotes
-   arguments and appends the enrollment token.
-5. Connect card command generation:
-   - default command comes from Host `bootstrap.startArgs`;
-   - if the operator edits the URL and `connection.kind === "direct"`, rewrite
-     `startArgs` to `--url=<edited>`;
-   - if the plan is assisted, the URL field is display-only and must not change
-     `startArgs` or reintroduce hostname detection.
-6. Render `bootstrap.prerequisites` generically. Show `bootstrap.notice` for
-   assisted plans. Keep the local-only warning only for a direct plan whose
-   (possibly edited) URL is loopback.
-7. Remove `isDevTunnelUrl`, `devTunnelLoginCommand`, and all URL-suffix branching
+3. Generate prerequisites and Node arguments on the Host from the active provider.
+4. Change `enrollCommand` to accept `startArgs: string[]`; it should only quote
+   arguments and append the enrollment token.
+5. Render prerequisite command blocks generically in `ConnectNodeCard`.
+6. Remove `isDevTunnelUrl`, `devTunnelLoginCommand`, and all URL-suffix branching
    from the UI.
-8. Test direct and Dev Tunnels enrollment responses end to end, including
-   fallback-when-no-tunnel and edited-direct-URL command rewriting.
+7. Keep local-only URL warnings based on a direct connection plan, not on provider
+   hostname detection.
+8. Test direct and Dev Tunnels enrollment responses end to end.
 
 ## Task 6: Create the Node route registry
 
@@ -529,17 +410,17 @@ Do not add protocol tests in this task. The schemas do not exist yet.
 
 **Steps:**
 
-1. Define `NodeRouteProvider`, `NodeRouteSession`, `NodeRouteAction`, and
-   `NodeRouteContext`.
-2. Implement the direct route as a session whose endpoint is the supplied URL
-   and whose recovery, stop, and actions are no-ops.
+1. Define `NodeRouteProvider`, `NodeRouteSession`, and `NodeRouteContext`.
+2. Implement the direct route as a session whose endpoint is the supplied URL and
+   whose recovery and stop operations are no-ops.
 3. Adapt `connectDevTunnel` to the common session interface:
    - `url` becomes `endpoint`,
    - `recycle` becomes `recover`,
-   - `rebuildNow` becomes `actions` entry `{ id: "rebuild", run }`.
-4. Register Dev Tunnels against the protocol union variant
-   `{ kind: "provider", provider: "devtunnel", tunnelId }`.
-5. Reject an unknown plan or missing `tunnelId` with an actionable startup error.
+   - `rebuildNow` remains an optional operator action exposed as diagnostics
+     metadata rather than a core method.
+4. Register Dev Tunnels with a Zod parameter schema requiring a qualified
+   `tunnelId`.
+5. Reject an unknown provider or invalid params with an actionable startup error.
 6. Preserve the existing supervision tests while renaming only the public
    abstraction.
 
@@ -554,53 +435,47 @@ Do not add protocol tests in this task. The schemas do not exist yet.
 - Modify: `apps/node/src/host-endpoints.test.ts`
 - Modify: `apps/node/src/config-server.ts`
 - Modify: `apps/node/src/config-server.test.ts`
-- Modify: `apps/node/public/config.js`
 - Modify: `apps/node/src/settings.ts`
 
 **Steps:**
 
 1. Resolve a `NodeConnectionPlan` from command-line/environment inputs before
-   loading effective settings. `--devtunnel` / `FLEET_DEVTUNNEL_ID` become a
-   Dev Tunnels provider plan; `--url` / `FLEET_HOST_URL` become a direct plan.
-   Do not persist the plan in `settings.json`.
-2. Ask `openRoute()` to open it and seed settings from `routeSession.endpoint`.
+   loading effective settings.
+2. Ask the route registry to open it and seed settings from
+   `routeSession.endpoint`.
 3. Replace `TunnelMode = "devtunnel" | "direct"` with route-session policy:
    - a direct session can rotate among direct known URLs,
-   - a provider session owns its endpoint and does not dial unrelated fallbacks,
-     including a public login-walled URL announced over `host_url`.
+   - a provider session owns its endpoint and does not dial unrelated fallbacks.
 4. Replace direct calls to `devTunnel.recycle()` with `routeSession.recover()`.
 5. Replace Dev Tunnels-specific config status with generic route status:
-   `{ provider, endpoint, state, actions }`. Wire `POST /api/route/rebuild` (or
-   keep `/api/devtunnel/rebuild` as an alias) to `actions` id `"rebuild"`.
-6. Update `apps/node/public/config.js` in the same task. The rebuild button and
-   status line must not keep reading `status.devTunnel`.
-7. Keep `--devtunnel` and `FLEET_DEVTUNNEL_ID` as a compatibility input.
-8. Ensure `main.ts` imports no provider implementation and contains no
+   `{ provider, endpoint, state, actions }`.
+6. Keep `--devtunnel` and `FLEET_DEVTUNNEL_ID` as a compatibility input that the
+   Dev Tunnels plugin translates into a provider connection plan.
+7. Ensure `main.ts` imports no provider implementation and contains no
    `devtunnel` hostname or command checks.
 
-## Task 8: Remove the leftover broadcast boolean
+## Task 8: Replace the broadcast boolean with route semantics
 
 **Files:**
 
 - Modify: `apps/host/src/tunnel.ts`
 - Modify: `apps/host/src/host-url.ts`
 - Modify: `apps/host/src/host-url.test.ts`
+- Modify: `apps/node/src/host-endpoints.ts`
+- Modify: `apps/node/src/host-endpoints.test.ts`
 - Modify: `packages/protocol/src/index.ts`
 
 **Steps:**
 
-1. Delete `nodeDialable` from any remaining compatibility re-export or comment.
-   Broadcast already uses `manifest.route === "direct"` from Task 4.
-2. Keep the defense-in-depth hostname check in `isBroadcastableHostUrl()` for
-   manually configured `FLEET_PUBLIC_URL`; a typed Dev Tunnels URL must still
-   never be broadcast.
-3. Test:
+1. Remove `nodeDialable` from provider metadata.
+2. Make `broadcastTunnelUrl()` consider only active `direct` connection plans.
+3. Keep the defense-in-depth hostname check for manually configured
+   `FLEET_PUBLIC_URL`; a typed Dev Tunnels URL must still never be broadcast.
+4. Test:
    - Dev Tunnels is advertised for enrollment but not broadcast,
    - direct providers remain broadcastable,
-   - a manually entered login-walled URL remains blocked.
-
-Node adoption of announced URLs was already moved to route-session policy in
-Task 7. Do not reopen `host-endpoints.ts` here.
+   - a manually entered login-walled URL remains blocked,
+   - route changes never cause a provider-backed Node to adopt a public login URL.
 
 ## Task 9: Remove compatibility shims and document the extension point
 
@@ -610,6 +485,7 @@ Task 7. Do not reopen `host-endpoints.ts` here.
 - Modify: `ARCHITECTURE.md`
 - Modify: `README.md`
 - Modify: `README.zh-CN.md`
+- Modify: `docs/superpowers/specs/2026-08-17-devtunnel-provider-design.md`
 
 **Steps:**
 
@@ -620,17 +496,12 @@ Task 7. Do not reopen `host-endpoints.ts` here.
    - core owns lifecycle and Fleet authentication,
    - Host plugins expose tunnels,
    - Node plugins open routes,
-   - direct providers share the built-in direct route,
-   - `route` on the manifest decides broadcast eligibility.
+   - direct providers share the built-in direct route.
 3. Add a concise "adding a provider" checklist:
-   - add the id to `TunnelProvider` in protocol,
-   - register manifest (`route` included) and Host driver,
-   - for a **direct** CLI provider: provider module plus tests; no Node or
-     Connect-card changes;
-   - for an **assisted** route: Host driver, Node driver, a new
-     `NodeConnectionPlan` union variant, and a CLI encoding (this refactor only
-     keeps `--devtunnel`);
-   - add parser and conformance tests;
+   - register manifest and Host driver,
+   - select direct or provider-assisted enrollment,
+   - add a Node driver only when required,
+   - add parser and conformance tests,
    - document authentication and URL stability.
 4. Mark the Dev Tunnels design as historical implementation evidence and point
    future provider work to this plan's final architecture.
@@ -657,27 +528,18 @@ Manual checks:
 5. Restart the Dev Tunnels Host and confirm the Node route recovers and follows a
    changed forwarded port.
 6. Confirm a private Dev Tunnels URL is never sent in a `host_url` message.
-7. Run an external tunnel process, including Dev Tunnels, and confirm it reuses a
-   named tunnel rather than minting a throwaway `host -p` tunnel.
-8. Disable a running provider and confirm it does not restart.
-9. Use the Node config page rebuild button on a Dev Tunnels node.
+7. Run an external tunnel process and confirm the Host observes it but cannot stop
+   it.
 
 ## Acceptance criteria
 
-- Adding a **direct** CLI-backed Host provider requires one protocol id, one
-  Host provider module, and tests; no change to `TunnelManager`,
-  `TunnelSupervisor`, Node `main.ts`, or the Connect card.
-- Adding an **assisted** route in a later change requires one Host provider, one
-  Node route provider, a new `NodeConnectionPlan` union variant, and a CLI
-  encoding. This refactor does not add that encoding; `--devtunnel` remains the
-  only assisted CLI.
+- Adding a direct CLI-backed Host provider requires one provider ID entry, one
+  provider module, and tests; no change to `TunnelManager`, `TunnelSupervisor`,
+  Node `main.ts`, or the Connect card.
+- Adding a provider-assisted route requires one Host provider and one Node route
+  provider, joined by a validated connection plan.
 - `apps/node/src/main.ts` has no Dev Tunnels-specific branches.
 - The UI does not inspect provider URL suffixes.
-- Editing the Connect-card URL rewrites a direct command and leaves an assisted
-  command unchanged.
-- Disable does not restart; crash while enabled does.
-- External `tunnel-process` runs `prepare()` then `start()` and persists the
-  tunnel id.
 - Fleet `hello` / `welcome`, registration, event buffering, and session behavior
   are unchanged.
 - All existing tunnel and reconnect regression tests remain green.
