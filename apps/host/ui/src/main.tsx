@@ -2,6 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { FluentProvider } from "@fluentui/react-components";
 import { App } from "./App";
+import { AuthGate } from "./components/AuthGate";
 import { fleetDarkTheme } from "./theme";
 import "./styles.css";
 
@@ -12,7 +13,9 @@ createRoot(document.getElementById("root")!).render(
         would stretch that portal to full screen and cover the app. */}
     <FluentProvider theme={fleetDarkTheme}>
       <div className="fluent-root">
-        <App />
+        <AuthGate>
+          <App />
+        </AuthGate>
       </div>
     </FluentProvider>
   </StrictMode>,

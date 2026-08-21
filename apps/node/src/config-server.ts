@@ -105,6 +105,85 @@ export type ConfigRouter = (
  */
 const HOST = "127.0.0.1";
 
+/** Loopback names a browser on this machine can legitimately have used. */
+const LOOPBACK_NAMES = new Set(["127.0.0.1", "localhost", "::1"]);
+
+function hostnameOf(value: string): string | undefined {
+  const authority = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").split("/")[0] ?? "";
+  const bracketed = /^\[([^\]]+)]/.exec(authority);
+  if (bracketed) return bracketed[1]?.toLowerCase();
+  const [host] = authority.split(":");
+  return host ? host.toLowerCase() : undefined;
+}
+
+function portOf(value: string): string | undefined {
+  const authority = value.replace(/^[a-z][a-z0-9+.-]*:\/\//i, "").split("/")[0] ?? "";
+  const withoutHost = authority.startsWith("[")
+    ? authority.slice(authority.indexOf("]") + 1)
+    : authority;
+  const [, port] = withoutHost.split(":");
+  return port;
+}
+
+export type GuardInput = {
+  method: string;
+  host?: string | undefined;
+  origin?: string | undefined;
+  contentType?: string | undefined;
+  port: number;
+};
+
+/**
+ * Why a request was refused before it reached a handler, or `undefined`.
+ *
+ * Binding to loopback is not by itself a boundary a browser respects. Any page
+ * the person at this machine happens to open can POST to 127.0.0.1 — and a
+ * simple request (`text/plain`, a form) is sent without a preflight the server
+ * ever gets to refuse, so the first place this can be stopped is here, by what
+ * the browser was honest about: `Origin`. `Host` closes the other half, DNS
+ * rebinding, where the attacker's own name resolves to loopback and the page is
+ * therefore same-origin with this server.
+ */
+export function refuseRequest({
+  method,
+  host,
+  origin,
+  contentType,
+  port,
+}: GuardInput): ConfigReply | undefined {
+  const name = host ? hostnameOf(host) : undefined;
+  const hostPort = host ? portOf(host) : undefined;
+  if (!name || !LOOPBACK_NAMES.has(name) || (hostPort && hostPort !== String(port))) {
+    return {
+      status: 403,
+      body: {
+        error: `This page is only reachable at http://${HOST}:${port}. Open it there rather than through another name.`,
+      },
+    };
+  }
+  if (origin !== undefined) {
+    const originName = hostnameOf(origin);
+    const originPort = portOf(origin);
+    if (
+      !originName ||
+      !LOOPBACK_NAMES.has(originName) ||
+      (originPort ?? "") !== String(port)
+    ) {
+      return { status: 403, body: { error: "Cross-origin request refused" } };
+    }
+  }
+  if (method.toUpperCase() === "GET" || method.toUpperCase() === "HEAD") return undefined;
+  // A cross-site form or `text/plain` fetch cannot set this header, so
+  // insisting on it is what keeps a request that never asked permission out.
+  if (!(contentType ?? "").toLowerCase().startsWith("application/json")) {
+    return {
+      status: 415,
+      body: { error: "Expected content-type: application/json" },
+    };
+  }
+  return undefined;
+}
+
 export function configServerPort(env: NodeJS.ProcessEnv = process.env): number {
   const parsed = Number(env.FLEET_NODE_CONFIG_PORT ?? 8788);
   return Number.isInteger(parsed) && parsed > 0 && parsed < 65_536 ? parsed : 8788;
@@ -143,6 +222,7 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
     new FleetClient({
       hostUrl: () => options.getSettings().hostUrl,
       nodeId: () => options.getStatus().nodeId,
+      nodeSecret: () => options.getCredentials()?.secret,
     });
   const pickFolder = options.pickFolder ?? pickFolderDefault;
   const inspectPath = options.inspectPath ?? inspectPathDefault;
@@ -298,16 +378,37 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
 
 export function startConfigServer(options: ConfigServerOptions): Server {
   const route = createConfigRouter(options);
+  const port = options.port ?? configServerPort();
 
   const server = createServer((request, response) => {
     const url = request.url ?? "/";
     const pathname = url.split("?")[0] ?? url;
+    const refusal = refuseRequest({
+      method: request.method ?? "GET",
+      host: request.headers.host,
+      origin: request.headers.origin,
+      contentType: request.headers["content-type"],
+      port,
+    });
+    if (refusal) {
+      // Read to completion first: a body left unread makes a browser report the
+      // refusal as a network error rather than as the answer it is.
+      request.resume();
+      response.writeHead(refusal.status, {
+        "content-type": "application/json",
+        "cache-control": "no-store",
+      });
+      response.end(JSON.stringify(refusal.body));
+      return;
+    }
     const asset = request.method === "GET" ? configAsset(pathname) : undefined;
     if (asset) {
       response.writeHead(200, {
         "content-type": asset.contentType,
         // The page is same-origin only; no browser should embed or frame it.
         "cache-control": "no-store",
+        "content-security-policy": "frame-ancestors 'none'",
+        "x-content-type-options": "nosniff",
       });
       response.end(asset.body);
       return;
@@ -331,7 +432,6 @@ export function startConfigServer(options: ConfigServerOptions): Server {
     });
   });
 
-  const port = options.port ?? configServerPort();
   server.listen(port, HOST, () => {
     options.log(`  config UI   http://${HOST}:${port}`);
   });

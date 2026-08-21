@@ -108,8 +108,10 @@ describe("FleetStore", () => {
     expect(store.getDefaultYolo()).toBe(false);
   });
 
-  it("defaults yolo on until it is explicitly turned off", () => {
+  it("defaults yolo off until it is explicitly turned on", () => {
     const { store } = setup();
+    expect(store.getDefaultYolo()).toBe(false);
+    store.setDefaultYolo(true);
     expect(store.getDefaultYolo()).toBe(true);
     store.setDefaultYolo(false);
     expect(store.getDefaultYolo()).toBe(false);

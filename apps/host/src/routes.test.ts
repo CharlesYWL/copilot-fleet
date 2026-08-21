@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { FastifyInstance } from "fastify";
+import type { FastifyInstance, InjectOptions } from "fastify";
 import { buildServer } from "./server.js";
+
+const OPERATOR_PASSWORD = "test-password";
 
 /**
  * Route-level coverage.
@@ -11,9 +13,18 @@ import { buildServer } from "./server.js";
  */
 describe("host routes", () => {
   let app: FastifyInstance;
+  let cookie = "";
+
+  /**
+   * Every route below now sits behind the operator session, so the suite
+   * signs in once per test and speaks as that operator. Unauthenticated
+   * behaviour is asserted separately, in request-guard.test.ts.
+   */
+  const inject = async (options: InjectOptions) =>
+    app.inject({ ...options, headers: { ...options.headers, cookie } });
 
   const enroll = async (name: string, capabilities = ["copilot-acp", "host-yolo"]) => {
-    const response = await app.inject({
+    const response = await inject({
       method: "POST",
       url: "/api/nodes/register",
       payload: {
@@ -30,9 +41,21 @@ describe("host routes", () => {
   };
 
   beforeEach(async () => {
-    app = await buildServer({ databasePath: ":memory:", enrollmentToken: "test-token" });
+    app = await buildServer({
+      databasePath: ":memory:",
+      enrollmentToken: "test-token",
+      operatorPassword: OPERATOR_PASSWORD,
+    });
     app.log.level = "silent";
     await app.ready();
+
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { password: OPERATOR_PASSWORD },
+    });
+    expect(login.statusCode).toBe(200);
+    cookie = (login.headers["set-cookie"] as string).split(";")[0] ?? "";
   });
 
   afterEach(async () => {
@@ -40,11 +63,11 @@ describe("host routes", () => {
   });
 
   it("reports health and an empty snapshot", async () => {
-    const health = await app.inject({ method: "GET", url: "/api/health" });
+    const health = await inject({ method: "GET", url: "/api/health" });
     expect(health.statusCode).toBe(200);
     expect(health.json()).toMatchObject({ ok: true });
 
-    const snapshot = await app.inject({ method: "GET", url: "/api/snapshot" });
+    const snapshot = await inject({ method: "GET", url: "/api/snapshot" });
     expect(snapshot.json()).toMatchObject({
       nodes: [],
       workspaces: [],
@@ -59,13 +82,13 @@ describe("host routes", () => {
   it("serves a log endpoint the browser can read the Host's problems from", async () => {
     // The Host logs to a terminal that, on an unattended fleet, nobody is
     // watching. This is how the operator sees it without one.
-    const response = await app.inject({ method: "GET", url: "/api/logs" });
+    const response = await inject({ method: "GET", url: "/api/logs" });
     expect(response.statusCode).toBe(200);
     expect(Array.isArray(response.json().entries)).toBe(true);
   });
 
   it("refuses enrollment with the wrong token", async () => {
-    const response = await app.inject({
+    const response = await inject({
       method: "POST",
       url: "/api/nodes/register",
       payload: {
@@ -87,21 +110,21 @@ describe("host routes", () => {
     expect(second.nodeId).toBe(first.nodeId);
     expect(second.secret).not.toBe(first.secret);
 
-    const nodes = await app.inject({ method: "GET", url: "/api/nodes" });
+    const nodes = await inject({ method: "GET", url: "/api/nodes" });
     expect(nodes.json()).toHaveLength(1);
     // The secret must never travel back out over a listing route.
     expect(JSON.stringify(nodes.json())).not.toContain(second.secret);
   });
 
   it("rejects a duplicate workspace name", async () => {
-    const created = await app.inject({
+    const created = await inject({
       method: "POST",
       url: "/api/workspaces",
       payload: { name: "fleet", description: "" },
     });
     expect(created.statusCode).toBe(201);
 
-    const duplicate = await app.inject({
+    const duplicate = await inject({
       method: "POST",
       url: "/api/workspaces",
       payload: { name: "fleet", description: "" },
@@ -127,13 +150,13 @@ describe("host routes", () => {
       { method: "DELETE" as const, url: "/api/sessions/missing" },
     ];
     for (const route of routes) {
-      const response = await app.inject(route);
+      const response = await inject(route);
       expect(response.statusCode, route.url).toBe(404);
     }
   });
 
   it("maps schema violations to 400", async () => {
-    const response = await app.inject({
+    const response = await inject({
       method: "POST",
       url: "/api/workspaces",
       payload: { description: "no name" },
@@ -143,12 +166,12 @@ describe("host routes", () => {
 
   it("refuses a session on an offline node", async () => {
     const { nodeId } = await enroll("offline-node");
-    const workspace = await app.inject({
+    const workspace = await inject({
       method: "POST",
       url: "/api/workspaces",
       payload: { name: "fleet", description: "" },
     });
-    const placement = await app.inject({
+    const placement = await inject({
       method: "POST",
       url: "/api/placements",
       payload: {
@@ -157,7 +180,7 @@ describe("host routes", () => {
         localPath: "/tmp/fleet",
       },
     });
-    const response = await app.inject({
+    const response = await inject({
       method: "POST",
       url: "/api/sessions",
       payload: {
@@ -170,12 +193,12 @@ describe("host routes", () => {
   });
 
   it("refuses a placement for an unknown node", async () => {
-    const workspace = await app.inject({
+    const workspace = await inject({
       method: "POST",
       url: "/api/workspaces",
       payload: { name: "fleet", description: "" },
     });
-    const response = await app.inject({
+    const response = await inject({
       method: "POST",
       url: "/api/placements",
       payload: {
@@ -188,40 +211,41 @@ describe("host routes", () => {
   });
 
   it("round-trips the session defaults", async () => {
-    // Both are on when unset, so each toggle has to be able to turn its own off.
+    // Auto-resume is on when unset; YOLO is not, because handing every new
+    // session a permission-free agent is the operator's decision to make.
     const read = async () =>
-      (await app.inject({ method: "GET", url: "/api/defaults" })).json();
-    expect(await read()).toEqual({ yolo: true, autoResume: true });
-
-    await app.inject({ method: "POST", url: "/api/defaults", payload: { yolo: false } });
-    // A client that knows about one setting must not reset the other simply by
-    // not mentioning it.
+      (await inject({ method: "GET", url: "/api/defaults" })).json();
     expect(await read()).toEqual({ yolo: false, autoResume: true });
 
-    await app.inject({
+    await inject({ method: "POST", url: "/api/defaults", payload: { yolo: true } });
+    // A client that knows about one setting must not reset the other simply by
+    // not mentioning it.
+    expect(await read()).toEqual({ yolo: true, autoResume: true });
+
+    await inject({
       method: "POST",
       url: "/api/defaults",
       payload: { autoResume: false },
     });
-    expect(await read()).toEqual({ yolo: false, autoResume: false });
+    expect(await read()).toEqual({ yolo: true, autoResume: false });
   });
 
   it("serves the enrollment command inputs", async () => {
-    const response = await app.inject({ method: "GET", url: "/api/enrollment" });
+    const response = await inject({ method: "GET", url: "/api/enrollment" });
     expect(response.json()).toMatchObject({ enrollmentToken: "test-token" });
     expect((response.json() as { hostUrl: string }).hostUrl).toMatch(/^http/);
   });
 
   it("exports and replaces the fleet from a Host archive", async () => {
     const enrolled = await enroll("box");
-    const created = await app.inject({
+    const created = await inject({
       method: "POST",
       url: "/api/workspaces",
       payload: { name: "repo", description: "" },
     });
     expect(created.statusCode).toBe(201);
 
-    const exported = await app.inject({ method: "GET", url: "/api/backup" });
+    const exported = await inject({ method: "GET", url: "/api/backup" });
     expect(exported.statusCode).toBe(200);
     const backup = exported.json() as {
       kind: string;
@@ -233,30 +257,28 @@ describe("host routes", () => {
     expect(backup.publicUrl).toBeUndefined();
 
     backup.enrollmentToken = "restored-token";
-    const imported = await app.inject({
+    const imported = await inject({
       method: "POST",
       url: "/api/backup",
       payload: backup,
     });
     expect(imported.statusCode).toBe(200);
 
-    const snapshot = (
-      await app.inject({ method: "GET", url: "/api/snapshot" })
-    ).json() as {
+    const snapshot = (await inject({ method: "GET", url: "/api/snapshot" })).json() as {
       nodes: { id: string }[];
       workspaces: { name: string }[];
     };
     expect(snapshot.nodes.map((node) => node.id)).toContain(enrolled.nodeId);
     expect(snapshot.workspaces.map((workspace) => workspace.name)).toContain("repo");
     expect(
-      (await app.inject({ method: "GET", url: "/api/enrollment" })).json(),
+      (await inject({ method: "GET", url: "/api/enrollment" })).json(),
     ).toMatchObject({
       enrollmentToken: "restored-token",
     });
   });
 
   it("refuses a Node identity file on the Host import endpoint", async () => {
-    const response = await app.inject({
+    const response = await inject({
       method: "POST",
       url: "/api/backup",
       payload: {
@@ -285,7 +307,7 @@ describe("host routes", () => {
   });
 
   it("keeps unknown API paths as JSON 404s", async () => {
-    const response = await app.inject({ method: "GET", url: "/api/nope" });
+    const response = await inject({ method: "GET", url: "/api/nope" });
     expect(response.statusCode).toBe(404);
   });
 });

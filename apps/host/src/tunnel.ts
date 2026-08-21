@@ -531,6 +531,19 @@ export class TunnelSupervisor {
     return this.primaryManager()?.activeTunnelId();
   }
 
+  /**
+   * Every address a tunnel is currently serving this Host at.
+   *
+   * The request guard needs all of them, not just the primary: two providers
+   * can run side by side, and a browser arriving over the one that is not
+   * primary is an operator, not an attacker.
+   */
+  allTunnelUrls(): string[] {
+    return providerList
+      .map((spec) => this.managers.get(spec.id)?.activeTunnelUrl())
+      .filter((url): url is string => Boolean(url));
+  }
+
   async info(fallbackPublicUrl: string): Promise<TunnelInfo> {
     // Touch every provider so a switched-off one still reports its state and
     // the UI can offer it, rather than only listing what has already run.

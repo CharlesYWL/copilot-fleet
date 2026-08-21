@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
 
 /**
  * The subset of a placement this page needs. Declared locally rather than
@@ -40,19 +41,29 @@ export function ownPlacements(
 export type FleetClientOptions = {
   hostUrl: () => string;
   nodeId: () => string;
+  /**
+   * This node's secret, which is how the Host tells a relayed call from an
+   * anonymous one. Absent before enrollment, when there is nothing to say.
+   */
+  nodeSecret?: () => string | undefined;
 };
+
+/** The identity headers a relayed call carries, or nothing before enrollment. */
+type NodeCredentialHeaders = Record<string, string>;
 
 async function request<T>(
   base: string,
   path: string,
   schema: z.ZodType<T>,
-  init: { method?: string; body?: string } = {},
+  init: { method?: string; body?: string; credentials?: NodeCredentialHeaders } = {},
 ): Promise<T> {
   const response = await fetch(new URL(path, base), {
     ...(init.method ? { method: init.method } : {}),
-    ...(init.body
-      ? { body: init.body, headers: { "content-type": "application/json" } }
-      : {}),
+    ...(init.body ? { body: init.body } : {}),
+    headers: {
+      ...(init.body ? { "content-type": "application/json" } : {}),
+      ...init.credentials,
+    },
     signal: AbortSignal.timeout(10_000),
   });
   const text = await response.text();
@@ -84,11 +95,25 @@ async function request<T>(
 export class FleetClient {
   constructor(private readonly options: FleetClientOptions) {}
 
+  /**
+   * What identifies this node to the Host, when it has an identity yet.
+   *
+   * Sent on every call rather than only the writes: the Host's API is not open
+   * to anonymous callers any more, so a read without this is a 401.
+   */
+  private credentials(): NodeCredentialHeaders {
+    const nodeId = this.options.nodeId();
+    const secret = this.options.nodeSecret?.();
+    if (!nodeId || !secret) return {};
+    return { [NODE_ID_HEADER]: nodeId, [NODE_SECRET_HEADER]: secret };
+  }
+
   async listWorkspaces(): Promise<WorkspaceLike[]> {
     return request(
       this.options.hostUrl(),
       "/api/workspaces",
       z.array(WorkspaceLikeSchema),
+      { credentials: this.credentials() },
     );
   }
 
@@ -97,6 +122,7 @@ export class FleetClient {
       this.options.hostUrl(),
       "/api/placements",
       z.array(PlacementLikeSchema),
+      { credentials: this.credentials() },
     );
     return ownPlacements(placements, this.options.nodeId());
   }
@@ -105,6 +131,7 @@ export class FleetClient {
     return request(this.options.hostUrl(), "/api/workspaces", WorkspaceLikeSchema, {
       method: "POST",
       body: JSON.stringify({ name, description }),
+      credentials: this.credentials(),
     });
   }
 
@@ -117,14 +144,20 @@ export class FleetClient {
       this.options.hostUrl(),
       `/api/workspaces/${encodeURIComponent(id)}`,
       WorkspaceLikeSchema,
-      { method: "PATCH", body: JSON.stringify({ name, description }) },
+      {
+        method: "PATCH",
+        body: JSON.stringify({ name, description }),
+        credentials: this.credentials(),
+      },
     );
   }
 
   /**
-   * Rejects a path on a placement this node does not own. The Host cannot make
-   * that call for us — it has no way to tell which node the request came from —
-   * so the check has to happen here, where the identity is known.
+   * Rejects a path on a placement this node does not own.
+   *
+   * The Host now refuses the same thing, having learned who is calling from the
+   * credentials above, but the message it can give is a bare 403; checking here
+   * is what turns that into something the page can explain.
    */
   async updateOwnPlacementPath(id: string, localPath: string): Promise<PlacementLike> {
     const mine = await this.listOwnPlacements();
@@ -135,7 +168,11 @@ export class FleetClient {
       this.options.hostUrl(),
       `/api/placements/${encodeURIComponent(id)}`,
       PlacementLikeSchema,
-      { method: "PATCH", body: JSON.stringify({ localPath }) },
+      {
+        method: "PATCH",
+        body: JSON.stringify({ localPath }),
+        credentials: this.credentials(),
+      },
     );
   }
 
@@ -145,6 +182,7 @@ export class FleetClient {
   ): Promise<PlacementLike> {
     return request(this.options.hostUrl(), "/api/placements", PlacementLikeSchema, {
       method: "POST",
+      credentials: this.credentials(),
       body: JSON.stringify({
         workspaceId,
         nodeId: this.options.nodeId(),

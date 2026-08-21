@@ -17,6 +17,7 @@ import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
 import { useSessionChimes } from "./hooks/useSessionChimes";
+import { signOut } from "./lib/auth";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import { isDisposableSession, filterVisibleSessions } from "./lib/session-status";
 import {
@@ -85,7 +86,7 @@ export function App() {
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [defaultYolo, setDefaultYolo] = useState(true);
+  const [defaultYolo, setDefaultYolo] = useState(false);
   /**
    * Unsent composer text, per session.
    *
@@ -257,6 +258,7 @@ export function App() {
           onLayoutChange={handleLayoutChange}
           soundEnabled={sound.enabled}
           onToggleSound={sound.toggle}
+          onSignOut={() => void signOut()}
         />
         <div className={styles.body}>
           {layout === "grid" ? (

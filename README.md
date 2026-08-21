@@ -51,6 +51,14 @@ This single command runs the Fastify API on `http://127.0.0.1:8787`, Vite on
 `http://127.0.0.1:5173`, and the local Node service. The Node reads its
 `FLEET_*` settings from `.env`.
 
+The UI asks for an operator password before it shows anything. Set
+`FLEET_OPERATOR_PASSWORD` in `.env` to choose it; leave it unset and the Host
+generates one on first boot and prints it to its console:
+
+```
+No FLEET_OPERATOR_PASSWORD set, so this Host generated one. Sign in with: …
+```
+
 To keep a tunnel URL stable while you edit code, start the tunnel as its own
 process instead:
 
@@ -392,6 +400,13 @@ Reach a remote node's page over SSH port forwarding rather than binding wider.
 Each provider runs on its own, so more than one can be up at a time; the one
 marked for enrollment is the address handed to new nodes.
 
+That address is the Host, not a separate handshake channel. The tunnel forwards
+to `http://127.0.0.1:8787` (or `PORT`): `/api`, `/ws/node`, `/ws/browser`, and
+the built UI when one is there. In `npm run dev` the page you click is Vite on
+`http://127.0.0.1:5173`; the tunnel does not point at that. Opening the public
+URL still hits the Host, so `/api/health` answers and everything else still
+asks for the operator password.
+
 When the Host's public address changes — a tunnel comes up, rotates, or is
 switched to another provider — it tells the nodes that are still connected. Each
 one records the new address, keeps the old one as a fallback, and **does not drop
@@ -608,6 +623,21 @@ that never got that far is simply over.
 
 ## Security notes
 
+- The web UI and the whole `/api` surface sit behind an operator password. Set
+  `FLEET_OPERATOR_PASSWORD`; a Host started without one generates a password on
+  first boot and prints it to its console. Signing in sets an `HttpOnly`,
+  `SameSite=Strict` session cookie that lasts 12 hours. Repeated wrong guesses
+  lock sign-in for the whole Host — not per client — for a few minutes.
+  `/api/health` stays unauthenticated so a tunnel URL can be probed without
+  becoming an administrator.
+- The Host answers only to names it knows: loopback, `FLEET_PUBLIC_URL`, the
+  live tunnel URL, and anything listed in `FLEET_ALLOWED_HOSTS`. Requests
+  arriving under any other `Host`, or from another `Origin`, are refused —
+  which is what keeps a page the operator happens to visit from reaching the
+  fleet through a rebound DNS name. `FLEET_ALLOWED_HOSTS=*` disables the check.
+- A node's own credentials reach only the workspace and placement endpoints its
+  config page relays through, and a node can only create or repoint placements
+  on itself.
 - Production startup refuses a missing or default `change-me` enrollment token.
 - A successful enrollment creates a unique high-entropy node secret; only its
   SHA-256 hash is stored by the Host.
@@ -618,12 +648,17 @@ that never got that far is simply over.
 - Copilot is spawned directly with argument arrays, `shell: false`, and the
   selected placement as `cwd`.
 - Permissions are explicit and auditable in the UI (allow-once / deny only).
-  For unattended runs, set `FLEET_YOLO=1` on the Node so Copilot starts with
-  `--allow-all` (tools, paths, and URLs). Unanswered and disconnected requests
-  still fail closed when YOLO is off.
-- The MVP has no user authentication. Put an internet-exposed Host behind an
-  authenticated reverse proxy or access policy (for example Cloudflare Access)
-  and use HTTPS/WSS.
+  YOLO is off by default, on the Host and on each new session. For unattended
+  runs, set `FLEET_YOLO=1` on the Node so Copilot starts with `--allow-all`
+  (tools, paths, and URLs). Unanswered and disconnected requests still fail
+  closed when YOLO is off.
+- The node's local config page is bound to loopback and additionally refuses
+  requests that do not name `127.0.0.1` (or `localhost`) on its own port, come
+  from another origin, or write without `content-type: application/json`. It
+  does not defend against another user signed in to the same machine.
+- An internet-exposed Host should still use HTTPS/WSS, and putting one behind
+  an authenticated reverse proxy or access policy (for example Cloudflare
+  Access) remains a good second layer.
 
 ## Commands
 
