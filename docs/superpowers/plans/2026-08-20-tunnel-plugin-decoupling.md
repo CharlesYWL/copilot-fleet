@@ -485,6 +485,7 @@ handled by a built-in no-process route.
 - Modify: `ARCHITECTURE.md`
 - Modify: `README.md`
 - Modify: `README.zh-CN.md`
+- Modify: `docs/superpowers/specs/2026-08-17-devtunnel-provider-design.md`
 
 **Steps:**
 
