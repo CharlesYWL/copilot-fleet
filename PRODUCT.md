@@ -20,7 +20,7 @@ A self-hosted browser control plane for running and supervising multiple GitHub 
 
 ## MVP user flows
 
-1. Start Host and open the browser dashboard.
+1. Start Host, sign in with the operator password, and open the browser dashboard.
 2. Start Node with Host URL + enrollment token + node name. Node registers and appears online.
 3. Create a Workspace, then add one or more node placements with local paths.
 4. Start a Copilot session by selecting Workspace, eligible Node/placement, and initial prompt.
@@ -56,13 +56,15 @@ Every command has `commandId`; every node event has `eventId`, `sessionId`, and 
 
 ## Security baseline
 
+- Operator password gates the web UI and `/api`. Set `FLEET_OPERATOR_PASSWORD`, or let the Host generate one on first boot and print it to its console. A tunnel only proves the Host is reachable.
+- Host answers only to names it knows (loopback, `FLEET_PUBLIC_URL`, live tunnel URLs, `FLEET_ALLOWED_HOSTS`). Cross-origin requests and rebound DNS names are refused. `FLEET_ALLOWED_HOSTS=*` turns that check off.
 - Host creates an enrollment token; successful registration returns a unique node ID and node secret.
-- Node stores credentials in a user-local config file and uses them for reconnects.
+- Node stores credentials in a user-local config file and uses them for reconnects. Those credentials reach only the catalog routes the node's config page relays, and a node can only create or repoint placements on itself.
 - Workspace paths are never accepted from arbitrary session-create payloads; Host may only select a preconfigured placement.
 - Node validates the resolved working directory and enforces concurrency.
 - Copilot authentication stays on the node. Tokens are never uploaded to Host.
-- Permission requests are explicit and auditable; deny by default.
-- Cloudflare Tunnel may expose Host HTTP/WSS. Nodes only need outbound HTTPS/WSS.
+- Permission requests are explicit and auditable; deny by default. YOLO is off unless explicitly enabled.
+- Cloudflare Tunnel may expose Host HTTP/WSS (the process on `PORT`, not the Vite dev server). Nodes only need outbound HTTPS/WSS.
 
 ## UI MVP
 
@@ -84,4 +86,4 @@ Every command has `commandId`; every node event has `eventId`, `sessionId`, and 
 
 ## Acceptance test
 
-On a Windows node with authenticated Copilot CLI, a user can register the node, map a workspace path, start two Copilot ACP sessions on the same node, watch both stream in the live grid, open either session, send a follow-up, approve/deny a permission request, cancel the active turn without killing the session, and stop the process. Host restart preserves nodes, workspaces, placements, sessions, and event history.
+On a Windows node with authenticated Copilot CLI, a user signs in with the operator password, registers the node, maps a workspace path, starts two Copilot ACP sessions on the same node, watches both stream in the live grid, opens either session, sends a follow-up, approves or denies a permission request, cancels the active turn without killing the session, and stops the process. Without that password, `/api/snapshot` and `/api/enrollment` refuse the caller. Host restart preserves nodes, workspaces, placements, sessions, and event history, and signs the operator out.

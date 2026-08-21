@@ -399,6 +399,13 @@ Reach a remote node's page over SSH port forwarding rather than binding wider.
 Each provider runs on its own, so more than one can be up at a time; the one
 marked for enrollment is the address handed to new nodes.
 
+That address is the Host, not a separate handshake channel. The tunnel forwards
+to `http://127.0.0.1:8787` (or `PORT`): `/api`, `/ws/node`, `/ws/browser`, and
+the built UI when one is there. In `npm run dev` the page you click is Vite on
+`http://127.0.0.1:5173`; the tunnel does not point at that. Opening the public
+URL still hits the Host, so `/api/health` answers and everything else still
+asks for the operator password.
+
 When the Host's public address changes — a tunnel comes up, rotates, or is
 switched to another provider — it tells the nodes that are still connected. Each
 one records the new address, keeps the old one as a fallback, and **does not drop
@@ -613,8 +620,10 @@ that never got that far is simply over.
 - The web UI and the whole `/api` surface sit behind an operator password. Set
   `FLEET_OPERATOR_PASSWORD`; a Host started without one generates a password on
   first boot and prints it to its console. Signing in sets an `HttpOnly`,
-  `SameSite=Strict` session cookie that lasts 12 hours, and repeated wrong
-  guesses lock sign-in out for a few minutes.
+  `SameSite=Strict` session cookie that lasts 12 hours. Repeated wrong guesses
+  lock sign-in for the whole Host — not per client — for a few minutes.
+  `/api/health` stays unauthenticated so a tunnel URL can be probed without
+  becoming an administrator.
 - The Host answers only to names it knows: loopback, `FLEET_PUBLIC_URL`, the
   live tunnel URL, and anything listed in `FLEET_ALLOWED_HOSTS`. Requests
   arriving under any other `Host`, or from another `Origin`, are refused —

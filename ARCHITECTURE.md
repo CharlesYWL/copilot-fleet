@@ -304,12 +304,15 @@ ACP support in Copilot CLI is still public preview, so protocol/package versions
 
 ## Security boundary
 
-- Enrollment token is exchanged once for a unique Node secret; Host stores only its hash.
+- The browser UI and `/api` sit behind an operator password (`FLEET_OPERATOR_PASSWORD`, or one generated on first boot). Sessions are `HttpOnly`, `SameSite=Strict` cookies held in memory — a Host restart signs everyone out.
+- A central `onRequest` guard covers `/api/*` and `/ws/*` so a route added later is protected by having been added at all. Unrecognised `Host`/`Origin` names are refused (DNS rebinding). Open paths are health, sign-in/out/status, and `/api/nodes/register` (enrollment token). `/ws/node` authenticates in the first frame instead.
+- A tunnel (Cloudflare, Dev Tunnels, …) forwards to the Host process on `PORT` (default 8787): `/api`, `/ws/node`, `/ws/browser`, and the built UI. It authenticates a network path, not an operator. In `npm run dev` the page you click is Vite on 5173; the tunnel does not point at that.
+- Enrollment token is exchanged once for a unique Node secret; Host stores only its hash. Node HTTP credentials reach only the catalog routes the config page relays, and a node can only place its own paths.
 - Copilot credentials stay on the Node.
 - Session creation references a Placement ID, never an arbitrary browser-supplied path.
 - Child processes use an argument array and `shell: false`.
-- Permission requests fail closed.
-- The MVP has no user authentication; internet exposure requires HTTPS/WSS plus an authenticated reverse proxy such as Cloudflare Access.
+- Permission requests fail closed. YOLO is off unless the stored default is exactly `"1"`.
+- Internet exposure should still use HTTPS/WSS. An access policy in front of the Host (for example Cloudflare Access) remains a good second layer. Shared-password SSO/RBAC is still an MVP non-goal.
 
 ## MVP non-goals
 
