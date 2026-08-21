@@ -9,11 +9,9 @@ should hold the orchestrator role — Copilot, Pi via `pi-acp`, or another. This
 document assumes Copilot because Fleet already runs it; the tool surface below is
 harness-agnostic and is what makes that choice swappable.
 
-**Supersedes the relay half of** `2026-08-17-session-relay-design.md`. That document
-established that ACP has no peer channel and the Host must carry information
-between sessions. It then proposed a static `SessionLink` — worker fires,
-reviewer runs, every time. That is the thing this design rejects. The transport
-analysis in it still holds and is not repeated here.
+ACP has no peer channel; the Host must carry information between sessions.
+A static `SessionLink` — worker fires, reviewer runs, every time — is the thing
+this design rejects.
 
 ## The requirement
 
