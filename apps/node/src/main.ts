@@ -52,7 +52,7 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter } from "./router.js";
 import { EventOutbox } from "./outbox.js";
-import { closeQuietly } from "./socket.js";
+import { closeQuietly, HOST_DIAL_TIMEOUT_MS, watchHostLiveness } from "./socket.js";
 import { configServerPort, startConfigServer } from "./config-server.js";
 import {
   loadSettings,
@@ -274,6 +274,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         settings.contextTier,
       );
   let socket: WebSocket | undefined;
+  /**
+   * Stops the liveness watchdog on whichever socket is current.
+   *
+   * Held out here rather than beside the socket because the socket can be
+   * abandoned without ever closing: retargeting a node drops the listeners
+   * first, so the watchdog's own `close` hook is exactly what does not run.
+   */
+  let stopLiveness: () => void = () => {};
+  const releaseLiveness = (): void => {
+    stopLiveness();
+    stopLiveness = () => {};
+  };
   let shuttingDown = false;
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
@@ -374,6 +386,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // Removing listeners first stops the close handler from scheduling its own
     // retry against the URL we are moving away from.
     current?.removeAllListeners();
+    // Which also removes the hook that would have retired the watchdog, so it
+    // is retired here instead of being left pinging a socket nobody holds.
+    releaseLiveness();
     if (current) closeQuietly(current);
     connect();
   }
@@ -565,13 +580,31 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     const url = new URL("/ws/node", dialUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     log(`Connecting to ${url}`);
-    const active = new WebSocket(url);
+    // Bounded, because an unanswered dial is the one failure this loop cannot
+    // see: a dev tunnel whose relay is gone still accepts the connection, and
+    // without a deadline the node waits on it for the operating system's whole
+    // retransmission budget instead of failing and rebuilding the tunnel.
+    const active = new WebSocket(url, { handshakeTimeout: HOST_DIAL_TIMEOUT_MS });
     const attemptUrl = dialUrl;
     // Distinguishes "this address does not reach the Host" from "the Host hung
     // up on us", which is what decides whether to try a different address.
     let welcomed = false;
+    // A dial that replaces one still in flight must not leave its watchdog
+    // behind; the only socket worth watching is the one being opened here.
+    releaseLiveness();
     socket = active;
+    // Registered before the close handler below so the watchdog is gone before
+    // anything decides what to do about the disconnection.
+    active.once("close", () => {
+      if (socket === active) releaseLiveness();
+    });
     active.on("open", () => {
+      stopLiveness = watchHostLiveness(active, {
+        onDead: (silentMs) =>
+          warn(
+            `Host stopped answering for ${Math.round(silentMs / 1000)}s; dropping the connection so it can be rebuilt`,
+          ),
+      });
       send({
         type: "hello",
         nodeId: auth.nodeId,
@@ -805,6 +838,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // An unref'd timer does not hold the loop open, but it does keep firing while
     // the process winds down, which resurrects a socket we are trying to close.
     clearInterval(heartbeatTimer);
+    releaseLiveness();
     configServer.close();
     socket?.close();
     await router.stopAll();
