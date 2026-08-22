@@ -7,6 +7,7 @@ import {
   type SessionEvent,
 } from "@fleet/protocol";
 import type { AgentFactory, SessionAgent } from "./agents.js";
+import { installRequestedAgent, type CatalogEntry } from "./agent-catalog.js";
 import { resolveMcpServers } from "./mcp-endpoint.js";
 
 export type CommandResult = {
@@ -48,6 +49,15 @@ export class CommandRouter {
      * endpoint the Host names. Only an orchestrator is given one.
      */
     private readonly hostUrl: () => string = () => "",
+    /**
+     * What agents this machine offers, read fresh so an operator who drops one
+     * in does not have to restart the Node to use it.
+     */
+    private readonly agentCatalog: () => Promise<
+      readonly CatalogEntry[]
+    > = async () => [],
+    /** Where a refused agent is reported; a session still starts without one. */
+    private readonly warn: (message: string) => void = () => {},
   ) {}
 
   /**
@@ -184,6 +194,14 @@ export class CommandRouter {
         }
       };
       const mcpServers = resolveMcpServers(command.mcpServers, this.hostUrl());
+      const requested = await installRequestedAgent(
+        cwd,
+        command.agent,
+        await this.agentCatalog(),
+      );
+      if (requested.reason) {
+        this.warn(`session ${command.sessionId.slice(0, 8)}: ${requested.reason}`);
+      }
       const agent = await this.factory.start(
         command.sessionId,
         cwd,
@@ -194,8 +212,9 @@ export class CommandRouter {
               sequenceOffset: command.sequenceOffset,
               yolo: command.yolo,
               mcpServers,
+              agent: requested.selected,
             }
-          : { yolo: command.yolo, mcpServers },
+          : { yolo: command.yolo, mcpServers, agent: requested.selected },
       );
       slot.agent = agent;
       if (this.slots.get(command.sessionId) !== slot) {

@@ -207,6 +207,7 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "phases", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("runs", "pending_prompt", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("nodes", "agents", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.rebuildSessionStateFromEvents();
   }
@@ -639,7 +640,7 @@ export class FleetStore {
     input: Omit<
       FleetNode,
       "id" | "activeSessions" | "lastHeartbeat" | "online" | "homeDir" | "revision"
-    > & { homeDir?: string; revision?: string },
+    > & { homeDir?: string; revision?: string; agents?: FleetNode["agents"] },
   ): { node: FleetNode; secret: string } {
     const secret = randomUUID() + randomUUID();
     const now = new Date().toISOString();
@@ -652,7 +653,7 @@ export class FleetStore {
     if (existing) {
       this.statement(
         `UPDATE nodes SET secret_hash=?, os=?, arch=?, version=?, revision=?, capabilities=?,
-           max_sessions=?, last_heartbeat=?, home_dir=? WHERE id=?`,
+           agents=?, max_sessions=?, last_heartbeat=?, home_dir=? WHERE id=?`,
       ).run(
         hash(secret),
         input.os,
@@ -660,6 +661,7 @@ export class FleetStore {
         input.version,
         input.revision ?? "",
         JSON.stringify(input.capabilities),
+        JSON.stringify(input.agents ?? []),
         input.maxSessions,
         now,
         input.homeDir ?? "",
@@ -671,8 +673,8 @@ export class FleetStore {
     const id = randomUUID();
     this.statement(
       `INSERT INTO nodes
-        (id,name,secret_hash,os,arch,version,revision,capabilities,max_sessions,last_heartbeat,online,home_dir)
-       VALUES (?,?,?,?,?,?,?,?,?,?,0,?)`,
+        (id,name,secret_hash,os,arch,version,revision,capabilities,agents,max_sessions,last_heartbeat,online,home_dir)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)`,
     ).run(
       id,
       input.name,
@@ -682,6 +684,7 @@ export class FleetStore {
       input.version,
       input.revision ?? "",
       JSON.stringify(input.capabilities),
+      JSON.stringify(input.agents ?? []),
       input.maxSessions,
       now,
       input.homeDir ?? "",
@@ -1646,6 +1649,7 @@ function nodeFromRow(row: Row): FleetNode {
     version: String(row.version),
     revision: String(row.revision ?? ""),
     capabilities: JSON.parse(String(row.capabilities)) as string[],
+    agents: parseJsonList(row.agents),
     maxSessions: Number(row.max_sessions),
     activeSessions: Number(row.active_sessions),
     lastHeartbeat: String(row.last_heartbeat),

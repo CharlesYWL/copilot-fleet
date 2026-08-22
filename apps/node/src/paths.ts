@@ -2,11 +2,17 @@ import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   envFilePath as sharedEnvFilePath,
+  packageRoot as sharedPackageRoot,
   packageVersion as sharedPackageVersion,
 } from "@fleet/protocol/runtime";
 
 function moduleDirectory(): string {
   return dirname(fileURLToPath(import.meta.url));
+}
+
+/** The `@fleet/node` package root, where shipped assets like `agents/` live. */
+export function packageRoot(startDirectory = moduleDirectory()): string {
+  return sharedPackageRoot(startDirectory);
 }
 
 /**

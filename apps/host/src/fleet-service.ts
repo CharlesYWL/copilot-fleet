@@ -30,6 +30,15 @@ import type { FleetStore } from "./store.js";
 import { isBroadcastableHostUrl } from "./host-url.js";
 import { reservedSessionCount, yoloUnsupportedReason } from "./session-policy.js";
 
+/**
+ * The agent an orchestrator is put into, when its machine carries one.
+ *
+ * A name shared with the Node's built-in catalog rather than a definition:
+ * changing how the orchestrator thinks is a change to that markdown file, not
+ * to the Host.
+ */
+export const ORCHESTRATOR_AGENT = "fleet-orchestrator";
+
 /** `Omit` over a union has to be distributed, or the discriminant collapses. */
 type DistributiveOmit<T, K extends keyof never> = T extends unknown ? Omit<T, K> : never;
 
@@ -271,6 +280,7 @@ export class FleetService {
         prompt: input.prompt,
         yolo: input.yolo,
         mcpServers: this.mcpServersFor(session),
+        agent: this.agentFor(session, node),
       },
       { state: "failed", activity: "Node disconnected before process start" },
     );
@@ -303,6 +313,28 @@ export class FleetService {
         headers: [{ name: "Authorization", value: `Bearer ${token}` }],
       },
     ];
+  }
+
+  /**
+   * The custom agent a session should be put into, on start and on resume.
+   *
+   * Derived from the role for the same reason as {@link mcpServersFor}: one
+   * answer to "what is this session", and a resumed orchestrator cannot come
+   * back as something else.
+   *
+   * Asked of the Node's catalog rather than named blindly. A Node too old to
+   * carry the definition degrades to an ordinary lead steered by its briefing,
+   * which is worth more than a lead that fails to start — and checking here
+   * keeps that a quiet fact rather than a warning logged on every dispatch.
+   */
+  agentFor(
+    session: Pick<FleetSession, "runRole">,
+    node: Pick<FleetNode, "agents">,
+  ): string {
+    if (session.runRole !== "lead") return "";
+    return node.agents.some((agent) => agent.name === ORCHESTRATOR_AGENT)
+      ? ORCHESTRATOR_AGENT
+      : "";
   }
 
   /**
@@ -575,6 +607,10 @@ export class FleetService {
         // Re-issued, not replayed: `session/load` takes its own server list, and
         // an orchestrator reloaded without one wakes up with no way to dispatch.
         mcpServers: this.mcpServersFor(session),
+        // The selection survives `session/load`, but the file it names has to
+        // still be beneath the session; a scratch directory is exactly where
+        // something else may have cleaned up while this node was away.
+        agent: this.agentFor(session, node),
       });
       // The socket went away mid-sweep; the rest are settled and resumable by
       // hand, and the next reconnect will not pick them up again.

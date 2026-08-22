@@ -69,6 +69,7 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
         version: input.version,
         revision: input.revision,
         capabilities: input.capabilities,
+        agents: input.agents,
         maxSessions: input.maxSessions,
         homeDir: input.homeDir,
       });

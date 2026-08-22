@@ -154,6 +154,7 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       yolo: session.yolo,
       // An orchestrator resumed by hand needs its tools back too.
       mcpServers: service.mcpServersFor(session),
+      agent: node ? service.agentFor(session, node) : "",
     });
     if (!dispatched.sent) return reply.code(503).send({ error: "Node is offline" });
     service.publishSession(

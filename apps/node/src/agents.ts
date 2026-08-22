@@ -3,7 +3,7 @@ import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
 import type { McpHttpServer, PromptAttachment, SessionEvent } from "@fleet/protocol";
-import { attachmentSummary } from "@fleet/protocol";
+import { attachmentSummary, errorMessage } from "@fleet/protocol";
 import {
   configValueFor,
   toSessionCommands,
@@ -119,6 +119,13 @@ export type StartAgentOptions = {
    * `session/load`. Empty for every ordinary session.
    */
   mcpServers?: readonly McpHttpServer[];
+  /**
+   * A custom agent to put this session into, already written beneath `cwd`.
+   *
+   * A name rather than a definition: the router installs the file, this only
+   * selects it. Empty for every ordinary session.
+   */
+  agent?: string;
 };
 
 export interface AgentFactory {
@@ -362,6 +369,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly copilotCommand = "",
     private readonly contextTier: ContextTier | undefined = undefined,
     private readonly mcpServerConfigs: readonly McpHttpServer[] = [],
+    /** A custom agent to select once the session exists. Empty for workers. */
+    private readonly customAgent = "",
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -484,7 +493,41 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     // machine in this fleet — same Copilot build, same fleet build, same agent
     // otherwise working, and a composer with nothing on it.
     await this.recoverConfigOptions();
+    await this.selectCustomAgent();
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
+  }
+
+  /**
+   * Puts the session into its custom agent, before anything is asked of it.
+   *
+   * Ordering is the whole point: the first prompt follows immediately, and an
+   * agent selected after it would leave the opening turn — the one that plans
+   * the task — running as an ordinary session.
+   *
+   * The `--agent` launch flag looks like it would do this and does not; in ACP
+   * mode it is accepted and ignored, leaving the picker on its default. This
+   * call is the only route.
+   *
+   * A failure here is reported and survived. The picker is absent on a machine
+   * whose catalog does not have the file, and a session with the wrong prompt
+   * is worth more than no session at all.
+   */
+  private async selectCustomAgent(): Promise<void> {
+    if (!this.customAgent) return;
+    const picker = this.configOptions.find((option) => option.category === "_agent");
+    if (!picker) {
+      this.emit("system", {
+        message: `Copilot offered no agent picker, so "${this.customAgent}" was not applied`,
+      });
+      return;
+    }
+    try {
+      await this.setConfigOption(picker.id, this.customAgent);
+    } catch (error) {
+      this.emit("system", {
+        message: `Could not select agent "${this.customAgent}": ${errorMessage(error)}`,
+      });
+    }
   }
 
   /** Gets the pickers back when a start — of either kind — brought none. */
@@ -793,6 +836,7 @@ export class AcpAgentFactory implements AgentFactory {
       this.copilotCommand,
       (await this.acceptsContextTier()) ? this.contextTier : undefined,
       options.mcpServers ?? [],
+      options.agent ?? "",
     );
     try {
       await agent.start(cwd, options.resumeAgentSessionId);

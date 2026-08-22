@@ -44,6 +44,7 @@ import {
   type TunnelMode,
 } from "./host-endpoints.js";
 import { envFilePath, packageVersion } from "./paths.js";
+import { catalogSummary, readAgentCatalog, userAgentDirectory } from "./agent-catalog.js";
 import {
   AUTH_FAILED_CLOSE_CODE,
   SUPERSEDED_CLOSE_CODE,
@@ -224,6 +225,30 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   log(`  capacity    ${settings.maxSessions} concurrent sessions`);
   if (!mockAgent) log(`  context     ${settings.contextTier}`);
   log(`  config      ${configDirectory()}`);
+  /**
+   * Read fresh on every use rather than cached at startup, so an operator who
+   * drops an agent into the config directory does not have to restart the Node
+   * to offer it. A handful of small files is not worth a cache.
+   */
+  const agentCatalog = async () => {
+    try {
+      return await readAgentCatalog();
+    } catch (error) {
+      warn(`Could not read the agent catalog: ${errorMessage(error)}`);
+      return [];
+    }
+  };
+  const catalogAtStartup = await agentCatalog();
+  /** What the Host is told this machine can be; refreshed on every dial. */
+  let advertisedAgents = catalogSummary(catalogAtStartup);
+  log(
+    `  agents      ${
+      catalogAtStartup.length === 0
+        ? "none"
+        : catalogAtStartup.map((entry) => entry.name).join(", ")
+    }`,
+  );
+  log(`  agents dir  ${userAgentDirectory()}`);
   const overridden = Object.keys(flags.env);
   // Naming the keys (never the values — one of them is a token) explains why
   // this run disagrees with the config page.
@@ -300,6 +325,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     },
     validateWorkspacePath,
     () => settings.hostUrl,
+    agentCatalog,
+    warn,
   );
 
   /** Registers when the stored identity is missing or the operator renamed this node. */
@@ -586,6 +613,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     const url = new URL("/ws/node", dialUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     log(`Connecting to ${url}`);
+    // Re-read before announcing rather than at startup, so an agent dropped in
+    // while this node was disconnected is offered as soon as it reconnects.
+    void agentCatalog().then((entries) => {
+      advertisedAgents = catalogSummary(entries);
+    });
     // Bounded, because an unanswered dial is the one failure this loop cannot
     // see: a dev tunnel whose relay is gone still accepts the connection, and
     // without a deadline the node waits on it for the operating system's whole
@@ -620,6 +652,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         version: VERSION,
         revision: REVISION,
         capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
+        agents: advertisedAgents,
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
         name: settings.nodeName,
@@ -804,6 +837,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       version: VERSION,
       revision: REVISION,
       capabilities: NODE_CAPABILITIES,
+      agents: advertisedAgents,
       maxSessions: settings.maxSessions,
       homeDir: homedir(),
     });

@@ -10,6 +10,7 @@ const node = (id: string, name: string, online = true): FleetNode => ({
   version: "0.1.0",
   revision: "",
   capabilities: [],
+  agents: [],
   maxSessions: 4,
   activeSessions: 0,
   lastHeartbeat: "2026-08-08T00:00:00.000Z",

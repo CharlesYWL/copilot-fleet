@@ -357,3 +357,39 @@ describe("host revision", () => {
     expect(service.snapshot().hostRevision).toBe("cccccccccccc");
   });
 });
+
+describe("agentFor", () => {
+  const orchestrator = { runRole: "lead" as const };
+  const carries = { agents: [{ name: "fleet-orchestrator", description: "" }] };
+
+  it("puts an orchestrator into the agent its machine carries", () => {
+    const { service } = setup();
+    expect(service.agentFor(orchestrator, carries)).toBe("fleet-orchestrator");
+  });
+
+  it.each(["worker", "reviewer", ""] as const)(
+    "gives a %s session no agent at all",
+    (runRole) => {
+      /*
+       * The same role gate as the MCP server: a worker is not denied an agent,
+       * it is never given one, so no picker appears and there is nothing to ask
+       * for. The catalog being present on the machine changes nothing.
+       */
+      const { service } = setup();
+      expect(service.agentFor({ runRole }, carries)).toBe("");
+    },
+  );
+
+  it("starts an ordinary lead on a machine that carries nothing", () => {
+    // A Node too old for the catalog is stale, not broken. A lead steered by
+    // its briefing alone is worth more than no orchestrator at all.
+    const { service } = setup();
+    expect(service.agentFor(orchestrator, { agents: [] })).toBe("");
+  });
+
+  it("does not settle for a different agent the machine happens to have", () => {
+    const { service } = setup();
+    const other = { agents: [{ name: "something-else", description: "" }] };
+    expect(service.agentFor(orchestrator, other)).toBe("");
+  });
+});

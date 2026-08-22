@@ -20,6 +20,24 @@ export const terminalSessionStates = new Set<SessionState>([
   "failed",
 ]);
 
+/**
+ * A Copilot agent definition a Node can put a session into.
+ *
+ * Reported upward like `capabilities` and a session's `commands`, because the
+ * Host has to know what a machine can *be* before it sends work there. Without
+ * it the Host names an agent and finds out on the machine, at runtime, that a
+ * stale Node has never heard of it.
+ */
+export const NodeAgentSchema = z.object({
+  name: z
+    .string()
+    .min(1)
+    .max(40)
+    .regex(/^[a-z0-9-]+$/, "Agent names are file-safe ids, not sentences"),
+  description: z.string().max(200).default(""),
+});
+export type NodeAgent = z.infer<typeof NodeAgentSchema>;
+
 export const NodeSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -33,6 +51,13 @@ export const NodeSchema = z.object({
    */
   revision: z.string().default(""),
   capabilities: z.array(z.string()),
+  /**
+   * Agents this machine can put a session into.
+   *
+   * Defaulted, so a Node from a build that predates the catalog reads as "offers
+   * none" rather than failing to register.
+   */
+  agents: z.array(NodeAgentSchema).default([]),
   maxSessions: z.number().int().positive(),
   activeSessions: z.number().int().nonnegative(),
   lastHeartbeat: z.string().datetime(),
@@ -416,6 +441,15 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
      * a server here, with a token scoped to itself.
      */
     mcpServers: z.array(McpHttpServerSchema).default([]),
+    /**
+     * An agent from this Node's catalog to put the session into.
+     *
+     * A name, not a definition: the markdown ships with the Node, so the Host
+     * chooses a role rather than transmitting one. Empty for every ordinary
+     * session, which is the same role gate as `mcpServers` — a worker is not
+     * denied an agent, it is never given one and no picker appears.
+     */
+    agent: z.string().max(40).default(""),
   }),
   z.object({
     type: z.literal("resume_session"),
@@ -432,6 +466,14 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
      * orchestrator that wakes up unable to dispatch anything.
      */
     mcpServers: z.array(McpHttpServerSchema).default([]),
+    /**
+     * Re-supplied for a different reason than `mcpServers`.
+     *
+     * The selection itself survives `session/load` — verified — but the file it
+     * names has to still be on disk beneath the session, and a scratch
+     * directory is exactly the kind of place something else may have cleaned up.
+     */
+    agent: z.string().max(40).default(""),
   }),
   z.object({
     type: z.literal("prompt"),
@@ -487,6 +529,7 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     version: z.string().min(1),
     revision: z.string().default(""),
     capabilities: z.array(z.string()),
+    agents: z.array(NodeAgentSchema).default([]),
     maxSessions: z.number().int().positive(),
     homeDir: z.string().default(""),
     /**
@@ -994,6 +1037,7 @@ export const RegisterNodeSchema = z.object({
   version: z.string().min(1),
   revision: z.string().default(""),
   capabilities: z.array(z.string()),
+  agents: z.array(NodeAgentSchema).default([]),
   maxSessions: z.number().int().min(1).max(64),
   homeDir: z.string().max(4096).default(""),
 });
