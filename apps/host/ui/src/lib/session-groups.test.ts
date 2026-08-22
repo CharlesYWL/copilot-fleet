@@ -42,6 +42,7 @@ const session = (
   configOptions: [],
   runId: "",
   runRole: "" as const,
+  readOnly: false,
   name: "",
   nodeId,
   nodeName,

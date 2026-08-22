@@ -86,6 +86,7 @@ function session(id: string, overrides: Partial<FleetSession> = {}): FleetSessio
     configOptions: [],
     runId: "r1",
     runRole: "worker",
+    readOnly: false,
     ...overrides,
   };
 }

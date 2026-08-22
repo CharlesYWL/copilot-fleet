@@ -334,12 +334,13 @@ describe("planNextActions", () => {
       world({
         run: run({ placementId: "p1" }),
         steps: [step("look", { category: "explore" })],
-        // n1, which the stale pin names, has no room. n2 holds the same
-        // workspace and does.
+        // n1, which the stale pin names, has no room *for reading* — writing
+        // sessions would not stand in a reader's way, and filling it with those
+        // would prove nothing about the pin. n2 holds the same workspace.
         sessions: [
-          session("a", { nodeId: "n1" }),
-          session("b", { nodeId: "n1" }),
-          session("c", { nodeId: "n1" }),
+          session("a", { nodeId: "n1", readOnly: true }),
+          session("b", { nodeId: "n1", readOnly: true }),
+          session("c", { nodeId: "n1", readOnly: true }),
         ],
       }),
     );
@@ -568,5 +569,69 @@ describe("planNextActions", () => {
       nodes: [node("n1", { online: false }), node("n2")],
     });
     expect(planNextActions(offline).some((a) => a.type === "settle_step")).toBe(false);
+  });
+});
+
+describe("capacity by kind", () => {
+  it("does not queue research behind implementation", () => {
+    /*
+     * The complaint this fixes: an orchestrator asked to look something up was
+     * told there were no free slots, because a machine busy changing code had
+     * spent the only budget there was. Reading and writing are limited by
+     * different things, so they are counted separately.
+     */
+    const actions = planNextActions(
+      world({
+        steps: [step("look", { category: "explore" })],
+        sessions: [
+          session("a", { nodeId: "n1" }),
+          session("b", { nodeId: "n1" }),
+          session("c", { nodeId: "n1" }),
+          session("d", { nodeId: "n2" }),
+          session("e", { nodeId: "n2" }),
+          session("f", { nodeId: "n2" }),
+        ],
+      }),
+    );
+
+    expect(actions.map((action) => action.type)).toContain("start_step");
+  });
+
+  it("still refuses a change when the writing budget is spent", () => {
+    const actions = planNextActions(
+      world({
+        steps: [step("build", { category: "implement" })],
+        sessions: [
+          session("a", { nodeId: "n1" }),
+          session("b", { nodeId: "n1" }),
+          session("c", { nodeId: "n1" }),
+          session("d", { nodeId: "n2" }),
+          session("e", { nodeId: "n2" }),
+          session("f", { nodeId: "n2" }),
+        ],
+      }),
+    );
+
+    expect(actions.map((action) => action.type)).not.toContain("start_step");
+  });
+
+  it("bounds reading too, so a look is not free", () => {
+    // An explore is a real process. "Reads do not queue behind writes" must not
+    // become "a machine will take any number of reads".
+    const actions = planNextActions(
+      world({
+        steps: [step("look", { category: "explore" })],
+        sessions: [
+          session("a", { nodeId: "n1", readOnly: true }),
+          session("b", { nodeId: "n1", readOnly: true }),
+          session("c", { nodeId: "n1", readOnly: true }),
+          session("d", { nodeId: "n2", readOnly: true }),
+          session("e", { nodeId: "n2", readOnly: true }),
+          session("f", { nodeId: "n2", readOnly: true }),
+        ],
+      }),
+    );
+
+    expect(actions.map((action) => action.type)).not.toContain("start_step");
   });
 });

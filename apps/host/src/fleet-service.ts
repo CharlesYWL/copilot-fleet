@@ -28,7 +28,11 @@ import {
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
 import { isBroadcastableHostUrl } from "./host-url.js";
-import { reservedSessionCount, yoloUnsupportedReason } from "./session-policy.js";
+import {
+  capacityFor,
+  reservedSessionCount,
+  yoloUnsupportedReason,
+} from "./session-policy.js";
 
 /**
  * The agent an orchestrator is put into, when its machine carries one.
@@ -252,13 +256,23 @@ export class FleetService {
     name?: string;
     runId?: string;
     runRole?: RunRole;
+    /** Work that only reads, which is counted against its own allowance. */
+    readOnly?: boolean;
   }):
     | { ok: true; session: FleetSession }
     | { ok: false; status: number; error: string; session?: FleetSession } {
     const node = this.store.getNode(input.placement.nodeId);
     if (!node?.online) return { ok: false, status: 409, error: "Node is offline" };
-    if (reservedSessionCount(this.store.listSessions(), node.id) >= node.maxSessions) {
-      return { ok: false, status: 409, error: "Node is at capacity" };
+    const kind = input.readOnly ? "read-only" : "writing";
+    if (
+      reservedSessionCount(this.store.listSessions(), node.id, kind) >=
+      capacityFor(node, kind)
+    ) {
+      return {
+        ok: false,
+        status: 409,
+        error: `Node is at capacity for ${kind} work`,
+      };
     }
     const unsupported = yoloUnsupportedReason(node, input.yolo);
     if (unsupported) return { ok: false, status: 409, error: unsupported };
@@ -268,7 +282,11 @@ export class FleetService {
       input.prompt,
       input.yolo,
       input.name ?? "",
-      { runId: input.runId ?? "", runRole: input.runRole ?? "" },
+      {
+        runId: input.runId ?? "",
+        runRole: input.runRole ?? "",
+        readOnly: input.readOnly ?? false,
+      },
     );
     this.publishSession(session);
     const dispatched = this.dispatch(
@@ -281,6 +299,7 @@ export class FleetService {
         yolo: input.yolo,
         mcpServers: this.mcpServersFor(session),
         agent: this.agentFor(session, node),
+        readOnly: session.readOnly,
       },
       { state: "failed", activity: "Node disconnected before process start" },
     );
@@ -590,10 +609,18 @@ export class FleetService {
       .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
     if (candidates.length === 0) return;
 
-    let reserved = reservedSessionCount(this.store.listSessions(), nodeId);
+    // Counted per kind, the same split the dispatch path and the Node use.
+    let reservedWriting = reservedSessionCount(this.store.listSessions(), nodeId);
+    let reservedReading = reservedSessionCount(
+      this.store.listSessions(),
+      nodeId,
+      "read-only",
+    );
     let resumed = 0;
     for (const session of candidates) {
-      if (reserved >= node.maxSessions) break;
+      const kind = session.readOnly ? "read-only" : "writing";
+      const held = kind === "read-only" ? reservedReading : reservedWriting;
+      if (held >= capacityFor(node, kind)) continue;
       const placement = this.store.getPlacement(session.placementId);
       if (!placement) continue;
       if (yoloUnsupportedReason(node, session.yolo)) continue;
@@ -611,6 +638,7 @@ export class FleetService {
         // still be beneath the session; a scratch directory is exactly where
         // something else may have cleaned up while this node was away.
         agent: this.agentFor(session, node),
+        readOnly: session.readOnly,
       });
       // The socket went away mid-sweep; the rest are settled and resumable by
       // hand, and the next reconnect will not pick them up again.
@@ -622,7 +650,8 @@ export class FleetService {
           "Reconnecting automatically",
         ),
       );
-      reserved += 1;
+      if (kind === "read-only") reservedReading += 1;
+      else reservedWriting += 1;
       resumed += 1;
     }
     if (resumed > 0) {

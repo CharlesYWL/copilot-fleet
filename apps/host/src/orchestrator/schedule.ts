@@ -12,7 +12,11 @@ import {
   type RunStep,
   type RunStepState,
 } from "@fleet/protocol";
-import { reservedSessionCount } from "../session-policy.js";
+import {
+  capacityFor,
+  reservedSessionCount,
+  type SessionKind,
+} from "../session-policy.js";
 
 /**
  * What the engine should do next, decided without touching the database or the
@@ -55,16 +59,26 @@ export type ScheduleInput = {
 };
 
 /**
- * Slots this node can still take, one held back.
+ * Slots this node can still take of a given kind, one held back.
  *
- * Filling a node to `maxSessions` makes the next dispatch hit the Node's own
+ * Filling a node to its ceiling makes the next dispatch hit the Node's own
  * fatal "at capacity" check, which costs the whole connection rather than one
  * step. A single-slot node is the exception: reserving headroom there would
  * mean it could never run anything at all.
+ *
+ * Read-only work has its own ceiling, so a machine busy implementing can still
+ * be asked to look something up. What it cannot do is take an unlimited number
+ * of lookups — an explore is a real process, and the second ceiling is what
+ * keeps "reads do not queue behind writes" from meaning "reads are free".
  */
-export function remainingCapacity(node: FleetNode, reserved: number): number {
-  if (node.maxSessions <= 1) return Math.max(0, node.maxSessions - reserved);
-  return Math.max(0, node.maxSessions - reserved - 1);
+export function remainingCapacity(
+  node: FleetNode,
+  reserved: number,
+  kind: SessionKind = "writing",
+): number {
+  const ceiling = capacityFor(node, kind);
+  if (ceiling <= 1) return Math.max(0, ceiling - reserved);
+  return Math.max(0, ceiling - reserved - 1);
 }
 
 const isInFlight = (state: RunStepState) => state === "starting" || state === "running";
@@ -261,11 +275,13 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
 
   // Dispatch before finishing, so a run with work left never looks done.
   const reservedByNode = new Map<string, number>();
-  const reservedFor = (nodeId: string) => {
-    if (!reservedByNode.has(nodeId)) {
-      reservedByNode.set(nodeId, reservedSessionCount(input.sessions, nodeId));
+  const key = (nodeId: string, kind: SessionKind) => `${nodeId}:${kind}`;
+  const reservedFor = (nodeId: string, kind: SessionKind) => {
+    const cacheKey = key(nodeId, kind);
+    if (!reservedByNode.has(cacheKey)) {
+      reservedByNode.set(cacheKey, reservedSessionCount(input.sessions, nodeId, kind));
     }
-    return reservedByNode.get(nodeId)!;
+    return reservedByNode.get(cacheKey)!;
   };
 
   const writingInFlight = new Set(
@@ -295,7 +311,13 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     if (!placementId) continue;
 
     const placement = placementById.get(placementId)!;
-    reservedByNode.set(placement.nodeId, reservedFor(placement.nodeId) + 1);
+    const startedKind: SessionKind = isReadOnlyCategory(step.category)
+      ? "read-only"
+      : "writing";
+    reservedByNode.set(
+      key(placement.nodeId, startedKind),
+      reservedFor(placement.nodeId, startedKind) + 1,
+    );
     if (isWritingCategory(step.category)) writingInFlight.add(placementId);
     settled.set(step.id, "starting");
     started += 1;
@@ -396,7 +418,7 @@ export type PlacementRequest = {
   hasWritingStep: boolean;
   placements: readonly Placement[];
   nodeById: ReadonlyMap<string, FleetNode>;
-  reservedFor: (nodeId: string) => number;
+  reservedFor: (nodeId: string, kind: SessionKind) => number;
   writingInFlight: ReadonlySet<string>;
 };
 
@@ -420,6 +442,7 @@ export type PlacementRequest = {
 export function decidePlacement(request: PlacementRequest): Placement | string {
   const { run, placements, nodeById, reservedFor, writingInFlight } = request;
   const writes = isWritingCategory(request.category);
+  const kind: SessionKind = writes ? "writing" : "read-only";
   const pinned =
     run.placementId && request.hasWritingStep
       ? placements.find((placement) => placement.id === run.placementId)
@@ -442,7 +465,7 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
     if (!usable(node, run)) {
       return `${pinned!.nodeName} ${why} and is not available. Wait for it, or ask a human.`;
     }
-    if (remainingCapacity(node!, reservedFor(node!.id)) < 1) {
+    if (remainingCapacity(node!, reservedFor(node!.id, kind), kind) < 1) {
       return `${pinned!.nodeName} ${why} but has no free slot. Wait for a step to settle — you will be told when one does.`;
     }
     return pinned!;
@@ -465,7 +488,9 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
     .flatMap((placement) => {
       const node = nodeById.get(placement.nodeId);
       if (!usable(node, run)) return [];
-      return [{ placement, free: remainingCapacity(node!, reservedFor(node!.id)) }];
+      return [
+        { placement, free: remainingCapacity(node!, reservedFor(node!.id, kind), kind) },
+      ];
     })
     .sort((a, b) => b.free - a.free);
 
@@ -509,7 +534,10 @@ function choosePlacement(
     if (isWritingCategory(step.category) && context.writingInFlight.has(chosen.id)) {
       return undefined;
     }
-    if (remainingCapacity(node!, context.reservedFor(node!.id)) < 1) return undefined;
+    const kind: SessionKind = isReadOnlyCategory(step.category) ? "read-only" : "writing";
+    if (remainingCapacity(node!, context.reservedFor(node!.id, kind), kind) < 1) {
+      return undefined;
+    }
     return chosen.id;
   }
 

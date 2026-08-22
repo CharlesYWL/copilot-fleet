@@ -184,7 +184,13 @@ export const WorkerStepTimeline = ({
                 ) : (
                   <Text className={styles.meta}>No output recorded yet.</Text>
                 )}
-                {step.sessionId && (
+                {/*
+                  Offered only while the session is still there. Archiving a
+                  task removes its sessions, and a step keeps the id of one that
+                  is gone — a button that led nowhere would be worse than saying
+                  so. What the step produced is on the step itself, above.
+                */}
+                {step.sessionId && session && (
                   <div>
                     <Button
                       size="small"
@@ -195,6 +201,11 @@ export const WorkerStepTimeline = ({
                       Open transcript
                     </Button>
                   </div>
+                )}
+                {step.sessionId && !session && (
+                  <Text className={styles.meta}>
+                    Its session has been cleared away; the output above is what it left.
+                  </Text>
                 )}
               </div>
             )}

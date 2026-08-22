@@ -506,6 +506,84 @@ describe("run routes", () => {
     expect(missing.statusCode).toBe(404);
   });
 
+  it("archives a task: the record stays, the sessions go", async () => {
+    /*
+     * The two halves people expect from different words. Deleting would take
+     * what the task learned with it; cancelling alone leaves its workers in the
+     * tree with nothing to do. Archiving ends the work and clears the machinery
+     * while keeping the account of it.
+     */
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: { steps: [{ stepKey: "audit", title: "Audit", prompt: "audit" }] },
+    });
+
+    const archived = await inject({ method: "POST", url: `/api/runs/${run.id}/archive` });
+    expect(archived.statusCode).toBe(200);
+
+    const after = await inject({ method: "GET", url: `/api/runs/${run.id}` });
+    expect(after.statusCode).toBe(200);
+    const body = after.json() as { run: { state: string }; steps: unknown[] };
+    expect(body.run.state).toBe("cancelled");
+    // The plan is the record; losing it would make archiving a delete.
+    expect(body.steps).toHaveLength(1);
+
+    const snapshot = (await inject({ method: "GET", url: "/api/snapshot" })).json() as {
+      sessions: { runId: string }[];
+    };
+    expect(snapshot.sessions.filter((session) => session.runId === run.id)).toHaveLength(
+      0,
+    );
+  });
+
+  it("archives an already finished task, which is when it matters most", async () => {
+    // A completed task's workers are exactly the ones sitting idle in the tree.
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+
+    const first = await inject({ method: "POST", url: `/api/runs/${run.id}/archive` });
+    expect(first.statusCode).toBe(200);
+
+    // And again, because a person may archive what is already archived.
+    const again = await inject({ method: "POST", url: `/api/runs/${run.id}/archive` });
+    expect(again.statusCode).toBe(200);
+  });
+
+  it("does not relabel a task that already ended on its own", async () => {
+    /*
+     * Archiving is about clearing the machinery away, not about the verdict. A
+     * task that finished stays finished — calling it cancelled because someone
+     * tidied up afterwards would rewrite what happened.
+     */
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: { steps: [{ stepKey: "audit", title: "Audit", prompt: "audit" }] },
+    });
+    await inject({ method: "POST", url: `/api/runs/${run.id}/cancel` });
+
+    await inject({ method: "POST", url: `/api/runs/${run.id}/archive` });
+
+    const after = (
+      await inject({ method: "GET", url: `/api/runs/${run.id}` })
+    ).json() as {
+      run: { state: string; failureReason: string };
+    };
+    expect(after.run.state).toBe("cancelled");
+    // The reason it ended is the earlier one, not "archived".
+    expect(after.run.failureReason).toContain("Cancelled by an operator");
+  });
+
+  it("refuses to archive a task that does not exist", async () => {
+    const missing = await inject({ method: "POST", url: "/api/runs/nope/archive" });
+    expect(missing.statusCode).toBe(404);
+  });
+
   it("refuses a review of a task nobody handed over", async () => {
     // The person is asked once, at the end. Answering a task that is still
     // being worked on would be a decision nobody was waiting for.

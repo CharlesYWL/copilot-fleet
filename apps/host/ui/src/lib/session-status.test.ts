@@ -30,6 +30,7 @@ const session = (values: Partial<FleetSession> & { id?: string }): FleetSession 
   configOptions: [],
   runId: "",
   runRole: "" as const,
+  readOnly: false,
   ...values,
 });
 

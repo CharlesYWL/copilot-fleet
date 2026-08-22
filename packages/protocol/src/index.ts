@@ -242,6 +242,16 @@ export const SessionSchema = z.object({
    */
   runId: z.string().default(""),
   runRole: RunRoleSchema.default(""),
+  /**
+   * Whether this session was dispatched to read rather than to change things.
+   *
+   * The kind lives on the step's `category`, but capacity is decided from
+   * sessions, and by then the step is a lookup away — so the fact is recorded
+   * here at dispatch. Defaulted to `false` because that is the safe reading:
+   * an operator's own session, and any session from a build before this field,
+   * may write.
+   */
+  readOnly: z.boolean().default(false),
 });
 export type FleetSession = z.infer<typeof SessionSchema>;
 
@@ -450,6 +460,14 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
      * denied an agent, it is never given one and no picker appears.
      */
     agent: z.string().max(40).default(""),
+    /**
+     * Work that only reads, which the Node counts against its own allowance.
+     *
+     * Sent so both sides split capacity the same way. If only the Host did, it
+     * would dispatch work the machine then refuses, and a refusal at that point
+     * costs the connection rather than the step.
+     */
+    readOnly: z.boolean().default(false),
   }),
   z.object({
     type: z.literal("resume_session"),
@@ -474,6 +492,14 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
      * directory is exactly the kind of place something else may have cleaned up.
      */
     agent: z.string().max(40).default(""),
+    /**
+     * Work that only reads, which the Node counts against its own allowance.
+     *
+     * Sent so both sides split capacity the same way. If only the Host did, it
+     * would dispatch work the machine then refuses, and a refusal at that point
+     * costs the connection rather than the step.
+     */
+    readOnly: z.boolean().default(false),
   }),
   z.object({
     type: z.literal("prompt"),

@@ -305,13 +305,24 @@ export class FleetTools {
     const sessions = this.store.listSessions();
     const placements = this.store.listPlacements();
     const lines = this.store.listNodes().map((node) => {
-      const reserved = reservedSessionCount(sessions, node.id);
-      const free = remainingCapacity(node, reserved);
+      const writing = remainingCapacity(
+        node,
+        reservedSessionCount(sessions, node.id, "writing"),
+        "writing",
+      );
+      const reading = remainingCapacity(
+        node,
+        reservedSessionCount(sessions, node.id, "read-only"),
+        "read-only",
+      );
       const paths = placements
         .filter((placement) => placement.nodeId === node.id)
         .map((placement) => `${placement.workspaceName}:${placement.localPath}`);
       return [
-        `${node.name} — ${node.online ? "online" : "offline"}, ${free} free slot(s)`,
+        // Two numbers because they are two budgets: reading never queues behind
+        // writing, so one number would send the orchestrator away from a machine
+        // that could have answered its question immediately.
+        `${node.name} — ${node.online ? "online" : "offline"}, ${writing} free for changes, ${reading} free for reading`,
         `  os: ${node.os}/${node.arch}`,
         `  yolo: ${node.capabilities.includes(HOST_YOLO_CAPABILITY) ? "yes" : "no"}`,
         `  workspaces: ${paths.length > 0 ? paths.join(", ") : "(none)"}`,
@@ -439,7 +450,7 @@ export class FleetTools {
       hasWritingStep: steps.some((step) => isWritingCategory(step.category)),
       placements: this.store.listPlacements(),
       nodeById,
-      reservedFor: (nodeId) => reservedSessionCount(sessions, nodeId),
+      reservedFor: (nodeId, kind) => reservedSessionCount(sessions, nodeId, kind),
       writingInFlight,
     });
   }

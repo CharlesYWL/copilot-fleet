@@ -165,6 +165,60 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     return withSteps(id);
   });
 
+  /**
+   * Ends a task and clears away the sessions it started.
+   *
+   * Distinct from cancel, which stops the work and leaves everything where it
+   * is. Archiving is what a person does when they are finished looking: the
+   * record — the task, its phases, its steps and the notes and output it
+   * collected — stays, and the worker sessions stop cluttering the tree.
+   *
+   * Deliberately not a delete. What the task learned is often the only thing
+   * worth keeping from a piece of work that did not pan out, and it lives on
+   * the run rather than in the sessions.
+   */
+  app.post("/api/runs/:id/archive", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const run = store.getRun(id);
+    if (!run) return reply.code(404).send({ error: "Run not found" });
+
+    if (!terminalRunStates.has(run.state)) {
+      stopRunSessions(service, id);
+      for (const step of store.listRunSteps(id)) {
+        if (["succeeded", "failed", "skipped", "cancelled"].includes(step.state))
+          continue;
+        store.updateRunStep(step.id, { state: "cancelled" });
+      }
+      const cancelled = store.setRunState(id, "cancelled", "Archived by an operator")!;
+      service.publishRun(cancelled);
+      service.publishRunSteps(id, store.listRunSteps(id));
+    }
+
+    /*
+     * Settled here rather than waited for. `stop` has gone to the Node and its
+     * own terminal event will follow, but a person who archived a task should
+     * not watch its sessions linger while that arrives — and a Node that is
+     * offline would never send it at all.
+     */
+    for (const session of service.store.listSessions()) {
+      if (session.runId !== id) continue;
+      if (!terminalSessionStates.has(session.state)) {
+        service.publishSession(
+          store.transitionSession(session.id, "stopped", "Task archived"),
+        );
+      }
+      try {
+        store.deleteSession(session.id);
+      } catch {
+        // One session that will not go is not a reason to leave the rest, and
+        // the task is archived either way.
+        continue;
+      }
+    }
+    service.broadcast({ type: "snapshot", data: service.snapshot() });
+    return withSteps(id);
+  });
+
   app.delete("/api/runs/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
     const run = store.getRun(id);

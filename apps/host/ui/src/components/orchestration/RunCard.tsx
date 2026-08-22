@@ -169,7 +169,7 @@ export const RunCard = ({
       {onOpenWorker && (
         <WorkerLinks
           className={styles.workers}
-          steps={model.steps}
+          steps={model.reachableSteps}
           max={2}
           onOpenWorker={onOpenWorker}
           onOpenMore={onOpen}

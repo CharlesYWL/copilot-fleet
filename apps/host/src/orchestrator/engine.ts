@@ -11,7 +11,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { wakeEnvelope } from "./briefing.js";
-import { planNextActions, type ScheduleAction } from "./schedule.js";
+import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./schedule.js";
 
 /**
  * Turns the scheduler's decisions into writes and commands.
@@ -155,6 +155,9 @@ export class OrchestratorEngine {
       name: step.title,
       runId: run.id,
       runRole: step.category.startsWith("review") ? "reviewer" : "worker",
+      // Decided here because the step knows the category and the session does
+      // not; capacity is read from sessions long after this point.
+      readOnly: isReadOnlyCategory(step.category),
     });
 
     if (!result.ok) {

@@ -40,6 +40,7 @@ const session = (id: string, name: string): FleetSession =>
     configOptions: [],
     runId: "",
     runRole: "" as const,
+    readOnly: false,
   }) as FleetSession;
 
 const on = (

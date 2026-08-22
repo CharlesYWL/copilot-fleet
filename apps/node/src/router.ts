@@ -8,6 +8,7 @@ import {
 } from "@fleet/protocol";
 import type { AgentFactory, SessionAgent } from "./agents.js";
 import { installRequestedAgent, type CatalogEntry } from "./agent-catalog.js";
+type SessionKind = "writing" | "read-only";
 import { resolveMcpServers } from "./mcp-endpoint.js";
 
 export type CommandResult = {
@@ -29,6 +30,14 @@ export class CommandRefused extends Error {}
 type SessionSlot = {
   agent?: SessionAgent;
   ready: Promise<void>;
+  /**
+   * What this slot's session may do, so capacity is counted by kind.
+   *
+   * The Host counts the same way. If only one side split its budget the two
+   * would disagree, and the Host would cheerfully dispatch work this machine
+   * then refuses — which costs the whole connection, not just the step.
+   */
+  kind: SessionKind;
 };
 
 type LaunchCommand = Extract<NodeCommand, { type: "start_session" | "resume_session" }>;
@@ -170,11 +179,13 @@ export class CommandRouter {
   private startSession(command: LaunchCommand): Promise<void> {
     const existing = this.slots.get(command.sessionId);
     if (existing) return existing.ready;
-    if (this.slots.size >= this.maxSessions) {
-      return Promise.reject(new Error("Node is at capacity"));
+    const kind: SessionKind = command.readOnly ? "read-only" : "writing";
+    const held = [...this.slots.values()].filter((slot) => slot.kind === kind).length;
+    if (held >= this.maxSessions) {
+      return Promise.reject(new Error(`Node is at capacity for ${kind} work`));
     }
 
-    const slot: SessionSlot = { ready: Promise.resolve() };
+    const slot: SessionSlot = { ready: Promise.resolve(), kind };
     this.slots.set(command.sessionId, slot);
     slot.ready = this.initializeSession(command, slot);
     return slot.ready;

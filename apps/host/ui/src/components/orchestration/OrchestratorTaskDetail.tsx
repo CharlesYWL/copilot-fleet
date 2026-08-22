@@ -149,7 +149,7 @@ export type OrchestratorTaskDetailProps = {
   onOpenLead: () => void;
   onOpenWorker: (sessionId: string) => void;
   onReview: (approved: boolean, note: string) => Promise<boolean>;
-  onAbandon: () => Promise<boolean>;
+  onArchive: () => Promise<boolean>;
 };
 
 /**
@@ -167,10 +167,10 @@ export const OrchestratorTaskDetail = ({
   onOpenLead,
   onOpenWorker,
   onReview,
-  onAbandon,
+  onArchive,
 }: OrchestratorTaskDetailProps) => {
   const styles = useStyles();
-  const [abandonOpen, setAbandonOpen] = useState(false);
+  const [archiveOpen, setArchiveOpen] = useState(false);
   const [sendBackOpen, setSendBackOpen] = useState(false);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -214,15 +214,18 @@ export const OrchestratorTaskDetail = ({
             <Button appearance="subtle" icon={<Chat20Regular />} onClick={onOpenLead}>
               Conversation
             </Button>
-            {!finished && (
-              <Button
-                appearance="subtle"
-                className={styles.danger}
-                onClick={() => setAbandonOpen(true)}
-              >
-                Abandon
-              </Button>
-            )}
+            {/*
+              Offered on a finished task too. A completed task's workers are
+              exactly the ones still sitting in the tree with nothing to do, and
+              clearing them away is the whole point of archiving.
+            */}
+            <Button
+              appearance="subtle"
+              className={styles.danger}
+              onClick={() => setArchiveOpen(true)}
+            >
+              Archive
+            </Button>
           </div>
         </div>
         {run.objective && run.objective !== run.name && (
@@ -350,23 +353,27 @@ export const OrchestratorTaskDetail = ({
         </DialogSurface>
       </Dialog>
 
-      <Dialog open={abandonOpen} onOpenChange={(_, data) => setAbandonOpen(data.open)}>
+      <Dialog open={archiveOpen} onOpenChange={(_, data) => setArchiveOpen(data.open)}>
         <DialogSurface>
           <DialogBody>
-            <DialogTitle>Abandon “{run.name}”?</DialogTitle>
+            <DialogTitle>Archive “{run.name}”?</DialogTitle>
             {/*
               Says exactly what happens, because the difference between this and
-              deleting is the whole reason it is safe: the record stays.
+              deleting is the whole reason it is safe: what the task learned
+              stays, and only the machinery goes away.
             */}
             <DialogContent>
-              <p>Any worker still running for this task is stopped.</p>
               <p>
-                The task and everything it has already produced stay here to read. Nothing
-                further will be dispatched, and it cannot be resumed.
+                Any worker still running for this task is stopped, and its sessions are
+                removed from the fleet.
+              </p>
+              <p>
+                The task keeps its phases, its steps, its notes and everything they
+                produced. Nothing further will be dispatched, and it cannot be resumed.
               </p>
             </DialogContent>
             <DialogActions>
-              <Button appearance="secondary" onClick={() => setAbandonOpen(false)}>
+              <Button appearance="secondary" onClick={() => setArchiveOpen(false)}>
                 Keep going
               </Button>
               <Button
@@ -374,13 +381,13 @@ export const OrchestratorTaskDetail = ({
                 disabled={busy}
                 onClick={() => {
                   setBusy(true);
-                  void onAbandon().then((ok) => {
+                  void onArchive().then((ok) => {
                     setBusy(false);
-                    if (ok) setAbandonOpen(false);
+                    if (ok) setArchiveOpen(false);
                   });
                 }}
               >
-                Abandon task
+                Archive task
               </Button>
             </DialogActions>
           </DialogBody>

@@ -44,6 +44,15 @@ export type RunAttention = "permission" | "failed-step" | "offline-node" | undef
 export type RunViewModel = {
   run: Run;
   steps: RunStep[];
+  /**
+   * Steps whose session is still on the fleet, so a link to one leads somewhere.
+   *
+   * A step keeps its session id forever; the session does not. Archiving a task
+   * removes them, and joining here — once, where the sessions are already in
+   * hand — is what stops every surface that offers a transcript from having to
+   * remember that.
+   */
+  reachableSteps: RunStep[];
   stage: OrchestrationStage;
   attention: RunAttention;
   /** The session a permission is waiting on, so the UI can go straight there. */
@@ -133,6 +142,9 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
       return {
         run,
         steps,
+        reachableSteps: steps.filter(
+          (step) => step.sessionId && sessionById.has(step.sessionId),
+        ),
         stage: stageOf(run, steps),
         attention,
         attentionSessionId: blocked?.sessionId ?? "",

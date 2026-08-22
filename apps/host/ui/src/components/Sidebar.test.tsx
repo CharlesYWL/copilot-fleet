@@ -38,6 +38,7 @@ const session = (
     configOptions: [],
     runId: "",
     runRole: "" as const,
+    readOnly: false,
   }) as FleetSession;
 
 const catalog = {

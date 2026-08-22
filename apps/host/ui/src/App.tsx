@@ -516,16 +516,16 @@ export function App() {
   };
 
   /**
-   * Abandons a task.
+   * Archives a task.
    *
-   * Mapped onto the existing run cancel, which stops dispatching and closes any
-   * unfinished step but keeps the run and everything it produced. `DELETE`
-   * would remove the record, which contradicts the one thing the confirmation
-   * promises: that what has already been done stays readable.
+   * Not `DELETE`, which would remove the record and contradict the one thing
+   * the confirmation promises: that what the task learned stays readable. The
+   * archive route stops any live worker, closes unfinished steps, and clears
+   * the sessions away — the run, its phases, its steps and its notes remain.
    */
-  const handleAbandonRun = async (runId: string) => {
-    const abandoned = await request(`/api/runs/${runId}/cancel`, { method: "POST" });
-    if (!abandoned.ok) return false;
+  const handleArchiveRun = async (runId: string) => {
+    const archived = await request(`/api/runs/${runId}/archive`, { method: "POST" });
+    if (!archived.ok) return false;
     await refresh();
     return true;
   };
@@ -718,7 +718,7 @@ export function App() {
                   onReview={(approved, note) =>
                     handleReviewTask(selectedRunModel.run.id, approved, note)
                   }
-                  onAbandon={() => handleAbandonRun(selectedRunModel.run.id)}
+                  onArchive={() => handleArchiveRun(selectedRunModel.run.id)}
                 />
               )}
 

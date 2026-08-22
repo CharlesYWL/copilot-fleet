@@ -204,6 +204,7 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "run_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "run_role", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "read_only", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("runs", "phases", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("runs", "pending_prompt", "TEXT NOT NULL DEFAULT ''");
@@ -1023,14 +1024,14 @@ export class FleetStore {
     prompt: string,
     yolo = false,
     name = "",
-    run: { runId?: string; runRole?: RunRole } = {},
+    run: { runId?: string; runRole?: RunRole; readOnly?: boolean } = {},
   ): FleetSession {
     const now = new Date().toISOString();
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -1046,6 +1047,7 @@ export class FleetStore {
       name.trim(),
       run.runId ?? "",
       run.runRole ?? "",
+      run.readOnly ? 1 : 0,
     );
     return this.getSession(id)!;
   }
@@ -1699,6 +1701,7 @@ function sessionFromRow(row: Row): FleetSession {
     configOptions: parseJsonList(row.config_options),
     runId: String(row.run_id ?? ""),
     runRole: String(row.run_role ?? ""),
+    readOnly: Boolean(row.read_only),
   });
 }
 

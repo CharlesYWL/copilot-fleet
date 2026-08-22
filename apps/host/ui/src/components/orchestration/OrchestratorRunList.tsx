@@ -156,7 +156,7 @@ export const OrchestratorRunList = ({
               <td className={styles.td}>{STAGE_LABELS[model.stage]}</td>
               <td className={styles.td}>
                 <WorkerLinks
-                  steps={model.steps}
+                  steps={model.reachableSteps}
                   max={3}
                   onOpenWorker={onOpenWorker}
                   onOpenMore={() => onOpenRun(model.run.id)}
