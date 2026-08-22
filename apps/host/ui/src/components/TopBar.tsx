@@ -19,6 +19,7 @@ import {
   SpeakerMute20Regular,
   Warning20Regular,
 } from "@fluentui/react-icons";
+import { BrandMark } from "./BrandMark";
 import { ContextModeToggle, type ContextMode } from "./navigation/ContextModeToggle";
 import { semanticColors } from "../theme";
 
@@ -57,19 +58,6 @@ const useStyles = makeStyles({
     // The word goes before the mode switch does; the mark still says where you
     // are, and the switch is what the screen is for.
     "@media (max-width: 600px)": { display: "none" },
-  },
-  logo: {
-    width: "30px",
-    height: "30px",
-    flexShrink: 0,
-    display: "grid",
-    placeItems: "center",
-    borderRadius: tokens.borderRadiusMedium,
-    fontWeight: tokens.fontWeightBold,
-    fontSize: "13px",
-    color: "#ffffff",
-    background: "linear-gradient(145deg,#6c8cff,#8d67e8)",
-    boxShadow: "0 6px 20px #6c8cff40",
   },
   stats: {
     display: "flex",
@@ -208,9 +196,7 @@ export const TopBar = ({
           />
         )}
         <div className={styles.brand}>
-          <div className={styles.logo} aria-hidden="true">
-            CF
-          </div>
+          <BrandMark size={30} />
           <Text weight="semibold">Copilot Fleet</Text>
         </div>
       </div>

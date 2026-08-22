@@ -9,6 +9,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { onSignedOut } from "../lib/auth";
+import { BrandMark } from "./BrandMark";
 
 const useStyles = makeStyles({
   screen: {
@@ -27,6 +28,11 @@ const useStyles = makeStyles({
     borderRadius: tokens.borderRadiusLarge,
     border: `1px solid ${tokens.colorNeutralStroke2}`,
     background: tokens.colorNeutralBackground1,
+  },
+  brand: {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
   },
   caption: {
     color: tokens.colorNeutralForeground3,
@@ -123,9 +129,12 @@ function SignInCard({ onSignedIn }: { onSignedIn: () => void }) {
         void submit();
       }}
     >
-      <Text weight="semibold" size={500}>
-        Copilot Fleet
-      </Text>
+      <div className={styles.brand}>
+        <BrandMark size={36} />
+        <Text weight="semibold" size={500}>
+          Copilot Fleet
+        </Text>
+      </div>
       <Field
         label="Operator password"
         validationState={error ? "error" : "none"}

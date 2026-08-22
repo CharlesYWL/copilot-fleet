@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { fleetDarkTheme } from "../theme";
+import markUrl from "../assets/copilot-fleet-mark.svg";
 import { TopBar } from "./TopBar";
 
 const show = (overrides: Partial<Parameters<typeof TopBar>[0]> = {}) =>
@@ -84,6 +85,23 @@ describe("TopBar counts", () => {
 });
 
 describe("TopBar layout", () => {
+  it("wears the fleet's own mark, and still says whose console this is", () => {
+    /*
+     * The mark replaced a gradient tile with "CF" written on it. It is
+     * decorative because the words are right there: an accessible name on the
+     * image would only make the brand be read twice.
+     */
+    show();
+    const bar = screen.getByRole("banner");
+    const mark = bar.querySelector("img");
+
+    expect(mark?.getAttribute("src")).toBe(markUrl);
+    expect(mark?.getAttribute("width")).toBe("30");
+    expect(mark?.getAttribute("height")).toBe("30");
+    expect(within(bar).getByText("Copilot Fleet")).toBeTruthy();
+    expect(within(bar).queryByRole("img", { name: /Copilot Fleet/ })).toBeNull();
+  });
+
   it("puts the mode switch in a column of its own, not between two auto margins", () => {
     /*
      * Auto margins only centre within whatever the sides leave, so the switch

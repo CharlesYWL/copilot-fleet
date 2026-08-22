@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { AuthGate } from "./AuthGate";
 import { announceSignedOut } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
+import markUrl from "../assets/copilot-fleet-mark.svg";
 
 const show = () =>
   render(
@@ -42,6 +43,28 @@ describe("AuthGate", () => {
     show();
     expect(await screen.findByLabelText("Operator password")).toBeTruthy();
     expect(screen.queryByText("console")).toBeNull();
+  });
+
+  it("shows the brand on the card it asks for a password from", async () => {
+    /*
+     * The sign-in card and the top bar are the two places the console names
+     * itself, so they wear the same mark rather than each having their own
+     * idea of it. The mark is decorative here too: the heading beside it
+     * already says "Copilot Fleet".
+     */
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => answer({ authenticated: false })),
+    );
+    show();
+
+    const card = (await screen.findByLabelText("Operator password")).closest("form")!;
+    const mark = card.querySelector("img");
+
+    expect(mark?.getAttribute("src")).toBe(markUrl);
+    expect(mark?.getAttribute("width")).toBe("36");
+    expect(within(card).getByText("Copilot Fleet")).toBeTruthy();
+    expect(within(card).queryByRole("img")).toBeNull();
   });
 
   it("treats an unreachable Host as signed out rather than hanging", async () => {
