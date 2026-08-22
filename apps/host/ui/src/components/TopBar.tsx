@@ -1,24 +1,40 @@
+import type { ReactElement } from "react";
 import {
   Button,
   Text,
+  Tooltip,
   makeStyles,
   mergeClasses,
+  shorthands,
   tokens,
 } from "@fluentui/react-components";
 import {
   Navigation20Regular,
+  PlugConnected20Regular,
+  PlugDisconnected20Regular,
+  Pulse20Regular,
+  Server20Regular,
   SignOut20Regular,
   Speaker220Regular,
   SpeakerMute20Regular,
+  Warning20Regular,
 } from "@fluentui/react-icons";
 import { ContextModeToggle, type ContextMode } from "./navigation/ContextModeToggle";
 import { semanticColors } from "../theme";
 
 const useStyles = makeStyles({
+  /**
+   * Three columns rather than a row with auto margins.
+   *
+   * Auto margins only centre the middle within whatever the sides leave, so
+   * the mode switch drifted as the brand or the counts changed width. A fixed
+   * centre column puts it in the middle of the window and keeps it there.
+   */
   bar: {
     height: "56px",
     flexShrink: 0,
-    display: "flex",
+    display: "grid",
+    gridTemplateColumns: "1fr auto 1fr",
     alignItems: "center",
     gap: "16px",
     padding: "0 20px",
@@ -26,6 +42,8 @@ const useStyles = makeStyles({
     background: tokens.colorNeutralBackground2,
     "@media (max-width: 767px)": { gap: "8px", padding: "0 10px" },
   },
+  left: { display: "flex", alignItems: "center", gap: "10px", minWidth: 0 },
+  centre: { display: "flex", justifyContent: "center", minWidth: 0 },
   /** The drawer handle, which only exists at widths where there is a drawer. */
   navButton: {
     display: "none",
@@ -35,7 +53,7 @@ const useStyles = makeStyles({
     display: "flex",
     alignItems: "center",
     gap: "10px",
-    marginRight: "auto",
+    minWidth: 0,
     // The word goes before the mode switch does; the mark still says where you
     // are, and the switch is what the screen is for.
     "@media (max-width: 600px)": { display: "none" },
@@ -43,6 +61,7 @@ const useStyles = makeStyles({
   logo: {
     width: "30px",
     height: "30px",
+    flexShrink: 0,
     display: "grid",
     placeItems: "center",
     borderRadius: tokens.borderRadiusMedium,
@@ -52,51 +71,50 @@ const useStyles = makeStyles({
     background: "linear-gradient(145deg,#6c8cff,#8d67e8)",
     boxShadow: "0 6px 20px #6c8cff40",
   },
-  modes: {
-    display: "flex",
-    alignItems: "center",
-    gap: "4px",
-    padding: "3px",
-    borderRadius: tokens.borderRadiusMedium,
-    background: tokens.colorNeutralBackground3,
-  },
-  attentionButton: {
-    display: "flex",
-    alignItems: "baseline",
-    gap: "6px",
-    minHeight: "32px",
-  },
   stats: {
     display: "flex",
     alignItems: "center",
-    gap: "20px",
-    marginLeft: "auto",
-    "@media (max-width: 900px)": { gap: "10px" },
+    justifyContent: "flex-end",
+    gap: "2px",
+    minWidth: 0,
   },
+  /**
+   * A count with its meaning in the icon rather than beside it.
+   *
+   * The words cost more room than they were worth: three labels pushed the
+   * mode switch off centre and were the first thing to wrap on a narrow
+   * window. The number is the information; the icon says which number it is,
+   * and the tooltip and accessible name still spell it out.
+   */
   stat: {
     display: "flex",
-    alignItems: "baseline",
-    gap: "6px",
+    alignItems: "center",
+    gap: "5px",
+    padding: "4px 8px",
+    borderRadius: tokens.borderRadiusMedium,
+    color: tokens.colorNeutralForeground3,
     // Counts that are not about a person waiting can go; "needs you" stays.
     "@media (max-width: 767px)": { display: "none" },
   },
   statValue: {
-    fontSize: "15px",
+    fontSize: tokens.fontSizeBase300,
     fontWeight: tokens.fontWeightSemibold,
+    color: tokens.colorNeutralForeground1,
+    fontVariantNumeric: "tabular-nums",
   },
-  warn: {
-    color: semanticColors.permission,
+  attentionButton: {
+    minWidth: "auto",
+    ...shorthands.padding("4px", "8px"),
   },
-  caption: {
-    color: tokens.colorNeutralForeground3,
-    fontSize: tokens.fontSizeBase200,
-  },
-  /** The connection word is reassurance, not information; it goes first. */
+  warn: { color: semanticColors.permission },
+  /** The connection state is reassurance, not information; a dot is enough. */
   connection: {
-    color: tokens.colorNeutralForeground3,
-    fontSize: tokens.fontSizeBase200,
-    "@media (max-width: 600px)": { display: "none" },
+    display: "flex",
+    alignItems: "center",
+    padding: "4px 6px",
+    color: semanticColors.completed,
   },
+  connectionLost: { color: semanticColors.permission },
   soundButton: {
     "@media (max-width: 600px)": { display: "none" },
   },
@@ -105,16 +123,34 @@ const useStyles = makeStyles({
 type StatProps = {
   label: string;
   value: number;
+  icon: ReactElement;
   warn?: boolean;
 };
 
-const Stat = ({ label, value, warn = false }: StatProps) => {
+const Stat = ({ label, value, icon, warn = false }: StatProps) => {
   const styles = useStyles();
+  /*
+   * Named explicitly rather than left to the tooltip.
+   *
+   * A tooltip labels a control; this is a plain box, so without a role and a
+   * name of its own the count reached assistive tech as a bare "1" with no
+   * hint of what was being counted. The words moved into the icon visually,
+   * not out of the page.
+   */
+  const description = `${value} ${label}`;
   return (
-    <div className={styles.stat}>
-      <span className={mergeClasses(styles.statValue, warn && styles.warn)}>{value}</span>
-      <Text className={styles.caption}>{label}</Text>
-    </div>
+    <Tooltip relationship="label" content={description} withArrow>
+      <div
+        className={mergeClasses(styles.stat, warn && styles.warn)}
+        role="img"
+        aria-label={description}
+      >
+        {icon}
+        <span className={mergeClasses(styles.statValue, warn && styles.warn)}>
+          {value}
+        </span>
+      </div>
+    </Tooltip>
   );
 };
 
@@ -159,43 +195,65 @@ export const TopBar = ({
   const styles = useStyles();
   return (
     <header className={styles.bar}>
-      {onToggleNav && (
-        <Button
-          appearance="subtle"
-          size="small"
-          className={styles.navButton}
-          icon={<Navigation20Regular />}
-          aria-label={navOpen ? "Close navigation" : "Open navigation"}
-          aria-expanded={navOpen}
-          onClick={onToggleNav}
-        />
-      )}
-      <div className={styles.brand}>
-        <div className={styles.logo} aria-hidden="true">
-          CF
-        </div>
-        <Text weight="semibold">Copilot Fleet</Text>
-      </div>
-      <ContextModeToggle context={context} />
-      <div className={styles.stats}>
-        <Stat label="nodes online" value={nodesOnline} />
-        <Stat label="live sessions" value={liveSessions} />
-        {waitingPermissions > 0 && onShowAttention ? (
+      <div className={styles.left}>
+        {onToggleNav && (
           <Button
             appearance="subtle"
             size="small"
-            className={styles.attentionButton}
-            onClick={onShowAttention}
+            className={styles.navButton}
+            icon={<Navigation20Regular />}
+            aria-label={navOpen ? "Close navigation" : "Open navigation"}
+            aria-expanded={navOpen}
+            onClick={onToggleNav}
+          />
+        )}
+        <div className={styles.brand}>
+          <div className={styles.logo} aria-hidden="true">
+            CF
+          </div>
+          <Text weight="semibold">Copilot Fleet</Text>
+        </div>
+      </div>
+
+      <div className={styles.centre}>
+        <ContextModeToggle context={context} />
+      </div>
+
+      <div className={styles.stats}>
+        <Stat
+          label={nodesOnline === 1 ? "node online" : "nodes online"}
+          value={nodesOnline}
+          icon={<Server20Regular />}
+        />
+        <Stat
+          label={liveSessions === 1 ? "live session" : "live sessions"}
+          value={liveSessions}
+          icon={<Pulse20Regular />}
+        />
+        {waitingPermissions > 0 && onShowAttention ? (
+          <Tooltip
+            relationship="label"
+            content={`${waitingPermissions} waiting for you`}
+            withArrow
           >
-            <span className={mergeClasses(styles.statValue, styles.warn)}>
-              {waitingPermissions}
-            </span>
-            <Text className={styles.caption}>needs you</Text>
-          </Button>
+            <Button
+              appearance="subtle"
+              size="small"
+              className={mergeClasses(styles.attentionButton, styles.warn)}
+              icon={<Warning20Regular />}
+              aria-label={`${waitingPermissions} waiting for you`}
+              onClick={onShowAttention}
+            >
+              <span className={mergeClasses(styles.statValue, styles.warn)}>
+                {waitingPermissions}
+              </span>
+            </Button>
+          </Tooltip>
         ) : (
           <Stat
-            label="needs you"
+            label="waiting for you"
             value={waitingPermissions}
+            icon={<Warning20Regular />}
             warn={waitingPermissions > 0}
           />
         )}
@@ -209,7 +267,21 @@ export const TopBar = ({
           aria-pressed={soundEnabled}
           onClick={onToggleSound}
         />
-        <Text className={styles.connection}>{connected ? "live" : "reconnecting…"}</Text>
+        <Tooltip
+          relationship="label"
+          content={connected ? "Connected to the Host" : "Reconnecting to the Host…"}
+          withArrow
+        >
+          <span
+            className={mergeClasses(
+              styles.connection,
+              !connected && styles.connectionLost,
+            )}
+            role="img"
+          >
+            {connected ? <PlugConnected20Regular /> : <PlugDisconnected20Regular />}
+          </span>
+        </Tooltip>
         <Button
           appearance="subtle"
           size="small"

@@ -110,6 +110,13 @@ const useStyles = makeStyles({
    * panes, and squeezing the tree instead just moves the problem.
    */
   navDrawer: {
+    /*
+     * The drawer stretches with the body, but a block box does not pass that
+     * height on — so the sidebar sized itself to its tree and its footer sat
+     * wherever the last workspace ended instead of at the bottom.
+     */
+    display: "flex",
+    minHeight: 0,
     "@media (max-width: 767px)": {
       position: "absolute",
       insetBlockStart: 0,
