@@ -1,7 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
-import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
+import type {
+  FleetNode,
+  FleetSession,
+  Placement,
+  SessionEvent,
+  Workspace,
+} from "@fleet/protocol";
 import { SessionGrid } from "./SessionGrid";
 import { CatalogProvider } from "../hooks/useCatalog";
 import { DRAG_MIME } from "../lib/drag-drop";
@@ -32,6 +38,8 @@ const session = (id: string, name: string): FleetSession =>
     yolo: false,
     commands: [],
     configOptions: [],
+    runId: "",
+    runRole: "" as const,
   }) as FleetSession;
 
 const on = (
@@ -70,6 +78,7 @@ const show = (
   workspaces: Workspace[] = [workspace("w1", "repo")],
   nodes: FleetNode[] = [node("n1", "WEILI-PC")],
   placements: Placement[] = [],
+  overrides: Partial<Parameters<typeof SessionGrid>[0]> = {},
 ) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
@@ -80,9 +89,18 @@ const show = (
           nodes={nodes}
           placements={placements}
           events={{}}
+          waitingPermissions={[]}
+          attentionOnly={false}
+          onAttentionOnlyChange={vi.fn()}
+          orchestrator={{
+            started: true,
+            summary: { total: 0, running: 0, needsYou: 0, dominantStage: undefined },
+            onOpen: vi.fn(),
+          }}
           onOpen={vi.fn()}
           onPermission={vi.fn()}
           onNewSession={vi.fn()}
+          {...overrides}
         />
       </CatalogProvider>
     </FluentProvider>,
@@ -165,9 +183,45 @@ describe("SessionGrid ordering", () => {
       [placement("p1", "w1", "n1"), placement("p2", "w1", "n2")],
     );
 
-    const titles = [...container.querySelectorAll('[aria-label^="Open "]')].map((item) =>
-      item.getAttribute("aria-label"),
+    const titles = [...container.querySelectorAll('[aria-label^="Open "]')].map(
+      (item) =>
+        // The label now carries the status too, which is the point of it; the
+        // order is what this test is about.
+        item.getAttribute("aria-label")?.split(" — ")[0],
     );
     expect(titles).toEqual(["Open First on devbox1", "Open Second on devbox2"]);
+  });
+
+  it("keeps the orchestrator reachable even with no sessions of your own", () => {
+    /*
+     * The wall hides the sidebar, so its orchestrator entry is the only way in.
+     * Replacing the whole page with an empty state took that with it, which
+     * made switching to the wall a one-way door on a fleet whose work is all
+     * orchestrated.
+     */
+    const { container } = show([], [workspace("w1", "repo")]);
+
+    expect(container.querySelectorAll("article")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: /Orchestrator/ })).toBeTruthy();
+  });
+
+  it("shows only what is waiting on you when asked", () => {
+    const first = session("s1", "First");
+    const second = session("s2", "Second");
+    const { container } = show(
+      [first, second],
+      [workspace("w1", "repo")],
+      [node("n1", "WEILI-PC")],
+      [],
+      {
+        attentionOnly: true,
+        waitingPermissions: [{ sessionId: "s2" } as unknown as SessionEvent],
+      },
+    );
+
+    const titles = [...container.querySelectorAll('[aria-label^="Open "]')].map(
+      (item) => item.getAttribute("aria-label")?.split(" — ")[0],
+    );
+    expect(titles).toEqual(["Open Second on WEILI-PC"]);
   });
 });

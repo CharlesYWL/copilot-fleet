@@ -86,6 +86,36 @@ export function envFilePath(startDirectory = moduleDirectory()): string {
 }
 
 /**
+ * The semver of the package a module belongs to.
+ *
+ * Read rather than repeated. Both services used to carry their own
+ * `const VERSION = "0.1.0"`, which meant a release had to remember five files
+ * — three manifests and two constants — and the constants are the two nobody
+ * looks at. They disagree silently: the Host reports one number over `/api/health`
+ * while `package.json` says another, and nothing fails.
+ *
+ * Takes the caller's directory because `import.meta.url` only means anything in
+ * the module it is written in; resolving from here would always answer with the
+ * protocol package's own version.
+ */
+export function packageVersion(startDirectory: string, fallback = "0.0.0"): string {
+  try {
+    const manifest: unknown = JSON.parse(
+      readFileSync(resolve(packageRoot(startDirectory), "package.json"), "utf8"),
+    );
+    if (typeof manifest === "object" && manifest !== null && "version" in manifest) {
+      const version = (manifest as { version: unknown }).version;
+      if (typeof version === "string" && version) return version;
+    }
+    return fallback;
+  } catch {
+    // A missing or unreadable manifest is a packaging problem, not a reason to
+    // refuse to start: an unknown version still runs sessions.
+    return fallback;
+  }
+}
+
+/**
  * The commit this checkout is built from, or `""` when that cannot be known.
  *
  * The package version is a constant nobody bumps between deploys, so comparing

@@ -4,7 +4,6 @@ import {
   MAX_LOGIN_FAILURES,
   OPERATOR_COOKIE,
   OperatorAuth,
-  SESSION_TTL_MS,
   clearedCookie,
   generatePassword,
   hashPassword,
@@ -44,32 +43,44 @@ describe("password storage", () => {
 });
 
 describe("OperatorAuth", () => {
+  /** Stands in for the settings table, so a "restart" can reuse the same one. */
+  const settings = () => {
+    const values = new Map<string, string>();
+    return {
+      getSessionKey: () => values.get("key"),
+      setSessionKey: (key: string) => void values.set("key", key),
+    };
+  };
+
   const setup = (
     overrides: Partial<{
       stored: string | undefined;
       configured: string | undefined;
       now: () => number;
+      keys: ReturnType<typeof settings>;
     }> = {},
   ) => {
     const announced: string[] = [];
     let stored = overrides.stored;
+    const keys = overrides.keys ?? settings();
     const auth = new OperatorAuth({
       getStoredHash: () => stored,
       setStoredHash: (hash) => {
         stored = hash;
       },
+      ...keys,
       configuredPassword: overrides.configured,
       announce: (password) => announced.push(password),
       ...(overrides.now ? { now: overrides.now } : {}),
     });
-    return { auth, announced, storedHash: () => stored };
+    return { auth, announced, keys, storedHash: () => stored };
   };
 
   it("accepts the configured password and nothing else", () => {
     const { auth, announced } = setup({ configured: "from-env" });
     expect(auth.login("from-env").ok).toBe(true);
     expect(auth.login("from-envy").ok).toBe(false);
-    // Nothing was invented, so nothing was announced or persisted.
+    // Nothing was invented, so nothing was announced.
     expect(announced).toEqual([]);
   });
 
@@ -106,17 +117,60 @@ describe("OperatorAuth", () => {
     expect(auth.verify(outcome.token)).toBe(false);
   });
 
-  it("expires a session rather than trusting it forever", () => {
-    let now = 1_000;
-    const { auth } = setup({ configured: "pw", now: () => now });
-    const outcome = auth.login("pw");
+  it("keeps a session valid across a Host restart", () => {
+    /*
+     * The reported problem: every refresh asked for the password again. The
+     * cookie was fine — the sessions were a Map, and a Host under `tsx watch`
+     * restarts on every file save, so each one signed the operator out.
+     */
+    const keys = settings();
+    const stored = hashPassword("pw");
+    const first = setup({ configured: "pw", stored, keys });
+    const outcome = first.auth.login("pw");
     if (!outcome.ok) throw new Error("expected a successful login");
-    expect(outcome.expiresAt).toBe(1_000 + SESSION_TTL_MS);
 
-    now += SESSION_TTL_MS - 1;
-    expect(auth.verify(outcome.token)).toBe(true);
-    now += 1;
-    expect(auth.verify(outcome.token)).toBe(false);
+    const afterRestart = setup({ configured: "pw", stored: first.storedHash(), keys });
+
+    expect(afterRestart.auth.verify(outcome.token)).toBe(true);
+  });
+
+  it("signs everyone out when the password changes", () => {
+    const keys = settings();
+    const before = setup({ configured: "old", keys });
+    const outcome = before.auth.login("old");
+    if (!outcome.ok) throw new Error("expected a successful login");
+
+    const after = setup({ configured: "new", stored: before.storedHash(), keys });
+
+    expect(after.auth.verify(outcome.token)).toBe(false);
+  });
+
+  it("will not take a cookie another Host signed", () => {
+    const outcome = setup({ configured: "pw" }).auth.login("pw");
+    if (!outcome.ok) throw new Error("expected a successful login");
+
+    // Same password, different signing key: the token is not transferable.
+    expect(setup({ configured: "pw" }).auth.verify(outcome.token)).toBe(false);
+  });
+
+  it("keeps one verifier for a configured password, so its salt is stable", () => {
+    // Re-hashing on every boot salts anew, and anything derived from the
+    // verifier — including which password a cookie was issued for — moved with
+    // it. Reusing the stored one is what makes a session outlive a restart.
+    const first = setup({ configured: "pw" });
+    const second = setup({ configured: "pw", stored: first.storedHash() });
+
+    expect(second.storedHash()).toBe(first.storedHash());
+    expect(second.auth.login("pw").ok).toBe(true);
+  });
+
+  it("replaces the verifier when the configured password no longer matches it", () => {
+    const first = setup({ configured: "old" });
+    const second = setup({ configured: "new", stored: first.storedHash() });
+
+    expect(second.storedHash()).not.toBe(first.storedHash());
+    expect(second.auth.login("new").ok).toBe(true);
+    expect(second.auth.login("old").ok).toBe(false);
   });
 
   it("stops answering guesses once there have been too many", () => {

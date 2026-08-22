@@ -7,7 +7,7 @@ import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { errorMessage } from "@fleet/protocol";
 import { cachedGitRevision } from "./host-revision.js";
-import { OperatorAuth, PASSWORD_SETTING_KEY } from "./auth.js";
+import { OperatorAuth, PASSWORD_SETTING_KEY, SESSION_KEY_SETTING } from "./auth.js";
 import {
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
@@ -18,13 +18,19 @@ import { FleetService } from "./fleet-service.js";
 import { registerBrowserGateway } from "./gateway/browser-socket.js";
 import { registerNodeGateway } from "./gateway/node-socket.js";
 import { startHostUrlMonitor } from "./host-url.js";
-import { envFilePath } from "./paths.js";
+import { envFilePath, packageVersion } from "./paths.js";
 import { startPresenceMonitor } from "./presence.js";
+import { OrchestratorEngine } from "./orchestrator/engine.js";
+import { LeadTokens } from "./orchestrator/lead-tokens.js";
+import { MCP_PATH, mcpRoutes } from "./orchestrator/mcp-routes.js";
+import { startRunDeadlineMonitor } from "./orchestrator/deadlines.js";
 import { registerRequestGuard } from "./request-guard.js";
 import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { nodeRoutes } from "./routes/nodes.js";
 import { sessionRoutes } from "./routes/sessions.js";
+import { runRoutes } from "./routes/runs.js";
+import { orchestratorRoutes } from "./routes/orchestrators.js";
 import { systemRoutes } from "./routes/system.js";
 import { FleetStore } from "./store.js";
 import { TunnelSupervisor } from "./tunnel.js";
@@ -33,7 +39,7 @@ import { createLogBuffer } from "@fleet/protocol/log-buffer";
 
 loadEnv({ path: envFilePath(), quiet: true });
 
-const VERSION = "0.1.0";
+const VERSION = packageVersion();
 
 export {
   resolveDatabasePath,
@@ -73,6 +79,10 @@ export async function buildServer(
   const auth = new OperatorAuth({
     getStoredHash: () => store.getSetting(PASSWORD_SETTING_KEY),
     setStoredHash: (hash) => store.setSetting(PASSWORD_SETTING_KEY, hash),
+    // Persisted so a restart does not sign the operator out. In development the
+    // Host restarts on every file save, which made that constant.
+    getSessionKey: () => store.getSetting(SESSION_KEY_SETTING),
+    setSessionKey: (key) => store.setSetting(SESSION_KEY_SETTING, key),
     configuredPassword: options.operatorPassword ?? process.env.FLEET_OPERATOR_PASSWORD,
     // Info rather than warn: the buffer behind /api/logs keeps warnings and
     // errors, and this is the one line that must never be readable over HTTP.
@@ -152,9 +162,44 @@ export async function buildServer(
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
 
+  /*
+   * Constructed after the service and subscribed to its events, so the engine
+   * reacts to the same facts browsers do. The dependency only points this way:
+   * FleetService knows nothing about orchestration, and this file is the one
+   * place that knows both halves.
+   */
+  const engine = new OrchestratorEngine(service);
+  service.onSessionEvent((event) => engine.handleSessionEvent(event));
+
+  /**
+   * The orchestrator's tools reach the Host over its own HTTP MCP endpoint,
+   * which means the Node has to be able to dial it. The Host names the path;
+   * the Node resolves it against the address it is connected on.
+   */
+  const leadTokens = new LeadTokens(store);
+  service.attachOrchestration({
+    leadTokens,
+    /*
+     * Only the path here really matters: the Node rebases this onto the address
+     * it is actually connected on, because it knows which one works from where
+     * it stands and the Host does not. The rest is still resolved the way
+     * enrollment is, so the value is a sensible one to read in a log or hand to
+     * anything that has no better idea.
+     */
+    mcpUrl: () => new URL(MCP_PATH, enrollmentHostUrl()).toString(),
+    tickRun: (runId) => engine.tickRun(runId),
+  });
+  await app.register(mcpRoutes, { service, tokens: leadTokens });
+  await app.register(runRoutes, { service, engine });
+  await app.register(orchestratorRoutes, { service, engine });
+
   registerBrowserGateway(app, service);
   registerNodeGateway(app, service);
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs);
+  // Timeouts are the absence of events; without a clock nothing would ever
+  // notice one. See the monitor for why this is not the busy-wait the design
+  // rules out.
+  const runDeadlineTimer = startRunDeadlineMonitor(engine);
 
   const uiRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ui");
   if (existsSync(uiRoot)) {
@@ -183,6 +228,7 @@ export async function buildServer(
 
   app.addHook("onClose", async () => {
     clearInterval(presenceTimer);
+    clearInterval(runDeadlineTimer);
     clearInterval(hostUrlMonitor);
     await tunnel.stop();
     service.shutdown();

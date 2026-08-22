@@ -2,7 +2,7 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   OPERATOR_COOKIE,
-  SESSION_TTL_MS,
+  SESSION_MAX_AGE_MS,
   clearedCookie,
   readCookie,
   sessionCookie,
@@ -44,7 +44,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, { au
     return reply
       .header(
         "set-cookie",
-        sessionCookie(outcome.token, overTls(request), SESSION_TTL_MS),
+        sessionCookie(outcome.token, overTls(request), SESSION_MAX_AGE_MS),
       )
       .send({ ok: true });
   });

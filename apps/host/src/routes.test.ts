@@ -311,3 +311,213 @@ describe("host routes", () => {
     expect(response.statusCode).toBe(404);
   });
 });
+
+describe("run routes", () => {
+  let app: FastifyInstance;
+  let cookie = "";
+
+  const inject = async (options: InjectOptions) =>
+    app.inject({ ...options, headers: { ...options.headers, cookie } });
+
+  const workspaceWithPlacement = async () => {
+    const register = await inject({
+      method: "POST",
+      url: "/api/nodes/register",
+      payload: {
+        name: "node",
+        os: "linux",
+        arch: "x64",
+        version: "0.1.0",
+        capabilities: ["copilot-acp", "host-yolo"],
+        maxSessions: 1,
+        enrollmentToken: "test-token",
+      },
+    });
+    const { nodeId } = register.json() as { nodeId: string };
+    const workspace = await inject({
+      method: "POST",
+      url: "/api/workspaces",
+      payload: { name: "repo", description: "" },
+    });
+    const workspaceId = (workspace.json() as { id: string }).id;
+    await inject({
+      method: "POST",
+      url: "/api/placements",
+      payload: { workspaceId, nodeId, localPath: "/src/repo" },
+    });
+    return { workspaceId, nodeId };
+  };
+
+  const createRun = async (workspaceId: string) => {
+    const response = await inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: { workspaceId, name: "audit", objective: "audit then fix" },
+    });
+    expect(response.statusCode).toBe(201);
+    return response.json() as { id: string; state: string };
+  };
+
+  beforeEach(async () => {
+    app = await buildServer({
+      databasePath: ":memory:",
+      enrollmentToken: "test-token",
+      operatorPassword: OPERATOR_PASSWORD,
+    });
+    app.log.level = "silent";
+    await app.ready();
+    const login = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { password: OPERATOR_PASSWORD },
+    });
+    cookie = (login.headers["set-cookie"] as string).split(";")[0] ?? "";
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  it("creates a run that waits for a human before anything runs", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    expect(run.state).toBe("awaiting_approval");
+
+    const listed = await inject({ method: "GET", url: "/api/runs" });
+    const body = listed.json() as { runs: unknown[]; stepsByRunId: Record<string, []> };
+    expect(body.runs).toHaveLength(1);
+    expect(body.stepsByRunId[run.id]).toEqual([]);
+  });
+
+  it("refuses a plan whose steps depend on each other and names the cycle", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    const response = await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: {
+        steps: [
+          { stepKey: "a", title: "A", prompt: "a", dependsOn: ["b"] },
+          { stepKey: "b", title: "B", prompt: "b", dependsOn: ["a"] },
+        ],
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    const body = response.json() as { error: string; cycle: string[] };
+    expect(body.cycle.sort()).toEqual(["a", "b"]);
+    expect(body.error).toContain("cycle");
+  });
+
+  it("refuses a plan that depends on a step nobody submitted", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    const response = await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: {
+        steps: [{ stepKey: "fix", title: "Fix", prompt: "fix", dependsOn: ["audit"] }],
+      },
+    });
+    expect(response.statusCode).toBe(400);
+    expect((response.json() as { error: string }).error).toContain("audit");
+  });
+
+  it("dispatches the first step on approval and owns the session it creates", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: {
+        steps: [
+          { stepKey: "audit", title: "Audit", prompt: "audit it", category: "explore" },
+          {
+            stepKey: "fix",
+            title: "Fix",
+            prompt: "fix it",
+            category: "implement",
+            dependsOn: ["audit"],
+          },
+        ],
+      },
+    });
+
+    const approved = await inject({ method: "POST", url: `/api/runs/${run.id}/approve` });
+    expect(approved.statusCode).toBe(200);
+    const body = approved.json() as {
+      run: { state: string; placementId: string };
+      steps: { stepKey: string; state: string; sessionId: string }[];
+    };
+    expect(body.run.state).toBe("running");
+
+    const audit = body.steps.find((step) => step.stepKey === "audit")!;
+    // No node is connected, so the command cannot be delivered and the step
+    // goes back in the queue rather than being blamed for it.
+    expect(["starting", "pending"]).toContain(audit.state);
+    // The dependent step must not have moved either way.
+    expect(body.steps.find((step) => step.stepKey === "fix")?.state).toBe("pending");
+  });
+
+  it("cancels a run once and stays cancelled", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: { steps: [{ stepKey: "audit", title: "Audit", prompt: "audit" }] },
+    });
+    const cancelled = await inject({ method: "POST", url: `/api/runs/${run.id}/cancel` });
+    expect(cancelled.statusCode).toBe(200);
+    const body = cancelled.json() as {
+      run: { state: string };
+      steps: { state: string }[];
+    };
+    expect(body.run.state).toBe("cancelled");
+    expect(body.steps[0]?.state).toBe("cancelled");
+
+    const again = await inject({ method: "POST", url: `/api/runs/${run.id}/cancel` });
+    expect(again.statusCode).toBe(200);
+    expect((again.json() as { run: { state: string } }).run.state).toBe("cancelled");
+  });
+
+  it("will not plan a run that was already approved", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    await inject({ method: "POST", url: `/api/runs/${run.id}/approve` });
+    const response = await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: { steps: [{ stepKey: "late", title: "Late", prompt: "late" }] },
+    });
+    expect(response.statusCode).toBe(409);
+  });
+
+  it("deletes a run and forgets its steps", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+    await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/plan`,
+      payload: { steps: [{ stepKey: "audit", title: "Audit", prompt: "audit" }] },
+    });
+    const removed = await inject({ method: "DELETE", url: `/api/runs/${run.id}` });
+    expect(removed.statusCode).toBe(204);
+    const missing = await inject({ method: "GET", url: `/api/runs/${run.id}` });
+    expect(missing.statusCode).toBe(404);
+  });
+
+  it("refuses a review of a task nobody handed over", async () => {
+    // The person is asked once, at the end. Answering a task that is still
+    // being worked on would be a decision nobody was waiting for.
+    const { workspaceId } = await workspaceWithPlacement();
+    const run = await createRun(workspaceId);
+
+    const response = await inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/review`,
+      payload: { approved: true },
+    });
+
+    expect(response.statusCode).toBe(409);
+  });
+});

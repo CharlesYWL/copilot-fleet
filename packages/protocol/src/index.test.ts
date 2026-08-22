@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  BrowserMessageSchema,
   HOST_BACKUP_KIND,
+  HOST_YOLO_CAPABILITY,
   HostBackupSchema,
   HostToNodeMessageSchema,
   NODE_BACKUP_KIND,
@@ -11,8 +13,11 @@ import {
   SessionEventSchema,
   SessionSchema,
   SetSessionConfigSchema,
+  SnapshotSchema,
   backupKind,
   canTransition,
+  canTransitionRun,
+  canTransitionRunStep,
   eventPayload,
   isRotatingTunnelUrl,
   normalizeHostUrl,
@@ -330,5 +335,125 @@ describe("backup archives", () => {
     });
     expect(parsed.settings.contextTier).toBe("long_context");
     expect(parsed.settings.knownHostUrls).toEqual([]);
+  });
+});
+
+describe("run orchestration protocol", () => {
+  const now = "2026-01-01T00:00:00.000Z";
+  const session = {
+    id: "s1",
+    workspaceId: "w1",
+    workspaceName: "w",
+    placementId: "p1",
+    nodeId: "n1",
+    nodeName: "n",
+    state: "idle",
+    initialPrompt: "hi",
+    currentActivity: "",
+    lastText: "",
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  it("exports host-yolo as a named capability", () => {
+    expect(HOST_YOLO_CAPABILITY).toBe("host-yolo");
+  });
+
+  it("defaults runId and runRole on sessions", () => {
+    const parsed = SessionSchema.parse(session);
+    expect(parsed.runId).toBe("");
+    expect(parsed.runRole).toBe("");
+  });
+
+  it("defaults runs on snapshots so an older Host does not break a browser", () => {
+    const snapshot = SnapshotSchema.parse({
+      nodes: [],
+      workspaces: [],
+      placements: [],
+      sessions: [],
+      hostRevision: "abc",
+    });
+    expect(snapshot.runs).toEqual([]);
+  });
+
+  it("accepts run and run_steps browser messages", () => {
+    const run = {
+      id: "r1",
+      workspaceId: "w1",
+      name: "n",
+      objective: "o",
+      state: "running",
+      createdAt: now,
+      updatedAt: now,
+    };
+    const parsed = BrowserMessageSchema.parse({ type: "run", run });
+    expect(parsed.type).toBe("run");
+    if (parsed.type === "run") {
+      // Budgets and bookkeeping all carry defaults so a run row written before
+      // a policy field existed still parses.
+      expect(parsed.run.policy.maxWakes).toBe(12);
+      expect(parsed.run.policy.startingTimeoutMs).toBe(120_000);
+      expect(parsed.run.placementId).toBe("");
+      expect(parsed.run.settleSeq).toBe(0);
+      expect(parsed.run.wakeSeq).toBe(0);
+    }
+
+    expect(
+      BrowserMessageSchema.parse({
+        type: "run_steps",
+        runId: "r1",
+        steps: [
+          {
+            id: "st1",
+            runId: "r1",
+            stepKey: "audit",
+            title: "Audit",
+            prompt: "look",
+            state: "pending",
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      }).type,
+    ).toBe("run_steps");
+  });
+
+  it("keeps old host backups readable and carries runs when present", () => {
+    const backup = {
+      kind: HOST_BACKUP_KIND,
+      version: 1,
+      exportedAt: now,
+      enrollmentToken: "t",
+      tunnel: { enabled: false, provider: "cloudflare" },
+      defaults: { yolo: true, autoResume: true },
+      nodes: [],
+      workspaces: [],
+      placements: [],
+      sessions: [],
+      events: [],
+    };
+    const parsed = HostBackupSchema.parse(backup);
+    expect(parsed.runs).toEqual([]);
+    expect(parsed.runSteps).toEqual([]);
+  });
+
+  it("gates run transitions on approval being the entrance", () => {
+    expect(canTransitionRun("awaiting_approval", "planning")).toBe(true);
+    // The handwritten-DAG fixture has no Lead, so there is nothing to plan.
+    expect(canTransitionRun("awaiting_approval", "running")).toBe(true);
+    expect(canTransitionRun("running", "awaiting_lead")).toBe(true);
+    expect(canTransitionRun("planning", "awaiting_lead")).toBe(false);
+    expect(canTransitionRun("completed", "running")).toBe(false);
+  });
+
+  it("makes a step pass through starting, because a send is not a receipt", () => {
+    expect(canTransitionRunStep("pending", "starting")).toBe(true);
+    expect(canTransitionRunStep("pending", "running")).toBe(false);
+    expect(canTransitionRunStep("starting", "running")).toBe(true);
+    // The command never left; the step goes back in the queue.
+    expect(canTransitionRunStep("starting", "pending")).toBe(true);
+    // The node vanished before acknowledging it.
+    expect(canTransitionRunStep("starting", "failed")).toBe(true);
+    expect(canTransitionRunStep("succeeded", "running")).toBe(false);
   });
 });

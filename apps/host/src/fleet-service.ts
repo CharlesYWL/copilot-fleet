@@ -15,8 +15,13 @@ import {
   type FleetNode,
   type FleetSession,
   type HostBackup,
+  type McpHttpServer,
   type NodeCommand,
   type NodeUpdateStage,
+  type Placement,
+  type Run,
+  type RunRole,
+  type RunStep,
   type SessionEvent,
   type SessionState,
   type Snapshot,
@@ -63,6 +68,40 @@ export class FleetService {
   private readonly updatesInFlight = new Set<string>();
   /** Suppresses disconnect bookkeeping while the Host itself is shutting down. */
   private closing = false;
+  /**
+   * Who wants to hear about session events.
+   *
+   * A set of callbacks rather than a direct call into the orchestrator, so the
+   * service stays unaware that orchestration exists — `server.ts` is the only
+   * place that knows both halves.
+   */
+  private readonly sessionEventListeners = new Set<(event: SessionEvent) => void>();
+  /**
+   * Set by `server.ts` once the MCP endpoint and the engine exist.
+   *
+   * Late-bound rather than constructor arguments because the service is built
+   * before both of them, and it must stay unaware of orchestration otherwise —
+   * these are the two seams, and they are the only two.
+   */
+  private leadTokens: { mint: (sessionId: string) => string } | undefined;
+  private mcpUrl: (() => string) | undefined;
+  private runTicker: ((runId: string) => void) | undefined;
+
+  /** Wires the orchestration seams. Called once, from `server.ts`. */
+  attachOrchestration(input: {
+    leadTokens: { mint: (sessionId: string) => string };
+    mcpUrl: () => string;
+    tickRun: (runId: string) => void;
+  }): void {
+    this.leadTokens = input.leadTokens;
+    this.mcpUrl = input.mcpUrl;
+    this.runTicker = input.tickRun;
+  }
+
+  /** Advances one run now, used by the tools so a dispatch is not left waiting. */
+  tickRun(runId: string): void {
+    this.runTicker?.(runId);
+  }
 
   constructor(
     readonly store: FleetStore,
@@ -84,6 +123,7 @@ export class FleetService {
       workspaces: this.store.listWorkspaces(),
       placements: this.store.listPlacements(),
       sessions: this.store.listSessions(),
+      runs: this.store.listRuns(),
       hostRevision: this.hostRevision,
     };
   }
@@ -165,6 +205,15 @@ export class FleetService {
     for (const session of sessions) this.publishSession(session);
   }
 
+  publishRun(run: Run): void {
+    this.broadcast({ type: "run", run });
+  }
+
+  /** Steps travel whole: a step that was removed has no row left to describe. */
+  publishRunSteps(runId: string, steps: readonly RunStep[]): void {
+    this.broadcast({ type: "run_steps", runId, steps: [...steps] });
+  }
+
   /**
    * Announces the workspace/placement catalog after any edit to it.
    *
@@ -178,6 +227,82 @@ export class FleetService {
       workspaces: this.store.listWorkspaces(),
       placements: this.store.listPlacements(),
     });
+  }
+
+  /**
+   * Creates a session and asks its Node to start it.
+   *
+   * Shared by the REST route, the orchestrator, and the MCP facade so all three
+   * enforce the same admission rules — capacity, yolo support, a live node —
+   * rather than each growing its own copy that drifts.
+   */
+  createAndStartSession(input: {
+    placement: Placement;
+    prompt: string;
+    yolo: boolean;
+    name?: string;
+    runId?: string;
+    runRole?: RunRole;
+  }):
+    | { ok: true; session: FleetSession }
+    | { ok: false; status: number; error: string; session?: FleetSession } {
+    const node = this.store.getNode(input.placement.nodeId);
+    if (!node?.online) return { ok: false, status: 409, error: "Node is offline" };
+    if (reservedSessionCount(this.store.listSessions(), node.id) >= node.maxSessions) {
+      return { ok: false, status: 409, error: "Node is at capacity" };
+    }
+    const unsupported = yoloUnsupportedReason(node, input.yolo);
+    if (unsupported) return { ok: false, status: 409, error: unsupported };
+
+    const session = this.store.createSession(
+      input.placement,
+      input.prompt,
+      input.yolo,
+      input.name ?? "",
+      { runId: input.runId ?? "", runRole: input.runRole ?? "" },
+    );
+    this.publishSession(session);
+    const dispatched = this.dispatch(
+      node.id,
+      {
+        type: "start_session",
+        sessionId: session.id,
+        localPath: input.placement.localPath,
+        prompt: input.prompt,
+        yolo: input.yolo,
+        mcpServers: this.mcpServersFor(session),
+      },
+      { state: "failed", activity: "Node disconnected before process start" },
+    );
+    if (!dispatched.sent) {
+      return {
+        ok: false,
+        status: 503,
+        error: "Node disconnected",
+        ...(dispatched.session ? { session: dispatched.session } : {}),
+      };
+    }
+    return { ok: true, session };
+  }
+
+  /**
+   * The MCP servers a session should be given, on start and on resume alike.
+   *
+   * Derived from the session's role rather than stored, so there is one answer
+   * to "what tools does this have" and a resumed orchestrator cannot come back
+   * without them. A fresh token is minted each time: they are cheap, and it
+   * means an old one stops working the moment a session restarts.
+   */
+  mcpServersFor(session: Pick<FleetSession, "id" | "runRole">): McpHttpServer[] {
+    if (session.runRole !== "lead" || !this.leadTokens || !this.mcpUrl) return [];
+    const token = this.leadTokens.mint(session.id);
+    return [
+      {
+        name: "fleet",
+        url: this.mcpUrl(),
+        headers: [{ name: "Authorization", value: `Bearer ${token}` }],
+      },
+    ];
   }
 
   /**
@@ -447,6 +572,9 @@ export class FleetService {
         agentSessionId: session.agentSessionId,
         sequenceOffset: this.store.maxEventSequence(session.id),
         yolo: session.yolo,
+        // Re-issued, not replayed: `session/load` takes its own server list, and
+        // an orchestrator reloaded without one wakes up with no way to dispatch.
+        mcpServers: this.mcpServersFor(session),
       });
       // The socket went away mid-sweep; the rest are settled and resumable by
       // hand, and the next reconnect will not pick them up again.
@@ -520,7 +648,24 @@ export class FleetService {
       );
     } catch (error) {
       this.log.error({ error, event }, "Rejected session event");
+    } finally {
+      // After the store is updated, so a listener that reads it sees the event
+      // it was told about. One-way on purpose: the service never imports the
+      // orchestrator, which is what keeps the dependency pointing inward.
+      for (const listener of this.sessionEventListeners) {
+        try {
+          listener(event);
+        } catch (error) {
+          this.log.error({ error, event }, "A session event listener threw");
+        }
+      }
     }
+  }
+
+  /** Subscribes to session events; returns a function that unsubscribes. */
+  onSessionEvent(listener: (event: SessionEvent) => void): () => void {
+    this.sessionEventListeners.add(listener);
+    return () => this.sessionEventListeners.delete(listener);
   }
 
   /** Fails a session whose Node reported the command it was given did not run. */

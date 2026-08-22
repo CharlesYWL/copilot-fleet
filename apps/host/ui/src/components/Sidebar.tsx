@@ -7,6 +7,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import {
+  shorthands,
   Button,
   Text,
   Tree,
@@ -20,11 +21,20 @@ import {
 import {
   Add20Regular,
   Delete20Regular,
+  Chat20Regular,
+  Flow16Regular,
+  Flow20Regular,
   Folder20Regular,
   Server20Regular,
   Settings20Regular,
 } from "@fluentui/react-icons";
-import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
+import type {
+  FleetNode,
+  FleetSession,
+  Placement,
+  SessionEvent,
+  Workspace,
+} from "@fleet/protocol";
 import { groupSessionsByWorkspace } from "../lib/session-groups";
 import {
   DRAG_MIME,
@@ -36,7 +46,11 @@ import {
 } from "../lib/drag-drop";
 import { useCatalog } from "../hooks/useCatalog";
 import { sessionLabel } from "../lib/session-label";
-import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
+import {
+  sessionAccent,
+  sessionStatusDescriptor,
+  sessionStatusLabel,
+} from "../lib/session-status";
 import {
   nextClosedItems,
   nodeKey,
@@ -45,6 +59,9 @@ import {
   type TreeReading,
 } from "../lib/tree-collapse";
 import { StatusDot } from "./StatusDot";
+import { StatusIndicator } from "./StatusIndicator";
+import { statusVisuals } from "../theme";
+import type { AppView } from "../App";
 
 const useStyles = makeStyles({
   sidebar: {
@@ -92,6 +109,13 @@ const useStyles = makeStyles({
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
+  },
+  /** Marks a session the engine is driving, not the operator. */
+  dispatchedMark: {
+    display: "inline-flex",
+    alignItems: "center",
+    flexShrink: 0,
+    color: tokens.colorBrandForeground2,
   },
   offline: {
     color: tokens.colorNeutralForeground4,
@@ -157,9 +181,74 @@ const useStyles = makeStyles({
   navButton: {
     justifyContent: "flex-start",
   },
+  /** The one row that is not a workspace, so it is styled as its own thing. */
+  orchestration: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    width: "100%",
+    padding: "8px 10px",
+    marginBottom: "4px",
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: tokens.borderRadiusMedium,
+    background: "transparent",
+    color: tokens.colorNeutralForeground1,
+    font: "inherit",
+    textAlign: "left",
+    cursor: "pointer",
+    ":hover": { background: tokens.colorNeutralBackground3 },
+  },
+  orchestrationActive: {
+    background: tokens.colorNeutralBackground3,
+    // Griffel wants the longhand here, since the shorthand is set above.
+    borderTopColor: tokens.colorBrandStroke1,
+    borderRightColor: tokens.colorBrandStroke1,
+    borderBottomColor: tokens.colorBrandStroke1,
+    borderLeftColor: tokens.colorBrandStroke1,
+  },
+  orchestrationLabel: {
+    flexGrow: 1,
+    minWidth: 0,
+    fontWeight: tokens.fontWeightSemibold,
+  },
+  orchestrationCount: {
+    fontSize: tokens.fontSizeBase200,
+    color: tokens.colorNeutralForeground3,
+    fontVariantNumeric: "tabular-nums",
+  },
+  /** Amber only, and only for what a person has to act on. */
+  attentionBadge: {
+    minWidth: "18px",
+    height: "18px",
+    display: "grid",
+    placeItems: "center",
+    padding: "0 5px",
+    borderRadius: "9px",
+    background: statusVisuals.attention.surface,
+    color: statusVisuals.attention.foreground,
+    ...shorthands.border("1px", "solid", statusVisuals.attention.border),
+    fontSize: "10px",
+    fontWeight: tokens.fontWeightSemibold,
+    fontVariantNumeric: "tabular-nums",
+  },
+  /** The lead's conversation, one level under the orchestrator row. */
+  leadRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+    width: "100%",
+    minHeight: "34px",
+    padding: "0 12px 0 28px",
+    ...shorthands.borderStyle("none"),
+    borderRadius: tokens.borderRadiusMedium,
+    background: "transparent",
+    color: tokens.colorNeutralForeground2,
+    font: "inherit",
+    textAlign: "left",
+    cursor: "pointer",
+    ":hover": { background: tokens.colorNeutralBackground1Hover },
+  },
 });
-
-export type SidebarView = "session" | "settings";
 
 type SidebarProps = {
   nodes: FleetNode[];
@@ -167,11 +256,19 @@ type SidebarProps = {
   sessions: FleetSession[];
   placements: Placement[];
   selectedSessionId: string | undefined;
-  view: SidebarView;
+  view: AppView;
   endedCount: number;
+  /** Live work across the fleet, shown beside the Orchestrator row. */
+  liveWorkCount: number;
+  /** Tasks waiting on a person; drawn separately because amber means act. */
+  attentionCount: number;
+  /** The lead, when one is running, so its conversation gets its own row. */
+  leadSession: FleetSession | undefined;
+  waitingPermissions: readonly SessionEvent[];
   onSelectSession: (sessionId: string) => void;
+  onSelectLeadSession: () => void;
   onNewSession: () => void;
-  onSelectView: (view: Exclude<SidebarView, "session">) => void;
+  onSelectView: (view: Exclude<AppView, "session" | "overview">) => void;
   onClearEnded: () => void;
 };
 
@@ -183,7 +280,12 @@ export const Sidebar = ({
   selectedSessionId,
   view,
   endedCount,
+  liveWorkCount,
+  attentionCount,
+  leadSession,
+  waitingPermissions,
   onSelectSession,
+  onSelectLeadSession,
   onNewSession,
   onSelectView,
   onClearEnded,
@@ -255,6 +357,71 @@ export const Sidebar = ({
   return (
     <nav className={styles.sidebar} aria-label="Fleet navigation">
       <div className={styles.scroll}>
+        <Text as="span" className={styles.sectionLabel}>
+          Fleet
+        </Text>
+        {/*
+          The orchestrator sits above the workspaces rather than inside one.
+          It is the fleet-wide surface — the session you brief, and the work it
+          has out on every machine — so nesting it under a repository would
+          both bury it and imply it belongs to that repository.
+        */}
+        <button
+          type="button"
+          className={mergeClasses(
+            styles.orchestration,
+            (view === "orchestrator" || view === "orchestrator-task") &&
+              styles.orchestrationActive,
+          )}
+          aria-current={view === "orchestrator" ? "page" : undefined}
+          onClick={() => onSelectView("orchestrator")}
+        >
+          <Flow20Regular aria-hidden="true" />
+          <span className={styles.orchestrationLabel}>Orchestrator</span>
+          {attentionCount > 0 && (
+            <span
+              className={styles.attentionBadge}
+              title={`${attentionCount} waiting for you`}
+            >
+              {attentionCount}
+            </span>
+          )}
+          {liveWorkCount > 0 && (
+            <span className={styles.orchestrationCount}>{liveWorkCount}</span>
+          )}
+        </button>
+        {/*
+          The lead's conversation belongs to the orchestrator, not to the
+          workspace its process happens to run in. It is filtered out of the
+          session tree for the same reason, so this is its only way in.
+        */}
+        {leadSession && (
+          <button
+            type="button"
+            className={mergeClasses(
+              styles.leadRow,
+              view === "session" &&
+                selectedSessionId === leadSession.id &&
+                styles.orchestrationActive,
+            )}
+            aria-current={
+              view === "session" && selectedSessionId === leadSession.id
+                ? "page"
+                : undefined
+            }
+            onClick={onSelectLeadSession}
+          >
+            <Chat20Regular aria-hidden="true" />
+            <span className={styles.orchestrationLabel}>Conversation</span>
+            <StatusIndicator
+              descriptor={sessionStatusDescriptor(
+                leadSession,
+                waitingPermissions.some((event) => event.sessionId === leadSession.id),
+              )}
+              variant="dot"
+            />
+          </button>
+        )}
         <Text as="span" className={styles.sectionLabel}>
           Agents
         </Text>
@@ -511,6 +678,16 @@ export const Sidebar = ({
                                       state={session.state}
                                       color={sessionAccent(session)}
                                     />
+                                    {session.runRole !== "" && (
+                                      <span
+                                        className={styles.dispatchedMark}
+                                        role="img"
+                                        aria-label="Dispatched by the orchestrator"
+                                        title="Dispatched by the orchestrator"
+                                      >
+                                        <Flow16Regular />
+                                      </span>
+                                    )}
                                     <span
                                       className={styles.sessionName}
                                       title={`${sessionStatusLabel(session)} · ${session.initialPrompt}`}

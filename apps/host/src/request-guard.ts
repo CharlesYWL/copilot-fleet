@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
+import { MCP_PATH } from "./orchestrator/mcp-routes.js";
 import { OPERATOR_COOKIE, readCookie, type OperatorAuth } from "./auth.js";
 
 /**
@@ -161,6 +162,15 @@ export function registerRequestGuard(
     // node dials whatever address it was enrolled with — a LAN IP, a forwarded
     // loopback port — so neither the cookie nor the name check applies to it.
     if (pathname === "/ws/node") return;
+
+    /*
+     * The orchestrator's tool endpoint authenticates itself, with a bearer
+     * token scoped to one session, and is called by an agent process rather
+     * than by a browser. It is therefore exempt from the operator cookie for
+     * the same reason the node gateway is — and from the host-name check,
+     * because the agent dials the Host on whatever address its node was told.
+     */
+    if (pathname === MCP_PATH) return;
 
     const credentials = nodeCredentials(request);
     if (credentials) {

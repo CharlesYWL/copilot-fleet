@@ -7,6 +7,13 @@ import {
   type FleetSession,
   type HostBackup,
   type Placement,
+  type Run,
+  type RunPolicy,
+  type RunRole,
+  type RunState,
+  type RunStep,
+  type RunNote,
+  type RunStepState,
   type SessionEvent,
   type SessionState,
   type TunnelProvider,
@@ -16,6 +23,10 @@ import {
   HostBackupSchema,
   NodeSchema,
   PlacementSchema,
+  RunPolicySchema,
+  RunSchema,
+  RunStepSchema,
+  RunNoteSchema,
   SessionEventSchema,
   SessionSchema,
   TunnelProviderSchema,
@@ -24,8 +35,40 @@ import {
   canTransition,
   sessionFieldsForHostImport,
   terminalSessionStates,
+  tryParseJson,
   tunnelProviders,
 } from "@fleet/protocol";
+
+/**
+ * A policy as it arrives from a request body.
+ *
+ * `Partial` is not enough under `exactOptionalPropertyTypes`: a parsed JSON
+ * body has keys that are present and explicitly `undefined`, which that type
+ * forbids.
+ */
+export type RunPolicyInput = { [K in keyof RunPolicy]?: RunPolicy[K] | undefined };
+
+/**
+ * A step as a caller describes it, before the store gives it an id and a state.
+ */
+export type RunStepInput = {
+  stepKey: string;
+  title: string;
+  prompt: string;
+  category?: string | undefined;
+  dependsOn?: readonly string[] | undefined;
+  position?: number | undefined;
+  /**
+   * Where this step should run, when the caller has already decided.
+   *
+   * The orchestrator tools resolve a checkout in order to answer the model with
+   * a real path, so recording it here is what keeps that answer true — the
+   * engine used to decide again from scratch and could pick somewhere else.
+   */
+  placementId?: string | undefined;
+  /** The phase its task was in when this was dispatched. */
+  phaseIndex?: number | undefined;
+};
 
 type Row = Record<string, unknown>;
 
@@ -114,6 +157,40 @@ export class FleetStore {
       CREATE INDEX IF NOT EXISTS idx_sessions_workspace ON sessions(workspace_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_placement ON sessions(placement_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_state ON sessions(state);
+      CREATE TABLE IF NOT EXISTS runs (
+        id TEXT PRIMARY KEY,
+        workspace_id TEXT NOT NULL REFERENCES workspaces(id),
+        name TEXT NOT NULL, objective TEXT NOT NULL, state TEXT NOT NULL,
+        lead_session_id TEXT NOT NULL DEFAULT '',
+        placement_id TEXT NOT NULL DEFAULT '',
+        policy TEXT NOT NULL, failure_reason TEXT NOT NULL DEFAULT '',
+        settle_seq INTEGER NOT NULL DEFAULT 0,
+        wake_seq INTEGER NOT NULL DEFAULT 0,
+        empty_wake_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS run_steps (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+        step_key TEXT NOT NULL, title TEXT NOT NULL, prompt TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT '', depends_on TEXT NOT NULL DEFAULT '[]',
+        state TEXT NOT NULL, session_id TEXT NOT NULL DEFAULT '',
+        placement_id TEXT NOT NULL DEFAULT '', output TEXT NOT NULL DEFAULT '',
+        event_seq_from INTEGER NOT NULL DEFAULT 0,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        dispatched_at TEXT NOT NULL DEFAULT '',
+        position INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        UNIQUE(run_id, step_key)
+      );
+      CREATE TABLE IF NOT EXISTS run_notes (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
+        phase_index INTEGER NOT NULL DEFAULT 0,
+        body TEXT NOT NULL, created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_run_notes_run ON run_notes(run_id);
+      CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id);
+      CREATE INDEX IF NOT EXISTS idx_run_steps_session ON run_steps(session_id);
+      CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
     `);
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "revision", "TEXT NOT NULL DEFAULT ''");
@@ -125,6 +202,12 @@ export class FleetStore {
     this.addColumnIfMissing("placements", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("workspaces", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "position", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("sessions", "run_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "run_role", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("runs", "phases", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumnIfMissing("runs", "phase_index", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("runs", "pending_prompt", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.rebuildSessionStateFromEvents();
   }
 
@@ -353,6 +436,19 @@ export class FleetStore {
       events: (
         this.statement("SELECT * FROM events ORDER BY session_id,sequence").all() as Row[]
       ).map(eventFromRow),
+      runs: (this.statement("SELECT * FROM runs ORDER BY created_at").all() as Row[]).map(
+        runFromRow,
+      ),
+      runSteps: (
+        this.statement(
+          "SELECT * FROM run_steps ORDER BY run_id,position,created_at",
+        ).all() as Row[]
+      ).map(runStepFromRow),
+      runNotes: (
+        this.statement(
+          "SELECT * FROM run_notes ORDER BY run_id,created_at",
+        ).all() as Row[]
+      ).map(runNoteFromRow),
     };
     return HostBackupSchema.parse(backup);
   }
@@ -368,7 +464,7 @@ export class FleetStore {
     const parsed = HostBackupSchema.parse(backup);
     this.transaction(() => {
       this.db.exec(
-        "DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes; DELETE FROM settings",
+        "DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes; DELETE FROM settings",
       );
       this.setTunnelEnabled(parsed.tunnel.enabled);
       this.setTunnelProvider(parsed.tunnel.provider);
@@ -424,8 +520,8 @@ export class FleetStore {
           `INSERT INTO sessions
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
-             config_options,position)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             config_options,position,run_id,run_role)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           session.id,
           session.workspaceId,
@@ -443,6 +539,8 @@ export class FleetStore {
           JSON.stringify(session.commands),
           JSON.stringify(session.configOptions),
           session.position,
+          session.runId,
+          session.runRole,
         );
       }
       for (const event of parsed.events) {
@@ -456,6 +554,63 @@ export class FleetStore {
           JSON.stringify(event.payload),
           event.createdAt,
         );
+      }
+      for (const run of parsed.runs) {
+        this.statement(
+          `INSERT INTO runs
+            (id,workspace_id,name,objective,state,lead_session_id,placement_id,policy,
+             failure_reason,settle_seq,wake_seq,empty_wake_count,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          run.id,
+          run.workspaceId,
+          run.name,
+          run.objective,
+          runStateForHostImport(run.state),
+          run.leadSessionId,
+          run.placementId,
+          JSON.stringify(run.policy),
+          run.failureReason,
+          run.settleSeq,
+          run.wakeSeq,
+          run.emptyWakeCount,
+          run.createdAt,
+          run.updatedAt,
+        );
+      }
+      for (const step of parsed.runSteps) {
+        this.statement(
+          `INSERT INTO run_steps
+            (id,run_id,step_key,title,prompt,category,depends_on,state,session_id,
+             placement_id,output,event_seq_from,attempts,phase_index,dispatched_at,position,
+             created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        ).run(
+          step.id,
+          step.runId,
+          step.stepKey,
+          step.title,
+          step.prompt,
+          step.category,
+          JSON.stringify(step.dependsOn),
+          runStepStateForHostImport(step.state),
+          step.sessionId,
+          step.placementId,
+          step.output,
+          step.eventSeqFrom,
+          step.attempts,
+          step.phaseIndex,
+          step.dispatchedAt,
+          step.position,
+          step.createdAt,
+          step.updatedAt,
+        );
+      }
+      // After the runs they reference, or the foreign key rejects them.
+      for (const note of parsed.runNotes) {
+        this.statement(
+          "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
+        ).run(note.id, note.runId, note.phaseIndex, note.body, note.createdAt);
       }
     });
   }
@@ -865,13 +1020,14 @@ export class FleetStore {
     prompt: string,
     yolo = false,
     name = "",
+    run: { runId?: string; runRole?: RunRole } = {},
   ): FleetSession {
     const now = new Date().toISOString();
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -885,6 +1041,8 @@ export class FleetStore {
       now,
       yolo ? 1 : 0,
       name.trim(),
+      run.runId ?? "",
+      run.runRole ?? "",
     );
     return this.getSession(id)!;
   }
@@ -942,6 +1100,282 @@ export class FleetStore {
         });
     });
     return this.listSessions();
+  }
+
+  /**
+   * Creates a run in the one state it may start in.
+   *
+   * `awaiting_approval` is the entrance rather than a checkpoint: a human
+   * authorises the objective and its budget once, and every later dispatch
+   * spends that authorisation instead of asking again.
+   */
+  createRun(input: {
+    workspaceId: string;
+    name: string;
+    objective: string;
+    policy?: RunPolicyInput | undefined;
+    /** The stages the orchestrator planned; empty for an unphased run. */
+    phases?: readonly string[] | undefined;
+  }): Run {
+    const now = new Date().toISOString();
+    const id = randomUUID();
+    const policy = RunPolicySchema.parse(input.policy ?? {});
+    this.statement(
+      `INSERT INTO runs
+       (id,workspace_id,name,objective,state,policy,phases,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      id,
+      input.workspaceId,
+      input.name,
+      input.objective,
+      "awaiting_approval",
+      JSON.stringify(policy),
+      JSON.stringify(input.phases ?? []),
+      now,
+      now,
+    );
+    return this.getRun(id)!;
+  }
+
+  getRun(id: string): Run | undefined {
+    const row = this.statement("SELECT * FROM runs WHERE id=?").get(id) as
+      Row | undefined;
+    return row ? runFromRow(row) : undefined;
+  }
+
+  listRuns(): Run[] {
+    return (
+      this.statement("SELECT * FROM runs ORDER BY created_at DESC").all() as Row[]
+    ).map(runFromRow);
+  }
+
+  /** Patches a run. Callers check {@link canTransitionRun} before moving state. */
+  updateRun(
+    id: string,
+    patch: Partial<
+      Pick<
+        Run,
+        | "state"
+        | "leadSessionId"
+        | "placementId"
+        | "failureReason"
+        | "emptyWakeCount"
+        | "name"
+        | "phaseIndex"
+        | "pendingPrompt"
+      >
+    > & { phases?: readonly string[] | undefined },
+  ): Run | undefined {
+    if (!this.getRun(id)) return undefined;
+    const columns: Record<string, unknown> = {
+      state: patch.state,
+      lead_session_id: patch.leadSessionId,
+      placement_id: patch.placementId,
+      failure_reason: patch.failureReason,
+      empty_wake_count: patch.emptyWakeCount,
+      name: patch.name,
+      phase_index: patch.phaseIndex,
+      pending_prompt: patch.pendingPrompt,
+      phases: patch.phases === undefined ? undefined : JSON.stringify(patch.phases),
+    };
+    const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
+    if (entries.length === 0) return this.getRun(id);
+    const assignments = entries.map(([column]) => `${column}=?`).join(",");
+    this.statement(`UPDATE runs SET ${assignments},updated_at=? WHERE id=?`).run(
+      ...entries.map(([, value]) => value as string | number),
+      new Date().toISOString(),
+      id,
+    );
+    return this.getRun(id);
+  }
+
+  setRunState(id: string, state: RunState, failureReason = ""): Run | undefined {
+    return this.updateRun(id, { state, ...(failureReason ? { failureReason } : {}) });
+  }
+
+  /**
+   * Advances the settle counter.
+   *
+   * Counters rather than timestamps because "wake the Lead exactly once per
+   * settle" is decided by comparing these two numbers, and a wall clock loses
+   * that comparison to same-millisecond settles and to restarts.
+   */
+  recordRunSettle(id: string): Run | undefined {
+    if (!this.getRun(id)) return undefined;
+    this.statement("UPDATE runs SET settle_seq=settle_seq+1,updated_at=? WHERE id=?").run(
+      new Date().toISOString(),
+      id,
+    );
+    return this.getRun(id);
+  }
+
+  /** Catches the wake counter up to the settle counter; see {@link recordRunSettle}. */
+  recordRunWake(id: string): Run | undefined {
+    if (!this.getRun(id)) return undefined;
+    this.statement("UPDATE runs SET wake_seq=settle_seq,updated_at=? WHERE id=?").run(
+      new Date().toISOString(),
+      id,
+    );
+    return this.getRun(id);
+  }
+
+  /**
+   * Writes a step, or takes another run at one that already exists.
+   *
+   * The step key is the Lead's name for a unit of work, so reusing it is how a
+   * retry says "this is that step again": the row is reused and `attempts`
+   * moves, rather than the run growing a second step that means the same thing.
+   */
+  upsertRunStep(runId: string, input: RunStepInput): RunStep {
+    const now = new Date().toISOString();
+    const existing = this.statement(
+      "SELECT * FROM run_steps WHERE run_id=? AND step_key=?",
+    ).get(runId, input.stepKey) as Row | undefined;
+
+    if (existing) {
+      this.statement(
+        `UPDATE run_steps
+         SET title=?,prompt=?,category=?,depends_on=?,state='pending',
+             attempts=attempts+1,session_id='',placement_id=?,output='',
+             dispatched_at='',phase_index=?,updated_at=?
+         WHERE id=?`,
+      ).run(
+        input.title,
+        input.prompt,
+        input.category ?? String(existing.category ?? ""),
+        JSON.stringify(input.dependsOn ?? parseJsonList(existing.depends_on)),
+        input.placementId ?? "",
+        input.phaseIndex ?? Number(existing.phase_index ?? 0),
+        now,
+        String(existing.id),
+      );
+      return this.getRunStep(String(existing.id))!;
+    }
+
+    const id = randomUUID();
+    this.statement(
+      `INSERT INTO run_steps
+       (id,run_id,step_key,title,prompt,category,depends_on,state,attempts,position,placement_id,phase_index,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      id,
+      runId,
+      input.stepKey,
+      input.title,
+      input.prompt,
+      input.category ?? "",
+      JSON.stringify(input.dependsOn ?? []),
+      "pending",
+      1,
+      input.position ?? this.listRunSteps(runId).length,
+      input.placementId ?? "",
+      input.phaseIndex ?? 0,
+      now,
+      now,
+    );
+    return this.getRunStep(id)!;
+  }
+
+  getRunStep(id: string): RunStep | undefined {
+    const row = this.statement("SELECT * FROM run_steps WHERE id=?").get(id) as
+      Row | undefined;
+    return row ? runStepFromRow(row) : undefined;
+  }
+
+  listRunSteps(runId: string): RunStep[] {
+    return (
+      this.statement(
+        "SELECT * FROM run_steps WHERE run_id=? ORDER BY position,created_at",
+      ).all(runId) as Row[]
+    ).map(runStepFromRow);
+  }
+
+  /** The step a session is doing the work for, if it belongs to a run at all. */
+  getRunStepBySession(sessionId: string): RunStep | undefined {
+    if (!sessionId) return undefined;
+    const row = this.statement("SELECT * FROM run_steps WHERE session_id=?").get(
+      sessionId,
+    ) as Row | undefined;
+    return row ? runStepFromRow(row) : undefined;
+  }
+
+  /**
+   * Records what a phase established, in the orchestrator's own words.
+   *
+   * Append-only, and written as a phase ends rather than assembled at the end.
+   * The person reviewing a finished task sees a short account of how it got
+   * there; reconstructing that from a dozen worker transcripts is the thing
+   * this exists to save them.
+   */
+  appendRunNote(runId: string, phaseIndex: number, body: string): RunNote {
+    const id = randomUUID();
+    const createdAt = new Date().toISOString();
+    this.statement(
+      "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
+    ).run(id, runId, phaseIndex, body, createdAt);
+    return { id, runId, phaseIndex, body, createdAt };
+  }
+
+  listRunNotes(runId: string): RunNote[] {
+    return (
+      this.statement("SELECT * FROM run_notes WHERE run_id=? ORDER BY created_at").all(
+        runId,
+      ) as Row[]
+    ).map(runNoteFromRow);
+  }
+
+  updateRunStep(
+    id: string,
+    patch: Partial<
+      Pick<
+        RunStep,
+        "state" | "sessionId" | "placementId" | "output" | "eventSeqFrom" | "dispatchedAt"
+      >
+    >,
+  ): RunStep | undefined {
+    if (!this.getRunStep(id)) return undefined;
+    const columns: Record<string, unknown> = {
+      state: patch.state,
+      session_id: patch.sessionId,
+      placement_id: patch.placementId,
+      output: patch.output,
+      event_seq_from: patch.eventSeqFrom,
+      dispatched_at: patch.dispatchedAt,
+    };
+    const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
+    if (entries.length === 0) return this.getRunStep(id);
+    const assignments = entries.map(([column]) => `${column}=?`).join(",");
+    this.statement(`UPDATE run_steps SET ${assignments},updated_at=? WHERE id=?`).run(
+      ...entries.map(([, value]) => value as string | number),
+      new Date().toISOString(),
+      id,
+    );
+    return this.getRunStep(id);
+  }
+
+  /** Replaces a run's whole plan. Used by the handwritten-DAG fixture. */
+  replaceRunSteps(runId: string, steps: readonly RunStepInput[]): RunStep[] {
+    return this.transaction(() => {
+      this.statement("DELETE FROM run_steps WHERE run_id=?").run(runId);
+      steps.forEach((step, index) => {
+        this.upsertRunStep(runId, { ...step, position: index });
+      });
+      return this.listRunSteps(runId);
+    });
+  }
+
+  /** Deletes a run, its steps, and its notes. Callers stop live sessions first. */
+  deleteRun(id: string): boolean {
+    return this.transaction(() => {
+      if (!this.getRun(id)) return false;
+      // Notes reference the run, so they have to go first or the foreign key
+      // rejects the delete and takes the whole transaction with it.
+      this.statement("DELETE FROM run_notes WHERE run_id=?").run(id);
+      this.statement("DELETE FROM run_steps WHERE run_id=?").run(id);
+      this.statement("DELETE FROM runs WHERE id=?").run(id);
+      return true;
+    });
   }
 
   private sessionQuery(suffix: string): StatementSync {
@@ -1259,6 +1693,70 @@ function sessionFromRow(row: Row): FleetSession {
     yolo: Number(row.yolo ?? 0) === 1,
     commands: parseJsonList(row.commands),
     configOptions: parseJsonList(row.config_options),
+    runId: String(row.run_id ?? ""),
+    runRole: String(row.run_role ?? ""),
+  });
+}
+
+function runFromRow(row: Row): Run {
+  // `tryParseJson` answers with a result envelope, not the value: reading it as
+  // the value silently produced `{ok,value}`, which parses to a policy of pure
+  // defaults — so an orchestrator's `on_any_settle` came back as `none` and its
+  // run finished instead of waking it.
+  const stored = tryParseJson(String(row.policy ?? ""));
+  return RunSchema.parse({
+    id: String(row.id),
+    workspaceId: String(row.workspace_id),
+    name: String(row.name),
+    objective: String(row.objective),
+    state: String(row.state),
+    leadSessionId: String(row.lead_session_id ?? ""),
+    placementId: String(row.placement_id ?? ""),
+    // A policy that will not parse is a row from a build that shaped it
+    // differently; defaults are a working run, a throw is a lost one.
+    policy: stored.ok ? stored.value : {},
+    phases: parseJsonList(row.phases),
+    phaseIndex: Number(row.phase_index ?? 0),
+    failureReason: String(row.failure_reason ?? ""),
+    pendingPrompt: String(row.pending_prompt ?? ""),
+    settleSeq: Number(row.settle_seq ?? 0),
+    wakeSeq: Number(row.wake_seq ?? 0),
+    emptyWakeCount: Number(row.empty_wake_count ?? 0),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  });
+}
+
+function runStepFromRow(row: Row): RunStep {
+  return RunStepSchema.parse({
+    id: String(row.id),
+    runId: String(row.run_id),
+    stepKey: String(row.step_key),
+    title: String(row.title),
+    prompt: String(row.prompt),
+    category: String(row.category ?? ""),
+    dependsOn: parseJsonList(row.depends_on),
+    state: String(row.state),
+    sessionId: String(row.session_id ?? ""),
+    placementId: String(row.placement_id ?? ""),
+    output: String(row.output ?? ""),
+    eventSeqFrom: Number(row.event_seq_from ?? 0),
+    attempts: Number(row.attempts ?? 0),
+    phaseIndex: Number(row.phase_index ?? 0),
+    dispatchedAt: String(row.dispatched_at ?? ""),
+    position: Number(row.position ?? 0),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+  });
+}
+
+function runNoteFromRow(row: Row): RunNote {
+  return RunNoteSchema.parse({
+    id: String(row.id),
+    runId: String(row.run_id),
+    phaseIndex: Number(row.phase_index ?? 0),
+    body: String(row.body ?? ""),
+    createdAt: String(row.created_at),
   });
 }
 
@@ -1278,6 +1776,28 @@ function parseJsonList(value: unknown): unknown[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Where an imported run has to land.
+ *
+ * Sessions come back `offline` on import, so a run restored as `running` would
+ * be waiting on a settle that nothing alive can produce — and with no connected
+ * node, nothing will ever tick it either. `awaiting_lead` is the same landing
+ * the engine uses whenever it has stopped advancing on its own, so the run
+ * shows up asking for a human instead of pretending to work.
+ */
+function runStateForHostImport(state: RunState): RunState {
+  if (state === "running" || state === "awaiting_lead" || state === "planning") {
+    return "awaiting_lead";
+  }
+  if (state === "aggregating") return "awaiting_lead";
+  return state;
+}
+
+/** A step that was mid-flight when the archive was written did not survive it. */
+function runStepStateForHostImport(state: RunStepState): RunStepState {
+  return state === "starting" || state === "running" ? "failed" : state;
 }
 
 function eventFromRow(row: Row): SessionEvent {

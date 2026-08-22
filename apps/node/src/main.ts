@@ -43,14 +43,14 @@ import {
   type HostEndpoints,
   type TunnelMode,
 } from "./host-endpoints.js";
-import { envFilePath } from "./paths.js";
+import { envFilePath, packageVersion } from "./paths.js";
 import {
   AUTH_FAILED_CLOSE_CODE,
   SUPERSEDED_CLOSE_CODE,
   acquireInstanceLock,
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
-import { CommandRouter } from "./router.js";
+import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { EventOutbox } from "./outbox.js";
 import { closeQuietly, HOST_DIAL_TIMEOUT_MS, watchHostLiveness } from "./socket.js";
 import { configServerPort, startConfigServer } from "./config-server.js";
@@ -74,7 +74,7 @@ import {
   waitForParentExit,
 } from "./updater.js";
 
-const VERSION = "0.1.0";
+const VERSION = packageVersion();
 const REVISION = gitRevision();
 const NODE_CAPABILITIES = [
   "copilot-acp",
@@ -290,11 +290,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
-  const router = new CommandRouter(factory, settings.maxSessions, (event) => {
-    // Held rather than dropped when the Host is unreachable: the agent keeps
-    // working through a Host restart, and these are the only record of it.
-    if (!sendEvent(event)) outbox.add(event);
-  });
+  const router = new CommandRouter(
+    factory,
+    settings.maxSessions,
+    (event) => {
+      // Held rather than dropped when the Host is unreachable: the agent keeps
+      // working through a Host restart, and these are the only record of it.
+      if (!sendEvent(event)) outbox.add(event);
+    },
+    validateWorkspacePath,
+    () => settings.hostUrl,
+  );
 
   /** Registers when the stored identity is missing or the operator renamed this node. */
   async function ensureCredentials(): Promise<Credentials> {

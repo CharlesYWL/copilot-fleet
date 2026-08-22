@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
 import { Sidebar } from "./Sidebar";
@@ -36,6 +36,8 @@ const session = (
     yolo: false,
     commands: [],
     configOptions: [],
+    runId: "",
+    runRole: "" as const,
   }) as FleetSession;
 
 const catalog = {
@@ -54,10 +56,17 @@ const catalog = {
   updateAllNodes: vi.fn(),
 };
 
-const show = (placements: Placement[], sessions = [session("s1", "w1", "n1")]) =>
-  render(tree(placements, sessions));
+const show = (
+  placements: Placement[],
+  sessions = [session("s1", "w1", "n1")],
+  overrides: Partial<Parameters<typeof Sidebar>[0]> = {},
+) => render(tree(placements, sessions, overrides));
 
-const tree = (placements: Placement[], sessions: FleetSession[]) => (
+const tree = (
+  placements: Placement[],
+  sessions: FleetSession[],
+  overrides: Partial<Parameters<typeof Sidebar>[0]> = {},
+) => (
   <FluentProvider theme={fleetDarkTheme}>
     <CatalogProvider value={catalog}>
       <Sidebar
@@ -68,10 +77,16 @@ const tree = (placements: Placement[], sessions: FleetSession[]) => (
         selectedSessionId={undefined}
         view="session"
         endedCount={0}
+        liveWorkCount={0}
+        attentionCount={0}
+        leadSession={undefined}
+        waitingPermissions={[]}
         onSelectSession={vi.fn()}
+        onSelectLeadSession={vi.fn()}
         onNewSession={vi.fn()}
         onSelectView={vi.fn()}
         onClearEnded={vi.fn()}
+        {...overrides}
       />
     </CatalogProvider>
   </FluentProvider>
@@ -135,5 +150,75 @@ describe("Sidebar folding", () => {
       ),
     );
     expect(screen.getByText("s2")).toBeTruthy();
+  });
+});
+
+describe("Sidebar orchestrator row", () => {
+  const lead = (): FleetSession => ({
+    ...session("lead1", "w1", "n1", "idle"),
+    name: "Orchestrator",
+    runRole: "lead",
+  });
+
+  it("puts the orchestrator above the workspaces, not inside one", () => {
+    /*
+     * The orchestrator is fleet-wide. Filing it under whichever workspace its
+     * process happens to run in would make it look like one project's tool.
+     */
+    show([placement], [session("s1", "w1", "n1")], { leadSession: lead() });
+
+    const row = screen.getByRole("button", { name: /Orchestrator/ });
+    const workspaceRow = screen.getByTitle(/^repo — drag/i);
+    expect(
+      row.compareDocumentPosition(workspaceRow) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("goes to the orchestrator rather than selecting a session", () => {
+    const onSelectView = vi.fn();
+    const onSelectSession = vi.fn();
+    show([placement], [session("s1", "w1", "n1")], { onSelectView, onSelectSession });
+
+    fireEvent.click(screen.getByRole("button", { name: /Orchestrator/ }));
+
+    expect(onSelectView).toHaveBeenCalledWith("orchestrator");
+    expect(onSelectSession).not.toHaveBeenCalled();
+  });
+
+  it("shows the lead's conversation as its own row under the orchestrator", () => {
+    const onSelectLeadSession = vi.fn();
+    show([placement], [session("s1", "w1", "n1")], {
+      leadSession: lead(),
+      onSelectLeadSession,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Conversation/ }));
+    expect(onSelectLeadSession).toHaveBeenCalled();
+  });
+
+  it("offers no conversation row when no orchestrator is running", () => {
+    show([placement], [session("s1", "w1", "n1")], { leadSession: undefined });
+    expect(screen.queryByRole("button", { name: /Conversation/ })).toBeNull();
+  });
+
+  it("counts what is waiting on a person beside the orchestrator", () => {
+    show([placement], [session("s1", "w1", "n1")], { attentionCount: 3 });
+    expect(screen.getByTitle("3 waiting for you").textContent).toBe("3");
+  });
+
+  it("shows no count when nothing is waiting", () => {
+    show([placement], [session("s1", "w1", "n1")], { attentionCount: 0 });
+    expect(screen.queryByTitle(/waiting for you/)).toBeNull();
+  });
+
+  it("marks a dispatched worker apart from a session someone started", () => {
+    const worker: FleetSession = {
+      ...session("worker1", "w1", "n1", "running"),
+      runRole: "worker",
+    };
+    show([placement], [session("s1", "w1", "n1", "running"), worker]);
+
+    expect(screen.getByText("worker1")).toBeTruthy();
+    expect(screen.getAllByTitle("Dispatched by the orchestrator")).toHaveLength(1);
   });
 });

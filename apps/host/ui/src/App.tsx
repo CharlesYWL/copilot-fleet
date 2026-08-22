@@ -4,6 +4,8 @@ import {
   ToastTitle,
   Toaster,
   makeStyles,
+  mergeClasses,
+  shorthands,
   tokens,
   useId,
   useToastController,
@@ -11,6 +13,7 @@ import {
 import {
   terminalSessionStates,
   type FleetSession,
+  type RunNote,
   type SessionEvent,
 } from "@fleet/protocol";
 import { api, useFleet, type Notify } from "./hooks/useFleet";
@@ -32,11 +35,49 @@ import { NewSessionDialog } from "./components/NewSessionDialog";
 import { SessionFocusDialog } from "./components/SessionFocusDialog";
 import { SessionGrid } from "./components/SessionGrid";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { Sidebar, type SidebarView } from "./components/Sidebar";
+import { DispatchedBanner } from "./components/orchestration/DispatchedBanner";
+import { StartOrchestrator } from "./components/orchestration/StartOrchestrator";
+import { OrchestratorPage } from "./components/orchestration/OrchestratorPage";
+import { OrchestratorTaskDetail } from "./components/orchestration/OrchestratorTaskDetail";
+import { CreateOrchestrationDialog } from "./components/orchestration/CreateOrchestrationDialog";
+import {
+  buildRunViewModels,
+  liveSteps,
+  summarise,
+  tasksAwaitingHuman,
+} from "./lib/orchestration-view";
+import type {
+  OrchestratorViewMode,
+  SessionLayoutMode,
+} from "./components/navigation/ContextModeToggle";
+import { Sidebar } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
-import { TopBar, type LayoutMode } from "./components/TopBar";
+import { TopBar } from "./components/TopBar";
 
 const noEvents: SessionEvent[] = [];
+const noNotes: RunNote[] = [];
+
+/**
+ * What the main area is showing.
+ *
+ * `overview` is its own view rather than a flag on `session` because it is the
+ * one that hides the sidebar, and because the top bar's mode slot has to know
+ * which pair of choices to offer. Keeping the orchestrator views in the same
+ * union is what stops switching to the wall from silently dropping them, which
+ * is what the old `layout === "grid" → view = "session"` line did.
+ */
+export type AppView =
+  "session" | "overview" | "orchestrator" | "orchestrator-task" | "settings";
+
+/**
+ * Where a conversation was opened from, so leaving it goes back there.
+ *
+ * A worker's transcript is an ordinary session view; without this, closing one
+ * landed on the orchestrator's front page rather than the task it belonged to,
+ * which is a different place from the one the operator left.
+ */
+export type ReturnContext =
+  { kind: "orchestrator-task"; runId: string } | { kind: "orchestrator" } | undefined;
 
 const useStyles = makeStyles({
   app: {
@@ -50,6 +91,48 @@ const useStyles = makeStyles({
     flexGrow: 1,
     display: "flex",
     minHeight: 0,
+    minWidth: 0,
+    position: "relative",
+  },
+  /** Stacks the dispatched-work banner above a worker's transcript. */
+  session: {
+    flexGrow: 1,
+    display: "flex",
+    flexDirection: "column",
+    minWidth: 0,
+    minHeight: 0,
+  },
+  /**
+   * Below this width the sidebar and the main area cannot both be useful.
+   *
+   * So the sidebar becomes a drawer over the content rather than a column
+   * beside it: 240px of tree next to 120px of transcript is two unusable
+   * panes, and squeezing the tree instead just moves the problem.
+   */
+  navDrawer: {
+    "@media (max-width: 767px)": {
+      position: "absolute",
+      insetBlockStart: 0,
+      insetBlockEnd: 0,
+      insetInlineStart: 0,
+      zIndex: 20,
+      boxShadow: tokens.shadow28,
+    },
+  },
+  navHidden: {
+    "@media (max-width: 767px)": { display: "none" },
+  },
+  scrim: {
+    display: "none",
+    "@media (max-width: 767px)": {
+      display: "block",
+      position: "absolute",
+      inset: 0,
+      zIndex: 15,
+      background: "rgba(0,0,0,0.5)",
+      ...shorthands.borderStyle("none"),
+      cursor: "pointer",
+    },
   },
 });
 
@@ -73,6 +156,8 @@ export function App() {
   const {
     snapshot,
     events,
+    runSteps,
+    runNotes,
     connected,
     nodeUpdates,
     refresh,
@@ -81,11 +166,18 @@ export function App() {
     request,
   } = useFleet(notify);
   const catalog = useCatalogOperations({ request, refresh, notify });
-  const [view, setView] = useState<SidebarView>("session");
-  const [layout, setLayout] = useState<LayoutMode>("tree");
+  const [view, setView] = useState<AppView>("session");
+  const [orchestratorViewMode, setOrchestratorViewMode] =
+    useState<OrchestratorViewMode>("stage");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
+  const [selectedRunId, setSelectedRunId] = useState<string>();
+  const [returnContext, setReturnContext] = useState<ReturnContext>();
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [orchestrationDialogOpen, setOrchestrationDialogOpen] = useState(false);
+  const [attentionOnly, setAttentionOnly] = useState(false);
+  /** Narrow screens show the tree as a drawer; wide ones ignore this. */
+  const [navOpen, setNavOpen] = useState(false);
   const [defaultYolo, setDefaultYolo] = useState(false);
   /**
    * Unsent composer text, per session.
@@ -162,25 +254,50 @@ export function App() {
   // Live updates only cover what streams while this tab is open, so every tile
   // needs its history once before the monitor wall can preview it.
   useEffect(() => {
-    if (layout !== "grid") return;
+    if (view !== "overview") return;
     for (const session of visibleSessions) {
       if (backfilled.current.has(session.id)) continue;
       backfilled.current.add(session.id);
       void loadEvents(session.id);
     }
-  }, [layout, visibleSessions, loadEvents]);
+  }, [view, visibleSessions, loadEvents]);
 
-  const handleSelectSession = (sessionId: string) => {
+  /**
+   * Opens a session's transcript.
+   *
+   * `from` records where the operator was, so that leaving the transcript
+   * returns there instead of to whatever the app considers home.
+   */
+  const handleSelectSession = (sessionId: string, from?: ReturnContext) => {
     setSelectedSessionId(sessionId);
+    setReturnContext(from);
+    setNavOpen(false);
+    if (view === "overview" && !from) {
+      setFocusOpen(true);
+      return;
+    }
     setView("session");
-    if (layout === "grid") setFocusOpen(true);
   };
 
-  const handleLayoutChange = (next: LayoutMode) => {
-    setLayout(next);
+  const handleSessionLayoutChange = (next: SessionLayoutMode) => {
     setFocusOpen(false);
-    // Settings only exists beside the tree, so grid always lands on sessions.
-    if (next === "grid") setView("session");
+    setView(next === "tree" ? "session" : "overview");
+  };
+
+  /** Opens one task's detail, from any of the three orchestrator views. */
+  const handleOpenRun = (runId: string) => {
+    setSelectedRunId(runId);
+    setView("orchestrator-task");
+  };
+
+  const handleBackFromSession = () => {
+    if (returnContext?.kind === "orchestrator-task") {
+      setSelectedRunId(returnContext.runId);
+      setView("orchestrator-task");
+    } else {
+      setView("orchestrator");
+    }
+    setReturnContext(undefined);
   };
 
   const handlePermission = (
@@ -238,6 +355,198 @@ export function App() {
     return true;
   };
 
+  /**
+   * Starts the session you talk to.
+   *
+   * It needs a workspace because its workers do — the orchestrator itself only
+   * dispatches. The first workspace that an online node actually holds is the
+   * one picked, since any other choice would produce an orchestrator that can
+   * see nowhere to send work.
+   */
+  const handleStartOrchestrator = async () => {
+    const reachable = snapshot.placements.find((placement) =>
+      snapshot.nodes.some((node) => node.id === placement.nodeId && node.online),
+    );
+    if (!reachable) {
+      notify(
+        "No online node holds a workspace yet, so there is nowhere to work.",
+        "error",
+      );
+      return false;
+    }
+    const created = await request<{ session: FleetSession }>("/api/orchestrators", {
+      method: "POST",
+      body: JSON.stringify({ workspaceId: reachable.workspaceId }),
+    });
+    if (!created.ok) return false;
+    await refresh();
+    setView("orchestrator");
+    return true;
+  };
+
+  /**
+   * The orchestrator, and the work it has out.
+   *
+   * Read from the snapshot rather than held in state so it survives a refresh
+   * and a reconnect without a second source of truth.
+   */
+  const orchestrator = useMemo(
+    () =>
+      snapshot.sessions.find(
+        (session) =>
+          session.runRole === "lead" && !terminalSessionStates.has(session.state),
+      ),
+    [snapshot.sessions],
+  );
+  /** Every task this orchestrator is running, oldest first. */
+  const orchestratorRuns = useMemo(
+    () =>
+      orchestrator
+        ? snapshot.runs
+            .filter((run) => run.leadSessionId === orchestrator.id)
+            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+        : [],
+    [snapshot.runs, orchestrator],
+  );
+  const orchestratorSteps = useMemo(
+    () => orchestratorRuns.flatMap((run) => runSteps[run.id] ?? []),
+    [orchestratorRuns, runSteps],
+  );
+
+  /** Everything the three orchestrator views read, derived once. */
+  const runModels = useMemo(
+    () =>
+      buildRunViewModels({
+        runs: orchestratorRuns,
+        stepsByRun: runSteps,
+        sessions: snapshot.sessions,
+        placements: snapshot.placements,
+        waitingPermissions,
+      }),
+    [
+      orchestratorRuns,
+      runSteps,
+      snapshot.sessions,
+      snapshot.placements,
+      waitingPermissions,
+    ],
+  );
+  const orchestratorSummary = useMemo(() => summarise(runModels), [runModels]);
+  /**
+   * One number for "waiting on you", counting each thing once.
+   *
+   * A permission on a worker is already what makes its task need a person, so
+   * adding the two totals reported one prompt as two. Only permissions on
+   * sessions no task owns are counted separately.
+   */
+  const attentionCount = useMemo(() => {
+    const ownedByATask = new Set(
+      runModels.flatMap((model) =>
+        model.steps.map((step) => step.sessionId).filter(Boolean),
+      ),
+    );
+    const loose = waitingPermissions.filter(
+      (event) => !ownedByATask.has(event.sessionId),
+    ).length;
+    return loose + orchestratorSummary.needsYou;
+  }, [runModels, waitingPermissions, orchestratorSummary.needsYou]);
+  const selectedRunModel = useMemo(
+    () => runModels.find((model) => model.run.id === selectedRunId),
+    [runModels, selectedRunId],
+  );
+
+  /*
+   * A task that no longer exists cannot stay open. Deleting or losing the run
+   * underneath the detail page would otherwise leave a header with no body.
+   */
+  useEffect(() => {
+    if (view !== "orchestrator-task") return;
+    if (selectedRunId && runModels.some((model) => model.run.id === selectedRunId)) {
+      return;
+    }
+    setView("orchestrator");
+  }, [view, selectedRunId, runModels]);
+
+  /*
+   * The orchestrator's history, which nothing else asks for.
+   *
+   * Events are fetched for the *selected* session, and the orchestrator is
+   * never that — it has a view of its own. So its transcript held only what
+   * happened to stream while the tab was open, and reopening the view, or
+   * reloading the page, showed an empty conversation that was in fact intact
+   * on the Host.
+   */
+  const orchestratorId = orchestrator?.id;
+  useEffect(() => {
+    if (!orchestratorId) return;
+    void loadEvents(orchestratorId);
+  }, [orchestratorId, loadEvents]);
+
+  /**
+   * The person's answer to a task the orchestrator handed over.
+   *
+   * The one decision left to a human. Approving closes the task; sending it
+   * back returns it to the orchestrator with the note, which it acts on.
+   */
+  const handleReviewTask = async (runId: string, approved: boolean, note: string) => {
+    const answered = await request(`/api/runs/${runId}/review`, {
+      method: "POST",
+      body: JSON.stringify({ approved, note }),
+    });
+    if (!answered.ok) return false;
+    await refresh();
+    return true;
+  };
+
+  /** Ends the orchestrator and everything it started. */
+  const handleStopOrchestrator = async (sessionId: string) => {
+    const stopped = await request(`/api/orchestrators/${sessionId}/stop`, {
+      method: "POST",
+    });
+    if (!stopped.ok) return false;
+    await refresh();
+    return true;
+  };
+
+  /**
+   * Abandons a task.
+   *
+   * Mapped onto the existing run cancel, which stops dispatching and closes any
+   * unfinished step but keeps the run and everything it produced. `DELETE`
+   * would remove the record, which contradicts the one thing the confirmation
+   * promises: that what has already been done stays readable.
+   */
+  const handleAbandonRun = async (runId: string) => {
+    const abandoned = await request(`/api/runs/${runId}/cancel`, { method: "POST" });
+    if (!abandoned.ok) return false;
+    await refresh();
+    return true;
+  };
+
+  /**
+   * Opens a new task on the orchestrator.
+   *
+   * One call: the Host creates the run bound to the lead and briefs it in the
+   * same request. Doing it as two calls from here would leave a run with no
+   * orchestrator aware of it whenever the second one failed.
+   */
+  const handleCreateRun = async (input: {
+    workspaceId: string;
+    name: string;
+    objective: string;
+  }) => {
+    if (!orchestrator) return false;
+    const created = await request<{ run: { id: string } }>(
+      `/api/orchestrators/${orchestrator.id}/runs`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+    if (!created.ok) return false;
+    await refresh();
+    setSelectedRunId(created.data.run.id);
+    setView("orchestrator-task");
+    return true;
+  };
+
   // The rename is broadcast back as a session update, so there is nothing to
   // re-read here.
   const handleRenameSession = (sessionId: string, name: string) =>
@@ -252,41 +561,159 @@ export function App() {
         <TopBar
           nodesOnline={snapshot.nodes.filter((node) => node.online).length}
           liveSessions={liveSessions.length}
-          waitingPermissions={waitingPermissions.length}
+          waitingPermissions={attentionCount}
           connected={connected}
-          layout={layout}
-          onLayoutChange={handleLayoutChange}
+          context={
+            view === "orchestrator"
+              ? {
+                  kind: "orchestrator",
+                  mode: orchestratorViewMode,
+                  onChange: setOrchestratorViewMode,
+                }
+              : view === "session" || view === "overview"
+                ? {
+                    kind: "session",
+                    mode: view === "overview" ? "overview" : "tree",
+                    onChange: handleSessionLayoutChange,
+                  }
+                : { kind: "none" }
+          }
           soundEnabled={sound.enabled}
           onToggleSound={sound.toggle}
           onSignOut={() => void signOut()}
+          onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}
+          navOpen={navOpen}
+          onShowAttention={
+            orchestratorSummary.needsYou > 0
+              ? () => setView("orchestrator")
+              : waitingPermissions.length > 0
+                ? () => {
+                    setAttentionOnly(true);
+                    setView("overview");
+                  }
+                : undefined
+          }
         />
         <div className={styles.body}>
-          {layout === "grid" ? (
+          {view === "overview" ? (
             <SessionGrid
               sessions={visibleSessions}
               workspaces={snapshot.workspaces}
               nodes={snapshot.nodes}
               placements={snapshot.placements}
               events={events}
+              waitingPermissions={waitingPermissions}
+              attentionOnly={attentionOnly}
+              onAttentionOnlyChange={setAttentionOnly}
+              orchestrator={{
+                started: Boolean(orchestrator),
+                summary: orchestratorSummary,
+                onOpen: () => setView("orchestrator"),
+              }}
               onOpen={handleSelectSession}
               onPermission={handlePermission}
               onNewSession={() => setDialogOpen(true)}
             />
           ) : (
             <>
-              <Sidebar
-                nodes={snapshot.nodes}
-                workspaces={snapshot.workspaces}
-                sessions={visibleSessions}
-                placements={snapshot.placements}
-                selectedSessionId={selectedSessionId}
-                view={view}
-                endedCount={endedCount}
-                onSelectSession={handleSelectSession}
-                onNewSession={() => setDialogOpen(true)}
-                onSelectView={setView}
-                onClearEnded={() => void handleClearEnded()}
-              />
+              {navOpen && (
+                <button
+                  type="button"
+                  className={styles.scrim}
+                  aria-label="Close navigation"
+                  onClick={() => setNavOpen(false)}
+                />
+              )}
+              <div
+                className={mergeClasses(styles.navDrawer, !navOpen && styles.navHidden)}
+              >
+                <Sidebar
+                  nodes={snapshot.nodes}
+                  workspaces={snapshot.workspaces}
+                  sessions={visibleSessions}
+                  placements={snapshot.placements}
+                  selectedSessionId={selectedSessionId}
+                  view={view}
+                  endedCount={endedCount}
+                  liveWorkCount={
+                    // What is happening plus what is waiting on the person: both
+                    // are reasons to look, and a task handed over is the more
+                    // urgent of the two.
+                    liveSteps(orchestratorSteps).length +
+                    tasksAwaitingHuman(orchestratorRuns).length
+                  }
+                  attentionCount={orchestratorSummary.needsYou}
+                  leadSession={orchestrator}
+                  waitingPermissions={waitingPermissions}
+                  onSelectSession={handleSelectSession}
+                  onSelectLeadSession={() => {
+                    if (!orchestrator) return;
+                    handleSelectSession(orchestrator.id, { kind: "orchestrator" });
+                    setNavOpen(false);
+                  }}
+                  onNewSession={() => setDialogOpen(true)}
+                  onSelectView={(next) => {
+                    setView(next);
+                    setNavOpen(false);
+                  }}
+                  onClearEnded={() => void handleClearEnded()}
+                />
+              </div>
+
+              {view === "orchestrator" &&
+                (orchestrator ? (
+                  <OrchestratorPage
+                    models={runModels}
+                    summary={orchestratorSummary}
+                    mode={orchestratorViewMode}
+                    selectedRunId={selectedRunId}
+                    onOpenRun={handleOpenRun}
+                    onOpenLead={() =>
+                      handleSelectSession(orchestrator.id, { kind: "orchestrator" })
+                    }
+                    onOpenWorker={(sessionId) =>
+                      handleSelectSession(sessionId, { kind: "orchestrator" })
+                    }
+                    onNewRun={() => setOrchestrationDialogOpen(true)}
+                    onStopOrchestrator={() =>
+                      void handleStopOrchestrator(orchestrator.id)
+                    }
+                  />
+                ) : (
+                  <StartOrchestrator
+                    canStart={snapshot.placements.some((placement) =>
+                      snapshot.nodes.some(
+                        (node) => node.id === placement.nodeId && node.online,
+                      ),
+                    )}
+                    onStart={() => void handleStartOrchestrator()}
+                  />
+                ))}
+
+              {view === "orchestrator-task" && selectedRunModel && orchestrator && (
+                <OrchestratorTaskDetail
+                  model={selectedRunModel}
+                  notes={runNotes[selectedRunModel.run.id] ?? noNotes}
+                  sessions={snapshot.sessions}
+                  onBack={() => setView("orchestrator")}
+                  onOpenLead={() =>
+                    handleSelectSession(orchestrator.id, {
+                      kind: "orchestrator-task",
+                      runId: selectedRunModel.run.id,
+                    })
+                  }
+                  onOpenWorker={(sessionId) =>
+                    handleSelectSession(sessionId, {
+                      kind: "orchestrator-task",
+                      runId: selectedRunModel.run.id,
+                    })
+                  }
+                  onReview={(approved, note) =>
+                    handleReviewTask(selectedRunModel.run.id, approved, note)
+                  }
+                  onAbandon={() => handleAbandonRun(selectedRunModel.run.id)}
+                />
+              )}
 
               {view === "settings" && (
                 <SettingsPanel
@@ -300,36 +727,56 @@ export function App() {
 
               {view === "session" &&
                 (activeSession ? (
-                  <TerminalView
-                    session={activeSession}
-                    events={events[activeSession.id] ?? noEvents}
-                    onPrompt={(prompt, attachments) =>
-                      void command(`/api/sessions/${activeSession.id}/prompt`, {
-                        prompt,
-                        attachments,
-                      })
-                    }
-                    onCancel={() =>
-                      void command(`/api/sessions/${activeSession.id}/cancel`)
-                    }
-                    onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
-                    onDismiss={() => void handleDismissSession(activeSession.id)}
-                    onResume={() =>
-                      void command(`/api/sessions/${activeSession.id}/resume`)
-                    }
-                    onRename={(name) => handleRenameSession(activeSession.id, name)}
-                    onPermission={(requestId, outcome, optionId) =>
-                      handlePermission(activeSession.id, requestId, outcome, optionId)
-                    }
-                    onConfigChange={(configId, value) =>
-                      void command(`/api/sessions/${activeSession.id}/config`, {
-                        configId,
-                        value,
-                      })
-                    }
-                    draft={draftFor(drafts, activeSession.id)}
-                    onDraftChange={(update) => changeDraft(activeSession.id, update)}
-                  />
+                  <div className={styles.session}>
+                    {(activeSession.runRole !== "" || returnContext) && (
+                      <DispatchedBanner
+                        session={activeSession}
+                        step={orchestratorSteps.find(
+                          (step) => step.sessionId === activeSession.id,
+                        )}
+                        runName={
+                          returnContext?.kind === "orchestrator-task"
+                            ? runModels.find(
+                                (model) => model.run.id === returnContext.runId,
+                              )?.run.name
+                            : undefined
+                        }
+                        onBack={handleBackFromSession}
+                      />
+                    )}
+                    <TerminalView
+                      session={activeSession}
+                      events={events[activeSession.id] ?? noEvents}
+                      onPrompt={(prompt, attachments) =>
+                        void command(`/api/sessions/${activeSession.id}/prompt`, {
+                          prompt,
+                          attachments,
+                        })
+                      }
+                      onCancel={() =>
+                        void command(`/api/sessions/${activeSession.id}/cancel`)
+                      }
+                      onStop={() =>
+                        void command(`/api/sessions/${activeSession.id}/stop`)
+                      }
+                      onDismiss={() => void handleDismissSession(activeSession.id)}
+                      onResume={() =>
+                        void command(`/api/sessions/${activeSession.id}/resume`)
+                      }
+                      onRename={(name) => handleRenameSession(activeSession.id, name)}
+                      onPermission={(requestId, outcome, optionId) =>
+                        handlePermission(activeSession.id, requestId, outcome, optionId)
+                      }
+                      onConfigChange={(configId, value) =>
+                        void command(`/api/sessions/${activeSession.id}/config`, {
+                          configId,
+                          value,
+                        })
+                      }
+                      draft={draftFor(drafts, activeSession.id)}
+                      onDraftChange={(update) => changeDraft(activeSession.id, update)}
+                    />
+                  </div>
                 ) : (
                   <EmptySessions onNewSession={() => setDialogOpen(true)} />
                 ))}
@@ -337,7 +784,7 @@ export function App() {
           )}
         </div>
 
-        {layout === "grid" && activeSession && (
+        {view === "overview" && activeSession && (
           <SessionFocusDialog
             session={activeSession}
             events={events[activeSession.id] ?? noEvents}
@@ -374,6 +821,13 @@ export function App() {
           defaultYolo={defaultYolo}
           onOpenChange={setDialogOpen}
           onCreate={handleCreateSession}
+        />
+        <CreateOrchestrationDialog
+          open={orchestrationDialogOpen}
+          workspaces={snapshot.workspaces}
+          placements={eligiblePlacements}
+          onOpenChange={setOrchestrationDialogOpen}
+          onCreate={handleCreateRun}
         />
         <Toaster toasterId={toasterId} />
       </div>

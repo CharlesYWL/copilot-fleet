@@ -163,6 +163,15 @@ export function attachmentSummary(attachment: PromptAttachment): AttachmentSumma
   };
 }
 
+/**
+ * The seat a session occupies in a run.
+ *
+ * Declared before `SessionSchema` because the session carries it. `""` is an
+ * ordinary session an operator opened; the rest belong to the engine.
+ */
+export const RunRoleSchema = z.enum(["", "lead", "worker", "reviewer"]);
+export type RunRole = z.infer<typeof RunRoleSchema>;
+
 export const SessionSchema = z.object({
   id: z.string().min(1),
   workspaceId: z.string().min(1),
@@ -196,6 +205,18 @@ export const SessionSchema = z.object({
    */
   commands: z.array(SessionCommandSchema).default([]),
   configOptions: z.array(SessionConfigOptionSchema).default([]),
+  /**
+   * The run that owns this session, and the seat it occupies in it.
+   *
+   * Defaulted rather than nullable so a session row written before
+   * orchestration existed still parses, and so `runRole` is a single
+   * comparison at every gate: `""` means an operator opened this by hand, and
+   * anything else means the engine owns it. `lead` is the only key to the MCP
+   * facade — worker and reviewer sessions are never handed fleet tools, which
+   * is what keeps orchestration from nesting.
+   */
+  runId: z.string().default(""),
+  runRole: RunRoleSchema.default(""),
 });
 export type FleetSession = z.infer<typeof SessionSchema>;
 
@@ -363,6 +384,20 @@ export const nodeUpdateStages = [
 export const NodeUpdateStageSchema = z.enum(nodeUpdateStages);
 export type NodeUpdateStage = z.infer<typeof NodeUpdateStageSchema>;
 
+/**
+ * An MCP server a session should be given, in the one transport this needs.
+ *
+ * Narrower than ACP's own union on purpose: the Host only ever hands out its
+ * own HTTP endpoint with a scoped token, and modelling stdio or SSE here would
+ * be inventing wire surface for a case that does not exist.
+ */
+export const McpHttpServerSchema = z.object({
+  name: z.string().min(1),
+  url: z.string().url(),
+  headers: z.array(z.object({ name: z.string().min(1), value: z.string() })).default([]),
+});
+export type McpHttpServer = z.infer<typeof McpHttpServerSchema>;
+
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start_session"),
@@ -372,6 +407,15 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     prompt: z.string().min(1),
     /** Launches Copilot with --allow-all; decided by the Host. */
     yolo: z.boolean().default(false),
+    /**
+     * Tools this session may call back into the Host with.
+     *
+     * Defaulted to empty, which is what every ordinary session gets: tools are
+     * injected per session in ACP, so a worker is not "denied" the fleet tools
+     * — it is never given them, and cannot ask. Only an orchestrator is handed
+     * a server here, with a token scoped to itself.
+     */
+    mcpServers: z.array(McpHttpServerSchema).default([]),
   }),
   z.object({
     type: z.literal("resume_session"),
@@ -382,6 +426,12 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     /** Continues the host's event sequence so replayed rows stay ordered. */
     sequenceOffset: z.number().int().nonnegative().default(0),
     yolo: z.boolean().default(false),
+    /**
+     * Re-supplied on resume, because `session/load` takes its own `mcpServers`
+     * and a session reloaded without them comes back with no tools — an
+     * orchestrator that wakes up unable to dispatch anything.
+     */
+    mcpServers: z.array(McpHttpServerSchema).default([]),
   }),
   z.object({
     type: z.literal("prompt"),
@@ -555,6 +605,16 @@ export const HOST_URL_SYNC_CAPABILITY = "host-url-sync";
 export const SELF_UPDATE_CAPABILITY = "self-update";
 
 /**
+ * A Node willing to launch Copilot with `--allow-all`.
+ *
+ * Named here rather than spelled as a literal at each check because the
+ * orchestrator gates dispatch on it too, and a capability string that is
+ * typed out in three places is a capability string that will be misspelled in
+ * one of them.
+ */
+export const HOST_YOLO_CAPABILITY = "host-yolo";
+
+/**
  * A Node that treats its name as a label on its `nodeId` rather than as its
  * identity: it proposes renames over `hello` and accepts `node_name` back.
  */
@@ -661,6 +721,186 @@ export function sameHostUrl(left: string, right: string): boolean {
 }
 
 /**
+ * What a run and its steps are allowed to consume before the engine gives the
+ * decision back to a human.
+ *
+ * Every field has a default because a policy blob is stored as JSON and read
+ * back by code that may be newer than the row.
+ */
+export const RunPolicySchema = z.object({
+  maxParallel: z.number().int().positive().default(3),
+  /** Cumulative sessions this run may spawn, the Lead included. */
+  maxSessions: z.number().int().positive().default(8),
+  maxWakes: z.number().int().positive().default(12),
+  /** Cap on one step's output inside a wake envelope. */
+  maxOutputChars: z.number().int().positive().default(8_000),
+  yolo: z.boolean().default(true),
+  onStepFailure: z.enum(["wake", "fail-fast", "continue"]).default("wake"),
+  wakePolicy: z.enum(["on_any_settle", "none"]).default("none"),
+  stepTimeoutMs: z.number().int().positive().default(3_600_000),
+  /**
+   * Bounds only the dispatch window — frame out, Copilot spawned, session
+   * created — which is a different order of magnitude from how long the work
+   * takes. Folding it into `stepTimeoutMs` would hold a placement's write lock
+   * for an hour on a step that never started.
+   */
+  startingTimeoutMs: z.number().int().positive().default(120_000),
+  staleAfterMs: z.number().int().positive().default(60_000),
+});
+export type RunPolicy = z.infer<typeof RunPolicySchema>;
+
+export const RunStateSchema = z.enum([
+  "awaiting_approval",
+  "planning",
+  "running",
+  "awaiting_lead",
+  /**
+   * Every phase is done and the orchestrator has handed the result to a person.
+   *
+   * The one place a human is still in the loop. The orchestrator drives a task
+   * from phase to phase on its own — it is what checks a worker's output and
+   * decides whether that phase is finished — so the person is not a step in
+   * the middle of the work; they are the sign-off at the end of it.
+   */
+  "awaiting_human",
+  "aggregating",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+export type RunState = z.infer<typeof RunStateSchema>;
+
+export const RunStepStateSchema = z.enum([
+  "pending",
+  /**
+   * The receipt is written and the command is on its way out.
+   *
+   * A database transaction cannot hold a socket send, so there is always a
+   * moment where the Host has promised a step but the Node has not confirmed
+   * it. Naming that moment is what lets a failed send roll back and a Node
+   * lost mid-dispatch be told apart from one that is merely slow. The session
+   * state machine has carried the same state, for the same reason, since
+   * before runs existed.
+   */
+  "starting",
+  "running",
+  "succeeded",
+  "failed",
+  "skipped",
+  "cancelled",
+]);
+export type RunStepState = z.infer<typeof RunStepStateSchema>;
+
+export const RunSchema = z.object({
+  id: z.string().min(1),
+  workspaceId: z.string().min(1),
+  name: z.string().min(1),
+  objective: z.string().min(1),
+  state: RunStateSchema,
+  leadSessionId: z.string().default(""),
+  /**
+   * The working surface this run was pinned to.
+   *
+   * Empty until the first side-effecting step lands, then fixed. A workspace
+   * has one placement per node — separate checkouts on separate machines — so
+   * re-picking between steps is what would hand a reviewer a stale tree.
+   */
+  placementId: z.string().default(""),
+  // Zod does not re-parse a literal default, so the default is produced by
+  // parsing an empty object — otherwise a run row with no policy would come
+  // back as `{}` and every budget check would read `undefined`.
+  policy: RunPolicySchema.default(() => RunPolicySchema.parse({})),
+  /**
+   * The stages this task goes through, named by the orchestrator when it plans
+   * the task.
+   *
+   * Not a fixed set. "Plan, implement, review" suits a change; a question
+   * needs one phase and a person's sign-off. Deciding how many there are is
+   * part of the planning, so the shape is a list rather than an enum.
+   *
+   * Empty means the task was never planned in phases — the handwritten-DAG
+   * fixture, and any task from before this existed.
+   */
+  phases: z.array(z.string()).default([]),
+  /** Which phase is being worked on now; an index into {@link phases}. */
+  phaseIndex: z.number().int().nonnegative().default(0),
+  failureReason: z.string().default(""),
+  /**
+   * A message owed to the orchestrator, held until it is free to read it.
+   *
+   * Copilot refuses a prompt while a turn is in flight, and that refusal comes
+   * back as a transcript notice rather than an error the sender can see. A
+   * route that dispatched directly therefore had no way to know its brief had
+   * been dropped — the task was created and the orchestrator was never told.
+   * Writing it here makes the delivery owed rather than attempted: the engine
+   * hands it over on the first tick where the lead is idle, and a restart in
+   * between changes nothing.
+   */
+  pendingPrompt: z.string().default(""),
+  /**
+   * Monotonic counters, not timestamps.
+   *
+   * "Wake the Lead exactly once per settle" rests entirely on comparing these
+   * two, and wall-clock strings lose that comparison to same-millisecond
+   * settles, clock skew, and restarts.
+   */
+  settleSeq: z.number().int().nonnegative().default(0),
+  wakeSeq: z.number().int().nonnegative().default(0),
+  emptyWakeCount: z.number().int().nonnegative().default(0),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export type Run = z.infer<typeof RunSchema>;
+
+export const RunStepSchema = z.object({
+  id: z.string().min(1),
+  runId: z.string().min(1),
+  /**
+   * The Lead's name for this unit of work.
+   *
+   * Unique within a run, and the Lead decides what it means: reusing a key is
+   * how a retry says "this is the same step again" and gets `attempts`
+   * incremented instead of a second row.
+   */
+  stepKey: z.string().min(1),
+  title: z.string().min(1),
+  prompt: z.string().min(1),
+  category: z.string().default(""),
+  dependsOn: z.array(z.string()).default([]),
+  state: RunStepStateSchema,
+  sessionId: z.string().default(""),
+  placementId: z.string().default(""),
+  output: z.string().default(""),
+  /**
+   * Where this step's output starts in its session's event stream.
+   *
+   * A session can be prompted again, so "every agent_text on this session" is
+   * not this step's output; without a watermark the second wake would replay
+   * the first one's work back to the Lead.
+   */
+  eventSeqFrom: z.number().int().nonnegative().default(0),
+  attempts: z.number().int().nonnegative().default(0),
+  /** Which phase of its task this step was dispatched in. */
+  phaseIndex: z.number().int().nonnegative().default(0),
+  /** When the step entered `starting`; the dispatch deadline counts from here. */
+  dispatchedAt: z.string().default(""),
+  position: z.number().int().nonnegative().default(0),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export type RunStep = z.infer<typeof RunStepSchema>;
+
+/** A line the orchestrator wrote as a phase ended, for the person to read. */
+export const RunNoteSchema = z.object({
+  id: z.string().min(1),
+  runId: z.string().min(1),
+  phaseIndex: z.number().int().nonnegative().default(0),
+  body: z.string().default(""),
+  createdAt: z.string().datetime(),
+});
+export type RunNote = z.infer<typeof RunNoteSchema>;
+
+/**
  * Everything a freshly connected browser needs to render the fleet.
  *
  * Spelled out rather than left as an open record so the UI can consume it
@@ -671,6 +911,8 @@ export const SnapshotSchema = z.object({
   workspaces: z.array(WorkspaceSchema),
   placements: z.array(PlacementSchema),
   sessions: z.array(SessionSchema),
+  /** Defaulted so a browser talking to a Host without runs still parses. */
+  runs: z.array(RunSchema).default([]),
   /**
    * The commit the Host is running, so a browser can mark Nodes that are behind
    * it. Sent with the fleet rather than fetched separately because the two are
@@ -725,6 +967,21 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("session_notice"),
     sessionId: z.string().min(1),
     message: z.string().min(1),
+  }),
+  /**
+   * One run after any change to it.
+   *
+   * Runs go out on the browser channel rather than as SessionEvents because
+   * orchestration progress is not something an agent said — no Node produces
+   * it, and adding it to the Node wire union would break every Node that has
+   * not been updated.
+   */
+  z.object({ type: z.literal("run"), run: RunSchema }),
+  /** A run's steps, sent whole: a removed step has no row left to describe. */
+  z.object({
+    type: z.literal("run_steps"),
+    runId: z.string().min(1),
+    steps: z.array(RunStepSchema),
   }),
 ]);
 export type BrowserMessage = z.infer<typeof BrowserMessageSchema>;
@@ -962,6 +1219,18 @@ export const HostBackupSchema = z.object({
   placements: z.array(HostBackupPlacementSchema),
   sessions: z.array(HostBackupSessionSchema),
   events: z.array(SessionEventSchema),
+  /**
+   * Defaulted, or every archive written before orchestration existed stops
+   * importing — the one failure mode a backup format may not have.
+   */
+  runs: z.array(RunSchema).default([]),
+  runSteps: z.array(RunStepSchema).default([]),
+  /**
+   * A task's notes are the orchestrator's own record of it — what a phase
+   * concluded, what it handed over. Dropping them on a move would leave a live
+   * task with its steps intact and no memory of why they were run.
+   */
+  runNotes: z.array(RunNoteSchema).default([]),
 });
 export type HostBackup = z.infer<typeof HostBackupSchema>;
 
@@ -1078,6 +1347,87 @@ const transitions: Record<SessionState, ReadonlySet<SessionState>> = {
 
 export function canTransition(from: SessionState, to: SessionState): boolean {
   return from === to || transitions[from].has(to);
+}
+
+const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
+  /*
+   * Approval is the entrance, not a mid-course gate: a human authorises the
+   * objective and its budget once, and the Lead spends that budget without
+   * asking again. `running` is reachable directly for the handwritten-DAG
+   * fixture, which has no Lead and therefore nothing to plan — its plan
+   * arrived over REST.
+   */
+  awaiting_approval: new Set(["planning", "running", "failed", "cancelled"]),
+  planning: new Set(["running", "failed", "cancelled"]),
+  running: new Set([
+    "awaiting_lead",
+    "awaiting_human",
+    "aggregating",
+    "completed",
+    "failed",
+    "cancelled",
+  ]),
+  awaiting_lead: new Set([
+    "running",
+    "awaiting_human",
+    "aggregating",
+    "completed",
+    "failed",
+    "cancelled",
+  ]),
+  /*
+   * A person can send a task back, which is why this is not terminal: rejecting
+   * returns it to `running` with the reviewer's note, and the orchestrator
+   * carries on from the phase it was in.
+   */
+  awaiting_human: new Set(["running", "completed", "failed", "cancelled"]),
+  aggregating: new Set(["completed", "failed", "cancelled"]),
+  completed: new Set(),
+  failed: new Set(),
+  cancelled: new Set(),
+};
+
+const runStepTransitions: Record<RunStepState, ReadonlySet<RunStepState>> = {
+  pending: new Set(["starting", "skipped", "cancelled"]),
+  // Back to pending when the command never left, failed when the Node was lost
+  // before it answered. Both are reachable only from here, which is the point
+  // of naming the window at all.
+  starting: new Set(["running", "pending", "failed", "cancelled"]),
+  running: new Set(["succeeded", "failed", "cancelled"]),
+  succeeded: new Set(),
+  failed: new Set(),
+  skipped: new Set(),
+  cancelled: new Set(),
+};
+
+export function canTransitionRun(from: RunState, to: RunState): boolean {
+  return from === to || runTransitions[from].has(to);
+}
+
+export function canTransitionRunStep(from: RunStepState, to: RunStepState): boolean {
+  return from === to || runStepTransitions[from].has(to);
+}
+
+/** Runs the engine will no longer advance on its own. */
+export const terminalRunStates = new Set<RunState>(["completed", "failed", "cancelled"]);
+
+/** Steps that are done deciding; a late event about one is noise. */
+export const terminalRunStepStates = new Set<RunStepState>([
+  "succeeded",
+  "failed",
+  "skipped",
+  "cancelled",
+]);
+
+/**
+ * Categories that write to the checkout.
+ *
+ * The parallel limit is scoped to these because the race is over files, not
+ * over the run: a read-only reviewer sharing a checkout with its implementer
+ * is not a hazard, it is the only way it can see the diff at all.
+ */
+export function isWritingCategory(category: string): boolean {
+  return category === "implement" || category === "test";
 }
 
 /**

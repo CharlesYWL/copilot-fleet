@@ -621,6 +621,60 @@ process and is terminal. And `failed` is not one thing: a session that reached
 the agent keeps its agent session id and is offered as **resumable**, while one
 that never got that far is simply over.
 
+### Runs: several sessions toward one objective
+
+There are two ways to put several agents on one job.
+
+**Talk to an orchestrator.** The sidebar's first row is **Orchestration**, above
+the workspaces, because it is the fleet's own surface rather than any one
+repository's. Start one and you get a session you chat with, which does not
+write code itself — it starts other agents that do. Ask it for something and it
+picks a machine, dispatches a worker, and ends its turn. When that worker
+finishes, the Host wakes the orchestrator with a summary, and it decides what
+happens next. Ask it for a review and it dispatches one onto the same checkout
+the work happened in, so the reviewer sees the actual changes.
+
+The view is the conversation, with a rail beside it listing what is out on the
+fleet; clicking a step opens that worker's transcript.
+
+It never sits and waits, which is the point: the conversation is durable, so a
+worker that takes twenty minutes costs nothing while it runs, and a Host restart
+does not lose the thread.
+
+The orchestrator reaches the fleet through an MCP server the Host exposes, with
+a bearer token scoped to that one session. Workers are given no tools at all —
+not denied them, never handed them — which is what stops orchestration nesting.
+
+**Or write the plan yourself.** A **run** is an objective plus a budget with a
+fixed list of steps, approved once. There is no UI for this; it is the engine's
+own fixture, and it is reachable over REST:
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/runs \
+  -H 'content-type: application/json' \
+  -d '{"workspaceId":"<id>","name":"audit","objective":"audit, fix, then test"}'
+
+curl -X POST http://127.0.0.1:8787/api/runs/<runId>/plan \
+  -H 'content-type: application/json' \
+  -d '{"steps":[
+        {"stepKey":"audit","title":"Audit","prompt":"Find the flaky test","category":"explore"},
+        {"stepKey":"fix","title":"Fix","prompt":"Fix it","category":"implement","dependsOn":["audit"]},
+        {"stepKey":"test","title":"Test","prompt":"Run the suite","category":"test","dependsOn":["fix"]}
+      ]}'
+
+curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
+```
+
+Either way the Host runs it: it picks a placement, waits for `turn_complete` and
+then `idle` before calling a step done, pins the whole run to the first checkout
+it wrote to, and stops the sessions it still holds when the run ends. A restart
+mid-run does not mis-settle anything, because `offline` is read as unknown
+rather than as failure.
+
+Approving is deliberately the only gate. A human authorises the objective and
+its budget; individual dispatches are not re-approved, and the budget is what
+stops a run rather than a prompt each time.
+
 ## Security notes
 
 - The web UI and the whole `/api` surface sit behind an operator password. Set

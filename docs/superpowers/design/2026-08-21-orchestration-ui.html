@@ -1,0 +1,853 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Copilot Fleet — Orchestration</title>
+  <style>
+    :root {
+      --bg: oklch(14% 0.012 255);
+      --surface: oklch(18% 0.014 255);
+      --surface-2: oklch(21% 0.016 255);
+      --surface-3: oklch(25% 0.016 255);
+      --fg: oklch(94% 0.008 255);
+      --muted: oklch(68% 0.018 255);
+      --border: oklch(33% 0.018 255);
+      --border-soft: oklch(27% 0.016 255);
+      --accent: oklch(72% 0.15 220);
+      --accent-deep: oklch(53% 0.13 220);
+      --success: oklch(72% 0.15 155);
+      --warn: oklch(78% 0.14 78);
+      --danger: oklch(68% 0.19 25);
+      --info: oklch(74% 0.12 245);
+      --font-ui: "Segoe UI Variable", "Segoe UI", sans-serif;
+      --font-mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      --shadow: 0 16px 36px oklch(4% 0.01 255 / .35);
+      --r-sm: 4px;
+      --r-md: 7px;
+      --r-lg: 10px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      overflow: hidden;
+      color: var(--fg);
+      background: var(--bg);
+      font: 14px/1.5 var(--font-ui);
+    }
+    button, input, textarea, select { font: inherit; }
+    button { color: inherit; }
+    button, [role="button"] { -webkit-tap-highlight-color: transparent; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    ::selection { background: oklch(72% .15 220 / .28); }
+
+    .app { height: 100%; display: grid; grid-template-rows: 44px minmax(0, 1fr); }
+    .topbar {
+      position: relative;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--border);
+      background: oklch(16% .012 255);
+    }
+    .brand { display: flex; align-items: center; gap: 9px; min-width: 196px; }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 25px;
+      height: 25px;
+      border: 1px solid oklch(64% .12 220);
+      border-radius: var(--r-sm);
+      color: var(--accent);
+      font: 600 10px/1 var(--font-mono);
+      letter-spacing: .06em;
+    }
+    .brand-name { font-weight: 600; letter-spacing: -.01em; }
+    .top-divider { width: 1px; height: 20px; background: var(--border); }
+    .layout-toggle { display: flex; border: 1px solid var(--border); border-radius: var(--r-sm); overflow: hidden; }
+    .icon-btn, .layout-toggle button {
+      display: grid;
+      place-items: center;
+      width: 30px;
+      height: 28px;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      cursor: pointer;
+    }
+    .layout-toggle button[aria-pressed="true"] { background: var(--surface-3); color: var(--fg); }
+    .layout-toggle button:hover, .icon-btn:hover { background: var(--surface-3); }
+    .top-stats { margin-left: auto; display: flex; align-items: stretch; height: 100%; }
+    .top-stat {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      padding: 0 12px;
+      border-left: 1px solid var(--border-soft);
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .top-stat strong { color: var(--fg); font: 600 12px/1 var(--font-mono); }
+    .needs-you {
+      position: relative;
+      border: 0;
+      border-left: 1px solid oklch(57% .11 78);
+      background: oklch(28% .055 78);
+      color: oklch(92% .07 83);
+      cursor: pointer;
+    }
+    .needs-you:hover { background: oklch(34% .065 78); }
+    .needs-you strong { color: oklch(94% .08 83); }
+    .pulse {
+      width: 7px; height: 7px; border-radius: 50%; background: var(--warn);
+      box-shadow: 0 0 0 0 oklch(78% .14 78 / .35);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 5px transparent; } }
+    .live-indicator { color: var(--success); }
+    .live-indicator::before {
+      content: "";
+      width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+    }
+
+    .shell { min-height: 0; display: grid; grid-template-columns: 220px minmax(0, 1fr); }
+    .sidebar {
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border);
+      background: oklch(16% .012 255);
+    }
+    .sidebar-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 42px;
+      padding: 0 10px 0 14px;
+      border-bottom: 1px solid var(--border-soft);
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .tree { padding: 8px; overflow: auto; }
+    .tree-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 29px;
+      padding: 4px 7px;
+      border: 1px solid transparent;
+      border-radius: var(--r-sm);
+      color: var(--muted);
+      cursor: pointer;
+    }
+    .tree-row:hover { background: var(--surface); color: var(--fg); }
+    .tree-row.selected {
+      color: var(--fg);
+      border-color: oklch(53% .10 220 / .6);
+      background: oklch(24% .035 220);
+    }
+    .tree-row.indent-1 { padding-left: 21px; }
+    .tree-row.indent-2 { padding-left: 37px; }
+    .tree-row .count {
+      margin-left: auto;
+      color: var(--muted);
+      font: 11px var(--font-mono);
+    }
+    .tree-row .state-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
+    .tree-row .state-dot.busy { background: var(--info); }
+    .tree-row .state-dot.idle { border: 1px solid var(--muted); background: transparent; }
+    .sidebar-footer {
+      margin-top: auto;
+      padding: 10px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .new-run-btn, .primary-btn, .secondary-btn, .danger-btn {
+      min-height: 34px;
+      border-radius: var(--r-sm);
+      padding: 0 12px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .02em;
+      cursor: pointer;
+      transition: background .15s, border-color .15s, transform .1s;
+    }
+    .new-run-btn, .primary-btn {
+      border: 1px solid oklch(78% .12 220);
+      background: var(--accent);
+      color: oklch(14% .025 235);
+    }
+    .new-run-btn { width: 100%; }
+    .new-run-btn:hover, .primary-btn:hover { background: oklch(80% .13 220); }
+    .new-run-btn:active, .primary-btn:active, .secondary-btn:active, .danger-btn:active { transform: translateY(1px); }
+    .secondary-btn { border: 1px solid var(--border); background: var(--surface-2); color: var(--fg); }
+    .secondary-btn:hover { background: var(--surface-3); border-color: oklch(45% .02 255); }
+    .danger-btn { border: 1px solid oklch(55% .13 25); background: transparent; color: oklch(79% .12 25); }
+    .danger-btn:hover { background: oklch(27% .065 25); color: oklch(91% .05 25); }
+
+    .main { min-width: 0; min-height: 0; position: relative; overflow: hidden; }
+    .view { display: none; height: 100%; min-width: 0; min-height: 0; }
+    .view.active { display: flex; flex-direction: column; }
+    .page-header {
+      flex: 0 0 auto;
+      min-height: 58px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 9px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .page-title { min-width: 0; }
+    .page-title h1 { margin: 0; font-size: 18px; line-height: 1.25; font-weight: 600; letter-spacing: -.01em; }
+    .page-title p { margin: 2px 0 0; color: var(--muted); font-size: 12px; }
+    .header-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+    .eyebrow { color: var(--muted); font: 600 10px/1.4 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+
+    /* Runs overview */
+    .runs-toolbar {
+      display: flex; align-items: center; gap: 8px; padding: 9px 14px;
+      border-bottom: 1px solid var(--border-soft); background: var(--surface);
+    }
+    .search {
+      width: min(320px, 40vw); height: 30px; border: 1px solid var(--border);
+      border-radius: var(--r-sm); background: var(--bg); color: var(--fg); padding: 0 10px;
+    }
+    .filter-btn {
+      height: 30px; border: 1px solid var(--border); border-radius: var(--r-sm);
+      background: transparent; color: var(--muted); padding: 0 10px; cursor: pointer;
+    }
+    .filter-btn:hover, .filter-btn.active { color: var(--fg); background: var(--surface-3); }
+    .run-board { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 280px; overflow: hidden; }
+    .runs-list { min-width: 0; overflow: auto; }
+    .run-head, .run-row {
+      display: grid;
+      grid-template-columns: minmax(260px, 1.7fr) 142px minmax(160px, .8fr) 150px 170px;
+      align-items: center;
+      column-gap: 12px;
+      padding: 0 14px;
+    }
+    .run-head {
+      position: sticky; top: 0; z-index: 2; height: 34px;
+      border-bottom: 1px solid var(--border); background: oklch(17% .012 255);
+      color: var(--muted); font: 600 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase;
+    }
+    .run-row {
+      min-height: 82px;
+      border-bottom: 1px solid var(--border-soft);
+      cursor: pointer;
+      transition: background .12s;
+    }
+    .run-row:hover { background: var(--surface); }
+    .run-row.selected { background: oklch(21% .025 220); box-shadow: inset 2px 0 var(--accent); }
+    .run-row.blocked { background: oklch(20% .025 78); }
+    .run-row.blocked:hover { background: oklch(23% .032 78); }
+    .objective { min-width: 0; }
+    .objective strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 550; }
+    .objective small { display: block; margin-top: 5px; color: var(--muted); font: 11px var(--font-mono); }
+    .state-pill, .category-pill {
+      display: inline-flex; align-items: center; gap: 6px; width: fit-content;
+      border: 1px solid var(--border); border-radius: 999px; padding: 2px 8px;
+      color: var(--muted); font-size: 11px; white-space: nowrap;
+    }
+    .state-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .state-pill.running { border-color: oklch(49% .08 220); color: var(--info); }
+    .state-pill.running::before { box-shadow: 0 0 0 3px oklch(74% .12 245 / .12); }
+    .state-pill.waiting-human { border-radius: var(--r-sm); border-color: oklch(58% .12 78); color: var(--warn); font-weight: 600; }
+    .state-pill.waiting-human::before { border-radius: 1px; }
+    .state-pill.complete { color: var(--success); border-color: oklch(50% .09 155); }
+    .state-pill.planning { color: oklch(78% .09 285); border-color: oklch(51% .07 285); }
+    .state-pill.failed { color: var(--danger); border-color: oklch(52% .11 25); }
+    .progress { display: flex; gap: 3px; }
+    .progress span { height: 5px; flex: 1; max-width: 26px; border-radius: 1px; background: var(--border); }
+    .progress .done { background: var(--success); }
+    .progress .active { background: var(--info); animation: breathe 1.8s infinite; }
+    .progress .failed { background: var(--danger); }
+    @keyframes breathe { 50% { opacity: .45; } }
+    .progress-label { margin-top: 5px; color: var(--muted); font: 10px var(--font-mono); }
+    .budget-compact { display: grid; gap: 4px; color: var(--muted); font: 10px var(--font-mono); }
+    .budget-line { display: grid; grid-template-columns: 48px 1fr 28px; align-items: center; gap: 5px; }
+    .meter { height: 3px; background: var(--border); overflow: hidden; }
+    .meter > i { display: block; height: 100%; background: var(--muted); }
+    .meter.warn > i { background: var(--warn); }
+    .machine-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+    .machine-tag {
+      border: 1px solid var(--border); border-radius: 3px; padding: 2px 5px;
+      color: var(--muted); background: var(--surface); font: 10px var(--font-mono);
+    }
+    .attention-rail { min-height: 0; padding: 14px; border-left: 1px solid var(--border); background: oklch(16% .012 255); overflow: auto; }
+    .attention-rail h2 { margin: 0 0 10px; font-size: 12px; font-weight: 600; }
+    .attention-card {
+      padding: 11px; border: 1px solid oklch(48% .075 78); border-radius: var(--r-md);
+      background: oklch(22% .036 78); cursor: pointer;
+    }
+    .attention-card:hover { border-color: oklch(62% .11 78); background: oklch(25% .045 78); }
+    .attention-card + .attention-card { margin-top: 8px; }
+    .attention-card strong { display: block; color: oklch(92% .05 80); font-size: 12px; }
+    .attention-card p { margin: 5px 0 9px; color: oklch(73% .035 78); font-size: 11px; line-height: 1.45; }
+    .attention-card .action-link { color: oklch(91% .07 82); font-weight: 600; font-size: 11px; }
+    .rail-section { margin-top: 20px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
+    .activity { display: grid; grid-template-columns: 42px 1fr; gap: 7px; margin: 9px 0; color: var(--muted); font-size: 11px; }
+    .activity time { font-family: var(--font-mono); color: oklch(54% .015 255); }
+
+    /* Run detail */
+    .detail-grid { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 250px; }
+    .timeline-pane { overflow: auto; padding: 14px 18px 40px; }
+    .lead-row {
+      display: grid; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: center; gap: 10px;
+      min-height: 48px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--r-md);
+      background: var(--surface);
+    }
+    .lead-icon {
+      display: grid; place-items: center; width: 30px; height: 30px; border-radius: 50%;
+      border: 1px dashed oklch(52% .06 285); color: oklch(75% .09 285); font: 600 10px var(--font-mono);
+    }
+    .lead-row strong { display: block; font-size: 12px; }
+    .lead-row small { color: var(--muted); }
+    .lead-state { color: var(--info); font: 11px var(--font-mono); }
+    .timeline-label { margin: 18px 0 8px 19px; color: var(--muted); font: 600 10px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+    .timeline { position: relative; }
+    .timeline::before { content: ""; position: absolute; left: 18px; top: 0; bottom: 0; width: 1px; background: var(--border); }
+    .step {
+      position: relative;
+      display: grid;
+      grid-template-columns: 38px minmax(0, 1fr);
+      margin-bottom: 7px;
+    }
+    .step-node {
+      position: relative; z-index: 1; margin: 14px auto 0; width: 11px; height: 11px;
+      border: 2px solid var(--bg); outline: 1px solid var(--border); border-radius: 50%; background: var(--border);
+    }
+    .step.succeeded .step-node { background: var(--success); outline-color: oklch(56% .1 155); }
+    .step.running .step-node { background: var(--info); outline-color: var(--info); box-shadow: 0 0 0 4px oklch(74% .12 245 / .12); }
+    .step.pending .step-node { background: var(--bg); }
+    .step-card {
+      border: 1px solid var(--border-soft); border-radius: var(--r-md); background: var(--surface);
+      overflow: hidden; cursor: pointer;
+    }
+    .step-card:hover { border-color: var(--border); background: var(--surface-2); }
+    .step.running .step-card { border-color: oklch(49% .08 245); background: oklch(20% .022 245); }
+    .step-summary {
+      min-height: 49px; display: grid; grid-template-columns: minmax(180px, 1fr) auto auto;
+      align-items: center; gap: 12px; padding: 8px 11px;
+    }
+    .step-title { min-width: 0; }
+    .step-title strong { display: block; font-size: 12px; font-weight: 550; }
+    .step-title small { display: block; margin-top: 2px; color: var(--muted); font: 10px var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .category-pill { padding: 1px 7px; font: 10px var(--font-mono); }
+    .category-pill.implement { color: oklch(78% .1 245); border-color: oklch(46% .06 245); }
+    .category-pill.test { color: oklch(80% .1 155); border-color: oklch(46% .06 155); }
+    .category-pill.explore { color: oklch(78% .08 285); border-color: oklch(45% .05 285); }
+    .category-pill.review-deep { color: oklch(81% .11 78); border-color: oklch(49% .07 78); }
+    .category-pill.review-quick { color: oklch(76% .07 40); border-color: oklch(45% .06 40); }
+    .step-time { min-width: 50px; text-align: right; color: var(--muted); font: 10px var(--font-mono); }
+    .step-body { display: none; border-top: 1px solid var(--border-soft); }
+    .step.expanded .step-body { display: grid; grid-template-columns: minmax(0, 1fr) 170px; }
+    .output-peek { padding: 11px; font: 11px/1.55 var(--font-mono); color: oklch(78% .02 255); background: oklch(14% .012 255); }
+    .output-peek .cmd { color: var(--accent); }
+    .output-peek .ok { color: var(--success); }
+    .step-meta { padding: 10px; border-left: 1px solid var(--border-soft); display: grid; gap: 9px; align-content: start; }
+    .meta-pair span { display: block; color: var(--muted); font-size: 10px; }
+    .meta-pair strong { display: block; margin-top: 2px; font: 10px var(--font-mono); }
+    .open-transcript { color: var(--fg); border: 0; background: transparent; padding: 0; text-align: left; text-decoration: underline; text-underline-offset: 3px; cursor: pointer; font-size: 11px; }
+    .budget-panel { min-height: 0; border-left: 1px solid var(--border); padding: 14px; background: oklch(16% .012 255); overflow: auto; }
+    .budget-panel h2 { margin: 0 0 12px; font-size: 12px; }
+    .budget-card { padding: 11px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); }
+    .budget-card + .budget-card { margin-top: 8px; }
+    .budget-card-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .budget-card-head span { color: var(--muted); font-size: 11px; }
+    .budget-card-head strong { font: 600 16px var(--font-mono); }
+    .budget-card .meter { margin-top: 9px; height: 5px; border-radius: 2px; }
+    .budget-note { margin: 10px 0 18px; color: var(--muted); font-size: 11px; }
+    .machine-occupancy { margin-top: 18px; }
+    .machine-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border-soft); }
+    .machine-row strong { display: block; font: 11px var(--font-mono); }
+    .machine-row span { color: var(--muted); font-size: 10px; }
+    .mini-node { width: 7px; height: 7px; border-radius: 50%; background: var(--success); }
+
+    /* Lead transcript */
+    .lead-layout { min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 250px; }
+    .lead-transcript { min-height: 0; display: flex; flex-direction: column; }
+    .messages { min-height: 0; overflow: auto; padding: 18px max(22px, calc((100% - 800px)/2)); }
+    .exchange { display: grid; grid-template-columns: 100px minmax(0, 1fr); gap: 14px; margin-bottom: 18px; }
+    .exchange-label { padding-top: 2px; color: var(--muted); font: 600 10px var(--font-mono); letter-spacing: .06em; text-transform: uppercase; }
+    .wake-envelope {
+      border: 1px solid oklch(43% .035 255); border-radius: var(--r-sm);
+      background: oklch(19% .018 255); box-shadow: inset 3px 0 oklch(55% .04 255);
+    }
+    .envelope-head {
+      display: flex; justify-content: space-between; gap: 12px; padding: 8px 10px;
+      border-bottom: 1px solid var(--border-soft); color: var(--muted); font: 10px var(--font-mono);
+    }
+    .envelope-body { padding: 10px; color: oklch(81% .012 255); font-size: 12px; }
+    .envelope-body strong { color: var(--fg); }
+    .decision {
+      border: 1px solid oklch(46% .06 285); border-radius: var(--r-md);
+      background: oklch(20% .024 285);
+    }
+    .decision-reason { padding: 11px; font-size: 12px; line-height: 1.6; }
+    .tool-call {
+      display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 8px; align-items: center;
+      padding: 9px 10px; border-top: 1px solid oklch(38% .04 285); background: oklch(17% .02 285);
+      font: 11px var(--font-mono);
+    }
+    .tool-icon { color: oklch(76% .09 285); }
+    .tool-call code { color: oklch(85% .05 285); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tool-result { color: var(--success); font-size: 10px; }
+    .composer {
+      flex: 0 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px;
+      padding: 10px 14px; border-top: 1px solid var(--border); background: var(--surface);
+    }
+    .composer textarea {
+      height: 42px; resize: none; border: 1px solid var(--border); border-radius: var(--r-sm);
+      padding: 9px 10px; background: var(--bg); color: var(--fg);
+    }
+    .audit-rail { min-height: 0; border-left: 1px solid var(--border); padding: 14px; overflow: auto; background: oklch(16% .012 255); }
+    .audit-rail h2 { margin: 0 0 10px; font-size: 12px; }
+    .audit-item { padding: 8px 0; border-bottom: 1px solid var(--border-soft); }
+    .audit-item span { display: block; color: var(--muted); font: 10px var(--font-mono); }
+    .audit-item strong { display: block; margin-top: 3px; font-size: 11px; font-weight: 550; }
+
+    /* Needs you */
+    .blocked-page { min-height: 0; overflow: auto; padding: 24px; }
+    .blocked-hero {
+      max-width: 980px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 16px;
+    }
+    .blocked-main {
+      border: 1px solid oklch(53% .09 78); border-radius: var(--r-lg); background: oklch(20% .032 78); overflow: hidden;
+    }
+    .blocked-banner { display: flex; gap: 12px; padding: 18px; border-bottom: 1px solid oklch(42% .06 78); }
+    .blocked-symbol {
+      flex: 0 0 auto; display: grid; place-items: center; width: 34px; height: 34px;
+      border: 1px solid var(--warn); border-radius: var(--r-sm); color: var(--warn); font: 600 18px var(--font-mono);
+    }
+    .blocked-banner h1 { margin: 0; font-size: 19px; }
+    .blocked-banner p { margin: 5px 0 0; color: oklch(76% .035 78); }
+    .blocked-context { padding: 18px; }
+    .blocked-context h2 { margin: 0 0 8px; font-size: 13px; }
+    .last-turns { border: 1px solid oklch(41% .035 78); border-radius: var(--r-sm); background: oklch(16% .018 78); }
+    .last-turn { padding: 10px; border-bottom: 1px solid oklch(37% .03 78); font-size: 11px; }
+    .last-turn:last-child { border-bottom: 0; }
+    .last-turn span { color: var(--muted); font: 10px var(--font-mono); }
+    .resolution { margin-top: 16px; }
+    .resolution textarea {
+      width: 100%; min-height: 80px; resize: vertical; border: 1px solid var(--border);
+      border-radius: var(--r-sm); padding: 10px; background: var(--bg); color: var(--fg);
+    }
+    .resolution-actions { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+    .resolution-actions small { margin-left: auto; color: var(--muted); }
+    .blocked-side { display: grid; gap: 10px; align-content: start; }
+    .fact-card { padding: 13px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); }
+    .fact-card h2 { margin: 0 0 10px; font-size: 12px; }
+    .fact-row { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--border-soft); font-size: 11px; }
+    .fact-row:last-child { border-bottom: 0; }
+    .fact-row span { color: var(--muted); }
+    .fact-row strong { font-family: var(--font-mono); font-weight: 500; text-align: right; }
+
+    /* New run */
+    .new-run-page { min-height: 0; overflow: auto; padding: 24px; }
+    .new-run-wrap { max-width: 900px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr) 290px; gap: 18px; }
+    .form-panel { border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--surface); overflow: hidden; }
+    .form-section { padding: 18px; border-bottom: 1px solid var(--border); }
+    .form-section:last-child { border-bottom: 0; }
+    .form-section h2 { margin: 0 0 4px; font-size: 13px; }
+    .form-section > p { margin: 0 0 13px; color: var(--muted); font-size: 11px; }
+    .field-label { display: block; margin-bottom: 6px; color: oklch(82% .012 255); font-size: 11px; font-weight: 550; }
+    .text-input, .select-input {
+      width: 100%; min-height: 36px; border: 1px solid var(--border); border-radius: var(--r-sm);
+      background: var(--bg); color: var(--fg); padding: 8px 10px;
+    }
+    textarea.text-input { min-height: 84px; resize: vertical; }
+    .knob-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .knob {
+      padding: 11px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--bg);
+    }
+    .knob-head { display: flex; justify-content: space-between; align-items: center; }
+    .knob-head span { color: var(--muted); font-size: 11px; }
+    .knob-head output { font: 600 16px var(--font-mono); }
+    .knob input { width: 100%; margin: 12px 0 0; accent-color: var(--accent); }
+    .authorization {
+      padding: 15px; border: 1px solid oklch(45% .055 220); border-radius: var(--r-md);
+      background: oklch(19% .025 220);
+    }
+    .authorization h2 { margin: 0 0 8px; font-size: 13px; }
+    .authorization ul { margin: 0; padding-left: 18px; color: oklch(77% .02 255); font-size: 11px; }
+    .authorization li + li { margin-top: 5px; }
+    .approval-check { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; font-size: 11px; }
+    .approval-check input { margin-top: 3px; accent-color: var(--accent); }
+    .approval-side { display: grid; gap: 10px; align-content: start; }
+    .approval-summary { padding: 15px; border: 1px solid var(--border); border-radius: var(--r-md); background: var(--surface); }
+    .approval-summary h2 { margin: 0 0 12px; font-size: 12px; }
+    .approval-summary .fact-row strong { color: var(--fg); }
+    .approve-btn { width: 100%; margin-top: 12px; min-height: 40px; }
+    .approval-side small { color: var(--muted); line-height: 1.5; }
+
+    .toast {
+      position: fixed; right: 16px; bottom: 16px; z-index: 50; min-width: 260px;
+      padding: 10px 12px; border: 1px solid oklch(47% .08 155); border-radius: var(--r-md);
+      background: oklch(20% .035 155); color: oklch(90% .05 155); box-shadow: var(--shadow);
+      transform: translateY(20px); opacity: 0; pointer-events: none; transition: .2s;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+
+    @media (max-width: 1050px) {
+      .top-stat.optional { display: none; }
+      .run-head, .run-row { grid-template-columns: minmax(240px, 1.5fr) 140px minmax(140px, .7fr) 140px; }
+      .run-head > :last-child, .run-row > :last-child { display: none; }
+      .run-board { grid-template-columns: 1fr; }
+      .attention-rail { display: none; }
+    }
+    @media (max-width: 780px) {
+      body { overflow: auto; }
+      .app { min-height: 100%; height: auto; }
+      .topbar { position: sticky; top: 0; }
+      .brand { min-width: 0; }
+      .brand-name { display: none; }
+      .top-stat { padding: 0 8px; }
+      .top-stat span { display: none; }
+      .shell { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .main, .view { min-height: calc(100vh - 44px); height: auto; }
+      .runs-list { overflow: visible; }
+      .run-head { display: none; }
+      .run-row { grid-template-columns: 1fr auto; gap: 8px; padding: 12px; }
+      .run-row > :nth-child(3), .run-row > :nth-child(4), .run-row > :nth-child(5) { grid-column: 1 / -1; }
+      .run-row > :nth-child(5) { display: flex; }
+      .detail-grid, .lead-layout, .blocked-hero, .new-run-wrap { grid-template-columns: 1fr; }
+      .budget-panel, .audit-rail { border-left: 0; border-top: 1px solid var(--border); }
+      .step-summary { grid-template-columns: 1fr auto; }
+      .step-time { display: none; }
+      .step.expanded .step-body { grid-template-columns: 1fr; }
+      .step-meta { border-left: 0; border-top: 1px solid var(--border-soft); }
+      .exchange { grid-template-columns: 1fr; gap: 5px; }
+      .messages { padding: 14px; }
+      .knob-grid { grid-template-columns: 1fr; }
+      .blocked-page, .new-run-page { padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar" data-od-id="global-topbar">
+      <div class="brand" data-od-id="copilot-fleet-brand">
+        <span class="brand-mark">CF</span>
+        <span class="brand-name">Copilot Fleet</span>
+      </div>
+      <span class="top-divider"></span>
+      <div class="layout-toggle" aria-label="Layout">
+        <button aria-label="Tree layout" aria-pressed="true"><svg viewBox="0 0 24 24"><path d="M4 5h6M4 12h10M4 19h16"/><path d="M7 5v14"/></svg></button>
+        <button aria-label="Grid layout" aria-pressed="false"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6"/><rect x="14" y="4" width="6" height="6"/><rect x="4" y="14" width="6" height="6"/><rect x="14" y="14" width="6" height="6"/></svg></button>
+      </div>
+      <div class="top-stats">
+        <div class="top-stat optional"><strong>4/5</strong><span>nodes online</span></div>
+        <div class="top-stat"><strong>6</strong><span>live sessions</span></div>
+        <button class="top-stat needs-you" data-nav="needs" data-od-id="topbar-needs-you">
+          <span class="pulse"></span><strong>3</strong><span>needs you</span>
+        </button>
+        <button class="icon-btn optional" aria-label="Sound on"><svg viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9H5z"/><path d="M17 9c1.2 1.6 1.2 4.4 0 6"/></svg></button>
+        <div class="top-stat live-indicator"><span>live</span></div>
+      </div>
+    </header>
+
+    <div class="shell">
+      <aside class="sidebar" data-od-id="workspace-sidebar">
+        <div class="sidebar-heading"><span>Fleet</span><button class="icon-btn" aria-label="Collapse all">−</button></div>
+        <nav class="tree" aria-label="Fleet navigation">
+          <div class="tree-row selected" data-nav="runs"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5z"/><path d="M8 8h8M8 12h8M8 16h5"/></svg><span>Orchestration</span><span class="count">5</span></div>
+          <div class="tree-row"><svg viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3z"/></svg><span>cursor-proxy</span></div>
+          <div class="tree-row indent-1"><span class="state-dot busy"></span><span>atlas-dev</span><span class="count">2</span></div>
+          <div class="tree-row indent-2"><svg viewBox="0 0 24 24"><path d="M7 8l-3 4 3 4M17 8l3 4-3 4M14 5l-4 14"/></svg><span>auth retry fix</span></div>
+          <div class="tree-row indent-1"><span class="state-dot busy"></span><span>forge-01</span><span class="count">3</span></div>
+          <div class="tree-row indent-2"><svg viewBox="0 0 24 24"><path d="M7 8l-3 4 3 4M17 8l3 4-3 4M14 5l-4 14"/></svg><span>token telemetry</span></div>
+          <div class="tree-row indent-1"><span class="state-dot idle"></span><span>home-mini</span></div>
+          <div class="tree-row"><svg viewBox="0 0 24 24"><path d="M3 7h7l2 2h9v10H3z"/></svg><span>fleet-host</span></div>
+          <div class="tree-row indent-1"><span class="state-dot busy"></span><span>win-build-02</span><span class="count">1</span></div>
+          <div class="tree-row indent-1"><span class="state-dot"></span><span>mac-studio</span></div>
+        </nav>
+        <div class="sidebar-footer"><button class="new-run-btn" data-nav="new-run" data-od-id="sidebar-new-run">New orchestration run</button></div>
+      </aside>
+
+      <main class="main">
+        <section class="view active" id="runs-view" data-od-id="runs-list-screen">
+          <div class="page-header">
+            <div class="page-title"><h1 data-od-id="runs-heading">Orchestration runs</h1><p>Lead-directed work across 4 online nodes</p></div>
+            <div class="header-actions"><button class="secondary-btn">Export log</button><button class="primary-btn" data-nav="new-run">New run</button></div>
+          </div>
+          <div class="runs-toolbar">
+            <input class="search" type="search" placeholder="Filter objectives, nodes, states…" aria-label="Filter runs">
+            <button class="filter-btn active">All 5</button><button class="filter-btn">Autonomous 2</button><button class="filter-btn">Needs you 1</button>
+          </div>
+          <div class="run-board">
+            <div class="runs-list">
+              <div class="run-head"><span>Objective</span><span>State</span><span>Steps</span><span>Budget</span><span>Machines</span></div>
+              <article class="run-row blocked" data-nav="needs" data-od-id="run-row-flaky-auth">
+                <div class="objective"><strong>Fix the flaky auth refresh test and get it reviewed</strong><small>RUN-184 · cursor-proxy · 18m ago</small></div>
+                <div><span class="state-pill waiting-human">Needs you</span></div>
+                <div><div class="progress"><span class="done"></span><span class="done"></span><span class="done"></span><span></span><span></span></div><div class="progress-label">3 settled · lead stalled</div></div>
+                <div class="budget-compact"><div class="budget-line"><span>wakes</span><div class="meter warn"><i style="width:100%"></i></div><b>12/12</b></div><div class="budget-line"><span>sessions</span><div class="meter"><i style="width:50%"></i></div><b>4/8</b></div></div>
+                <div class="machine-tags"><span class="machine-tag">atlas-dev</span><span class="machine-tag">forge-01</span></div>
+              </article>
+              <article class="run-row selected" data-nav="detail" data-od-id="run-row-token-telemetry">
+                <div class="objective"><strong>Add per-model token telemetry to the proxy dashboard</strong><small>RUN-187 · cursor-proxy · 7m ago</small></div>
+                <div><span class="state-pill running">Running itself</span></div>
+                <div><div class="progress"><span class="done"></span><span class="done"></span><span class="active"></span><span></span></div><div class="progress-label">2 settled · 1 in flight</div></div>
+                <div class="budget-compact"><div class="budget-line"><span>wakes</span><div class="meter"><i style="width:17%"></i></div><b>2/12</b></div><div class="budget-line"><span>sessions</span><div class="meter"><i style="width:38%"></i></div><b>3/8</b></div></div>
+                <div class="machine-tags"><span class="machine-tag">forge-01</span><span class="machine-tag">win-build-02</span></div>
+              </article>
+              <article class="run-row" data-od-id="run-row-linux-installer">
+                <div class="objective"><strong>Trace the Linux installer hang after credential exchange</strong><small>RUN-186 · fleet-host · 11m ago</small></div>
+                <div><span class="state-pill planning">Planning</span></div>
+                <div><div class="progress"><span class="active"></span><span></span><span></span></div><div class="progress-label">Lead thinking</div></div>
+                <div class="budget-compact"><div class="budget-line"><span>wakes</span><div class="meter"><i style="width:8%"></i></div><b>1/12</b></div><div class="budget-line"><span>sessions</span><div class="meter"><i style="width:0%"></i></div><b>0/6</b></div></div>
+                <div class="machine-tags"><span class="machine-tag">mac-studio</span></div>
+              </article>
+              <article class="run-row" data-od-id="run-row-sound-toggle">
+                <div class="objective"><strong>Verify sound notification behavior across reconnects</strong><small>RUN-181 · fleet-host · 1h ago</small></div>
+                <div><span class="state-pill complete">Completed</span></div>
+                <div><div class="progress"><span class="done"></span><span class="done"></span><span class="done"></span></div><div class="progress-label">3 settled · passed review</div></div>
+                <div class="budget-compact"><div class="budget-line"><span>wakes</span><div class="meter"><i style="width:50%"></i></div><b>4/8</b></div><div class="budget-line"><span>sessions</span><div class="meter"><i style="width:60%"></i></div><b>3/5</b></div></div>
+                <div class="machine-tags"><span class="machine-tag">home-mini</span></div>
+              </article>
+              <article class="run-row" data-od-id="run-row-windows-signing">
+                <div class="objective"><strong>Repair Windows signing workflow for release candidates</strong><small>RUN-179 · fleet-host · 2h ago</small></div>
+                <div><span class="state-pill failed">Failed</span></div>
+                <div><div class="progress"><span class="done"></span><span class="failed"></span></div><div class="progress-label">certificate unavailable</div></div>
+                <div class="budget-compact"><div class="budget-line"><span>wakes</span><div class="meter"><i style="width:25%"></i></div><b>2/8</b></div><div class="budget-line"><span>sessions</span><div class="meter"><i style="width:40%"></i></div><b>2/5</b></div></div>
+                <div class="machine-tags"><span class="machine-tag">win-build-02</span></div>
+              </article>
+            </div>
+            <aside class="attention-rail" data-od-id="needs-you-rail">
+              <h2>Needs you · 3</h2>
+              <div class="attention-card" data-nav="needs"><strong>Run stalled after two idle Lead turns</strong><p>Auth refresh fix used its final wake without dispatching or finishing.</p><span class="action-link">Review and unblock →</span></div>
+              <div class="attention-card"><strong>2 permission prompts</strong><p>forge-01 requests access to run the integration test container.</p><span class="action-link">Review permissions →</span></div>
+              <div class="rail-section"><h2>Live activity</h2>
+                <div class="activity"><time>20:28</time><span>RUN-187 dispatched <b>test</b> to win-build-02</span></div>
+                <div class="activity"><time>20:26</time><span>RUN-187 implementation settled on forge-01</span></div>
+                <div class="activity"><time>20:24</time><span>RUN-186 Lead wake #1 started</span></div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="detail-view" data-od-id="run-detail-screen">
+          <div class="page-header">
+            <button class="icon-btn" data-nav="runs" aria-label="Back to runs"><svg viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg></button>
+            <div class="page-title"><div class="eyebrow">RUN-187 · running itself</div><h1>Add per-model token telemetry to the proxy dashboard</h1></div>
+            <div class="header-actions"><button class="secondary-btn" data-nav="lead">Open Lead audit</button><button class="danger-btn">Stop this run</button></div>
+          </div>
+          <div class="detail-grid">
+            <div class="timeline-pane">
+              <article class="lead-row" data-nav="lead" data-od-id="lead-planner-row">
+                <div class="lead-icon">LEAD</div><div><strong>Planner</strong><small>Sleeping until the running test settles · last wake 2m ago</small></div><span class="lead-state">waiting</span>
+              </article>
+              <div class="timeline-label">Worker steps</div>
+              <div class="timeline">
+                <article class="step succeeded" data-od-id="step-explore-schema">
+                  <span class="step-node"></span><div class="step-card"><div class="step-summary"><div class="step-title"><strong>Map existing telemetry and usage schema</strong><small>atlas-dev · C:\src\cursor-proxy\worktrees\run-187-a</small></div><span class="category-pill explore">explore</span><span class="step-time">2m 14s</span></div></div>
+                </article>
+                <article class="step succeeded" data-od-id="step-implement-model-usage">
+                  <span class="step-node"></span><div class="step-card"><div class="step-summary"><div class="step-title"><strong>Implement per-model usage aggregation and API fields</strong><small>forge-01 · /srv/code/cursor-proxy/.fleet/run-187</small></div><span class="category-pill implement">implement</span><span class="step-time">6m 42s</span></div></div>
+                </article>
+                <article class="step running expanded" data-od-id="step-test-telemetry">
+                  <span class="step-node"></span><div class="step-card"><div class="step-summary"><div class="step-title"><strong>Run telemetry unit and dashboard contract tests</strong><small>win-build-02 · D:\checkouts\cursor-proxy\run-187</small></div><span class="category-pill test">test</span><span class="step-time">1m 37s</span></div><div class="step-body"><div class="output-peek"><div><span class="cmd">$ pnpm test telemetry --runInBand</span></div><div><span class="ok">✓</span> usage-grouping.test.ts (14 tests)</div><div><span class="ok">✓</span> model-labels.test.ts (8 tests)</div><div>• dashboard-contract.test.ts <span style="color:var(--muted)">running…</span></div></div><div class="step-meta"><div class="meta-pair"><span>Node</span><strong>win-build-02</strong></div><div class="meta-pair"><span>Checkout</span><strong>run-187</strong></div><div class="meta-pair"><span>Model</span><strong>GPT-5.6 Sol</strong></div><button class="open-transcript" data-action="open-worker">Open full transcript ↗</button></div></div></div>
+                </article>
+                <article class="step pending" data-od-id="step-review-deep">
+                  <span class="step-node"></span><div class="step-card"><div class="step-summary"><div class="step-title"><strong>Deep review of telemetry changes</strong><small>Will run on forge-01 — same checkout as implementation</small></div><span class="category-pill review-deep">review-deep</span><span class="step-time">pending</span></div></div>
+                </article>
+              </div>
+            </div>
+            <aside class="budget-panel" data-od-id="run-budget-panel">
+              <h2>Hard budgets</h2>
+              <div class="budget-card"><div class="budget-card-head"><span>Lead wakes</span><strong>2 / 12</strong></div><div class="meter"><i style="width:17%"></i></div></div>
+              <div class="budget-card"><div class="budget-card-head"><span>Sessions spawned</span><strong>3 / 8</strong></div><div class="meter"><i style="width:38%"></i></div></div>
+              <p class="budget-note">The engine cannot exceed these limits without returning the run to you.</p>
+              <div class="machine-occupancy"><h2>Machine occupancy</h2>
+                <div class="machine-row"><span class="mini-node"></span><div><strong>win-build-02</strong><span>test · 1m 37s</span></div></div>
+                <div class="machine-row"><span class="mini-node" style="background:var(--muted)"></span><div><strong>forge-01</strong><span>checkout retained for review</span></div></div>
+                <div class="machine-row"><span class="mini-node" style="background:var(--muted)"></span><div><strong>atlas-dev</strong><span>released 8m ago</span></div></div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view" id="lead-view" data-od-id="lead-session-screen">
+          <div class="page-header">
+            <button class="icon-btn" data-nav="detail" aria-label="Back to run"><svg viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg></button>
+            <div class="page-title"><div class="eyebrow">RUN-187 · Lead audit</div><h1>Planner reasoning chain</h1><p>Wake envelopes are engine-authored; decisions are Lead-authored.</p></div>
+            <div class="header-actions"><span class="state-pill running">waiting on step</span></div>
+          </div>
+          <div class="lead-layout">
+            <div class="lead-transcript">
+              <div class="messages">
+                <div class="exchange">
+                  <div class="exchange-label">Engine wake · 01</div>
+                  <div class="wake-envelope"><div class="envelope-head"><span>objective_approved</span><time>20:21:04</time></div><div class="envelope-body"><strong>Objective:</strong> Add per-model token telemetry to the proxy dashboard.<br><strong>Authority:</strong> 3 parallel · 8 sessions · 12 wakes · workspace cursor-proxy.</div></div>
+                </div>
+                <div class="exchange">
+                  <div class="exchange-label">Lead decision</div>
+                  <div class="decision"><div class="decision-reason">I need a bounded map of the existing usage path before choosing the implementation checkout. I’ll inspect on the developer node where the dashboard is already warm.</div><div class="tool-call"><span class="tool-icon">↳</span><code>dispatch(category: "explore", node: "atlas-dev", task: "Map telemetry…")</code><span class="tool-result">accepted</span></div></div>
+                </div>
+                <div class="exchange">
+                  <div class="exchange-label">Engine wake · 02</div>
+                  <div class="wake-envelope"><div class="envelope-head"><span>step_settled · explore-01</span><time>20:23:28</time></div><div class="envelope-body"><strong>Succeeded in 2m 14s.</strong> Usage is aggregated in <code>src/usage/store.ts</code>; model ID is already available before persistence. API response is shaped in <code>routes/usage.ts</code>. No schema migration required.</div></div>
+                </div>
+                <div class="exchange">
+                  <div class="exchange-label">Lead decision</div>
+                  <div class="decision"><div class="decision-reason">The change is contained and does not require migration work. I’ll implement on forge-01, then test on the Windows build node to catch dashboard contract differences.</div><div class="tool-call"><span class="tool-icon">↳</span><code>dispatch(category: "implement", node: "forge-01", task: "Add per-model aggregation…")</code><span class="tool-result">accepted</span></div></div>
+                </div>
+                <div class="exchange">
+                  <div class="exchange-label">Engine wake · 03</div>
+                  <div class="wake-envelope"><div class="envelope-head"><span>step_settled · implement-02</span><time>20:27:10</time></div><div class="envelope-body"><strong>Succeeded in 6m 42s.</strong> Added model-keyed token counters, API fields, and dashboard labels. Changed 5 files, +118/−14. Worker reports unit tests passing on forge-01.</div></div>
+                </div>
+                <div class="exchange">
+                  <div class="exchange-label">Lead decision</div>
+                  <div class="decision"><div class="decision-reason">Worker-local tests passed, but the cross-platform dashboard contract is the risk. I’ll test on win-build-02 before dispatching a deep reviewer back onto forge-01’s physical checkout.</div><div class="tool-call"><span class="tool-icon">↳</span><code>dispatch(category: "test", node: "win-build-02", source: "implement-02")</code><span class="tool-result">running</span></div></div>
+                </div>
+              </div>
+              <form class="composer" data-od-id="lead-composer"><textarea placeholder="Interject with context or redirect the Lead…" aria-label="Message the Lead"></textarea><button class="primary-btn" type="submit">Send to Lead</button></form>
+            </div>
+            <aside class="audit-rail"><h2>Audit index</h2><div class="audit-item"><span>20:21 · WAKE 01</span><strong>Objective approved</strong></div><div class="audit-item"><span>20:21 · ACTION</span><strong>Dispatched exploration</strong></div><div class="audit-item"><span>20:23 · WAKE 02</span><strong>Exploration settled</strong></div><div class="audit-item"><span>20:23 · ACTION</span><strong>Dispatched implementation</strong></div><div class="audit-item"><span>20:27 · WAKE 03</span><strong>Implementation settled</strong></div><div class="audit-item"><span>20:27 · ACTION</span><strong>Dispatched Windows tests</strong></div></aside>
+          </div>
+        </section>
+
+        <section class="view" id="needs-view" data-od-id="needs-you-screen">
+          <div class="page-header"><button class="icon-btn" data-nav="runs" aria-label="Back to runs"><svg viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg></button><div class="page-title"><div class="eyebrow">RUN-184 · awaiting operator</div><h1>Fix the flaky auth refresh test and get it reviewed</h1></div><div class="header-actions"><button class="danger-btn">Cancel run</button></div></div>
+          <div class="blocked-page">
+            <div class="blocked-hero">
+              <section class="blocked-main">
+                <div class="blocked-banner"><div class="blocked-symbol">!</div><div><h1 data-od-id="blocked-heading">This run cannot advance without you</h1><p>The Lead used the final allowed wake after two turns that did not dispatch, finish, or escalate.</p></div></div>
+                <div class="blocked-context">
+                  <h2>What happened</h2>
+                  <div class="last-turns"><div class="last-turn"><span>WAKE 11 · review settled</span><br>Deep review found a possible race in token refresh cleanup; requested clarification.</div><div class="last-turn"><span>LEAD TURN 11 · no action</span><br>“I should inspect whether the cleanup ordering is intentional before deciding.”</div><div class="last-turn"><span>LEAD TURN 12 · no action · budget exhausted</span><br>“The reviewer’s concern may require broader context from the authentication owner.”</div></div>
+                  <div class="resolution"><label class="field-label" for="guidance">Give the Lead context or a direct instruction</label><textarea id="guidance">Treat the cleanup ordering as intentional. Ask a quick reviewer to verify only the test isolation change, then finish if clean.</textarea><div class="resolution-actions"><button class="primary-btn" data-action="resume-run">Send guidance &amp; resume</button><button class="secondary-btn">Mark run complete</button><small>Adds 1 wake · 13 of 13</small></div></div>
+                </div>
+              </section>
+              <aside class="blocked-side">
+                <div class="fact-card"><h2>Why it stopped</h2><div class="fact-row"><span>Trigger</span><strong>wake budget</strong></div><div class="fact-row"><span>Idle Lead turns</span><strong>2</strong></div><div class="fact-row"><span>Last action</span><strong>review-deep</strong></div></div>
+                <div class="fact-card"><h2>Current budget</h2><div class="fact-row"><span>Lead wakes</span><strong style="color:var(--warn)">12 / 12</strong></div><div class="fact-row"><span>Sessions</span><strong>4 / 8</strong></div><div class="fact-row"><span>Machines held</span><strong>1</strong></div></div>
+                <div class="fact-card"><h2>Other needs you</h2><div class="fact-row"><span>Permissions</span><strong>2 prompts</strong></div><div class="fact-row"><span>Blocked runs</span><strong>1 run</strong></div></div>
+              </aside>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="new-run-view" data-od-id="new-run-screen">
+          <div class="page-header"><button class="icon-btn" data-nav="runs" aria-label="Cancel new run"><svg viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></svg></button><div class="page-title"><div class="eyebrow">Approval gate</div><h1 data-od-id="new-run-heading">Authorize an orchestration run</h1><p>Approve the objective and hard limits once. The Lead handles individual dispatches.</p></div></div>
+          <div class="new-run-page">
+            <div class="new-run-wrap">
+              <form class="form-panel" id="new-run-form">
+                <div class="form-section"><h2>Objective</h2><p>Describe a finish line the Lead can verify.</p><label class="field-label" for="objective">What should this run accomplish?</label><textarea class="text-input" id="objective">Reduce the proxy dashboard usage query latency and add a regression test</textarea></div>
+                <div class="form-section"><h2>Target</h2><p>Workers may use any available node with access to this workspace.</p><label class="field-label" for="workspace">Workspace</label><select class="select-input" id="workspace"><option>cursor-proxy · 3 eligible nodes</option><option>fleet-host · 2 eligible nodes</option></select></div>
+                <div class="form-section"><h2>Hard budgets</h2><p>The engine stops and returns to you before crossing any limit.</p><div class="knob-grid">
+                  <label class="knob"><span class="knob-head"><span>Max parallel</span><output id="parallel-output">3</output></span><input type="range" min="1" max="5" value="3" data-output="parallel-output"></label>
+                  <label class="knob"><span class="knob-head"><span>Max sessions</span><output id="sessions-output">8</output></span><input type="range" min="1" max="16" value="8" data-output="sessions-output"></label>
+                  <label class="knob"><span class="knob-head"><span>Max wakes</span><output id="wakes-output">12</output></span><input type="range" min="2" max="24" value="12" data-output="wakes-output"></label>
+                </div></div>
+                <div class="form-section"><div class="authorization"><h2>You are authorizing the Lead to</h2><ul><li>Inspect and modify files in the selected workspace on eligible machines.</li><li>Spawn up to 8 worker sessions, with at most 3 running at once.</li><li>Choose worker categories, nodes, and models; reviewers stay on the implementation checkout.</li><li>Run repository-defined tests and commands within existing node permissions.</li><li>Stop and return to you if it needs more authority, budget, or human judgment.</li></ul></div><label class="approval-check"><input type="checkbox" id="approve-check"><span>I approve this objective and these limits. Individual worker dispatches do not require separate approval.</span></label></div>
+              </form>
+              <aside class="approval-side"><div class="approval-summary"><h2>Run authorization</h2><div class="fact-row"><span>Workspace</span><strong>cursor-proxy</strong></div><div class="fact-row"><span>Eligible nodes</span><strong>3 online</strong></div><div class="fact-row"><span>Parallel limit</span><strong id="summary-parallel">3</strong></div><div class="fact-row"><span>Session limit</span><strong id="summary-sessions">8</strong></div><div class="fact-row"><span>Wake limit</span><strong id="summary-wakes">12</strong></div><button class="primary-btn approve-btn" form="new-run-form" type="submit" data-od-id="approve-and-start">Approve &amp; start planning</button></div><small>No code is changed until the Lead dispatches its first worker. You can stop the run at any time; active sessions receive cancellation.</small></aside>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <div class="toast" role="status" aria-live="polite"></div>
+
+  <script>
+    const views = {
+      runs: document.getElementById('runs-view'),
+      detail: document.getElementById('detail-view'),
+      lead: document.getElementById('lead-view'),
+      needs: document.getElementById('needs-view'),
+      'new-run': document.getElementById('new-run-view')
+    };
+
+    function navigate(name) {
+      Object.values(views).forEach(view => view.classList.remove('active'));
+      views[name].classList.add('active');
+      document.querySelectorAll('.tree-row').forEach(row => row.classList.toggle('selected', name === 'runs' && row.dataset.nav === 'runs'));
+    }
+
+    document.querySelectorAll('[data-nav]').forEach(element => {
+      element.addEventListener('click', () => navigate(element.dataset.nav));
+    });
+
+    document.querySelectorAll('.step-card').forEach(card => {
+      card.addEventListener('click', event => {
+        if (event.target.closest('button')) return;
+        card.closest('.step').classList.toggle('expanded');
+      });
+    });
+
+    document.querySelectorAll('.layout-toggle button').forEach(button => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('.layout-toggle button').forEach(item => item.setAttribute('aria-pressed', 'false'));
+        button.setAttribute('aria-pressed', 'true');
+        showToast(button.getAttribute('aria-label') + ' selected');
+      });
+    });
+
+    document.querySelectorAll('.filter-btn').forEach(button => {
+      button.addEventListener('click', () => {
+        document.querySelectorAll('.filter-btn').forEach(item => item.classList.remove('active'));
+        button.classList.add('active');
+      });
+    });
+
+    document.querySelectorAll('input[type="range"]').forEach(input => {
+      input.addEventListener('input', () => {
+        document.getElementById(input.dataset.output).value = input.value;
+        const summaryId = 'summary-' + input.dataset.output.replace('-output', '');
+        document.getElementById(summaryId).textContent = input.value;
+      });
+    });
+
+    document.querySelector('.composer').addEventListener('submit', event => {
+      event.preventDefault();
+      const textarea = event.currentTarget.querySelector('textarea');
+      if (!textarea.value.trim()) return;
+      showToast('Message queued for the Lead’s next wake');
+      textarea.value = '';
+    });
+
+    document.getElementById('new-run-form').addEventListener('submit', event => {
+      event.preventDefault();
+      if (!document.getElementById('approve-check').checked) {
+        showToast('Confirm the authorization before starting');
+        document.getElementById('approve-check').focus();
+        return;
+      }
+      showToast('Run approved — Lead planning started');
+      setTimeout(() => navigate('runs'), 900);
+    });
+
+    document.querySelector('[data-action="resume-run"]').addEventListener('click', () => {
+      showToast('Guidance sent — run resumed with 1 additional wake');
+      setTimeout(() => navigate('detail'), 900);
+    });
+
+    document.querySelector('[data-action="open-worker"]').addEventListener('click', event => {
+      event.stopPropagation();
+      showToast('Worker transcript opened in the session pane');
+    });
+
+    function showToast(message) {
+      const toast = document.querySelector('.toast');
+      toast.textContent = message;
+      toast.classList.add('show');
+      clearTimeout(window.toastTimer);
+      window.toastTimer = setTimeout(() => toast.classList.remove('show'), 2200);
+    }
+  </script>
+</body>
+</html>

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import {
   envFilePath as sharedEnvFilePath,
   packageRoot as sharedPackageRoot,
+  packageVersion as sharedPackageVersion,
 } from "@fleet/protocol/runtime";
 
 /**
@@ -24,4 +25,9 @@ export function packageRoot(startDirectory = moduleDirectory()): string {
 /** Absolute path of the repo-root `.env`. */
 export function envFilePath(startDirectory = moduleDirectory()): string {
   return sharedEnvFilePath(startDirectory);
+}
+
+/** This package's semver, as `package.json` declares it. */
+export function packageVersion(startDirectory = moduleDirectory()): string {
+  return sharedPackageVersion(startDirectory);
 }

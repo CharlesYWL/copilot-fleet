@@ -1,10 +1,17 @@
 import { useMemo, type KeyboardEvent } from "react";
-import { Text, makeStyles, mergeClasses, tokens } from "@fluentui/react-components";
+import {
+  shorthands,
+  Text,
+  makeStyles,
+  mergeClasses,
+  tokens,
+} from "@fluentui/react-components";
+import { Warning16Regular } from "@fluentui/react-icons";
 import type { FleetSession, SessionEvent } from "@fleet/protocol";
-import { blockColor, terminal } from "../theme";
+import { blockColor, statusVisuals, terminal } from "../theme";
 import { toPreviewLines } from "../lib/session-preview";
 import { sessionLabel } from "../lib/session-label";
-import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
+import { sessionStatusDescriptor } from "../lib/session-status";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -13,7 +20,7 @@ import {
   toTerminalBlocks,
 } from "../lib/terminal-blocks";
 import { PermissionBanner } from "./PermissionBanner";
-import { StatusDot } from "./StatusDot";
+import { StatusIndicator } from "./StatusIndicator";
 
 const useStyles = makeStyles({
   tile: {
@@ -23,9 +30,30 @@ const useStyles = makeStyles({
     width: "100%",
     height: "220px",
     borderRadius: tokens.borderRadiusLarge,
-    border: "1px solid transparent",
+    ...shorthands.border("1px", "solid", "transparent"),
     background: terminal.background,
     overflow: "hidden",
+  },
+  /**
+   * The one tile that cannot make progress without a person.
+   *
+   * Border, surface, icon and word all at once. A tile that differed only by
+   * the colour of an 8px dot was easy to scan straight past, which is the one
+   * failure mode this state cannot have.
+   */
+  blocked: {
+    ...shorthands.borderWidth("2px"),
+    ...shorthands.borderColor(statusVisuals.attention.border),
+    background: `color-mix(in srgb, ${terminal.background} 88%, ${statusVisuals.attention.foreground} 12%)`,
+  },
+  attentionTag: {
+    flexShrink: 0,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "4px",
+    color: statusVisuals.attention.foreground,
+    fontSize: "10px",
+    fontWeight: tokens.fontWeightSemibold,
   },
   open: {
     flexGrow: 1,
@@ -52,6 +80,7 @@ const useStyles = makeStyles({
   },
   state: {
     flexShrink: 0,
+    marginLeft: "auto",
     textTransform: "uppercase",
     letterSpacing: "1px",
     fontSize: "9px",
@@ -96,6 +125,8 @@ const useStyles = makeStyles({
 type SessionTileProps = {
   session: FleetSession;
   events: SessionEvent[];
+  /** Passed in so the wall and the tile agree on what is blocked. */
+  awaitingPermission?: boolean;
   onOpen: (sessionId: string) => void;
   onPermission: (
     sessionId: string,
@@ -108,6 +139,7 @@ type SessionTileProps = {
 export const SessionTile = ({
   session,
   events,
+  awaitingPermission,
   onOpen,
   onPermission,
 }: SessionTileProps) => {
@@ -118,10 +150,8 @@ export const SessionTile = ({
     [blocks, session.lastText],
   );
   const permission = useMemo(() => pendingPermission(events), [events]);
-
-  // A waiting request outranks the run state: it is the only tile the operator
-  // has to act on, so it gets the alert colour.
-  const accent = permission ? terminal.permission : sessionAccent(session);
+  const blocked = Boolean(permission) || Boolean(awaitingPermission);
+  const descriptor = sessionStatusDescriptor(session, blocked);
 
   const handleOpen = () => onOpen(session.id);
 
@@ -138,27 +168,37 @@ export const SessionTile = ({
   };
 
   return (
-    <article className={styles.tile} style={{ borderColor: accent }}>
+    <article
+      className={mergeClasses(styles.tile, blocked && styles.blocked)}
+      style={blocked ? undefined : { borderColor: descriptor.color }}
+    >
       <div
         className={styles.open}
         role="button"
         tabIndex={0}
-        aria-label={`Open ${sessionLabel(session)} on ${session.nodeName}`}
+        aria-label={`Open ${sessionLabel(session)} on ${session.nodeName} — ${descriptor.label}`}
         title={session.initialPrompt}
         onClick={handleOpen}
         onKeyDown={handleKeyDown}
       >
         <div className={styles.head}>
-          <StatusDot state={session.state} color={accent} />
-          <span className={styles.state} style={{ color: accent }}>
-            {sessionStatusLabel(session)}
-          </span>
+          <StatusIndicator descriptor={descriptor} variant="dot" />
           <Text weight="semibold" className={styles.name}>
             {sessionLabel(session)}
           </Text>
+          {blocked ? (
+            <span className={styles.attentionTag}>
+              <Warning16Regular aria-hidden="true" />
+              needs you
+            </span>
+          ) : (
+            <span className={styles.state} style={{ color: descriptor.color }}>
+              {descriptor.shortLabel}
+            </span>
+          )}
         </div>
         <Text className={styles.subtitle}>
-          {session.nodeName} · {session.currentActivity || session.initialPrompt}
+          {session.nodeName} · {session.workspaceName}
         </Text>
         <div className={styles.preview}>
           {lines.length === 0 ? (

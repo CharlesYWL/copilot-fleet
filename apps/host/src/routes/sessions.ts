@@ -14,11 +14,7 @@ import {
   terminalSessionStates,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
-import {
-  configUnsupportedReason,
-  reservedSessionCount,
-  yoloUnsupportedReason,
-} from "../session-policy.js";
+import { configUnsupportedReason, yoloUnsupportedReason } from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
 
@@ -35,34 +31,19 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const input = CreateSessionSchema.parse(request.body);
     const placement = store.getPlacement(input.placementId);
     if (!placement) return reply.code(404).send({ error: "Placement not found" });
-    const node = store.getNode(placement.nodeId);
-    if (!node?.online) return reply.code(409).send({ error: "Node is offline" });
-    if (reservedSessionCount(store.listSessions(), node.id) >= node.maxSessions) {
-      return reply.code(409).send({ error: "Node is at capacity" });
+    const result = service.createAndStartSession({
+      placement,
+      prompt: input.prompt,
+      yolo: input.yolo ?? store.getDefaultYolo(),
+      ...(input.name === undefined ? {} : { name: input.name }),
+    });
+    if (!result.ok) {
+      return reply.code(result.status).send({
+        error: result.error,
+        ...(result.session ? { session: result.session } : {}),
+      });
     }
-    const yolo = input.yolo ?? store.getDefaultYolo();
-    const unsupported = yoloUnsupportedReason(node, yolo);
-    if (unsupported) return reply.code(409).send({ error: unsupported });
-
-    const session = store.createSession(placement, input.prompt, yolo, input.name);
-    service.publishSession(session);
-    const dispatched = service.dispatch(
-      node.id,
-      {
-        type: "start_session",
-        sessionId: session.id,
-        localPath: placement.localPath,
-        prompt: input.prompt,
-        yolo,
-      },
-      { state: "failed", activity: "Node disconnected before process start" },
-    );
-    if (!dispatched.sent) {
-      return reply
-        .code(503)
-        .send({ error: "Node disconnected", session: dispatched.session });
-    }
-    return reply.code(202).send(session);
+    return reply.code(202).send(result.session);
   });
 
   /**
@@ -171,6 +152,8 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       agentSessionId: session.agentSessionId,
       sequenceOffset: store.maxEventSequence(id),
       yolo: session.yolo,
+      // An orchestrator resumed by hand needs its tools back too.
+      mcpServers: service.mcpServersFor(session),
     });
     if (!dispatched.sent) return reply.code(503).send({ error: "Node is offline" });
     service.publishSession(

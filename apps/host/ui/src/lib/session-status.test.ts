@@ -6,6 +6,7 @@ import {
   isDisposableSession,
   isDormantSession,
   sessionAccent,
+  sessionStatusDescriptor,
   sessionStatusLabel,
 } from "./session-status";
 
@@ -27,6 +28,8 @@ const session = (values: Partial<FleetSession> & { id?: string }): FleetSession 
   yolo: false,
   commands: [],
   configOptions: [],
+  runId: "",
+  runRole: "" as const,
   ...values,
 });
 
@@ -91,5 +94,82 @@ describe("session status", () => {
     const value = spent("a");
     expect(sessionStatusLabel(value)).toBe("failed");
     expect(sessionAccent(value)).not.toBe(RESUMABLE_ACCENT);
+  });
+});
+
+describe("run-owned sessions in the session list", () => {
+  it("shows a run's workers but keeps the orchestrator out of the list", () => {
+    const mine = session({ id: "mine" });
+    const worker = session({ id: "worker", runId: "r1", runRole: "worker" });
+    const lead = session({ id: "lead", runId: "r1", runRole: "lead" });
+
+    /*
+     * This has to agree with the tree exactly. When it did not, an operator
+     * landed on a worker transcript beside "No sessions", with a Resume button
+     * that would have restarted it outside the run that owns it.
+     */
+    expect(
+      filterVisibleSessions([mine, worker, lead], undefined).map((s) => s.id),
+    ).toEqual(["mine", "worker"]);
+  });
+
+  it("still shows one that was opened from the Runs panel on purpose", () => {
+    const worker = session({ id: "worker", runId: "r1", runRole: "worker" });
+    expect(filterVisibleSessions([worker], "worker").map((s) => s.id)).toEqual([
+      "worker",
+    ]);
+  });
+});
+
+describe("sessionStatusDescriptor", () => {
+  it("puts a blocked session above a running one", () => {
+    // The session is still `running` as far as its own state machine knows;
+    // the permission lives in the event log, so it is passed in.
+    const blocked = sessionStatusDescriptor(session({ state: "running" }), true);
+    const busy = sessionStatusDescriptor(session({ state: "running" }));
+
+    expect(blocked.state).toBe("waiting-for-permission");
+    expect(blocked.priority).toBeGreaterThan(busy.priority);
+  });
+
+  it("never leaves colour as the only signal", () => {
+    // Someone who cannot separate amber from green must still be able to read
+    // every state, so each one carries a word and an icon of its own.
+    const states: SessionState[] = ["running", "idle", "failed", "completed", "offline"];
+    const seen = new Set<string>();
+    for (const state of states) {
+      const descriptor = sessionStatusDescriptor(session({ state }));
+      expect(descriptor.label).not.toBe("");
+      expect(descriptor.shortLabel).not.toBe("");
+      expect(descriptor.icon).toBeTruthy();
+      seen.add(descriptor.shortLabel);
+    }
+    expect(sessionStatusDescriptor(session({ state: "running" }), true).shortLabel).toBe(
+      "needs you",
+    );
+    expect(seen.size).toBeGreaterThan(1);
+  });
+
+  it("shows a recoverable session as resumable rather than as a casualty", () => {
+    const descriptor = sessionStatusDescriptor(dormant("a"));
+
+    expect(descriptor.shortLabel).toBe("resumable");
+    expect(descriptor.tone).toBe("attention");
+    expect(descriptor.color).toBe(RESUMABLE_ACCENT);
+  });
+
+  it("keeps a genuinely dead session looking dead", () => {
+    const descriptor = sessionStatusDescriptor(spent("a"));
+
+    expect(descriptor.state).toBe("failed");
+    expect(descriptor.tone).toBe("danger");
+  });
+
+  it("calls a session that finished cleanly done, not failed", () => {
+    expect(sessionStatusDescriptor(session({ state: "completed" })).state).toBe("done");
+  });
+
+  it("reads a starting session as running, because work is on its way", () => {
+    expect(sessionStatusDescriptor(session({ state: "starting" })).state).toBe("running");
   });
 });

@@ -3,6 +3,8 @@ import {
   errorMessage,
   type BrowserMessage,
   type NodeUpdateStage,
+  type RunStep,
+  type RunNote,
   type SessionEvent,
   type Snapshot,
 } from "@fleet/protocol";
@@ -26,6 +28,7 @@ const emptySnapshot: Snapshot = {
   workspaces: [],
   placements: [],
   sessions: [],
+  runs: [],
   hostRevision: "",
 };
 
@@ -38,6 +41,16 @@ export type NodeUpdateProgress = Record<
 export function useFleet(notify: Notify) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [events, setEvents] = useState<Record<string, SessionEvent[]>>({});
+  /**
+   * Steps per run, kept beside the snapshot rather than inside it.
+   *
+   * A snapshot carries runs so a refreshed browser has something to draw, but
+   * steps are the part that changes every few seconds, and they arrive whole
+   * per run — so they patch by run id instead of forcing a whole snapshot.
+   */
+  const [runSteps, setRunSteps] = useState<Record<string, RunStep[]>>({});
+  /** What the orchestrator wrote as each phase ended, per task. */
+  const [runNotes, setRunNotes] = useState<Record<string, RunNote[]>>({});
   const [connected, setConnected] = useState(false);
   const [nodeUpdates, setNodeUpdates] = useState<NodeUpdateProgress>({});
 
@@ -70,6 +83,19 @@ export function useFleet(notify: Notify) {
   const refresh = useCallback(async () => {
     try {
       setSnapshot(await api<Snapshot>("/api/snapshot"));
+      /*
+       * Steps come from their own endpoint, not the snapshot.
+       * They change often enough that carrying every one of them in the
+       * snapshot would bloat it, but without this a refreshed browser shows
+       * every run as "0 steps" until the next live broadcast happens to
+       * arrive — which for a finished run is never.
+       */
+      const runs = await api<{
+        stepsByRunId: Record<string, RunStep[]>;
+        notesByRunId: Record<string, RunNote[]>;
+      }>("/api/runs");
+      setRunSteps(runs.stepsByRunId ?? {});
+      setRunNotes(runs.notesByRunId ?? {});
     } catch (reason) {
       report(reason);
     }
@@ -194,6 +220,24 @@ export function useFleet(notify: Notify) {
           notifyRef.current(message.message, "error");
           return;
         }
+        if (message.type === "run") {
+          const incoming = message.run;
+          setSnapshot((value) => {
+            const known = value.runs.some((run) => run.id === incoming.id);
+            return {
+              ...value,
+              runs: known
+                ? value.runs.map((run) => (run.id === incoming.id ? incoming : run))
+                : [incoming, ...value.runs],
+            };
+          });
+          return;
+        }
+        if (message.type === "run_steps") {
+          const { runId, steps } = message;
+          setRunSteps((value) => ({ ...value, [runId]: steps }));
+          return;
+        }
         const { event } = message;
         setEvents((value) => ({
           ...value,
@@ -213,6 +257,8 @@ export function useFleet(notify: Notify) {
   return {
     snapshot,
     events,
+    runSteps,
+    runNotes,
     connected,
     nodeUpdates,
     refresh,

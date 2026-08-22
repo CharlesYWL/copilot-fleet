@@ -7,6 +7,7 @@ import {
   type SessionEvent,
 } from "@fleet/protocol";
 import type { AgentFactory, SessionAgent } from "./agents.js";
+import { resolveMcpServers } from "./mcp-endpoint.js";
 
 export type CommandResult = {
   commandId: string;
@@ -42,6 +43,11 @@ export class CommandRouter {
     private readonly validatePath: (
       path: string,
     ) => Promise<string> = validateWorkspacePath,
+    /**
+     * The Host address this node is connected on, used to rebase the MCP
+     * endpoint the Host names. Only an orchestrator is given one.
+     */
+    private readonly hostUrl: () => string = () => "",
   ) {}
 
   /**
@@ -177,6 +183,7 @@ export class CommandRouter {
           this.release(command.sessionId, slot);
         }
       };
+      const mcpServers = resolveMcpServers(command.mcpServers, this.hostUrl());
       const agent = await this.factory.start(
         command.sessionId,
         cwd,
@@ -186,8 +193,9 @@ export class CommandRouter {
               resumeAgentSessionId: command.agentSessionId,
               sequenceOffset: command.sequenceOffset,
               yolo: command.yolo,
+              mcpServers,
             }
-          : { yolo: command.yolo },
+          : { yolo: command.yolo, mcpServers },
       );
       slot.agent = agent;
       if (this.slots.get(command.sessionId) !== slot) {

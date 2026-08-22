@@ -2,7 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import type { PromptAttachment, SessionEvent } from "@fleet/protocol";
+import type { McpHttpServer, PromptAttachment, SessionEvent } from "@fleet/protocol";
 import { attachmentSummary } from "@fleet/protocol";
 import {
   configValueFor,
@@ -114,6 +114,11 @@ export type StartAgentOptions = {
   sequenceOffset?: number;
   /** Launch Copilot with --allow-all. The Host owns this decision. */
   yolo?: boolean;
+  /**
+   * MCP servers to hand this session, supplied on both `session/new` and
+   * `session/load`. Empty for every ordinary session.
+   */
+  mcpServers?: readonly McpHttpServer[];
 };
 
 export interface AgentFactory {
@@ -356,8 +361,28 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly yolo = false,
     private readonly copilotCommand = "",
     private readonly contextTier: ContextTier | undefined = undefined,
+    private readonly mcpServerConfigs: readonly McpHttpServer[] = [],
   ) {
     super(fleetSessionId, sink, sequenceOffset);
+  }
+
+  /**
+   * ACP's own MCP shape, built from the Host's.
+   *
+   * Kept as a method rather than a stored array because both `session/new` and
+   * `session/load` need it, and a resumed session that skipped it would come
+   * back with no tools at all.
+   */
+  private mcpServers(): acp.McpServer[] {
+    return this.mcpServerConfigs.map((server) => ({
+      type: "http" as const,
+      name: server.name,
+      url: server.url,
+      headers: server.headers.map((header) => ({
+        name: header.name,
+        value: header.value,
+      })),
+    }));
   }
 
   async start(cwd: string, resumeAgentSessionId?: string): Promise<void> {
@@ -437,7 +462,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           {
             sessionId: resumeAgentSessionId,
             cwd,
-            mcpServers: [],
+            mcpServers: this.mcpServers(),
           },
         );
         this.captureConfigOptions(loaded.configOptions);
@@ -449,7 +474,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
         cwd,
-        mcpServers: [],
+        mcpServers: this.mcpServers(),
       });
       this.agentSessionId = created.sessionId;
       this.captureConfigOptions(created.configOptions);
@@ -767,6 +792,7 @@ export class AcpAgentFactory implements AgentFactory {
       options.yolo ?? false,
       this.copilotCommand,
       (await this.acceptsContextTier()) ? this.contextTier : undefined,
+      options.mcpServers ?? [],
     );
     try {
       await agent.start(cwd, options.resumeAgentSessionId);

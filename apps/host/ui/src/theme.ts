@@ -55,29 +55,87 @@ export const terminal = {
   dim: "#4d576d",
 } as const;
 
+/**
+ * What a colour means, rather than where it is used.
+ *
+ * Named for the state it signals so that a session tile, a run card and a
+ * transcript block cannot drift into three shades of "roughly running". Colour
+ * is never the only channel — every consumer pairs one of these with an icon
+ * or a word — but when it is used it should be the same colour everywhere.
+ *
+ * Amber is reserved. It means a person is being waited on and nothing else, so
+ * that a screen with amber on it always has something to do.
+ */
+export const semanticColors = {
+  /** Selection, the current mode, and anything clickable that is chosen. */
+  interaction: "#6c8cff",
+  /** A person is blocked. The only interrupt colour. */
+  permission: "#f7bf61",
+  running: "#4ad6a7",
+  idle: "#6c8cff",
+  failed: "#ff6b7a",
+  completed: "#4ad6a7",
+  neutral: "#8994ab",
+  dim: "#4d576d",
+} as const;
+
+export type StatusTone = "success" | "info" | "attention" | "danger" | "neutral";
+
+/** The colour and surface each tone draws itself with. */
+export const statusVisuals: Record<
+  StatusTone,
+  { foreground: string; surface: string; border: string }
+> = {
+  success: {
+    foreground: semanticColors.running,
+    surface: "rgba(74, 214, 167, 0.10)",
+    border: "rgba(74, 214, 167, 0.45)",
+  },
+  info: {
+    foreground: semanticColors.idle,
+    surface: "rgba(108, 140, 255, 0.10)",
+    border: "rgba(108, 140, 255, 0.45)",
+  },
+  attention: {
+    foreground: semanticColors.permission,
+    surface: "rgba(247, 191, 97, 0.12)",
+    border: "rgba(247, 191, 97, 0.60)",
+  },
+  danger: {
+    foreground: semanticColors.failed,
+    surface: "rgba(255, 107, 122, 0.10)",
+    border: "rgba(255, 107, 122, 0.45)",
+  },
+  neutral: {
+    foreground: semanticColors.neutral,
+    surface: "rgba(137, 148, 171, 0.08)",
+    border: "rgba(137, 148, 171, 0.35)",
+  },
+};
+
 export const blockColor: Record<TerminalBlockKind, string> = {
   user: terminal.user,
   agent: terminal.agent,
   thought: terminal.thought,
-  tool: terminal.tool,
-  permission: terminal.permission,
+  tool: semanticColors.running,
+  permission: semanticColors.permission,
   permission_result: terminal.dim,
   turn: terminal.dim,
   state: terminal.dim,
-  error: terminal.error,
+  error: semanticColors.failed,
   system: terminal.dim,
 };
 
 export const stateAccent: Record<string, string> = {
-  queued: "#8994ab",
-  starting: "#f7bf61",
-  running: "#4ad6a7",
-  idle: "#6c8cff",
-  cancelling: "#f7bf61",
-  offline: "#ff6b7a",
-  stopped: "#ff6b7a",
-  completed: "#4ad6a7",
-  failed: "#ff6b7a",
+  queued: semanticColors.neutral,
+  starting: semanticColors.permission,
+  running: semanticColors.running,
+  idle: semanticColors.idle,
+  cancelling: semanticColors.permission,
+  offline: semanticColors.failed,
+  stopped: semanticColors.failed,
+  completed: semanticColors.completed,
+  failed: semanticColors.failed,
 };
 
 /**

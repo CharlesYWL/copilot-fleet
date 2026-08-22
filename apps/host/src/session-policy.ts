@@ -1,4 +1,5 @@
 import {
+  HOST_YOLO_CAPABILITY,
   SESSION_CONFIG_CAPABILITY,
   terminalSessionStates,
   type FleetNode,
@@ -14,7 +15,7 @@ export function yoloUnsupportedReason(
   node: Pick<FleetNode, "name" | "capabilities">,
   yolo: boolean,
 ): string | undefined {
-  if (!yolo || node.capabilities.includes("host-yolo")) return undefined;
+  if (!yolo || node.capabilities.includes(HOST_YOLO_CAPABILITY)) return undefined;
   return `Node "${node.name}" runs an older agent that cannot apply YOLO mode. Update and restart it, or turn YOLO off for this session.`;
 }
 

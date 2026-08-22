@@ -19,11 +19,14 @@ import {
   Textarea,
   makeStyles,
   mergeClasses,
+  shorthands,
   tokens,
 } from "@fluentui/react-components";
 import {
   ArrowClockwise20Regular,
+  ArrowDown16Regular,
   ArrowSwap16Regular,
+  Clock16Regular,
   Attach20Regular,
   Brain16Regular,
   Checkmark16Regular,
@@ -54,9 +57,10 @@ import {
   type SessionEvent,
   type PromptAttachment,
 } from "@fleet/protocol";
-import { blockColor, terminal } from "../theme";
+import { blockColor, semanticColors, statusVisuals, terminal } from "../theme";
 import { sessionLabel } from "../lib/session-label";
 import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
+import { transcriptNotice } from "../lib/transcript-notice";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -109,12 +113,20 @@ const useStyles = makeStyles({
     padding: "12px 18px",
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
     background: tokens.colorNeutralBackground2,
+    // Below this the name and the actions cannot share a line without one of
+    // them being squeezed into a column of single letters.
+    "@media (max-width: 700px)": {
+      flexWrap: "wrap",
+      gap: "8px",
+      padding: "10px 12px",
+    },
   },
   headerText: {
     display: "flex",
     flexDirection: "column",
     marginRight: "auto",
     minWidth: 0,
+    "@media (max-width: 700px)": { flexBasis: "100%", marginRight: 0 },
   },
   title: {
     display: "flex",
@@ -139,6 +151,9 @@ const useStyles = makeStyles({
   subtitle: {
     color: tokens.colorNeutralForeground4,
     fontSize: tokens.fontSizeBase200,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
   },
   state: {
     textTransform: "uppercase",
@@ -153,6 +168,42 @@ const useStyles = makeStyles({
     minHeight: 0,
     minWidth: 0,
   },
+  /** Floats over the stream, so appearing never shifts what is being read. */
+  noticeSlot: {
+    position: "absolute",
+    left: 0,
+    right: "28px",
+    bottom: "10px",
+    display: "flex",
+    justifyContent: "center",
+    pointerEvents: "none",
+    zIndex: 3,
+  },
+  notice: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "7px",
+    minHeight: "30px",
+    padding: "0 12px",
+    ...shorthands.border("1px", "solid", tokens.colorNeutralStroke1),
+    borderRadius: "15px",
+    background: tokens.colorNeutralBackground3,
+    color: tokens.colorNeutralForeground2,
+    fontSize: tokens.fontSizeBase200,
+    boxShadow: tokens.shadow8,
+    pointerEvents: "auto",
+  },
+  noticeAction: {
+    cursor: "pointer",
+    color: semanticColors.interaction,
+    font: "inherit",
+    ":hover": { background: tokens.colorNeutralBackground1Hover },
+  },
+  noticeStalled: {
+    ...shorthands.borderColor(statusVisuals.attention.border),
+    color: statusVisuals.attention.foreground,
+  },
+  noticeDetail: { color: tokens.colorNeutralForeground3 },
   stream: {
     flexGrow: 1,
     overflowY: "auto",
@@ -492,6 +543,11 @@ export const TerminalView = ({
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pinnedRef = useRef(true);
+  /** Mirrors `pinnedRef` for rendering; the ref is what the scroll handler reads. */
+  const [pinned, setPinned] = useState(true);
+  const [unseen, setUnseen] = useState(0);
+  const [lastEventAt, setLastEventAt] = useState(0);
+  const [tick, setTick] = useState(() => Date.now());
 
   const { prompt, attachments } = draft;
   const setPrompt = (value: string) =>
@@ -576,8 +632,42 @@ export const TerminalView = ({
 
   useEffect(() => {
     pinnedRef.current = true;
+    setPinned(true);
+    setUnseen(0);
     scrollToEnd();
   }, [session.id, scrollToEnd]);
+
+  /*
+   * How far behind the reader is, and how long the agent has been silent.
+   *
+   * Counted from events rather than blocks because a block can absorb many
+   * events into one line, and "3 new lines" should mean three things arrived.
+   */
+  useEffect(() => {
+    if (events.length === 0) return;
+    setLastEventAt(Date.now());
+    if (pinnedRef.current) {
+      setUnseen(0);
+      return;
+    }
+    setUnseen((count) => count + 1);
+  }, [events.length]);
+
+  // A clock, only while it could change the answer: a silent running session.
+  useEffect(() => {
+    const running = session.state === "running" || session.state === "starting";
+    if (!running) return;
+    const timer = setInterval(() => setTick(Date.now()), 5_000);
+    return () => clearInterval(timer);
+  }, [session.state]);
+
+  const notice = transcriptNotice({
+    session,
+    pinned,
+    unseen,
+    lastEventAt,
+    now: tick,
+  });
 
   /**
    * The composer grows with what is typed, and scrolls once it has grown enough.
@@ -736,7 +826,10 @@ export const TerminalView = ({
     const element = streamRef.current;
     if (!element) return;
     const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-    pinnedRef.current = distance < 48;
+    const atEnd = distance < 48;
+    pinnedRef.current = atEnd;
+    setPinned(atEnd);
+    if (atEnd) setUnseen(0);
     updateActivePrompt();
   };
 
@@ -884,6 +977,40 @@ export const TerminalView = ({
           )}
           {session.state === "running" && <div className={styles.working}>working…</div>}
         </div>
+        {/*
+          Floated over the stream rather than inserted into it, so appearing
+          never shifts the text someone is reading.
+        */}
+        {notice && (
+          <div className={styles.noticeSlot} aria-live="polite">
+            {notice.kind === "new-output" ? (
+              <button
+                type="button"
+                className={mergeClasses(styles.notice, styles.noticeAction)}
+                onClick={() => {
+                  pinnedRef.current = true;
+                  setPinned(true);
+                  setUnseen(0);
+                  scrollToEnd();
+                }}
+              >
+                <ArrowDown16Regular aria-hidden="true" />
+                {notice.label}
+              </button>
+            ) : (
+              <span
+                className={mergeClasses(
+                  styles.notice,
+                  notice.kind === "stalled" && styles.noticeStalled,
+                )}
+              >
+                <Clock16Regular aria-hidden="true" />
+                <strong>{notice.label}</strong>
+                <span className={styles.noticeDetail}>· {notice.detail}</span>
+              </span>
+            )}
+          </div>
+        )}
         {promptMarks.length > 0 && (
           <PromptRail
             marks={promptMarks}

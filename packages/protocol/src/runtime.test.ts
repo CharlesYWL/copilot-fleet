@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { envFilePath, packageRoot, repoRoot } from "./runtime.js";
+import { envFilePath, packageRoot, packageVersion, repoRoot } from "./runtime.js";
 
 describe("filesystem anchors", () => {
   let checkout: string;
@@ -58,5 +59,44 @@ describe("filesystem anchors", () => {
     } finally {
       rmSync(outer, { recursive: true, force: true });
     }
+  });
+
+  it("reads a version from the package a module belongs to", () => {
+    const host = join(checkout, "apps", "host");
+    writeFileSync(
+      join(host, "package.json"),
+      JSON.stringify({ name: "@fleet/host", version: "1.2.3" }),
+    );
+    // Sources and build output sit at different depths and must still agree,
+    // which is the whole reason this walks up rather than counting `../`.
+    expect(packageVersion(join(host, "src"))).toBe("1.2.3");
+    expect(packageVersion(join(host, "dist", "server"))).toBe("1.2.3");
+  });
+
+  it("answers with the workspace version, not a parent project's", () => {
+    // The checkout manifest has no version; climbing past the package would
+    // report whatever project the checkout happens to sit inside.
+    expect(packageVersion(join(checkout, "apps", "host", "src"))).toBe("0.0.0");
+  });
+
+  it("still starts when the manifest cannot be read", () => {
+    // An unknown version is a packaging problem, not a reason to refuse to run.
+    expect(packageVersion(join(checkout, "nowhere"), "unknown")).toBe("unknown");
+  });
+});
+
+describe("declared versions", () => {
+  it("reports the version its own package.json declares", async () => {
+    /*
+     * The Host and the Node each used to carry `const VERSION = "0.1.0"`, so a
+     * release meant editing five files and the two constants were the ones
+     * nobody looked at. They then disagree in silence — `/api/health` says one
+     * number, `package.json` says another, and nothing fails.
+     */
+    const here = dirname(fileURLToPath(import.meta.url));
+    const declared: { version?: string } = JSON.parse(
+      readFileSync(join(packageRoot(here), "package.json"), "utf8"),
+    );
+    expect(packageVersion(here)).toBe(declared.version);
   });
 });

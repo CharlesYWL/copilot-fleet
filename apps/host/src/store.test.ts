@@ -903,3 +903,188 @@ describe("Host backup", () => {
     expect(other.listWorkspaces()).toHaveLength(1);
   });
 });
+
+describe("FleetStore runs", () => {
+  it("creates a run that starts unapproved and unpinned", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      name: "flaky auth",
+      objective: "Fix the flaky auth refresh test",
+    });
+    expect(run.state).toBe("awaiting_approval");
+    expect(run.placementId).toBe("");
+    expect(run.settleSeq).toBe(0);
+    expect(run.policy.maxWakes).toBe(12);
+    expect(store.listRuns()).toHaveLength(1);
+    expect(store.getRun(run.id)?.objective).toBe("Fix the flaky auth refresh test");
+  });
+
+  it("reuses a row when a step key comes back, so a retry is not a second step", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      name: "r",
+      objective: "o",
+    });
+    const first = store.upsertRunStep(run.id, {
+      stepKey: "audit",
+      title: "Audit",
+      prompt: "look",
+    });
+    expect(first.attempts).toBe(1);
+    const retry = store.upsertRunStep(run.id, {
+      stepKey: "audit",
+      title: "Audit",
+      prompt: "look again",
+    });
+    expect(retry.id).toBe(first.id);
+    expect(retry.attempts).toBe(2);
+    expect(retry.prompt).toBe("look again");
+    expect(store.listRunSteps(run.id)).toHaveLength(1);
+  });
+
+  it("counts settles and wakes separately so a wake can be owed", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    const settled = store.recordRunSettle(run.id);
+    expect(settled?.settleSeq).toBe(1);
+    expect(settled?.wakeSeq).toBe(0);
+    const woken = store.recordRunWake(run.id);
+    expect(woken?.wakeSeq).toBe(1);
+  });
+
+  it("defaults run columns on sessions written before runs existed", () => {
+    const { store, placement } = setup();
+    const plain = store.createSession(placement, "hello");
+    expect(plain.runId).toBe("");
+    expect(plain.runRole).toBe("");
+    const worker = store.createSession(placement, "work", false, "", {
+      runId: "r1",
+      runRole: "worker",
+    });
+    expect(worker.runId).toBe("r1");
+    expect(worker.runRole).toBe("worker");
+  });
+
+  it("reads a policy back as it was written, not as defaults", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      name: "r",
+      objective: "o",
+      policy: { wakePolicy: "on_any_settle", maxWakes: 5 },
+    });
+    // A policy silently read as defaults turns an orchestrator's wake path off
+    // and finishes its run behind its back.
+    expect(run.policy.wakePolicy).toBe("on_any_settle");
+    expect(store.getRun(run.id)?.policy.wakePolicy).toBe("on_any_settle");
+    expect(store.getRun(run.id)?.policy.maxWakes).toBe(5);
+  });
+  it("carries runs through a backup and never restores one still believing it is live", () => {
+    const first = new FleetStore(":memory:");
+    stores.push(first);
+    const { node } = first.registerNode({
+      name: "node",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+    });
+    const workspace = first.createWorkspace("repo", "");
+    const placement = first.createPlacement(workspace.id, node.id, "C:\\repo");
+    const run = first.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    first.setRunState(run.id, "running");
+    const step = first.upsertRunStep(run.id, {
+      stepKey: "impl",
+      title: "Implement",
+      prompt: "do",
+    });
+    const session = first.createSession(placement, "work", false, "", {
+      runId: run.id,
+      runRole: "worker",
+    });
+    first.updateRunStep(step.id, { state: "starting", sessionId: session.id });
+
+    const backup = first.exportHostBackup({ enrollmentToken: "t" });
+    expect(backup.runs).toHaveLength(1);
+    expect(backup.runSteps).toHaveLength(1);
+
+    const second = new FleetStore(":memory:");
+    stores.push(second);
+    second.replaceHostBackup(backup);
+
+    // Sessions land offline on import, so a run that came back "running" would
+    // wait forever for a settle that nothing can produce.
+    expect(second.getRun(run.id)?.state).toBe("awaiting_lead");
+    expect(second.listRunSteps(run.id)[0]?.state).toBe("failed");
+  });
+
+  it("carries a task's notes and phases through a move", () => {
+    /*
+     * Notes are the orchestrator's own record of a task and phase_index is
+     * where each step belongs in it. A restore that dropped either left a live
+     * task with its steps intact and no memory of why they were run — and
+     * because run_notes references runs, omitting it from the wipe made the
+     * whole restore fail the foreign key rather than merely lose data.
+     */
+    const first = new FleetStore(":memory:");
+    stores.push(first);
+    const workspace = first.createWorkspace("repo", "");
+    const run = first.createRun({
+      workspaceId: workspace.id,
+      name: "r",
+      objective: "o",
+      phases: ["Implement", "Review"],
+    });
+    first.updateRun(run.id, { phaseIndex: 1 });
+    first.upsertRunStep(run.id, {
+      stepKey: "review",
+      title: "Review",
+      prompt: "check",
+      phaseIndex: 1,
+    });
+    first.appendRunNote(run.id, 0, "wrote the thing");
+    first.appendRunNote(run.id, 1, "looks right");
+
+    const backup = first.exportHostBackup({ enrollmentToken: "t" });
+    expect(backup.runNotes).toHaveLength(2);
+
+    const second = new FleetStore(":memory:");
+    stores.push(second);
+    // A populated target is the normal case for a restore, and run_notes there
+    // is exactly what the wipe used to trip over.
+    const other = second.createWorkspace("old", "");
+    const stale = second.createRun({
+      workspaceId: other.id,
+      name: "old",
+      objective: "o",
+    });
+    second.appendRunNote(stale.id, 0, "from before the move");
+
+    second.replaceHostBackup(backup);
+
+    expect(second.listRunNotes(run.id).map((note) => note.body)).toEqual([
+      "wrote the thing",
+      "looks right",
+    ]);
+    expect(second.listRunSteps(run.id)[0]?.phaseIndex).toBe(1);
+    expect(second.getRun(stale.id)).toBeUndefined();
+  });
+
+  it("deletes a task's notes along with it", () => {
+    // run_notes references runs, so a task that ever recorded one could not be
+    // deleted at all — the foreign key took the whole transaction with it.
+    const store = new FleetStore(":memory:");
+    stores.push(store);
+    const workspace = store.createWorkspace("repo", "");
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    store.upsertRunStep(run.id, { stepKey: "impl", title: "Implement", prompt: "do" });
+    store.appendRunNote(run.id, 0, "what happened");
+
+    expect(store.deleteRun(run.id)).toBe(true);
+    expect(store.getRun(run.id)).toBeUndefined();
+    expect(store.listRunNotes(run.id)).toEqual([]);
+  });
+});

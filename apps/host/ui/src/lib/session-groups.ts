@@ -51,6 +51,15 @@ export function groupSessionsByWorkspace(
   }
 
   for (const session of sessions) {
+    /*
+     * The orchestrator is the fleet's own surface rather than one repository's,
+     * so it lives in the Orchestration view and not under a workspace. Its
+     * workers do belong here: they are running in a real checkout on a real
+     * node, and hiding them made the tree disagree with what the fleet was
+     * actually doing. They are marked instead, so it stays clear that the
+     * engine — not the operator — is driving them.
+     */
+    if (session.runRole === "lead") continue;
     const group = ensureWorkspace(session.workspaceId, session.workspaceName);
     const nodeGroup = group.nodes.find((item) => item.nodeId === session.nodeId);
     if (nodeGroup) {

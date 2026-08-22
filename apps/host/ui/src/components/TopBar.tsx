@@ -1,18 +1,18 @@
 import {
   Button,
   Text,
-  ToggleButton,
   makeStyles,
   mergeClasses,
   tokens,
 } from "@fluentui/react-components";
 import {
-  Grid20Regular,
+  Navigation20Regular,
   SignOut20Regular,
   Speaker220Regular,
   SpeakerMute20Regular,
-  TextBulletListTree20Regular,
 } from "@fluentui/react-icons";
+import { ContextModeToggle, type ContextMode } from "./navigation/ContextModeToggle";
+import { semanticColors } from "../theme";
 
 const useStyles = makeStyles({
   bar: {
@@ -24,12 +24,21 @@ const useStyles = makeStyles({
     padding: "0 20px",
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
     background: tokens.colorNeutralBackground2,
+    "@media (max-width: 767px)": { gap: "8px", padding: "0 10px" },
+  },
+  /** The drawer handle, which only exists at widths where there is a drawer. */
+  navButton: {
+    display: "none",
+    "@media (max-width: 767px)": { display: "inline-flex" },
   },
   brand: {
     display: "flex",
     alignItems: "center",
     gap: "10px",
     marginRight: "auto",
+    // The word goes before the mode switch does; the mark still says where you
+    // are, and the switch is what the screen is for.
+    "@media (max-width: 600px)": { display: "none" },
   },
   logo: {
     width: "30px",
@@ -51,26 +60,45 @@ const useStyles = makeStyles({
     borderRadius: tokens.borderRadiusMedium,
     background: tokens.colorNeutralBackground3,
   },
+  attentionButton: {
+    display: "flex",
+    alignItems: "baseline",
+    gap: "6px",
+    minHeight: "32px",
+  },
   stats: {
     display: "flex",
     alignItems: "center",
     gap: "20px",
+    marginLeft: "auto",
+    "@media (max-width: 900px)": { gap: "10px" },
   },
   stat: {
     display: "flex",
     alignItems: "baseline",
     gap: "6px",
+    // Counts that are not about a person waiting can go; "needs you" stays.
+    "@media (max-width: 767px)": { display: "none" },
   },
   statValue: {
     fontSize: "15px",
     fontWeight: tokens.fontWeightSemibold,
   },
   warn: {
-    color: "#f7bf61",
+    color: semanticColors.permission,
   },
   caption: {
     color: tokens.colorNeutralForeground3,
     fontSize: tokens.fontSizeBase200,
+  },
+  /** The connection word is reassurance, not information; it goes first. */
+  connection: {
+    color: tokens.colorNeutralForeground3,
+    fontSize: tokens.fontSizeBase200,
+    "@media (max-width: 600px)": { display: "none" },
+  },
+  soundButton: {
+    "@media (max-width: 600px)": { display: "none" },
   },
 });
 
@@ -90,19 +118,29 @@ const Stat = ({ label, value, warn = false }: StatProps) => {
   );
 };
 
-/** Tree pairs the session list with one terminal; grid tiles every session. */
-export type LayoutMode = "tree" | "grid";
-
+/**
+ * The fleet's own header.
+ *
+ * The mode slot is contextual: what it offers depends on what the main area is
+ * showing, which is why it takes a `ContextMode` rather than a layout value.
+ * A stat that reads zero is still worth its space — an operator scanning for
+ * "is anything waiting on me" should find the answer in the same place whether
+ * it is 0 or 4.
+ */
 type TopBarProps = {
   nodesOnline: number;
   liveSessions: number;
   waitingPermissions: number;
   connected: boolean;
-  layout: LayoutMode;
-  onLayoutChange: (layout: LayoutMode) => void;
+  context: ContextMode;
   soundEnabled: boolean;
   onToggleSound: () => void;
   onSignOut: () => void;
+  /** Jumps to whatever needs a person, when anything does. */
+  onShowAttention?: (() => void) | undefined;
+  /** Only meaningful below the width where the tree becomes a drawer. */
+  onToggleNav?: (() => void) | undefined;
+  navOpen?: boolean;
 };
 
 export const TopBar = ({
@@ -110,59 +148,68 @@ export const TopBar = ({
   liveSessions,
   waitingPermissions,
   connected,
-  layout,
-  onLayoutChange,
+  context,
   soundEnabled,
   onToggleSound,
   onSignOut,
+  onShowAttention,
+  onToggleNav,
+  navOpen = false,
 }: TopBarProps) => {
   const styles = useStyles();
   return (
     <header className={styles.bar}>
+      {onToggleNav && (
+        <Button
+          appearance="subtle"
+          size="small"
+          className={styles.navButton}
+          icon={<Navigation20Regular />}
+          aria-label={navOpen ? "Close navigation" : "Open navigation"}
+          aria-expanded={navOpen}
+          onClick={onToggleNav}
+        />
+      )}
       <div className={styles.brand}>
         <div className={styles.logo} aria-hidden="true">
           CF
         </div>
         <Text weight="semibold">Copilot Fleet</Text>
       </div>
-      <div className={styles.modes} role="group" aria-label="Layout mode">
-        <ToggleButton
-          appearance="subtle"
-          size="small"
-          checked={layout === "tree"}
-          icon={<TextBulletListTree20Regular />}
-          onClick={() => onLayoutChange("tree")}
-        >
-          Tree
-        </ToggleButton>
-        <ToggleButton
-          appearance="subtle"
-          size="small"
-          checked={layout === "grid"}
-          icon={<Grid20Regular />}
-          onClick={() => onLayoutChange("grid")}
-        >
-          View
-        </ToggleButton>
-      </div>
+      <ContextModeToggle context={context} />
       <div className={styles.stats}>
         <Stat label="nodes online" value={nodesOnline} />
         <Stat label="live sessions" value={liveSessions} />
-        <Stat
-          label="permissions"
-          value={waitingPermissions}
-          warn={waitingPermissions > 0}
-        />
+        {waitingPermissions > 0 && onShowAttention ? (
+          <Button
+            appearance="subtle"
+            size="small"
+            className={styles.attentionButton}
+            onClick={onShowAttention}
+          >
+            <span className={mergeClasses(styles.statValue, styles.warn)}>
+              {waitingPermissions}
+            </span>
+            <Text className={styles.caption}>needs you</Text>
+          </Button>
+        ) : (
+          <Stat
+            label="needs you"
+            value={waitingPermissions}
+            warn={waitingPermissions > 0}
+          />
+        )}
         <Button
           appearance="subtle"
           size="small"
+          className={styles.soundButton}
           icon={soundEnabled ? <Speaker220Regular /> : <SpeakerMute20Regular />}
           title={soundEnabled ? "Mute alerts" : "Play a sound on alerts"}
           aria-label={soundEnabled ? "Mute alerts" : "Play a sound on alerts"}
           aria-pressed={soundEnabled}
           onClick={onToggleSound}
         />
-        <Text className={styles.caption}>{connected ? "live" : "reconnecting…"}</Text>
+        <Text className={styles.connection}>{connected ? "live" : "reconnecting…"}</Text>
         <Button
           appearance="subtle"
           size="small"

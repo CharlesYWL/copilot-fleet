@@ -23,6 +23,8 @@ const session = (values: Partial<FleetSession> = {}): FleetSession => ({
   agentSessionId: "acp-1",
   yolo: false,
   commands: [],
+  runId: "",
+  runRole: "",
   configOptions: [
     {
       id: "model",

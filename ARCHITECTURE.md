@@ -43,6 +43,173 @@ copilot --acp --stdio
 - **Turn**: one initial or follow-up prompt. MVP permits one active Turn per Session.
 - **SessionEvent**: ordered append-only normalized ACP output/state/tool/permission event.
 - **Permission request**: ACP request waiting for an allow-once or deny browser decision; timeout/disconnect denies it.
+- **Run**: one approved objective plus the budget it may spend. Owns its Sessions.
+- **RunStep**: one unit of a Run's work, executed by one Session on one Placement.
+
+## Orchestration
+
+A Run is an objective a human approved once, together with hard budgets. The
+Host — not a model — owns the resulting state machine, so the whole thing
+survives a restart.
+
+Two properties do most of the work:
+
+- **Propose / dispose.** Whoever plans the work only asks for a step; the Host
+  decides whether it may run, where it runs, and when it is done. A planner is
+  never trusted to report its own success.
+- **Dispatch is two-phase.** A database transaction cannot hold a WebSocket
+  send, so a step's receipt lands as `starting` before its command goes out. A
+  send that fails rolls the step back to `pending`; a Node lost before it
+  acknowledges is failed by a deadline sweep.
+
+Three rules follow from problems that only appear in production:
+
+- **`offline` means unknown.** A Host that just restarted has heard from nobody.
+  It may not settle a step, finish a Run, or wake anything until Nodes report in.
+- **Completion is two facts.** A step succeeds only on `turn_complete` _and then_
+  `idle`. `command_result{ok:true}` means the command arrived, nothing more.
+- **A Run is pinned to one Placement.** A Workspace has one Placement per Node,
+  and those are separate checkouts. Re-picking between steps is exactly what
+  would hand a reviewer a tree without the implementation in it.
+
+The parallel limit is therefore scoped to a Placement, not a Workspace: two
+writing steps may not share a checkout, but a read-only reviewer may — and must,
+or it cannot see the diff.
+
+Timeouts are the absence of events, so the Host runs a low-frequency deadline
+sweep alongside the heartbeat sweep. Every deadline is recomputed from stored
+timestamps, so nothing about it needs to survive a restart.
+
+### The orchestrator
+
+A Run can be planned by hand, or driven by an **orchestrator**: an ordinary
+Session, in a Workspace, that a human talks to and that starts other Sessions.
+
+It differs from every other Session in exactly one way — it is handed an MCP
+server on `session/new`, pointed at the Host, with a bearer token scoped to
+itself. Workers are handed none. ACP injects tools per session, so a worker is
+not denied the fleet tools; it is never given them and cannot ask for them,
+which is what keeps orchestration one level deep.
+
+The rhythm is the load-bearing part. `fleet_start_work` returns as soon as the
+receipt is written, the orchestrator ends its turn, and the engine wakes it with
+a bounded summary when the work settles — a plain prompt, not a new event type.
+So an orchestrator costs nothing between dispatching and being woken, and the
+conversation survives a restart because none of it is held in memory.
+
+One orchestrator runs many **tasks**, each its own Run with its own budget. It
+is long-lived and will be asked for unrelated things over its life, and one
+bucket for all of them meant a survey of a second repository shared a budget —
+and a checkout — with yesterday's review.
+
+A task moves through **phases** the orchestrator names when it plans one, and
+the orchestrator is what moves it: it dispatches the work for a phase, reads
+what came back, and either advances or sends more work out. That judgement is
+the job. A person is asked exactly once, at the end, when the task is handed
+over — they approve it, or send it back with a note that arrives as the
+orchestrator's next turn and is acted on rather than discussed.
+
+The phases are a list rather than an enum because how many there are is part of
+the planning. Plan / implement / review suits a change; a question wants one
+phase and a sign-off. Fixing the set would have made the orchestrator invent
+stages with no work in them to fill a shape it did not choose.
+
+While a task waits on a person nothing new is dispatched and the orchestrator
+is not woken — that would be the engine talking over the review it just asked
+for. What already happened is still recorded, though: a step that settles in
+that window is closed and its worker reclaimed, because otherwise an agent
+would hold a slot for as long as the person took to look.
+
+A message for the orchestrator is **owed, not sent**. Copilot refuses a prompt
+while a turn is in flight, and refuses it as a transcript notice rather than as
+an error the sender can see — so a route that dispatched directly had no way to
+learn its message had been dropped. Opening a task recorded one nothing had been
+told about; sending one back was worse, because leaving `awaiting_human` is what
+takes the review controls away, and with no steps left to settle no wake could
+ever be owed either. The message is therefore written on the run and handed over
+on the first tick where the lead is idle. It outranks a wake and suppresses it
+for that tick, since both are prompts and only one turn can be in flight; the
+wake stays owed in `settleSeq`. One tick sends at most one prompt per lead: a
+tick walks every run and re-reads sessions, but a lead just prompted still reads
+`idle` until the Node says otherwise, so two tasks sharing an orchestrator would
+otherwise both send and the second would be lost.
+
+A settled worker is stopped at once. `idle` means "waiting for another turn",
+not "finished", and an idle agent still reserves a slot on its node; nothing
+reclaimed one until its whole Run ended, which for a long-lived orchestrator is
+never. Three read-only errands were enough to fill a node with agents that had
+nothing left to do, and the fleet reported itself full. That is asked of the
+state rather than of the transition — a step is terminal only once, and
+anything that missed the moment would otherwise hold its slot forever. A
+follow-up after that point is refused rather than accepted, because no step is
+tracking that turn: the prompt would land, and the wake it promised could never
+come.
+
+Where a step runs is decided once, in `decidePlacement`, and recorded on the
+step. A Run pins to a checkout when it first writes to one, so later work that
+must see those changes — a reviewer above all — is sent there. That pin says
+where the changes are, not where the orchestrator lives: naming a workspace is
+how it works on something else, read-only work never takes the write lock, and
+a pin belonging to a Run that has written nothing is ignored outright.
+
+Its token is signed rather than stored: an HMAC over the session id, keyed from
+settings, so nothing about it has to survive in memory and a restart changes
+nothing. An earlier version kept hashes in a map and that was wrong in a way
+worth recording — an orchestrator its Node keeps alive never settles, so nothing
+resumes it and nothing hands it a replacement. It carried on with a token the
+restarted Host no longer knew, and Copilot's response to a server it cannot
+authenticate against is to drop that server's tools from the list entirely. The
+symptom was "the fleet tools are unavailable", three steps removed from the
+cause.
+
+Revocation is therefore the state of the session rather than the presence of a
+row: a call must resolve to a session that still exists, is still a lead, and is
+not terminal. Stopping an orchestrator takes its tools away on the next call.
+
+`session/load` takes its own server list, so an orchestrator resumed without one
+comes back unable to dispatch anything; the same config is supplied on both
+paths.
+
+The Host names only the path. Which address reaches the Host differs per Node —
+tunnel, LAN, loopback — and the Node is the one that knows, because it is
+connected on it. Left to the Host the address came from the same resolution
+enrollment uses, which prefers a public tunnel, and an agent on the Host's own
+machine would have been sent out to the internet to reach a port it was already
+talking to.
+
+## Browser UI
+
+Three destinations: the **Orchestrator**, the **sessions** it and the operator
+have started, and Settings. The orchestrator sits above the workspace tree
+rather than inside it, because it is fleet-wide — filing it under whichever
+workspace its process happens to occupy made it read as one project's tool, and
+that is the opposite of what it is.
+
+Sessions are arranged as a tree or as a wall; the orchestrator's tasks as a
+stage board, a list, or a dependency graph. These are two different levels, and
+the top bar shows whichever belongs to the current destination. Collapsing them
+into one setting is what once made switching to the wall silently drop the
+orchestrator: there was no way to be in "overview" and "orchestrator" at once.
+
+The board's four stages — planning, in progress, validation, done — are derived
+from Run state and its steps, not stored. A Run's own `phases` are named per
+task, so they cannot be columns; two tasks would disagree about what the board
+was. What is stored stays per-task, and the board reads across it.
+
+**Attention** is the one interrupt. It cannot be read from Run state alone: a
+permission belongs to a session event, and is joined to a task through the step
+that owns that session. It is the only use of amber, it sorts to the front of
+every list, and it is counted once in the top bar and beside the Orchestrator
+row.
+
+Opening a worker's transcript from a task remembers the task, so leaving is a
+return rather than a fresh navigation. Composer drafts are held above all of
+this, keyed by session, because half of what an operator does unmounts the
+terminal view.
+
+The UI does not offer a way to pause and resume a task. Nothing in the protocol
+resumes one, and a stop that looked reversible would be a lie about what the
+engine can do. Abandoning cancels and keeps the record.
 
 ## Scheduling
 
@@ -304,7 +471,7 @@ ACP support in Copilot CLI is still public preview, so protocol/package versions
 
 ## Security boundary
 
-- The browser UI and `/api` sit behind an operator password (`FLEET_OPERATOR_PASSWORD`, or one generated on first boot). Sessions are `HttpOnly`, `SameSite=Strict` cookies held in memory — a Host restart signs everyone out.
+- The browser UI and `/api` sit behind an operator password (`FLEET_OPERATOR_PASSWORD`, or one generated on first boot). Sessions are `HttpOnly`, `SameSite=Strict` cookies, signed rather than stored: the key is persisted, so a restart does not sign anyone out, and the cookie names the password it was issued under, so changing the password invalidates every one of them. They do not otherwise expire. Signing out clears the cookie and refuses it for the life of the process — the only unconditional revocation is changing the password.
 - A central `onRequest` guard covers `/api/*` and `/ws/*` so a route added later is protected by having been added at all. Unrecognised `Host`/`Origin` names are refused (DNS rebinding). Open paths are health, sign-in/out/status, and `/api/nodes/register` (enrollment token). `/ws/node` authenticates in the first frame instead.
 - A tunnel (Cloudflare, Dev Tunnels, …) forwards to the Host process on `PORT` (default 8787): `/api`, `/ws/node`, `/ws/browser`, and the built UI. It authenticates a network path, not an operator. In `npm run dev` the page you click is Vite on 5173; the tunnel does not point at that.
 - Enrollment token is exchanged once for a unique Node secret; Host stores only its hash. Node HTTP credentials reach only the catalog routes the config page relays, and a node can only place its own paths.
@@ -318,7 +485,6 @@ ACP support in Copilot CLI is still public preview, so protocol/package versions
 
 - Session migration or automatic resume after Node disconnect
 - Git clone/worktree lifecycle
-- Agent-to-agent DAGs
 - Multi-user RBAC and billing
 - Agent adapters other than Copilot CLI
 - Kubernetes/Nomad scheduling

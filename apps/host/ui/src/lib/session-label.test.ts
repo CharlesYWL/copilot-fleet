@@ -20,6 +20,8 @@ const session = (values: Partial<FleetSession>): FleetSession => ({
   yolo: false,
   commands: [],
   configOptions: [],
+  runId: "",
+  runRole: "" as const,
   ...values,
 });
 

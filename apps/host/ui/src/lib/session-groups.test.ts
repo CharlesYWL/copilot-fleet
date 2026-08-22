@@ -39,6 +39,8 @@ const session = (
   yolo: false,
   commands: [],
   configOptions: [],
+  runId: "",
+  runRole: "" as const,
   name: "",
   nodeId,
   nodeName,
@@ -163,5 +165,38 @@ describe("groupSessionsByWorkspace", () => {
     );
 
     expect(groups[0]!.nodes.map((item) => item.nodeName)).toEqual(["devbox2", "devbox1"]);
+  });
+});
+
+describe("run-owned sessions", () => {
+  it("shows a run's workers in the tree but keeps the orchestrator out", () => {
+    const mine = session("mine", "w1", "Alpha", "n1", "mac");
+    const worker: FleetSession = {
+      ...session("worker", "w1", "Alpha", "n1", "mac"),
+      runId: "r1",
+      runRole: "worker",
+    };
+    const lead: FleetSession = {
+      ...session("lead", "w1", "Alpha", "n1", "mac"),
+      runId: "r1",
+      runRole: "lead",
+    };
+
+    const groups = groupSessionsByWorkspace(
+      [mine, worker, lead],
+      [node("n1", "mac")],
+      [workspace("w1", "Alpha")],
+    );
+
+    const ids = groups.flatMap((group) =>
+      group.nodes.flatMap((item) => item.sessions.map((entry) => entry.id)),
+    );
+    /*
+     * A worker is an ordinary session on a real node in a real checkout, and
+     * hiding it made the tree disagree with what the fleet was doing. The
+     * orchestrator is the one that belongs elsewhere: it is the fleet's own
+     * surface rather than any single repository's.
+     */
+    expect(ids).toEqual(["mine", "worker"]);
   });
 });

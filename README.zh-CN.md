@@ -505,6 +505,52 @@ npm test
 提示词；**Stop** 结束进程，是终态。而 `failed` 并不是一回事：抵达过代理的会话保留着它的
 agent session id，会被作为**可恢复**提供出来；而从未走到那一步的会话就是结束了。
 
+### Run：多个会话朝一个目标
+
+把多个 agent 放到同一件事上，有两条路。
+
+**跟 orchestrator 对话。** 侧边栏第一行就是 **Orchestration**，在所有 workspace 之上——
+因为它是整个 fleet 的界面，不属于任何单个仓库。开一个，你就得到一个可以聊天的会话。
+它自己不写代码——它启动别的 agent 去写。你交代一件事，它挑机器、派一个 worker，然后
+**结束自己这一轮**。那个 worker 干完时，Host 会带着摘要把 orchestrator 叫醒，由它决定
+下一步。你让它找人 review，它会把 reviewer 派到工作实际发生的那个 checkout 上，所以
+reviewer 看得见真实改动。
+
+界面就是那段对话，旁边一条 rail 列着撒在 fleet 上的活；点某一步就进到那个 worker 的
+transcript。
+
+它从不干等，这正是重点：对话是持久的，一个跑二十分钟的 worker 期间不占任何东西，Host
+重启也不会把这条线索弄丢。
+
+orchestrator 通过 Host 暴露的 MCP 服务器够到整个 fleet，token 只对它这一个会话有效。
+worker 则完全没有工具——不是被禁用，而是从没给过——这就是编排不会嵌套的原因。
+
+**或者自己写计划。** 一个 **run** 是目标加预算，外加一份固定的步骤清单，只批准一次。
+它没有界面——那是引擎自己的夹具，只走 REST：
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/runs \
+  -H 'content-type: application/json' \
+  -d '{"workspaceId":"<id>","name":"audit","objective":"审查、修复、再跑测试"}'
+
+curl -X POST http://127.0.0.1:8787/api/runs/<runId>/plan \
+  -H 'content-type: application/json' \
+  -d '{"steps":[
+        {"stepKey":"audit","title":"Audit","prompt":"找出不稳定的测试","category":"explore"},
+        {"stepKey":"fix","title":"Fix","prompt":"修好它","category":"implement","dependsOn":["audit"]},
+        {"stepKey":"test","title":"Test","prompt":"跑一遍测试","category":"test","dependsOn":["fix"]}
+      ]}'
+
+curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
+```
+
+两条路都由 Host 执行：挑选 placement，必须先收到 `turn_complete` 再看到 `idle` 才判定
+一步成功，把整个 run 钉死在它第一次写入的那个 checkout 上，并在 run 结束时停掉仍然持有的
+会话。中途重启不会误判，因为 `offline` 被读作「未知」而不是「失败」。
+
+批准是唯一的闸门，这是有意为之：人批准的是目标和预算，之后每一次派发不再单独审批——
+真正拦住一个 run 的是预算，而不是每次都弹一个提示。
+
 ## 安全说明
 
 - 网页界面和整个 `/api` 面都在一个操作者密码之后。可以设置
