@@ -386,26 +386,44 @@ export function App() {
       body: JSON.stringify({ workspaceId: reachable.workspaceId }),
     });
     if (!created.ok) return false;
+    // Opened rather than merely created: starting a conversation and landing on
+    // a different one is the kind of thing you only notice after typing into it.
+    setOpenConversationId(created.data.session.id);
     await refresh();
     setView("orchestrator");
     return true;
   };
 
   /**
-   * The orchestrator, and the work it has out.
+   * The orchestrator conversations, newest first, and which one is open.
+   *
+   * A list rather than one session: the Host has always accepted several leads
+   * — it is only this that assumed one, by taking the first it found, so the
+   * way to start a second conversation was to stop the first.
    *
    * Read from the snapshot rather than held in state so it survives a refresh
-   * and a reconnect without a second source of truth.
+   * and a reconnect without a second source of truth. Only the *choice* of
+   * which is open is state, and it falls back rather than dangling when the
+   * chosen one ends.
    */
-  const orchestrator = useMemo(
+  const orchestrators = useMemo(
     () =>
-      snapshot.sessions.find(
-        (session) =>
-          session.runRole === "lead" && !terminalSessionStates.has(session.state),
-      ),
+      snapshot.sessions
+        .filter(
+          (session) =>
+            session.runRole === "lead" && !terminalSessionStates.has(session.state),
+        )
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     [snapshot.sessions],
   );
-  /** Every task this orchestrator is running, oldest first. */
+  const [openConversationId, setOpenConversationId] = useState<string>();
+  const orchestrator = useMemo(
+    () =>
+      orchestrators.find((session) => session.id === openConversationId) ??
+      orchestrators[0],
+    [orchestrators, openConversationId],
+  );
+  /** Every task this conversation is running, oldest first. */
   const orchestratorRuns = useMemo(
     () =>
       orchestrator
@@ -650,12 +668,18 @@ export function App() {
                     tasksAwaitingHuman(orchestratorRuns).length
                   }
                   attentionCount={orchestratorSummary.needsYou}
-                  leadSession={orchestrator}
+                  leadSessions={orchestrators}
                   waitingPermissions={waitingPermissions}
                   onSelectSession={handleSelectSession}
-                  onSelectLeadSession={() => {
-                    if (!orchestrator) return;
-                    handleSelectSession(orchestrator.id, { kind: "orchestrator" });
+                  onSelectLeadSession={(sessionId) => {
+                    // Opening a conversation is also choosing it: the task views
+                    // above it show that conversation's work, not the newest.
+                    setOpenConversationId(sessionId);
+                    handleSelectSession(sessionId, { kind: "orchestrator" });
+                    setNavOpen(false);
+                  }}
+                  onNewConversation={() => {
+                    void handleStartOrchestrator();
                     setNavOpen(false);
                   }}
                   onNewSession={() => setDialogOpen(true)}

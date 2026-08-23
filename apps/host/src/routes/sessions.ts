@@ -14,6 +14,7 @@ import {
   terminalSessionStates,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
+import { conversationTitle, isUnnamed } from "../orchestrator/conversation-title.js";
 import { configUnsupportedReason, yoloUnsupportedReason } from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
@@ -123,6 +124,25 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
         { state: "failed", activity: "Node disconnected before prompt" },
       );
       if (!dispatched.sent) return reply.code(503).send({ error: "Node disconnected" });
+      /*
+       * An orchestrator's conversation takes its name from the first thing a
+       * person says to it, so a fleet running several can tell them apart.
+       *
+       * Named from the request rather than from the reply because the request
+       * is what the person came to do, and because it is available now — a name
+       * that appears only after the model has finished would leave every new
+       * conversation anonymous for exactly as long as it is most confusing.
+       *
+       * Never overwrites a name: their own beats ours, and the second message
+       * of a conversation is not what it is about.
+       */
+      if (session.runRole === "lead" && isUnnamed(session.name)) {
+        const title = conversationTitle(input.prompt);
+        if (title) {
+          const named = store.renameSession(id, title);
+          if (named) service.publishSession(named);
+        }
+      }
       return reply.code(202).send({ ok: true });
     },
   );

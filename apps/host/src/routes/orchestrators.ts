@@ -163,6 +163,18 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       name: input.name ?? "Orchestrator",
       runId: run.id,
       runRole: "lead",
+      /*
+       * Counted against reading rather than writing, for the same reason the
+       * comment above gives: an orchestrator's job is to call tools, and it is
+       * told in as many words not to touch the checkout.
+       *
+       * This is capacity accounting, not a sandbox — it has a shell and YOLO,
+       * so it *could* write. What it will not do is contend for the tree, which
+       * is what the writing budget exists to ration. Counting it there made
+       * every conversation cost a slot that implementation work needed, and a
+       * second conversation on a small node was refused outright.
+       */
+      readOnly: true,
     });
     if (!started.ok) {
       store.deleteRun(run.id);

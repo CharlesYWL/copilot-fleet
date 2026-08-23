@@ -80,10 +80,11 @@ const tree = (
         endedCount={0}
         liveWorkCount={0}
         attentionCount={0}
-        leadSession={undefined}
+        leadSessions={[]}
         waitingPermissions={[]}
         onSelectSession={vi.fn()}
         onSelectLeadSession={vi.fn()}
+        onNewConversation={vi.fn()}
         onNewSession={vi.fn()}
         onSelectView={vi.fn()}
         onClearEnded={vi.fn()}
@@ -155,9 +156,9 @@ describe("Sidebar folding", () => {
 });
 
 describe("Sidebar orchestrator row", () => {
-  const lead = (): FleetSession => ({
-    ...session("lead1", "w1", "n1", "idle"),
-    name: "Orchestrator",
+  const lead = (id = "lead1", name = "Orchestrator"): FleetSession => ({
+    ...session(id, "w1", "n1", "idle"),
+    name,
     runRole: "lead",
   });
 
@@ -166,9 +167,9 @@ describe("Sidebar orchestrator row", () => {
      * The orchestrator is fleet-wide. Filing it under whichever workspace its
      * process happens to run in would make it look like one project's tool.
      */
-    show([placement], [session("s1", "w1", "n1")], { leadSession: lead() });
+    show([placement], [session("s1", "w1", "n1")], { leadSessions: [lead()] });
 
-    const row = screen.getByRole("button", { name: /Orchestrator/ });
+    const row = screen.getByRole("button", { name: /^Orchestrator$/ });
     const workspaceRow = screen.getByTitle(/^repo — drag/i);
     expect(
       row.compareDocumentPosition(workspaceRow) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -186,20 +187,41 @@ describe("Sidebar orchestrator row", () => {
     expect(onSelectSession).not.toHaveBeenCalled();
   });
 
-  it("shows the lead's conversation as its own row under the orchestrator", () => {
+  it("lists every conversation, not just the one that started first", () => {
+    /*
+     * The Host has always run as many orchestrator conversations as you open.
+     * The UI took the first it found, which is why the only way to start a
+     * second was to stop the first.
+     */
     const onSelectLeadSession = vi.fn();
     show([placement], [session("s1", "w1", "n1")], {
-      leadSession: lead(),
+      leadSessions: [lead("lead1", "Rate limiting"), lead("lead2", "Audit the auth")],
       onSelectLeadSession,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /Conversation/ }));
-    expect(onSelectLeadSession).toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /Audit the auth/ }));
+
+    expect(onSelectLeadSession).toHaveBeenCalledWith("lead2");
+  });
+
+  it("offers a way to start another conversation once one exists", () => {
+    const onNewConversation = vi.fn();
+    show([placement], [session("s1", "w1", "n1")], {
+      leadSessions: [lead()],
+      onNewConversation,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /New conversation/ }));
+
+    expect(onNewConversation).toHaveBeenCalled();
   });
 
   it("offers no conversation row when no orchestrator is running", () => {
-    show([placement], [session("s1", "w1", "n1")], { leadSession: undefined });
-    expect(screen.queryByRole("button", { name: /Conversation/ })).toBeNull();
+    // And no "new conversation" either: there is nothing to add one to yet,
+    // and starting the first one is what the orchestrator page is for.
+    show([placement], [session("s1", "w1", "n1")], { leadSessions: [] });
+
+    expect(screen.queryByRole("button", { name: /New conversation/ })).toBeNull();
   });
 
   it("counts what is waiting on a person beside the orchestrator", () => {

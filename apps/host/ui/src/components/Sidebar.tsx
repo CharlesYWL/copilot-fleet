@@ -263,11 +263,19 @@ type SidebarProps = {
   liveWorkCount: number;
   /** Tasks waiting on a person; drawn separately because amber means act. */
   attentionCount: number;
-  /** The lead, when one is running, so its conversation gets its own row. */
-  leadSession: FleetSession | undefined;
+  /**
+   * The orchestrator's conversations, newest first.
+   *
+   * Plural because the Host runs as many as you open: each is a thread you talk
+   * to, with its own tasks under it, and they are listed here for the same
+   * reason a chat app lists them — you pick one up, not "the" one.
+   */
+  leadSessions: readonly FleetSession[];
   waitingPermissions: readonly SessionEvent[];
   onSelectSession: (sessionId: string) => void;
-  onSelectLeadSession: () => void;
+  onSelectLeadSession: (sessionId: string) => void;
+  /** Starts another conversation with the orchestrator. */
+  onNewConversation: () => void;
   onNewSession: () => void;
   onSelectView: (view: Exclude<AppView, "session" | "overview">) => void;
   onClearEnded: () => void;
@@ -283,10 +291,11 @@ export const Sidebar = ({
   endedCount,
   liveWorkCount,
   attentionCount,
-  leadSession,
+  leadSessions,
   waitingPermissions,
   onSelectSession,
   onSelectLeadSession,
+  onNewConversation,
   onNewSession,
   onSelectView,
   onClearEnded,
@@ -392,35 +401,42 @@ export const Sidebar = ({
           )}
         </button>
         {/*
-          The lead's conversation belongs to the orchestrator, not to the
-          workspace its process happens to run in. It is filtered out of the
-          session tree for the same reason, so this is its only way in.
+          A conversation belongs to the orchestrator, not to the workspace its
+          process happens to run in. They are filtered out of the session tree
+          for the same reason, so these are their only way in.
         */}
-        {leadSession && (
+        {leadSessions.map((lead) => {
+          const open = view === "session" && selectedSessionId === lead.id;
+          return (
+            <button
+              key={lead.id}
+              type="button"
+              className={mergeClasses(styles.leadRow, open && styles.orchestrationActive)}
+              aria-current={open ? "page" : undefined}
+              title={sessionLabel(lead)}
+              onClick={() => onSelectLeadSession(lead.id)}
+            >
+              <Chat20Regular aria-hidden="true" />
+              <span className={styles.orchestrationLabel}>{sessionLabel(lead)}</span>
+              <StatusIndicator
+                descriptor={sessionStatusDescriptor(
+                  lead,
+                  waitingPermissions.some((event) => event.sessionId === lead.id),
+                )}
+                variant="dot"
+              />
+            </button>
+          );
+        })}
+        {leadSessions.length > 0 && (
           <button
             type="button"
-            className={mergeClasses(
-              styles.leadRow,
-              view === "session" &&
-                selectedSessionId === leadSession.id &&
-                styles.orchestrationActive,
-            )}
-            aria-current={
-              view === "session" && selectedSessionId === leadSession.id
-                ? "page"
-                : undefined
-            }
-            onClick={onSelectLeadSession}
+            className={styles.leadRow}
+            title="Start another conversation with the orchestrator"
+            onClick={onNewConversation}
           >
-            <Chat20Regular aria-hidden="true" />
-            <span className={styles.orchestrationLabel}>Conversation</span>
-            <StatusIndicator
-              descriptor={sessionStatusDescriptor(
-                leadSession,
-                waitingPermissions.some((event) => event.sessionId === leadSession.id),
-              )}
-              variant="dot"
-            />
+            <Add20Regular aria-hidden="true" />
+            <span className={styles.orchestrationLabel}>New conversation</span>
           </button>
         )}
         <Text as="span" className={styles.sectionLabel}>
