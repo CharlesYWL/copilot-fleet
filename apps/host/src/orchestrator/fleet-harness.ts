@@ -63,12 +63,14 @@ export function fleet(): { store: FleetStore; service: FleetService; leadId: str
     "Orchestrator",
     { runRole: "lead" },
   );
-  const run = store.createRun({
-    workspaceId: first.id,
-    name: "General",
-    objective: "general",
-    policy: { wakePolicy: "on_any_settle" },
-  });
-  store.updateRun(run.id, { leadSessionId: lead.id, state: "running" });
+  /*
+   * No task, which is how a real conversation starts.
+   *
+   * This used to seed one called "General", copying what the Host did then. It
+   * no longer does either, and a harness that kept the fixture would be the
+   * only place the old shape still existed — which is precisely where a
+   * regression hides: every test would exercise "a lead that already has a
+   * task" and none would exercise the first call of a fresh one.
+   */
   return { store, service, leadId: lead.id };
 }

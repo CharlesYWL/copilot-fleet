@@ -11,13 +11,13 @@ const CreateOrchestratorSchema = z.object({
   /** Where its workers run. The orchestrator itself only talks. */
   workspaceId: z.string().min(1),
   name: z.string().min(1).max(80).optional(),
-  policy: z
-    .object({
-      maxParallel: z.number().int().positive().max(10).optional(),
-      maxSessions: z.number().int().positive().max(50).optional(),
-      maxWakes: z.number().int().positive().max(100).optional(),
-    })
-    .optional(),
+  /*
+   * No budgets here any more.
+   *
+   * They used to seed the conversation's "General" task, which every later task
+   * then copied its policy from. With no such task there is nothing to seed and
+   * nothing to copy: each task takes the defaults. Nobody ever sent this field.
+   */
 });
 
 const ReviewSchema = z.object({
@@ -105,10 +105,18 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (!workspace) return reply.code(404).send({ error: "Workspace not found" });
 
     /*
-     * The orchestrator runs on a machine that can reach this workspace, which
-     * is also where its workers will run. It is given a placement because every
-     * session needs a working directory, not because it should edit anything —
-     * its instructions tell it to dispatch rather than to write.
+     * A conversation starts with no tasks at all.
+     *
+     * It used to open with one called "General", so that work could be
+     * dispatched without naming a task first. That stopped paying for itself
+     * twice over: nothing can be dispatched into an unplanned task any more,
+     * since planning is where success criteria are written; and once a fleet
+     * could hold several conversations, each contributed an identical empty
+     * card to a board whose job is to show what the fleet is doing.
+     *
+     * So the lead carries no `runId`, and its tasks are found by their own
+     * `leadSessionId` — which is what every path here already used to find
+     * them.
      */
     const placements = store
       .listPlacements()
@@ -121,21 +129,12 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       });
     }
 
-    const run = store.createRun({
-      workspaceId: input.workspaceId,
-      // The first task, so an orchestrator can be given work without having to
-      // name one. Anything unrelated gets a task of its own.
-      name: "General",
-      objective: `Interactive orchestration of ${workspace.name}`,
-      policy: {
-        ...input.policy,
-        // The wake path is the whole point of this session: a settled worker
-        // must come back to it, which the handwritten-DAG fixture never does.
-        wakePolicy: "on_any_settle",
-        onStepFailure: "wake",
-      },
-    });
-
+    /*
+     * The orchestrator runs on a machine that can reach this workspace, which
+     * is also where its workers will run. It is given a placement because every
+     * session needs a working directory, not because it should edit anything —
+     * its instructions tell it to dispatch rather than to write.
+     */
     const started = service.createAndStartSession({
       placement,
       /*
@@ -161,34 +160,21 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
        */
       yolo: true,
       name: input.name ?? "Orchestrator",
-      runId: run.id,
       runRole: "lead",
       /*
-       * Counted against reading rather than writing, for the same reason the
-       * comment above gives: an orchestrator's job is to call tools, and it is
-       * told in as many words not to touch the checkout.
-       *
-       * This is capacity accounting, not a sandbox — it has a shell and YOLO,
-       * so it *could* write. What it will not do is contend for the tree, which
-       * is what the writing budget exists to ration. Counting it there made
-       * every conversation cost a slot that implementation work needed, and a
-       * second conversation on a small node was refused outright.
+       * Counted against reading rather than writing: an orchestrator's job is
+       * to call tools, and it is told in as many words not to touch the
+       * checkout. This is capacity accounting, not a sandbox — it has a shell
+       * and YOLO, so it *could* write. What it will not do is contend for the
+       * tree, which is what the writing budget exists to ration.
        */
       readOnly: true,
     });
     if (!started.ok) {
-      store.deleteRun(run.id);
       return reply.code(started.status).send({ error: started.error });
     }
 
-    // Recorded after the session exists, because the token is minted against
-    // its id and the run has to be able to find its way back to it.
-    const linked = store.updateRun(run.id, {
-      leadSessionId: started.session.id,
-      state: "running",
-    })!;
-    service.publishRun(linked);
-    return reply.code(201).send({ session: started.session, run: linked });
+    return reply.code(201).send({ session: started.session });
   });
 
   /**

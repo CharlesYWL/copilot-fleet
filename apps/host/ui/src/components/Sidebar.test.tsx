@@ -238,6 +238,37 @@ describe("Sidebar orchestrator row", () => {
     expect(screen.getByTitle(long).tagName).toBe("BUTTON");
   });
 
+  it("folds the conversations away, and the row still says only its own name", () => {
+    /*
+     * Two controls side by side rather than one inside the other. The first
+     * attempt nested the disclosure inside the row's button — invalid, and it
+     * left the row announcing itself as "Hide conversations Orchestrator", so
+     * the name assertion here is the part that matters.
+     */
+    show([placement], [session("s1", "w1", "n1")], {
+      leadSessions: [lead("lead1", "Rate limiting")],
+    });
+
+    expect(screen.getByRole("button", { name: "Orchestrator" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Rate limiting/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide conversations" }));
+
+    expect(screen.queryByRole("button", { name: /Rate limiting/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /New conversation/ })).toBeNull();
+    // The board is still one click away with the list folded.
+    expect(screen.getByRole("button", { name: "Orchestrator" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show conversations" }));
+    expect(screen.getByRole("button", { name: /Rate limiting/ })).toBeTruthy();
+  });
+
+  it("offers nothing to fold when there are no conversations", () => {
+    show([placement], [session("s1", "w1", "n1")], { leadSessions: [] });
+
+    expect(screen.queryByRole("button", { name: /conversations/ })).toBeNull();
+  });
+
   it("offers no conversation row when no orchestrator is running", () => {
     // And no "new conversation" either: there is nothing to add one to yet,
     // and starting the first one is what the orchestrator page is for.

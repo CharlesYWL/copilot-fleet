@@ -20,6 +20,8 @@ import {
 } from "@fluentui/react-components";
 import {
   Add20Regular,
+  ChevronDown20Regular,
+  ChevronRight20Regular,
   Delete20Regular,
   Chat20Regular,
   Flow16Regular,
@@ -183,21 +185,39 @@ const useStyles = makeStyles({
     justifyContent: "flex-start",
   },
   /** The one row that is not a workspace, so it is styled as its own thing. */
+  /**
+   * The row that holds the fold control and the link into the board.
+   *
+   * The frame lives here rather than on either control, because they are two
+   * buttons — one inside the other is invalid, and it made the row announce
+   * itself as "Hide conversations Orchestrator".
+   */
+  orchestrationRow: {
+    display: "flex",
+    alignItems: "center",
+    gap: "2px",
+    width: "100%",
+    marginBottom: "4px",
+    paddingLeft: "6px",
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: tokens.borderRadiusMedium,
+    background: "transparent",
+    ":hover": { background: tokens.colorNeutralBackground3 },
+  },
   orchestration: {
     display: "flex",
     alignItems: "center",
     gap: "8px",
-    width: "100%",
-    padding: "8px 10px",
-    marginBottom: "4px",
-    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    flexGrow: 1,
+    minWidth: 0,
+    padding: "8px 10px 8px 4px",
+    ...shorthands.borderStyle("none"),
     borderRadius: tokens.borderRadiusMedium,
     background: "transparent",
     color: tokens.colorNeutralForeground1,
     font: "inherit",
     textAlign: "left",
     cursor: "pointer",
-    ":hover": { background: tokens.colorNeutralBackground3 },
   },
   orchestrationActive: {
     background: tokens.colorNeutralBackground3,
@@ -206,6 +226,24 @@ const useStyles = makeStyles({
     borderRightColor: tokens.colorBrandStroke1,
     borderBottomColor: tokens.colorBrandStroke1,
     borderLeftColor: tokens.colorBrandStroke1,
+  },
+  /** The fold control, sized to the tree's own chevrons so the rows line up. */
+  disclosure: {
+    flexShrink: 0,
+    display: "grid",
+    placeItems: "center",
+    width: "20px",
+    height: "20px",
+    ...shorthands.borderStyle("none"),
+    borderRadius: tokens.borderRadiusSmall,
+    background: "transparent",
+    color: tokens.colorNeutralForeground3,
+    cursor: "pointer",
+    "> svg": { fontSize: "16px" },
+    ":hover": {
+      background: tokens.colorNeutralBackground1Hover,
+      color: tokens.colorNeutralForeground1,
+    },
   },
   orchestrationLabel: {
     flexGrow: 1,
@@ -316,6 +354,13 @@ export const Sidebar = ({
 }: SidebarProps) => {
   const styles = useStyles();
   const [closedItems, setClosedItems] = useState<ReadonlySet<string>>(new Set());
+  /*
+   * Conversations fold away like a workspace's sessions do, and for the same
+   * reason: this list grows with use, and it sits above everything else in the
+   * sidebar. Open by default and remembered only when closed, so a fleet with
+   * one conversation never has to open anything.
+   */
+  const [conversationsClosed, setConversationsClosed] = useState(false);
   const [dropTarget, setDropTarget] = useState<{ key: string; edge: DropEdge }>();
   const { updatePlacement, reorderPlacements, reorderWorkspaces, reorderSessions } =
     useCatalog();
@@ -390,59 +435,90 @@ export const Sidebar = ({
           has out on every machine — so nesting it under a repository would
           both bury it and imply it belongs to that repository.
         */}
-        <button
-          type="button"
+        {/*
+          Two controls, side by side, rather than one inside the other: a
+          button nested in a button is invalid, and the outer row ended up
+          announcing itself as "Hide conversations Orchestrator".
+        */}
+        <div
           className={mergeClasses(
-            styles.orchestration,
+            styles.orchestrationRow,
             (view === "orchestrator" || view === "orchestrator-task") &&
               styles.orchestrationActive,
           )}
-          aria-current={view === "orchestrator" ? "page" : undefined}
-          onClick={() => onSelectView("orchestrator")}
         >
-          <Flow20Regular aria-hidden="true" />
-          <span className={styles.orchestrationLabel}>Orchestrator</span>
-          {attentionCount > 0 && (
-            <span
-              className={styles.attentionBadge}
-              title={`${attentionCount} waiting for you`}
+          {leadSessions.length > 0 && (
+            <button
+              type="button"
+              className={styles.disclosure}
+              aria-expanded={!conversationsClosed}
+              aria-label={
+                conversationsClosed ? "Show conversations" : "Hide conversations"
+              }
+              title={conversationsClosed ? "Show conversations" : "Hide conversations"}
+              onClick={() => setConversationsClosed((closed) => !closed)}
             >
-              {attentionCount}
-            </span>
+              {conversationsClosed ? (
+                <ChevronRight20Regular aria-hidden="true" />
+              ) : (
+                <ChevronDown20Regular aria-hidden="true" />
+              )}
+            </button>
           )}
-          {liveWorkCount > 0 && (
-            <span className={styles.orchestrationCount}>{liveWorkCount}</span>
-          )}
-        </button>
+          <button
+            type="button"
+            className={styles.orchestration}
+            aria-current={view === "orchestrator" ? "page" : undefined}
+            onClick={() => onSelectView("orchestrator")}
+          >
+            <Flow20Regular aria-hidden="true" />
+            <span className={styles.orchestrationLabel}>Orchestrator</span>
+            {attentionCount > 0 && (
+              <span
+                className={styles.attentionBadge}
+                title={`${attentionCount} waiting for you`}
+              >
+                {attentionCount}
+              </span>
+            )}
+            {liveWorkCount > 0 && (
+              <span className={styles.orchestrationCount}>{liveWorkCount}</span>
+            )}
+          </button>
+        </div>
         {/*
           A conversation belongs to the orchestrator, not to the workspace its
           process happens to run in. They are filtered out of the session tree
           for the same reason, so these are their only way in.
         */}
-        {leadSessions.map((lead) => {
-          const open = view === "session" && selectedSessionId === lead.id;
-          return (
-            <button
-              key={lead.id}
-              type="button"
-              className={mergeClasses(styles.leadRow, open && styles.orchestrationActive)}
-              aria-current={open ? "page" : undefined}
-              title={sessionLabel(lead)}
-              onClick={() => onSelectLeadSession(lead.id)}
-            >
-              <Chat20Regular aria-hidden="true" />
-              <span className={styles.orchestrationLabel}>{sessionLabel(lead)}</span>
-              <StatusIndicator
-                descriptor={sessionStatusDescriptor(
-                  lead,
-                  waitingPermissions.some((event) => event.sessionId === lead.id),
+        {!conversationsClosed &&
+          leadSessions.map((lead) => {
+            const open = view === "session" && selectedSessionId === lead.id;
+            return (
+              <button
+                key={lead.id}
+                type="button"
+                className={mergeClasses(
+                  styles.leadRow,
+                  open && styles.orchestrationActive,
                 )}
-                variant="dot"
-              />
-            </button>
-          );
-        })}
-        {leadSessions.length > 0 && (
+                aria-current={open ? "page" : undefined}
+                title={sessionLabel(lead)}
+                onClick={() => onSelectLeadSession(lead.id)}
+              >
+                <Chat20Regular aria-hidden="true" />
+                <span className={styles.orchestrationLabel}>{sessionLabel(lead)}</span>
+                <StatusIndicator
+                  descriptor={sessionStatusDescriptor(
+                    lead,
+                    waitingPermissions.some((event) => event.sessionId === lead.id),
+                  )}
+                  variant="dot"
+                />
+              </button>
+            );
+          })}
+        {leadSessions.length > 0 && !conversationsClosed && (
           <button
             type="button"
             className={styles.leadRow}

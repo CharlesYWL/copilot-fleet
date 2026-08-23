@@ -423,16 +423,21 @@ export function App() {
       orchestrators[0],
     [orchestrators, openConversationId],
   );
-  /** Every task this conversation is running, oldest first. */
-  const orchestratorRuns = useMemo(
-    () =>
-      orchestrator
-        ? snapshot.runs
-            .filter((run) => run.leadSessionId === orchestrator.id)
-            .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
-        : [],
-    [snapshot.runs, orchestrator],
-  );
+  /**
+   * Every task any live conversation is running, oldest first.
+   *
+   * Across all of them, not just the open one. The orchestrator page is the
+   * fleet's board — its own row in the sidebar, separate from the conversation
+   * rows — so it answers "what is the fleet doing", and filtering it to one
+   * conversation made work invisible the moment a second conversation existed
+   * and became the one you happened to be looking at.
+   */
+  const orchestratorRuns = useMemo(() => {
+    const live = new Set(orchestrators.map((session) => session.id));
+    return snapshot.runs
+      .filter((run) => live.has(run.leadSessionId))
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }, [snapshot.runs, orchestrators]);
   const orchestratorSteps = useMemo(
     () => orchestratorRuns.flatMap((run) => runSteps[run.id] ?? []),
     [orchestratorRuns, runSteps],
@@ -727,12 +732,17 @@ export function App() {
                   notes={runNotes[selectedRunModel.run.id] ?? noNotes}
                   sessions={snapshot.sessions}
                   onBack={() => setView("orchestrator")}
-                  onOpenLead={() =>
-                    handleSelectSession(orchestrator.id, {
+                  onOpenLead={() => {
+                    // The conversation that owns this task, not whichever one
+                    // happens to be open: on a board that shows every
+                    // conversation's work, those are routinely different.
+                    const owner = selectedRunModel.run.leadSessionId;
+                    setOpenConversationId(owner);
+                    handleSelectSession(owner, {
                       kind: "orchestrator-task",
                       runId: selectedRunModel.run.id,
-                    })
-                  }
+                    });
+                  }}
                   onOpenWorker={(sessionId) =>
                     handleSelectSession(sessionId, {
                       kind: "orchestrator-task",

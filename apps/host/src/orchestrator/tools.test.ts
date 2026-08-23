@@ -58,7 +58,7 @@ describe("FleetTools", () => {
       verify: "print the file and quote the lines you mean",
       context: "the person already looked in the repo root and found nothing",
     });
-    const step = store.listRunSteps(tasks()[1]!.id)[0]!;
+    const step = store.listRunSteps(tasks()[0]!.id)[0]!;
 
     expect(step.prompt).toContain("TASK: Find the config");
     expect(step.prompt).toContain("DELIVERABLE\nthe path of the config file");
@@ -71,7 +71,7 @@ describe("FleetTools", () => {
 
   it("leaves out the context heading when there is nothing to say under it", () => {
     start({ task: "Explore Beta" });
-    const step = store.listRunSteps(tasks()[1]!.id)[0]!;
+    const step = store.listRunSteps(tasks()[0]!.id)[0]!;
 
     expect(step.prompt).not.toContain("CONTEXT");
     expect(step.prompt).toContain("VERIFY");
@@ -81,26 +81,53 @@ describe("FleetTools", () => {
     const result = start({ task: "Explore Beta" });
     expect(result.text).toContain("Explore Beta");
     expect(result.ok).toBe(true);
-    expect(tasks().map((run) => run.name)).toEqual(["General", "Explore Beta"]);
-    // One step each, rather than both spending the same task's allowance.
+    expect(tasks().map((run) => run.name)).toEqual(["Explore Beta"]);
+    expect(store.listRunSteps(tasks()[0]!.id)).toHaveLength(1);
+
+    // A second name is a second task, rather than more work in the first: they
+    // are unrelated, and sharing a budget and a checkout would say otherwise.
+    start({ task: "Audit Alpha", workspace: "Alpha" });
+    expect(tasks().map((run) => run.name)).toEqual(["Explore Beta", "Audit Alpha"]);
+    expect(store.listRunSteps(tasks()[0]!.id)).toHaveLength(1);
     expect(store.listRunSteps(tasks()[1]!.id)).toHaveLength(1);
-    expect(store.listRunSteps(tasks()[0]!.id)).toHaveLength(0);
+  });
+
+  it("has no task at all until one is opened", () => {
+    /*
+     * A conversation used to start with one called "General" so that work could
+     * go out without naming a task. Nothing can be dispatched into an unplanned
+     * task any more — planning is where success criteria are written — so the
+     * placeholder only added an empty card per conversation to the board.
+     */
+    expect(tasks()).toEqual([]);
+
+    const result = tools().startWork({
+      category: "explore",
+      title: "look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      verify: "list the directory and say what you saw",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("no task yet");
+    expect(tasks()).toEqual([]);
   });
 
   it("adds to a task that already exists instead of opening a second one", () => {
     start({ task: "Explore Beta" });
     start({ task: "explore beta", title: "look again" });
 
-    expect(tasks()).toHaveLength(2);
-    expect(store.listRunSteps(tasks()[1]!.id)).toHaveLength(2);
+    expect(tasks()).toHaveLength(1);
+    expect(store.listRunSteps(tasks()[0]!.id)).toHaveLength(2);
   });
 
   it("continues the most recent task when none is named", () => {
     start({ task: "Explore Beta" });
     start({ title: "and again" });
 
-    expect(tasks()).toHaveLength(2);
-    expect(store.listRunSteps(tasks()[1]!.id)).toHaveLength(2);
+    expect(tasks()).toHaveLength(1);
+    expect(store.listRunSteps(tasks()[0]!.id)).toHaveLength(2);
   });
 
   it("sends work to the workspace it was told to, not the run's own", () => {
@@ -112,6 +139,10 @@ describe("FleetTools", () => {
   });
 
   it("says which workspaces exist when the named one does not", () => {
+    // Needs a task first: without one there is nothing to dispatch into, and
+    // that refusal comes before the workspace is even looked at.
+    start({ task: "Explore Beta" });
+
     const result = start({ workspace: "Gamma" });
 
     expect(result.ok).toBe(false);
