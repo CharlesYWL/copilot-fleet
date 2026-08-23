@@ -19,6 +19,7 @@ import {
   type NodeCommand,
   type NodeUpdateStage,
   type Placement,
+  type StartupConfig,
   type Run,
   type RunRole,
   type RunStep,
@@ -299,6 +300,7 @@ export class FleetService {
         yolo: input.yolo,
         mcpServers: this.mcpServersFor(session),
         agent: this.agentFor(session, node),
+        config: this.startupConfigFor(session),
         readOnly: session.readOnly,
       },
       { state: "failed", activity: "Node disconnected before process start" },
@@ -354,6 +356,36 @@ export class FleetService {
     return node.agents.some((agent) => agent.name === ORCHESTRATOR_AGENT)
       ? ORCHESTRATOR_AGENT
       : "";
+  }
+
+  /**
+   * The pickers a session should start on.
+   *
+   * Two different kinds of setting, deliberately in one place because they are
+   * applied in one window — after the session exists, before it is prompted.
+   *
+   * **Mode is not a preference for a session the fleet drives.** Copilot's
+   * autopilot keeps working until it calls `task_complete`, and plan mode
+   * produces a plan instead of acting; both contradict the contract every fleet
+   * session runs under, which is to take one turn and stop. An orchestrator put
+   * into autopilot has nothing to do between wakes and spends the difference
+   * looping on a tool that cannot end a turn nobody started. So the fleet owns
+   * it for its own sessions, the same way it owns permissions.
+   *
+   * **Model and effort are a preference**, so they are only sent when someone
+   * has expressed one, and a machine that cannot honour them says so and
+   * carries on.
+   */
+  startupConfigFor(session: Pick<FleetSession, "runRole">): StartupConfig[] {
+    const config: StartupConfig[] = [];
+    if (session.runRole === "lead" || session.runRole === "worker") {
+      config.push({ id: "mode", value: "agent" });
+    }
+    const model = this.store.getDefaultModel();
+    if (model) config.push({ id: "model", value: model });
+    const effort = this.store.getDefaultReasoningEffort();
+    if (effort) config.push({ id: "reasoning_effort", value: effort });
+    return config;
   }
 
   /**
@@ -638,6 +670,7 @@ export class FleetService {
         // still be beneath the session; a scratch directory is exactly where
         // something else may have cleaned up while this node was away.
         agent: this.agentFor(session, node),
+        config: this.startupConfigFor(session),
         readOnly: session.readOnly,
       });
       // The socket went away mid-sweep; the rest are settled and resumable by

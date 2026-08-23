@@ -386,6 +386,33 @@ export class FleetStore {
     this.setSetting("defaults.autoResume", enabled ? "1" : "0");
   }
 
+  /**
+   * The model and reasoning effort new sessions start on.
+   *
+   * Empty means "whatever Copilot picks", which is the honest default: the
+   * fleet has no opinion until someone states one, and a hardcoded model name
+   * would go stale the week after it was written.
+   *
+   * Stored as the raw values Copilot reports, because those are what have to go
+   * back to it. The settings UI offers them from what sessions have actually
+   * reported rather than from a list of our own.
+   */
+  getDefaultModel(): string {
+    return this.getSetting("defaults.model") ?? "";
+  }
+
+  setDefaultModel(model: string): void {
+    this.setSetting("defaults.model", model);
+  }
+
+  getDefaultReasoningEffort(): string {
+    return this.getSetting("defaults.reasoningEffort") ?? "";
+  }
+
+  setDefaultReasoningEffort(effort: string): void {
+    this.setSetting("defaults.reasoningEffort", effort);
+  }
+
   setTunnelProvider(provider: TunnelProvider): void {
     this.setSetting("tunnel.provider", provider);
   }

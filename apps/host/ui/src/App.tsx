@@ -727,6 +727,7 @@ export function App() {
                   workspaces={snapshot.workspaces}
                   placements={snapshot.placements}
                   nodes={snapshot.nodes}
+                  sessions={snapshot.sessions}
                   hostRevision={snapshot.hostRevision}
                   nodeUpdates={nodeUpdates}
                 />

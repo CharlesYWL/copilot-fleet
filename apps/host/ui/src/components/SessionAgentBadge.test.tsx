@@ -5,6 +5,7 @@ import type { SessionConfigOption } from "@fleet/protocol";
 import { SessionAgentBadge } from "./SessionAgentBadge";
 import {
   customAgentName,
+  observedChoices,
   selectedAgent,
   visibleConfigOptions,
 } from "../lib/session-config";
@@ -34,6 +35,15 @@ const modeOption = (): SessionConfigOption => ({
     { value: "agent", name: "Agent", description: "" },
     { value: "plan", name: "Plan", description: "" },
   ],
+});
+
+const modelOption = (values: string[]): SessionConfigOption => ({
+  id: "model",
+  name: "Model",
+  description: "",
+  category: "model",
+  currentValue: values[0] ?? "",
+  choices: values.map((value) => ({ value, name: value, description: "" })),
 });
 
 const show = (options: SessionConfigOption[], disabled = false) => {
@@ -133,5 +143,38 @@ describe("reading the agent out of a session's config", () => {
     const stale = { ...agentOption("hephaestus"), choices: [] };
 
     expect(selectedAgent([stale])?.name).toBe("hephaestus");
+  });
+  it("keeps the mode picker away from a session the fleet drives", () => {
+    /*
+     * Pinning the mode at startup only helps if it cannot be undone afterwards.
+     * The reported failure was an orchestrator left in Copilot's autopilot: it
+     * had nothing to do between wakes and spent the difference calling
+     * `task_complete` over and over, trying to end a turn nobody had started.
+     */
+    for (const runRole of ["lead", "worker"]) {
+      expect(visibleConfigOptions([modeOption()], { runRole })).toEqual([]);
+    }
+  });
+
+  it("leaves the mode picker on a session the operator drives", () => {
+    // Plan mode is a reasonable thing to want in your own session.
+    expect(visibleConfigOptions([modeOption()], { runRole: "" })).toHaveLength(1);
+    expect(visibleConfigOptions([modeOption()])).toHaveLength(1);
+  });
+
+  it("offers defaults from the models sessions have actually reported", () => {
+    // Rather than from a list kept here, which is wrong from the first release
+    // that adds a model.
+    const sessions = [
+      { configOptions: [modelOption(["a", "b"])] },
+      { configOptions: [modelOption(["b", "c"])] },
+    ];
+
+    expect(observedChoices(sessions, "model").map((c) => c.value)).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+    expect(observedChoices(sessions, "reasoning_effort")).toEqual([]);
   });
 });

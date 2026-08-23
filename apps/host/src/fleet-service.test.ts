@@ -393,3 +393,47 @@ describe("agentFor", () => {
     expect(service.agentFor(orchestrator, other)).toBe("");
   });
 });
+
+/*
+ * Mode is not a preference for a session the fleet drives, and the failure it
+ * prevents was seen in the wild: an orchestrator left in Copilot's autopilot
+ * had nothing to do between wakes, and spent the difference calling
+ * `task_complete` over and over trying to end a turn nobody had started.
+ */
+describe("what a session starts on", () => {
+  it("pins a fleet-driven session to agent mode", () => {
+    const { service } = setup();
+
+    for (const runRole of ["lead", "worker"] as const) {
+      expect(service.startupConfigFor({ runRole })).toContainEqual({
+        id: "mode",
+        value: "agent",
+      });
+    }
+  });
+
+  it("leaves a hand-made session's mode alone", () => {
+    // Plan mode is a reasonable thing for a person to want in their own
+    // session. It is only wrong where the fleet is the one driving.
+    const { service } = setup();
+
+    expect(service.startupConfigFor({ runRole: "" })).toEqual([]);
+  });
+
+  it("says nothing about the model until somebody has an opinion", () => {
+    const { service } = setup();
+
+    expect(service.startupConfigFor({ runRole: "" })).toEqual([]);
+  });
+
+  it("carries the fleet's default model and effort to every session", () => {
+    const { store, service } = setup();
+    store.setDefaultModel("claude-opus-5");
+    store.setDefaultReasoningEffort("xhigh");
+
+    expect(service.startupConfigFor({ runRole: "" })).toEqual([
+      { id: "model", value: "claude-opus-5" },
+      { id: "reasoning_effort", value: "xhigh" },
+    ]);
+  });
+});

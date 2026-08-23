@@ -215,19 +215,53 @@ describe("host routes", () => {
     // session a permission-free agent is the operator's decision to make.
     const read = async () =>
       (await inject({ method: "GET", url: "/api/defaults" })).json();
-    expect(await read()).toEqual({ yolo: false, autoResume: true });
+    expect(await read()).toEqual({
+      yolo: false,
+      autoResume: true,
+      model: "",
+      reasoningEffort: "",
+    });
 
     await inject({ method: "POST", url: "/api/defaults", payload: { yolo: true } });
     // A client that knows about one setting must not reset the other simply by
     // not mentioning it.
-    expect(await read()).toEqual({ yolo: true, autoResume: true });
+    expect(await read()).toEqual({
+      yolo: true,
+      autoResume: true,
+      model: "",
+      reasoningEffort: "",
+    });
 
     await inject({
       method: "POST",
       url: "/api/defaults",
       payload: { autoResume: false },
     });
-    expect(await read()).toEqual({ yolo: true, autoResume: false });
+    expect(await read()).toEqual({
+      yolo: true,
+      autoResume: false,
+      model: "",
+      reasoningEffort: "",
+    });
+
+    // The model and effort a new session starts on travel the same way, and
+    // empty is a real answer: it means the fleet has no opinion and each
+    // machine keeps whatever Copilot picked.
+    await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { model: "claude-opus-5", reasoningEffort: "xhigh" },
+    });
+    expect(await read()).toEqual({
+      yolo: true,
+      autoResume: false,
+      model: "claude-opus-5",
+      reasoningEffort: "xhigh",
+    });
+
+    // Clearing one is a choice, not an omission, so it has to be honoured.
+    await inject({ method: "POST", url: "/api/defaults", payload: { model: "" } });
+    expect(await read()).toMatchObject({ model: "", reasoningEffort: "xhigh" });
   });
 
   it("serves the enrollment command inputs", async () => {

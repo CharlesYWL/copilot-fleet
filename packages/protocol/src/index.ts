@@ -433,6 +433,24 @@ export const McpHttpServerSchema = z.object({
 });
 export type McpHttpServer = z.infer<typeof McpHttpServerSchema>;
 
+/**
+ * A picker the Host wants set before the session is asked anything.
+ *
+ * Values are matched loosely by the Node, because the Host does not know how
+ * Copilot spells them: the mode picker's values are ACP URLs rather than the
+ * word "agent". Sending the intent and resolving it where the choices actually
+ * live beats hardcoding a URL from a protocol we do not own.
+ *
+ * Applied in the same window as the custom agent, and for the same reason: the
+ * first prompt follows immediately, and a setting applied after it has already
+ * missed the turn it was meant to govern.
+ */
+export const StartupConfigSchema = z.object({
+  id: z.string().min(1).max(60),
+  value: z.string().max(200),
+});
+export type StartupConfig = z.infer<typeof StartupConfigSchema>;
+
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start_session"),
@@ -468,6 +486,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
      * costs the connection rather than the step.
      */
     readOnly: z.boolean().default(false),
+    /** Pickers to set before the first prompt: mode, model, reasoning effort. */
+    config: z.array(StartupConfigSchema).default([]),
   }),
   z.object({
     type: z.literal("resume_session"),
@@ -500,6 +520,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
      * costs the connection rather than the step.
      */
     readOnly: z.boolean().default(false),
+    /** Pickers to set before the first prompt: mode, model, reasoning effort. */
+    config: z.array(StartupConfigSchema).default([]),
   }),
   z.object({
     type: z.literal("prompt"),
@@ -1191,6 +1213,15 @@ export const UpdateDefaultsSchema = z.object({
   yolo: z.boolean().optional(),
   /** Re-attach a session its Node lost, without waiting to be asked. */
   autoResume: z.boolean().optional(),
+  /**
+   * What new sessions start on. Empty means "whatever Copilot picks".
+   *
+   * Raw Copilot values rather than a list of our own, because these have to go
+   * back to it — and a model list maintained here would go stale the week after
+   * it was written.
+   */
+  model: z.string().max(120).optional(),
+  reasoningEffort: z.string().max(60).optional(),
 });
 
 export const PromptSchema = z.object({

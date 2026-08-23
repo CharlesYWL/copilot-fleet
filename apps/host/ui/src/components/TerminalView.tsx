@@ -1091,6 +1091,7 @@ export const TerminalView = ({
           />
           <SessionConfigBar
             options={session.configOptions}
+            session={session}
             disabled={!onConfigChange || isEnded}
             onChange={(configId, value) => onConfigChange?.(configId, value)}
           />

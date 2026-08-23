@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Tab, TabList, makeStyles, tokens } from "@fluentui/react-components";
-import type { FleetNode, Placement, Workspace } from "@fleet/protocol";
+import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
 import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { NodesPanel } from "./NodesPanel";
 import { GeneralPanel } from "./GeneralPanel";
@@ -36,6 +36,8 @@ type SettingsPanelProps = {
   workspaces: Workspace[];
   placements: Placement[];
   nodes: FleetNode[];
+  /** Read only to learn which models this fleet's Copilot offers. */
+  sessions: FleetSession[];
   hostRevision: string;
   nodeUpdates: NodeUpdateProgress;
 };
@@ -65,7 +67,7 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
         </TabList>
       </div>
       <div className={styles.body}>
-        {tab === "general" && <GeneralPanel />}
+        {tab === "general" && <GeneralPanel sessions={props.sessions} />}
         {tab === "diagnostics" && <DiagnosticsPanel />}
         {tab === "tunnel" && <TunnelPanel />}
         {tab === "nodes" && (

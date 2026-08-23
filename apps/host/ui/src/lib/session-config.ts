@@ -1,4 +1,4 @@
-import type { SessionConfigOption } from "@fleet/protocol";
+import type { SessionConfigChoice, SessionConfigOption } from "@fleet/protocol";
 
 /**
  * Which of the agent's pickers the fleet puts in front of an operator.
@@ -82,6 +82,30 @@ export function customAgentName(
 }
 
 /**
+ * Every value some session has reported for one picker.
+ *
+ * The settings screen offers defaults from what the fleet has actually seen
+ * rather than from a list kept here: model names change on Copilot's schedule,
+ * not ours, and a list hardcoded here is wrong from the first release that adds
+ * one.
+ *
+ * The cost is that the choices are empty until a session has run. That is the
+ * honest state — before then the Host genuinely does not know what this fleet's
+ * Copilot offers.
+ */
+export function observedChoices(
+  sessions: readonly { configOptions: SessionConfigOption[] }[],
+  optionId: string,
+): SessionConfigChoice[] {
+  const seen = new Map<string, SessionConfigChoice>();
+  for (const session of sessions) {
+    const option = session.configOptions.find((entry) => entry.id === optionId);
+    for (const choice of option?.choices ?? []) seen.set(choice.value, choice);
+  }
+  return [...seen.values()];
+}
+
+/**
  * The pickers worth rendering.
  *
  * Also drops any option with nothing to choose between: those are readouts, and
@@ -94,11 +118,23 @@ export function customAgentName(
  */
 export function visibleConfigOptions(
   options: readonly SessionConfigOption[],
+  session: { runRole?: string } = {},
 ): SessionConfigOption[] {
+  /*
+   * Mode is the fleet's for a session the fleet drives.
+   *
+   * Copilot's autopilot works until it calls `task_complete`, and plan mode
+   * produces a plan rather than an action; both contradict the contract these
+   * sessions run under, which is to take one turn and stop. The Host pins the
+   * mode at startup — offering a control that undoes that would just move the
+   * failure to whenever somebody used it.
+   */
+  const fleetOwnsMode = session.runRole === "lead" || session.runRole === "worker";
   return options.filter(
     (option) =>
       option.choices.length > 1 &&
       option.category !== AGENT_CATEGORY &&
+      !(fleetOwnsMode && option.category === "mode") &&
       !FLEET_OWNED_CATEGORIES.has(option.category) &&
       !FLEET_OWNED_IDS.has(option.id),
   );

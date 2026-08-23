@@ -2,7 +2,12 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import * as acp from "@agentclientprotocol/sdk";
-import type { McpHttpServer, PromptAttachment, SessionEvent } from "@fleet/protocol";
+import type {
+  McpHttpServer,
+  PromptAttachment,
+  SessionEvent,
+  StartupConfig,
+} from "@fleet/protocol";
 import { attachmentSummary, errorMessage } from "@fleet/protocol";
 import {
   configValueFor,
@@ -105,6 +110,44 @@ export interface SessionAgent {
   resync(): void;
 }
 
+/**
+ * Which of an option's choices the Host meant.
+ *
+ * Deliberately forgiving, because the Host is naming an intent and Copilot is
+ * naming an implementation. "agent" has to reach
+ * `https://agentclientprotocol.com/protocol/session-modes#agent`, and hardcoding
+ * that URL in the Host would tie a fleet setting to the spelling of a protocol
+ * neither side owns.
+ *
+ * Tried in order of confidence: the exact value, the fragment after a `#`, then
+ * the display name. Returns undefined rather than guessing when none matches —
+ * a wrong setting applied silently is worse than a default left in place.
+ */
+export function resolveConfigValue(
+  option: acp.SessionConfigOption,
+  wanted: string,
+): string | undefined {
+  const choices =
+    option.type === "select"
+      ? (toSessionConfigOptions([option])[0]?.choices ?? [])
+      : [
+          { value: "true", name: "On" },
+          { value: "false", name: "Off" },
+        ];
+  const want = wanted.trim().toLowerCase();
+  if (want === "") return undefined;
+
+  const exact = choices.find((choice) => choice.value.toLowerCase() === want);
+  if (exact) return exact.value;
+
+  const fragment = choices.find(
+    (choice) => choice.value.split("#").pop()?.toLowerCase() === want,
+  );
+  if (fragment) return fragment.value;
+
+  return choices.find((choice) => choice.name.trim().toLowerCase() === want)?.value;
+}
+
 export type EventSink = (event: SessionEvent) => void;
 
 export type StartAgentOptions = {
@@ -126,6 +169,14 @@ export type StartAgentOptions = {
    * selects it. Empty for every ordinary session.
    */
   agent?: string;
+  /**
+   * Pickers to set before the session is asked anything.
+   *
+   * Values arrive as intent rather than as Copilot's own spelling — see
+   * `resolveConfigValue` — because the Host cannot know that "agent mode" is
+   * written as an ACP URL.
+   */
+  config?: readonly StartupConfig[];
 };
 
 export interface AgentFactory {
@@ -371,6 +422,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly mcpServerConfigs: readonly McpHttpServer[] = [],
     /** A custom agent to select once the session exists. Empty for workers. */
     private readonly customAgent = "",
+    /** Pickers the Host wants set before the first prompt. Often empty. */
+    private readonly startupConfig: readonly StartupConfig[] = [],
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -494,7 +547,46 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     // otherwise working, and a composer with nothing on it.
     await this.recoverConfigOptions();
     await this.selectCustomAgent();
+    await this.applyStartupConfig();
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
+  }
+
+  /**
+   * Sets the pickers the Host asked for, before anything is asked of the model.
+   *
+   * After the agent rather than before it: selecting an agent can change what
+   * the other pickers offer, and a model chosen against the old list would be
+   * rejected or silently dropped.
+   *
+   * Each one is attempted on its own and a failure is reported rather than
+   * raised. A session running on yesterday's model is worth far more than no
+   * session, and the Host's defaults are a preference, not a requirement.
+   */
+  private async applyStartupConfig(): Promise<void> {
+    for (const wanted of this.startupConfig) {
+      const option = this.configOptions.find((entry) => entry.id === wanted.id);
+      if (!option) {
+        this.emit("system", {
+          message: `This agent has no "${wanted.id}" setting, so the fleet default was not applied`,
+        });
+        continue;
+      }
+      const value = resolveConfigValue(option, wanted.value);
+      if (value === undefined) {
+        this.emit("system", {
+          message: `"${wanted.value}" is not one of the choices for ${wanted.id}, so it was left alone`,
+        });
+        continue;
+      }
+      if (String(option.currentValue ?? "") === value) continue;
+      try {
+        await this.setConfigOption(wanted.id, value);
+      } catch (error) {
+        this.emit("system", {
+          message: `Could not set ${wanted.id} to "${wanted.value}": ${errorMessage(error)}`,
+        });
+      }
+    }
   }
 
   /**
@@ -837,6 +929,7 @@ export class AcpAgentFactory implements AgentFactory {
       (await this.acceptsContextTier()) ? this.contextTier : undefined,
       options.mcpServers ?? [],
       options.agent ?? "",
+      options.config ?? [],
     );
     try {
       await agent.start(cwd, options.resumeAgentSessionId);

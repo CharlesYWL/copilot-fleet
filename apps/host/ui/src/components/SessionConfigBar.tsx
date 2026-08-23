@@ -87,6 +87,8 @@ const useStyles = makeStyles({
 
 export type SessionConfigBarProps = {
   options: SessionConfigOption[];
+  /** Whose session this is: some pickers are the fleet's, not the operator's. */
+  session?: { runRole?: string };
   disabled?: boolean;
   onChange: (configId: string, value: string) => void;
 };
@@ -107,11 +109,12 @@ export type SessionConfigBarProps = {
  */
 export const SessionConfigBar = ({
   options,
+  session,
   disabled,
   onChange,
 }: SessionConfigBarProps) => {
   const styles = useStyles();
-  const usable = visibleConfigOptions(options);
+  const usable = visibleConfigOptions(options, session ?? {});
   if (usable.length === 0) return null;
 
   return (

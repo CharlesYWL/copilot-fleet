@@ -35,8 +35,8 @@ function hasSettled(events: SessionEvent[], sessionId: string): boolean {
  */
 const START_DEFAULTS: Pick<
   Extract<NodeCommand, { type: "start_session" }>,
-  "yolo" | "mcpServers" | "agent" | "readOnly"
-> = { yolo: false, mcpServers: [], agent: "", readOnly: false };
+  "yolo" | "mcpServers" | "agent" | "readOnly" | "config"
+> = { yolo: false, mcpServers: [], agent: "", readOnly: false, config: [] };
 
 describe("CommandRouter", () => {
   it("streams two sessions independently and deduplicates commands", async () => {

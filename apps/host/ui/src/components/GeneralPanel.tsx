@@ -7,8 +7,10 @@ import {
   DialogContent,
   DialogSurface,
   DialogTitle,
+  Dropdown,
   MessageBar,
   MessageBarBody,
+  Option,
   Spinner,
   Switch,
   Text,
@@ -16,6 +18,8 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
+import type { SessionConfigChoice, SessionConfigOption } from "@fleet/protocol";
+import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
 
 const useStyles = makeStyles({
@@ -56,7 +60,18 @@ const useStyles = makeStyles({
   },
 });
 
-type Defaults = { yolo: boolean; autoResume: boolean };
+type Defaults = {
+  yolo: boolean;
+  autoResume: boolean;
+  model: string;
+  reasoningEffort: string;
+};
+
+/** What to show on a closed dropdown, including for a value no longer offered. */
+const labelFor = (choices: readonly SessionConfigChoice[], value: string): string => {
+  if (value === "") return "Copilot's choice";
+  return choices.find((choice) => choice.value === value)?.name ?? value;
+};
 
 const downloadJson = (value: unknown, filename: string) => {
   const blob = new Blob([JSON.stringify(value, null, 2)], { type: "application/json" });
@@ -68,7 +83,12 @@ const downloadJson = (value: unknown, filename: string) => {
   URL.revokeObjectURL(url);
 };
 
-export const GeneralPanel = () => {
+export type GeneralPanelProps = {
+  /** Live sessions, read only to learn which models this fleet's Copilot offers. */
+  sessions: readonly { configOptions: SessionConfigOption[] }[];
+};
+
+export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
   const styles = useStyles();
   const [defaults, setDefaults] = useState<Defaults>();
   const [busy, setBusy] = useState(false);
@@ -159,7 +179,9 @@ export const GeneralPanel = () => {
     );
   }
 
-  const { yolo, autoResume } = defaults;
+  const { yolo, autoResume, model, reasoningEffort } = defaults;
+  const modelChoices = observedChoices(sessions, "model");
+  const effortChoices = observedChoices(sessions, "reasoning_effort");
 
   return (
     <div className={styles.panel}>
@@ -224,6 +246,72 @@ export const GeneralPanel = () => {
             onChange={(_event, data) => void update({ autoResume: data.checked })}
           />
         </div>
+      </section>
+
+      <section className={styles.card}>
+        <div className={styles.row}>
+          <div>
+            <Text weight="semibold">Model</Text>
+            <br />
+            <Text className={styles.caption}>
+              What every new session starts on, including orchestrators and the workers
+              they dispatch. Set before the first prompt, so it governs the opening turn.
+              A machine that does not offer the model says so and keeps its own.
+            </Text>
+          </div>
+          <Dropdown
+            disabled={busy || modelChoices.length === 0}
+            value={labelFor(modelChoices, model)}
+            selectedOptions={[model]}
+            onOptionSelect={(_event, data) =>
+              void update({ model: String(data.optionValue ?? "") })
+            }
+            aria-label="Default model"
+          >
+            <Option value="">Copilot's choice</Option>
+            {modelChoices.map((choice) => (
+              <Option key={choice.value} value={choice.value}>
+                {choice.name}
+              </Option>
+            ))}
+          </Dropdown>
+        </div>
+        <div className={styles.row}>
+          <div>
+            <Text weight="semibold">Reasoning effort</Text>
+            <br />
+            <Text className={styles.caption}>
+              How hard the model thinks before answering. Only some models offer it.
+            </Text>
+          </div>
+          <Dropdown
+            disabled={busy || effortChoices.length === 0}
+            value={labelFor(effortChoices, reasoningEffort)}
+            selectedOptions={[reasoningEffort]}
+            onOptionSelect={(_event, data) =>
+              void update({ reasoningEffort: String(data.optionValue ?? "") })
+            }
+            aria-label="Default reasoning effort"
+          >
+            <Option value="">Copilot's choice</Option>
+            {effortChoices.map((choice) => (
+              <Option key={choice.value} value={choice.value}>
+                {choice.name}
+              </Option>
+            ))}
+          </Dropdown>
+        </div>
+        {modelChoices.length === 0 && (
+          <Text className={styles.caption}>
+            {/*
+             * Honest rather than empty: the list comes from what sessions have
+             * reported, so before the first one the Host genuinely does not
+             * know what this fleet's Copilot offers.
+             */}
+            Nothing to choose from yet — the fleet learns which models exist from the
+            sessions it runs. Start one and come back.
+          </Text>
+        )}
       </section>
 
       <section className={styles.card}>

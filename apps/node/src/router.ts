@@ -224,8 +224,14 @@ export class CommandRouter {
               yolo: command.yolo,
               mcpServers,
               agent: requested.selected,
+              config: command.config,
             }
-          : { yolo: command.yolo, mcpServers, agent: requested.selected },
+          : {
+              yolo: command.yolo,
+              mcpServers,
+              agent: requested.selected,
+              config: command.config,
+            },
       );
       slot.agent = agent;
       if (this.slots.get(command.sessionId) !== slot) {
