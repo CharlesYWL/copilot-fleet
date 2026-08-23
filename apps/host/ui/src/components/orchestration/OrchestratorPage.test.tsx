@@ -25,6 +25,8 @@ const run = (overrides: Partial<Run> = {}): Run => ({
   policy: RunPolicySchema.parse({}),
   phases: ["Plan", "Review"],
   phaseIndex: 0,
+  successCriteria: [],
+  stopWhen: "",
   failureReason: "",
   pendingPrompt: "",
   settleSeq: 0,
@@ -292,6 +294,49 @@ describe("task detail", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Open the conversation" }));
     expect(onOpenLead).toHaveBeenCalled();
+  });
+
+  it("shows the person the same definition of done the orchestrator is held to", () => {
+    /*
+     * These are not decoration: fleet_submit_task refuses while an essential
+     * one is unmet. Showing them here is what lets a person disagree with the
+     * contract early, rather than discovering it at handover.
+     */
+    const model = models([
+      run({
+        id: "r1",
+        stopWhen: "the auth suite is green",
+        successCriteria: [
+          {
+            id: "logout-invalidates",
+            scenario: "reusing a token after logout returns 401",
+            expectedEvidence: "the auth suite's logout test passes",
+            essential: true,
+          },
+          {
+            id: "nice-message",
+            scenario: "the error names the expired token",
+            expectedEvidence: "the 401 body carries the token id",
+            essential: false,
+          },
+        ],
+      }),
+    ])[0]!;
+    detail({ model });
+
+    expect(screen.getByText("What done means")).toBeTruthy();
+    expect(screen.getByText(/Finished when the auth suite is green/)).toBeTruthy();
+    expect(screen.getByText(/reusing a token after logout returns 401/)).toBeTruthy();
+    // The evidence, not only the claim — a scenario with nothing to show it is
+    // the vagueness criteria exist to replace.
+    expect(screen.getByText(/the auth suite's logout test passes/)).toBeTruthy();
+    expect(screen.getByText("optional")).toBeTruthy();
+  });
+
+  it("shows no definition of done for a task planned before there was one", () => {
+    detail();
+
+    expect(screen.queryByText("What done means")).toBeNull();
   });
 
   it("does not claim a planned task is waiting to be planned", () => {

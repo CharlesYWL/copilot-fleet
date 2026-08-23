@@ -860,6 +860,44 @@ export const RunStepStateSchema = z.enum([
 ]);
 export type RunStepState = z.infer<typeof RunStepStateSchema>;
 
+/**
+ * One thing that has to be true for a task to be finished.
+ *
+ * Stated as something observable rather than as an intention. "The feature
+ * works" is a feeling; "`npm test -- auth` exits zero and the login route
+ * answers 200" is a thing someone can go and check.
+ *
+ * The minimum lengths are not arbitrary. They are the cheapest available
+ * approximation of the rule this exists to enforce — that a criterion nobody
+ * could check is not a criterion — and they cost nothing to satisfy honestly
+ * while making "verify it works" impossible to submit.
+ */
+export const RunCriterionSchema = z.object({
+  id: z
+    .string()
+    .min(1)
+    .max(40)
+    .regex(/^[a-z0-9-]+$/, "Criterion ids are file-safe handles, not sentences"),
+  /** What to do, with what inputs, and what counts as a pass. */
+  scenario: z.string().min(20).max(600),
+  /** The observable this produces: a command's output, a file, a status line. */
+  expectedEvidence: z.string().min(10).max(300),
+  /**
+   * Whether the task can be handed over without this one.
+   *
+   * Not every criterion is load-bearing. A task that must not ship without its
+   * migration proven can still ship without its nice-to-have covered, and
+   * saying which is which up front is what keeps the gate from becoming
+   * something to route around.
+   */
+  essential: z.boolean().default(true),
+});
+export type RunCriterion = z.infer<typeof RunCriterionSchema>;
+
+/** How a criterion turned out, as the orchestrator accounts for it. */
+export const CriterionOutcomeSchema = z.enum(["met", "unmet", "blocked"]);
+export type CriterionOutcome = z.infer<typeof CriterionOutcomeSchema>;
+
 export const RunSchema = z.object({
   id: z.string().min(1),
   workspaceId: z.string().min(1),
@@ -893,6 +931,22 @@ export const RunSchema = z.object({
   phases: z.array(z.string()).default([]),
   /** Which phase is being worked on now; an index into {@link phases}. */
   phaseIndex: z.number().int().nonnegative().default(0),
+  /**
+   * What has to be observably true for this task to be finished.
+   *
+   * Written when the task is planned, before any work goes out, because a
+   * definition of done arrived at afterwards is a description of what happened
+   * rather than a test of it. Empty only for tasks planned before this existed.
+   */
+  successCriteria: z.array(RunCriterionSchema).default([]),
+  /**
+   * One line naming the exact observable state that ends this task.
+   *
+   * Separate from the criteria, which say what must be true, because a task can
+   * satisfy every criterion and still not know when to stop looking. This is
+   * the sentence that says "then walk away".
+   */
+  stopWhen: z.string().default(""),
   failureReason: z.string().default(""),
   /**
    * A message owed to the orchestrator, held until it is free to read it.

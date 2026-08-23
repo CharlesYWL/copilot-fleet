@@ -30,6 +30,8 @@ function run(overrides: Partial<Run> = {}): Run {
     policy: RunPolicySchema.parse({}),
     phases: [],
     phaseIndex: 0,
+    successCriteria: [],
+    stopWhen: "",
     failureReason: "",
     pendingPrompt: "",
     settleSeq: 0,

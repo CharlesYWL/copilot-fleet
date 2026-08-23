@@ -608,6 +608,64 @@ describe("FleetStore", () => {
     ).toEqual(["model", "agent"]);
   });
 
+  it("opens a database written before tasks had a definition of done", () => {
+    /*
+     * The upgrade path for a Host that has been running. `createRun` names
+     * success_criteria and stop_when in its INSERT, so a missing migration is
+     * not a degraded read — every new task fails outright. Simulated by taking
+     * the columns away again, which is exactly the shape the older build left.
+     */
+    const file = join(mkdtempSync(join(tmpdir(), "fleet-criteria-")), "fleet.db");
+    directories.push(dirname(file));
+    const first = new FleetStore(file);
+    const { node } = first.registerNode({
+      name: "box",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: [],
+      maxSessions: 2,
+    });
+    const workspace = first.createWorkspace("repo", "");
+    first.createPlacement(workspace.id, node.id, "/repo");
+    const old = first.createRun({
+      workspaceId: workspace.id,
+      name: "Older task",
+      objective: "planned before criteria existed",
+    });
+    first.close();
+
+    const raw = new DatabaseSync(file);
+    raw.prepare("ALTER TABLE runs DROP COLUMN success_criteria").run();
+    raw.prepare("ALTER TABLE runs DROP COLUMN stop_when").run();
+    raw.close();
+
+    const reopened = new FleetStore(file);
+    stores.push(reopened);
+
+    // The task that predates the feature reads back with an empty contract
+    // rather than failing, and is not stuck because of it.
+    expect(reopened.getRun(old.id)?.successCriteria).toEqual([]);
+    expect(reopened.getRun(old.id)?.stopWhen).toBe("");
+
+    // And a task opened after the upgrade can carry one.
+    const fresh = reopened.createRun({
+      workspaceId: workspace.id,
+      name: "Newer task",
+      objective: "planned with criteria",
+      successCriteria: [
+        {
+          id: "it-holds",
+          scenario: "running the build prints no errors",
+          expectedEvidence: "npm run build exits 0",
+          essential: true,
+        },
+      ],
+      stopWhen: "the build is green",
+    });
+    expect(reopened.getRun(fresh.id)?.successCriteria[0]?.id).toBe("it-holds");
+  });
+
   it("moves a placement to another workspace, taking its sessions along", () => {
     // Sessions carry their own workspace_id so the sidebar can group history
     // without a join; leaving it behind would file past runs under the project

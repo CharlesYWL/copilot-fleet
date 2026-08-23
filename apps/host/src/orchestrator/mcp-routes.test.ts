@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import Fastify, { type FastifyInstance } from "fastify";
 import type { FleetSession } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
+import type { FleetStore } from "../store.js";
+import { fleet } from "./fleet-harness.js";
 import { LeadTokens } from "./lead-tokens.js";
 import { MCP_PATH, mcpRoutes } from "./mcp-routes.js";
 
@@ -112,5 +114,170 @@ describe("mcp endpoint", () => {
     ["missing", ""],
   ])("refuses a %s token", async (_label, token) => {
     expect((await list(token)).statusCode).toBe(401);
+  });
+});
+
+/*
+ * The unit tests call the tools directly with an already-parsed object, so they
+ * cannot catch a tool whose advertised schema and whose handler disagree — a
+ * model would follow the advertisement and be rejected by the parse. These go
+ * over the wire instead: what a caller is told, and what happens when it obeys.
+ */
+describe("orchestrator tools over the wire", () => {
+  let app: FastifyInstance;
+  let store: FleetStore;
+  let token: string;
+
+  const rpc = async (method: string, params?: unknown) => {
+    const response = await app.inject({
+      method: "POST",
+      url: MCP_PATH,
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      payload: { jsonrpc: "2.0", id: 1, method, params },
+    });
+    return response.json() as {
+      result?: {
+        tools?: { name: string; inputSchema: { properties?: Record<string, unknown> } }[];
+        content?: { text: string }[];
+        isError?: boolean;
+      };
+      error?: { message: string };
+    };
+  };
+
+  const call = async (name: string, args: unknown) => {
+    const out = await rpc("tools/call", { name, arguments: args });
+    return {
+      // A schema rejection comes back as a JSON-RPC error rather than a tool
+      // result, so both count as "the caller did not get away with it".
+      refused: Boolean(out.error) || Boolean(out.result?.isError),
+      text:
+        out.error?.message ?? (out.result?.content ?? []).map((c) => c.text).join("\n"),
+    };
+  };
+
+  const criteria = [
+    {
+      id: "logout-invalidates",
+      scenario: "reusing a token after logout returns 401",
+      expectedEvidence: "the auth suite's logout test passes",
+    },
+  ];
+
+  beforeEach(async () => {
+    const world = fleet();
+    store = world.store;
+    app = Fastify();
+    app.log.level = "silent";
+    const tokens = new LeadTokens(settings());
+    token = tokens.mint(world.leadId);
+    await app.register(mcpRoutes, { service: world.service, tokens });
+    await app.ready();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  const task = () => store.listRuns().find((run) => run.name === "Ship it");
+
+  const plan = (over: Record<string, unknown> = {}) =>
+    call("fleet_plan_task", {
+      task: "Ship it",
+      objective: "make the change",
+      phases: ["Only"],
+      successCriteria: criteria,
+      stopWhen: "the auth suite is green",
+      ...over,
+    });
+
+  it("tells a caller that planning needs a definition of done", async () => {
+    const listed = await rpc("tools/list");
+    const planTool = listed.result!.tools!.find((t) => t.name === "fleet_plan_task")!;
+
+    expect(Object.keys(planTool.inputSchema.properties ?? {})).toEqual(
+      expect.arrayContaining(["successCriteria", "stopWhen"]),
+    );
+  });
+
+  it("refuses to open a task with no criteria at all", async () => {
+    const result = await plan({ successCriteria: [] });
+
+    expect(result.refused).toBe(true);
+    expect(task()).toBeUndefined();
+  });
+
+  it("refuses a criterion too vague to check", async () => {
+    // "auth works" is the failure this whole mechanism exists to prevent, so
+    // the schema rejects it rather than trusting the model to be specific.
+    const result = await plan({
+      successCriteria: [{ id: "x", scenario: "works", expectedEvidence: "it does" }],
+    });
+
+    expect(result.refused).toBe(true);
+    expect(task()).toBeUndefined();
+  });
+
+  it("keeps the definition of done a caller sent over the wire", async () => {
+    const result = await plan();
+
+    expect(result.refused).toBe(false);
+    expect(task()!.successCriteria[0]!.id).toBe("logout-invalidates");
+    expect(task()!.stopWhen).toBe("the auth suite is green");
+    // The reply repeats the contract, because the turn that plans a task is
+    // usually not the turn that has to satisfy it.
+    expect(result.text).toContain("logout-invalidates");
+  });
+
+  const settleWork = async () => {
+    await call("fleet_start_work", {
+      category: "explore",
+      title: "look",
+      prompt: "go and look",
+      task: "Ship it",
+    });
+    for (const step of store.listRunSteps(task()!.id)) {
+      store.updateRunStep(step.id, { state: "succeeded" });
+    }
+  };
+
+  it("will not hand over a task whose criteria were not met", async () => {
+    await plan();
+    await settleWork();
+
+    const result = await call("fleet_submit_task", {
+      task: "Ship it",
+      summary: "Here it is.",
+      criteria: [
+        { id: "logout-invalidates", outcome: "unmet", evidence: "the test still fails" },
+      ],
+    });
+
+    expect(result.refused).toBe(true);
+    expect(task()!.state).not.toBe("awaiting_human");
+  });
+
+  it("hands over a task once its criteria are met", async () => {
+    await plan();
+    await settleWork();
+
+    const result = await call("fleet_submit_task", {
+      task: "Ship it",
+      summary: "Here it is.",
+      criteria: [
+        {
+          id: "logout-invalidates",
+          outcome: "met",
+          evidence: "ran the auth suite; the logout test passed",
+        },
+      ],
+    });
+
+    expect(result.refused).toBe(false);
+    expect(task()!.state).toBe("awaiting_human");
   });
 });

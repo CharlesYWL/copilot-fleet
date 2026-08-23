@@ -1,71 +1,13 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { FastifyBaseLogger } from "fastify";
-import { FleetStore } from "../store.js";
-import { FleetService } from "../fleet-service.js";
-import { OrchestratorEngine } from "./engine.js";
+import {
+  RunCriterionSchema,
+  type CriterionOutcome,
+  type RunCriterion,
+} from "@fleet/protocol";
+import type { FleetStore } from "../store.js";
+import type { FleetService } from "../fleet-service.js";
+import { fleet } from "./fleet-harness.js";
 import { FleetTools } from "./tools.js";
-
-const silent = {
-  info: () => {},
-  warn: () => {},
-  error: () => {},
-  debug: () => {},
-} as unknown as FastifyBaseLogger;
-
-function fakeSocket() {
-  return {
-    readyState: 1,
-    // `dispatch` compares against the socket's own OPEN, so a stub without it
-    // silently reads as closed and every command is "sent to a dead node".
-    OPEN: 1,
-    send: () => {},
-  } as unknown as Parameters<FleetService["attachNode"]>[1];
-}
-
-/** A fleet with one online node holding two different checkouts. */
-function fleet() {
-  const store = new FleetStore(":memory:");
-  const service = new FleetService(store, silent, "test");
-
-  const { node } = store.registerNode({
-    name: "box",
-    os: "linux",
-    arch: "x64",
-    version: "0.1.0",
-    capabilities: ["copilot-acp", "host-yolo"],
-    maxSessions: 8,
-  });
-  service.attachNode(node.id, fakeSocket());
-  store.setNodeOnline(node.id, true, 0);
-
-  const first = store.createWorkspace("Alpha", "");
-  const second = store.createWorkspace("Beta", "");
-  store.createPlacement(first.id, node.id, "/src/alpha");
-  store.createPlacement(second.id, node.id, "/src/beta");
-
-  const engine = new OrchestratorEngine(service);
-  service.attachOrchestration({
-    leadTokens: { mint: () => "flt_test" },
-    mcpUrl: () => "http://127.0.0.1/mcp",
-    tickRun: (runId) => engine.tickRun(runId),
-  });
-
-  const lead = store.createSession(
-    store.listPlacements()[0]!,
-    "orchestrate",
-    true,
-    "Orchestrator",
-    { runRole: "lead" },
-  );
-  const run = store.createRun({
-    workspaceId: first.id,
-    name: "General",
-    objective: "general",
-    policy: { wakePolicy: "on_any_settle" },
-  });
-  store.updateRun(run.id, { leadSessionId: lead.id, state: "running" });
-  return { store, service, leadId: lead.id };
-}
 
 describe("FleetTools", () => {
   let store: FleetStore;
@@ -185,12 +127,28 @@ describe("FleetTools phases", () => {
 
   const tools = () => new FleetTools(service, leadId);
 
-  const plan = (phases: string[]) =>
+  const criterion = (overrides: Partial<RunCriterion> = {}): RunCriterion =>
+    RunCriterionSchema.parse({
+      id: "it-works",
+      scenario: "running the build prints no errors",
+      expectedEvidence: "npm run build exits 0",
+      ...overrides,
+    });
+
+  const plan = (phases: string[], successCriteria: RunCriterion[] = [criterion()]) =>
     tools().planTask({
       task: "Ship it",
       objective: "make the change",
       phases,
+      successCriteria,
+      stopWhen: "the build is green on main",
     });
+
+  const submit = (
+    criteria: { id: string; outcome: CriterionOutcome; evidence: string }[] = [
+      { id: "it-works", outcome: "met", evidence: "npm run build exited 0" },
+    ],
+  ) => tools().submitTask({ task: "Ship it", summary: "Here it is.", criteria });
 
   const dispatch = () =>
     tools().startWork({
@@ -276,18 +234,18 @@ describe("FleetTools phases", () => {
     dispatch();
     settleAll();
 
-    const result = tools().submitTask({ task: "Ship it", summary: "Here it is." });
+    const result = submit();
 
     expect(result.ok).toBe(true);
     expect(task().state).toBe("awaiting_human");
-    expect(store.listRunNotes(task().id).at(-1)?.body).toBe("Here it is.");
+    expect(store.listRunNotes(task().id).at(-1)?.body).toContain("Here it is.");
   });
 
   it("will not hand over work that is still out", () => {
     plan(["Only"]);
     dispatch();
 
-    expect(tools().submitTask({ task: "Ship it", summary: "done" }).ok).toBe(false);
+    expect(submit().ok).toBe(false);
     expect(task().state).not.toBe("awaiting_human");
   });
 
@@ -295,7 +253,7 @@ describe("FleetTools phases", () => {
     plan(["Only"]);
     dispatch();
     settleAll();
-    tools().submitTask({ task: "Ship it", summary: "Here it is." });
+    submit();
 
     const result = dispatch();
 
@@ -310,5 +268,144 @@ describe("FleetTools phases", () => {
 
     expect(again.ok).toBe(false);
     expect(store.listRuns().filter((run) => run.name === "Ship it")).toHaveLength(1);
+  });
+});
+
+/*
+ * Criteria only mean something if they can stop a handover. Everything here is
+ * about that: a task promises what done looks like at plan time, and cannot be
+ * given to a person until the orchestrator says how each promise turned out.
+ */
+describe("FleetTools success criteria", () => {
+  let store: FleetStore;
+  let service: FleetService;
+  let leadId: string;
+  let runId: string;
+
+  const tools = () => new FleetTools(service, leadId);
+
+  const criteria = [
+    RunCriterionSchema.parse({
+      id: "logout-invalidates",
+      scenario: "reusing a token after logout returns 401",
+      expectedEvidence: "the auth suite's logout test passes",
+    }),
+    RunCriterionSchema.parse({
+      id: "nice-to-have",
+      scenario: "the error message names the expired token",
+      expectedEvidence: "the 401 body contains the token id",
+      essential: false,
+    }),
+  ];
+
+  const met = (id: string) => ({
+    id,
+    outcome: "met" as CriterionOutcome,
+    evidence: "ran the auth suite; the logout test passed",
+  });
+
+  beforeEach(() => {
+    const world = fleet();
+    store = world.store;
+    service = world.service;
+    leadId = world.leadId;
+    tools().planTask({
+      task: "Ship it",
+      objective: "make the change",
+      phases: ["Only"],
+      successCriteria: criteria,
+      stopWhen: "the auth suite is green",
+    });
+    runId = store.listRuns().find((run) => run.name === "Ship it")!.id;
+    tools().startWork({
+      category: "explore",
+      title: "look",
+      prompt: "go and look",
+      task: "Ship it",
+    });
+    for (const step of store.listRunSteps(runId)) {
+      store.updateRunStep(step.id, { state: "succeeded" });
+    }
+  });
+
+  const submit = (
+    reported: { id: string; outcome: CriterionOutcome; evidence: string }[],
+  ) =>
+    tools().submitTask({ task: "Ship it", summary: "Here it is.", criteria: reported });
+
+  const state = () => store.getRun(runId)!.state;
+
+  it("keeps what the task promised, so the gate has something to check", () => {
+    expect(store.getRun(runId)!.successCriteria.map((c) => c.id)).toEqual([
+      "logout-invalidates",
+      "nice-to-have",
+    ]);
+    expect(store.getRun(runId)!.stopWhen).toBe("the auth suite is green");
+  });
+
+  it("will not hand over a task whose essential criterion is unmet", () => {
+    const result = submit([
+      { id: "logout-invalidates", outcome: "unmet", evidence: "the test still fails" },
+    ]);
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("logout-invalidates");
+    expect(state()).not.toBe("awaiting_human");
+  });
+
+  it("treats a criterion that could not be checked as not met", () => {
+    // "blocked" is honest, and honesty is worth encouraging — but it is still
+    // not evidence that the thing works, so it cannot end the task either.
+    const result = submit([
+      { id: "logout-invalidates", outcome: "blocked", evidence: "no test database" },
+    ]);
+
+    expect(result.ok).toBe(false);
+    expect(state()).not.toBe("awaiting_human");
+  });
+
+  it("will not let an essential criterion be quietly left out", () => {
+    const result = submit([met("nice-to-have")]);
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("logout-invalidates");
+    // The refusal repeats what the criterion asked for, so the next attempt has
+    // it to hand rather than having to go back and look.
+    expect(result.text).toContain("the auth suite's logout test passes");
+    expect(state()).not.toBe("awaiting_human");
+  });
+
+  it("does not hold up a task for an optional criterion", () => {
+    const result = submit([met("logout-invalidates")]);
+
+    expect(result.ok).toBe(true);
+    expect(state()).toBe("awaiting_human");
+  });
+
+  it("refuses outcomes for criteria this task never had", () => {
+    // Otherwise a made-up id would satisfy nothing while looking thorough.
+    const result = submit([met("logout-invalidates"), met("invented")]);
+
+    expect(result.ok).toBe(false);
+    expect(result.text).toContain("invented");
+    expect(state()).not.toBe("awaiting_human");
+  });
+
+  it("records the evidence next to the summary the person reads", () => {
+    submit([met("logout-invalidates")]);
+
+    const note = store.listRunNotes(runId).at(-1)!.body;
+    expect(note).toContain("Here it is.");
+    expect(note).toContain("logout-invalidates: met");
+    expect(note).toContain("ran the auth suite");
+    expect(note).toContain("nice-to-have (optional): not reported");
+  });
+
+  it("still hands over a task that was planned before criteria existed", () => {
+    // Runs created by an older build have none, and are not stuck because of it.
+    store.updateRun(runId, { successCriteria: [] });
+
+    expect(submit([]).ok).toBe(true);
+    expect(state()).toBe("awaiting_human");
   });
 });

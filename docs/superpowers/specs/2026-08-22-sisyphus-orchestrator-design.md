@@ -140,6 +140,10 @@ Five changes, in dependency order. Each is useful alone.
 
 ### 3.1 Criteria as data, and a schema that refuses vagueness
 
+**Built.** `RunCriterionSchema` in the protocol, `runs.success_criteria` /
+`runs.stop_when` in the store, required by `fleet_plan_task`, enforced by
+`fleet_submit_task`, shown under "What done means" in the task detail.
+
 `fleet_plan_task` grows criteria beside its phases:
 
 ```ts
@@ -159,6 +163,18 @@ The minimum lengths are doing real work: they are the cheapest available
 approximation of "revise it before execution". Store on `runs`; surface in the
 task detail so a person reads the same contract the orchestrator is held to.
 
+Two things worth recording from building it:
+
+- **The schema is satisfiable.** A minimum length that no model reliably clears
+  would brick planning outright and would pass every unit test in the suite, so
+  it was checked against a live orchestrator rather than argued about. Given
+  "find out how many test files this repository has", it wrote a criterion that
+  parsed first time, and submitted with the command it had run as the evidence.
+- **`blocked` does not open the gate.** It is the honest answer when something
+  could not be checked, and honesty is worth encouraging, but it is still not
+  evidence that the thing works. A criterion that cannot be met at all goes to
+  `fleet_escalate`, because dropping one is a person's decision.
+
 ### 3.2 Evidence as rows, stamped with the tree
 
 A `run_evidence` table: `runId`, `criterionId`, `status` (pass/fail/blocked),
@@ -175,6 +191,12 @@ to stamp it. Then:
   against which tree, by which step.
 
 ### 3.3 `fleet_submit_task` becomes a gate rather than a report
+
+**Half built.** It now refuses when an essential criterion is reported `unmet`,
+`blocked`, or left out entirely, and records the evidence next to the summary a
+person reads. What it cannot yet do is check the claim: it takes the
+orchestrator's word that a criterion was met. §3.2 is what closes that — until
+then the gate forces a written observation per criterion rather than proving it.
 
 Today it takes a `summary` and hands over. It should refuse when an `essential`
 criterion has no non-stale `pass`. The refusal names the criteria, which turns
@@ -404,21 +426,25 @@ have with any paper or blog post we learn from.
 
 ## 6. Suggested order
 
-1. **Custom agent** — smallest, already proven, and it makes the rest cheaper to
-   express because the policy stops being re-sent prose.
-2. **Criteria + `stopWhen`** — the largest single behaviour change. After this
-   the orchestrator has a definition of done that is not a feeling.
+1. ~~**Custom agent**~~ — done. Smallest, already proven, and it made the rest
+   cheaper to express because the policy stopped being re-sent prose.
+2. ~~**Criteria + `stopWhen`**~~ — done. The largest single behaviour change.
+   The orchestrator now has a definition of done that is not a feeling, and
+   cannot hand a task over while an essential one is unmet.
 3. **Worker contract** — cheap, and it improves every dispatched session
-   immediately.
+   immediately. Next.
 4. **Evidence rows + tree stamps** — needs the criteria to hang off.
-5. **Submit gate** — needs the evidence to check.
+5. **Submit gate** — needs the evidence to check. Half of it now exists: the
+   refusal is real, but what it checks is the orchestrator's own report.
 
 ## 7. Open questions
 
-- **Does every task deserve criteria?** A one-phase question ("survey this
-  repo") has a deliverable but no QA channel. OmO's answer is a `research`-shape
-  goal that passes on a cited answer. We probably need the same escape hatch, or
-  the ceremony will make small tasks not worth opening.
+- ~~**Does every task deserve criteria?**~~ Answered by building it: yes, and it
+  is not ceremony. Asked to count test files — the smallest possible task, no QA
+  channel — a live orchestrator wrote one criterion naming the search it would
+  run and the count it would produce, and it cost one line. The `essential:
+  false` flag is the escape hatch for the parts that are genuinely optional.
+  Kept below for the reasoning that led there.
 - **Who writes the criteria — the person or the orchestrator?** OmO has the
   agent derive them from the brief and surface assumptions for a one-line veto.
   That fits our "New task" dialog well: the person states an outcome, the

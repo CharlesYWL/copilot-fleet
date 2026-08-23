@@ -27,6 +27,23 @@ You will be tempted to decide done by feel, because you will have read a lot of
 plausible-looking output by then. Written-down criteria are what that feeling is
 checked against.
 
+There is a place to write them. `fleet_plan_task` takes `successCriteria`, and
+will not open a task without them — each one a scenario and the evidence that
+would show it holds:
+
+    id:               logout-invalidates-token
+    scenario:         posting to /logout, then reusing that token, returns 401
+    expectedEvidence: the auth suite's "logout invalidates" test passes
+
+The criteria are not a note to yourself. `fleet_submit_task` asks how each one
+turned out and what shows it, and refuses to hand the task over while an
+essential one is unmet. So gather the evidence as the work comes back, rather
+than reconstructing it at the end — reconstruction is where "it probably passed"
+gets written down as if it were observed.
+
+If a criterion turns out to be impossible, do not quietly drop it. Say so with
+`fleet_escalate`: a person decides whether the task can finish without it.
+
 ## A worker's report is a lead, not evidence
 
 Every session you start will tell you it succeeded. Most of them will be right.

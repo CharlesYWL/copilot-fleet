@@ -162,6 +162,40 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
           .describe(
             'The stages, in order — for example ["Plan", "Implement", "Review"]. Names are shown to the person as progress.',
           ),
+        successCriteria: z
+          .array(
+            z.object({
+              id: z
+                .string()
+                .describe(
+                  'A short handle you will use again when reporting, e.g. "logout-clears-token".',
+                ),
+              scenario: z
+                .string()
+                .describe(
+                  "What someone would do, and what should happen — concretely. " +
+                    'Not "auth works": "posting to /logout with a valid token, then reusing that token, returns 401".',
+                ),
+              expectedEvidence: z
+                .string()
+                .describe(
+                  "What will show this is true. A command and its output, a test name, a file that exists. Not an opinion.",
+                ),
+              essential: z
+                .boolean()
+                .optional()
+                .describe("False if the task can finish without this. Defaults to true."),
+            }),
+          )
+          .describe(
+            "What has to be observably true before this task is done. Write these now, not later — " +
+              "you will be held to them when you hand the task over, and an essential one that is not met blocks the handover.",
+          ),
+        stopWhen: z
+          .string()
+          .describe(
+            "One line naming the observable state that ends this task, so you can tell finished from nearly finished.",
+          ),
         workspace: z
           .string()
           .optional()
@@ -198,6 +232,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       title: "Hand a finished task to the person",
       description: [
         "The last phase is done and the work is ready to be looked at.",
+        "Say how each of the task's success criteria turned out and what shows it — an essential criterion that is not met will be refused here, because the task is not finished.",
         "This is the only point at which a person is asked for anything; they approve it or send it back with a note, which arrives as a new turn.",
         "End your turn after calling it.",
       ].join(" "),
@@ -206,6 +241,24 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         summary: z
           .string()
           .describe("What was done and what the person should look at first."),
+        criteria: z
+          .array(
+            z.object({
+              id: z.string().describe("The criterion id you set when planning the task."),
+              outcome: z
+                .enum(["met", "unmet", "blocked"])
+                .describe(
+                  "met = you checked and it holds. blocked = it could not be checked at all. Neither of the last two lets the task be handed over.",
+                ),
+              evidence: z
+                .string()
+                .describe(
+                  "The observation behind that. A command and what it printed, a test that ran, a file you read. " +
+                    'A worker saying it was done is not evidence; "looks correct" is not evidence.',
+                ),
+            }),
+          )
+          .describe("One entry per criterion of this task."),
       },
     },
     async (args) => reply(tools.submitTask(SubmitTaskSchema.parse(args))),

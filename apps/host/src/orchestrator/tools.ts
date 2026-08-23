@@ -1,15 +1,19 @@
 import { z } from "zod";
 import {
+  CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
+  RunCriterionSchema,
   canTransitionRun,
   eventPayload,
   isWritingCategory,
   terminalRunStates,
   terminalRunStepStates,
   terminalSessionStates,
+  type CriterionOutcome,
   type FleetSession,
   type Placement,
   type Run,
+  type RunCriterion,
   type RunStep,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
@@ -53,6 +57,17 @@ export const PlanTaskSchema = z.object({
    * person sees as progress, so the names should mean something to them.
    */
   phases: z.array(z.string().min(1).max(40)).min(1).max(8),
+  /**
+   * What has to be observably true for this task to be finished.
+   *
+   * Required, and required *here* — before any work goes out. A definition of
+   * done arrived at afterwards describes what happened instead of testing it,
+   * and an orchestrator with no written definition decides done by feel after
+   * reading a great deal of plausible output.
+   */
+  successCriteria: z.array(RunCriterionSchema).min(1).max(8),
+  /** One line: the exact observable state that ends this task. */
+  stopWhen: z.string().min(10).max(300),
   workspace: z.string().optional(),
 });
 
@@ -66,6 +81,24 @@ export const AdvanceTaskSchema = TaskRefSchema.extend({
 export const SubmitTaskSchema = TaskRefSchema.extend({
   /** What was done and what the person should look at. */
   summary: z.string().min(1).max(4_000),
+  /**
+   * How each criterion turned out, and what shows it.
+   *
+   * One entry per criterion, because the alternative — a summary and a wave of
+   * the hand — is exactly what criteria exist to replace. An orchestrator that
+   * cannot say what proves a criterion has not established it.
+   */
+  criteria: z
+    .array(
+      z.object({
+        id: z.string().min(1).max(40),
+        outcome: CriterionOutcomeSchema,
+        /** The observable behind the claim. Not "looks correct". */
+        evidence: z.string().min(10).max(600),
+      }),
+    )
+    .max(8)
+    .default([]),
 });
 
 export const SessionRefSchema = z.object({ sessionId: z.string().min(1) });
@@ -80,16 +113,96 @@ const ok = (text: string): ToolResult => ({ ok: true, text });
 const refuse = (text: string): ToolResult => ({ ok: false, text });
 
 /** What the orchestrator is told once a task has its phases. */
-function planTaskReply(name: string, phases: readonly string[]): string {
+function planTaskReply(
+  name: string,
+  phases: readonly string[],
+  criteria: readonly RunCriterion[],
+): string {
   return [
     `Planned "${name}".`,
     `  phases: ${phases.join(" → ")}`,
     `  now on: ${phases[0]}`,
+    `  done when: ${criteria.length} criteria are met`,
+    ...criteria.map(
+      (c) => `    ${c.id}${c.essential ? "" : " (optional)"}: ${c.scenario}`,
+    ),
+    "",
+    "Those criteria are what fleet_submit_task will hold you to. You will have to",
+    "say how each one turned out and what shows it, so gather the evidence as you",
+    "go rather than reconstructing it at the end.",
     "",
     "Dispatch the work for this phase, then end your turn. When you are woken,",
     "check what came back: call fleet_advance_task if the phase is done, or",
     "dispatch more work if it is not.",
   ].join("\n");
+}
+
+/**
+ * Whether a task may be handed over, given what it promised and what came back.
+ *
+ * The whole point of writing criteria down at plan time is that something other
+ * than the model's mood decides whether they were met. So this is deliberately
+ * unsympathetic: an essential criterion that is unmet, blocked, or simply not
+ * mentioned stops the handover. Optional ones are recorded and ignored.
+ *
+ * It does not judge the *evidence* — no code can tell a real observation from a
+ * confident sentence. What it can do is make the orchestrator write one down per
+ * criterion, next to the claim, where a person will read them together.
+ */
+function judgeCriteria(
+  promised: readonly RunCriterion[],
+  reported: readonly { id: string; outcome: CriterionOutcome; evidence: string }[],
+): { refusal?: string; record: string } {
+  if (promised.length === 0) return { record: "" };
+
+  const byId = new Map(reported.map((entry) => [entry.id, entry]));
+  const unknown = reported.filter((entry) => !promised.some((c) => c.id === entry.id));
+  if (unknown.length > 0) {
+    return {
+      record: "",
+      refusal:
+        `No criterion called ${unknown.map((e) => `"${e.id}"`).join(", ")} on this task. ` +
+        `Its criteria are: ${promised.map((c) => c.id).join(", ")}.`,
+    };
+  }
+
+  const missing = promised.filter((c) => c.essential && !byId.has(c.id));
+  if (missing.length > 0) {
+    return {
+      record: "",
+      refusal:
+        `Say how ${missing.map((c) => `"${c.id}"`).join(", ")} turned out before handing this over.\n` +
+        missing
+          .map((c) => `  ${c.id}: ${c.scenario}\n    expects: ${c.expectedEvidence}`)
+          .join("\n"),
+    };
+  }
+
+  const failed = promised.filter((c) => c.essential && byId.get(c.id)?.outcome !== "met");
+  if (failed.length > 0) {
+    return {
+      record: "",
+      refusal:
+        `${failed.length} of this task's criteria are not met, so it is not finished:\n` +
+        failed
+          .map((c) => `  ${c.id} (${byId.get(c.id)!.outcome}): ${c.scenario}`)
+          .join("\n") +
+        `\n\nDispatch work to close them. If one cannot be met at all, say so with ` +
+        `fleet_escalate — a person decides whether to drop a criterion, not you.`,
+    };
+  }
+
+  return {
+    record:
+      "\n\nAgainst what this task promised:\n" +
+      promised
+        .map((c) => {
+          const entry = byId.get(c.id);
+          if (!entry) return `- ${c.id} (optional): not reported`;
+          return `- ${c.id}: ${entry.outcome} — ${entry.evidence}`;
+        })
+        .join("\n"),
+  };
 }
 
 /**
@@ -140,7 +253,11 @@ export class FleetTools {
   }
 
   /** Opens a task, so the orchestrator can start one without asking a human. */
-  private openTask(name: string, phases: readonly string[] = []): Run | undefined {
+  private openTask(
+    name: string,
+    phases: readonly string[] = [],
+    done: { successCriteria?: readonly RunCriterion[]; stopWhen?: string } = {},
+  ): Run | undefined {
     const lead = this.store.getSession(this.leadSessionId);
     if (!lead) return undefined;
     const template = this.runs()[0];
@@ -149,6 +266,8 @@ export class FleetTools {
       name,
       objective: name,
       phases,
+      successCriteria: done.successCriteria ?? [],
+      stopWhen: done.stopWhen ?? "",
       policy: {
         ...(template ? template.policy : {}),
         wakePolicy: "on_any_settle",
@@ -191,9 +310,11 @@ export class FleetTools {
       const planned = this.store.updateRun(existing.id, {
         phases: input.phases,
         phaseIndex: 0,
+        successCriteria: input.successCriteria,
+        stopWhen: input.stopWhen,
       })!;
       this.service.publishRun(planned);
-      return ok(planTaskReply(planned.name, input.phases));
+      return ok(planTaskReply(planned.name, input.phases, input.successCriteria));
     }
     if (existing) {
       return refuse(
@@ -201,12 +322,15 @@ export class FleetTools {
           `Use a different name, or dispatch into it with fleet_start_work.`,
       );
     }
-    const run = this.openTask(input.task, input.phases);
+    const run = this.openTask(input.task, input.phases, {
+      successCriteria: input.successCriteria,
+      stopWhen: input.stopWhen,
+    });
     if (!run) {
       return refuse("Could not open that task. Ask a human to restart the orchestrator.");
     }
     this.service.publishRun(run);
-    return ok(planTaskReply(run.name, input.phases));
+    return ok(planTaskReply(run.name, input.phases, input.successCriteria));
   }
 
   /**
@@ -289,7 +413,14 @@ export class FleetTools {
       return refuse(`"${run.name}" cannot be handed over from ${run.state}.`);
     }
 
-    this.store.appendRunNote(run.id, run.phaseIndex, input.summary);
+    const verdict = judgeCriteria(run.successCriteria, input.criteria);
+    if (verdict.refusal) return refuse(verdict.refusal);
+
+    this.store.appendRunNote(
+      run.id,
+      run.phaseIndex,
+      [input.summary, verdict.record].join(""),
+    );
     const submitted = this.store.updateRun(run.id, { state: "awaiting_human" })!;
     this.service.publishRun(submitted);
     return ok(

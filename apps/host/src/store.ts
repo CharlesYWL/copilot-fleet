@@ -13,6 +13,7 @@ import {
   type RunState,
   type RunStep,
   type RunNote,
+  type RunCriterion,
   type RunStepState,
   type SessionEvent,
   type SessionState,
@@ -209,6 +210,8 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("runs", "pending_prompt", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "agents", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumnIfMissing("runs", "success_criteria", "TEXT NOT NULL DEFAULT '[]'");
+    this.addColumnIfMissing("runs", "stop_when", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.rebuildSessionStateFromEvents();
   }
@@ -561,8 +564,9 @@ export class FleetStore {
         this.statement(
           `INSERT INTO runs
             (id,workspace_id,name,objective,state,lead_session_id,placement_id,policy,
+             phases,phase_index,success_criteria,stop_when,
              failure_reason,settle_seq,wake_seq,empty_wake_count,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           run.id,
           run.workspaceId,
@@ -572,6 +576,12 @@ export class FleetStore {
           run.leadSessionId,
           run.placementId,
           JSON.stringify(run.policy),
+          // Everything that says what the task *is* travels with it. Dropped,
+          // a restored task keeps its steps and forgets what they were for.
+          JSON.stringify(run.phases),
+          run.phaseIndex,
+          JSON.stringify(run.successCriteria),
+          run.stopWhen,
           run.failureReason,
           run.settleSeq,
           run.wakeSeq,
@@ -1121,14 +1131,18 @@ export class FleetStore {
     policy?: RunPolicyInput | undefined;
     /** The stages the orchestrator planned; empty for an unphased run. */
     phases?: readonly string[] | undefined;
+    /** What has to be observably true before this task is finished. */
+    successCriteria?: readonly RunCriterion[] | undefined;
+    /** One line naming the observable state that ends the task. */
+    stopWhen?: string | undefined;
   }): Run {
     const now = new Date().toISOString();
     const id = randomUUID();
     const policy = RunPolicySchema.parse(input.policy ?? {});
     this.statement(
       `INSERT INTO runs
-       (id,workspace_id,name,objective,state,policy,phases,created_at,updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,name,objective,state,policy,phases,success_criteria,stop_when,created_at,updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       input.workspaceId,
@@ -1137,6 +1151,8 @@ export class FleetStore {
       "awaiting_approval",
       JSON.stringify(policy),
       JSON.stringify(input.phases ?? []),
+      JSON.stringify(input.successCriteria ?? []),
+      input.stopWhen ?? "",
       now,
       now,
     );
@@ -1169,8 +1185,12 @@ export class FleetStore {
         | "name"
         | "phaseIndex"
         | "pendingPrompt"
+        | "stopWhen"
       >
-    > & { phases?: readonly string[] | undefined },
+    > & {
+      phases?: readonly string[] | undefined;
+      successCriteria?: readonly RunCriterion[] | undefined;
+    },
   ): Run | undefined {
     if (!this.getRun(id)) return undefined;
     const columns: Record<string, unknown> = {
@@ -1182,7 +1202,12 @@ export class FleetStore {
       name: patch.name,
       phase_index: patch.phaseIndex,
       pending_prompt: patch.pendingPrompt,
+      stop_when: patch.stopWhen,
       phases: patch.phases === undefined ? undefined : JSON.stringify(patch.phases),
+      success_criteria:
+        patch.successCriteria === undefined
+          ? undefined
+          : JSON.stringify(patch.successCriteria),
     };
     const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
     if (entries.length === 0) return this.getRun(id);
@@ -1723,6 +1748,8 @@ function runFromRow(row: Row): Run {
     // differently; defaults are a working run, a throw is a lost one.
     policy: stored.ok ? stored.value : {},
     phases: parseJsonList(row.phases),
+    successCriteria: parseJsonList(row.success_criteria),
+    stopWhen: String(row.stop_when ?? ""),
     phaseIndex: Number(row.phase_index ?? 0),
     failureReason: String(row.failure_reason ?? ""),
     pendingPrompt: String(row.pending_prompt ?? ""),

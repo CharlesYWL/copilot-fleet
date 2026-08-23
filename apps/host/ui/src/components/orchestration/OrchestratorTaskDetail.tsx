@@ -91,6 +91,53 @@ const useStyles = makeStyles({
     boxShadow: `inset 2px 0 ${semanticColors.interaction}`,
   },
   pip: { width: "8px", height: "8px", borderRadius: "50%", background: "currentColor" },
+  /*
+   * The contract the orchestrator is held to, shown to the person in the same
+   * words. It cannot hand the task over while an essential one is unmet, so
+   * this is not a summary of intent — it is what will actually be enforced.
+   */
+  stopWhen: {
+    margin: "0 0 10px",
+    color: tokens.colorNeutralForeground2,
+    fontSize: tokens.fontSizeBase300,
+    lineHeight: "1.5",
+  },
+  criteria: { display: "grid", gap: "6px", margin: 0, padding: 0, listStyle: "none" },
+  criterion: {
+    display: "flex",
+    alignItems: "flex-start",
+    gap: "10px",
+    padding: "10px 12px",
+    borderRadius: tokens.borderRadiusMedium,
+    background: tokens.colorNeutralBackground2,
+  },
+  criterionPip: {
+    flexShrink: 0,
+    width: "6px",
+    height: "6px",
+    marginTop: "6px",
+    borderRadius: "50%",
+    background: tokens.colorNeutralForeground4,
+  },
+  criterionText: { display: "flex", flexDirection: "column", gap: "2px", minWidth: 0 },
+  criterionScenario: {
+    color: tokens.colorNeutralForeground1,
+    fontSize: tokens.fontSizeBase200,
+    lineHeight: "1.5",
+  },
+  criterionEvidence: {
+    color: tokens.colorNeutralForeground3,
+    fontSize: tokens.fontSizeBase200,
+    lineHeight: "1.5",
+  },
+  optional: {
+    marginLeft: "6px",
+    color: tokens.colorNeutralForeground4,
+    fontFamily: terminal.font,
+    fontSize: "10px",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+  },
   notes: { display: "grid", gap: "8px", margin: 0, padding: 0, listStyle: "none" },
   note: {
     padding: "10px 12px",
@@ -289,6 +336,33 @@ export const OrchestratorTaskDetail = ({
                 </span>
               ))}
             </div>
+          </section>
+        )}
+
+        {run.successCriteria.length > 0 && (
+          <section className={styles.section}>
+            <Text className={styles.sectionLabel}>What done means</Text>
+            {run.stopWhen && (
+              <p className={styles.stopWhen}>Finished when {run.stopWhen}</p>
+            )}
+            <ul className={styles.criteria}>
+              {run.successCriteria.map((criterion) => (
+                <li key={criterion.id} className={styles.criterion}>
+                  <span className={styles.criterionPip} aria-hidden="true" />
+                  <div className={styles.criterionText}>
+                    <span className={styles.criterionScenario}>
+                      {criterion.scenario}
+                      {!criterion.essential && (
+                        <span className={styles.optional}>optional</span>
+                      )}
+                    </span>
+                    <span className={styles.criterionEvidence}>
+                      shown by {criterion.expectedEvidence}
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
           </section>
         )}
 
