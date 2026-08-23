@@ -10,6 +10,8 @@ import {
 } from "@fluentui/react-components";
 import {
   Navigation20Regular,
+  PanelLeftContract20Regular,
+  PanelLeftExpand20Regular,
   PlugConnected20Regular,
   PlugDisconnected20Regular,
   Pulse20Regular,
@@ -49,6 +51,17 @@ const useStyles = makeStyles({
   navButton: {
     display: "none",
     "@media (max-width: 767px)": { display: "inline-flex" },
+  },
+  /**
+   * The fold control for the tree, which only exists where the tree is a column.
+   *
+   * Deliberately a second button rather than the same one wearing two hats:
+   * below 768px the tree is a drawer that opens over the content, and folding
+   * away something that is already not taking any room is not a thing to offer.
+   */
+  collapseButton: {
+    display: "inline-flex",
+    "@media (max-width: 767px)": { display: "none" },
   },
   brand: {
     display: "flex",
@@ -165,6 +178,16 @@ type TopBarProps = {
   /** Only meaningful below the width where the tree becomes a drawer. */
   onToggleNav?: (() => void) | undefined;
   navOpen?: boolean;
+  /**
+   * Folds the tree away on the widths where it is a column beside the content.
+   *
+   * Separate from `onToggleNav` because they are different gestures on
+   * different layouts — one opens a drawer over the page, the other gives the
+   * page the sidebar's width back — and a single handler would have to guess
+   * which layout it was in.
+   */
+  onToggleNavCollapsed?: (() => void) | undefined;
+  navCollapsed?: boolean;
 };
 
 export const TopBar = ({
@@ -179,8 +202,11 @@ export const TopBar = ({
   onShowAttention,
   onToggleNav,
   navOpen = false,
+  onToggleNavCollapsed,
+  navCollapsed = false,
 }: TopBarProps) => {
   const styles = useStyles();
+  const collapseLabel = navCollapsed ? "Show sidebar" : "Hide sidebar";
   return (
     <header className={styles.bar}>
       <div className={styles.left}>
@@ -194,6 +220,25 @@ export const TopBar = ({
             aria-expanded={navOpen}
             onClick={onToggleNav}
           />
+        )}
+        {onToggleNavCollapsed && (
+          <Tooltip relationship="label" content={collapseLabel} withArrow>
+            <Button
+              appearance="subtle"
+              size="small"
+              className={styles.collapseButton}
+              icon={
+                navCollapsed ? (
+                  <PanelLeftExpand20Regular />
+                ) : (
+                  <PanelLeftContract20Regular />
+                )
+              }
+              aria-label={collapseLabel}
+              aria-expanded={!navCollapsed}
+              onClick={onToggleNavCollapsed}
+            />
+          </Tooltip>
         )}
         <div className={styles.brand}>
           <BrandMark size={30} />

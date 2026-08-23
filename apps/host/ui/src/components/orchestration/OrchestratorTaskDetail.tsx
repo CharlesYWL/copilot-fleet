@@ -198,6 +198,14 @@ export type OrchestratorTaskDetailProps = {
   notes: RunNote[];
   sessions: readonly FleetSession[];
   onBack: () => void;
+  /**
+   * What Back goes back to, when it is not the board.
+   *
+   * A task reached from a conversation returns to that conversation, and a
+   * button that still reads "All tasks" while doing so is describing a place
+   * the operator is not about to arrive at.
+   */
+  backLabel?: string;
   onOpenLead: () => void;
   onOpenWorker: (sessionId: string) => void;
   onReview: (approved: boolean, note: string) => Promise<boolean>;
@@ -220,6 +228,7 @@ export const OrchestratorTaskDetail = ({
   notes,
   sessions,
   onBack,
+  backLabel = "All tasks",
   onOpenLead,
   onOpenWorker,
   onReview,
@@ -259,7 +268,7 @@ export const OrchestratorTaskDetail = ({
             icon={<ArrowLeft20Regular />}
             onClick={onBack}
           >
-            All tasks
+            {backLabel}
           </Button>
           <Text className={styles.crumb}>
             Orchestrator / {run.name}

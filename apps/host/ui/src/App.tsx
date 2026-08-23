@@ -20,6 +20,7 @@ import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
 import { useSessionChimes } from "./hooks/useSessionChimes";
+import { useStickyFlag } from "./hooks/useStickyFlag";
 import { signOut } from "./lib/auth";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import { isDisposableSession, filterVisibleSessions } from "./lib/session-status";
@@ -39,6 +40,7 @@ import { DispatchedBanner } from "./components/orchestration/DispatchedBanner";
 import { StartOrchestrator } from "./components/orchestration/StartOrchestrator";
 import { OrchestratorPage } from "./components/orchestration/OrchestratorPage";
 import { OrchestratorTaskDetail } from "./components/orchestration/OrchestratorTaskDetail";
+import { ConversationTasks } from "./components/orchestration/ConversationTasks";
 import { CreateOrchestrationDialog } from "./components/orchestration/CreateOrchestrationDialog";
 import {
   buildRunViewModels,
@@ -117,6 +119,31 @@ const useStyles = makeStyles({
      */
     display: "flex",
     minHeight: 0,
+    /*
+     * The fold is the wrapper's width, not the sidebar's.
+     *
+     * The sidebar keeps its 280px throughout, so folding it clips the tree
+     * rather than reflowing it — a tree that reflows to 40px on the way out
+     * spends the animation rewrapping every label, which reads as a glitch.
+     * `visibility` rides along so that a folded sidebar is out of the tab order
+     * and out of the accessibility tree, but only once it has finished leaving:
+     * it flips to hidden at the end of the transition and back at the start of
+     * the return, which is exactly what a discrete property does here.
+     *
+     * `flexShrink` is load-bearing. A flex item with a width is still free to
+     * give it up, and a transcript is as wide as its widest line — so without
+     * this the tree was squeezed to whatever a table of Chinese prose left it,
+     * which was about 50px.
+     */
+    "@media (min-width: 768px)": {
+      width: "280px",
+      flexShrink: 0,
+      overflow: "hidden",
+      visibility: "visible",
+      transitionProperty: "width, visibility",
+      transitionDuration: "200ms",
+      transitionTimingFunction: "cubic-bezier(0.33, 0, 0.13, 1)",
+    },
     "@media (max-width: 767px)": {
       position: "absolute",
       insetBlockStart: 0,
@@ -125,6 +152,17 @@ const useStyles = makeStyles({
       zIndex: 20,
       boxShadow: tokens.shadow28,
     },
+    "@media (prefers-reduced-motion: reduce)": { transitionDuration: "1ms" },
+  },
+  /**
+   * The folded state, scoped to the widths that have a column to fold.
+   *
+   * Below 768px the sidebar is already a drawer over the content, so a
+   * remembered fold from a wider window must not follow the operator down and
+   * leave the drawer opening onto nothing.
+   */
+  navCollapsed: {
+    "@media (min-width: 768px)": { width: 0, visibility: "hidden" },
   },
   navHidden: {
     "@media (max-width: 767px)": { display: "none" },
@@ -178,6 +216,14 @@ export function App() {
     useState<OrchestratorViewMode>("stage");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
   const [selectedRunId, setSelectedRunId] = useState<string>();
+  /**
+   * The conversation a task was opened from, when one was.
+   *
+   * Only the task detail reads it, and only to decide where Back goes: reaching
+   * a task from a thread and being returned to the fleet-wide board is a change
+   * of place the operator did not ask for.
+   */
+  const [taskOrigin, setTaskOrigin] = useState<string>();
   const [returnContext, setReturnContext] = useState<ReturnContext>();
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -185,6 +231,10 @@ export function App() {
   const [attentionOnly, setAttentionOnly] = useState(false);
   /** Narrow screens show the tree as a drawer; wide ones ignore this. */
   const [navOpen, setNavOpen] = useState(false);
+  /** Wide screens can give the tree's column back to the content. */
+  const [navCollapsed, setNavCollapsed] = useStickyFlag("nav.collapsed", false);
+  /** The task list beside a conversation, folded away or not. */
+  const [tasksOpen, setTasksOpen] = useStickyFlag("conversation.tasks", true);
   const [defaultYolo, setDefaultYolo] = useState(false);
   /**
    * Unsent composer text, per session.
@@ -292,9 +342,23 @@ export function App() {
   };
 
   /** Opens one task's detail, from any of the three orchestrator views. */
-  const handleOpenRun = (runId: string) => {
+  const handleOpenRun = (runId: string, fromConversationId?: string) => {
     setSelectedRunId(runId);
+    // Cleared unless the task was opened from a conversation, so Back keeps
+    // meaning "where I was" rather than "wherever I last came from".
+    setTaskOrigin(fromConversationId);
     setView("orchestrator-task");
+  };
+
+  /** Leaves a task for whatever opened it: a conversation, or the board. */
+  const handleBackFromTask = () => {
+    if (taskOrigin) {
+      const conversation = taskOrigin;
+      setTaskOrigin(undefined);
+      handleSelectSession(conversation, { kind: "orchestrator" });
+      return;
+    }
+    setView("orchestrator");
   };
 
   const handleBackFromSession = () => {
@@ -484,6 +548,17 @@ export function App() {
     () => runModels.find((model) => model.run.id === selectedRunId),
     [runModels, selectedRunId],
   );
+  /**
+   * The tasks of the conversation on screen, if the session on screen is one.
+   *
+   * A worker's transcript gets nothing: it *is* one task's work, so a list of
+   * its siblings beside it would be answering a question nobody asked while
+   * reading it. Only a lead session — a conversation — owns tasks.
+   */
+  const conversationModels = useMemo(() => {
+    if (!activeSession || activeSession.runRole !== "lead") return [];
+    return runModels.filter((model) => model.run.leadSessionId === activeSession.id);
+  }, [runModels, activeSession]);
 
   /*
    * A task that no longer exists cannot stay open. Deleting or losing the run
@@ -634,6 +709,8 @@ export function App() {
           onSignOut={() => void signOut()}
           onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}
           navOpen={navOpen}
+          onToggleNavCollapsed={view === "overview" ? undefined : () => setNavCollapsed()}
+          navCollapsed={navCollapsed}
           onShowAttention={
             orchestratorSummary.needsYou > 0
               ? () => setView("orchestrator")
@@ -676,7 +753,11 @@ export function App() {
                 />
               )}
               <div
-                className={mergeClasses(styles.navDrawer, !navOpen && styles.navHidden)}
+                className={mergeClasses(
+                  styles.navDrawer,
+                  !navOpen && styles.navHidden,
+                  navCollapsed && styles.navCollapsed,
+                )}
               >
                 <Sidebar
                   nodes={snapshot.nodes}
@@ -752,7 +833,8 @@ export function App() {
                   model={selectedRunModel}
                   notes={runNotes[selectedRunModel.run.id] ?? noNotes}
                   sessions={snapshot.sessions}
-                  onBack={() => setView("orchestrator")}
+                  onBack={handleBackFromTask}
+                  backLabel={taskOrigin ? "Conversation" : "All tasks"}
                   onOpenLead={() => {
                     // The conversation that owns this task, not whichever one
                     // happens to be open: on a board that shows every
@@ -792,56 +874,78 @@ export function App() {
 
               {view === "session" &&
                 (activeSession ? (
-                  <div className={styles.session}>
-                    {(activeSession.runRole !== "" || returnContext) && (
-                      <DispatchedBanner
+                  <>
+                    <div className={styles.session}>
+                      {(activeSession.runRole !== "" || returnContext) && (
+                        <DispatchedBanner
+                          session={activeSession}
+                          step={orchestratorSteps.find(
+                            (step) => step.sessionId === activeSession.id,
+                          )}
+                          runName={
+                            returnContext?.kind === "orchestrator-task"
+                              ? runModels.find(
+                                  (model) => model.run.id === returnContext.runId,
+                                )?.run.name
+                              : undefined
+                          }
+                          onBack={handleBackFromSession}
+                        />
+                      )}
+                      <TerminalView
                         session={activeSession}
-                        step={orchestratorSteps.find(
-                          (step) => step.sessionId === activeSession.id,
-                        )}
-                        runName={
-                          returnContext?.kind === "orchestrator-task"
-                            ? runModels.find(
-                                (model) => model.run.id === returnContext.runId,
-                              )?.run.name
-                            : undefined
+                        events={events[activeSession.id] ?? noEvents}
+                        onPrompt={(prompt, attachments) =>
+                          void command(`/api/sessions/${activeSession.id}/prompt`, {
+                            prompt,
+                            attachments,
+                          })
                         }
-                        onBack={handleBackFromSession}
+                        onCancel={() =>
+                          void command(`/api/sessions/${activeSession.id}/cancel`)
+                        }
+                        onStop={() =>
+                          void command(`/api/sessions/${activeSession.id}/stop`)
+                        }
+                        onDismiss={() => void handleDismissSession(activeSession.id)}
+                        onResume={() =>
+                          void command(`/api/sessions/${activeSession.id}/resume`)
+                        }
+                        onRename={(name) => handleRenameSession(activeSession.id, name)}
+                        onPermission={(requestId, outcome, optionId) =>
+                          handlePermission(activeSession.id, requestId, outcome, optionId)
+                        }
+                        onConfigChange={(configId, value) =>
+                          void command(`/api/sessions/${activeSession.id}/config`, {
+                            configId,
+                            value,
+                          })
+                        }
+                        draft={draftFor(drafts, activeSession.id)}
+                        onDraftChange={(update) => changeDraft(activeSession.id, update)}
+                      />
+                    </div>
+                    {activeSession.runRole === "lead" && (
+                      <ConversationTasks
+                        models={conversationModels}
+                        open={tasksOpen}
+                        selectedRunId={selectedRunId}
+                        onToggle={() => setTasksOpen()}
+                        onOpenRun={(runId) => handleOpenRun(runId, activeSession.id)}
+                        onOpenWorker={(sessionId) =>
+                          handleSelectSession(sessionId, { kind: "orchestrator" })
+                        }
+                        onNewRun={() => {
+                          // The dialog briefs whichever conversation is open, so
+                          // opening it from a thread has to make that thread the
+                          // open one — otherwise the task lands on whichever
+                          // conversation was last chosen elsewhere.
+                          setOpenConversationId(activeSession.id);
+                          setOrchestrationDialogOpen(true);
+                        }}
                       />
                     )}
-                    <TerminalView
-                      session={activeSession}
-                      events={events[activeSession.id] ?? noEvents}
-                      onPrompt={(prompt, attachments) =>
-                        void command(`/api/sessions/${activeSession.id}/prompt`, {
-                          prompt,
-                          attachments,
-                        })
-                      }
-                      onCancel={() =>
-                        void command(`/api/sessions/${activeSession.id}/cancel`)
-                      }
-                      onStop={() =>
-                        void command(`/api/sessions/${activeSession.id}/stop`)
-                      }
-                      onDismiss={() => void handleDismissSession(activeSession.id)}
-                      onResume={() =>
-                        void command(`/api/sessions/${activeSession.id}/resume`)
-                      }
-                      onRename={(name) => handleRenameSession(activeSession.id, name)}
-                      onPermission={(requestId, outcome, optionId) =>
-                        handlePermission(activeSession.id, requestId, outcome, optionId)
-                      }
-                      onConfigChange={(configId, value) =>
-                        void command(`/api/sessions/${activeSession.id}/config`, {
-                          configId,
-                          value,
-                        })
-                      }
-                      draft={draftFor(drafts, activeSession.id)}
-                      onDraftChange={(update) => changeDraft(activeSession.id, update)}
-                    />
-                  </div>
+                  </>
                 ) : (
                   <EmptySessions onNewSession={() => setDialogOpen(true)} />
                 ))}

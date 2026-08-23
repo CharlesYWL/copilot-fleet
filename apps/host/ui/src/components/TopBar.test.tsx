@@ -127,3 +127,55 @@ describe("TopBar layout", () => {
     expect(bar.childElementCount).toBe(3);
   });
 });
+
+describe("TopBar sidebar fold", () => {
+  it("folds the tree away and says which way the control goes", () => {
+    /*
+     * The label is the whole affordance: the two panel glyphs differ by a
+     * chevron, and an operator should not have to read an icon to find out
+     * whether pressing it takes the sidebar away or brings it back.
+     */
+    const onToggleNavCollapsed = vi.fn();
+    const { rerender } = show({ onToggleNavCollapsed, navCollapsed: false });
+
+    const hide = screen.getByRole("button", { name: "Hide sidebar" });
+    expect(hide.getAttribute("aria-expanded")).toBe("true");
+    hide.click();
+    expect(onToggleNavCollapsed).toHaveBeenCalled();
+
+    rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <TopBar
+          nodesOnline={2}
+          liveSessions={3}
+          waitingPermissions={0}
+          connected
+          context={{ kind: "session", mode: "tree", onChange: vi.fn() }}
+          soundEnabled
+          onToggleSound={vi.fn()}
+          onSignOut={vi.fn()}
+          onToggleNavCollapsed={onToggleNavCollapsed}
+          navCollapsed
+        />
+      </FluentProvider>,
+    );
+    const show_ = screen.getByRole("button", { name: "Show sidebar" });
+    expect(show_.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("keeps the fold and the drawer as separate controls", () => {
+    /*
+     * They belong to different layouts — one opens a drawer over the page, the
+     * other gives the page the sidebar's width back — and CSS decides which is
+     * on screen. One button doing both would have to guess.
+     */
+    show({ onToggleNav: vi.fn(), onToggleNavCollapsed: vi.fn() });
+    expect(screen.getByRole("button", { name: "Open navigation" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Hide sidebar" })).toBeTruthy();
+  });
+
+  it("offers nothing to fold where there is no sidebar", () => {
+    show();
+    expect(screen.queryByRole("button", { name: /sidebar/ })).toBeNull();
+  });
+});
