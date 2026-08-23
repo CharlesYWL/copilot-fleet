@@ -634,16 +634,33 @@ finishes, the Host wakes the orchestrator with a summary, and it decides what
 happens next. Ask it for a review and it dispatches one onto the same checkout
 the work happened in, so the reviewer sees the actual changes.
 
-The view is the conversation, with a rail beside it listing what is out on the
-fleet; clicking a step opens that worker's transcript.
+![The orchestrator's architecture: a person asks a lead session, which reaches the Host through a bearer-scoped MCP tool surface; the tools write task state to SQLite, a pure scheduler reads a snapshot of it, and the orchestrator engine dispatches workers and wakes the lead with a summary once a worker's turn completes.](docs/orchestrator.png)
 
-It never sits and waits, which is the point: the conversation is durable, so a
-worker that takes twenty minutes costs nothing while it runs, and a Host restart
-does not lose the thread.
+The orchestrator is not a special kind of process. It is an ordinary session on
+an ordinary node, and the only thing that makes it a lead is that the Host hands
+it a tool surface — an MCP server, with a bearer token scoped to that one
+session. Workers are given no tools at all: not denied them, never handed them,
+which is what stops orchestration nesting.
 
-The orchestrator reaches the fleet through an MCP server the Host exposes, with
-a bearer token scoped to that one session. Workers are given no tools at all —
-not denied them, never handed them — which is what stops orchestration nesting.
+Two seams are worth naming, because they are what the awkward cases hang off.
+The **scheduler** is pure — a snapshot of runs, steps, sessions and nodes goes
+in, a list of actions comes out — so a Host restart mid-dispatch, a node that
+vanished, or two steps settling at once are all unit tests rather than
+situations you have to reproduce on a real fleet. The **engine** does nothing
+but carry those actions out, and it ticks on events plus a 15-second sweep, so a
+machine that loses power leaves a step overdue rather than stranded.
+
+The wake — the coral path above — is the whole design. The orchestrator never
+sits and waits: it dispatches, ends its turn, and is woken when there is
+something to decide. The conversation is durable, so a worker that takes twenty
+minutes costs nothing while it runs, and a Host restart does not lose the
+thread.
+
+You see all of this in three places. The sidebar lists your conversations; the
+**Orchestrator** board shows every conversation's tasks, because "what is the
+fleet doing" is a fleet-wide question; and a conversation carries its own tasks
+in a panel beside it, so what you just asked for is next to where you asked.
+Clicking a dispatched step opens that worker's transcript.
 
 **Or write the plan yourself.** A **run** is an objective plus a budget with a
 fixed list of steps, approved once. There is no UI for this; it is the engine's
