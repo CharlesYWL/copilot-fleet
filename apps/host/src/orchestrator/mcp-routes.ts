@@ -7,6 +7,7 @@ import type { FleetService } from "../fleet-service.js";
 import type { LeadTokens } from "./lead-tokens.js";
 import {
   AdvanceTaskSchema,
+  EscalateSchema,
   FleetTools,
   FollowUpSchema,
   PlanTaskSchema,
@@ -279,6 +280,27 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       },
     },
     async (args) => reply(tools.submitTask(SubmitTaskSchema.parse(args))),
+  );
+
+  server.registerTool(
+    "fleet_escalate",
+    {
+      title: "Hand over a task you cannot finish",
+      description: [
+        "For when a success criterion turns out to be impossible, or the task needs a decision that is not yours — a product choice, a destructive action, something outside the workspace.",
+        "Use this instead of lowering the bar: dropping a criterion is a person's decision, not yours.",
+        "The task goes to the same place a finished one does, and they can change it, drop a criterion, or stop it. End your turn after calling it.",
+      ].join(" "),
+      inputSchema: {
+        task: z.string().describe("The task you are stuck on."),
+        reason: z
+          .string()
+          .describe(
+            "What is in the way, concretely enough for a person to act on: what you tried, what happened, and what you would need in order to continue.",
+          ),
+      },
+    },
+    async (args) => reply(tools.escalate(EscalateSchema.parse(args))),
   );
 
   server.registerTool(

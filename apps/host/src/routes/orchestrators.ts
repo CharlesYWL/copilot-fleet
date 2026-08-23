@@ -138,7 +138,19 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
 
     const started = service.createAndStartSession({
       placement,
-      prompt: orchestratorBriefing(new FleetTools(service, "pending").listNodes().text),
+      /*
+       * Which half of the briefing depends on the machine: a Node whose catalog
+       * has the orchestrator agent already carries the judgement half, so
+       * repeating it here would be the same policy in two places with nothing
+       * keeping them in step.
+       */
+      prompt: orchestratorBriefing(new FleetTools(service, "pending").listNodes().text, {
+        hasAgent:
+          service.agentFor(
+            { runRole: "lead" },
+            store.getNode(placement.nodeId) ?? { agents: [] },
+          ) !== "",
+      }),
       /*
        * The orchestrator runs unattended by necessity: it is woken by the
        * engine, often while nobody is watching, and a permission prompt at

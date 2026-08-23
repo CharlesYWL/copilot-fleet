@@ -451,4 +451,49 @@ describe("FleetTools success criteria", () => {
     expect(submit([]).ok).toBe(true);
     expect(state()).toBe("awaiting_human");
   });
+
+  it("leaves a way out when a criterion turns out to be impossible", () => {
+    /*
+     * Without this the gate is a trap: submitting is refused, and an
+     * orchestrator with no legal move will either invent one or go quiet.
+     * Neither is better than saying "I am stuck, here is why".
+     *
+     * The bug this replaces was worse than a missing feature — three separate
+     * places told the orchestrator to call fleet_escalate while no such tool
+     * was registered, so being blocked led to a tool-not-found and then to
+     * improvisation.
+     */
+    expect(
+      submit([
+        { id: "logout-invalidates", outcome: "blocked", evidence: "no test database" },
+      ]).ok,
+    ).toBe(false);
+
+    const out = tools().escalate({
+      task: "Ship it",
+      reason:
+        "There is no test database on any node, so the logout test cannot run at all.",
+    });
+
+    expect(out.ok).toBe(true);
+    expect(state()).toBe("awaiting_human");
+    const note = store.listRunNotes(runId).at(-1)!.body;
+    // Named as unfinished, so nobody reads it as a completion.
+    expect(note).toContain("not finished");
+    expect(note).toContain("no test database");
+    // And carries what it was supposed to satisfy, so the person can decide
+    // whether to drop that criterion without going to look it up.
+    expect(note).toContain("logout-invalidates");
+  });
+
+  it("does not escalate a task the person already holds", () => {
+    submit([met("logout-invalidates")]);
+
+    const out = tools().escalate({
+      task: "Ship it",
+      reason: "changed my mind about this one, actually",
+    });
+
+    expect(out.ok).toBe(false);
+  });
 });

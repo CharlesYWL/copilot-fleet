@@ -158,6 +158,20 @@ export const SubmitTaskSchema = TaskRefSchema.extend({
 
 export const SessionRefSchema = z.object({ sessionId: z.string().min(1) });
 
+/**
+ * The way out when a task cannot be finished as promised.
+ *
+ * Needed because the criteria gate is deliberately unsympathetic: an essential
+ * criterion that cannot be met stops `fleet_submit_task`, and without this the
+ * orchestrator has no legal move left. Being stuck is not a reason to let it
+ * quietly lower the bar instead — dropping a criterion is a person's decision,
+ * so the task goes to them with the obstacle named.
+ */
+export const EscalateSchema = TaskRefSchema.extend({
+  /** What is in the way, concretely enough for a person to act on. */
+  reason: z.string().min(10).max(2_000),
+});
+
 export const FollowUpSchema = SessionRefSchema.extend({
   prompt: z.string().min(1).max(8_000),
 });
@@ -483,6 +497,61 @@ export class FleetTools {
         `Handed "${submitted.name}" to the person for review.`,
         "They will approve it or send it back with a note. Nothing more to do here;",
         "end your turn.",
+      ].join("\n"),
+    );
+  }
+
+  /**
+   * Hands a task over unfinished, with what is in the way.
+   *
+   * The counterpart to the criteria gate. `fleet_submit_task` refuses while an
+   * essential criterion is unmet, which is the point — but a criterion can turn
+   * out to be impossible, and an orchestrator with no way to say so would be
+   * left choosing between lying and going silent. This is the honest third
+   * option, and it deliberately reaches the same place a submission does: a
+   * person, who can drop the criterion, change it, or stop the task.
+   *
+   * Unlike submitting, work still out is not a reason to refuse. Being stuck
+   * often *is* the running step, and telling someone about it should not have
+   * to wait for the thing that is stuck.
+   */
+  escalate(input: z.infer<typeof EscalateSchema>): ToolResult {
+    const run = this.run(input.task);
+    if (!run) return refuse(`No task called "${input.task}".`);
+    if (terminalRunStates.has(run.state)) {
+      return refuse(`"${run.name}" is already closed.`);
+    }
+    if (run.state === "awaiting_human") {
+      return refuse(`"${run.name}" is already with the person.`);
+    }
+    if (!canTransitionRun(run.state, "awaiting_human")) {
+      return refuse(`"${run.name}" cannot be handed over from ${run.state}.`);
+    }
+
+    const unmet = run.successCriteria.filter((criterion) => criterion.essential);
+    this.store.appendRunNote(
+      run.id,
+      run.phaseIndex,
+      [
+        `Escalated — this task is not finished.`,
+        "",
+        input.reason,
+        ...(unmet.length > 0
+          ? [
+              "",
+              "What it was supposed to satisfy:",
+              ...unmet.map((c) => `- ${c.id}: ${c.scenario}`),
+            ]
+          : []),
+      ].join("\n"),
+    );
+    const escalated = this.store.updateRun(run.id, { state: "awaiting_human" })!;
+    this.service.publishRun(escalated);
+    return ok(
+      [
+        `Escalated "${escalated.name}" to the person.`,
+        "They decide what happens to it — dropping a criterion, changing the task, or",
+        "stopping it. Nothing more to do here; end your turn.",
       ].join("\n"),
     );
   }
