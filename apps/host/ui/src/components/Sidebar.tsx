@@ -46,6 +46,7 @@ import {
 } from "../lib/drag-drop";
 import { useCatalog } from "../hooks/useCatalog";
 import { sessionLabel } from "../lib/session-label";
+import { customAgentName } from "../lib/session-config";
 import {
   sessionAccent,
   sessionStatusDescriptor,
@@ -690,7 +691,20 @@ export const Sidebar = ({
                                     )}
                                     <span
                                       className={styles.sessionName}
-                                      title={`${sessionStatusLabel(session)} · ${session.initialPrompt}`}
+                                      /*
+                                       * The agent joins the hover text rather
+                                       * than the row: this list is the densest
+                                       * thing on screen, and a badge here would
+                                       * cost the name its width on every row to
+                                       * say something true of almost none.
+                                       */
+                                      title={[
+                                        sessionStatusLabel(session),
+                                        customAgentName(session.configOptions),
+                                        session.initialPrompt,
+                                      ]
+                                        .filter(Boolean)
+                                        .join(" · ")}
                                     >
                                       {sessionLabel(session)}
                                     </span>

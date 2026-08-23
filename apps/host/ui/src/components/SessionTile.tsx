@@ -11,6 +11,7 @@ import type { FleetSession, SessionEvent } from "@fleet/protocol";
 import { blockColor, statusVisuals, terminal } from "../theme";
 import { toPreviewLines } from "../lib/session-preview";
 import { sessionLabel } from "../lib/session-label";
+import { customAgentName } from "../lib/session-config";
 import { sessionStatusDescriptor } from "../lib/session-status";
 import {
   allowOnceOptionId,
@@ -98,6 +99,11 @@ const useStyles = makeStyles({
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
   },
+  /** Lifted out of the muted line, because it is the part that is unusual. */
+  agent: {
+    color: tokens.colorBrandForeground2,
+    fontWeight: tokens.fontWeightSemibold,
+  },
   // Lines are pinned to the bottom so the newest output sits where a terminal
   // tail would put it, however few lines the session has produced.
   preview: {
@@ -152,6 +158,7 @@ export const SessionTile = ({
   const permission = useMemo(() => pendingPermission(events), [events]);
   const blocked = Boolean(permission) || Boolean(awaitingPermission);
   const descriptor = sessionStatusDescriptor(session, blocked);
+  const agentName = customAgentName(session.configOptions);
 
   const handleOpen = () => onOpen(session.id);
 
@@ -199,6 +206,17 @@ export const SessionTile = ({
         </div>
         <Text className={styles.subtitle}>
           {session.nodeName} · {session.workspaceName}
+          {agentName && (
+            <>
+              {" · "}
+              {/*
+               * Named here because a tile is how you look at many sessions at
+               * once, and "which of these is not an ordinary Copilot" is not
+               * answerable from a name, a node, or a preview line.
+               */}
+              <span className={styles.agent}>{agentName}</span>
+            </>
+          )}
         </Text>
         <div className={styles.preview}>
           {lines.length === 0 ? (

@@ -89,6 +89,7 @@ import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
 import { PromptRail } from "./PromptRail";
 import { SessionConfigBar } from "./SessionConfigBar";
+import { SessionAgentBadge } from "./SessionAgentBadge";
 import { SlashMenu } from "./SlashMenu";
 import { StatusDot } from "./StatusDot";
 
@@ -912,6 +913,11 @@ export const TerminalView = ({
                 YOLO
               </Badge>
             )}
+            <SessionAgentBadge
+              options={session.configOptions}
+              disabled={!onConfigChange || isEnded}
+              onChange={(configId, value) => onConfigChange?.(configId, value)}
+            />
           </span>
           <Text className={styles.subtitle}>
             {session.workspaceName} · {session.nodeName} · {session.id.slice(0, 8)} ·{" "}

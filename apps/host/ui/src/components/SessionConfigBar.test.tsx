@@ -123,23 +123,48 @@ describe("SessionConfigBar", () => {
   });
 
   it("reports a pick of the empty-string choice", () => {
-    // Copilot's `agent` picker names its default persona "". Guarding the
-    // handler with a falsy test made that choice the one option in the menu
-    // that could be clicked and do nothing.
+    /*
+     * Copilot's `agent` picker names its default persona "". Guarding the
+     * handler with a falsy test made that choice the one option in the menu
+     * that could be clicked and do nothing.
+     *
+     * The agent picker itself has moved next to the session's name — see
+     * SessionAgentBadge, which guards the same case — but any picker may offer
+     * an empty value, so the bar keeps its own guard.
+     */
     const onChange = show([
       option({
-        id: "agent",
-        name: "Agent",
-        category: "_agent",
+        id: "persona",
+        name: "Persona",
+        category: "persona",
         currentValue: "feature-dev",
         choices: [
-          { value: "", name: "Copilot", description: "" },
+          { value: "", name: "Default", description: "" },
           { value: "feature-dev", name: "feature-dev", description: "" },
         ],
       }),
     ]);
-    fireEvent.click(screen.getByRole("button", { name: "Agent" }));
-    fireEvent.click(screen.getByRole("menuitemradio", { name: "Copilot" }));
-    expect(onChange).toHaveBeenCalledWith("agent", "");
+    fireEvent.click(screen.getByRole("button", { name: "Persona" }));
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Default" }));
+    expect(onChange).toHaveBeenCalledWith("persona", "");
+  });
+
+  it("leaves the agent picker to the badge beside the session's name", () => {
+    // Two controls in one strip both reading as "agent" — the mode picker's
+    // value is literally the word — is why the real one could not be found.
+    show([
+      option({
+        id: "agent",
+        name: "Agent",
+        category: "_agent",
+        currentValue: "fleet-orchestrator",
+        choices: [
+          { value: "", name: "Copilot", description: "" },
+          { value: "fleet-orchestrator", name: "fleet-orchestrator", description: "" },
+        ],
+      }),
+    ]);
+
+    expect(screen.queryByRole("button", { name: "Agent" })).toBeNull();
   });
 });
