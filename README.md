@@ -13,7 +13,7 @@ Every agent in the fleet on one screen, grouped by the project it is working in.
 Cards stream their transcript live, so a wall of them is readable without opening
 anything.
 
-![The Copilot Fleet monitor wall: five sessions across three workspaces and two nodes, each card streaming its own transcript.](docs/screenshots/monitor-wall.png)
+![The Copilot Fleet overview: five sessions across three workspaces and two nodes, each card streaming its own transcript.](docs/screenshots/monitor-wall.png)
 
 Open one and you get the whole conversation, the node it runs on, a composer that
 takes slash commands and file attachments, and the agent's own Model and Mode
@@ -395,7 +395,7 @@ Reach a remote node's page over SSH port forwarding rather than binding wider.
 
 ### Following the Host to a new URL
 
-![Settings → Tunnel: five providers — Cloudflare, Dev Tunnels, Tailscale Funnel, ngrok and bore — each with its own toggle and status, and a banner naming the address nodes are currently told to dial.](docs/screenshots/tunnel.png)
+![Settings → Tunnel: five providers — Cloudflare, Tailscale Funnel, Dev Tunnels, ngrok and bore — each with its own toggle and status, and a banner naming the address nodes are currently told to dial.](docs/screenshots/tunnel.png)
 
 Each provider runs on its own, so more than one can be up at a time; the one
 marked for enrollment is the address handed to new nodes.
@@ -563,7 +563,7 @@ Then open `http://127.0.0.1:5173`:
 
 1. Create a workspace under **Workspaces**.
 2. Add a placement for `mock-node` using an existing absolute directory.
-3. Start two sessions from **Dashboard**. Give one a name in the dialog; the
+3. Start two sessions with **New session**. Give one a name in the dialog; the
    other is listed by its prompt until you rename it from the session header.
 4. Open either card to observe independent streamed events, send a follow-up,
    cancel a turn, or stop the process.
@@ -625,7 +625,7 @@ that never got that far is simply over.
 
 There are two ways to put several agents on one job.
 
-**Talk to an orchestrator.** The sidebar's first row is **Orchestration**, above
+**Talk to an orchestrator.** The sidebar's first row is **Orchestrator**, above
 the workspaces, because it is the fleet's own surface rather than any one
 repository's. Start one and you get a session you chat with, which does not
 write code itself — it starts other agents that do. Ask it for something and it
