@@ -216,6 +216,28 @@ describe("Sidebar orchestrator row", () => {
     expect(onNewConversation).toHaveBeenCalled();
   });
 
+  it("keeps a long conversation name on one line", () => {
+    /*
+     * These rows carried fixed short labels until conversations began naming
+     * themselves after whatever a person asked for. A 48-character title
+     * wrapped to three lines and pushed the icon and status dot to the middle
+     * of a row that was no longer row-shaped.
+     *
+     * Asserting the style rather than the text, because the text is not what
+     * broke — the whole name is still there, and still on the tooltip.
+     */
+    const long = "hench很长一段总务hench很长一段总务hench很长一段总务hench很长一段总务";
+    show([placement], [session("s1", "w1", "n1")], {
+      leadSessions: [lead("lead1", long)],
+    });
+
+    const label = screen.getByText(long);
+    expect(getComputedStyle(label).whiteSpace).toBe("nowrap");
+    expect(getComputedStyle(label).textOverflow).toBe("ellipsis");
+    // The full name stays reachable on the row it belongs to.
+    expect(screen.getByTitle(long).tagName).toBe("BUTTON");
+  });
+
   it("offers no conversation row when no orchestrator is running", () => {
     // And no "new conversation" either: there is nothing to add one to yet,
     // and starting the first one is what the orchestrator page is for.

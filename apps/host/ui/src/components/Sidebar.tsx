@@ -211,6 +211,18 @@ const useStyles = makeStyles({
     flexGrow: 1,
     minWidth: 0,
     fontWeight: tokens.fontWeightSemibold,
+    /*
+     * One line, always.
+     *
+     * These labels were fixed short strings until conversations started naming
+     * themselves after whatever a person asked for. A 48-character title
+     * wrapped to three lines, pushing the icon and the status dot to the
+     * vertical middle of a row that was no longer row-shaped. The whole text
+     * is on the row's tooltip.
+     */
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
   },
   orchestrationCount: {
     fontSize: tokens.fontSizeBase200,
@@ -247,6 +259,8 @@ const useStyles = makeStyles({
     font: "inherit",
     textAlign: "left",
     cursor: "pointer",
+    // The icon and the status dot keep their size; only the name gives way.
+    "> svg": { flexShrink: 0 },
     ":hover": { background: tokens.colorNeutralBackground1Hover },
   },
 });
