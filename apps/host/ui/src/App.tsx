@@ -553,6 +553,27 @@ export function App() {
     return true;
   };
 
+  /** Puts a finished task back to work, with what is still wanted. */
+  const handleReopenRun = async (runId: string, note: string) => {
+    const reopened = await request(`/api/runs/${runId}/reopen`, {
+      method: "POST",
+      body: JSON.stringify({ note }),
+    });
+    if (!reopened.ok) return false;
+    await refresh();
+    return true;
+  };
+
+  /** Removes a finished task and the sessions it started. */
+  const handleDeleteRun = async (runId: string) => {
+    const deleted = await request(`/api/runs/${runId}`, { method: "DELETE" });
+    if (!deleted.ok) return false;
+    // Back to the board: the page this was opened from no longer has a task.
+    setView("orchestrator");
+    await refresh();
+    return true;
+  };
+
   /**
    * Opens a new task on the orchestrator.
    *
@@ -753,6 +774,8 @@ export function App() {
                     handleReviewTask(selectedRunModel.run.id, approved, note)
                   }
                   onArchive={() => handleArchiveRun(selectedRunModel.run.id)}
+                  onReopen={(note) => handleReopenRun(selectedRunModel.run.id, note)}
+                  onDelete={() => handleDeleteRun(selectedRunModel.run.id)}
                 />
               )}
 

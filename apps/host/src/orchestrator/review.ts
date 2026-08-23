@@ -43,3 +43,24 @@ function sendBackPrompt(task: string, note: string): string {
     "Call fleet_submit_task again once it is addressed.",
   ].join("\n");
 }
+
+/**
+ * The turn a reopened task arrives as.
+ *
+ * Same shape as a send-back and deliberately so — from the orchestrator's side
+ * these are the same event, a person saying the work is not finished after all.
+ * What differs is only that the task had already been closed, which is worth
+ * saying because its own history will read as complete.
+ */
+export function reopenPrompt(task: string, note: string): string {
+  return [
+    `<fleet-review task=${JSON.stringify(task)} verdict="reopened">`,
+    note,
+    "</fleet-review>",
+    "",
+    "This task was finished and has been reopened, so its notes and criteria",
+    "describe work you already did. Read them before deciding anything.",
+    "Act on the above: dispatch what it calls for, then end your turn.",
+    "Call fleet_submit_task again once it is addressed.",
+  ].join("\n");
+}

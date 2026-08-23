@@ -15,7 +15,12 @@ import {
   mergeClasses,
   tokens,
 } from "@fluentui/react-components";
-import { ArrowLeft20Regular, Chat20Regular } from "@fluentui/react-icons";
+import {
+  ArrowLeft20Regular,
+  ArrowCounterclockwise20Regular,
+  Chat20Regular,
+  Delete20Regular,
+} from "@fluentui/react-icons";
 import type { FleetSession, RunNote } from "@fleet/protocol";
 import type { RunViewModel } from "../../lib/orchestration-view";
 import { awaitingPlan, currentPhase } from "../../lib/orchestration-view";
@@ -197,6 +202,10 @@ export type OrchestratorTaskDetailProps = {
   onOpenWorker: (sessionId: string) => void;
   onReview: (approved: boolean, note: string) => Promise<boolean>;
   onArchive: () => Promise<boolean>;
+  /** Puts a finished task back to work, with what is still wanted. */
+  onReopen: (note: string) => Promise<boolean>;
+  /** Removes a finished task and the sessions it started. */
+  onDelete: () => Promise<boolean>;
 };
 
 /**
@@ -215,9 +224,14 @@ export const OrchestratorTaskDetail = ({
   onOpenWorker,
   onReview,
   onArchive,
+  onReopen,
+  onDelete,
 }: OrchestratorTaskDetailProps) => {
   const styles = useStyles();
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [reopenOpen, setReopenOpen] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [reopenNote, setReopenNote] = useState("");
   const [sendBackOpen, setSendBackOpen] = useState(false);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -262,17 +276,40 @@ export const OrchestratorTaskDetail = ({
               Conversation
             </Button>
             {/*
-              Offered on a finished task too. A completed task's workers are
-              exactly the ones still sitting in the tree with nothing to do, and
-              clearing them away is the whole point of archiving.
+              What you can do with a task depends on whether it is over.
+
+              A finished one is either wrong — reopen it, and the orchestrator
+              carries on next to the criteria and notes it already has — or done
+              with, and then archiving it would keep a record nobody wants.
+              A live one is neither: archiving stops it and keeps what it found.
             */}
-            <Button
-              appearance="subtle"
-              className={styles.danger}
-              onClick={() => setArchiveOpen(true)}
-            >
-              Archive
-            </Button>
+            {finished ? (
+              <>
+                <Button
+                  appearance="subtle"
+                  icon={<ArrowCounterclockwise20Regular />}
+                  onClick={() => setReopenOpen(true)}
+                >
+                  Reopen
+                </Button>
+                <Button
+                  appearance="subtle"
+                  className={styles.danger}
+                  icon={<Delete20Regular />}
+                  onClick={() => setDeleteOpen(true)}
+                >
+                  Delete
+                </Button>
+              </>
+            ) : (
+              <Button
+                appearance="subtle"
+                className={styles.danger}
+                onClick={() => setArchiveOpen(true)}
+              >
+                Archive
+              </Button>
+            )}
           </div>
         </div>
         {run.objective && run.objective !== run.name && (
@@ -462,6 +499,90 @@ export const OrchestratorTaskDetail = ({
                 }}
               >
                 Archive task
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+
+      <Dialog open={reopenOpen} onOpenChange={(_, data) => setReopenOpen(data.open)}>
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Reopen “{run.name}”?</DialogTitle>
+            <DialogContent>
+              {/*
+                A reason rather than a confirmation, for the same reason sending
+                a task back needs one: this wakes the orchestrator to act, and
+                "not done" is not something anyone can act on.
+              */}
+              <Field
+                label="What is still wanted?"
+                hint="The orchestrator is woken with this. It keeps the task's criteria, notes and steps."
+              >
+                <Textarea
+                  value={reopenNote}
+                  disabled={busy}
+                  resize="vertical"
+                  onChange={(_, data) => setReopenNote(data.value)}
+                />
+              </Field>
+            </DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={() => setReopenOpen(false)}>
+                Leave it closed
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={busy || reopenNote.trim().length === 0}
+                onClick={() => {
+                  setBusy(true);
+                  void onReopen(reopenNote.trim()).then((ok) => {
+                    setBusy(false);
+                    if (ok) {
+                      setReopenOpen(false);
+                      setReopenNote("");
+                    }
+                  });
+                }}
+              >
+                Reopen task
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+
+      <Dialog open={deleteOpen} onOpenChange={(_, data) => setDeleteOpen(data.open)}>
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Delete “{run.name}”?</DialogTitle>
+            <DialogContent>
+              {/*
+                Named against archiving, since that is the choice being made:
+                one keeps what the work found, this keeps nothing.
+              */}
+              <p>
+                The task goes, along with its phases, steps, notes and the sessions it
+                started. Nothing about it is kept.
+              </p>
+              <p>Archive it instead if the record is worth having.</p>
+            </DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={() => setDeleteOpen(false)}>
+                Keep it
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={busy}
+                onClick={() => {
+                  setBusy(true);
+                  void onDelete().then((ok) => {
+                    setBusy(false);
+                    if (ok) setDeleteOpen(false);
+                  });
+                }}
+              >
+                Delete task
               </Button>
             </DialogActions>
           </DialogBody>

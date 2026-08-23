@@ -8,6 +8,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
+import { reopenPrompt } from "../orchestrator/review.js";
 
 const CreateRunSchema = z.object({
   workspaceId: z.string().min(1),
@@ -29,6 +30,11 @@ const PlanStepSchema = z.object({
 });
 
 const PlanSchema = z.object({ steps: z.array(PlanStepSchema).min(1).max(20) });
+
+const ReopenSchema = z.object({
+  /** Why it is not finished after all. The orchestrator is woken to act on it. */
+  note: z.string().min(1).max(4_000),
+});
 
 export type RunRouteOptions = { service: FleetService; engine: OrchestratorEngine };
 
@@ -219,6 +225,61 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     return withSteps(id);
   });
 
+  /**
+   * Puts a finished task back to work, with what is still wanted.
+   *
+   * The counterpart to archiving. A person calls a task done and then finds it
+   * was not — or that the next thing to do belongs with this one, next to the
+   * criteria it was held to and the notes it collected, rather than in a new
+   * task that would start with none of that.
+   *
+   * A reason is required for the same reason a send-back requires one: the
+   * orchestrator is being woken to act, and "do more" is not something anyone
+   * can act on.
+   */
+  app.post("/api/runs/:id/reopen", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = ReopenSchema.parse(request.body);
+    const run = store.getRun(id);
+    if (!run) return reply.code(404).send({ error: "Run not found" });
+    if (!terminalRunStates.has(run.state)) {
+      return reply.code(409).send({ error: "That task has not finished" });
+    }
+    const lead = run.leadSessionId ? store.getSession(run.leadSessionId) : undefined;
+    if (!lead || terminalSessionStates.has(lead.state)) {
+      return reply.code(409).send({
+        error:
+          "The conversation that owns this task has ended, so nothing can pick it up",
+      });
+    }
+
+    const note = input.note.trim();
+    store.appendRunNote(id, run.phaseIndex, `Reopened by a person.\n\n${note}`);
+    /*
+     * Queued rather than sent. Copilot refuses a prompt mid-turn and reports it
+     * as a transcript notice rather than an error, so a direct dispatch would
+     * look like it worked and be lost; the engine delivers this on the first
+     * tick where the orchestrator is idle.
+     */
+    const reopened = store.updateRun(id, {
+      state: "running",
+      failureReason: "",
+      pendingPrompt: reopenPrompt(run.name, note),
+    })!;
+    service.publishRun(reopened);
+    engine.tick();
+    return withSteps(id);
+  });
+
+  /**
+   * Removes a task and everything it started.
+   *
+   * The other thing to do with a finished task, and the honest opposite of
+   * archiving: archiving keeps what the work learned, this keeps nothing. Its
+   * sessions go too — a run's workers cannot be found once the run is gone, so
+   * leaving them would strand them in the tree with no way back to why they
+   * exist.
+   */
   app.delete("/api/runs/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
     const run = store.getRun(id);
@@ -226,7 +287,17 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     // Sessions are stopped before the rows go, because a deleted run cannot
     // stop anything afterwards — there is nothing left to find them by.
     stopRunSessions(service, id);
+    for (const session of store.listSessions()) {
+      if (session.runId !== id) continue;
+      try {
+        store.deleteSession(session.id);
+      } catch {
+        // One session that will not go is not a reason to keep the task.
+        continue;
+      }
+    }
     store.deleteRun(id);
+    service.broadcast({ type: "snapshot", data: service.snapshot() });
     return reply.code(204).send();
   });
 };

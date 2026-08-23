@@ -443,7 +443,17 @@ describe("run orchestration protocol", () => {
     expect(canTransitionRun("awaiting_approval", "running")).toBe(true);
     expect(canTransitionRun("running", "awaiting_lead")).toBe(true);
     expect(canTransitionRun("planning", "awaiting_lead")).toBe(false);
-    expect(canTransitionRun("completed", "running")).toBe(false);
+    /*
+     * Finished, but not sealed. A person can reopen a task they had called done
+     * — because it was not, or because the next thing to do belongs with it
+     * rather than in a new task that would start with none of its history.
+     * Only back to `running`: every other way in is a fresh task.
+     */
+    expect(canTransitionRun("completed", "running")).toBe(true);
+    expect(canTransitionRun("failed", "running")).toBe(true);
+    expect(canTransitionRun("cancelled", "running")).toBe(true);
+    expect(canTransitionRun("completed", "awaiting_human")).toBe(false);
+    expect(canTransitionRun("completed", "planning")).toBe(false);
   });
 
   it("makes a step pass through starting, because a send is not a receipt", () => {

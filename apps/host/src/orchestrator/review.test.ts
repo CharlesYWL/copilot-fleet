@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { RunPolicySchema, type Run } from "@fleet/protocol";
-import { reviewOutcome } from "./review.js";
+import { reopenPrompt, reviewOutcome } from "./review.js";
 
 const run = (overrides: Partial<Run> = {}): Run => ({
   id: "r1",
@@ -69,5 +69,29 @@ describe("reviewOutcome", () => {
 
   it("refuses a task that does not exist", () => {
     expect(reviewOutcome(undefined, { approved: true }).kind).toBe("not_found");
+  });
+});
+
+/*
+ * Reopening is the same event as a send-back from the orchestrator's side — a
+ * person saying the work is not finished — with one difference worth spelling
+ * out in the prompt: the task's own notes and criteria describe work it already
+ * did, and will read as complete.
+ */
+describe("reopening a finished task", () => {
+  it("tells the orchestrator its own history is stale", () => {
+    const prompt = reopenPrompt("Ship it", "the migration is still missing");
+
+    expect(prompt).toContain('<fleet-review task="Ship it" verdict="reopened">');
+    expect(prompt).toContain("the migration is still missing");
+    expect(prompt).toContain("was finished and has been reopened");
+    expect(prompt).toContain("Read them before deciding anything");
+  });
+
+  it("asks for the same closing move as any other review", () => {
+    // So the orchestrator does not have to learn a second protocol for what is
+    // the same situation: act, end the turn, submit again.
+    expect(reopenPrompt("Ship it", "not done")).toContain("fleet_submit_task");
+    expect(reopenPrompt("Ship it", "not done")).toContain("end your turn");
   });
 });

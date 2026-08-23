@@ -274,11 +274,65 @@ describe("task detail", () => {
       onOpenWorker: vi.fn(),
       onReview: vi.fn().mockResolvedValue(true),
       onArchive: vi.fn().mockResolvedValue(true),
+      onReopen: vi.fn().mockResolvedValue(true),
+      onDelete: vi.fn().mockResolvedValue(true),
       ...overrides,
     };
     wrap(<OrchestratorTaskDetail {...props} />);
     return props;
   };
+
+  it("offers archiving while a task is still live, and not the other two", () => {
+    /*
+     * The three are mutually exclusive on purpose. Archiving a live task stops
+     * it and keeps what it found; a finished task is either wrong — reopen it —
+     * or done with, and then keeping a record of it is the thing nobody wants.
+     */
+    detail();
+
+    expect(screen.getByRole("button", { name: "Archive" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reopen" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete" })).toBeNull();
+  });
+
+  it.each(["completed", "failed", "cancelled"] as const)(
+    "offers reopening and deleting once a task is %s",
+    (state) => {
+      detail({ model: models([run({ id: "r1", state })])[0]! });
+
+      expect(screen.getByRole("button", { name: "Reopen" })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
+    },
+  );
+
+  it("will not reopen a task without saying what is still wanted", () => {
+    // The orchestrator is woken to act on this, and "not done" is not something
+    // anyone can act on — the same rule as sending a task back.
+    const model = models([run({ id: "r1", state: "completed" })])[0]!;
+    const props = detail({ model });
+
+    fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
+    const confirm = screen.getByRole("button", { name: "Reopen task" });
+    expect(confirm.hasAttribute("disabled")).toBe(true);
+
+    fireEvent.change(screen.getByRole("textbox"), {
+      target: { value: "the migration is still missing" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Reopen task" }));
+
+    expect(props.onReopen).toHaveBeenCalledWith("the migration is still missing");
+  });
+
+  it("deletes a finished task once, from its own confirmation", () => {
+    const model = models([run({ id: "r1", state: "completed" })])[0]!;
+    const props = detail({ model });
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
+
+    expect(props.onDelete).toHaveBeenCalledTimes(1);
+  });
 
   it("says a freshly opened task is waiting on the orchestrator, not on you", () => {
     /*
@@ -381,12 +435,18 @@ describe("task detail", () => {
     expect(props.onArchive).toHaveBeenCalled();
   });
 
-  it("offers archiving on a task that has already ended", () => {
-    // A finished task's workers are exactly the ones sitting in the tree with
-    // nothing left to do, so this is when clearing them away matters most.
+  it("does not offer archiving on a task that has already ended", () => {
+    /*
+     * It used to, on the grounds that a finished task's workers are the ones
+     * cluttering the tree. Deleting clears those too, and it is the honest
+     * choice at that point: archiving keeps a record, and the reason to keep
+     * one is that the work is over — which is also when there is nothing left
+     * to stop.
+     */
     const model = models([run({ id: "r1", state: "completed" })])[0]!;
     detail({ model });
-    expect(screen.getByRole("button", { name: "Archive" })).toBeTruthy();
+
+    expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
   });
 
   it("does not offer a transcript once its session is gone", () => {

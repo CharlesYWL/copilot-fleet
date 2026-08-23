@@ -1537,9 +1537,17 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
    */
   awaiting_human: new Set(["running", "completed", "failed", "cancelled"]),
   aggregating: new Set(["completed", "failed", "cancelled"]),
-  completed: new Set(),
-  failed: new Set(),
-  cancelled: new Set(),
+  /*
+   * Finished, but not sealed.
+   *
+   * A person can reopen a task they had called done — because it turned out not
+   * to be, or because the next thing to do belongs with it rather than in a new
+   * task that would start with none of its history. Only back to `running`:
+   * reopening means "carry on", and every other route in is a fresh task.
+   */
+  completed: new Set(["running"]),
+  failed: new Set(["running"]),
+  cancelled: new Set(["running"]),
 };
 
 const runStepTransitions: Record<RunStepState, ReadonlySet<RunStepState>> = {
