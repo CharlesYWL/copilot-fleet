@@ -110,6 +110,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       title: "Start work on a node",
       description: [
         "Start one worker agent on a node and return immediately.",
+        "Say what must come back, where to work, and what will show it is real — the Host writes the worker's brief from those, so a dispatch with no way to check it is refused before a machine is spent on it.",
         "The Host picks the machine; a review always lands on the same checkout the implementation used, so it can see the changes.",
         "Group related steps under one `task`, and start a separate task for an unrelated request.",
         "You are woken with the result when it finishes — do not poll, and do not wait.",
@@ -120,10 +121,26 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
           .enum(WORKER_CATEGORIES)
           .describe("What kind of work this is. Reviews are read-only."),
         title: z.string().describe("A short label, shown to the human."),
-        prompt: z
+        deliverable: z
           .string()
           .describe(
-            "The full instruction for the worker. It cannot see this conversation, so say everything it needs.",
+            "What the worker must send back. A patch, an answer, a number, a passing suite — concretely enough that you could tell whether you got it.",
+          ),
+        scope: z
+          .string()
+          .describe(
+            "Where to work and where not to: the files or directories in play, and anything it should leave alone.",
+          ),
+        verify: z
+          .string()
+          .describe(
+            'The command or observation that will show the deliverable is real — "npm test -- auth", "curl the endpoint and read the status". Not "check it works".',
+          ),
+        context: z
+          .string()
+          .optional()
+          .describe(
+            "What the worker cannot find out for itself. It cannot see this conversation, the person's messages, or any other worker's output, so repeat anything decided elsewhere.",
           ),
         workspace: z
           .string()

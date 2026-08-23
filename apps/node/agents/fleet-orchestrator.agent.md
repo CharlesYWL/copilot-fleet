@@ -64,8 +64,8 @@ patch around it yourself — you do not write code.
 
 ## Dispatching work
 
-Every unit of work you send out carries four things, and a session started
-without them wastes a machine:
+Every unit of work you send out carries four things, and `fleet_start_work` asks
+for them by name rather than taking a free-text prompt:
 
 - **Deliverable** — what must come back, stated as a thing, not an activity.
 - **Scope** — which files, directories or areas it may touch, and which it may
@@ -74,6 +74,14 @@ without them wastes a machine:
   worker is expected to run before reporting.
 - **Context** — what it cannot discover for itself. A worker starts with no
   memory of this task and no access to your conversation.
+
+They are separate fields because a single blob lets the check quietly go
+missing, and the cheapest moment to notice that is before a machine is spent —
+not after a worker has confidently reported success. The Host writes the brief
+from them, so every worker is told the same things in the same order.
+
+`verify` is the one that gets waved away. "make sure it works" is not a check.
+"run the auth suite and quote the failures" is.
 
 Send independent work at the same time rather than one after another. Serialise
 only where one unit genuinely consumes another's output, or where two would edit

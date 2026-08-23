@@ -208,6 +208,11 @@ model. Ours can be a `409` with a list.
 
 ### 3.4 The worker contract in the tool signature
 
+**Built.** `fleet_start_work` no longer takes a prompt; the Host composes one
+from the four fields, and appends the instruction to verify before answering —
+which is the line most likely to be dropped by a model in a hurry, and the one
+that decides whether a worker checks its own work.
+
 `fleet_start_work` replaces its free-text `prompt`:
 
 ```ts
@@ -220,6 +225,22 @@ context: z.string().max(6_000).optional(),  // what the worker cannot discover
 The Host composes the actual prompt from these, in the `TASK:` shape. Two wins
 over a blob: a call with no `verify` is rejected before a machine is spent on
 it, and the worker's brief becomes uniform enough to render in the UI.
+
+Also verified live. Given "find out which port this project listens on", the
+orchestrator filled all four without prompting — a `verify` that named the
+greps it would run and required the citation to be checked against real file
+contents, and a `context` that told the worker the stack was unknown and worth
+determining first. The report came back with a volunteered caveat: the port
+value exists but nothing in the tree reads it. That caveat is the behaviour the
+whole design is aiming at, and it was not asked for.
+
+**One thing this exposed, which is not fixed:** `apps/host/tsconfig.server.json`
+excludes `src/**/*.test.ts`, so service tests are never typechecked. Renaming
+these fields broke every test call site and the suite stayed green, because the
+tests call the tools directly and the composed prompt merely contained
+`undefined` where a field used to be. It is now asserted on directly, which
+catches this class where it matters. Turning typechecking on repo-wide surfaces
+about fifteen files of unrelated fixture drift — worth doing, separately.
 
 ### 3.5 A custom agent that carries the durable half
 
@@ -431,9 +452,9 @@ have with any paper or blog post we learn from.
 2. ~~**Criteria + `stopWhen`**~~ — done. The largest single behaviour change.
    The orchestrator now has a definition of done that is not a feeling, and
    cannot hand a task over while an essential one is unmet.
-3. **Worker contract** — cheap, and it improves every dispatched session
-   immediately. Next.
-4. **Evidence rows + tree stamps** — needs the criteria to hang off.
+3. ~~**Worker contract**~~ — done. Cheap, and it improved every dispatched
+   session immediately.
+4. **Evidence rows + tree stamps** — needs the criteria to hang off. Next.
 5. **Submit gate** — needs the evidence to check. Half of it now exists: the
    refusal is real, but what it checks is the orchestrator's own report.
 

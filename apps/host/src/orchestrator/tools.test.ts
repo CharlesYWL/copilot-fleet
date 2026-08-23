@@ -27,7 +27,9 @@ describe("FleetTools", () => {
     tools().startWork({
       category: "explore",
       title: "look",
-      prompt: "go and look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      verify: "list the directory and say what you saw",
       ...input,
     } as Parameters<FleetTools["startWork"]>[0]);
 
@@ -37,6 +39,43 @@ describe("FleetTools", () => {
       .listRuns()
       .filter((run) => run.leadSessionId === leadId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+
+  it("writes the worker's brief from what the dispatch promised", () => {
+    /*
+     * The Host composes it, not the orchestrator, so every worker is told the
+     * same things in the same order — and so the closing instruction to verify
+     * before answering cannot be dropped by a model in a hurry.
+     *
+     * Asserting on the text is also what catches this schema changing under the
+     * tests: they call the tool directly, and service tests are not typechecked,
+     * so a renamed field would otherwise compose "undefined" in silence.
+     */
+    start({
+      task: "Explore Beta",
+      title: "Find the config",
+      deliverable: "the path of the config file, and what it sets",
+      scope: "src/ only; do not change anything",
+      verify: "print the file and quote the lines you mean",
+      context: "the person already looked in the repo root and found nothing",
+    });
+    const step = store.listRunSteps(tasks()[1]!.id)[0]!;
+
+    expect(step.prompt).toContain("TASK: Find the config");
+    expect(step.prompt).toContain("DELIVERABLE\nthe path of the config file");
+    expect(step.prompt).toContain("SCOPE\nsrc/ only");
+    expect(step.prompt).toContain("VERIFY\nprint the file");
+    expect(step.prompt).toContain("CONTEXT\nthe person already looked");
+    expect(step.prompt).toMatch(/verification before you answer/);
+    expect(step.prompt).not.toContain("undefined");
+  });
+
+  it("leaves out the context heading when there is nothing to say under it", () => {
+    start({ task: "Explore Beta" });
+    const step = store.listRunSteps(tasks()[1]!.id)[0]!;
+
+    expect(step.prompt).not.toContain("CONTEXT");
+    expect(step.prompt).toContain("VERIFY");
+  });
 
   it("puts a named task in its own run, with its own budget", () => {
     const result = start({ task: "Explore Beta" });
@@ -154,7 +193,9 @@ describe("FleetTools phases", () => {
     tools().startWork({
       category: "explore",
       title: "look",
-      prompt: "go and look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      verify: "list the directory and say what you saw",
       task: "Ship it",
     });
 
@@ -320,7 +361,9 @@ describe("FleetTools success criteria", () => {
     tools().startWork({
       category: "explore",
       title: "look",
-      prompt: "go and look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      verify: "list the directory and say what you saw",
       task: "Ship it",
     });
     for (const step of store.listRunSteps(runId)) {

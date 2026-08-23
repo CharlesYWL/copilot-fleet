@@ -33,7 +33,28 @@ export const WORKER_CATEGORIES = [
 export const StartWorkSchema = z.object({
   category: z.enum(WORKER_CATEGORIES),
   title: z.string().min(1).max(120),
-  prompt: z.string().min(1).max(8_000),
+  /**
+   * What the worker has to send back.
+   *
+   * These four replace a single free-text prompt on purpose. A blob lets a
+   * dispatch leave out the part that matters and still look complete; asking
+   * for the parts separately means a brief with no way to check it is refused
+   * before a machine is spent on it, and means every worker gets told the same
+   * things in the same order.
+   */
+  deliverable: z.string().min(10).max(600),
+  /** Where to work and where not to — files, directories, boundaries. */
+  scope: z.string().min(10).max(800),
+  /** The command or observation that will show the deliverable is real. */
+  verify: z.string().min(10).max(800),
+  /**
+   * What the worker cannot find out for itself.
+   *
+   * It cannot see the orchestrator's conversation, the person's messages, or
+   * any other worker's output. Anything decided elsewhere has to be repeated
+   * here or it does not exist as far as the worker is concerned.
+   */
+  context: z.string().max(6_000).optional(),
   workspace: z.string().optional(),
   /**
    * Which piece of work this belongs to.
@@ -45,6 +66,40 @@ export const StartWorkSchema = z.object({
    */
   task: z.string().min(1).max(80).optional(),
 });
+
+/**
+ * The brief a worker actually receives.
+ *
+ * Composed by the Host rather than by the orchestrator, so every session gets
+ * the same shape whichever model dispatched it — and so the closing line, which
+ * is the one that decides whether a worker checks its own work, cannot be
+ * dropped by a model in a hurry.
+ */
+export function composeWorkerPrompt(input: {
+  title: string;
+  deliverable: string;
+  scope: string;
+  verify: string;
+  context?: string | undefined;
+}): string {
+  return [
+    `TASK: ${input.title}`,
+    "",
+    `DELIVERABLE`,
+    input.deliverable,
+    "",
+    `SCOPE`,
+    input.scope,
+    "",
+    `VERIFY`,
+    input.verify,
+    ...(input.context ? ["", `CONTEXT`, input.context] : []),
+    "",
+    "Do the verification before you answer, and say what it produced. If you",
+    "could not, say that instead — an unchecked claim is worse than an honest",
+    "gap, because it will be believed.",
+  ].join("\n");
+}
 
 export const PlanTaskSchema = z.object({
   task: z.string().min(1).max(80),
@@ -513,7 +568,7 @@ export class FleetTools {
     const step = this.store.upsertRunStep(run.id, {
       stepKey,
       title: input.title,
-      prompt: input.prompt,
+      prompt: composeWorkerPrompt(input),
       category: input.category,
       // Recorded so the engine dispatches where this reply says it will.
       placementId: placement.id,

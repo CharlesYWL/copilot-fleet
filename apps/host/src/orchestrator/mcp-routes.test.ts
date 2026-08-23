@@ -237,13 +237,41 @@ describe("orchestrator tools over the wire", () => {
     await call("fleet_start_work", {
       category: "explore",
       title: "look",
-      prompt: "go and look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      verify: "list the directory and say what you saw",
       task: "Ship it",
     });
     for (const step of store.listRunSteps(task()!.id)) {
       store.updateRunStep(step.id, { state: "succeeded" });
     }
   };
+
+  it("will not spend a machine on work with no way to check it", async () => {
+    // The cheapest moment to catch an uncheckable brief is before a session
+    // starts, not after a worker has confidently reported success.
+    await plan();
+    const result = await call("fleet_start_work", {
+      category: "explore",
+      title: "look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      task: "Ship it",
+    });
+
+    expect(result.refused).toBe(true);
+    expect(store.listRunSteps(task()!.id)).toHaveLength(0);
+  });
+
+  it("composes the worker's brief from a dispatch that came over the wire", async () => {
+    await plan();
+    await settleWork();
+
+    const step = store.listRunSteps(task()!.id)[0]!;
+    expect(step.prompt).toContain("DELIVERABLE");
+    expect(step.prompt).toContain("a list of what is in there");
+    expect(step.prompt).not.toContain("undefined");
+  });
 
   it("will not hand over a task whose criteria were not met", async () => {
     await plan();
