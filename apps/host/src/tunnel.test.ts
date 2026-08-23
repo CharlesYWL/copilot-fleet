@@ -302,7 +302,13 @@ describe("TunnelSupervisor", () => {
   const supervisor = (external?: { provider: "bore"; url?: string }) =>
     new TunnelSupervisor({
       localTarget: "http://127.0.0.1:8787",
-      readExternal: () => (external ? { tunnelId: undefined, ...external } : undefined),
+      // Spelled out rather than spread: under exactOptionalPropertyTypes an
+      // absent `url?` is not the same as one explicitly set to undefined, and
+      // ExternalTunnel wants the key present.
+      readExternal: () =>
+        external
+          ? { provider: external.provider, url: external.url, tunnelId: undefined }
+          : undefined,
       probe: fakeProbe(),
     });
 

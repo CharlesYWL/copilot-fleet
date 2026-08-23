@@ -15,6 +15,7 @@ function node(id: string, overrides: Partial<FleetNode> = {}): FleetNode {
     version: "0.1.0",
     revision: "",
     capabilities: ["copilot-acp", "host-yolo"],
+    agents: [],
     maxSessions: 4,
     activeSessions: 0,
     lastHeartbeat: iso(),
@@ -32,7 +33,6 @@ function placement(id: string, nodeId: string): Placement {
     nodeId,
     nodeName: nodeId,
     localPath: `/src/${nodeId}`,
-    position: 0,
   };
 }
 
@@ -46,7 +46,12 @@ function run(overrides: Partial<Run> = {}): Run {
     leadSessionId: "",
     placementId: "",
     policy: RunPolicySchema.parse({}),
+    phases: [],
+    phaseIndex: 0,
+    successCriteria: [],
+    stopWhen: "",
     failureReason: "",
+    pendingPrompt: "",
     settleSeq: 0,
     wakeSeq: 0,
     emptyWakeCount: 0,
@@ -64,6 +69,7 @@ function step(id: string, overrides: Partial<RunStep> = {}): RunStep {
     title: id,
     prompt: `do ${id}`,
     category: "implement",
+    phaseIndex: 0,
     dependsOn: [],
     state: "pending",
     sessionId: "",
@@ -100,6 +106,7 @@ function session(id: string, overrides: Partial<FleetSession> = {}): FleetSessio
     configOptions: [],
     runId: "r1",
     runRole: "worker",
+    readOnly: false,
     ...overrides,
   };
 }

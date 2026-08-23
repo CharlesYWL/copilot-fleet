@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import type { NodeBackup } from "@fleet/protocol";
 import {
   createConfigRouter,
   refuseRequest,
@@ -245,7 +246,7 @@ describe("config router", () => {
   });
 
   it("imports a node archive", async () => {
-    const applyBackup = vi.fn(async () => {});
+    const applyBackup = vi.fn(async (_archive: NodeBackup) => {});
     const { route } = router({ applyBackup });
     const archive = {
       kind: "copilot-fleet-node",
@@ -272,7 +273,7 @@ describe("config router", () => {
   });
 
   it("refuses a Host archive on the node import endpoint", async () => {
-    const applyBackup = vi.fn(async () => {});
+    const applyBackup = vi.fn(async (_archive: NodeBackup) => {});
     const { route } = router({ applyBackup });
     const response = await route(
       "POST",

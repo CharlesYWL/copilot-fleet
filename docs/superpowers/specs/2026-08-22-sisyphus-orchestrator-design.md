@@ -234,13 +234,17 @@ determining first. The report came back with a volunteered caveat: the port
 value exists but nothing in the tree reads it. That caveat is the behaviour the
 whole design is aiming at, and it was not asked for.
 
-**One thing this exposed, which is not fixed:** `apps/host/tsconfig.server.json`
-excludes `src/**/*.test.ts`, so service tests are never typechecked. Renaming
-these fields broke every test call site and the suite stayed green, because the
-tests call the tools directly and the composed prompt merely contained
-`undefined` where a field used to be. It is now asserted on directly, which
-catches this class where it matters. Turning typechecking on repo-wide surfaces
-about fifteen files of unrelated fixture drift — worth doing, separately.
+**One thing this exposed, now fixed:** `apps/host/tsconfig.server.json` and
+`apps/node/tsconfig.json` excluded `src/**/*.test.ts`, so service tests were
+never typechecked. Renaming these fields broke every test call site and the
+suite stayed green, because the tests call the tools directly and the composed
+prompt merely contained `undefined` where a field used to be. Both packages now
+carry a `tsconfig.test.json` that includes tests with `noEmit`, wired into
+`npm run typecheck`; `dist` is unchanged because the build still uses the
+emitting config. Closing it turned up a genuine type bug of the same vintage —
+`registerNode`'s signature meant `agents` to be optional but left it in the
+`Omit`, so the intersection could not loosen it — plus about two dozen fixtures
+that had drifted behind fields added since they were written.
 
 ### 3.5 A custom agent that carries the durable half
 

@@ -30,6 +30,7 @@ describe("authenticated node message ownership", () => {
       commandId: "command",
       sessionId: "foreign",
       ok: true,
+      fatal: false,
     } satisfies NodeToHostMessage;
     expect(nodeMessageBelongsTo("node-a", event, lookup)).toBe(false);
     expect(nodeMessageBelongsTo("node-a", result, lookup)).toBe(false);

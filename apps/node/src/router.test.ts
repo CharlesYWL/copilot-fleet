@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { SessionEvent } from "@fleet/protocol";
+import type { NodeCommand, SessionEvent } from "@fleet/protocol";
 import { CommandRouter } from "./router.js";
 import {
   MockAgentFactory,
@@ -26,6 +26,18 @@ function hasSettled(events: SessionEvent[], sessionId: string): boolean {
   );
 }
 
+/**
+ * The parts of a start command these tests never vary.
+ *
+ * Spread rather than repeated so that a new field on the command reaches every
+ * case at once — the tests are typechecked, so leaving it out here is a build
+ * error rather than a session started with a quietly missing setting.
+ */
+const START_DEFAULTS: Pick<
+  Extract<NodeCommand, { type: "start_session" }>,
+  "yolo" | "mcpServers" | "agent" | "readOnly"
+> = { yolo: false, mcpServers: [], agent: "", readOnly: false };
+
 describe("CommandRouter", () => {
   it("streams two sessions independently and deduplicates commands", async () => {
     const events: SessionEvent[] = [];
@@ -37,6 +49,7 @@ describe("CommandRouter", () => {
     );
     const first = {
       type: "start_session" as const,
+      ...START_DEFAULTS,
       commandId: "c1",
       sessionId: "s1",
       localPath: "/one",
@@ -44,6 +57,7 @@ describe("CommandRouter", () => {
     };
     const second = {
       type: "start_session" as const,
+      ...START_DEFAULTS,
       commandId: "c2",
       sessionId: "s2",
       localPath: "/two",
@@ -73,6 +87,7 @@ describe("CommandRouter", () => {
     );
     await router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "c1",
       sessionId: "s1",
       localPath: "/one",
@@ -108,6 +123,7 @@ describe("CommandRouter", () => {
     );
     await router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "c1",
       sessionId: "s1",
       localPath: "/one",
@@ -136,6 +152,7 @@ describe("CommandRouter", () => {
     );
     await router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "c1",
       sessionId: "s1",
       localPath: "/one",
@@ -143,6 +160,7 @@ describe("CommandRouter", () => {
     });
     const result = await router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "c2",
       sessionId: "s2",
       localPath: "/two",
@@ -173,6 +191,7 @@ describe("CommandRouter", () => {
     );
     const first = router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "first",
       sessionId: "s1",
       localPath: "/one",
@@ -180,6 +199,7 @@ describe("CommandRouter", () => {
     });
     const second = await router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "second",
       sessionId: "s2",
       localPath: "/two",
@@ -209,6 +229,7 @@ describe("CommandRouter", () => {
     const results = await Promise.all([
       router.route({
         type: "start_session",
+        ...START_DEFAULTS,
         commandId: "first",
         sessionId: "same",
         localPath: "/one",
@@ -216,6 +237,7 @@ describe("CommandRouter", () => {
       }),
       router.route({
         type: "start_session",
+        ...START_DEFAULTS,
         commandId: "duplicate",
         sessionId: "same",
         localPath: "/one",
@@ -244,6 +266,7 @@ describe("CommandRouter", () => {
       (
         await router.route({
           type: "start_session",
+          ...START_DEFAULTS,
           commandId: "first",
           sessionId: "s1",
           localPath: "/one",
@@ -257,6 +280,7 @@ describe("CommandRouter", () => {
       (
         await router.route({
           type: "start_session",
+          ...START_DEFAULTS,
           commandId: "second",
           sessionId: "s2",
           localPath: "/two",
@@ -282,6 +306,7 @@ describe("CommandRouter", () => {
     );
     const result = await router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "first",
       sessionId: "s1",
       localPath: "/one",
@@ -293,7 +318,10 @@ describe("CommandRouter", () => {
 
   it("resumes without prompting and continues the event sequence", async () => {
     const events: SessionEvent[] = [];
-    let received: { resume?: string; offset?: number } = {};
+    let received: { resume: string | undefined; offset: number | undefined } = {
+      resume: undefined,
+      offset: undefined,
+    };
     let prompts = 0;
     const factory: AgentFactory = {
       async start(sessionId, _cwd, sink, options) {
@@ -317,6 +345,7 @@ describe("CommandRouter", () => {
           async stop() {},
           resolvePermission() {},
           denyPendingPermissions() {},
+          async setConfigOption() {},
           busy: false,
           resync() {},
         };
@@ -335,6 +364,7 @@ describe("CommandRouter", () => {
       localPath: "/one",
       agentSessionId: "copilot-abc",
       sequenceOffset: 7,
+      ...START_DEFAULTS,
     });
     expect(result.ok).toBe(true);
     expect(received).toEqual({ resume: "copilot-abc", offset: 7 });
@@ -357,6 +387,7 @@ describe("CommandRouter", () => {
     );
     await router.route({
       type: "start_session",
+      ...START_DEFAULTS,
       commandId: "c1",
       sessionId: "s1",
       localPath: "/one",
@@ -370,6 +401,7 @@ describe("CommandRouter", () => {
       commandId: "c2",
       sessionId: "s1",
       prompt: "second",
+      attachments: [],
     });
     expect(refused.ok).toBe(false);
     expect(refused.error).toMatch(/still working/);
@@ -392,6 +424,7 @@ describe("CommandRouter", () => {
           commandId: "c3",
           sessionId: "s1",
           prompt: "third",
+          attachments: [],
         })
       ).ok,
     ).toBe(true);
@@ -405,6 +438,7 @@ function inertAgent(_sessionId: string, _sink: EventSink): SessionAgent {
     async stop() {},
     resolvePermission() {},
     denyPendingPermissions() {},
+    async setConfigOption() {},
     busy: false,
     resync() {},
   };
@@ -419,6 +453,7 @@ function failingAgent(sessionId: string, sink: EventSink): SessionAgent {
     async stop() {},
     resolvePermission() {},
     denyPendingPermissions() {},
+    async setConfigOption() {},
     busy: false,
     resync() {},
   };

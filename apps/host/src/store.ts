@@ -650,7 +650,15 @@ export class FleetStore {
   registerNode(
     input: Omit<
       FleetNode,
-      "id" | "activeSessions" | "lastHeartbeat" | "online" | "homeDir" | "revision"
+      | "id"
+      | "activeSessions"
+      | "lastHeartbeat"
+      | "online"
+      | "homeDir"
+      | "revision"
+      // Omitted so the optional versions below actually take effect — an
+      // intersection cannot loosen a property the Omit still requires.
+      | "agents"
     > & { homeDir?: string; revision?: string; agents?: FleetNode["agents"] },
   ): { node: FleetNode; secret: string } {
     const secret = randomUUID() + randomUUID();
