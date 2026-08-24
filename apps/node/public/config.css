@@ -189,7 +189,8 @@ select {
 }
 
 /* The primary action of its own card, so it is not the muted .row variant. */
-#tunnelRebuild {
+#tunnelRebuild,
+#save {
   background: #3b6fd4;
 }
 .inline {

@@ -32,6 +32,16 @@ export default defineConfig({
           setupFiles: ["apps/host/ui/src/test-setup.ts"],
         },
       },
+      {
+        // The node's config page is hand-written browser JavaScript served as
+        // it is, with no build step to type-check it — so the only way to know
+        // it still works is to run it in a DOM, which is what this project is.
+        test: {
+          name: "node-ui",
+          environment: "jsdom",
+          include: ["apps/node/public/**/*.test.js"],
+        },
+      },
     ],
     coverage: {
       provider: "v8",

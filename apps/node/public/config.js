@@ -45,8 +45,46 @@ const note = (id, text, ok) => {
 
 // ---- Node settings ----
 
-const render = (data) => {
-  for (const key of fields) $(key).value = data.settings[key];
+/**
+ * What the node last said its settings are, and whether the form has been
+ * edited since.
+ *
+ * The page polls every five seconds so the connection dot stays honest, and
+ * that poll used to repaint the form along with it: a value typed into Max
+ * sessions was overwritten by the node's own within five seconds, which made
+ * the field impossible to change at all. Edits now belong to whoever is typing
+ * until they press Save or Revert, and only the status half of the page follows
+ * the poll. Nothing typed here reaches the node until Save — Revert throws the
+ * edits away and shows what the node is actually running.
+ */
+let savedSettings = null;
+let editing = false;
+
+const showSettings = (settings) => {
+  for (const key of fields) $(key).value = settings[key];
+};
+
+const setEditing = (value) => {
+  editing = value;
+  $("revert").disabled = !value;
+  $("unsaved").textContent = value
+    ? "Unsaved changes. Save applies them to this node; Revert discards them."
+    : "";
+};
+
+/**
+ * Repaints the page.
+ *
+ * `adopt` decides whether the form fields are repainted with it. It defaults to
+ * "only when nobody is mid-edit", and is forced by the two events that make the
+ * form stale on purpose: a save, and an imported identity.
+ */
+const render = (data, { adopt = !editing } = {}) => {
+  savedSettings = data.settings;
+  if (adopt) {
+    showSettings(data.settings);
+    setEditing(false);
+  }
   // The Host announces its address when it moves, so this node may be dialing
   // somewhere nobody typed here. Naming the addresses it would fall back to
   // explains that, and explains why it still connects after a tunnel rotates.
@@ -77,13 +115,28 @@ const render = (data) => {
   }
 };
 
-const load = async () => {
+const load = async (options) => {
   try {
-    render(await (await fetch("/api/config")).json());
+    render(await (await fetch("/api/config")).json(), options);
   } catch (error) {
     note("msg", "Could not read config: " + error.message, false);
   }
 };
+
+// Typing anywhere in the form claims it, which is what keeps the poll off it.
+// `change` is here for the browsers that only fire `input` on text controls.
+for (const event of ["input", "change"]) {
+  $("form").addEventListener(event, () => setEditing(true));
+}
+
+$("revert").addEventListener("click", () => {
+  if (savedSettings) showSettings(savedSettings);
+  setEditing(false);
+  note("msg", "", true);
+  // The node may have moved on while the form was held: adopt whatever it says
+  // now rather than the copy this page happened to be holding.
+  void load({ adopt: true });
+});
 
 $("form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -94,18 +147,21 @@ $("form").addEventListener("submit", async (event) => {
   }
   $("save").disabled = true;
   try {
-    render(await post("/api/config", body));
+    render(await post("/api/config", body), { adopt: true });
     note("msg", "Saved.", true);
   } catch (error) {
+    // The edits stay in the form: a rejected save is the moment they are least
+    // safe to throw away.
     note("msg", error.message, false);
   } finally {
     $("save").disabled = false;
   }
 });
 
-void load();
-// The connection state changes without any interaction here, so poll it.
-setInterval(load, 5000);
+void load({ adopt: true });
+// The connection state changes without any interaction here, so poll it. The
+// form is left alone while it is being edited — see {@link render}.
+setInterval(() => void load(), 5000);
 
 // ---- Dev tunnel ----
 
@@ -219,7 +275,7 @@ $("backupFile").addEventListener("change", async (event) => {
   }
   try {
     const archive = JSON.parse(await file.text());
-    render(await post("/api/backup", archive));
+    render(await post("/api/backup", archive), { adopt: true });
     note("backupMsg", "Imported. Reconnecting…", true);
   } catch (error) {
     note("backupMsg", error.message, false);

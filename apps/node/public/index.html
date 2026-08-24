@@ -90,7 +90,11 @@
           </span>
         </label>
 
-        <button type="submit" id="save">Save</button>
+        <span class="hint" id="unsaved"></span>
+        <div class="row">
+          <button type="submit" id="save">Save</button>
+          <button type="button" class="secondary" id="revert" disabled>Revert</button>
+        </div>
         <div id="msg"></div>
       </form>
 
