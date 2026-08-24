@@ -7,6 +7,7 @@ import {
   UpdatePlacementSchema,
   UpdateWorkspaceSchema,
   errorMessage,
+  isChatsWorkspace,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 
@@ -45,6 +46,12 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
     if (!store.getWorkspace(id)) {
       return reply.code(404).send({ error: "Unknown workspace" });
     }
+    // Ahead of the try, because the catch below reports every failure as a name
+    // collision — which this is not, and saying so would send an operator
+    // looking for a workspace that does not exist.
+    if (isChatsWorkspace(id)) {
+      return reply.code(409).send({ error: "Chats is built in and cannot be renamed" });
+    }
     try {
       const workspace = store.updateWorkspace(id, input.name, input.description);
       service.publishCatalog();
@@ -79,6 +86,12 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
     // the placement the Host later hands out as a working directory.
     if (request.fleetNodeId && input.nodeId !== request.fleetNodeId) {
       return reply.code(403).send({ error: "A node may only place its own paths" });
+    }
+    if (isChatsWorkspace(input.workspaceId)) {
+      return reply.code(409).send({
+        error:
+          "Chats is built in — every node gets one automatically, at its home directory",
+      });
     }
     try {
       const placement = store.createPlacement(

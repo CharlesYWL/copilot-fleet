@@ -540,292 +540,308 @@ export const Sidebar = ({
             openItems={openItems}
             onOpenChange={handleOpenChange}
           >
-            {groups.map((group) => (
-              <TreeItem
-                itemType="branch"
-                value={workspaceKey(group.workspaceId)}
-                key={group.workspaceId}
-              >
-                <TreeItemLayout
-                  iconBefore={<Folder20Regular />}
-                  draggable
-                  className={mergeClasses(
-                    styles.draggable,
-                    dropTarget?.key === group.workspaceId &&
-                      (dropTarget.edge === "before"
-                        ? styles.dropBefore
-                        : styles.dropAfter),
-                  )}
-                  title={`${group.workspaceName} — drag above or below another workspace to reorder`}
-                  onDragStart={(event: DragEvent<HTMLDivElement>) => {
-                    event.dataTransfer.setData(
-                      DRAG_MIME,
-                      encodeDrag({ kind: "workspace", id: group.workspaceId }),
-                    );
-                    event.dataTransfer.effectAllowed = "move";
-                  }}
-                  onDragOver={(event: DragEvent<HTMLDivElement>) => {
-                    if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
-                    event.preventDefault();
-                    event.dataTransfer.dropEffect = "move";
-                    setDropTarget({
-                      key: group.workspaceId,
-                      edge: edgeFromPointer(
-                        event.currentTarget.getBoundingClientRect(),
-                        event.clientY,
-                      ),
-                    });
-                  }}
-                  onDragLeave={() => setDropTarget(undefined)}
-                  onDrop={(event: DragEvent<HTMLDivElement>) => {
-                    const edge = dropTarget?.edge ?? "before";
-                    setDropTarget(undefined);
-                    const payload = decodeDrag(event.dataTransfer.getData(DRAG_MIME));
-                    if (!payload) return;
-                    event.preventDefault();
-                    if (payload.kind === "workspace") {
-                      void reorderWorkspaces(
-                        reorder(
-                          workspaces.map((entry) => entry.id),
-                          payload.id,
-                          group.workspaceId,
-                          edge,
-                        ),
-                      );
-                      return;
-                    }
-                    if (payload.kind !== "placement") return;
-                    void updatePlacement(payload.id, { workspaceId: group.workspaceId });
-                  }}
+            {groups.map((group) => {
+              // Chats is the fleet's own row rather than one of the operator's
+              // projects: it cannot be reordered, and a checkout dropped on it
+              // would be refused by the Host — so it does not offer either.
+              const reserved = group.kind === "chats";
+              // A chat checkout is the node's own home directory, written by the
+              // Host from what that machine reports. There is nothing to refile
+              // and nothing to reorder, so these rows offer no handle at all
+              // rather than a drag the Host would then refuse.
+              const movable = (nodeId: string) =>
+                reserved ? undefined : placementFor(group.workspaceId, nodeId);
+              return (
+                <TreeItem
+                  itemType="branch"
+                  value={workspaceKey(group.workspaceId)}
+                  key={group.workspaceId}
                 >
-                  {group.workspaceName}
-                </TreeItemLayout>
-                <Tree>
-                  {group.nodes.length === 0 ? (
-                    <TreeItem
-                      itemType="leaf"
-                      value={`${workspaceKey(group.workspaceId)}:empty`}
-                    >
-                      <TreeItemLayout className={styles.offline}>
-                        No sessions
-                      </TreeItemLayout>
-                    </TreeItem>
-                  ) : (
-                    group.nodes.map((nodeGroup) => (
+                  <TreeItemLayout
+                    iconBefore={reserved ? <Chat20Regular /> : <Folder20Regular />}
+                    draggable={!reserved}
+                    className={mergeClasses(
+                      !reserved && styles.draggable,
+                      dropTarget?.key === group.workspaceId &&
+                        (dropTarget.edge === "before"
+                          ? styles.dropBefore
+                          : styles.dropAfter),
+                    )}
+                    title={
+                      reserved
+                        ? "Questions and research that need no checkout — each session runs in its node's home directory"
+                        : `${group.workspaceName} — drag above or below another workspace to reorder`
+                    }
+                    onDragStart={(event: DragEvent<HTMLDivElement>) => {
+                      if (reserved) return;
+                      event.dataTransfer.setData(
+                        DRAG_MIME,
+                        encodeDrag({ kind: "workspace", id: group.workspaceId }),
+                      );
+                      event.dataTransfer.effectAllowed = "move";
+                    }}
+                    onDragOver={(event: DragEvent<HTMLDivElement>) => {
+                      if (reserved) return;
+                      if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
+                      event.preventDefault();
+                      event.dataTransfer.dropEffect = "move";
+                      setDropTarget({
+                        key: group.workspaceId,
+                        edge: edgeFromPointer(
+                          event.currentTarget.getBoundingClientRect(),
+                          event.clientY,
+                        ),
+                      });
+                    }}
+                    onDragLeave={() => setDropTarget(undefined)}
+                    onDrop={(event: DragEvent<HTMLDivElement>) => {
+                      const edge = dropTarget?.edge ?? "before";
+                      setDropTarget(undefined);
+                      if (reserved) return;
+                      const payload = decodeDrag(event.dataTransfer.getData(DRAG_MIME));
+                      if (!payload) return;
+                      event.preventDefault();
+                      if (payload.kind === "workspace") {
+                        void reorderWorkspaces(
+                          reorder(
+                            // Chats is pinned above the list by the Host and is
+                            // not part of the order being described, so sending it
+                            // back would ask for a move that is refused anyway.
+                            workspaces
+                              .filter((entry) => entry.kind !== "chats")
+                              .map((entry) => entry.id),
+                            payload.id,
+                            group.workspaceId,
+                            edge,
+                          ),
+                        );
+                        return;
+                      }
+                      if (payload.kind !== "placement") return;
+                      void updatePlacement(payload.id, {
+                        workspaceId: group.workspaceId,
+                      });
+                    }}
+                  >
+                    {group.workspaceName}
+                  </TreeItemLayout>
+                  <Tree>
+                    {group.nodes.length === 0 ? (
                       <TreeItem
-                        itemType="branch"
-                        value={nodeKey(group.workspaceId, nodeGroup.nodeId)}
-                        key={nodeGroup.nodeId}
+                        itemType="leaf"
+                        value={`${workspaceKey(group.workspaceId)}:empty`}
                       >
-                        <TreeItemLayout
-                          iconBefore={<Server20Regular />}
-                          // The node under a workspace is that workspace's
-                          // checkout on that machine, so this row is the
-                          // placement — drag it to file it elsewhere. A node
-                          // left over from deleted history has no placement to
-                          // move and stays put.
-                          draggable={Boolean(
-                            placementFor(group.workspaceId, nodeGroup.nodeId),
-                          )}
-                          onDragStart={(event: DragEvent<HTMLDivElement>) => {
-                            const placement = placementFor(
-                              group.workspaceId,
-                              nodeGroup.nodeId,
-                            );
-                            if (!placement) return;
-                            event.dataTransfer.setData(
-                              DRAG_MIME,
-                              encodeDrag({ kind: "placement", id: placement.id }),
-                            );
-                            event.dataTransfer.effectAllowed = "move";
-                          }}
-                          title={
-                            placementFor(group.workspaceId, nodeGroup.nodeId)
-                              ? `${nodeGroup.nodeName} — drag onto a sibling to reorder, or onto another workspace to move`
-                              : nodeGroup.nodeName
-                          }
-                          className={mergeClasses(
-                            nodeGroup.online ? undefined : styles.offline,
-                            placementFor(group.workspaceId, nodeGroup.nodeId) &&
-                              styles.draggable,
-                            dropTarget?.key ===
-                              nodeKey(group.workspaceId, nodeGroup.nodeId) &&
-                              (dropTarget.edge === "before"
-                                ? styles.dropBefore
-                                : styles.dropAfter),
-                          )}
-                          onDragOver={(event: DragEvent<HTMLDivElement>) => {
-                            const target = placementFor(
-                              group.workspaceId,
-                              nodeGroup.nodeId,
-                            );
-                            if (!target) return;
-                            if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
-                            event.preventDefault();
-                            event.dataTransfer.dropEffect = "move";
-                            // Stops the workspace row underneath from also
-                            // showing a line, which would make it unclear where
-                            // the item is going to land.
-                            event.stopPropagation();
-                            setDropTarget({
-                              key: nodeKey(group.workspaceId, nodeGroup.nodeId),
-                              edge: edgeFromPointer(
-                                event.currentTarget.getBoundingClientRect(),
-                                event.clientY,
-                              ),
-                            });
-                          }}
-                          onDragLeave={() => setDropTarget(undefined)}
-                          onDrop={(event: DragEvent<HTMLDivElement>) => {
-                            const edge = dropTarget?.edge ?? "before";
-                            setDropTarget(undefined);
-                            const target = placementFor(
-                              group.workspaceId,
-                              nodeGroup.nodeId,
-                            );
-                            const payload = decodeDrag(
-                              event.dataTransfer.getData(DRAG_MIME),
-                            );
-                            if (!target || payload?.kind !== "placement") return;
-                            event.preventDefault();
-                            event.stopPropagation();
-                            const siblings = placements
-                              .filter((entry) => entry.workspaceId === group.workspaceId)
-                              .map((entry) => entry.id);
-                            // Dropping a placement from another workspace onto
-                            // a row here means "put it in this workspace", not
-                            // "reorder"; the id is not among these siblings.
-                            if (!siblings.includes(payload.id)) {
-                              void updatePlacement(payload.id, {
-                                workspaceId: group.workspaceId,
-                              });
-                              return;
-                            }
-                            void reorderPlacements(
-                              group.workspaceId,
-                              reorder(siblings, payload.id, target.id, edge),
-                            );
-                          }}
-                        >
-                          {nodeGroup.nodeName}
+                        <TreeItemLayout className={styles.offline}>
+                          No sessions
                         </TreeItemLayout>
-                        <Tree>
-                          {nodeGroup.sessions.map((session) => {
-                            const isSelected =
-                              view === "session" && session.id === selectedSessionId;
-                            return (
-                              <TreeItem
-                                itemType="leaf"
-                                value={session.id}
-                                key={session.id}
-                                aria-selected={isSelected}
-                                onClick={() => onSelectSession(session.id)}
-                                onKeyDown={handleSessionKeyDown(session.id)}
-                              >
-                                <TreeItemLayout
-                                  draggable
-                                  className={mergeClasses(
-                                    styles.row,
-                                    styles.draggable,
-                                    isSelected && styles.selectedRow,
-                                    dropTarget?.key === session.id &&
-                                      (dropTarget.edge === "before"
-                                        ? styles.dropBefore
-                                        : styles.dropAfter),
-                                  )}
-                                  onDragStart={(event: DragEvent<HTMLDivElement>) => {
-                                    event.dataTransfer.setData(
-                                      DRAG_MIME,
-                                      encodeDrag({ kind: "session", id: session.id }),
-                                    );
-                                    event.dataTransfer.effectAllowed = "move";
-                                  }}
-                                  onDragOver={(event: DragEvent<HTMLDivElement>) => {
-                                    if (!event.dataTransfer.types.includes(DRAG_MIME)) {
-                                      return;
-                                    }
-                                    event.preventDefault();
-                                    event.dataTransfer.dropEffect = "move";
-                                    // Without this the node row above also
-                                    // claims the drag, and the line appears in
-                                    // the wrong place.
-                                    event.stopPropagation();
-                                    setDropTarget({
-                                      key: session.id,
-                                      edge: edgeFromPointer(
-                                        event.currentTarget.getBoundingClientRect(),
-                                        event.clientY,
-                                      ),
-                                    });
-                                  }}
-                                  onDragLeave={() => setDropTarget(undefined)}
-                                  onDrop={(event: DragEvent<HTMLDivElement>) => {
-                                    const edge = dropTarget?.edge ?? "before";
-                                    setDropTarget(undefined);
-                                    const payload = decodeDrag(
-                                      event.dataTransfer.getData(DRAG_MIME),
-                                    );
-                                    if (payload?.kind !== "session") return;
-                                    event.preventDefault();
-                                    event.stopPropagation();
-                                    const siblings = nodeGroup.sessions.map(
-                                      (entry) => entry.id,
-                                    );
-                                    // Sessions belong to the machine that runs
-                                    // them, so one dragged from another node is
-                                    // not something this list can accept.
-                                    if (!siblings.includes(payload.id)) return;
-                                    void reorderSessions(
-                                      reorder(siblings, payload.id, session.id, edge),
-                                    );
-                                  }}
-                                >
-                                  <span className={styles.sessionLabel}>
-                                    <StatusDot
-                                      state={session.state}
-                                      color={sessionAccent(session)}
-                                    />
-                                    {session.runRole !== "" && (
-                                      <span
-                                        className={styles.dispatchedMark}
-                                        role="img"
-                                        aria-label="Dispatched by the orchestrator"
-                                        title="Dispatched by the orchestrator"
-                                      >
-                                        <Flow16Regular />
-                                      </span>
-                                    )}
-                                    <span
-                                      className={styles.sessionName}
-                                      /*
-                                       * The agent joins the hover text rather
-                                       * than the row: this list is the densest
-                                       * thing on screen, and a badge here would
-                                       * cost the name its width on every row to
-                                       * say something true of almost none.
-                                       */
-                                      title={[
-                                        sessionStatusLabel(session),
-                                        customAgentName(session.configOptions),
-                                        session.initialPrompt,
-                                      ]
-                                        .filter(Boolean)
-                                        .join(" · ")}
-                                    >
-                                      {sessionLabel(session)}
-                                    </span>
-                                  </span>
-                                </TreeItemLayout>
-                              </TreeItem>
-                            );
-                          })}
-                        </Tree>
                       </TreeItem>
-                    ))
-                  )}
-                </Tree>
-              </TreeItem>
-            ))}
+                    ) : (
+                      group.nodes.map((nodeGroup) => (
+                        <TreeItem
+                          itemType="branch"
+                          value={nodeKey(group.workspaceId, nodeGroup.nodeId)}
+                          key={nodeGroup.nodeId}
+                        >
+                          <TreeItemLayout
+                            iconBefore={<Server20Regular />}
+                            // The node under a workspace is that workspace's
+                            // checkout on that machine, so this row is the
+                            // placement — drag it to file it elsewhere. A node
+                            // left over from deleted history has no placement to
+                            // move and stays put.
+                            draggable={Boolean(movable(nodeGroup.nodeId))}
+                            onDragStart={(event: DragEvent<HTMLDivElement>) => {
+                              const placement = movable(nodeGroup.nodeId);
+                              if (!placement) return;
+                              event.dataTransfer.setData(
+                                DRAG_MIME,
+                                encodeDrag({ kind: "placement", id: placement.id }),
+                              );
+                              event.dataTransfer.effectAllowed = "move";
+                            }}
+                            title={
+                              movable(nodeGroup.nodeId)
+                                ? `${nodeGroup.nodeName} — drag onto a sibling to reorder, or onto another workspace to move`
+                                : nodeGroup.nodeName
+                            }
+                            className={mergeClasses(
+                              nodeGroup.online ? undefined : styles.offline,
+                              movable(nodeGroup.nodeId) && styles.draggable,
+                              dropTarget?.key ===
+                                nodeKey(group.workspaceId, nodeGroup.nodeId) &&
+                                (dropTarget.edge === "before"
+                                  ? styles.dropBefore
+                                  : styles.dropAfter),
+                            )}
+                            onDragOver={(event: DragEvent<HTMLDivElement>) => {
+                              const target = movable(nodeGroup.nodeId);
+                              if (!target) return;
+                              if (!event.dataTransfer.types.includes(DRAG_MIME)) return;
+                              event.preventDefault();
+                              event.dataTransfer.dropEffect = "move";
+                              // Stops the workspace row underneath from also
+                              // showing a line, which would make it unclear where
+                              // the item is going to land.
+                              event.stopPropagation();
+                              setDropTarget({
+                                key: nodeKey(group.workspaceId, nodeGroup.nodeId),
+                                edge: edgeFromPointer(
+                                  event.currentTarget.getBoundingClientRect(),
+                                  event.clientY,
+                                ),
+                              });
+                            }}
+                            onDragLeave={() => setDropTarget(undefined)}
+                            onDrop={(event: DragEvent<HTMLDivElement>) => {
+                              const edge = dropTarget?.edge ?? "before";
+                              setDropTarget(undefined);
+                              const target = movable(nodeGroup.nodeId);
+                              const payload = decodeDrag(
+                                event.dataTransfer.getData(DRAG_MIME),
+                              );
+                              if (!target || payload?.kind !== "placement") return;
+                              event.preventDefault();
+                              event.stopPropagation();
+                              const siblings = placements
+                                .filter(
+                                  (entry) => entry.workspaceId === group.workspaceId,
+                                )
+                                .map((entry) => entry.id);
+                              // Dropping a placement from another workspace onto
+                              // a row here means "put it in this workspace", not
+                              // "reorder"; the id is not among these siblings.
+                              if (!siblings.includes(payload.id)) {
+                                void updatePlacement(payload.id, {
+                                  workspaceId: group.workspaceId,
+                                });
+                                return;
+                              }
+                              void reorderPlacements(
+                                group.workspaceId,
+                                reorder(siblings, payload.id, target.id, edge),
+                              );
+                            }}
+                          >
+                            {nodeGroup.nodeName}
+                          </TreeItemLayout>
+                          <Tree>
+                            {nodeGroup.sessions.map((session) => {
+                              const isSelected =
+                                view === "session" && session.id === selectedSessionId;
+                              return (
+                                <TreeItem
+                                  itemType="leaf"
+                                  value={session.id}
+                                  key={session.id}
+                                  aria-selected={isSelected}
+                                  onClick={() => onSelectSession(session.id)}
+                                  onKeyDown={handleSessionKeyDown(session.id)}
+                                >
+                                  <TreeItemLayout
+                                    draggable
+                                    className={mergeClasses(
+                                      styles.row,
+                                      styles.draggable,
+                                      isSelected && styles.selectedRow,
+                                      dropTarget?.key === session.id &&
+                                        (dropTarget.edge === "before"
+                                          ? styles.dropBefore
+                                          : styles.dropAfter),
+                                    )}
+                                    onDragStart={(event: DragEvent<HTMLDivElement>) => {
+                                      event.dataTransfer.setData(
+                                        DRAG_MIME,
+                                        encodeDrag({ kind: "session", id: session.id }),
+                                      );
+                                      event.dataTransfer.effectAllowed = "move";
+                                    }}
+                                    onDragOver={(event: DragEvent<HTMLDivElement>) => {
+                                      if (!event.dataTransfer.types.includes(DRAG_MIME)) {
+                                        return;
+                                      }
+                                      event.preventDefault();
+                                      event.dataTransfer.dropEffect = "move";
+                                      // Without this the node row above also
+                                      // claims the drag, and the line appears in
+                                      // the wrong place.
+                                      event.stopPropagation();
+                                      setDropTarget({
+                                        key: session.id,
+                                        edge: edgeFromPointer(
+                                          event.currentTarget.getBoundingClientRect(),
+                                          event.clientY,
+                                        ),
+                                      });
+                                    }}
+                                    onDragLeave={() => setDropTarget(undefined)}
+                                    onDrop={(event: DragEvent<HTMLDivElement>) => {
+                                      const edge = dropTarget?.edge ?? "before";
+                                      setDropTarget(undefined);
+                                      const payload = decodeDrag(
+                                        event.dataTransfer.getData(DRAG_MIME),
+                                      );
+                                      if (payload?.kind !== "session") return;
+                                      event.preventDefault();
+                                      event.stopPropagation();
+                                      const siblings = nodeGroup.sessions.map(
+                                        (entry) => entry.id,
+                                      );
+                                      // Sessions belong to the machine that runs
+                                      // them, so one dragged from another node is
+                                      // not something this list can accept.
+                                      if (!siblings.includes(payload.id)) return;
+                                      void reorderSessions(
+                                        reorder(siblings, payload.id, session.id, edge),
+                                      );
+                                    }}
+                                  >
+                                    <span className={styles.sessionLabel}>
+                                      <StatusDot
+                                        state={session.state}
+                                        color={sessionAccent(session)}
+                                      />
+                                      {session.runRole !== "" && (
+                                        <span
+                                          className={styles.dispatchedMark}
+                                          role="img"
+                                          aria-label="Dispatched by the orchestrator"
+                                          title="Dispatched by the orchestrator"
+                                        >
+                                          <Flow16Regular />
+                                        </span>
+                                      )}
+                                      <span
+                                        className={styles.sessionName}
+                                        /*
+                                         * The agent joins the hover text rather
+                                         * than the row: this list is the densest
+                                         * thing on screen, and a badge here would
+                                         * cost the name its width on every row to
+                                         * say something true of almost none.
+                                         */
+                                        title={[
+                                          sessionStatusLabel(session),
+                                          customAgentName(session.configOptions),
+                                          session.initialPrompt,
+                                        ]
+                                          .filter(Boolean)
+                                          .join(" · ")}
+                                      >
+                                        {sessionLabel(session)}
+                                      </span>
+                                    </span>
+                                  </TreeItemLayout>
+                                </TreeItem>
+                              );
+                            })}
+                          </Tree>
+                        </TreeItem>
+                      ))
+                    )}
+                  </Tree>
+                </TreeItem>
+              );
+            })}
           </Tree>
         )}
       </div>

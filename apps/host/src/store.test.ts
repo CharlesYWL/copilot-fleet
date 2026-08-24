@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { canTransition } from "@fleet/protocol";
+import { canTransition, CHATS_WORKSPACE_ID, CHATS_WORKSPACE_NAME } from "@fleet/protocol";
 import { FleetStore } from "./store.js";
 
 const stores: FleetStore[] = [];
@@ -335,7 +335,12 @@ describe("FleetStore", () => {
 
     const reopened = new FleetStore(path);
     stores.push(reopened);
-    expect(reopened.listWorkspaces()).toHaveLength(1);
+    // Two, not one: Chats is seeded on every open, so it sits above the project
+    // this test created rather than replacing it.
+    expect(reopened.listWorkspaces().map((entry) => entry.id)).toEqual([
+      CHATS_WORKSPACE_ID,
+      workspace.id,
+    ]);
     expect(reopened.getSession(session.id)?.initialPrompt).toBe("persist this");
     expect(reopened.listEvents(session.id)[0]?.payload.text).toBe("saved");
   });
@@ -844,8 +849,7 @@ describe("FleetStore", () => {
   });
 
   it("updates and deletes workspaces, placements, and idle nodes", () => {
-    const { store, node, placement } = setup();
-    const workspace = store.listWorkspaces()[0]!;
+    const { store, node, workspace, placement } = setup();
 
     expect(store.updateWorkspace(workspace.id, "renamed", "updated")?.name).toBe(
       "renamed",
@@ -869,11 +873,171 @@ describe("FleetStore", () => {
     const archived = store.createSession(replacement, "archive me");
     store.transitionSession(archived.id, "stopped", "done");
     store.deleteWorkspace(workspace.id);
-    expect(store.listWorkspaces()).toHaveLength(0);
+    // Chats is left: it is the fleet's own row and no project delete takes it.
+    expect(store.listWorkspaces().map((entry) => entry.id)).toEqual([CHATS_WORKSPACE_ID]);
     expect(store.listPlacements()).toHaveLength(0);
 
     store.deleteNode(node.id);
     expect(store.getNode(node.id)).toBeUndefined();
+  });
+});
+
+/**
+ * The reserved workspace, and the rule that keeps it honest.
+ *
+ * Everything here exists because a Chats row that could be renamed, refiled or
+ * repathed by hand would either be silently undone by the next heartbeat or
+ * leave a session running in a directory nobody chose.
+ */
+describe("Chats workspace", () => {
+  it("seeds itself above the operator's projects", () => {
+    const { store, workspace } = setup();
+    const chats = store.getWorkspace(CHATS_WORKSPACE_ID);
+
+    expect(chats?.kind).toBe("chats");
+    expect(chats?.name).toBe(CHATS_WORKSPACE_NAME);
+    expect(store.listWorkspaces().map((entry) => entry.id)).toEqual([
+      CHATS_WORKSPACE_ID,
+      workspace.id,
+    ]);
+  });
+
+  it("stays pinned no matter how the projects are reordered", () => {
+    const { store, workspace } = setup();
+    const second = store.createWorkspace("zzz", "");
+
+    store.reorderWorkspaces([second.id, workspace.id]);
+    expect(store.listWorkspaces().map((entry) => entry.id)).toEqual([
+      CHATS_WORKSPACE_ID,
+      second.id,
+      workspace.id,
+    ]);
+  });
+
+  it("takes the reserved name from a project that already held it", () => {
+    /*
+     * The upgrade path for a Host whose operator already had a workspace called
+     * Chats. `name` is unique, so the seed used to fail — quietly, leaving a
+     * Host with no Chats row at all and nothing downstream written to survive
+     * it. Simulated by taking the reserved row away again and putting a project
+     * in its place, which is exactly the shape the older build left.
+     */
+    const file = join(mkdtempSync(join(tmpdir(), "fleet-chats-")), "fleet.db");
+    directories.push(dirname(file));
+    const first = new FleetStore(file);
+    const mine = first.createWorkspace("mine", "");
+    first.close();
+
+    const raw = new DatabaseSync(file);
+    raw.prepare("DELETE FROM workspaces WHERE id=?").run(CHATS_WORKSPACE_ID);
+    raw
+      .prepare("UPDATE workspaces SET name=? WHERE id=?")
+      .run(CHATS_WORKSPACE_NAME, mine.id);
+    raw.close();
+
+    const reopened = new FleetStore(file);
+    stores.push(reopened);
+
+    // The reserved row exists and holds the name; the project keeps its id,
+    // its placements and its history, and only its label moved.
+    expect(reopened.getWorkspace(CHATS_WORKSPACE_ID)?.name).toBe(CHATS_WORKSPACE_NAME);
+    expect(reopened.getWorkspace(mine.id)?.name).toBe(`${CHATS_WORKSPACE_NAME} (2)`);
+  });
+
+  it("refuses to be renamed or deleted", () => {
+    const { store } = setup();
+
+    // Asserted on the whole sentence, not just "built in". These used to be
+    // built by appending "d" to a verb, which read correctly for these two and
+    // produced "cannot be move a checkout out ofd" for every other refusal.
+    expect(() => store.updateWorkspace(CHATS_WORKSPACE_ID, "Notes", "")).toThrow(
+      "Chats is built in and cannot be renamed",
+    );
+    expect(() => store.deleteWorkspace(CHATS_WORKSPACE_ID)).toThrow(
+      "Chats is built in and cannot be deleted",
+    );
+    expect(store.getWorkspace(CHATS_WORKSPACE_ID)?.name).toBe(CHATS_WORKSPACE_NAME);
+  });
+
+  it("gives a node that reports a home directory a checkout there", () => {
+    const store = new FleetStore(":memory:");
+    stores.push(store);
+    const { node } = store.registerNode({
+      name: "box",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+      homeDir: "/home/box",
+    });
+
+    expect(store.chatPlacementFor(node.id)?.localPath).toBe("/home/box");
+  });
+
+  it("follows a machine whose home directory moved", () => {
+    // A rebuilt or migrated node reports a new home on reconnect, and a chat
+    // left pointing at the old one would start in a directory that is gone.
+    const store = new FleetStore(":memory:");
+    stores.push(store);
+    const { node } = store.registerNode({
+      name: "box",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+      homeDir: "/home/box",
+    });
+    const before = store.chatPlacementFor(node.id)!;
+
+    store.setNodeIdentity(node.id, { homeDir: "/Users/box" });
+    const after = store.chatPlacementFor(node.id)!;
+
+    expect(after.id).toBe(before.id);
+    expect(after.localPath).toBe("/Users/box");
+  });
+
+  it("gives no checkout to a node that does not know its home directory", () => {
+    // `localPath` is handed straight to the agent as a working directory, so
+    // "" would start a process wherever the Node happened to be.
+    const { store, node } = setup();
+    expect(store.chatPlacementFor(node.id)).toBeUndefined();
+  });
+
+  it("refuses to have checkouts added, moved, or removed by hand", () => {
+    const store = new FleetStore(":memory:");
+    stores.push(store);
+    const { node } = store.registerNode({
+      name: "box",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+      homeDir: "/home/box",
+    });
+    const project = store.createWorkspace("repo", "");
+    const checkout = store.createPlacement(project.id, node.id, "/src/repo");
+    const chat = store.chatPlacementFor(node.id)!;
+
+    expect(() => store.createPlacement(CHATS_WORKSPACE_ID, node.id, "/tmp")).toThrow(
+      "Chats is built in and cannot be given checkouts by hand",
+    );
+    expect(() => store.updatePlacement(chat.id, "/tmp")).toThrow(
+      "Chats is built in and cannot be repointed at another directory by hand",
+    );
+    expect(() => store.deletePlacement(chat.id)).toThrow(
+      "Chats is built in and cannot be stripped of its checkouts by hand",
+    );
+    // And the other direction: a checkout dropped into Chats would be repathed
+    // to the home directory by the next heartbeat, losing it without saying so.
+    expect(() =>
+      store.updatePlacement(checkout.id, undefined, CHATS_WORKSPACE_ID),
+    ).toThrow("Chats is built in and cannot be given checkouts by hand");
+
+    expect(store.chatPlacementFor(node.id)?.localPath).toBe("/home/box");
+    expect(store.getPlacement(checkout.id)?.workspaceId).toBe(project.id);
   });
 });
 
@@ -936,7 +1100,10 @@ describe("Host backup", () => {
     expect(restored.getTunnelProvider()).toBe("tailscale");
     expect(restored.getSetting("enrollment.token")).toBe("move-me");
     expect(restored.getSetting("host.publicUrl")).toBe("https://fleet.example.com");
-    expect(restored.listWorkspaces()[0]?.id).toBe(workspace.id);
+    expect(restored.listWorkspaces().map((entry) => entry.id)).toEqual([
+      CHATS_WORKSPACE_ID,
+      workspace.id,
+    ]);
     expect(restored.listPlacements()[0]?.localPath).toBe("C:\\repo");
 
     const importedLive = restored.getSession(live.id)!;
@@ -957,8 +1124,12 @@ describe("Host backup", () => {
     stores.push(other);
     other.createWorkspace("pre-existing", "");
     other.replaceHostBackup(backup);
-    expect(other.listWorkspaces().map((entry) => entry.name)).toEqual([workspace.name]);
-    expect(other.listWorkspaces()).toHaveLength(1);
+    // The destination's own project is gone; Chats is seeded back because the
+    // restore deleted it too and nothing downstream works without it.
+    expect(other.listWorkspaces().map((entry) => entry.name)).toEqual([
+      CHATS_WORKSPACE_NAME,
+      workspace.name,
+    ]);
   });
 });
 

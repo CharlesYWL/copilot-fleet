@@ -37,6 +37,16 @@ copilot --acp --stdio
 
 - **Node**: registered machine, capabilities, capacity, active count, and liveness.
 - **Workspace**: logical project visible in the UI.
+- **Chats**: one reserved Workspace, kind `chats`, id `chats`. It holds sessions
+  that are not about a checkout — a question, a piece of research — and its
+  Placements are derived rather than filed: every Node that reports a home
+  directory gets one there, rewritten on each reconnect. It is a real Workspace
+  row rather than a null `workspaceId` on the Session because that column is
+  load-bearing in the sessions foreign key, run pinning, capacity accounting,
+  the sidebar tree, and backup; making it optional would have touched all of
+  those to express something only the UI cares about. It cannot be renamed,
+  deleted, or have Placements added, moved, or removed by hand, and the seed
+  moves an operator's own workspace aside if one already holds the name.
 - **Placement**: `(workspaceId, nodeId, localPath)`. It is the only source of a Session working directory.
 - **Session**: one long-lived Copilot process bound to one Placement. Carries an
   optional operator-chosen name; empty means the UI labels it by its initial prompt.
@@ -151,6 +161,13 @@ must see those changes — a reviewer above all — is sent there. That pin says
 where the changes are, not where the orchestrator lives: naming a workspace is
 how it works on something else, read-only work never takes the write lock, and
 a pin belonging to a Run that has written nothing is ignored outright.
+
+Naming **Chats** is how it asks for the one destination that is not a checkout,
+and the only place the decision loses a candidate rather than gaining one: a
+writing or reviewing step drops every Chats Placement before ranking, and is
+refused if nothing else is left. The cost of not doing that is not a step that
+fails — it is a step that succeeds in a home directory and takes the Run's pin
+with it, sending the review that follows to a tree the work was never in.
 
 Its token is signed rather than stored: an HMAC over the session id, keyed from
 settings, so nothing about it has to survive in memory and a restart changes

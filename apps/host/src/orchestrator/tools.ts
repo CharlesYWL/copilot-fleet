@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
+  isChatsWorkspace,
   RunCriterionSchema,
   canTransitionRun,
   eventPayload,
@@ -583,7 +584,22 @@ export class FleetTools {
         `  workspaces: ${paths.length > 0 ? paths.join(", ") : "(none)"}`,
       ].join("\n");
     });
-    return ok(lines.length > 0 ? lines.join("\n") : "No nodes are enrolled yet.");
+    if (lines.length === 0) return ok("No nodes are enrolled yet.");
+    // Said once at the end rather than beside every machine that has one:
+    // Chats looks exactly like a checkout in the list above, and an
+    // orchestrator that read it as one would send an implementation there.
+    const chats = placements.some((placement) => isChatsWorkspace(placement.workspaceId));
+    return ok(
+      [
+        lines.join("\n"),
+        ...(chats
+          ? [
+              "",
+              "Chats is not a checkout — it is each node's home directory. Name it as the workspace for a question or a piece of research that needs no repository; work that changes or reviews code cannot go there.",
+            ]
+          : []),
+      ].join("\n"),
+    );
   }
 
   /**

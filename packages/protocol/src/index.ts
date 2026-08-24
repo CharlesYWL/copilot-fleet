@@ -67,13 +67,63 @@ export const NodeSchema = z.object({
 });
 export type FleetNode = z.infer<typeof NodeSchema>;
 
+/**
+ * What a workspace is for, which decides what may be done to it.
+ *
+ * `project` is every workspace an operator creates: a repository, checked out
+ * somewhere, that work can be written to. `chats` is the single reserved one
+ * described by {@link CHATS_WORKSPACE_ID}.
+ */
+export const WorkspaceKindSchema = z.enum(["project", "chats"]);
+export type WorkspaceKind = z.infer<typeof WorkspaceKindSchema>;
+
+/**
+ * The reserved workspace holding sessions that are not about a checkout.
+ *
+ * A question, a piece of research, a bit of reading on the web: work that wants
+ * an agent and a machine but no repository. Before this it still needed both,
+ * because a Session's working directory comes from a Placement and a Placement
+ * belongs to a Workspace — so asking the fleet a question meant first inventing
+ * a project for it to be asked in.
+ *
+ * It is a real workspace row rather than a null `workspaceId` on the session,
+ * and that is the whole design. `workspaceId` is load-bearing in the sessions
+ * foreign key, run pinning, capacity accounting, the sidebar tree, and backup;
+ * making it optional would have touched every one of those to express something
+ * only the UI cares about. A reserved row costs a `kind` column and some guards,
+ * and everything downstream keeps working unchanged.
+ *
+ * The id is fixed rather than generated so a Host that restarts, restores a
+ * backup, or is rebuilt from scratch keeps pointing history at the same row.
+ */
+export const CHATS_WORKSPACE_ID = "chats";
+export const CHATS_WORKSPACE_NAME = "Chats";
+export const CHATS_WORKSPACE_DESCRIPTION =
+  "Questions and research that need no checkout. Sessions here run in each node's home directory.";
+
 export const WorkspaceSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
   description: z.string(),
   createdAt: z.string().datetime(),
+  /**
+   * Defaulted, so a workspace row written before Chats existed reads as the
+   * ordinary project it has always been.
+   */
+  kind: WorkspaceKindSchema.default("project"),
 });
 export type Workspace = z.infer<typeof WorkspaceSchema>;
+
+/**
+ * Whether an id names the reserved Chats workspace.
+ *
+ * Asked of the id rather than of a loaded row because most callers — a
+ * placement, a session, a run — carry the id and would otherwise need a lookup
+ * to answer a constant.
+ */
+export function isChatsWorkspace(workspaceId: string): boolean {
+  return workspaceId === CHATS_WORKSPACE_ID;
+}
 
 export const PlacementSchema = z.object({
   id: z.string().min(1),

@@ -1,5 +1,6 @@
 import {
   HOST_YOLO_CAPABILITY,
+  isChatsWorkspace,
   isWritingCategory,
   terminalRunStates,
   terminalRunStepStates,
@@ -438,6 +439,11 @@ export type PlacementRequest = {
  *
  * Naming a workspace is therefore how the orchestrator says "this is different
  * work"; saying nothing means "carry on where we were".
+ *
+ * Chats is the one destination that is not a checkout. It is a home directory
+ * on each machine, and work sent there is a question rather than a change — so
+ * anything that writes, or that has to read what a previous step wrote, is
+ * refused rather than quietly sent to a directory with none of it in.
  */
 export function decidePlacement(request: PlacementRequest): Placement | string {
   const { run, placements, nodeById, reservedFor, writingInFlight } = request;
@@ -482,9 +488,24 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
       : "This run's workspace has no checkout on any node. Ask a human to add one.";
   }
 
+  /*
+   * Chats holds no repository, so a step that writes has nothing to write to
+   * and a review has nothing to review. Dropped here rather than refused at the
+   * far end: a writing step that reached a home directory would take the run's
+   * pin with it, and every later step — the review above all — would be sent to
+   * a directory that has never held the work.
+   */
+  const eligible =
+    writes || isReviewCategory(request.category)
+      ? candidates.filter((placement) => !isChatsWorkspace(placement.workspaceId))
+      : candidates;
+  if (eligible.length === 0) {
+    return "Chats has no checkout, so nothing can be changed or reviewed there. Send questions and research to Chats, and name a workspace for work on a repository.";
+  }
+
   let blockedByWriter = false;
   let full = false;
-  const ranked = candidates
+  const ranked = eligible
     .flatMap((placement) => {
       const node = nodeById.get(placement.nodeId);
       if (!usable(node, run)) return [];

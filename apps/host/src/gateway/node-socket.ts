@@ -115,6 +115,11 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
         ? settleNodeName(service, app, node, hello.name, hello.knownName)
         : undefined;
       if (named) service.publishNode(named);
+      // The node's Chats checkout is written from the home directory it just
+      // reported, so the catalog browsers hold is a beat out of date until it is
+      // republished — and a machine that has only ever connected once would
+      // otherwise show no Chats row at all until something else changed.
+      service.publishCatalog();
       // After the node is published, so the row already shows the revision it
       // came back on when the update it was waiting for is marked finished.
       service.settleUpdateOnReconnect(hello.nodeId, hello.revision);

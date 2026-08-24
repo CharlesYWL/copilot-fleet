@@ -138,6 +138,86 @@ describe("FleetTools", () => {
     expect(result.text).toContain("/src/beta");
   });
 
+  /**
+   * Chats is a destination with no repository in it.
+   *
+   * The node in the harness reports no home directory, so each of these opts in
+   * by giving it one — which is also the only way a Chats checkout is ever
+   * created.
+   */
+  describe("Chats", () => {
+    const withChats = () => {
+      const node = store.listNodes()[0]!;
+      store.setNodeIdentity(node.id, { homeDir: "/home/box" });
+      return store.chatPlacementFor(node.id)!;
+    };
+
+    it("takes a question, and runs it in the node's home directory", () => {
+      const chat = withChats();
+      const result = start({ task: "Ask something", workspace: "Chats" });
+
+      expect(result.ok).toBe(true);
+      expect(result.text).toContain(chat.localPath);
+    });
+
+    it("refuses a change, which would have nothing to change", () => {
+      /*
+       * And more than nothing: a writing step that reached a home directory
+       * would take the run's pin with it, so every later step — the review
+       * above all — would be sent to a tree that never held the work.
+       */
+      withChats();
+      start({ task: "Ask something", workspace: "Chats" });
+
+      const result = start({
+        category: "implement",
+        title: "change it",
+        workspace: "Chats",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain("no checkout");
+    });
+
+    it("refuses a review, which would have nothing to review", () => {
+      withChats();
+      start({ task: "Ask something", workspace: "Chats" });
+
+      const result = start({
+        category: "review-deep",
+        title: "read it back",
+        workspace: "Chats",
+      });
+
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain("no checkout");
+    });
+
+    it("still sends a change to a real workspace named alongside it", () => {
+      // The refusal drops Chats from the candidates rather than refusing the
+      // whole dispatch, so a search that matched both still lands on the repo.
+      withChats();
+      start({ task: "Work on Beta" });
+
+      const result = start({
+        category: "implement",
+        title: "change it",
+        workspace: "Beta",
+      });
+
+      expect(result.ok).toBe(true);
+      expect(result.text).toContain("/src/beta");
+    });
+
+    it("says what Chats is when it lists the machines", () => {
+      withChats();
+      const result = tools().listNodes();
+
+      expect(result.text).toContain("/home/box");
+      expect(result.text).toContain("not a checkout");
+    });
+  });
+
   it("says which workspaces exist when the named one does not", () => {
     // Needs a task first: without one there is nothing to dispatch into, and
     // that refusal comes before the workspace is even looked at.

@@ -86,6 +86,23 @@ pair. The same project can sit at a different absolute path on every machine, an
 a session is always started from a stored placement — never from a path typed
 into a request.
 
+### Chats
+
+Not every question is about a checkout. **Chats** is a workspace the Host creates
+for itself, pinned above your projects in the sidebar, for the sessions that only
+need an agent and a machine: a question, a bit of reading, research on something
+you have not written yet. Every node that reports a home directory gets a Chats
+placement there automatically, so there is nothing to set up — pick **Chats** in
+**New session** and it runs in that machine's home directory.
+
+Because it is derived rather than filed, it is the one workspace you cannot edit:
+it has no rename, no delete, and no placements to add, move or remove. If you
+already had a project called Chats, it keeps everything but its label, which moves
+to `Chats (2)` so the reserved name is free.
+
+An orchestrator can use it too — see
+[Chats as a destination](#chats-as-a-destination).
+
 Connected nodes are told when the Host's public URL changes, so a rotated tunnel
 does not strand them — see
 [Following the Host to a new URL](#following-the-host-to-a-new-url).
@@ -661,6 +678,20 @@ You see all of this in three places. The sidebar lists your conversations; the
 fleet doing" is a fleet-wide question; and a conversation carries its own tasks
 in a panel beside it, so what you just asked for is next to where you asked.
 Clicking a dispatched step opens that worker's transcript.
+
+### Chats as a destination
+
+An orchestrator picks where each worker runs, and [Chats](#chats) is one of the
+choices: naming it as the `workspace` sends that worker to the node's home
+directory instead of a checkout. That is how a task that is a question — look
+something up, read around a problem, compare two approaches — gets dispatched at
+all, without inventing a project for it to be asked in first.
+
+It is the one destination the Host refuses work for. A step that writes or
+reviews is never sent there, because a change made in a home directory would pin
+the whole task to it, and every later step — the review most of all — would then
+be sent somewhere the work has never been. The refusal says so, and names the
+alternative: send research to Chats, name a workspace for the repository.
 
 **Or write the plan yourself.** A **run** is an objective plus a budget with a
 fixed list of steps, approved once. There is no UI for this; it is the engine's

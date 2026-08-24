@@ -100,6 +100,7 @@ function mechanics(): string[] {
     "- A review always lands on the same checkout the implementation used, so it sees the actual changes. You do not have to arrange that.",
     "- `review-deep` is for correctness and design; `review-quick` for an obvious-mistakes pass.",
     "- To work on a different repository, name its `workspace`. Say which one whenever a task is not about the repository you have been working in.",
+    '- `workspace: "Chats"` is not a repository: it is each machine\'s home directory, for a question or a piece of research that needs no checkout. Nothing there can be changed or reviewed, and a task sent there is usually one phase and a sign-off.',
     "",
     "## Talking to the human",
     "",

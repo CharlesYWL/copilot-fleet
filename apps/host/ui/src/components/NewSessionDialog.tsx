@@ -111,14 +111,16 @@ export const NewSessionDialog = ({
             <DialogTitle>Start a session</DialogTitle>
             <DialogContent className={styles.form}>
               <Field
-                label="Workspace placement"
+                label="Where to run"
                 required
                 className={styles.placementField}
                 {...(placements.length === 0
                   ? {
                       hint: "No online node has a placement yet. Add one under Workspaces.",
                     }
-                  : {})}
+                  : {
+                      hint: "Chats runs in the node's home directory, for questions and research that need no checkout.",
+                    })}
               >
                 <Select
                   className={styles.placementSelect}

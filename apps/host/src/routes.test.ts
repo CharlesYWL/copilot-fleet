@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance, InjectOptions } from "fastify";
+import { CHATS_WORKSPACE_ID } from "@fleet/protocol";
 import { buildServer } from "./server.js";
 
 const OPERATOR_PASSWORD = "test-password";
@@ -70,7 +71,9 @@ describe("host routes", () => {
     const snapshot = await inject({ method: "GET", url: "/api/snapshot" });
     expect(snapshot.json()).toMatchObject({
       nodes: [],
-      workspaces: [],
+      // Never empty: Chats is seeded when the database is opened, so a Host
+      // with nothing enrolled still offers somewhere to ask a question.
+      workspaces: [{ id: CHATS_WORKSPACE_ID, kind: "chats" }],
       placements: [],
       sessions: [],
     });
@@ -343,6 +346,71 @@ describe("host routes", () => {
   it("keeps unknown API paths as JSON 404s", async () => {
     const response = await inject({ method: "GET", url: "/api/nope" });
     expect(response.statusCode).toBe(404);
+  });
+
+  /**
+   * The reserved workspace, over the wire.
+   *
+   * The store refuses these too, but the routes are where an operator's browser
+   * actually asks — and one of them used to report every failure as a name
+   * collision, which would send them looking for a workspace that is not there.
+   */
+  it("gives an enrolled node a Chats checkout at its home directory", async () => {
+    const register = await inject({
+      method: "POST",
+      url: "/api/nodes/register",
+      payload: {
+        name: "box",
+        os: "linux",
+        arch: "x64",
+        version: "0.1.0",
+        capabilities: ["copilot-acp"],
+        maxSessions: 1,
+        homeDir: "/home/box",
+        enrollmentToken: "test-token",
+      },
+    });
+    const { nodeId } = register.json() as { nodeId: string };
+
+    const placements = await inject({ method: "GET", url: "/api/placements" });
+    expect(placements.json()).toMatchObject([
+      {
+        workspaceId: CHATS_WORKSPACE_ID,
+        workspaceName: "Chats",
+        nodeId,
+        localPath: "/home/box",
+      },
+    ]);
+  });
+
+  it("refuses to rename, delete, or place into Chats", async () => {
+    const { nodeId } = await enroll("box");
+
+    const renamed = await inject({
+      method: "PATCH",
+      url: `/api/workspaces/${CHATS_WORKSPACE_ID}`,
+      payload: { name: "Notes", description: "" },
+    });
+    expect(renamed.statusCode).toBe(409);
+    expect(renamed.json()).toMatchObject({
+      error: expect.stringContaining("built in"),
+    });
+
+    const deleted = await inject({
+      method: "DELETE",
+      url: `/api/workspaces/${CHATS_WORKSPACE_ID}`,
+    });
+    expect(deleted.statusCode).toBe(409);
+
+    const placed = await inject({
+      method: "POST",
+      url: "/api/placements",
+      payload: { workspaceId: CHATS_WORKSPACE_ID, nodeId, localPath: "/tmp" },
+    });
+    expect(placed.statusCode).toBe(409);
+    expect(placed.json()).toMatchObject({
+      error: expect.stringContaining("built in"),
+    });
   });
 });
 

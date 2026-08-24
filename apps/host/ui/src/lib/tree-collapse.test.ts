@@ -19,6 +19,7 @@ const groups = (
   {
     workspaceId: "w1",
     workspaceName: "repo",
+    kind: "project",
     nodes: nodes.map((entry) => ({
       nodeId: entry.nodeId,
       nodeName: entry.nodeId,

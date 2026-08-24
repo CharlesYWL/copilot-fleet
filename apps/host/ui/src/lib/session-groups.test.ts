@@ -18,11 +18,16 @@ const node = (id: string, name: string, online = true): FleetNode => ({
   homeDir: "/Users/me",
 });
 
-const workspace = (id: string, name: string): Workspace => ({
+const workspace = (
+  id: string,
+  name: string,
+  kind: Workspace["kind"] = "project",
+): Workspace => ({
   id,
   name,
   description: "",
   createdAt: "2026-08-08T00:00:00.000Z",
+  kind,
 });
 
 const session = (
@@ -99,7 +104,9 @@ describe("groupSessionsByWorkspace", () => {
       [workspace("w1", "Empty")],
     );
 
-    expect(groups).toEqual([{ workspaceId: "w1", workspaceName: "Empty", nodes: [] }]);
+    expect(groups).toEqual([
+      { workspaceId: "w1", workspaceName: "Empty", kind: "project", nodes: [] },
+    ]);
   });
 
   it("orders the nodes under a workspace by its placements", () => {

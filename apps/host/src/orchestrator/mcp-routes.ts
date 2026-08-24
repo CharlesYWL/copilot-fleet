@@ -147,7 +147,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
           .string()
           .optional()
           .describe(
-            "Which workspace to work in, by name. Defaults to the one the current task is already using. Name one to work on a different repository.",
+            'Which workspace to work in, by name. Defaults to the one the current task is already using. Name one to work on a different repository, or "Chats" for a question or a piece of research that needs no checkout at all.',
           ),
         task: z
           .string()
@@ -217,7 +217,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         workspace: z
           .string()
           .optional()
-          .describe("Which workspace this task is about, by name."),
+          .describe(
+            'Which workspace this task is about, by name. "Chats" for a question or a piece of research that needs no checkout.',
+          ),
       },
     },
     async (args) => reply(tools.planTask(PlanTaskSchema.parse(args))),

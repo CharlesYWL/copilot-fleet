@@ -1,4 +1,10 @@
-import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
+import type {
+  FleetNode,
+  FleetSession,
+  Placement,
+  Workspace,
+  WorkspaceKind,
+} from "@fleet/protocol";
 
 export type SessionNodeGroup = {
   nodeId: string;
@@ -10,6 +16,15 @@ export type SessionNodeGroup = {
 export type SessionWorkspaceGroup = {
   workspaceId: string;
   workspaceName: string;
+  /**
+   * What this group is, so the tree can tell the reserved Chats row from a
+   * project without knowing the reserved id itself.
+   *
+   * A group can outlive its workspace — history kept after a project was
+   * deleted still renders — and one of those has no row to read a kind from, so
+   * it falls back to `project`, which is what it was.
+   */
+  kind: WorkspaceKind;
   nodes: SessionNodeGroup[];
 };
 
@@ -34,12 +49,17 @@ export function groupSessionsByWorkspace(
   const onlineById = new Map(nodes.map((node) => [node.id, node.online]));
   const byWorkspace = new Map<string, SessionWorkspaceGroup>();
 
-  const ensureWorkspace = (workspaceId: string, workspaceName: string) => {
+  const ensureWorkspace = (
+    workspaceId: string,
+    workspaceName: string,
+    kind: WorkspaceKind = "project",
+  ) => {
     const existing = byWorkspace.get(workspaceId);
     if (existing) return existing;
     const created: SessionWorkspaceGroup = {
       workspaceId,
       workspaceName,
+      kind,
       nodes: [],
     };
     byWorkspace.set(workspaceId, created);
@@ -47,7 +67,7 @@ export function groupSessionsByWorkspace(
   };
 
   for (const workspace of workspaces) {
-    ensureWorkspace(workspace.id, workspace.name);
+    ensureWorkspace(workspace.id, workspace.name, workspace.kind);
   }
 
   for (const session of sessions) {

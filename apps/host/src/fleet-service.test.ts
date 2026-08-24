@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import {
+  CHATS_WORKSPACE_NAME,
   HOST_URL_SYNC_CAPABILITY,
   NODE_NAME_SYNC_CAPABILITY,
   SELF_UPDATE_CAPABILITY,
@@ -16,7 +17,7 @@ type SentFrame = {
   nodeId?: string;
   stage?: string;
   detail?: string;
-  command?: { type: string; sessionId: string };
+  command?: { type: string; sessionId: string; localPath?: string };
 };
 
 /** Just enough socket for the service to consider it writable and record sends. */
@@ -435,5 +436,47 @@ describe("what a session starts on", () => {
       { id: "model", value: "claude-opus-5" },
       { id: "reasoning_effort", value: "xhigh" },
     ]);
+  });
+});
+
+/**
+ * The whole point of Chats, checked end to end.
+ *
+ * The route tests prove the placement exists; this proves the working directory
+ * the Node is actually told to start in is the machine's home directory, which
+ * is the one fact an operator would notice being wrong.
+ */
+describe("a session started in Chats", () => {
+  it("is dispatched to the node's home directory", () => {
+    const store = new FleetStore(":memory:");
+    const service = new FleetService(store, silentLog, "");
+    const { node } = store.registerNode({
+      name: "box",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+      homeDir: "C:\\Users\\weili",
+    });
+    const wire = fakeSocket();
+    service.attachNode(node.id, wire.socket);
+    store.setNodeOnline(node.id, true, 0);
+
+    const chat = store.chatPlacementFor(node.id)!;
+    const result = service.createAndStartSession({
+      placement: chat,
+      prompt: "what is a monad",
+      yolo: false,
+    });
+
+    expect(result.ok).toBe(true);
+    const start = wire.sent.find((frame) => frame.command?.type === "start_session");
+    expect(start).toMatchObject({
+      command: { localPath: "C:\\Users\\weili" },
+    });
+    expect(store.getSession(result.ok ? result.session.id : "")?.workspaceName).toBe(
+      CHATS_WORKSPACE_NAME,
+    );
   });
 });

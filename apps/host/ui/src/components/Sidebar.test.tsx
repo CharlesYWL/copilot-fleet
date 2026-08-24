@@ -9,8 +9,18 @@ import { fleetDarkTheme } from "../theme";
 const node = (id: string, name: string): FleetNode =>
   ({ id, name, online: true, homeDir: "/home/me" }) as FleetNode;
 
-const workspace = (id: string, name: string): Workspace =>
-  ({ id, name, description: "", createdAt: "2026-08-08T00:00:00.000Z" }) as Workspace;
+const workspace = (
+  id: string,
+  name: string,
+  kind: Workspace["kind"] = "project",
+): Workspace =>
+  ({
+    id,
+    name,
+    description: "",
+    createdAt: "2026-08-08T00:00:00.000Z",
+    kind,
+  }) as Workspace;
 
 const session = (
   id: string,
@@ -121,6 +131,30 @@ describe("Sidebar drag handles", () => {
     show([]);
     expect(screen.queryByTitle(/WEILI-PC — drag/i)).toBeNull();
     expect(screen.getByTitle("WEILI-PC").getAttribute("draggable")).not.toBe("true");
+  });
+
+  /**
+   * Chats is the fleet's own row, not one of the operator's projects.
+   *
+   * Every handle here would offer a gesture the Host refuses: it is pinned
+   * above the list, its checkout is the node's home directory, and neither is
+   * an operator's to move.
+   */
+  it("offers no drag handles on Chats or the machines under it", () => {
+    const chatPlacement: Placement = {
+      id: "pc",
+      workspaceId: "chats",
+      nodeId: "n1",
+      localPath: "/home/me",
+    };
+    show([chatPlacement], [session("s1", "chats", "n1")], {
+      workspaces: [workspace("chats", "Chats", "chats"), workspace("w1", "repo")],
+    });
+
+    expect(screen.getByTitle(/Questions and research/i).getAttribute("draggable")).toBe(
+      "false",
+    );
+    expect(screen.queryByTitle(/WEILI-PC — drag/i)).toBeNull();
   });
 });
 

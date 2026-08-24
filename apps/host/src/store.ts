@@ -21,6 +21,9 @@ import {
   type Workspace,
   HOST_BACKUP_KIND,
   BACKUP_VERSION,
+  CHATS_WORKSPACE_DESCRIPTION,
+  CHATS_WORKSPACE_ID,
+  CHATS_WORKSPACE_NAME,
   HostBackupSchema,
   NodeSchema,
   PlacementSchema,
@@ -34,6 +37,7 @@ import {
   WorkspaceSchema,
   eventPayload,
   canTransition,
+  isChatsWorkspace,
   sessionFieldsForHostImport,
   terminalSessionStates,
   tryParseJson,
@@ -104,6 +108,29 @@ const settledStateList = [...terminalStateList, "offline"];
 
 const placeholders = (values: readonly unknown[]): string =>
   values.map(() => "?").join(",");
+
+/**
+ * Refuses an edit aimed at the reserved Chats workspace.
+ *
+ * Its name, its description and the placements under it are all derived — the
+ * name is what the UI pins, and each placement is a node's own home directory,
+ * rewritten whenever that node reports one. An operator edit would either be
+ * undone by the next heartbeat or leave a chat session pointing at a directory
+ * nobody chose, so it is refused here, in the store, rather than only in the
+ * route that happens to be the usual way in.
+ *
+ * `refusal` is the finished clause rather than a verb to conjugate. Deriving
+ * the past tense by appending "d" read correctly for "rename" and "delete" and
+ * produced "cannot be move a checkout out ofd" for everything else.
+ */
+function assertNotReserved(workspaceId: string, refusal: string): void {
+  if (!isChatsWorkspace(workspaceId)) return;
+  throw new Error(`Chats is built in and cannot be ${refusal}`);
+}
+
+/** What a placement edit is told, since three of them say the same thing. */
+const NO_MANUAL_CHECKOUTS =
+  "given checkouts by hand — every node gets one automatically, at its home directory";
 
 export class FleetStore {
   private readonly db: DatabaseSync;
@@ -213,7 +240,74 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "success_criteria", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "stop_when", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("workspaces", "kind", "TEXT NOT NULL DEFAULT 'project'");
+    this.ensureChatsWorkspace();
     this.rebuildSessionStateFromEvents();
+  }
+
+  /**
+   * Seeds the reserved Chats workspace if it is not already there.
+   *
+   * Run on every open rather than as a one-time migration: the row also has to
+   * exist on a database restored from a backup taken before Chats existed, and
+   * an insert guarded by its own id makes "create it" and "leave it alone" the
+   * same call. `createdAt` is therefore whenever this Host first opened the
+   * file, which is as true a creation date as a reserved row can have.
+   */
+  private ensureChatsWorkspace(): void {
+    if (this.getWorkspace(CHATS_WORKSPACE_ID)) return;
+    this.transaction(() => this.seedChatsWorkspace());
+  }
+
+  /**
+   * The body of {@link ensureChatsWorkspace}, without a transaction of its own.
+   *
+   * `transaction` issues a bare `BEGIN IMMEDIATE`, which SQLite refuses inside
+   * another one — and restoring a backup has to seed this row within the same
+   * transaction that deleted every workspace, or a failure part-way through
+   * would leave a Host with no Chats workspace and no way back.
+   */
+  private seedChatsWorkspace(): void {
+    if (this.getWorkspace(CHATS_WORKSPACE_ID)) return;
+    this.freeChatsName();
+    this.statement(
+      `INSERT INTO workspaces (id,name,description,created_at,position,kind)
+       VALUES (?,?,?,?,-1,'chats')`,
+    ).run(
+      CHATS_WORKSPACE_ID,
+      CHATS_WORKSPACE_NAME,
+      CHATS_WORKSPACE_DESCRIPTION,
+      new Date().toISOString(),
+    );
+  }
+
+  /**
+   * Moves an operator's own workspace out of the reserved name, if one holds it.
+   *
+   * `name` is unique, so a project someone already called "Chats" would make
+   * the seed fail — and an insert that fails quietly leaves a Host with no
+   * Chats row at all, which nothing downstream is written to survive. The
+   * reserved row takes the name and the project keeps everything else,
+   * including its id, its placements and its history; only the label moves, and
+   * it moves somewhere the operator can see and rename back.
+   */
+  private freeChatsName(): void {
+    const clash = this.statement("SELECT id FROM workspaces WHERE name=? AND id<>?").get(
+      CHATS_WORKSPACE_NAME,
+      CHATS_WORKSPACE_ID,
+    ) as Row | undefined;
+    if (!clash) return;
+    const taken = new Set(
+      (this.statement("SELECT name FROM workspaces").all() as Row[]).map((row) =>
+        String(row.name),
+      ),
+    );
+    let suffix = 2;
+    while (taken.has(`${CHATS_WORKSPACE_NAME} (${suffix})`)) suffix += 1;
+    this.statement("UPDATE workspaces SET name=? WHERE id=?").run(
+      `${CHATS_WORKSPACE_NAME} (${suffix})`,
+      String(clash.id),
+    );
   }
 
   /**
@@ -526,13 +620,14 @@ export class FleetStore {
       }
       for (const workspace of parsed.workspaces) {
         this.statement(
-          "INSERT INTO workspaces (id,name,description,created_at,position) VALUES (?,?,?,?,?)",
+          "INSERT INTO workspaces (id,name,description,created_at,position,kind) VALUES (?,?,?,?,?,?)",
         ).run(
           workspace.id,
           workspace.name,
           workspace.description,
           workspace.createdAt,
           workspace.position,
+          workspace.kind,
         );
       }
       for (const placement of parsed.placements) {
@@ -651,7 +746,14 @@ export class FleetStore {
           "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
         ).run(note.id, note.runId, note.phaseIndex, note.body, note.createdAt);
       }
+      // The restore deleted every workspace, and an archive taken before Chats
+      // existed has no row to put back — so the Host would come up from a valid
+      // backup with the one workspace nothing is written to work without.
+      this.seedChatsWorkspace();
     });
+    // Placements went too, and the ones under Chats are derived rather than
+    // archived: each node rebuilds its own on the reconnect that follows.
+    for (const node of parsed.nodes) this.syncChatPlacement(node.id);
   }
 
   /** Keeps databases created before a column was introduced usable. */
@@ -713,6 +815,7 @@ export class FleetStore {
         input.homeDir ?? "",
         existing.id,
       );
+      this.syncChatPlacement(existing.id);
       return { node: this.getNode(existing.id)!, secret };
     }
 
@@ -735,6 +838,7 @@ export class FleetStore {
       now,
       input.homeDir ?? "",
     );
+    this.syncChatPlacement(id);
     return { node: this.getNode(id)!, secret };
   }
 
@@ -804,6 +908,10 @@ export class FleetStore {
     set("home_dir", identity.homeDir ? identity.homeDir : undefined);
     if (columns.length === 0) return;
     this.statement(`UPDATE nodes SET ${columns.join(",")} WHERE id=?`).run(...values, id);
+    // A machine that moved, was rebuilt, or only learned to report a home
+    // directory in a later build corrects its Chats checkout here — the same
+    // reconnect that corrects everything else it describes about itself.
+    if (identity.homeDir) this.syncChatPlacement(id);
   }
 
   authenticateNode(id: string, secret: string): boolean {
@@ -856,18 +964,20 @@ export class FleetStore {
   }
 
   createWorkspace(name: string, description: string): Workspace {
-    const workspace = {
+    const workspace: Workspace = {
       id: randomUUID(),
       name,
       description,
       createdAt: new Date().toISOString(),
+      kind: "project",
     };
     // New workspaces go to the end, so an order arranged by hand survives the
     // next project being added.
-    const last = this.statement("SELECT MAX(position) position FROM workspaces").get() as
-      Row | undefined;
+    const last = this.statement(
+      "SELECT MAX(position) position FROM workspaces WHERE kind<>'chats'",
+    ).get() as Row | undefined;
     this.statement(
-      "INSERT INTO workspaces (id,name,description,created_at,position) VALUES (?,?,?,?,?)",
+      "INSERT INTO workspaces (id,name,description,created_at,position,kind) VALUES (?,?,?,?,?,'project')",
     ).run(
       workspace.id,
       name,
@@ -885,6 +995,7 @@ export class FleetStore {
   }
 
   updateWorkspace(id: string, name: string, description: string): Workspace | undefined {
+    assertNotReserved(id, "renamed");
     this.statement("UPDATE workspaces SET name=?,description=? WHERE id=?").run(
       name,
       description,
@@ -898,6 +1009,7 @@ export class FleetStore {
    * any non-terminal session is still attached so we never yank a live agent.
    */
   deleteWorkspace(id: string): void {
+    assertNotReserved(id, "deleted");
     this.assertNoLiveSessions("workspace_id", id, "workspace");
     this.transaction(() => {
       this.deleteSessionsWhere("workspace_id", id);
@@ -908,15 +1020,25 @@ export class FleetStore {
 
   listWorkspaces(): Workspace[] {
     return (
-      this.statement("SELECT * FROM workspaces ORDER BY position,name").all() as Row[]
+      this.statement(
+        // Chats is pinned to the top, above whatever order the operator
+        // arranged their projects into. It is the fleet's own row rather than
+        // one of theirs, and letting it drift into the middle of the list — or
+        // be dragged there — would suggest it can be organised like a project.
+        `SELECT * FROM workspaces
+         ORDER BY CASE WHEN kind='chats' THEN 0 ELSE 1 END, position, name`,
+      ).all() as Row[]
     ).map(workspaceFromRow);
   }
 
   /** See {@link reorderPlacements}: the whole list travels, for the same reason. */
   reorderWorkspaces(orderedIds: readonly string[]): Workspace[] {
-    const own = (this.statement("SELECT id FROM workspaces").all() as Row[]).map((row) =>
-      String(row.id),
-    );
+    // Chats is excluded rather than refused: it is pinned above the list by
+    // {@link listWorkspaces} either way, and a browser that sends the rendered
+    // order back is describing what it drew, not asking to move it.
+    const own = (
+      this.statement("SELECT id FROM workspaces WHERE kind<>'chats'").all() as Row[]
+    ).map((row) => String(row.id));
     const known = new Set(own);
     const ordered = orderedIds.filter((id) => known.has(id));
     const missing = own.filter((id) => !ordered.includes(id));
@@ -929,6 +1051,15 @@ export class FleetStore {
   }
 
   createPlacement(workspaceId: string, nodeId: string, localPath: string): Placement {
+    assertNotReserved(workspaceId, NO_MANUAL_CHECKOUTS);
+    return this.insertPlacement(workspaceId, nodeId, localPath);
+  }
+
+  private insertPlacement(
+    workspaceId: string,
+    nodeId: string,
+    localPath: string,
+  ): Placement {
     const placement = { id: randomUUID(), workspaceId, nodeId, localPath };
     // New placements land at the end of their workspace's list rather than
     // wherever `name` happens to put them, so an order the operator arranged by
@@ -940,6 +1071,44 @@ export class FleetStore {
       "INSERT INTO placements (id,workspace_id,node_id,local_path,position) VALUES (?,?,?,?,?)",
     ).run(placement.id, workspaceId, nodeId, localPath, Number(last?.position ?? -1) + 1);
     return this.getPlacement(placement.id)!;
+  }
+
+  /**
+   * Points a node's Chats checkout at the home directory it just reported.
+   *
+   * Chat placements are derived, not filed: an operator never adds one, and the
+   * path is whatever the machine says its home is. So this runs on every
+   * registration and every reconnect, which is also what repairs a node that
+   * moved, was rebuilt under a new user, or first reported a home directory
+   * only after a Host upgrade taught it to.
+   *
+   * A node that does not know its home directory is skipped rather than given
+   * an empty path: `localPath` is handed straight to the agent as a working
+   * directory, and `""` would start a process wherever the Node happened to be.
+   * It simply has no Chats row until it reports one.
+   */
+  syncChatPlacement(nodeId: string): Placement | undefined {
+    const node = this.getNode(nodeId);
+    if (!node?.homeDir) return undefined;
+    const existing = this.statement(
+      "SELECT id,local_path FROM placements WHERE workspace_id=? AND node_id=?",
+    ).get(CHATS_WORKSPACE_ID, nodeId) as Row | undefined;
+    if (!existing) return this.insertPlacement(CHATS_WORKSPACE_ID, nodeId, node.homeDir);
+    if (String(existing.local_path) !== node.homeDir) {
+      this.statement("UPDATE placements SET local_path=? WHERE id=?").run(
+        node.homeDir,
+        String(existing.id),
+      );
+    }
+    return this.getPlacement(String(existing.id));
+  }
+
+  /** The Chats checkout for a node, if that node has reported a home directory. */
+  chatPlacementFor(nodeId: string): Placement | undefined {
+    const row = this.statement(
+      "SELECT id FROM placements WHERE workspace_id=? AND node_id=?",
+    ).get(CHATS_WORKSPACE_ID, nodeId) as Row | undefined;
+    return row ? this.getPlacement(String(row.id)) : undefined;
   }
 
   /**
@@ -978,6 +1147,15 @@ export class FleetStore {
     localPath?: string,
     workspaceId?: string,
   ): Placement | undefined {
+    const existing = this.getPlacement(id);
+    // Both directions: a chat checkout is the node's own home directory and is
+    // not an operator's to repath or refile, and a project checkout moved into
+    // Chats would be silently repathed to the home directory by the next
+    // heartbeat — losing the checkout without ever saying so.
+    if (existing) {
+      assertNotReserved(existing.workspaceId, "repointed at another directory by hand");
+    }
+    if (workspaceId !== undefined) assertNotReserved(workspaceId, NO_MANUAL_CHECKOUTS);
     if (localPath !== undefined) {
       this.statement("UPDATE placements SET local_path=? WHERE id=?").run(localPath, id);
     }
@@ -1025,6 +1203,10 @@ export class FleetStore {
   }
 
   deletePlacement(id: string): void {
+    const existing = this.getPlacement(id);
+    if (existing) {
+      assertNotReserved(existing.workspaceId, "stripped of its checkouts by hand");
+    }
     this.assertNoLiveSessions("placement_id", id, "placement");
     this.transaction(() => {
       this.deleteSessionsWhere("placement_id", id);
@@ -1057,9 +1239,12 @@ export class FleetStore {
   listPlacements(): Placement[] {
     return (
       this.statement(
+        // Chats first, to match {@link listWorkspaces}: every list a browser
+        // builds from these — the sidebar tree, the new-session picker — should
+        // put the fleet's own row in the same place.
         `SELECT p.*,w.name workspace_name,n.name node_name FROM placements p
          JOIN workspaces w ON w.id=p.workspace_id JOIN nodes n ON n.id=p.node_id
-         ORDER BY w.name,p.position,n.name`,
+         ORDER BY CASE WHEN w.kind='chats' THEN 0 ELSE 1 END,w.name,p.position,n.name`,
       ).all() as Row[]
     ).map(placementFromRow);
   }
@@ -1726,6 +1911,7 @@ function workspaceFromRow(row: Row): Workspace {
     name: String(row.name),
     description: String(row.description),
     createdAt: String(row.created_at),
+    kind: String(row.kind ?? "project"),
   });
 }
 
