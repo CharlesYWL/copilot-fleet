@@ -24,6 +24,9 @@ const session = (over: Partial<FleetSession> = {}) =>
     ...over,
   }) as FleetSession;
 
+/** The parts of an advertised JSON Schema property these tests care about. */
+type JsonSchemaField = { maxLength?: number; minLength?: number; description?: string };
+
 describe("mcp endpoint", () => {
   const store = settings();
   let sessions: Map<string, FleetSession>;
@@ -141,7 +144,10 @@ describe("orchestrator tools over the wire", () => {
     });
     return response.json() as {
       result?: {
-        tools?: { name: string; inputSchema: { properties?: Record<string, unknown> } }[];
+        tools?: {
+          name: string;
+          inputSchema: { properties?: Record<string, JsonSchemaField> };
+        }[];
         content?: { text: string }[];
         isError?: boolean;
       };
@@ -307,5 +313,165 @@ describe("orchestrator tools over the wire", () => {
 
     expect(result.refused).toBe(false);
     expect(task()!.state).toBe("awaiting_human");
+  });
+});
+
+/*
+ * The limits used to be invisible. Every constraint lived on the handler's
+ * schema and every description lived on the advertised one, so a caller was
+ * told what `context` was for, told to repeat everything decided elsewhere in
+ * it, and not told there was a ceiling — until a dispatch it believed it had
+ * made came back rejected by a number it had never seen.
+ *
+ * The ceilings are gone now rather than merely visible, because refusing a
+ * brief for saying too much costs more than the long brief did. What is left is
+ * an asymmetry these pin down: the minimums still refuse a brief with no way to
+ * check it, and nothing refuses one for length.
+ */
+describe("the limits a caller is held to", () => {
+  let app: FastifyInstance;
+  let store: FleetStore;
+  let token: string;
+
+  beforeEach(async () => {
+    const world = fleet();
+    store = world.store;
+    app = Fastify();
+    app.log.level = "silent";
+    const tokens = new LeadTokens(settings());
+    token = tokens.mint(world.leadId);
+    await app.register(mcpRoutes, { service: world.service, tokens });
+    await app.ready();
+  });
+
+  afterEach(async () => {
+    await app.close();
+  });
+
+  const rpc = async (method: string, params?: unknown) => {
+    const response = await app.inject({
+      method: "POST",
+      url: MCP_PATH,
+      headers: {
+        authorization: `Bearer ${token}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+      },
+      payload: { jsonrpc: "2.0", id: 1, method, params },
+    });
+    return response.json() as {
+      result?: {
+        tools?: {
+          name: string;
+          inputSchema: { properties?: Record<string, JsonSchemaField> };
+        }[];
+        content?: { text: string }[];
+        isError?: boolean;
+      };
+      error?: { message: string };
+    };
+  };
+
+  const advertised = async (tool: string) => {
+    const listed = await rpc("tools/list");
+    return listed.result!.tools!.find((t) => t.name === tool)!.inputSchema.properties!;
+  };
+
+  const dispatch = async (over: Record<string, unknown>) => {
+    await rpc("tools/call", {
+      name: "fleet_plan_task",
+      arguments: {
+        task: "Ship it",
+        objective: "make the change",
+        phases: ["Only"],
+        successCriteria: [
+          {
+            id: "logout-invalidates",
+            scenario: "reusing a token after logout returns 401",
+            expectedEvidence: "the auth suite's logout test passes",
+          },
+        ],
+        stopWhen: "the auth suite is green",
+      },
+    });
+    const out = await rpc("tools/call", {
+      name: "fleet_start_work",
+      arguments: {
+        category: "explore",
+        title: "look",
+        deliverable: "a list of what is in there",
+        scope: "the whole checkout, read-only",
+        verify: "list the directory and say what you saw",
+        task: "Ship it",
+        ...over,
+      },
+    });
+    return {
+      refused: Boolean(out.error) || Boolean(out.result?.isError),
+      text:
+        out.error?.message ?? (out.result?.content ?? []).map((c) => c.text).join("\n"),
+    };
+  };
+
+  const started = () =>
+    store.listRuns().flatMap((run) => store.listRunSteps(run.id)).length;
+
+  it("puts no ceiling on the fields that carry the brief", async () => {
+    const properties = await advertised("fleet_start_work");
+
+    for (const field of ["deliverable", "scope", "verify", "context"]) {
+      expect(properties[field]?.maxLength).toBeUndefined();
+    }
+  });
+
+  it("still says what each of those fields must at least contain", async () => {
+    // Dropping the ceilings is not the same as dropping the contract. The floor
+    // is the half that does the work: it is what refuses a brief nobody could
+    // check, before a machine is spent on it.
+    const properties = await advertised("fleet_start_work");
+
+    for (const field of ["deliverable", "scope", "verify"]) {
+      expect(properties[field]?.minLength).toBeGreaterThan(0);
+    }
+  });
+
+  it("dispatches a context far past the ceiling it used to have", async () => {
+    // 6000 was the reported failure and 12000 replaced it; neither is a limit
+    // now, so the number here is chosen to be well clear of both.
+    const result = await dispatch({ context: "x".repeat(200_000) });
+
+    expect(result.refused).toBe(false);
+    expect(started()).toBe(1);
+  });
+
+  it("gives the worker the whole context, rather than a clipped one", async () => {
+    // Accepting a long brief and quietly truncating it would be the same bug
+    // wearing a friendlier face: the worker would never learn what it was not
+    // told, and would have no way to notice.
+    const context = `decided offline: ${"y".repeat(80_000)} ...and finally, use the v2 client.`;
+
+    await dispatch({ context });
+
+    const step = store.listRunSteps(store.listRuns()[0]!.id)[0]!;
+    expect(step.prompt).toContain(context);
+    expect(step.prompt).not.toContain("elided");
+  });
+
+  it("carries a brief larger than the transport used to allow", async () => {
+    // Fastify defaults to a 1 MB body, and hitting it is the worst refusal
+    // available: a bare 413 that never reaches the MCP layer, so the caller is
+    // told nothing about which tool failed or that its worker never started.
+    const result = await dispatch({ context: "x".repeat(2_000_000) });
+
+    expect(result.refused).toBe(false);
+    expect(started()).toBe(1);
+  });
+
+  it("keeps the floors that the other tools depend on", async () => {
+    const properties = await advertised("fleet_plan_task");
+
+    expect(properties.stopWhen?.minLength).toBeGreaterThan(0);
+    expect(properties.objective?.minLength).toBeGreaterThan(0);
+    expect(properties.objective?.maxLength).toBeUndefined();
   });
 });

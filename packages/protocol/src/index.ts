@@ -949,11 +949,25 @@ export const RunCriterionSchema = z.object({
     .string()
     .min(1)
     .max(40)
-    .regex(/^[a-z0-9-]+$/, "Criterion ids are file-safe handles, not sentences"),
+    .regex(/^[a-z0-9-]+$/, "Criterion ids are file-safe handles, not sentences")
+    .describe(
+      'A short lowercase handle you will use again when reporting, e.g. "logout-clears-token".',
+    ),
   /** What to do, with what inputs, and what counts as a pass. */
-  scenario: z.string().min(20).max(600),
+  scenario: z
+    .string()
+    .min(20)
+    .describe(
+      "What someone would do, and what should happen — concretely. " +
+        'Not "auth works": "posting to /logout with a valid token, then reusing that token, returns 401".',
+    ),
   /** The observable this produces: a command's output, a file, a status line. */
-  expectedEvidence: z.string().min(10).max(300),
+  expectedEvidence: z
+    .string()
+    .min(10)
+    .describe(
+      "What will show this is true. A command and its output, a test name, a file that exists. Not an opinion.",
+    ),
   /**
    * Whether the task can be handed over without this one.
    *
@@ -962,7 +976,10 @@ export const RunCriterionSchema = z.object({
    * saying which is which up front is what keeps the gate from becoming
    * something to route around.
    */
-  essential: z.boolean().default(true),
+  essential: z
+    .boolean()
+    .default(true)
+    .describe("False if the task can finish without this. Defaults to true."),
 });
 export type RunCriterion = z.infer<typeof RunCriterionSchema>;
 

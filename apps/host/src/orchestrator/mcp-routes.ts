@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { z } from "zod";
+import type { z } from "zod";
 import { terminalSessionStates } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { LeadTokens } from "./lead-tokens.js";
@@ -15,9 +15,25 @@ import {
   StartWorkSchema,
   SubmitTaskSchema,
   WORKER_CATEGORIES,
+  explainInvalidArgs,
+  type ToolResult,
 } from "./tools.js";
 
 export const MCP_PATH = "/mcp";
+
+/**
+ * How large a single tool call may be.
+ *
+ * The one bound left on a brief, and the only place a bound belongs: the schema
+ * no longer caps the free-text fields, because a dispatch refused for saying too
+ * much is worse than a long one. Fastify's default is 1 MB, and hitting it is
+ * the worst failure available here — a bare HTTP 413 that never reaches the MCP
+ * layer, so the caller gets a transport error with no tool, no reason, and no
+ * word that its worker was never started. This is set far above any brief an
+ * orchestrator would write, so what remains is a real resource limit rather than
+ * an opinion about length.
+ */
+export const MCP_BODY_LIMIT = 32 * 1024 * 1024;
 
 export type McpRouteOptions = { service: FleetService; tokens: LeadTokens };
 
@@ -33,7 +49,7 @@ export const mcpRoutes: FastifyPluginAsync<McpRouteOptions> = async (
   app,
   { service, tokens },
 ) => {
-  app.post(MCP_PATH, async (request, reply) => {
+  app.post(MCP_PATH, { bodyLimit: MCP_BODY_LIMIT }, async (request, reply) => {
     const header = request.headers.authorization ?? "";
     const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
     const leadSessionId = tokens.resolve(token);
@@ -94,6 +110,25 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     ...(result.ok ? {} : { isError: true }),
   });
 
+  /**
+   * Runs a tool behind the same schema that was advertised for it.
+   *
+   * The schemas come from `tools.ts` rather than being restated here, because
+   * the two copies used to disagree: the advertisement carried the descriptions
+   * and no limits, the handler carried the limits and no descriptions. A caller
+   * that believed the advertisement wrote a `context` as long as it liked and
+   * had the dispatch rejected afterwards, by a length it was never told about.
+   * Passing the shape through means a limit cannot exist without being visible.
+   */
+  const guard =
+    <T>(name: string, schema: z.ZodType<T>, act: (input: T) => ToolResult) =>
+    (args: unknown) => {
+      const parsed = schema.safeParse(args);
+      return reply(
+        parsed.success ? act(parsed.data) : explainInvalidArgs(name, parsed.error, args),
+      );
+    };
+
   server.registerTool(
     "fleet_list_nodes",
     {
@@ -117,47 +152,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "You are woken with the result when it finishes — do not poll, and do not wait.",
         `Categories: ${WORKER_CATEGORIES.join(", ")}.`,
       ].join(" "),
-      inputSchema: {
-        category: z
-          .enum(WORKER_CATEGORIES)
-          .describe("What kind of work this is. Reviews are read-only."),
-        title: z.string().describe("A short label, shown to the human."),
-        deliverable: z
-          .string()
-          .describe(
-            "What the worker must send back. A patch, an answer, a number, a passing suite — concretely enough that you could tell whether you got it.",
-          ),
-        scope: z
-          .string()
-          .describe(
-            "Where to work and where not to: the files or directories in play, and anything it should leave alone.",
-          ),
-        verify: z
-          .string()
-          .describe(
-            'The command or observation that will show the deliverable is real — "npm test -- auth", "curl the endpoint and read the status". Not "check it works".',
-          ),
-        context: z
-          .string()
-          .optional()
-          .describe(
-            "What the worker cannot find out for itself. It cannot see this conversation, the person's messages, or any other worker's output, so repeat anything decided elsewhere.",
-          ),
-        workspace: z
-          .string()
-          .optional()
-          .describe(
-            'Which workspace to work in, by name. Defaults to the one the current task is already using. Name one to work on a different repository, or "Chats" for a question or a piece of research that needs no checkout at all.',
-          ),
-        task: z
-          .string()
-          .optional()
-          .describe(
-            "Which piece of work this belongs to. Reuse a name to add to that task; pass a new name to start a separate one. Omit to continue the task you started last.",
-          ),
-      },
+      inputSchema: StartWorkSchema.shape,
     },
-    async (args) => reply(tools.startWork(StartWorkSchema.parse(args))),
+    guard("fleet_start_work", StartWorkSchema, (input) => tools.startWork(input)),
   );
 
   server.registerTool(
@@ -170,59 +167,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "A person is only asked at the very end, when you call fleet_submit_task.",
         "Choose phases that fit the request — three or four for a change, one for a question. Do not invent stages that have no work in them.",
       ].join(" "),
-      inputSchema: {
-        task: z.string().describe("A short name for this piece of work."),
-        objective: z
-          .string()
-          .describe("What finishing it means, in a sentence the person would recognise."),
-        phases: z
-          .array(z.string())
-          .describe(
-            'The stages, in order — for example ["Plan", "Implement", "Review"]. Names are shown to the person as progress.',
-          ),
-        successCriteria: z
-          .array(
-            z.object({
-              id: z
-                .string()
-                .describe(
-                  'A short handle you will use again when reporting, e.g. "logout-clears-token".',
-                ),
-              scenario: z
-                .string()
-                .describe(
-                  "What someone would do, and what should happen — concretely. " +
-                    'Not "auth works": "posting to /logout with a valid token, then reusing that token, returns 401".',
-                ),
-              expectedEvidence: z
-                .string()
-                .describe(
-                  "What will show this is true. A command and its output, a test name, a file that exists. Not an opinion.",
-                ),
-              essential: z
-                .boolean()
-                .optional()
-                .describe("False if the task can finish without this. Defaults to true."),
-            }),
-          )
-          .describe(
-            "What has to be observably true before this task is done. Write these now, not later — " +
-              "you will be held to them when you hand the task over, and an essential one that is not met blocks the handover.",
-          ),
-        stopWhen: z
-          .string()
-          .describe(
-            "One line naming the observable state that ends this task, so you can tell finished from nearly finished.",
-          ),
-        workspace: z
-          .string()
-          .optional()
-          .describe(
-            'Which workspace this task is about, by name. "Chats" for a question or a piece of research that needs no checkout.',
-          ),
-      },
+      inputSchema: PlanTaskSchema.shape,
     },
-    async (args) => reply(tools.planTask(PlanTaskSchema.parse(args))),
+    guard("fleet_plan_task", PlanTaskSchema, (input) => tools.planTask(input)),
   );
 
   server.registerTool(
@@ -234,16 +181,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "If it is not good enough, dispatch more work instead — that is the same decision, made the other way.",
         "Refused while any step is still running: you cannot judge a phase you have not seen the end of.",
       ].join(" "),
-      inputSchema: {
-        task: z.string().describe("The task to advance."),
-        note: z
-          .string()
-          .describe(
-            "What this phase established, in a sentence. The person reads these as the story of the task.",
-          ),
-      },
+      inputSchema: AdvanceTaskSchema.shape,
     },
-    async (args) => reply(tools.advanceTask(AdvanceTaskSchema.parse(args))),
+    guard("fleet_advance_task", AdvanceTaskSchema, (input) => tools.advanceTask(input)),
   );
 
   server.registerTool(
@@ -256,32 +196,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "This is the only point at which a person is asked for anything; they approve it or send it back with a note, which arrives as a new turn.",
         "End your turn after calling it.",
       ].join(" "),
-      inputSchema: {
-        task: z.string().describe("The task to hand over."),
-        summary: z
-          .string()
-          .describe("What was done and what the person should look at first."),
-        criteria: z
-          .array(
-            z.object({
-              id: z.string().describe("The criterion id you set when planning the task."),
-              outcome: z
-                .enum(["met", "unmet", "blocked"])
-                .describe(
-                  "met = you checked and it holds. blocked = it could not be checked at all. Neither of the last two lets the task be handed over.",
-                ),
-              evidence: z
-                .string()
-                .describe(
-                  "The observation behind that. A command and what it printed, a test that ran, a file you read. " +
-                    'A worker saying it was done is not evidence; "looks correct" is not evidence.',
-                ),
-            }),
-          )
-          .describe("One entry per criterion of this task."),
-      },
+      inputSchema: SubmitTaskSchema.shape,
     },
-    async (args) => reply(tools.submitTask(SubmitTaskSchema.parse(args))),
+    guard("fleet_submit_task", SubmitTaskSchema, (input) => tools.submitTask(input)),
   );
 
   server.registerTool(
@@ -293,16 +210,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "Use this instead of lowering the bar: dropping a criterion is a person's decision, not yours.",
         "The task goes to the same place a finished one does, and they can change it, drop a criterion, or stop it. End your turn after calling it.",
       ].join(" "),
-      inputSchema: {
-        task: z.string().describe("The task you are stuck on."),
-        reason: z
-          .string()
-          .describe(
-            "What is in the way, concretely enough for a person to act on: what you tried, what happened, and what you would need in order to continue.",
-          ),
-      },
+      inputSchema: EscalateSchema.shape,
     },
-    async (args) => reply(tools.escalate(EscalateSchema.parse(args))),
+    guard("fleet_escalate", EscalateSchema, (input) => tools.escalate(input)),
   );
 
   server.registerTool(
@@ -322,9 +232,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       title: "Read a worker's full output",
       description:
         "The complete transcript of one worker, for when the summary you were woken with was not enough.",
-      inputSchema: { sessionId: z.string().describe("The worker's session id.") },
+      inputSchema: SessionRefSchema.shape,
     },
-    async (args) => reply(tools.transcript(SessionRefSchema.parse(args))),
+    guard("fleet_transcript", SessionRefSchema, (input) => tools.transcript(input)),
   );
 
   server.registerTool(
@@ -333,12 +243,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       title: "Send a worker another turn",
       description:
         "Add a follow-up instruction to a worker that has finished its turn but is still open. Use this instead of starting a second worker for the same task.",
-      inputSchema: {
-        sessionId: z.string().describe("The worker's session id."),
-        prompt: z.string().describe("What it should do next."),
-      },
+      inputSchema: FollowUpSchema.shape,
     },
-    async (args) => reply(tools.followUp(FollowUpSchema.parse(args))),
+    guard("fleet_follow_up", FollowUpSchema, (input) => tools.followUp(input)),
   );
 
   server.registerTool(
@@ -346,9 +253,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Stop a worker",
       description: "End a worker that is going nowhere, freeing its slot.",
-      inputSchema: { sessionId: z.string().describe("The worker's session id.") },
+      inputSchema: SessionRefSchema.shape,
     },
-    async (args) => reply(tools.stopWork(SessionRefSchema.parse(args))),
+    guard("fleet_stop_work", SessionRefSchema, (input) => tools.stopWork(input)),
   );
 
   return server;

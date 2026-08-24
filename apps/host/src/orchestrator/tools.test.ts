@@ -7,7 +7,7 @@ import {
 import type { FleetStore } from "../store.js";
 import type { FleetService } from "../fleet-service.js";
 import { fleet } from "./fleet-harness.js";
-import { FleetTools } from "./tools.js";
+import { FleetTools, StartWorkSchema, explainInvalidArgs } from "./tools.js";
 
 describe("FleetTools", () => {
   let store: FleetStore;
@@ -606,5 +606,64 @@ describe("FleetTools success criteria", () => {
     });
 
     expect(out.ok).toBe(false);
+  });
+});
+
+/*
+ * The net under the schema. It only runs if the advertised schema and the
+ * handler's ever come apart, but what it produces is what a model would have
+ * to act on if they did, so it is held to reading as an instruction.
+ */
+describe("explainInvalidArgs", () => {
+  const reject = (args: unknown) => {
+    const parsed = StartWorkSchema.safeParse(args);
+    if (parsed.success) throw new Error("expected these arguments to be refused");
+    return explainInvalidArgs("fleet_start_work", parsed.error, args);
+  };
+
+  const dispatch = (over: Record<string, unknown>) => ({
+    category: "explore",
+    title: "look",
+    deliverable: "a list of what is in there",
+    scope: "the whole checkout, read-only",
+    verify: "list the directory and say what you saw",
+    ...over,
+  });
+
+  it("says the call had no effect, so a caller does not wait for a worker", () => {
+    const out = reject(dispatch({ verify: "eh" }));
+
+    expect(out.ok).toBe(false);
+    expect(out.text).toContain("did nothing");
+    expect(out.text).toContain("Nothing was started");
+  });
+
+  it("passes on what the failing field was for, not just that it failed", () => {
+    const out = reject(dispatch({ verify: "eh" }));
+
+    expect(out.text).toContain("verify");
+    expect(out.text).toContain("the command to run or the observation to make");
+  });
+
+  it("says which field is missing rather than describing its type", () => {
+    const args = dispatch({});
+    delete (args as Record<string, unknown>).verify;
+
+    expect(reject(args).text).toContain("verify: missing, and required.");
+  });
+
+  it("no longer has a length to complain about on the brief itself", () => {
+    // The ceiling that produced the reported failures is gone, so the one
+    // remaining way to be refused is having said too little.
+    expect(
+      StartWorkSchema.safeParse(dispatch({ context: "x".repeat(500_000) })).success,
+    ).toBe(true);
+  });
+
+  it("never answers with a dump of Zod issue objects", () => {
+    const out = reject(dispatch({ scope: "tiny" }));
+
+    expect(out.text).not.toContain('"code"');
+    expect(out.text).not.toContain("too_small");
   });
 });

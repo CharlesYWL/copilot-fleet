@@ -31,9 +31,31 @@ export const WORKER_CATEGORIES = [
   "review-deep",
 ] as const;
 
+/**
+ * Every limit below is advertised to the caller, because `mcp-routes` builds
+ * each tool's JSON Schema from these shapes rather than from a second
+ * hand-written copy. A limit a model cannot see is one it will keep walking
+ * into: the failure it produces arrives *after* the call, phrased as a schema
+ * violation, at the point where the model believed it had just delegated the
+ * work. Keeping the description and the constraint on the same line is what
+ * stops the two drifting apart again.
+ *
+ * The free-text fields carry a minimum and no maximum, and the asymmetry is the
+ * point. A minimum enforces the thing this tool exists to enforce — a brief with
+ * no way to check it is refused before a machine is spent on it. A maximum only
+ * enforces brevity, and brevity is not worth a refused dispatch: an orchestrator
+ * relaying what a person said, what an earlier worker found, and the constraints
+ * agreed along the way is doing exactly what `context` is for, and being stopped
+ * for it teaches it to send less than the worker needed. Size is bounded once,
+ * at the transport in `mcp-routes`, where it is a resource question rather than
+ * a matter of taste.
+ */
 export const StartWorkSchema = z.object({
-  category: z.enum(WORKER_CATEGORIES),
-  title: z.string().min(1).max(120),
+  category: z
+    .enum(WORKER_CATEGORIES)
+    .describe("What kind of work this is. Reviews are read-only."),
+  /** Bounded because it is a label, not a brief: the UI renders it in a row. */
+  title: z.string().min(1).max(120).describe("A short label, shown to the human."),
   /**
    * What the worker has to send back.
    *
@@ -43,20 +65,63 @@ export const StartWorkSchema = z.object({
    * before a machine is spent on it, and means every worker gets told the same
    * things in the same order.
    */
-  deliverable: z.string().min(10).max(600),
+  deliverable: z
+    .string()
+    .min(10, "deliverable must say what comes back concretely enough to recognise it")
+    .describe(
+      "What the worker must send back. A patch, an answer, a number, a passing suite — " +
+        "concretely enough that you could tell whether you got it.",
+    ),
   /** Where to work and where not to — files, directories, boundaries. */
-  scope: z.string().min(10).max(800),
+  scope: z
+    .string()
+    .min(10, "scope must say where to work and where not to")
+    .describe(
+      "Where to work and where not to: the files or directories in play, and anything it " +
+        "should leave alone.",
+    ),
   /** The command or observation that will show the deliverable is real. */
-  verify: z.string().min(10).max(800),
+  verify: z
+    .string()
+    .min(
+      10,
+      "verify must name the command to run or the observation to make. " +
+        '"check it works" is not something a worker can do',
+    )
+    .describe(
+      'The command or observation that will show the deliverable is real — "npm test -- auth", ' +
+        '"curl the endpoint and read the status". Not "check it works".',
+    ),
   /**
    * What the worker cannot find out for itself.
    *
    * It cannot see the orchestrator's conversation, the person's messages, or
    * any other worker's output. Anything decided elsewhere has to be repeated
    * here or it does not exist as far as the worker is concerned.
+   *
+   * Unbounded, because this is the field whose whole job is bulk relay, and the
+   * cost of clipping it is paid by a worker that never finds out what it was not
+   * told. What is left is a judgement the orchestrator makes rather than one the
+   * schema makes for it: the worker can open the repository itself, so quoted
+   * code spends the brief on something it could have looked up.
    */
-  context: z.string().max(6_000).optional(),
-  workspace: z.string().optional(),
+  context: z
+    .string()
+    .optional()
+    .describe(
+      "What the worker cannot find out for itself. It cannot see this conversation, the " +
+        "person's messages, or any other worker's output, so repeat anything decided elsewhere. " +
+        "No length limit — though it can read the repository itself, so this goes further spent " +
+        "on decisions and constraints than on quoted code.",
+    ),
+  workspace: z
+    .string()
+    .optional()
+    .describe(
+      "Which workspace to work in, by name. Defaults to the one the current task is already " +
+        'using. Name one to work on a different repository, or "Chats" for a question or a ' +
+        "piece of research that needs no checkout at all.",
+    ),
   /**
    * Which piece of work this belongs to.
    *
@@ -65,7 +130,15 @@ export const StartWorkSchema = z.object({
    * continues whatever was started last, so a single line of work never has to
    * think about this at all.
    */
-  task: z.string().min(1).max(80).optional(),
+  task: z
+    .string()
+    .min(1)
+    .max(80)
+    .optional()
+    .describe(
+      "Which piece of work this belongs to. Reuse a name to add to that task; pass a new name " +
+        "to start a separate one. Omit to continue the task you started last.",
+    ),
 });
 
 /**
@@ -103,8 +176,11 @@ export function composeWorkerPrompt(input: {
 }
 
 export const PlanTaskSchema = z.object({
-  task: z.string().min(1).max(80),
-  objective: z.string().min(1).max(2_000),
+  task: z.string().min(1).max(80).describe("A short name for this piece of work."),
+  objective: z
+    .string()
+    .min(1)
+    .describe("What finishing it means, in a sentence the person would recognise."),
   /**
    * The stages this task will go through, in order.
    *
@@ -112,7 +188,14 @@ export const PlanTaskSchema = z.object({
    * plan / implement / review; a question may want one. The list is what the
    * person sees as progress, so the names should mean something to them.
    */
-  phases: z.array(z.string().min(1).max(40)).min(1).max(8),
+  phases: z
+    .array(z.string().min(1).max(40))
+    .min(1)
+    .max(8)
+    .describe(
+      'The stages, in order — for example ["Plan", "Implement", "Review"]. Names are shown ' +
+        "to the person as progress. Between one and eight.",
+    ),
   /**
    * What has to be observably true for this task to be finished.
    *
@@ -121,22 +204,52 @@ export const PlanTaskSchema = z.object({
    * and an orchestrator with no written definition decides done by feel after
    * reading a great deal of plausible output.
    */
-  successCriteria: z.array(RunCriterionSchema).min(1).max(8),
+  successCriteria: z
+    .array(RunCriterionSchema)
+    .min(1)
+    .max(8)
+    .describe(
+      "What has to be observably true before this task is done. Write these now, not later — " +
+        "you will be held to them when you hand the task over, and an essential one that is " +
+        "not met blocks the handover.",
+    ),
   /** One line: the exact observable state that ends this task. */
-  stopWhen: z.string().min(10).max(300),
-  workspace: z.string().optional(),
+  stopWhen: z
+    .string()
+    .min(10)
+    .describe(
+      "One line naming the observable state that ends this task, so you can tell finished " +
+        "from nearly finished.",
+    ),
+  workspace: z
+    .string()
+    .optional()
+    .describe(
+      'Which workspace this task is about, by name. "Chats" for a question or a piece of ' +
+        "research that needs no checkout.",
+    ),
 });
 
-export const TaskRefSchema = z.object({ task: z.string().min(1).max(80) });
+export const TaskRefSchema = z.object({
+  task: z.string().min(1).max(80).describe("The task this is about, by name."),
+});
 
 export const AdvanceTaskSchema = TaskRefSchema.extend({
   /** What this phase established, in a sentence, for the person reading later. */
-  note: z.string().min(1).max(2_000),
+  note: z
+    .string()
+    .min(1)
+    .describe(
+      "What this phase established, in a sentence. The person reads these as the story of the task.",
+    ),
 });
 
 export const SubmitTaskSchema = TaskRefSchema.extend({
   /** What was done and what the person should look at. */
-  summary: z.string().min(1).max(4_000),
+  summary: z
+    .string()
+    .min(1)
+    .describe("What was done and what the person should look at first."),
   /**
    * How each criterion turned out, and what shows it.
    *
@@ -147,17 +260,33 @@ export const SubmitTaskSchema = TaskRefSchema.extend({
   criteria: z
     .array(
       z.object({
-        id: z.string().min(1).max(40),
-        outcome: CriterionOutcomeSchema,
+        id: z
+          .string()
+          .min(1)
+          .max(40)
+          .describe("The criterion id you set when planning the task."),
+        outcome: CriterionOutcomeSchema.describe(
+          "met = you checked and it holds. blocked = it could not be checked at all. " +
+            "Neither of the last two lets the task be handed over.",
+        ),
         /** The observable behind the claim. Not "looks correct". */
-        evidence: z.string().min(10).max(600),
+        evidence: z
+          .string()
+          .min(10)
+          .describe(
+            "The observation behind that. A command and what it printed, a test that ran, a file you read. " +
+              'A worker saying it was done is not evidence; "looks correct" is not evidence.',
+          ),
       }),
     )
     .max(8)
-    .default([]),
+    .default([])
+    .describe("One entry per criterion of this task."),
 });
 
-export const SessionRefSchema = z.object({ sessionId: z.string().min(1) });
+export const SessionRefSchema = z.object({
+  sessionId: z.string().min(1).describe("The worker's session id."),
+});
 
 /**
  * The way out when a task cannot be finished as promised.
@@ -170,17 +299,80 @@ export const SessionRefSchema = z.object({ sessionId: z.string().min(1) });
  */
 export const EscalateSchema = TaskRefSchema.extend({
   /** What is in the way, concretely enough for a person to act on. */
-  reason: z.string().min(10).max(2_000),
+  reason: z
+    .string()
+    .min(10)
+    .describe(
+      "What is in the way, concretely enough for a person to act on: what you tried, what " +
+        "happened, and what you would need in order to continue.",
+    ),
 });
 
 export const FollowUpSchema = SessionRefSchema.extend({
-  prompt: z.string().min(1).max(8_000),
+  prompt: z.string().min(1).describe("What it should do next."),
 });
 
 export type ToolResult = { ok: boolean; text: string };
 
 const ok = (text: string): ToolResult => ({ ok: true, text });
 const refuse = (text: string): ToolResult => ({ ok: false, text });
+
+/** Follows an issue's path into the arguments, to report what was actually sent. */
+function valueAtPath(root: unknown, path: readonly PropertyKey[]): unknown {
+  let current = root;
+  for (const key of path) {
+    if (current === null || typeof current !== "object") return undefined;
+    current = (current as Record<PropertyKey, unknown>)[key];
+  }
+  return current;
+}
+
+/** One schema complaint, in the terms of what the caller actually sent. */
+function describeIssue(issue: z.core.$ZodIssue, args: unknown): string {
+  const field = issue.path.length > 0 ? issue.path.join(".") : "(the call itself)";
+  const value = valueAtPath(args, issue.path);
+  const count = (n: number | bigint) => Number(n).toLocaleString("en-US");
+
+  if (issue.code === "too_big" && typeof value === "string") {
+    return `${field}: ${issue.message} — it was ${count(value.length)} characters, and the limit is ${count(issue.maximum)}.`;
+  }
+  if (issue.code === "too_big" && Array.isArray(value)) {
+    return `${field}: ${issue.message} — it had ${count(value.length)} entries, and the limit is ${count(issue.maximum)}.`;
+  }
+  if (issue.code === "invalid_type" && value === undefined) {
+    return `${field}: missing, and required.`;
+  }
+  return `${field}: ${issue.message}`;
+}
+
+/**
+ * What a caller is told when its arguments do not fit the schema.
+ *
+ * A net rather than the usual path: the MCP server validates against this same
+ * schema before a handler runs, and each limit carries its own message, so this
+ * only fires if those two ever come apart. It exists because of what the
+ * default is — Zod's `ZodError.message` is a JSON array of issue objects, which
+ * reads to a model as a malfunction rather than as something it did, and says
+ * nothing about the fact that decides what to do next: that the call had no
+ * effect. A model that cannot tell a rejected dispatch from a failed one will
+ * either give up on work it could have had by shortening a field, or settle
+ * down to wait for a worker that was never started.
+ */
+export function explainInvalidArgs(
+  tool: string,
+  error: z.ZodError,
+  args: unknown,
+): ToolResult {
+  return refuse(
+    [
+      `${tool} did nothing: the call did not fit the tool's schema.`,
+      ...error.issues.map((issue) => `  ${describeIssue(issue, args)}`),
+      "",
+      "Nothing was started and no budget was spent. Every limit is in this tool's schema,",
+      "so fix what is listed above and call it again.",
+    ].join("\n"),
+  );
+}
 
 /** What the orchestrator is told once a task has its phases. */
 function planTaskReply(

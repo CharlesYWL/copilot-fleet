@@ -216,15 +216,50 @@ that decides whether a worker checks its own work.
 `fleet_start_work` replaces its free-text `prompt`:
 
 ```ts
-deliverable: z.string().min(10).max(400),   // what must come back
-scope: z.string().min(10).max(600),         // files, dirs, boundaries
-verify: z.string().min(10).max(600),        // the command or channel that proves it
-context: z.string().max(6_000).optional(),  // what the worker cannot discover
+deliverable: z.string().min(10),   // what must come back
+scope: z.string().min(10),         // files, dirs, boundaries
+verify: z.string().min(10),        // the command or channel that proves it
+context: z.string().optional(),    // what the worker cannot discover
 ```
 
 The Host composes the actual prompt from these, in the `TASK:` shape. Two wins
 over a blob: a call with no `verify` is rejected before a machine is spent on
 it, and the worker's brief becomes uniform enough to render in the UI.
+
+**Minimums, not maximums — and the asymmetry is the design.** These fields
+originally carried both, and the ceilings were invisible: the constraints lived
+on the handler's schema while the descriptions lived on a second, hand-written
+schema that `mcp-routes` advertised, which carried no lengths at all. So
+`context` told a caller to repeat everything decided elsewhere, named no
+ceiling, and then refused the dispatch against a `6_000` it had never been
+shown. The refusal was Zod's default `message` — a JSON array of issue objects,
+which reads as a malfunction rather than as something the caller did, and never
+says the one thing that decides what to do next: that no worker was started and
+no budget was spent.
+
+Visibility was the first fix: the second schema is gone, and `mcp-routes` now
+advertises `StartWorkSchema.shape` itself, so a constraint cannot exist without
+reaching the caller as JSON Schema. But it only made the wrong rule legible. A
+maximum on a brief buys brevity, and brevity is not worth a refused dispatch —
+an orchestrator relaying what a person said, what an earlier worker found, and
+the constraints agreed along the way is doing precisely what `context` is for,
+and being stopped for it teaches it to send the worker less than the worker
+needed. So the ceilings came off the free-text fields here, in `fleet_plan_task`,
+`fleet_advance_task`, `fleet_submit_task`, `fleet_escalate`, `fleet_follow_up`
+and `RunCriterionSchema`. The floors stay: they are what refuse a brief nobody
+could check, which is the thing this tool exists to do.
+
+Size is bounded once, at the transport. Fastify defaults to a 1 MB body and the
+MCP route had taken that default, which made the worst refusal in the system
+reachable — a bare `413` that never reaches the MCP layer, leaving the caller a
+transport error naming no tool, no reason, and no hint that its worker never
+started. `MCP_BODY_LIMIT` raises it to 32 MB, far above any brief, so what
+remains is a resource limit rather than an opinion about length.
+
+Truncating instead of refusing was considered and rejected: it is the same bug
+wearing a friendlier face, since a worker handed a clipped brief never finds out
+what it was not told and has no way to notice. `mcp-routes.test.ts` dispatches a
+200,000-character context and asserts the worker's prompt contains all of it.
 
 Also verified live. Given "find out which port this project listens on", the
 orchestrator filled all four without prompting — a `verify` that named the
