@@ -8,6 +8,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
+import { archiveRun, purgeRun, stopRunSessions } from "../orchestrator/lifecycle.js";
 import { reopenPrompt } from "../orchestrator/review.js";
 
 const CreateRunSchema = z.object({
@@ -174,54 +175,14 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
   /**
    * Ends a task and clears away the sessions it started.
    *
-   * Distinct from cancel, which stops the work and leaves everything where it
-   * is. Archiving is what a person does when they are finished looking: the
-   * record — the task, its phases, its steps and the notes and output it
-   * collected — stays, and the worker sessions stop cluttering the tree.
-   *
-   * Deliberately not a delete. What the task learned is often the only thing
-   * worth keeping from a piece of work that did not pan out, and it lives on
-   * the run rather than in the sessions.
+   * The mechanics are in `orchestrator/lifecycle`, shared with the tool the
+   * orchestrator closes its own tasks through. What is decided here is only the
+   * reason, which is the part that differs by who asked.
    */
   app.post("/api/runs/:id/archive", async (request, reply) => {
     const { id } = request.params as { id: string };
-    const run = store.getRun(id);
-    if (!run) return reply.code(404).send({ error: "Run not found" });
-
-    if (!terminalRunStates.has(run.state)) {
-      stopRunSessions(service, id);
-      for (const step of store.listRunSteps(id)) {
-        if (["succeeded", "failed", "skipped", "cancelled"].includes(step.state))
-          continue;
-        store.updateRunStep(step.id, { state: "cancelled" });
-      }
-      const cancelled = store.setRunState(id, "cancelled", "Archived by an operator")!;
-      service.publishRun(cancelled);
-      service.publishRunSteps(id, store.listRunSteps(id));
-    }
-
-    /*
-     * Settled here rather than waited for. `stop` has gone to the Node and its
-     * own terminal event will follow, but a person who archived a task should
-     * not watch its sessions linger while that arrives — and a Node that is
-     * offline would never send it at all.
-     */
-    for (const session of service.store.listSessions()) {
-      if (session.runId !== id) continue;
-      if (!terminalSessionStates.has(session.state)) {
-        service.publishSession(
-          store.transitionSession(session.id, "stopped", "Task archived"),
-        );
-      }
-      try {
-        store.deleteSession(session.id);
-      } catch {
-        // One session that will not go is not a reason to leave the rest, and
-        // the task is archived either way.
-        continue;
-      }
-    }
-    service.broadcast({ type: "snapshot", data: service.snapshot() });
+    if (!store.getRun(id)) return reply.code(404).send({ error: "Run not found" });
+    archiveRun(service, id, "Archived by an operator");
     return withSteps(id);
   });
 
@@ -275,41 +236,14 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
    * Removes a task and everything it started.
    *
    * The other thing to do with a finished task, and the honest opposite of
-   * archiving: archiving keeps what the work learned, this keeps nothing. Its
-   * sessions go too — a run's workers cannot be found once the run is gone, so
-   * leaving them would strand them in the tree with no way back to why they
-   * exist.
+   * archiving: archiving keeps what the work learned, this keeps nothing.
    */
   app.delete("/api/runs/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
-    const run = store.getRun(id);
-    if (!run) return reply.code(404).send({ error: "Run not found" });
-    // Sessions are stopped before the rows go, because a deleted run cannot
-    // stop anything afterwards — there is nothing left to find them by.
-    stopRunSessions(service, id);
-    for (const session of store.listSessions()) {
-      if (session.runId !== id) continue;
-      try {
-        store.deleteSession(session.id);
-      } catch {
-        // One session that will not go is not a reason to keep the task.
-        continue;
-      }
-    }
-    store.deleteRun(id);
-    service.broadcast({ type: "snapshot", data: service.snapshot() });
+    if (!purgeRun(service, id)) return reply.code(404).send({ error: "Run not found" });
     return reply.code(204).send();
   });
 };
-
-/** Stops every session a run still holds. Idempotent, so cancel-then-delete is safe. */
-function stopRunSessions(service: FleetService, runId: string): void {
-  for (const session of service.store.listSessions()) {
-    if (session.runId !== runId) continue;
-    if (terminalSessionStates.has(session.state)) continue;
-    service.dispatch(session.nodeId, { type: "stop", sessionId: session.id });
-  }
-}
 
 /**
  * The keys on a dependency cycle, or an empty list.

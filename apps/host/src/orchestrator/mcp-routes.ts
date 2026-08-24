@@ -7,10 +7,13 @@ import type { FleetService } from "../fleet-service.js";
 import type { LeadTokens } from "./lead-tokens.js";
 import {
   AdvanceTaskSchema,
+  CloseTaskSchema,
+  DiscardTaskSchema,
   EscalateSchema,
   FleetTools,
   FollowUpSchema,
   PlanTaskSchema,
+  ReopenTaskSchema,
   SessionRefSchema,
   StartWorkSchema,
   SubmitTaskSchema,
@@ -193,6 +196,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       description: [
         "The last phase is done and the work is ready to be looked at.",
         "Say how each of the task's success criteria turned out and what shows it — an essential criterion that is not met will be refused here, because the task is not finished.",
+        "The summary is shown to the person as markdown above the approve and send-back buttons, so write it to be scanned — a bold one-line verdict, then short `###` sections with bullets under them. A long unbroken paragraph is refused.",
         "This is the only point at which a person is asked for anything; they approve it or send it back with a note, which arrives as a new turn.",
         "End your turn after calling it.",
       ].join(" "),
@@ -213,6 +217,49 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       inputSchema: EscalateSchema.shape,
     },
     guard("fleet_escalate", EscalateSchema, (input) => tools.escalate(input)),
+  );
+
+  server.registerTool(
+    "fleet_close_task",
+    {
+      title: "End a task that is not going to be finished",
+      description: [
+        "For when a task stops being worth doing: the request was withdrawn, another task covers it, or what it was for no longer exists.",
+        "This is not escalating — nobody has to decide anything, so do not send it to a person just to have it stopped.",
+        "Any worker still running is stopped and its session removed; the task keeps its phases, steps and notes, and cannot be resumed except by fleet_reopen_task.",
+        "Refused while a person holds it for review. End your turn after calling it.",
+      ].join(" "),
+      inputSchema: CloseTaskSchema.shape,
+    },
+    guard("fleet_close_task", CloseTaskSchema, (input) => tools.closeTask(input)),
+  );
+
+  server.registerTool(
+    "fleet_reopen_task",
+    {
+      title: "Take a task back and carry on with it",
+      description: [
+        "For a task that turns out not to be over — either one you handed over and the person has not answered yet, or one that is already closed and the next thing to do belongs with it.",
+        "Reopening keeps the task's criteria, notes and steps, which is the point: a new task would start with none of that context.",
+        "Taking one back from review means the person is no longer being asked, so only do it when what you learned makes the question different.",
+        "The task returns to the phase it was on. Dispatch what it needs, then end your turn.",
+      ].join(" "),
+      inputSchema: ReopenTaskSchema.shape,
+    },
+    guard("fleet_reopen_task", ReopenTaskSchema, (input) => tools.reopenTask(input)),
+  );
+
+  server.registerTool(
+    "fleet_discard_task",
+    {
+      title: "Delete a task that should not exist",
+      description: [
+        "For a task opened by mistake — a duplicate, a misread request, a name you want back — caught before any work went out.",
+        "It and its record are removed permanently. Refused once the task has a dispatched step or a note, because destroying a record a person might read is their decision, not yours: close it instead, which keeps what it learned.",
+      ].join(" "),
+      inputSchema: DiscardTaskSchema.shape,
+    },
+    guard("fleet_discard_task", DiscardTaskSchema, (input) => tools.discardTask(input)),
   );
 
   server.registerTool(

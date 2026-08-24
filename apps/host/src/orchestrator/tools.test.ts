@@ -550,9 +550,68 @@ describe("FleetTools success criteria", () => {
 
     const note = store.listRunNotes(runId).at(-1)!.body;
     expect(note).toContain("Here it is.");
-    expect(note).toContain("logout-invalidates: met");
+    expect(note).toContain("**logout-invalidates** — met");
     expect(note).toContain("ran the auth suite");
-    expect(note).toContain("nice-to-have (optional): not reported");
+    expect(note).toContain("**nice-to-have** *(optional)* — not reported");
+  });
+
+  it("refuses a handover written as a wall of prose", () => {
+    /*
+     * The review page is this text and two buttons, so an unscannable summary
+     * is not a style complaint — it is the person having to reconstruct the
+     * argument before they can make the only decision the orchestrator cannot.
+     */
+    const wall =
+      "Implementation is done and backed by real before/after evidence: the new tests " +
+      "failed on unmodified source and then passed, the dead rule was deleted, the copy " +
+      "was worse than the primary so the worker added dedicated keys instead of mutating " +
+      "the shared ones, gates are green, and the layout numbers are still unverified by " +
+      "machine because jsdom cannot resolve them, so please look at those yourself.";
+
+    const result = tools().submitTask({
+      task: "Ship it",
+      summary: wall,
+      criteria: [met("logout-invalidates")],
+    });
+
+    expect(result.ok).toBe(false);
+    // The refusal carries the shape, so the next attempt is a rewrite and not a guess.
+    expect(result.text).toContain("### How it was proven");
+    // Nothing moved: the task is still the orchestrator's to hand over.
+    expect(state()).not.toBe("awaiting_human");
+    expect(store.listRunNotes(runId)).toHaveLength(0);
+  });
+
+  it("takes a long handover that is written to be scanned", () => {
+    const report = [
+      "**The empty state now uses a native 48px glyph.**",
+      "",
+      "### What was done",
+      "- swapped `Search20Regular` for `Search48Regular` in both variants",
+      "- deleted the dead `fontSize: 48px` rule that was scaling the old glyph",
+      "",
+      "### How it was proven",
+      "- the new tests failed on unmodified source, then passed 10/10 and 21/21",
+      "",
+      "### Not verified",
+      "- the layout numbers, which jsdom cannot resolve",
+    ].join("\n");
+
+    const result = tools().submitTask({
+      task: "Ship it",
+      summary: report,
+      criteria: [met("logout-invalidates")],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(state()).toBe("awaiting_human");
+    expect(store.listRunNotes(runId).at(-1)!.body).toContain("### How it was proven");
+  });
+
+  it("does not demand headings of a one-line answer", () => {
+    // A question answered in a sentence needs no structure, and asking for it
+    // would make the gate ceremony rather than a service to the reader.
+    expect(submit([met("logout-invalidates")]).ok).toBe(true);
   });
 
   it("still hands over a task that was planned before criteria existed", () => {
@@ -606,6 +665,290 @@ describe("FleetTools success criteria", () => {
     });
 
     expect(out.ok).toBe(false);
+  });
+});
+
+/*
+ * The endings that are not "it worked".
+ *
+ * Until these existed the orchestrator had two ways to finish a task and no way
+ * to abandon one, so a withdrawn request either sat open forever or was pushed
+ * at a person as an escalation — asking them to decide something they had just
+ * decided themselves.
+ */
+describe("FleetTools task lifecycle", () => {
+  let store: FleetStore;
+  let service: FleetService;
+  let leadId: string;
+
+  const tools = () => new FleetTools(service, leadId);
+
+  beforeEach(() => {
+    const world = fleet();
+    store = world.store;
+    service = world.service;
+    leadId = world.leadId;
+  });
+
+  const plan = (task = "Ship it", phases: string[] = ["Only"]) =>
+    tools().planTask({
+      task,
+      objective: "make the change",
+      phases,
+      successCriteria: [
+        RunCriterionSchema.parse({
+          id: "it-works",
+          scenario: "running the build prints no errors",
+          expectedEvidence: "npm run build exits 0",
+        }),
+      ],
+      stopWhen: "the build is green on main",
+    });
+
+  const task = (name = "Ship it") => store.listRuns().find((run) => run.name === name)!;
+
+  const dispatch = (name = "Ship it") =>
+    tools().startWork({
+      category: "explore",
+      title: "look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      verify: "list the directory and say what you saw",
+      task: name,
+    });
+
+  const settleAll = (runId: string) => {
+    for (const step of store.listRunSteps(runId)) {
+      store.updateRunStep(step.id, { state: "succeeded" });
+    }
+  };
+
+  const handOver = () => {
+    settleAll(task().id);
+    tools().submitTask({
+      task: "Ship it",
+      summary: "Here it is.",
+      criteria: [{ id: "it-works", outcome: "met", evidence: "the build exited 0" }],
+    });
+  };
+
+  describe("closing", () => {
+    it("ends a task nobody wants any more, and keeps what it learned", () => {
+      plan("Ship it", ["Look", "Change"]);
+      dispatch();
+      settleAll(task().id);
+      tools().advanceTask({ task: "Ship it", note: "Found the file." });
+
+      const out = tools().closeTask({
+        task: "Ship it",
+        reason: "The person withdrew this — the feature is being cut instead.",
+      });
+
+      expect(out.ok).toBe(true);
+      expect(task().state).toBe("cancelled");
+      // The record is the whole difference between this and deleting.
+      expect(store.listRunSteps(task().id)).toHaveLength(1);
+      const notes = store.listRunNotes(task().id).map((note) => note.body);
+      expect(notes).toContain("Found the file.");
+      expect(notes.at(-1)).toContain("Closed without finishing.");
+      expect(notes.at(-1)).toContain("the feature is being cut");
+    });
+
+    it("stops the workers it still had, and says how many", () => {
+      plan();
+      dispatch();
+      const live = store.listRunSteps(task().id);
+      expect(live).toHaveLength(1);
+      expect(store.listSessions().some((s) => s.runId === task().id)).toBe(true);
+
+      const out = tools().closeTask({
+        task: "Ship it",
+        reason: "Superseded by the migration task, which covers this as well.",
+      });
+
+      expect(out.ok).toBe(true);
+      expect(out.text).toContain("1 step(s) were still running");
+      // Both halves of archiving: the step is settled and the session is gone.
+      expect(store.getRunStep(live[0]!.id)!.state).toBe("cancelled");
+      expect(store.listSessions().some((s) => s.runId === task().id)).toBe(false);
+    });
+
+    it("will not take a task back from the person by closing it", () => {
+      /*
+       * The one version of this that would surprise someone: they are looking at
+       * the review page while it disappears. Taking it back is a real thing to
+       * want, and it has its own tool that says so in the record.
+       */
+      plan();
+      handOver();
+      expect(task().state).toBe("awaiting_human");
+
+      const out = tools().closeTask({
+        task: "Ship it",
+        reason: "Actually the person said to drop this one entirely.",
+      });
+
+      expect(out.ok).toBe(false);
+      expect(out.text).toContain("fleet_reopen_task");
+      expect(task().state).toBe("awaiting_human");
+    });
+
+    it("does not close a task twice", () => {
+      plan();
+      tools().closeTask({ task: "Ship it", reason: "Withdrawn before anything ran." });
+
+      const again = tools().closeTask({
+        task: "Ship it",
+        reason: "Withdrawn before anything ran.",
+      });
+
+      expect(again.ok).toBe(false);
+      expect(again.text).toContain("already closed");
+    });
+
+    it("points a re-planned name at reopening rather than a dead end", () => {
+      /*
+       * A closed task keeps its name. Before closing existed that was rare;
+       * now it is the ordinary aftermath, and the old refusal sent the caller
+       * to dispatch into a cancelled run, which refuses in turn.
+       */
+      plan();
+      tools().closeTask({
+        task: "Ship it",
+        reason: "Withdrawn; the person changed tack.",
+      });
+
+      const again = plan();
+
+      expect(again.ok).toBe(false);
+      expect(again.text).toContain("fleet_reopen_task");
+    });
+  });
+
+  describe("reopening", () => {
+    it("takes a task back from review, so the person stops being asked", () => {
+      plan();
+      handOver();
+
+      const out = tools().reopenTask({
+        task: "Ship it",
+        reason: "The reviewer found the same bug in the other tab; this is not done.",
+      });
+
+      expect(out.ok).toBe(true);
+      expect(task().state).toBe("running");
+      expect(store.listRunNotes(task().id).at(-1)!.body).toContain(
+        "Taken back before review",
+      );
+    });
+
+    it("carries a finished task on from the phase it was on", () => {
+      plan();
+      handOver();
+      store.updateRun(task().id, { state: "completed" });
+
+      const out = tools().reopenTask({
+        task: "Ship it",
+        reason: "The person wants the same change applied to the second tab.",
+      });
+
+      expect(out.ok).toBe(true);
+      expect(task().state).toBe("running");
+      expect(task().phaseIndex).toBe(0);
+      // The point of reopening rather than opening: the contract survives.
+      expect(task().successCriteria.map((c) => c.id)).toEqual(["it-works"]);
+      expect(store.listRunNotes(task().id).at(-1)!.body).toContain("Reopened");
+    });
+
+    it("clears the reason a task failed, so it does not read as still broken", () => {
+      plan();
+      store.updateRun(task().id, { state: "failed", failureReason: "the node vanished" });
+
+      tools().reopenTask({
+        task: "Ship it",
+        reason: "The node is back; pick this up where it stopped.",
+      });
+
+      expect(task().failureReason).toBe("");
+    });
+
+    it("refuses to reopen a task that is still open", () => {
+      plan();
+
+      const out = tools().reopenTask({
+        task: "Ship it",
+        reason: "I would like to carry on with this one.",
+      });
+
+      expect(out.ok).toBe(false);
+      expect(out.text).toContain("fleet_start_work");
+    });
+  });
+
+  describe("discarding", () => {
+    it("removes a task that dispatched nothing", () => {
+      plan("Duplicate");
+      const id = task("Duplicate").id;
+
+      const out = tools().discardTask({
+        task: "Duplicate",
+        reason: "Opened this twice; the other one has the same phases.",
+      });
+
+      expect(out.ok).toBe(true);
+      expect(store.getRun(id)).toBeUndefined();
+    });
+
+    it("will not destroy a record a person might read", () => {
+      /*
+       * The same rule that stops it dropping a success criterion. Once work has
+       * gone out there is something to have learned, and what to do with that is
+       * a person's call — so the refusal names the tool that keeps it.
+       */
+      plan();
+      dispatch();
+
+      const out = tools().discardTask({
+        task: "Ship it",
+        reason: "On reflection this task was a misreading of the request.",
+      });
+
+      expect(out.ok).toBe(false);
+      expect(out.text).toContain("fleet_close_task");
+      expect(store.getRun(task().id)).toBeTruthy();
+    });
+
+    it("will not delete a task out from under the person reviewing it", () => {
+      plan();
+      handOver();
+
+      const out = tools().discardTask({
+        task: "Ship it",
+        reason: "I would rather this had never been opened at all.",
+      });
+
+      expect(out.ok).toBe(false);
+      expect(out.text).toContain("leave it there");
+      expect(store.getRun(task().id)).toBeTruthy();
+    });
+  });
+
+  it("touches no task belonging to another orchestrator", () => {
+    // The scoping every tool here relies on: a task is found by name, and the
+    // names are only unique within one conversation.
+    plan();
+    const mine = task().id;
+    const other = store.createRun({
+      workspaceId: store.listWorkspaces()[0]!.id,
+      name: "Ship it",
+      objective: "someone else's",
+    });
+
+    expect(
+      tools().closeTask({ task: "Ship it", reason: "Withdrawn by the person." }).ok,
+    ).toBe(true);
+    expect(store.getRun(other.id)!.state).not.toBe("cancelled");
+    expect(store.getRun(mine)!.state).toBe("cancelled");
   });
 });
 

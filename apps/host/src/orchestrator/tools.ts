@@ -19,6 +19,8 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { reservedSessionCount } from "../session-policy.js";
+import { HANDOVER_SHAPE } from "./briefing.js";
+import { archiveRun, purgeRun } from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle } from "./engine.js";
 
@@ -249,7 +251,12 @@ export const SubmitTaskSchema = TaskRefSchema.extend({
   summary: z
     .string()
     .min(1)
-    .describe("What was done and what the person should look at first."),
+    .describe(
+      "The report a person reads before approving or sending this back. Markdown, written to be " +
+        "scanned: a bold one-line verdict, then short `###` sections — what was done, how it was " +
+        "proven, what to look at first, what is still unverified — with bullets under each. " +
+        "One unbroken paragraph is refused. Keep it short; the criteria below carry the evidence.",
+    ),
   /**
    * How each criterion turned out, and what shows it.
    *
@@ -310,6 +317,68 @@ export const EscalateSchema = TaskRefSchema.extend({
 
 export const FollowUpSchema = SessionRefSchema.extend({
   prompt: z.string().min(1).describe("What it should do next."),
+});
+
+/**
+ * Ending a task that is not going to be handed over.
+ *
+ * The third ending, next to submitting and escalating, and the one that was
+ * missing: a task can stop being worth doing. The request is withdrawn, another
+ * task turns out to cover it, or what it was for no longer exists. Without this
+ * the orchestrator's only honest move was to escalate — sending a person a
+ * decision they had already made — and its dishonest one was to leave the task
+ * open forever.
+ *
+ * A reason is required for the same reason every other ending needs one: the
+ * record outlives the conversation the decision was made in.
+ */
+export const CloseTaskSchema = TaskRefSchema.extend({
+  reason: z
+    .string()
+    .min(10)
+    .describe(
+      "Why this task is not going to be finished — what changed, or what covers it instead. " +
+        "This is what the record will say, so write it for someone who was not in the conversation.",
+    ),
+});
+
+/**
+ * Taking a task back, whether a person is holding it or it is already closed.
+ *
+ * Both directions matter and neither had a tool. A task in review is frozen —
+ * submitting and advancing both refuse while a person holds it — so an
+ * orchestrator told "wait, also do X" in conversation had nothing to call and
+ * could only wait for a button. A finished task has the opposite problem: its
+ * criteria, notes and steps are exactly the context the follow-up work needs,
+ * and a fresh task starts with none of it.
+ */
+export const ReopenTaskSchema = TaskRefSchema.extend({
+  reason: z
+    .string()
+    .min(10)
+    .describe(
+      "What is still wanted, concretely. This is appended to the task's notes and read " +
+        "alongside the criteria it was already held to.",
+    ),
+});
+
+/**
+ * Removing a task, record and all.
+ *
+ * Guarded rather than offered freely. The real use is a task that should not
+ * exist — opened twice, named wrongly, or planned against a misread request —
+ * and for that, deleting is tidier than leaving a cancelled ghost on the board.
+ * Once a task has dispatched work or written a note it has a record, and a
+ * record is a person's to destroy; the tool refuses and points at closing
+ * instead, which keeps what was learned.
+ */
+export const DiscardTaskSchema = TaskRefSchema.extend({
+  reason: z
+    .string()
+    .min(10)
+    .describe(
+      "Why this task should not exist. Said to the person reading along, not filed.",
+    ),
 });
 
 export type ToolResult = { ok: boolean; text: string };
@@ -456,15 +525,44 @@ function judgeCriteria(
 
   return {
     record:
-      "\n\nAgainst what this task promised:\n" +
+      "\n\n### Checked against what this task promised\n\n" +
       promised
         .map((c) => {
           const entry = byId.get(c.id);
-          if (!entry) return `- ${c.id} (optional): not reported`;
-          return `- ${c.id}: ${entry.outcome} — ${entry.evidence}`;
+          if (!entry) return `- **${c.id}** *(optional)* — not reported`;
+          return `- **${c.id}** — ${entry.outcome}\n  ${entry.evidence.trim()}`;
         })
         .join("\n"),
   };
+}
+
+/**
+ * Whether a handover can be read, which is a different question from whether it
+ * is true. Nothing here can tell an honest report from a confident one.
+ *
+ * Only long summaries are held to it. A one-line answer to a one-line question
+ * needs no headings, and demanding them would turn this into ceremony. A wall
+ * of prose is where the reader actually loses, so that is where it bites.
+ */
+const PROSE_WALL = 320;
+
+function judgeSummary(summary: string): string | undefined {
+  const text = summary.trim();
+  if (text.length <= PROSE_WALL) return undefined;
+  const structured = /^\s{0,3}(#{1,6} |[-*+] |\d+[.)] |> |\|)/m.test(text);
+  if (structured) return undefined;
+
+  return [
+    `That summary is ${text.length} characters of unbroken prose, and it is the only thing`,
+    "a person sees before approving this or sending it back. Nothing else was changed:",
+    "the task is still yours, so call this again with the same criteria and a summary",
+    "they can scan.",
+    "",
+    HANDOVER_SHAPE,
+    "",
+    "Drop any section that has nothing in it. Keep it short — the criteria you report",
+    "carry the evidence, so the summary does not have to repeat it.",
+  ].join("\n");
 }
 
 /**
@@ -579,6 +677,20 @@ export class FleetTools {
       return ok(planTaskReply(planned.name, input.phases, input.successCriteria));
     }
     if (existing) {
+      /*
+       * A closed task keeps its name, and until closing was possible that was
+       * rare enough to ignore. It is not now: an orchestrator that closes
+       * "Fix login" and is later asked for it again would be refused and told
+       * to dispatch into a cancelled run, which refuses in turn. Reopening is
+       * what it actually wants — the criteria and notes are still there.
+       */
+      if (terminalRunStates.has(existing.state)) {
+        return refuse(
+          `"${existing.name}" already exists and is ${existing.state}. ` +
+            `Reopen it with fleet_reopen_task, which keeps its criteria and notes, ` +
+            `or plan this under a different name.`,
+        );
+      }
       return refuse(
         `"${existing.name}" already exists (${this.phaseLine(existing)}). ` +
           `Use a different name, or dispatch into it with fleet_start_work.`,
@@ -678,10 +790,15 @@ export class FleetTools {
     const verdict = judgeCriteria(run.successCriteria, input.criteria);
     if (verdict.refusal) return refuse(verdict.refusal);
 
+    // After the criteria, deliberately. If the work is not finished, how the
+    // report reads is not the orchestrator's next problem.
+    const unreadable = judgeSummary(input.summary);
+    if (unreadable) return refuse(unreadable);
+
     this.store.appendRunNote(
       run.id,
       run.phaseIndex,
-      [input.summary, verdict.record].join(""),
+      [input.summary.trim(), verdict.record].join(""),
     );
     const submitted = this.store.updateRun(run.id, { state: "awaiting_human" })!;
     this.service.publishRun(submitted);
@@ -726,14 +843,15 @@ export class FleetTools {
       run.id,
       run.phaseIndex,
       [
-        `Escalated — this task is not finished.`,
+        `**Escalated — this task is not finished.**`,
         "",
-        input.reason,
+        input.reason.trim(),
         ...(unmet.length > 0
           ? [
               "",
-              "What it was supposed to satisfy:",
-              ...unmet.map((c) => `- ${c.id}: ${c.scenario}`),
+              "### What it was supposed to satisfy",
+              "",
+              ...unmet.map((c) => `- **${c.id}** — ${c.scenario}`),
             ]
           : []),
       ].join("\n"),
@@ -746,6 +864,143 @@ export class FleetTools {
         "They decide what happens to it — dropping a criterion, changing the task, or",
         "stopping it. Nothing more to do here; end your turn.",
       ].join("\n"),
+    );
+  }
+
+  /**
+   * Ends a task nobody is going to finish, and clears its workers away.
+   *
+   * The third ending. Submitting says it is done, escalating says it is stuck
+   * and a person must choose — this says the question stopped mattering, which
+   * needs no decision from anyone. What the task learned stays on the record;
+   * only the machinery goes.
+   *
+   * Refused while a person is holding it. A task in review has been handed
+   * over, and taking it back silently while they read it is the one version of
+   * this that would surprise someone. `fleet_reopen_task` is the way back, and
+   * it says so.
+   */
+  closeTask(input: z.infer<typeof CloseTaskSchema>): ToolResult {
+    const run = this.run(input.task);
+    if (!run) return refuse(`No task called "${input.task}".`);
+    if (terminalRunStates.has(run.state)) {
+      return refuse(`"${run.name}" is already closed (${run.state}).`);
+    }
+    if (run.state === "awaiting_human") {
+      return refuse(
+        `"${run.name}" is with the person for review, so it is not yours to close. ` +
+          `Take it back with fleet_reopen_task first if it should not have gone to them.`,
+      );
+    }
+
+    const reason = input.reason.trim();
+    this.store.appendRunNote(
+      run.id,
+      run.phaseIndex,
+      [`**Closed without finishing.**`, "", reason].join("\n"),
+    );
+    const live = this.store
+      .listRunSteps(run.id)
+      .filter((step) => !terminalRunStepStates.has(step.state)).length;
+    archiveRun(this.service, run.id, reason);
+
+    return ok(
+      [
+        `Closed "${run.name}".`,
+        ...(live > 0
+          ? [`  ${live} step(s) were still running and have been stopped.`]
+          : []),
+        "Its phases, steps and notes are kept; its workers are gone. Nothing more to do",
+        "here; end your turn.",
+      ].join("\n"),
+    );
+  }
+
+  /**
+   * Takes a task back — from the person holding it, or from being finished.
+   *
+   * One tool for both because they are one situation: the task is not over
+   * after all, and the work that comes next belongs with the criteria and notes
+   * it already has rather than in a new task that would start with none of
+   * them.
+   *
+   * No wake is queued, unlike the person's reopen. That one exists to tell an
+   * idle orchestrator something happened; here the orchestrator is the thing
+   * that happened, and waking it would be talking to itself.
+   */
+  reopenTask(input: z.infer<typeof ReopenTaskSchema>): ToolResult {
+    const run = this.run(input.task);
+    if (!run) return refuse(`No task called "${input.task}".`);
+    if (!terminalRunStates.has(run.state) && run.state !== "awaiting_human") {
+      return refuse(
+        `"${run.name}" is still open (${this.phaseLine(run)}), so there is nothing to ` +
+          `reopen. Dispatch the work with fleet_start_work.`,
+      );
+    }
+    if (!canTransitionRun(run.state, "running")) {
+      return refuse(`"${run.name}" cannot be reopened from ${run.state}.`);
+    }
+
+    const held = run.state === "awaiting_human";
+    const reason = input.reason.trim();
+    this.store.appendRunNote(
+      run.id,
+      run.phaseIndex,
+      [held ? `**Taken back before review.**` : `**Reopened.**`, "", reason].join("\n"),
+    );
+    const reopened = this.store.updateRun(run.id, {
+      state: "running",
+      failureReason: "",
+    })!;
+    this.service.publishRun(reopened);
+
+    return ok(
+      [
+        held
+          ? `Took "${reopened.name}" back from review; the person is no longer being asked.`
+          : `Reopened "${reopened.name}" on ${this.phaseLine(reopened)}.`,
+        "Its criteria and notes are unchanged and still apply — read them before deciding",
+        "anything, because they describe work you already did.",
+        "Dispatch what this needs, then end your turn. Call fleet_submit_task again once",
+        "it is addressed.",
+      ].join("\n"),
+    );
+  }
+
+  /**
+   * Removes a task that should not exist.
+   *
+   * Narrow on purpose. A task with a note or a dispatched step has a record,
+   * and destroying a record is a person's decision — the same rule that keeps
+   * the orchestrator from dropping a success criterion. What is left is the
+   * case this is actually for: a duplicate, a misreading, a name it wants back,
+   * caught before any work went out.
+   */
+  discardTask(input: z.infer<typeof DiscardTaskSchema>): ToolResult {
+    const run = this.run(input.task);
+    if (!run) return refuse(`No task called "${input.task}".`);
+
+    const steps = this.store.listRunSteps(run.id).length;
+    const notes = this.store.listRunNotes(run.id).length;
+    if (steps > 0 || notes > 0) {
+      return refuse(
+        [
+          `"${run.name}" has a record — ${steps} step(s) and ${notes} note(s) — so it is not`,
+          "yours to delete. Deleting is what a person does with a task nobody will read again.",
+          run.state === "awaiting_human"
+            ? "It is with the person now; leave it there."
+            : terminalRunStates.has(run.state)
+              ? "It is already closed, so there is nothing left to do to it."
+              : "Call fleet_close_task instead — it stops the work and keeps what was learned.",
+        ].join("\n"),
+      );
+    }
+
+    const name = run.name;
+    purgeRun(this.service, run.id);
+    return ok(
+      `Deleted "${name}". It had dispatched nothing, so nothing was lost. ` +
+        `Say why in your next message — a task vanishing from the board is otherwise unexplained.`,
     );
   }
 

@@ -24,6 +24,34 @@
  * is exactly what this design removes. It dispatches, it stops, and it is
  * woken.
  */
+/**
+ * The shape a finished task is handed over in.
+ *
+ * Not decoration. The review page is this text and two buttons, so it is the
+ * whole basis of the only decision a person makes in this system. Written as
+ * one paragraph it forces them to reconstruct the argument before they can
+ * judge it; these headings are the questions they were going to ask anyway.
+ *
+ * It lives here, with the other things the orchestrator is told, and
+ * `fleet_submit_task` quotes it when refusing a wall of prose — so the
+ * instruction and the enforcement cannot drift apart.
+ */
+export const HANDOVER_SHAPE = [
+  "**<one line: what is now true that was not before>**",
+  "",
+  "### What was done",
+  "- <the change, and where>",
+  "",
+  "### How it was proven",
+  "- <command or test> — <what it printed>",
+  "",
+  "### What to look at",
+  "- <the first thing to open, and why it is first>",
+  "",
+  "### Not verified",
+  "- <what no machine could check here — or `nothing`>",
+].join("\n");
+
 export function orchestratorBriefing(
   nodeSummary: string,
   options: { hasAgent: boolean } = { hasAgent: false },
@@ -78,7 +106,18 @@ function mechanics(): string[] {
     "3. Good enough? `fleet_advance_task` moves to the next phase. Not good enough? Dispatch more work in this phase — that is the same judgement, made the other way.",
     "4. When the last phase is done, `fleet_submit_task` hands the result to the human, who approves it or sends it back with a note.",
     "",
-    "`fleet_transcript` gets a worker's full output when the wake summary is not enough to judge by. `fleet_escalate` is for a decision that is not yours to make.",
+    "`fleet_transcript` gets a worker's full output when the wake summary is not enough to judge by.",
+    "",
+    "## How a task ends",
+    "",
+    "Four endings, and picking the wrong one is how tasks pile up:",
+    "",
+    "- **`fleet_submit_task`** — it is done. A person approves it or sends it back.",
+    "- **`fleet_escalate`** — it is stuck on something only a person can decide: an impossible criterion, a product choice, a destructive action.",
+    "- **`fleet_close_task`** — it stopped being worth doing. The request was withdrawn, another task covers it, or what it was for is gone. Nobody has to decide anything, so do not escalate this: workers are stopped, the record is kept, and the task is over.",
+    "- **`fleet_discard_task`** — it should never have existed: a duplicate, or a misread request, caught before any work went out. Refused once the task has a step or a note, because destroying a record is a person's decision.",
+    "",
+    "`fleet_reopen_task` is the way back from the first three. Use it when a task turns out not to be over — including one you have already handed over and the person has not answered yet, where taking it back is better than letting them approve a question you now know is wrong. Reopening keeps the criteria, notes and steps; a new task would start with none of them.",
     "",
     "## Waking",
     "",
@@ -107,6 +146,7 @@ function mechanics(): string[] {
     "- They are asked once, at the end. Do not ask them to approve a phase, pick the next step, or tell you a worker's output was fine — deciding those is the job.",
     "- If a tool refuses, read the reason and say it plainly. Do not retry the same call.",
     "- Say what you decided and why, briefly. They are reading along, not driving.",
+    "- The review page is your `fleet_submit_task` summary and two buttons, rendered as markdown. Write it to be scanned — a bold one-line verdict, then short `###` sections with bullets under them. A long unbroken paragraph is refused there, because it makes the reader rebuild your reasoning before they can judge it.",
   ];
 }
 

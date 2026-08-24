@@ -393,6 +393,37 @@ describe("task detail", () => {
     expect(screen.queryByText("What done means")).toBeNull();
   });
 
+  it("renders a handover as markdown, not as one paragraph of source", () => {
+    /*
+     * This note and two buttons are the whole review. Left as plain text the
+     * orchestrator's structure arrives as literal `###` and `-`, which reads
+     * worse than the prose it was meant to replace.
+     */
+    const model = models([run({ id: "r1", state: "awaiting_human" })])[0]!;
+    detail({
+      model,
+      notes: [
+        {
+          id: "n1",
+          runId: "r1",
+          phaseIndex: 1,
+          body: [
+            "**The empty state uses a native 48px glyph.**",
+            "",
+            "### How it was proven",
+            "- the new tests failed first, then passed 10/10",
+          ].join("\n"),
+          createdAt: ISO,
+        },
+      ],
+    });
+
+    const card = screen.getByText("Ready for you").closest("section")!;
+    expect(within(card).getByRole("heading", { name: "How it was proven" })).toBeTruthy();
+    expect(within(card).getAllByRole("listitem").length).toBeGreaterThan(0);
+    expect(within(card).queryByText(/### How it was proven/)).toBeNull();
+  });
+
   it("does not claim a planned task is waiting to be planned", () => {
     detail();
     expect(screen.queryByText(/Waiting for the orchestrator to plan this/)).toBeNull();

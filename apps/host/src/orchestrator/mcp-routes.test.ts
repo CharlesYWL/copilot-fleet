@@ -314,6 +314,92 @@ describe("orchestrator tools over the wire", () => {
     expect(result.refused).toBe(false);
     expect(task()!.state).toBe("awaiting_human");
   });
+
+  it.each(["fleet_close_task", "fleet_reopen_task", "fleet_discard_task"])(
+    "offers %s, so a task has an ending other than done",
+    async (name) => {
+      const listed = await rpc("tools/list");
+      const tool = listed.result!.tools!.find((entry) => entry.name === name)!;
+
+      expect(tool).toBeTruthy();
+      // Every one of them writes to the record, so every one asks why.
+      expect(Object.keys(tool.inputSchema.properties ?? {})).toEqual(
+        expect.arrayContaining(["task", "reason"]),
+      );
+    },
+  );
+
+  it("closes a task over the wire, stopping its workers and keeping its record", async () => {
+    await plan();
+    await call("fleet_start_work", {
+      category: "explore",
+      title: "look",
+      deliverable: "a list of what is in there",
+      scope: "the whole checkout, read-only",
+      verify: "list the directory and say what you saw",
+      task: "Ship it",
+    });
+
+    const result = await call("fleet_close_task", {
+      task: "Ship it",
+      reason: "The person withdrew this; the feature is being cut instead.",
+    });
+
+    expect(result.refused).toBe(false);
+    expect(task()!.state).toBe("cancelled");
+    expect(store.listRunSteps(task()!.id)).toHaveLength(1);
+    expect(store.listSessions().some((s) => s.runId === task()!.id)).toBe(false);
+  });
+
+  it("refuses a closing with no reason, before anything is stopped", async () => {
+    // The schema, not the handler: a caller that obeys the advertisement must
+    // not be able to end a task and leave the record saying nothing.
+    await plan();
+
+    const result = await call("fleet_close_task", { task: "Ship it" });
+
+    expect(result.refused).toBe(true);
+    expect(task()!.state).not.toBe("cancelled");
+  });
+
+  it("reopens a task it had already handed over", async () => {
+    await plan();
+    await settleWork();
+    await call("fleet_submit_task", {
+      task: "Ship it",
+      summary: "Here it is.",
+      criteria: [
+        {
+          id: "logout-invalidates",
+          outcome: "met",
+          evidence: "ran the auth suite; the logout test passed",
+        },
+      ],
+    });
+    expect(task()!.state).toBe("awaiting_human");
+
+    const result = await call("fleet_reopen_task", {
+      task: "Ship it",
+      reason: "The reviewer found the same bug in the other tab, so this is not done.",
+    });
+
+    expect(result.refused).toBe(false);
+    expect(task()!.state).toBe("running");
+    expect(task()!.successCriteria).toHaveLength(1);
+  });
+
+  it("discards a task that never dispatched anything", async () => {
+    await plan();
+    const id = task()!.id;
+
+    const result = await call("fleet_discard_task", {
+      task: "Ship it",
+      reason: "Opened this twice by mistake; the other one is identical.",
+    });
+
+    expect(result.refused).toBe(false);
+    expect(store.getRun(id)).toBeUndefined();
+  });
 });
 
 /*

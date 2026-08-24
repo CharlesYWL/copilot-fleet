@@ -25,6 +25,7 @@ import type { FleetSession, RunNote } from "@fleet/protocol";
 import type { RunViewModel } from "../../lib/orchestration-view";
 import { awaitingPlan, currentPhase } from "../../lib/orchestration-view";
 import { semanticColors, statusVisuals, terminal } from "../../theme";
+import { MarkdownBody } from "../MarkdownBody";
 import { RunStatusIndicator } from "./RunStatusIndicator";
 import { WorkerStepTimeline } from "./WorkerStepTimeline";
 
@@ -153,6 +154,24 @@ const useStyles = makeStyles({
     lineHeight: "1.55",
     whiteSpace: "pre-wrap",
   },
+  /*
+   * The same surface, for text the orchestrator wrote rather than text we did.
+   *
+   * Handover notes are markdown — headings, bullets, evidence — and a paragraph
+   * of `pre-wrap` turns that into the wall of prose this exists to avoid. The
+   * renderer supplies the line breaks, so this must not.
+   */
+  noteSurface: {
+    padding: "12px 14px",
+    borderRadius: tokens.borderRadiusMedium,
+    background: tokens.colorNeutralBackground2,
+    color: tokens.colorNeutralForeground2,
+  },
+  noteMarkdown: {
+    fontSize: "13px",
+    lineHeight: "1.6",
+    color: "inherit",
+  },
   noteLabel: {
     display: "block",
     marginBottom: "4px",
@@ -170,6 +189,15 @@ const useStyles = makeStyles({
     background: statusVisuals.attention.surface,
   },
   reviewButtons: { display: "flex", gap: "8px", flexWrap: "wrap" },
+  /*
+   * A long handover scrolls inside the card rather than pushing Approve and
+   * Send back off the fold. The decision is the point of this page; it should
+   * never be further away than the report that argues for it.
+   */
+  reviewBody: {
+    maxHeight: "min(48vh, 560px)",
+    overflowY: "auto",
+  },
   /**
    * Deliberately not the attention colour.
    *
@@ -331,7 +359,13 @@ export const OrchestratorTaskDetail = ({
           <section className={mergeClasses(styles.section, styles.review)}>
             <Text weight="semibold">Ready for you</Text>
             {notes.length > 0 && (
-              <Text className={styles.note}>{notes[notes.length - 1]?.body}</Text>
+              <div className={mergeClasses(styles.noteSurface, styles.reviewBody)}>
+                <MarkdownBody
+                  text={notes[notes.length - 1]?.body ?? ""}
+                  className={styles.noteMarkdown}
+                  copyable
+                />
+              </div>
             )}
             <div className={styles.reviewButtons}>
               <Button
@@ -417,13 +451,13 @@ export const OrchestratorTaskDetail = ({
             <Text className={styles.sectionLabel}>What happened</Text>
             <ul className={styles.notes}>
               {notes.map((entry) => (
-                <li key={entry.id} className={styles.note}>
+                <li key={entry.id} className={styles.noteSurface}>
                   {run.phases[entry.phaseIndex] && (
                     <span className={styles.noteLabel}>
                       {run.phases[entry.phaseIndex]}
                     </span>
                   )}
-                  {entry.body}
+                  <MarkdownBody text={entry.body} className={styles.noteMarkdown} />
                 </li>
               ))}
             </ul>
