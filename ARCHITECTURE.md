@@ -433,11 +433,15 @@ revision differs from the Host's. A Node built from a tarball reports no
 revision at all and is simply never called stale, since there is nothing to
 compare and no checkout to pull into.
 
-An update pulls fast-forward only, installs, and builds _before_ anything is
-torn down, so a checkout that has diverged, or that no longer compiles, leaves
-the machine running the code it already had. Only once the build succeeds does
-the Node give up its place. A pull that changes nothing skips the restart
+An update fetches, resets the checkout hard onto its tracking branch, installs,
+and builds _before_ anything is torn down, so a build that no longer compiles
+leaves the machine running the code it already had. Only once the build succeeds
+does the Node give up its place. A reset that changes nothing skips the restart
 entirely rather than dropping every connection to arrive back where it started.
+The reset is deliberate: a Node's checkout is a deployment, not somewhere to
+keep work, and `--ff-only` meant one stray local commit on a machine nobody logs
+into froze it behind the rest of the fleet forever. Untracked files survive, so
+the `.env` that names the Host is not swept away with the divergence.
 
 A Node does not replace itself. It exits with status 75 and a supervisor
 (`apps/node/supervisor.mjs`, or PM2/NSSM/systemd) starts the new build. The

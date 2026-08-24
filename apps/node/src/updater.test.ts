@@ -42,6 +42,11 @@ function scriptedRun(answers: Record<string, CommandResult[]>) {
 
 const ok = (output = ""): CommandResult => ({ ok: true, output });
 
+/** Every run has to answer the upstream lookup before it can reset onto it. */
+const upstream = {
+  "git rev-parse --abbrev-ref --symbolic-full-name @{u}": [ok("origin/main")],
+};
+
 describe("updateCheckout", () => {
   const stages: NodeUpdateStage[] = [];
   const report = (stage: NodeUpdateStage) => {
@@ -51,6 +56,7 @@ describe("updateCheckout", () => {
   it("installs and builds before asking for a restart", async () => {
     stages.length = 0;
     const { run, calls } = scriptedRun({
+      ...upstream,
       "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
     });
     const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
@@ -60,17 +66,20 @@ describe("updateCheckout", () => {
     // does not compile must leave the machine on the code it already had.
     expect(calls).toEqual([
       "git rev-parse HEAD",
-      "git pull --ff-only",
+      "git fetch --prune",
+      "git rev-parse --abbrev-ref --symbolic-full-name @{u}",
+      "git reset --hard origin/main",
       "git rev-parse HEAD",
       "npm install",
       "npm run build:node",
     ]);
-    expect(stages).toEqual(["checking", "pulling", "installing", "building"]);
+    expect(stages).toEqual(["checking", "pulling", "pulling", "installing", "building"]);
   });
 
   it("does not restart a node that was already current", async () => {
     stages.length = 0;
     const { run, calls } = scriptedRun({
+      ...upstream,
       "git rev-parse HEAD": [ok("same11111111"), ok("same11111111")],
     });
     const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
@@ -81,16 +90,49 @@ describe("updateCheckout", () => {
     expect(calls).not.toContain("npm install");
   });
 
-  it("stops at a pull that would need a merge, leaving the build alone", async () => {
+  it("resets onto whichever branch the checkout tracks", async () => {
     stages.length = 0;
     const { run, calls } = scriptedRun({
-      "git pull --ff-only": [{ ok: false, output: "Not possible to fast-forward" }],
+      "git rev-parse --abbrev-ref --symbolic-full-name @{u}": [ok("upstream/release")],
+      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
+    });
+    await updateCheckout({ repoRoot: gitCheckout(), report, run });
+
+    // Assuming origin/main would drag a machine parked on a release branch onto
+    // a different one, which is a worse outcome than not updating it at all.
+    expect(calls).toContain("git reset --hard upstream/release");
+  });
+
+  it("stops at a fetch that failed, leaving the checkout alone", async () => {
+    stages.length = 0;
+    const { run, calls } = scriptedRun({
+      ...upstream,
+      "git fetch --prune": [{ ok: false, output: "Could not resolve host: github.com" }],
     });
     const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
 
     expect(outcome).toEqual({
       action: "failed",
-      reason: "git pull: Not possible to fast-forward",
+      reason: "git fetch: Could not resolve host: github.com",
+    });
+    // Resetting onto a stale remote-tracking ref would report success while
+    // moving the machine nowhere, or backwards.
+    expect(calls).not.toContain("git reset --hard origin/main");
+    expect(calls).not.toContain("npm run build:node");
+  });
+
+  it("stops when the branch has nothing to be reset onto", async () => {
+    stages.length = 0;
+    const { run, calls } = scriptedRun({
+      "git rev-parse --abbrev-ref --symbolic-full-name @{u}": [
+        { ok: false, output: "no upstream configured for branch 'wip'" },
+      ],
+    });
+    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
+
+    expect(outcome).toEqual({
+      action: "failed",
+      reason: "git rev-parse @{u}: no upstream configured for branch 'wip'",
     });
     expect(calls).not.toContain("npm run build:node");
   });
@@ -98,6 +140,7 @@ describe("updateCheckout", () => {
   it("keeps running the old build when the new one does not compile", async () => {
     stages.length = 0;
     const { run } = scriptedRun({
+      ...upstream,
       "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
       "npm run build:node": [{ ok: false, output: "TS2345" }],
     });

@@ -55,7 +55,7 @@
 
     <svg viewBox="0 0 960 780" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="update-title update-desc">
       <title id="update-title">Updating a Node — every exit leaves the machine as it was</title>
-      <desc id="update-desc">Flowchart of the Host-driven node update: a node running sessions is refused, the checkout is pulled fast-forward only, an unchanged HEAD skips the restart, npm install and the node build both run before anything is torn down, and only a successful build leads to exit status 75 and a supervisor restart. All three refusal paths end at the same terminal, where the node keeps running the code it already had.</desc>
+      <desc id="update-desc">Flowchart of the Host-driven node update: a node running sessions is refused, the checkout is fetched and reset hard onto the branch it tracks, an unchanged HEAD skips the restart, npm install and the node build both run before anything is torn down, and only a successful build leads to exit status 75 and a supervisor restart. All three refusal paths end at the same terminal, where the node keeps running the code it already had.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
@@ -129,8 +129,8 @@
       <rect x="210" y="210" width="220" height="58" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
       <rect x="218" y="218" width="30" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
       <text x="233" y="227" fill="#2d3142" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">GIT</text>
-      <text x="320" y="247" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">git pull --ff-only</text>
-      <text x="320" y="261" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', monospace" text-anchor="middle">a diverged tree stops here</text>
+      <text x="320" y="247" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">git fetch · reset --hard</text>
+      <text x="320" y="261" fill="#4f5d75" font-size="8.5" font-family="'Geist Mono', monospace" text-anchor="middle">local divergence is discarded</text>
 
       <!-- Diamond B -->
       <polygon points="320,290 398,330 320,370 242,330" fill="#f5f5f5"/>

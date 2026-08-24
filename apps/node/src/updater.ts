@@ -91,12 +91,26 @@ export type UpdateOutcome =
   | { action: "none"; reason: string }
   | { action: "failed"; reason: string };
 
+/** Names the branch this checkout tracks, the same one `git pull` would merge. */
+const UPSTREAM_REF = ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"];
+
 /**
  * Brings the checkout up to date, stopping at the first step that fails.
  *
- * `--ff-only` is what keeps this safe to run unattended: a machine with local
- * commits or a dirty tree refuses to move rather than inventing a merge nobody
- * asked for, and says so.
+ * The pull is a fetch followed by a hard reset onto the tracking branch rather
+ * than `git pull`. `--ff-only` was the safer-looking choice and was the wrong
+ * one in practice: nobody is at the keyboard when this runs, so a machine that
+ * had picked up a local commit — a debug print committed months ago, a merge
+ * someone started on the box — refused every update from then on and stayed
+ * behind the rest of the fleet until a human logged in. A Node's checkout is a
+ * deployment, not somewhere to keep work: the remote is what it is supposed to
+ * be running, so local commits and local edits to tracked files are discarded
+ * to get there.
+ *
+ * Untracked files survive, because `git reset --hard` only deletes the ones
+ * standing where a tracked file has to go. That is deliberate — `.env` on that
+ * machine is untracked, and cleaning it away would point the Node at a
+ * different Host, or at none.
  */
 export function updateCheckout({
   repoRoot,
@@ -113,9 +127,24 @@ export function updateCheckout({
       return { action: "failed", reason: `git rev-parse: ${before.output}` };
     }
 
-    report("pulling", "git pull --ff-only");
-    const pull = await run("git", ["pull", "--ff-only"], repoRoot);
-    if (!pull.ok) return { action: "failed", reason: `git pull: ${pull.output}` };
+    report("pulling", "git fetch --prune");
+    const fetched = await run("git", ["fetch", "--prune"], repoRoot);
+    if (!fetched.ok) return { action: "failed", reason: `git fetch: ${fetched.output}` };
+
+    // Asked rather than assumed to be origin/main: a machine parked on a
+    // release branch must be reset onto that branch, not dragged onto another.
+    // git's own message names the branch when there is no upstream at all.
+    const upstream = await run("git", UPSTREAM_REF, repoRoot);
+    if (!upstream.ok) {
+      return { action: "failed", reason: `git rev-parse @{u}: ${upstream.output}` };
+    }
+    const target = upstream.output.trim();
+
+    report("pulling", `git reset --hard ${target}`);
+    const reset = await run("git", ["reset", "--hard", target], repoRoot);
+    if (!reset.ok) {
+      return { action: "failed", reason: `git reset --hard ${target}: ${reset.output}` };
+    }
 
     const after = await run("git", ["rev-parse", "HEAD"], repoRoot);
     if (!after.ok) return { action: "failed", reason: `git rev-parse: ${after.output}` };

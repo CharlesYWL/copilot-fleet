@@ -459,7 +459,7 @@ under the Host URL field.
 
 ## Keeping nodes up to date
 
-![Updating a node, as a flowchart: a busy node is refused, the pull is fast-forward only, an unchanged HEAD skips the restart, install and build both run before anything is torn down, and only a successful build reaches exit 75 and a supervisor restart. Every other exit leaves the machine on the code it already had.](docs/update-node.png)
+![Updating a node, as a flowchart: a busy node is refused, the checkout is reset hard onto its tracking branch, an unchanged HEAD skips the restart, install and build both run before anything is torn down, and only a successful build reaches exit 75 and a supervisor restart. Every other exit leaves the machine on the code it already had.](docs/update-node.png)
 
 The shape of that diagram is the whole feature: there is exactly one path that
 ends in a restart, and every guard that fails leaves the machine running what it
@@ -467,9 +467,10 @@ was already running.
 
 The Nodes tab compares each machine's commit with the Host's and marks it **Up
 to date**, **Update available**, or **Manual update**. **Update** on a row — or
-**Update all** above the table — tells those machines to `git pull --ff-only`,
-`npm install`, `npm run build:node`, and restart into the new build. Progress
-appears in the row as it happens.
+**Update all** above the table — tells those machines to `git fetch --prune`,
+`git reset --hard` onto the branch they track, `npm install`,
+`npm run build:node`, and restart into the new build. Progress appears in the row
+as it happens.
 
 The commit is compared, not the package version: `0.1.0` never moves between
 deploys, so comparing it would report every machine as current no matter how far
@@ -483,9 +484,15 @@ What it will not do:
   and go ahead. Each keeps its transcript and can be resumed afterwards.
   **Update all** never does this: it skips busy machines rather than deciding
   for you across the fleet.
-- **Move a checkout that has diverged.** `--ff-only` means a machine with local
-  commits, or a dirty tree in the way, stops and reports it instead of inventing
-  a merge nobody asked for.
+- **Keep local work on a node.** The checkout is reset hard onto the branch it
+  tracks, so local commits and local edits to tracked files are discarded — the
+  remote is what that machine is meant to be running, and `--ff-only` used to
+  mean one stray commit froze a machine behind the fleet until someone logged
+  into it. Untracked files are left alone, so the `.env` naming the Host
+  survives. A node is a deployment; do the work somewhere else.
+- **Move a machine off the branch it is on.** The reset target is the branch's
+  own upstream, not `origin/main`, and a branch with no upstream stops with that
+  as the reason.
 - **Restart into a build that does not compile.** `npm run build:node` runs
   before anything is torn down; if it fails the node stays up on the code it
   already had and reports the error.
