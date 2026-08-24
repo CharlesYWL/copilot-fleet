@@ -81,6 +81,16 @@ export function needsReconnect(before: Settings, after: Settings): boolean {
 export const DEFAULT_PERMISSION_TIMEOUT_MS = 1_800_000;
 
 /**
+ * How many agents a machine runs at once before the Host looks elsewhere.
+ *
+ * Sessions spend most of their life waiting — on a model, on a tool, on a human
+ * — so the limit that matters in practice is memory and disk, not cores, and 4
+ * left capable machines idle while the Host queued work behind them. Lower it
+ * on a small box; the node UI and `--max-sessions` both change it per machine.
+ */
+export const DEFAULT_MAX_SESSIONS = 10;
+
+/**
  * Environment variables seed the first run; once settings.json exists it wins,
  * because otherwise an edit made in the UI would silently revert to whatever
  * the .env file still says on the next restart. Command-line flags outrank
@@ -90,7 +100,7 @@ export function settingsFromEnv(env: NodeJS.ProcessEnv = process.env): Settings 
   return SettingsSchema.parse({
     hostUrl: env.FLEET_HOST_URL ?? "http://127.0.0.1:8787",
     nodeName: env.FLEET_NODE_NAME ?? hostname(),
-    maxSessions: Number(env.FLEET_MAX_SESSIONS ?? 4),
+    maxSessions: Number(env.FLEET_MAX_SESSIONS ?? DEFAULT_MAX_SESSIONS),
     copilotCommand: env.FLEET_COPILOT_COMMAND ?? "",
     permissionTimeoutMs: Number(
       env.PERMISSION_TIMEOUT_MS ?? DEFAULT_PERMISSION_TIMEOUT_MS,

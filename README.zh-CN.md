@@ -109,8 +109,8 @@ npm run start:node -- --url="https://fleet.example.com" --token="replace-with-ho
 
 节点名默认取机器的主机名，两端都可以改 —— Host 的 Nodes 标签页，或者节点自己的配置页。
 重命名不会改变机器身份，它的放置和会话都会跟着走；名字由 Host 拥有，所以如果节点离线
-期间两端都改过，以 Host 的名字为准并推送回去。想要 4 以外的并发容量就传
-`--max-sessions 8`。
+期间两端都改过，以 Host 的名字为准并推送回去。想要 10 以外的并发容量就传
+`--max-sessions 4`。
 
 首次注册会用注册令牌换取一个专属的节点密钥。凭据持久化在
 `$env:APPDATA\CopilotFleet\node.json`，之后启动不再需要注册令牌。服务使用向外的 WSS

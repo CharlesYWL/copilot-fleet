@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  DEFAULT_MAX_SESSIONS,
   DEFAULT_PERMISSION_TIMEOUT_MS,
   loadSettings,
   needsReconnect,
@@ -17,7 +18,8 @@ describe("settingsFromEnv", () => {
     const settings = settingsFromEnv({});
     expect(settings.hostUrl).toBe("http://127.0.0.1:8787");
     expect(settings.nodeName.length).toBeGreaterThan(0);
-    expect(settings.maxSessions).toBe(4);
+    expect(settings.maxSessions).toBe(DEFAULT_MAX_SESSIONS);
+    expect(DEFAULT_MAX_SESSIONS).toBe(10);
     // The documented default, so a node without the variable does not deny
     // permissions long before the operator's .env says it should.
     expect(settings.permissionTimeoutMs).toBe(DEFAULT_PERMISSION_TIMEOUT_MS);

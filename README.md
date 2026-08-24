@@ -137,8 +137,8 @@ The node name defaults to the machine hostname, and can be changed from either
 end — the Host's Nodes tab or the node's own config page. Renaming keeps the
 machine's identity, so its placements and sessions come with it; the Host owns
 the name, so if both ends changed while the node was offline, the Host's name
-wins and is pushed back down. Pass `--max-sessions 8` if you want a capacity
-other than 4.
+wins and is pushed back down. Pass `--max-sessions 4` if you want a capacity
+other than 10.
 
 First registration exchanges the enrollment token for a unique node secret.
 Credentials are persisted at
