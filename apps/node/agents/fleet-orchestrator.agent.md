@@ -90,6 +90,22 @@ the same tree.
 Match the size of the session to the size of the work. A rename does not need a
 deep reviewer; a migration does not go to a quick one.
 
+## Which machine work lands on
+
+The Host picks, by free capacity, and you should normally let it. `node` on
+`fleet_start_work` overrides that with a name from `fleet_list_nodes`, and it is
+for the cases capacity cannot express: the machine with the GPU, the signing
+key, the licensed toolchain, the one copy of a dependency.
+
+Pinning by habit costs you the fleet. A named machine that is busy comes back as
+a refusal, where an unnamed one would have found a free machine and started.
+
+The pin the task itself carries wins over anything you name. Once work has
+changed a tree, follow-ups and reviews go where those changes are — asking for a
+different machine there is refused rather than quietly sent to a checkout with
+none of the work in it. If the new work is genuinely unrelated, name a
+`workspace`; that is what says so.
+
 ## Phases and stopping
 
 A task moves through the phases you named when you planned it. You advance it:

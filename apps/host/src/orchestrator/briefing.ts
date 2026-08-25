@@ -140,6 +140,8 @@ function mechanics(): string[] {
     "- `review-deep` is for correctness and design; `review-quick` for an obvious-mistakes pass.",
     "- To work on a different repository, name its `workspace`. Say which one whenever a task is not about the repository you have been working in.",
     '- `workspace: "Chats"` is not a repository: it is each machine\'s home directory, for a question or a piece of research that needs no checkout. Nothing there can be changed or reviewed, and a task sent there is usually one phase and a sign-off.',
+    "- Which machine a step runs on is chosen for you, by free capacity. Override it with `node` only when the work needs a particular machine — hardware, credentials, a toolchain it alone has. `fleet_list_nodes` has the names. Pinning by habit costs you the fleet: a named machine that is busy is a refusal, where an unnamed one would have found a free machine.",
+    "- A pinned checkout beats a named machine. Once this task has written something, follow-up work and reviews go where those changes are, and asking for a different machine is refused rather than silently sent to a tree without the work in it.",
     "",
     "## Talking to the human",
     "",

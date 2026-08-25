@@ -125,6 +125,24 @@ export const StartWorkSchema = z.object({
         "piece of research that needs no checkout at all.",
     ),
   /**
+   * Which machine, when it matters.
+   *
+   * The Host's own choice is capacity-driven and knows nothing else: it cannot
+   * see that one machine has the GPU, the signing key, the licensed toolchain
+   * or the only copy of a dependency. Optional because that is the exception —
+   * a run that names a machine for every step has given up the fleet's ability
+   * to spread work and gets a refusal instead of a slower node.
+   */
+  node: z
+    .string()
+    .optional()
+    .describe(
+      "Which machine to run on, by name from fleet_list_nodes. Leave this out unless the " +
+        "work genuinely needs a particular machine — hardware, credentials or a toolchain " +
+        "only it has. The Host otherwise picks the one with the most free capacity, and " +
+        "naming a busy machine gets a refusal rather than a slower one.",
+    ),
+  /**
    * Which piece of work this belongs to.
    *
    * Steps under one task share a budget, a checkout once something has been
@@ -1039,6 +1057,11 @@ export class FleetTools {
     return ok(
       [
         lines.join("\n"),
+        "",
+        // The names above are the only place these come from, so the tool that
+        // takes one says so here rather than leaving the orchestrator to guess
+        // that a machine can be asked for at all.
+        "Pass a name as `node` to fleet_start_work to pin a step to one of these machines. Only do that when the work needs that machine — hardware, credentials, a toolchain it alone has. Otherwise leave it out and the machine with the most free capacity is chosen for you.",
         ...(chats
           ? [
               "",
@@ -1052,9 +1075,12 @@ export class FleetTools {
   /**
    * Starts one worker.
    *
-   * Placement is chosen here rather than by the caller: which machine is free,
-   * and which checkout a reviewer has to land on to see the diff, are facts
-   * the Host holds and the model does not.
+   * Placement is chosen here rather than by the caller, because which machine
+   * is free and which checkout a reviewer has to land on to see the diff are
+   * facts the Host holds and the model does not. `node` is the exception, and
+   * only that: it narrows the choice to one machine for the cases the Host
+   * cannot see — hardware, credentials, a toolchain — and every other rule
+   * still applies on top of it.
    */
   startWork(input: z.infer<typeof StartWorkSchema>): ToolResult {
     const existing = this.run(input.task);
@@ -1128,7 +1154,10 @@ export class FleetTools {
         `  ${this.phaseLine(run)}`,
         `  step: ${stepKey}`,
         `  session: ${dispatched.sessionId}`,
-        `  node: ${session?.nodeName ?? "?"}`,
+        // Named whether or not it was asked for: an orchestrator that pinned a
+        // step has to be able to see that the pin took, and one that did not
+        // still has to know where its changes now live.
+        `  node: ${session?.nodeName ?? placement.nodeName ?? "?"}${input.node ? " (as asked)" : ""}`,
         `  path: ${placement.localPath}`,
         "",
         "You will be woken when it finishes. Do not poll for it.",
@@ -1165,6 +1194,7 @@ export class FleetTools {
       run,
       category: input.category,
       workspace: input.workspace,
+      node: input.node,
       hasWritingStep: steps.some((step) => isWritingCategory(step.category)),
       placements: this.store.listPlacements(),
       nodeById,

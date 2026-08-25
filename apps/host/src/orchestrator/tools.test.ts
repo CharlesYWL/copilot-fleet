@@ -13,12 +13,14 @@ describe("FleetTools", () => {
   let store: FleetStore;
   let service: FleetService;
   let leadId: string;
+  let addNode: ReturnType<typeof fleet>["addNode"];
 
   beforeEach(() => {
     const world = fleet();
     store = world.store;
     service = world.service;
     leadId = world.leadId;
+    addNode = world.addNode;
   });
 
   const tools = () => new FleetTools(service, leadId);
@@ -136,6 +138,75 @@ describe("FleetTools", () => {
 
     expect(result.ok).toBe(true);
     expect(result.text).toContain("/src/beta");
+  });
+
+  /**
+   * Choosing the machine, which is otherwise the Host's job.
+   *
+   * The Host ranks by free capacity and knows nothing else — not which machine
+   * has the GPU, the signing key or the licensed toolchain. `node` is how the
+   * orchestrator supplies the part the ranking cannot see.
+   */
+  describe("naming a machine", () => {
+    it("dispatches to the machine that was named, not the roomiest one", () => {
+      addNode("gpu-rig");
+      // The lead session sits on box, so gpu-rig is in fact the roomier of the
+      // two; naming box is what proves the name and not the ranking decided it.
+      const result = start({ task: "Explore Beta", workspace: "Beta", node: "box" });
+
+      expect(result.ok).toBe(true);
+      expect(result.text).toContain("node: box (as asked)");
+      expect(result.text).toContain("path: /src/beta");
+
+      const step = store.listRunSteps(tasks()[0]!.id)[0]!;
+      const placement = store.getPlacement(step.placementId)!;
+      expect(store.getNode(placement.nodeId)?.name).toBe("box");
+    });
+
+    it("refuses an unknown machine instead of quietly using another", () => {
+      /*
+       * Silently falling back is the failure that matters here: the whole
+       * reason to name a machine is that the others will not do, so work that
+       * lands elsewhere is worse than work that does not start.
+       */
+      const result = start({ task: "Explore Beta", node: "laptop" });
+
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain('No node is called "laptop"');
+      expect(store.listRunSteps(tasks()[0]!.id)).toHaveLength(0);
+    });
+
+    it("refuses an offline machine by name, rather than sending work past it", () => {
+      addNode("gpu-rig", { online: false });
+      const result = start({ task: "Explore Beta", node: "gpu-rig" });
+
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain("gpu-rig is offline");
+    });
+
+    it("keeps a review with the changes even when another machine is named", () => {
+      addNode("gpu-rig");
+      // Pinned to box by writing there, so gpu-rig is a tree with no diff in it.
+      start({ task: "Ship it", category: "implement", title: "build it", node: "box" });
+      const review = start({
+        task: "Ship it",
+        category: "review-deep",
+        title: "check it",
+        node: "gpu-rig",
+      });
+
+      expect(review.ok).toBe(false);
+      expect(review.text).toContain("holds the changes to review");
+      expect(review.text).toContain("Send it to box");
+    });
+
+    it("still lets the Host choose when no machine is named", () => {
+      addNode("gpu-rig");
+      const result = start({ task: "Explore Beta" });
+
+      expect(result.ok).toBe(true);
+      expect(result.text).not.toContain("(as asked)");
+    });
   });
 
   /**

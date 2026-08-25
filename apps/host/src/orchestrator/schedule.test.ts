@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { FleetNode, FleetSession, Placement, Run, RunStep } from "@fleet/protocol";
 import { RunPolicySchema } from "@fleet/protocol";
-import { planNextActions, remainingCapacity, type ScheduleInput } from "./schedule.js";
+import {
+  decidePlacement,
+  planNextActions,
+  remainingCapacity,
+  type PlacementRequest,
+  type ScheduleInput,
+} from "./schedule.js";
 
 const NOW = Date.parse("2026-01-01T12:00:00.000Z");
 const iso = (offsetMs = 0) => new Date(NOW + offsetMs).toISOString();
@@ -640,5 +646,133 @@ describe("capacity by kind", () => {
     );
 
     expect(actions.map((action) => action.type)).not.toContain("start_step");
+  });
+});
+
+describe("naming a machine", () => {
+  const NODES = { n1: "WEILI-MS-SP", n2: "CHARLES-DESK" } as const;
+
+  /** Placements carry the node's name; the store joins it, so a fixture must too. */
+  const on = (
+    id: string,
+    nodeId: keyof typeof NODES,
+    extra: Partial<Placement> = {},
+  ) => ({
+    ...placement(id, nodeId),
+    nodeName: NODES[nodeId],
+    ...extra,
+  });
+
+  const ask = (overrides: Partial<PlacementRequest> = {}) =>
+    decidePlacement({
+      run: run(),
+      category: "implement",
+      hasWritingStep: false,
+      placements: [on("p1", "n1"), on("p2", "n2")],
+      nodeById: new Map([
+        ["n1", node("n1", { name: NODES.n1 })],
+        ["n2", node("n2", { name: NODES.n2 })],
+      ]),
+      reservedFor: () => 0,
+      writingInFlight: new Set<string>(),
+      ...overrides,
+    });
+
+  it("sends the step to the machine that was named, not the roomiest one", () => {
+    // p1 would win on capacity alone, since both are empty and it is first.
+    expect(ask({ node: "CHARLES-DESK" })).toMatchObject({ id: "p2" });
+  });
+
+  it("takes a prefix, because the orchestrator retypes what it read", () => {
+    expect(ask({ node: "weili" })).toMatchObject({ id: "p1" });
+  });
+
+  it("refuses a name that fits two machines rather than picking one", () => {
+    const answer = ask({
+      node: "node",
+      nodeById: new Map([
+        ["n1", node("n1", { name: "node-a" })],
+        ["n2", node("n2", { name: "node-b" })],
+      ]),
+    });
+
+    expect(answer).toBe(
+      '"node" matches 2 nodes: node-a, node-b. Name one of them exactly.',
+    );
+  });
+
+  it("says which machines exist when the name matches none", () => {
+    expect(ask({ node: "laptop" })).toContain("fleet_list_nodes");
+  });
+
+  it("blames the machine that was named, not the fleet, when it is full", () => {
+    /*
+     * "Every node with that checkout is full" is true and useless here: the
+     * orchestrator named one machine, and reading that as fleet-wide saturation
+     * is how it gives up on work another machine would have taken.
+     */
+    const answer = ask({ node: "WEILI-MS-SP", reservedFor: () => 99 });
+
+    expect(answer).toContain("WEILI-MS-SP has no free slot");
+    expect(answer).toContain("omit `node`");
+  });
+
+  it("says the machine is offline rather than that nothing has the checkout", () => {
+    const answer = ask({
+      node: "WEILI-MS-SP",
+      nodeById: new Map([
+        ["n1", node("n1", { name: NODES.n1, online: false })],
+        ["n2", node("n2", { name: NODES.n2 })],
+      ]),
+    });
+
+    expect(answer).toContain("WEILI-MS-SP is offline");
+  });
+
+  it("says so when the named machine has no copy of the repository", () => {
+    const answer = ask({
+      node: "CHARLES-DESK",
+      placements: [on("p1", "n1")],
+    });
+
+    expect(answer).toContain("CHARLES-DESK has no checkout");
+  });
+
+  it("will not move a review away from the changes it has to see", () => {
+    /*
+     * Where this run's changes are is a fact, not a preference. Honouring the
+     * request would send the reviewer to a tree with none of the work in it,
+     * and it would approve what it could not find anything wrong with.
+     */
+    const answer = ask({
+      run: run({ placementId: "p1" }),
+      hasWritingStep: true,
+      category: "review-deep",
+      node: "CHARLES-DESK",
+    });
+
+    expect(answer).toContain("holds the changes to review");
+    expect(answer).toContain("Send it to WEILI-MS-SP");
+  });
+
+  it("still lets a named machine take work that is genuinely unrelated", () => {
+    // A named workspace is how the orchestrator says "this is different work",
+    // and that releases the pin the same way it does without a named machine.
+    const answer = ask({
+      run: run({ placementId: "p1" }),
+      hasWritingStep: true,
+      workspace: "other-repo",
+      node: "CHARLES-DESK",
+      placements: [
+        on("p1", "n1"),
+        on("p2", "n2", { workspaceId: "w2", workspaceName: "other-repo" }),
+      ],
+    });
+
+    expect(answer).toMatchObject({ id: "p2" });
+  });
+
+  it("leaves the Host's own choice alone when no machine is named", () => {
+    expect(ask()).toMatchObject({ id: "p1" });
   });
 });

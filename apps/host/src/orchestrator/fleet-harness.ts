@@ -1,4 +1,5 @@
 import type { FastifyBaseLogger } from "fastify";
+import type { FleetNode } from "@fleet/protocol";
 import { FleetStore } from "../store.js";
 import { FleetService } from "../fleet-service.js";
 import { OrchestratorEngine } from "./engine.js";
@@ -26,8 +27,17 @@ function fakeSocket() {
  * Shared by the tests that call the tools directly and the ones that go through
  * the MCP endpoint, so both are talking to the same world — a harness that
  * drifted between them would let a wire-level bug hide behind a passing unit.
+ *
+ * A second machine is offered rather than included. Placement is decided by
+ * counting what is free, so an extra node changes the answer for every test in
+ * both files; the ones that need somewhere else to send work ask for it.
  */
-export function fleet(): { store: FleetStore; service: FleetService; leadId: string } {
+export function fleet(): {
+  store: FleetStore;
+  service: FleetService;
+  leadId: string;
+  addNode: (name: string, options?: { online?: boolean }) => FleetNode;
+} {
   const store = new FleetStore(":memory:");
   const service = new FleetService(store, silent, "test");
 
@@ -48,6 +58,25 @@ export function fleet(): { store: FleetStore; service: FleetService; leadId: str
   const second = store.createWorkspace("Beta", "");
   store.createPlacement(first.id, node.id, "/src/alpha");
   store.createPlacement(second.id, node.id, "/src/beta");
+
+  /** Another machine with the same two checkouts, so only the name differs. */
+  const addNode = (name: string, options: { online?: boolean } = {}) => {
+    const added = store.registerNode({
+      name,
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      revision: "test",
+      capabilities: ["copilot-acp", "host-yolo"],
+      agents: [],
+      maxSessions: 8,
+    }).node;
+    service.attachNode(added.id, fakeSocket());
+    store.setNodeOnline(added.id, options.online ?? true, 0);
+    store.createPlacement(first.id, added.id, `/src/alpha-${name}`);
+    store.createPlacement(second.id, added.id, `/src/beta-${name}`);
+    return added;
+  };
 
   const engine = new OrchestratorEngine(service);
   service.attachOrchestration({
@@ -72,5 +101,5 @@ export function fleet(): { store: FleetStore; service: FleetService; leadId: str
    * regression hides: every test would exercise "a lead that already has a
    * task" and none would exercise the first call of a fresh one.
    */
-  return { store, service, leadId: lead.id };
+  return { store, service, leadId: lead.id, addNode };
 }

@@ -409,6 +409,16 @@ export type PlacementRequest = {
   /** The workspace the orchestrator named, if it named one. */
   workspace?: string | undefined;
   /**
+   * The machine the orchestrator named, if it named one.
+   *
+   * Distinct from `workspace`, which says *what* to work on. This says *where*,
+   * and exists because the Host's own ranking — most free slots first — knows
+   * about capacity and nothing else. It cannot know that one machine has the
+   * toolchain, the credentials or the hardware a step needs, and the
+   * orchestrator sometimes does.
+   */
+  node?: string | undefined;
+  /**
    * Whether this run has ever written to its pinned checkout.
    *
    * The pin is only meaningful once something has changed a tree; asked rather
@@ -422,6 +432,37 @@ export type PlacementRequest = {
   reservedFor: (nodeId: string, kind: SessionKind) => number;
   writingInFlight: ReadonlySet<string>;
 };
+
+/**
+ * The machine an orchestrator meant, or a sentence saying why it is not one.
+ *
+ * Exact name first, then a unique substring, because the orchestrator reads
+ * these names out of `fleet_list_nodes` and re-types them: "weili" should reach
+ * `WEILI-MS-SP`. Two matches are refused rather than guessed between — picking
+ * one would send work to a machine nobody chose, which is the whole thing
+ * naming a machine was meant to prevent.
+ */
+export function resolveNode(
+  wanted: string,
+  nodes: readonly FleetNode[],
+): FleetNode | string {
+  const needle = wanted.trim().toLowerCase();
+  if (!needle) return "Node name was empty. Omit `node` to let the Host choose.";
+
+  const exact = nodes.filter((node) => node.name.toLowerCase() === needle);
+  const matches =
+    exact.length > 0
+      ? exact
+      : nodes.filter((node) => node.name.toLowerCase().includes(needle));
+
+  if (matches.length === 1) return matches[0]!;
+  if (matches.length === 0) {
+    return `No node is called "${wanted}". Call fleet_list_nodes to see the machines that exist.`;
+  }
+  return `"${wanted}" matches ${matches.length} nodes: ${matches
+    .map((node) => node.name)
+    .join(", ")}. Name one of them exactly.`;
+}
 
 /**
  * Where one step should run, or a sentence saying why nowhere will do.
@@ -440,6 +481,12 @@ export type PlacementRequest = {
  * Naming a workspace is therefore how the orchestrator says "this is different
  * work"; saying nothing means "carry on where we were".
  *
+ * Naming a machine is a narrower request and is treated as one: it filters the
+ * candidates rather than releasing the pin. Where this run's changes live is a
+ * fact, not a preference, so a step that has to see them is refused with the
+ * machine that holds them named — silently honouring the request would send a
+ * review to a tree with none of the work in it.
+ *
  * Chats is the one destination that is not a checkout. It is a home directory
  * on each machine, and work sent there is a question rather than a change — so
  * anything that writes, or that has to read what a previous step wrote, is
@@ -455,6 +502,13 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
       : undefined;
   const wanted = request.workspace?.trim().toLowerCase();
 
+  let onlyNode: FleetNode | undefined;
+  if (request.node?.trim()) {
+    const resolved = resolveNode(request.node, [...nodeById.values()]);
+    if (typeof resolved === "string") return resolved;
+    onlyNode = resolved;
+  }
+
   /*
    * A review of changes it cannot see is worthless, so the pin wins here even
    * if a workspace was named — that combination is a mistake, not a request.
@@ -464,6 +518,9 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
     const why = isReviewCategory(request.category)
       ? "holds the changes to review"
       : "holds this run's changes";
+    if (onlyNode && onlyNode.id !== pinned!.nodeId) {
+      return `${pinned!.nodeName} ${why}, so this cannot run on ${onlyNode.name}. Send it to ${pinned!.nodeName}, or name a workspace if this is unrelated work.`;
+    }
     if (writes && writingInFlight.has(pinned!.id)) {
       return `Another step is already writing to ${pinned!.nodeName}, which ${why}. Only one writer at a time; a review can go now.`;
     }
@@ -477,15 +534,28 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
     return pinned!;
   }
 
-  const candidates = placements.filter((placement) =>
+  const inWorkspace = placements.filter((placement) =>
     wanted
       ? (placement.workspaceName ?? "").toLowerCase().includes(wanted)
       : placement.workspaceId === run.workspaceId,
   );
-  if (candidates.length === 0) {
+  if (inWorkspace.length === 0) {
     return wanted
       ? `No checkout matches "${request.workspace}". Call fleet_list_nodes to see which workspaces exist.`
       : "This run's workspace has no checkout on any node. Ask a human to add one.";
+  }
+
+  /*
+   * A machine is asked for by name, so being told it simply has no copy of the
+   * repository is more use than being ranked past it in silence.
+   */
+  let candidates = inWorkspace;
+  if (onlyNode) {
+    candidates = inWorkspace.filter((placement) => placement.nodeId === onlyNode.id);
+    if (candidates.length === 0) {
+      const which = wanted ? `"${request.workspace}"` : "this task's workspace";
+      return `${onlyNode.name} has no checkout of ${which}. Call fleet_list_nodes to see what is on it, or omit \`node\` to let the Host choose.`;
+    }
   }
 
   /*
@@ -525,6 +595,22 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
       continue;
     }
     return placement;
+  }
+
+  /*
+   * A machine asked for by name gets its own answers. "Every node with that
+   * checkout is full" is true but useless when the orchestrator named exactly
+   * one — it reads as though the fleet is saturated, and the next thing it
+   * does is give up on work another machine could have taken.
+   */
+  if (onlyNode) {
+    if (full) {
+      return `${onlyNode.name} has no free slot. Wait for a step to settle, or omit \`node\` to use whichever machine is free.`;
+    }
+    if (blockedByWriter) {
+      return `Another step is already writing to the checkout on ${onlyNode.name}. Only one writer at a time; a review or an explore can go there now.`;
+    }
+    return `${onlyNode.name} is offline${run.policy.yolo ? " or too old to run unattended" : ""}. Wait for it, or omit \`node\` to use another machine.`;
   }
 
   if (full) {
