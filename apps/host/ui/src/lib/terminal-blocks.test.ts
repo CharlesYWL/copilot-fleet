@@ -108,6 +108,33 @@ describe("toTerminalBlocks", () => {
     ]);
   });
 
+  it("folds an orchestrator wake into a step line instead of a chat bubble", () => {
+    const blocks = toTerminalBlocks([
+      event("system", {
+        text: [
+          'User: <fleet-wake task="Migration UI Bugs" phase="Open PR" (1/1) wakes=2/12>',
+          "Just finished:",
+          "- Open PR for the fix (implement): succeeded",
+          "  A very long paragraph of everything the worker did, repeated at length.",
+          "</fleet-wake>",
+          "",
+          "Nothing else is running. Dispatch the next step, or report and stop.",
+        ].join("\n"),
+      }),
+    ]);
+
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      kind: "wake",
+      text: "1 worker finished",
+      detail:
+        "Migration UI Bugs · Open PR (1/1) · Open PR for the fix: succeeded · wake 2/12",
+    });
+    // The envelope is kept whole, because the row is a fold and not a summary
+    // the reader has to trust without being able to check it.
+    expect(blocks[0]?.body).toContain("repeated at length");
+  });
+
   it("skips a payload that lost its shape instead of printing a blank line", () => {
     const blocks = toTerminalBlocks([
       event("agent_text", { text: 42 }),

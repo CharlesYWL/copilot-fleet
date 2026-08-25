@@ -124,6 +124,7 @@ export const blockColor: Record<TerminalBlockKind, string> = {
   state: terminal.dim,
   error: semanticColors.failed,
   system: terminal.dim,
+  wake: semanticColors.running,
 };
 
 export const stateAccent: Record<string, string> = {

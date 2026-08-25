@@ -191,6 +191,33 @@ describe("TerminalView transcript", () => {
     expect(screen.getByText("Fixed the flake in the retry helper.")).toBeTruthy();
   });
 
+  it("folds an orchestrator wake to one line instead of a chat bubble", async () => {
+    // A wake arrives down the prompt channel, so the transcript records it as
+    // something the operator said. It is a whole transcript of everything that
+    // settled, and as a bubble it buried the orchestrator's reply under it.
+    const output = `${"the worker explained itself at length. ".repeat(30)}done`;
+    const { container } = show({ runRole: "lead" }, EMPTY_DRAFT, [
+      streamEvent("system", {
+        text: [
+          'User: <fleet-wake task="Migration UI Bugs" phase="Open PR" (1/1) wakes=2/12>',
+          "Just finished:",
+          "- Open PR for the fix (implement): succeeded",
+          `  ${output}`,
+          "</fleet-wake>",
+        ].join("\n"),
+      }),
+    ]);
+
+    expect(screen.queryByText(output, { exact: false })).toBeNull();
+    // Not the operator's column, and not a mark on the prompt rail either.
+    expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(0);
+
+    const toggle = screen.getByRole("button", { name: /1 worker finished/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    toggle.click();
+    expect(await screen.findByText(output, { exact: false })).toBeTruthy();
+  });
+
   it("gives every prompt a mark on the rail, and a way back to it", () => {
     // The rail replaces the scrollbar, so each prompt has to be addressable
     // from it: the marks are what a reader navigates a long session by.

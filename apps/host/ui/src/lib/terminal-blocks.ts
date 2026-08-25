@@ -1,4 +1,5 @@
 import { eventPayload, type AttachmentSummary, type SessionEvent } from "@fleet/protocol";
+import { parseWake, wakeDetail, wakeTitle } from "./fleet-wake";
 
 export type TerminalBlockKind =
   | "user"
@@ -10,7 +11,8 @@ export type TerminalBlockKind =
   | "turn"
   | "state"
   | "error"
-  | "system";
+  | "system"
+  | "wake";
 
 export type TerminalBlock = {
   key: string;
@@ -22,6 +24,8 @@ export type TerminalBlock = {
   toolKind?: string;
   /** One-line summary of a tool's input, shown dimmed after its title. */
   detail?: string;
+  /** Full text a summarised block folds away, kept for whoever expands it. */
+  body?: string;
   /** Files that went with this message, by name; their bytes are never kept. */
   attachments?: AttachmentSummary[];
 };
@@ -108,10 +112,30 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       const text = payload?.text ?? "";
       if (!text) continue;
       const isUser = text.startsWith(USER_PREFIX);
+      const prompt = isUser ? text.slice(USER_PREFIX.length) : text;
+
+      /*
+       * A wake is delivered down the prompt channel because that is the only
+       * way to hand a running agent something to read, but nobody typed it —
+       * so it gets a folded step line rather than the operator's own column.
+       */
+      const wake = isUser ? parseWake(prompt) : undefined;
+      if (wake) {
+        blocks.push({
+          key: event.eventId,
+          kind: "wake",
+          text: wakeTitle(wake),
+          detail: wakeDetail(wake),
+          body: prompt,
+          createdAt: event.createdAt,
+        });
+        continue;
+      }
+
       blocks.push({
         key: event.eventId,
         kind: isUser ? "user" : "system",
-        text: isUser ? text.slice(USER_PREFIX.length) : text,
+        text: prompt,
         createdAt: event.createdAt,
         // The bytes are never stored, so this list is the only trace a prompt
         // carried files at all. Without it a transcript reads as though the

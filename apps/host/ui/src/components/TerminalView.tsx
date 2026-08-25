@@ -1184,6 +1184,8 @@ const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBloc
 
   if (block.kind === "thought") return <ThoughtLine block={block} time={time} />;
 
+  if (block.kind === "wake") return <WakeLine block={block} time={time} />;
+
   // Raw agent stderr and errors are the two things a truncated line would
   // actively cost the reader, so they keep their full text under the row.
   if (block.kind === "error" || block.kind === "system") {
@@ -1253,6 +1255,39 @@ const ThoughtLine = ({ block, time }: { block: TerminalBlock; time: string }) =>
       {expanded ? (
         <div className={styles.stepBody}>
           <MarkdownBody text={block.text} muted />
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+/**
+ * A wake, folded to one line the way a tool call is.
+ *
+ * The Host delivers these down the prompt channel, so the transcript records
+ * them as something the operator said — and a wake is a whole transcript of
+ * everything that settled, which as a chat bubble pushed the orchestrator's own
+ * reply off the screen. The row says what came back; the envelope is one click
+ * away for the reader who wants to check the orchestrator's judgement of it.
+ */
+const WakeLine = ({ block, time }: { block: TerminalBlock; time: string }) => {
+  const styles = useStyles();
+  const [expanded, setExpanded] = useState(false);
+
+  return (
+    <div>
+      <StepRow
+        icon={expanded ? <ChevronDown16Regular /> : <ChevronRight16Regular />}
+        title={block.text}
+        detail={expanded ? undefined : block.detail}
+        time={time}
+        color={blockColor.wake}
+        onClick={() => setExpanded((current) => !current)}
+        expanded={expanded}
+      />
+      {expanded ? (
+        <div className={styles.stepBody}>
+          <MarkdownBody text={block.body ?? block.detail ?? ""} muted copyable />
         </div>
       ) : null}
     </div>

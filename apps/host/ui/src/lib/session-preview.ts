@@ -37,6 +37,9 @@ export function toPreviewLines(
 function blockText(block: TerminalBlock): string {
   if (block.kind === "turn") return `turn complete (${block.text})`;
   if (block.kind === "tool" && block.status) return `${block.text} · ${block.status}`;
+  // The tile shows the summary, never the envelope: a wake carries every step's
+  // full output, which alone would fill a tile built to show twelve lines.
+  if (block.kind === "wake" && block.detail) return `${block.text} · ${block.detail}`;
   return block.text;
 }
 
