@@ -1180,14 +1180,16 @@ export class FleetTools {
     const nodeById = new Map(this.store.listNodes().map((node) => [node.id, node]));
     const steps = this.store.listRunSteps(run.id);
     const writingInFlight = new Set(
-      steps
+      sessions
         .filter(
-          (step) =>
-            !terminalRunStepStates.has(step.state) &&
-            isWritingCategory(step.category) &&
-            step.placementId,
+          (session) =>
+            session.runRole !== "lead" &&
+            !session.readOnly &&
+            session.state !== "idle" &&
+            !terminalSessionStates.has(session.state) &&
+            session.placementId,
         )
-        .map((step) => step.placementId),
+        .map((session) => session.placementId),
     );
 
     return decidePlacement({
@@ -1226,7 +1228,7 @@ export class FleetTools {
 
   /** The full transcript of one worker, for when the summary was not enough. */
   transcript(input: z.infer<typeof SessionRefSchema>): ToolResult {
-    const owned = this.ownedSession(input.sessionId);
+    const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
     if (typeof owned === "string") return refuse(owned);
     const text = this.store
       .listEvents(owned.id)
@@ -1239,22 +1241,56 @@ export class FleetTools {
   }
 
   /**
-   * Adds a turn to a worker that is still in flight.
+   * Adds another tracked turn to the same worker.
    *
-   * Only while its step is open. Once a step settles the worker is stopped and
-   * its slot released, and a prompt sent after that used to be answered with
-   * "you will be woken when it finishes" — which was untrue, because no step
-   * was tracking that turn and so nothing would ever settle or wake. Starting
-   * fresh work is the honest way to continue, and it lands on the same checkout.
+   * Settled workers normally remain idle and attached until the task is archived
+   * or deleted, so the next turn needs no reconstruction or session/load. Resume
+   * remains the recovery path for a Node restart or an explicitly stopped worker.
    */
   followUp(input: z.infer<typeof FollowUpSchema>): ToolResult {
-    const owned = this.ownedSession(input.sessionId);
+    const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
     if (typeof owned === "string") return refuse(owned);
     const step = this.stepFor(owned.id);
-    if (!step || terminalRunStepStates.has(step.state)) {
-      return refuse(
-        `That worker's step has already settled, so a follow-up would go nowhere. ` +
-          `Call fleet_start_work again — it lands on the same checkout.`,
+    if (!step) return refuse("That worker is not attached to a tracked step.");
+    if (terminalRunStepStates.has(step.state)) {
+      const run = this.store.getRun(step.runId);
+      if (!run || terminalRunStates.has(run.state) || run.state === "awaiting_human") {
+        return refuse("That worker's task is not open for more work.");
+      }
+      const placementId = step.placementId || owned.placementId;
+      const needsResume =
+        terminalSessionStates.has(owned.state) || owned.state === "offline";
+      if (owned.state !== "idle" && !needsResume) {
+        return refuse(
+          `That worker is ${owned.state}, so it cannot take a follow-up yet. Wait for it to become idle.`,
+        );
+      }
+      if (needsResume && !owned.agentSessionId) {
+        return refuse(
+          "That worker has no resumable Copilot conversation. Start replacement work and repeat the lost context explicitly.",
+        );
+      }
+
+      this.store.retryRunStepInSession(
+        run.id,
+        {
+          stepKey: step.stepKey,
+          title: step.title,
+          prompt: input.prompt,
+          category: step.category,
+          dependsOn: step.dependsOn,
+          placementId,
+          phaseIndex: run.phaseIndex,
+          position: step.position,
+        },
+        owned.id,
+        this.store.maxEventSequence(owned.id),
+      );
+      this.service.tickRun(run.id);
+      return ok(
+        needsResume
+          ? "Queued the follow-up in the same worker session. It will resume when scheduling allows, and you will be woken when it finishes."
+          : "Queued the follow-up in the same open worker session. It will start when scheduling allows, and you will be woken when it finishes.",
       );
     }
     if (owned.state !== "idle") {
@@ -1298,14 +1334,17 @@ export class FleetTools {
    * Scoped to its own tasks, so one orchestrator cannot prompt or stop
    * another's worker — or a session a human opened by hand.
    */
-  private ownedSession(sessionId: string): FleetSession | string {
+  private ownedSession(
+    sessionId: string,
+    options: { allowTerminal?: boolean } = {},
+  ): FleetSession | string {
     const session = this.store.getSession(sessionId);
     if (!session) return "No such session.";
     const mine = new Set(this.runs().map((run) => run.id));
     if (!session.runId || !mine.has(session.runId)) {
       return "That session does not belong to you.";
     }
-    if (terminalSessionStates.has(session.state)) {
+    if (!options.allowTerminal && terminalSessionStates.has(session.state)) {
       return `That worker has already ended (${session.state}).`;
     }
     return session;

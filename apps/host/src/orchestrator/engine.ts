@@ -59,8 +59,13 @@ export class OrchestratorEngine {
     if (event.type === "state") {
       const state = eventPayload(event, "state")?.state;
       if (!state) return;
-      // A new turn invalidates the previous one's completion.
-      if (state === "running") this.turnComplete.delete(event.sessionId);
+      // A new launch or turn invalidates the previous one's completion. A
+      // resumed session reaches `starting`, then `idle`, before its queued
+      // follow-up starts; clearing here prevents that idle event from settling
+      // the new attempt with the previous turn's receipt.
+      if (state === "starting" || state === "running") {
+        this.turnComplete.delete(event.sessionId);
+      }
       this.tick();
     }
   }
@@ -101,6 +106,10 @@ export class OrchestratorEngine {
     switch (action.type) {
       case "start_step":
         return this.startStep(run, action);
+      case "resume_step":
+        return this.resumeStep(run, action);
+      case "prompt_step":
+        return this.promptStep(run, action);
       case "advance_step":
         return Boolean(this.store.updateRunStep(action.stepId, { state: "running" }));
       case "settle_step":
@@ -182,6 +191,66 @@ export class OrchestratorEngine {
      */
     if (!run.placementId && isWritingCategory(step.category)) {
       this.store.updateRun(run.id, { placementId: placement.id });
+    }
+    if (run.state === "planning" || run.state === "awaiting_lead") {
+      if (canTransitionRun(run.state, "running")) {
+        this.store.setRunState(run.id, "running");
+      }
+    }
+    return true;
+  }
+
+  /** Re-attaches a settled worker; its persisted retry prompt is sent once idle. */
+  private resumeStep(
+    run: Run,
+    action: Extract<ScheduleAction, { type: "resume_step" }>,
+  ): boolean {
+    const step = this.store.getRunStep(action.stepId);
+    const session = this.store.getSession(action.sessionId);
+    if (!step || step.state !== "pending" || !session) return false;
+    if (!terminalSessionStates.has(session.state)) return false;
+    this.store.updateRunStep(step.id, { dispatchedAt: new Date().toISOString() });
+    const resumed = this.service.resumeSession(
+      session.id,
+      "Resuming for orchestrator follow-up",
+    );
+    if (resumed.ok) return true;
+
+    this.store.updateRunStep(step.id, {
+      state: "failed",
+      output: `Could not resume the same worker session: ${resumed.error}`,
+      dispatchedAt: "",
+    });
+    this.store.recordRunSettle(run.id);
+    if (run.state === "running" && canTransitionRun(run.state, "awaiting_lead")) {
+      this.store.setRunState(run.id, "awaiting_lead");
+    }
+    return true;
+  }
+
+  /** Sends the retry only after session/load has restored the same conversation. */
+  private promptStep(
+    run: Run,
+    action: Extract<ScheduleAction, { type: "prompt_step" }>,
+  ): boolean {
+    const step = this.store.getRunStep(action.stepId);
+    const session = this.store.getSession(action.sessionId);
+    if (!step || step.state !== "pending" || session?.state !== "idle") return false;
+
+    this.store.updateRunStep(step.id, {
+      state: "starting",
+      eventSeqFrom: this.store.maxEventSequence(session.id),
+      dispatchedAt: new Date().toISOString(),
+    });
+    const sent = this.service.dispatch(session.nodeId, {
+      type: "prompt",
+      sessionId: session.id,
+      prompt: action.prompt,
+      attachments: [],
+    });
+    if (!sent.sent) {
+      this.store.updateRunStep(step.id, { state: "pending", dispatchedAt: "" });
+      return true;
     }
     if (run.state === "planning" || run.state === "awaiting_lead") {
       if (canTransitionRun(run.state, "running")) {
@@ -296,10 +365,12 @@ export class OrchestratorEngine {
         category: step.category || "step",
         state: step.state,
         output: step.output,
+        sessionId: step.sessionId,
       })),
       running: running.map((step) => ({
         title: step.title,
         category: step.category || "step",
+        sessionId: step.sessionId,
       })),
     });
   }

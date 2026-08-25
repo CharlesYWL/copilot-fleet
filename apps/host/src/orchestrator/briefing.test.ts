@@ -105,6 +105,7 @@ describe("what the orchestrator is told", () => {
       const text = orchestratorBriefing("NODE-SUMMARY-HERE", { hasAgent });
       expect(text).toContain("fleet_advance_task");
       expect(text).toContain("fleet_transcript");
+      expect(text).toContain("fleet_follow_up");
       expect(text).toContain("<fleet-wake>");
       expect(text).toContain("review-quick");
       expect(text).toContain("Only one writing step runs on a checkout at a time");
@@ -118,5 +119,13 @@ describe("what the orchestrator is told", () => {
     const registered = new Set(await registeredTools());
 
     expect(toolsNamedIn(agentFile).filter((name) => !registered.has(name))).toEqual([]);
+  });
+
+  it("distinguishes a revisit from a different worker role", () => {
+    expect(agentFile).toContain("same session");
+    expect(agentFile).toContain("planning, coding, testing and review");
+    expect(agentFile).toContain("fleet_follow_up");
+    expect(agentFile).toContain("fleet_list_work");
+    expect(agentFile).toContain("stay open and idle");
   });
 });

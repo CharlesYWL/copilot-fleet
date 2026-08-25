@@ -229,8 +229,8 @@ describe("OrchestratorEngine", () => {
     engine.tickRun(run.id);
 
     expect(store.getRun(run.id)?.state).toBe("completed");
-    // Idle workers still reserve a slot on their node, so the run lets them go.
-    expect(commands("stop").length).toBeGreaterThan(0);
+    // Completed tasks keep their workers attached until archive or delete.
+    expect(commands("stop")).toHaveLength(0);
   });
 
   it("does not settle anything while the fleet is offline", () => {

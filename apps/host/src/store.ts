@@ -1527,6 +1527,30 @@ export class FleetStore {
     return this.getRunStep(id)!;
   }
 
+  /**
+   * Retries one step in the Copilot session that already knows the work.
+   *
+   * `upsertRunStep` deliberately clears the old session association. A follow-up
+   * has to restore it in the same transaction, or a Host crash between the two
+   * writes turns "reuse this worker" into an ordinary pending step that starts a
+   * different session after restart.
+   */
+  retryRunStepInSession(
+    runId: string,
+    input: RunStepInput,
+    sessionId: string,
+    eventSeqFrom: number,
+  ): RunStep {
+    return this.transaction(() => {
+      const retried = this.upsertRunStep(runId, input);
+      return this.updateRunStep(retried.id, {
+        sessionId,
+        placementId: input.placementId ?? "",
+        eventSeqFrom,
+      })!;
+    });
+  }
+
   getRunStep(id: string): RunStep | undefined {
     const row = this.statement("SELECT * FROM run_steps WHERE id=?").get(id) as
       Row | undefined;

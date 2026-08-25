@@ -130,12 +130,15 @@ function mechanics(): string[] {
     "",
     "`fleet_start_work` takes no free-text prompt. It asks for the **deliverable** that must come back, the **scope** to work in, how to **verify** it, and any **context** the worker cannot discover — and the Host writes the brief from those. A dispatch with no way to check it is refused before a machine is spent on it.",
     "",
+    "`fleet_follow_up` gives an existing worker another turn. Workers stay open and idle after settling until the task is archived or deleted, so a normal revisit continues immediately in the same live session; resume is only a recovery path after interruption. Use the session id in the wake or `fleet_list_work` when sending another round of feedback back to the same worker. Use `fleet_start_work` for a genuinely different unit or role: planning, coding, testing and review should normally have separate sessions.",
+    "",
     "The worker cannot see this conversation, the human's messages, or other workers' output. Anything decided elsewhere has to be repeated in `context` or it does not exist as far as the worker is concerned.",
     "",
     "## Categories and machines",
     "",
     "- `implement` and `test` write to files. `explore`, `review-quick` and `review-deep` only read, and do not count against the same budget.",
     "- Only one writing step runs on a checkout at a time. A review or an explore can run beside it.",
+    "- An idle worker still reserves its node slot. That is intentional: keep task sessions open for revisits, and release them by archiving or deleting the task rather than stopping each completed turn.",
     "- A review always lands on the same checkout the implementation used, so it sees the actual changes. You do not have to arrange that.",
     "- `review-deep` is for correctness and design; `review-quick` for an obvious-mistakes pass.",
     "- To work on a different repository, name its `workspace`. Say which one whenever a task is not about the repository you have been working in.",
@@ -175,7 +178,7 @@ function judgement(): string[] {
     "",
     "- Every session you start will tell you it succeeded, and most will be right. Treat the claim as something to disprove anyway: ask what observable thing would be different if it were true, and get that thing rather than the worker's description of it.",
     '- "Should pass", "looks correct" and "I\'ve implemented it" are not evidence. A green suite is supporting evidence, not proof — it says nothing broke in the way the tests already knew how to check.',
-    "- Never advance a phase because a worker claimed to be done. Advance it because you checked. When what came back does not match what you asked for, dispatch again with the specific gap named, and do not patch around it yourself.",
+    "- Never advance a phase because a worker claimed to be done. Advance it because you checked. When what came back does not match what you asked for, use `fleet_follow_up` on that worker with the specific gap named. Start replacement work only when the session cannot be resumed.",
     "",
     "## Reading your own history",
     "",
@@ -201,8 +204,14 @@ export function wakeEnvelope(input: {
   isLastPhase?: boolean;
   wakes: number;
   maxWakes: number;
-  settled: { title: string; category: string; state: string; output: string }[];
-  running: { title: string; category: string }[];
+  settled: {
+    title: string;
+    category: string;
+    state: string;
+    output: string;
+    sessionId: string;
+  }[];
+  running: { title: string; category: string; sessionId: string }[];
 }): string {
   const phase =
     input.phase && input.phaseCount
@@ -215,13 +224,15 @@ export function wakeEnvelope(input: {
     "Just finished:",
   ];
   for (const step of input.settled) {
-    lines.push(`- ${step.title} (${step.category}): ${step.state}`);
+    lines.push(
+      `- ${step.title} (${step.category}, session ${step.sessionId}): ${step.state}`,
+    );
     lines.push(`  ${step.output || "(no output)"}`);
   }
   if (input.running.length > 0) {
     lines.push("Still running:");
     for (const step of input.running) {
-      lines.push(`- ${step.title} (${step.category})`);
+      lines.push(`- ${step.title} (${step.category}, session ${step.sessionId})`);
     }
   }
   lines.push("</fleet-wake>", "");

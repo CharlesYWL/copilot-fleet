@@ -317,6 +317,68 @@ export class FleetService {
   }
 
   /**
+   * Re-attaches one finished Copilot conversation without prompting it.
+   *
+   * Kept beside creation because both paths enforce the same admission rules
+   * and assemble the same launch context. The caller may send a prompt
+   * immediately afterwards: the Node queues it behind session initialization.
+   */
+  resumeSession(
+    sessionId: string,
+    activity = "Resuming Copilot session",
+  ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
+    const session = this.store.getSession(sessionId);
+    if (!session) return { ok: false, status: 404, error: "Session not found" };
+    if (!canTransition(session.state, "starting")) {
+      return { ok: false, status: 409, error: "Session is already live" };
+    }
+    if (!session.agentSessionId) {
+      return { ok: false, status: 409, error: "Session has no resumable agent id" };
+    }
+    const placement = this.store.getPlacement(session.placementId);
+    if (!placement) {
+      return { ok: false, status: 409, error: "Placement was removed" };
+    }
+    const node = this.store.getNode(session.nodeId);
+    if (!node?.online) return { ok: false, status: 503, error: "Node is offline" };
+    const kind = session.readOnly ? "read-only" : "writing";
+    if (
+      reservedSessionCount(this.store.listSessions(), node.id, kind) >=
+      capacityFor(node, kind)
+    ) {
+      return {
+        ok: false,
+        status: 409,
+        error: `Node is at capacity for ${kind} work`,
+      };
+    }
+    const unsupported = yoloUnsupportedReason(node, session.yolo);
+    if (unsupported) return { ok: false, status: 409, error: unsupported };
+
+    const resumed = this.store.transitionSession(sessionId, "starting", activity)!;
+    this.publishSession(resumed);
+    const dispatched = this.dispatch(
+      session.nodeId,
+      {
+        type: "resume_session",
+        sessionId,
+        localPath: placement.localPath,
+        agentSessionId: session.agentSessionId,
+        sequenceOffset: this.store.maxEventSequence(sessionId),
+        yolo: session.yolo,
+        mcpServers: this.mcpServersFor(session),
+        agent: this.agentFor(session, node),
+        config: this.startupConfigFor(session),
+        readOnly: session.readOnly,
+      },
+      { state: "failed", activity: "Node disconnected before session resume" },
+    );
+    if (!dispatched.sent) return { ok: false, status: 503, error: "Node is offline" };
+
+    return { ok: true, session: resumed };
+  }
+
+  /**
    * The MCP servers a session should be given, on start and on resume alike.
    *
    * Derived from the session's role rather than stored, so there is one answer

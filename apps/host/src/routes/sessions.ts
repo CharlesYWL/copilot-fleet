@@ -9,13 +9,12 @@ import {
   ReorderSessionsSchema,
   SetSessionConfigSchema,
   base64Bytes,
-  canTransition,
   errorMessage,
   terminalSessionStates,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { conversationTitle, isUnnamed } from "../orchestrator/conversation-title.js";
-import { configUnsupportedReason, yoloUnsupportedReason } from "../session-policy.js";
+import { configUnsupportedReason } from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
 
@@ -149,39 +148,8 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
 
   app.post("/api/sessions/:id/resume", async (request, reply) => {
     const { id } = request.params as { id: string };
-    const session = store.getSession(id);
-    if (!session) return reply.code(404).send({ error: "Session not found" });
-    if (!canTransition(session.state, "starting")) {
-      return reply.code(409).send({ error: "Session is already live" });
-    }
-    if (!session.agentSessionId) {
-      return reply.code(409).send({ error: "Session has no resumable agent id" });
-    }
-    const placement = store.getPlacement(session.placementId);
-    if (!placement) return reply.code(409).send({ error: "Placement was removed" });
-    const node = store.getNode(session.nodeId);
-    const unsupported = node && yoloUnsupportedReason(node, session.yolo);
-    if (unsupported) return reply.code(409).send({ error: unsupported });
-
-    // No fallback transition: a resume that never left the Host leaves the
-    // session exactly as the operator found it, so they can retry.
-    const dispatched = service.dispatch(session.nodeId, {
-      type: "resume_session",
-      sessionId: id,
-      localPath: placement.localPath,
-      agentSessionId: session.agentSessionId,
-      sequenceOffset: store.maxEventSequence(id),
-      yolo: session.yolo,
-      // An orchestrator resumed by hand needs its tools back too.
-      mcpServers: service.mcpServersFor(session),
-      agent: node ? service.agentFor(session, node) : "",
-      config: service.startupConfigFor(session),
-      readOnly: session.readOnly,
-    });
-    if (!dispatched.sent) return reply.code(503).send({ error: "Node is offline" });
-    service.publishSession(
-      store.transitionSession(id, "starting", "Resuming Copilot session"),
-    );
+    const resumed = service.resumeSession(id);
+    if (!resumed.ok) return reply.code(resumed.status).send({ error: resumed.error });
     return reply.code(202).send({ ok: true });
   });
 

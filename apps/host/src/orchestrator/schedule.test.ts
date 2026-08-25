@@ -168,6 +168,108 @@ describe("planNextActions", () => {
     expect(actions.some((a) => a.type === "settle_step")).toBe(false);
   });
 
+  it("does not treat a resumed idle session as proof its retry prompt ran", () => {
+    const retry = step("s1", {
+      state: "starting",
+      sessionId: "sess1",
+      placementId: "p1",
+      attempts: 2,
+    });
+    const idle = world({
+      steps: [retry],
+      sessions: [session("sess1", { state: "idle" })],
+      turnCompleteSessionIds: new Set(["sess1"]),
+    });
+    expect(types(idle)).not.toContain("advance_step");
+    expect(types(idle)).not.toContain("settle_step");
+
+    const running = world({
+      steps: [retry],
+      sessions: [session("sess1", { state: "running" })],
+    });
+    expect(types(running)).toContain("advance_step");
+  });
+
+  it("queues an idle follow-up until the task has parallel capacity", () => {
+    const actions = planNextActions(
+      world({
+        run: run({ policy: RunPolicySchema.parse({ maxParallel: 1 }) }),
+        steps: [
+          step("busy", {
+            state: "running",
+            sessionId: "busy-session",
+            placementId: "p2",
+          }),
+          step("retry", {
+            state: "pending",
+            sessionId: "idle-session",
+            placementId: "p1",
+            attempts: 2,
+          }),
+        ],
+        sessions: [
+          session("busy-session", { state: "running", placementId: "p2" }),
+          session("idle-session", { state: "idle", placementId: "p1" }),
+        ],
+      }),
+    );
+
+    expect(actions.map((action) => action.type)).not.toContain("prompt_step");
+  });
+
+  it("settles a retry whose resume attempt ended instead of resuming forever", () => {
+    const actions = planNextActions(
+      world({
+        steps: [
+          step("retry", {
+            state: "pending",
+            sessionId: "sess1",
+            placementId: "p1",
+            attempts: 2,
+            dispatchedAt: "2026-08-25T10:00:00.000Z",
+          }),
+        ],
+        sessions: [
+          session("sess1", {
+            state: "failed",
+            currentActivity: "session/load failed",
+          }),
+        ],
+      }),
+    );
+
+    expect(actions).toContainEqual(
+      expect.objectContaining({
+        type: "settle_step",
+        stepId: expect.any(String),
+        state: "failed",
+        output: "session/load failed",
+      }),
+    );
+    expect(actions.map((action) => action.type)).not.toContain("resume_step");
+  });
+
+  it("does not resume a retry beside a writer started earlier in the same pass", () => {
+    const actions = planNextActions(
+      world({
+        run: run({ placementId: "p1" }),
+        steps: [
+          step("fresh", { category: "implement" }),
+          step("retry", {
+            category: "implement",
+            sessionId: "sess1",
+            placementId: "p1",
+            attempts: 2,
+          }),
+        ],
+        sessions: [session("sess1", { state: "stopped" })],
+      }),
+    );
+
+    expect(actions.map((action) => action.type)).toContain("start_step");
+    expect(actions.map((action) => action.type)).not.toContain("resume_step");
+  });
+
   it("keeps a slot of headroom so a node is never filled to its limit", () => {
     const full = world({
       steps: [step("s1")],
@@ -223,13 +325,26 @@ describe("planNextActions", () => {
     expect(started[0]).toMatchObject({ placementId: "p1" });
   });
 
-  it("stops a worker as soon as its step settles, so the slot comes back", () => {
-    /*
-     * The reported deadlock: an explore reported success, its agent stayed
-     * `idle`, and `idle` still reserves a slot. Nothing reclaimed it until the
-     * whole run ended — which for a long-lived orchestrator is never — so the
-     * node filled up with agents that had nothing left to do.
-     */
+  it("does not start a writer beside another task's writer on the checkout", () => {
+    const actions = planNextActions(
+      world({
+        run: run({ placementId: "p1" }),
+        steps: [step("next", { category: "implement" })],
+        sessions: [
+          session("other-writer", {
+            placementId: "p1",
+            state: "running",
+            readOnly: false,
+            runId: "another-run",
+          }),
+        ],
+      }),
+    );
+
+    expect(actions.map((action) => action.type)).not.toContain("start_step");
+  });
+
+  it("keeps a worker open when its step settles", () => {
     const actions = planNextActions(
       world({
         steps: [step("s1", { state: "running", sessionId: "sess1", placementId: "p1" })],
@@ -241,18 +356,10 @@ describe("planNextActions", () => {
     expect(actions).toContainEqual(
       expect.objectContaining({ type: "settle_step", state: "succeeded" }),
     );
-    expect(actions).toContainEqual(
-      expect.objectContaining({ type: "stop_session", sessionId: "sess1" }),
-    );
+    expect(actions.map((action) => action.type)).not.toContain("stop_session");
   });
 
-  it("still reclaims a worker whose step settled before anyone was looking", () => {
-    /*
-     * Reclaiming only at the moment of settling was not enough: a step that is
-     * already terminal is skipped by every later pass, so a worker stranded by
-     * a Host restart — or by a `stop` that never reached its node — held its
-     * slot forever. Asked of the state, not the transition.
-     */
+  it("keeps an already-settled worker open for a later revisit", () => {
     const actions = planNextActions(
       world({
         // A long-lived orchestrator: its run never finishes, so the cleanup
@@ -265,9 +372,7 @@ describe("planNextActions", () => {
       }),
     );
 
-    expect(actions).toContainEqual(
-      expect.objectContaining({ type: "stop_session", sessionId: "sess1" }),
-    );
+    expect(actions.map((action) => action.type)).not.toContain("stop_session");
   });
 
   it("leaves an offline worker alone, because offline is unknown", () => {
@@ -380,12 +485,12 @@ describe("planNextActions", () => {
     );
   });
 
-  it("does nothing new while a person holds the task, but still frees slots", () => {
+  it("does nothing new while a person holds the task and keeps its workers", () => {
     /*
      * A task handed over is waiting on a person, not on the fleet: dispatching
      * or waking would be the engine talking over the review it asked for. What
-     * already happened is still recorded, though — skipping that would leave a
-     * finished worker holding a slot for as long as the person took to look.
+     * already happened is still recorded, and the finished worker remains open
+     * in case the person sends the task back.
      */
     const actions = planNextActions(
       world({
@@ -401,10 +506,8 @@ describe("planNextActions", () => {
       }),
     );
 
-    expect(actions).toContainEqual(
-      expect.objectContaining({ type: "stop_session", sessionId: "sess1" }),
-    );
     const types = actions.map((action) => action.type);
+    expect(types).not.toContain("stop_session");
     expect(types).not.toContain("start_step");
     expect(types).not.toContain("wake_lead");
   });
@@ -498,7 +601,7 @@ describe("planNextActions", () => {
     expect(types(input)).toContain("deliver_prompt");
   });
 
-  it("finishes a handwritten plan and stops the sessions it still holds", () => {
+  it("finishes a handwritten plan and keeps its sessions open", () => {
     const input = world({
       run: run({ policy: RunPolicySchema.parse({ wakePolicy: "none" }) }),
       steps: [step("s1", { state: "succeeded", sessionId: "sess1" })],
@@ -506,10 +609,7 @@ describe("planNextActions", () => {
     });
     const actions = planNextActions(input);
     expect(actions.some((a) => a.type === "wake_lead")).toBe(false);
-    // An idle worker still reserves a slot on its node until it is stopped.
-    expect(actions).toContainEqual(
-      expect.objectContaining({ type: "stop_session", sessionId: "sess1" }),
-    );
+    expect(actions.map((action) => action.type)).not.toContain("stop_session");
     expect(actions).toContainEqual(
       expect.objectContaining({ type: "finish_run", state: "completed" }),
     );
@@ -556,7 +656,10 @@ describe("planNextActions", () => {
       run: run({ placementId: "p1" }),
       steps: [step("s1")],
       // n1 is nearly full and n2 is empty, but the run is already pinned to n1.
-      sessions: [session("a", { nodeId: "n1" }), session("b", { nodeId: "n1" })],
+      sessions: [
+        session("a", { nodeId: "n1", placementId: "another-checkout-a" }),
+        session("b", { nodeId: "n1", placementId: "another-checkout-b" }),
+      ],
     });
     expect(planNextActions(input).find((a) => a.type === "start_step")).toMatchObject({
       placementId: "p1",

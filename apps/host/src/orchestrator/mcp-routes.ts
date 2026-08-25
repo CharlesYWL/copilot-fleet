@@ -288,8 +288,11 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     "fleet_follow_up",
     {
       title: "Send a worker another turn",
-      description:
-        "Add a follow-up instruction to a worker that has finished its turn but is still open. Use this instead of starting a second worker for the same task.",
+      description: [
+        "Give the same worker another turn. Settled task workers normally stay open and idle, so revisits continue immediately in the same live session; interrupted sessions are resumed when possible.",
+        "Use this for another revision of the same deliverable or another round of feedback for the same coder.",
+        "Use fleet_start_work instead for a genuinely different unit or role, such as planning, coding, testing or review.",
+      ].join(" "),
       inputSchema: FollowUpSchema.shape,
     },
     guard("fleet_follow_up", FollowUpSchema, (input) => tools.followUp(input)),

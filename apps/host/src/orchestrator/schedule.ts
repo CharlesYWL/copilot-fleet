@@ -29,6 +29,10 @@ import {
  */
 export type ScheduleAction =
   | { type: "start_step"; stepId: string; placementId: string; prompt: string }
+  /** Re-attaches the session a pending retry already belongs to. */
+  | { type: "resume_step"; stepId: string; sessionId: string }
+  /** Starts the retry turn once its resumed session is idle. */
+  | { type: "prompt_step"; stepId: string; sessionId: string; prompt: string }
   /** The Node took the command: `starting` becomes `running`. */
   | { type: "advance_step"; stepId: string }
   | { type: "settle_step"; stepId: string; state: RunStepState; output: string }
@@ -93,9 +97,9 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
    * dispatched and the orchestrator is not woken, because that would be the
    * engine talking over the review it just asked for.
    *
-   * Recording what already happened still runs, though. Settling a step and
-   * reclaiming its worker are facts about the past, and skipping them would
-   * leave an agent holding a slot for as long as the person took to look.
+   * Recording what already happened still runs, though. Workers deliberately
+   * remain attached and idle until the task is archived or deleted, so a person
+   * can send it back without paying to reconstruct their context.
    */
   const heldByHuman = run.state === "awaiting_human";
 
@@ -137,7 +141,12 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
        * on every reconnect, so it survives a Host restart, while a command id
        * does not.
        */
-      if (pending && pending.state !== "queued" && pending.state !== "offline") {
+      const acknowledged =
+        pending &&
+        (step.attempts > 1
+          ? pending.state === "running"
+          : pending.state !== "queued" && pending.state !== "offline");
+      if (acknowledged) {
         settled.set(step.id, "running");
         actions.push({ type: "advance_step", stepId: step.id });
         // Falls through: a fast agent can finish before the next tick arrives.
@@ -241,38 +250,13 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
 
   const live = steps.filter((step) => !terminalRunStepStates.has(effectiveState(step)));
   const inFlight = live.filter((step) => isInFlight(effectiveState(step)));
-
-  /*
-   * A worker whose step is finished is done, and an agent sitting `idle` still
-   * reserves a slot on its node — `idle` means "waiting for another turn", not
-   * "finished". Nothing used to reclaim these until the whole run ended, which
-   * was survivable while a run was a short batch and is not survivable now that
-   * an orchestrator is long-lived: three explores in a row and the fleet is
-   * wedged, reporting a node full of agents that have nothing left to do.
-   *
-   * Asked of the state rather than of the transition, deliberately. Reclaiming
-   * only at the moment a step settled left anything that was already settled
-   * stranded forever — the step is terminal, so no later pass looks at it
-   * again. That covers the Host restarting between the settle and the stop, a
-   * `stop` that never reached its node, and steps that settled before this
-   * existed at all. Re-sending a stop to a session that is already stopping is
-   * harmless; never sending one is not.
-   *
-   * The transcript outlives the process, so stopping costs nothing a later
-   * `fleet_transcript` needs.
-   */
-  for (const step of steps) {
-    if (!terminalRunStepStates.has(effectiveState(step))) continue;
-    const session = step.sessionId ? sessionById.get(step.sessionId) : undefined;
-    if (!session || terminalSessionStates.has(session.state)) continue;
-    // Offline is unknown, not lost: the command would not reach it anyway.
-    if (session.state === "offline") continue;
-    actions.push({
-      type: "stop_session",
-      sessionId: session.id,
-      reason: "Its step has settled",
-    });
-  }
+  const activeRetries = live.filter((step) => {
+    if (effectiveState(step) !== "pending" || !step.sessionId) return false;
+    const session = sessionById.get(step.sessionId);
+    return Boolean(
+      session && session.state !== "idle" && !terminalSessionStates.has(session.state),
+    );
+  });
 
   // Dispatch before finishing, so a run with work left never looks done.
   const reservedByNode = new Map<string, number>();
@@ -286,21 +270,108 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   };
 
   const writingInFlight = new Set(
-    inFlight
-      .filter((step) => isWritingCategory(step.category) && step.placementId)
-      .map((step) => step.placementId),
+    input.sessions
+      .filter(
+        (session) =>
+          session.runRole !== "lead" &&
+          !session.readOnly &&
+          session.state !== "idle" &&
+          !terminalSessionStates.has(session.state) &&
+          session.placementId,
+      )
+      .map((session) => session.placementId),
   );
+  for (const step of [...inFlight, ...activeRetries]) {
+    if (isWritingCategory(step.category) && step.placementId) {
+      writingInFlight.add(step.placementId);
+    }
+  }
   // Any writing step, settled or not: its changes are still in that tree.
   const hasWritingStep = steps.some((step) => isWritingCategory(step.category));
   let started = 0;
-  const parallelBudget = heldByHuman ? 0 : run.policy.maxParallel - inFlight.length;
+  const parallelBudget = heldByHuman
+    ? 0
+    : run.policy.maxParallel - inFlight.length - activeRetries.length;
 
   for (const step of steps) {
-    if (started >= parallelBudget) break;
     if (effectiveState(step) !== "pending") continue;
     const unmet = step.dependsOn.some((key) => stateByKey.get(key) !== "succeeded");
     if (unmet) continue;
 
+    /*
+     * A pending step with a session id is a retry of that same Copilot
+     * conversation, not a request for another worker. Resuming and prompting
+     * are separate actions because session/load lands on idle; keeping the
+     * prompt in the step makes the hand-off durable across a Host restart.
+     */
+    if (step.sessionId) {
+      const session = sessionById.get(step.sessionId);
+      const placementId = step.placementId || session?.placementId;
+      if (!session || !placementId) continue;
+      const anotherWriter =
+        isWritingCategory(step.category) &&
+        input.sessions.some(
+          (candidate) =>
+            candidate.id !== session.id &&
+            candidate.placementId === placementId &&
+            candidate.runRole !== "lead" &&
+            !candidate.readOnly &&
+            candidate.state !== "idle" &&
+            !terminalSessionStates.has(candidate.state),
+        );
+      if (anotherWriter) continue;
+
+      if (session.state === "idle") {
+        if (started >= parallelBudget) continue;
+        if (isWritingCategory(step.category) && writingInFlight.has(placementId)) {
+          continue;
+        }
+        if (isWritingCategory(step.category)) writingInFlight.add(placementId);
+        started += 1;
+        actions.push({
+          type: "prompt_step",
+          stepId: step.id,
+          sessionId: session.id,
+          prompt: step.prompt,
+        });
+        continue;
+      }
+      if (!terminalSessionStates.has(session.state)) continue;
+      if (step.dispatchedAt) {
+        settled.set(step.id, "failed");
+        actions.push({
+          type: "settle_step",
+          stepId: step.id,
+          state: "failed",
+          output:
+            session.currentActivity ||
+            "The existing worker session ended while it was being resumed.",
+        });
+        continue;
+      }
+      if (started >= parallelBudget) continue;
+      if (isWritingCategory(step.category) && writingInFlight.has(placementId)) {
+        continue;
+      }
+
+      const placement = placementById.get(placementId);
+      const node = placement ? nodeById.get(placement.nodeId) : undefined;
+      if (!placement || !node?.online) continue;
+      const kind: SessionKind = session.readOnly ? "read-only" : "writing";
+      if (remainingCapacity(node, reservedFor(node.id, kind), kind) <= 0) continue;
+
+      reservedByNode.set(key(node.id, kind), reservedFor(node.id, kind) + 1);
+      if (isWritingCategory(step.category)) writingInFlight.add(placementId);
+      started += 1;
+      actions.push({
+        type: "resume_step",
+        stepId: step.id,
+        sessionId: session.id,
+      });
+      continue;
+    }
+
+    if (started >= parallelBudget) break;
     const placementId = choosePlacement(step, {
       run,
       placements: input.placements,
@@ -355,13 +426,6 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         ["failed", "cancelled"].includes(effectiveState(step)),
       );
       const fatal = anyFailed && run.policy.onStepFailure !== "continue";
-      for (const session of ownedLiveSessions(input)) {
-        actions.push({
-          type: "stop_session",
-          sessionId: session.id,
-          reason: "The run that owned this session finished",
-        });
-      }
       actions.push({
         type: "finish_run",
         state: fatal ? "failed" : "completed",
@@ -383,14 +447,6 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   }
 
   return actions;
-}
-
-/** Sessions this run is still holding open, which each reserve a node slot. */
-function ownedLiveSessions(input: ScheduleInput): FleetSession[] {
-  return input.sessions.filter(
-    (session) =>
-      session.runId === input.run.id && !terminalSessionStates.has(session.state),
-  );
 }
 
 /** Read-only work: it cannot disturb a checkout, so it takes no write lock. */

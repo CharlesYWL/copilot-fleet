@@ -310,20 +310,127 @@ describe("FleetTools", () => {
     expect(listed).toContain("Audit Alpha");
   });
 
-  it("refuses a follow-up to a worker whose step has settled", () => {
-    /*
-     * It used to accept one and answer "you will be woken when it finishes".
-     * Nothing was tracking that turn, so no wake could ever come.
-     */
+  it("does not start a writer beside another task's writer on the checkout", () => {
+    const first = start({ task: "First change", category: "implement" });
+    expect(first.ok).toBe(true);
+
+    const second = start({ task: "Second change", category: "implement" });
+
+    expect(second.ok).toBe(false);
+    expect(second.text).toContain("Only one writer");
+  });
+
+  it("lets a distinct writing role start beside an idle retained worker", () => {
+    start({ task: "Ship Beta", category: "implement" });
+    const run = store.listRuns().find((entry) => entry.name === "Ship Beta")!;
+    const implementation = store.listRunSteps(run.id)[0]!;
+    store.updateRunStep(implementation.id, { state: "succeeded" });
+    store.transitionSession(implementation.sessionId, "starting");
+    store.transitionSession(implementation.sessionId, "running");
+    store.transitionSession(implementation.sessionId, "idle");
+
+    const result = start({
+      task: "Ship Beta",
+      category: "test",
+      title: "test the change",
+    });
+
+    expect(result.ok, result.text).toBe(true);
+    expect(store.listRunSteps(run.id)).toHaveLength(2);
+  });
+
+  it("resumes the same worker when revisiting a settled step", () => {
     start({ task: "Explore Beta" });
     const run = store.listRuns().find((entry) => entry.name === "Explore Beta")!;
     const step = store.listRunSteps(run.id)[0]!;
     store.updateRunStep(step.id, { state: "succeeded" });
+    store.appendEvent({
+      eventId: "agent-session",
+      sessionId: step.sessionId,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "copilot-worker-1" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(step.sessionId, "stopped");
 
     const result = tools().followUp({ sessionId: step.sessionId, prompt: "one more" });
+    const retried = store.getRunStep(step.id)!;
 
-    expect(result.ok).toBe(false);
-    expect(result.text).toContain("fleet_start_work");
+    expect(result.ok, result.text).toBe(true);
+    expect(result.text).toContain("same worker session");
+    expect(retried.sessionId).toBe(step.sessionId);
+    expect(retried.attempts).toBe(2);
+    expect(retried.state).toBe("pending");
+    expect(retried.prompt).toBe("one more");
+    expect(store.getSession(step.sessionId)?.state).toBe("starting");
+
+    store.transitionSession(step.sessionId, "idle");
+    service.tickRun(run.id);
+    expect(store.getRunStep(step.id)?.state).toBe("starting");
+  });
+
+  it("revisits a settled step in the worker that stayed open", () => {
+    start({ task: "Explore Beta" });
+    const run = store.listRuns().find((entry) => entry.name === "Explore Beta")!;
+    const step = store.listRunSteps(run.id)[0]!;
+    store.updateRunStep(step.id, { state: "succeeded" });
+    store.transitionSession(step.sessionId, "starting");
+    store.transitionSession(step.sessionId, "running");
+    store.transitionSession(step.sessionId, "idle");
+
+    const result = tools().followUp({
+      sessionId: step.sessionId,
+      prompt: "check the same finding again",
+    });
+    const retried = store.getRunStep(step.id)!;
+
+    expect(result.ok, result.text).toBe(true);
+    expect(result.text).toContain("same open worker session");
+    expect(retried.attempts).toBe(2);
+    expect(retried.sessionId).toBe(step.sessionId);
+    expect(retried.state).toBe("starting");
+    expect(store.getSession(step.sessionId)?.state).toBe("idle");
+  });
+
+  it("does not resume a writer beside another writer on the same checkout", () => {
+    start({ task: "Fix Beta", category: "implement" });
+    const run = store.listRuns().find((entry) => entry.name === "Fix Beta")!;
+    const first = store.listRunSteps(run.id)[0]!;
+    store.updateRunStep(first.id, { state: "succeeded" });
+    store.appendEvent({
+      eventId: "first-agent-session",
+      sessionId: first.sessionId,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "copilot-writer-1" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(first.sessionId, "stopped");
+
+    expect(
+      start({
+        task: "Fix Beta",
+        category: "implement",
+        title: "different coding work",
+      }).ok,
+    ).toBe(true);
+
+    const second = store.listRunSteps(run.id)[1]!;
+    const result = tools().followUp({
+      sessionId: first.sessionId,
+      prompt: "revisit the first change",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.text).toContain("when scheduling allows");
+    expect(store.getRunStep(first.id)?.attempts).toBe(2);
+    expect(store.getSession(first.sessionId)?.state).toBe("stopped");
+
+    store.updateRunStep(second.id, { state: "succeeded" });
+    store.transitionSession(second.sessionId, "stopped");
+    service.tickRun(run.id);
+    expect(store.getSession(first.sessionId)?.state).toBe("starting");
   });
 
   it("will not touch a session belonging to somebody else", () => {

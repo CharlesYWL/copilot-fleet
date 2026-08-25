@@ -40,8 +40,10 @@ export function archiveRun(service: FleetService, runId: string, reason: string)
   const run = store.getRun(runId);
   if (!run) return;
 
+  // Completed tasks keep their workers open for cheap revisits, so archive must
+  // stop sessions even when the run itself is already terminal.
+  stopRunSessions(service, runId);
   if (!terminalRunStates.has(run.state)) {
-    stopRunSessions(service, runId);
     for (const step of store.listRunSteps(runId)) {
       if (["succeeded", "failed", "skipped", "cancelled"].includes(step.state)) continue;
       store.updateRunStep(step.id, { state: "cancelled" });

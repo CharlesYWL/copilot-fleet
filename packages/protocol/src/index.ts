@@ -1618,7 +1618,9 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
 };
 
 const runStepTransitions: Record<RunStepState, ReadonlySet<RunStepState>> = {
-  pending: new Set(["starting", "skipped", "cancelled"]),
+  // A pending retry can fail while re-attaching its existing session, before a
+  // prompt starts. That is a real attempt failure, not a skipped dependency.
+  pending: new Set(["starting", "failed", "skipped", "cancelled"]),
   // Back to pending when the command never left, failed when the Node was lost
   // before it answered. Both are reachable only from here, which is the point
   // of naming the window at all.
