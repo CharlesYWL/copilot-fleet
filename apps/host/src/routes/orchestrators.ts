@@ -75,21 +75,42 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
 ) => {
   const { store } = service;
 
-  /** The live orchestrators, newest first, with every task each one drives. */
-  const live = () =>
+  /**
+   * Every orchestrator conversation not explicitly dismissed, newest first.
+   *
+   * Stopped leads remain part of the conversation history so clients can offer
+   * Resume and Dismiss rather than making Stop indistinguishable from Delete.
+   */
+  const conversations = () =>
     store
       .listSessions()
-      .filter(
-        (session) =>
-          session.runRole === "lead" && !terminalSessionStates.has(session.state),
-      )
+      .filter((session) => session.runRole === "lead")
       .map((session) => ({
         session,
         runs: store.listRuns().filter((run) => run.leadSessionId === session.id),
       }));
 
+  const stopOwnedRuns = (leadSessionId: string, reason: string) => {
+    const runs = store
+      .listRuns()
+      .filter((entry) => entry.leadSessionId === leadSessionId);
+    for (const run of runs) {
+      if (terminalRunStates.has(run.state)) continue;
+      for (const worker of store.listSessions()) {
+        if (worker.runId !== run.id) continue;
+        if (terminalSessionStates.has(worker.state)) continue;
+        service.dispatch(
+          worker.nodeId,
+          { type: "stop", sessionId: worker.id },
+          { state: "stopped", activity: "Stopped with orchestrator" },
+        );
+      }
+      service.publishRun(store.setRunState(run.id, "completed", reason)!);
+    }
+  };
+
   app.get("/api/orchestrators", async () => ({
-    orchestrators: live().map(({ session, runs }) => ({
+    orchestrators: conversations().map(({ session, runs }) => ({
       session,
       // `run` is the first task, kept so an older UI still finds one.
       run: runs[0],
@@ -293,20 +314,42 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (!session || session.runRole !== "lead") {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
-    const runs = store.listRuns().filter((entry) => entry.leadSessionId === id);
-    for (const run of runs) {
-      if (terminalRunStates.has(run.state)) continue;
-      for (const worker of store.listSessions()) {
-        if (worker.runId !== run.id) continue;
-        if (terminalSessionStates.has(worker.state)) continue;
-        service.dispatch(worker.nodeId, { type: "stop", sessionId: worker.id });
-      }
-      service.publishRun(store.setRunState(run.id, "completed", "Stopped by operator")!);
+    if (terminalSessionStates.has(session.state)) {
+      return { ok: true, alreadyTerminal: true };
     }
+    stopOwnedRuns(id, "Stopped by operator");
     // Stopping the session is the revocation: its token only opens anything
     // while it is still a live orchestrator.
-    service.dispatch(session.nodeId, { type: "stop", sessionId: id });
+    service.dispatch(
+      session.nodeId,
+      { type: "stop", sessionId: id },
+      { state: "stopped", activity: "Stopped by operator" },
+    );
     engine.tick();
     return { ok: true };
+  });
+
+  /**
+   * Explicitly removes a stopped conversation.
+   *
+   * This is separate from the generic session route so a failed lead cannot
+   * leave live tasks and workers orphaned when its transcript is dismissed.
+   */
+  app.delete("/api/orchestrators/:id", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = store.getSession(id);
+    if (!session || session.runRole !== "lead") {
+      return reply.code(404).send({ error: "Orchestrator not found" });
+    }
+    if (!terminalSessionStates.has(session.state)) {
+      return reply
+        .code(409)
+        .send({ error: "Stop the orchestrator before dismissing it" });
+    }
+
+    stopOwnedRuns(id, "Conversation dismissed by operator");
+    store.deleteSession(id);
+    engine.tick();
+    return reply.code(204).send();
   });
 };

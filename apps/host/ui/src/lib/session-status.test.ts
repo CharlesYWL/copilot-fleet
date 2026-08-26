@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { FleetSession, SessionState } from "@fleet/protocol";
 import {
   RESUMABLE_ACCENT,
+  filterOrchestratorConversations,
   filterVisibleSessions,
   isDisposableSession,
   isDormantSession,
@@ -72,6 +73,26 @@ describe("isDisposableSession", () => {
     expect(isDisposableSession(spent("a"))).toBe(true);
     expect(isDisposableSession(dormant("a"))).toBe(false);
     expect(isDisposableSession(session({ id: "a", state: "running" }))).toBe(false);
+    expect(
+      isDisposableSession(session({ id: "lead", state: "stopped", runRole: "lead" })),
+    ).toBe(false);
+  });
+});
+
+describe("filterOrchestratorConversations", () => {
+  it("keeps stopped conversations until they are explicitly dismissed", () => {
+    const conversations = filterOrchestratorConversations([
+      session({ id: "mine" }),
+      session({ id: "live", runRole: "lead", state: "idle" }),
+      session({
+        id: "stopped",
+        runRole: "lead",
+        state: "stopped",
+        agentSessionId: "copilot-lead-1",
+      }),
+    ]);
+
+    expect(conversations.map((item) => item.id)).toEqual(["live", "stopped"]);
   });
 });
 

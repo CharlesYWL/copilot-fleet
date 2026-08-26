@@ -59,6 +59,30 @@ const step = (id: string, overrides: Partial<RunStep> = {}): RunStep => ({
   ...overrides,
 });
 
+const conversation = (overrides: Partial<FleetSession> = {}): FleetSession => ({
+  id: "lead",
+  workspaceId: "w1",
+  workspaceName: "repo",
+  placementId: "p1",
+  nodeId: "n1",
+  nodeName: "node",
+  state: "idle",
+  name: "Orchestrator",
+  initialPrompt: "coordinate the fleet",
+  currentActivity: "",
+  lastText: "",
+  createdAt: ISO,
+  updatedAt: ISO,
+  agentSessionId: "copilot-lead-1",
+  yolo: true,
+  commands: [],
+  configOptions: [],
+  runId: "",
+  runRole: "lead",
+  readOnly: true,
+  ...overrides,
+});
+
 /**
  * View models for the given runs, with a live session behind every dispatched
  * step.
@@ -91,6 +115,7 @@ const page = (
 ) => {
   wrap(
     <OrchestratorPage
+      conversation={conversation()}
       models={list}
       summary={{ total: list.length, running: 0, needsYou: 0, dominantStage: "planning" }}
       mode={mode}
@@ -99,6 +124,8 @@ const page = (
       onOpenLead={vi.fn()}
       onNewRun={vi.fn()}
       onStopOrchestrator={vi.fn()}
+      onResumeOrchestrator={vi.fn()}
+      onDismissOrchestrator={vi.fn()}
       {...extra}
     />,
   );
@@ -221,6 +248,7 @@ describe("orchestrator views", () => {
     const onNewRun = vi.fn();
     wrap(
       <OrchestratorPage
+        conversation={conversation()}
         models={[]}
         summary={{ total: 0, running: 0, needsYou: 0, dominantStage: undefined }}
         mode="stage"
@@ -229,11 +257,34 @@ describe("orchestrator views", () => {
         onOpenLead={vi.fn()}
         onNewRun={onNewRun}
         onStopOrchestrator={vi.fn()}
+        onResumeOrchestrator={vi.fn()}
+        onDismissOrchestrator={vi.fn()}
       />,
     );
 
     fireEvent.click(screen.getAllByRole("button", { name: "New task" })[1]!);
     expect(onNewRun).toHaveBeenCalled();
+  });
+
+  it("keeps a stopped conversation available to resume or dismiss", () => {
+    const onResumeOrchestrator = vi.fn();
+    const onDismissOrchestrator = vi.fn();
+    page("stage", vi.fn(), undefined, {
+      conversation: conversation({ state: "stopped" }),
+      onResumeOrchestrator,
+      onDismissOrchestrator,
+    });
+
+    expect(screen.queryByRole("button", { name: "Stop orchestrator" })).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "New task" }).hasAttribute("disabled"),
+    ).toBe(true);
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume orchestrator" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss orchestrator" }));
+
+    expect(onResumeOrchestrator).toHaveBeenCalled();
+    expect(onDismissOrchestrator).toHaveBeenCalled();
   });
 
   it("puts what needs a person at the top of its column", () => {

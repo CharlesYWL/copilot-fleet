@@ -201,7 +201,24 @@ export function filterVisibleSessions(
   });
 }
 
+/**
+ * Every orchestrator conversation that has not been explicitly dismissed.
+ *
+ * A stopped lead is still a resumable conversation, and even one that cannot be
+ * resumed must remain reachable long enough for the operator to dismiss it.
+ * Filtering this list to live sessions made Stop behave like Delete.
+ */
+export function filterOrchestratorConversations(
+  sessions: readonly FleetSession[],
+): FleetSession[] {
+  return sessions.filter((session) => session.runRole === "lead");
+}
+
 /** Ended with nothing left to recover: what "Clear ended" actually removes. */
 export function isDisposableSession(session: FleetSession): boolean {
-  return terminalSessionStates.has(session.state) && !isResumableSession(session);
+  return (
+    session.runRole !== "lead" &&
+    terminalSessionStates.has(session.state) &&
+    !isResumableSession(session)
+  );
 }

@@ -1,4 +1,9 @@
 import { Button, makeStyles, tokens } from "@fluentui/react-components";
+import {
+  isResumableSession,
+  terminalSessionStates,
+  type FleetSession,
+} from "@fleet/protocol";
 import type { OrchestratorViewMode } from "../navigation/ContextModeToggle";
 import type { OrchestratorSummary, RunViewModel } from "../../lib/orchestration-view";
 import { OrchestratorHeader } from "./OrchestratorHeader";
@@ -36,12 +41,14 @@ const useStyles = makeStyles({
     flexShrink: 0,
     display: "flex",
     justifyContent: "flex-end",
+    gap: "8px",
     padding: "8px 20px",
     borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
   },
 });
 
 export type OrchestratorPageProps = {
+  conversation: FleetSession;
   models: RunViewModel[];
   summary: OrchestratorSummary;
   mode: OrchestratorViewMode;
@@ -58,6 +65,8 @@ export type OrchestratorPageProps = {
   onOpenLead: () => void;
   onNewRun: () => void;
   onStopOrchestrator: () => void;
+  onResumeOrchestrator: () => void;
+  onDismissOrchestrator: () => void;
 };
 
 /**
@@ -69,6 +78,7 @@ export type OrchestratorPageProps = {
  * conversation was always the main thing even when the work was.
  */
 export const OrchestratorPage = ({
+  conversation,
   models,
   summary,
   mode,
@@ -78,20 +88,30 @@ export const OrchestratorPage = ({
   onOpenLead,
   onNewRun,
   onStopOrchestrator,
+  onResumeOrchestrator,
+  onDismissOrchestrator,
 }: OrchestratorPageProps) => {
   const styles = useStyles();
+  const ended = terminalSessionStates.has(conversation.state);
+  const resumable = isResumableSession(conversation);
 
   return (
     <section className={styles.page} aria-label="Orchestrator">
-      <OrchestratorHeader summary={summary} onNewRun={onNewRun} onOpenLead={onOpenLead} />
+      <OrchestratorHeader
+        summary={summary}
+        canCreateRun={!ended}
+        onNewRun={onNewRun}
+        onOpenLead={onOpenLead}
+      />
 
       {models.length === 0 ? (
         <div className={styles.empty}>
           <p>
-            Nothing dispatched yet. Ask the orchestrator for something in its
-            conversation, or open a task here and it will plan the phases itself.
+            {ended
+              ? "This orchestrator conversation is stopped. Resume it to continue, or dismiss it when you no longer need the transcript."
+              : "Nothing dispatched yet. Ask the orchestrator for something in its conversation, or open a task here and it will plan the phases itself."}
           </p>
-          <Button appearance="primary" onClick={onNewRun}>
+          <Button appearance="primary" disabled={ended} onClick={onNewRun}>
             New task
           </Button>
         </div>
@@ -125,9 +145,22 @@ export const OrchestratorPage = ({
       )}
 
       <div className={styles.footer}>
-        <Button size="small" appearance="subtle" onClick={onStopOrchestrator}>
-          Stop orchestrator
-        </Button>
+        {ended ? (
+          <>
+            {resumable && (
+              <Button size="small" appearance="primary" onClick={onResumeOrchestrator}>
+                Resume orchestrator
+              </Button>
+            )}
+            <Button size="small" appearance="secondary" onClick={onDismissOrchestrator}>
+              Dismiss orchestrator
+            </Button>
+          </>
+        ) : (
+          <Button size="small" appearance="subtle" onClick={onStopOrchestrator}>
+            Stop orchestrator
+          </Button>
+        )}
       </div>
     </section>
   );

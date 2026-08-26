@@ -190,10 +190,15 @@ describe("Sidebar folding", () => {
 });
 
 describe("Sidebar orchestrator row", () => {
-  const lead = (id = "lead1", name = "Orchestrator"): FleetSession => ({
+  const lead = (
+    id = "lead1",
+    name = "Orchestrator",
+    overrides: Partial<FleetSession> = {},
+  ): FleetSession => ({
     ...session(id, "w1", "n1", "idle"),
     name,
     runRole: "lead",
+    ...overrides,
   });
 
   it("puts the orchestrator above the workspaces, not inside one", () => {
@@ -248,6 +253,19 @@ describe("Sidebar orchestrator row", () => {
     fireEvent.click(screen.getByRole("button", { name: /New conversation/ }));
 
     expect(onNewConversation).toHaveBeenCalled();
+  });
+
+  it("keeps a stopped conversation in the list so it can be reopened", () => {
+    show([placement], [session("s1", "w1", "n1")], {
+      leadSessions: [
+        lead("lead1", "Rate limiting", {
+          state: "stopped",
+          agentSessionId: "copilot-lead-1",
+        }),
+      ],
+    });
+
+    expect(screen.getByRole("button", { name: /Rate limiting/ })).toBeTruthy();
   });
 
   it("keeps a long conversation name on one line", () => {

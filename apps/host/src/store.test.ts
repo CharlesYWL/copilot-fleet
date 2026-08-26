@@ -805,6 +805,25 @@ describe("FleetStore", () => {
     expect(store.listSessions()).toHaveLength(0);
   });
 
+  it("keeps stopped orchestrator conversations out of bulk cleanup", () => {
+    const { store, placement } = setup();
+    const lead = store.createSession(placement, "coordinate", false, "Orchestrator", {
+      runRole: "lead",
+      readOnly: true,
+    });
+    store.transitionSession(lead.id, "stopped", "Stopped by operator");
+
+    expect(store.deleteEndedSessions()).toBe(0);
+    expect(store.getSession(lead.id)).toMatchObject({
+      id: lead.id,
+      state: "stopped",
+      runRole: "lead",
+    });
+
+    store.deleteSession(lead.id);
+    expect(store.getSession(lead.id)).toBeUndefined();
+  });
+
   it("renames nodes and tracks the home directory reported on reconnect", () => {
     const { store, node } = setup();
     expect(node.homeDir).toBe("");

@@ -57,6 +57,7 @@ const useStyles = makeStyles({
 
 export type OrchestratorHeaderProps = {
   summary: OrchestratorSummary;
+  canCreateRun: boolean;
   onNewRun: () => void;
   onOpenLead: () => void;
 };
@@ -70,6 +71,7 @@ export type OrchestratorHeaderProps = {
  */
 export const OrchestratorHeader = ({
   summary,
+  canCreateRun,
   onNewRun,
   onOpenLead,
 }: OrchestratorHeaderProps) => {
@@ -102,7 +104,12 @@ export const OrchestratorHeader = ({
           <Button
             appearance="primary"
             icon={<Add20Regular />}
-            title="Record a task, then ask the orchestrator in its conversation to plan it."
+            title={
+              canCreateRun
+                ? "Record a task, then ask the orchestrator in its conversation to plan it."
+                : "Resume the orchestrator before starting another task."
+            }
+            disabled={!canCreateRun}
             onClick={onNewRun}
           >
             New task

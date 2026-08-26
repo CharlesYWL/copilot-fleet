@@ -1868,15 +1868,16 @@ export class FleetStore {
    * A Node reboot settles its sessions as `failed` while Copilot still holds the
    * conversation, so "ended" and "gone" are not the same thing. Clearing swept
    * both away, which meant the single visible button after a restart was the one
-   * that destroyed the transcripts the operator had just come back for. Those
-   * rows can still be removed one at a time with {@link deleteSession}, which is
-   * a deliberate act on a session someone is looking at.
+   * that destroyed the transcripts the operator had just come back for.
+   * Orchestrator conversations are also excluded: Stop deliberately parks them
+   * for Resume or an explicit Dismiss. Those rows can still be removed one at a
+   * time with {@link deleteSession}.
    *
    * Returns how many went.
    */
   deleteEndedSessions(): number {
     const list = placeholders(terminalStateList);
-    const disposable = `state IN (${list}) AND agent_session_id = ''`;
+    const disposable = `state IN (${list}) AND agent_session_id = '' AND run_role <> 'lead'`;
     return this.transaction(() => {
       this.statement(
         `DELETE FROM events WHERE session_id IN

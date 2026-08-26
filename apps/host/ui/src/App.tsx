@@ -24,7 +24,11 @@ import { useSessionChimes } from "./hooks/useSessionChimes";
 import { useStickyFlag } from "./hooks/useStickyFlag";
 import { signOut } from "./lib/auth";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
-import { isDisposableSession, filterVisibleSessions } from "./lib/session-status";
+import {
+  filterOrchestratorConversations,
+  filterVisibleSessions,
+  isDisposableSession,
+} from "./lib/session-status";
 import {
   draftFor,
   pruneDrafts,
@@ -482,40 +486,43 @@ export function App() {
    * way to start a second conversation was to stop the first.
    *
    * Read from the snapshot rather than held in state so it survives a refresh
-   * and a reconnect without a second source of truth. Only the *choice* of
-   * which is open is state, and it falls back rather than dangling when the
-   * chosen one ends.
+   * and a reconnect without a second source of truth. Stopped conversations
+   * remain here until explicitly dismissed, so Stop never acts like Delete.
+   * Only the *choice* of which is open is state.
    */
   const orchestrators = useMemo(
     () =>
-      snapshot.sessions
-        .filter(
-          (session) =>
-            session.runRole === "lead" && !terminalSessionStates.has(session.state),
-        )
-        .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
+      filterOrchestratorConversations(snapshot.sessions).sort((a, b) =>
+        b.createdAt.localeCompare(a.createdAt),
+      ),
     [snapshot.sessions],
+  );
+  const liveOrchestrators = useMemo(
+    () => orchestrators.filter((session) => !terminalSessionStates.has(session.state)),
+    [orchestrators],
   );
   const [openConversationId, setOpenConversationId] = useState<string>();
   const orchestrator = useMemo(
     () =>
       orchestrators.find((session) => session.id === openConversationId) ??
+      liveOrchestrators[0] ??
       orchestrators[0],
-    [orchestrators, openConversationId],
+    [orchestrators, liveOrchestrators, openConversationId],
   );
   /**
-   * Every task any live conversation is running, oldest first.
+   * Every task owned by a retained conversation, oldest first.
    *
    * Across all of them, not just the open one. The orchestrator page is the
    * fleet's board — its own row in the sidebar, separate from the conversation
    * rows — so it answers "what is the fleet doing", and filtering it to one
-   * conversation made work invisible the moment a second conversation existed
-   * and became the one you happened to be looking at.
+   * conversation made work invisible the moment a second conversation existed.
+   * Keeping stopped conversations here also keeps their task history reachable
+   * until the conversation itself is dismissed.
    */
   const orchestratorRuns = useMemo(() => {
-    const live = new Set(orchestrators.map((session) => session.id));
+    const retained = new Set(orchestrators.map((session) => session.id));
     return snapshot.runs
-      .filter((run) => live.has(run.leadSessionId))
+      .filter((run) => retained.has(run.leadSessionId))
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }, [snapshot.runs, orchestrators]);
   const orchestratorSteps = useMemo(
@@ -625,6 +632,32 @@ export function App() {
       method: "POST",
     });
     if (!stopped.ok) return false;
+    // Keep the conversation that was just stopped in view so its new Resume and
+    // Dismiss actions replace Stop instead of the board jumping to another lead.
+    setOpenConversationId(sessionId);
+    await refresh();
+    return true;
+  };
+
+  const handleResumeOrchestrator = async (sessionId: string) => {
+    const resumed = await request(`/api/sessions/${sessionId}/resume`, {
+      method: "POST",
+    });
+    if (!resumed.ok) return false;
+    await refresh();
+    return true;
+  };
+
+  const handleDismissOrchestrator = async (sessionId: string) => {
+    const dismissed = await request(`/api/orchestrators/${sessionId}`, {
+      method: "DELETE",
+    });
+    if (!dismissed.ok) return false;
+    if (selectedSessionId === sessionId) {
+      setSelectedSessionId(undefined);
+      setFocusOpen(false);
+    }
+    setOpenConversationId((current) => (current === sessionId ? undefined : current));
     await refresh();
     return true;
   };
@@ -677,7 +710,7 @@ export function App() {
     name: string;
     objective: string;
   }) => {
-    if (!orchestrator) return false;
+    if (!orchestrator || terminalSessionStates.has(orchestrator.state)) return false;
     const created = await request<{ run: { id: string } }>(
       `/api/orchestrators/${orchestrator.id}/runs`,
       { method: "POST", body: JSON.stringify(input) },
@@ -817,6 +850,7 @@ export function App() {
               {view === "orchestrator" &&
                 (orchestrator ? (
                   <OrchestratorPage
+                    conversation={orchestrator}
                     models={runModels}
                     summary={orchestratorSummary}
                     mode={orchestratorViewMode}
@@ -831,6 +865,12 @@ export function App() {
                     onNewRun={() => setOrchestrationDialogOpen(true)}
                     onStopOrchestrator={() =>
                       void handleStopOrchestrator(orchestrator.id)
+                    }
+                    onResumeOrchestrator={() =>
+                      void handleResumeOrchestrator(orchestrator.id)
+                    }
+                    onDismissOrchestrator={() =>
+                      void handleDismissOrchestrator(orchestrator.id)
                     }
                   />
                 ) : (
@@ -921,11 +961,19 @@ export function App() {
                           void command(`/api/sessions/${activeSession.id}/cancel`)
                         }
                         onStop={() =>
-                          void command(`/api/sessions/${activeSession.id}/stop`)
+                          void (activeSession.runRole === "lead"
+                            ? handleStopOrchestrator(activeSession.id)
+                            : command(`/api/sessions/${activeSession.id}/stop`))
                         }
-                        onDismiss={() => void handleDismissSession(activeSession.id)}
+                        onDismiss={() =>
+                          void (activeSession.runRole === "lead"
+                            ? handleDismissOrchestrator(activeSession.id)
+                            : handleDismissSession(activeSession.id))
+                        }
                         onResume={() =>
-                          void command(`/api/sessions/${activeSession.id}/resume`)
+                          void (activeSession.runRole === "lead"
+                            ? handleResumeOrchestrator(activeSession.id)
+                            : command(`/api/sessions/${activeSession.id}/resume`))
                         }
                         onRename={(name) => handleRenameSession(activeSession.id, name)}
                         onPermission={(requestId, outcome, optionId) =>
@@ -982,9 +1030,21 @@ export function App() {
               })
             }
             onCancel={() => void command(`/api/sessions/${activeSession.id}/cancel`)}
-            onStop={() => void command(`/api/sessions/${activeSession.id}/stop`)}
-            onDismiss={() => void handleDismissSession(activeSession.id)}
-            onResume={() => void command(`/api/sessions/${activeSession.id}/resume`)}
+            onStop={() =>
+              void (activeSession.runRole === "lead"
+                ? handleStopOrchestrator(activeSession.id)
+                : command(`/api/sessions/${activeSession.id}/stop`))
+            }
+            onDismiss={() =>
+              void (activeSession.runRole === "lead"
+                ? handleDismissOrchestrator(activeSession.id)
+                : handleDismissSession(activeSession.id))
+            }
+            onResume={() =>
+              void (activeSession.runRole === "lead"
+                ? handleResumeOrchestrator(activeSession.id)
+                : command(`/api/sessions/${activeSession.id}/resume`))
+            }
             onRename={(name) => handleRenameSession(activeSession.id, name)}
             onPermission={(requestId, outcome, optionId) =>
               handlePermission(activeSession.id, requestId, outcome, optionId)
