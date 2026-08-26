@@ -1,14 +1,22 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionEvent } from "@fleet/protocol";
 import {
   MockAgentFactory,
   UnpromptedTurn,
   configRecoveryRequest,
+  copilotAcpAuthVersionError,
+  copilotFailureMessage,
   copilotLaunchArgs,
   copilotSupportsContextTier,
+  copilotVersionFromOutput,
   toolDetail,
   toolProgress,
+  withCopilotStartupTimeout,
 } from "./agents.js";
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("copilotLaunchArgs", () => {
   it("starts ACP over stdio", () => {
@@ -69,6 +77,35 @@ describe("copilotSupportsContextTier", () => {
       throw new Error("ENOENT");
     };
     expect(await copilotSupportsContextTier("copilot", help)).toBe(false);
+  });
+});
+
+describe("Copilot ACP startup", () => {
+  it("reads release versions while ignoring build suffixes", () => {
+    expect(copilotVersionFromOutput("GitHub Copilot CLI 1.0.81-12.")).toBe("1.0.81");
+    expect(copilotVersionFromOutput("unexpected output")).toBeUndefined();
+  });
+
+  it("rejects the ACP build that could claim login before checking it", () => {
+    expect(copilotAcpAuthVersionError("GitHub Copilot CLI 1.0.68")).toMatch(
+      /minimum 1\.0\.69.*copilot login/,
+    );
+    expect(copilotAcpAuthVersionError("GitHub Copilot CLI 1.0.69")).toBeUndefined();
+  });
+
+  it("turns an authentication rejection into an actionable node-local fix", () => {
+    expect(copilotFailureMessage(new Error("Authentication required"))).toContain(
+      "copilot login",
+    );
+  });
+
+  it("fails a silent ACP startup instead of waiting forever", async () => {
+    vi.useFakeTimers();
+    const assertion = expect(
+      withCopilotStartupTimeout(new Promise<void>(() => {}), 1_000),
+    ).rejects.toThrow(/copilot update.*copilot login/);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await assertion;
   });
 });
 

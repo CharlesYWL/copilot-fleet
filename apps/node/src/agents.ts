@@ -30,6 +30,17 @@ export type PermissionDecision = {
 export type ContextTier = "default" | "long_context";
 
 /**
+ * The first Copilot CLI release whose ACP handshake verifies login.
+ *
+ * Older builds can accept ACP initialization while signed out, leaving the
+ * first prompt waiting forever and the Host with no command failure to show.
+ */
+export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
+
+/** Long enough for a cold ACP process, bounded so startup cannot fail silently. */
+export const ACP_START_TIMEOUT_MS = 60_000;
+
+/**
  * The permissions picker, whose value the Host already knows.
  *
  * Named here because it is the lever {@link configRecoveryRequest} pulls to get
@@ -378,6 +389,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private agentSessionId: string | undefined;
   private connection: acp.ClientConnection | undefined;
   private child: ChildProcessWithoutNullStreams | undefined;
+  private stderrTail = "";
   private prompting = false;
   private stopping = false;
   /** `session/load` replays the whole history; the host already stored it. */
@@ -469,7 +481,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       const text = chunk.trim();
-      if (text) this.emit("system", { text });
+      if (!text) return;
+      this.stderrTail = `${this.stderrTail}\n${text}`.slice(-4_000);
+      this.emit("system", { text });
     });
     child.on("error", (error) => {
       this.emit("error", { message: error.message });
@@ -767,6 +781,16 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
   }
 
+  /** Ends an incomplete startup as a failure before its process is torn down. */
+  failStartup(error: unknown): Error {
+    const failure = new Error(copilotFailureMessage(error, this.stderrTail));
+    if (!this.hasTerminated) {
+      this.emit("error", { message: failure.message });
+      this.emit("state", { state: "failed", activity: failure.message });
+    }
+    return failure;
+  }
+
   resolvePermission(requestId: string, decision: PermissionDecision): void {
     const item = this.pending.get(requestId);
     if (!item) return;
@@ -893,12 +917,14 @@ export class AcpAgentFactory implements AgentFactory {
    * binary that was asked.
    */
   private contextTierSupport: Promise<boolean> | undefined;
+  private copilotValidation: Promise<void> | undefined;
 
   /** Values are injected: settings.ts is the only place that reads the env. */
   constructor(
     private permissionTimeoutMs: number,
     private copilotCommand: string,
     private contextTier: ContextTier = "long_context",
+    private readonly startTimeoutMs = ACP_START_TIMEOUT_MS,
   ) {}
 
   /** Lets the local config UI retune the agent without a process restart. */
@@ -907,7 +933,10 @@ export class AcpAgentFactory implements AgentFactory {
     copilotCommand: string,
     contextTier: ContextTier = this.contextTier,
   ): void {
-    if (copilotCommand !== this.copilotCommand) this.contextTierSupport = undefined;
+    if (copilotCommand !== this.copilotCommand) {
+      this.contextTierSupport = undefined;
+      this.copilotValidation = undefined;
+    }
     this.permissionTimeoutMs = permissionTimeoutMs;
     this.copilotCommand = copilotCommand;
     this.contextTier = contextTier;
@@ -919,6 +948,7 @@ export class AcpAgentFactory implements AgentFactory {
     sink: EventSink,
     options: StartAgentOptions = {},
   ): Promise<SessionAgent> {
+    await this.validateCopilot();
     const agent = new AcpAgent(
       sessionId,
       sink,
@@ -932,12 +962,32 @@ export class AcpAgentFactory implements AgentFactory {
       options.config ?? [],
     );
     try {
-      await agent.start(cwd, options.resumeAgentSessionId);
+      await withCopilotStartupTimeout(
+        agent.start(cwd, options.resumeAgentSessionId),
+        this.startTimeoutMs,
+      );
       return agent;
     } catch (error) {
+      const failure = agent.failStartup(error);
       await agent.stop();
-      throw error;
+      throw failure;
     }
+  }
+
+  private validateCopilot(): Promise<void> {
+    const command = this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot";
+    this.copilotValidation ??= copilotOutput(command, ["--version"])
+      .then((output) => {
+        const failure = copilotAcpAuthVersionError(output);
+        if (failure) throw new Error(failure);
+      })
+      .catch((error) => {
+        // An operator can update or repair Copilot without restarting the Node.
+        // A failed probe must therefore be retried by the next session.
+        this.copilotValidation = undefined;
+        throw error;
+      });
+    return this.copilotValidation;
   }
 
   private acceptsContextTier(): Promise<boolean> {
@@ -1201,12 +1251,84 @@ export async function copilotSupportsContextTier(
   }
 }
 
+export function copilotVersionFromOutput(output: string): string | undefined {
+  const match = output.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?\b/);
+  return match ? `${match[1]}.${match[2]}.${match[3]}` : undefined;
+}
+
+export function copilotAcpAuthVersionError(output: string): string | undefined {
+  const version = copilotVersionFromOutput(output);
+  if (!version || compareVersions(version, MIN_COPILOT_ACP_AUTH_VERSION) >= 0) {
+    return undefined;
+  }
+  return (
+    `Copilot CLI ${version} is too old for reliable ACP authentication. ` +
+    `Run \`copilot update\` on this node (minimum ${MIN_COPILOT_ACP_AUTH_VERSION}), ` +
+    "then run `copilot login` and retry."
+  );
+}
+
+function compareVersions(left: string, right: string): number {
+  const a = left.split(".").map(Number);
+  const b = right.split(".").map(Number);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = (a[index] ?? 0) - (b[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
+export function copilotFailureMessage(error: unknown, stderr = ""): string {
+  const primary = errorMessage(error, "Copilot ACP failed to start");
+  const detail = stderr
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1);
+  const message = detail && !primary.includes(detail) ? `${primary}: ${detail}` : primary;
+  if (
+    /\b(?:not (?:logged|signed) in|login required|authentication (?:required|failed)|unauthenticated|unauthorized)\b/i.test(
+      message,
+    ) &&
+    !message.includes("copilot login")
+  ) {
+    return `${message}. Run \`copilot login\` on this node, then retry.`;
+  }
+  return message;
+}
+
+export function withCopilotStartupTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs = ACP_START_TIMEOUT_MS,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(
+        new Error(
+          `Copilot ACP did not become ready within ${Math.round(timeoutMs / 1000)}s. ` +
+            "Run `copilot update` and `copilot login` on this node, then retry.",
+        ),
+      );
+    }, timeoutMs);
+    timer.unref();
+  });
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
 /** `copilot --help`, or a rejection if it cannot be run at all. */
 function copilotHelp(command: string): Promise<string> {
+  return copilotOutput(command, ["--help"]);
+}
+
+/** Captures one short Copilot metadata command without leaving a hung child. */
+function copilotOutput(command: string, args: string[]): Promise<string> {
   return new Promise((done, fail) => {
     const viaShell = process.platform === "win32";
     const executable = viaShell && command.includes(" ") ? `"${command}"` : command;
-    const child = spawn(executable, ["--help"], {
+    const child = spawn(executable, args, {
       shell: viaShell,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
@@ -1220,7 +1342,7 @@ function copilotHelp(command: string): Promise<string> {
     // session waiting behind it should not be held up over an optional flag.
     setTimeout(() => {
       child.kill();
-      fail(new Error("copilot --help timed out"));
+      fail(new Error(`copilot ${args.join(" ")} timed out`));
     }, 15_000).unref();
   });
 }

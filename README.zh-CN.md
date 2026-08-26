@@ -25,7 +25,7 @@ Copilot Fleet 是一个自托管的控制平面，用于在多台机器上运行
 ## 环境要求
 
 - Node.js 22.5 或更高版本，npm 10 或更高版本
-- 每台真实 Node 上都已安装并登录 GitHub Copilot CLI
+- 每台真实 Node 上都已安装并登录 GitHub Copilot CLI 1.0.69 或更高版本
 - 每个工作区放置（placement）都需要一个绝对本地路径
 
 ## Mac/Linux 上的 Host
@@ -93,8 +93,10 @@ npm start
 
 ## Windows 上的 Node（PowerShell）
 
-请先安装 Node.js 并登录 Copilot CLI。在一个已检出的 Fleet 目录中执行（或者直接粘贴
-Host 的 Nodes → Connect 卡片里给出的命令）：
+请先安装 Node.js，然后以实际运行 Node 的同一个系统用户执行 `copilot update` 和
+`copilot login`。最低版本是 Copilot CLI 1.0.69；更早的 ACP 版本可能在未登录时仍报告
+认证成功，导致 Host 上的会话一直等待却没有失败信息。在一个已检出的 Fleet 目录中执行
+（或者直接粘贴 Host 的 Nodes → Connect 卡片里给出的命令）：
 
 ![Settings → Nodes：新机器的注册命令，以及两台已注册节点的容量、平台、提交号和最后在线时间。](docs/screenshots/nodes.png)
 

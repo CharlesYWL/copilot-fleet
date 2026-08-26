@@ -29,7 +29,7 @@ pickers along the bottom.
 ## Requirements
 
 - Node.js 22.5 or newer and npm 10 or newer
-- GitHub Copilot CLI installed and authenticated on each real Node
+- GitHub Copilot CLI 1.0.69 or newer installed and authenticated on each real Node
 - An absolute local path for every workspace placement
 
 ## Mac/Linux Host
@@ -119,8 +119,11 @@ Fastify serves the built UI.
 
 ## Windows Node (PowerShell)
 
-Install Node.js and authenticate Copilot CLI first. From a checked-out Fleet
-directory (or paste the command from the Host's Nodes → Connect card):
+Install Node.js, then run `copilot update` and `copilot login` as the same OS
+user that will run the Node. Copilot CLI 1.0.69 is the minimum because older ACP
+builds can report authentication success while signed out, leaving a Host
+session waiting with no failure to display. From a checked-out Fleet directory
+(or paste the command from the Host's Nodes → Connect card):
 
 ![Settings → Nodes: the connect command for a new machine, and the two enrolled nodes with their capacity, platform, commit and last-seen time.](docs/screenshots/nodes.png)
 
