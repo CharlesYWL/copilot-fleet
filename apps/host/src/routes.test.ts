@@ -608,12 +608,11 @@ describe("run routes", () => {
     expect(missing.statusCode).toBe(404);
   });
 
-  it("archives a task: the record stays, the sessions go", async () => {
+  it("archives a task: the record stays and the work ends", async () => {
     /*
-     * The two halves people expect from different words. Deleting would take
-     * what the task learned with it; cancelling alone leaves its workers in the
-     * tree with nothing to do. Archiving ends the work and clears the machinery
-     * while keeping the account of it.
+     * Deleting would take what the task learned with it; cancelling alone leaves
+     * it active. Archiving ends the work while keeping the account of it and any
+     * worker conversations that can be resumed after a reopen.
      */
     const { workspaceId } = await workspaceWithPlacement();
     const run = await createRun(workspaceId);
@@ -632,13 +631,6 @@ describe("run routes", () => {
     expect(body.run.state).toBe("cancelled");
     // The plan is the record; losing it would make archiving a delete.
     expect(body.steps).toHaveLength(1);
-
-    const snapshot = (await inject({ method: "GET", url: "/api/snapshot" })).json() as {
-      sessions: { runId: string }[];
-    };
-    expect(snapshot.sessions.filter((session) => session.runId === run.id)).toHaveLength(
-      0,
-    );
   });
 
   it("archives an already finished task, which is when it matters most", async () => {

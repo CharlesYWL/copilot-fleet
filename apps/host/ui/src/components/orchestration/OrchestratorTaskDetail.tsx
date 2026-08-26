@@ -513,17 +513,17 @@ export const OrchestratorTaskDetail = ({
             <DialogTitle>Archive “{run.name}”?</DialogTitle>
             {/*
               Says exactly what happens, because the difference between this and
-              deleting is the whole reason it is safe: what the task learned
-              stays, and only the machinery goes away.
+              deleting is the whole reason it is safe: what the task and its
+              workers learned stays, while the machinery releases its slots.
             */}
             <DialogContent>
               <p>
                 Any worker still running for this task is stopped, and its sessions are
-                removed from the fleet.
+                parked outside the active fleet.
               </p>
               <p>
                 The task keeps its phases, its steps, its notes and everything they
-                produced. Nothing further will be dispatched, and it cannot be resumed.
+                produced. Reopen the task to resume one of its worker conversations.
               </p>
             </DialogContent>
             <DialogActions>

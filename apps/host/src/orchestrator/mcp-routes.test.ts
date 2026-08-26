@@ -348,7 +348,9 @@ describe("orchestrator tools over the wire", () => {
     expect(result.refused).toBe(false);
     expect(task()!.state).toBe("cancelled");
     expect(store.listRunSteps(task()!.id)).toHaveLength(1);
-    expect(store.listSessions().some((s) => s.runId === task()!.id)).toBe(false);
+    expect(store.listSessions().find((s) => s.runId === task()!.id)?.state).toBe(
+      "stopped",
+    );
   });
 
   it("refuses a closing with no reason, before anything is stopped", async () => {

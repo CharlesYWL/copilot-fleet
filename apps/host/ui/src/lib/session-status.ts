@@ -169,6 +169,8 @@ export function sessionAccent(session: FleetSession): string {
  *
  * Anything live, anything still resumable, and whatever is selected — so a
  * session that ends while being watched does not yank its own transcript away.
+ * Workers parked with an ended task are the exception: they stay out of the
+ * fleet list unless the operator deliberately opened one from the task view.
  *
  * The orchestrator is excluded unless it was opened deliberately: it is the
  * fleet's own surface, and it has a view of its own. Its workers are shown,
@@ -180,14 +182,23 @@ export function sessionAccent(session: FleetSession): string {
 export function filterVisibleSessions(
   sessions: FleetSession[],
   selectedSessionId: string | undefined,
+  terminalRunIds: ReadonlySet<string> = new Set(),
+  showSelectedParkedSession = false,
 ): FleetSession[] {
-  return sessions.filter(
-    (session) =>
-      (session.runRole !== "lead" || session.id === selectedSessionId) &&
-      (!terminalSessionStates.has(session.state) ||
-        isResumableSession(session) ||
-        session.id === selectedSessionId),
-  );
+  return sessions.filter((session) => {
+    const selected = session.id === selectedSessionId;
+    const parkedWithTask =
+      Boolean(session.runId) &&
+      terminalRunIds.has(session.runId) &&
+      terminalSessionStates.has(session.state);
+    if (parkedWithTask && !(selected && showSelectedParkedSession)) return false;
+    return (
+      (session.runRole !== "lead" || selected) &&
+      (selected ||
+        !terminalSessionStates.has(session.state) ||
+        isResumableSession(session))
+    );
+  });
 }
 
 /** Ended with nothing left to recover: what "Clear ended" actually removes. */

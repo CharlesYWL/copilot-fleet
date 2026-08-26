@@ -127,5 +127,7 @@ describe("what the orchestrator is told", () => {
     expect(agentFile).toContain("fleet_follow_up");
     expect(agentFile).toContain("fleet_list_work");
     expect(agentFile).toContain("stay open and idle");
+    expect(agentFile).toContain("Archiving stops them");
+    expect(agentFile).toContain("after reopening");
   });
 });

@@ -928,8 +928,8 @@ export class FleetTools {
         ...(live > 0
           ? [`  ${live} step(s) were still running and have been stopped.`]
           : []),
-        "Its phases, steps and notes are kept; its workers are gone. Nothing more to do",
-        "here; end your turn.",
+        "Its phases, steps, notes and worker conversations are kept. Reopen the task",
+        "before sending any of those workers more work. Nothing more to do here; end your turn.",
       ].join("\n"),
     );
   }
@@ -1244,8 +1244,9 @@ export class FleetTools {
    * Adds another tracked turn to the same worker.
    *
    * Settled workers normally remain idle and attached until the task is archived
-   * or deleted, so the next turn needs no reconstruction or session/load. Resume
-   * remains the recovery path for a Node restart or an explicitly stopped worker.
+   * or deleted, so the next turn needs no reconstruction or session/load. An
+   * archived worker is stopped but retained, and uses the same resume path as a
+   * Node restart or an explicitly stopped worker after its task is reopened.
    */
   followUp(input: z.infer<typeof FollowUpSchema>): ToolResult {
     const owned = this.ownedSession(input.sessionId, { allowTerminal: true });

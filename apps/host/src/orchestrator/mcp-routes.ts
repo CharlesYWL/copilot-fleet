@@ -226,7 +226,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       description: [
         "For when a task stops being worth doing: the request was withdrawn, another task covers it, or what it was for no longer exists.",
         "This is not escalating — nobody has to decide anything, so do not send it to a person just to have it stopped.",
-        "Any worker still running is stopped and its session removed; the task keeps its phases, steps and notes, and cannot be resumed except by fleet_reopen_task.",
+        "Any worker still running is stopped; the task keeps its phases, steps, notes and worker conversations, which can continue only after fleet_reopen_task.",
         "Refused while a person holds it for review. End your turn after calling it.",
       ].join(" "),
       inputSchema: CloseTaskSchema.shape,

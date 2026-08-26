@@ -106,11 +106,12 @@ revision. A planner, coder and reviewer should normally be separate sessions,
 while a coder fixing successive rounds of review feedback should normally be
 the same session.
 
-Worker sessions stay open and idle after their step settles. Keep them that way
-until the task is archived or deleted: the reserved slot is intentional, because
-it preserves the worker's full live context for a revisit. Do not call
-`fleet_stop_work` merely because a turn finished. A task reopened after approval
-should continue through these same sessions whenever the role still matches.
+Worker sessions stay open and idle after their step settles. Keep them that way:
+the reserved slot is intentional, because it preserves the worker's full live
+context for a revisit. Archiving stops them and releases the slots but keeps the
+conversations; after reopening, continue through those same sessions whenever
+the role still matches. Deleting the task removes them. Do not call
+`fleet_stop_work` merely because a turn finished.
 
 Match the size of the session to the size of the work. A rename does not need a
 deep reviewer; a migration does not go to a quick one.

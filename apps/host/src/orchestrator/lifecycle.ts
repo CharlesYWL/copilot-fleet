@@ -24,16 +24,15 @@ export function stopRunSessions(service: FleetService, runId: string): void {
 }
 
 /**
- * Ends a task and clears away the sessions it started.
+ * Ends a task and parks the sessions it started.
  *
- * Distinct from cancelling, which stops the work and leaves everything where it
- * is. Archiving is what is done when nobody is going to look again: the record
- * — the task, its phases, its steps and the notes and output it collected —
- * stays, and the worker sessions stop cluttering the tree.
+ * Distinct from cancelling, which stops the work and leaves the task active.
+ * Archiving stops every worker and hides it with the ended task, but preserves
+ * its Copilot session id and event log so reopening can continue the same
+ * conversation instead of reconstructing its context in a replacement.
  *
- * Deliberately not a delete. What a task learned is often the only thing worth
- * keeping from work that did not pan out, and it lives on the run rather than
- * in the sessions.
+ * Deliberately not a delete. What a task learned can live in both the run record
+ * and a worker conversation; purging the task is the operation that removes both.
  */
 export function archiveRun(service: FleetService, runId: string, reason: string): void {
   const { store } = service;
@@ -54,22 +53,15 @@ export function archiveRun(service: FleetService, runId: string, reason: string)
   }
 
   /*
-   * Settled here rather than waited for. `stop` has gone to the Node and its
-   * own terminal event will follow, but whoever archived a task should not
-   * watch its sessions linger while that arrives — and a Node that is offline
-   * would never send it at all.
+   * Settled here rather than waited for. `stop` has gone to the Node and its own
+   * terminal event will follow, but the stopped row is intentionally retained:
+   * it releases capacity while keeping the agent id and transcript available to
+   * `fleet_follow_up` after the task is reopened.
    */
   for (const session of store.listSessions()) {
     if (session.runId !== runId) continue;
     if (!terminalSessionStates.has(session.state)) {
       service.publishSession(store.transitionSession(session.id, "stopped", reason));
-    }
-    try {
-      store.deleteSession(session.id);
-    } catch {
-      // One session that will not go is not a reason to leave the rest, and
-      // the task is archived either way.
-      continue;
     }
   }
   service.broadcast({ type: "snapshot", data: service.snapshot() });
@@ -91,12 +83,10 @@ export function purgeRun(service: FleetService, runId: string): boolean {
   stopRunSessions(service, runId);
   for (const session of store.listSessions()) {
     if (session.runId !== runId) continue;
-    try {
-      store.deleteSession(session.id);
-    } catch {
-      // One session that will not go is not a reason to keep the task.
-      continue;
+    if (!terminalSessionStates.has(session.state)) {
+      store.transitionSession(session.id, "stopped", "Task deleted");
     }
+    store.deleteSession(session.id);
   }
   store.deleteRun(runId);
   service.broadcast({ type: "snapshot", data: service.snapshot() });

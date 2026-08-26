@@ -451,16 +451,18 @@ describe("task detail", () => {
   it("says what archiving does before doing it", async () => {
     /*
      * The difference between this and deleting is the whole reason it is safe,
-     * so the confirmation has to say both halves: the sessions go, the record
-     * stays.
+     * so the confirmation has to say both halves: the workers stop, and their
+     * resumable context stays with the record.
      */
     const props = detail();
     fireEvent.click(screen.getByRole("button", { name: "Archive" }));
 
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/removed from the fleet/)).toBeTruthy();
+    expect(within(dialog).getByText(/parked outside the active fleet/)).toBeTruthy();
     expect(within(dialog).getByText(/keeps its phases/)).toBeTruthy();
-    expect(within(dialog).getByText(/cannot be resumed/)).toBeTruthy();
+    expect(
+      within(dialog).getByText(/resume one of its worker conversations/),
+    ).toBeTruthy();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive task" }));
     expect(props.onArchive).toHaveBeenCalled();

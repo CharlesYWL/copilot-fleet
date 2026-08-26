@@ -932,12 +932,20 @@ describe("FleetTools task lifecycle", () => {
       expect(notes.at(-1)).toContain("the feature is being cut");
     });
 
-    it("stops the workers it still had, and says how many", () => {
+    it("stops the workers it still had, retains them, and says how many", () => {
       plan();
       dispatch();
       const live = store.listRunSteps(task().id);
       expect(live).toHaveLength(1);
-      expect(store.listSessions().some((s) => s.runId === task().id)).toBe(true);
+      const session = store.getSession(live[0]!.sessionId)!;
+      store.appendEvent({
+        eventId: "agent-session",
+        sessionId: session.id,
+        sequence: 1,
+        type: "agent_session",
+        payload: { agentSessionId: "copilot-worker-1" },
+        createdAt: new Date().toISOString(),
+      });
 
       const out = tools().closeTask({
         task: "Ship it",
@@ -946,9 +954,55 @@ describe("FleetTools task lifecycle", () => {
 
       expect(out.ok).toBe(true);
       expect(out.text).toContain("1 step(s) were still running");
-      // Both halves of archiving: the step is settled and the session is gone.
+      expect(out.text).toContain("worker conversations are kept");
       expect(store.getRunStep(live[0]!.id)!.state).toBe("cancelled");
-      expect(store.listSessions().some((s) => s.runId === task().id)).toBe(false);
+      expect(store.getSession(session.id)).toMatchObject({
+        state: "stopped",
+        agentSessionId: "copilot-worker-1",
+      });
+      expect(store.listEvents(session.id)).toHaveLength(1);
+    });
+
+    it("reopens a closed task and resumes its original worker conversation", () => {
+      plan();
+      dispatch();
+      const step = store.listRunSteps(task().id)[0]!;
+      store.appendEvent({
+        eventId: "agent-session",
+        sessionId: step.sessionId,
+        sequence: 1,
+        type: "agent_session",
+        payload: { agentSessionId: "copilot-worker-1" },
+        createdAt: new Date().toISOString(),
+      });
+      tools().closeTask({
+        task: "Ship it",
+        reason:
+          "The request looked obsolete, but the reviewer confirmed it still matters.",
+      });
+
+      expect(
+        tools().reopenTask({
+          task: "Ship it",
+          reason: "Apply the review feedback in the same implementation context.",
+        }).ok,
+      ).toBe(true);
+      const result = tools().followUp({
+        sessionId: step.sessionId,
+        prompt: "Apply the review comment and rerun the focused test.",
+      });
+
+      expect(result.ok, result.text).toBe(true);
+      expect(result.text).toContain("same worker session");
+      expect(store.getRunStep(step.id)).toMatchObject({
+        attempts: 2,
+        sessionId: step.sessionId,
+        state: "pending",
+      });
+      expect(store.getSession(step.sessionId)).toMatchObject({
+        state: "starting",
+        agentSessionId: "copilot-worker-1",
+      });
     });
 
     it("will not take a task back from the person by closing it", () => {

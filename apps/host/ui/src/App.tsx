@@ -11,6 +11,7 @@ import {
   useToastController,
 } from "@fluentui/react-components";
 import {
+  terminalRunStates,
   terminalSessionStates,
   type FleetSession,
   type RunNote,
@@ -254,9 +255,24 @@ export function App() {
       .catch(() => undefined);
   }, [dialogOpen]);
 
+  const terminalRunIds = useMemo(
+    () =>
+      new Set(
+        snapshot.runs
+          .filter((run) => terminalRunStates.has(run.state))
+          .map((run) => run.id),
+      ),
+    [snapshot.runs],
+  );
   const visibleSessions = useMemo(
-    () => filterVisibleSessions(snapshot.sessions, selectedSessionId),
-    [snapshot.sessions, selectedSessionId],
+    () =>
+      filterVisibleSessions(
+        snapshot.sessions,
+        selectedSessionId,
+        terminalRunIds,
+        Boolean(returnContext),
+      ),
+    [snapshot.sessions, selectedSessionId, terminalRunIds, returnContext],
   );
   const liveSessions = useMemo(
     () =>

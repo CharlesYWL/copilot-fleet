@@ -98,8 +98,9 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
    * engine talking over the review it just asked for.
    *
    * Recording what already happened still runs, though. Workers deliberately
-   * remain attached and idle until the task is archived or deleted, so a person
-   * can send it back without paying to reconstruct their context.
+   * remain attached and idle until the task is archived, so a person can send it
+   * back without paying to reconstruct their context. Archive stops but retains
+   * them for the same reason if the task is reopened later.
    */
   const heldByHuman = run.state === "awaiting_human";
 

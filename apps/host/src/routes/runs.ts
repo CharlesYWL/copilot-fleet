@@ -173,7 +173,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
   });
 
   /**
-   * Ends a task and clears away the sessions it started.
+   * Ends a task and parks the sessions it started.
    *
    * The mechanics are in `orchestrator/lifecycle`, shared with the tool the
    * orchestrator closes its own tasks through. What is decided here is only the

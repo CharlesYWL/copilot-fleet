@@ -120,6 +120,22 @@ describe("run-owned sessions in the session list", () => {
       "worker",
     ]);
   });
+
+  it("hides a stopped worker parked with an ended task", () => {
+    const worker = session({
+      id: "worker",
+      runId: "r1",
+      runRole: "worker",
+      state: "stopped",
+      agentSessionId: "copilot-worker-1",
+    });
+
+    expect(filterVisibleSessions([worker], undefined, new Set(["r1"]))).toEqual([]);
+    expect(filterVisibleSessions([worker], "worker", new Set(["r1"]))).toEqual([]);
+    expect(
+      filterVisibleSessions([worker], "worker", new Set(["r1"]), true).map((s) => s.id),
+    ).toEqual(["worker"]);
+  });
 });
 
 describe("sessionStatusDescriptor", () => {
