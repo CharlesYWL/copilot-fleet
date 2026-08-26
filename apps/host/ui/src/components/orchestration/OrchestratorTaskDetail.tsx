@@ -307,7 +307,7 @@ export const OrchestratorTaskDetail = ({
           <Text as="h1" className={styles.title}>
             {run.name}
           </Text>
-          <RunStatusIndicator model={model} />
+          <RunStatusIndicator model={model} dismissible />
           <div className={styles.actions}>
             <Button appearance="subtle" icon={<Chat20Regular />} onClick={onOpenLead}>
               Conversation

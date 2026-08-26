@@ -441,6 +441,73 @@ describe("task detail", () => {
     expect(props.onOpenLead).toHaveBeenCalled();
   });
 
+  it("dismisses a failed-step warning until another step fails", () => {
+    const runId = "dismiss-failure";
+    localStorage.removeItem(`fleet.ui.run.failed-step.${runId}`);
+    const firstFailure = step("failed-1", {
+      runId,
+      state: "failed",
+      updatedAt: "2026-01-01T12:01:00.000Z",
+    });
+    const resolvedLater = step("failed-2", {
+      runId,
+      state: "failed",
+      updatedAt: "2026-01-01T12:02:00.000Z",
+    });
+    const firstModel = models([run({ id: runId })], {
+      [runId]: [firstFailure, resolvedLater],
+    })[0]!;
+    const props = {
+      model: firstModel,
+      notes: [],
+      sessions: [],
+      onBack: vi.fn(),
+      onOpenLead: vi.fn(),
+      onOpenWorker: vi.fn(),
+      onReview: vi.fn().mockResolvedValue(true),
+      onArchive: vi.fn().mockResolvedValue(true),
+      onReopen: vi.fn().mockResolvedValue(true),
+      onDelete: vi.fn().mockResolvedValue(true),
+    };
+
+    const firstView = wrap(<OrchestratorTaskDetail {...props} />);
+    expect(screen.getByText("A step failed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss failed step warning" }));
+    expect(screen.queryByText("A step failed")).toBeNull();
+
+    firstView.unmount();
+    const reopenedView = wrap(<OrchestratorTaskDetail {...props} />);
+    expect(screen.queryByText("A step failed")).toBeNull();
+
+    const fewerFailures = models([run({ id: runId })], {
+      [runId]: [firstFailure],
+    })[0]!;
+    reopenedView.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <OrchestratorTaskDetail {...props} model={fewerFailures} />
+      </FluentProvider>,
+    );
+    expect(screen.queryByText("A step failed")).toBeNull();
+
+    const nextModel = models([run({ id: runId })], {
+      [runId]: [
+        firstFailure,
+        step("failed-3", {
+          runId,
+          state: "failed",
+          updatedAt: "2026-01-01T12:03:00.000Z",
+        }),
+      ],
+    })[0]!;
+    reopenedView.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <OrchestratorTaskDetail {...props} model={nextModel} />
+      </FluentProvider>,
+    );
+
+    expect(screen.getByText("A step failed")).toBeTruthy();
+  });
+
   it("opens a worker's transcript from its step", () => {
     const props = detail();
     fireEvent.click(screen.getByRole("button", { name: /Do the thing/ }));
