@@ -508,6 +508,7 @@ describe("task detail", () => {
     const firstModel = models([run({ id: runId })], {
       [runId]: [firstFailure, resolvedLater],
     })[0]!;
+    const onDismissFailure = vi.fn();
     const props = {
       model: firstModel,
       notes: [],
@@ -519,12 +520,14 @@ describe("task detail", () => {
       onArchive: vi.fn().mockResolvedValue(true),
       onReopen: vi.fn().mockResolvedValue(true),
       onDelete: vi.fn().mockResolvedValue(true),
+      onDismissFailure,
     };
 
     const firstView = wrap(<OrchestratorTaskDetail {...props} />);
     expect(screen.getByText("A step failed")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Dismiss failed step warning" }));
     expect(screen.queryByText("A step failed")).toBeNull();
+    expect(onDismissFailure).toHaveBeenCalledOnce();
 
     firstView.unmount();
     const reopenedView = wrap(<OrchestratorTaskDetail {...props} />);

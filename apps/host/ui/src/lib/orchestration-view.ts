@@ -75,9 +75,19 @@ export type BuildRunViewModelsInput = {
   placements?: readonly Placement[];
   /** Pending permission events, already filtered by the caller. */
   waitingPermissions?: readonly SessionEvent[];
+  /** Failed step attempts the operator has already acknowledged, keyed by run. */
+  acknowledgedFailedSteps?: Readonly<Record<string, readonly string[]>>;
 };
 
 const isLive = (step: RunStep) => step.state === "running" || step.state === "starting";
+
+export const failedStepTokens = (steps: readonly RunStep[]): string[] =>
+  steps
+    .filter((step) => step.state === "failed" || step.state === "cancelled")
+    // A retry increments attempts. updatedAt is deliberately excluded because
+    // bookkeeping edits to an already-failed step are not a new failure.
+    .map((step) => JSON.stringify([step.id, step.attempts]))
+    .sort();
 
 /**
  * Everything the orchestrator views need, computed once.
@@ -110,8 +120,9 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
       const blocked = steps.find(
         (step) => step.sessionId && blockedSessions.has(step.sessionId),
       );
-      const failed = steps.some(
-        (step) => step.state === "failed" || step.state === "cancelled",
+      const acknowledgedFailures = new Set(input.acknowledgedFailedSteps?.[run.id] ?? []);
+      const failed = failedStepTokens(steps).some(
+        (token) => !acknowledgedFailures.has(token),
       );
       const offline = steps.some((step) => {
         if (terminalRunStepStates.has(step.state)) return false;

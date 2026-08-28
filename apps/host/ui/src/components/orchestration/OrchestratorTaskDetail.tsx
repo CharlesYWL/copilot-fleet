@@ -242,6 +242,7 @@ export type OrchestratorTaskDetailProps = {
   onReopen: (note: string) => Promise<boolean>;
   /** Removes a finished task and the sessions it started. */
   onDelete: () => Promise<boolean>;
+  onDismissFailure?: () => void;
 };
 
 /**
@@ -263,6 +264,7 @@ export const OrchestratorTaskDetail = ({
   onArchive,
   onReopen,
   onDelete,
+  onDismissFailure,
 }: OrchestratorTaskDetailProps) => {
   const styles = useStyles();
   const [archiveOpen, setArchiveOpen] = useState(false);
@@ -307,7 +309,11 @@ export const OrchestratorTaskDetail = ({
           <Text as="h1" className={styles.title}>
             {run.name}
           </Text>
-          <RunStatusIndicator model={model} dismissible />
+          <RunStatusIndicator
+            model={model}
+            dismissible
+            {...(onDismissFailure ? { onDismissFailure } : {})}
+          />
           <div className={styles.actions}>
             <Button appearance="subtle" icon={<Chat20Regular />} onClick={onOpenLead}>
               Conversation

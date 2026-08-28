@@ -47,6 +47,7 @@ import { OrchestratorPage } from "./components/orchestration/OrchestratorPage";
 import { OrchestratorTaskDetail } from "./components/orchestration/OrchestratorTaskDetail";
 import { ConversationTasks } from "./components/orchestration/ConversationTasks";
 import { CreateOrchestrationDialog } from "./components/orchestration/CreateOrchestrationDialog";
+import { readDismissedFailures } from "./components/orchestration/RunStatusIndicator";
 import {
   buildRunViewModels,
   liveSteps,
@@ -529,6 +530,19 @@ export function App() {
     () => orchestratorRuns.flatMap((run) => runSteps[run.id] ?? []),
     [orchestratorRuns, runSteps],
   );
+  const [dismissedFailures, setDismissedFailures] = useState<
+    Record<string, readonly string[]>
+  >({});
+  const acknowledgedFailedSteps = useMemo(
+    () =>
+      Object.fromEntries(
+        orchestratorRuns.map((run) => [
+          run.id,
+          dismissedFailures[run.id] ?? readDismissedFailures(run.id),
+        ]),
+      ),
+    [orchestratorRuns, dismissedFailures],
+  );
 
   /** Everything the three orchestrator views read, derived once. */
   const runModels = useMemo(
@@ -539,6 +553,7 @@ export function App() {
         sessions: snapshot.sessions,
         placements: snapshot.placements,
         waitingPermissions,
+        acknowledgedFailedSteps,
       }),
     [
       orchestratorRuns,
@@ -546,6 +561,7 @@ export function App() {
       snapshot.sessions,
       snapshot.placements,
       waitingPermissions,
+      acknowledgedFailedSteps,
     ],
   );
   const orchestratorSummary = useMemo(() => summarise(runModels), [runModels]);
@@ -914,6 +930,14 @@ export function App() {
                   onArchive={() => handleArchiveRun(selectedRunModel.run.id)}
                   onReopen={(note) => handleReopenRun(selectedRunModel.run.id, note)}
                   onDelete={() => handleDeleteRun(selectedRunModel.run.id)}
+                  onDismissFailure={() =>
+                    setDismissedFailures((current) => ({
+                      ...current,
+                      [selectedRunModel.run.id]: readDismissedFailures(
+                        selectedRunModel.run.id,
+                      ),
+                    }))
+                  }
                 />
               )}
 
