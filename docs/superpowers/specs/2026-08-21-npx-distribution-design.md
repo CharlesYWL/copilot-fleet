@@ -1,7 +1,7 @@
 # NPX distribution for Host and Node
 
 **Date:** 2026-08-21
-**Status:** Proposed (for review)
+**Status:** Accepted — 2026-08-27, by Charles. npm scope locked as `@copilot-fleet`; git update path aligned with the current `updater.ts` (fetch + reset onto `@{u}`, not pull).
 **Scope:** Start a Host or a Node with `npx`, keep git-checkout `npm run` working, and let any mix of the two enroll, update, and reconnect on the existing protocol.
 
 ## The question this answers
@@ -16,8 +16,8 @@ Every supported run path is a git workspace:
 | --- | --- |
 | Connect card / README | `npm install && npm run build:node && npm run start:node -- …` from a clone |
 | Revision | `git rev-parse` (`packages/protocol/src/runtime.ts`) |
-| Staleness | Host SHA vs Node SHA (`nodeUpdateState`). Semver is `0.1.0` and never moves, so it is not compared |
-| Update | `git pull --ff-only`, `npm install`, `npm run build:node`, then exit 75 (`apps/node/src/updater.ts`) |
+| Staleness | Host SHA vs Node SHA (`nodeUpdateState`). Semver (`0.3.0`, read from `package.json`) is reported but not compared |
+| Update | `git fetch --prune`, then `git reset --hard` onto `@{u}`, `npm install`, `npm run build:node`, then exit 75 (`apps/node/src/updater.ts`). Local commits and edits to tracked files are discarded; untracked files — `.env` included — survive |
 | Supervisor | `cwd` is the repo root; child is `apps/node/dist/main.js` (`apps/node/supervisor.mjs`) |
 | Host DB / `.env` | `apps/host/data` and the repo-root `.env` |
 | Node identity | Already *not* in the checkout: `%APPDATA%\CopilotFleet` / `~/.config/copilot-fleet` |
@@ -54,12 +54,13 @@ An operator with Node.js 22.5+ and an authenticated Copilot CLI can paste one li
 | How `npx` Host runs | From this invocation's unpacked package. No Host runtime prefix. Data is not in that package |
 | What staleness compares | Git SHA, as today. Semver exists so npm has an install target |
 | SHA for an npm process | Baked at build/publish into `dist/revision.json`; `buildRevision()` is live git SHA, else baked |
-| `update_node` payload | Unchanged: `{ type, updateId }`. The Node picks git pull vs `npm install @latest` |
-| npm update analog of `git pull` | `@latest`, after the operator has updated the Host |
+| `update_node` payload | Unchanged: `{ type, updateId }`. The Node picks git fetch + reset vs `npm install @latest` |
+| npm update analog of the git fetch + reset | `@latest`, after the operator has updated the Host |
 | Protocol addition | Optional `installKind` on hello / register / `FleetNode`. Older Hosts strip it |
 | Capability | npm Nodes advertise `self-update` |
 | Connect card | Two commands, toggle **npx** (default) \| **From a checkout** |
 | npm package names | `@copilot-fleet/protocol`, `@copilot-fleet/host`, `@copilot-fleet/node` |
+| npm org / scope | `@copilot-fleet` — confirmed by Charles, 2026-08-27 |
 | Bins | `copilot-fleet`, `copilot-fleet-node` |
 | Workspace names | Stay `@fleet/*`; `publishConfig.name` is the npm name |
 | Publish trigger | Git tags `v*`, versions bump together |
@@ -68,7 +69,7 @@ An operator with Node.js 22.5+ and an authenticated Copilot CLI can paste one li
 | Host data (git) | Today's `apps/host/data` and repo-root `.env` |
 | cwd `.env` for npm Node | Not read. Flags + `settings.json` + optional file in the config directory |
 | Prefix on start | Upgrade to at least the launcher's version; never auto-downgrade |
-| Hello `version` | `package.json` semver, not the hardcoded `"0.1.0"` |
+| Hello `version` | `package.json` semver. Already landed: `packageVersion()` reads it and hello / register send it; nothing hardcodes `"0.1.0"` anymore |
 | Unpublished git Host vs npm Node | SHA mismatch stays `stale`. Do not invent a match. Caption for any stale npm Node: it installed `@latest`, which only matches a Host built from that published commit |
 
 ## Approaches rejected
@@ -99,7 +100,7 @@ The fleet does not grow a second protocol. Install kind only changes (1) where b
                                        │
                                        ├─ git checkout?  spawn apps/node/dist/main.js
                                        │                 cwd = repo root
-                                       │                 update = pull + install + build
+                                       │                 update = fetch + reset + install + build
                                        │
                                        └─ npm?           ensure prefix ≥ launcher version
                                                          spawn prefix/.../dist/main.js
@@ -127,7 +128,7 @@ If `@copilot-fleet/*` cannot be used, only `publishConfig.name` changes. Bin nam
 
 ### 2. Build identity
 
-`version` remains semver from `package.json` and must move on every publish. It is not what the Nodes table compares.
+`version` is already semver from `package.json` — `packageVersion()` in `packages/protocol/src/runtime.ts` reads it, and the packages sit at `0.3.0` — and must move on every publish. It is not what the Nodes table compares.
 
 `revision` remains a 12-character git SHA.
 
@@ -142,7 +143,7 @@ buildRevision() = gitRevision() || readBakedRevision()
 
 Empty SHA is still **Unknown**: an unpack that was not built in CI, or a Host too old to report one.
 
-This is what makes a mix comparable. An npx Host published from commit `abc123cdef45` and a git Node on that commit are **Up to date**. Semver equality would not be, once `0.1.0` starts moving on only one side.
+This is what makes a mix comparable. An npx Host published from commit `abc123cdef45` and a git Node on that commit are **Up to date**. Semver equality would not be, once `0.3.0` starts moving on only one side.
 
 ### 3. Install kind
 
@@ -231,7 +232,7 @@ The "bring code up to date" step splits; everything around it does not.
 
 | Kind | Replace code | Build | Restart |
 | --- | --- | --- | --- |
-| git | `git pull --ff-only` + `npm install` | `npm run build:node` | exit 75 |
+| git | `git fetch --prune` + `git reset --hard @{u}` + `npm install` | `npm run build:node` | exit 75 |
 | npm | `npm install @copilot-fleet/node@latest` in the prefix | none (tarball is prebuilt) | exit 75 |
 
 npm stages: `checking` → `installing` → `restarting`. Do not emit `pulling` or `building`.
@@ -244,7 +245,7 @@ Identity of `@latest`: prefer npm's `gitHead` sliced to 12 characters, else the 
 
 Heartbeat: keep async `spawn`. `spawnSync` for `npm install` is the bug that made the Host close the socket mid-update.
 
-`update_node` stays one message. Teaching the Host a target version would couple it to npm and still be wrong for git Nodes. The operational rule is the one git already has: **update the Host first, then Update nodes.** Git pull tracks origin; npm install tracks `@latest`. Neither is "the Host's exact SHA". A git Host on an unpublished commit will keep npm Nodes `stale` after a successful Update; that is shown as stale with the npm-Node caption in Protocol below, not as a failed update.
+`update_node` stays one message. Teaching the Host a target version would couple it to npm and still be wrong for git Nodes. The operational rule is the one git already has: **update the Host first, then Update nodes.** The git reset tracks the upstream branch; npm install tracks `@latest`. Neither is "the Host's exact SHA". A git Host on an unpublished commit will keep npm Nodes `stale` after a successful Update; that is shown as stale with the npm-Node caption in Protocol below, not as a failed update.
 
 Busy-node behaviour, Update all skipping busy machines, and "stop these sessions and continue" stay as they are. An npm restart kills agents the same way a git restart does.
 
@@ -291,9 +292,9 @@ The Host URL field on the card feeds both strings. Default tab is npx.
 | Host | Node | Enroll paste | Node update |
 | --- | --- | --- | --- |
 | npx | npx | npx | `npm install @latest` in prefix |
-| npx | git | checkout | `git pull --ff-only` |
+| npx | git | checkout | `git fetch --prune` + `git reset --hard @{u}` |
 | git | npx | npx | `npm install @latest` in prefix |
-| git | git | checkout | `git pull --ff-only` |
+| git | git | checkout | `git fetch --prune` + `git reset --hard @{u}` |
 
 Protocol, enrollment token, node secret, host-url announcements do not branch on this table.
 
@@ -301,7 +302,7 @@ Protocol, enrollment token, node secret, host-url announcements do not branch on
 
 - `installKind?: "git" | "npm"` on hello, register, `NodeSchema`, and the `nodes` table (empty default).
 - `revision` continues to mean SHA. npm Nodes send the baked SHA, not `""`.
-- `version` is `package.json` semver (today both sides hardcode `"0.1.0"`). Not used for staleness.
+- `version` is `package.json` semver — already landed; both sides read it through `packageVersion()` and ship `0.3.0`. Not used for staleness.
 - `nodeUpdateState` stays SHA equality plus `self-update`. No new state in the union.
 - Stale npm Node caption, without changing the enum: "Behind the Host's commit. An npm Node installs @latest, which only matches a Host built from that published commit." Shown whenever `installKind === "npm"` and the state is `stale`. No probe of the registry to guess whether this Host is unpublished.
 
@@ -312,7 +313,7 @@ No new `update_node` fields. No new capability name.
 | Failure | Behaviour |
 | --- | --- |
 | `npm install` in prefix fails | No exit 75; old child stays; row shows failed |
-| `git pull` / build fails | Unchanged |
+| `git fetch` / `git reset` / build fails | Unchanged |
 | Supervisor killed during update | Node gone until operator starts it; sessions offline, resumable when it returns |
 | `npx` without `@latest` after a prefix already exists | Supervisor upgrades prefix only if the *launcher* is newer; a stale cache launcher leaves a newer prefix running — correct |
 | Host unpublished, Node npm, operator clicks Update | Installs `@latest`; if SHA still differs, row stays `stale` with the npm-Node caption above |
