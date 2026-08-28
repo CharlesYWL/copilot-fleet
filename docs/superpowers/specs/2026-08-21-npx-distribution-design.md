@@ -3,6 +3,7 @@
 **Date:** 2026-08-21
 **Status:** Accepted — 2026-08-27, by Charles. npm scope locked as `@copilot-fleet`; git update path aligned with the current `updater.ts` (fetch + reset onto `@{u}`, not pull).
 **Scope:** Start a Host or a Node with `npx`, keep git-checkout `npm run` working, and let any mix of the two enroll, update, and reconnect on the existing protocol.
+**Review follow-up (2026-08-27):** Copilot's review of the accepted spec found three blockers — `publishConfig.name` does not rename an npm package, the Node tarball was missing `agents/` and `public/`, and install-kind detection could walk out of the prefix into an ancestor checkout. All three are folded in below as locked decisions. Still Accepted.
 
 ## The question this answers
 
@@ -50,6 +51,7 @@ An operator with Node.js 22.5+ and an authenticated Copilot CLI can paste one li
 | Topic | Choice |
 | --- | --- |
 | Install kinds | `git` \| `npm`. A property of a process, not of the fleet |
+| Install-kind detection bound | Never walk above the running package's root: the workspace root that owns this `apps/*` package (git), or the runtime prefix (npm) |
 | How `npx` Node stays alive across updates | Persistent runtime prefix + supervisor bin. Not the npx cache |
 | How `npx` Host runs | From this invocation's unpacked package. No Host runtime prefix. Data is not in that package |
 | What staleness compares | Git SHA, as today. Semver exists so npm has an install target |
@@ -62,7 +64,9 @@ An operator with Node.js 22.5+ and an authenticated Copilot CLI can paste one li
 | npm package names | `@copilot-fleet/protocol`, `@copilot-fleet/host`, `@copilot-fleet/node` |
 | npm org / scope | `@copilot-fleet` — confirmed by Charles, 2026-08-27 |
 | Bins | `copilot-fleet`, `copilot-fleet-node` |
-| Workspace names | Stay `@fleet/*`; `publishConfig.name` is the npm name |
+| Workspace names | Stay `@fleet/*`; the pack step rewrites the packed manifest to the npm name |
+| Publish manifests | Rewritten at pack time, never in the tree: `name` → `@copilot-fleet/*`, `@fleet/*` deps → their `@copilot-fleet/*` equivalents, `private` dropped, `publishConfig.access` set to `"public"` |
+| Node tarball contents | `dist/`, `bin/`, `agents/`, `public/`, `package.json` — the runtime reads `packageRoot()/agents` and `packageRoot()/public` |
 | Publish trigger | Git tags `v*`, versions bump together |
 | Node identity | Existing config directory. Unchanged |
 | Host data (npm) | User data directory, not next to the code |
@@ -122,9 +126,11 @@ Three packages, because they are already three workspaces:
 
 `npx @copilot-fleet/host` and `npx @copilot-fleet/node` run the only bin of each package.
 
-Tarballs contain `dist/` (Host also `dist/ui/`), `bin/`, `package.json`. Not `src/`, not tests.
+Tarballs contain what the runtime reads, not only what `tsc` emits. Node: `dist/`, `bin/`, `agents/`, `public/`, `package.json` — `builtinAgentDirectory()` is `packageRoot()/agents` (`apps/node/src/agent-catalog.ts`) and the config page is served from `packageRoot()/public` (`apps/node/src/config-assets.ts`), so a tarball without those directories is a Node with no built-in agents and a blank config page. Host: `dist/` (including `dist/ui/`), `bin/`, `package.json`. Not `src/`, not tests. Required check: install the packed Node tarball into a clean directory and assert `agents/` and `public/` exist and are readable at the paths the runtime joins.
 
-If `@copilot-fleet/*` cannot be used, only `publishConfig.name` changes. Bin names stay. Unscoped `npx copilot-fleet` is a later wrapper, not required for mixing.
+`publishConfig.name` is not how the packages get their npm names. npm ignores it — renaming through `publishConfig` is a pnpm 11.18+ feature, and this repo is npm workspaces with a `package-lock.json`. `@fleet/host` and `@fleet/node` also depend on `@fleet/protocol`, which never exists on the registry under that name; `npm publish --dry-run` on the unrewritten `@fleet/host` is the failing test this step exists to pass. The workspaces keep their `@fleet/*` names, and the pack step rewrites the manifest that goes into each tarball: `name` becomes the `@copilot-fleet/*` name, every `@fleet/*` dependency becomes its `@copilot-fleet/*` equivalent, `private` is dropped, and `publishConfig.access` is set to `"public"`. The tree is never renamed.
+
+If `@copilot-fleet/*` cannot be used, only the rewrite target changes. Bin names stay. Unscoped `npx copilot-fleet` is a later wrapper, not required for mixing.
 
 ### 2. Build identity
 
@@ -133,12 +139,12 @@ If `@copilot-fleet/*` cannot be used, only `publishConfig.name` changes. Bin nam
 `revision` remains a 12-character git SHA.
 
 - A git process: `git rev-parse --short=12 HEAD` (today).
-- An npm process: `dist/revision.json` written at build (`{ "revision": "<sha>" }`). `git` is expected to fail in the prefix.
+- An npm process: `dist/revision.json` written at build (`{ "revision": "<sha>" }`). `git` is not consulted in the prefix at all: `git rev-parse` walks up on its own, and a prefix that happens to sit under someone's checkout would answer with that ancestor's SHA.
 
 One helper, used by Host and Node:
 
 ```ts
-buildRevision() = gitRevision() || readBakedRevision()
+buildRevision() = installKind === "git" ? gitRevision() : readBakedRevision()
 ```
 
 Empty SHA is still **Unknown**: an unpack that was not built in CI, or a Host too old to report one.
@@ -149,12 +155,15 @@ This is what makes a mix comparable. An npx Host published from commit `abc123cd
 
 Detected from the code's own tree (`import.meta.url`), never from `cwd`. `npx` is started from random directories; a parent `package.json` or an unrelated `.git` must not decide.
 
+The walk is bounded, which today's `repoRoot()` is not. `repoRoot()` climbs until it finds a workspaces manifest; started from an npm prefix under `~/.local/share` or `%LOCALAPPDATA%`, that climb can leave the prefix, reach whatever git repository happens to contain the operator's home tooling, and adopt it. The process misclassifies as `git`, hellos with a stranger's SHA, and Update would `git reset --hard` a checkout that has nothing to do with Fleet. So detection never walks above the running package's root: for a checkout, the workspace root that contains this package as `apps/node` / `apps/host`; for npm, the runtime prefix.
+
 ```ts
-git  = nearest workspace root has `.git`
+git  = the bounded root is the monorepo layout — this package under `apps/`,
+       workspaces manifest and `.git` at that root
 npm  = anything else
 ```
 
-The existing `repoRoot()` walk already stops at the workspace manifest, so a clone nested in another project stays `git`.
+An npm process never calls `gitRevision()` or `updateCheckout` against an ancestor directory. A clone nested inside another project still classifies as `git`: its own workspace root is the bound, and everything above it is never consulted.
 
 Hello, register, and the snapshot's node object gain:
 
