@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import {
   RunPolicySchema,
@@ -101,6 +101,75 @@ describe("conversation tasks", () => {
     const panel = screen.getByRole("complementary", { name: "Conversation tasks" });
     expect(within(panel).getByRole("button", { name: /Alpha task/ })).toBeTruthy();
     expect(within(panel).getByRole("button", { name: /Beta task/ })).toBeTruthy();
+  });
+
+  it("scrolls instead of shrinking cards until their titles disappear", () => {
+    show({
+      models: models([
+        run({ id: "a", name: "Alpha task" }),
+        run({ id: "b", name: "Beta task" }),
+      ]),
+    });
+
+    const panel = screen.getByRole("complementary", { name: "Conversation tasks" });
+    const list = panel.querySelector("article")?.parentElement;
+    const card = panel.querySelector("article");
+
+    expect(list).not.toBeNull();
+    expect(card).not.toBeNull();
+    expect(getComputedStyle(list!).overflowY).toBe("auto");
+    expect(getComputedStyle(card!).flexShrink).toBe("0");
+  });
+
+  it("filters tasks by text, status, and phase", () => {
+    show({
+      models: models([
+        run({
+          id: "a",
+          name: "Alpha task",
+          objective: "Update the frontend",
+          phases: ["Plan", "Review"],
+          phaseIndex: 0,
+        }),
+        run({
+          id: "b",
+          name: "Beta task",
+          objective: "Repair the backend",
+          state: "completed",
+          phases: ["Build", "Ship"],
+          phaseIndex: 1,
+        }),
+      ]),
+    });
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search tasks" }), {
+      target: { value: "backend" },
+    });
+    expect(screen.queryByRole("button", { name: /Alpha task/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Beta task/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Filter tasks by status" }));
+    fireEvent.click(screen.getByRole("option", { name: "Done" }));
+    expect(screen.queryByRole("button", { name: /Alpha task/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Beta task/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear" }));
+    fireEvent.click(screen.getByRole("combobox", { name: "Filter tasks by phase" }));
+    fireEvent.click(screen.getByRole("option", { name: "Plan" }));
+    expect(screen.getByRole("button", { name: /Alpha task/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Beta task/ })).toBeNull();
+  });
+
+  it("explains when filters have no matches", () => {
+    show();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Search tasks" }), {
+      target: { value: "missing" },
+    });
+
+    expect(screen.getByText("No tasks match these filters.")).toBeTruthy();
+    expect(screen.getByText("0/1")).toBeTruthy();
   });
 
   it("opens a task from beside the conversation", () => {

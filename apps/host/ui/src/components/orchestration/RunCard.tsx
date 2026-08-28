@@ -16,6 +16,7 @@ const useStyles = makeStyles({
     position: "relative",
     width: "100%",
     minHeight: "116px",
+    flexShrink: 0,
     display: "flex",
     flexDirection: "column",
     gap: "8px",

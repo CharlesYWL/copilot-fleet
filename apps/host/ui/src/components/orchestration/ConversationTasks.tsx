@@ -1,5 +1,9 @@
+import { useMemo, useState } from "react";
 import {
   Button,
+  Dropdown,
+  Input,
+  Option,
   Text,
   Tooltip,
   makeStyles,
@@ -11,13 +15,24 @@ import {
   Add16Regular,
   PanelRightContract20Regular,
   PanelRightExpand20Regular,
+  Search16Regular,
 } from "@fluentui/react-icons";
 import type { RunViewModel } from "../../lib/orchestration-view";
+import { currentPhase, runStateLabel } from "../../lib/orchestration-view";
 import { statusVisuals, terminal } from "../../theme";
 import { RunCard } from "./RunCard";
 
 /** How wide the list is when it is open; the rail beside it is always there. */
 const WIDTH_VAR = "--fleet-conversation-tasks-width";
+const STATUS_OPTIONS = [
+  "Needs you",
+  "Deciding",
+  "Not started",
+  "Running",
+  "Done",
+  "Failed",
+  "Abandoned",
+] as const;
 
 const useStyles = makeStyles({
   panel: {
@@ -130,6 +145,21 @@ const useStyles = makeStyles({
     fontSize: "11px",
     fontVariantNumeric: "tabular-nums",
   },
+  clear: { marginLeft: "auto" },
+  filters: {
+    flexShrink: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: "6px",
+    padding: "0 12px 8px 4px",
+  },
+  search: { width: "100%" },
+  selects: {
+    display: "grid",
+    gridTemplateColumns: "repeat(2, minmax(0, 1fr))",
+    gap: "6px",
+  },
+  select: { minWidth: 0, width: "100%" },
   list: {
     flexGrow: 1,
     minHeight: 0,
@@ -184,10 +214,37 @@ export const ConversationTasks = ({
   onNewRun,
 }: ConversationTasksProps) => {
   const styles = useStyles();
+  const [search, setSearch] = useState("");
+  const [status, setStatus] = useState("");
+  const [phase, setPhase] = useState("");
   const attention = models.filter((model) => model.attention).length;
+  const searchQuery = search.trim().toLocaleLowerCase();
+  const phases = useMemo(
+    () =>
+      Array.from(
+        new Set(models.map((model) => currentPhase(model.run)).filter(Boolean)),
+      ).sort((left, right) => left.localeCompare(right)),
+    [models],
+  );
+  const visibleModels = useMemo(() => {
+    return models.filter((model) => {
+      if (status && runStateLabel(model.run) !== status) return false;
+      if (phase && currentPhase(model.run) !== phase) return false;
+      if (!searchQuery) return true;
+      return `${model.run.name}\n${model.run.objective}`
+        .toLocaleLowerCase()
+        .includes(searchQuery);
+    });
+  }, [models, phase, searchQuery, status]);
+  const filtersActive = Boolean(searchQuery || status || phase);
   const label = open
     ? "Hide this conversation's tasks"
     : "Show this conversation's tasks";
+  const clearFilters = () => {
+    setSearch("");
+    setStatus("");
+    setPhase("");
+  };
 
   return (
     <aside className={styles.panel} aria-label="Conversation tasks">
@@ -228,8 +285,66 @@ export const ConversationTasks = ({
         <div className={styles.inner}>
           <header className={styles.header}>
             <Text weight="semibold">Tasks</Text>
-            <span className={styles.count}>{models.length}</span>
+            <span className={styles.count}>
+              {filtersActive ? `${visibleModels.length}/${models.length}` : models.length}
+            </span>
+            {filtersActive && (
+              <Button
+                className={styles.clear}
+                size="small"
+                appearance="subtle"
+                onClick={clearFilters}
+              >
+                Clear
+              </Button>
+            )}
           </header>
+
+          {models.length > 0 && (
+            <div className={styles.filters}>
+              <Input
+                className={styles.search}
+                size="small"
+                contentBefore={<Search16Regular />}
+                value={search}
+                placeholder="Search tasks"
+                aria-label="Search tasks"
+                onChange={(_event, data) => setSearch(data.value)}
+              />
+              <div className={styles.selects}>
+                <Dropdown
+                  className={styles.select}
+                  size="small"
+                  value={status || "All statuses"}
+                  selectedOptions={[status]}
+                  aria-label="Filter tasks by status"
+                  onOptionSelect={(_event, data) => setStatus(data.optionValue ?? "")}
+                >
+                  <Option value="">All statuses</Option>
+                  {STATUS_OPTIONS.map((option) => (
+                    <Option key={option} value={option}>
+                      {option}
+                    </Option>
+                  ))}
+                </Dropdown>
+                <Dropdown
+                  className={styles.select}
+                  size="small"
+                  value={phase || "All phases"}
+                  selectedOptions={[phase]}
+                  aria-label="Filter tasks by phase"
+                  onOptionSelect={(_event, data) => setPhase(data.optionValue ?? "")}
+                >
+                  <Option value="">All phases</Option>
+                  {phases.map((option) => (
+                    <Option key={option} value={option}>
+                      {option}
+                    </Option>
+                  ))}
+                </Dropdown>
+              </div>
+            </div>
+          )}
 
           <div className={styles.list}>
             {models.length === 0 ? (
@@ -237,8 +352,10 @@ export const ConversationTasks = ({
                 Nothing dispatched from this conversation yet. Ask for something here, or
                 open a task and the orchestrator will plan it.
               </p>
+            ) : visibleModels.length === 0 ? (
+              <p className={styles.empty}>No tasks match these filters.</p>
             ) : (
-              models.map((model) => (
+              visibleModels.map((model) => (
                 <RunCard
                   key={model.run.id}
                   model={model}
