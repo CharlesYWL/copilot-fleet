@@ -3,7 +3,7 @@
 **Date:** 2026-08-21
 **Status:** Accepted — 2026-08-27, by Charles. npm scope locked as `@copilot-fleet`; git update path aligned with the current `updater.ts` (fetch + reset onto `@{u}`, not pull).
 **Scope:** Start a Host or a Node with `npx`, keep git-checkout `npm run` working, and let any mix of the two enroll, update, and reconnect on the existing protocol.
-**Review follow-up (2026-08-27):** Copilot's review of the accepted spec found three blockers — `publishConfig.name` does not rename an npm package, the Node tarball was missing `agents/` and `public/`, and install-kind detection could walk out of the prefix into an ancestor checkout. All three are folded in below as locked decisions. **Second pass (2026-08-28):** the first two remain resolved; rewriting packed `@fleet/*` *dependency keys* to `@copilot-fleet/*` would leave compiled `import "@fleet/protocol"` unresolved (`ERR_MODULE_NOT_FOUND`). Packed deps keep those keys and alias them (`"@fleet/protocol": "npm:@copilot-fleet/protocol@<same version>"`). The tarball smoke test must launch the installed bin. Still Accepted.
+**Review follow-up (2026-08-27):** Copilot's review of the accepted spec found three blockers — `publishConfig.name` does not rename an npm package, the Node tarball was missing `agents/` and `public/`, and install-kind detection could walk out of the prefix into an ancestor checkout. All three are folded in below as locked decisions. **Second pass (2026-08-28):** the first two remain resolved; rewriting packed `@fleet/*` *dependency keys* to `@copilot-fleet/*` would leave compiled `import "@fleet/protocol"` unresolved (`ERR_MODULE_NOT_FOUND`). Packed deps keep those keys and alias them (`"@fleet/protocol": "npm:@copilot-fleet/protocol@<same version>"`). The tarball smoke test must launch the installed bin. **Third pass (2026-08-28, local pack):** there is no `bin/` directory — Node's bin file is `supervisor.mjs` at the package root; Host gets a shebang wrapper `host.mjs` there. Packed `files` is mandatory: root `.gitignore` has `dist/`, so an unrewritten protocol pack after `tsc` ships **0** dist files, and pointing Node's bin at `supervisor.mjs` without `files` drops Node dist from 69 files to 0. `npm:` aliases only work for registry deps, so a local smoke test cannot `npm install` the three tarballs together as-is; it must `file:`-install protocol under the `@fleet/protocol` key (or `overrides`) and then launch the bin. Publish protocol to the registry first. Still Accepted.
 
 ## The question this answers
 
@@ -63,11 +63,16 @@ An operator with Node.js 22.5+ and an authenticated Copilot CLI can paste one li
 | Connect card | Two commands, toggle **npx** (default) \| **From a checkout** |
 | npm package names | `@copilot-fleet/protocol`, `@copilot-fleet/host`, `@copilot-fleet/node` |
 | npm org / scope | `@copilot-fleet` — confirmed by Charles, 2026-08-27 |
-| Bins | `copilot-fleet`, `copilot-fleet-node` |
+| Bins | `copilot-fleet` → `./host.mjs`; `copilot-fleet-node` → `./supervisor.mjs`. Both files sit at the package root. There is no `bin/` directory today and the pack step must not invent an empty one. |
+| Node bin in the tree | Change `"bin": { "copilot-fleet-node": "./supervisor.mjs" }` in `@fleet/node` so git `npm run start:node` and npx share one entry. Pack rewrite must set that path even if the tree still points at `./dist/main.js`. |
+| Packed `files` | Mandatory on every packed manifest. Protocol: `["dist"]`. Node: `["dist", "supervisor.mjs", "agents", "public"]`. Host: `["dist", "host.mjs"]`. `package.json` is always included. This is what includes gitignored `dist/` and excludes `src/` and tests. |
 | Workspace names | Stay `@fleet/*`; the pack step rewrites only the packed `name`, never the tree |
-| Publish manifests | Rewritten at pack time, never in the tree: `name` → `@copilot-fleet/*`; `@fleet/*` dependency **keys stay**; their specs become `npm:@copilot-fleet/<pkg>@<same version>`; `private` dropped; `publishConfig.access` `"public"`. Do not rewrite `dist/` import specifiers |
-| Node tarball contents | `dist/`, `bin/`, `agents/`, `public/`, `package.json` — the runtime reads `packageRoot()/agents` and `packageRoot()/public` |
-| Packed tarball smoke test | Install the packed Node tarball, assert `agents/` and `public/` are readable at the runtime paths, **and launch the installed bin** (help/version or a dry start that exits). A missing `@fleet/protocol` must fail this test |
+| Publish manifests | Rewritten at pack time, never in the tree: `name` → `@copilot-fleet/*`; `@fleet/*` dependency **keys stay**; their specs become `npm:@copilot-fleet/<pkg>@<same version>`; `private` dropped; `publishConfig.access` `"public"`; Node/Host `bin` pointed at the shebang wrappers; `files` set as above. Do not rewrite `dist/` import specifiers |
+| Node tarball contents | `dist/`, `supervisor.mjs`, `agents/`, `public/`, `package.json` — the runtime reads `packageRoot()/agents` and `packageRoot()/public` |
+| Host tarball contents | `dist/` (including `dist/ui/`), `host.mjs`, `package.json` |
+| Protocol tarball contents | `dist/`, `package.json` |
+| Packed tarball smoke test | Pack all three. Local/CI cannot resolve `npm:` aliases (`npm` error: "aliases only work for registry deps"). Install in a clean directory with protocol under the **`@fleet/protocol` key** via `file:` (root dep or `overrides`), plus the host and node tarballs. Assert `agents/` and `public/` at the Node runtime paths, **and launch both bins** (Node `--help` / Host dry start that exits). `npm install node.tgz protocol.tgz` together is not enough: protocol's packed `name` is `@copilot-fleet/protocol`, so it does not satisfy the `@fleet/protocol` key, and the alias still hits the registry. |
+| Publish order | Protocol to the registry first, then host and node. `npx @copilot-fleet/node` needs `@copilot-fleet/protocol` already published to resolve the alias. |
 | Publish trigger | Git tags `v*`, versions bump together |
 | Node identity | Existing config directory. Unchanged |
 | Host data (npm) | User data directory, not next to the code |
@@ -122,14 +127,22 @@ Three packages, because they are already three workspaces:
 | Workspace | npm name | bin |
 | --- | --- | --- |
 | `@fleet/protocol` | `@copilot-fleet/protocol` | — |
-| `@fleet/host` | `@copilot-fleet/host` | `copilot-fleet` |
-| `@fleet/node` | `@copilot-fleet/node` | `copilot-fleet-node` |
+| `@fleet/host` | `@copilot-fleet/host` | `copilot-fleet` → `./host.mjs` |
+| `@fleet/node` | `@copilot-fleet/node` | `copilot-fleet-node` → `./supervisor.mjs` |
 
 `npx @copilot-fleet/host` and `npx @copilot-fleet/node` run the only bin of each package.
 
-Tarballs contain what the runtime reads, not only what `tsc` emits. Node: `dist/`, `bin/`, `agents/`, `public/`, `package.json` — `builtinAgentDirectory()` is `packageRoot()/agents` (`apps/node/src/agent-catalog.ts`) and the config page is served from `packageRoot()/public` (`apps/node/src/config-assets.ts`), so a tarball without those directories is a Node with no built-in agents and a blank config page. Host: `dist/` (including `dist/ui/`), `bin/`, `package.json`. Not `src/`, not tests. Required check: install the packed Node tarball into a clean directory, assert `agents/` and `public/` exist and are readable at the paths the runtime joins, **and launch the installed bin** (help/version or a dry start that exits). Checking files alone would miss `ERR_MODULE_NOT_FOUND` on `@fleet/protocol`.
+Tarballs contain what the runtime reads, not only what `tsc` emits, and they are shaped by packed `files`, not by gitignore. Root `.gitignore` has `dist/`. Local `npm pack --dry-run` after `tsc`:
 
-`publishConfig.name` is not how the packages get their npm names. npm ignores it — renaming through `publishConfig` is a pnpm 11.18+ feature, and this repo is npm workspaces with a `package-lock.json`. The workspaces keep their `@fleet/*` names. The pack step rewrites the manifest that goes into each tarball: `name` becomes the `@copilot-fleet/*` name, `private` is dropped, and `publishConfig.access` is set to `"public"`. `@fleet/*` **dependency keys stay**, because compiled JS still `import … from "@fleet/protocol"` (and `@fleet/protocol/runtime`); renaming the key would install `@copilot-fleet/protocol` under a folder the import cannot see and throw `ERR_MODULE_NOT_FOUND`. The packed spec is an npm alias, e.g. `"@fleet/protocol": "npm:@copilot-fleet/protocol@0.3.0"`. Do not rewrite import specifiers in `dist/`. `npm publish --dry-run` on an unrewritten `@fleet/host` (still `private`, still named `@fleet/host`) is the failing test the name/`private`/`access` rewrite exists to pass. The tree is never renamed.
+- `@fleet/protocol` ships **0** dist files and 8 `src/` files (including tests). `exports` pointing at `dist/` does not override gitignore.
+- `@fleet/node` ships `dist/` today only because `"bin"` is `./dist/main.js`, which forces those files in; it also ships 45 `src/` files, 22 tests, `supervisor.mjs`, `agents/`, `public/`, and **no** `bin/` directory. Pointing `bin` at `./supervisor.mjs` without a `files` whitelist drops dist from 69 files to **0**.
+- `@fleet/host` has no `bin` and no `files`.
+
+Packed `files` is therefore mandatory: protocol `["dist"]`; Node `["dist", "supervisor.mjs", "agents", "public"]`; Host `["dist", "host.mjs"]`. Node: `builtinAgentDirectory()` is `packageRoot()/agents` (`apps/node/src/agent-catalog.ts`) and the config page is served from `packageRoot()/public` (`apps/node/src/config-assets.ts`), so a tarball without those directories is a Node with no built-in agents and a blank config page. Host: `dist/` includes `dist/ui/` (Vite `outDir`) plus `host.mjs`. Not `src/`, not tests, not a phantom `bin/` directory.
+
+`publishConfig.name` is not how the packages get their npm names. npm ignores it — renaming through `publishConfig` is a pnpm 11.18+ feature, and this repo is npm workspaces with a `package-lock.json`. The workspaces keep their `@fleet/*` names. The pack step rewrites the manifest that goes into each tarball: `name` becomes the `@copilot-fleet/*` name, `private` is dropped, `publishConfig.access` is `"public"`, `files` is set as above, and bins are `copilot-fleet` → `./host.mjs` and `copilot-fleet-node` → `./supervisor.mjs`. `@fleet/*` **dependency keys stay**, because compiled JS still `import … from "@fleet/protocol"` (and `@fleet/protocol/runtime`); renaming the key would install `@copilot-fleet/protocol` under a folder the import cannot see and throw `ERR_MODULE_NOT_FOUND`. The packed spec is an npm alias, e.g. `"@fleet/protocol": "npm:@copilot-fleet/protocol@0.3.0"`. Do not rewrite import specifiers in `dist/`. `npm publish --dry-run` on an unrewritten `@fleet/host` (still `private`, still named `@fleet/host`) is the failing test the name/`private`/`access` rewrite exists to pass. The tree is never renamed.
+
+`npm:` aliases only work for registry deps. A local smoke that `npm install`s `node.tgz` and `protocol.tgz` together still 404s on `@copilot-fleet/protocol`, because the protocol tarball's `name` is `@copilot-fleet/protocol` and does not occupy the `@fleet/protocol` key the Node import needs. The smoke test therefore `file:`-installs protocol **as** `@fleet/protocol` (a root dependency or `overrides`) alongside the host and node tarballs, asserts `agents/` and `public/` at the runtime paths, and launches both bins. Checking files alone would miss `ERR_MODULE_NOT_FOUND`. Once protocol is on the registry, `npx` resolves the alias for real; publish protocol first, then host and node.
 
 If `@copilot-fleet/*` cannot be used, only the rewrite target changes. Bin names stay. Unscoped `npx copilot-fleet` is a later wrapper, not required for mixing.
 
@@ -217,7 +230,7 @@ Tunnel binaries stay on PATH. They were never downloaded into the repo.
 
 No second restart protocol. Exit 75, storm guard (five in twenty seconds), `FLEET_RESTART_MODE=exit`, `argvForRestart` dropping persisted flags — all stay.
 
-The published Node bin *is* the supervisor (today the private bin points at `dist/main.js`, which is why npx would skip it). Git `npm run start:node` / `npm run node` call the same supervisor.
+The published Node bin *is* `supervisor.mjs` (today the private bin points at `dist/main.js`, which is why npx would skip the supervisor). Git `npm run start:node` / `npm run node` call the same file. Implementation moves the tree `bin` to `./supervisor.mjs` and the pack step writes that path; it does not create a `bin/` directory. The Host bin is a new `host.mjs` shebang wrapper that runs `dist/server/server.js` — Host has no bin today.
 
 On start:
 
@@ -350,3 +363,4 @@ README leads with npx for running; clone stays the development path. Architectur
 3. **Never downgrade the prefix.** A pinned `npx @copilot-fleet/node@1.0.0` on a machine already at 1.2.0 still runs 1.2.0. Pinning belongs in `FLEET_NODE_RUNTIME` pointing at another directory, if anyone needs it later.
 4. **Publish cadence.** Tags, not every main push. A git Host on main and an npm Node on the last tag will often be stale. That is the trade for not publishing broken main.
 5. **`gitHead` on the registry.** npm sets it when publishing from a git checkout. If CI checks out a detached tag, confirm `gitHead` is still the tagged commit; otherwise fall back to semver for the "already latest" short-circuit, and still report baked SHA after restart.
+6. **`npm:` aliases are registry-only.** Local `file:` tarballs cannot use `npm:@copilot-fleet/protocol@0.3.0`. The smoke test must occupy the `@fleet/protocol` key itself. Forgetting that looks like a packaging bug when it is npm's alias rule.
