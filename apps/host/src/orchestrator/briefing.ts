@@ -194,6 +194,34 @@ function judgement(): string[] {
   ];
 }
 
+/** A periodic, read-only reminder for one orchestrator conversation. */
+export function statusCheckEnvelope(
+  tasks: readonly {
+    name: string;
+    state: string;
+    phase: string;
+    openSteps: number;
+    dispatchedSteps: number;
+  }[],
+): string {
+  const lines = [
+    '<fleet-status-check interval="30m">',
+    "Review only these active tasks assigned to this conversation:",
+    ...tasks.map(
+      (task) =>
+        `- ${task.name} — ${task.state}; ${task.phase}; ${task.openSteps} open step(s), ${task.dispatchedSteps} dispatched`,
+    ),
+    "</fleet-status-check>",
+    "",
+    "Use fleet_list_work to inspect their current status. This is a read-only check:",
+    "do not prompt, follow up with, stop, or otherwise disturb a worker whose step is",
+    "already starting or running. If every task is waiting on dispatched work, say so",
+    "briefly and end your turn. If a task has no work in flight and needs your next",
+    "decision, make that decision.",
+  ];
+  return lines.join("\n");
+}
+
 /** The envelope a woken orchestrator reads. */
 export function wakeEnvelope(input: {
   runId: string;

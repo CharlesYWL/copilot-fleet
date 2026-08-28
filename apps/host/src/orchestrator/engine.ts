@@ -4,13 +4,15 @@ import {
   eventPayload,
   isWritingCategory,
   terminalRunStates,
+  terminalRunStepStates,
   terminalSessionStates,
   type Run,
   type RunStep,
   type SessionEvent,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
-import { wakeEnvelope } from "./briefing.js";
+import { statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
+import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS } from "./deadlines.js";
 import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./schedule.js";
 
 /**
@@ -77,6 +79,7 @@ export class OrchestratorEngine {
       if (terminalRunStates.has(run.state)) continue;
       this.tickRun(run.id, nowMs);
     }
+    this.remindIdleLeads(nowMs);
   }
 
   tickRun(runId: string, nowMs = Date.now()): void {
@@ -98,11 +101,11 @@ export class OrchestratorEngine {
     if (actions.length === 0) return;
 
     let touched = false;
-    for (const action of actions) touched = this.execute(run, action) || touched;
+    for (const action of actions) touched = this.execute(run, action, nowMs) || touched;
     if (touched) this.publish(runId);
   }
 
-  private execute(run: Run, action: ScheduleAction): boolean {
+  private execute(run: Run, action: ScheduleAction, nowMs: number): boolean {
     switch (action.type) {
       case "start_step":
         return this.startStep(run, action);
@@ -125,9 +128,9 @@ export class OrchestratorEngine {
         this.stopSession(action.sessionId);
         return false;
       case "deliver_prompt":
-        return this.deliverPrompt(run, action.prompt);
+        return this.deliverPrompt(run, action.prompt, nowMs);
       case "wake_lead":
-        return this.wakeLead(run);
+        return this.wakeLead(run, nowMs);
       case "finish_run":
         return this.finishRun(run, action.state, action.reason);
     }
@@ -293,12 +296,13 @@ export class OrchestratorEngine {
    * moves first: a send that fails costs one message rather than risking a loop
    * that repeats it on every tick forever.
    */
-  private deliverPrompt(run: Run, prompt: string): boolean {
+  private deliverPrompt(run: Run, prompt: string, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
     if (!lead || lead.state !== "idle") return false;
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     this.store.updateRun(run.id, { pendingPrompt: "" });
+    this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
     this.service.dispatch(lead.nodeId, {
       type: "prompt",
       sessionId: lead.id,
@@ -314,12 +318,13 @@ export class OrchestratorEngine {
    * The counter moves before the prompt is sent, so a send that fails costs a
    * wake rather than risking a loop that sends forever.
    */
-  private wakeLead(run: Run): boolean {
+  private wakeLead(run: Run, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
     if (!lead || lead.state !== "idle") return false;
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     this.store.recordRunWake(run.id);
+    this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
     this.service.dispatch(lead.nodeId, {
       type: "prompt",
       sessionId: lead.id,
@@ -327,6 +332,79 @@ export class OrchestratorEngine {
       attachments: [],
     });
     return true;
+  }
+
+  /**
+   * Gives each idle Lead one read-only status check for its own active tasks.
+   *
+   * This runs after ordinary task briefs and settle wakes, so those prompts win.
+   * It only ever addresses the Lead session; dispatched workers are neither
+   * prompted nor stopped by this path.
+   */
+  private remindIdleLeads(nowMs: number): void {
+    const sessions = this.store.listSessions();
+    const sessionById = new Map(sessions.map((session) => [session.id, session]));
+    const activeByLead = new Map<string, Run[]>();
+
+    for (const run of this.store.listRuns()) {
+      if (!run.leadSessionId) continue;
+      if (
+        terminalRunStates.has(run.state) ||
+        run.state === "awaiting_approval" ||
+        run.state === "awaiting_human"
+      ) {
+        continue;
+      }
+      const owned = activeByLead.get(run.leadSessionId) ?? [];
+      owned.push(run);
+      activeByLead.set(run.leadSessionId, owned);
+    }
+
+    for (const [leadSessionId, runs] of activeByLead) {
+      const lead = sessionById.get(leadSessionId);
+      if (!lead || lead.runRole !== "lead" || lead.state !== "idle") continue;
+      if (this.promptedThisTick.has(lead.id)) continue;
+
+      const lastAutomatedPrompt = Date.parse(
+        this.store.lastOrchestratorPromptAt(lead.id),
+      );
+      const lastActivity = Date.parse(lead.updatedAt);
+      const baseline = Math.max(
+        Number.isFinite(lastAutomatedPrompt) ? lastAutomatedPrompt : 0,
+        Number.isFinite(lastActivity) ? lastActivity : Date.parse(lead.createdAt),
+      );
+      if (nowMs - baseline < ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS) continue;
+
+      const tasks = runs.map((run) => {
+        const steps = this.store.listRunSteps(run.id);
+        const open = steps.filter((step) => !terminalRunStepStates.has(step.state));
+        const dispatched = open.filter(
+          (step) => step.state === "starting" || step.state === "running",
+        );
+        const phase =
+          run.phases.length > 0
+            ? `phase ${run.phaseIndex + 1}/${run.phases.length}: ${
+                run.phases[run.phaseIndex] ?? "done"
+              }`
+            : "no phases";
+        return {
+          name: run.name,
+          state: run.state,
+          phase,
+          openSteps: open.length,
+          dispatchedSteps: dispatched.length,
+        };
+      });
+
+      this.promptedThisTick.add(lead.id);
+      this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+      this.service.dispatch(lead.nodeId, {
+        type: "prompt",
+        sessionId: lead.id,
+        prompt: statusCheckEnvelope(tasks),
+        attachments: [],
+      });
+    }
   }
 
   /** The bounded summary a woken Lead reads instead of the whole fleet. */

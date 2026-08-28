@@ -233,6 +233,11 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "run_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "run_role", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "read_only", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing(
+      "sessions",
+      "last_lead_prompt_at",
+      "TEXT NOT NULL DEFAULT ''",
+    );
     this.addColumnIfMissing("runs", "phases", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("runs", "pending_prompt", "TEXT NOT NULL DEFAULT ''");
@@ -1311,6 +1316,25 @@ export class FleetStore {
     return (
       this.sessionQuery("ORDER BY s.position,s.created_at DESC").all() as Row[]
     ).map(sessionFromRow);
+  }
+
+  /** When the engine last sent this Lead any automated prompt. */
+  lastOrchestratorPromptAt(id: string): string {
+    const row = this.statement(
+      "SELECT last_lead_prompt_at FROM sessions WHERE id=? AND run_role='lead'",
+    ).get(id) as Row | undefined;
+    return String(row?.last_lead_prompt_at ?? "");
+  }
+
+  /**
+   * Records before sending, so a crash after dispatch cannot repeat the prompt
+   * on every deadline sweep after restart.
+   */
+  recordOrchestratorPrompt(id: string, at = new Date().toISOString()): boolean {
+    const result = this.statement(
+      "UPDATE sessions SET last_lead_prompt_at=? WHERE id=? AND run_role='lead'",
+    ).run(at, id);
+    return Number(result.changes) > 0;
   }
 
   /**

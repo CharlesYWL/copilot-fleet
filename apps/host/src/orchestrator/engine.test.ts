@@ -5,7 +5,7 @@ import { canTransition } from "@fleet/protocol";
 import { FleetService } from "../fleet-service.js";
 import { FleetStore } from "../store.js";
 import { OrchestratorEngine, truncateMiddle } from "./engine.js";
-import { runSweepInterval } from "./deadlines.js";
+import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS, runSweepInterval } from "./deadlines.js";
 
 type SentFrame = {
   type: string;
@@ -351,6 +351,161 @@ describe("OrchestratorEngine held messages", () => {
         .map((command) => command.prompt)
         .sort(),
     ).toEqual(["first task", "second task"]);
+  });
+});
+
+describe("OrchestratorEngine status checks", () => {
+  const createLead = (kit: ReturnType<typeof setup>, prompt = "orchestrate") => {
+    const lead = kit.store.createSession(kit.placement, prompt, false, "", {
+      runRole: "lead",
+    });
+    kit.store.transitionSession(lead.id, "starting");
+    kit.store.transitionSession(lead.id, "running");
+    return kit.store.transitionSession(lead.id, "idle");
+  };
+
+  const assignTask = (
+    kit: ReturnType<typeof setup>,
+    leadSessionId: string,
+    name: string,
+  ) => {
+    const created = kit.store.createRun({
+      workspaceId: kit.workspace.id,
+      name,
+      objective: name,
+      policy: { wakePolicy: "on_any_settle" },
+    });
+    return kit.store.updateRun(created.id, {
+      state: "running",
+      leadSessionId,
+    })!;
+  };
+
+  it("checks an idle Lead every 30 minutes, not on every deadline sweep", () => {
+    const kit = setup();
+    const lead = createLead(kit);
+    assignTask(kit, lead.id, "Active task");
+    const baseline = Date.parse(kit.store.getSession(lead.id)!.updatedAt);
+
+    kit.engine.tick(baseline + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS - 1);
+    expect(kit.commands("prompt")).toHaveLength(0);
+
+    kit.engine.tick(baseline + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS);
+    expect(kit.commands("prompt")).toHaveLength(1);
+
+    kit.engine.tick(baseline + 2 * ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS - 1);
+    expect(kit.commands("prompt")).toHaveLength(1);
+
+    kit.engine.tick(baseline + 2 * ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS);
+    expect(kit.commands("prompt")).toHaveLength(2);
+  });
+
+  it("does nothing when every assigned task is done or waiting for review", () => {
+    const kit = setup();
+    const lead = createLead(kit);
+    const review = assignTask(kit, lead.id, "Waiting for review");
+    const done = assignTask(kit, lead.id, "Done");
+    kit.store.updateRun(review.id, { state: "awaiting_human" });
+    kit.store.updateRun(done.id, { state: "completed" });
+
+    kit.engine.tick(
+      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
+        ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS,
+    );
+
+    expect(kit.commands("prompt")).toHaveLength(0);
+  });
+
+  it("does not interrupt a Lead that is already in a turn", () => {
+    const kit = setup();
+    const lead = createLead(kit);
+    assignTask(kit, lead.id, "Active task");
+    kit.store.transitionSession(lead.id, "running");
+
+    kit.engine.tick(
+      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
+        ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS,
+    );
+
+    expect(kit.commands("prompt")).toHaveLength(0);
+  });
+
+  it("keeps each conversation's reminder scoped to its assigned tasks", () => {
+    const kit = setup();
+    const first = createLead(kit, "first");
+    const second = createLead(kit, "second");
+    assignTask(kit, first.id, "First lead task");
+    assignTask(kit, second.id, "Second lead task");
+    const due =
+      Math.max(
+        Date.parse(kit.store.getSession(first.id)!.updatedAt),
+        Date.parse(kit.store.getSession(second.id)!.updatedAt),
+      ) + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS;
+
+    kit.engine.tick(due);
+
+    const prompts = kit.commands("prompt");
+    expect(prompts).toHaveLength(2);
+    const firstPrompt = prompts.find((command) => command.sessionId === first.id)?.prompt;
+    const secondPrompt = prompts.find(
+      (command) => command.sessionId === second.id,
+    )?.prompt;
+    expect(firstPrompt).toContain("First lead task");
+    expect(firstPrompt).not.toContain("Second lead task");
+    expect(secondPrompt).toContain("Second lead task");
+    expect(secondPrompt).not.toContain("First lead task");
+  });
+
+  it("prompts only the Lead and never interrupts a dispatched worker", () => {
+    const kit = setup();
+    const lead = createLead(kit);
+    const run = assignTask(kit, lead.id, "Long-running task");
+    kit.store.upsertRunStep(run.id, {
+      stepKey: "step-1",
+      title: "Keep working",
+      prompt: "work",
+      category: "implement",
+    });
+    kit.engine.tickRun(run.id);
+    const worker = kit.store.getSession(kit.store.listRunSteps(run.id)[0]!.sessionId)!;
+    kit.store.transitionSession(worker.id, "starting");
+    kit.store.transitionSession(worker.id, "running");
+    kit.engine.tickRun(run.id);
+
+    kit.engine.tick(
+      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
+        ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS,
+    );
+
+    expect(kit.commands("prompt")).toHaveLength(1);
+    expect(kit.commands("prompt")[0]?.sessionId).toBe(lead.id);
+    expect(kit.commands("prompt")[0]?.prompt).toContain("read-only check");
+    expect(kit.commands("stop")).toHaveLength(0);
+  });
+
+  it("lets an owed task brief take priority over the periodic reminder", () => {
+    const kit = setup();
+    const lead = createLead(kit);
+    const run = assignTask(kit, lead.id, "New task");
+    kit.store.updateRun(run.id, { pendingPrompt: "read the new task brief" });
+    const due =
+      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
+      ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS;
+
+    kit.engine.tick(due);
+
+    expect(kit.commands("prompt").map((command) => command.prompt)).toEqual([
+      "read the new task brief",
+    ]);
+
+    // The brief itself resets the 30-minute clock, even before the Node reports
+    // the Lead as running.
+    kit.engine.tick(due + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS - 1);
+    expect(kit.commands("prompt")).toHaveLength(1);
+
+    kit.engine.tick(due + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS);
+    expect(kit.commands("prompt")).toHaveLength(2);
+    expect(kit.commands("prompt")[1]?.prompt).toContain("<fleet-status-check");
   });
 });
 

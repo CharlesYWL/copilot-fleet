@@ -3,7 +3,7 @@ import Fastify from "fastify";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { orchestratorBriefing } from "./briefing.js";
+import { orchestratorBriefing, statusCheckEnvelope } from "./briefing.js";
 import { fleet } from "./fleet-harness.js";
 import { LeadTokens } from "./lead-tokens.js";
 import { MCP_PATH, mcpRoutes } from "./mcp-routes.js";
@@ -129,5 +129,23 @@ describe("what the orchestrator is told", () => {
     expect(agentFile).toContain("stay open and idle");
     expect(agentFile).toContain("Archiving stops them");
     expect(agentFile).toContain("after reopening");
+  });
+
+  it("makes periodic status checks read-only for dispatched workers", () => {
+    const text = statusCheckEnvelope([
+      {
+        name: "Fix auth",
+        state: "running",
+        phase: "phase 2/3: implement",
+        openSteps: 1,
+        dispatchedSteps: 1,
+      },
+    ]);
+
+    expect(text).toContain("Fix auth");
+    expect(text).toContain("fleet_list_work");
+    expect(text).toContain("read-only check");
+    expect(text).toContain("do not prompt, follow up with, stop");
+    expect(text).toContain("waiting on dispatched work");
   });
 });

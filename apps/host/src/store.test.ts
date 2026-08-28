@@ -1215,6 +1215,23 @@ describe("FleetStore runs", () => {
     expect(worker.runRole).toBe("worker");
   });
 
+  it("persists automated prompt times only for Lead sessions", () => {
+    const { store, placement } = setup();
+    const lead = store.createSession(placement, "orchestrate", false, "", {
+      runRole: "lead",
+    });
+    const worker = store.createSession(placement, "work", false, "", {
+      runRole: "worker",
+    });
+    const checkedAt = "2026-08-28T18:00:00.000Z";
+
+    expect(store.lastOrchestratorPromptAt(lead.id)).toBe("");
+    expect(store.recordOrchestratorPrompt(lead.id, checkedAt)).toBe(true);
+    expect(store.lastOrchestratorPromptAt(lead.id)).toBe(checkedAt);
+    expect(store.recordOrchestratorPrompt(worker.id, checkedAt)).toBe(false);
+    expect(store.lastOrchestratorPromptAt(worker.id)).toBe("");
+  });
+
   it("reads a policy back as it was written, not as defaults", () => {
     const { store, workspace } = setup();
     const run = store.createRun({

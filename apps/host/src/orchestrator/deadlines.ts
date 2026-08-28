@@ -1,5 +1,8 @@
 import type { OrchestratorEngine } from "./engine.js";
 
+/** An idle Lead reviews its assigned active tasks at most twice an hour. */
+export const ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+
 /**
  * How often the deadline sweep runs; never longer than the shortest deadline
  * it has to enforce.
