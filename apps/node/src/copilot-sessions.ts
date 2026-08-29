@@ -3,6 +3,17 @@ import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { errorMessage } from "@fleet/protocol";
 import { copilotLaunchArgs, type ContextTier } from "./agents.js";
+import {
+  boundedSessionPreview,
+  discoveredSession,
+  type DiscoveredCopilotSession,
+  type SessionPreview,
+} from "./copilot-session-model.js";
+
+export type {
+  DiscoveredCopilotSession,
+  SessionPreview,
+} from "./copilot-session-model.js";
 
 export type DiscoveryErrorCode =
   | "unsupported_list"
@@ -20,20 +31,6 @@ export class CopilotSessionDiscoveryError extends Error {
     this.name = "CopilotSessionDiscoveryError";
   }
 }
-
-export type DiscoveredCopilotSession = {
-  id: string;
-  cwd: string;
-  additionalDirectories: string[];
-  loadSupported: boolean;
-  title?: string;
-  updatedAt?: string;
-};
-
-export type SessionPreview = {
-  items: Array<{ role: "user" | "assistant"; text: string }>;
-  truncated: boolean;
-};
 
 type DiscoveryConnection = {
   initialize: () => Promise<acp.InitializeResponse>;
@@ -87,47 +84,6 @@ function withTimeout<T>(work: Promise<T>, message: string): Promise<T> {
   });
 }
 
-function metadata(
-  info: acp.SessionInfo,
-  loadSupported: boolean,
-): DiscoveredCopilotSession {
-  return {
-    id: info.sessionId,
-    cwd: info.cwd,
-    additionalDirectories: [...(info.additionalDirectories ?? [])],
-    loadSupported,
-    ...(typeof info.title === "string" && info.title !== "" ? { title: info.title } : {}),
-    ...(typeof info.updatedAt === "string" && info.updatedAt !== ""
-      ? { updatedAt: info.updatedAt }
-      : {}),
-  };
-}
-
-function boundPreview(
-  source: readonly { role: "user" | "assistant"; text: string }[],
-  maxCharacters: number,
-  maxItems: number,
-  previouslyTruncated: boolean,
-): SessionPreview {
-  const items: Array<{ role: "user" | "assistant"; text: string }> = [];
-  let remaining = maxCharacters;
-  let truncated = previouslyTruncated || source.length > maxItems;
-  for (const item of source.slice(-maxItems).reverse()) {
-    if (remaining <= 0) {
-      truncated = true;
-      break;
-    }
-    const text =
-      item.text.length <= remaining
-        ? item.text
-        : item.text.slice(item.text.length - remaining);
-    if (text.length !== item.text.length) truncated = true;
-    items.unshift({ role: item.role, text });
-    remaining -= text.length;
-  }
-  return { items, truncated };
-}
-
 /**
  * Discovers Copilot conversations exclusively through the public ACP surface.
  */
@@ -177,7 +133,7 @@ export class CopilotSessionDiscovery {
         );
       }
       const sessions = result.sessions.map((info) =>
-        metadata(info, capabilities?.loadSession === true),
+        discoveredSession(info, capabilities?.loadSession === true),
       );
       const expiresAt = now + (this.options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS);
       for (const session of sessions) {
@@ -257,7 +213,7 @@ export class CopilotSessionDiscovery {
           `Copilot could not load this session: ${errorMessage(error)}`,
         );
       }
-      return boundPreview(
+      return boundedSessionPreview(
         messages,
         this.options.previewCharacters ?? DEFAULT_PREVIEW_CHARACTERS,
         this.options.previewItems ?? DEFAULT_PREVIEW_ITEMS,
