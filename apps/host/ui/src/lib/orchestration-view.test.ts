@@ -160,6 +160,25 @@ describe("buildRunViewModels", () => {
     expect(model?.attentionSessionId).toBe("s1");
   });
 
+  it("removes failed-step attention after every current failure is acknowledged", () => {
+    const failed = step("failed", { state: "failed", attempts: 2 });
+    const [model] = buildRunViewModels({
+      runs: [run()],
+      stepsByRun: { r1: [failed, step("running", { state: "running" })] },
+      sessions: [],
+      acknowledgedFailedSteps: {
+        r1: [JSON.stringify([failed.id, failed.attempts])],
+      },
+    });
+
+    expect(model?.attention).toBeUndefined();
+    expect(model?.liveSteps).toBe(1);
+    expect(summarise(model ? [model] : [])).toMatchObject({
+      running: 1,
+      needsYou: 0,
+    });
+  });
+
   it("treats a task handed to a person as needing one", () => {
     const [model] = build({
       runs: [run({ state: "awaiting_human" })],

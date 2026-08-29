@@ -38,6 +38,13 @@ export type NodeUpdateProgress = Record<
   { stage: NodeUpdateStage; detail: string }
 >;
 
+export function sessionFailureMessage(
+  session: Pick<Snapshot["sessions"][number], "nodeName" | "currentActivity">,
+): string {
+  const reason = session.currentActivity || "Session failed";
+  return session.nodeName ? `${session.nodeName}: ${reason}` : reason;
+}
+
 export function useFleet(notify: Notify) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [events, setEvents] = useState<Record<string, SessionEvent[]>>({});
@@ -187,7 +194,7 @@ export function useFleet(notify: Notify) {
         if (message.type === "session") {
           const { session } = message;
           if (session.state === "failed") {
-            notifyRef.current(session.currentActivity || "Session failed", "error");
+            notifyRef.current(sessionFailureMessage(session), "error");
           }
           setSnapshot((value) => ({
             ...value,
