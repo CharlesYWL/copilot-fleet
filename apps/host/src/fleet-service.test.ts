@@ -57,6 +57,147 @@ function setup(hostRevision: string | (() => string) = "") {
   return { store, service, enroll };
 }
 
+describe("adopting discovered Copilot sessions", () => {
+  it("creates one Fleet session with the stable ACP id and dispatches resume", () => {
+    const { store, service, enroll } = setup();
+    const wire = enroll("box", ["copilot-acp", "host-yolo"]);
+    store.setNodeOnline(wire.nodeId, true, 0);
+    const workspace = store.createWorkspace("repo", "");
+    const placement = store.createPlacement(workspace.id, wire.nodeId, "C:\\repo");
+
+    const result = service.adoptAndResumeSession({
+      placement,
+      agentSessionId: "stable-acp-id",
+      additionalDirectories: ["C:\\shared"],
+      yolo: false,
+      name: "Existing work",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(store.listSessions()).toHaveLength(1);
+    expect(store.listSessions()[0]).toMatchObject({
+      agentSessionId: "stable-acp-id",
+      name: "Existing work",
+      state: "starting",
+    });
+    expect(wire.sent.at(-1)).toMatchObject({
+      type: "command",
+      command: {
+        type: "resume_session",
+        sessionId: store.listSessions()[0]!.id,
+        localPath: "C:\\repo",
+        additionalDirectories: ["C:\\shared"],
+      },
+    });
+  });
+
+  it("prevents a second live adoption of the same ACP session", () => {
+    const { store, service, enroll } = setup();
+    const wire = enroll("box", ["copilot-acp"]);
+    store.setNodeOnline(wire.nodeId, true, 0);
+    const workspace = store.createWorkspace("repo", "");
+    const placement = store.createPlacement(workspace.id, wire.nodeId, "C:\\repo");
+
+    expect(
+      service.adoptAndResumeSession({
+        placement,
+        agentSessionId: "same-acp-id",
+        yolo: false,
+      }).ok,
+    ).toBe(true);
+    const duplicate = service.adoptAndResumeSession({
+      placement,
+      agentSessionId: "same-acp-id",
+      yolo: false,
+    });
+
+    expect(duplicate).toEqual({
+      ok: false,
+      status: 409,
+      error: "This Copilot session is already live in Fleet",
+    });
+    expect(store.listSessions()).toHaveLength(1);
+  });
+
+  it("reuses a settled ACP session on another node without duplicating history", () => {
+    const { store, service, enroll } = setup();
+    const first = enroll("first", ["copilot-acp"]);
+    const second = enroll("second", ["copilot-acp"]);
+    store.setNodeOnline(first.nodeId, true, 0);
+    store.setNodeOnline(second.nodeId, true, 0);
+    const workspace = store.createWorkspace("repo", "");
+    const oldPlacement = store.createPlacement(
+      workspace.id,
+      first.nodeId,
+      "C:\\old-repo",
+    );
+    const newPlacement = store.createPlacement(workspace.id, second.nodeId, "D:\\repo");
+
+    const original = service.adoptAndResumeSession({
+      placement: oldPlacement,
+      agentSessionId: "portable-acp-id",
+      yolo: false,
+    });
+    expect(original.ok).toBe(true);
+    const originalId = original.ok ? original.session.id : "";
+    store.transitionSession(originalId, "failed", "Old node stopped");
+
+    const resumed = service.adoptAndResumeSession({
+      placement: newPlacement,
+      agentSessionId: "portable-acp-id",
+      yolo: false,
+    });
+
+    expect(resumed.ok).toBe(true);
+    expect(store.listSessions()).toHaveLength(1);
+    expect(resumed.ok ? resumed.session : undefined).toMatchObject({
+      id: originalId,
+      nodeId: second.nodeId,
+      placementId: newPlacement.id,
+      state: "starting",
+    });
+    expect(second.sent.at(-1)).toMatchObject({
+      command: { type: "resume_session", sessionId: originalId, localPath: "D:\\repo" },
+    });
+  });
+
+  it("does not relocate settled history when the target node cannot resume", () => {
+    const { store, service, enroll } = setup();
+    const first = enroll("first", ["copilot-acp"]);
+    const second = enroll("second", ["copilot-acp"]);
+    store.setNodeOnline(first.nodeId, true, 0);
+    store.setNodeOnline(second.nodeId, false, 0);
+    const workspace = store.createWorkspace("repo", "");
+    const oldPlacement = store.createPlacement(
+      workspace.id,
+      first.nodeId,
+      "C:\\old-repo",
+    );
+    const newPlacement = store.createPlacement(workspace.id, second.nodeId, "D:\\repo");
+    const original = service.adoptAndResumeSession({
+      placement: oldPlacement,
+      agentSessionId: "stable-history",
+      yolo: false,
+    });
+    expect(original.ok).toBe(true);
+    const originalId = original.ok ? original.session.id : "";
+    store.transitionSession(originalId, "failed", "Old node stopped");
+
+    expect(
+      service.adoptAndResumeSession({
+        placement: newPlacement,
+        agentSessionId: "stable-history",
+        yolo: false,
+      }),
+    ).toEqual({ ok: false, status: 503, error: "Node is offline" });
+    expect(store.getSession(originalId)).toMatchObject({
+      nodeId: first.nodeId,
+      placementId: oldPlacement.id,
+      state: "failed",
+    });
+  });
+});
+
 describe("handleEvent after a Host restart", () => {
   const event = (sessionId: string, sequence: number, payload: object, type = "state") =>
     ({

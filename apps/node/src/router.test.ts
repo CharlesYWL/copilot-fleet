@@ -318,9 +318,14 @@ describe("CommandRouter", () => {
 
   it("resumes without prompting and continues the event sequence", async () => {
     const events: SessionEvent[] = [];
-    let received: { resume: string | undefined; offset: number | undefined } = {
+    let received: {
+      resume: string | undefined;
+      offset: number | undefined;
+      additionalDirectories: readonly string[] | undefined;
+    } = {
       resume: undefined,
       offset: undefined,
+      additionalDirectories: undefined,
     };
     let prompts = 0;
     const factory: AgentFactory = {
@@ -328,6 +333,7 @@ describe("CommandRouter", () => {
         received = {
           resume: options?.resumeAgentSessionId,
           offset: options?.sequenceOffset,
+          additionalDirectories: options?.additionalDirectories,
         };
         sink({
           eventId: `${sessionId}-resumed`,
@@ -363,11 +369,16 @@ describe("CommandRouter", () => {
       sessionId: "s1",
       localPath: "/one",
       agentSessionId: "copilot-abc",
+      additionalDirectories: ["/shared"],
       sequenceOffset: 7,
       ...START_DEFAULTS,
     });
     expect(result.ok).toBe(true);
-    expect(received).toEqual({ resume: "copilot-abc", offset: 7 });
+    expect(received).toEqual({
+      resume: "copilot-abc",
+      offset: 7,
+      additionalDirectories: ["/shared"],
+    });
     expect(prompts).toBe(0);
     expect(events[0]?.sequence).toBe(8);
   });

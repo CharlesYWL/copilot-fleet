@@ -22,6 +22,22 @@ const WorkspaceLikeSchema = z.object({
 });
 export type WorkspaceLike = z.infer<typeof WorkspaceLikeSchema>;
 
+const SessionStatusLikeSchema = z.object({
+  id: z.string(),
+  placementId: z.string(),
+  nodeId: z.string(),
+  state: z.string(),
+  agentSessionId: z.string().default(""),
+});
+export type SessionStatusLike = z.infer<typeof SessionStatusLikeSchema>;
+
+const StartedSessionSchema = z.object({
+  id: z.string(),
+  state: z.string(),
+  agentSessionId: z.string().default(""),
+});
+export type StartedSession = z.infer<typeof StartedSessionSchema>;
+
 /**
  * Narrows the fleet's placements to the ones this machine owns.
  *
@@ -188,6 +204,40 @@ export class FleetClient {
         nodeId: this.options.nodeId(),
         localPath,
       }),
+    });
+  }
+
+  async listOwnSessions(): Promise<SessionStatusLike[]> {
+    return request(
+      this.options.hostUrl(),
+      "/api/sessions",
+      z.array(SessionStatusLikeSchema),
+      { credentials: this.credentials() },
+    );
+  }
+
+  async createOwnSession(input: {
+    placementId: string;
+    prompt: string;
+    name?: string;
+  }): Promise<StartedSession> {
+    return request(this.options.hostUrl(), "/api/sessions", StartedSessionSchema, {
+      method: "POST",
+      credentials: this.credentials(),
+      body: JSON.stringify(input),
+    });
+  }
+
+  async adoptOwnSession(input: {
+    placementId: string;
+    agentSessionId: string;
+    additionalDirectories: string[];
+    name?: string;
+  }): Promise<StartedSession> {
+    return request(this.options.hostUrl(), "/api/sessions/adopt", StartedSessionSchema, {
+      method: "POST",
+      credentials: this.credentials(),
+      body: JSON.stringify(input),
     });
   }
 }

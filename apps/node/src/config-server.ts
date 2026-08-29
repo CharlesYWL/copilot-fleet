@@ -1,10 +1,12 @@
 import { createServer, type Server } from "node:http";
+import { resolve } from "node:path";
 import { z } from "zod";
 import {
   BACKUP_VERSION,
   HOST_BACKUP_KIND,
   NODE_BACKUP_KIND,
   NodeBackupSchema,
+  SESSION_NAME_MAX_LENGTH,
   backupKind,
   errorMessage,
   type NodeBackup,
@@ -13,9 +15,21 @@ import type { LogEntry } from "@fleet/protocol/log-buffer";
 import { EditableSettingsSchema, type Settings } from "./settings.js";
 import type { Credentials } from "./config.js";
 import { configAsset } from "./config-assets.js";
-import { FleetClient, type PlacementLike, type WorkspaceLike } from "./fleet-client.js";
+import {
+  FleetClient,
+  type PlacementLike,
+  type SessionStatusLike,
+  type StartedSession,
+  type WorkspaceLike,
+} from "./fleet-client.js";
 import { pickFolder as pickFolderDefault, type PickerResult } from "./pick-folder.js";
 import { inspectPath as inspectPathDefault, type PathCheck } from "./path-check.js";
+import {
+  CopilotSessionDiscovery,
+  CopilotSessionDiscoveryError,
+  type DiscoveredCopilotSession,
+  type SessionPreview,
+} from "./copilot-sessions.js";
 
 /** An id turns create into update; the page uses one form for both. */
 const WorkspaceInputSchema = z.object({
@@ -28,6 +42,12 @@ const PlacementInputSchema = z.object({
   id: z.string().optional(),
   workspaceId: z.string().default(""),
   localPath: z.string().min(1).max(4096),
+});
+
+const NewSessionInputSchema = z.object({
+  placementId: z.string().min(1),
+  prompt: z.string().min(1).max(100_000),
+  name: z.string().max(SESSION_NAME_MAX_LENGTH).optional(),
 });
 
 export type ConfigStatus = {
@@ -59,6 +79,27 @@ export type FleetApi = {
   ) => Promise<WorkspaceLike>;
   createOwnPlacement: (workspaceId: string, localPath: string) => Promise<PlacementLike>;
   updateOwnPlacementPath: (id: string, localPath: string) => Promise<PlacementLike>;
+  listOwnSessions: () => Promise<SessionStatusLike[]>;
+  createOwnSession: (input: {
+    placementId: string;
+    prompt: string;
+    name?: string;
+  }) => Promise<StartedSession>;
+  adoptOwnSession: (input: {
+    placementId: string;
+    agentSessionId: string;
+    additionalDirectories: string[];
+    name?: string;
+  }) => Promise<StartedSession>;
+};
+
+export type SessionDiscoveryApi = {
+  list: (cursor?: string) => Promise<{
+    sessions: DiscoveredCopilotSession[];
+    nextCursor?: string;
+  }>;
+  preview: (sessionId: string) => Promise<SessionPreview>;
+  get: (sessionId: string) => DiscoveredCopilotSession | undefined;
 };
 
 export type ConfigServerOptions = {
@@ -84,6 +125,7 @@ export type ConfigServerOptions = {
   fleet?: FleetApi;
   pickFolder?: (start: string) => Promise<PickerResult>;
   inspectPath?: (path: string) => PathCheck;
+  sessionDiscovery?: SessionDiscoveryApi;
 };
 
 export type ConfigReply = { status: number; body: unknown };
@@ -192,6 +234,32 @@ export function configServerPort(env: NodeJS.ProcessEnv = process.env): number {
 const ok = (body: unknown): ConfigReply => ({ status: 200, body });
 const badRequest = (error: string): ConfigReply => ({ status: 400, body: { error } });
 
+function discoveryFailure(error: unknown): ConfigReply {
+  if (!(error instanceof CopilotSessionDiscoveryError)) {
+    return { status: 502, body: { error: errorMessage(error) } };
+  }
+  const status =
+    error.code === "session_not_found"
+      ? 404
+      : error.code === "unsupported_list" || error.code === "unsupported_load"
+        ? 409
+        : error.code === "load_failed"
+          ? 422
+          : 502;
+  return { status, body: { error: error.message, code: error.code } };
+}
+
+function comparablePath(path: string): string {
+  const normalized = resolve(path).replace(/[\\/]+$/, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function queryValue(url: string, name: string): string | undefined {
+  const query = url.split("?")[1];
+  if (!query) return undefined;
+  return new URLSearchParams(query).get(name) ?? undefined;
+}
+
 /** Host calls fail for ordinary reasons (offline, stale URL), so they are
  * reported as a message the page can show rather than a 500. */
 async function relay(work: () => Promise<unknown>): Promise<ConfigReply> {
@@ -226,6 +294,12 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
     });
   const pickFolder = options.pickFolder ?? pickFolderDefault;
   const inspectPath = options.inspectPath ?? inspectPathDefault;
+  const discovery =
+    options.sessionDiscovery ??
+    new CopilotSessionDiscovery({
+      getCopilotCommand: () => options.getSettings().copilotCommand,
+      getContextTier: () => options.getSettings().contextTier,
+    });
   const state = (): ConfigReply =>
     ok({ settings: options.getSettings(), status: options.getStatus() });
 
@@ -293,6 +367,30 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
           workspaces: await fleet.listWorkspaces(),
           placements: await fleet.listOwnPlacements(),
         })),
+    ],
+    [
+      "POST /api/sessions/new",
+      async (body) => {
+        const input = NewSessionInputSchema.safeParse(JSON.parse(body));
+        if (!input.success) {
+          return badRequest(input.error.issues[0]?.message ?? "Invalid session");
+        }
+        const mine = await fleet.listOwnPlacements();
+        if (!mine.some((placement) => placement.id === input.data.placementId)) {
+          return {
+            status: 403,
+            body: { error: "That placement belongs to another node" },
+          };
+        }
+        return relay(async () => {
+          const created = await fleet.createOwnSession({
+            placementId: input.data.placementId,
+            prompt: input.data.prompt,
+            ...(input.data.name === undefined ? {} : { name: input.data.name }),
+          });
+          return { sessionId: created.id, state: created.state };
+        });
+      },
     ],
     ["POST /api/check-path", async (body) => ok(inspectPath(pathFrom(body)))],
     [
@@ -364,6 +462,118 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
   return async (method, url, body) => {
     // Query strings belong to the page, not to the route key.
     const pathname = url.split("?")[0] ?? url;
+    if (method === "GET" && pathname === "/api/sessions") {
+      try {
+        const [page, placements, statuses] = await Promise.all([
+          discovery.list(queryValue(url, "cursor")),
+          fleet.listOwnPlacements(),
+          fleet.listOwnSessions(),
+        ]);
+        const placementByPath = new Map(
+          placements.map((placement) => [comparablePath(placement.localPath), placement]),
+        );
+        const statusByAgentId = new Map(
+          statuses
+            .filter((status) => status.agentSessionId)
+            .map((status) => [status.agentSessionId, status]),
+        );
+        return ok({
+          sessions: page.sessions.map((session) => {
+            const placement = placementByPath.get(comparablePath(session.cwd));
+            const status = statusByAgentId.get(session.id);
+            const alreadyLive =
+              status &&
+              ["queued", "starting", "running", "idle", "cancelling"].includes(
+                status.state,
+              );
+            const resumeReason = !session.loadSupported
+              ? "This Copilot version can discover this session but cannot load its context."
+              : !placement
+                ? "No Fleet placement on this node matches this session's project."
+                : alreadyLive
+                  ? "This Copilot session is already live in Fleet."
+                  : undefined;
+            return {
+              id: session.id,
+              title: session.title ?? null,
+              updatedAt: session.updatedAt ?? null,
+              createdAt: null,
+              status: status?.state ?? "Available",
+              workspaceName: placement?.workspaceName ?? null,
+              placementId: placement?.id ?? null,
+              resumable: Boolean(session.loadSupported && placement && !alreadyLive),
+              resumeReason: resumeReason ?? null,
+              legacy: session.title === undefined || session.updatedAt === undefined,
+            };
+          }),
+          ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+        });
+      } catch (error) {
+        return discoveryFailure(error);
+      }
+    }
+    const previewMatch = /^\/api\/sessions\/([^/]+)\/preview$/.exec(pathname);
+    if (method === "GET" && previewMatch?.[1]) {
+      try {
+        const id = decodeURIComponent(previewMatch[1]);
+        return ok({ id, ...(await discovery.preview(id)) });
+      } catch (error) {
+        return discoveryFailure(error);
+      }
+    }
+    const resumeMatch = /^\/api\/sessions\/([^/]+)\/resume$/.exec(pathname);
+    if (method === "POST" && resumeMatch?.[1]) {
+      const sessionId = decodeURIComponent(resumeMatch[1]);
+      const session = discovery.get(sessionId);
+      if (!session) {
+        return {
+          status: 404,
+          body: { error: "Refresh the Copilot session list before resuming it" },
+        };
+      }
+      try {
+        const [placements, statuses] = await Promise.all([
+          fleet.listOwnPlacements(),
+          fleet.listOwnSessions(),
+        ]);
+        const placement = placements.find(
+          (candidate) =>
+            comparablePath(candidate.localPath) === comparablePath(session.cwd),
+        );
+        if (!placement) {
+          return {
+            status: 409,
+            body: {
+              error: "No Fleet placement on this node matches this session's project.",
+            },
+          };
+        }
+        const live = statuses.find(
+          (status) =>
+            status.agentSessionId === sessionId &&
+            ["queued", "starting", "running", "idle", "cancelling"].includes(
+              status.state,
+            ),
+        );
+        if (live) {
+          return {
+            status: 409,
+            body: { error: "This Copilot session is already live in Fleet." },
+          };
+        }
+        const resumed = await fleet.adoptOwnSession({
+          placementId: placement.id,
+          agentSessionId: sessionId,
+          additionalDirectories: session.additionalDirectories,
+          ...(session.title === undefined
+            ? {}
+            : { name: session.title.slice(0, SESSION_NAME_MAX_LENGTH) }),
+        });
+        return ok({ sessionId: resumed.id, state: resumed.state });
+      } catch (error) {
+        return { status: 502, body: { error: errorMessage(error) } };
+      }
+    }
     const handler = routes.get(`${method} ${pathname}`);
     if (!handler) return { status: 404, body: { error: "Not found" } };
     try {

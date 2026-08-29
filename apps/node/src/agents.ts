@@ -164,6 +164,8 @@ export type EventSink = (event: SessionEvent) => void;
 export type StartAgentOptions = {
   /** Copilot session id to re-attach to via ACP `session/load`. */
   resumeAgentSessionId?: string;
+  /** Workspace roots that were attached to the original Copilot session. */
+  additionalDirectories?: readonly string[];
   /** First event sequence number to use, so resumed runs keep ordering. */
   sequenceOffset?: number;
   /** Launch Copilot with --allow-all. The Host owns this decision. */
@@ -436,6 +438,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly customAgent = "",
     /** Pickers the Host wants set before the first prompt. Often empty. */
     private readonly startupConfig: readonly StartupConfig[] = [],
+    /** Workspace roots to restore when loading an existing Copilot session. */
+    private readonly additionalDirectories: readonly string[] = [],
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -538,6 +542,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           {
             sessionId: resumeAgentSessionId,
             cwd,
+            ...(this.additionalDirectories.length > 0
+              ? { additionalDirectories: [...this.additionalDirectories] }
+              : {}),
             mcpServers: this.mcpServers(),
           },
         );
@@ -960,6 +967,7 @@ export class AcpAgentFactory implements AgentFactory {
       options.mcpServers ?? [],
       options.agent ?? "",
       options.config ?? [],
+      options.additionalDirectories ?? [],
     );
     try {
       await withCopilotStartupTimeout(

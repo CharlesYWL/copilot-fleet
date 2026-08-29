@@ -317,6 +317,56 @@ export class FleetService {
   }
 
   /**
+   * Adopts a Copilot-owned ACP session into Fleet and resumes it on its node.
+   */
+  adoptAndResumeSession(input: {
+    placement: Placement;
+    agentSessionId: string;
+    additionalDirectories?: string[];
+    yolo: boolean;
+    name?: string;
+  }): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
+    const sessions = this.store.listSessions();
+    const existing = sessions.find(
+      (session) => session.agentSessionId === input.agentSessionId,
+    );
+    if (
+      existing &&
+      ["queued", "starting", "running", "idle", "cancelling"].includes(existing.state)
+    ) {
+      return {
+        ok: false,
+        status: 409,
+        error: "This Copilot session is already live in Fleet",
+      };
+    }
+    const node = this.store.getNode(input.placement.nodeId);
+    const socket = node ? this.nodeSockets.get(node.id) : undefined;
+    if (!node?.online || !socket || socket.readyState !== socket.OPEN) {
+      return { ok: false, status: 503, error: "Node is offline" };
+    }
+    const kind = existing?.readOnly ? "read-only" : "writing";
+    if (reservedSessionCount(sessions, node.id, kind) >= capacityFor(node, kind)) {
+      return {
+        ok: false,
+        status: 409,
+        error: `Node is at capacity for ${kind} work`,
+      };
+    }
+    const unsupported = yoloUnsupportedReason(node, input.yolo);
+    if (unsupported) return { ok: false, status: 409, error: unsupported };
+
+    const adopted = this.store.adoptSession(
+      input.placement,
+      input.agentSessionId,
+      input.additionalDirectories ?? [],
+      input.yolo,
+      input.name ?? "",
+    );
+    return this.resumeSession(adopted.session.id, "Adopting Copilot session");
+  }
+
+  /**
    * Re-attaches one finished Copilot conversation without prompting it.
    *
    * Kept beside creation because both paths enforce the same admission rules
@@ -364,6 +414,7 @@ export class FleetService {
         sessionId,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
+        additionalDirectories: session.additionalDirectories ?? [],
         sequenceOffset: this.store.maxEventSequence(sessionId),
         yolo: session.yolo,
         mcpServers: this.mcpServersFor(session),
@@ -723,6 +774,7 @@ export class FleetService {
         sessionId: session.id,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
+        additionalDirectories: session.additionalDirectories ?? [],
         sequenceOffset: this.store.maxEventSequence(session.id),
         yolo: session.yolo,
         // Re-issued, not replayed: `session/load` takes its own server list, and

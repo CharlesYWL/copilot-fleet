@@ -54,6 +54,7 @@ const respond = (path, init) => {
   if (path === "/api/config") return reply({ settings: stored, status });
   if (path === "/api/logs") return reply({ entries: [] });
   if (path === "/api/fleet") return reply({ workspaces: [], placements: [] });
+  if (path === "/api/sessions") return reply({ sessions: [] });
   throw new Error(`unexpected request: ${path}`);
 };
 
@@ -170,5 +171,212 @@ describe("node settings form", () => {
     expect($("revert").disabled).toBe(false);
     await poll();
     expect($("maxSessions").value).toBe("24");
+  });
+});
+
+describe("Copilot session history", () => {
+  it("sorts, searches, and selects by stable session id", async () => {
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/sessions") {
+        return reply({
+          sessions: [
+            {
+              id: "stable-old",
+              title: null,
+              updatedAt: null,
+              createdAt: null,
+              status: "Available",
+              workspaceName: "Legacy project",
+              resumable: true,
+              resumeReason: null,
+              legacy: true,
+            },
+            {
+              id: "stable-new",
+              title: "Current work",
+              updatedAt: "2026-08-28T23:00:00.000Z",
+              createdAt: null,
+              status: "Available",
+              workspaceName: "Fleet",
+              resumable: true,
+              resumeReason: null,
+              legacy: false,
+            },
+          ],
+        });
+      }
+      return respond(path, init);
+    });
+    await startPage();
+    await vi.waitFor(() =>
+      expect(document.querySelectorAll("[data-session-id]")).toHaveLength(2),
+    );
+
+    const rows = document.querySelectorAll("[data-session-id]");
+    expect([...rows].map((row) => row.dataset.sessionId)).toEqual([
+      "stable-new",
+      "stable-old",
+    ]);
+    rows[0]?.click();
+    expect($("sessionStableId").textContent).toBe("stable-new");
+
+    type("sessionSearch", "legacy");
+    expect(
+      [...document.querySelectorAll("[data-session-id]")].map(
+        (row) => row.dataset.sessionId,
+      ),
+    ).toEqual(["stable-old"]);
+  });
+
+  it("prevents a repeated click from sending a duplicate resume", async () => {
+    let finishResume;
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/sessions") {
+        return reply({
+          sessions: [
+            {
+              id: "stable-session",
+              title: "Resume me",
+              updatedAt: "2026-08-28T23:00:00.000Z",
+              createdAt: null,
+              status: "Available",
+              workspaceName: "Fleet",
+              resumable: true,
+              resumeReason: null,
+              legacy: false,
+            },
+          ],
+        });
+      }
+      if (path === "/api/sessions/stable-session/resume" && init?.method === "POST") {
+        return new Promise((resolve) => {
+          finishResume = resolve;
+        });
+      }
+      return respond(path, init);
+    });
+    await startPage();
+    await vi.waitFor(() => expect($("sessionList").textContent).toContain("Resume me"));
+    document.querySelector("[data-session-id]")?.click();
+
+    $("resumeSession").click();
+    $("resumeSession").click();
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([path]) => String(path).endsWith("/stable-session/resume")),
+    ).toHaveLength(1);
+
+    finishResume({
+      ok: true,
+      json: async () => ({ sessionId: "fleet-session", state: "starting" }),
+    });
+    await vi.waitFor(() => expect($("resumeSession").textContent).toBe("Resumed"));
+    expect($("resumeSession").disabled).toBe(true);
+  });
+
+  it("paginates large histories without losing the selected session", async () => {
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/sessions") {
+        return reply({
+          sessions: [
+            {
+              id: "page-one",
+              title: "First page",
+              updatedAt: "2026-08-28T23:00:00.000Z",
+              createdAt: null,
+              status: "Available",
+              workspaceName: "Fleet",
+              resumable: true,
+              resumeReason: null,
+              legacy: false,
+            },
+          ],
+          nextCursor: "opaque:2",
+        });
+      }
+      if (path === "/api/sessions?cursor=opaque%3A2") {
+        return reply({
+          sessions: [
+            {
+              id: "page-two",
+              title: "Second page",
+              updatedAt: "2026-08-27T23:00:00.000Z",
+              createdAt: null,
+              status: "Available",
+              workspaceName: "Fleet",
+              resumable: true,
+              resumeReason: null,
+              legacy: false,
+            },
+          ],
+        });
+      }
+      return respond(path, init);
+    });
+    await startPage();
+    await vi.waitFor(() => expect($("sessionList").textContent).toContain("First page"));
+    document.querySelector('[data-session-id="page-one"]')?.click();
+
+    $("sessionMore").click();
+    await vi.waitFor(() => expect($("sessionList").textContent).toContain("Second page"));
+
+    expect(document.querySelectorAll("[data-session-id]")).toHaveLength(2);
+    expect($("sessionStableId").textContent).toBe("page-one");
+  });
+
+  it("ignores a context preview that arrives after selection changed", async () => {
+    let finishOldPreview;
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/sessions") {
+        return reply({
+          sessions: ["old", "new"].map((id) => ({
+            id,
+            title: id,
+            updatedAt: "2026-08-28T23:00:00.000Z",
+            createdAt: null,
+            status: "Available",
+            workspaceName: "Fleet",
+            resumable: true,
+            resumeReason: null,
+            legacy: false,
+          })),
+        });
+      }
+      if (path === "/api/sessions/old/preview") {
+        return new Promise((resolve) => {
+          finishOldPreview = resolve;
+        });
+      }
+      if (path === "/api/sessions/new/preview") {
+        return reply({
+          items: [{ role: "assistant", text: "new selection context" }],
+          truncated: false,
+        });
+      }
+      return respond(path, init);
+    });
+    await startPage();
+    await vi.waitFor(() =>
+      expect(document.querySelectorAll("[data-session-id]")).toHaveLength(2),
+    );
+    const oldRow = document.querySelector('[data-session-id="old"]');
+    oldRow?.click();
+    $("loadPreview").click();
+    document.querySelector('[data-session-id="new"]')?.click();
+    $("loadPreview").click();
+    await vi.waitFor(() =>
+      expect($("sessionPreview").textContent).toContain("new selection context"),
+    );
+
+    finishOldPreview({
+      ok: true,
+      json: async () => ({
+        items: [{ role: "assistant", text: "stale context" }],
+        truncated: false,
+      }),
+    });
+    await Promise.resolve();
+    expect($("sessionPreview").textContent).not.toContain("stale context");
   });
 });

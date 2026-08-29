@@ -8,191 +8,365 @@
     <script src="/config.js" type="module" defer></script>
   </head>
   <body>
-    <main>
-      <h1>Copilot Fleet node</h1>
-      <p class="sub">Local configuration. Reachable from this machine only.</p>
-
-      <div class="card">
-        <div class="status">
-          <span class="dot" id="dot" aria-hidden="true"></span>
-          <strong id="conn">Loading…</strong>
+    <div class="app-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Local node console</p>
+          <h1>Copilot Fleet</h1>
         </div>
-        <div class="meta" id="meta"></div>
-      </div>
-
-      <form class="card" id="form">
-        <div class="warn">
-          Pointing this node at a different Host lets that Host run commands on this
-          machine. Only enter a URL you control.
+        <div class="header-actions">
+          <div class="status compact">
+            <span class="dot" id="dot" aria-hidden="true"></span>
+            <div>
+              <strong id="conn">Loading…</strong>
+              <div class="meta" id="meta"></div>
+            </div>
+          </div>
+          <button type="button" id="newSession">New session</button>
         </div>
+      </header>
 
-        <label>
-          <span class="label">Host URL</span>
-          <input
-            id="hostUrl"
-            name="hostUrl"
-            type="url"
-            required
-            placeholder="https://example.trycloudflare.com"
-          />
-          <span class="hint"
-            >Saving reconnects immediately. Running sessions keep going.</span
+      <aside class="session-sidebar" aria-label="Copilot sessions">
+        <div class="sidebar-head">
+          <div>
+            <h2>Sessions</h2>
+            <p class="sub">Copilot history on this user account</p>
+          </div>
+          <button
+            type="button"
+            class="icon-button"
+            id="sessionRefresh"
+            aria-label="Refresh sessions"
+            title="Refresh sessions"
           >
-          <span class="hint" id="hostUrlFallbacks"></span>
-        </label>
-
-        <label>
-          <span class="label">Node name</span>
-          <input id="nodeName" name="nodeName" required maxlength="120" />
-          <span class="hint">Changing this re-registers the node with the Host.</span>
-        </label>
-
-        <label>
-          <span class="label">Max concurrent sessions</span>
-          <input
-            id="maxSessions"
-            name="maxSessions"
-            type="number"
-            min="1"
-            max="64"
-            required
-          />
-        </label>
-
-        <label>
-          <span class="label">Copilot command</span>
-          <input id="copilotCommand" name="copilotCommand" placeholder="copilot" />
-          <span class="hint">Leave empty to use <code>copilot</code> from PATH.</span>
-        </label>
-
-        <label>
-          <span class="label">Permission timeout (ms)</span>
-          <input
-            id="permissionTimeoutMs"
-            name="permissionTimeoutMs"
-            type="number"
-            min="1000"
-            max="3600000"
-            required
-          />
-          <span class="hint">How long a non-YOLO session waits for your approval.</span>
-        </label>
-
-        <label>
-          <span class="label">Context window</span>
-          <select id="contextTier" name="contextTier">
-            <option value="long_context">Long</option>
-            <option value="default">Default</option>
-          </select>
-          <span class="hint">
-            Applies to sessions started from here on. Ignored if this machine's Copilot is
-            too old to accept <code>--context</code>.
-          </span>
-        </label>
-
-        <span class="hint" id="unsaved"></span>
-        <div class="row">
-          <button type="submit" id="save">Save</button>
-          <button type="button" class="secondary" id="revert" disabled>Revert</button>
-        </div>
-        <div id="msg"></div>
-      </form>
-
-      <div class="card hidden" id="tunnelCard">
-        <h2>Dev tunnel</h2>
-        <p class="sub spaced">
-          This node reaches the Host through a local forward opened by
-          <code>devtunnel connect</code>. Restarting the Host replaces its tunnel host and
-          the relay key with it, which this client cannot always recover from — the port
-          below then refuses every dial while the Host is fine. Rebuild it here instead of
-          killing the node and starting it again.
-        </p>
-        <div class="meta" id="tunnelMeta"></div>
-        <div class="row">
-          <button type="button" id="tunnelRebuild">Rebuild tunnel</button>
-        </div>
-        <div id="tunnelMsg"></div>
-      </div>
-
-      <div class="card">
-        <h2>Diagnostics</h2>
-        <p class="sub spaced">
-          What this node has been saying. Its console is on this machine, which is rarely
-          where the person debugging it is sitting.
-        </p>
-        <div class="row">
-          <label class="inline">
-            <input type="checkbox" id="logProblemsOnly" checked />
-            <span>Problems only</span>
-          </label>
-          <button type="button" class="secondary" id="logRefresh">Refresh</button>
-        </div>
-        <pre class="logs" id="logs" aria-live="polite">Loading…</pre>
-      </div>
-
-      <div class="card">
-        <h2>Move this node</h2>
-        <p class="sub spaced">
-          Download this machine's identity and settings, then import the file on another
-          box. The file contains the node secret — treat it like a password. Running
-          agents on this process are stopped when you import.
-        </p>
-        <div class="row">
-          <button type="button" id="exportNode">Export identity</button>
-          <button type="button" class="secondary" id="importNode">
-            Import identity…
+            ↻
           </button>
         </div>
-        <input
-          id="backupFile"
-          class="hidden"
-          type="file"
-          accept="application/json,.json"
-          aria-label="Choose a node identity archive to import"
-        />
-        <div id="backupMsg"></div>
-      </div>
-
-      <div class="card">
-        <h2>Workspaces</h2>
-        <p class="sub spaced">Shared across the fleet.</p>
-        <div id="workspaces"></div>
-        <div class="item">
-          <label>
-            <span class="label">New workspace</span>
-            <div class="row">
-              <input id="wsName" maxlength="100" placeholder="Project name" />
-              <button type="button" id="wsAdd">Create</button>
-            </div>
-          </label>
+        <label class="search">
+          <span class="sr-only">Search sessions</span>
+          <input
+            id="sessionSearch"
+            type="search"
+            placeholder="Search title or project"
+            autocomplete="off"
+          />
+        </label>
+        <div class="filter-row" role="group" aria-label="Filter sessions">
+          <button type="button" class="filter active" data-session-filter="all">
+            All
+          </button>
+          <button type="button" class="filter" data-session-filter="resumable">
+            Resumable
+          </button>
+          <button type="button" class="filter" data-session-filter="legacy">Older</button>
         </div>
-        <div id="wsMsg"></div>
-      </div>
-
-      <div class="card">
-        <h2>Placements on this machine</h2>
-        <p class="sub spaced">
-          Where each workspace lives locally. Paths are checked against this machine
-          before they are saved.
-        </p>
-        <div id="placements"></div>
-        <div class="item">
-          <span class="label">Add a placement here</span>
-          <label>
-            <select id="plWorkspace">
-              <option value="">Select a workspace</option>
-            </select>
-          </label>
-          <div class="row">
-            <input id="plPath" placeholder="/Users/me/project" />
-            <button type="button" id="plBrowse">Browse…</button>
-            <button type="button" id="plAdd">Add</button>
+        <div id="sessionList" class="session-list" aria-live="polite">
+          <div class="skeleton-list" aria-label="Loading sessions">
+            <span></span><span></span><span></span>
           </div>
-          <div class="hint">Browse opens a folder dialog on this node's own screen.</div>
-          <div class="check" id="plCheck"></div>
         </div>
-        <div id="plMsg"></div>
-      </div>
-    </main>
+        <button type="button" class="secondary full hidden" id="sessionMore">
+          Load more
+        </button>
+      </aside>
+
+      <nav class="section-nav" aria-label="Node tools">
+        <button type="button" class="nav-item active" data-panel="sessionPanel">
+          Session details
+        </button>
+        <button type="button" class="nav-item" data-panel="settingsPanel">
+          Node settings
+        </button>
+        <button type="button" class="nav-item" data-panel="workspacePanel">
+          Workspaces
+        </button>
+        <button type="button" class="nav-item" data-panel="diagnosticsPanel">
+          Diagnostics
+        </button>
+        <button type="button" class="nav-item" data-panel="transferPanel">
+          Move this node
+        </button>
+      </nav>
+
+      <main class="content">
+        <section class="panel active" id="sessionPanel" aria-labelledby="sessionTitle">
+          <div id="sessionEmpty" class="empty-state">
+            <div class="empty-icon" aria-hidden="true"></div>
+            <h2 id="sessionTitle">Select a session</h2>
+            <p>
+              Choose a Copilot session to inspect its metadata and load a context preview
+              only when needed.
+            </p>
+          </div>
+          <div id="sessionDetail" class="hidden">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow" id="sessionProject">Project unavailable</p>
+                <h2 id="sessionDetailTitle">Untitled session</h2>
+              </div>
+              <button type="button" id="resumeSession">Resume</button>
+            </div>
+            <dl class="session-meta">
+              <div>
+                <dt>Status</dt>
+                <dd id="sessionStatus">Available</dd>
+              </div>
+              <div>
+                <dt>Last activity</dt>
+                <dd id="sessionUpdated">Unavailable</dd>
+              </div>
+              <div>
+                <dt>Created</dt>
+                <dd id="sessionCreated">Unavailable</dd>
+              </div>
+              <div>
+                <dt>Session ID</dt>
+                <dd id="sessionStableId">—</dd>
+              </div>
+            </dl>
+            <div id="resumeNotice"></div>
+            <div class="section-heading">
+              <div>
+                <h3>Context preview</h3>
+                <p>Loaded on demand from Copilot. Private paths are never shown.</p>
+              </div>
+              <button type="button" class="secondary" id="loadPreview">
+                Load preview
+              </button>
+            </div>
+            <div id="sessionPreview" class="preview empty">
+              Select “Load preview” to inspect recent conversation context.
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" id="settingsPanel" aria-labelledby="settingsTitle">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Runtime configuration</p>
+              <h2 id="settingsTitle">Node settings</h2>
+            </div>
+          </div>
+          <form class="card form-grid" id="form">
+            <div class="warn full-span">
+              Pointing this node at a different Host lets that Host run commands on this
+              machine. Only enter a URL you control.
+            </div>
+            <label>
+              <span class="label">Host URL</span>
+              <input
+                id="hostUrl"
+                name="hostUrl"
+                type="url"
+                required
+                placeholder="https://example.trycloudflare.com"
+              />
+              <span class="hint"
+                >Saving reconnects immediately. Running sessions keep going.</span
+              >
+              <span class="hint" id="hostUrlFallbacks"></span>
+            </label>
+            <label>
+              <span class="label">Node name</span>
+              <input id="nodeName" name="nodeName" required maxlength="120" />
+              <span class="hint">Changing this re-registers the node with the Host.</span>
+            </label>
+            <label>
+              <span class="label">Max concurrent sessions</span>
+              <input
+                id="maxSessions"
+                name="maxSessions"
+                type="number"
+                min="1"
+                max="64"
+                required
+              />
+            </label>
+            <label>
+              <span class="label">Copilot command</span>
+              <input id="copilotCommand" name="copilotCommand" placeholder="copilot" />
+              <span class="hint">Leave empty to use <code>copilot</code> from PATH.</span>
+            </label>
+            <label>
+              <span class="label">Permission timeout (ms)</span>
+              <input
+                id="permissionTimeoutMs"
+                name="permissionTimeoutMs"
+                type="number"
+                min="1000"
+                max="3600000"
+                required
+              />
+              <span class="hint">How long a non-YOLO session waits for approval.</span>
+            </label>
+            <label>
+              <span class="label">Context window</span>
+              <select id="contextTier" name="contextTier">
+                <option value="long_context">Long</option>
+                <option value="default">Default</option>
+              </select>
+              <span class="hint">Applies to sessions started from here on.</span>
+            </label>
+            <div class="full-span">
+              <span class="hint" id="unsaved"></span>
+              <div class="row">
+                <button type="submit" id="save">Save</button>
+                <button type="button" class="secondary" id="revert" disabled>
+                  Revert
+                </button>
+              </div>
+              <div id="msg"></div>
+            </div>
+          </form>
+
+          <div class="card hidden" id="tunnelCard">
+            <h3>Dev tunnel</h3>
+            <p class="sub spaced">
+              Rebuild the local forward if the Host tunnel rotated and this node can no
+              longer connect.
+            </p>
+            <div class="meta" id="tunnelMeta"></div>
+            <div class="row">
+              <button type="button" id="tunnelRebuild">Rebuild tunnel</button>
+            </div>
+            <div id="tunnelMsg"></div>
+          </div>
+        </section>
+
+        <section class="panel" id="workspacePanel" aria-labelledby="workspaceTitle">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Project locations</p>
+              <h2 id="workspaceTitle">Workspaces and placements</h2>
+            </div>
+          </div>
+          <div class="two-column">
+            <div class="card">
+              <h3>Workspaces</h3>
+              <p class="sub spaced">Shared across the fleet.</p>
+              <div id="workspaces"></div>
+              <div class="item">
+                <label>
+                  <span class="label">New workspace</span>
+                  <div class="row">
+                    <input id="wsName" maxlength="100" placeholder="Project name" />
+                    <button type="button" id="wsAdd">Create</button>
+                  </div>
+                </label>
+              </div>
+              <div id="wsMsg"></div>
+            </div>
+            <div class="card">
+              <h3>Placements on this machine</h3>
+              <p class="sub spaced">
+                Paths are checked locally and are never exposed in session discovery.
+              </p>
+              <div id="placements"></div>
+              <div class="item">
+                <span class="label">Add a placement here</span>
+                <label>
+                  <select id="plWorkspace">
+                    <option value="">Select a workspace</option>
+                  </select>
+                </label>
+                <div class="row">
+                  <input id="plPath" placeholder="Local project folder" />
+                  <button type="button" id="plBrowse">Browse…</button>
+                  <button type="button" id="plAdd">Add</button>
+                </div>
+                <div class="hint">Browse opens a folder dialog on this node.</div>
+                <div class="check" id="plCheck"></div>
+              </div>
+              <div id="plMsg"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel" id="diagnosticsPanel" aria-labelledby="diagnosticsTitle">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Local runtime</p>
+              <h2 id="diagnosticsTitle">Diagnostics</h2>
+            </div>
+            <button type="button" class="secondary" id="logRefresh">Refresh</button>
+          </div>
+          <div class="card">
+            <label class="inline">
+              <input type="checkbox" id="logProblemsOnly" checked />
+              <span>Problems only</span>
+            </label>
+            <pre class="logs" id="logs" aria-live="polite">Loading…</pre>
+          </div>
+        </section>
+
+        <section class="panel" id="transferPanel" aria-labelledby="transferTitle">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Identity archive</p>
+              <h2 id="transferTitle">Move this node</h2>
+            </div>
+          </div>
+          <div class="card">
+            <p class="sub spaced">
+              Download this machine’s identity and settings, then import the file on
+              another box. The archive contains the node secret; treat it like a password.
+              Importing stops running agents.
+            </p>
+            <div class="row">
+              <button type="button" id="exportNode">Export identity</button>
+              <button type="button" class="secondary" id="importNode">
+                Import identity…
+              </button>
+            </div>
+            <input
+              id="backupFile"
+              class="hidden"
+              type="file"
+              accept="application/json,.json"
+              aria-label="Choose a node identity archive to import"
+            />
+            <div id="backupMsg"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <dialog id="newSessionDialog">
+      <form method="dialog" class="dialog-card" id="newSessionForm">
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">Start fresh</p>
+            <h2>New Copilot session</h2>
+          </div>
+          <button
+            type="button"
+            class="icon-button"
+            id="newSessionClose"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <label>
+          <span class="label">Workspace</span>
+          <select id="newSessionPlacement" required>
+            <option value="">Select a placement</option>
+          </select>
+        </label>
+        <label>
+          <span class="label">Name <span class="optional">(optional)</span></span>
+          <input id="newSessionName" maxlength="120" />
+        </label>
+        <label>
+          <span class="label">First prompt</span>
+          <textarea id="newSessionPrompt" rows="5" required></textarea>
+        </label>
+        <div id="newSessionMsg"></div>
+        <div class="dialog-actions">
+          <button type="button" class="secondary" id="newSessionCancel">Cancel</button>
+          <button type="submit" id="newSessionCreate">Create session</button>
+        </div>
+      </form>
+    </dialog>
   </body>
 </html>

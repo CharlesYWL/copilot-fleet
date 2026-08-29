@@ -14,6 +14,7 @@ const placement = {
   workspaceId: "ws-1",
   nodeId: "node-1",
   localPath: "/tmp/fleet",
+  workspaceName: "fleet",
 };
 
 function router(overrides: Partial<ConfigServerOptions> = {}) {
@@ -24,6 +25,17 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
     updateWorkspace: vi.fn(async () => workspace),
     createOwnPlacement: vi.fn(async () => placement),
     updateOwnPlacementPath: vi.fn(async () => placement),
+    listOwnSessions: vi.fn(async () => []),
+    createOwnSession: vi.fn(async () => ({
+      id: "fleet-new",
+      state: "starting",
+      agentSessionId: "",
+    })),
+    adoptOwnSession: vi.fn(async () => ({
+      id: "fleet-resumed",
+      state: "starting",
+      agentSessionId: "acp-1",
+    })),
   };
   const options: ConfigServerOptions = {
     getSettings: () => settingsFromEnv({}),
@@ -48,6 +60,11 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
       path.trim() === "/tmp/fleet"
         ? { ok: true, kind: "directory" }
         : { ok: false, reason: "No such folder" },
+    sessionDiscovery: {
+      list: vi.fn(async () => ({ sessions: [] })),
+      preview: vi.fn(async () => ({ items: [], truncated: false })),
+      get: vi.fn(() => undefined),
+    },
     ...overrides,
   };
   return { route: createConfigRouter(options), fleet, options };
@@ -226,6 +243,158 @@ describe("config router", () => {
     const response = await route("POST", "/api/config", "not json");
     expect(response.status).toBe(500);
     expect(log).toHaveBeenCalled();
+  });
+
+  it("maps ACP metadata to owned placements without exposing private paths", async () => {
+    const sessionDiscovery = {
+      list: vi.fn(async () => ({
+        sessions: [
+          {
+            id: "acp-1",
+            cwd: "/tmp/fleet",
+            additionalDirectories: ["/private/other"],
+            loadSupported: true,
+            title: "Continue work",
+            updatedAt: "2026-08-28T12:00:00.000Z",
+          },
+          {
+            id: "legacy",
+            cwd: "/private/missing",
+            additionalDirectories: [],
+            loadSupported: true,
+          },
+        ],
+        nextCursor: "next",
+      })),
+      preview: vi.fn(async () => ({ items: [], truncated: false })),
+      get: vi.fn(() => undefined),
+    };
+    const { route } = router({ sessionDiscovery });
+
+    const response = await route("GET", "/api/sessions?cursor=opaque", "");
+    const serialized = JSON.stringify(response.body);
+
+    expect(sessionDiscovery.list).toHaveBeenCalledWith("opaque");
+    expect(response.body).toMatchObject({
+      nextCursor: "next",
+      sessions: [
+        {
+          id: "acp-1",
+          title: "Continue work",
+          updatedAt: "2026-08-28T12:00:00.000Z",
+          createdAt: null,
+          workspaceName: "fleet",
+          placementId: "pl-1",
+          resumable: true,
+          resumeReason: null,
+          legacy: false,
+        },
+        {
+          id: "legacy",
+          title: null,
+          updatedAt: null,
+          createdAt: null,
+          workspaceName: null,
+          placementId: null,
+          resumable: false,
+          legacy: true,
+          resumeReason: expect.stringContaining("No Fleet placement"),
+        },
+      ],
+    });
+    expect(serialized).not.toContain("/tmp/fleet");
+    expect(serialized).not.toContain("/private");
+  });
+
+  it("loads previews on demand and resumes through the Host adoption API", async () => {
+    const session = {
+      id: "acp-1",
+      cwd: "/tmp/fleet",
+      additionalDirectories: [],
+      loadSupported: true,
+      title: "Continue work",
+    };
+    const sessionDiscovery = {
+      list: vi.fn(async () => ({ sessions: [session] })),
+      preview: vi.fn(async () => ({
+        items: [{ role: "user" as const, text: "hello" }],
+        truncated: false,
+      })),
+      get: vi.fn(() => session),
+    };
+    const { route, fleet } = router({ sessionDiscovery });
+
+    expect(await route("GET", "/api/sessions/acp-1/preview", "")).toMatchObject({
+      status: 200,
+      body: { id: "acp-1", items: [{ text: "hello" }], truncated: false },
+    });
+    const resumed = await route("POST", "/api/sessions/acp-1/resume", "{}");
+
+    expect(resumed).toMatchObject({
+      status: 200,
+      body: { sessionId: "fleet-resumed", state: "starting" },
+    });
+    expect(fleet.adoptOwnSession).toHaveBeenCalledWith({
+      placementId: "pl-1",
+      agentSessionId: "acp-1",
+      additionalDirectories: [],
+      name: "Continue work",
+    });
+  });
+
+  it("refuses duplicate live resume before asking the Host to adopt it", async () => {
+    const session = {
+      id: "acp-1",
+      cwd: "/tmp/fleet",
+      additionalDirectories: [],
+      loadSupported: true,
+    };
+    const { route, fleet } = router({
+      sessionDiscovery: {
+        list: vi.fn(async () => ({ sessions: [session] })),
+        preview: vi.fn(async () => ({ items: [], truncated: false })),
+        get: vi.fn(() => session),
+      },
+    });
+    vi.mocked(fleet.listOwnSessions).mockResolvedValue([
+      {
+        id: "fleet-live",
+        placementId: "pl-1",
+        nodeId: "node-1",
+        state: "idle",
+        agentSessionId: "acp-1",
+      },
+    ]);
+
+    const response = await route("POST", "/api/sessions/acp-1/resume", "{}");
+
+    expect(response.status).toBe(409);
+    expect(fleet.adoptOwnSession).not.toHaveBeenCalled();
+  });
+
+  it("creates new sessions only on a placement owned by this node", async () => {
+    const { route, fleet } = router();
+    const response = await route(
+      "POST",
+      "/api/sessions/new",
+      JSON.stringify({ placementId: "pl-1", prompt: "start here", name: "" }),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ sessionId: "fleet-new", state: "starting" });
+    expect(fleet.createOwnSession).toHaveBeenCalledWith({
+      placementId: "pl-1",
+      prompt: "start here",
+      name: "",
+    });
+
+    vi.mocked(fleet.listOwnPlacements).mockResolvedValueOnce([]);
+    expect(
+      await route(
+        "POST",
+        "/api/sessions/new",
+        JSON.stringify({ placementId: "theirs", prompt: "no" }),
+      ),
+    ).toMatchObject({ status: 403 });
   });
 
   it("exports the stored identity", async () => {

@@ -81,4 +81,49 @@ describe("FleetClient credentials", () => {
     expect(calls[0]?.headers.has(NODE_ID_HEADER)).toBe(false);
     expect(calls[0]?.headers.has(NODE_SECRET_HEADER)).toBe(false);
   });
+
+  it("uses node credentials for scoped session lifecycle calls", async () => {
+    const calls: Array<{ url: string; method: string; body: string }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: URL | string, init?: RequestInit) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: String(init?.body ?? ""),
+        });
+        const body = String(input).endsWith("/api/sessions")
+          ? init?.method === "POST"
+            ? JSON.stringify({ id: "fleet-new", state: "starting", agentSessionId: "" })
+            : "[]"
+          : JSON.stringify({
+              id: "fleet-adopted",
+              state: "starting",
+              agentSessionId: "acp-1",
+            });
+        return new Response(body, { status: 200 });
+      }),
+    );
+    const client = new FleetClient({
+      hostUrl: () => "http://127.0.0.1:8787",
+      nodeId: () => "node-1",
+      nodeSecret: () => "secret",
+    });
+
+    await client.listOwnSessions();
+    await client.createOwnSession({ placementId: "p1", prompt: "hello" });
+    await client.adoptOwnSession({
+      placementId: "p1",
+      agentSessionId: "acp-1",
+      additionalDirectories: ["C:\\shared"],
+    });
+
+    expect(calls.map((call) => [call.method, new URL(call.url).pathname])).toEqual([
+      ["GET", "/api/sessions"],
+      ["POST", "/api/sessions"],
+      ["POST", "/api/sessions/adopt"],
+    ]);
+    expect(calls[2]?.body).toContain('"agentSessionId":"acp-1"');
+    expect(calls[2]?.body).toContain('"additionalDirectories":["C:\\\\shared"]');
+  });
 });

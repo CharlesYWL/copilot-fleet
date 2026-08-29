@@ -268,6 +268,8 @@ export const SessionSchema = z.object({
   updatedAt: z.string().datetime(),
   /** Copilot's own ACP session id, needed to resume the conversation. */
   agentSessionId: z.string().default(""),
+  /** Additional workspace roots that ACP must restore with this session. */
+  additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).optional(),
   /** Runs Copilot with --allow-all: no permission prompts for this session. */
   yolo: z.boolean().default(false),
   /**
@@ -545,6 +547,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
     agentSessionId: z.string().min(1),
+    /** Workspace roots originally attached to the Copilot conversation. */
+    additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
     /** Continues the host's event sequence so replayed rows stay ordered. */
     sequenceOffset: z.number().int().nonnegative().default(0),
     yolo: z.boolean().default(false),

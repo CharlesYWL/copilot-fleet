@@ -220,6 +220,7 @@ export class CommandRouter {
         command.type === "resume_session"
           ? {
               resumeAgentSessionId: command.agentSessionId,
+              additionalDirectories: command.additionalDirectories,
               sequenceOffset: command.sequenceOffset,
               yolo: command.yolo,
               mcpServers,
