@@ -11,6 +11,7 @@
     "start": "node dist/server/server.js"
   },
   "dependencies": {
+    "@azure/msal-node": "^5.6.0",
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "@fleet/protocol": "0.3.0",

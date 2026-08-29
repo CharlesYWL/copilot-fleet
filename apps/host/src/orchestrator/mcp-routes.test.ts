@@ -21,8 +21,12 @@ const session = (over: Partial<FleetSession> = {}) =>
     state: "idle",
     runRole: "lead",
     runId: "run-1",
+    nodeId: "node-1",
     ...over,
   }) as FleetSession;
+
+/** The claims a token for that session carries. */
+const lead = { sessionId: "lead-1", runId: "run-1", nodeId: "node-1" };
 
 /** The parts of an advertised JSON Schema property these tests care about. */
 type JsonSchemaField = { maxLength?: number; minLength?: number; description?: string };
@@ -38,7 +42,12 @@ describe("mcp endpoint", () => {
     app = Fastify();
     app.log.level = "silent";
     const service = {
-      store: { getSession: (id: string) => sessions.get(id) },
+      store: {
+        getSession: (id: string) => sessions.get(id),
+        // No task in this world: the fake fleet is a bare lead conversation,
+        // and a lead with no run is authorised by its session alone.
+        getRun: () => undefined,
+      },
     } as unknown as FleetService;
     await app.register(mcpRoutes, { service, tokens: new LeadTokens(store) });
     await app.ready();
@@ -68,7 +77,7 @@ describe("mcp endpoint", () => {
   });
 
   it("lists the fleet tools to a live orchestrator", async () => {
-    const token = new LeadTokens(store).mint("lead-1");
+    const token = new LeadTokens(store).mint(lead);
 
     const response = await list(token);
 
@@ -84,7 +93,7 @@ describe("mcp endpoint", () => {
     // so nothing resumes it and nothing hands it a replacement token. It kept
     // asking with the one it had, and a Host that only remembered tokens in
     // memory answered 401 to every call — once per file save, under watch mode.
-    const token = new LeadTokens(store).mint("lead-1");
+    const token = new LeadTokens(store).mint(lead);
 
     await boot();
 
@@ -93,21 +102,21 @@ describe("mcp endpoint", () => {
 
   it("refuses a token once its orchestrator has been stopped", async () => {
     // Revocation is now the state of the session rather than a list of tokens.
-    const token = new LeadTokens(store).mint("lead-1");
+    const token = new LeadTokens(store).mint(lead);
     sessions.set("lead-1", session({ state: "stopped" }));
 
     expect((await list(token)).statusCode).toBe(401);
   });
 
   it("refuses a token for a session that is no longer an orchestrator", async () => {
-    const token = new LeadTokens(store).mint("lead-1");
+    const token = new LeadTokens(store).mint(lead);
     sessions.set("lead-1", session({ runRole: "worker" }));
 
     expect((await list(token)).statusCode).toBe(401);
   });
 
   it("refuses a token for a session the Host has never heard of", async () => {
-    const token = new LeadTokens(store).mint("ghost");
+    const token = new LeadTokens(store).mint({ ...lead, sessionId: "ghost" });
 
     expect((await list(token)).statusCode).toBe(401);
   });
@@ -180,7 +189,7 @@ describe("orchestrator tools over the wire", () => {
     app = Fastify();
     app.log.level = "silent";
     const tokens = new LeadTokens(settings());
-    token = tokens.mint(world.leadId);
+    token = tokens.mint(world.leadSubject);
     await app.register(mcpRoutes, { service: world.service, tokens });
     await app.ready();
   });
@@ -427,7 +436,7 @@ describe("the limits a caller is held to", () => {
     app = Fastify();
     app.log.level = "silent";
     const tokens = new LeadTokens(settings());
-    token = tokens.mint(world.leadId);
+    token = tokens.mint(world.leadSubject);
     await app.register(mcpRoutes, { service: world.service, tokens });
     await app.ready();
   });

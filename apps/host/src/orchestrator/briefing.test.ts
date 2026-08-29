@@ -17,7 +17,7 @@ async function registeredTools(): Promise<string[]> {
     getSetting: () => undefined,
     setSetting: () => {},
   });
-  const token = tokens.mint(world.leadId);
+  const token = tokens.mint(world.leadSubject);
   await app.register(mcpRoutes, { service: world.service, tokens });
   await app.ready();
   const response = await app.inject({

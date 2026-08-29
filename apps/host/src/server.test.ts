@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import {
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
-  resolveEnrollmentToken,
+  resolveLegacyEnrollmentToken,
   resolvePublicHostUrl,
   yoloUnsupportedReason,
 } from "./server.js";
@@ -54,20 +54,57 @@ describe("yolo capability guard", () => {
 });
 
 describe("production enrollment token", () => {
-  it("rejects missing and default production tokens", () => {
-    expect(() => resolveEnrollmentToken(undefined, "production")).toThrow(
-      /ENROLLMENT_TOKEN/,
-    );
-    expect(() => resolveEnrollmentToken("change-me", "production")).toThrow(
-      /ENROLLMENT_TOKEN/,
-    );
+  const generate = () => "minted";
+
+  /*
+   * The absence of a token used to stop a production Host from booting. It no
+   * longer does: a fresh install enrols machines with one-time grants, so
+   * demanding a fleet-wide secret would be demanding a credential that
+   * authorises nothing anybody wanted.
+   */
+  it("lets a fresh production Host start with no token at all", () => {
+    expect(
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: undefined,
+        legacyNodes: 0,
+        nodeEnv: "production",
+        generate,
+      }),
+    ).toBeUndefined();
+  });
+
+  it("still rejects the shipped placeholder in production", () => {
+    expect(() =>
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: "change-me",
+        legacyNodes: 0,
+        nodeEnv: "production",
+        generate,
+      }),
+    ).toThrow(/ENROLLMENT_TOKEN/);
   });
 
   it("allows an explicit non-default production token", () => {
-    expect(resolveEnrollmentToken("production-secret", "production")).toBe(
-      "production-secret",
-    );
-    expect(resolveEnrollmentToken(undefined, "test")).toBe("change-me");
+    expect(
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: "production-secret",
+        legacyNodes: 0,
+        nodeEnv: "production",
+        generate,
+      }),
+    ).toBe("production-secret");
+    expect(
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: "change-me",
+        legacyNodes: 0,
+        nodeEnv: "test",
+        generate,
+      }),
+    ).toBe("change-me");
   });
 });
 

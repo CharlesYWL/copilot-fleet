@@ -5,7 +5,9 @@ import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
 import {
   HOST_URL_SYNC_CAPABILITY,
+  HostHandshakeFrameSchema,
   HostToNodeMessageSchema,
+  MUTUAL_AUTH_PROTOCOL,
   NODE_NAME_SYNC_CAPABILITY,
   NodeToHostMessageSchema,
   RegisterNodeSchema,
@@ -15,11 +17,13 @@ import {
   decodeFrame,
   errorMessage,
   sameHostUrl,
+  AuthenticatedEnvelopeSchema,
   type NodeBackup,
   type NodeToHostMessage,
   type NodeUpdateStage,
   type SessionEvent,
 } from "@fleet/protocol";
+import { type AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
@@ -30,13 +34,23 @@ import {
   saveCredentials,
   type Credentials,
 } from "./config.js";
-import { planCredentials } from "./enrollment.js";
+import {
+  HostFingerprintMismatchError,
+  enrollWithGrant,
+  openNodeChannel,
+  planCredentials,
+} from "./enrollment.js";
+import {
+  legacyKeyUpgradeRefusal,
+  unsolicitedKeyAcknowledgement,
+} from "./legacy-migration.js";
 import {
   adoptHostUrl,
   dialableInMode,
   endpointsAfterOperatorEdit,
   endpointsBehindLocalForward,
   firstDialUrl,
+  isConfidentialHostUrl,
   nextHostUrl,
   promoteHostUrl,
   recordHostUrl,
@@ -300,6 +314,21 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       );
   let socket: WebSocket | undefined;
   /**
+   * The sealed channel for the current connection, once both ends have proved
+   * themselves. Absent for a legacy Node, and cleared on every close: a channel
+   * is bound to one connection's ephemeral keys and means nothing on the next.
+   */
+  let channel: AuthenticatedChannel | undefined;
+  /**
+   * Whether the current connection is a sealed one.
+   *
+   * Tracked per connection rather than read off the stored credentials, because
+   * the two can disagree for the life of one dial: a Node re-enrolled from
+   * another terminal writes a key-based identity while this process is still
+   * talking over the plain connection it authenticated with.
+   */
+  let sealedConnection = false;
+  /**
    * Stops the liveness watchdog on whichever socket is current.
    *
    * Held out here rather than beside the socket because the socket can be
@@ -334,7 +363,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     const plan = planCredentials(await loadCredentials(), settings);
     if (plan.action === "register") {
       log(plan.reason);
-      const registered = await register();
+      const registered = await enroll();
       await saveCredentials(registered);
       log(`Registered as node ${registered.nodeId}`);
       return registered;
@@ -610,6 +639,24 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   function connect(): void {
     const auth = credentials;
+    /*
+     * The last gate before this machine's credential goes on a wire.
+     *
+     * `hostUrlCandidates` will offer the primary even when nothing suits the
+     * mode, because a node with no address at all cannot report that it is
+     * stuck — which is right for an unreachable address and wrong for an
+     * unusable one. A legacy `hello` puts a reusable secret in the first frame,
+     * and every protocol here has the Host sending lead tokens back, so a
+     * plain-HTTP address off this machine is not a dial worth attempting. The
+     * node waits and says why instead.
+     */
+    if (!isConfidentialHostUrl(dialUrl)) {
+      errorLog(
+        `Refusing to dial ${dialUrl}: this node's credentials and the Host's tokens would cross it in clear text. Set an HTTPS Host URL on the node config page, or run this node behind a local forward such as \`devtunnel connect\`.`,
+      );
+      reconnectTimer = setTimeout(connect, RECONNECT_DELAY_MS);
+      return;
+    }
     const url = new URL("/ws/node", dialUrl);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
     log(`Connecting to ${url}`);
@@ -627,15 +674,55 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // Distinguishes "this address does not reach the Host" from "the Host hung
     // up on us", which is what decides whether to try a different address.
     let welcomed = false;
+    /**
+     * The Node's half of the handshake, while it is still running.
+     *
+     * Held here rather than on the socket because the socket is replaced on
+     * every dial and the session must not outlive the one it belongs to: a
+     * proof computed for one connection is worthless on the next, and reusing
+     * a channel across dials would repeat a nonce under one key.
+     */
+    const session =
+      auth.authProtocol === MUTUAL_AUTH_PROTOCOL
+        ? openNodeChannel({ credentials: auth, dialedHostUrl: attemptUrl })
+        : undefined;
     // A dial that replaces one still in flight must not leave its watchdog
     // behind; the only socket worth watching is the one being opened here.
     releaseLiveness();
     socket = active;
+    channel = undefined;
+    sealedConnection = session !== undefined;
     // Registered before the close handler below so the watchdog is gone before
     // anything decides what to do about the disconnection.
     active.once("close", () => {
-      if (socket === active) releaseLiveness();
+      if (socket === active) {
+        releaseLiveness();
+        channel = undefined;
+      }
     });
+
+    /** What this machine reports about itself, in whichever frame carries it. */
+    const inventory = () => ({
+      os: platform(),
+      arch: arch(),
+      version: VERSION,
+      revision: REVISION,
+      capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
+      agents: advertisedAgents,
+      maxSessions: settings.maxSessions,
+      homeDir: homedir(),
+      name: settings.nodeName,
+      // What the Host last told us it has. A difference from `name` is an
+      // operator edit here; a difference from the Host's row means the Host
+      // was renamed while this node was away, and the Host wins.
+      knownName: auth.name,
+      activeSessionIds: router.activeSessionIds,
+      // What each of those is doing. Without it the Host assumes idle, and a
+      // socket that drops mid-turn leaves the UI offering a composer over an
+      // agent that cannot take another prompt.
+      busySessionIds: router.busySessionIds,
+    });
+
     active.on("open", () => {
       stopLiveness = watchHostLiveness(active, {
         onDead: (silentMs) =>
@@ -643,32 +730,58 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
             `Host stopped answering for ${Math.round(silentMs / 1000)}s; dropping the connection so it can be rebuilt`,
           ),
       });
-      send({
-        type: "hello",
-        nodeId: auth.nodeId,
-        secret: auth.secret,
-        os: platform(),
-        arch: arch(),
-        version: VERSION,
-        revision: REVISION,
-        capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
-        agents: advertisedAgents,
-        maxSessions: settings.maxSessions,
-        homeDir: homedir(),
-        name: settings.nodeName,
-        // What the Host last told us it has. A difference from `name` is an
-        // operator edit here; a difference from the Host's row means the Host
-        // was renamed while this node was away, and the Host wins.
-        knownName: auth.name,
-        activeSessionIds: router.activeSessionIds,
-        // What each of those is doing. Without it the Host assumes idle, and a
-        // socket that drops mid-turn leaves the UI offering a composer over an
-        // agent that cannot take another prompt.
-        busySessionIds: router.busySessionIds,
-      });
+      if (session) {
+        // Nothing about this machine travels yet: `client_hello` says who is
+        // dialing, and the inventory follows once the Host has proved itself.
+        active.send(JSON.stringify(session.clientHello));
+        return;
+      }
+      if (auth.authProtocol !== "legacy-secret") return;
+      send({ type: "hello", nodeId: auth.nodeId, secret: auth.secret, ...inventory() });
     });
+
+    /**
+     * The Host's answer to `client_hello`, checked before anything is sent.
+     *
+     * A refusal here is not a retry: it means whatever answered that address
+     * could not sign for the fingerprint printed on the Connect card, and the
+     * only correct thing to do with it is to say so and hang up.
+     */
+    const acceptChallenge = (frame: unknown): boolean => {
+      if (!session) return false;
+      const opened = session.accept(frame as never);
+      if (!opened.ok) {
+        errorLog(`Refused the Host's identity: ${opened.reason}`);
+        active.close(AUTH_FAILED_CLOSE_CODE, "Host identity refused");
+        return false;
+      }
+      channel = opened.channel;
+      active.send(JSON.stringify(opened.proof));
+      // The inventory a legacy node put in `hello` goes here, sealed.
+      send({ type: "ready", ...inventory() });
+      return true;
+    };
+
     active.on("message", async (raw: unknown) => {
-      const frame = decodeFrame(String(raw), HostToNodeMessageSchema);
+      const text = String(raw);
+      if (session && !channel) {
+        const handshake = decodeFrame(text, HostHandshakeFrameSchema);
+        if (!handshake.ok) {
+          errorLog(`Rejected Host handshake frame: ${handshake.detail}`);
+          active.close(handshake.code, handshake.reason);
+          return;
+        }
+        if (handshake.value.type !== "host_challenge") {
+          errorLog("Host sent a sealed frame before it had proved itself");
+          active.close(AUTH_FAILED_CLOSE_CODE, "Host identity refused");
+          return;
+        }
+        acceptChallenge(handshake.value);
+        return;
+      }
+      const plaintext = channel ? openSealed(text, active) : text;
+      if (plaintext === undefined) return;
+      const frame = decodeFrame(plaintext, HostToNodeMessageSchema);
       if (!frame.ok) {
         errorLog(`Rejected Host message: ${frame.detail}`);
         active.close(frame.code, frame.reason);
@@ -679,6 +792,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
         flushOutbox();
+        return;
+      }
+      if (frame.value.type === "request_node_key") {
+        // A legacy connection cannot prove which Host is on the other end, so
+        // there is no key to generate — only an operator to tell.
+        warn(legacyKeyUpgradeRefusal(frame.value));
+        return;
+      }
+      if (frame.value.type === "node_key_accepted") {
+        warn(unsolicitedKeyAcknowledgement());
         return;
       }
       if (frame.value.type === "host_url") {
@@ -716,12 +839,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // agents or schedule a retry against the URL we just left.
       if (socket !== active) return;
       if (code === AUTH_FAILED_CLOSE_CODE) {
-        // The stored secret will never be accepted again, so retrying it is an
-        // infinite loop. Registering reclaims this node by name, which keeps its
-        // id and therefore its placements and session history.
+        /*
+         * The credential this node holds will never be accepted again, so
+         * retrying it is an infinite loop. Re-enrolling reclaims this node by
+         * name, which keeps its id and therefore its placements and session
+         * history — but only when the operator has supplied fresh enrollment
+         * authority, because a grant is one-time and a key-based node cannot
+         * mint itself a new one.
+         */
         log("Host rejected our credentials; enrolling again");
         try {
-          credentials = await register();
+          credentials = await enroll();
           await saveCredentials(credentials);
           log(`Re-enrolled as node ${credentials.nodeId}`);
         } catch (error) {
@@ -796,14 +924,60 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   function send(message: NodeToHostMessage): void {
     NodeToHostMessageSchema.parse(message);
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+    writeFrame(JSON.stringify(message));
   }
 
   /** Reports whether the event actually left, so the caller can hold it if not. */
   function sendEvent(event: SessionEvent): boolean {
+    return writeFrame(
+      JSON.stringify(NodeToHostMessageSchema.parse({ type: "event", event })),
+    );
+  }
+
+  /**
+   * Puts one frame on the wire, sealed when there is a channel to seal it with.
+   *
+   * One door rather than a choice at each call site: a `send` that forgot to
+   * seal would be a command result or a transcript in the clear, and the whole
+   * point of the channel is that there is no path around it.
+   *
+   * Nothing leaves at all while a mutual handshake is still in flight. The
+   * heartbeat fires on its own timer, and a plaintext beat landing where the
+   * Host expects a proof would cost the connection every time the two coincided
+   * — so the frame is dropped, and events are reported as unsent so the outbox
+   * holds them for the welcome.
+   */
+  function writeFrame(payload: string): boolean {
     if (socket?.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify(NodeToHostMessageSchema.parse({ type: "event", event })));
+    if (sealedConnection && !channel) return false;
+    socket.send(channel ? JSON.stringify(channel.seal(payload)) : payload);
     return true;
+  }
+
+  /**
+   * Opens a sealed Host frame, or closes the connection.
+   *
+   * A failure is never recoverable: an edited frame, a repeat, a gap or one
+   * addressed to another connection all mean the stream is no longer the one
+   * that was authenticated, and the reconnect that follows negotiates fresh
+   * ephemeral keys.
+   */
+  function openSealed(text: string, active: WebSocket): string | undefined {
+    const envelope = decodeFrame(text, AuthenticatedEnvelopeSchema);
+    if (!envelope.ok) {
+      errorLog(`Rejected Host envelope: ${envelope.detail}`);
+      active.close(envelope.code, envelope.reason);
+      return undefined;
+    }
+    const opened = channel?.open(envelope.value);
+    if (!opened?.ok) {
+      errorLog(
+        `Host frame failed channel authentication (${opened?.reason ?? "no channel"})`,
+      );
+      active.close(AUTH_FAILED_CLOSE_CODE, "Channel authentication failed");
+      return undefined;
+    }
+    return opened.plaintext;
   }
 
   /**
@@ -822,15 +996,35 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     );
   }
 
-  async function register(): Promise<Credentials> {
-    const enrollmentToken = env.FLEET_ENROLLMENT_TOKEN;
-    if (!enrollmentToken) {
-      throw new Error(
-        "An enrollment token is required for first registration: pass --token=<token> or set FLEET_ENROLLMENT_TOKEN",
-      );
+  /**
+   * Enrolls, and says plainly when the Host is not the Host that was named.
+   *
+   * A fingerprint mismatch is the one enrolment failure that is not worth
+   * retrying and is not the operator's typo: something is answering that
+   * address that cannot sign for the key on the Connect card. Nothing was sent
+   * to it, and the message names both fingerprints so the operator can see
+   * which one they are actually talking to.
+   */
+  async function enroll(): Promise<Credentials> {
+    try {
+      return await register();
+    } catch (error) {
+      if (error instanceof HostFingerprintMismatchError) errorLog(error.message);
+      throw error;
     }
-    const body = RegisterNodeSchema.parse({
-      enrollmentToken,
+  }
+
+  /**
+   * Joins a fleet, by whichever protocol the operator's Connect command names.
+   *
+   * A command carrying a Host id, a fingerprint and a one-time grant enrols
+   * against a key this machine generates; the fleet-wide token remains for
+   * Nodes and Connect commands that predate keys. The two are deliberately not
+   * interchangeable: a token cannot authorise a key-based enrolment, and a
+   * grant is never sent to a Host that has not proved its fingerprint.
+   */
+  async function register(): Promise<Credentials> {
+    const payload = {
       name: settings.nodeName,
       os: platform(),
       arch: arch(),
@@ -840,7 +1034,33 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       agents: advertisedAgents,
       maxSessions: settings.maxSessions,
       homeDir: homedir(),
-    });
+    };
+    const grant = env.FLEET_ENROLLMENT_GRANT;
+    const hostId = env.FLEET_HOST_ID;
+    const hostFingerprint = env.FLEET_HOST_FINGERPRINT;
+    if (grant || hostId || hostFingerprint) {
+      if (!grant || !hostId || !hostFingerprint) {
+        throw new Error(
+          "A key-based enrollment needs all three of --enrollment-grant, --host-id and --host-fingerprint. Copy the whole command from the Host's Connect card.",
+        );
+      }
+      const enrolled = await enrollWithGrant({
+        hostUrl: settings.hostUrl,
+        hostId,
+        hostFingerprint,
+        grant,
+        registration: payload,
+      });
+      return enrolled.credentials;
+    }
+
+    const enrollmentToken = env.FLEET_ENROLLMENT_TOKEN;
+    if (!enrollmentToken) {
+      throw new Error(
+        "An enrollment token is required for first registration: pass --token=<token> or set FLEET_ENROLLMENT_TOKEN",
+      );
+    }
+    const body = RegisterNodeSchema.parse({ ...payload, enrollmentToken });
     const response = await fetch(new URL("/api/nodes/register", settings.hostUrl), {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -855,8 +1075,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     return {
       hostUrl: settings.hostUrl,
       nodeId: result.nodeId,
-      secret: result.secret,
       name: settings.nodeName,
+      authProtocol: "legacy-secret",
+      secret: result.secret,
     };
   }
 

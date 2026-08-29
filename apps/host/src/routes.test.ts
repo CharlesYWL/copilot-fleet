@@ -15,14 +15,22 @@ const OPERATOR_PASSWORD = "test-password";
 describe("host routes", () => {
   let app: FastifyInstance;
   let cookie = "";
+  let csrfToken = "";
 
   /**
    * Every route below now sits behind the operator session, so the suite
    * signs in once per test and speaks as that operator. Unauthenticated
    * behaviour is asserted separately, in request-guard.test.ts.
+   *
+   * The CSRF proof rides along for the same reason a browser sends one: the
+   * guard requires it on every state-changing operator request, and a helper
+   * that omitted it would be testing the refusal rather than the route.
    */
   const inject = async (options: InjectOptions) =>
-    app.inject({ ...options, headers: { ...options.headers, cookie } });
+    app.inject({
+      ...options,
+      headers: { ...options.headers, cookie, "x-csrf-token": csrfToken },
+    });
 
   const enroll = async (name: string, capabilities = ["copilot-acp", "host-yolo"]) => {
     const response = await inject({
@@ -57,6 +65,12 @@ describe("host routes", () => {
     });
     expect(login.statusCode).toBe(200);
     cookie = (login.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const csrf = await app.inject({
+      method: "GET",
+      url: "/api/auth/csrf",
+      headers: { cookie },
+    });
+    csrfToken = (csrf.json() as { csrfToken: string }).csrfToken;
   });
 
   afterEach(async () => {
@@ -417,9 +431,13 @@ describe("host routes", () => {
 describe("run routes", () => {
   let app: FastifyInstance;
   let cookie = "";
+  let csrfToken = "";
 
   const inject = async (options: InjectOptions) =>
-    app.inject({ ...options, headers: { ...options.headers, cookie } });
+    app.inject({
+      ...options,
+      headers: { ...options.headers, cookie, "x-csrf-token": csrfToken },
+    });
 
   const workspaceWithPlacement = async () => {
     const register = await inject({
@@ -474,6 +492,12 @@ describe("run routes", () => {
       payload: { password: OPERATOR_PASSWORD },
     });
     cookie = (login.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const csrf = await app.inject({
+      method: "GET",
+      url: "/api/auth/csrf",
+      headers: { cookie },
+    });
+    csrfToken = (csrf.json() as { csrfToken: string }).csrfToken;
   });
 
   afterEach(async () => {

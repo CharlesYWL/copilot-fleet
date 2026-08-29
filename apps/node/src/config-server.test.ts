@@ -1,11 +1,21 @@
-import { describe, expect, it, vi } from "vitest";
-import type { NodeBackup } from "@fleet/protocol";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  MUTUAL_AUTH_PROTOCOL,
+  NODE_ID_HEADER,
+  NODE_PROOF_NONCE_HEADER,
+  NODE_PROOF_SIGNATURE_HEADER,
+  NODE_PROOF_TIMESTAMP_HEADER,
+  NODE_SECRET_HEADER,
+  type NodeBackup,
+} from "@fleet/protocol";
+import { createIdentityKeyPair, verifyNodeHttpProof } from "@fleet/protocol/node-auth";
 import {
   createConfigRouter,
   refuseRequest,
   type ConfigServerOptions,
   type FleetApi,
 } from "./config-server.js";
+import type { Credentials } from "./config.js";
 import { settingsFromEnv } from "./settings.js";
 
 const workspace = { id: "ws-1", name: "fleet", description: "" };
@@ -16,6 +26,32 @@ const placement = {
   localPath: "/tmp/fleet",
 };
 
+/** Everything the router needs except the Host client, which varies by test. */
+const baseOptions = (): Omit<ConfigServerOptions, "fleet"> => ({
+  getSettings: () => settingsFromEnv({}),
+  getStatus: () => ({
+    nodeId: "node-1",
+    version: "0.1.0",
+    connected: true,
+    activeSessions: 0,
+    mockAgent: false,
+  }),
+  applySettings: vi.fn(async () => {}),
+  getCredentials: () => ({
+    hostUrl: "http://127.0.0.1:8787",
+    nodeId: "node-1",
+    authProtocol: "legacy-secret",
+    secret: "secret",
+    name: "node",
+  }),
+  applyBackup: vi.fn(async () => {}),
+  log: () => {},
+  inspectPath: (path) =>
+    path.trim() === "/tmp/fleet"
+      ? { ok: true, kind: "directory" }
+      : { ok: false, reason: "No such folder" },
+});
+
 function router(overrides: Partial<ConfigServerOptions> = {}) {
   const fleet: FleetApi = {
     listWorkspaces: vi.fn(async () => [workspace]),
@@ -25,32 +61,19 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
     createOwnPlacement: vi.fn(async () => placement),
     updateOwnPlacementPath: vi.fn(async () => placement),
   };
-  const options: ConfigServerOptions = {
-    getSettings: () => settingsFromEnv({}),
-    getStatus: () => ({
-      nodeId: "node-1",
-      version: "0.1.0",
-      connected: true,
-      activeSessions: 0,
-      mockAgent: false,
-    }),
-    applySettings: vi.fn(async () => {}),
-    getCredentials: () => ({
-      hostUrl: "http://127.0.0.1:8787",
-      nodeId: "node-1",
-      secret: "secret",
-      name: "node",
-    }),
-    applyBackup: vi.fn(async () => {}),
-    log: () => {},
-    fleet,
-    inspectPath: (path) =>
-      path.trim() === "/tmp/fleet"
-        ? { ok: true, kind: "directory" }
-        : { ok: false, reason: "No such folder" },
-    ...overrides,
-  };
+  const options: ConfigServerOptions = { ...baseOptions(), fleet, ...overrides };
   return { route: createConfigRouter(options), fleet, options };
+}
+
+/**
+ * The same router with the Host client the process actually builds.
+ *
+ * `router` above replaces it with a stub, which is right for the endpoint
+ * behaviour and wrong for the one thing that has to be asserted here: what this
+ * process puts on the wire on the page's behalf.
+ */
+function relayingRouter(overrides: Partial<ConfigServerOptions> = {}) {
+  return createConfigRouter({ ...baseOptions(), ...overrides });
 }
 
 /**
@@ -187,6 +210,77 @@ describe("config router", () => {
     expect(response.body).toEqual({ error: "fetch failed" });
   });
 
+  /**
+   * The page cannot call the Host itself — different origin, no CORS — so this
+   * process relays for it. A keyed Node has no shared secret to relay with, and
+   * for a while that meant every catalog call on its config page came back a
+   * 401. It signs with the same key that authenticates its WebSocket instead.
+   */
+  describe("relaying the catalog for a keyed Node", () => {
+    afterEach(() => {
+      vi.unstubAllGlobals();
+    });
+
+    const keys = createIdentityKeyPair();
+    const keyed: Credentials = {
+      hostUrl: "http://127.0.0.1:8787",
+      nodeId: "node-1",
+      name: "node",
+      authProtocol: MUTUAL_AUTH_PROTOCOL,
+      privateKey: keys.privateKey,
+      publicKey: keys.publicKey,
+      host: { hostId: "host-1", publicKey: keys.publicKey, fingerprint: "a".repeat(64) },
+    };
+
+    const relayed = () => {
+      const calls: { url: string; headers: Headers }[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: URL | string, init?: RequestInit) => {
+          calls.push({ url: String(input), headers: new Headers(init?.headers ?? {}) });
+          return new Response("[]", { status: 200 });
+        }),
+      );
+      return calls;
+    };
+
+    it("signs the calls it makes on behalf of the page", async () => {
+      const calls = relayed();
+      // No `fleet` override: the client the router builds is what is under test.
+      const route = relayingRouter({ getCredentials: () => keyed });
+
+      const response = await route("GET", "/api/fleet", "");
+
+      expect(response.status).toBe(200);
+      expect(calls).toHaveLength(2);
+      for (const call of calls) {
+        expect(call.headers.get(NODE_ID_HEADER)).toBe("node-1");
+        expect(call.headers.has(NODE_SECRET_HEADER)).toBe(false);
+        expect(
+          verifyNodeHttpProof({
+            publicKey: keys.publicKey,
+            nodeId: "node-1",
+            method: "GET",
+            path: new URL(call.url).pathname,
+            timestamp: call.headers.get(NODE_PROOF_TIMESTAMP_HEADER) ?? "",
+            nonce: call.headers.get(NODE_PROOF_NONCE_HEADER) ?? "",
+            signature: call.headers.get(NODE_PROOF_SIGNATURE_HEADER) ?? "",
+          }),
+        ).toEqual({ ok: true });
+      }
+    });
+
+    it("still relays a legacy Node's secret, because that is all it has", async () => {
+      const calls = relayed();
+      const route = relayingRouter();
+
+      await route("GET", "/api/fleet", "");
+
+      expect(calls[0]?.headers.get(NODE_SECRET_HEADER)).toBe("secret");
+      expect(calls[0]?.headers.has(NODE_PROOF_SIGNATURE_HEADER)).toBe(false);
+    });
+  });
+
   it("refuses a placement path this machine cannot open", async () => {
     const { route, fleet } = router();
     const response = await route(
@@ -255,6 +349,7 @@ describe("config router", () => {
       credentials: {
         hostUrl: "https://fleet.example.com",
         nodeId: "moved",
+        authProtocol: "legacy-secret",
         secret: "other-secret",
         name: "moved-box",
       },

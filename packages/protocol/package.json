@@ -15,6 +15,10 @@
     "./log-buffer": {
       "types": "./dist/log-buffer.d.ts",
       "default": "./dist/log-buffer.js"
+    },
+    "./node-auth": {
+      "types": "./dist/node-auth.d.ts",
+      "default": "./dist/node-auth.js"
     }
   },
   "scripts": {

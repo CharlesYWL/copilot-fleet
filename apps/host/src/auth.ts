@@ -11,6 +11,27 @@ import {
 export const OPERATOR_COOKIE = "fleet_operator";
 
 /**
+ * The short grant a correct console claim code buys.
+ *
+ * `SameSite=Strict`, because it is only ever sent by the first-run page itself.
+ * That also means it is deliberately absent from the Microsoft callback, which
+ * arrives as a top-level cross-site navigation — the login transaction carries
+ * the grant across that gap instead.
+ */
+export const BOOTSTRAP_COOKIE = "fleet_bootstrap";
+
+/**
+ * Which browser this is, for the limits that are not allowed to key on an IP.
+ *
+ * `SameSite=Lax` so it survives the redirect back from Microsoft, and carrying
+ * no authority of its own so that leaking it grants nothing.
+ */
+export const BINDING_COOKIE = "fleet_bind";
+
+/** How long a browser keeps its binding identifier. */
+export const BINDING_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
  * How long the browser is asked to keep the cookie.
  *
  * Not an expiry so much as "until something revokes it": a login lasts until
@@ -103,6 +124,22 @@ export class OperatorAuth {
   }
 
   login(password: string): LoginOutcome {
+    const checked = this.check(password);
+    if (!checked.ok) return checked;
+    return { ok: true, token: this.issue() };
+  }
+
+  /**
+   * Whether a password is the right one, and whether we are still answering.
+   *
+   * Separate from {@link login} because the opaque server-side session that
+   * replaced the signed cookie needs the credential decision without the token
+   * that used to come with it. The lockout lives here so both callers get it:
+   * a limit only one path enforces is not a limit.
+   */
+  check(
+    password: string,
+  ): { ok: true } | { ok: false; status: 401 | 429; error: string } {
     if (!this.allowAttempt()) {
       return {
         ok: false,
@@ -115,7 +152,7 @@ export class OperatorAuth {
       return { ok: false, status: 401, error: "Incorrect password" };
     }
     this.failures = [];
-    return { ok: true, token: this.issue() };
+    return { ok: true };
   }
 
   /** Whether a cookie value names a session that is still valid. */
@@ -250,4 +287,45 @@ export function clearedCookie(secure: boolean): string {
   ];
   if (secure) parts.push("Secure");
   return parts.join("; ");
+}
+
+/**
+ * A cookie carrying no authority, only an identity for the rate limits.
+ *
+ * `SameSite=Lax` rather than `Strict` because the Microsoft callback is a
+ * top-level navigation from another site, and a `Strict` cookie would not be
+ * sent with it — leaving the Host unable to tell which browser it had started
+ * the login for.
+ */
+export function bindingCookie(value: string, secure: boolean): string {
+  const parts = [
+    `${BINDING_COOKIE}=${value}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Lax",
+    `Max-Age=${Math.floor(BINDING_MAX_AGE_MS / 1000)}`,
+  ];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+/** The bootstrap grant, which never leaves the first-run page's own origin. */
+export function bootstrapCookie(
+  value: string,
+  secure: boolean,
+  maxAgeMs: number,
+): string {
+  const parts = [
+    `${BOOTSTRAP_COOKIE}=${value}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${Math.floor(maxAgeMs / 1000)}`,
+  ];
+  if (secure) parts.push("Secure");
+  return parts.join("; ");
+}
+
+export function clearedBootstrapCookie(secure: boolean): string {
+  return bootstrapCookie("", secure, 0);
 }

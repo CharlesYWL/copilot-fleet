@@ -314,16 +314,20 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
         )}
       </section>
 
-      <section className={styles.card}>
+      <section className={styles.card} aria-label="Fleet data archive">
         <div>
-          <Text weight="semibold">Move this Host</Text>
+          <Text weight="semibold">Export fleet data</Text>
           <br />
           <Text className={styles.caption}>
-            Download a file with workspaces, nodes, sessions, transcripts, and settings.
-            Importing on another machine replaces everything there. The file includes the
-            enrollment token — treat it like a secret. Quick-tunnel URLs are left out; a
-            named hostname is kept. Node identities stay valid so existing machines can
-            reconnect, but Copilot conversations still live on those machines.
+            Downloads workspaces, nodes, sessions, transcripts and session settings.
+            Importing on another machine replaces all of that there. This file{" "}
+            <strong>does not carry</strong> who may administer this Host: the
+            administrator list, the Microsoft registration, this Host&apos;s signing key
+            and its Node credentials stay behind, and importing deliberately leaves the
+            receiving machine&apos;s own security settings intact. To move a Host itself,
+            use the portable backup in <strong>Settings → Security</strong>. Quick-tunnel
+            URLs are left out; a named hostname is kept. Copilot conversations still live
+            on the machines that ran them.
           </Text>
         </div>
         <div className={styles.actions}>
@@ -332,14 +336,14 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
             disabled={busy}
             onClick={() => void handleExport()}
           >
-            Export fleet
+            Export fleet data
           </Button>
           <Button
             appearance="secondary"
             disabled={busy}
             onClick={() => fileInput.current?.click()}
           >
-            Import fleet…
+            Import fleet data…
           </Button>
         </div>
         <input
@@ -367,12 +371,13 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
       >
         <DialogSurface>
           <DialogBody>
-            <DialogTitle>Replace this Host?</DialogTitle>
+            <DialogTitle>Replace this fleet&apos;s data?</DialogTitle>
             <DialogContent>
               <Text>
-                Importing wipes workspaces, nodes, sessions, and settings on this machine
-                and restores the archive. Connected nodes will drop and reconnect if their
-                secrets still match.
+                Importing wipes workspaces, nodes, sessions and session settings on this
+                machine and restores the archive. Who may administer this Host is left
+                exactly as it is. Connected nodes will drop and reconnect if their
+                credentials still match.
               </Text>
             </DialogContent>
             <DialogActions>

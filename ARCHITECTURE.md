@@ -196,6 +196,17 @@ talking to.
 
 ## Browser UI
 
+Nothing renders until the Host says who is asking. `AuthGate` holds the whole
+app behind one card — a security checkpoint rather than a login form: the
+brand, a trust rail naming the three separate facts (Host → Microsoft identity
+→ Nodes) and which of them currently hold, and exactly one question at a time.
+The states are named after what the Host is, not after what failed:
+`entra-unconfigured`, `unclaimed`, signed-out, `forbidden`, device-blocked, and
+"this address cannot sign you in". A refusal that happens at the Microsoft
+callback redirects back into the app with a closed-set reason code rather than
+leaving a JSON body in the address bar, and the app supplies its own words for
+it — so a crafted link cannot put a stranger's sentence on the sign-in screen.
+
 Three destinations: the **Orchestrator**, the **sessions** it and the operator
 have started, and Settings. The orchestrator sits above the workspace tree
 rather than inside it, because it is fleet-wide — filing it under whichever
@@ -319,7 +330,12 @@ REST performs CRUD and commands. WebSocket pushes snapshots, Node status, Sessio
 
 The Node WebSocket carries:
 
-- authenticated hello and welcome
+- a mutually authenticated handshake — `client_hello`, signed `host_challenge`,
+  `node_proof` — after which every frame is an AEAD-sealed, sequenced envelope.
+  The legacy `hello` first frame is still accepted while machines that predate
+  Node keys are being migrated. They are migrated by re-running a Connect
+  command, not over that connection: a shared secret has already reached
+  whatever relayed it, so nothing sent back can prove which Host is answering.
 - heartbeat with active Session IDs, and which of them are mid-turn
 - Host commands: start, prompt, cancel, stop, permission response
 - Host address announcements when the Host's public URL changes
@@ -492,18 +508,52 @@ ACP support in Copilot CLI is still public preview, so protocol/package versions
 
 ## Security boundary
 
-- The browser UI and `/api` sit behind an operator password (`FLEET_OPERATOR_PASSWORD`, or one generated on first boot). Sessions are `HttpOnly`, `SameSite=Strict` cookies, signed rather than stored: the key is persisted, so a restart does not sign anyone out, and the cookie names the password it was issued under, so changing the password invalidates every one of them. They do not otherwise expire. Signing out clears the cookie and refuses it for the life of the process — the only unconditional revocation is changing the password.
-- A central `onRequest` guard covers `/api/*` and `/ws/*` so a route added later is protected by having been added at all. Unrecognised `Host`/`Origin` names are refused (DNS rebinding). Open paths are health, sign-in/out/status, and `/api/nodes/register` (enrollment token). `/ws/node` authenticates in the first frame instead.
-- A tunnel (Cloudflare, Dev Tunnels, …) forwards to the Host process on `PORT` (default 8787): `/api`, `/ws/node`, `/ws/browser`, and the built UI. It authenticates a network path, not an operator. In `npm run dev` the page you click is Vite on 5173; the tunnel does not point at that.
-- Enrollment token is exchanged once for a unique Node secret; Host stores only its hash. Node HTTP credentials reach only the catalog routes the config page relays, and a node can only place its own paths.
+Five separate facts, deliberately not collapsed into one: a tunnel decides who can **reach** the Host, Entra plus this Host's administrator table decides who may **operate** it, a live lead token decides which orchestrator may call `/mcp`, a Node key decides which **machine** is connected, and the Host signing key decides whether a command came from the real Host.
+
+### Who may operate a Fleet
+
+- **Two proofs to claim.** A fresh Host prints a 128-bit one-time claim code to its own stdout (bypassing the HTTP-readable log buffer), keeps only its hash in memory, and expires it in 30 minutes. Claiming needs that code **and** a Microsoft sign-in. Neither alone is sufficient, and the claim is one `BEGIN IMMEDIATE` transaction, so two identities racing produce one administrator and one `409`.
+- **An upgraded Host proves the same thing with the password it already had.** `POST /api/auth/bootstrap/password` (`apps/host/src/routes/auth.ts`) issues the identical short, browser-bound bootstrap grant to a live password or recovery session on a Host with no administrators, and is audited as `bootstrap_password_granted` rather than as a console redemption. It is an ordinary operator route — live session plus CSRF — and additionally refuses a Microsoft session and a Host that already has an administrator. The console code is neither required nor revealed; `ClaimCodeService.grantTrusted` mints the grant without touching it, so an operator session never becomes console-equivalent knowledge.
+- **Authentication is not authorization.** Entra says who somebody is; this Host's `administrators` table says whether they may drive it. A valid account from the configured tenant that nobody added receives a named `403` and no session at all. Identity is keyed on immutable `(tid, oid)` — never email, which can be reassigned.
+- **No source-address trust.** Every supported tunnel relays into `http://127.0.0.1:<port>`, so `request.ip`, apparent loopback, `x-forwarded-proto` and the `Host` header describe the relay, not the browser. None of them is a security input. The only trustworthy witness to a scheme is the set of URLs this Host published for itself (`apps/host/src/auth/external-scheme.ts`).
+- **Six named states** (`entra-unconfigured`, `unclaimed`, `legacy-password`, `hybrid`, `microsoft-only`, `recovery`) rather than a pair of booleans, because each asks the browser for something different and the gate has to say which.
+- **Login flows.** Authorization code + PKCE with a `http://localhost/api/auth/entra/callback` redirect is primary; Entra ignores the port, so one registration covers every local forward. Device code is an optional fallback that stays off until an administrator has watched one complete on this Host — the verification runs whatever the setting says and only a completion writes it, because otherwise the switch would be its own precondition. MSAL performs all protocol and token validation; Fleet hand-rolls no JWT checking and persists no Microsoft token.
+- **Sessions** are opaque 256-bit values stored as SHA-256 digests, `HttpOnly`/`SameSite=Strict`, `Secure` on a published HTTPS endpoint, seven-day idle and 30-day absolute. CSRF is `HMAC(csrfKey, sessionTokenHash)` — derived, so there is no per-session secret to leak. Removing an administrator revokes their sessions and closes their live browser sockets in the same operation; a 60-second sweep re-checks every socket against the live rows.
+- **High-impact actions** — removing an administrator, disabling the password, minting an enrollment grant, exporting a portable backup — additionally require an authorization-code sign-in within ten minutes. A device sign-in does not satisfy it: an attacker can start a device flow and have an administrator finish it.
+- **Legacy password** is opt-in, warned about, and disabled by writing `auth.passwordEnabled=0` so a stale `FLEET_OPERATOR_PASSWORD` cannot re-enable it. A local console command can issue a temporary recovery password, which is audited.
+
+### The guard
+
+- A central `onRequest` guard covers `/api/*` and `/ws/*`, so a route added later is protected by having been added at all. Rules are ordered **method + anchored regex** naming an expected principal (`anonymous`, `bootstrap`, `transaction`, `operator`, `node-protocol`, `enrollment`, `lead`), not a literal set of open paths — which is how a parameterized route such as `/api/auth/device/poll/:flowId` would otherwise be left out or let in wholesale. Anything unmatched is an operator route.
+- Unrecognised `Host`/`Origin` names are refused (DNS rebinding). A session or bootstrap grant is issued only over loopback or a published HTTPS endpoint; a plain-HTTP relay such as `bore` is refused by the Host for the operator console, not merely greyed out in the panel.
+- `/mcp` is a second machine principal, not an operator-cookie exception: a signed lead token bound to a live lead session, run and node, with browser `Origin` rejected and every failure audited without recording the bearer.
+- A tunnel (Dev Tunnels, Cloudflare, …) forwards to the Host process on `PORT` (default 8787): `/api`, `/ws/node`, `/ws/browser`, and the built UI. It authenticates a network path, not an operator. In `npm run dev` the page you click is Vite on 5173; the tunnel does not point at that.
+
+### Machines
+
+- New enrollment sends no reusable credential to an unauthenticated Host. A one-time grant (256 bits, 15 minutes, one machine, stored only as the digest that is also its HMAC key) authorises exactly one Node public key. The Node generates its Ed25519 pair first, pins the Host fingerprint from the Connect command, and completes only against a Host that can sign for it.
+- Each connection authenticates ephemeral X25519 keys with both persistent identities and derives directional AES-256-GCM keys over the transcript, with a per-direction monotonic sequence. A relay can carry the traffic but cannot read, forge, or replay it.
+- The fleet-wide `ENROLLMENT_TOKEN` exists only for machines that predate Node keys. A fresh Host never has one: it does not require one to start, does not persist one, and refuses token registration outright. An upgrade is recognised by evidence — a stored token, or Nodes still authenticating with a shared secret — and mints one for itself if the settings table lost it. There is no automatic upgrade off a shared secret: that secret has by definition reached whatever terminates the Node's connection, so a key request sent back over it proves only that the asker has seen it. A legacy machine migrates by running a fresh Connect command, which carries a one-time grant and the Host fingerprint out of band and reclaims that machine's own row. Settings reports the remaining count; enforcement deletes the stored secrets, retires the token, and is refused while any Node still needs one.
+- The Host database holds the Host private key, the administrator table, and the CSRF and lead-token keys, so its file permissions are part of the boundary. The data directory is `0700` and the database plus its `-wal`/`-shm` journals are `0600` on Unix; on a production Windows Host every explicit entry in the tree is cleared with `icacls /reset /T` and replaced with inheritance broken and full control for the running account, SYSTEM (`S-1-5-18`) and local Administrators (`S-1-5-32-544`), applied with `/T` so the existing database and journals are covered too. A production Host that cannot apply either refuses to start.
+- Nothing that carries a credential crosses a plain-HTTP address that is not loopback. The tunnel manager refuses to start an ineligible provider however the request arrives — route, persisted settings at boot, or unattended restart — and refuses to adopt one started outside the Host, so such a URL never enters the allowlist, the scheme map, or enrollment. The request guard refuses `/mcp` and the enrollment routes over an address this Host published as HTTP, and a Node refuses to enrol, dial, or rebase an agent's MCP endpoint onto one.
+- Node HTTP credentials reach only the catalog routes the config page relays, and a node can only place its own paths.
 - Copilot credentials stay on the Node.
+
+### Everything else
+
 - Session creation references a Placement ID, never an arbitrary browser-supplied path.
 - Child processes use an argument array and `shell: false`.
 - Permission requests fail closed. YOLO is off unless the stored default is exactly `"1"`.
-- Internet exposure should still use HTTPS/WSS. An access policy in front of the Host (for example Cloudflare Access) remains a good second layer. Shared-password SSO/RBAC is still an MVP non-goal.
+- A version 1 data restore preserves the security envelope of the Host it lands in — administrators, auth mode, Entra config, Host identity, CSRF and lead-token keys — and can never return a secured Host to `unclaimed`. A version 2 portable backup moves that envelope deliberately, encrypted with `scrypt` + AES-256-GCM under an operator passphrase, atomically, revoking every session on restore. Whether mutual Node authentication is enforced travels in the sealed section, so a fleet that had retired the shared Node secret does not come back accepting it — and the fleet-wide enrollment token that enforcement retired is not written back. After the transaction commits, the Host reloads its identity service, adopts the archive's lead-token and CSRF keys, and only then publishes: nothing observes a Host that is half of each.
+- A bounded local `security_audit` (newest 10,000 rows, 500-character sanitized detail) records the decisions. Claim codes, authorization codes, device codes, Microsoft tokens, cookies, invitations, grants, lead tokens and private keys are never written to it.
+- Internet exposure should still use HTTPS/WSS. An access policy in front of the Host (for example Cloudflare Access) remains a good second layer.
 
 ## MVP non-goals
 
+- Viewer/operator/admin role differences — every administrator is a peer with full authority
+- Cross-tenant administrators for one Fleet, and Graph-based user search
+- Hardware-backed Host or Node keys
+- End-to-end encryption of Node payloads against a malicious tunnel relay
 - Session migration or automatic resume after Node disconnect
 - Git clone/worktree lifecycle
 - Multi-user RBAC and billing

@@ -1,12 +1,52 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { z } from "zod";
 
 /** Where the signing key lives, so it outlives the process that made it. */
 export const LEAD_TOKEN_KEY_SETTING = "orchestrator.tokenKey";
+
+/** The claim set this Host issues. A later one is a different number. */
+export const LEAD_TOKEN_VERSION = 1 as const;
+
+/**
+ * A bound on a credential nobody has authenticated yet.
+ *
+ * Everything past this point — the HMAC, the base64 decode, the JSON parse —
+ * is work done on behalf of an unauthenticated caller, so the length is
+ * checked before any of it happens.
+ */
+export const MAX_LEAD_TOKEN_LENGTH = 4_096;
 
 export type TokenKeyStore = {
   getSetting(key: string): string | undefined;
   setSetting(key: string, value: string): void;
 };
+
+/**
+ * What a lead token says, and therefore what can be re-checked later.
+ *
+ * The session alone was not enough: it says who is calling but not what they
+ * were authorised for, so a token minted for one run kept working after the
+ * session was moved onto another. Naming the run and the node makes the
+ * authorisation checkable against the fleet as it is now rather than as it was
+ * when the token was written.
+ */
+export const LeadTokenClaimsSchema = z.object({
+  version: z.literal(LEAD_TOKEN_VERSION),
+  sessionId: z.string().min(1).max(200),
+  runId: z.string().max(200),
+  nodeId: z.string().max(200),
+  issuedAt: z.string().min(1).max(64),
+});
+export type LeadTokenClaims = z.infer<typeof LeadTokenClaimsSchema>;
+
+/** The three facts a token is minted about. */
+export type LeadTokenSubject = {
+  sessionId: string;
+  runId: string;
+  nodeId: string;
+};
+
+export type LeadTokensOptions = { now?: (() => number) | undefined };
 
 /**
  * The bearer tokens orchestrator sessions authenticate their tool calls with.
@@ -22,14 +62,17 @@ export type TokenKeyStore = {
  * nothing and there is no table to fall out of step with the sessions.
  *
  * Revocation is therefore not the absence of an entry but the state of the
- * session: {@link resolve} only answers with a session id, and the caller
- * checks it is still a live orchestrator. Stopping one takes its tools away
- * immediately, which is the only revocation this needs.
+ * fleet: {@link resolve} answers with the claims that were signed, and the
+ * caller checks each one against a live lead. Stopping one, cancelling its
+ * run, or deleting the machine it was placed on takes its tools away on the
+ * very next call, which is the only revocation this needs.
  */
 export class LeadTokens {
-  private readonly key: Buffer;
+  private key: Buffer;
+  private readonly now: () => number;
 
-  constructor(store: TokenKeyStore) {
+  constructor(store: TokenKeyStore, options: LeadTokensOptions = {}) {
+    this.now = options.now ?? Date.now;
     const existing = store.getSetting(LEAD_TOKEN_KEY_SETTING);
     if (existing) {
       this.key = Buffer.from(existing, "base64");
@@ -40,32 +83,66 @@ export class LeadTokens {
   }
 
   /**
-   * A token for this session.
+   * A token for one lead, as it stands right now.
    *
-   * Deterministic, so a start and a later resume produce the same one and there
-   * is no window where a session is holding a token that has been replaced.
+   * Minting again does not withdraw an earlier token: both are signed by the
+   * same key and describe the same lead, so a resume cannot leave a running
+   * agent holding something the Host has stopped recognising.
    */
-  mint(sessionId: string): string {
-    return `flt_${encode(sessionId)}.${this.sign(sessionId)}`;
+  mint(subject: LeadTokenSubject): string {
+    const claims: LeadTokenClaims = {
+      version: LEAD_TOKEN_VERSION,
+      sessionId: subject.sessionId,
+      runId: subject.runId,
+      nodeId: subject.nodeId,
+      issuedAt: new Date(this.now()).toISOString(),
+    };
+    const payload = encode(JSON.stringify(claims));
+    return `flt_${payload}.${this.sign(payload)}`;
   }
 
-  /** The session this token speaks for, or nothing if it was not signed here. */
-  resolve(token: string): string | undefined {
-    if (!token.startsWith("flt_")) return undefined;
-    const [encoded, signature] = token.slice(4).split(".");
-    if (!encoded || !signature) return undefined;
-    const sessionId = Buffer.from(encoded, "base64url").toString("utf8");
-    if (!sessionId) return undefined;
-    return equal(signature, this.sign(sessionId)) ? sessionId : undefined;
+  /**
+   * The claims this token carries, or nothing if it was not signed here.
+   *
+   * Answering with the claims rather than a session id is what lets the caller
+   * ask the question the signature cannot: whether the fleet still looks the
+   * way the token says it did.
+   */
+  resolve(token: string): LeadTokenClaims | undefined {
+    if (!token.startsWith("flt_") || token.length > MAX_LEAD_TOKEN_LENGTH) {
+      return undefined;
+    }
+
+    const [payload, signature] = token.slice(4).split(".");
+    if (!payload || !signature) return undefined;
+    if (!equal(signature, this.sign(payload))) return undefined;
+    const decoded = decode(payload);
+    if (decoded === undefined) return undefined;
+    const claims = LeadTokenClaimsSchema.safeParse(decoded);
+    return claims.success ? claims.data : undefined;
   }
 
-  private sign(sessionId: string): string {
-    return createHmac("sha256", this.key).update(sessionId).digest("base64url");
+  /** Adopts the key restored with a portable Host identity without a restart. */
+  adoptKey(encoded: string): void {
+    this.key = Buffer.from(encoded, "base64");
+  }
+
+  private sign(payload: string): string {
+    return createHmac("sha256", this.key).update(payload).digest("base64url");
   }
 }
 
 function encode(value: string): string {
   return Buffer.from(value, "utf8").toString("base64url");
+}
+
+/** A signed payload is still arbitrary bytes until it parses. */
+function decode(payload: string): unknown {
+  try {
+    return JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+  } catch {
+    return undefined;
+  }
 }
 
 function equal(left: string, right: string): boolean {

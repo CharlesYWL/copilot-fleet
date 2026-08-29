@@ -36,6 +36,8 @@ export function fleet(): {
   store: FleetStore;
   service: FleetService;
   leadId: string;
+  /** What a lead token for this world's orchestrator has to claim. */
+  leadSubject: { sessionId: string; runId: string; nodeId: string };
   addNode: (name: string, options?: { online?: boolean }) => FleetNode;
 } {
   const store = new FleetStore(":memory:");
@@ -101,5 +103,11 @@ export function fleet(): {
    * regression hides: every test would exercise "a lead that already has a
    * task" and none would exercise the first call of a fresh one.
    */
-  return { store, service, leadId: lead.id, addNode };
+  return {
+    store,
+    service,
+    leadId: lead.id,
+    leadSubject: { sessionId: lead.id, runId: lead.runId, nodeId: lead.nodeId },
+    addNode,
+  };
 }

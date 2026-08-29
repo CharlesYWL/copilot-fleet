@@ -1,4 +1,5 @@
 import type { McpHttpServer } from "@fleet/protocol";
+import { isConfidentialHostUrl } from "./host-endpoints.js";
 
 /**
  * Rebases the Host's MCP address onto the one this node actually reaches it on.
@@ -19,7 +20,23 @@ export function resolveMcpServers(
 ): McpHttpServer[] {
   // Tolerates absence: a Host older than this field sends a command without
   // one, and an ordinary session is meant to have no servers at all.
-  return (servers ?? []).map((server) => ({
+  const declared = servers ?? [];
+  if (declared.length === 0) return [];
+  /*
+   * Checked here rather than left to the transport, because of what these
+   * headers carry. Each server is handed to an agent with a live lead token in
+   * it — the orchestrator's whole control plane, good for starting sessions and
+   * reading transcripts — and the agent will send it on every call to whatever
+   * address comes out of this function. Producing a plain-HTTP one off this
+   * machine hands that token to the path. Failing the command is loud, and the
+   * router reports it as a refused start rather than losing it.
+   */
+  if (!isConfidentialHostUrl(hostUrl)) {
+    throw new Error(
+      `Refusing to point an agent at ${hostUrl}: the MCP endpoint carries this run's lead token, so it needs HTTPS or a loopback address. Publish the Host over an HTTPS tunnel, or run this node behind a local forward.`,
+    );
+  }
+  return declared.map((server) => ({
     ...server,
     url: rebase(server.url, hostUrl),
   }));

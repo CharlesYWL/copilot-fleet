@@ -41,7 +41,7 @@ npm install
 cp .env.example .env
 ```
 
-Set a strong random `ENROLLMENT_TOKEN` in `.env`, then start development mode:
+Start development mode:
 
 ```bash
 npm run dev
@@ -51,13 +51,20 @@ This single command runs the Fastify API on `http://127.0.0.1:8787`, Vite on
 `http://127.0.0.1:5173`, and the local Node service. The Node reads its
 `FLEET_*` settings from `.env`.
 
-The UI asks for an operator password before it shows anything. Set
-`FLEET_OPERATOR_PASSWORD` in `.env` to choose it; leave it unset and the Host
-generates one on first boot and prints it to its console:
+A fresh Host has no password and no administrator. It prints a one-time claim
+code to its own console and admits to nothing else until somebody uses it:
 
 ```
-No FLEET_OPERATOR_PASSWORD set, so this Host generated one. Sign in with: …
+Copilot Fleet is unclaimed. Claim it at http://127.0.0.1:8787 with this
+one-time code:
+
+    v-0MArasdtNAfxqlM5_pnA
+
+It expires in 30 minutes and is printed only here.
 ```
+
+See [First run: claiming a Fleet](#first-run-claiming-a-fleet) for the two
+proofs a claim takes and how to register the Entra app it needs.
 
 To keep a tunnel URL stable while you edit code, start the tunnel as its own
 process instead:
@@ -74,9 +81,11 @@ runs. Stop everything with Ctrl+C as usual.
 Open the UI → **Settings**:
 
 - **General** — session defaults, plus export/import to move this Host.
-- **Tunnel** — run Cloudflare, Dev Tunnels, Tailscale Funnel, ngrok, or bore;
+- **Security** — administrators, invitations, password migration, the Host
+  fingerprint, Node key migration, and this Host's security audit.
+- **Tunnel** — run Dev Tunnels, Cloudflare, Tailscale Funnel, ngrok, or bore;
   each installed provider has its own switch and status.
-- **Nodes** — rename/delete machines and copy the enroll command.
+- **Nodes** — rename/delete machines and mint a one-time connect command.
 - **Workspaces** — map projects to per-machine paths.
 
 ![Settings → Workspaces & placements: three workspaces, each mapped to an absolute path on the machines that hold it.](docs/screenshots/workspaces.png)
@@ -85,6 +94,166 @@ A workspace is logical; a placement is the physical `(workspace, node) → path`
 pair. The same project can sit at a different absolute path on every machine, and
 a session is always started from a stored placement — never from a path typed
 into a request.
+
+## First run: claiming a Fleet
+
+A Fleet Host can start processes and read every transcript on every machine
+enrolled in it. Who may do that is decided by Microsoft Entra ID plus this
+Host's own list of administrators — and nothing else. A tunnel decides who can
+_reach_ the Host; it never decides who may operate it.
+
+Two proofs are needed to claim a fresh Host, and one alone is worth nothing:
+
+1. **The console claim code.** 128 random bits, printed only to the Host's own
+   stdout, valid for 30 minutes, and consumed by the first successful claim.
+   Holding it proves you have access to the machine — which is the only fact a
+   Host can establish about a network caller, because every supported tunnel
+   relays into `http://127.0.0.1:<port>` and the source address, `Host` header
+   and `x-forwarded-proto` all describe the relay rather than the browser.
+2. **A Microsoft account.** Signing in proves who you are. Fleet records the
+   account's immutable `(tenant id, object id)` pair and issues its own opaque
+   session; no Microsoft access, refresh, or ID token is ever persisted.
+
+The first account to present both becomes the one and only administrator.
+Anyone else in the same tenant who signs in afterwards is refused with a named
+`403` and receives no session at all.
+
+### Register the Entra app (once per organisation)
+
+The published package contains no client ID, because a single-tenant ID cannot
+be baked into a package other tenants install. Register your own — it takes a
+minute and needs no secret:
+
+| Setting                     | Value                                                      |
+| --------------------------- | ---------------------------------------------------------- |
+| Supported account types     | **Single tenant**                                          |
+| Platform                    | **Mobile and desktop applications** (public client)        |
+| Redirect URI                | `http://localhost/api/auth/entra/callback`                 |
+| Client secret / certificate | **None**                                                   |
+| API permissions             | **None** — `openid profile email` are consented by default |
+| Allow public client flows   | Enabled                                                    |
+
+Entra ignores the _port_ when matching a `localhost` redirect URI, so one
+registration covers every port and every local forward. Nothing else has to be
+registered when the tunnel URL changes.
+
+Then either put the IDs in the environment:
+
+```bash
+FLEET_ENTRA_TENANT_ID=<directory (tenant) id>
+FLEET_ENTRA_CLIENT_ID=<application (client) id>
+```
+
+or leave them out and paste them into the first-run screen, which asks for the
+console claim code before it will accept them. Neither value is a secret;
+saving them grants nobody access.
+
+### The claim itself
+
+1. Start the Host and copy the claim code from its console.
+2. Open `http://localhost:8787` — use `localhost`, not `127.0.0.1`; the UI
+   redirects if you get it wrong, because the registered reply URL is matched by
+   name and the transaction cookie follows it.
+3. Enter the claim code, then **Sign in with Microsoft**.
+4. You are now this Fleet's administrator. Enrol machines from
+   **Settings → Nodes**.
+
+### Signing in from somewhere else
+
+Authorization code with PKCE and a loopback callback is the primary flow, so a
+remote browser has two options:
+
+- **Forward the Host to your own machine** and use `http://localhost:<port>`:
+
+  ```bash
+  devtunnel connect <tunnel-id>
+  ```
+
+  Any local forward works — SSH `-L`, a provider's client, whatever you already
+  use. This is the recommended path and always available.
+
+- **Device sign-in**, if your tenant permits it. Microsoft recommends blocking
+  the device code flow by default and Conditional Access commonly does, so
+  Fleet keeps it **off** until it has watched one complete. An administrator
+  turns it on from **Settings → Security → Verify device sign-in**: the check
+  runs whatever the setting currently says, and only a completed flow writes
+  it. A tenant that blocks the flow leaves it off and says so, rather than
+  producing a login that hangs.
+
+  A device code is the one credential an attacker can ask _you_ to enter on
+  their behalf. Only ever enter a code the Fleet page in front of you is
+  showing. Fleet additionally requires a fresh authorization-code sign-in — not
+  a device sign-in — before removing an administrator, disabling the password,
+  or exporting a portable backup.
+
+Fleet sessions are per-origin. A session issued on `localhost` authorises that
+forwarded UI and does not set a cookie for a public tunnel domain.
+
+### Adding and removing administrators
+
+Fleet asks for no Graph permission to search your directory, so an invitation is
+how somebody is added:
+
+1. **Settings → Security → Add administrator** mints a single-use link that
+   expires in 15 minutes.
+2. The recipient opens it and signs in with Microsoft.
+3. That records them as a **candidate** — it grants nothing. The exact account
+   that turned up is shown, with its object and tenant id.
+4. An existing administrator approves or rejects that identity.
+
+A leaked link is therefore not an escalation: the wrong person redeeming it
+appears in the pending list and is rejected.
+
+Removing an administrator revokes every session they hold and closes their open
+browser connections in the same operation, mid-transcript if necessary. The last
+active administrator cannot be removed, and removal needs a Microsoft
+authorization-code sign-in from the last ten minutes.
+
+### Migrating off the shared password
+
+Hosts that predate Microsoft identity keep working: password sign-in stays
+enabled until an administrator turns it off. `FLEET_OPERATOR_PASSWORD` is now an
+explicit, warned-about escape hatch — a fresh Host without one generates
+nothing.
+
+1. Sign in with the password the Host already has. Because nobody administers it
+   yet, the console shows a migration checkpoint rather than the fleet.
+2. If this Host has no Entra registration, paste the tenant and client IDs there.
+3. **Claim with Microsoft.** The account you sign in with becomes this Fleet's
+   first administrator, and the console appears.
+4. **Settings → Security → Disable password sign-in**.
+
+The console claim code is not needed for any of that: proving the existing
+password proves the same thing it stands for, so the Host trades that session
+for the same short, browser-bound bootstrap grant and audits it as
+`bootstrap_password_granted`. A Host that never had a password, and a portable
+restore onto a rebuilt machine, still take the printed code.
+
+Disabling deletes the stored verifier, records the choice so a stale
+`FLEET_OPERATOR_PASSWORD` left in a shell profile cannot re-enable it, and
+revokes every password session. If you lock yourself out, a local recovery
+command on the Host console issues a temporary password and writes an audit
+event; disable it again once you are back in.
+
+### Tunnels and who can reach the sign-in page
+
+| Provider                             | Reachability                             | Operator console                    |
+| ------------------------------------ | ---------------------------------------- | ----------------------------------- |
+| Direct `localhost`                   | This machine only                        | Always allowed                      |
+| Dev Tunnels (creator-private)        | Microsoft login at the tunnel            | **Default and recommended**         |
+| Dev Tunnels (tenant / anonymous)     | Wider, by your `devtunnel access` policy | Allowed, with a warning             |
+| Cloudflare / ngrok / Tailscale HTTPS | Anyone with the URL                      | Allowed after claim, with a warning |
+| `bore` and any plain-HTTP relay      | Anyone with the URL, in clear text       | **Refused**                         |
+
+A fresh Host defaults to Dev Tunnels because its URL alone reaches nothing: the
+provider demands a Microsoft login before Fleet's own claim screen is even
+visible. A public HTTPS provider is fine after the Host is claimed — the sign-in
+page grants nothing on its own — but a stranger can at least see it.
+
+`bore` is refused for the operator console by the Host itself, not merely greyed
+out in the panel: it relays plain TCP, so the session cookie and every
+transcript behind it would cross it readable. The refusal holds for any client,
+including one that never renders the UI.
 
 ### Chats
 
@@ -130,11 +299,22 @@ session waiting with no failure to display. From a checked-out Fleet directory
 ```powershell
 npm install
 npm run build:node
-npm run start:node -- --url="https://fleet.example.com" --token="replace-with-host-token"
+npm run start:node -- --url="https://fleet.example.com" `
+  --host-id="<host-id>" `
+  --host-fingerprint="<sha256>" `
+  --enrollment-grant="<id>.<secret>"
 ```
 
-The same three lines work in bash — flags avoid the `$env:` / `VAR=value`
-split between shells.
+The same lines work in bash — flags avoid the `$env:` / `VAR=value` split
+between shells. Generate them from **Settings → Nodes → Generate a connect
+command**: the grant is minted on request, is good for one machine and fifteen
+minutes, and is never stored by the Host in a form it could hand out again.
+
+The node generates its own Ed25519 key pair _before_ it contacts anything, and
+pins `--host-fingerprint`. A relay or an impostor that answers the URL cannot
+produce a signature for the matching key, so the node sends it no enrollment
+completion and accepts no command from it — which is what makes a relay merely
+a relay.
 
 The node name defaults to the machine hostname, and can be changed from either
 end — the Host's Nodes tab or the node's own config page. Renaming keeps the
@@ -143,11 +323,24 @@ the name, so if both ends changed while the node was offline, the Host's name
 wins and is pushed back down. Pass `--max-sessions 4` if you want a capacity
 other than 10.
 
-First registration exchanges the enrollment token for a unique node secret.
-Credentials are persisted at
-`$env:APPDATA\CopilotFleet\node.json`; subsequent starts do not need the
-enrollment token. The service uses an outbound WSS connection, so no inbound
-Node port is required.
+Enrollment stores the node's private key and the Host's public key at
+`$env:APPDATA\CopilotFleet\node.json`; subsequent starts need no grant, and no
+reusable shared secret is ever issued. The service uses an outbound WSS
+connection, so no inbound Node port is required.
+
+The older fleet-wide `--token` / `ENROLLMENT_TOKEN` exists only for machines that
+predate Node keys. A fresh Host has none: it neither requires one to start nor
+persists one, and it refuses token registration outright. It is a reusable
+credential that authorises any machine and that a node sends before it can tell
+the Host from a relay, so it is deprecated. Existing nodes do **not** upgrade
+themselves: a shared secret has already reached whatever relays that node's
+connection, so nothing sent back over it can prove which Host is answering.
+Migrate each machine by minting a fresh Connect command and running it there —
+the grant is one-time, the fingerprint comes from your screen rather than the
+wire, and enrolling under the machine's existing name reclaims the same node,
+keeping its id, placements and session history. **Settings → Security** shows how
+many are left and lets an administrator switch the shared secret off for good
+once none are.
 
 ### Node command-line flags
 
@@ -156,18 +349,21 @@ a flag wins over both `.env` and the saved `settings.json` — which is what mak
 it usable to point one run at a different Host without editing files on that
 machine. Run `npm run start:node -- --help` for the current list.
 
-| Flag                              | Replaces                 |
-| --------------------------------- | ------------------------ |
-| `--url`, `--host-url`             | `FLEET_HOST_URL`         |
-| `--name`, `--node-name`           | `FLEET_NODE_NAME`        |
-| `--token`, `--enrollment-token`   | `FLEET_ENROLLMENT_TOKEN` |
-| `--max-sessions`                  | `FLEET_MAX_SESSIONS`     |
-| `--copilot-command`               | `FLEET_COPILOT_COMMAND`  |
-| `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`  |
-| `--context-tier`                  | `FLEET_CONTEXT_TIER`     |
-| `--devtunnel`                     | `FLEET_DEVTUNNEL_ID`     |
-| `--config-port`                   | `FLEET_NODE_CONFIG_PORT` |
-| `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`       |
+| Flag                              | Replaces                              |
+| --------------------------------- | ------------------------------------- |
+| `--url`, `--host-url`             | `FLEET_HOST_URL`                      |
+| `--name`, `--node-name`           | `FLEET_NODE_NAME`                     |
+| `--enrollment-grant`              | `FLEET_ENROLLMENT_GRANT`              |
+| `--host-id`                       | `FLEET_HOST_ID`                       |
+| `--host-fingerprint`              | `FLEET_HOST_FINGERPRINT`              |
+| `--token`, `--enrollment-token`   | `FLEET_ENROLLMENT_TOKEN` (deprecated) |
+| `--max-sessions`                  | `FLEET_MAX_SESSIONS`                  |
+| `--copilot-command`               | `FLEET_COPILOT_COMMAND`               |
+| `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`               |
+| `--context-tier`                  | `FLEET_CONTEXT_TIER`                  |
+| `--devtunnel`                     | `FLEET_DEVTUNNEL_ID`                  |
+| `--config-port`                   | `FLEET_NODE_CONFIG_PORT`              |
+| `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`                    |
 
 Both `--flag value` and `--flag=value` are accepted. The `--` after the npm
 script name is npm's own separator; without it npm eats the flags. The same
@@ -332,12 +528,41 @@ stopped offering.
 
 ### Moving a Host or a Node to another machine
 
-The fleet is two kinds of state, so there are two files.
+The fleet is two kinds of state, so there are two files — and one of them now
+comes in two versions, because moving a Host's _data_ and moving its _identity_
+are different operations with different risks.
 
-**Host** — Settings → General → **Export fleet**. The JSON file holds workspaces,
-placements, nodes (identity hashes, not plaintext secrets), sessions, transcripts,
-defaults, the enrollment token, and tunnel provider/enabled. Import on the new
-machine **replaces** whatever is already there.
+**Host data (version 1)** — Settings → General → **Export fleet data**. The JSON
+file holds workspaces, placements, nodes (identity hashes, not plaintext
+secrets), sessions, transcripts, defaults, any legacy enrollment token, and
+tunnel provider/enabled. It is **data only**: import on the new machine
+**replaces** the catalog, but deliberately **preserves the security envelope of
+the Host it lands in** — administrators, authentication mode and Entra
+configuration, the Host signing key, the CSRF and lead-token keys, and password
+mode all survive. A data restore can never return a secured Host to `unclaimed`
+or silently hand it a different identity, which is exactly why it cannot move a
+Host on its own.
+
+**Host identity (portable, version 2)** — Settings → **Security** → **Move this
+Host**. This is the file that moves a Host to a new machine intact. Its
+security section — administrators, Entra configuration, the Host private key,
+CSRF and lead-token keys, Node public keys, and whether mutual Node
+authentication is enforced — is encrypted with a passphrase you supply (scrypt +
+AES-256-GCM, minimum 14 characters, never persisted). Exporting it, and
+importing it into an already claimed Host, both require a Microsoft
+authorization-code sign-in from the last ten minutes; importing into a fresh
+Host instead takes that Host's console claim code plus the passphrase, and
+creates no session — an administrator signs in afterwards through the restored
+configuration.
+
+A fleet that had already retired the shared Node secret restores that way too:
+enforcement travels in the sealed section, and the fleet-wide enrollment token
+it retired is not written back.
+
+Restoring revokes every browser session and closes browser and Node sockets, and
+either applies whole or not at all. **Stop the old Host before starting the moved
+one**: two processes sharing one Host identity is a fingerprint two machines can
+sign for, and Nodes cannot tell them apart.
 
 Existing nodes reconnect with the `node.json` they already have, as long as they
 can still reach the Host. A named hostname / `FLEET_PUBLIC_URL` / Tailscale Funnel
@@ -425,7 +650,7 @@ to `http://127.0.0.1:8787` (or `PORT`): `/api`, `/ws/node`, `/ws/browser`, and
 the built UI when one is there. In `npm run dev` the page you click is Vite on
 `http://127.0.0.1:5173`; the tunnel does not point at that. Opening the public
 URL still hits the Host, so `/api/health` answers and everything else still
-asks for the operator password.
+asks for a Microsoft sign-in.
 
 When the Host's public address changes — a tunnel comes up, rotates, or is
 switched to another provider — it tells the nodes that are still connected. Each
@@ -574,17 +799,21 @@ npm install
 npm run host
 ```
 
-Run a deterministic no-login Node in terminal 2:
+Claim it: open `http://localhost:8787`, enter the code the Host printed, and
+sign in with Microsoft. Then mint a connect command from **Settings → Nodes**
+and run a deterministic no-login Node in terminal 2:
 
 ```bash
-npm run node -- --url=http://127.0.0.1:8787 \
-  --token=change-me \
+npm run node -- --url=http://localhost:8787 \
+  --host-id="<host-id>" \
+  --host-fingerprint="<sha256>" \
+  --enrollment-grant="<id>.<secret>" \
   --name=mock-node \
   --max-sessions=2 \
   --mock-agent
 ```
 
-Then open `http://127.0.0.1:5173`:
+Then open `http://localhost:5173`:
 
 ![The Start a session dialog: a workspace placement, an optional session name, the initial prompt, and the YOLO toggle that decides whether the agent asks before running tools.](docs/screenshots/new-session.png)
 
@@ -612,10 +841,11 @@ The vertical split is the whole design: the Host owns desired state and history,
 the Node owns execution. Copilot credentials, child processes, and local paths
 never cross it, and the Node is the side that dials out.
 
-1. The Node registers once with the enrollment token and receives a node ID and
-   secret.
-2. The Node authenticates its outbound WebSocket. Heartbeats report active
-   session inventory.
+1. The Node generates its own key pair, pins the Host fingerprint, and enrols
+   with a one-time grant; the Host stores only its public key.
+2. The Node authenticates its outbound WebSocket by signing the whole
+   handshake, and both ends derive per-direction AEAD keys for it. Heartbeats
+   report active session inventory.
 3. The browser creates a session from a stored placement. The Host never accepts
    a path in the session-create request.
 4. The Host dispatches a deduplicated command. The Node validates and resolves
@@ -735,24 +965,65 @@ stops a run rather than a prompt each time.
 
 ## Security notes
 
-- The web UI and the whole `/api` surface sit behind an operator password. Set
-  `FLEET_OPERATOR_PASSWORD`; a Host started without one generates a password on
-  first boot and prints it to its console. Signing in sets an `HttpOnly`,
-  `SameSite=Strict` session cookie that lasts 12 hours. Repeated wrong guesses
-  lock sign-in for the whole Host — not per client — for a few minutes.
-  `/api/health` stays unauthenticated so a tunnel URL can be probed without
-  becoming an administrator.
+- The web UI and the whole `/api` surface require a Fleet session belonging to a
+  live administrator. A Fleet session is issued only after Microsoft Entra ID
+  has authenticated the person **and** this Host's own administrator table has
+  authorized them: a valid account from the right tenant that nobody added is
+  refused with a named `403` and gets no session. Sessions are opaque 256-bit
+  values stored as SHA-256 digests, `HttpOnly`, `SameSite=Strict`, `Secure` on a
+  configured HTTPS endpoint, with a seven-day idle and 30-day absolute life. No
+  Microsoft access, refresh, ID or device token is ever persisted.
+  `/api/health` and `/api/auth/status` stay unauthenticated so a tunnel URL can
+  be probed without becoming an administrator.
+- Claiming a fresh Host takes two independent proofs: a 128-bit one-time code
+  printed only to the Host's console, and a Microsoft sign-in. Neither is
+  sufficient alone, the claim is a single atomic transaction, and a second
+  identity racing it gets `409` rather than a second administrator. Request IP,
+  apparent loopback, `x-forwarded-proto` and caller-supplied `Host` values are
+  not security inputs — every supported tunnel relays into loopback, so all of
+  them describe the relay.
+- Every state-changing browser request carries an `X-CSRF-Token` derived from
+  the session with an HMAC, so nothing per-session is stored to leak.
+- High-impact changes — removing an administrator, disabling the password,
+  minting an enrollment grant, exporting a portable backup — additionally
+  require an **authorization-code** sign-in from the last ten minutes. A device
+  sign-in does not satisfy it, because an attacker can start a device flow and
+  have an administrator finish it.
+- Removing an administrator revokes their sessions and closes their live browser
+  sockets in the same operation; a 60-second sweep re-checks every open socket
+  against the live session and administrator rows.
+- Legacy password sign-in is opt-in and off on a fresh Host. Disabling it
+  deletes the verifier and records the choice, so a stale
+  `FLEET_OPERATOR_PASSWORD` cannot re-enable it.
 - The Host answers only to names it knows: loopback, `FLEET_PUBLIC_URL`, the
   live tunnel URL, and anything listed in `FLEET_ALLOWED_HOSTS`. Requests
   arriving under any other `Host`, or from another `Origin`, are refused —
   which is what keeps a page the operator happens to visit from reaching the
   fleet through a rebound DNS name. `FLEET_ALLOWED_HOSTS=*` disables the check.
+- A session or bootstrap grant is issued only over loopback or an endpoint this
+  Host itself published as HTTPS. A plain-HTTP relay such as `bore` is refused
+  for the operator console by the Host, not merely disabled in the UI.
+- `/mcp` is a separate machine principal, not an operator-cookie exception. It
+  accepts only a signed lead token bound to a live lead session, run and node,
+  rejects browser `Origin` headers, and audits every refusal without recording
+  the bearer value.
 - A node's own credentials reach only the workspace and placement endpoints its
   config page relays through, and a node can only create or repoint placements
   on itself.
-- Production startup refuses a missing or default `change-me` enrollment token.
-- A successful enrollment creates a unique high-entropy node secret; only its
-  SHA-256 hash is stored by the Host.
+- New enrollment sends no reusable credential to an unauthenticated Host. A
+  one-time grant authorises exactly one Node public key for fifteen minutes;
+  the node pins the Host fingerprint before it completes, both ends sign the
+  whole handshake, and the connection derives per-direction AES-256-GCM keys
+  with sequenced frames — so a relay can carry the traffic without reading,
+  forging, or replaying it.
+- The legacy fleet-wide enrollment token exists only for machines that predate
+  Node keys. A fresh Host never has one, does not persist one, and refuses token
+  registration; Settings shows how many machines are left, and enforcement —
+  which deletes the stored secrets and retires the token — is refused while any
+  node still needs one. There is no automatic upgrade off a shared secret: that
+  secret has already reached whatever relays the connection, so a machine
+  migrates by running a fresh Connect command, which reclaims its own node row
+  against a key.
 - Copilot authentication and tokens remain on the Node and are never included
   in Fleet messages.
 - Session requests reference preconfigured placement IDs. Nodes also require an
@@ -764,6 +1035,10 @@ stops a run rather than a prompt each time.
   runs, set `FLEET_YOLO=1` on the Node so Copilot starts with `--allow-all`
   (tools, paths, and URLs). Unanswered and disconnected requests still fail
   closed when YOLO is off.
+- Security-relevant decisions are recorded in a local audit kept to the newest
+  10,000 rows, readable from Settings → Security. Claim codes, authorization
+  codes, device codes, Microsoft tokens, Fleet cookies, invitations, enrollment
+  grants, lead tokens and private keys are never logged.
 - The node's local config page is bound to loopback and additionally refuses
   requests that do not name `127.0.0.1` (or `localhost`) on its own port, come
   from another origin, or write without `content-type: application/json`. It

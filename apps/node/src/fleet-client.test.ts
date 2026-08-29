@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
+import {
+  NODE_ID_HEADER,
+  NODE_PROOF_NONCE_HEADER,
+  NODE_PROOF_SIGNATURE_HEADER,
+  NODE_PROOF_TIMESTAMP_HEADER,
+  NODE_SECRET_HEADER,
+} from "@fleet/protocol";
+import { createIdentityKeyPair, verifyNodeHttpProof } from "@fleet/protocol/node-auth";
 import { FleetClient, ownPlacements, type PlacementLike } from "./fleet-client.js";
 
 const placements: PlacementLike[] = [
@@ -36,15 +43,29 @@ describe("FleetClient credentials", () => {
   });
 
   const capture = () => {
-    const calls: { url: string; headers: Headers }[] = [];
+    const calls: { url: string; headers: Headers; body: string }[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: URL | string, init?: RequestInit) => {
         calls.push({
           url: String(input),
           headers: new Headers(init?.headers ?? {}),
+          body: typeof init?.body === "string" ? init.body : "",
         });
-        return new Response("[]", { status: 200 });
+        // Shaped to satisfy either schema, so a test can assert what was sent
+        // without also standing up a Host's replies.
+        const single = {
+          id: "w1",
+          name: "fleet",
+          description: "",
+          workspaceId: "w1",
+          nodeId: "node-1",
+          localPath: "/a",
+        };
+        const method = (init?.method ?? "GET").toUpperCase();
+        return new Response(JSON.stringify(method === "GET" ? [] : single), {
+          status: 200,
+        });
       }),
     );
     return calls;
@@ -80,5 +101,92 @@ describe("FleetClient credentials", () => {
 
     expect(calls[0]?.headers.has(NODE_ID_HEADER)).toBe(false);
     expect(calls[0]?.headers.has(NODE_SECRET_HEADER)).toBe(false);
+  });
+
+  /**
+   * A keyed Node has no shared secret to send, so the relay its config page
+   * depends on had nothing to say and every call came back a 401. It signs
+   * instead: the same identity that authenticates its WebSocket, over exactly
+   * the request it is making, and nothing reusable on the wire.
+   */
+  it("signs each relayed call with the key it enrolled with", async () => {
+    const calls = capture();
+    const keys = createIdentityKeyPair();
+    const client = new FleetClient({
+      hostUrl: () => "http://127.0.0.1:8787",
+      nodeId: () => "node-1",
+      nodeKey: () => keys.privateKey,
+    });
+
+    await client.listWorkspaces();
+    await client.createWorkspace("fleet", "");
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.headers.has(NODE_SECRET_HEADER)).toBe(false);
+    const nonces = new Set<string>();
+    for (const [index, call] of calls.entries()) {
+      const timestamp = call.headers.get(NODE_PROOF_TIMESTAMP_HEADER) ?? "";
+      const nonce = call.headers.get(NODE_PROOF_NONCE_HEADER) ?? "";
+      const signature = call.headers.get(NODE_PROOF_SIGNATURE_HEADER) ?? "";
+      nonces.add(nonce);
+      expect(call.headers.get(NODE_ID_HEADER)).toBe("node-1");
+      expect(
+        verifyNodeHttpProof({
+          publicKey: keys.publicKey,
+          nodeId: "node-1",
+          method: index === 0 ? "GET" : "POST",
+          path: "/api/workspaces",
+          ...(index === 0 ? {} : { body: call.body }),
+          timestamp,
+          nonce,
+          signature,
+        }),
+      ).toEqual({ ok: true });
+    }
+    // A nonce reused across calls is a proof the Host has to accept twice.
+    expect(nonces.size).toBe(2);
+  });
+
+  it("signs the path it actually calls, parameters and all", async () => {
+    const calls = capture();
+    const keys = createIdentityKeyPair();
+    const client = new FleetClient({
+      hostUrl: () => "http://127.0.0.1:8787",
+      nodeId: () => "node-1",
+      nodeKey: () => keys.privateKey,
+    });
+
+    await client.updateWorkspace("w 1", "fleet", "");
+
+    const call = calls[0];
+    const verify = (path: string) =>
+      verifyNodeHttpProof({
+        publicKey: keys.publicKey,
+        nodeId: "node-1",
+        method: "PATCH",
+        path,
+        body: call?.body ?? "",
+        timestamp: call?.headers.get(NODE_PROOF_TIMESTAMP_HEADER) ?? "",
+        nonce: call?.headers.get(NODE_PROOF_NONCE_HEADER) ?? "",
+        signature: call?.headers.get(NODE_PROOF_SIGNATURE_HEADER) ?? "",
+      });
+    expect(verify("/api/workspaces/w%201")).toEqual({ ok: true });
+    // The proof is for one resource, not for the collection it lives in.
+    expect(verify("/api/workspaces/other")).toEqual({ ok: false, reason: "signature" });
+  });
+
+  it("keeps sending the shared secret while that is all a Node has", async () => {
+    const calls = capture();
+    const client = new FleetClient({
+      hostUrl: () => "http://127.0.0.1:8787",
+      nodeId: () => "node-1",
+      nodeSecret: () => "s3cret",
+      nodeKey: () => undefined,
+    });
+
+    await client.listWorkspaces();
+
+    expect(calls[0]?.headers.get(NODE_SECRET_HEADER)).toBe("s3cret");
+    expect(calls[0]?.headers.has(NODE_PROOF_SIGNATURE_HEADER)).toBe(false);
   });
 });

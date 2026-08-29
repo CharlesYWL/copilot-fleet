@@ -208,6 +208,11 @@ const ProviderCard = ({
                 Used for enrollment
               </Badge>
             )}
+            {spec.access === "creator-private" && spec.controlPlaneEligible && (
+              <Badge appearance="outline" color="success">
+                Private — recommended
+              </Badge>
+            )}
             {state.external && <Badge appearance="outline">External process</Badge>}
           </div>
           <Text className={styles.caption}>
@@ -222,11 +227,38 @@ const ProviderCard = ({
         </div>
         <Switch
           checked={state.enabled || state.status === "on"}
-          disabled={!spec.binaryPresent || switching || state.external}
+          // A provider with no TLS is never offered for the console. The Host
+          // refuses it too — this only saves the operator the round trip.
+          disabled={
+            !spec.binaryPresent ||
+            switching ||
+            state.external ||
+            !spec.controlPlaneEligible
+          }
           label={state.enabled ? "On" : "Off"}
           onChange={(_event, data) => onToggle(data.checked)}
         />
       </div>
+
+      {!spec.controlPlaneEligible && (
+        <MessageBar intent="error">
+          <MessageBarBody>
+            {spec.label} publishes plain HTTP with no TLS, so the operator session cookie
+            and every transcript behind it would cross it readable. Fleet will not expose
+            the console through it.
+          </MessageBarBody>
+        </MessageBar>
+      )}
+
+      {spec.controlPlaneEligible && spec.access === "public" && (
+        <MessageBar intent="warning">
+          <MessageBarBody>
+            Anyone with the URL reaches the sign-in page. That page grants nothing on its
+            own — a Microsoft account still has to be an administrator here — but a
+            private tunnel keeps strangers off it entirely.
+          </MessageBarBody>
+        </MessageBar>
+      )}
 
       {state.error && (
         <MessageBar intent="error">
@@ -346,7 +378,8 @@ export const TunnelPanel = () => {
         <Text className={styles.caption}>
           Each provider runs on its own, so more than one can be up at a time — a fixed
           public hostname for teammates, a private tunnel for just this account. The one
-          marked for enrollment is the address handed to new nodes.
+          marked for enrollment is the address handed to new nodes. A tunnel decides who
+          can reach this Host; it never decides who may operate it.
         </Text>
       </div>
 

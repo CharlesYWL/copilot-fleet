@@ -27,7 +27,39 @@ function hostnameOf(url: string): string | undefined {
 function isLoopbackUrl(url: string): boolean {
   const host = hostnameOf(url);
   if (!host) return false;
-  return /^127\./.test(host) || host === "localhost" || host === "::1";
+  return (
+    /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
+    host === "localhost" ||
+    host === "::1"
+  );
+}
+
+/**
+ * Whether this Node may put its credentials on that address.
+ *
+ * A Node's traffic is not one cookie. The legacy protocol sends a shared secret
+ * in the clear by construction; the new one signs a handshake, and then the
+ * Host sends back the lead token an agent authenticates `/mcp` with, plus every
+ * prompt and transcript the fleet produces. On plain HTTP to anything that is
+ * not this machine — a LAN address, a `bore` relay — all of that is readable by
+ * whoever is on the path, and the sealed channel does not save it: the frames
+ * that set the channel up are the ones that carry the credential.
+ *
+ * Loopback is the exception and the only one, because `http://127.0.0.1` never
+ * reaches a wire. That is exactly what a `devtunnel connect` forward gives this
+ * node, which is why refusing plain HTTP does not cost the private-tunnel mode
+ * anything.
+ */
+export function isConfidentialHostUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url.trim());
+  } catch {
+    return false;
+  }
+  if (parsed.protocol === "https:") return true;
+  if (parsed.protocol !== "http:") return false;
+  return isLoopbackUrl(url.trim());
 }
 
 /**
@@ -47,6 +79,9 @@ function isLoopbackUrl(url: string): boolean {
  */
 export function dialableInMode(url: string, mode: TunnelMode): boolean {
   if (!normalizeHostUrl(url)) return false;
+  // Ahead of the mode question, because an address nothing may be sent over is
+  // not an address either mode can use.
+  if (!isConfidentialHostUrl(url)) return false;
   return mode === "devtunnel" ? isLoopbackUrl(url) : !isLoginWalledTunnelUrl(url);
 }
 

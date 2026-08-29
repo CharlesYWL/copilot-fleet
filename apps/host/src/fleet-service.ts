@@ -15,6 +15,7 @@ import {
   type FleetNode,
   type FleetSession,
   type HostBackup,
+  type HostPortableBackupData,
   type McpHttpServer,
   type NodeCommand,
   type NodeUpdateStage,
@@ -23,11 +24,12 @@ import {
   type Run,
   type RunRole,
   type RunStep,
+  type SecurityBackupPayload,
   type SessionEvent,
   type SessionState,
   type Snapshot,
 } from "@fleet/protocol";
-import type { FleetStore } from "./store.js";
+import type { FleetStore, RevokedSession } from "./store.js";
 import { isBroadcastableHostUrl } from "./host-url.js";
 import {
   capacityFor,
@@ -53,6 +55,21 @@ export type CommandRequest = DistributiveOmit<NodeCommand, "commandId">;
 /** What to do with the session when its Node turns out to be unreachable. */
 export type DispatchFallback = { state: SessionState; activity: string };
 
+/**
+ * One end of a Node connection, as everything outside the gateway sees it.
+ *
+ * Narrower than a WebSocket on purpose: the gateway hands over a sealing
+ * wrapper for a mutually authenticated Node and the raw socket for a legacy
+ * one, and nothing here should be able to tell — or reach past the wrapper to
+ * the socket underneath it.
+ */
+export type NodeLink = {
+  readonly readyState: number;
+  readonly OPEN: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+};
+
 export type DispatchResult = {
   sent: boolean;
   /** The session after the fallback transition, when one was applied. */
@@ -70,7 +87,16 @@ export type DispatchResult = {
  * reachable from a test.
  */
 export class FleetService {
-  private readonly nodeSockets = new Map<string, WebSocket>();
+  /**
+   * What the service needs from a Node connection, which is not a WebSocket.
+   *
+   * A mutually authenticated Node is spoken to through a sealing wrapper rather
+   * than the raw socket, so every existing path — dispatch, host_url, renames,
+   * update requests — is encrypted by construction instead of by each caller
+   * remembering to encrypt. A `ws` socket satisfies this shape as it is, which
+   * is what keeps the legacy protocol working unchanged.
+   */
+  private readonly nodeSockets = new Map<string, NodeLink>();
   private readonly browserSockets = new Set<WebSocket>();
   /**
    * Nodes told to update that have not yet reported how it went.
@@ -97,13 +123,17 @@ export class FleetService {
    * before both of them, and it must stay unaware of orchestration otherwise —
    * these are the two seams, and they are the only two.
    */
-  private leadTokens: { mint: (sessionId: string) => string } | undefined;
+  private leadTokens:
+    | { mint: (subject: { sessionId: string; runId: string; nodeId: string }) => string }
+    | undefined;
   private mcpUrl: (() => string) | undefined;
   private runTicker: ((runId: string) => void) | undefined;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
-    leadTokens: { mint: (sessionId: string) => string };
+    leadTokens: {
+      mint: (subject: { sessionId: string; runId: string; nodeId: string }) => string;
+    };
     mcpUrl: () => string;
     tickRun: (runId: string) => void;
   }): void {
@@ -156,11 +186,11 @@ export class FleetService {
     this.browserSockets.delete(socket);
   }
 
-  nodeSocket(nodeId: string): WebSocket | undefined {
+  nodeSocket(nodeId: string): NodeLink | undefined {
     return this.nodeSockets.get(nodeId);
   }
 
-  attachNode(nodeId: string, socket: WebSocket): void {
+  attachNode(nodeId: string, socket: NodeLink): void {
     this.nodeSockets.set(nodeId, socket);
   }
 
@@ -198,7 +228,29 @@ export class FleetService {
     this.broadcast({ type: "snapshot", data: this.snapshot() });
   }
 
-  send(socket: WebSocket, message: unknown): void {
+  /**
+   * Becomes the Host a portable archive describes, and hangs up on everything
+   * that was talking to the one it used to be.
+   *
+   * Nodes are dropped for the same reason a data restore drops them, and the
+   * sessions this returns are the browser sessions the store revoked — their
+   * sockets are closed by the caller, which is the half of a revocation that
+   * a database row cannot do.
+   */
+  importPortableBackup(input: {
+    data: HostPortableBackupData;
+    security: SecurityBackupPayload;
+  }): { revokedSessions: RevokedSession[] } {
+    this.evictAllNodes(4002, "Host restored from a portable backup");
+    return this.store.importPortableBackup(input);
+  }
+
+  /** Publishes after restore-time credentials and sockets have been replaced. */
+  publishSnapshot(): void {
+    this.broadcast({ type: "snapshot", data: this.snapshot() });
+  }
+
+  send(socket: NodeLink, message: unknown): void {
     if (socket.readyState === socket.OPEN) socket.send(JSON.stringify(message));
   }
 
@@ -385,10 +437,20 @@ export class FleetService {
    * to "what tools does this have" and a resumed orchestrator cannot come back
    * without them. A fresh token is minted each time: they are cheap, and it
    * means an old one stops working the moment a session restarts.
+   *
+   * The token names the run and the machine as well as the session, so `/mcp`
+   * can re-check the authorisation against the fleet as it stands rather than
+   * as it stood when the token was written.
    */
-  mcpServersFor(session: Pick<FleetSession, "id" | "runRole">): McpHttpServer[] {
+  mcpServersFor(
+    session: Pick<FleetSession, "id" | "runRole" | "runId" | "nodeId">,
+  ): McpHttpServer[] {
     if (session.runRole !== "lead" || !this.leadTokens || !this.mcpUrl) return [];
-    const token = this.leadTokens.mint(session.id);
+    const token = this.leadTokens.mint({
+      sessionId: session.id,
+      runId: session.runId,
+      nodeId: session.nodeId,
+    });
     return [
       {
         name: "fleet",

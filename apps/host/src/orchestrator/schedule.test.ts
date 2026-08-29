@@ -27,6 +27,7 @@ function node(id: string, overrides: Partial<FleetNode> = {}): FleetNode {
     lastHeartbeat: iso(),
     online: true,
     homeDir: "",
+    authProtocol: "legacy-secret",
     ...overrides,
   };
 }

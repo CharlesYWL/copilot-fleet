@@ -2,10 +2,12 @@ import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
 import {
   type FleetNode,
   type FleetSession,
   type HostBackup,
+  type HostPortableBackupData,
   type Placement,
   type Run,
   type RunPolicy,
@@ -15,6 +17,7 @@ import {
   type RunNote,
   type RunCriterion,
   type RunStepState,
+  type SecurityBackupPayload,
   type SessionEvent,
   type SessionState,
   type TunnelProvider,
@@ -24,6 +27,8 @@ import {
   CHATS_WORKSPACE_DESCRIPTION,
   CHATS_WORKSPACE_ID,
   CHATS_WORKSPACE_NAME,
+  DEFAULT_TUNNEL_PROVIDER,
+  MUTUAL_AUTH_PROTOCOL,
   HostBackupSchema,
   NodeSchema,
   PlacementSchema,
@@ -31,6 +36,7 @@ import {
   RunSchema,
   RunStepSchema,
   RunNoteSchema,
+  SecurityBackupPayloadSchema,
   SessionEventSchema,
   SessionSchema,
   TunnelProviderSchema,
@@ -43,6 +49,7 @@ import {
   tryParseJson,
   tunnelProviders,
 } from "@fleet/protocol";
+import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 
 /**
  * A policy as it arrives from a request body.
@@ -102,6 +109,162 @@ export type ReportedNodeIdentity = {
   homeDir?: string;
 };
 
+/**
+ * A person, as Entra describes them.
+ *
+ * `tenantId` and `objectId` are the only two fields Fleet ever authorises on:
+ * they are immutable and issued by the identity provider. The other two are
+ * display metadata and are deliberately not part of any lookup.
+ */
+export type AdministratorIdentity = {
+  tenantId: string;
+  objectId: string;
+  username: string;
+  displayName: string;
+};
+
+export type Administrator = AdministratorIdentity & {
+  id: string;
+  addedVia: string;
+  addedByAdminId: string;
+  createdAt: string;
+  lastLoginAt: string;
+  disabledAt: string;
+};
+
+export type NewAdministrator = AdministratorIdentity & {
+  addedVia: string;
+  addedByAdminId?: string | undefined;
+};
+
+/** How a browser session was authenticated, which decides what it may do. */
+export type OperatorAuthMethod =
+  "password" | "recovery" | "microsoft-code" | "microsoft-device";
+
+export type OperatorSessionRow = {
+  tokenHash: string;
+  administratorId: string;
+  authMethod: OperatorAuthMethod;
+  authenticatedAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+  revokedAt: string;
+};
+
+export type NewOperatorSession = {
+  tokenHash: string;
+  administratorId: string;
+  authMethod: OperatorAuthMethod;
+  authenticatedAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+};
+
+export type AdministratorInvitation = {
+  id: string;
+  createdByAdminId: string;
+  createdAt: string;
+  expiresAt: string;
+  consumedAt: string;
+  candidateTenantId: string;
+  candidateObjectId: string;
+  candidateUsername: string;
+  candidateDisplayName: string;
+  decidedByAdminId: string;
+  decidedAt: string;
+  decision: string;
+};
+
+export type SecurityAuditInput = {
+  eventType: string;
+  actorKind: string;
+  outcome: string;
+  actorId?: string | undefined;
+  targetId?: string | undefined;
+  requestHost?: string | undefined;
+  tunnelProvider?: string | undefined;
+  detail?: string | undefined;
+};
+
+export type SecurityAuditRecord = {
+  id: string;
+  eventType: string;
+  actorKind: string;
+  actorId: string;
+  targetId: string;
+  requestHost: string;
+  tunnelProvider: string;
+  outcome: string;
+  detail: string;
+  createdAt: string;
+};
+
+/** What a revoked session was, so its live socket can be found and closed. */
+export type RevokedSession = { tokenHash: string; administratorId: string };
+
+/**
+ * One authorisation for one machine to join the fleet.
+ *
+ * The row holds `SHA-256(secret)` and nothing else that could enrol anything:
+ * the digest is what the completion's HMAC is keyed with, so the Host can check
+ * a proof it could never have produced.
+ */
+export type EnrollmentGrantRow = {
+  id: string;
+  tokenHash: string;
+  createdByAdminId: string;
+  createdAt: string;
+  expiresAt: string;
+  consumedAt: string;
+  consumedByNodeId: string;
+};
+
+/** MVP administrators are peers, and twenty peers is already a large fleet. */
+export const MAX_ADMINISTRATORS = 20;
+
+/** The one setting that decides whether a legacy Node may still connect. */
+export const MUTUAL_AUTH_REQUIRED_SETTING = "node.mutualAuthentication.required";
+
+/** Newest-first retention for the local security log. */
+export const MAX_SECURITY_AUDIT_ROWS = 10_000;
+
+/**
+ * A sanitised reason, never a request body or a provider's output.
+ *
+ * The audit is readable by every administrator, so anything copied into it is
+ * effectively published to all of them; a cap is what keeps an attacker from
+ * using the log as storage.
+ */
+export const MAX_AUDIT_DETAIL_LENGTH = 500;
+
+/**
+ * Settings a data restore must not touch.
+ *
+ * Everything here answers "who owns this Host", not "what is on it": erasing
+ * any of them would either lock every administrator out or hand the Host back
+ * to whoever reaches it first. The Host's own identity and the key its lead
+ * tokens are signed with are here for the same reason from the other side —
+ * they are what the fleet's machines and its running orchestrators recognise
+ * this Host by, and a data restore is not a change of identity.
+ */
+export const PRESERVED_SETTING_KEYS = [
+  "auth.mode",
+  "auth.passwordEnabled",
+  "auth.operatorPassword",
+  "auth.passwordIsRecovery",
+  "auth.entraTenantId",
+  "auth.entraClientId",
+  "auth.deviceFlowEnabled",
+  "auth.csrfKey",
+  "auth.sessionKey",
+  "orchestrator.tokenKey",
+  "host.identity.id",
+  "host.identity.privateKey",
+  "host.identity.publicKey",
+  "host.identity.fingerprint",
+  "node.mutualAuthentication.required",
+] as const;
+
 const terminalStateList = [...terminalSessionStates];
 /** Terminal plus offline: settled enough that a cascade delete is safe. */
 const settledStateList = [...terminalStateList, "offline"];
@@ -132,9 +295,11 @@ function assertNotReserved(workspaceId: string, refusal: string): void {
 const NO_MANUAL_CHECKOUTS =
   "given checkouts by hand — every node gets one automatically, at its home directory";
 
+/** How the Host locks its own data down, injectable so tests can watch it. */
+export type SecureFiles = (databasePath: string) => void;
+
 export class FleetStore {
-  private readonly db: DatabaseSync;
-  /**
+  private readonly db: DatabaseSync; /**
    * Compiling the same SQL on every call showed up on the hot path: a node
    * heartbeat arrives every five seconds per node and each one re-prepared the
    * session query. Statements are cached by text and live as long as the
@@ -142,10 +307,30 @@ export class FleetStore {
    */
   private readonly statements = new Map<string, StatementSync>();
 
-  constructor(path: string) {
+  constructor(path: string, options: { secureFiles?: SecureFiles } = {}) {
+    /*
+     * The default writes to stderr rather than to a logger, because the store
+     * is constructed before anything that has one — and a Host that could not
+     * protect its own database must not have that fact swallowed. The server
+     * passes a logging one in.
+     */
+    const secure =
+      options.secureFiles ??
+      ((databasePath) =>
+        secureHostDataFiles(
+          databasePath,
+          defaultSecureDataDeps((message) => process.stderr.write(`${message}\n`)),
+        ));
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+    /*
+     * After the first pragma, not before: WAL mode is what creates the `-wal`
+     * and `-shm` sidecars, and those carry the same rows the database does. A
+     * Host that locked down only the main file would be leaving its private key
+     * readable in a journal.
+     */
+    secure(path);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS nodes (
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, secret_hash TEXT NOT NULL,
@@ -219,9 +404,82 @@ export class FleetStore {
       CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id);
       CREATE INDEX IF NOT EXISTS idx_run_steps_session ON run_steps(session_id);
       CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
+      -- Who may drive this Host. Keyed by the two immutable Entra claims: an
+      -- address is a display label that a tenant admin can hand to somebody
+      -- else, and authorising one would hand them the fleet with it.
+      CREATE TABLE IF NOT EXISTS administrators (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        username TEXT NOT NULL DEFAULT '',
+        display_name TEXT NOT NULL DEFAULT '',
+        added_by_admin_id TEXT NOT NULL DEFAULT '',
+        added_via TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_login_at TEXT NOT NULL DEFAULT '',
+        disabled_at TEXT NOT NULL DEFAULT '',
+        UNIQUE(tenant_id, object_id)
+      );
+      -- Only the digest, so a database read is not a set of live cookies.
+      CREATE TABLE IF NOT EXISTS operator_sessions (
+        token_hash TEXT PRIMARY KEY,
+        administrator_id TEXT NOT NULL DEFAULT '',
+        auth_method TEXT NOT NULL,
+        authenticated_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT NOT NULL DEFAULT ''
+      );
+      CREATE INDEX IF NOT EXISTS idx_operator_sessions_admin
+        ON operator_sessions(administrator_id);
+      CREATE TABLE IF NOT EXISTS administrator_invitations (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_by_admin_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT NOT NULL DEFAULT '',
+        candidate_tenant_id TEXT NOT NULL DEFAULT '',
+        candidate_object_id TEXT NOT NULL DEFAULT '',
+        candidate_username TEXT NOT NULL DEFAULT '',
+        candidate_display_name TEXT NOT NULL DEFAULT '',
+        decided_by_admin_id TEXT NOT NULL DEFAULT '',
+        decided_at TEXT NOT NULL DEFAULT '',
+        decision TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS security_audit (
+        id TEXT PRIMARY KEY,
+        event_type TEXT NOT NULL,
+        actor_kind TEXT NOT NULL,
+        actor_id TEXT NOT NULL DEFAULT '',
+        target_id TEXT NOT NULL DEFAULT '',
+        request_host TEXT NOT NULL DEFAULT '',
+        tunnel_provider TEXT NOT NULL DEFAULT '',
+        outcome TEXT NOT NULL,
+        detail TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        sequence INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_security_audit_sequence
+        ON security_audit(sequence);
+      CREATE TABLE IF NOT EXISTS enrollment_grants (
+        id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_by_admin_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT NOT NULL DEFAULT '',
+        consumed_by_node_id TEXT NOT NULL DEFAULT ''
+      );
     `);
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "revision", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("nodes", "public_key", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing(
+      "nodes",
+      "auth_protocol",
+      "TEXT NOT NULL DEFAULT 'legacy-secret'",
+    );
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "yolo", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "name", "TEXT NOT NULL DEFAULT ''");
@@ -451,7 +709,7 @@ export class FleetStore {
   getTunnelProvider(): TunnelProvider {
     const stored = this.getSetting("tunnel.provider");
     const parsed = TunnelProviderSchema.safeParse(stored);
-    return parsed.success ? parsed.data : "cloudflare";
+    return parsed.success ? parsed.data : DEFAULT_TUNNEL_PROVIDER;
   }
 
   /**
@@ -593,172 +851,451 @@ export class FleetStore {
    */
   replaceHostBackup(backup: HostBackup): void {
     const parsed = HostBackupSchema.parse(backup);
-    this.transaction(() => {
-      this.db.exec(
-        "DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes; DELETE FROM settings",
+    this.transaction(() => this.replaceHostBackupRows(parsed));
+    // Placements went too, and the ones under Chats are derived rather than
+    // archived: each node rebuilds its own on the reconnect that follows.
+    for (const node of parsed.nodes) this.syncChatPlacement(node.id);
+  }
+
+  /**
+   * The body of a data restore, without a transaction of its own.
+   *
+   * Separate so a portable restore can put the data and the security envelope
+   * back in one commit: a Host left with somebody else's catalog and its own
+   * administrators is not a state anybody asked for, and it is what a restore
+   * that failed halfway would leave behind.
+   */
+  private replaceHostBackupRows(parsed: HostBackup): void {
+    this.db.exec(
+      "DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
+    );
+    /*
+     * Settings are replaced wholesale except the ones that decide who may
+     * operate this Host. An archive predates the security envelope it is
+     * being restored into, so clearing `auth.*` would delete the Entra
+     * configuration and CSRF key out from under administrators the archive
+     * does not even know about — leaving a claimed Host that nobody can sign
+     * into. Restoring data must not silently unclaim a Host.
+     */
+    this.statement(
+      `DELETE FROM settings WHERE key NOT IN (${placeholders(PRESERVED_SETTING_KEYS)})`,
+    ).run(...(PRESERVED_SETTING_KEYS as unknown as string[]));
+    this.setTunnelEnabled(parsed.tunnel.enabled);
+    this.setTunnelProvider(parsed.tunnel.provider);
+    this.setDefaultYolo(parsed.defaults.yolo);
+    this.setAutoResume(parsed.defaults.autoResume);
+    this.setSetting("enrollment.token", parsed.enrollmentToken);
+    if (parsed.publicUrl) this.setSetting("host.publicUrl", parsed.publicUrl);
+    for (const node of parsed.nodes) {
+      this.statement(
+        `INSERT INTO nodes
+            (id,name,secret_hash,public_key,auth_protocol,os,arch,version,revision,
+             capabilities,max_sessions,active_sessions,last_heartbeat,online,home_dir)
+           VALUES (?,?,?,'',?,?,?,?,?,?,?,0,?,0,?)`,
+      ).run(
+        node.id,
+        node.name,
+        node.secretHash,
+        // A version 1 archive predates Node keys, so every row it carries is a
+        // shared-secret machine. A portable restore corrects this afterwards
+        // from its security envelope, which is the only place a key can be.
+        node.authProtocol,
+        node.os,
+        node.arch,
+        node.version,
+        node.revision,
+        JSON.stringify(node.capabilities),
+        node.maxSessions,
+        node.lastHeartbeat,
+        node.homeDir,
       );
-      this.setTunnelEnabled(parsed.tunnel.enabled);
-      this.setTunnelProvider(parsed.tunnel.provider);
-      this.setDefaultYolo(parsed.defaults.yolo);
-      this.setAutoResume(parsed.defaults.autoResume);
-      this.setSetting("enrollment.token", parsed.enrollmentToken);
-      if (parsed.publicUrl) this.setSetting("host.publicUrl", parsed.publicUrl);
-      for (const node of parsed.nodes) {
-        this.statement(
-          `INSERT INTO nodes
-            (id,name,secret_hash,os,arch,version,revision,capabilities,max_sessions,
-             active_sessions,last_heartbeat,online,home_dir)
-           VALUES (?,?,?,?,?,?,?,?,?,0,?,0,?)`,
-        ).run(
-          node.id,
-          node.name,
-          node.secretHash,
-          node.os,
-          node.arch,
-          node.version,
-          node.revision,
-          JSON.stringify(node.capabilities),
-          node.maxSessions,
-          node.lastHeartbeat,
-          node.homeDir,
-        );
-      }
-      for (const workspace of parsed.workspaces) {
-        this.statement(
-          "INSERT INTO workspaces (id,name,description,created_at,position,kind) VALUES (?,?,?,?,?,?)",
-        ).run(
-          workspace.id,
-          workspace.name,
-          workspace.description,
-          workspace.createdAt,
-          workspace.position,
-          workspace.kind,
-        );
-      }
-      for (const placement of parsed.placements) {
-        this.statement(
-          "INSERT INTO placements (id,workspace_id,node_id,local_path,position) VALUES (?,?,?,?,?)",
-        ).run(
-          placement.id,
-          placement.workspaceId,
-          placement.nodeId,
-          placement.localPath,
-          placement.position,
-        );
-      }
-      for (const session of parsed.sessions) {
-        const imported = sessionFieldsForHostImport(session);
-        this.statement(
-          `INSERT INTO sessions
+    }
+    for (const workspace of parsed.workspaces) {
+      this.statement(
+        "INSERT INTO workspaces (id,name,description,created_at,position,kind) VALUES (?,?,?,?,?,?)",
+      ).run(
+        workspace.id,
+        workspace.name,
+        workspace.description,
+        workspace.createdAt,
+        workspace.position,
+        workspace.kind,
+      );
+    }
+    for (const placement of parsed.placements) {
+      this.statement(
+        "INSERT INTO placements (id,workspace_id,node_id,local_path,position) VALUES (?,?,?,?,?)",
+      ).run(
+        placement.id,
+        placement.workspaceId,
+        placement.nodeId,
+        placement.localPath,
+        placement.position,
+      );
+    }
+    for (const session of parsed.sessions) {
+      const imported = sessionFieldsForHostImport(session);
+      this.statement(
+        `INSERT INTO sessions
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
              config_options,position,run_id,run_role)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        ).run(
-          session.id,
-          session.workspaceId,
-          session.placementId,
-          session.nodeId,
-          imported.state,
-          session.initialPrompt,
-          imported.currentActivity,
-          session.lastText,
-          session.createdAt,
-          session.updatedAt,
-          session.agentSessionId,
-          session.yolo ? 1 : 0,
-          session.name,
-          JSON.stringify(session.commands),
-          JSON.stringify(session.configOptions),
-          session.position,
-          session.runId,
-          session.runRole,
-        );
-      }
-      for (const event of parsed.events) {
-        this.statement(
-          "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at) VALUES (?,?,?,?,?,?)",
-        ).run(
-          event.eventId,
-          event.sessionId,
-          event.sequence,
-          event.type,
-          JSON.stringify(event.payload),
-          event.createdAt,
-        );
-      }
-      for (const run of parsed.runs) {
-        this.statement(
-          `INSERT INTO runs
+      ).run(
+        session.id,
+        session.workspaceId,
+        session.placementId,
+        session.nodeId,
+        imported.state,
+        session.initialPrompt,
+        imported.currentActivity,
+        session.lastText,
+        session.createdAt,
+        session.updatedAt,
+        session.agentSessionId,
+        session.yolo ? 1 : 0,
+        session.name,
+        JSON.stringify(session.commands),
+        JSON.stringify(session.configOptions),
+        session.position,
+        session.runId,
+        session.runRole,
+      );
+    }
+    for (const event of parsed.events) {
+      this.statement(
+        "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at) VALUES (?,?,?,?,?,?)",
+      ).run(
+        event.eventId,
+        event.sessionId,
+        event.sequence,
+        event.type,
+        JSON.stringify(event.payload),
+        event.createdAt,
+      );
+    }
+    for (const run of parsed.runs) {
+      this.statement(
+        `INSERT INTO runs
             (id,workspace_id,name,objective,state,lead_session_id,placement_id,policy,
              phases,phase_index,success_criteria,stop_when,
              failure_reason,settle_seq,wake_seq,empty_wake_count,created_at,updated_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        ).run(
-          run.id,
-          run.workspaceId,
-          run.name,
-          run.objective,
-          runStateForHostImport(run.state),
-          run.leadSessionId,
-          run.placementId,
-          JSON.stringify(run.policy),
-          // Everything that says what the task *is* travels with it. Dropped,
-          // a restored task keeps its steps and forgets what they were for.
-          JSON.stringify(run.phases),
-          run.phaseIndex,
-          JSON.stringify(run.successCriteria),
-          run.stopWhen,
-          run.failureReason,
-          run.settleSeq,
-          run.wakeSeq,
-          run.emptyWakeCount,
-          run.createdAt,
-          run.updatedAt,
-        );
-      }
-      for (const step of parsed.runSteps) {
-        this.statement(
-          `INSERT INTO run_steps
+      ).run(
+        run.id,
+        run.workspaceId,
+        run.name,
+        run.objective,
+        runStateForHostImport(run.state),
+        run.leadSessionId,
+        run.placementId,
+        JSON.stringify(run.policy),
+        // Everything that says what the task *is* travels with it. Dropped,
+        // a restored task keeps its steps and forgets what they were for.
+        JSON.stringify(run.phases),
+        run.phaseIndex,
+        JSON.stringify(run.successCriteria),
+        run.stopWhen,
+        run.failureReason,
+        run.settleSeq,
+        run.wakeSeq,
+        run.emptyWakeCount,
+        run.createdAt,
+        run.updatedAt,
+      );
+    }
+    for (const step of parsed.runSteps) {
+      this.statement(
+        `INSERT INTO run_steps
             (id,run_id,step_key,title,prompt,category,depends_on,state,session_id,
              placement_id,output,event_seq_from,attempts,phase_index,dispatched_at,position,
              created_at,updated_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        ).run(
-          step.id,
-          step.runId,
-          step.stepKey,
-          step.title,
-          step.prompt,
-          step.category,
-          JSON.stringify(step.dependsOn),
-          runStepStateForHostImport(step.state),
-          step.sessionId,
-          step.placementId,
-          step.output,
-          step.eventSeqFrom,
-          step.attempts,
-          step.phaseIndex,
-          step.dispatchedAt,
-          step.position,
-          step.createdAt,
-          step.updatedAt,
-        );
-      }
-      // After the runs they reference, or the foreign key rejects them.
-      for (const note of parsed.runNotes) {
-        this.statement(
-          "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
-        ).run(note.id, note.runId, note.phaseIndex, note.body, note.createdAt);
-      }
-      // The restore deleted every workspace, and an archive taken before Chats
-      // existed has no row to put back — so the Host would come up from a valid
-      // backup with the one workspace nothing is written to work without.
-      this.seedChatsWorkspace();
+      ).run(
+        step.id,
+        step.runId,
+        step.stepKey,
+        step.title,
+        step.prompt,
+        step.category,
+        JSON.stringify(step.dependsOn),
+        runStepStateForHostImport(step.state),
+        step.sessionId,
+        step.placementId,
+        step.output,
+        step.eventSeqFrom,
+        step.attempts,
+        step.phaseIndex,
+        step.dispatchedAt,
+        step.position,
+        step.createdAt,
+        step.updatedAt,
+      );
+    }
+    // After the runs they reference, or the foreign key rejects them.
+    for (const note of parsed.runNotes) {
+      this.statement(
+        "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
+      ).run(note.id, note.runId, note.phaseIndex, note.body, note.createdAt);
+    }
+    // The restore deleted every workspace, and an archive taken before Chats
+    // existed has no row to put back — so the Host would come up from a valid
+    // backup with the one workspace nothing is written to work without.
+    this.seedChatsWorkspace();
+  }
+
+  /**
+   * The Host's authority, ready to be sealed and carried to another machine.
+   *
+   * Its contents are the answer to "who owns this Host and what does it prove
+   * things with", which is why the caller encrypts it: administrators, the
+   * Entra configuration, the CSRF and lead-token keys, the Host identity when
+   * it has one, and the material Nodes authenticate against.
+   *
+   * Sessions, invitations and half-finished logins are deliberately absent.
+   * They belong to the machine that issued them and mean nothing on another.
+   */
+  exportSecurityBackup(): SecurityBackupPayload {
+    const setting = (key: string) => this.getSetting(key) ?? "";
+    const csrfKey = setting("auth.csrfKey");
+    const leadTokenKey = setting(LEAD_TOKEN_KEY_SETTING);
+    if (!csrfKey || !leadTokenKey) {
+      // Both are written on the first boot that needs them; a Host without
+      // them has not finished starting, and an archive missing either would
+      // restore a Host whose sessions and lead tokens cannot be verified.
+      throw new Error("This Host has no security keys to export yet.");
+    }
+    const identity = {
+      id: setting("host.identity.id"),
+      privateKey: setting("host.identity.privateKey"),
+      publicKey: setting("host.identity.publicKey"),
+      fingerprint: setting("host.identity.fingerprint"),
+    };
+    const administrators = (
+      this.statement(
+        "SELECT * FROM administrators ORDER BY created_at, id",
+      ).all() as Row[]
+    ).map((row) => {
+      const administrator = toAdministrator(row);
+      return {
+        id: administrator.id,
+        tenantId: administrator.tenantId,
+        objectId: administrator.objectId,
+        username: administrator.username,
+        displayName: administrator.displayName,
+        addedVia: administrator.addedVia,
+        addedByAdminId: administrator.addedByAdminId,
+        createdAt: administrator.createdAt,
+        lastLoginAt: administrator.lastLoginAt,
+        disabledAt: administrator.disabledAt,
+      };
     });
-    // Placements went too, and the ones under Chats are derived rather than
-    // archived: each node rebuilds its own on the reconnect that follows.
-    for (const node of parsed.nodes) this.syncChatPlacement(node.id);
+    const nodeAuth = (
+      this.statement(
+        "SELECT id, secret_hash, public_key, auth_protocol FROM nodes ORDER BY name",
+      ).all() as Row[]
+    ).map((row) => ({
+      nodeId: String(row.id),
+      // Named rather than inferred from which column is populated: a fleet
+      // mid-migration has both kinds, and a machine that has upgraded still
+      // has its old hash until enforcement deletes it.
+      authProtocol: String(row.auth_protocol || "legacy-secret"),
+      secretHash: String(row.secret_hash ?? ""),
+      publicKey: String(row.public_key ?? ""),
+    }));
+    return SecurityBackupPayloadSchema.parse({
+      version: 1,
+      enrollmentToken: setting("enrollment.token"),
+      auth: {
+        mode: setting("auth.mode"),
+        passwordEnabled: setting("auth.passwordEnabled") === "1",
+        passwordVerifier: setting("auth.operatorPassword"),
+        passwordIsRecovery: setting("auth.passwordIsRecovery") === "1",
+        entraTenantId: setting("auth.entraTenantId"),
+        entraClientId: setting("auth.entraClientId"),
+        deviceFlowEnabled: setting("auth.deviceFlowEnabled") === "1",
+        csrfKey,
+      },
+      // Enforcement is part of who may talk to this Host, so it travels with
+      // the administrators rather than with the catalog.
+      node: {
+        mutualAuthenticationRequired: this.mutualNodeAuthenticationRequired(),
+      },
+      leadTokenKey,
+      ...(identity.id || identity.privateKey || identity.publicKey
+        ? { hostIdentity: identity }
+        : {}),
+      administrators,
+      nodeAuth,
+    });
+  }
+
+  /**
+   * Becomes the Host the archive describes, data and authority together.
+   *
+   * One transaction, because the two halves are one decision: a machine that
+   * took the catalog and kept its own administrators is a machine two people
+   * think they own. Every browser session on the receiving Host is revoked and
+   * returned to the caller, so the sockets they are holding can be closed —
+   * the Host they signed into is not the Host they are now talking to.
+   */
+  importPortableBackup(input: {
+    data: HostPortableBackupData;
+    security: SecurityBackupPayload;
+  }): { revokedSessions: RevokedSession[] } {
+    const authByNode = new Map(
+      input.security.nodeAuth.map((node) => [node.nodeId, node]),
+    );
+    if (
+      authByNode.size !== input.data.nodes.length ||
+      input.data.nodes.some((node) => !authByNode.has(node.id))
+    ) {
+      throw new Error("That backup's Node data does not match its security envelope.");
+    }
+    const data = HostBackupSchema.parse({
+      ...input.data,
+      enrollmentToken: input.security.enrollmentToken,
+      nodes: input.data.nodes.map((node) => {
+        const auth = authByNode.get(node.id);
+        // A Node with neither proof cannot be restored: it would come back as a
+        // row nothing can authenticate against, which is a machine the operator
+        // has to re-enrol without being told why.
+        if (!auth || (!auth.secretHash && !auth.publicKey)) {
+          throw new Error(
+            "That backup has no authentication record for one of its Nodes.",
+          );
+        }
+        return { ...node, secretHash: auth.secretHash };
+      }),
+      kind: HOST_BACKUP_KIND,
+      version: BACKUP_VERSION,
+    });
+    const security = SecurityBackupPayloadSchema.parse(input.security);
+    if (security.administrators.every((row) => row.disabledAt !== "")) {
+      // A restore that left nobody able to sign in would be a Host locked
+      // against its own operator, recoverable only from the console.
+      throw new Error("That backup contains no active administrator.");
+    }
+    const revokedSessions = this.transaction(() => {
+      this.replaceHostBackupRows(data);
+      return this.replaceSecurityRows(security);
+    });
+    for (const node of data.nodes) this.syncChatPlacement(node.id);
+    return { revokedSessions };
+  }
+
+  /** The security half of a portable restore, inside the caller's transaction. */
+  private replaceSecurityRows(security: SecurityBackupPayload): RevokedSession[] {
+    const at = new Date().toISOString();
+    const live = this.statement(
+      "SELECT token_hash, administrator_id FROM operator_sessions WHERE revoked_at=''",
+    ).all() as Row[];
+    this.statement("UPDATE operator_sessions SET revoked_at=? WHERE revoked_at=''").run(
+      at,
+    );
+    // Nothing half-finished travels or survives: an invitation issued here was
+    // issued by the Host this one has just stopped being.
+    this.statement("DELETE FROM administrator_invitations").run();
+    /*
+     * Disabled rather than deleted. `operator_sessions` points at these rows,
+     * so deleting them would either break that reference or take with it the
+     * revoked sessions the caller still has to close sockets for. Disabling
+     * ends their authority just as completely.
+     */
+    this.statement("UPDATE administrators SET disabled_at=? WHERE disabled_at=''").run(
+      at,
+    );
+    for (const administrator of security.administrators) {
+      const existing = this.statement(
+        "SELECT id FROM administrators WHERE tenant_id=? AND object_id=?",
+      ).get(administrator.tenantId, administrator.objectId) as Row | undefined;
+      if (existing) {
+        // The same person, already known here under a local id that other
+        // rows point at. Their identity is `(tid, oid)`, so that row is them.
+        this.statement(
+          `UPDATE administrators
+             SET username=?, display_name=?, added_via=?, added_by_admin_id=?,
+                 created_at=?, last_login_at=?, disabled_at=?
+           WHERE id=?`,
+        ).run(
+          administrator.username,
+          administrator.displayName,
+          administrator.addedVia,
+          administrator.addedByAdminId,
+          administrator.createdAt,
+          administrator.lastLoginAt,
+          administrator.disabledAt,
+          String(existing.id),
+        );
+        continue;
+      }
+      this.statement(
+        `INSERT INTO administrators
+           (id,tenant_id,object_id,username,display_name,added_by_admin_id,added_via,
+            created_at,last_login_at,disabled_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        administrator.id,
+        administrator.tenantId,
+        administrator.objectId,
+        administrator.username,
+        administrator.displayName,
+        administrator.addedByAdminId,
+        administrator.addedVia,
+        administrator.createdAt,
+        administrator.lastLoginAt,
+        administrator.disabledAt,
+      );
+    }
+    this.setSetting("auth.mode", security.auth.mode);
+    this.setSetting("auth.passwordEnabled", security.auth.passwordEnabled ? "1" : "0");
+    this.setSetting("auth.operatorPassword", security.auth.passwordVerifier);
+    this.setSetting(
+      "auth.passwordIsRecovery",
+      security.auth.passwordIsRecovery ? "1" : "0",
+    );
+    this.setSetting("auth.entraTenantId", security.auth.entraTenantId);
+    this.setSetting("auth.entraClientId", security.auth.entraClientId);
+    this.setSetting(
+      "auth.deviceFlowEnabled",
+      security.auth.deviceFlowEnabled ? "1" : "0",
+    );
+    this.setSetting("auth.csrfKey", security.auth.csrfKey);
+    this.setSetting(LEAD_TOKEN_KEY_SETTING, security.leadTokenKey);
+    /*
+     * Enforcement, and what it implies about the retired credential. A fleet
+     * that had declared the shared Node secret over must not come back
+     * accepting it, and the fleet-wide token that enforcement retired must not
+     * be written back into the settings table as an authority nobody is
+     * watching.
+     */
+    this.setMutualNodeAuthenticationRequired(security.node.mutualAuthenticationRequired);
+    this.setSetting(
+      "enrollment.token",
+      security.node.mutualAuthenticationRequired ? "" : security.enrollmentToken,
+    );
+    if (security.hostIdentity) {
+      this.setSetting("host.identity.id", security.hostIdentity.id);
+      this.setSetting("host.identity.privateKey", security.hostIdentity.privateKey);
+      this.setSetting("host.identity.publicKey", security.hostIdentity.publicKey);
+      this.setSetting("host.identity.fingerprint", security.hostIdentity.fingerprint);
+    }
+    // Applied over the nodes the data half just restored, so a machine that
+    // still has its `node.json` reconnects without being re-enrolled. Both
+    // proofs travel: a fleet mid-migration has machines of each kind, and the
+    // one this Host cannot restore is the one that comes back a stranger.
+    for (const node of security.nodeAuth) {
+      this.statement(
+        "UPDATE nodes SET secret_hash=?, public_key=?, auth_protocol=? WHERE id=?",
+      ).run(node.secretHash, node.publicKey, node.authProtocol, node.nodeId);
+    }
+    // A grant authorises one machine to join the Host that printed it. This is
+    // no longer that Host.
+    this.statement("DELETE FROM enrollment_grants").run();
+    return live.map((row) => ({
+      tokenHash: String(row.token_hash),
+      administratorId: String(row.administrator_id),
+    }));
   }
 
   /** Keeps databases created before a column was introduced usable. */
@@ -771,6 +1308,473 @@ export class FleetStore {
   close(): void {
     this.statements.clear();
     this.db.close();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Security: who may drive this Host, and what they did.
+  //
+  // Kept together because every rule below is one transaction away from being
+  // an authorisation bug: removing an administrator has to revoke their
+  // sessions in the same commit, and claiming a Host has to see a count that
+  // nobody else can change between the check and the insert.
+  // ---------------------------------------------------------------------------
+
+  countActiveAdministrators(): number {
+    const row = this.statement(
+      "SELECT COUNT(*) AS total FROM administrators WHERE disabled_at=''",
+    ).get() as Row | undefined;
+    return Number(row?.total ?? 0);
+  }
+
+  listAdministrators(): Administrator[] {
+    const rows = this.statement(
+      "SELECT * FROM administrators WHERE disabled_at='' ORDER BY created_at, id",
+    ).all() as Row[];
+    return rows.map((row) => toAdministrator(row));
+  }
+
+  getAdministrator(id: string): Administrator | undefined {
+    const row = this.statement(
+      "SELECT * FROM administrators WHERE id=? AND disabled_at=''",
+    ).get(id) as Row | undefined;
+    return row ? toAdministrator(row) : undefined;
+  }
+
+  /** The authorisation lookup, by the only two claims Fleet trusts. */
+  findAdministrator(tenantId: string, objectId: string): Administrator | undefined {
+    const row = this.statement(
+      "SELECT * FROM administrators WHERE tenant_id=? AND object_id=? AND disabled_at=''",
+    ).get(tenantId, objectId) as Row | undefined;
+    return row ? toAdministrator(row) : undefined;
+  }
+
+  insertAdministrator(input: NewAdministrator): Administrator {
+    return this.transaction(() => this.insertAdministratorRow(input));
+  }
+
+  /**
+   * The first claim, as one indivisible decision.
+   *
+   * Two browsers can hold a valid identity at the same moment, and both can
+   * observe an empty table before either writes. `BEGIN IMMEDIATE` takes the
+   * write lock before the count is read, so the loser sees one administrator
+   * rather than creating a second.
+   */
+  claimFirstAdministrator(identity: AdministratorIdentity): Administrator | undefined {
+    return this.transaction(() => {
+      if (this.countActiveAdministrators() > 0) return undefined;
+      return this.insertAdministratorRow({ ...identity, addedVia: "claim" });
+    });
+  }
+
+  disableAdministrator(id: string): boolean {
+    return this.transaction(() => this.disableAdministratorRow(id) !== undefined);
+  }
+
+  /**
+   * Removes an administrator and ends every session they hold, together.
+   *
+   * Separating the two would leave a window in which a removed administrator
+   * still holds a working cookie, and the window would be however long the
+   * second statement took to arrive — including forever, if it failed.
+   */
+  disableAdministratorAndRevoke(id: string): RevokedSession[] {
+    return this.transaction(() => {
+      if (this.disableAdministratorRow(id) === undefined) return [];
+      return this.revokeSessionsForAdministratorRow(id);
+    });
+  }
+
+  touchAdministratorLogin(id: string, at: string): void {
+    this.statement("UPDATE administrators SET last_login_at=? WHERE id=?").run(at, id);
+  }
+
+  private insertAdministratorRow(input: NewAdministrator): Administrator {
+    const existing = this.statement(
+      "SELECT * FROM administrators WHERE tenant_id=? AND object_id=?",
+    ).get(input.tenantId, input.objectId) as Row | undefined;
+    if (existing && String(existing.disabled_at) === "") {
+      this.statement(
+        "UPDATE administrators SET username=?, display_name=? WHERE id=?",
+      ).run(input.username, input.displayName, String(existing.id));
+      return toAdministrator({
+        ...existing,
+        username: input.username,
+        display_name: input.displayName,
+      });
+    }
+    if (this.countActiveAdministrators() >= MAX_ADMINISTRATORS) {
+      throw new Error(
+        `This Host already has the maximum of ${MAX_ADMINISTRATORS} administrators`,
+      );
+    }
+    const createdAt = new Date().toISOString();
+    if (existing) {
+      this.statement(
+        `UPDATE administrators
+         SET username=?, display_name=?, added_via=?, added_by_admin_id=?, disabled_at=''
+         WHERE id=?`,
+      ).run(
+        input.username,
+        input.displayName,
+        input.addedVia,
+        input.addedByAdminId ?? "",
+        String(existing.id),
+      );
+      return toAdministrator({
+        ...existing,
+        username: input.username,
+        display_name: input.displayName,
+        added_via: input.addedVia,
+        added_by_admin_id: input.addedByAdminId ?? "",
+        disabled_at: "",
+      });
+    }
+    const id = randomUUID();
+    this.statement(
+      `INSERT INTO administrators
+         (id,tenant_id,object_id,username,display_name,added_by_admin_id,added_via,created_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+    ).run(
+      id,
+      input.tenantId,
+      input.objectId,
+      input.username,
+      input.displayName,
+      input.addedByAdminId ?? "",
+      input.addedVia,
+      createdAt,
+    );
+    return {
+      id,
+      tenantId: input.tenantId,
+      objectId: input.objectId,
+      username: input.username,
+      displayName: input.displayName,
+      addedByAdminId: input.addedByAdminId ?? "",
+      addedVia: input.addedVia,
+      createdAt,
+      lastLoginAt: "",
+      disabledAt: "",
+    };
+  }
+
+  /**
+   * The body of a removal, without a transaction of its own.
+   *
+   * Returns nothing when the removal is refused, which is the case that matters:
+   * the final active administrator cannot be removed, or the Host would be left
+   * with no way in at all short of a local recovery command.
+   */
+  private disableAdministratorRow(id: string): Administrator | undefined {
+    const row = this.statement(
+      "SELECT * FROM administrators WHERE id=? AND disabled_at=''",
+    ).get(id) as Row | undefined;
+    if (!row) return undefined;
+    if (this.countActiveAdministrators() <= 1) return undefined;
+    const disabledAt = new Date().toISOString();
+    this.statement("UPDATE administrators SET disabled_at=? WHERE id=?").run(
+      disabledAt,
+      id,
+    );
+    return toAdministrator({ ...row, disabled_at: disabledAt });
+  }
+
+  insertOperatorSession(input: NewOperatorSession): void {
+    this.statement(
+      `INSERT INTO operator_sessions
+         (token_hash,administrator_id,auth_method,authenticated_at,last_seen_at,expires_at)
+       VALUES (?,?,?,?,?,?)`,
+    ).run(
+      input.tokenHash,
+      input.administratorId,
+      input.authMethod,
+      input.authenticatedAt,
+      input.lastSeenAt,
+      input.expiresAt,
+    );
+  }
+
+  getOperatorSession(tokenHash: string): OperatorSessionRow | undefined {
+    const row = this.statement("SELECT * FROM operator_sessions WHERE token_hash=?").get(
+      tokenHash,
+    ) as Row | undefined;
+    return row ? toOperatorSession(row) : undefined;
+  }
+
+  touchOperatorSession(tokenHash: string, lastSeenAt: string): void {
+    this.statement("UPDATE operator_sessions SET last_seen_at=? WHERE token_hash=?").run(
+      lastSeenAt,
+      tokenHash,
+    );
+  }
+
+  revokeOperatorSession(tokenHash: string): void {
+    this.statement(
+      "UPDATE operator_sessions SET revoked_at=? WHERE token_hash=? AND revoked_at=''",
+    ).run(new Date().toISOString(), tokenHash);
+  }
+
+  revokeSessionsForAdministrator(administratorId: string): RevokedSession[] {
+    return this.transaction(() =>
+      this.revokeSessionsForAdministratorRow(administratorId),
+    );
+  }
+
+  /** Ends every session that was authenticated a particular way. */
+  revokeSessionsByMethod(authMethod: OperatorAuthMethod): RevokedSession[] {
+    return this.transaction(() => {
+      const rows = this.statement(
+        "SELECT token_hash, administrator_id FROM operator_sessions WHERE auth_method=? AND revoked_at=''",
+      ).all(authMethod) as Row[];
+      this.statement(
+        "UPDATE operator_sessions SET revoked_at=? WHERE auth_method=? AND revoked_at=''",
+      ).run(new Date().toISOString(), authMethod);
+      return rows.map((row) => ({
+        tokenHash: String(row.token_hash),
+        administratorId: String(row.administrator_id),
+      }));
+    });
+  }
+
+  countOperatorSessions(): number {
+    const row = this.statement(
+      "SELECT COUNT(*) AS total FROM operator_sessions",
+    ).get() as Row | undefined;
+    return Number(row?.total ?? 0);
+  }
+
+  /** Drops rows that can no longer authenticate anything. */
+  deleteExpiredOperatorSessions(nowIso: string): number {
+    const rows = this.statement(
+      "SELECT token_hash FROM operator_sessions WHERE expires_at<=? OR revoked_at<>''",
+    ).all(nowIso) as Row[];
+    if (rows.length === 0) return 0;
+    this.statement(
+      "DELETE FROM operator_sessions WHERE expires_at<=? OR revoked_at<>''",
+    ).run(nowIso);
+    return rows.length;
+  }
+
+  private revokeSessionsForAdministratorRow(administratorId: string): RevokedSession[] {
+    const rows = this.statement(
+      "SELECT token_hash FROM operator_sessions WHERE administrator_id=? AND revoked_at=''",
+    ).all(administratorId) as Row[];
+    this.statement(
+      "UPDATE operator_sessions SET revoked_at=? WHERE administrator_id=? AND revoked_at=''",
+    ).run(new Date().toISOString(), administratorId);
+    return rows.map((row) => ({
+      tokenHash: String(row.token_hash),
+      administratorId,
+    }));
+  }
+
+  createInvitation(input: {
+    tokenHash: string;
+    createdByAdminId: string;
+    expiresAt: string;
+  }): AdministratorInvitation {
+    const id = randomUUID();
+    const createdAt = new Date().toISOString();
+    this.statement(
+      `INSERT INTO administrator_invitations
+         (id,token_hash,created_by_admin_id,created_at,expires_at)
+       VALUES (?,?,?,?,?)`,
+    ).run(id, input.tokenHash, input.createdByAdminId, createdAt, input.expiresAt);
+    return {
+      id,
+      createdByAdminId: input.createdByAdminId,
+      createdAt,
+      expiresAt: input.expiresAt,
+      consumedAt: "",
+      candidateTenantId: "",
+      candidateObjectId: "",
+      candidateUsername: "",
+      candidateDisplayName: "",
+      decidedByAdminId: "",
+      decidedAt: "",
+      decision: "",
+    };
+  }
+
+  /**
+   * Redeems an invitation into a candidate, and only a candidate.
+   *
+   * A link that leaks is a link somebody else can open, so redemption records
+   * who turned up and grants nothing. An existing administrator sees the exact
+   * identity and decides.
+   */
+  consumeInvitation(
+    tokenHash: string,
+    identity: AdministratorIdentity,
+  ): AdministratorInvitation | undefined {
+    return this.transaction(() => {
+      const now = new Date().toISOString();
+      const row = this.statement(
+        `SELECT * FROM administrator_invitations
+         WHERE token_hash=? AND consumed_at='' AND expires_at>?`,
+      ).get(tokenHash, now) as Row | undefined;
+      if (!row) return undefined;
+      this.statement(
+        `UPDATE administrator_invitations
+         SET consumed_at=?, candidate_tenant_id=?, candidate_object_id=?,
+             candidate_username=?, candidate_display_name=?
+         WHERE id=?`,
+      ).run(
+        now,
+        identity.tenantId,
+        identity.objectId,
+        identity.username,
+        identity.displayName,
+        String(row.id),
+      );
+      return toInvitation({
+        ...row,
+        consumed_at: now,
+        candidate_tenant_id: identity.tenantId,
+        candidate_object_id: identity.objectId,
+        candidate_username: identity.username,
+        candidate_display_name: identity.displayName,
+      });
+    });
+  }
+
+  getInvitation(id: string): AdministratorInvitation | undefined {
+    const row = this.statement("SELECT * FROM administrator_invitations WHERE id=?").get(
+      id,
+    ) as Row | undefined;
+    return row ? toInvitation(row) : undefined;
+  }
+
+  listInvitations(): AdministratorInvitation[] {
+    const rows = this.statement(
+      "SELECT * FROM administrator_invitations ORDER BY created_at DESC",
+    ).all() as Row[];
+    return rows.map((row) => toInvitation(row));
+  }
+
+  listPendingCandidates(): AdministratorInvitation[] {
+    const rows = this.statement(
+      `SELECT * FROM administrator_invitations
+       WHERE consumed_at<>'' AND decision='' ORDER BY consumed_at`,
+    ).all() as Row[];
+    return rows.map((row) => toInvitation(row));
+  }
+
+  approveCandidate(
+    invitationId: string,
+    decidedByAdminId: string,
+  ): Administrator | undefined {
+    return this.transaction(() => {
+      const row = this.decidePendingRow(invitationId, decidedByAdminId, "approved");
+      if (!row) return undefined;
+      return this.insertAdministratorRow({
+        tenantId: String(row.candidate_tenant_id),
+        objectId: String(row.candidate_object_id),
+        username: String(row.candidate_username),
+        displayName: String(row.candidate_display_name),
+        addedVia: "invitation",
+        addedByAdminId: decidedByAdminId,
+      });
+    });
+  }
+
+  rejectCandidate(invitationId: string, decidedByAdminId: string): boolean {
+    return this.transaction(
+      () =>
+        this.decidePendingRow(invitationId, decidedByAdminId, "rejected") !== undefined,
+    );
+  }
+
+  revokeInvitation(invitationId: string): boolean {
+    const now = new Date().toISOString();
+    const row = this.statement(
+      "SELECT id FROM administrator_invitations WHERE id=? AND decision=''",
+    ).get(invitationId) as Row | undefined;
+    if (!row) return false;
+    this.statement(
+      `UPDATE administrator_invitations
+       SET decision='revoked', decided_at=?, consumed_at=CASE consumed_at WHEN '' THEN ? ELSE consumed_at END
+       WHERE id=?`,
+    ).run(now, now, invitationId);
+    return true;
+  }
+
+  private decidePendingRow(
+    invitationId: string,
+    decidedByAdminId: string,
+    decision: "approved" | "rejected",
+  ): Row | undefined {
+    const row = this.statement(
+      `SELECT * FROM administrator_invitations
+       WHERE id=? AND consumed_at<>'' AND decision=''`,
+    ).get(invitationId) as Row | undefined;
+    if (!row) return undefined;
+    this.statement(
+      "UPDATE administrator_invitations SET decision=?, decided_by_admin_id=?, decided_at=? WHERE id=?",
+    ).run(decision, decidedByAdminId, new Date().toISOString(), invitationId);
+    return row;
+  }
+
+  /**
+   * Appends one security event and trims the log in the same commit.
+   *
+   * Trimming separately would let a burst grow the table without bound between
+   * the append and whatever was meant to prune it. `sequence` rather than
+   * `created_at` because thousands of events can share a millisecond, and an
+   * ambiguous order is an ambiguous retention rule.
+   */
+  recordSecurityAudit(entry: SecurityAuditInput): void {
+    this.transaction(() => {
+      const highest = this.statement(
+        "SELECT COALESCE(MAX(sequence),0) AS top FROM security_audit",
+      ).get() as Row | undefined;
+      const sequence = Number(highest?.top ?? 0) + 1;
+      this.statement(
+        `INSERT INTO security_audit
+           (id,event_type,actor_kind,actor_id,target_id,request_host,tunnel_provider,outcome,detail,created_at,sequence)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        randomUUID(),
+        entry.eventType,
+        entry.actorKind,
+        entry.actorId ?? "",
+        entry.targetId ?? "",
+        entry.requestHost ?? "",
+        entry.tunnelProvider ?? "",
+        entry.outcome,
+        (entry.detail ?? "").slice(0, MAX_AUDIT_DETAIL_LENGTH),
+        new Date().toISOString(),
+        sequence,
+      );
+      this.statement("DELETE FROM security_audit WHERE sequence<=?").run(
+        sequence - MAX_SECURITY_AUDIT_ROWS,
+      );
+    });
+  }
+
+  listSecurityAudit(limit: number): SecurityAuditRecord[] {
+    const rows = this.statement(
+      "SELECT * FROM security_audit ORDER BY sequence DESC LIMIT ?",
+    ).all(Math.max(1, Math.floor(limit))) as Row[];
+    return rows.map((row) => ({
+      id: String(row.id),
+      eventType: String(row.event_type),
+      actorKind: String(row.actor_kind),
+      actorId: String(row.actor_id),
+      targetId: String(row.target_id),
+      requestHost: String(row.request_host),
+      tunnelProvider: String(row.tunnel_provider),
+      outcome: String(row.outcome),
+      detail: String(row.detail),
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  countSecurityAudit(): number {
+    const row = this.statement("SELECT COUNT(*) AS total FROM security_audit").get() as
+      Row | undefined;
+    return Number(row?.total ?? 0);
   }
 
   resetConnectivity(): void {
@@ -790,6 +1794,7 @@ export class FleetStore {
       | "online"
       | "homeDir"
       | "revision"
+      | "authProtocol"
       // Omitted so the optional versions below actually take effect — an
       // intersection cannot loosen a property the Omit still requires.
       | "agents"
@@ -923,9 +1928,186 @@ export class FleetStore {
     const row = this.statement("SELECT secret_hash FROM nodes WHERE id=?").get(id) as
       Row | undefined;
     if (!row) return false;
+    const stored = String(row.secret_hash);
+    // A key-based Node has no shared secret at all, and an empty stored hash
+    // must never be something an empty presented one matches.
+    if (!stored) return false;
     const supplied = Buffer.from(hash(secret));
-    const expected = Buffer.from(String(row.secret_hash));
+    const expected = Buffer.from(stored);
     return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+  }
+
+  /**
+   * Enrolls a Node against a public key instead of minting it a secret.
+   *
+   * The name is reclaimed exactly as token registration reclaims it, so a
+   * rebuilt machine keeps its placements and its session history — but the row
+   * it reclaims has its key replaced, because the machine that proved the grant
+   * is the one that owns the row from here on.
+   */
+  registerNodeWithKey(
+    input: Omit<
+      FleetNode,
+      | "id"
+      | "activeSessions"
+      | "lastHeartbeat"
+      | "online"
+      | "homeDir"
+      | "revision"
+      | "agents"
+      | "authProtocol"
+    > & {
+      homeDir?: string;
+      revision?: string;
+      agents?: FleetNode["agents"];
+      publicKey: string;
+    },
+  ): FleetNode {
+    if (!input.publicKey) {
+      throw new Error("A key-based Node registration needs a public key.");
+    }
+    const now = new Date().toISOString();
+    const existing = this.statement("SELECT id FROM nodes WHERE name=?").get(
+      input.name,
+    ) as { id: string } | undefined;
+    const id = existing?.id ?? randomUUID();
+    if (existing) {
+      this.statement(
+        `UPDATE nodes SET secret_hash='', public_key=?, auth_protocol=?, os=?, arch=?,
+           version=?, revision=?, capabilities=?, agents=?, max_sessions=?,
+           last_heartbeat=?, home_dir=? WHERE id=?`,
+      ).run(
+        input.publicKey,
+        MUTUAL_AUTH_PROTOCOL,
+        input.os,
+        input.arch,
+        input.version,
+        input.revision ?? "",
+        JSON.stringify(input.capabilities),
+        JSON.stringify(input.agents ?? []),
+        input.maxSessions,
+        now,
+        input.homeDir ?? "",
+        id,
+      );
+    } else {
+      this.statement(
+        `INSERT INTO nodes
+          (id,name,secret_hash,public_key,auth_protocol,os,arch,version,revision,
+           capabilities,agents,max_sessions,last_heartbeat,online,home_dir)
+         VALUES (?,?,'',?,?,?,?,?,?,?,?,?,?,0,?)`,
+      ).run(
+        id,
+        input.name,
+        input.publicKey,
+        MUTUAL_AUTH_PROTOCOL,
+        input.os,
+        input.arch,
+        input.version,
+        input.revision ?? "",
+        JSON.stringify(input.capabilities),
+        JSON.stringify(input.agents ?? []),
+        input.maxSessions,
+        now,
+        input.homeDir ?? "",
+      );
+    }
+    this.syncChatPlacement(id);
+    return this.getNode(id)!;
+  }
+
+  /**
+   * Deletes the shared secret of every Node that no longer needs one.
+   *
+   * The last step of the migration and the one that makes it irreversible.
+   * While both proofs exist, anything that learned a secret can still use it,
+   * and relaxing the enforcement switch brings that back; enforcement is the
+   * operator saying that is over, so the weaker proof has to actually go.
+   *
+   * A Node that has not upgraded keeps the only credential it has: it is
+   * refused at the gateway by the switch, which is a state an operator can
+   * undo, rather than by having been made unauthenticatable, which is not.
+   */
+  clearLegacyNodeSecrets(): number {
+    const { changes } = this.statement(
+      "UPDATE nodes SET secret_hash='' WHERE auth_protocol=? AND secret_hash<>''",
+    ).run(MUTUAL_AUTH_PROTOCOL);
+    return Number(changes);
+  }
+
+  /** The one key a Node may prove itself with, or `""` for a legacy machine. */
+  nodePublicKey(id: string): string {
+    const row = this.statement("SELECT public_key FROM nodes WHERE id=?").get(id) as
+      Row | undefined;
+    return row ? String(row.public_key ?? "") : "";
+  }
+
+  /** How far the fleet is through the migration, for Settings and for the enforcement switch. */
+  nodeAuthenticationSummary(): { total: number; mutualAuth: number; legacy: number } {
+    const rows = this.statement("SELECT auth_protocol FROM nodes").all() as Row[];
+    const mutualAuth = rows.filter(
+      (row) => String(row.auth_protocol) === MUTUAL_AUTH_PROTOCOL,
+    ).length;
+    return { total: rows.length, mutualAuth, legacy: rows.length - mutualAuth };
+  }
+
+  /**
+   * Whether the shared-secret protocol is still accepted.
+   *
+   * Off unless an operator has explicitly turned it on, and it must stay off
+   * until every machine has upgraded: switching early does not make a fleet
+   * safer, it makes the Nodes that have not been restarted yet unreachable —
+   * and an operator who has locked half their fleet out turns it back off and
+   * leaves it off.
+   */
+  mutualNodeAuthenticationRequired(): boolean {
+    return this.getSetting(MUTUAL_AUTH_REQUIRED_SETTING) === "1";
+  }
+
+  setMutualNodeAuthenticationRequired(required: boolean): void {
+    this.setSetting(MUTUAL_AUTH_REQUIRED_SETTING, required ? "1" : "0");
+  }
+
+  // -- enrollment grants -------------------------------------------------------
+
+  createEnrollmentGrant(input: {
+    tokenHash: string;
+    createdByAdminId: string;
+    createdAt: string;
+    expiresAt: string;
+  }): EnrollmentGrantRow {
+    const id = randomUUID();
+    this.statement(
+      `INSERT INTO enrollment_grants (id,token_hash,created_by_admin_id,created_at,expires_at)
+       VALUES (?,?,?,?,?)`,
+    ).run(id, input.tokenHash, input.createdByAdminId, input.createdAt, input.expiresAt);
+    return this.getEnrollmentGrant(id)!;
+  }
+
+  getEnrollmentGrant(id: string): EnrollmentGrantRow | undefined {
+    const row = this.statement("SELECT * FROM enrollment_grants WHERE id=?").get(id) as
+      Row | undefined;
+    return row ? toEnrollmentGrant(row) : undefined;
+  }
+
+  /**
+   * Spends a grant, or reports that somebody else already did.
+   *
+   * One statement with the unconsumed condition in its `WHERE`, so two Nodes
+   * completing at once produce one enrolment rather than two rows sharing a
+   * grant — which is the whole meaning of "single use".
+   */
+  consumeEnrollmentGrant(id: string, nodeId: string, at: string): boolean {
+    const result = this.statement(
+      `UPDATE enrollment_grants SET consumed_at=?, consumed_by_node_id=?
+       WHERE id=? AND consumed_at=''`,
+    ).run(at, nodeId, id);
+    return Number(result.changes) === 1;
+  }
+
+  /** Clears every grant, for a restore that has made this a different Host. */
+  deleteEnrollmentGrants(): void {
+    this.statement("DELETE FROM enrollment_grants").run();
   }
 
   setNodeOnline(id: string, online: boolean, activeSessions = 0): FleetNode | undefined {
@@ -1951,6 +3133,7 @@ function nodeFromRow(row: Row): FleetNode {
     lastHeartbeat: String(row.last_heartbeat),
     online: Boolean(row.online),
     homeDir: String(row.home_dir ?? ""),
+    authProtocol: String(row.auth_protocol || "legacy-secret"),
   });
 }
 
@@ -2113,4 +3296,67 @@ function eventFromRow(row: Row): SessionEvent {
     payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
     createdAt: String(row.created_at),
   });
+}
+
+function toAdministrator(row: Row): Administrator {
+  return {
+    id: String(row.id),
+    tenantId: String(row.tenant_id),
+    objectId: String(row.object_id),
+    username: String(row.username),
+    displayName: String(row.display_name),
+    addedByAdminId: String(row.added_by_admin_id),
+    addedVia: String(row.added_via),
+    createdAt: String(row.created_at),
+    lastLoginAt: String(row.last_login_at),
+    disabledAt: String(row.disabled_at),
+  };
+}
+
+/**
+ * `auth_method` is read back as written rather than re-parsed.
+ *
+ * Every value in the column came from {@link NewOperatorSession}, and a session
+ * whose method could not be recognised must not be silently downgraded to one
+ * that can — the callers treat `microsoft-code` as the strongest proof there is.
+ */
+function toOperatorSession(row: Row): OperatorSessionRow {
+  return {
+    tokenHash: String(row.token_hash),
+    administratorId: String(row.administrator_id),
+    authMethod: String(row.auth_method) as OperatorAuthMethod,
+    authenticatedAt: String(row.authenticated_at),
+    lastSeenAt: String(row.last_seen_at),
+    expiresAt: String(row.expires_at),
+    revokedAt: String(row.revoked_at),
+  };
+}
+
+function toInvitation(row: Row): AdministratorInvitation {
+  return {
+    id: String(row.id),
+    createdByAdminId: String(row.created_by_admin_id),
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at),
+    consumedAt: String(row.consumed_at),
+    candidateTenantId: String(row.candidate_tenant_id),
+    candidateObjectId: String(row.candidate_object_id),
+    candidateUsername: String(row.candidate_username),
+    candidateDisplayName: String(row.candidate_display_name),
+    decidedByAdminId: String(row.decided_by_admin_id),
+    decidedAt: String(row.decided_at),
+    decision: String(row.decision),
+  };
+}
+
+function toEnrollmentGrant(row: Row): EnrollmentGrantRow {
+  return {
+    id: String(row.id),
+    tokenHash: String(row.token_hash),
+    createdByAdminId: String(row.created_by_admin_id),
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at),
+    consumedAt: String(row.consumed_at),
+    consumedByNodeId: String(row.consumed_by_node_id),
+  };
 }

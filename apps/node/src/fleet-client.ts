@@ -1,5 +1,12 @@
 import { z } from "zod";
-import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
+import {
+  NODE_ID_HEADER,
+  NODE_PROOF_NONCE_HEADER,
+  NODE_PROOF_SIGNATURE_HEADER,
+  NODE_PROOF_TIMESTAMP_HEADER,
+  NODE_SECRET_HEADER,
+} from "@fleet/protocol";
+import { signNodeHttpProof } from "@fleet/protocol/node-auth";
 
 /**
  * The subset of a placement this page needs. Declared locally rather than
@@ -43,9 +50,17 @@ export type FleetClientOptions = {
   nodeId: () => string;
   /**
    * This node's secret, which is how the Host tells a relayed call from an
-   * anonymous one. Absent before enrollment, when there is nothing to say.
+   * anonymous one. Absent before enrollment, and on a node that has a key.
    */
   nodeSecret?: () => string | undefined;
+  /**
+   * This node's private key, for a machine that has one instead of a secret.
+   *
+   * Preferred over the secret when both somehow exist: a signature authorises
+   * the one call it was made for, and a secret authorises every call anyone
+   * who sees it cares to make.
+   */
+  nodeKey?: () => string | undefined;
 };
 
 /** The identity headers a relayed call carries, or nothing before enrollment. */
@@ -55,14 +70,32 @@ async function request<T>(
   base: string,
   path: string,
   schema: z.ZodType<T>,
-  init: { method?: string; body?: string; credentials?: NodeCredentialHeaders } = {},
+  init: {
+    method?: string;
+    body?: string;
+    credentials?: (input: {
+      method: string;
+      path: string;
+      body?: string;
+    }) => NodeCredentialHeaders;
+  } = {},
 ): Promise<T> {
-  const response = await fetch(new URL(path, base), {
+  const method = init.method ?? "GET";
+  const url = new URL(path, base);
+  const response = await fetch(url, {
     ...(init.method ? { method: init.method } : {}),
     ...(init.body ? { body: init.body } : {}),
     headers: {
       ...(init.body ? { "content-type": "application/json" } : {}),
-      ...init.credentials,
+      // Built here rather than passed in, because a signature covers the exact
+      // call being made — the method, the path the URL resolved to, and the
+      // body — and a caller assembling it separately is a caller that will
+      // eventually sign one request and send another.
+      ...init.credentials?.({
+        method,
+        path: url.pathname,
+        ...(init.body === undefined ? {} : { body: init.body }),
+      }),
     },
     signal: AbortSignal.timeout(10_000),
   });
@@ -100,11 +133,36 @@ export class FleetClient {
    *
    * Sent on every call rather than only the writes: the Host's API is not open
    * to anonymous callers any more, so a read without this is a 401.
+   *
+   * A keyed node signs the call instead of presenting anything reusable. That
+   * is the whole difference: a secret observed once authorises every future
+   * call, and a signature authorises the one that carried it.
    */
-  private credentials(): NodeCredentialHeaders {
+  private credentials(input: {
+    method: string;
+    path: string;
+    body?: string;
+  }): NodeCredentialHeaders {
     const nodeId = this.options.nodeId();
+    if (!nodeId) return {};
+    const privateKey = this.options.nodeKey?.();
+    if (privateKey) {
+      const proof = signNodeHttpProof({
+        privateKey,
+        nodeId,
+        method: input.method,
+        path: input.path,
+        ...(input.body === undefined ? {} : { body: input.body }),
+      });
+      return {
+        [NODE_ID_HEADER]: nodeId,
+        [NODE_PROOF_TIMESTAMP_HEADER]: proof.timestamp,
+        [NODE_PROOF_NONCE_HEADER]: proof.nonce,
+        [NODE_PROOF_SIGNATURE_HEADER]: proof.signature,
+      };
+    }
     const secret = this.options.nodeSecret?.();
-    if (!nodeId || !secret) return {};
+    if (!secret) return {};
     return { [NODE_ID_HEADER]: nodeId, [NODE_SECRET_HEADER]: secret };
   }
 
@@ -113,7 +171,7 @@ export class FleetClient {
       this.options.hostUrl(),
       "/api/workspaces",
       z.array(WorkspaceLikeSchema),
-      { credentials: this.credentials() },
+      { credentials: (input) => this.credentials(input) },
     );
   }
 
@@ -122,7 +180,7 @@ export class FleetClient {
       this.options.hostUrl(),
       "/api/placements",
       z.array(PlacementLikeSchema),
-      { credentials: this.credentials() },
+      { credentials: (input) => this.credentials(input) },
     );
     return ownPlacements(placements, this.options.nodeId());
   }
@@ -131,7 +189,7 @@ export class FleetClient {
     return request(this.options.hostUrl(), "/api/workspaces", WorkspaceLikeSchema, {
       method: "POST",
       body: JSON.stringify({ name, description }),
-      credentials: this.credentials(),
+      credentials: (input) => this.credentials(input),
     });
   }
 
@@ -147,7 +205,7 @@ export class FleetClient {
       {
         method: "PATCH",
         body: JSON.stringify({ name, description }),
-        credentials: this.credentials(),
+        credentials: (input) => this.credentials(input),
       },
     );
   }
@@ -171,7 +229,7 @@ export class FleetClient {
       {
         method: "PATCH",
         body: JSON.stringify({ localPath }),
-        credentials: this.credentials(),
+        credentials: (input) => this.credentials(input),
       },
     );
   }
@@ -182,7 +240,7 @@ export class FleetClient {
   ): Promise<PlacementLike> {
     return request(this.options.hostUrl(), "/api/placements", PlacementLikeSchema, {
       method: "POST",
-      credentials: this.credentials(),
+      credentials: (input) => this.credentials(input),
       body: JSON.stringify({
         workspaceId,
         nodeId: this.options.nodeId(),

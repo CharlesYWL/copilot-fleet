@@ -6,13 +6,16 @@ import {
   endpointsBehindLocalForward,
   firstDialUrl,
   hostUrlCandidates,
+  isConfidentialHostUrl,
   nextHostUrl,
   promoteHostUrl,
   recordHostUrl,
   type HostEndpoints,
 } from "./host-endpoints.js";
 
-const lan = "http://192.168.1.20:8787";
+const lan = "https://192.168.1.20:8787";
+/** The same machine over a wire anyone on the path can read. */
+const plainLan = "http://192.168.1.20:8787";
 const tunnel = "https://one.trycloudflare.com";
 const rotated = "https://two.trycloudflare.com";
 const forward = "http://127.0.0.1:8790";
@@ -136,6 +139,63 @@ describe("tunnel mode exclusivity", () => {
   it("rejects addresses that are not addresses", () => {
     expect(dialableInMode("", "direct")).toBe(false);
     expect(dialableInMode("   ", "devtunnel")).toBe(false);
+  });
+});
+
+/**
+ * What a Node may put its credentials on.
+ *
+ * A Node's traffic is not merely a session cookie: the connection carries its
+ * shared secret on the legacy protocol, its signed proofs on the new one, and
+ * the lead token the Host hands an agent for `/mcp`. On plain HTTP to anything
+ * that is not this machine — a LAN address, a `bore` relay — every one of those
+ * is readable by whoever is on the path, and the sealed channel does not help:
+ * the legacy hello is in the clear by construction, and the tokens the Host
+ * sends afterwards ride the same wire.
+ *
+ * Loopback is the exception and the only one. `http://127.0.0.1` and
+ * `http://localhost` never leave the machine, which is exactly what a
+ * `devtunnel connect` forward gives this node.
+ */
+describe("plain HTTP to somewhere that is not this machine", () => {
+  it("refuses a LAN address, however the node was started", () => {
+    expect(isConfidentialHostUrl(plainLan)).toBe(false);
+    expect(dialableInMode(plainLan, "direct")).toBe(false);
+    expect(dialableInMode(plainLan, "devtunnel")).toBe(false);
+  });
+
+  it("refuses a plain-HTTP relay", () => {
+    expect(isConfidentialHostUrl("http://bore.pub:45871")).toBe(false);
+    expect(dialableInMode("http://bore.pub:45871", "direct")).toBe(false);
+  });
+
+  it("keeps loopback, which is what a local forward is", () => {
+    expect(isConfidentialHostUrl(forward)).toBe(true);
+    expect(isConfidentialHostUrl("http://localhost:8787")).toBe(true);
+    expect(isConfidentialHostUrl("http://127.0.0.1:8787")).toBe(true);
+    expect(isConfidentialHostUrl("http://[::1]:8787")).toBe(true);
+    expect(dialableInMode(forward, "devtunnel")).toBe(true);
+  });
+
+  it("keeps every https address, loopback or not", () => {
+    expect(isConfidentialHostUrl(tunnel)).toBe(true);
+    expect(isConfidentialHostUrl(lan)).toBe(true);
+  });
+
+  it("refuses what is not an address at all", () => {
+    expect(isConfidentialHostUrl("")).toBe(false);
+    expect(isConfidentialHostUrl("not-a-url")).toBe(false);
+    expect(isConfidentialHostUrl("ftp://fleet.example.com")).toBe(false);
+  });
+
+  /*
+   * The rotation must not quietly pick one either. A node whose only remaining
+   * fallback is a LAN address is stranded, and saying so beats sending its
+   * secret over the wire.
+   */
+  it("keeps one out of the candidate list even as a last resort", () => {
+    const endpoints: HostEndpoints = { hostUrl: tunnel, knownHostUrls: [plainLan] };
+    expect(hostUrlCandidates(endpoints, "direct")).toEqual([tunnel]);
   });
 });
 

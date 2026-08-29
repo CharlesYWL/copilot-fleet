@@ -41,14 +41,55 @@ export function enrollCommand(
   enrollmentToken: string,
   tunnelId?: string,
 ): string {
-  // The node opens the tunnel itself and discovers the forwarded port, so a
-  // dev tunnel needs no second terminal and no transcribed port number.
-  const target = isDevTunnelUrl(hostUrl)
-    ? `--devtunnel="${tunnelId ?? "<tunnel-id>"}"`
-    : `--url="${hostUrl}"`;
   return [
     "npm install",
     "npm run build:node",
-    `npm run start:node -- ${target} --token="${enrollmentToken}"`,
+    `npm run start:node -- ${dialFlag(hostUrl, tunnelId)} --token="${enrollmentToken}"`,
   ].join("\n");
+}
+
+/**
+ * How a node is told where to find the Host.
+ *
+ * The node opens a dev tunnel itself and discovers the forwarded port, so a
+ * dev tunnel needs no second terminal and no transcribed port number — and it
+ * must never be handed the private URL, which it cannot authenticate to.
+ */
+function dialFlag(hostUrl: string, tunnelId?: string): string {
+  return isDevTunnelUrl(hostUrl)
+    ? `--devtunnel="${tunnelId ?? "<tunnel-id>"}"`
+    : `--url="${hostUrl}"`;
+}
+
+/** What the Connect card needs to print a key-based command. */
+export type ConnectCommandFields = {
+  hostUrl: string;
+  hostId: string;
+  hostFingerprint: string;
+  enrollmentGrant: string;
+  tunnelId?: string | undefined;
+};
+
+/**
+ * The command that enrolls a machine against a Host it will pin.
+ *
+ * The fingerprint is the part that matters and the part a person can lose: it
+ * travels here, in the same paste as everything else, because a fingerprint the
+ * operator has to look up separately is one they will skip — and a node that
+ * skips it sends its enrollment to whatever answers the URL.
+ *
+ * No fleet-wide token appears, because there is no longer one to send: the
+ * grant is single-use, expires, and authorises exactly the key the node is
+ * about to generate.
+ */
+export function keyEnrollCommand(fields: ConnectCommandFields): string {
+  const flags = [
+    dialFlag(fields.hostUrl, fields.tunnelId),
+    `--host-id="${fields.hostId}"`,
+    `--host-fingerprint="${fields.hostFingerprint}"`,
+    `--enrollment-grant="${fields.enrollmentGrant}"`,
+  ].join(" ");
+  return ["npm install", "npm run build:node", `npm run start:node -- ${flags}`].join(
+    "\n",
+  );
 }

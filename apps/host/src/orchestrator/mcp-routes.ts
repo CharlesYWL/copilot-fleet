@@ -1,10 +1,12 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { z } from "zod";
-import { terminalSessionStates } from "@fleet/protocol";
+import { terminalRunStates, terminalSessionStates } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
-import type { LeadTokens } from "./lead-tokens.js";
+import { hostnameOf } from "../request-guard.js";
+import type { SecurityAuditInput } from "../store.js";
+import type { LeadTokenClaims, LeadTokens } from "./lead-tokens.js";
 import {
   AdvanceTaskSchema,
   CloseTaskSchema,
@@ -38,7 +40,97 @@ export const MCP_PATH = "/mcp";
  */
 export const MCP_BODY_LIMIT = 32 * 1024 * 1024;
 
-export type McpRouteOptions = { service: FleetService; tokens: LeadTokens };
+export type McpRouteOptions = {
+  service: FleetService;
+  tokens: LeadTokens;
+  /** Where a refusal is recorded. Optional so a harness can leave it out. */
+  audit?: ((entry: SecurityAuditInput) => void) | undefined;
+};
+
+/**
+ * Why a call was refused, in words short enough to store.
+ *
+ * Recorded, never returned: the caller gets one answer for all of them,
+ * because telling it that the signature was fine but the run had moved on is
+ * telling it which of its guesses was warm.
+ */
+type LeadRefusal =
+  | "browser origin"
+  | "no bearer token"
+  | "token not signed by this Host"
+  | "no such session"
+  | "session is not a lead"
+  | "lead has finished"
+  | "run has finished"
+  | "run no longer matches"
+  | "node no longer matches";
+
+const REFUSED_BODY = { error: "This token does not belong to a live orchestrator" };
+
+declare module "fastify" {
+  interface FastifyRequest {
+    fleetLeadClaims?: LeadTokenClaims;
+  }
+}
+
+/**
+ * What the caller had to prove, in one place.
+ *
+ * `/mcp` is a machine principal rather than an operator exception: it takes a
+ * signed claim set and nothing else. A browser must not be able to reach it at
+ * all — an `Origin` header is the one thing only a browser sends — and an
+ * operator cookie is never even read here, because operating a Host and
+ * orchestrating a run are different authorities.
+ */
+function authorizeLead(
+  request: FastifyRequest,
+  service: FleetService,
+  tokens: LeadTokens,
+):
+  | { ok: true; claims: LeadTokenClaims }
+  | { ok: false; status: 401 | 403; why: LeadRefusal } {
+  if (request.headers.origin !== undefined) {
+    return { ok: false, status: 403, why: "browser origin" };
+  }
+  const header = request.headers.authorization ?? "";
+  const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+  if (!token) return { ok: false, status: 401, why: "no bearer token" };
+  const claims = tokens.resolve(token);
+  if (!claims) return { ok: false, status: 401, why: "token not signed by this Host" };
+  /*
+   * The signature says what was authorised; the fleet says whether it still
+   * is. That is what revocation is now — stopping an orchestrator, cancelling
+   * its run, or deleting the machine it was placed on all take its tools away
+   * on the next call, with no token list to keep in step.
+   */
+  const lead = service.store.getSession(claims.sessionId);
+  if (!lead) return { ok: false, status: 401, why: "no such session" };
+  if (lead.runRole !== "lead")
+    return { ok: false, status: 401, why: "session is not a lead" };
+  if (terminalSessionStates.has(lead.state)) {
+    return { ok: false, status: 401, why: "lead has finished" };
+  }
+  if (lead.runId !== claims.runId) {
+    return { ok: false, status: 401, why: "run no longer matches" };
+  }
+  if (lead.nodeId !== claims.nodeId) {
+    return { ok: false, status: 401, why: "node no longer matches" };
+  }
+  /*
+   * The task itself, not only the session running it. Cancelling a task sends
+   * a stop to the machine and waits for it to be confirmed, so between the two
+   * the lead is still a live session — and one more turn of tools inside that
+   * window is exactly what an operator cancelling a run is trying to prevent.
+   *
+   * A lead with no task is not refused here: nothing was cancelled, and the
+   * session check above is the whole authorisation for a bare conversation.
+   */
+  const run = claims.runId ? service.store.getRun(claims.runId) : undefined;
+  if (run && terminalRunStates.has(run.state)) {
+    return { ok: false, status: 401, why: "run has finished" };
+  }
+  return { ok: true, claims };
+}
 
 /**
  * The tool surface an orchestrator session reaches the fleet through.
@@ -50,55 +142,67 @@ export type McpRouteOptions = { service: FleetService; tokens: LeadTokens };
  */
 export const mcpRoutes: FastifyPluginAsync<McpRouteOptions> = async (
   app,
-  { service, tokens },
+  { service, tokens, audit },
 ) => {
-  app.post(MCP_PATH, { bodyLimit: MCP_BODY_LIMIT }, async (request, reply) => {
-    const header = request.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice(7).trim() : "";
-    const leadSessionId = tokens.resolve(token);
-    /*
-     * The signature says which session this is; the session itself says whether
-     * it may still act. That is what revocation is now — stopping an
-     * orchestrator takes its tools away on the next call, with no token list to
-     * keep in step.
-     */
-    const lead = leadSessionId ? service.store.getSession(leadSessionId) : undefined;
-    const live =
-      lead && lead.runRole === "lead" && !terminalSessionStates.has(lead.state);
-    if (!leadSessionId || !live) {
-      return reply
-        .code(401)
-        .send({ error: "This token does not belong to a live orchestrator" });
-    }
-
-    const server = buildServer(service, leadSessionId);
-    /*
-     * Stateless mode, which the SDK selects by an explicit `undefined` session
-     * generator. This repo compiles with `exactOptionalPropertyTypes`, under
-     * which "present and undefined" is not the same as "absent" — so the one
-     * place the two conventions meet is cast here rather than by loosening the
-     * setting for every file.
-     */
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    } as unknown as ConstructorParameters<typeof StreamableHTTPServerTransport>[0]);
-    // Fastify has already parsed the body, so it is handed over rather than
-    // left for the transport to read from a stream that is now empty.
-    reply.hijack();
-    try {
-      await server.connect(transport as unknown as Parameters<typeof server.connect>[0]);
-      await transport.handleRequest(request.raw, reply.raw, request.body);
-    } catch (error) {
-      app.log.error({ err: error }, "MCP request failed");
-      if (!reply.raw.headersSent) {
-        reply.raw.writeHead(500, { "content-type": "application/json" });
-        reply.raw.end(JSON.stringify({ error: "MCP request failed" }));
+  app.post(
+    MCP_PATH,
+    {
+      bodyLimit: MCP_BODY_LIMIT,
+      onRequest: async (request, reply) => {
+        const authorized = authorizeLead(request, service, tokens);
+        if (!authorized.ok) {
+          // The bearer itself is never written down: the audit is read by every
+          // administrator, so a rejected token recorded there would be a working
+          // token published to all of them if the rejection was a race.
+          audit?.({
+            eventType:
+              authorized.why === "browser origin"
+                ? "mcp_browser_origin_rejected"
+                : "mcp_lead_token_rejected",
+            actorKind: "lead",
+            outcome: "denied",
+            requestHost: (hostnameOf(request.headers.host) ?? "").slice(0, 100),
+            detail: authorized.why,
+          });
+          return reply.code(authorized.status).send(REFUSED_BODY);
+        }
+        request.fleetLeadClaims = authorized.claims;
+      },
+    },
+    async (request, reply) => {
+      const claims = request.fleetLeadClaims;
+      if (!claims) return reply.code(401).send(REFUSED_BODY);
+      const server = buildServer(service, claims.sessionId);
+      /*
+       * Stateless mode, which the SDK selects by an explicit `undefined` session
+       * generator. This repo compiles with `exactOptionalPropertyTypes`, under
+       * which "present and undefined" is not the same as "absent" — so the one
+       * place the two conventions meet is cast here rather than by loosening the
+       * setting for every file.
+       */
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+      } as unknown as ConstructorParameters<typeof StreamableHTTPServerTransport>[0]);
+      // Fastify has already parsed the body, so it is handed over rather than
+      // left for the transport to read from a stream that is now empty.
+      reply.hijack();
+      try {
+        await server.connect(
+          transport as unknown as Parameters<typeof server.connect>[0],
+        );
+        await transport.handleRequest(request.raw, reply.raw, request.body);
+      } catch (error) {
+        app.log.error({ err: error }, "MCP request failed");
+        if (!reply.raw.headersSent) {
+          reply.raw.writeHead(500, { "content-type": "application/json" });
+          reply.raw.end(JSON.stringify({ error: "MCP request failed" }));
+        }
+      } finally {
+        await server.close().catch(() => undefined);
       }
-    } finally {
-      await server.close().catch(() => undefined);
-    }
-  });
+    },
+  );
 };
 
 function buildServer(service: FleetService, leadSessionId: string): McpServer {

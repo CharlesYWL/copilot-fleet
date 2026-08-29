@@ -82,6 +82,18 @@ async function runVersionProbe(spec: ProviderSpec): Promise<boolean> {
 /** Backoff for unattended restarts; caps so a dead provider stops hammering. */
 export const RESTART_DELAYS_MS = [1_000, 5_000, 15_000, 30_000, 60_000];
 
+/**
+ * Why a provider is refused, in the words the panel and the API both use.
+ *
+ * One sentence in one place: this is raised from the manager, returned in the
+ * state of an external tunnel nobody may adopt, and matched by the route that
+ * refuses the request — three readings of the same rule that only have to
+ * disagree once to become two rules.
+ */
+export function ineligibleProviderMessage(provider: TunnelProvider): string {
+  return `${providerSpecs[provider].label} publishes plain HTTP, so Fleet will not expose the operator console, node credentials or lead tokens through it. Use an HTTPS provider such as Dev Tunnels.`;
+}
+
 export function restartDelay(attempt: number): number {
   const index = Math.min(attempt, RESTART_DELAYS_MS.length - 1);
   return RESTART_DELAYS_MS[index]!;
@@ -176,10 +188,28 @@ export class TunnelManager {
     if (options.provider) this.provider = options.provider;
   }
 
-  /** External state only counts when it belongs to the provider this owns. */
+  /**
+   * External state only counts when it belongs to the provider this owns, and
+   * when that provider is one the console may stand behind.
+   *
+   * Adopting is not passive: an adopted URL becomes the address enrollment
+   * hands out, a name the request guard answers to, and an entry in the scheme
+   * map that decides whether a session cookie may be issued. A `bore` process
+   * somebody started in another terminal must not acquire all three by
+   * existing. It cannot be stopped from here — this manager never spawned it —
+   * so it is reported as an error the operator can act on instead.
+   */
   private ownExternal(): ExternalTunnel | undefined {
     const external = this.readExternal();
-    return external?.provider === this.provider ? external : undefined;
+    if (external?.provider !== this.provider) return undefined;
+    return providerSpecs[this.provider].controlPlaneEligible ? external : undefined;
+  }
+
+  /** Whether an external tunnel is running that this manager refuses to adopt. */
+  private refusedExternal(): ExternalTunnel | undefined {
+    const external = this.readExternal();
+    if (external?.provider !== this.provider) return undefined;
+    return providerSpecs[this.provider].controlPlaneEligible ? undefined : external;
   }
 
   get activeProvider(): TunnelProvider {
@@ -197,6 +227,9 @@ export class TunnelManager {
         installHint: spec.installHint,
         setupSteps: spec.setupSteps,
         docsUrl: spec.docsUrl,
+        externalScheme: spec.externalScheme,
+        access: spec.access,
+        controlPlaneEligible: spec.controlPlaneEligible,
         ...(spec.caveat ? { caveat: spec.caveat } : {}),
       })),
     );
@@ -218,6 +251,16 @@ export class TunnelManager {
 
   /** This provider's live state, without the shared provider catalog. */
   state(): TunnelState {
+    const refused = this.refusedExternal();
+    if (refused) {
+      return {
+        provider: this.provider,
+        enabled: false,
+        status: "error",
+        error: ineligibleProviderMessage(this.provider),
+        external: true,
+      };
+    }
     const externalMine = this.ownExternal();
     const url = externalMine ? externalMine.url : this.tunnelUrl;
     const online = externalMine ? Boolean(externalMine.url) : this.status === "on";
@@ -258,6 +301,22 @@ export class TunnelManager {
     this.cancelRestart();
 
     const spec = providerSpecs[this.provider];
+    /*
+     * Checked here rather than only in `POST /api/tunnel`, because the route is
+     * one of three ways a tunnel comes up. The settings row an operator enabled
+     * before this rule existed is replayed on every boot, and the unattended
+     * restart below re-enters this method on its own — so a rule that lived in
+     * the route was a rule two paths walked around. A provider with no TLS
+     * would carry the Fleet session cookie, the node credentials and every
+     * transcript in clear text, and none of that depends on who asked.
+     */
+    if (!spec.controlPlaneEligible) {
+      this.status = "error";
+      this.error = ineligibleProviderMessage(this.provider);
+      this.wantEnabled = false;
+      this.onEnabledCleared?.();
+      throw new Error(this.error);
+    }
     if (!(await this.probe.present(spec))) {
       this.status = "error";
       this.error = `${spec.binary} is not installed or not on PATH`;
@@ -542,6 +601,20 @@ export class TunnelSupervisor {
     return providerList
       .map((spec) => this.managers.get(spec.id)?.activeTunnelUrl())
       .filter((url): url is string => Boolean(url));
+  }
+
+  /**
+   * The same URLs, with the provider that published each one.
+   *
+   * The scheme policy needs the pair: `bore` forwards plain TCP with no TLS at
+   * all, so an operator session must never be issued over it, and the only way
+   * to know that about a hostname is to remember who produced it.
+   */
+  allTunnelEndpoints(): { provider: TunnelProvider; url: string | undefined }[] {
+    return providerList.map((spec) => ({
+      provider: spec.id,
+      url: this.managers.get(spec.id)?.activeTunnelUrl(),
+    }));
   }
 
   async info(fallbackPublicUrl: string): Promise<TunnelInfo> {
