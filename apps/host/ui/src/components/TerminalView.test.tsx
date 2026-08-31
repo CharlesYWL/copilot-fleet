@@ -169,6 +169,36 @@ describe("TerminalView transcript", () => {
     expect(screen.getByText("failed")).toBeTruthy();
   });
 
+  it("stops animating a pending tool when its node is offline", () => {
+    const pendingTool = streamEvent("tool", {
+      toolCallId: "t1",
+      title: "Run deployment approval regression tests",
+      kind: "execute",
+      status: "pending",
+    });
+    const running = show({ state: "running" }, EMPTY_DRAFT, [pendingTool]);
+    expect(screen.getByLabelText("Tool running")).toBeTruthy();
+
+    running.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <TerminalView
+          session={session({ state: "offline" })}
+          events={[pendingTool]}
+          onPrompt={vi.fn()}
+          onCancel={vi.fn()}
+          onStop={vi.fn()}
+          onPermission={vi.fn()}
+          onConfigChange={vi.fn()}
+          draft={EMPTY_DRAFT}
+          onDraftChange={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+
+    expect(screen.queryByLabelText("Tool running")).toBeNull();
+    expect(screen.getByText("Run deployment approval regression tests")).toBeTruthy();
+  });
+
   it("renders the final response carried by a completed task_complete call", () => {
     show({}, EMPTY_DRAFT, [
       streamEvent("tool", {
