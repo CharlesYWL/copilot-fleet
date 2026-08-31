@@ -14,7 +14,7 @@ tags:
 **EM owner**: TBD
 **Architect**: TBD
 **Program Manager**: N/A
-**Status**: Revised after security review
+**Status**: Implemented; simplified for local Microsoft-corporate use
 **Original date**: 2026-08-27
 **Revision date**: 2026-08-28
 
@@ -34,9 +34,9 @@ This revision changes the preferred design accordingly:
 - Authorization code with PKCE and a loopback redirect is the primary flow.
 - Device code is an optional remote fallback, enabled only after Phase 0 proves
   the target tenant permits it.
-- Public npm distribution uses a bring-your-own single-tenant Entra
-  registration. Internally managed distributions may preconfigure an approved
-  registration.
+- The default local distribution preconfigures the Microsoft corporate tenant
+  and KYC's Visual Studio public client; environment overrides remain available
+  for another approved registration.
 - Fresh Hosts have an explicit `entra-unconfigured` state.
 - First claim requires a high-entropy, one-time claim code printed only to the
   Host console plus Microsoft authentication. Request IP, forwarded headers,
@@ -45,6 +45,20 @@ This revision changes the preferred design accordingly:
 - New Node enrollment uses one-time grants and asymmetric Node keys. Node
   credentials are not sent to an unauthenticated Host.
 - Backup/restore preserves the security boundary and Host identity.
+
+### Product simplification (2026-08-31)
+
+The implemented local-VM-manager experience preconfigures the Microsoft
+corporate tenant and the same Visual Studio public client used by KYC. Normal
+users do not enter tenant or client IDs: after the password/console bootstrap,
+they click **Sign in with Microsoft**, choose an account, and Fleet records that
+identity. `FLEET_ENTRA_TENANT_ID` and `FLEET_ENTRA_CLIENT_ID` remain advanced
+overrides only.
+
+The built-in client requires the hostless `http://localhost:<port>/` callback.
+This intentionally narrows the default distribution to Microsoft corporate
+local use; a generally distributed multi-tenant product would need a separately
+owned registration.
 
 ## Related documents
 
@@ -205,9 +219,9 @@ manual two-account, two-machine exercise against the target Entra tenant.
 | Authorization code + PKCE through each public tunnel URL | Familiar SSO | Every rotating public URL would need registration | Rejected |
 | Authorization code + PKCE through loopback | Public client, no secret, localhost port ignored by Entra, works on Host or through a local port forward | Direct remote public URL needs a forward or fallback | **Primary flow** |
 | Device flow as fallback | Direct remote browser works without a local listener | May be blocked by CA; code phishing risk | Optional only after tenant verification |
-| Baked single-tenant client ID | Zero setup in one tenant | Public npm package works only for that tenant; app ownership is centralized | Allowed only for a controlled internal distribution |
+| Baked single-tenant client ID | Zero setup and KYC-like sign-in in the Microsoft tenant | Distribution is intentionally limited to that tenant; app ownership is centralized | **Preferred for this local internal manager** |
 | Fleet-owned multi-tenant client ID | Zero BYO setup across tenants | Larger governance, consent, and abuse boundary than requested | Non-MVP |
-| BYO single-tenant registration | Least privilege, tenant owner controls policy, compatible with public npm | One-time setup per deployment/organization | **Shipping default** |
+| BYO single-tenant registration | Least privilege and compatible with another tenant | Extra setup that does not fit the local manager UX | Advanced override only |
 | Infer safe claim from loopback/IP | No claim secret | All current tunnels relay into local loopback; source and forwarded headers are untrustworthy | Rejected |
 | Console claim code plus Microsoft login | Network attacker lacks console proof; works through any tunnel | One-time copy step | **Preferred bootstrap** |
 | Node shared secret plus Host proof | Small change | Secret is sent before/through a relay; channel is not bound | Rejected for new enrollment |
@@ -240,14 +254,10 @@ graph TD
 
 ### Shipping decision
 
-The public npm package does not contain a single-tenant client ID. It supports:
-
-1. **BYO registration**, the default for public distribution.
-2. **Preconfigured registration**, for a controlled internal package or
-   deployment that has an approved client ID and tenant ID.
-
-A future Fleet-owned multi-tenant registration is a separate governance
-decision and is not required by this MVP.
+Fleet preconfigures the Microsoft corporate tenant and KYC's Visual Studio
+public client for the default local experience. There is no first-run Entra
+configuration screen. Environment overrides support testing another compatible
+approved public client.
 
 ### Required registration configuration
 
@@ -255,7 +265,7 @@ decision and is not required by this MVP.
 | --- | --- |
 | Supported accounts | Single tenant |
 | Platform | Mobile and desktop/public client |
-| Redirect URI | `http://localhost/api/auth/entra/callback` |
+| Redirect URI | `http://localhost:<port>/` |
 | Public client flows | Enabled; Fleet's device fallback remains disabled until separately verified |
 | Client secret/certificate | None |
 | Requested scopes | `openid profile` and optional `email` display hint |
@@ -288,10 +298,9 @@ FLEET_ENTRA_TENANT_ID=<tenant id>
 
 The client ID and tenant ID are configuration, not secrets.
 
-When they are absent, the Host enters `entra-unconfigured`. The claim-code
-holder may enter them in the configuration-only first-run UI. Saving them does
-not grant access; Microsoft authentication and the same bootstrap grant are
-still required to claim the Host.
+When they are absent, the Host uses the built-in Microsoft corporate
+configuration. `entra-unconfigured` remains a fail-closed state for an explicit
+override that cannot be loaded, not a normal first-run screen.
 
 Phase 0 must prove both flows against the actual target tenant:
 
@@ -314,7 +323,8 @@ stateDiagram-v2
     [*] --> EntraUnconfigured: Fresh Host, no Entra config
     EntraUnconfigured --> Unclaimed: Claim holder saves valid Entra config
     Unclaimed --> MicrosoftOnly: Claim code + Microsoft identity
-    LegacyPassword --> Hybrid: Existing password Host adds first admin
+    LegacyPassword --> MicrosoftOnly: Existing password Host adds first admin
+    MicrosoftOnly --> Hybrid: Recent Microsoft reauth enables password
     Hybrid --> MicrosoftOnly: Recent Microsoft reauth disables password
     MicrosoftOnly --> Recovery: Local recovery command
     Recovery --> Hybrid: Temporary password enabled
@@ -569,16 +579,20 @@ create a local forward and use authorization-code login.
   sockets in the same operation.
 - Removal requires recent authorization-code reauthentication.
 
-### Disable password login
+### Password policy after claim
 
-Upgraded Hosts retain password access until a Microsoft admin has signed in
-successfully. Disable is enabled only when:
+The first successful Microsoft claim automatically deletes the legacy verifier,
+revokes password sessions, and leaves the Host `microsoft-only`.
+
+An administrator may explicitly enable password login only when:
 
 - at least one active Microsoft admin exists
 - the current principal is a Microsoft admin
 - authorization-code reauthentication occurred within ten minutes
+- the chosen password is at least 16 characters
 
-Disabling:
+Enabling stores a newly salted verifier and moves the Host to `hybrid`.
+Disabling again:
 
 - deletes the stored password verifier
 - persists `auth.passwordEnabled=0`
@@ -1093,6 +1107,7 @@ to avoid two processes sharing one identity.
 | `POST` | `/api/auth/administrator-invitations/:id/reject` | Recent code-flow admin | Reject the recorded candidate identity |
 | `DELETE` | `/api/auth/administrators/:id` | Recent code-flow admin | Disable administrator and revoke sessions |
 | `POST` | `/api/auth/password/disable` | Recent code-flow admin | Disable legacy password |
+| `POST` | `/api/auth/password/enable` | Recent code-flow admin | Explicitly enable a new shared password |
 | `POST` | `/api/enrollment-grants` | Recent admin | Create one-time Node grant and command |
 | `GET` | `/api/security/audit` | Admin | Read bounded local security audit |
 

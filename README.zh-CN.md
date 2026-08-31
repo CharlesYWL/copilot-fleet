@@ -118,32 +118,23 @@ Microsoft Entra ID 加上这台 Host 自己的管理员名单决定 —— 除�
 第一个同时给出这两样东西的账号成为唯一的管理员。同一租户里之后登录的其他人会收到明确的
 `403`，并且拿不到任何会话。
 
-### 注册 Entra 应用（每个组织一次）
+### Microsoft 登录无需配置
 
-发布的包里不含 client ID —— 单租户 ID 无法预置进别的租户会安装的包。自己注册一个即可，
-不需要任何密钥：
+Fleet 默认使用 Microsoft 公司租户，以及 KYC 本地开发所用的 Visual Studio 公共客户端。
+直接点击 **Sign in with Microsoft** 并选择账号即可；Fleet 只保存账号的 tenant/object ID，
+不会保存 Microsoft token。
 
-| 设置项           | 值                                          |
-| ---------------- | ------------------------------------------- |
-| 支持的账户类型   | **仅此组织目录（单租户）**                  |
-| 平台             | **移动和桌面应用程序**（公共客户端）        |
-| 重定向 URI       | `http://localhost/api/auth/entra/callback`  |
-| 客户端密码/证书  | **无**                                      |
-| API 权限         | **无** —— `openid profile email` 默认已同意 |
-| 允许公共客户端流 | 启用                                        |
+这个公共客户端使用 `http://localhost:<port>/` 回调，所以即使 Host 在隧道后面，登录仍从
+localhost 完成。
 
-Entra 在匹配 `localhost` 重定向 URI 时会忽略**端口**，所以一次注册就覆盖了所有端口和所有
-本地转发；隧道地址变化时也不需要再注册任何东西。
-
-然后把两个 ID 写进环境变量：
+下面两个环境变量只用于测试其他已批准的公共客户端；普通使用无需设置：
 
 ```bash
 FLEET_ENTRA_TENANT_ID=<目录（租户）ID>
 FLEET_ENTRA_CLIENT_ID=<应用程序（客户端）ID>
 ```
 
-或者干脆不写，在首次运行的界面里粘贴 —— 它会先要控制台上的认领码。这两个值都不是机密，
-保存它们不会给任何人授权。
+这两个值不是机密，但覆盖值必须对应兼容且已批准的公共客户端。
 
 ### 认领本身
 
@@ -202,9 +193,11 @@ Fleet 不申请任何用于搜索目录的 Graph 权限，所以添加人的方�
 
 1. 用这台 Host 已有的密码登录。因为还没有人管理它，控制台显示的是迁移检查点，而不是
    fleet 本身。
-2. 如果这台 Host 还没有 Entra 注册信息，就在那里填入租户 ID 和客户端 ID。
-3. **Claim with Microsoft**。你登录用的账号成为这个 Fleet 的第一个管理员，控制台随即出现。
-4. **Settings → Security → Disable password sign-in**。
+2. **Claim with Microsoft**。你登录用的账号成为这个 Fleet 的第一个管理员；共享密码会自动
+   删除，使用它的会话会立即失效，然后控制台出现。
+
+认领后默认只允许 Microsoft 登录。确实需要两种方式的管理员可以到
+**Settings → Security → Enable password sign-in**，设置一个至少 16 个字符的新密码。
 
 上面这些都不需要控制台认领码：证明已有的密码，证明的正是认领码所代表的事情，所以 Host 会
 把那个会话换成同样短、同样绑定浏览器的 bootstrap 授权，并以 `bootstrap_password_granted`

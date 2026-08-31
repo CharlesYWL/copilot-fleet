@@ -237,10 +237,13 @@ describe("password bootstrap", () => {
       expect(claimed.headers.location).toBe("/");
 
       expect(await status()).toMatchObject({
+        state: "microsoft-only",
         claimCodeRequired: false,
         authenticated: true,
+        passwordEnabled: false,
         identity: { username: "alice@example.com" },
       });
+      expect((await passwordLogin()).statusCode).toBe(409);
       expect(
         (
           await app.inject({
@@ -317,14 +320,6 @@ describe("password bootstrap", () => {
       // The session the claim just issued is a Microsoft one.
       const refused = await passwordBootstrap({ "x-csrf-token": await csrf() });
       expect(refused.statusCode).toBe(403);
-      expect(jar.get("fleet_bootstrap")).toBeUndefined();
-    });
-
-    it("refuses a password session too, because there is nothing left to claim", async () => {
-      jar.clear();
-      await passwordLogin();
-      const refused = await passwordBootstrap({ "x-csrf-token": await csrf() });
-      expect(refused.statusCode).toBe(409);
       expect(jar.get("fleet_bootstrap")).toBeUndefined();
     });
   });

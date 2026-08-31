@@ -313,6 +313,43 @@ describe("SecurityPanel", () => {
     );
   });
 
+  it("lets an administrator explicitly enable password sign-in", async () => {
+    const fetchMock = host(
+      {},
+      {
+        "/api/auth/status": {
+          ...(defaults["/api/auth/status"] as object),
+          state: "microsoft-only",
+          passwordEnabled: false,
+        },
+      },
+    );
+    show();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: /enable password sign-in/i }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.change(within(dialog).getByLabelText(/^new operator password$/i), {
+      target: { value: "a-new-operator-password" },
+    });
+    fireEvent.change(within(dialog).getByLabelText(/confirm operator password/i), {
+      target: { value: "a-new-operator-password" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: /^enable$/i }));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            String(url).includes("/api/auth/password/enable") &&
+            JSON.parse(String((init as RequestInit).body)).password ===
+              "a-new-operator-password",
+        ),
+      ).toBe(true),
+    );
+  });
+
   it("reports how far the Node key migration has got, and blocks enforcement until it is done", async () => {
     host();
     show();

@@ -18,8 +18,13 @@ import {
   sessionCookie,
 } from "../auth.js";
 import { BOOTSTRAP_GRANT_TTL_MS } from "../auth/claim.js";
+import { VISUAL_STUDIO_PUBLIC_CLIENT_ID } from "../auth/entra.js";
 import { OPERATOR_SESSION_ABSOLUTE_MS } from "../auth/sessions.js";
-import { newBinding, type FleetAuth } from "../auth/service.js";
+import {
+  MIN_OPERATOR_PASSWORD_LENGTH,
+  newBinding,
+  type FleetAuth,
+} from "../auth/service.js";
 import { hostnameOf } from "../request-guard.js";
 import { requireAdministrator as administratorFor } from "./require-administrator.js";
 
@@ -32,10 +37,23 @@ const ConfigureSchema = z.object({
 const CodeStartSchema = z.object({
   invitation: z.string().min(1).max(256).optional(),
 });
+const EnablePasswordSchema = z.object({
+  password: z.string().min(MIN_OPERATOR_PASSWORD_LENGTH).max(512),
+});
 
 export const ENTRA_CALLBACK_PATH = "/api/auth/entra/callback";
 
-export type AuthRouteOptions = { auth: FleetAuth };
+export function entraCallbackPath(config: { clientId: string } | undefined): string {
+  return config?.clientId === VISUAL_STUDIO_PUBLIC_CLIENT_ID ? "/" : ENTRA_CALLBACK_PATH;
+}
+
+export type AuthRouteOptions = {
+  auth: FleetAuth;
+  /** Vite's UI origin, so the hostless callback returns to the live dev app. */
+  uiOrigin?: string | undefined;
+  /** The API listener Microsoft must return the authorization code to. */
+  loopbackCallbackOrigin?: string | undefined;
+};
 
 /**
  * Which browser this is, invented if it has not said.
@@ -70,10 +88,24 @@ function appendCookie(reply: FastifyReply, cookie: string): void {
  * request that arrived under a name this Host never published has already been
  * refused by the endpoint policy before this is reached.
  */
-function callbackUri(request: FastifyRequest): string {
+export function entraCallbackUri(
+  config: { clientId: string } | undefined,
+  loopbackOrigin: string,
+): string {
+  return new URL(entraCallbackPath(config), `${loopbackOrigin}/`).toString();
+}
+
+function callbackUri(
+  request: FastifyRequest,
+  auth: FleetAuth,
+  loopbackCallbackOrigin: string | undefined,
+): string {
   const host = request.headers.host ?? "";
   const port = host.includes(":") ? host.slice(host.lastIndexOf(":") + 1) : "";
-  return `http://localhost${port ? `:${port}` : ""}${ENTRA_CALLBACK_PATH}`;
+  return entraCallbackUri(
+    auth.entraConfig(),
+    loopbackCallbackOrigin ?? `http://localhost${port ? `:${port}` : ""}`,
+  );
 }
 
 /**
@@ -128,7 +160,10 @@ function refuseCodeLogin(endpoint: CodeLoginEndpoint): {
  * own rule rather than relying on the guard. The guard's job is to make sure
  * nothing else can be reached this way.
  */
-export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, { auth }) => {
+export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
+  app,
+  { auth, uiOrigin, loopbackCallbackOrigin },
+) => {
   app.get("/api/auth/status", async (request) => {
     const session = auth.verifySession(
       readCookie(request.headers.cookie, OPERATOR_COOKIE),
@@ -225,7 +260,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, { au
       binding: browser.id,
       bootstrapToken: readCookie(request.headers.cookie, BOOTSTRAP_COOKIE),
       host: request.headers.host,
-      redirectUri: callbackUri(request),
+      redirectUri: callbackUri(request, auth, loopbackCallbackOrigin),
       invitation: input.invitation,
     });
     if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
@@ -240,12 +275,14 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, { au
    * address bar with no console, no explanation they could act on, and no way
    * back — and the app is the only thing that can offer the next step.
    */
-  app.get(ENTRA_CALLBACK_PATH, async (request, reply) => {
+  const completeCallback = async (request: FastifyRequest, reply: FastifyReply) => {
     const secure = auth.secureCookies(request.headers.host);
+    const appLocation = (path: string): string =>
+      uiOrigin ? new URL(path, uiOrigin).toString() : path;
     const fail = (code: AuthErrorCode, message?: string) =>
       reply
         .header("set-cookie", clearedBootstrapCookie(secure))
-        .redirect(authErrorRedirect(code, message), 302);
+        .redirect(appLocation(authErrorRedirect(code, message)), 302);
 
     const endpoint = codeLoginEndpoint(request.headers.host);
     if (!endpoint.available) {
@@ -291,7 +328,14 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, { au
       reply,
       sessionCookie(outcome.session.token, secure, OPERATOR_SESSION_ABSOLUTE_MS),
     );
-    return reply.redirect("/", 302);
+    return reply.redirect(appLocation("/"), 302);
+  };
+
+  app.get(ENTRA_CALLBACK_PATH, completeCallback);
+  app.get("/", async (request, reply) => {
+    const query = request.query as Record<string, string | undefined>;
+    if (!query.code && !query.error && !query.state) return reply.callNotFound();
+    return completeCallback(request, reply);
   });
 
   /**
@@ -461,8 +505,16 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (app, { au
     if (!auth.passwordEnabled()) {
       return reply.send({ ok: true, alreadyDisabled: true });
     }
-    auth.disablePassword();
+    auth.disablePassword(administrator.id);
     return reply.send({ ok: true });
+  });
+
+  app.post("/api/auth/password/enable", async (request, reply) => {
+    const administrator = requireAdministrator(request, reply, true);
+    if (!administrator) return reply;
+    const input = EnablePasswordSchema.parse(request.body);
+    auth.enablePassword(input.password, administrator.id);
+    return reply.send({ ok: true, passwordEnabled: true, state: auth.state() });
   });
 
   app.get("/api/security/audit", async (request, reply) => {

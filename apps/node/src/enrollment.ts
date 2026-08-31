@@ -4,6 +4,8 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   NodeEnrollmentChallengeResponseSchema,
   NodeEnrollmentReceiptSchema,
+  NodeRegistrationPayloadSchema,
+  RegisterNodeSchema,
   parseEnrollmentGrant,
   type HostChallenge,
   type NodeClientHello,
@@ -56,16 +58,127 @@ import type { Settings } from "./settings.js";
  * with a different key is not one this Node will speak to.
  */
 export type CredentialPlan =
-  | { action: "register"; reason: string }
+  | {
+      action: "register";
+      reason: string;
+      /**
+       * The identity this registration is replacing, when there is one.
+       *
+       * Its *name* is what gets sent: the Host indexes machines by name, so
+       * enrolling under the one this Node already answers to reclaims the row
+       * — the same id, the same placements, the same session history — instead
+       * of stranding all of it on a node that will never come back online.
+       */
+      reclaims?: Credentials;
+    }
   | { action: "move"; credentials: Credentials }
   | { action: "reuse"; credentials: Credentials };
+
+/**
+ * The three flags a Connect command carries, once they are known to be whole.
+ *
+ * A tuple rather than three loose strings because they are only ever meaningful
+ * together: the grant authorises the enrolment, and the id and fingerprint are
+ * what the Host is checked against before the grant is sent to it.
+ */
+export type KeyEnrollmentTuple = {
+  /** `<grant-id>.<grant-secret>` from the Connect card. */
+  grant: string;
+  hostId: string;
+  hostFingerprint: string;
+};
+
+/**
+ * The key enrolment this run was asked to perform, if it was asked for one.
+ *
+ * Partial is an error rather than "no". An operator who pasted two thirds of a
+ * Connect command has said what they want, and the failure modes of guessing
+ * are both bad: with nothing stored the Node fails later with a message about a
+ * missing token, and with credentials on disk it silently keeps them — which is
+ * how a machine an operator believed they had migrated to key authentication
+ * carries on presenting a shared secret indefinitely.
+ */
+export function keyEnrollmentTuple(
+  env: Record<string, string | undefined>,
+): KeyEnrollmentTuple | undefined {
+  const grant = (env.FLEET_ENROLLMENT_GRANT ?? "").trim();
+  const hostId = (env.FLEET_HOST_ID ?? "").trim();
+  const hostFingerprint = (env.FLEET_HOST_FINGERPRINT ?? "").trim();
+  if (!grant && !hostId && !hostFingerprint) return undefined;
+  if (!grant || !hostId || !hostFingerprint) {
+    throw new Error(
+      "A key-based enrollment needs all three of --enrollment-grant, --host-id and --host-fingerprint. Copy the whole command from the Host's Connect card.",
+    );
+  }
+  return { grant, hostId, hostFingerprint };
+}
+
+/**
+ * Whether this machine is already the thing the Connect command is asking for.
+ *
+ * The command says "be a key-enrolled member of this Host". A Node that already
+ * holds a key pinned to that same Host identity is that, so re-running it —
+ * from a service unit that bakes the flags in, from a shell history — is a
+ * restart rather than a migration, and spending a one-time grant it no longer
+ * needs would fail the boot on a grant that has already been consumed.
+ *
+ * Anything else re-enrols: a shared-secret machine (the migration this exists
+ * for), and a machine pinned to a different Host or to a key that Host no
+ * longer has.
+ */
+function alreadyEnrolledWith(stored: Credentials, tuple: KeyEnrollmentTuple): boolean {
+  return (
+    stored.authProtocol === MUTUAL_AUTH_PROTOCOL &&
+    stored.host.hostId === tuple.hostId &&
+    sameDigest(stored.host.fingerprint, tuple.hostFingerprint)
+  );
+}
+
+export type CredentialPlanOptions = {
+  /** The Connect command this run was started with, if there was one. */
+  keyEnrollment?: KeyEnrollmentTuple | undefined;
+  /**
+   * Enrol even though the stored identity parses.
+   *
+   * Set when the Host has already refused it: retrying a credential that will
+   * never be accepted again is an infinite loop, and the stored name is still
+   * the right thing to enrol under because it is what reclaims the row.
+   */
+  forced?: boolean | undefined;
+};
 
 export function planCredentials(
   stored: Credentials | undefined,
   settings: Pick<Settings, "hostUrl" | "nodeName">,
+  options: CredentialPlanOptions = {},
 ): CredentialPlan {
   if (!stored) {
     return { action: "register", reason: "No stored credentials, registering" };
+  }
+  /*
+   * A Connect command outranks what is on disk.
+   *
+   * There is no automatic upgrade from the shared secret — that exchange is
+   * proved with the very credential a relay has already seen, so it is gone —
+   * and the instruction that replaced it is "run a fresh Connect command". This
+   * is where that instruction has to be obeyed: reusing the stored secret
+   * because it still parses turns the one supported migration into a no-op that
+   * reports success, and leaves the operator watching a Node reconnect happily
+   * on the credential they were trying to retire.
+   */
+  if (options.keyEnrollment && !alreadyEnrolledWith(stored, options.keyEnrollment)) {
+    return {
+      action: "register",
+      reason: `Connect command supplied for Host ${options.keyEnrollment.hostId}; re-enrolling "${stored.name}" with a key`,
+      reclaims: stored,
+    };
+  }
+  if (options.forced) {
+    return {
+      action: "register",
+      reason: `Enrolling again as "${stored.name}"`,
+      reclaims: stored,
+    };
   }
   if (stored.hostUrl !== settings.hostUrl) {
     return { action: "move", credentials: { ...stored, hostUrl: settings.hostUrl } };
@@ -303,6 +416,161 @@ export async function enrollWithGrant(
       },
     },
   };
+}
+
+export type TokenRegistrationInput = {
+  hostUrl: string;
+  /** The fleet-wide token, from `--token` or `FLEET_ENROLLMENT_TOKEN`. */
+  enrollmentToken: string;
+  registration: NodeRegistrationPayload;
+  fetch?: FetchLike;
+};
+
+/**
+ * Joins a fleet the old way: a fleet-wide token in, a reusable secret back.
+ *
+ * Kept for Hosts and Connect commands that predate Node keys, and held to the
+ * same rule about where it may be spoken. The confidentiality check is not
+ * belt-and-braces here, it is the *only* protection this exchange has: the
+ * token authorises any machine that holds it, the secret the Host answers with
+ * authenticates every later connection, and both cross the wire in the clear.
+ * A relay that reads one exchange can enrol machines of its own and impersonate
+ * this one, without having to alter a byte.
+ *
+ * Loopback is the exception and the only one, because `http://127.0.0.1` never
+ * reaches a wire — which is exactly what a `devtunnel connect` forward gives
+ * this node.
+ */
+export async function registerWithToken(
+  input: TokenRegistrationInput,
+): Promise<Credentials> {
+  if (!isConfidentialHostUrl(input.hostUrl)) {
+    throw new Error(
+      `Refusing to register against ${input.hostUrl}: the enrollment token and the secret this Host answers with would cross that address in clear text, and both are reusable by whoever reads them. Use an HTTPS address, or a loopback forward such as \`devtunnel connect\`.`,
+    );
+  }
+  const call = input.fetch ?? (globalThis.fetch as unknown as FetchLike);
+  const body = RegisterNodeSchema.parse({
+    ...input.registration,
+    enrollmentToken: input.enrollmentToken,
+  });
+  const response = await call(new URL("/api/nodes/register", input.hostUrl), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Node registration failed (${response.status}): ${await response.text()}`,
+    );
+  }
+  const result = (await response.json()) as { nodeId: string; secret: string };
+  return {
+    hostUrl: input.hostUrl,
+    nodeId: result.nodeId,
+    name: input.registration.name,
+    authProtocol: "legacy-secret",
+    secret: result.secret,
+  };
+}
+
+export type EnsureCredentialsInput = {
+  stored: Credentials | undefined;
+  settings: Pick<Settings, "hostUrl" | "nodeName">;
+  /** Process environment plus command-line flags, flags already merged over. */
+  env: Record<string, string | undefined>;
+  /** What this machine reports about itself. The name is decided here. */
+  machine: Omit<NodeRegistrationPayload, "name">;
+  /**
+   * Enrol even when the stored identity parses, because the Host has already
+   * refused it and retrying it would loop forever.
+   */
+  forceEnrollment?: boolean | undefined;
+  log?: (message: string) => void;
+  fetch?: FetchLike;
+};
+
+export type EnsuredCredentials = {
+  credentials: Credentials;
+  /** Whether the caller has to write `node.json`. */
+  persist: boolean;
+};
+
+/**
+ * The identity this run will speak as, enrolling if it has to.
+ *
+ * The whole decision lives here rather than in the process that acts on it,
+ * because every interesting case is a *refusal to act on what is on disk*: a
+ * Connect command re-enrols a machine whose stored credentials are perfectly
+ * readable, a two-thirds command fails instead of quietly keeping them, and a
+ * plain-HTTP address stops the exchange before a credential is sent to it.
+ * None of that is reachable by a test when it is written inline in a startup
+ * sequence that also grabs a lock and opens a socket.
+ */
+export async function ensureNodeCredentials(
+  input: EnsureCredentialsInput,
+): Promise<EnsuredCredentials> {
+  const log = input.log ?? (() => {});
+  // Ahead of reading the plan, so a partial Connect command is refused whether
+  // or not this machine happens to have credentials already.
+  const keyEnrollment = keyEnrollmentTuple(input.env);
+  const plan = planCredentials(input.stored, input.settings, {
+    keyEnrollment,
+    forced: input.forceEnrollment,
+  });
+  if (plan.action === "reuse") {
+    log(`Reusing stored credentials for node ${plan.credentials.nodeId}`);
+    return { credentials: plan.credentials, persist: false };
+  }
+  if (plan.action === "move") {
+    log(
+      `Host URL changed to ${input.settings.hostUrl}, reusing node ${plan.credentials.nodeId}`,
+    );
+    return { credentials: plan.credentials, persist: true };
+  }
+
+  log(plan.reason);
+  const registration = NodeRegistrationPayloadSchema.parse({
+    ...input.machine,
+    // The Host indexes machines by name, so this field is what decides whether
+    // an enrolment reclaims this machine's row or abandons it.
+    name: plan.reclaims?.name ?? input.settings.nodeName,
+  });
+  const forwarded = input.fetch ? { fetch: input.fetch } : {};
+  if (keyEnrollment) {
+    const enrolled = await enrollWithGrant({
+      hostUrl: input.settings.hostUrl,
+      hostId: keyEnrollment.hostId,
+      hostFingerprint: keyEnrollment.hostFingerprint,
+      grant: keyEnrollment.grant,
+      registration,
+      ...forwarded,
+    });
+    if (plan.reclaims && enrolled.credentials.nodeId !== plan.reclaims.nodeId) {
+      // Worth saying out loud: the Host had no row under this name, so the
+      // placements and history of the old id stay where they are.
+      log(
+        `Host issued a new id ${enrolled.credentials.nodeId}; the previous node ${plan.reclaims.nodeId} was not reclaimed`,
+      );
+    }
+    log(`Enrolled as node ${enrolled.credentials.nodeId} with a key pair`);
+    return { credentials: enrolled.credentials, persist: true };
+  }
+
+  const enrollmentToken = input.env.FLEET_ENROLLMENT_TOKEN;
+  if (!enrollmentToken) {
+    throw new Error(
+      "An enrollment token is required for first registration: pass --token=<token> or set FLEET_ENROLLMENT_TOKEN",
+    );
+  }
+  const credentials = await registerWithToken({
+    hostUrl: input.settings.hostUrl,
+    enrollmentToken,
+    registration,
+    ...forwarded,
+  });
+  log(`Registered as node ${credentials.nodeId}`);
+  return { credentials, persist: true };
 }
 
 export type ChannelRefusal = { ok: false; reason: string };

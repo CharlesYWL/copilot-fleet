@@ -8,6 +8,7 @@ import {
   DialogContent,
   DialogSurface,
   DialogTitle,
+  Field,
   Input,
   Link,
   MessageBar,
@@ -330,13 +331,89 @@ function PasswordCard({
 }) {
   const styles = useStyles();
   const [open, setOpen] = useState(false);
+  const [enableOpen, setEnableOpen] = useState(false);
+  const [password, setPassword] = useState("");
+  const [confirmation, setConfirmation] = useState("");
+  const enableError =
+    password.length > 0 && password.length < 16
+      ? "Use at least 16 characters."
+      : confirmation.length > 0 && password !== confirmation
+        ? "The passwords do not match."
+        : undefined;
   if (!status.passwordEnabled) {
     return (
       <section className={styles.card} aria-label="Password sign-in">
         <Text weight="semibold">Password sign-in</Text>
         <Text className={styles.caption}>
-          Disabled. Only Microsoft accounts this Host has been told about can sign in.
+          Disabled by default after this Host was claimed. Only approved Microsoft
+          accounts can sign in.
         </Text>
+        <div className={styles.row}>
+          <Button appearance="secondary" onClick={() => setEnableOpen(true)}>
+            Enable password sign-in
+          </Button>
+        </div>
+        <Dialog
+          open={enableOpen}
+          onOpenChange={(_event, data) => setEnableOpen(data.open)}
+        >
+          <DialogSurface>
+            <DialogBody>
+              <DialogTitle>Enable shared password sign-in?</DialogTitle>
+              <DialogContent>
+                <Text>
+                  This adds a second way to control every Node. Anyone who knows this
+                  password has full Fleet access and is not identified as a Microsoft
+                  account.
+                </Text>
+                <Field
+                  label="New operator password"
+                  hint="At least 16 characters."
+                  validationState={enableError ? "error" : "none"}
+                  {...(enableError ? { validationMessage: enableError } : {})}
+                >
+                  <Input
+                    type="password"
+                    value={password}
+                    autoComplete="new-password"
+                    onChange={(_event, data) => setPassword(data.value)}
+                  />
+                </Field>
+                <Field label="Confirm operator password">
+                  <Input
+                    type="password"
+                    value={confirmation}
+                    autoComplete="new-password"
+                    onChange={(_event, data) => setConfirmation(data.value)}
+                  />
+                </Field>
+              </DialogContent>
+              <DialogActions>
+                <Button appearance="secondary" onClick={() => setEnableOpen(false)}>
+                  Cancel
+                </Button>
+                <Button
+                  appearance="primary"
+                  disabled={!password || !confirmation || Boolean(enableError)}
+                  onClick={() => {
+                    const chosen = password;
+                    setPassword("");
+                    setConfirmation("");
+                    setEnableOpen(false);
+                    void run(() =>
+                      api("/api/auth/password/enable", {
+                        method: "POST",
+                        body: JSON.stringify({ password: chosen }),
+                      }),
+                    );
+                  }}
+                >
+                  Enable
+                </Button>
+              </DialogActions>
+            </DialogBody>
+          </DialogSurface>
+        </Dialog>
       </section>
     );
   }

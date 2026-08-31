@@ -219,7 +219,7 @@ function viewFor(
    * opens. Offering the Microsoft button beside it offers a button whose only
    * possible outcome is "this Host has no Microsoft sign-in configuration yet".
    */
-  if (status.passwordEnabled && !status.entraConfigured) return "password-sign-in";
+  if (status.passwordEnabled && status.claimCodeRequired) return "password-sign-in";
   if (status.codeLogin.localForwardRequired) {
     return status.deviceFlowEnabled ? "device" : "local-forward";
   }
@@ -818,9 +818,9 @@ function PasswordOnlySignIn({ onSignedIn }: { onSignedIn: () => Promise<void> })
   return (
     <>
       <Text className={styles.caption}>
-        This Host has no Microsoft sign-in configured yet, so the password it was set up
-        with is the way in. Signing in is also how you finish the move: this Host asks for
-        a Microsoft registration and a first administrator straight afterwards.
+        This Host was protected by an operator password before Microsoft sign-in was
+        added. Sign in with that password once; Fleet then asks you to claim it with your
+        Microsoft account. There are no tenant or client IDs to enter.
       </Text>
       <PasswordForm onSignedIn={onSignedIn} appearance="primary" />
     </>

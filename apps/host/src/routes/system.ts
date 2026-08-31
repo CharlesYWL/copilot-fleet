@@ -222,7 +222,19 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       const { publicUrl: archivedUrl, ...rest } = backup;
       const publicUrl =
         archivedUrl && isTransferableHostUrl(archivedUrl) ? archivedUrl : undefined;
-      service.importHostBackup(publicUrl ? { ...rest, publicUrl } : rest);
+      try {
+        service.importHostBackup(publicUrl ? { ...rest, publicUrl } : rest);
+      } catch (error) {
+        /*
+         * The restore refused itself and rolled back, so the operator still has
+         * the Host they had a moment ago. The reason is the useful part — a
+         * version 1 archive naming a key-based Node this Host has no key for
+         * has a next step, and a 500 carrying none reads as a broken Host.
+         */
+        return reply.code(409).send({
+          error: errorMessage(error, "That archive could not be restored."),
+        });
+      }
       // An archive from a grant-only Host carries no token, and restoring an
       // empty string as one would be a credential that matches an empty body.
       enrollment.token = backup.enrollmentToken || undefined;

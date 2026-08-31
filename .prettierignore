@@ -4,7 +4,3 @@ package-lock.json
 
 # Hand-written design records; reformatting them only churns history.
 docs
-
-# Agent skill definitions dropped into the working tree by tooling. Not this
-# repository's source, and reformatting one rewrites somebody else's file.
-.skills

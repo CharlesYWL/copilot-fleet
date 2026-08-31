@@ -199,7 +199,21 @@ describe("AuthGate, signed out of a legacy-password Host", () => {
     expect(await screen.findByLabelText(/operator password/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /sign in with microsoft/i })).toBeNull();
     expect(screen.getByRole("button", { name: /^sign in$/i })).toBeTruthy();
-    expect(screen.getByText(/no microsoft sign-in configured/i)).toBeTruthy();
+    expect(screen.getByText(/no tenant or client ids to enter/i)).toBeTruthy();
+  });
+
+  it("still requires the legacy password before first claim when Microsoft is built in", async () => {
+    host(
+      {},
+      {
+        authenticated: false,
+        entraConfigured: true,
+      },
+    );
+    show();
+
+    expect(await screen.findByLabelText(/operator password/i)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /sign in with microsoft/i })).toBeNull();
   });
 
   it("goes to the migration checkpoint the moment the password is accepted", async () => {

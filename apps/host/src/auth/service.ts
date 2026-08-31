@@ -45,6 +45,7 @@ import { deriveAuthState, resolvePasswordMode, type AuthState } from "./state.js
 export const AUTH_MODE_SETTING = "auth.mode";
 export const PASSWORD_ENABLED_SETTING = "auth.passwordEnabled";
 export const PASSWORD_RECOVERY_SETTING = "auth.passwordIsRecovery";
+export const PASSWORD_EXPLICIT_SETTING = "auth.passwordExplicitlyEnabled";
 export const ENTRA_TENANT_SETTING = "auth.entraTenantId";
 export const ENTRA_CLIENT_SETTING = "auth.entraClientId";
 export const DEVICE_FLOW_SETTING = "auth.deviceFlowEnabled";
@@ -52,6 +53,7 @@ export const CSRF_KEY_SETTING = "auth.csrfKey";
 
 /** An admin invitation is short-lived and single-use by construction. */
 export const INVITATION_TTL_MS = 15 * 60 * 1000;
+export const MIN_OPERATOR_PASSWORD_LENGTH = 16;
 
 /** A ceiling on concurrent device logins, per the design's bounds. */
 export const MAX_DEVICE_FLOWS = 50;
@@ -188,7 +190,17 @@ export class FleetAuth {
     });
     // A Host nobody owns prints a code on every boot; a claimed one has no use
     // for one and must not leave a second way in lying around.
-    if (this.store.countActiveAdministrators() === 0) this.claim.issue();
+    if (this.store.countActiveAdministrators() === 0) {
+      this.claim.issue();
+    } else if (
+      this.passwordAuth &&
+      this.store.getSetting(PASSWORD_EXPLICIT_SETTING) !== "1"
+    ) {
+      // Passwords that survived from before Microsoft ownership were never an
+      // administrator's explicit hybrid-mode choice. Retire them on the first
+      // boot under this policy; only Settings can opt back in.
+      this.disablePassword();
+    }
   }
 
   // -- state -----------------------------------------------------------------
@@ -342,10 +354,12 @@ export class FleetAuth {
    * would leave a credential in the database that any future code path could
    * decide to honour again.
    */
-  disablePassword(): RevokedSession[] {
+  disablePassword(actorId = ""): RevokedSession[] {
     this.store.setSetting(PASSWORD_ENABLED_SETTING, "0");
     this.store.setSetting(PASSWORD_RECOVERY_SETTING, "0");
+    this.store.setSetting(PASSWORD_EXPLICIT_SETTING, "0");
     this.store.setSetting("auth.operatorPassword", "");
+    if (this.claimed()) this.store.setSetting(AUTH_MODE_SETTING, "microsoft-only");
     this.passwordAuth = undefined;
     const revoked = [
       ...this.sessions.revokeByMethod("password"),
@@ -354,10 +368,38 @@ export class FleetAuth {
     this.onSessionsRevoked(revoked);
     this.audit({
       eventType: "password_login_disabled",
-      actorKind: "operator",
+      actorKind: actorId ? "administrator" : "operator",
+      actorId,
       outcome: "allowed",
     });
     return revoked;
+  }
+
+  /** Explicitly restores the optional shared-password login path. */
+  enablePassword(password: string, actorId: string): void {
+    if (password.length < MIN_OPERATOR_PASSWORD_LENGTH) {
+      throw new Error(
+        `An operator password must be at least ${MIN_OPERATOR_PASSWORD_LENGTH} characters.`,
+      );
+    }
+    const hash = hashPassword(password);
+    this.store.setSetting("auth.operatorPassword", hash);
+    this.store.setSetting(PASSWORD_ENABLED_SETTING, "1");
+    this.store.setSetting(PASSWORD_RECOVERY_SETTING, "0");
+    this.store.setSetting(PASSWORD_EXPLICIT_SETTING, "1");
+    this.store.setSetting(AUTH_MODE_SETTING, "hybrid");
+    this.passwordAuth = new OperatorAuth({
+      getStoredHash: () => hash,
+      setStoredHash: () => {},
+      announce: () => {},
+      now: this.now,
+    });
+    this.audit({
+      eventType: "password_login_enabled",
+      actorKind: "administrator",
+      actorId,
+      outcome: "allowed",
+    });
   }
 
   /**
@@ -375,6 +417,7 @@ export class FleetAuth {
     this.store.setSetting("auth.operatorPassword", hash);
     this.store.setSetting(PASSWORD_ENABLED_SETTING, "1");
     this.store.setSetting(PASSWORD_RECOVERY_SETTING, "1");
+    this.store.setSetting(PASSWORD_EXPLICIT_SETTING, "0");
     this.passwordAuth = new OperatorAuth({
       getStoredHash: () => hash,
       setStoredHash: () => {},
@@ -661,7 +704,8 @@ export class FleetAuth {
         };
       }
       this.claim.clear();
-      this.store.setSetting(AUTH_MODE_SETTING, "microsoft-only");
+      if (this.passwordEnabled()) this.disablePassword(administrator.id);
+      else this.store.setSetting(AUTH_MODE_SETTING, "microsoft-only");
       this.audit({
         eventType: "fleet_claimed",
         actorKind: "administrator",

@@ -79,9 +79,24 @@ describe("resolvePasswordMode", () => {
       storedHash: undefined,
       configuredPassword: undefined,
     });
+
     expect(mode.enabled).toBe(false);
     expect(mode.hash).toBeUndefined();
     expect(mode.source).toBe("none");
+  });
+
+  it("keeps a password explicitly enabled in Settings over a stale environment value", () => {
+    const stored = hashPassword("chosen-in-settings");
+    const mode = resolvePasswordMode({
+      persistedEnabled: true,
+      storedHash: stored,
+      configuredPassword: "old-env-password",
+    });
+
+    expect(mode.enabled).toBe(true);
+    expect(mode.hash).toBe(stored);
+    expect(verifyPassword("chosen-in-settings", mode.hash ?? "")).toBe(true);
+    expect(verifyPassword("old-env-password", mode.hash ?? "")).toBe(false);
   });
 
   it("lets a stale environment password be overruled by an explicit disable", () => {
@@ -129,18 +144,6 @@ describe("resolvePasswordMode", () => {
     });
     expect(mode.hash).toBe(stored);
     expect(mode.warning).toBeUndefined();
-  });
-
-  it("replaces a verifier the configured password no longer matches", () => {
-    const stored = hashPassword("old");
-    const mode = resolvePasswordMode({
-      persistedEnabled: true,
-      storedHash: stored,
-      configuredPassword: "new",
-    });
-    expect(mode.hash).not.toBe(stored);
-    expect(verifyPassword("new", mode.hash ?? "")).toBe(true);
-    expect(verifyPassword("old", mode.hash ?? "")).toBe(false);
   });
 
   it("honours an explicit enable that has a verifier but no environment value", () => {

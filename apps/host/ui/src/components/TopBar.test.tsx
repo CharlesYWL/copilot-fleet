@@ -85,6 +85,38 @@ describe("TopBar counts", () => {
 });
 
 describe("TopBar layout", () => {
+  it("shows the Microsoft account beside sign out", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              state: "microsoft-only",
+              authenticated: true,
+              passwordEnabled: false,
+              entraConfigured: true,
+              deviceFlowEnabled: false,
+              claimCodeRequired: false,
+              canSignIn: true,
+              codeLogin: { available: true, localForwardRequired: false },
+              identity: {
+                username: "charlesyin@microsoft.com",
+                displayName: "Charles Yin",
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+    try {
+      show();
+      expect(await screen.findByText("Charles Yin")).toBeTruthy();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("wears the fleet's own mark, and still says whose console this is", () => {
     /*
      * The mark replaced a gradient tile with "CF" written on it. It is

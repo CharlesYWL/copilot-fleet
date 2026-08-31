@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { MUTUAL_AUTH_PROTOCOL } from "@fleet/protocol";
+import { createIdentityKeyPair } from "@fleet/protocol/node-auth";
 import { FleetStore } from "./store.js";
 import type { SecurityBackupPayload } from "./auth/security-backup.js";
 
@@ -73,6 +75,21 @@ function foreignBackup() {
   return other.exportHostBackup({ enrollmentToken: "their-token" });
 }
 
+/** A machine that authenticates with a key pair rather than a shared secret. */
+function keyedNode(store: FleetStore, name = "keyed-box") {
+  const identity = createIdentityKeyPair();
+  const node = store.registerNodeWithKey({
+    name,
+    os: "linux",
+    arch: "x64",
+    version: "0.1.0",
+    capabilities: ["copilot-acp"],
+    maxSessions: 2,
+    publicKey: identity.publicKey,
+  });
+  return { identity, node };
+}
+
 /**
  * A data restore is not a change of ownership.
  *
@@ -120,6 +137,128 @@ describe("version 1 data restore", () => {
     expect(store.listWorkspaces().map((entry) => entry.name)).not.toContain("ours");
     expect(store.listNodes().map((entry) => entry.name)).toEqual(["their-box"]);
     expect(store.getSetting("enrollment.token")).toBe("their-token");
+  });
+});
+
+/**
+ * A version 1 archive has no security envelope, so it carries no Node keys —
+ * only the fact that a machine had one. Restoring it therefore has exactly two
+ * honest outcomes for a key-based Node: keep the key this Host already holds
+ * for that row, or refuse. Writing `mutual-auth-v1` over an empty public key is
+ * neither: the gateway refuses every connection that machine makes afterwards,
+ * so a restore that reported success silently drops it out of the fleet.
+ */
+describe("version 1 data restore with key-based Nodes", () => {
+  it("keeps the key this Host already holds for the machine", () => {
+    const store = secured(setup());
+    const { identity, node } = keyedNode(store);
+    const archive = store.exportHostBackup({ enrollmentToken: "our-token" });
+    store.createWorkspace("added-after-the-archive", "");
+
+    store.replaceHostBackup(archive);
+
+    const restored = store.getNode(node.id);
+    expect(restored?.authProtocol).toBe(MUTUAL_AUTH_PROTOCOL);
+    // The one field the archive could not carry, and the only copy of it.
+    expect(store.nodePublicKey(node.id)).toBe(identity.publicKey);
+    expect(store.listWorkspaces().map((entry) => entry.name)).not.toContain(
+      "added-after-the-archive",
+    );
+  });
+
+  it("keeps each machine's own key when there are several", () => {
+    const store = secured(setup());
+    const first = keyedNode(store, "alpha");
+    const second = keyedNode(store, "beta");
+    const { node: legacy, secret } = store.registerNode({
+      name: "gamma",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+    });
+
+    store.replaceHostBackup(store.exportHostBackup({ enrollmentToken: "our-token" }));
+
+    expect(store.nodePublicKey(first.node.id)).toBe(first.identity.publicKey);
+    expect(store.nodePublicKey(second.node.id)).toBe(second.identity.publicKey);
+    // A shared-secret machine still comes back on the hash the archive carries.
+    expect(store.nodePublicKey(legacy.id)).toBe("");
+    expect(store.authenticateNode(legacy.id, secret)).toBe(true);
+  });
+
+  /*
+   * Somebody else's archive, or this Host's own from before the row existed.
+   * Either way the key is nowhere: not in the file, and not in this database.
+   */
+  it("refuses a key-based Node it has no key for, and says what to do instead", () => {
+    const origin = secured(setup());
+    keyedNode(origin, "their-keyed-box");
+    const archive = origin.exportHostBackup({ enrollmentToken: "their-token" });
+
+    const destination = secured(setup());
+    expect(() => destination.replaceHostBackup(archive)).toThrow(
+      /portable archive|re-enrol/i,
+    );
+  });
+
+  it("changes nothing at all when it refuses", () => {
+    const origin = secured(setup());
+    keyedNode(origin, "their-keyed-box");
+    const archive = origin.exportHostBackup({ enrollmentToken: "their-token" });
+
+    const destination = secured(setup());
+    destination.createWorkspace("ours", "");
+    const resident = destination.registerNode({
+      name: "our-box",
+      os: "linux",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+    });
+
+    expect(() => destination.replaceHostBackup(archive)).toThrow();
+
+    expect(destination.listWorkspaces().map((entry) => entry.name)).toContain("ours");
+    expect(destination.listNodes().map((entry) => entry.name)).toEqual(["our-box"]);
+    expect(destination.authenticateNode(resident.node.id, resident.secret)).toBe(true);
+    expect(destination.getSetting("enrollment.token")).toBe("secured-enrollment-token");
+  });
+
+  /*
+   * The same Host, after the row was deleted: an id that used to exist is not
+   * an id whose key can be produced, and the machine would come back as a Node
+   * nothing can authenticate.
+   */
+  it("refuses when the row it would reclaim the key from is gone", () => {
+    const store = secured(setup());
+    const { node } = keyedNode(store);
+    const archive = store.exportHostBackup({ enrollmentToken: "our-token" });
+    store.deleteNode(node.id);
+
+    expect(() => store.replaceHostBackup(archive)).toThrow(/re-enrol/i);
+    expect(store.getNode(node.id)).toBeUndefined();
+  });
+
+  /** Whatever else happens, this row must never exist. */
+  it("never leaves a mutual-auth Node with an empty public key", () => {
+    const origin = secured(setup());
+    keyedNode(origin, "their-keyed-box");
+    const archive = origin.exportHostBackup({ enrollmentToken: "their-token" });
+    const destination = secured(setup());
+
+    try {
+      destination.replaceHostBackup(archive);
+    } catch {
+      // The refusal is asserted above; this test is about what is left behind.
+    }
+
+    for (const node of destination.listNodes()) {
+      if (node.authProtocol !== MUTUAL_AUTH_PROTOCOL) continue;
+      expect(destination.nodePublicKey(node.id)).not.toBe("");
+    }
   });
 });
 
@@ -230,6 +369,51 @@ describe("portable security backup", () => {
     // that still has its `node.json` reconnects without being re-enrolled.
     expect(moved.authenticateNode(registered.node.id, registered.secret)).toBe(true);
     expect(moved.listWorkspaces().map((entry) => entry.name)).toContain("Chats");
+  });
+
+  /**
+   * The portable half of the same question: a version 2 archive *does* carry
+   * Node keys, in the encrypted envelope, and they have to be visible to the
+   * data half — a row inserted with an empty key and corrected afterwards is
+   * exactly the state a failure between the two halves would commit.
+   */
+  it("restores a key-based Node from the key in its encrypted envelope", () => {
+    const origin = secured(setup());
+    const { identity: nodeKey, node } = keyedNode(origin);
+    const data = portableData(origin);
+    const security = origin.exportSecurityBackup();
+
+    const moved = setup();
+    moved.importPortableBackup({ data, security });
+
+    expect(moved.getNode(node.id)?.authProtocol).toBe(MUTUAL_AUTH_PROTOCOL);
+    expect(moved.nodePublicKey(node.id)).toBe(nodeKey.publicKey);
+  });
+
+  it("refuses an envelope with no key for a Node that authenticates with one", () => {
+    const origin = secured(setup());
+    keyedNode(origin);
+    const data = portableData(origin);
+    const exported = origin.exportSecurityBackup();
+    const security: SecurityBackupPayload = {
+      ...exported,
+      // A machine that would come back as `mutual-auth-v1` with nothing to
+      // verify against: refused, rather than restored into silence.
+      nodeAuth: exported.nodeAuth.map((entry) => ({
+        ...entry,
+        publicKey: "",
+        secretHash: "a".repeat(64),
+      })),
+    };
+
+    const destination = secured(setup());
+    destination.createWorkspace("ours", "");
+
+    expect(() => destination.importPortableBackup({ data, security })).toThrow(
+      /envelope/i,
+    );
+    expect(destination.listWorkspaces().map((entry) => entry.name)).toContain("ours");
+    expect(destination.listNodes()).toEqual([]);
   });
 
   it("ends every session the receiving Host had open", () => {

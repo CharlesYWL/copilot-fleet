@@ -236,7 +236,7 @@ describe("a fresh production Host", () => {
     await app.ready();
     const status = await app.inject({ method: "GET", url: "/api/auth/status" });
     expect(status.statusCode).toBe(200);
-    expect((status.json() as { state: string }).state).toBe("entra-unconfigured");
+    expect((status.json() as { state: string }).state).toBe("unclaimed");
   });
 
   it("persists no fleet-wide enrollment token", async () => {
@@ -249,7 +249,7 @@ describe("a fresh production Host", () => {
     const store = new FleetStore(databasePath);
     expect(store.getSetting("enrollment.token") ?? "").toBe("");
     store.close();
-  });
+  }, 30_000);
 
   it("does not publish a legacy token from /api/enrollment", async () => {
     const signed = await claimed({ databasePath: ":memory:" });

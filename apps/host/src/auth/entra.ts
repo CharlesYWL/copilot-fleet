@@ -49,6 +49,19 @@ export const EntraConfigSchema = z.object({
 export type EntraConfig = z.infer<typeof EntraConfigSchema>;
 
 /**
+ * The same public client KYC uses for local development.
+ *
+ * It accepts a hostless localhost redirect and carries no client secret. Fleet
+ * asks only for identity scopes and never keeps the Microsoft token.
+ */
+export const MICROSOFT_CORP_TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47";
+export const VISUAL_STUDIO_PUBLIC_CLIENT_ID = "aebc6443-996d-45c2-90f0-388ff96faa56";
+export const BUILT_IN_ENTRA_CONFIG: EntraConfig = EntraConfigSchema.parse({
+  tenantId: MICROSOFT_CORP_TENANT_ID,
+  clientId: VISUAL_STUDIO_PUBLIC_CLIENT_ID,
+});
+
+/**
  * A person as Entra validated them.
  *
  * `tenantId` and `objectId` are the authorisation keys. The other two are

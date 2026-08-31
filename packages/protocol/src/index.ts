@@ -2144,6 +2144,7 @@ export const SecurityBackupPayloadSchema = z.object({
   auth: z.object({
     mode: z.string().max(40).default(""),
     passwordEnabled: z.boolean(),
+    passwordExplicitlyEnabled: z.boolean().default(false),
     /** Only present while the migration password is still switched on. */
     passwordVerifier: z.string().max(500).default(""),
     passwordIsRecovery: z.boolean().default(false),

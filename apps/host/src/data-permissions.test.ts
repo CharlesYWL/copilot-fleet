@@ -99,101 +99,139 @@ describe("securing the Host data directory on Windows", () => {
       platform: "win32",
       // A deployed Host, which is the only place Fleet reconfigures an ACL.
       production: true,
-      env: {
-        SystemRoot: "C:\\Windows",
-        USERDOMAIN: "CONTOSO",
-        USERNAME: "fleetsvc",
-      },
+      env: { SystemRoot: "C:\\Windows" },
       ...overrides,
     });
 
-  /*
+  /** The one invocation, as `[executable, ...args]`. */
+  const invocation = (overrides: Partial<SecureDataDeps> = {}): string[] => {
+    const { deps, acls } = windows(overrides);
+    secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps);
+    expect(acls).toHaveLength(1);
+    return acls[0]!;
+  };
+
+  /**
    * chmod is a no-op on NTFS, so the mode bits Unix relies on say nothing here.
-   * The equivalent is an explicit ACL: every explicit entry cleared, then
-   * exactly the three principals the design names.
+   * The equivalent is an explicit ACL — and it is written in one call, because
+   * the two-step shape this replaced (`icacls /reset /T`, then a grant) left
+   * the whole tree inheriting `C:\ProgramData`'s "Users: read" in between. That
+   * is a window, on every boot, where the file holding the Host's private key
+   * is readable by every account on the machine.
    */
-  it("replaces the whole DACL with one naming the user, SYSTEM and Administrators", () => {
+  it("assigns the whole DACL in a single invocation", () => {
     const { deps, acls, chmods } = windows();
     secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps);
     expect(chmods).toEqual([]);
-    expect(acls).toHaveLength(2);
-    for (const [executable] of acls) {
-      // Resolved absolutely from SystemRoot rather than looked up on PATH, so
-      // what runs is the operating system's icacls and not something earlier on
-      // a caller-controlled search path.
-      expect(executable).toBe("C:\\Windows\\System32\\icacls.exe");
-    }
-    const [, ...granted] = acls[1]!;
-    expect(granted[0]).toBe("C:\\fleet\\data");
-    expect(granted).toContain("/inheritance:r");
-    expect(granted.join(" ")).toContain("CONTOSO\\fleetsvc");
-    // SIDs, not display names: "Administrators" and "SYSTEM" are localised and
-    // renameable, and an ACL that failed to name them would silently grant
-    // nothing rather than fail.
-    expect(granted.join(" ")).toContain("*S-1-5-18");
-    expect(granted.join(" ")).toContain("*S-1-5-32-544");
-    // Nobody else, however the directory got there.
-    expect(granted.filter((arg) => arg === "/grant:r")).toHaveLength(3);
-    expect(granted.join(" ")).not.toContain("/grant ");
+    expect(acls).toHaveLength(1);
+    const script = acls[0]!.join(" ");
+    // Nothing clears permissions and then puts them back.
+    expect(script).not.toContain("/reset");
+    expect(script).not.toContain("icacls");
   });
 
   /*
-   * `/grant:r` replaces the entry for the principal it names and nothing else,
-   * so a directory carrying an explicit "Users: read" from whoever created it
-   * keeps it — the one thing this file exists to prevent. Only `/reset` clears
-   * entries nobody enumerated, so it has to come first and it has to run over
-   * the whole tree.
+   * Resolved absolutely from SystemRoot rather than looked up on PATH, so what
+   * runs is the operating system's own shell and not something earlier on a
+   * search path a caller controls. Windows PowerShell rather than `pwsh`: it
+   * ships with Windows, and its .NET Framework runtime has
+   * `FileInfo.SetAccessControl` as an instance method.
    */
-  it("clears every explicit entry it did not put there before granting", () => {
-    const { deps, acls } = windows();
-    secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps);
-    const [, ...reset] = acls[0]!;
-    expect(reset[0]).toBe("C:\\fleet\\data");
-    expect(reset).toContain("/reset");
-    expect(reset).toContain("/T");
-    // The reset must not be the last word, or the directory would be left
-    // inheriting whatever its parent grants.
-    expect(acls[1]?.join(" ")).toContain("/inheritance:r");
+  it("runs the shell that ships with Windows, by absolute path", () => {
+    const [executable] = invocation();
+    expect(executable).toBe(
+      "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    );
+    const args = invocation().slice(1);
+    expect(args).toContain("-NoProfile");
+    expect(args).toContain("-NonInteractive");
+    expect(args).toContain("-Command");
+  });
+
+  /*
+   * A name is not an identity. `USERDOMAIN\USERNAME` is localised, renameable,
+   * spelled differently on an Entra-joined machine, and settable by whoever
+   * launched the process — and an entry that failed to resolve would grant
+   * nothing on a directory whose inheritance had just been broken, which is a
+   * Host that cannot reopen its own database.
+   */
+  it("asks Windows for the running account's SID instead of reading its name", () => {
+    const script = invocation().join(" ");
+    expect(script).toContain("[System.Security.Principal.WindowsIdentity]::GetCurrent()");
+    expect(script).toContain("GetCurrent().User");
+    expect(script).not.toContain("USERNAME");
+    expect(script).not.toContain("USERDOMAIN");
+  });
+
+  /** With no name in the environment at all, since none is consulted. */
+  it("needs no account name in the environment", () => {
+    const script = invocation({ env: { SystemRoot: "C:\\Windows" } }).join(" ");
+    expect(script).toContain("GetCurrent().User");
+  });
+
+  /*
+   * SIDs, not display names: "Administrators" and "SYSTEM" are localised and
+   * renameable. Exactly three, because a fourth is somebody the design did not
+   * put inside the trust boundary.
+   */
+  it("allows the running account, SYSTEM and Administrators, and nobody else", () => {
+    const script = invocation().join(" ");
+    expect(script).toContain("SecurityIdentifier('S-1-5-18')");
+    expect(script).toContain("SecurityIdentifier('S-1-5-32-544')");
+    expect(script).toContain("$allowed=@($me,");
+    expect(script.match(/AddAccessRule/g)).toHaveLength(1);
+    expect(script).toContain("'FullControl'");
+  });
+
+  /**
+   * The descriptor is built from nothing rather than edited, so what lands is
+   * exactly those three entries: a directory carrying an explicit "Users: read"
+   * — from whoever created it, from a copy, from an older build — loses it in
+   * the same write that adds the three, with no moment in between.
+   */
+  it("writes a descriptor built from nothing, with inheritance broken", () => {
+    const script = invocation().join(" ");
+    expect(script).toContain(
+      "New-Object System.Security.AccessControl.DirectorySecurity",
+    );
+    expect(script).toContain("New-Object System.Security.AccessControl.FileSecurity");
+    // Protected, and without copying the inherited entries in first.
+    expect(script).toContain("SetAccessRuleProtection($true,$false)");
+    expect(script).toContain("SetAccessControl($acl)");
   });
 
   /**
    * The database, its write-ahead log and its shared-memory file already exist
-   * by the time a Host restarts, and each may carry a DACL of its own. An ACL
+   * by the time a Host restarts, and each carries a DACL of its own. An ACL
    * applied to the directory alone leaves those exactly as they were, which is
    * the file holding the Host's private key still readable by whoever could
    * read it before.
    *
-   * The reset is what reaches them, and it is also what re-enables inheritance
-   * on them so the grant that follows lands. The grant itself must *not* carry
-   * `/T`: applied to a file, `(OI)(CI)` is not a valid inheritance flag, so
-   * icacls drops the grant while `/inheritance:r` still strips what the file
-   * inherited — leaving an empty DACL that even the Host cannot open. That is a
-   * bricked Host, verified against the real tool.
+   * The recursion is what reaches them; the inheritable flags on the directory
+   * are what covers the journals SQLite writes later.
    */
-  it("reaches the database and its journals through the reset, not the grant", () => {
-    const { deps, acls } = windows();
-    secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps);
-    expect(acls[0]).toContain("/T");
-    expect(acls[1]).not.toContain("/T");
-    // Inheritable, so both the journals that exist and the ones SQLite writes
-    // later land inside the same three entries.
-    expect(acls[1]?.join(" ")).toContain("(OI)(CI)F");
+  it("reaches the database and its journals, and the ones not written yet", () => {
+    const script = invocation().join(" ");
+    expect(script).toContain("Get-Item -LiteralPath $root");
+    expect(script).toContain("Get-ChildItem -LiteralPath $root -Recurse -Force");
+    expect(script).toContain("'ContainerInherit,ObjectInherit'");
+    // A file inherits nothing to anything; `(OI)(CI)` on one is what used to
+    // silently drop the entry and leave an empty DACL behind.
+    expect(script).toContain("$inherit=if($container)");
   });
 
   /*
-   * `/C` tells icacls to carry on past a file it could not change and still
-   * report success, which would turn "this Host protected its key" into "this
-   * Host tried". A production Host that cannot finish the job has to stop.
+   * The target is the one value that is not fixed, so it travels as a
+   * single-quoted PowerShell literal with its quotes doubled: nothing in a
+   * path can then be read as anything but a path.
    */
-  it("never asks icacls to continue past a failure", () => {
+  it("quotes the directory rather than interpolating it into the script", () => {
     const { deps, acls } = windows();
-    secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps);
-    for (const invocation of acls) {
-      expect(invocation).not.toContain("/C");
-    }
+    secureHostDataFiles("C:\\fleet\\o'brien data\\fleet.db", deps);
+    expect(acls[0]!.join(" ")).toContain("$root='C:\\fleet\\o''brien data'");
   });
 
-  it("stops before granting anything when the reset fails", () => {
+  it("says so loudly in production when the ACL cannot be applied", () => {
     const attempts: string[][] = [];
     const { deps } = windows({
       applyWindowsAcl: (executable, args) => {
@@ -204,13 +242,15 @@ describe("securing the Host data directory on Windows", () => {
     expect(() => secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps)).toThrow(
       /permission/i,
     );
+    // And it failed having changed nothing, rather than half-way through a
+    // sequence that had already opened the tree up.
     expect(attempts).toHaveLength(1);
   });
 
   /*
-   * Replacing a DACL is hard to undo and, on a machine that spells the running
-   * account differently, can leave a directory the Host itself cannot reopen.
-   * A developer checkout is not the machine that boundary is for.
+   * Replacing a DACL is hard to undo and, on a machine where the Host runs as
+   * somebody else, can leave a directory its owner cannot reopen. A developer
+   * checkout is not the machine that boundary is for.
    */
   it("leaves a developer machine's permissions alone", () => {
     const { deps, acls } = windows({ production: false });
@@ -219,21 +259,10 @@ describe("securing the Host data directory on Windows", () => {
   });
 
   it("refuses to guess an executable path when SystemRoot is missing", () => {
-    const { deps, acls } = windows({ env: { USERNAME: "fleetsvc" } });
+    const { deps, acls } = windows({ env: {} });
     expect(() => secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps)).toThrow(
       /permission/i,
     );
     expect(acls).toEqual([]);
-  });
-
-  it("says so loudly in production when the ACL cannot be applied", () => {
-    const { deps } = windows({
-      applyWindowsAcl: () => {
-        throw new Error("Access is denied.");
-      },
-    });
-    expect(() => secureHostDataFiles("C:\\fleet\\data\\fleet.db", deps)).toThrow(
-      /permission/i,
-    );
   });
 });

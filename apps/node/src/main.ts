@@ -10,7 +10,6 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   NODE_NAME_SYNC_CAPABILITY,
   NodeToHostMessageSchema,
-  RegisterNodeSchema,
   SELF_UPDATE_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
   SESSION_CONFIG_CAPABILITY,
@@ -36,9 +35,8 @@ import {
 } from "./config.js";
 import {
   HostFingerprintMismatchError,
-  enrollWithGrant,
+  ensureNodeCredentials,
   openNodeChannel,
-  planCredentials,
 } from "./enrollment.js";
 import {
   legacyKeyUpgradeRefusal,
@@ -358,25 +356,42 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     warn,
   );
 
-  /** Registers when the stored identity is missing or the operator renamed this node. */
-  async function ensureCredentials(): Promise<Credentials> {
-    const plan = planCredentials(await loadCredentials(), settings);
-    if (plan.action === "register") {
-      log(plan.reason);
-      const registered = await enroll();
-      await saveCredentials(registered);
-      log(`Registered as node ${registered.nodeId}`);
-      return registered;
+  /**
+   * The identity this process speaks as, enrolling when it must.
+   *
+   * A fingerprint mismatch is the one enrolment failure that is not worth
+   * retrying and is not the operator's typo: something is answering that
+   * address that cannot sign for the key on the Connect card. Nothing was sent
+   * to it, and the message names both fingerprints so the operator can see
+   * which one they are actually talking to.
+   */
+  async function ensureCredentials(
+    options: { forceEnrollment?: boolean } = {},
+  ): Promise<Credentials> {
+    try {
+      const outcome = await ensureNodeCredentials({
+        stored: await loadCredentials(),
+        settings,
+        env,
+        machine: {
+          os: platform(),
+          arch: arch(),
+          version: VERSION,
+          revision: REVISION,
+          capabilities: NODE_CAPABILITIES,
+          agents: advertisedAgents,
+          maxSessions: settings.maxSessions,
+          homeDir: homedir(),
+        },
+        ...(options.forceEnrollment ? { forceEnrollment: true } : {}),
+        log,
+      });
+      if (outcome.persist) await saveCredentials(outcome.credentials);
+      return outcome.credentials;
+    } catch (error) {
+      if (error instanceof HostFingerprintMismatchError) errorLog(error.message);
+      throw error;
     }
-    if (plan.action === "move") {
-      log(
-        `Host URL changed to ${settings.hostUrl}, reusing node ${plan.credentials.nodeId}`,
-      );
-      await saveCredentials(plan.credentials);
-      return plan.credentials;
-    }
-    log(`Reusing stored credentials for node ${plan.credentials.nodeId}`);
-    return plan.credentials;
   }
 
   /**
@@ -849,8 +864,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
          */
         log("Host rejected our credentials; enrolling again");
         try {
-          credentials = await enroll();
-          await saveCredentials(credentials);
+          credentials = await ensureCredentials({ forceEnrollment: true });
           log(`Re-enrolled as node ${credentials.nodeId}`);
         } catch (error) {
           errorLog(`Re-enrollment failed: ${errorMessage(error)}`);
@@ -994,91 +1008,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       `Delivered ${sent}/${held} event(s) buffered while the Host was unreachable` +
         (dropped > 0 ? `; ${dropped} older one(s) were dropped for capacity` : ""),
     );
-  }
-
-  /**
-   * Enrolls, and says plainly when the Host is not the Host that was named.
-   *
-   * A fingerprint mismatch is the one enrolment failure that is not worth
-   * retrying and is not the operator's typo: something is answering that
-   * address that cannot sign for the key on the Connect card. Nothing was sent
-   * to it, and the message names both fingerprints so the operator can see
-   * which one they are actually talking to.
-   */
-  async function enroll(): Promise<Credentials> {
-    try {
-      return await register();
-    } catch (error) {
-      if (error instanceof HostFingerprintMismatchError) errorLog(error.message);
-      throw error;
-    }
-  }
-
-  /**
-   * Joins a fleet, by whichever protocol the operator's Connect command names.
-   *
-   * A command carrying a Host id, a fingerprint and a one-time grant enrols
-   * against a key this machine generates; the fleet-wide token remains for
-   * Nodes and Connect commands that predate keys. The two are deliberately not
-   * interchangeable: a token cannot authorise a key-based enrolment, and a
-   * grant is never sent to a Host that has not proved its fingerprint.
-   */
-  async function register(): Promise<Credentials> {
-    const payload = {
-      name: settings.nodeName,
-      os: platform(),
-      arch: arch(),
-      version: VERSION,
-      revision: REVISION,
-      capabilities: NODE_CAPABILITIES,
-      agents: advertisedAgents,
-      maxSessions: settings.maxSessions,
-      homeDir: homedir(),
-    };
-    const grant = env.FLEET_ENROLLMENT_GRANT;
-    const hostId = env.FLEET_HOST_ID;
-    const hostFingerprint = env.FLEET_HOST_FINGERPRINT;
-    if (grant || hostId || hostFingerprint) {
-      if (!grant || !hostId || !hostFingerprint) {
-        throw new Error(
-          "A key-based enrollment needs all three of --enrollment-grant, --host-id and --host-fingerprint. Copy the whole command from the Host's Connect card.",
-        );
-      }
-      const enrolled = await enrollWithGrant({
-        hostUrl: settings.hostUrl,
-        hostId,
-        hostFingerprint,
-        grant,
-        registration: payload,
-      });
-      return enrolled.credentials;
-    }
-
-    const enrollmentToken = env.FLEET_ENROLLMENT_TOKEN;
-    if (!enrollmentToken) {
-      throw new Error(
-        "An enrollment token is required for first registration: pass --token=<token> or set FLEET_ENROLLMENT_TOKEN",
-      );
-    }
-    const body = RegisterNodeSchema.parse({ ...payload, enrollmentToken });
-    const response = await fetch(new URL("/api/nodes/register", settings.hostUrl), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!response.ok) {
-      throw new Error(
-        `Node registration failed (${response.status}): ${await response.text()}`,
-      );
-    }
-    const result = (await response.json()) as { nodeId: string; secret: string };
-    return {
-      hostUrl: settings.hostUrl,
-      nodeId: result.nodeId,
-      name: settings.nodeName,
-      authProtocol: "legacy-secret",
-      secret: result.secret,
-    };
   }
 
   connect();

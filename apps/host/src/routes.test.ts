@@ -328,6 +328,50 @@ describe("host routes", () => {
     });
   });
 
+  /**
+   * A version 1 archive carries no Node keys, only the fact that a machine had
+   * one. Restoring it over a Host that has no key for that row would write a
+   * `mutual-auth-v1` Node with nothing to verify against — a machine the
+   * gateway refuses from then on, dropped out of the fleet by a restore that
+   * reported success. The refusal has to say what to do instead.
+   */
+  it("refuses an archive whose key-based Node it has no key for", async () => {
+    const enrolled = await enroll("box");
+    await inject({
+      method: "POST",
+      url: "/api/workspaces",
+      payload: { name: "ours", description: "" },
+    });
+    const backup = (await inject({ method: "GET", url: "/api/backup" })).json() as {
+      nodes: { id: string; authProtocol: string; secretHash: string }[];
+    };
+    // The same archive taken after that machine migrated to a key pair.
+    for (const node of backup.nodes) {
+      node.authProtocol = "mutual-auth-v1";
+      node.secretHash = "";
+    }
+
+    const restored = await inject({
+      method: "POST",
+      url: "/api/backup",
+      payload: backup,
+    });
+
+    expect(restored.statusCode).toBe(409);
+    expect((restored.json() as { error: string }).error).toMatch(
+      /portable archive|re-enrol/i,
+    );
+    // And nothing moved: the machine still authenticates, and the catalog the
+    // operator had a moment ago is still there.
+    const snapshot = (await inject({ method: "GET", url: "/api/snapshot" })).json() as {
+      nodes: { id: string; authProtocol: string }[];
+      workspaces: { name: string }[];
+    };
+    expect(snapshot.nodes.map((node) => node.id)).toEqual([enrolled.nodeId]);
+    expect(snapshot.nodes[0]?.authProtocol).toBe("legacy-secret");
+    expect(snapshot.workspaces.map((workspace) => workspace.name)).toContain("ours");
+  });
+
   it("refuses a Node identity file on the Host import endpoint", async () => {
     const response = await inject({
       method: "POST",

@@ -91,6 +91,19 @@ export function resolvePasswordMode(input: PasswordModeInput): PasswordMode {
     };
   }
 
+  // Once Settings has explicitly enabled a verifier, that stored choice wins
+  // over an old FLEET_OPERATOR_PASSWORD left in the environment. Otherwise a
+  // restart would silently replace the password the administrator just chose.
+  if (input.persistedEnabled === true && input.storedHash) {
+    return {
+      enabled: true,
+      hash: input.storedHash,
+      source: "stored",
+      persist: { passwordEnabled: true, hash: input.storedHash },
+      warning: undefined,
+    };
+  }
+
   if (input.configuredPassword) {
     const matches =
       input.storedHash !== undefined &&

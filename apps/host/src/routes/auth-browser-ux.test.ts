@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { AUTH_ERROR_MESSAGE_PARAM, AUTH_ERROR_PARAM } from "@fleet/protocol";
 import { buildServer } from "../server.js";
-import { codeLoginEndpoint } from "./auth.js";
-import type { DeviceCodeStarted, EntraIdentity } from "../auth/entra.js";
+import { codeLoginEndpoint, entraCallbackPath, entraCallbackUri } from "./auth.js";
+import {
+  BUILT_IN_ENTRA_CONFIG,
+  type DeviceCodeStarted,
+  type EntraIdentity,
+} from "../auth/entra.js";
 
 const TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 const CLIENT = "11111111-2222-3333-4444-555555555555";
@@ -144,6 +148,14 @@ describe("browser-facing auth endpoints", () => {
   };
 
   describe("status", () => {
+    it("uses the hostless localhost callback required by the built-in client", () => {
+      expect(entraCallbackPath(BUILT_IN_ENTRA_CONFIG)).toBe("/");
+      expect(entraCallbackUri(BUILT_IN_ENTRA_CONFIG, "http://localhost:8790")).toBe(
+        "http://localhost:8790/",
+      );
+      expect(entraCallbackPath({ clientId: CLIENT })).toBe("/api/auth/entra/callback");
+    });
+
     it("says a loopback browser can finish a code sign-in here", async () => {
       expect(await status()).toMatchObject({
         codeLogin: { available: true, localForwardRequired: false },
@@ -173,6 +185,21 @@ describe("browser-facing auth endpoints", () => {
   });
 
   describe("callback failures", () => {
+    it("accepts the hostless localhost callback used by the built-in public client", async () => {
+      const finished = await app.inject({
+        method: "GET",
+        url: "/?code=auth-code&state=never-issued",
+        headers: { host: "localhost:8787" },
+      });
+
+      expect(finished.statusCode).toBe(302);
+      expect(
+        new URL(String(finished.headers.location), "http://localhost").searchParams.get(
+          AUTH_ERROR_PARAM,
+        ),
+      ).toBe("expired");
+    });
+
     it("sends an unauthorized account back to the app with a named reason", async () => {
       await claim();
       // A second, unknown identity finishing a sign-in on the same Host.

@@ -13,7 +13,11 @@ import { FleetAuth } from "./auth/service.js";
 import { EnrollmentGrants } from "./auth/enrollment-grants.js";
 import { HostIdentityService } from "./auth/host-identity.js";
 import { NodeEnrollment } from "./auth/node-enrollment.js";
-import type { EntraConfig, EntraProvider } from "./auth/entra.js";
+import {
+  BUILT_IN_ENTRA_CONFIG,
+  type EntraConfig,
+  type EntraProvider,
+} from "./auth/entra.js";
 import {
   BrowserSessionRegistry,
   SESSION_REVALIDATION_MS,
@@ -89,6 +93,8 @@ export async function buildServer(
     announceClaimCode?: (code: string) => void;
     /** Injected in tests; production builds the MSAL-backed provider. */
     entraProvider?: (config: EntraConfig) => EntraProvider;
+    /** Tests opt in explicitly; real local and production Hosts use it by default. */
+    useBuiltInEntra?: boolean;
   } = {},
 ): Promise<FastifyInstance> {
   const logs = createLogBuffer();
@@ -159,7 +165,9 @@ export async function buildServer(
             tenantId: process.env.FLEET_ENTRA_TENANT_ID,
             clientId: process.env.FLEET_ENTRA_CLIENT_ID,
           }
-        : undefined,
+        : (options.useBuiltInEntra ?? process.env.NODE_ENV !== "test")
+          ? BUILT_IN_ENTRA_CONFIG
+          : undefined,
     announceClaimCode:
       options.announceClaimCode ??
       ((code) =>
@@ -229,7 +237,13 @@ export async function buildServer(
       tunnelUrls: () => tunnel.allTunnelUrls(),
     },
   });
-  await app.register(authRoutes, { auth });
+  await app.register(authRoutes, {
+    auth,
+    loopbackCallbackOrigin: `http://localhost:${listenPort}`,
+    ...(process.env.npm_lifecycle_event === "dev"
+      ? { uiOrigin: "http://localhost:5173" }
+      : {}),
+  });
   await app.register(systemRoutes, {
     service,
     tunnel,

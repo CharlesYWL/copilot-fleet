@@ -118,35 +118,26 @@ The first account to present both becomes the one and only administrator.
 Anyone else in the same tenant who signs in afterwards is refused with a named
 `403` and receives no session at all.
 
-### Register the Entra app (once per organisation)
+### Microsoft sign-in needs no setup
 
-The published package contains no client ID, because a single-tenant ID cannot
-be baked into a package other tenants install. Register your own — it takes a
-minute and needs no secret:
+Fleet uses the Microsoft corporate tenant and the same Visual Studio public
+client used by KYC for local development. Click **Sign in with Microsoft** and
+choose an account; Fleet persists only the account's tenant and object IDs, not
+the Microsoft token.
 
-| Setting                     | Value                                                      |
-| --------------------------- | ---------------------------------------------------------- |
-| Supported account types     | **Single tenant**                                          |
-| Platform                    | **Mobile and desktop applications** (public client)        |
-| Redirect URI                | `http://localhost/api/auth/entra/callback`                 |
-| Client secret / certificate | **None**                                                   |
-| API permissions             | **None** — `openid profile email` are consented by default |
-| Allow public client flows   | Enabled                                                    |
+The public client accepts a hostless `http://localhost:<port>/` callback. That
+is why login runs on localhost even when the Host is reached through a tunnel.
 
-Entra ignores the _port_ when matching a `localhost` redirect URI, so one
-registration covers every port and every local forward. Nothing else has to be
-registered when the tunnel URL changes.
-
-Then either put the IDs in the environment:
+The environment variables below are advanced overrides for testing another
+approved registration; normal use leaves them unset:
 
 ```bash
 FLEET_ENTRA_TENANT_ID=<directory (tenant) id>
 FLEET_ENTRA_CLIENT_ID=<application (client) id>
 ```
 
-or leave them out and paste them into the first-run screen, which asks for the
-console claim code before it will accept them. Neither value is a secret;
-saving them grants nobody access.
+Neither value is a secret, but an override must name a compatible approved
+public client.
 
 ### The claim itself
 
@@ -211,17 +202,19 @@ authorization-code sign-in from the last ten minutes.
 
 ### Migrating off the shared password
 
-Hosts that predate Microsoft identity keep working: password sign-in stays
-enabled until an administrator turns it off. `FLEET_OPERATOR_PASSWORD` is now an
-explicit, warned-about escape hatch — a fresh Host without one generates
-nothing.
+Hosts that predate Microsoft identity keep working long enough to migrate.
+`FLEET_OPERATOR_PASSWORD` is an explicit, warned-about escape hatch — a fresh
+Host without one generates nothing.
 
 1. Sign in with the password the Host already has. Because nobody administers it
    yet, the console shows a migration checkpoint rather than the fleet.
-2. If this Host has no Entra registration, paste the tenant and client IDs there.
-3. **Claim with Microsoft.** The account you sign in with becomes this Fleet's
-   first administrator, and the console appears.
-4. **Settings → Security → Disable password sign-in**.
+2. **Claim with Microsoft.** The account you sign in with becomes this Fleet's
+   first administrator, the shared password is deleted automatically, its
+   sessions are revoked, and the console appears.
+
+Microsoft-only is the secure default after claim. An administrator who
+explicitly needs both methods can go to **Settings → Security → Enable password
+sign-in** and choose a new password of at least 16 characters.
 
 The console claim code is not needed for any of that: proving the existing
 password proves the same thing it stands for, so the Host trades that session
@@ -992,7 +985,8 @@ stops a run rather than a prompt each time.
 - Removing an administrator revokes their sessions and closes their live browser
   sockets in the same operation; a 60-second sweep re-checks every open socket
   against the live session and administrator rows.
-- Legacy password sign-in is opt-in and off on a fresh Host. Disabling it
+- Legacy password sign-in is opt-in, off on a fresh Host, and retired
+  automatically by the first Microsoft claim. Disabling it
   deletes the verifier and records the choice, so a stale
   `FLEET_OPERATOR_PASSWORD` cannot re-enable it.
 - The Host answers only to names it knows: loopback, `FLEET_PUBLIC_URL`, the

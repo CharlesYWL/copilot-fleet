@@ -402,6 +402,7 @@ describe("administrator management", () => {
         cancelDeviceCode: () => {},
       }),
     });
+
     hybrid.log.level = "silent";
     await hybrid.ready();
     const previous = app;
@@ -426,6 +427,19 @@ describe("administrator management", () => {
       );
       await signIn(admin);
 
+      expect(
+        (await app.inject({ method: "GET", url: "/api/auth/status" })).json(),
+      ).toMatchObject({
+        state: "microsoft-only",
+        passwordEnabled: false,
+      });
+      expect(
+        (
+          await post(admin, "/api/auth/password/enable", {
+            password: "re-enabled-operator-password",
+          })
+        ).statusCode,
+      ).toBe(200);
       const status = await app.inject({ method: "GET", url: "/api/auth/status" });
       expect((status.json() as { state: string }).state).toBe("hybrid");
 
@@ -441,12 +455,28 @@ describe("administrator management", () => {
       const afterwards = await app.inject({
         method: "POST",
         url: "/api/auth/login",
-        payload: { password: "test-password" },
+        payload: { password: "re-enabled-operator-password" },
       });
       expect(afterwards.statusCode).toBe(409);
     } finally {
       app = previous;
       await hybrid.close();
     }
+  });
+
+  it("lets a recently authenticated Microsoft administrator enable password sign-in", async () => {
+    const response = await post(owner, "/api/auth/password/enable", {
+      password: "a-new-operator-password",
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({ passwordEnabled: true, state: "hybrid" });
+
+    const password = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { password: "a-new-operator-password" },
+    });
+    expect(password.statusCode).toBe(200);
   });
 });

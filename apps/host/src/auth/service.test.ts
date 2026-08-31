@@ -79,6 +79,62 @@ describe("FleetAuth", () => {
     expect(auth.verifySession(signedIn.session.token)).toBeUndefined();
   });
 
+  it("lets an administrator explicitly enable a new password", () => {
+    const { auth, store } = setup();
+    store.insertAdministrator({
+      tenantId: "t",
+      objectId: "admin",
+      username: "a@example.com",
+      displayName: "A",
+      addedVia: "claim",
+    });
+
+    auth.enablePassword("a-new-operator-password", "admin");
+
+    expect(auth.state()).toBe("hybrid");
+    expect(auth.passwordEnabled()).toBe(true);
+    expect(auth.passwordLogin("a-new-operator-password", "localhost:8787").ok).toBe(true);
+  });
+
+  it("retires a legacy password when a claimed Host restarts", () => {
+    const store = new FleetStore(":memory:");
+    stores.push(store);
+    setup({ store, configuredPassword: "legacy-password" });
+    store.insertAdministrator({
+      tenantId: "t",
+      objectId: "admin",
+      username: "a@example.com",
+      displayName: "A",
+      addedVia: "claim",
+    });
+
+    const restarted = setup({ store, configuredPassword: "legacy-password" });
+
+    expect(restarted.auth.state()).toBe("microsoft-only");
+    expect(restarted.auth.passwordEnabled()).toBe(false);
+  });
+
+  it("keeps a password that an administrator explicitly enabled", () => {
+    const store = new FleetStore(":memory:");
+    stores.push(store);
+    store.insertAdministrator({
+      tenantId: "t",
+      objectId: "admin",
+      username: "a@example.com",
+      displayName: "A",
+      addedVia: "claim",
+    });
+    const first = setup({ store });
+    first.auth.enablePassword("a-new-operator-password", "admin");
+
+    const restarted = setup({ store, configuredPassword: "stale-env-password" });
+
+    expect(restarted.auth.state()).toBe("hybrid");
+    expect(
+      restarted.auth.passwordLogin("a-new-operator-password", "localhost:8787").ok,
+    ).toBe(true);
+  });
+
   it("refuses a password sign-in over a known plain-HTTP relay", () => {
     const store = new FleetStore(":memory:");
     stores.push(store);

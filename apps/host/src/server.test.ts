@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { resolve } from "node:path";
 import {
+  buildServer,
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
   resolveLegacyEnrollmentToken,
@@ -72,6 +73,31 @@ describe("production enrollment token", () => {
         generate,
       }),
     ).toBeUndefined();
+  });
+
+  describe("built-in Microsoft sign-in", () => {
+    it("preconfigures the local Host without asking for tenant or client IDs", async () => {
+      const app = await buildServer({
+        databasePath: ":memory:",
+        operatorPassword: "test-password",
+        useBuiltInEntra: true,
+        announceClaimCode: () => {},
+      });
+      try {
+        const status = await app.inject({
+          method: "GET",
+          url: "/api/auth/status",
+          headers: { host: "localhost:8787" },
+        });
+        expect(status.json()).toMatchObject({
+          state: "legacy-password",
+          entraConfigured: true,
+          passwordEnabled: true,
+        });
+      } finally {
+        await app.close();
+      }
+    });
   });
 
   it("still rejects the shipped placeholder in production", () => {

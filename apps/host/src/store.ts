@@ -250,6 +250,7 @@ export const MAX_AUDIT_DETAIL_LENGTH = 500;
 export const PRESERVED_SETTING_KEYS = [
   "auth.mode",
   "auth.passwordEnabled",
+  "auth.passwordExplicitlyEnabled",
   "auth.operatorPassword",
   "auth.passwordIsRecovery",
   "auth.entraTenantId",
@@ -858,14 +859,61 @@ export class FleetStore {
   }
 
   /**
+   * The key each Node on this Host proves itself with right now.
+   *
+   * Read before a restore deletes the rows, because for a version 1 archive it
+   * is the only copy in existence: the archive has no envelope to carry one,
+   * and a public key that was dropped cannot be recovered from anywhere except
+   * the machine it belongs to, by enrolling it again.
+   */
+  private currentNodePublicKeys(): Map<string, string> {
+    const rows = this.statement("SELECT id, public_key FROM nodes").all() as Row[];
+    return new Map(rows.map((row) => [String(row.id), String(row.public_key ?? "")]));
+  }
+
+  /**
    * The body of a data restore, without a transaction of its own.
    *
    * Separate so a portable restore can put the data and the security envelope
    * back in one commit: a Host left with somebody else's catalog and its own
    * administrators is not a state anybody asked for, and it is what a restore
    * that failed halfway would leave behind.
+   *
+   * `suppliedKeys` is where a key-based Node's public key comes from. A
+   * portable archive carries them in its encrypted envelope and passes them in
+   * here, inside the same transaction. A version 1 archive has no envelope and
+   * therefore no keys at all, so the only place one can come from is the row
+   * this Host already has for that Node — which is the same-Host case, and the
+   * only one a data restore can honestly serve.
    */
-  private replaceHostBackupRows(parsed: HostBackup): void {
+  private replaceHostBackupRows(
+    parsed: HostBackup,
+    suppliedKeys?: ReadonlyMap<string, string>,
+  ): void {
+    const keys = suppliedKeys ?? this.currentNodePublicKeys();
+    /*
+     * Checked before a single row is deleted, and it is a refusal rather than a
+     * repair.
+     *
+     * A key-based Node restored without its public key comes back as
+     * `mutual-auth-v1` with nothing to verify against: the gateway refuses
+     * every connection it makes, and the machine is dropped out of the fleet by
+     * a restore that reported success. The archive cannot supply the key and
+     * this Host does not have one, so there is no version of this that works —
+     * only one that says so, while everything is still where the operator left
+     * it.
+     */
+    for (const node of parsed.nodes) {
+      if (node.authProtocol !== MUTUAL_AUTH_PROTOCOL) continue;
+      if (keys.get(node.id)) continue;
+      throw new Error(
+        suppliedKeys
+          ? `That backup's security envelope carries no key for Node "${node.name}", which authenticates with one. Nothing was restored.`
+          : `That archive carries Node "${node.name}", which authenticates with a key this Host does not have. ` +
+              "A version 1 archive holds no Node keys, so restoring it would leave that machine unable to connect. " +
+              "Restore the portable archive with its backup passphrase, or re-enrol that machine with a fresh Connect command.",
+      );
+    }
     this.db.exec(
       "DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
     );
@@ -891,14 +939,16 @@ export class FleetStore {
         `INSERT INTO nodes
             (id,name,secret_hash,public_key,auth_protocol,os,arch,version,revision,
              capabilities,max_sessions,active_sessions,last_heartbeat,online,home_dir)
-           VALUES (?,?,?,'',?,?,?,?,?,?,?,0,?,0,?)`,
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,0,?)`,
       ).run(
         node.id,
         node.name,
         node.secretHash,
-        // A version 1 archive predates Node keys, so every row it carries is a
-        // shared-secret machine. A portable restore corrects this afterwards
-        // from its security envelope, which is the only place a key can be.
+        // A version 1 archive predates Node keys and carries none, so a
+        // key-based machine keeps the key this Host already had for it — the
+        // check above is what guarantees there is one. A portable restore
+        // passes the keys from its encrypted envelope instead.
+        node.authProtocol === MUTUAL_AUTH_PROTOCOL ? (keys.get(node.id) ?? "") : "",
         node.authProtocol,
         node.os,
         node.arch,
@@ -1109,6 +1159,7 @@ export class FleetStore {
       auth: {
         mode: setting("auth.mode"),
         passwordEnabled: setting("auth.passwordEnabled") === "1",
+        passwordExplicitlyEnabled: setting("auth.passwordExplicitlyEnabled") === "1",
         passwordVerifier: setting("auth.operatorPassword"),
         passwordIsRecovery: setting("auth.passwordIsRecovery") === "1",
         entraTenantId: setting("auth.entraTenantId"),
@@ -1177,7 +1228,15 @@ export class FleetStore {
       throw new Error("That backup contains no active administrator.");
     }
     const revokedSessions = this.transaction(() => {
-      this.replaceHostBackupRows(data);
+      // The envelope is the only place a portable archive's Node keys are, and
+      // the data half has to be able to see them: a Node row inserted with an
+      // empty key and corrected afterwards is a `mutual-auth-v1` row with
+      // nothing to verify against for the length of the transaction, and the
+      // state a failure between the two halves would leave behind.
+      this.replaceHostBackupRows(
+        data,
+        new Map(security.nodeAuth.map((node) => [node.nodeId, node.publicKey])),
+      );
       return this.replaceSecurityRows(security);
     });
     for (const node of data.nodes) this.syncChatPlacement(node.id);
@@ -1249,6 +1308,10 @@ export class FleetStore {
     }
     this.setSetting("auth.mode", security.auth.mode);
     this.setSetting("auth.passwordEnabled", security.auth.passwordEnabled ? "1" : "0");
+    this.setSetting(
+      "auth.passwordExplicitlyEnabled",
+      security.auth.passwordExplicitlyEnabled ? "1" : "0",
+    );
     this.setSetting("auth.operatorPassword", security.auth.passwordVerifier);
     this.setSetting(
       "auth.passwordIsRecovery",
