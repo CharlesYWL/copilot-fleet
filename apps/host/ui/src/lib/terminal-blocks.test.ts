@@ -95,6 +95,24 @@ describe("toTerminalBlocks", () => {
     });
   });
 
+  it("keeps a task completion response through the status-only final update", () => {
+    const blocks = toTerminalBlocks([
+      event("tool", {
+        toolCallId: "done",
+        title: "task_complete",
+        response: "The branch is main.",
+        status: "pending",
+      }),
+      event("tool", { toolCallId: "done", status: "completed" }),
+    ]);
+
+    expect(blocks[0]).toMatchObject({
+      text: "task_complete",
+      status: "completed",
+      body: "The branch is main.",
+    });
+  });
+
   it("promotes user prompts and drops raw protocol noise", () => {
     const blocks = toTerminalBlocks([
       event("system", { text: "User: fix the bug" }),

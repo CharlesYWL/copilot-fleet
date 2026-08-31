@@ -1214,14 +1214,21 @@ const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBloc
       (toolKindIcons[block.toolKind ?? ""] ?? kindIcons.tool)
     );
     return (
-      <StepRow
-        icon={icon}
-        title={block.text}
-        detail={block.detail}
-        time={time}
-        color={failed ? terminal.error : running ? terminal.tool : undefined}
-        failed={failed}
-      />
+      <div>
+        <StepRow
+          icon={icon}
+          title={block.text}
+          detail={block.detail}
+          time={time}
+          color={failed ? terminal.error : running ? terminal.tool : undefined}
+          failed={failed}
+        />
+        {block.body && block.status === "completed" ? (
+          <div className={styles.message}>
+            <MarkdownBody text={block.body} copyable />
+          </div>
+        ) : null}
+      </div>
     );
   }
 

@@ -11,6 +11,7 @@ import {
   copilotVersionFromOutput,
   toolDetail,
   toolProgress,
+  taskCompletionResponse,
   withCopilotStartupTimeout,
 } from "./agents.js";
 
@@ -142,6 +143,32 @@ describe("toolDetail", () => {
     expect(toolDetail({ rawInput: { command: "npm test -w @fleet/host" } })).toBe(
       "npm test -w @fleet/host",
     );
+  });
+
+  describe("taskCompletionResponse", () => {
+    it("keeps the final response from a resumed CLI session completion tool", () => {
+      expect(
+        taskCompletionResponse({
+          title: "task_complete",
+          rawInput: { summary: "The current branch is `main`." },
+        }),
+      ).toBe("The current branch is `main`.");
+    });
+
+    it("does not expose arbitrary tool inputs as assistant responses", () => {
+      expect(
+        taskCompletionResponse({
+          title: "write_file",
+          rawInput: { summary: "secret", content: "private bytes" },
+        }),
+      ).toBeUndefined();
+      expect(
+        taskCompletionResponse({
+          title: "task_complete",
+          rawInput: { content: "no user-facing summary" },
+        }),
+      ).toBeUndefined();
+    });
   });
 
   it("flattens a wrapped command onto the one line it will be drawn on", () => {

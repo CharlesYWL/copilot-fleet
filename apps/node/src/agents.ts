@@ -897,6 +897,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         status: update.status,
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
+        ...toolResponsePayload(update),
       });
       return;
     }
@@ -907,6 +908,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         title: update.title,
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
+        ...toolResponsePayload(update),
       });
       return;
     }
@@ -1215,6 +1217,32 @@ function toolDetailPayload(update: {
 }): { detail?: string } {
   const detail = toolDetail(update);
   return detail ? { detail } : {};
+}
+
+/**
+ * The final answer carried by Copilot's completion tool, when present.
+ *
+ * Some sessions created by Copilot CLI are instructed to finish by calling
+ * `task_complete` with their user-facing response in `summary`. ACP emits no
+ * later agent-message chunk for those turns, so dropping this one field makes a
+ * successful resumed turn look unanswered. No other tool input or output is
+ * copied into the Fleet transcript.
+ */
+export function taskCompletionResponse(update: {
+  title?: string | null;
+  rawInput?: unknown;
+}): string | undefined {
+  if (update.title?.trim().toLowerCase() !== "task_complete") return undefined;
+  if (!update.rawInput || typeof update.rawInput !== "object") return undefined;
+  const summary = (update.rawInput as Record<string, unknown>).summary;
+  return typeof summary === "string" && summary.trim() ? summary : undefined;
+}
+
+function toolResponsePayload(update: { title?: string | null; rawInput?: unknown }): {
+  response?: string;
+} {
+  const response = taskCompletionResponse(update);
+  return response ? { response } : {};
 }
 
 /**

@@ -396,13 +396,16 @@ export const sessionEventPayloadSchemas = {
   // line — an icon for the category and a dimmed summary of what it ran on —
   // instead of a paragraph-sized block per step. `detail` is drawn from the
   // few short input fields a tool names (a command, a path, a query); tool
-  // output and file contents are deliberately never carried here.
+  // output and file contents are deliberately never carried here. `response`
+  // is narrower: only the user-facing summary from Copilot's `task_complete`
+  // tool, which is the final answer for some resumed CLI conversations.
   tool: z.object({
     toolCallId: text,
     title: text,
     status: text,
     kind: text,
     detail: text,
+    response: text,
   }),
   permission: z.object({
     requestId: text,

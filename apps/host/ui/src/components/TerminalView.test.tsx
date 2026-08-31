@@ -169,6 +169,24 @@ describe("TerminalView transcript", () => {
     expect(screen.getByText("failed")).toBeTruthy();
   });
 
+  it("renders the final response carried by a completed task_complete call", () => {
+    show({}, EMPTY_DRAFT, [
+      streamEvent("tool", {
+        toolCallId: "done-1",
+        title: "task_complete",
+        status: "pending",
+        response: "The current branch is `main`.",
+      }),
+      streamEvent("tool", {
+        toolCallId: "done-1",
+        status: "completed",
+      }),
+    ]);
+
+    expect(screen.getByText("task_complete")).toBeTruthy();
+    expect(screen.getByText("main", { selector: "code" })).toBeTruthy();
+  });
+
   it("folds reasoning to a preview the reader can open", async () => {
     const thought = `${"deliberating ".repeat(40)}end`;
     show({}, EMPTY_DRAFT, [streamEvent("agent_thought", { text: thought })]);
