@@ -359,6 +359,60 @@ describe("Copilot session history", () => {
     expect($("newSessionMsg").textContent).toContain("Host unavailable");
   });
 
+  it("ignores an older Fleet load that finishes after a newer successful load", async () => {
+    let finishInitialFleet;
+    let initialFleetParsed;
+    const parsed = new Promise((resolve) => {
+      initialFleetParsed = resolve;
+    });
+    let fleetLoads = 0;
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/fleet") {
+        fleetLoads += 1;
+        if (fleetLoads === 1) {
+          return new Promise((resolve) => {
+            finishInitialFleet = resolve;
+          });
+        }
+        return reply({
+          workspaces: [{ id: "ws-1", name: "Fleet" }],
+          placements: [
+            {
+              id: "pl-1",
+              workspaceId: "ws-1",
+              workspaceName: "Fleet",
+              localPath: "/repo",
+            },
+          ],
+        });
+      }
+      if (path === "/api/workspaces" && init?.method === "POST") {
+        return reply({ id: "ws-1", name: "Fleet" });
+      }
+      return respond(path, init);
+    });
+    await startPage();
+    $("wsName").value = "Fleet";
+    $("wsAdd").click();
+    await vi.waitFor(() =>
+      expect($("newSessionPlacement").querySelector('[value="pl-1"]')).toBeTruthy(),
+    );
+
+    finishInitialFleet({
+      ok: false,
+      json: async () => {
+        initialFleetParsed();
+        return { error: "stale failure" };
+      },
+    });
+    await parsed;
+    await Promise.resolve();
+
+    expect($("newSessionPlacement").querySelector('[value="pl-1"]')).toBeTruthy();
+    expect($("newSessionPlacement").dataset.unavailableReason).toBe("");
+    expect($("wsMsg").textContent).not.toContain("stale failure");
+  });
+
   it("ignores a context preview that arrives after selection changed", async () => {
     let finishOldPreview;
     vi.mocked(fetch).mockImplementation((path, init) => {

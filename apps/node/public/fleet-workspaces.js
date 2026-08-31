@@ -4,6 +4,7 @@ export const initFleetWorkspaces = () => {
   let workspaces = [];
   let placements = [];
   let fleetLoadError = "";
+  let fleetLoadSequence = 0;
 
   const workspaceItem = (workspace) =>
     el("div", { className: "item" }, [
@@ -98,16 +99,19 @@ export const initFleetWorkspaces = () => {
   };
 
   const loadFleet = async () => {
+    const sequence = ++fleetLoadSequence;
     try {
       const response = await fetch("/api/fleet");
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not reach the Host");
+      if (sequence !== fleetLoadSequence) return;
       workspaces = data.workspaces;
       placements = data.placements;
       fleetLoadError = "";
       renderFleet();
       note("wsMsg", "", true);
     } catch (error) {
+      if (sequence !== fleetLoadSequence) return;
       workspaces = [];
       placements = [];
       fleetLoadError = error.message;
