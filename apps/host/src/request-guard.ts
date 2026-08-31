@@ -44,6 +44,9 @@ const NODE_METHOD_PATHS: ReadonlyArray<{ method: string; pattern: RegExp }> = [
   { method: "GET", pattern: /^\/api\/placements$/ },
   { method: "POST", pattern: /^\/api\/placements$/ },
   { method: "PATCH", pattern: /^\/api\/placements\/[^/]+$/ },
+  { method: "GET", pattern: /^\/api\/sessions$/ },
+  { method: "POST", pattern: /^\/api\/sessions$/ },
+  { method: "POST", pattern: /^\/api\/sessions\/adopt$/ },
 ];
 
 export function nodeReachable(method: string, pathname: string): boolean {

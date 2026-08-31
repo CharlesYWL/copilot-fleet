@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
+import { NODE_ID_HEADER, NODE_SECRET_HEADER, SessionSchema } from "@fleet/protocol";
 
 /**
  * The subset of a placement this page needs. Declared locally rather than
@@ -21,6 +21,22 @@ const WorkspaceLikeSchema = z.object({
   description: z.string().optional().default(""),
 });
 export type WorkspaceLike = z.infer<typeof WorkspaceLikeSchema>;
+
+const SessionStatusLikeSchema = SessionSchema.pick({
+  id: true,
+  placementId: true,
+  nodeId: true,
+  state: true,
+  agentSessionId: true,
+});
+export type SessionStatusLike = z.infer<typeof SessionStatusLikeSchema>;
+
+const StartedSessionSchema = SessionSchema.pick({
+  id: true,
+  state: true,
+  agentSessionId: true,
+});
+export type StartedSession = z.infer<typeof StartedSessionSchema>;
 
 /**
  * Narrows the fleet's placements to the ones this machine owns.
@@ -188,6 +204,40 @@ export class FleetClient {
         nodeId: this.options.nodeId(),
         localPath,
       }),
+    });
+  }
+
+  async listOwnSessions(): Promise<SessionStatusLike[]> {
+    return request(
+      this.options.hostUrl(),
+      "/api/sessions",
+      z.array(SessionStatusLikeSchema),
+      { credentials: this.credentials() },
+    );
+  }
+
+  async createOwnSession(input: {
+    placementId: string;
+    prompt: string;
+    name?: string;
+  }): Promise<StartedSession> {
+    return request(this.options.hostUrl(), "/api/sessions", StartedSessionSchema, {
+      method: "POST",
+      credentials: this.credentials(),
+      body: JSON.stringify(input),
+    });
+  }
+
+  async adoptOwnSession(input: {
+    placementId: string;
+    agentSessionId: string;
+    additionalDirectories: string[];
+    name?: string;
+  }): Promise<StartedSession> {
+    return request(this.options.hostUrl(), "/api/sessions/adopt", StartedSessionSchema, {
+      method: "POST",
+      credentials: this.credentials(),
+      body: JSON.stringify(input),
     });
   }
 }

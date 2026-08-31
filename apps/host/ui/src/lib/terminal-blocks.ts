@@ -68,6 +68,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       const title = payload?.title ?? "";
       const toolKind = payload?.kind ?? "";
       const detail = payload?.detail ?? "";
+      const response = payload?.response ?? "";
       const existing = toolCallId ? toolBlockIndex.get(toolCallId) : undefined;
       const previous = existing === undefined ? undefined : blocks[existing];
       if (previous) {
@@ -78,6 +79,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
         if (status) previous.status = status;
         if (toolKind) previous.toolKind = toolKind;
         if (detail) previous.detail = detail;
+        if (response) previous.body = response;
         continue;
       }
       blocks.push({
@@ -88,6 +90,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
         ...(status ? { status } : {}),
         ...(toolKind ? { toolKind } : {}),
         ...(detail ? { detail } : {}),
+        ...(response ? { body: response } : {}),
       });
       if (toolCallId) toolBlockIndex.set(toolCallId, blocks.length - 1);
       continue;

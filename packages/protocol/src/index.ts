@@ -19,6 +19,14 @@ export const terminalSessionStates = new Set<SessionState>([
   "completed",
   "failed",
 ]);
+/** States backed by an active or reserved Node slot. */
+export const liveSessionStates = new Set<SessionState>([
+  "queued",
+  "starting",
+  "running",
+  "idle",
+  "cancelling",
+]);
 
 /**
  * A Copilot agent definition a Node can put a session into.
@@ -268,6 +276,8 @@ export const SessionSchema = z.object({
   updatedAt: z.string().datetime(),
   /** Copilot's own ACP session id, needed to resume the conversation. */
   agentSessionId: z.string().default(""),
+  /** Additional workspace roots that ACP must restore with this session. */
+  additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).optional(),
   /** Runs Copilot with --allow-all: no permission prompts for this session. */
   yolo: z.boolean().default(false),
   /**
@@ -394,13 +404,16 @@ export const sessionEventPayloadSchemas = {
   // line — an icon for the category and a dimmed summary of what it ran on —
   // instead of a paragraph-sized block per step. `detail` is drawn from the
   // few short input fields a tool names (a command, a path, a query); tool
-  // output and file contents are deliberately never carried here.
+  // output and file contents are deliberately never carried here. `response`
+  // is narrower: only the user-facing summary from Copilot's `task_complete`
+  // tool, which is the final answer for some resumed CLI conversations.
   tool: z.object({
     toolCallId: text,
     title: text,
     status: text,
     kind: text,
     detail: text,
+    response: text,
   }),
   permission: z.object({
     requestId: text,
@@ -545,6 +558,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
     agentSessionId: z.string().min(1),
+    /** Workspace roots originally attached to the Copilot conversation. */
+    additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
     /** Continues the host's event sequence so replayed rows stay ordered. */
     sequenceOffset: z.number().int().nonnegative().default(0),
     yolo: z.boolean().default(false),

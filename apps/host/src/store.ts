@@ -38,6 +38,7 @@ import {
   eventPayload,
   canTransition,
   isChatsWorkspace,
+  liveSessionStates,
   sessionFieldsForHostImport,
   terminalSessionStates,
   tryParseJson,
@@ -223,6 +224,11 @@ export class FleetStore {
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "revision", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing(
+      "sessions",
+      "additional_directories",
+      "TEXT NOT NULL DEFAULT '[]'",
+    );
     this.addColumnIfMissing("sessions", "yolo", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "name", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "commands", "TEXT NOT NULL DEFAULT ''");
@@ -652,8 +658,8 @@ export class FleetStore {
           `INSERT INTO sessions
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
-             config_options,position,run_id,run_role)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             config_options,position,run_id,run_role,additional_directories)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           session.id,
           session.workspaceId,
@@ -673,6 +679,7 @@ export class FleetStore {
           session.position,
           session.runId,
           session.runRole,
+          JSON.stringify(session.additionalDirectories ?? []),
         );
       }
       for (const event of parsed.events) {
@@ -1285,6 +1292,84 @@ export class FleetStore {
       run.readOnly ? 1 : 0,
     );
     return this.getSession(id)!;
+  }
+
+  /**
+   * Creates the Fleet row for a conversation that already exists in Copilot.
+   *
+   * The lookup and insert share one SQLite transaction, so two relayed resume
+   * requests — even from different nodes — cannot create two Fleet sessions
+   * for the same live ACP session. A settled row is reused and moved to the
+   * selected placement: that preserves its Fleet transcript and stable Host id
+   * instead of making a second history for one Copilot conversation.
+   */
+  adoptSession(
+    placement: Placement,
+    agentSessionId: string,
+    additionalDirectories: readonly string[],
+    yolo = false,
+    name = "",
+  ): { session: FleetSession; created: boolean; alreadyLive: boolean } {
+    return this.transaction(() => {
+      const existingRow = this.sessionQuery(
+        "WHERE s.agent_session_id=? ORDER BY s.created_at DESC LIMIT 1",
+      ).get(agentSessionId) as Row | undefined;
+      if (existingRow) {
+        let session = sessionFromRow(existingRow);
+        const alreadyLive = liveSessionStates.has(session.state);
+        if (!alreadyLive) {
+          this.statement(
+            `UPDATE sessions
+             SET workspace_id=?,placement_id=?,node_id=?,yolo=?,
+                 additional_directories=?,
+                 name=CASE WHEN name='' THEN ? ELSE name END,updated_at=?
+             WHERE id=?`,
+          ).run(
+            placement.workspaceId,
+            placement.id,
+            placement.nodeId,
+            yolo ? 1 : 0,
+            JSON.stringify(additionalDirectories),
+            name.trim(),
+            new Date().toISOString(),
+            session.id,
+          );
+          session = this.getSession(session.id)!;
+        }
+        return {
+          session,
+          created: false,
+          alreadyLive,
+        };
+      }
+
+      const now = new Date().toISOString();
+      const id = randomUUID();
+      this.statement(
+        `INSERT INTO sessions
+         (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,agent_session_id,additional_directories,yolo,name,run_id,run_role,read_only)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      ).run(
+        id,
+        placement.workspaceId,
+        placement.id,
+        placement.nodeId,
+        "stopped",
+        "Resumed Copilot session",
+        "Ready to resume",
+        "",
+        now,
+        now,
+        agentSessionId,
+        JSON.stringify(additionalDirectories),
+        yolo ? 1 : 0,
+        name.trim(),
+        "",
+        "",
+        0,
+      );
+      return { session: this.getSession(id)!, created: true, alreadyLive: false };
+    });
   }
 
   /**
@@ -1991,6 +2076,7 @@ function sessionFromRow(row: Row): FleetSession {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     agentSessionId: String(row.agent_session_id ?? ""),
+    additionalDirectories: parseJsonList(row.additional_directories),
     yolo: Number(row.yolo ?? 0) === 1,
     commands: parseJsonList(row.commands),
     configOptions: parseJsonList(row.config_options),

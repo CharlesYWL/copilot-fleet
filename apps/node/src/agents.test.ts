@@ -9,8 +9,10 @@ import {
   copilotLaunchArgs,
   copilotSupportsContextTier,
   copilotVersionFromOutput,
+  supportedAdditionalDirectories,
   toolDetail,
   toolProgress,
+  taskCompletionResponse,
   withCopilotStartupTimeout,
 } from "./agents.js";
 
@@ -21,6 +23,26 @@ afterEach(() => {
 describe("copilotLaunchArgs", () => {
   it("starts ACP over stdio", () => {
     expect(copilotLaunchArgs(false)).toEqual(["--acp", "--stdio"]);
+  });
+
+  describe("supportedAdditionalDirectories", () => {
+    it("sends restored roots only when the agent advertises support", () => {
+      expect(
+        supportedAdditionalDirectories(
+          { sessionCapabilities: { additionalDirectories: {} } },
+          ["/shared"],
+        ),
+      ).toEqual({ additionalDirectories: ["/shared"] });
+      expect(
+        supportedAdditionalDirectories({ sessionCapabilities: {} }, ["/shared"]),
+      ).toEqual({});
+      expect(
+        supportedAdditionalDirectories(
+          { sessionCapabilities: { additionalDirectories: {} } },
+          [],
+        ),
+      ).toEqual({});
+    });
   });
 
   it("adds Copilot's yolo flag when the Host asks for it", () => {
@@ -142,6 +164,32 @@ describe("toolDetail", () => {
     expect(toolDetail({ rawInput: { command: "npm test -w @fleet/host" } })).toBe(
       "npm test -w @fleet/host",
     );
+  });
+
+  describe("taskCompletionResponse", () => {
+    it("keeps the final response from a resumed CLI session completion tool", () => {
+      expect(
+        taskCompletionResponse({
+          title: "task_complete",
+          rawInput: { summary: "The current branch is `main`." },
+        }),
+      ).toBe("The current branch is `main`.");
+    });
+
+    it("does not expose arbitrary tool inputs as assistant responses", () => {
+      expect(
+        taskCompletionResponse({
+          title: "write_file",
+          rawInput: { summary: "secret", content: "private bytes" },
+        }),
+      ).toBeUndefined();
+      expect(
+        taskCompletionResponse({
+          title: "task_complete",
+          rawInput: { content: "no user-facing summary" },
+        }),
+      ).toBeUndefined();
+    });
   });
 
   it("flattens a wrapped command onto the one line it will be drawn on", () => {

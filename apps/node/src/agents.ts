@@ -21,6 +21,17 @@ export type PermissionDecision = {
   optionId?: string;
 };
 
+/** Restored workspace roots that this ACP agent has declared it can accept. */
+export function supportedAdditionalDirectories(
+  capabilities: acp.AgentCapabilities | undefined,
+  directories: readonly string[],
+): { additionalDirectories?: string[] } {
+  return capabilities?.sessionCapabilities?.additionalDirectories != null &&
+    directories.length > 0
+    ? { additionalDirectories: [...directories] }
+    : {};
+}
+
 /**
  * Which context window Copilot is launched with.
  *
@@ -164,6 +175,8 @@ export type EventSink = (event: SessionEvent) => void;
 export type StartAgentOptions = {
   /** Copilot session id to re-attach to via ACP `session/load`. */
   resumeAgentSessionId?: string;
+  /** Workspace roots that were attached to the original Copilot session. */
+  additionalDirectories?: readonly string[];
   /** First event sequence number to use, so resumed runs keep ordering. */
   sequenceOffset?: number;
   /** Launch Copilot with --allow-all. The Host owns this decision. */
@@ -436,6 +449,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly customAgent = "",
     /** Pickers the Host wants set before the first prompt. Often empty. */
     private readonly startupConfig: readonly StartupConfig[] = [],
+    /** Workspace roots to restore when loading an existing Copilot session. */
+    private readonly additionalDirectories: readonly string[] = [],
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -524,12 +539,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
     this.connection = app.connect(stream);
-    await this.connection.agent.request(acp.methods.agent.initialize, {
-      protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
+    const initialized = await this.connection.agent.request(
+      acp.methods.agent.initialize,
+      {
+        protocolVersion: acp.PROTOCOL_VERSION,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+        },
       },
-    });
+    );
     if (resumeAgentSessionId) {
       this.replaying = true;
       try {
@@ -538,6 +556,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           {
             sessionId: resumeAgentSessionId,
             cwd,
+            ...supportedAdditionalDirectories(
+              initialized.agentCapabilities,
+              this.additionalDirectories,
+            ),
             mcpServers: this.mcpServers(),
           },
         );
@@ -890,6 +912,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         status: update.status,
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
+        ...toolResponsePayload(update),
       });
       return;
     }
@@ -900,6 +923,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         title: update.title,
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
+        ...toolResponsePayload(update),
       });
       return;
     }
@@ -960,6 +984,7 @@ export class AcpAgentFactory implements AgentFactory {
       options.mcpServers ?? [],
       options.agent ?? "",
       options.config ?? [],
+      options.additionalDirectories ?? [],
     );
     try {
       await withCopilotStartupTimeout(
@@ -1207,6 +1232,32 @@ function toolDetailPayload(update: {
 }): { detail?: string } {
   const detail = toolDetail(update);
   return detail ? { detail } : {};
+}
+
+/**
+ * The final answer carried by Copilot's completion tool, when present.
+ *
+ * Some sessions created by Copilot CLI are instructed to finish by calling
+ * `task_complete` with their user-facing response in `summary`. ACP emits no
+ * later agent-message chunk for those turns, so dropping this one field makes a
+ * successful resumed turn look unanswered. No other tool input or output is
+ * copied into the Fleet transcript.
+ */
+export function taskCompletionResponse(update: {
+  title?: string | null;
+  rawInput?: unknown;
+}): string | undefined {
+  if (update.title?.trim().toLowerCase() !== "task_complete") return undefined;
+  if (!update.rawInput || typeof update.rawInput !== "object") return undefined;
+  const summary = (update.rawInput as Record<string, unknown>).summary;
+  return typeof summary === "string" && summary.trim() ? summary : undefined;
+}
+
+function toolResponsePayload(update: { title?: string | null; rawInput?: unknown }): {
+  response?: string;
+} {
+  const response = taskCompletionResponse(update);
+  return response ? { response } : {};
 }
 
 /**

@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
+import { z } from "zod";
 import {
   CreateSessionSchema,
   MAX_ATTACHMENTS_PER_PROMPT,
@@ -7,6 +8,7 @@ import {
   PromptSchema,
   RenameSessionSchema,
   ReorderSessionsSchema,
+  SESSION_NAME_MAX_LENGTH,
   SetSessionConfigSchema,
   base64Bytes,
   errorMessage,
@@ -18,6 +20,15 @@ import { configUnsupportedReason } from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
 
+const AdoptSessionSchema = CreateSessionSchema.pick({
+  placementId: true,
+  yolo: true,
+}).extend({
+  agentSessionId: z.string().min(1).max(500),
+  additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
+  name: z.string().max(SESSION_NAME_MAX_LENGTH).optional(),
+});
+
 /** Session lifecycle: create, prompt, resume, cancel, stop, dismiss. */
 export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
   app,
@@ -25,12 +36,20 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
 ) => {
   const { store } = service;
 
-  app.get("/api/sessions", async () => store.listSessions());
+  app.get("/api/sessions", async (request) => {
+    const sessions = store.listSessions();
+    return request.fleetNodeId
+      ? sessions.filter((session) => session.nodeId === request.fleetNodeId)
+      : sessions;
+  });
 
   app.post("/api/sessions", async (request, reply) => {
     const input = CreateSessionSchema.parse(request.body);
     const placement = store.getPlacement(input.placementId);
     if (!placement) return reply.code(404).send({ error: "Placement not found" });
+    if (request.fleetNodeId && placement.nodeId !== request.fleetNodeId) {
+      return reply.code(403).send({ error: "A node may only start its own sessions" });
+    }
     const result = service.createAndStartSession({
       placement,
       prompt: input.prompt,
@@ -43,6 +62,24 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
         ...(result.session ? { session: result.session } : {}),
       });
     }
+    return reply.code(202).send(result.session);
+  });
+
+  app.post("/api/sessions/adopt", async (request, reply) => {
+    const input = AdoptSessionSchema.parse(request.body);
+    const placement = store.getPlacement(input.placementId);
+    if (!placement) return reply.code(404).send({ error: "Placement not found" });
+    if (request.fleetNodeId && placement.nodeId !== request.fleetNodeId) {
+      return reply.code(403).send({ error: "A node may only resume its own sessions" });
+    }
+    const result = service.adoptAndResumeSession({
+      placement,
+      agentSessionId: input.agentSessionId,
+      additionalDirectories: input.additionalDirectories,
+      yolo: input.yolo ?? store.getDefaultYolo(),
+      ...(input.name === undefined ? {} : { name: input.name }),
+    });
+    if (!result.ok) return reply.code(result.status).send({ error: result.error });
     return reply.code(202).send(result.session);
   });
 

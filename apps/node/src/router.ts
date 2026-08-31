@@ -197,6 +197,21 @@ export class CommandRouter {
   ): Promise<void> {
     try {
       const cwd = await this.validatePath(command.localPath);
+      let additionalDirectories: string[] = [];
+      if (command.type === "resume_session") {
+        const restored = await Promise.allSettled(
+          command.additionalDirectories.map(this.validatePath),
+        );
+        additionalDirectories = restored.flatMap((result) =>
+          result.status === "fulfilled" ? [result.value] : [],
+        );
+        const unavailable = restored.length - additionalDirectories.length;
+        if (unavailable > 0) {
+          this.warn(
+            `session ${command.sessionId.slice(0, 8)}: omitted ${unavailable} unavailable additional workspace root${unavailable === 1 ? "" : "s"}`,
+          );
+        }
+      }
       const sink = (event: SessionEvent) => {
         this.emit(event);
         const state = eventPayload(event, "state")?.state;
@@ -220,6 +235,7 @@ export class CommandRouter {
         command.type === "resume_session"
           ? {
               resumeAgentSessionId: command.agentSessionId,
+              additionalDirectories,
               sequenceOffset: command.sequenceOffset,
               yolo: command.yolo,
               mcpServers,

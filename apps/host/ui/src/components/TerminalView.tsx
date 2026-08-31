@@ -54,6 +54,7 @@ import {
   isResumableSession,
   terminalSessionStates,
   type FleetSession,
+  type SessionState,
   type SessionEvent,
   type PromptAttachment,
 } from "@fleet/protocol";
@@ -979,7 +980,9 @@ export const TerminalView = ({
           {blocks.length === 0 ? (
             <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
           ) : (
-            blocks.map((block) => <TerminalLine block={block} key={block.key} />)
+            blocks.map((block) => (
+              <TerminalLine block={block} sessionState={session.state} key={block.key} />
+            ))
           )}
           {session.state === "running" && <div className={styles.working}>working…</div>}
         </div>
@@ -1131,7 +1134,13 @@ export const TerminalView = ({
  * be bordered cards with a timestamp column, which meant a turn that ran ten
  * tools pushed its own answer off the screen.
  */
-const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBlock }) {
+const TerminalLine = memo(function TerminalLine({
+  block,
+  sessionState,
+}: {
+  block: TerminalBlock;
+  sessionState: SessionState;
+}) {
   const styles = useStyles();
   const time = formatTime(block.createdAt);
 
@@ -1207,21 +1216,30 @@ const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBloc
 
   if (block.kind === "tool") {
     const failed = block.status === "failed";
-    const running = block.status ? runningStatuses.has(block.status) : false;
+    const running =
+      (sessionState === "running" || sessionState === "cancelling") &&
+      Boolean(block.status && runningStatuses.has(block.status));
     const icon = running ? (
-      <SpinnerIos16Regular className={styles.spin} />
+      <SpinnerIos16Regular className={styles.spin} aria-label="Tool running" />
     ) : (
       (toolKindIcons[block.toolKind ?? ""] ?? kindIcons.tool)
     );
     return (
-      <StepRow
-        icon={icon}
-        title={block.text}
-        detail={block.detail}
-        time={time}
-        color={failed ? terminal.error : running ? terminal.tool : undefined}
-        failed={failed}
-      />
+      <div>
+        <StepRow
+          icon={icon}
+          title={block.text}
+          detail={block.detail}
+          time={time}
+          color={failed ? terminal.error : running ? terminal.tool : undefined}
+          failed={failed}
+        />
+        {block.body && block.status === "completed" ? (
+          <div className={styles.message}>
+            <MarkdownBody text={block.body} copyable />
+          </div>
+        ) : null}
+      </div>
     );
   }
 
