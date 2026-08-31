@@ -38,6 +38,7 @@ import {
   eventPayload,
   canTransition,
   isChatsWorkspace,
+  liveSessionStates,
   sessionFieldsForHostImport,
   terminalSessionStates,
   tryParseJson,
@@ -1315,13 +1316,7 @@ export class FleetStore {
       ).get(agentSessionId) as Row | undefined;
       if (existingRow) {
         let session = sessionFromRow(existingRow);
-        const alreadyLive = [
-          "queued",
-          "starting",
-          "running",
-          "idle",
-          "cancelling",
-        ].includes(session.state);
+        const alreadyLive = liveSessionStates.has(session.state);
         if (!alreadyLive) {
           this.statement(
             `UPDATE sessions

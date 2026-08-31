@@ -41,6 +41,9 @@ export function boundedSessionPreview(
   maxItems: number,
   previouslyTruncated: boolean,
 ): SessionPreview {
+  if (maxItems === 0) {
+    return { items: [], truncated: previouslyTruncated || source.length > 0 };
+  }
   const items: Array<{ role: "user" | "assistant"; text: string }> = [];
   let remaining = maxCharacters;
   let truncated = previouslyTruncated || source.length > maxItems;

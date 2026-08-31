@@ -9,6 +9,7 @@ import {
   SELF_UPDATE_CAPABILITY,
   canTransition,
   eventPayload,
+  liveSessionStates,
   nodeUpdateState,
   terminalSessionStates,
   type BrowserMessage,
@@ -330,10 +331,7 @@ export class FleetService {
     const existing = sessions.find(
       (session) => session.agentSessionId === input.agentSessionId,
     );
-    if (
-      existing &&
-      ["queued", "starting", "running", "idle", "cancelling"].includes(existing.state)
-    ) {
+    if (existing && liveSessionStates.has(existing.state)) {
       return {
         ok: false,
         status: 409,

@@ -19,6 +19,14 @@ export const terminalSessionStates = new Set<SessionState>([
   "completed",
   "failed",
 ]);
+/** States backed by an active or reserved Node slot. */
+export const liveSessionStates = new Set<SessionState>([
+  "queued",
+  "starting",
+  "running",
+  "idle",
+  "cancelling",
+]);
 
 /**
  * A Copilot agent definition a Node can put a session into.

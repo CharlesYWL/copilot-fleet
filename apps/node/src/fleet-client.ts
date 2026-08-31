@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { NODE_ID_HEADER, NODE_SECRET_HEADER } from "@fleet/protocol";
+import { NODE_ID_HEADER, NODE_SECRET_HEADER, SessionSchema } from "@fleet/protocol";
 
 /**
  * The subset of a placement this page needs. Declared locally rather than
@@ -22,19 +22,19 @@ const WorkspaceLikeSchema = z.object({
 });
 export type WorkspaceLike = z.infer<typeof WorkspaceLikeSchema>;
 
-const SessionStatusLikeSchema = z.object({
-  id: z.string(),
-  placementId: z.string(),
-  nodeId: z.string(),
-  state: z.string(),
-  agentSessionId: z.string().default(""),
+const SessionStatusLikeSchema = SessionSchema.pick({
+  id: true,
+  placementId: true,
+  nodeId: true,
+  state: true,
+  agentSessionId: true,
 });
 export type SessionStatusLike = z.infer<typeof SessionStatusLikeSchema>;
 
-const StartedSessionSchema = z.object({
-  id: z.string(),
-  state: z.string(),
-  agentSessionId: z.string().default(""),
+const StartedSessionSchema = SessionSchema.pick({
+  id: true,
+  state: true,
+  agentSessionId: true,
 });
 export type StartedSession = z.infer<typeof StartedSessionSchema>;
 

@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { NodeCommand, SessionEvent } from "@fleet/protocol";
 import { CommandRouter } from "./router.js";
 import {
@@ -361,7 +361,7 @@ describe("CommandRouter", () => {
       factory,
       1,
       (event) => events.push(event),
-      async (path) => path,
+      async (path) => `/canonical${path}`,
     );
     const result = await router.route({
       type: "resume_session",
@@ -377,10 +377,57 @@ describe("CommandRouter", () => {
     expect(received).toEqual({
       resume: "copilot-abc",
       offset: 7,
-      additionalDirectories: ["/shared"],
+      additionalDirectories: ["/canonical/shared"],
     });
     expect(prompts).toBe(0);
     expect(events[0]?.sequence).toBe(8);
+  });
+
+  it("omits an unavailable restored workspace root without blocking resume", async () => {
+    const received: Array<readonly string[] | undefined> = [];
+    const start: AgentFactory["start"] = vi.fn(async (_id, _cwd, _sink, options) => {
+      received.push(options?.additionalDirectories);
+      return {
+        async prompt() {},
+        async cancel() {},
+        async stop() {},
+        resolvePermission() {},
+        denyPendingPermissions() {},
+        async setConfigOption() {},
+        busy: false,
+        resync() {},
+      };
+    });
+    const warn = vi.fn();
+    const router = new CommandRouter(
+      { start },
+      1,
+      () => undefined,
+      async (path) => {
+        if (path === "/missing") throw new Error("Workspace path does not exist");
+        return path;
+      },
+      undefined,
+      undefined,
+      warn,
+    );
+
+    const result = await router.route({
+      type: "resume_session",
+      commandId: "r1",
+      sessionId: "s1",
+      localPath: "/one",
+      agentSessionId: "copilot-abc",
+      additionalDirectories: ["/missing"],
+      sequenceOffset: 0,
+      ...START_DEFAULTS,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(received).toEqual([[]]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("omitted 1 unavailable additional workspace root"),
+    );
   });
 
   it("refuses a prompt while a turn is in flight instead of dropping it", async () => {

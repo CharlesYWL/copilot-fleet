@@ -9,6 +9,7 @@ import {
   copilotLaunchArgs,
   copilotSupportsContextTier,
   copilotVersionFromOutput,
+  supportedAdditionalDirectories,
   toolDetail,
   toolProgress,
   taskCompletionResponse,
@@ -22,6 +23,26 @@ afterEach(() => {
 describe("copilotLaunchArgs", () => {
   it("starts ACP over stdio", () => {
     expect(copilotLaunchArgs(false)).toEqual(["--acp", "--stdio"]);
+  });
+
+  describe("supportedAdditionalDirectories", () => {
+    it("sends restored roots only when the agent advertises support", () => {
+      expect(
+        supportedAdditionalDirectories(
+          { sessionCapabilities: { additionalDirectories: {} } },
+          ["/shared"],
+        ),
+      ).toEqual({ additionalDirectories: ["/shared"] });
+      expect(
+        supportedAdditionalDirectories({ sessionCapabilities: {} }, ["/shared"]),
+      ).toEqual({});
+      expect(
+        supportedAdditionalDirectories(
+          { sessionCapabilities: { additionalDirectories: {} } },
+          [],
+        ),
+      ).toEqual({});
+    });
   });
 
   it("adds Copilot's yolo flag when the Host asks for it", () => {

@@ -312,17 +312,51 @@ describe("Copilot session history", () => {
           ],
         });
       }
+      if (path === "/api/sessions/page-one/preview") {
+        return reply({
+          items: [{ role: "assistant", text: "retained preview" }],
+          truncated: false,
+        });
+      }
       return respond(path, init);
     });
     await startPage();
     await vi.waitFor(() => expect($("sessionList").textContent).toContain("First page"));
     document.querySelector('[data-session-id="page-one"]')?.click();
+    $("loadPreview").click();
+    await vi.waitFor(() =>
+      expect($("sessionPreview").textContent).toContain("retained preview"),
+    );
 
     $("sessionMore").click();
     await vi.waitFor(() => expect($("sessionList").textContent).toContain("Second page"));
 
     expect(document.querySelectorAll("[data-session-id]")).toHaveLength(2);
     expect($("sessionStableId").textContent).toBe("page-one");
+    expect($("sessionPreview").textContent).toContain("retained preview");
+  });
+
+  it("explains in the new-session dialog when placements cannot be loaded", async () => {
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/fleet") {
+        return Promise.resolve({
+          ok: false,
+          json: async () => ({ error: "Host unavailable" }),
+        });
+      }
+      return respond(path, init);
+    });
+    await startPage();
+    await vi.waitFor(() =>
+      expect($("newSessionPlacement").dataset.unavailableReason).toBe("Host unavailable"),
+    );
+    $("newSessionDialog").showModal = () => {
+      $("newSessionDialog").open = true;
+    };
+
+    $("newSession").click();
+
+    expect($("newSessionMsg").textContent).toContain("Host unavailable");
   });
 
   it("ignores a context preview that arrives after selection changed", async () => {
@@ -369,14 +403,24 @@ describe("Copilot session history", () => {
       expect($("sessionPreview").textContent).toContain("new selection context"),
     );
 
+    let oldPreviewParsed;
+    const parsed = new Promise((resolve) => {
+      oldPreviewParsed = resolve;
+    });
     finishOldPreview({
       ok: true,
-      json: async () => ({
-        items: [{ role: "assistant", text: "stale context" }],
-        truncated: false,
-      }),
+      json: async () => {
+        oldPreviewParsed();
+        return {
+          items: [{ role: "assistant", text: "stale context" }],
+          truncated: false,
+        };
+      },
     });
-    await Promise.resolve();
+    await parsed;
+    await vi.waitFor(() =>
+      expect($("sessionPreview").textContent).toContain("new selection context"),
+    );
     expect($("sessionPreview").textContent).not.toContain("stale context");
   });
 });

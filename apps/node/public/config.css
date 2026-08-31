@@ -97,8 +97,8 @@ textarea {
   grid-template:
     "header header" auto
     "sidebar nav" auto
-    "sidebar content" minmax(0, 1fr) /
-    minmax(270px, 330px) minmax(0, 1fr);
+    "sidebar content" minmax(0, 1fr)
+    / minmax(270px, 330px) minmax(0, 1fr);
 }
 
 .app-header {
@@ -669,7 +669,7 @@ dialog::backdrop {
   padding: 0;
   margin: -1px;
   overflow: hidden;
-  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
   white-space: nowrap;
   border: 0;
 }
@@ -686,8 +686,8 @@ dialog::backdrop {
       "header" auto
       "sidebar" auto
       "nav" auto
-      "content" minmax(0, 1fr) /
-      minmax(0, 1fr);
+      "content" minmax(0, 1fr)
+      / minmax(0, 1fr);
   }
 
   .session-sidebar {

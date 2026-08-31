@@ -7,25 +7,29 @@ describe("config assets", () => {
     // that tsx and the built dist/ agree on where they are.
     expect(configAsset("/")?.body).toContain("<!doctype html>");
     expect(configAsset("/config.css")?.contentType).toBe("text/css; charset=utf-8");
-    expect(configAsset("/config.js")?.body).toContain("initSessions");
-    expect(configAsset("/sessions.js")?.body).toContain("selectedSessionId");
-    expect(configAsset("/node-settings.js")?.body).toContain("savedSettings");
-    expect(configAsset("/ui.js")?.contentType).toBe("text/javascript; charset=utf-8");
+    for (const path of [
+      "/config.js",
+      "/diagnostics.js",
+      "/fleet-workspaces.js",
+      "/node-settings.js",
+      "/sessions.js",
+      "/ui.js",
+    ]) {
+      const asset = configAsset(path);
+      expect(asset?.contentType).toBe("text/javascript; charset=utf-8");
+      expect(asset?.body.length).toBeGreaterThan(0);
+    }
   });
 
   it("ships the responsive session-management shell", () => {
     const html = configAsset("/")?.body ?? "";
     const css = configAsset("/config.css")?.body ?? "";
-    const script = configAsset("/sessions.js")?.body ?? "";
 
     expect(html).toContain('id="sessionSearch"');
     expect(html).toContain('id="sessionList"');
     expect(html).toContain('id="resumeSession"');
     expect(html).toContain('id="newSessionDialog"');
     expect(css).toContain("@media (max-width: 900px)");
-    expect(script).toContain("selectedSessionId");
-    expect(script).toContain("previewRequest?.abort()");
-    expect(script).toContain("resumedSessionIds");
   });
 
   it("has no path but its own", () => {

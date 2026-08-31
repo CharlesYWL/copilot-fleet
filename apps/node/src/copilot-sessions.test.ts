@@ -44,10 +44,12 @@ function setup(options: {
       getContextTier: () => "default",
       openConnection,
       ...(options.now ? { now: options.now } : {}),
-      ...(options.previewCharacters
+      ...(options.previewCharacters !== undefined
         ? { previewCharacters: options.previewCharacters }
         : {}),
-      ...(options.previewItems ? { previewItems: options.previewItems } : {}),
+      ...(options.previewItems !== undefined
+        ? { previewItems: options.previewItems }
+        : {}),
     }),
     list,
     load,
@@ -170,6 +172,22 @@ describe("CopilotSessionDiscovery", () => {
         { role: "user", text: "er" },
         { role: "assistant", text: "abcdefghij" },
       ],
+      truncated: true,
+    });
+  });
+
+  it("returns no preview items when the configured item limit is zero", async () => {
+    const { discovery } = setup({
+      pages: {
+        "": { sessions: [{ sessionId: "s1", cwd: "/repo", title: "bounded" }] },
+      },
+      replay: [text("agent_message_chunk", "hidden")],
+      previewItems: 0,
+    });
+    await discovery.list();
+
+    await expect(discovery.preview("s1")).resolves.toEqual({
+      items: [],
       truncated: true,
     });
   });

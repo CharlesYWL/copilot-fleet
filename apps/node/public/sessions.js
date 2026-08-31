@@ -7,6 +7,7 @@ export const initSessions = () => {
   let sessionFilter = "all";
   let sessionLoading = false;
   let previewRequest;
+  let previewedSessionId = "";
   const resumedSessionIds = new Set();
 
   const formatDate = (value) => {
@@ -125,15 +126,18 @@ export const initSessions = () => {
         : session.resumeReason || "This session cannot be resumed.",
       session.resumable,
     );
-    $("loadPreview").disabled = false;
-    $("sessionPreview").className = "preview empty";
-    $("sessionPreview").textContent =
-      "Select “Load preview” to inspect recent conversation context.";
+    if (previewedSessionId !== session.id) {
+      $("loadPreview").disabled = false;
+      $("sessionPreview").className = "preview empty";
+      $("sessionPreview").textContent =
+        "Select “Load preview” to inspect recent conversation context.";
+    }
   };
 
   const selectSession = (id) => {
     if (id === selectedSessionId) return;
     selectedSessionId = id;
+    previewedSessionId = "";
     previewRequest?.abort();
     renderSessions();
     renderSelectedSession();
@@ -231,11 +235,13 @@ export const initSessions = () => {
       if (selectedSessionId !== requestedId) return;
       const items = Array.isArray(data.items) ? data.items : [];
       if (!items.length) {
+        previewedSessionId = requestedId;
         view.className = "preview empty";
         view.textContent =
           "Copilot loaded this session, but no text preview is available.";
         return;
       }
+      previewedSessionId = requestedId;
       view.className = "preview";
       view.replaceChildren(
         ...items.map((item) =>
@@ -304,6 +310,8 @@ export const initSessions = () => {
 
   $("newSession").addEventListener("click", () => {
     newSessionDialog.showModal();
+    const unavailableReason = $("newSessionPlacement").dataset.unavailableReason;
+    note("newSessionMsg", unavailableReason || "", !unavailableReason);
     $("newSessionPlacement").focus();
   });
   $("newSessionClose").addEventListener("click", closeNewSession);

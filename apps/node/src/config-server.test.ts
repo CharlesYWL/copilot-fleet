@@ -28,12 +28,12 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
     listOwnSessions: vi.fn(async () => []),
     createOwnSession: vi.fn(async () => ({
       id: "fleet-new",
-      state: "starting",
+      state: "starting" as const,
       agentSessionId: "",
     })),
     adoptOwnSession: vi.fn(async () => ({
       id: "fleet-resumed",
-      state: "starting",
+      state: "starting" as const,
       agentSessionId: "acp-1",
     })),
   };
@@ -372,6 +372,28 @@ describe("config router", () => {
     expect(fleet.adoptOwnSession).not.toHaveBeenCalled();
   });
 
+  it("refuses resume when Copilot cannot load the discovered session", async () => {
+    const session = {
+      id: "legacy-only",
+      cwd: "/tmp/fleet",
+      additionalDirectories: [],
+      loadSupported: false,
+    };
+    const { route, fleet } = router({
+      sessionDiscovery: {
+        list: vi.fn(async () => ({ sessions: [session] })),
+        preview: vi.fn(async () => ({ items: [], truncated: false })),
+        get: vi.fn(() => session),
+      },
+    });
+
+    expect(await route("POST", "/api/sessions/legacy-only/resume", "{}")).toMatchObject({
+      status: 409,
+      body: { code: "unsupported_load" },
+    });
+    expect(fleet.adoptOwnSession).not.toHaveBeenCalled();
+  });
+
   it("creates new sessions only on a placement owned by this node", async () => {
     const { route, fleet } = router();
     const response = await route(
@@ -395,6 +417,16 @@ describe("config router", () => {
         JSON.stringify({ placementId: "theirs", prompt: "no" }),
       ),
     ).toMatchObject({ status: 403 });
+  });
+
+  it("returns a clear 400 for malformed new-session JSON", async () => {
+    const { route, fleet } = router();
+
+    expect(await route("POST", "/api/sessions/new", "{")).toEqual({
+      status: 400,
+      body: { error: "Not valid JSON." },
+    });
+    expect(fleet.createOwnSession).not.toHaveBeenCalled();
   });
 
   it("exports the stored identity", async () => {

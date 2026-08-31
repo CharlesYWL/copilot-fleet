@@ -3,6 +3,7 @@ import { $, el, note, post } from "./ui.js";
 export const initFleetWorkspaces = () => {
   let workspaces = [];
   let placements = [];
+  let fleetLoadError = "";
 
   const workspaceItem = (workspace) =>
     el("div", { className: "item" }, [
@@ -84,6 +85,16 @@ export const initFleetWorkspaces = () => {
       ),
     );
     sessionPlacement.value = selectedPlacement;
+    sessionPlacement.dataset.unavailableReason = placements.length
+      ? ""
+      : fleetLoadError || "Create a placement on this machine before starting a session.";
+    if ($("newSessionDialog").open) {
+      note(
+        "newSessionMsg",
+        sessionPlacement.dataset.unavailableReason,
+        Boolean(placements.length),
+      );
+    }
   };
 
   const loadFleet = async () => {
@@ -93,9 +104,14 @@ export const initFleetWorkspaces = () => {
       if (!response.ok) throw new Error(data.error || "Could not reach the Host");
       workspaces = data.workspaces;
       placements = data.placements;
+      fleetLoadError = "";
       renderFleet();
       note("wsMsg", "", true);
     } catch (error) {
+      workspaces = [];
+      placements = [];
+      fleetLoadError = error.message;
+      renderFleet();
       note("wsMsg", error.message, false);
     }
   };

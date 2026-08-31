@@ -1,6 +1,10 @@
 import { resolve } from "node:path";
 import { z } from "zod";
-import { SESSION_NAME_MAX_LENGTH, errorMessage } from "@fleet/protocol";
+import {
+  SESSION_NAME_MAX_LENGTH,
+  errorMessage,
+  liveSessionStates,
+} from "@fleet/protocol";
 import { CopilotSessionDiscoveryError } from "./copilot-sessions.js";
 import type {
   ConfigReply,
@@ -14,7 +18,6 @@ const NewSessionInputSchema = z.object({
   name: z.string().max(SESSION_NAME_MAX_LENGTH).optional(),
 });
 
-const liveStates = new Set(["queued", "starting", "running", "idle", "cancelling"]);
 const ok = (body: unknown): ConfigReply => ({ status: 200, body });
 const badRequest = (error: string): ConfigReply => ({ status: 400, body: { error } });
 
@@ -59,7 +62,13 @@ export function createSessionRouteHandler(
   return async (method, url, body) => {
     const pathname = url.split("?")[0] ?? url;
     if (method === "POST" && pathname === "/api/sessions/new") {
-      const input = NewSessionInputSchema.safeParse(JSON.parse(body));
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        return badRequest("Not valid JSON.");
+      }
+      const input = NewSessionInputSchema.safeParse(parsed);
       if (!input.success) {
         return badRequest(input.error.issues[0]?.message ?? "Invalid session");
       }
@@ -99,7 +108,7 @@ export function createSessionRouteHandler(
           sessions: page.sessions.map((session) => {
             const placement = placementByPath.get(comparablePath(session.cwd));
             const status = statusByAgentId.get(session.id);
-            const alreadyLive = status && liveStates.has(status.state);
+            const alreadyLive = status && liveSessionStates.has(status.state);
             const resumeReason = !session.loadSupported
               ? "This Copilot version can discover this session but cannot load its context."
               : !placement
@@ -147,6 +156,16 @@ export function createSessionRouteHandler(
         body: { error: "Refresh the Copilot session list before resuming it" },
       };
     }
+    if (!session.loadSupported) {
+      return {
+        status: 409,
+        body: {
+          error:
+            "This Copilot version can discover this session but cannot load its context.",
+          code: "unsupported_load",
+        },
+      };
+    }
     try {
       const [placements, statuses] = await Promise.all([
         fleet.listOwnPlacements(),
@@ -165,7 +184,8 @@ export function createSessionRouteHandler(
         };
       }
       const live = statuses.find(
-        (status) => status.agentSessionId === sessionId && liveStates.has(status.state),
+        (status) =>
+          status.agentSessionId === sessionId && liveSessionStates.has(status.state),
       );
       if (live) {
         return {

@@ -21,6 +21,17 @@ export type PermissionDecision = {
   optionId?: string;
 };
 
+/** Restored workspace roots that this ACP agent has declared it can accept. */
+export function supportedAdditionalDirectories(
+  capabilities: acp.AgentCapabilities | undefined,
+  directories: readonly string[],
+): { additionalDirectories?: string[] } {
+  return capabilities?.sessionCapabilities?.additionalDirectories != null &&
+    directories.length > 0
+    ? { additionalDirectories: [...directories] }
+    : {};
+}
+
 /**
  * Which context window Copilot is launched with.
  *
@@ -528,12 +539,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
     this.connection = app.connect(stream);
-    await this.connection.agent.request(acp.methods.agent.initialize, {
-      protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
+    const initialized = await this.connection.agent.request(
+      acp.methods.agent.initialize,
+      {
+        protocolVersion: acp.PROTOCOL_VERSION,
+        clientCapabilities: {
+          fs: { readTextFile: false, writeTextFile: false },
+        },
       },
-    });
+    );
     if (resumeAgentSessionId) {
       this.replaying = true;
       try {
@@ -542,9 +556,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           {
             sessionId: resumeAgentSessionId,
             cwd,
-            ...(this.additionalDirectories.length > 0
-              ? { additionalDirectories: [...this.additionalDirectories] }
-              : {}),
+            ...supportedAdditionalDirectories(
+              initialized.agentCapabilities,
+              this.additionalDirectories,
+            ),
             mcpServers: this.mcpServers(),
           },
         );
