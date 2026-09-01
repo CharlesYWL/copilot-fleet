@@ -104,7 +104,7 @@ export const OrchestratorPage = ({
     <section className={styles.page} aria-label="Orchestrator">
       <OrchestratorHeader
         summary={summary}
-        canCreateRun={!ended}
+        canCreateRun={!ended && !stopping}
         onNewRun={onNewRun}
         onOpenLead={onOpenLead}
       />
@@ -116,7 +116,7 @@ export const OrchestratorPage = ({
               ? "This orchestrator conversation is stopped. Resume it to continue, or dismiss it when you no longer need the transcript."
               : "Nothing dispatched yet. Ask the orchestrator for something in its conversation, or open a task here and it will plan the phases itself."}
           </p>
-          <Button appearance="primary" disabled={ended} onClick={onNewRun}>
+          <Button appearance="primary" disabled={ended || stopping} onClick={onNewRun}>
             New task
           </Button>
         </div>

@@ -101,6 +101,16 @@ describe("TerminalView composer", () => {
     expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
   });
 
+  it("does not accept a prompt after Stop is requested from an idle session", () => {
+    show({ stopRequested: true });
+    const box = screen.getByLabelText("Follow-up prompt") as HTMLTextAreaElement;
+    expect(box.disabled).toBe(true);
+    expect(box.placeholder).toBe("Stopping this session");
+    expect(
+      (screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
   it("still offers the pickers on a session that cannot be prompted", () => {
     // Switching model is a setting, not a turn, so an agent mid-run is exactly
     // when an operator reaches for it.

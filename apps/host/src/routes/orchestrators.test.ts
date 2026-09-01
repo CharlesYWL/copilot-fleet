@@ -4,6 +4,7 @@ import { ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { orchestratorRoutes } from "./orchestrators.js";
+import { sessionRoutes } from "./sessions.js";
 
 describe("orchestrator lifecycle routes", () => {
   const apps: ReturnType<typeof Fastify>[] = [];
@@ -73,6 +74,7 @@ describe("orchestrator lifecycle routes", () => {
     const app = Fastify({ logger: false });
     apps.push(app);
     await app.register(orchestratorRoutes, { service, engine });
+    await app.register(sessionRoutes, { service });
     await app.ready();
     return {
       app,
@@ -128,6 +130,27 @@ describe("orchestrator lifecycle routes", () => {
     expect(
       dispatch.mock.calls.filter(([, command]) => command.type === "stop"),
     ).toHaveLength(2);
+
+    const newTask = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/runs`,
+      payload: {
+        workspaceId: store.getSession(leadId)!.workspaceId,
+        name: "Too late",
+        objective: "must not start",
+      },
+    });
+    const newPrompt = await app.inject({
+      method: "POST",
+      url: `/api/sessions/${leadId}/prompt`,
+      payload: { prompt: "must not send" },
+    });
+    expect(newTask.statusCode).toBe(409);
+    expect(newPrompt.statusCode).toBe(409);
+    expect(store.listRuns()).toHaveLength(1);
+    expect(
+      dispatch.mock.calls.filter(([, command]) => command.type === "prompt"),
+    ).toHaveLength(0);
   });
 
   it("blocks early resume, then continues only stopped unfinished work once", async () => {

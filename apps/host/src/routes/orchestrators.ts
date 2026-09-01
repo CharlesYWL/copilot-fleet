@@ -260,6 +260,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (!lead || lead.runRole !== "lead" || terminalSessionStates.has(lead.state)) {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
+    if (lead.stopRequested) {
+      return reply.code(409).send({ error: "The orchestrator is stopping" });
+    }
     const workspace = store.getWorkspace(input.workspaceId);
     if (!workspace) return reply.code(404).send({ error: "Workspace not found" });
     const reachable = store

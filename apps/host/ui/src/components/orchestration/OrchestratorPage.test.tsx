@@ -294,6 +294,11 @@ describe("orchestrator views", () => {
 
     const stopping = screen.getByRole("button", { name: "Stopping orchestrator" });
     expect(stopping.hasAttribute("disabled")).toBe(true);
+    expect(
+      screen
+        .getAllByRole("button", { name: "New task" })
+        .every((button) => button.hasAttribute("disabled")),
+    ).toBe(true);
     expect(screen.queryByRole("button", { name: "Resume orchestrator" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
   });

@@ -146,6 +146,9 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       }
       const session = store.getSession(id);
       if (!session) return reply.code(404).send({ error: "Session not found" });
+      if (session.stopRequested) {
+        return reply.code(409).send({ error: "Session is stopping" });
+      }
       if (session.state !== "idle") {
         return reply.code(409).send({ error: "Session must be idle" });
       }

@@ -702,7 +702,7 @@ export const TerminalView = ({
     setAttachError(undefined);
   }, [session.id]);
 
-  const canPrompt = session.state === "idle";
+  const canPrompt = session.state === "idle" && !session.stopRequested;
   const isEnded = terminalSessionStates.has(session.state);
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
   const canResume = Boolean(onResume) && isResumableSession(session);
@@ -1057,9 +1057,11 @@ export const TerminalView = ({
           resize="none"
           aria-label="Follow-up prompt"
           placeholder={
-            canPrompt
-              ? "Send a follow-up prompt. Type / for commands, paste or attach files · Enter sends"
-              : "Available when the session is idle"
+            session.stopRequested
+              ? "Stopping this session"
+              : canPrompt
+                ? "Send a follow-up prompt. Type / for commands, paste or attach files · Enter sends"
+                : "Available when the session is idle"
           }
         />
         {attachError ? (
