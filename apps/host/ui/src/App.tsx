@@ -491,12 +491,20 @@ export function App() {
    * remain here until explicitly dismissed, so Stop never acts like Delete.
    * Only the *choice* of which is open is state.
    */
-  const orchestrators = useMemo(
+  const allOrchestrators = useMemo(
     () =>
       filterOrchestratorConversations(snapshot.sessions).sort((a, b) =>
         b.createdAt.localeCompare(a.createdAt),
       ),
     [snapshot.sessions],
+  );
+  const orchestrators = useMemo(
+    () => allOrchestrators.filter((session) => !session.dismissed),
+    [allOrchestrators],
+  );
+  const dismissedOrchestrators = useMemo(
+    () => allOrchestrators.filter((session) => session.dismissed),
+    [allOrchestrators],
   );
   const liveOrchestrators = useMemo(
     () => orchestrators.filter((session) => !terminalSessionStates.has(session.state)),
@@ -656,7 +664,7 @@ export function App() {
   };
 
   const handleResumeOrchestrator = async (sessionId: string) => {
-    const resumed = await request(`/api/sessions/${sessionId}/resume`, {
+    const resumed = await request(`/api/orchestrators/${sessionId}/resume`, {
       method: "POST",
     });
     if (!resumed.ok) return false;
@@ -674,6 +682,16 @@ export function App() {
       setFocusOpen(false);
     }
     setOpenConversationId((current) => (current === sessionId ? undefined : current));
+    await refresh();
+    return true;
+  };
+
+  const handleRestoreOrchestrator = async (sessionId: string) => {
+    const restored = await request(`/api/orchestrators/${sessionId}/restore`, {
+      method: "POST",
+    });
+    if (!restored.ok) return false;
+    setOpenConversationId(sessionId);
     await refresh();
     return true;
   };
@@ -841,6 +859,7 @@ export function App() {
                   }
                   attentionCount={orchestratorSummary.needsYou}
                   leadSessions={orchestrators}
+                  dismissedLeadSessions={dismissedOrchestrators}
                   waitingPermissions={waitingPermissions}
                   onSelectSession={handleSelectSession}
                   onSelectLeadSession={(sessionId) => {
@@ -849,6 +868,9 @@ export function App() {
                     setOpenConversationId(sessionId);
                     handleSelectSession(sessionId, { kind: "orchestrator" });
                     setNavOpen(false);
+                  }}
+                  onRestoreLeadSession={(sessionId) => {
+                    void handleRestoreOrchestrator(sessionId);
                   }}
                   onNewConversation={() => {
                     void handleStartOrchestrator();

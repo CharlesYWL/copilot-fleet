@@ -1,4 +1,5 @@
 import {
+  ORCHESTRATOR_STOP_REASON,
   terminalRunStates,
   terminalRunStepStates,
   type FleetSession,
@@ -58,6 +59,8 @@ export type RunViewModel = {
   /** The session a permission is waiting on, so the UI can go straight there. */
   attentionSessionId: string;
   liveSteps: number;
+  stoppingSteps?: number;
+  stoppingUnavailable?: boolean;
   completedSteps: number;
   totalSteps: number;
   /** Newest of the run and its steps, so the list can sort by real activity. */
@@ -116,6 +119,9 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
     .map((run) => {
       const steps = input.stepsByRun[run.id] ?? [];
       const live = steps.filter(isLive);
+      const stoppingSessions = steps
+        .map((step) => (step.sessionId ? sessionById.get(step.sessionId) : undefined))
+        .filter((session) => session?.stopRequested);
       const completed = steps.filter((step) => step.state === "succeeded");
       const blocked = steps.find(
         (step) => step.sessionId && blockedSessions.has(step.sessionId),
@@ -160,6 +166,10 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
         attention,
         attentionSessionId: blocked?.sessionId ?? "",
         liveSteps: live.length,
+        stoppingSteps: stoppingSessions.length,
+        stoppingUnavailable: stoppingSessions.some(
+          (session) => session?.state === "offline",
+        ),
         completedSteps: completed.length,
         totalSteps: steps.length,
         latestActivityAt: latestActivity(run, steps),
@@ -189,6 +199,10 @@ export function stageOf(run: Run, steps: readonly RunStep[]): OrchestrationStage
     return steps.length > 0 ? "validation" : "planning";
   }
   return steps.length > 0 ? "implementation" : "planning";
+}
+
+export function isOrchestratorStoppedRun(run: Run): boolean {
+  return run.state === "cancelled" && run.failureReason === ORCHESTRATOR_STOP_REASON;
 }
 
 /**

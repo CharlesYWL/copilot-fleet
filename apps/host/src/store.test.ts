@@ -1095,8 +1095,10 @@ describe("Host backup", () => {
       payload: { agentSessionId: "acp-keep" },
       createdAt: new Date().toISOString(),
     });
+    store.setSessionControls(live.id, { stopRequested: true });
     const stopped = store.createSession(placement, "already done");
     store.transitionSession(stopped.id, "stopped", "done");
+    store.setSessionControls(stopped.id, { dismissed: true });
 
     const backup = store.exportHostBackup({
       enrollmentToken: "move-me",
@@ -1131,8 +1133,12 @@ describe("Host backup", () => {
     expect(importedLive.agentSessionId).toBe("acp-keep");
     expect(importedLive.name).toBe("alpha");
     expect(importedLive.yolo).toBe(true);
+    expect(importedLive.stopRequested).toBe(true);
     expect(restored.listEvents(live.id)).toHaveLength(2);
-    expect(restored.getSession(stopped.id)?.state).toBe("stopped");
+    expect(restored.getSession(stopped.id)).toMatchObject({
+      state: "stopped",
+      dismissed: true,
+    });
   });
 
   it("replaces whatever was already on the destination Host", () => {

@@ -16,7 +16,11 @@ import {
 } from "@fluentui/react-icons";
 import { useState } from "react";
 import type { RunViewModel } from "../../lib/orchestration-view";
-import { failedStepTokens, runStateLabel } from "../../lib/orchestration-view";
+import {
+  failedStepTokens,
+  isOrchestratorStoppedRun,
+  runStateLabel,
+} from "../../lib/orchestration-view";
 import { statusVisuals, type StatusTone } from "../../theme";
 
 export const FAILED_STEP_DISMISS_PREFIX = "fleet.ui.run.failed-step.";
@@ -89,6 +93,13 @@ const rememberDismissedFailures = (runId: string, tokens: readonly string[]) => 
  * which one is blocking an agent right now.
  */
 export function runVisual(model: RunViewModel): Visual {
+  if ((model.stoppingSteps ?? 0) > 0) {
+    return {
+      label: model.stoppingUnavailable ? "Stopping · node offline" : "Stopping",
+      tone: "attention",
+      icon: model.stoppingUnavailable ? PlugDisconnectedRegular : ArrowClockwiseRegular,
+    };
+  }
   if (model.attention === "permission") {
     return {
       label: model.run.state === "awaiting_human" ? "Needs review" : "Needs you",
@@ -109,7 +120,11 @@ export function runVisual(model: RunViewModel): Visual {
     return { label: "Done", tone: "neutral", icon: CheckmarkCircleRegular };
   }
   if (model.run.state === "cancelled") {
-    return { label: "Abandoned", tone: "neutral", icon: CircleRegular };
+    return {
+      label: isOrchestratorStoppedRun(model.run) ? "Stopped" : "Abandoned",
+      tone: "neutral",
+      icon: CircleRegular,
+    };
   }
   if (model.run.state === "failed") {
     return { label: "Failed", tone: "danger", icon: ErrorCircleRegular };

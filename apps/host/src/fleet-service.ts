@@ -377,6 +377,15 @@ export class FleetService {
   ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
+    if (session.stopRequested) {
+      return { ok: false, status: 409, error: "Session is still stopping" };
+    }
+    if (session.dismissed) {
+      return { ok: false, status: 409, error: "Restore the session before resuming it" };
+    }
+    if (liveSessionStates.has(session.state)) {
+      return { ok: false, status: 409, error: "Session is already live" };
+    }
     if (!canTransition(session.state, "starting")) {
       return { ok: false, status: 409, error: "Session is already live" };
     }
@@ -717,6 +726,10 @@ export class FleetService {
       activeSessionIds,
       busySessionIds,
     );
+    for (const session of settled) {
+      if (!session.stopRequested) continue;
+      this.dispatch(nodeId, { type: "stop", sessionId: session.id });
+    }
     this.autoResume(nodeId, settled);
     return settled;
   }
@@ -743,7 +756,13 @@ export class FleetService {
     const node = this.store.getNode(nodeId);
     if (!node) return;
     const candidates = settled
-      .filter((session) => session.state === "failed" && session.agentSessionId)
+      .filter(
+        (session) =>
+          session.state === "failed" &&
+          session.agentSessionId &&
+          !session.stopRequested &&
+          !session.dismissed,
+      )
       // Newest first, by creation: when capacity cannot cover them all, the
       // most recently started work is the likeliest to still matter. Last
       // activity would be the better signal, but reconciliation has just
@@ -840,6 +859,13 @@ export class FleetService {
       }
       const payload = eventPayload(event, "state");
       if (!payload?.state) return;
+      if (session.dismissed && !terminalSessionStates.has(payload.state)) {
+        this.log.warn(
+          { sessionId: session.id, state: payload.state },
+          "Recorded but ignored a live state event for a dismissed session",
+        );
+        return;
+      }
       // A rejected transition would otherwise strand the session in its old
       // state with nothing but a log line to explain it.
       if (!canTransition(session.state, payload.state)) {
@@ -849,13 +875,18 @@ export class FleetService {
         );
         return;
       }
-      this.publishSession(
-        this.store.transitionSession(
-          session.id,
-          payload.state,
-          payload.activity ?? session.currentActivity,
-        ),
+      let updated = this.store.transitionSession(
+        session.id,
+        payload.state,
+        payload.activity ?? session.currentActivity,
       );
+      if (session.stopRequested && terminalSessionStates.has(payload.state)) {
+        updated = this.store.setSessionControls(session.id, { stopRequested: false });
+      }
+      this.publishSession(updated);
+      if (session.stopRequested && !terminalSessionStates.has(payload.state)) {
+        this.dispatch(session.nodeId, { type: "stop", sessionId: session.id });
+      }
     } catch (error) {
       this.log.error({ error, event }, "Rejected session event");
     } finally {
@@ -882,7 +913,12 @@ export class FleetService {
   failFromCommandResult(sessionId: string, reason: string): void {
     const session = this.store.getSession(sessionId);
     if (!session || terminalSessionStates.has(session.state)) return;
-    this.publishSession(this.store.transitionSession(session.id, "failed", reason));
+    this.store.transitionSession(session.id, "failed", reason);
+    this.publishSession(
+      session.stopRequested
+        ? this.store.setSessionControls(session.id, { stopRequested: false })
+        : this.store.getSession(session.id)!,
+    );
   }
 
   /**

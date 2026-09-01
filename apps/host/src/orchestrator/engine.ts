@@ -3,6 +3,7 @@ import {
   canTransitionRunStep,
   eventPayload,
   isWritingCategory,
+  ORCHESTRATOR_STOP_REASON,
   terminalRunStates,
   terminalRunStepStates,
   terminalSessionStates,
@@ -55,6 +56,7 @@ export class OrchestratorEngine {
   handleSessionEvent(event: SessionEvent): void {
     if (event.type === "turn_complete") {
       this.turnComplete.add(event.sessionId);
+      this.reconcileStoppedAttempt(event.sessionId);
       this.tick();
       return;
     }
@@ -68,7 +70,71 @@ export class OrchestratorEngine {
       if (state === "starting" || state === "running") {
         this.turnComplete.delete(event.sessionId);
       }
+      this.reconcileStoppedAttempt(event.sessionId);
       this.tick();
+    }
+  }
+
+  /**
+   * Applies a late, authoritative outcome without reopening a cancelled run.
+   *
+   * Stop wins over new dispatch, but an attempt that genuinely completed at
+   * the same time keeps its success, and a host-reported failure stays failed.
+   * The event-log lookup also reconstructs the completion receipt after a Host
+   * restart instead of depending only on the in-memory set.
+   */
+  private reconcileStoppedAttempt(sessionId: string): void {
+    const step = this.store
+      .listRuns()
+      .filter(
+        (run) =>
+          run.state === "cancelled" && run.failureReason === ORCHESTRATOR_STOP_REASON,
+      )
+      .flatMap((run) => this.store.listRunSteps(run.id))
+      .find(
+        (candidate) =>
+          candidate.sessionId === sessionId && candidate.stoppedByOrchestrator,
+      );
+    if (!step) return;
+    const session = this.store.getSession(sessionId);
+    if (!session) return;
+
+    if (session.state === "failed") {
+      this.store.updateRunStep(step.id, {
+        state: "failed",
+        output: session.currentActivity,
+        stoppedByOrchestrator: false,
+      });
+      this.service.publishRunSteps(step.runId, this.store.listRunSteps(step.runId));
+      return;
+    }
+
+    const completedTurn =
+      this.turnComplete.has(sessionId) ||
+      this.store
+        .listEvents(sessionId)
+        .some(
+          (event) => event.type === "turn_complete" && event.sequence > step.eventSeqFrom,
+        );
+    if (
+      completedTurn &&
+      (session.state === "idle" ||
+        session.state === "completed" ||
+        session.state === "stopped")
+    ) {
+      const output = this.store
+        .listEvents(sessionId)
+        .filter(
+          (event) => event.type === "agent_text" && event.sequence > step.eventSeqFrom,
+        )
+        .map((event) => eventPayload(event, "agent_text")?.text ?? "")
+        .join("");
+      this.store.updateRunStep(step.id, {
+        state: "succeeded",
+        output,
+        stoppedByOrchestrator: false,
+      });
+      this.service.publishRunSteps(step.runId, this.store.listRunSteps(step.runId));
     }
   }
 

@@ -269,7 +269,7 @@ describe("orchestrator views", () => {
   it("keeps a stopped conversation available to resume or dismiss", () => {
     const onResumeOrchestrator = vi.fn();
     const onDismissOrchestrator = vi.fn();
-    page("stage", vi.fn(), undefined, {
+    page("stage", vi.fn(), models([run({ state: "cancelled" })]), {
       conversation: conversation({ state: "stopped" }),
       onResumeOrchestrator,
       onDismissOrchestrator,
@@ -285,6 +285,26 @@ describe("orchestrator views", () => {
 
     expect(onResumeOrchestrator).toHaveBeenCalled();
     expect(onDismissOrchestrator).toHaveBeenCalled();
+  });
+
+  it("shows Stop progress and prevents repeated actions until acknowledgement", () => {
+    page("stage", vi.fn(), undefined, {
+      conversation: conversation({ state: "offline", stopRequested: true }),
+    });
+
+    const stopping = screen.getByRole("button", { name: "Stopping orchestrator" });
+    expect(stopping.hasAttribute("disabled")).toBe(true);
+    expect(screen.queryByRole("button", { name: "Resume orchestrator" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
+  });
+
+  it("still offers Stop when the lead ended before its owned work", () => {
+    page("stage", vi.fn(), undefined, {
+      conversation: conversation({ state: "failed" }),
+    });
+
+    expect(screen.getByRole("button", { name: "Stop orchestrator" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
   });
 
   it("puts what needs a person at the top of its column", () => {

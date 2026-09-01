@@ -303,6 +303,19 @@ export const SessionSchema = z.object({
   runId: z.string().default(""),
   runRole: RunRoleSchema.default(""),
   /**
+   * Persisted control intent, separate from the worker's last observed state.
+   *
+   * A disconnected Node can leave a session `offline` while a stop request is
+   * still outstanding. Keeping the intent separately lets reconnect recovery
+   * reissue the stop instead of incorrectly resuming the session.
+   */
+  stopRequested: z.boolean().optional(),
+  /**
+   * Visibility is not execution state. Dismissed orchestrators retain their
+   * transcript, runs, and late events and can be restored independently.
+   */
+  dismissed: z.boolean().optional(),
+  /**
    * Whether this session was dispatched to read rather than to change things.
    *
    * The kind lives on the step's `category`, but capacity is decided from
@@ -1106,6 +1119,8 @@ export const RunStepSchema = z.object({
    * the first one's work back to the Lead.
    */
   eventSeqFrom: z.number().int().nonnegative().default(0),
+  /** This attempt was unfinished when its owning orchestrator was stopped. */
+  stoppedByOrchestrator: z.boolean().optional(),
   attempts: z.number().int().nonnegative().default(0),
   /** Which phase of its task this step was dispatched in. */
   phaseIndex: z.number().int().nonnegative().default(0),
@@ -1116,6 +1131,9 @@ export const RunStepSchema = z.object({
   updatedAt: z.string().datetime(),
 });
 export type RunStep = z.infer<typeof RunStepSchema>;
+
+/** Persisted reason that identifies work cancelled by an orchestration Stop. */
+export const ORCHESTRATOR_STOP_REASON = "Stopped with orchestrator";
 
 /** A line the orchestrator wrote as a phase ended, for the person to read. */
 export const RunNoteSchema = z.object({

@@ -1,6 +1,7 @@
 import { Button, makeStyles, tokens } from "@fluentui/react-components";
 import {
   isResumableSession,
+  terminalRunStates,
   terminalSessionStates,
   type FleetSession,
 } from "@fleet/protocol";
@@ -93,7 +94,11 @@ export const OrchestratorPage = ({
 }: OrchestratorPageProps) => {
   const styles = useStyles();
   const ended = terminalSessionStates.has(conversation.state);
-  const resumable = isResumableSession(conversation);
+  const stopping = Boolean(conversation.stopRequested);
+  const hasActiveWork = models.some(
+    (model) => !terminalRunStates.has(model.run.state) || (model.stoppingSteps ?? 0) > 0,
+  );
+  const resumable = isResumableSession(conversation) && !stopping;
 
   return (
     <section className={styles.page} aria-label="Orchestrator">
@@ -145,7 +150,7 @@ export const OrchestratorPage = ({
       )}
 
       <div className={styles.footer}>
-        {ended ? (
+        {ended && !stopping && !hasActiveWork ? (
           <>
             {resumable && (
               <Button size="small" appearance="primary" onClick={onResumeOrchestrator}>
@@ -157,8 +162,13 @@ export const OrchestratorPage = ({
             </Button>
           </>
         ) : (
-          <Button size="small" appearance="subtle" onClick={onStopOrchestrator}>
-            Stop orchestrator
+          <Button
+            size="small"
+            appearance="subtle"
+            disabled={stopping}
+            onClick={onStopOrchestrator}
+          >
+            {stopping ? "Stopping orchestrator" : "Stop orchestrator"}
           </Button>
         )}
       </div>

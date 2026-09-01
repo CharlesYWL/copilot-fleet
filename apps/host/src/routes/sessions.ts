@@ -246,11 +246,14 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (terminalSessionStates.has(session.state)) {
       return reply.code(200).send({ ok: true, alreadyTerminal: true });
     }
-    const dispatched = service.dispatch(
-      session.nodeId,
-      { type: "stop", sessionId: id },
-      { state: "stopped", activity: "Stopped while offline" },
-    );
+    if (session.stopRequested) {
+      return reply.code(200).send({ ok: true, alreadyStopping: true });
+    }
+    service.publishSession(store.setSessionControls(id, { stopRequested: true }));
+    const dispatched = service.dispatch(session.nodeId, {
+      type: "stop",
+      sessionId: id,
+    });
     return reply.code(dispatched.sent ? 202 : 200).send({ ok: true });
   });
 

@@ -40,6 +40,7 @@ import {
   isChatsWorkspace,
   liveSessionStates,
   sessionFieldsForHostImport,
+  terminalRunStates,
   terminalSessionStates,
   tryParseJson,
   tunnelProviders,
@@ -239,6 +240,8 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "run_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "run_role", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "read_only", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("sessions", "stop_requested", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("sessions", "dismissed", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing(
       "sessions",
       "last_lead_prompt_at",
@@ -251,6 +254,11 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "success_criteria", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "stop_when", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing(
+      "run_steps",
+      "stopped_by_orchestrator",
+      "INTEGER NOT NULL DEFAULT 0",
+    );
     this.addColumnIfMissing("workspaces", "kind", "TEXT NOT NULL DEFAULT 'project'");
     this.ensureChatsWorkspace();
     this.rebuildSessionStateFromEvents();
@@ -658,8 +666,9 @@ export class FleetStore {
           `INSERT INTO sessions
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
-             config_options,position,run_id,run_role,additional_directories)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             config_options,position,run_id,run_role,additional_directories,
+             stop_requested,dismissed)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           session.id,
           session.workspaceId,
@@ -680,6 +689,8 @@ export class FleetStore {
           session.runId,
           session.runRole,
           JSON.stringify(session.additionalDirectories ?? []),
+          session.stopRequested ? 1 : 0,
+          session.dismissed ? 1 : 0,
         );
       }
       for (const event of parsed.events) {
@@ -728,9 +739,9 @@ export class FleetStore {
         this.statement(
           `INSERT INTO run_steps
             (id,run_id,step_key,title,prompt,category,depends_on,state,session_id,
-             placement_id,output,event_seq_from,attempts,phase_index,dispatched_at,position,
-             created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             placement_id,output,event_seq_from,stopped_by_orchestrator,attempts,
+             phase_index,dispatched_at,position,created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           step.id,
           step.runId,
@@ -744,6 +755,7 @@ export class FleetStore {
           step.placementId,
           step.output,
           step.eventSeqFrom,
+          step.stoppedByOrchestrator ? 1 : 0,
           step.attempts,
           step.phaseIndex,
           step.dispatchedAt,
@@ -1554,6 +1566,60 @@ export class FleetStore {
   }
 
   /**
+   * Makes a run unschedulable and records all unfinished steps in one commit.
+   *
+   * The run row is the scheduler gate, while the step marker is what Resume
+   * later uses. Keeping them in one SQLite transaction means a Host restart
+   * cannot observe only half of an accepted orchestration Stop.
+   */
+  cancelRunWithUnfinishedSteps(
+    id: string,
+    reason: string,
+    stoppedByOrchestrator: boolean,
+  ): Run | undefined {
+    const run = this.getRun(id);
+    if (!run || terminalRunStates.has(run.state)) return run;
+    return this.transaction(() => {
+      const now = new Date().toISOString();
+      this.statement(
+        "UPDATE runs SET state='cancelled',failure_reason=?,updated_at=? WHERE id=?",
+      ).run(reason, now, id);
+      this.statement(
+        `UPDATE run_steps
+         SET state='cancelled',stopped_by_orchestrator=?,updated_at=?
+         WHERE run_id=? AND state NOT IN ('succeeded','failed','skipped','cancelled')`,
+      ).run(stoppedByOrchestrator ? 1 : 0, now, id);
+      return this.getRun(id)!;
+    });
+  }
+
+  /**
+   * Reopens exactly the steps marked by the matching orchestration Stop.
+   *
+   * Returns undefined for a repeated Resume or for a run cancelled by another
+   * operation. The step reset and run transition commit together so recovery
+   * never sees a live run whose resumable steps are still terminal.
+   */
+  resumeOrchestratorStoppedRun(id: string, stopReason: string): Run | undefined {
+    const run = this.getRun(id);
+    if (!run || run.state !== "cancelled" || run.failureReason !== stopReason) {
+      return undefined;
+    }
+    return this.transaction(() => {
+      const now = new Date().toISOString();
+      this.statement(
+        `UPDATE run_steps
+         SET state='pending',stopped_by_orchestrator=0,dispatched_at='',updated_at=?
+         WHERE run_id=? AND stopped_by_orchestrator=1`,
+      ).run(now, id);
+      this.statement(
+        "UPDATE runs SET state='running',failure_reason='',updated_at=? WHERE id=?",
+      ).run(now, id);
+      return this.getRun(id)!;
+    });
+  }
+
+  /**
    * Advances the settle counter.
    *
    * Counters rather than timestamps because "wake the Lead exactly once per
@@ -1597,7 +1663,7 @@ export class FleetStore {
         `UPDATE run_steps
          SET title=?,prompt=?,category=?,depends_on=?,state='pending',
              attempts=attempts+1,session_id='',placement_id=?,output='',
-             dispatched_at='',phase_index=?,updated_at=?
+             dispatched_at='',stopped_by_orchestrator=0,phase_index=?,updated_at=?
          WHERE id=?`,
       ).run(
         input.title,
@@ -1713,7 +1779,13 @@ export class FleetStore {
     patch: Partial<
       Pick<
         RunStep,
-        "state" | "sessionId" | "placementId" | "output" | "eventSeqFrom" | "dispatchedAt"
+        | "state"
+        | "sessionId"
+        | "placementId"
+        | "output"
+        | "eventSeqFrom"
+        | "stoppedByOrchestrator"
+        | "dispatchedAt"
       >
     >,
   ): RunStep | undefined {
@@ -1724,6 +1796,12 @@ export class FleetStore {
       placement_id: patch.placementId,
       output: patch.output,
       event_seq_from: patch.eventSeqFrom,
+      stopped_by_orchestrator:
+        patch.stoppedByOrchestrator === undefined
+          ? undefined
+          : patch.stoppedByOrchestrator
+            ? 1
+            : 0,
       dispatched_at: patch.dispatchedAt,
     };
     const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
@@ -1789,6 +1867,37 @@ export class FleetStore {
     return this.getSession(id)!;
   }
 
+  setSessionControls(
+    id: string,
+    controls: { stopRequested?: boolean; dismissed?: boolean },
+  ): FleetSession {
+    const current = this.getSession(id);
+    if (!current) throw new Error("Session not found");
+    this.statement(
+      `UPDATE sessions
+       SET stop_requested=?,dismissed=?,updated_at=?
+       WHERE id=?`,
+    ).run(
+      controls.stopRequested === undefined
+        ? current.stopRequested
+          ? 1
+          : 0
+        : controls.stopRequested
+          ? 1
+          : 0,
+      controls.dismissed === undefined
+        ? current.dismissed
+          ? 1
+          : 0
+        : controls.dismissed
+          ? 1
+          : 0,
+      new Date().toISOString(),
+      id,
+    );
+    return this.getSession(id)!;
+  }
+
   /** Soft disconnect: sessions stay recoverable if the Node still has them. */
   markNodeSessionsOffline(nodeId: string, activity: string): FleetSession[] {
     const ids = this.sessionIdsWhere(
@@ -1826,7 +1935,7 @@ export class FleetStore {
     // Runs on every heartbeat, so it must not walk the session table: the
     // filter is an indexed lookup and the common answer is an empty list.
     const rows = this.statement(
-      "SELECT id,agent_session_id FROM sessions WHERE node_id=? AND state=?",
+      "SELECT id,agent_session_id,stop_requested FROM sessions WHERE node_id=? AND state=?",
     ).all(nodeId, "offline") as Row[];
     return rows.map((row) => {
       const id = String(row.id);
@@ -1834,6 +1943,14 @@ export class FleetStore {
         return busy.has(id)
           ? this.transitionSession(id, "running", "Reconnected to node; still working")
           : this.transitionSession(id, "idle", "Reconnected to node");
+      }
+      if (row.stop_requested) {
+        this.transitionSession(
+          id,
+          "stopped",
+          "Node confirmed the session is no longer active",
+        );
+        return this.setSessionControls(id, { stopRequested: false });
       }
       return this.transitionSession(
         id,
@@ -2082,6 +2199,8 @@ function sessionFromRow(row: Row): FleetSession {
     configOptions: parseJsonList(row.config_options),
     runId: String(row.run_id ?? ""),
     runRole: String(row.run_role ?? ""),
+    stopRequested: Boolean(row.stop_requested),
+    dismissed: Boolean(row.dismissed),
     readOnly: Boolean(row.read_only),
   });
 }
@@ -2131,6 +2250,7 @@ function runStepFromRow(row: Row): RunStep {
     placementId: String(row.placement_id ?? ""),
     output: String(row.output ?? ""),
     eventSeqFrom: Number(row.event_seq_from ?? 0),
+    stoppedByOrchestrator: Boolean(row.stopped_by_orchestrator),
     attempts: Number(row.attempts ?? 0),
     phaseIndex: Number(row.phase_index ?? 0),
     dispatchedAt: String(row.dispatched_at ?? ""),
