@@ -29,61 +29,125 @@ import { useMemo, useState } from "react";
 import { statusVisuals } from "../theme";
 
 const useStyles = makeStyles({
-  bell: { position: "relative" },
+  bell: {
+    minWidth: "auto",
+    gap: "5px",
+    ...shorthands.padding("4px", "8px"),
+  },
   count: {
-    position: "absolute",
-    insetInlineEnd: "-4px",
-    insetBlockStart: "-5px",
-    minWidth: "17px",
-    height: "17px",
-    padding: "0 4px",
-    borderRadius: "9px",
-    background: statusVisuals.danger.foreground,
-    color: tokens.colorNeutralForegroundInverted,
-    fontSize: "10px",
-    fontWeight: tokens.fontWeightBold,
-    lineHeight: "17px",
-    textAlign: "center",
+    color: statusVisuals.danger.foreground,
+    fontSize: tokens.fontSizeBase300,
+    fontWeight: tokens.fontWeightSemibold,
     fontVariantNumeric: "tabular-nums",
     pointerEvents: "none",
   },
   panel: {
-    width: "min(420px, calc(100vw - 24px))",
+    width: "min(440px, calc(100vw - 20px))",
     maxHeight: "min(620px, calc(100vh - 80px))",
     padding: 0,
     display: "flex",
     flexDirection: "column",
     overflow: "hidden",
+    borderRadius: tokens.borderRadiusLarge,
+    boxShadow: tokens.shadow16,
   },
   header: {
     display: "flex",
     alignItems: "center",
-    gap: "8px",
-    padding: "12px 14px",
+    gap: "12px",
+    padding: "14px 16px",
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+    background: tokens.colorNeutralBackground2,
   },
-  heading: { flexGrow: 1, fontWeight: tokens.fontWeightSemibold },
+  headerCopy: {
+    flexGrow: 1,
+    minWidth: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: "10px",
+  },
+  headerIcon: {
+    width: "32px",
+    height: "32px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    flexShrink: 0,
+    borderRadius: tokens.borderRadiusCircular,
+    background: tokens.colorBrandBackground2,
+    color: tokens.colorBrandForeground1,
+  },
+  headerText: {
+    minWidth: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: "1px",
+  },
+  heading: {
+    fontSize: tokens.fontSizeBase400,
+    fontWeight: tokens.fontWeightSemibold,
+    lineHeight: tokens.lineHeightBase400,
+  },
+  summary: {
+    color: tokens.colorNeutralForeground3,
+    fontSize: tokens.fontSizeBase200,
+  },
   list: {
     margin: 0,
     padding: 0,
     listStyle: "none",
     overflowY: "auto",
+    background: tokens.colorNeutralBackground1,
   },
   empty: {
-    padding: "36px 24px",
+    minHeight: "190px",
+    padding: "32px 24px",
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: "8px",
     textAlign: "center",
     color: tokens.colorNeutralForeground3,
+  },
+  emptyIcon: {
+    width: "40px",
+    height: "40px",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: "2px",
+    borderRadius: tokens.borderRadiusCircular,
+    background: tokens.colorNeutralBackground3,
+    color: tokens.colorNeutralForeground2,
+  },
+  emptyTitle: {
+    color: tokens.colorNeutralForeground1,
+    fontWeight: tokens.fontWeightSemibold,
+  },
+  emptyBody: {
+    maxWidth: "260px",
+    fontSize: tokens.fontSizeBase200,
+    lineHeight: tokens.lineHeightBase300,
   },
   item: {
     display: "grid",
     gridTemplateColumns: "1fr auto",
-    gap: "4px",
-    padding: "10px 10px 10px 14px",
+    gap: "8px",
+    padding: "12px 10px 12px 16px",
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
     background: tokens.colorNeutralBackground1,
+    transitionProperty: "background-color",
+    transitionDuration: tokens.durationFaster,
+    "&:hover": {
+      background: tokens.colorNeutralBackground1Hover,
+    },
+    "&:hover > span, &:focus-within > span": {
+      opacity: 1,
+    },
   },
   unread: {
-    background: tokens.colorNeutralBackground1Hover,
+    background: tokens.colorBrandBackground2,
     boxShadow: `inset 3px 0 ${tokens.colorBrandStroke1}`,
   },
   main: {
@@ -91,14 +155,19 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     alignItems: "stretch",
-    gap: "5px",
-    padding: "2px 4px",
+    gap: "6px",
+    padding: "1px 4px 1px 0",
+    ...shorthands.borderRadius(tokens.borderRadiusMedium),
     ...shorthands.borderStyle("none"),
     background: "transparent",
     color: "inherit",
     font: "inherit",
     textAlign: "left",
     cursor: "pointer",
+    "&:focus-visible": {
+      outline: `2px solid ${tokens.colorStrokeFocus2}`,
+      outlineOffset: "2px",
+    },
   },
   titleRow: {
     display: "flex",
@@ -106,11 +175,25 @@ const useStyles = makeStyles({
     gap: "7px",
   },
   indicator: { flexShrink: 0, marginTop: "2px" },
-  title: { flexGrow: 1, minWidth: 0, fontWeight: tokens.fontWeightSemibold },
+  title: {
+    flexGrow: 1,
+    minWidth: 0,
+    fontWeight: tokens.fontWeightSemibold,
+    lineHeight: tokens.lineHeightBase300,
+  },
+  openIcon: {
+    flexShrink: 0,
+    marginTop: "1px",
+    color: tokens.colorNeutralForeground4,
+  },
   body: {
     color: tokens.colorNeutralForeground2,
     fontSize: tokens.fontSizeBase200,
     lineHeight: "1.45",
+    display: "-webkit-box",
+    WebkitLineClamp: 2,
+    WebkitBoxOrient: "vertical",
+    overflow: "hidden",
   },
   meta: {
     display: "flex",
@@ -124,15 +207,27 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     gap: "2px",
+    opacity: 0.45,
+    transitionProperty: "opacity",
+    transitionDuration: tokens.durationFaster,
+    "@media (max-width: 767px)": { opacity: 1 },
   },
   resolved: {
     background: tokens.colorNeutralBackground2,
+    color: tokens.colorNeutralForeground2,
   },
   footer: {
     display: "flex",
-    justifyContent: "flex-end",
-    padding: "8px 12px",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "12px",
+    padding: "10px 12px 10px 16px",
     borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
+    background: tokens.colorNeutralBackground2,
+  },
+  footerLabel: {
+    color: tokens.colorNeutralForeground3,
+    fontSize: tokens.fontSizeBase200,
   },
   warning: { color: statusVisuals.attention.foreground },
   error: { color: statusVisuals.danger.foreground },
@@ -253,7 +348,15 @@ export const NotificationCenter = ({
       </PopoverTrigger>
       <PopoverSurface className={styles.panel} aria-label="Notifications">
         <div className={styles.header}>
-          <Text className={styles.heading}>Notifications</Text>
+          <div className={styles.headerCopy}>
+            <span className={styles.headerIcon} aria-hidden="true">
+              <Alert20Regular />
+            </span>
+            <span className={styles.headerText}>
+              <Text className={styles.heading}>Notifications</Text>
+              <Text className={styles.summary}>{unreadLabel}</Text>
+            </span>
+          </div>
           <Button
             appearance="subtle"
             size="small"
@@ -264,7 +367,15 @@ export const NotificationCenter = ({
           </Button>
         </div>
         {ordered.length === 0 ? (
-          <div className={styles.empty}>No notifications yet.</div>
+          <div className={styles.empty}>
+            <span className={styles.emptyIcon} aria-hidden="true">
+              <Checkmark16Regular />
+            </span>
+            <Text className={styles.emptyTitle}>No notifications yet.</Text>
+            <Text className={styles.emptyBody}>
+              Updates that need your attention will appear here.
+            </Text>
+          </div>
         ) : (
           <ul className={styles.list}>
             {ordered.map((notification) => {
@@ -311,7 +422,7 @@ export const NotificationCenter = ({
                         {severityIcon(notification.severity, resolved)}
                       </span>
                       <span className={styles.title}>{title}</span>
-                      <Open16Regular aria-hidden="true" />
+                      <Open16Regular className={styles.openIcon} aria-hidden="true" />
                     </span>
                     {body && <span className={styles.body}>{body}</span>}
                     <span className={styles.meta}>
@@ -360,8 +471,9 @@ export const NotificationCenter = ({
           </ul>
         )}
         <div className={styles.footer}>
+          <Text className={styles.footerLabel}>Desktop notifications</Text>
           <Button
-            appearance="subtle"
+            appearance={browserEnabled ? "secondary" : "subtle"}
             size="small"
             aria-pressed={browserEnabled}
             onClick={onToggleBrowser}

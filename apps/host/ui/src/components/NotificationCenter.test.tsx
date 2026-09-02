@@ -63,7 +63,7 @@ const open = (unreadCount: number) =>
   );
 
 describe("NotificationCenter", () => {
-  it("hides the numeric badge at zero and shows it above zero", () => {
+  it("hides the inline count at zero and shows it above zero", () => {
     const { rerender } = render(
       <FluentProvider theme={fleetDarkTheme}>
         <NotificationCenter
