@@ -55,6 +55,7 @@ const show = (
         onPrompt={vi.fn()}
         onCancel={vi.fn()}
         onStop={vi.fn()}
+        onResume={vi.fn()}
         onPermission={vi.fn()}
         onConfigChange={vi.fn()}
         draft={draft}
@@ -109,6 +110,18 @@ describe("TerminalView composer", () => {
     expect(
       (screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled,
     ).toBe(true);
+  });
+
+  it("does not offer Resume while Stop acknowledgement is pending", () => {
+    show({ state: "offline", stopRequested: true });
+
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+
+  it("offers Resume after an offline session has finished stopping", () => {
+    show({ state: "offline", stopRequested: false });
+
+    expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
   });
 
   it("still offers the pickers on a session that cannot be prompted", () => {

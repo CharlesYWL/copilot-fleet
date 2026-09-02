@@ -707,7 +707,8 @@ export const TerminalView = ({
   const canPrompt = session.state === "idle" && !session.stopRequested;
   const isEnded = terminalSessionStates.has(session.state);
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
-  const canResume = Boolean(onResume) && isResumableSession(session);
+  const canResume =
+    Boolean(onResume) && !session.stopRequested && isResumableSession(session);
 
   const query = slashQuery(prompt);
   const matches = useMemo(

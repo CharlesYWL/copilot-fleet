@@ -288,8 +288,52 @@ describe("orchestrator task lifecycle", () => {
       type: "stop",
       sessionId: session.id,
     });
+    service.reconcile(session.nodeId, [session.id], [session.id]);
+    expect(
+      dispatch.mock.calls.filter(([, command]) => command.type === "stop"),
+    ).toHaveLength(1);
 
     store.markNodeSessionsOffline(session.nodeId, "Disconnected again");
+    service.reconcile(session.nodeId, []);
+    expect(store.getSession(session.id)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+  });
+
+  it("clears stale Stop intent from a terminal session without redispatching", () => {
+    const { store, service } = fleet();
+    const placement = store.listPlacements()[0]!;
+    const session = store.createSession(placement, "work");
+    store.transitionSession(session.id, "stopped");
+    store.setSessionControls(session.id, { stopRequested: true });
+    const dispatch = vi.spyOn(service, "dispatch");
+
+    service.reconcile(session.nodeId, [session.id]);
+
+    expect(store.getSession(session.id)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("settles a persisted Stop when a non-offline session disappears", () => {
+    const { store, service } = fleet();
+    const placement = store.listPlacements()[0]!;
+    const session = store.createSession(placement, "work");
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "running");
+    store.setSessionControls(session.id, { stopRequested: true });
+    const dispatch = vi.spyOn(service, "dispatch");
+
+    service.reconcile(session.nodeId, [session.id], [session.id]);
+    expect(store.getSession(session.id)).toMatchObject({
+      state: "running",
+      stopRequested: true,
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+
     service.reconcile(session.nodeId, []);
     expect(store.getSession(session.id)).toMatchObject({
       state: "stopped",
