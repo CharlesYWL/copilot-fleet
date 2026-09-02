@@ -290,6 +290,17 @@ type NotificationGroup = {
   notifications: Notification[];
 };
 
+type NotificationAction = (id: string) => void | Promise<unknown>;
+
+async function applySequentially(
+  notifications: readonly Notification[],
+  action: NotificationAction,
+): Promise<void> {
+  for (const notification of notifications) {
+    await action(notification.id);
+  }
+}
+
 function notificationGroupKey(notification: Notification): string {
   if (notification.kind === "agent_completion" || notification.kind === "agent_failure") {
     const sessionId =
@@ -307,10 +318,10 @@ export type NotificationCenterProps = {
   browserEnabled: boolean;
   onToggleBrowser: () => void;
   onNavigate: (notification: Notification) => void;
-  onMarkRead: (id: string) => void;
+  onMarkRead: NotificationAction;
   onMarkAllRead: () => void;
   onDismissAll: () => void;
-  onDismiss: (id: string) => void;
+  onDismiss: NotificationAction;
 };
 
 export const NotificationCenter = ({
@@ -434,11 +445,16 @@ export const NotificationCenter = ({
                     className={styles.main}
                     aria-label={`Open ${title}`}
                     onClick={() => {
-                      for (const item of unreadNotifications) {
-                        if (item.id !== notification.id) onMarkRead(item.id);
-                      }
-                      onNavigate(notification);
-                      setOpen(false);
+                      void (async () => {
+                        await applySequentially(
+                          unreadNotifications.filter(
+                            (item) => item.id !== notification.id,
+                          ),
+                          onMarkRead,
+                        );
+                        onNavigate(notification);
+                        setOpen(false);
+                      })();
                     }}
                   >
                     <span className={styles.titleRow}>
@@ -496,9 +512,7 @@ export const NotificationCenter = ({
                           icon={<Checkmark16Regular />}
                           aria-label={`Mark ${title} read`}
                           onClick={() => {
-                            for (const item of unreadNotifications) {
-                              onMarkRead(item.id);
-                            }
+                            void applySequentially(unreadNotifications, onMarkRead);
                           }}
                         />
                       </Tooltip>
@@ -510,9 +524,7 @@ export const NotificationCenter = ({
                         icon={<Dismiss16Regular />}
                         aria-label={`Dismiss ${title}`}
                         onClick={() => {
-                          for (const item of group.notifications) {
-                            onDismiss(item.id);
-                          }
+                          void applySequentially(group.notifications, onDismiss);
                         }}
                       />
                     </Tooltip>

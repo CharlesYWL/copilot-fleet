@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { describe, expect, it, vi } from "vitest";
 import type { Notification } from "@fleet/protocol";
@@ -138,7 +138,7 @@ describe("NotificationCenter", () => {
     expect(within(items[1]!).getByText("Title old")).toBeTruthy();
   });
 
-  it("marks one or all read, dismisses, and navigates from the item", () => {
+  it("marks one or all read, dismisses, and navigates from the item", async () => {
     const unread = notification("unread", "2026-09-01T19:00:00.000Z");
     const read = notification("read", "2026-09-01T18:00:00.000Z", {
       readAt: "2026-09-01T18:30:00.000Z",
@@ -156,7 +156,7 @@ describe("NotificationCenter", () => {
     expect(props.onMarkRead).toHaveBeenCalledWith("unread");
     expect(props.onMarkAllRead).toHaveBeenCalledTimes(1);
     expect(props.onDismiss).toHaveBeenCalledWith("unread");
-    expect(props.onNavigate).toHaveBeenCalledWith(unread);
+    await waitFor(() => expect(props.onNavigate).toHaveBeenCalledWith(unread));
   });
 
   it("clears every notification through the bulk action", () => {
@@ -170,7 +170,7 @@ describe("NotificationCenter", () => {
     expect(onDismissAll).toHaveBeenCalledTimes(1);
   });
 
-  it("aggregates repeated lifecycle messages by agent", () => {
+  it("aggregates repeated lifecycle messages by agent", async () => {
     const first = notification("first", "2026-09-01T18:00:00.000Z", {
       category: "agent_lifecycle",
       kind: "agent_completion",
@@ -207,8 +207,49 @@ describe("NotificationCenter", () => {
         name: "Mark Router cleanup completed a turn read",
       }),
     );
-    expect(props.onMarkRead).toHaveBeenCalledWith("first");
-    expect(props.onMarkRead).toHaveBeenCalledWith("second");
+    await waitFor(() => expect(props.onMarkRead).toHaveBeenCalledTimes(2));
+    expect(props.onMarkRead).toHaveBeenNthCalledWith(1, "second");
+    expect(props.onMarkRead).toHaveBeenNthCalledWith(2, "first");
+  });
+
+  it("serializes grouped mutations and finishes older reads before navigation", async () => {
+    let releaseRead!: () => void;
+    const firstRead = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    const onMarkRead = vi
+      .fn()
+      .mockImplementationOnce(() => firstRead)
+      .mockResolvedValue(undefined);
+    const onNavigate = vi.fn();
+    const first = notification("first", "2026-09-01T18:00:00.000Z", {
+      category: "agent_lifecycle",
+      kind: "agent_completion",
+      navigation: { type: "session", sessionId: "session-1" },
+      data: { sessionId: "session-1" },
+    });
+    const second = notification("second", "2026-09-01T19:00:00.000Z", {
+      category: "agent_lifecycle",
+      kind: "agent_completion",
+      navigation: { type: "session", sessionId: "session-1" },
+      data: { sessionId: "session-1" },
+    });
+    show([first, second], 2, { onMarkRead, onNavigate });
+    open(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Mark Title second read" }));
+    expect(onMarkRead).toHaveBeenCalledTimes(1);
+    expect(onMarkRead).toHaveBeenCalledWith("second");
+    releaseRead();
+    await waitFor(() => expect(onMarkRead).toHaveBeenCalledTimes(2));
+    expect(onMarkRead).toHaveBeenNthCalledWith(2, "first");
+
+    onMarkRead.mockClear();
+    onMarkRead.mockImplementationOnce(() => firstRead);
+    fireEvent.click(screen.getByRole("button", { name: "Open Title second" }));
+    await waitFor(() => expect(onNavigate).toHaveBeenCalledWith(second));
+    expect(onMarkRead).toHaveBeenCalledTimes(1);
+    expect(onMarkRead).toHaveBeenCalledWith("first");
   });
 
   it("renders resolved permission and review items as no longer actionable", () => {

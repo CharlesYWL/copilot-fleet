@@ -179,10 +179,10 @@ type TopBarProps = {
   browserNotificationsEnabled?: boolean;
   onToggleBrowserNotifications?: () => void;
   onNavigateNotification?: (notification: Notification) => void;
-  onMarkNotificationRead?: (id: string) => void;
+  onMarkNotificationRead?: (id: string) => void | Promise<unknown>;
   onMarkAllNotificationsRead?: () => void;
   onDismissAllNotifications?: () => void;
-  onDismissNotification?: (id: string) => void;
+  onDismissNotification?: (id: string) => void | Promise<unknown>;
   onSignOut: () => void;
   /** Jumps to whatever needs a person, when anything does. */
   onShowAttention?: (() => void) | undefined;

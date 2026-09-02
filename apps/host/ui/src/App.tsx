@@ -911,10 +911,10 @@ export function App() {
           browserNotificationsEnabled={delivery.browserEnabled}
           onToggleBrowserNotifications={delivery.toggleBrowser}
           onNavigateNotification={handleNotificationNavigate}
-          onMarkNotificationRead={(id) => void markNotificationRead(id)}
+          onMarkNotificationRead={markNotificationRead}
           onMarkAllNotificationsRead={() => void markAllNotificationsRead()}
           onDismissAllNotifications={() => void dismissAllNotifications()}
-          onDismissNotification={(id) => void dismissNotification(id)}
+          onDismissNotification={dismissNotification}
           onSignOut={() => void signOut()}
           onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}
           navOpen={navOpen}

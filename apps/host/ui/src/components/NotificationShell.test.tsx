@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -76,7 +76,7 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("notification shell integration", () => {
-  it("renders an authoritative live upsert in the badge and navigates to its session", () => {
+  it("renders an authoritative live upsert in the badge and navigates to its session", async () => {
     const Harness = () => {
       const fleet = useFleet(vi.fn());
       const [destination, setDestination] = useState("");
@@ -91,10 +91,10 @@ describe("notification shell integration", () => {
               void fleet.markNotificationRead(notification.id);
               setDestination(notification.navigation.sessionId ?? "fleet");
             }}
-            onMarkRead={(id) => void fleet.markNotificationRead(id)}
+            onMarkRead={fleet.markNotificationRead}
             onMarkAllRead={() => void fleet.markAllNotificationsRead()}
             onDismissAll={() => void fleet.dismissAllNotifications()}
-            onDismiss={(id) => void fleet.dismissNotification(id)}
+            onDismiss={fleet.dismissNotification}
           />
           <output aria-label="Destination">{destination}</output>
         </>
@@ -122,7 +122,9 @@ describe("notification shell integration", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Open Permission needed" }));
 
-    expect(screen.getByLabelText("Destination").textContent).toBe("s1");
+    await waitFor(() =>
+      expect(screen.getByLabelText("Destination").textContent).toBe("s1"),
+    );
     expect(fetch).toHaveBeenCalledWith(
       "/api/notifications/authoritative/read",
       expect.objectContaining({ method: "POST" }),
