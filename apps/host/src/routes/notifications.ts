@@ -89,6 +89,12 @@ export const notificationRoutes: FastifyPluginAsync<NotificationRouteOptions> = 
     );
   });
 
+  app.post("/api/notifications/dismiss-all", async () => {
+    return MarkAllNotificationsReadResponseSchema.parse(
+      service.notifications.dismissAll(),
+    );
+  });
+
   app.post("/api/notifications/:id/read", async (request, reply) => {
     const { id } = request.params as { id: string };
     const result = service.notifications.markRead(id);

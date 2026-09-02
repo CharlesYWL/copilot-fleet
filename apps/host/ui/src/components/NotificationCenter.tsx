@@ -225,10 +225,6 @@ const useStyles = makeStyles({
     borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
     background: tokens.colorNeutralBackground2,
   },
-  footerLabel: {
-    color: tokens.colorNeutralForeground3,
-    fontSize: tokens.fontSizeBase200,
-  },
   warning: { color: statusVisuals.attention.foreground },
   error: { color: statusVisuals.danger.foreground },
   info: { color: statusVisuals.info.foreground },
@@ -288,15 +284,44 @@ function timestamp(value: string): string {
   }).format(new Date(value));
 }
 
+type NotificationGroup = {
+  key: string;
+  latest: Notification;
+  notifications: Notification[];
+};
+
+type NotificationAction = (id: string) => void | Promise<unknown>;
+
+async function applySequentially(
+  notifications: readonly Notification[],
+  action: NotificationAction,
+): Promise<void> {
+  for (const notification of notifications) {
+    await action(notification.id);
+  }
+}
+
+function notificationGroupKey(notification: Notification): string {
+  if (notification.kind === "agent_completion" || notification.kind === "agent_failure") {
+    const sessionId =
+      typeof notification.data.sessionId === "string"
+        ? notification.data.sessionId
+        : notification.navigation.sessionId;
+    if (sessionId) return `${notification.kind}:${sessionId}`;
+  }
+  return notification.id;
+}
+
 export type NotificationCenterProps = {
   notifications: readonly Notification[];
   unreadCount: number;
   browserEnabled: boolean;
   onToggleBrowser: () => void;
   onNavigate: (notification: Notification) => void;
-  onMarkRead: (id: string) => void;
+  onMarkRead: NotificationAction;
   onMarkAllRead: () => void;
-  onDismiss: (id: string) => void;
+  onDismissAll: () => void;
+  onDismiss: NotificationAction;
 };
 
 export const NotificationCenter = ({
@@ -307,6 +332,7 @@ export const NotificationCenter = ({
   onNavigate,
   onMarkRead,
   onMarkAllRead,
+  onDismissAll,
   onDismiss,
 }: NotificationCenterProps) => {
   const styles = useStyles();
@@ -320,6 +346,23 @@ export const NotificationCenter = ({
       ),
     [notifications],
   );
+  const groups = useMemo(() => {
+    const grouped = new Map<string, NotificationGroup>();
+    for (const notification of ordered) {
+      const key = notificationGroupKey(notification);
+      const current = grouped.get(key);
+      if (current) {
+        current.notifications.push(notification);
+      } else {
+        grouped.set(key, {
+          key,
+          latest: notification,
+          notifications: [notification],
+        });
+      }
+    }
+    return [...grouped.values()];
+  }, [ordered]);
   const unreadLabel =
     unreadCount === 1 ? "1 unread notification" : `${unreadCount} unread notifications`;
 
@@ -360,10 +403,10 @@ export const NotificationCenter = ({
           <Button
             appearance="subtle"
             size="small"
-            disabled={unreadCount === 0}
-            onClick={onMarkAllRead}
+            disabled={notifications.length === 0}
+            onClick={onDismissAll}
           >
-            Mark all read
+            Clear all
           </Button>
         </div>
         {ordered.length === 0 ? (
@@ -378,14 +421,18 @@ export const NotificationCenter = ({
           </div>
         ) : (
           <ul className={styles.list}>
-            {ordered.map((notification) => {
-              const unread = !notification.readAt;
+            {groups.map((group) => {
+              const notification = group.latest;
+              const unreadNotifications = group.notifications.filter(
+                (item) => !item.readAt,
+              );
+              const unread = unreadNotifications.length > 0;
               const resolved = notification.status === "resolved";
               const title = notificationTitle(notification);
               const body = notificationBody(notification);
               return (
                 <li
-                  key={notification.id}
+                  key={group.key}
                   className={mergeClasses(
                     styles.item,
                     unread && styles.unread,
@@ -398,8 +445,16 @@ export const NotificationCenter = ({
                     className={styles.main}
                     aria-label={`Open ${title}`}
                     onClick={() => {
-                      onNavigate(notification);
-                      setOpen(false);
+                      void (async () => {
+                        await applySequentially(
+                          unreadNotifications.filter(
+                            (item) => item.id !== notification.id,
+                          ),
+                          onMarkRead,
+                        );
+                        onNavigate(notification);
+                        setOpen(false);
+                      })();
                     }}
                   >
                     <span className={styles.titleRow}>
@@ -434,6 +489,11 @@ export const NotificationCenter = ({
                           Resolved
                         </Badge>
                       )}
+                      {group.notifications.length > 1 && (
+                        <Badge size="small" appearance="outline">
+                          {group.notifications.length} updates
+                        </Badge>
+                      )}
                       <time
                         dateTime={notification.createdAt}
                         title={notification.createdAt}
@@ -451,7 +511,9 @@ export const NotificationCenter = ({
                           size="small"
                           icon={<Checkmark16Regular />}
                           aria-label={`Mark ${title} read`}
-                          onClick={() => onMarkRead(notification.id)}
+                          onClick={() => {
+                            void applySequentially(unreadNotifications, onMarkRead);
+                          }}
                         />
                       </Tooltip>
                     )}
@@ -461,7 +523,9 @@ export const NotificationCenter = ({
                         size="small"
                         icon={<Dismiss16Regular />}
                         aria-label={`Dismiss ${title}`}
-                        onClick={() => onDismiss(notification.id)}
+                        onClick={() => {
+                          void applySequentially(group.notifications, onDismiss);
+                        }}
                       />
                     </Tooltip>
                   </span>
@@ -471,7 +535,14 @@ export const NotificationCenter = ({
           </ul>
         )}
         <div className={styles.footer}>
-          <Text className={styles.footerLabel}>Desktop notifications</Text>
+          <Button
+            appearance="subtle"
+            size="small"
+            disabled={unreadCount === 0}
+            onClick={onMarkAllRead}
+          >
+            Mark all read
+          </Button>
           <Button
             appearance={browserEnabled ? "secondary" : "subtle"}
             size="small"

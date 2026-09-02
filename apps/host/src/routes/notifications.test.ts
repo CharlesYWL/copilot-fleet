@@ -237,6 +237,40 @@ describe("notification routes", () => {
       expect(missing.statusCode).toBe(404);
     }
   });
+
+  it("clears every visible notification and resets the unread count", async () => {
+    const cleared = await inject({
+      method: "POST",
+      url: "/api/notifications/dismiss-all",
+    });
+    expect(cleared.statusCode).toBe(200);
+    const clearedBody = cleared.json() as {
+      updated: number;
+      unreadCount: number;
+      notifications: Notification[];
+    };
+    expect(clearedBody).toMatchObject({
+      updated: 3,
+      unreadCount: 0,
+    });
+    expect(clearedBody.notifications.map((entry) => entry.id)).toEqual([
+      seeded[2]!.id,
+      seeded[1]!.id,
+      seeded[0]!.id,
+    ]);
+    expect(clearedBody.notifications.every((entry) => entry.status === "dismissed")).toBe(
+      true,
+    );
+
+    const hydration = await inject({
+      method: "GET",
+      url: "/api/notifications",
+    });
+    expect(hydration.json()).toMatchObject({
+      notifications: [],
+      unreadCount: 0,
+    });
+  });
 });
 
 function notificationInput(

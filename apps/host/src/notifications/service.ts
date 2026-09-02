@@ -114,12 +114,15 @@ const roleLabel = (runRole: RunRole): string => {
 const sessionLabel = (session: FleetSession): string =>
   boundedLabel(`${session.workspaceName} on ${session.nodeName}`);
 
+const agentLabel = (session: FleetSession): string =>
+  boundedLabel(session.name.trim() || `${session.workspaceName} on ${session.nodeName}`);
+
 const subjectForAgent = (session: FleetSession) => ({
   type: "agent" as const,
   id: session.id,
-  label: roleLabel(session.runRole),
+  label: agentLabel(session),
   parentId: session.id,
-  parentLabel: sessionLabel(session),
+  parentLabel: roleLabel(session.runRole),
 });
 
 const subjectForStep = (run: Run, step: RunStep) => ({
@@ -248,12 +251,15 @@ export class NotificationService {
             digest(input.transition.eventId),
           ].join(":");
     const completed = input.kind === "agent_completion";
+    const agentName = agentLabel(input.session);
     return this.insert({
       sourceKey,
       category: "agent_lifecycle",
       kind: input.kind,
       severity: completed ? "info" : "error",
-      title: completed ? "Agent turn completed" : "Agent session failed",
+      title: completed
+        ? titledLabel("", `${agentName} completed a turn`)
+        : titledLabel("", `${agentName} session failed`),
       body: completed
         ? "The agent finished a turn and is ready for follow-up."
         : "The agent session ended unexpectedly.",
@@ -440,6 +446,23 @@ export class NotificationService {
 
   markAllRead(): MarkAllNotificationsReadResponse {
     const result = this.store.markAllNotificationsRead();
+    if (this.deferredPublications) {
+      for (const notification of result.notifications) {
+        this.defer(notification, true);
+      }
+      return result;
+    }
+    for (const notification of result.notifications) {
+      this.publisher.notificationUpsert(notification);
+    }
+    if (result.updated > 0) {
+      this.publisher.notificationUnreadCount(result.unreadCount);
+    }
+    return result;
+  }
+
+  dismissAll(): MarkAllNotificationsReadResponse {
+    const result = this.store.dismissAllNotifications();
     if (this.deferredPublications) {
       for (const notification of result.notifications) {
         this.defer(notification, true);

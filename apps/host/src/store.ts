@@ -1999,6 +1999,35 @@ export class FleetStore {
     return this.getNotification(id);
   }
 
+  dismissAllNotifications(
+    at = new Date().toISOString(),
+  ): MarkAllNotificationsReadResponse {
+    const timestamp = NotificationSchema.shape.updatedAt.parse(at);
+    return this.transactionIfNeeded(() => {
+      const notifications = (
+        this.statement(
+          `UPDATE notifications
+           SET status='dismissed',
+               dismissed_at=COALESCE(dismissed_at,?),
+               updated_at=?
+           WHERE status <> 'dismissed'
+           RETURNING *`,
+        ).all(timestamp, timestamp) as Row[]
+      )
+        .map(notificationFromRow)
+        .sort(
+          (left, right) =>
+            right.createdAt.localeCompare(left.createdAt) ||
+            right.id.localeCompare(left.id),
+        );
+      return {
+        updated: notifications.length,
+        notifications,
+        unreadCount: this.notificationUnreadCount(),
+      };
+    });
+  }
+
   resolveNotification(
     id: string,
     at = new Date().toISOString(),
