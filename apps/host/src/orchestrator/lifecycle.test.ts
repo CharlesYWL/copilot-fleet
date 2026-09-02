@@ -29,6 +29,7 @@ describe("orchestrator task lifecycle", () => {
       payload: { agentSessionId: "copilot-worker-1" },
       createdAt: new Date().toISOString(),
     });
+    store.updateNotificationPreference(session.id, session.id, true);
     const dispatch = vi.spyOn(service, "dispatch");
 
     archiveRun(service, run.id, "Archived after approval");
@@ -58,6 +59,7 @@ describe("orchestrator task lifecycle", () => {
       "state",
     ]);
     expect(store.getRun(run.id)?.state).toBe("completed");
+    expect(store.listNotifications().notifications).toEqual([]);
   });
 
   it("cancels only unfinished steps and resumes only those cancelled by Stop", () => {
@@ -259,10 +261,59 @@ describe("orchestrator task lifecycle", () => {
     });
     store.transitionSession(session.id, "starting");
     store.transitionSession(session.id, "idle");
+    service.handleEvent({
+      eventId: "permission",
+      sessionId: session.id,
+      sequence: 1,
+      type: "permission",
+      payload: { requestId: "request-1" },
+      createdAt: new Date().toISOString(),
+    });
+    const permission = store.listNotifications().notifications[0]!;
+    expect(permission.status).toBe("active");
 
     expect(purgeRun(service, run.id)).toBe(true);
 
     expect(store.getSession(session.id)).toBeUndefined();
     expect(store.getRun(run.id)).toBeUndefined();
+    expect(store.getNotification(permission.id)?.status).toBe("resolved");
+  });
+
+  it("resolves an active review when a task is archived or purged", () => {
+    const archived = fleet();
+    const archivedRun = archived.store.createRun({
+      workspaceId: archived.store.listWorkspaces()[0]!.id,
+      name: "Archive review",
+      objective: "archive it",
+    });
+    archived.store.setRunState(archivedRun.id, "running");
+    archived.service.requestRunReview({
+      runId: archivedRun.id,
+      note: "ready",
+      reason: "completed",
+    });
+
+    archiveRun(archived.service, archivedRun.id, "Archived by a person");
+    expect(
+      archived.store.getNotificationBySourceKey(`review:${archivedRun.id}:1`),
+    ).toMatchObject({ status: "resolved" });
+
+    const purged = fleet();
+    const purgedRun = purged.store.createRun({
+      workspaceId: purged.store.listWorkspaces()[0]!.id,
+      name: "Purge review",
+      objective: "purge it",
+    });
+    purged.store.setRunState(purgedRun.id, "running");
+    purged.service.requestRunReview({
+      runId: purgedRun.id,
+      note: "ready",
+      reason: "completed",
+    });
+
+    expect(purgeRun(purged.service, purgedRun.id)).toBe(true);
+    expect(
+      purged.store.getNotificationBySourceKey(`review:${purgedRun.id}:1`),
+    ).toMatchObject({ status: "resolved" });
   });
 });

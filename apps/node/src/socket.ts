@@ -1,4 +1,6 @@
 import type WebSocket from "ws";
+import type { NodeToHostMessage, OutboxFlushId, SessionEvent } from "@fleet/protocol";
+import type { EventOutbox, OutboxFlush } from "./outbox.js";
 
 /**
  * How long a dial may sit in the opening handshake before it is abandoned.
@@ -51,6 +53,74 @@ export type LivenessSocket = {
 
 /** `ws`'s OPEN, spelled out so the watchdog needs nothing from the class. */
 const SOCKET_OPEN = 1;
+
+type OutboxFlushedMessage = Extract<NodeToHostMessage, { type: "outbox_flushed" }>;
+
+export type ReconnectInventory = {
+  activeSessionIds: readonly string[];
+  busySessionIds: readonly string[];
+};
+
+export type ReconnectFlush = OutboxFlush & {
+  flushId?: OutboxFlushId;
+  reconciliationSent: boolean;
+};
+
+/**
+ * Flushes buffered events before sending the inventory that unlocks Host
+ * reconciliation. If either send stops accepting frames, the final inventory
+ * is withheld so a partial flush cannot falsely settle the session.
+ */
+export function flushReconnectOutbox(
+  outbox: EventOutbox,
+  sendEvent: (
+    event: SessionEvent,
+    position: {
+      flushId: OutboxFlushId;
+      eventCount: number;
+      eventIndex: number;
+    },
+  ) => boolean,
+  sendReconciliation: (message: OutboxFlushedMessage) => boolean,
+  inventory: () => ReconnectInventory,
+): ReconnectFlush {
+  const batch = outbox.currentBatch;
+  if (!batch) return { sent: 0, dropped: 0, reconciliationSent: false };
+  let sent = 0;
+  for (const [eventIndex, event] of batch.events.entries()) {
+    if (
+      !sendEvent(event, {
+        flushId: batch.flushId,
+        eventCount: batch.events.length,
+        eventIndex,
+      })
+    ) {
+      return {
+        flushId: batch.flushId,
+        sent,
+        dropped: batch.dropped,
+        reconciliationSent: false,
+      };
+    }
+    sent += 1;
+  }
+  const current = inventory();
+  const reconciliationSent = sendReconciliation({
+    type: "outbox_flushed",
+    activeSessionIds: [...current.activeSessionIds],
+    busySessionIds: [...current.busySessionIds],
+    outboxFlush: {
+      flushId: batch.flushId,
+      eventCount: batch.events.length,
+    },
+  });
+  return {
+    flushId: batch.flushId,
+    sent,
+    dropped: batch.dropped,
+    reconciliationSent,
+  };
+}
 
 export type LivenessOptions = {
   intervalMs?: number;

@@ -515,6 +515,7 @@ type TerminalViewProps = {
   onResume?: () => void;
   onClose?: () => void;
   onConfigChange?: (configId: string, value: string) => void;
+  notificationPreferenceControl?: ReactNode;
   draft: SessionDraft;
   onDraftChange: (update: (current: SessionDraft) => SessionDraft) => void;
 };
@@ -531,6 +532,7 @@ export const TerminalView = ({
   onResume,
   onClose,
   onConfigChange,
+  notificationPreferenceControl,
   draft,
   onDraftChange,
 }: TerminalViewProps) => {
@@ -925,6 +927,7 @@ export const TerminalView = ({
             {session.currentActivity}
           </Text>
         </div>
+        {notificationPreferenceControl}
         <Button
           appearance="secondary"
           icon={<RecordStop20Regular />}

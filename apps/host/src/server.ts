@@ -28,6 +28,8 @@ import { registerRequestGuard } from "./request-guard.js";
 import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { nodeRoutes } from "./routes/nodes.js";
+import { notificationRoutes } from "./routes/notifications.js";
+import { startNotificationRetentionMonitor } from "./notifications/retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { runRoutes } from "./routes/runs.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
@@ -161,6 +163,7 @@ export async function buildServer(
   await app.register(nodeRoutes, { service, enrollment });
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
+  await app.register(notificationRoutes, { service });
 
   /*
    * Constructed after the service and subscribed to its events, so the engine
@@ -196,6 +199,7 @@ export async function buildServer(
   registerBrowserGateway(app, service);
   registerNodeGateway(app, service);
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs);
+  const notificationRetentionTimer = startNotificationRetentionMonitor(service);
   // Timeouts are the absence of events; without a clock nothing would ever
   // notice one. See the monitor for why this is not the busy-wait the design
   // rules out.
@@ -228,6 +232,7 @@ export async function buildServer(
 
   app.addHook("onClose", async () => {
     clearInterval(presenceTimer);
+    clearInterval(notificationRetentionTimer);
     clearInterval(runDeadlineTimer);
     clearInterval(hostUrlMonitor);
     await tunnel.stop();

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Toast,
+  ToastBody,
   ToastTitle,
   Toaster,
   makeStyles,
@@ -14,15 +15,17 @@ import {
   terminalRunStates,
   terminalSessionStates,
   type FleetSession,
+  type Notification,
   type RunNote,
   type SessionEvent,
 } from "@fleet/protocol";
 import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
-import { usePermissionAlerts } from "./hooks/usePermissionAlerts";
-import { useSessionChimes } from "./hooks/useSessionChimes";
+import { useNotificationDelivery } from "./hooks/useNotificationDelivery";
+import { useNotificationPreference } from "./hooks/useNotificationPreference";
 import { useStickyFlag } from "./hooks/useStickyFlag";
 import { signOut } from "./lib/auth";
+import { notificationTarget } from "./lib/notification-navigation";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import {
   filterOrchestratorConversations,
@@ -40,7 +43,7 @@ import { EmptySessions } from "./components/EmptySessions";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { SessionFocusDialog } from "./components/SessionFocusDialog";
 import { SessionGrid } from "./components/SessionGrid";
-import { SettingsPanel } from "./components/SettingsPanel";
+import { SettingsPanel, type SettingsTab } from "./components/SettingsPanel";
 import { DispatchedBanner } from "./components/orchestration/DispatchedBanner";
 import { StartOrchestrator } from "./components/orchestration/StartOrchestrator";
 import { OrchestratorPage } from "./components/orchestration/OrchestratorPage";
@@ -61,6 +64,7 @@ import type {
 import { Sidebar } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
 import { TopBar } from "./components/TopBar";
+import { LifecycleNotificationControl } from "./components/LifecycleNotificationControl";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
@@ -206,6 +210,7 @@ export function App() {
 
   const {
     snapshot,
+    liveNotificationUpdates,
     events,
     runSteps,
     runNotes,
@@ -215,6 +220,9 @@ export function App() {
     loadEvents,
     command,
     request,
+    markNotificationRead,
+    markAllNotificationsRead,
+    dismissNotification,
   } = useFleet(notify);
   const catalog = useCatalogOperations({ request, refresh, notify });
   const [view, setView] = useState<AppView>("session");
@@ -235,6 +243,7 @@ export function App() {
   const [dialogOpen, setDialogOpen] = useState(false);
   const [orchestrationDialogOpen, setOrchestrationDialogOpen] = useState(false);
   const [attentionOnly, setAttentionOnly] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   /** Narrow screens show the tree as a drawer; wide ones ignore this. */
   const [navOpen, setNavOpen] = useState(false);
   /** Wide screens can give the tree's column back to the content. */
@@ -304,6 +313,7 @@ export function App() {
   const activeSession = snapshot.sessions.find(
     (session) => session.id === selectedSessionId,
   );
+  const notificationPreference = useNotificationPreference(activeSession?.id, request);
 
   // A dismissed or cleared session takes its unsent draft with it.
   useEffect(() => {
@@ -346,16 +356,19 @@ export function App() {
    * `from` records where the operator was, so that leaving the transcript
    * returns there instead of to whatever the app considers home.
    */
-  const handleSelectSession = (sessionId: string, from?: ReturnContext) => {
-    setSelectedSessionId(sessionId);
-    setReturnContext(from);
-    setNavOpen(false);
-    if (view === "overview" && !from) {
-      setFocusOpen(true);
-      return;
-    }
-    setView("session");
-  };
+  const handleSelectSession = useCallback(
+    (sessionId: string, from?: ReturnContext) => {
+      setSelectedSessionId(sessionId);
+      setReturnContext(from);
+      setNavOpen(false);
+      if (view === "overview" && !from) {
+        setFocusOpen(true);
+        return;
+      }
+      setView("session");
+    },
+    [view],
+  );
 
   const handleSessionLayoutChange = (next: SessionLayoutMode) => {
     setFocusOpen(false);
@@ -363,13 +376,13 @@ export function App() {
   };
 
   /** Opens one task's detail, from any of the three orchestrator views. */
-  const handleOpenRun = (runId: string, fromConversationId?: string) => {
+  const handleOpenRun = useCallback((runId: string, fromConversationId?: string) => {
     setSelectedRunId(runId);
     // Cleared unless the task was opened from a conversation, so Back keeps
     // meaning "where I was" rather than "wherever I last came from".
     setTaskOrigin(fromConversationId);
     setView("orchestrator-task");
-  };
+  }, []);
 
   /** Leaves a task for whatever opened it: a conversation, or the board. */
   const handleBackFromTask = () => {
@@ -427,9 +440,6 @@ export function App() {
     await refresh();
     return true;
   };
-
-  usePermissionAlerts(waitingPermissions, handleSelectSession);
-  const sound = useSessionChimes(snapshot.sessions, waitingPermissions);
 
   const handleCreateSession = async (
     placementId: string,
@@ -595,6 +605,112 @@ export function App() {
     () => runModels.find((model) => model.run.id === selectedRunId),
     [runModels, selectedRunId],
   );
+  const handleNotificationNavigate = useCallback(
+    (notification: Notification) => {
+      void markNotificationRead(notification.id);
+      const target = notificationTarget(
+        notification,
+        runSteps,
+        snapshot.sessions,
+        orchestratorRuns,
+      );
+      if (target.kind === "session") {
+        if (target.returnRunId) {
+          setSelectedRunId(target.returnRunId);
+          handleSelectSession(target.sessionId, {
+            kind: "orchestrator-task",
+            runId: target.returnRunId,
+          });
+          return;
+        }
+        handleSelectSession(target.sessionId);
+        return;
+      }
+      if (target.kind === "run") {
+        handleOpenRun(target.runId);
+        return;
+      }
+      if (target.kind === "node") {
+        setSettingsTab("nodes");
+        setView("settings");
+        return;
+      }
+      if (target.kind === "orchestrator") {
+        setView("orchestrator");
+        return;
+      }
+      setView("overview");
+    },
+    [
+      handleOpenRun,
+      handleSelectSession,
+      markNotificationRead,
+      orchestratorRuns,
+      runSteps,
+      snapshot.sessions,
+    ],
+  );
+  const isNotificationTargetVisible = useCallback(
+    (notification: Notification) => {
+      const target = notificationTarget(
+        notification,
+        runSteps,
+        snapshot.sessions,
+        orchestratorRuns,
+      );
+      if (target.kind === "session") {
+        return (
+          target.sessionId === selectedSessionId &&
+          (view === "session" || (view === "overview" && focusOpen))
+        );
+      }
+      if (target.kind === "run") {
+        return view === "orchestrator-task" && selectedRunId === target.runId;
+      }
+      if (target.kind === "node") {
+        return view === "settings" && settingsTab === "nodes";
+      }
+      if (target.kind === "orchestrator") return view === "orchestrator";
+      return view === "overview";
+    },
+    [
+      focusOpen,
+      orchestratorRuns,
+      runSteps,
+      selectedRunId,
+      selectedSessionId,
+      settingsTab,
+      snapshot.sessions,
+      view,
+    ],
+  );
+  const notifyDurable = useCallback(
+    (notification: Notification) => {
+      dispatchToast(
+        <Toast>
+          <ToastTitle>{notification.title}</ToastTitle>
+          {notification.body && <ToastBody>{notification.body}</ToastBody>}
+        </Toast>,
+        {
+          intent:
+            notification.severity === "error" || notification.severity === "critical"
+              ? "error"
+              : notification.severity === "warning"
+                ? "warning"
+                : "info",
+          position: "bottom-end",
+        },
+      );
+    },
+    [dispatchToast],
+  );
+  const delivery = useNotificationDelivery({
+    notificationUpdates: liveNotificationUpdates,
+    unreadCount: snapshot.notificationUnreadCount,
+    isTargetVisible: isNotificationTargetVisible,
+    onToast: notifyDurable,
+    onNavigate: handleNotificationNavigate,
+  });
   /**
    * The tasks of the conversation on screen, if the session on screen is one.
    *
@@ -787,8 +903,16 @@ export function App() {
                   }
                 : { kind: "none" }
           }
-          soundEnabled={sound.enabled}
-          onToggleSound={sound.toggle}
+          soundEnabled={delivery.soundEnabled}
+          onToggleSound={delivery.toggleSound}
+          notifications={snapshot.notifications}
+          notificationUnreadCount={snapshot.notificationUnreadCount}
+          browserNotificationsEnabled={delivery.browserEnabled}
+          onToggleBrowserNotifications={delivery.toggleBrowser}
+          onNavigateNotification={handleNotificationNavigate}
+          onMarkNotificationRead={(id) => void markNotificationRead(id)}
+          onMarkAllNotificationsRead={() => void markAllNotificationsRead()}
+          onDismissNotification={(id) => void dismissNotification(id)}
           onSignOut={() => void signOut()}
           onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}
           navOpen={navOpen}
@@ -971,6 +1095,8 @@ export function App() {
                   sessions={snapshot.sessions}
                   hostRevision={snapshot.hostRevision}
                   nodeUpdates={nodeUpdates}
+                  selectedTab={settingsTab}
+                  onSelectedTabChange={setSettingsTab}
                 />
               )}
 
@@ -1030,6 +1156,14 @@ export function App() {
                             configId,
                             value,
                           })
+                        }
+                        notificationPreferenceControl={
+                          <LifecycleNotificationControl
+                            preference={notificationPreference.preference}
+                            loading={notificationPreference.loading}
+                            onSet={notificationPreference.setLifecycleEnabled}
+                            onReset={notificationPreference.reset}
+                          />
                         }
                         draft={draftFor(drafts, activeSession.id)}
                         onDraftChange={(update) => changeDraft(activeSession.id, update)}
@@ -1100,6 +1234,14 @@ export function App() {
                 configId,
                 value,
               })
+            }
+            notificationPreferenceControl={
+              <LifecycleNotificationControl
+                preference={notificationPreference.preference}
+                loading={notificationPreference.loading}
+                onSet={notificationPreference.setLifecycleEnabled}
+                onReset={notificationPreference.reset}
+              />
             }
             draft={draftFor(drafts, activeSession.id)}
             onDraftChange={(update) => changeDraft(activeSession.id, update)}

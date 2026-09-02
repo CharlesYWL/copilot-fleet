@@ -8,9 +8,12 @@ import {
   NODE_NAME_SYNC_CAPABILITY,
   SELF_UPDATE_CAPABILITY,
   canTransition,
+  canTransitionRun,
+  canTransitionRunStep,
   eventPayload,
   liveSessionStates,
   nodeUpdateState,
+  terminalRunStepStates,
   terminalSessionStates,
   type BrowserMessage,
   type FleetNode,
@@ -19,17 +22,30 @@ import {
   type McpHttpServer,
   type NodeCommand,
   type NodeUpdateStage,
+  type Notification,
   type Placement,
   type StartupConfig,
   type Run,
   type RunRole,
   type RunStep,
+  type RunStepState,
   type SessionEvent,
   type SessionState,
   type Snapshot,
 } from "@fleet/protocol";
-import type { FleetStore } from "./store.js";
+import type {
+  FleetStore,
+  SessionTransitionIntent,
+  SessionTurnCompletion,
+} from "./store.js";
 import { isBroadcastableHostUrl } from "./host-url.js";
+import {
+  NotificationService,
+  notificationAttemptKey,
+  type EffectiveSessionNotificationPreference,
+  type NotificationAttemptContext,
+  type NotificationMutation,
+} from "./notifications/service.js";
 import {
   capacityFor,
   reservedSessionCount,
@@ -58,6 +74,50 @@ export type DispatchResult = {
   sent: boolean;
   /** The session after the fallback transition, when one was applied. */
   session?: FleetSession;
+};
+
+export type EventHandlingResult =
+  | { outcome: "accepted" }
+  | {
+      outcome: "permanent_rejection";
+      reason: "session_missing" | "identity_conflict" | "sqlite_constraint";
+    }
+  | { outcome: "retryable_failure" };
+
+type HostTransitionCause =
+  | "resume_requested"
+  | "dispatch_fallback"
+  | "operator_cancel_requested"
+  | "operator_settlement"
+  | "automatic_resume"
+  | "connectivity_lost";
+
+type AcceptedSessionTransitionSource =
+  | {
+      type: "session_event";
+      event: Pick<SessionEvent, "eventId" | "sequence" | "createdAt">;
+    }
+  | {
+      type: "fatal_command_result";
+      commandId: string;
+      createdAt: string;
+    }
+  | {
+      type: "reconciliation";
+      outcome: "restored" | "missing";
+    }
+  | {
+      type: "host";
+      cause: HostTransitionCause;
+    };
+
+type AcceptedSessionTransition = {
+  before: FleetSession;
+  after: FleetSession;
+  source: AcceptedSessionTransitionSource;
+  intent: SessionTransitionIntent | undefined;
+  completion: SessionTurnCompletion | undefined;
+  context: NotificationAttemptContext;
 };
 
 /**
@@ -101,6 +161,7 @@ export class FleetService {
   private leadTokens: { mint: (sessionId: string) => string } | undefined;
   private mcpUrl: (() => string) | undefined;
   private runTicker: ((runId: string) => void) | undefined;
+  readonly notifications: NotificationService;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -130,7 +191,14 @@ export class FleetService {
      * marking every node that updated correctly as out of date.
      */
     private readonly revisionSource: string | (() => string) = "",
-  ) {}
+  ) {
+    this.notifications = new NotificationService(store, {
+      notificationUpsert: (notification) => this.publishNotification(notification),
+      notificationUnreadCount: (unreadCount) =>
+        this.publishNotificationUnreadCount(unreadCount),
+      runUpsert: (run) => this.publishRun(run),
+    });
+  }
 
   snapshot(): Snapshot {
     return {
@@ -139,6 +207,8 @@ export class FleetService {
       placements: this.store.listPlacements(),
       sessions: this.store.listSessions(),
       runs: this.store.listRuns(),
+      notifications: this.store.listNotificationHydration(),
+      notificationUnreadCount: this.store.notificationUnreadCount(),
       hostRevision: this.hostRevision,
     };
   }
@@ -224,6 +294,109 @@ export class FleetService {
     this.broadcast({ type: "run", run });
   }
 
+  publishNotification(notification: Notification): void {
+    this.broadcast({ type: "notification_upsert", notification });
+  }
+
+  publishNotificationUnreadCount(
+    unreadCount = this.store.notificationUnreadCount(),
+  ): void {
+    this.broadcast({ type: "notification_unread_count", unreadCount });
+  }
+
+  effectiveNotificationPreference(
+    sessionId: string,
+  ): EffectiveSessionNotificationPreference | undefined {
+    const session = this.store.getSession(sessionId);
+    return session ? this.notifications.effectivePreference(session) : undefined;
+  }
+
+  updateNotificationPreference(
+    sessionId: string,
+    lifecycleEnabled: boolean,
+  ): EffectiveSessionNotificationPreference | undefined {
+    const session = this.store.getSession(sessionId);
+    return session
+      ? this.notifications.updatePreference(session, lifecycleEnabled)
+      : undefined;
+  }
+
+  resetNotificationPreference(
+    sessionId: string,
+  ): EffectiveSessionNotificationPreference | undefined {
+    const session = this.store.getSession(sessionId);
+    return session ? this.notifications.resetPreference(session) : undefined;
+  }
+
+  requestRunReview(input: {
+    runId: string;
+    note: string;
+    reason: "completed" | "blocked";
+  }): Run | undefined {
+    return this.notifications.requestRunReview(input);
+  }
+
+  resolveRunReview(runId: string): NotificationMutation | undefined {
+    const run = this.store.getRun(runId);
+    return run ? this.notifications.resolveRunReview(run) : undefined;
+  }
+
+  resolveSessionPermissionRequests(sessionId: string): number {
+    return this.notifications.resolveSessionPermissionRequests(sessionId);
+  }
+
+  settleOrchestrationStep(input: {
+    runId: string;
+    stepId: string;
+    state: RunStepState;
+    output: string;
+    patch?: Pick<RunStep, "dispatchedAt"> | undefined;
+  }): boolean {
+    const settled = this.notifications.commitAtomically(
+      () => {
+        const run = this.store.getRun(input.runId);
+        const step = this.store.getRunStep(input.stepId);
+        if (
+          !run ||
+          !step ||
+          step.runId !== run.id ||
+          !canTransitionRunStep(step.state, input.state)
+        ) {
+          return undefined;
+        }
+        const updatedStep = this.store.updateRunStep(step.id, {
+          state: input.state,
+          output: input.output,
+          ...(input.patch ?? {}),
+        });
+        if (!updatedStep) return undefined;
+
+        this.store.recordRunSettle(run.id);
+        let updatedRun = this.store.getRun(run.id)!;
+        if (
+          updatedRun.policy.wakePolicy !== "none" &&
+          updatedRun.state === "running" &&
+          canTransitionRun(updatedRun.state, "awaiting_lead")
+        ) {
+          updatedRun = this.store.setRunState(run.id, "awaiting_lead")!;
+        }
+        if (updatedStep.sessionId) {
+          this.store.clearSessionTurnCompletion(updatedStep.sessionId);
+        }
+        if (updatedStep.state === "failed") {
+          this.notifications.createOrchestrationStepFailure(updatedRun, updatedStep);
+        }
+        return { run: updatedRun, step: updatedStep };
+      },
+      (result) => {
+        if (!result) return;
+        this.publishRun(result.run);
+        this.publishRunSteps(result.run.id, this.store.listRunSteps(result.run.id));
+      },
+    );
+    return settled !== undefined;
+  }
+
   /** Steps travel whole: a step that was removed has no row left to describe. */
   publishRunSteps(runId: string, steps: readonly RunStep[]): void {
     this.broadcast({ type: "run_steps", runId, steps: [...steps] });
@@ -260,6 +433,8 @@ export class FleetService {
     runRole?: RunRole;
     /** Work that only reads, which is counted against its own allowance. */
     readOnly?: boolean;
+    /** Authoritative orchestration attempt when the step is not attached yet. */
+    dispatchAttempt?: string;
   }):
     | { ok: true; session: FleetSession }
     | { ok: false; status: number; error: string; session?: FleetSession } {
@@ -305,6 +480,7 @@ export class FleetService {
         readOnly: session.readOnly,
       },
       { state: "failed", activity: "Node disconnected before process start" },
+      input.dispatchAttempt,
     );
     if (!dispatched.sent) {
       return {
@@ -412,7 +588,10 @@ export class FleetService {
     const unsupported = yoloUnsupportedReason(node, session.yolo);
     if (unsupported) return { ok: false, status: 409, error: unsupported };
 
-    const resumed = this.store.transitionSession(sessionId, "starting", activity)!;
+    const resumed = this.transitionSession(sessionId, "starting", activity, {
+      type: "host",
+      cause: "resume_requested",
+    });
     this.publishSession(resumed);
     const dispatched = this.dispatch(
       session.nodeId,
@@ -516,21 +695,113 @@ export class FleetService {
     nodeId: string,
     request: CommandRequest,
     fallback?: DispatchFallback,
+    attemptOverride?: string,
   ): DispatchResult {
+    const lifecycleIntent =
+      request.type === "cancel" || request.type === "stop" ? request.type : undefined;
     const socket = this.nodeSockets.get(nodeId);
     if (socket && socket.readyState === socket.OPEN) {
+      if (lifecycleIntent) {
+        this.store.writeAtomically(() => {
+          this.store.setSessionTransitionIntent(request.sessionId, lifecycleIntent);
+          this.store.clearSessionTurnCompletion(request.sessionId);
+        });
+      } else if (
+        request.type === "start_session" ||
+        request.type === "resume_session" ||
+        request.type === "prompt"
+      ) {
+        const session = this.store.getSession(request.sessionId);
+        if (!session) return { sent: false };
+        const commandId = randomUUID();
+        const attempt = attemptOverride ?? this.dispatchAttemptKey(session);
+        const eventSeqFrom =
+          request.type === "resume_session"
+            ? request.sequenceOffset
+            : this.store.maxEventSequence(request.sessionId);
+        // A new attempt must not inherit a stop/cancel or completion receipt
+        // from the old one, and its sequence boundary must be durable before send.
+        this.store.writeAtomically(() => {
+          this.store.clearSessionTransitionIntent(request.sessionId);
+          this.store.clearSessionTurnCompletion(request.sessionId);
+          this.store.setSessionDispatchAttempt(request.sessionId, {
+            commandId,
+            eventSeqFrom,
+            attempt,
+          });
+        });
+        const command = { ...request, commandId } as NodeCommand;
+        this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
+        return { sent: true };
+      }
       const command = { ...request, commandId: randomUUID() } as NodeCommand;
       this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
       return { sent: true };
     }
     if (!fallback) return { sent: false };
-    const session = this.store.transitionSession(
-      request.sessionId,
-      fallback.state,
-      fallback.activity,
+    const session = this.notifications.commitAtomically(
+      () => {
+        if (lifecycleIntent) {
+          this.store.setSessionTransitionIntent(request.sessionId, lifecycleIntent);
+          this.store.clearSessionTurnCompletion(request.sessionId);
+        }
+        const settled = this.transitionSession(
+          request.sessionId,
+          fallback.state,
+          fallback.activity,
+          { type: "host", cause: "dispatch_fallback" },
+        );
+        if (terminalSessionStates.has(fallback.state)) {
+          this.store.clearSessionTurnCompletion(request.sessionId);
+        }
+        if (lifecycleIntent) {
+          this.store.consumeSessionTransitionIntent(request.sessionId);
+        }
+        if (terminalSessionStates.has(fallback.state)) {
+          this.resolveSessionPermissionRequests(request.sessionId);
+        }
+        return settled;
+      },
+      (settled) => this.publishSession(settled),
     );
-    this.publishSession(session);
     return { sent: false, session };
+  }
+
+  /**
+   * Settles a session synchronously after a stop command and consumes its
+   * durable suppression intent. Used by run archive/purge, which cannot wait
+   * for a Node event before releasing capacity.
+   */
+  settleCommandedSession(
+    sessionId: string,
+    state: SessionState,
+    activity: string,
+    publish = true,
+  ): FleetSession {
+    return this.notifications.commitAtomically(
+      () => {
+        const session = this.transitionSession(sessionId, state, activity, {
+          type: "host",
+          cause: "operator_settlement",
+        });
+        this.store.consumeSessionTransitionIntent(sessionId);
+        this.store.clearSessionTurnCompletion(sessionId);
+        if (terminalSessionStates.has(state)) {
+          this.resolveSessionPermissionRequests(sessionId);
+        }
+        return session;
+      },
+      (session) => {
+        if (publish) this.publishSession(session);
+      },
+    );
+  }
+
+  beginSessionCancellation(sessionId: string): FleetSession {
+    return this.transitionSession(sessionId, "cancelling", "Cancelling active turn", {
+      type: "host",
+      cause: "operator_cancel_requested",
+    });
   }
 
   /**
@@ -701,6 +972,7 @@ export class FleetService {
     nodeId: string,
     activeSessionIds: readonly string[],
     busySessionIds: readonly string[] = [],
+    reconcileSessions = true,
   ): void {
     const { node, changed } = this.store.recordPresence(
       nodeId,
@@ -708,7 +980,8 @@ export class FleetService {
       activeSessionIds.length,
     );
     if (node && changed) this.publishNode(node);
-    this.publishSessions(this.reconcile(nodeId, activeSessionIds, busySessionIds));
+    if (!reconcileSessions) return;
+    this.reconcile(nodeId, activeSessionIds, busySessionIds);
   }
 
   /**
@@ -721,10 +994,56 @@ export class FleetService {
     activeSessionIds: readonly string[],
     busySessionIds: readonly string[] = [],
   ): FleetSession[] {
-    const settled = this.store.reconcileOfflineSessions(
-      nodeId,
-      activeSessionIds,
-      busySessionIds,
+    const settled = this.notifications.commitAtomically(
+      () => {
+        const offline = new Map(
+          this.store
+            .listSessions()
+            .filter((session) => session.nodeId === nodeId && session.state === "offline")
+            .map((session) => [
+              session.id,
+              {
+                session,
+                intent: this.store.getSessionTransitionIntent(session.id),
+                completion: this.store.getSessionTurnCompletion(session.id),
+                context: this.notificationAttemptContext(session),
+              },
+            ]),
+        );
+        const reconciled = this.store.reconcileOfflineSessions(
+          nodeId,
+          activeSessionIds,
+          busySessionIds,
+        );
+        for (const session of reconciled) {
+          const prior = offline.get(session.id);
+          if (prior) {
+            this.acceptSessionTransition({
+              before: prior.session,
+              after: session,
+              source: {
+                type: "reconciliation",
+                outcome: session.state === "failed" ? "missing" : "restored",
+              },
+              intent: prior.intent,
+              completion: prior.completion,
+              context: prior.context,
+            });
+            if (
+              prior.intent &&
+              ["idle", "stopped", "completed", "failed"].includes(session.state)
+            ) {
+              this.store.consumeSessionTransitionIntent(session.id);
+            }
+            this.clearConsumedTurnCompletion(session, prior.intent, prior.context);
+          }
+          if (session.state === "failed") {
+            this.resolveSessionPermissionRequests(session.id);
+          }
+        }
+        return reconciled;
+      },
+      (reconciled) => this.publishSessions(reconciled),
     );
     for (const session of settled) {
       if (!session.stopRequested) continue;
@@ -808,11 +1127,10 @@ export class FleetService {
       // hand, and the next reconnect will not pick them up again.
       if (!dispatched.sent) break;
       this.publishSession(
-        this.store.transitionSession(
-          session.id,
-          "starting",
-          "Reconnecting automatically",
-        ),
+        this.transitionSession(session.id, "starting", "Reconnecting automatically", {
+          type: "host",
+          cause: "automatic_resume",
+        }),
       );
       if (kind === "read-only") reservedReading += 1;
       else reservedWriting += 1;
@@ -832,7 +1150,29 @@ export class FleetService {
     if (node) this.publishNode(node);
     // Soft-fail: the Node may still be running agents and will resurrect
     // them on the next hello that lists those session ids.
-    this.publishSessions(this.store.markNodeSessionsOffline(nodeId, activity));
+    const before = new Map(
+      this.store
+        .listSessions()
+        .filter(
+          (session) =>
+            session.nodeId === nodeId && !terminalSessionStates.has(session.state),
+        )
+        .map((session) => [session.id, session]),
+    );
+    const offline = this.store.markNodeSessionsOffline(nodeId, activity);
+    for (const session of offline) {
+      const prior = before.get(session.id);
+      if (!prior) continue;
+      this.acceptSessionTransition({
+        before: prior,
+        after: session,
+        source: { type: "host", cause: "connectivity_lost" },
+        intent: this.store.getSessionTransitionIntent(session.id),
+        completion: this.store.getSessionTurnCompletion(session.id),
+        context: this.notificationAttemptContext(prior),
+      });
+    }
+    this.publishSessions(offline);
   }
 
   /** True while the Host is tearing down, so close handlers stay quiet. */
@@ -840,65 +1180,380 @@ export class FleetService {
     return this.closing;
   }
 
-  handleEvent(event: SessionEvent): void {
-    try {
+  handleEvent(event: SessionEvent): boolean {
+    return this.handleEventResult(event).outcome === "accepted";
+  }
+
+  handleEventResult(event: SessionEvent): EventHandlingResult {
+    type WriteResult = {
+      outcome: "accepted" | "permanent_rejection";
+      reason?: "session_missing" | "identity_conflict";
+      skipped: number;
+      publish: boolean;
+      notifyListeners: boolean;
+      redispatchStop?: boolean;
+      session?: FleetSession;
+    };
+
+    const write = (): WriteResult => {
+      const session = this.store.getSession(event.sessionId);
+      if (!session) {
+        return {
+          outcome: "permanent_rejection",
+          reason: "session_missing",
+          skipped: 0,
+          publish: false,
+          notifyListeners: false,
+        };
+      }
       const appended = this.store.appendEvent(event);
-      if (!appended.stored) return;
-      if (appended.skipped > 0) {
+      if (!appended.stored) {
+        return appended.conflict
+          ? {
+              outcome: "permanent_rejection",
+              reason: "identity_conflict",
+              skipped: 0,
+              publish: false,
+              notifyListeners: false,
+            }
+          : {
+              outcome: "accepted",
+              skipped: 0,
+              publish: false,
+              notifyListeners: false,
+            };
+      }
+      let context = this.notificationAttemptContext(session);
+      if (this.isStaleAttemptEvent(session, event, context)) {
+        return {
+          outcome: "accepted",
+          skipped: appended.skipped,
+          publish: false,
+          notifyListeners: false,
+        };
+      }
+
+      if (event.type === "state") {
+        const payload = eventPayload(event, "state");
+        if (!payload?.state) {
+          this.log.error(
+            { sessionId: session.id, eventId: event.eventId },
+            "Dropped an unreadable session state event",
+          );
+          return {
+            outcome: "accepted",
+            skipped: appended.skipped,
+            publish: false,
+            notifyListeners: false,
+          };
+        }
+        if (session.dismissed && !terminalSessionStates.has(payload.state)) {
+          this.log.warn(
+            { sessionId: session.id, state: payload.state },
+            "Recorded but ignored a live state event for a dismissed session",
+          );
+          return {
+            outcome: "accepted",
+            skipped: appended.skipped,
+            publish: false,
+            notifyListeners: false,
+          };
+        }
+        if (!canTransition(session.state, payload.state)) {
+          this.log.error(
+            { sessionId: session.id, from: session.state, to: payload.state },
+            "Dropped session state event the transition table forbids",
+          );
+          return {
+            outcome: "accepted",
+            skipped: appended.skipped,
+            publish: false,
+            notifyListeners: false,
+          };
+        }
+        if (
+          payload.state === "running" &&
+          context.step &&
+          event.sequence > context.step.eventSeqFrom
+        ) {
+          const step = this.store.updateRunStep(context.step.id, {
+            eventSeqFrom: event.sequence,
+          });
+          if (step) context = { ...context, step };
+        }
+
+        const intent = this.store.getSessionTransitionIntent(session.id);
+        let transitioned = this.transitionSession(
+          session.id,
+          payload.state,
+          payload.activity ?? session.currentActivity,
+          {
+            type: "session_event",
+            event: {
+              eventId: event.eventId,
+              sequence: event.sequence,
+              createdAt: event.createdAt,
+            },
+          },
+          context,
+        );
+        const redispatchStop =
+          session.stopRequested && !terminalSessionStates.has(payload.state);
+        if (session.stopRequested && terminalSessionStates.has(payload.state)) {
+          transitioned = this.store.setSessionControls(session.id, {
+            stopRequested: false,
+          });
+        }
+        if (
+          intent &&
+          ["idle", "stopped", "completed", "failed"].includes(payload.state)
+        ) {
+          this.store.consumeSessionTransitionIntent(session.id);
+        }
+        this.clearConsumedTurnCompletion(transitioned, intent, context);
+        return {
+          outcome: "accepted",
+          skipped: appended.skipped,
+          publish: true,
+          notifyListeners: true,
+          redispatchStop,
+          session: transitioned,
+        };
+      }
+
+      if (event.type === "turn_complete") {
+        if (!eventPayload(event, "turn_complete")) {
+          return {
+            outcome: "accepted",
+            skipped: appended.skipped,
+            publish: false,
+            notifyListeners: false,
+          };
+        }
+        if (!this.store.getSessionTransitionIntent(session.id)) {
+          this.store.setSessionTurnCompletion(session.id, {
+            eventId: event.eventId,
+            sequence: event.sequence,
+            attempt: notificationAttemptKey(session, context),
+          });
+        }
+      } else if (event.type === "permission") {
+        const payload = eventPayload(event, "permission");
+        if (!payload) {
+          return {
+            outcome: "accepted",
+            skipped: appended.skipped,
+            publish: false,
+            notifyListeners: false,
+          };
+        }
+        this.notifications.createPermissionRequest({
+          session,
+          requestId: payload.requestId,
+          event: {
+            eventId: event.eventId,
+            sequence: event.sequence,
+            createdAt: event.createdAt,
+          },
+          context,
+        });
+      } else if (event.type === "permission_result") {
+        const payload = eventPayload(event, "permission_result");
+        if (!payload) {
+          return {
+            outcome: "accepted",
+            skipped: appended.skipped,
+            publish: false,
+            notifyListeners: false,
+          };
+        }
+        this.notifications.resolvePermissionRequest({
+          session,
+          requestId: payload.requestId,
+          event: {
+            eventId: event.eventId,
+            sequence: event.sequence,
+            createdAt: event.createdAt,
+          },
+          context,
+        });
+      }
+
+      return {
+        outcome: "accepted",
+        skipped: appended.skipped,
+        publish: true,
+        notifyListeners: true,
+        session: this.store.getSession(session.id)!,
+      };
+    };
+
+    const afterCommit = (result: WriteResult): void => {
+      if (result.skipped > 0) {
         this.log.warn(
-          { sessionId: event.sessionId, skipped: appended.skipped },
+          { sessionId: event.sessionId, skipped: result.skipped },
           "Session events were lost while the Host was unreachable",
         );
       }
-      this.broadcast({ type: "event", event });
-      const session = this.store.getSession(event.sessionId);
-      if (!session) return;
-      if (event.type !== "state") {
-        this.publishSession(this.store.getSession(session.id)!);
-        return;
+      if (result.publish && result.session) {
+        this.broadcast({ type: "event", event });
+        this.publishSession(result.session);
+        if (result.notifyListeners) this.notifySessionEventListeners(event);
       }
-      const payload = eventPayload(event, "state");
-      if (!payload?.state) return;
-      if (session.dismissed && !terminalSessionStates.has(payload.state)) {
-        this.log.warn(
-          { sessionId: session.id, state: payload.state },
-          "Recorded but ignored a live state event for a dismissed session",
-        );
-        return;
+      if (result.redispatchStop && result.session) {
+        this.dispatch(result.session.nodeId, {
+          type: "stop",
+          sessionId: result.session.id,
+        });
       }
-      // A rejected transition would otherwise strand the session in its old
-      // state with nothing but a log line to explain it.
-      if (!canTransition(session.state, payload.state)) {
-        this.log.error(
-          { sessionId: session.id, from: session.state, to: payload.state },
-          "Dropped session state event the transition table forbids",
-        );
-        return;
-      }
-      let updated = this.store.transitionSession(
-        session.id,
-        payload.state,
-        payload.activity ?? session.currentActivity,
-      );
-      if (session.stopRequested && terminalSessionStates.has(payload.state)) {
-        updated = this.store.setSessionControls(session.id, { stopRequested: false });
-      }
-      this.publishSession(updated);
-      if (session.stopRequested && !terminalSessionStates.has(payload.state)) {
-        this.dispatch(session.nodeId, { type: "stop", sessionId: session.id });
-      }
+    };
+
+    try {
+      const result = eventMayAffectNotifications(event)
+        ? this.notifications.commitAtomically(write, afterCommit)
+        : (() => {
+            const committed = this.store.writeAtomically(write);
+            afterCommit(committed);
+            return committed;
+          })();
+      return result.outcome === "accepted"
+        ? { outcome: "accepted" }
+        : {
+            outcome: "permanent_rejection",
+            reason: result.reason ?? "identity_conflict",
+          };
     } catch (error) {
+      if (isSqliteConstraintError(error)) {
+        this.log.error({ error, event }, "Permanently rejected session event");
+        return { outcome: "permanent_rejection", reason: "sqlite_constraint" };
+      }
       this.log.error({ error, event }, "Rejected session event");
-    } finally {
-      // After the store is updated, so a listener that reads it sees the event
-      // it was told about. One-way on purpose: the service never imports the
-      // orchestrator, which is what keeps the dependency pointing inward.
-      for (const listener of this.sessionEventListeners) {
-        try {
-          listener(event);
-        } catch (error) {
-          this.log.error({ error, event }, "A session event listener threw");
-        }
+      return { outcome: "retryable_failure" };
+    }
+  }
+
+  private notificationAttemptContext(session: FleetSession): NotificationAttemptContext {
+    const context = this.runStepAttemptContext(session);
+    if (!context.step) return {};
+    const dispatch = this.store.getSessionDispatchAttempt(session.id);
+    if (!dispatch) return context;
+    return dispatch.attempt === notificationAttemptKey(session, context) ? context : {};
+  }
+
+  private runStepAttemptContext(session: FleetSession): NotificationAttemptContext {
+    if (session.runRole !== "worker" && session.runRole !== "reviewer") return {};
+    const step = this.store.getRunStepBySession(session.id);
+    if (!step || (session.runId && step.runId !== session.runId)) return {};
+    return { step, run: this.store.getRun(step.runId) };
+  }
+
+  private dispatchAttemptKey(session: FleetSession): string {
+    const context = this.runStepAttemptContext(session);
+    return context.step && !terminalRunStepStates.has(context.step.state)
+      ? notificationAttemptKey(session, context)
+      : `session:${session.id}`;
+  }
+
+  /**
+   * Leaves an orchestration completion receipt until the step settlement that
+   * consumes it. Everything else has already used the receipt, or invalidated
+   * it by beginning another turn.
+   */
+  private clearConsumedTurnCompletion(
+    session: FleetSession,
+    intent: SessionTransitionIntent | undefined,
+    context: NotificationAttemptContext,
+  ): void {
+    const stepConsumesReceipt =
+      !intent &&
+      context.step !== undefined &&
+      !terminalRunStepStates.has(context.step.state) &&
+      ["idle", "completed", "failed", "stopped"].includes(session.state);
+    if (!stepConsumesReceipt) {
+      this.store.clearSessionTurnCompletion(session.id);
+    }
+  }
+
+  private isStaleAttemptEvent(
+    session: FleetSession,
+    event: SessionEvent,
+    context: NotificationAttemptContext,
+  ): boolean {
+    if (session.runRole !== "worker" && session.runRole !== "reviewer") return false;
+    if (
+      !["state", "turn_complete", "error", "permission", "permission_result"].includes(
+        event.type,
+      )
+    ) {
+      return false;
+    }
+    const dispatch = this.store.getSessionDispatchAttempt(session.id);
+    if (dispatch && event.sequence <= dispatch.eventSeqFrom) return true;
+    if (dispatch?.attempt === `session:${session.id}`) return false;
+    const step = context.step;
+    if (!step) return false;
+    let currentTerminalEvent = false;
+    if (terminalRunStepStates.has(step.state)) {
+      if (event.type === "permission_result") {
+        // A failing agent can terminalize the step before denying its pending
+        // permission request. The exact request identity still guards resolve.
+        currentTerminalEvent = true;
+      } else if (event.type === "state") {
+        const intent = this.store.getSessionTransitionIntent(session.id);
+        const state = eventPayload(event, "state")?.state;
+        const settlesIntent =
+          (intent === "stop" &&
+            state !== undefined &&
+            ["stopped", "failed"].includes(state)) ||
+          (intent === "cancel" &&
+            state !== undefined &&
+            ["idle", "stopped", "failed"].includes(state));
+        if (!settlesIntent) return true;
+        currentTerminalEvent = true;
+      } else {
+        return true;
+      }
+    }
+    if (event.sequence <= step.eventSeqFrom) return true;
+    if (currentTerminalEvent) return false;
+    if (event.type === "state") {
+      const state = eventPayload(event, "state")?.state;
+      if (state === "running") return false;
+      if (step.state === "pending" && session.state === "starting" && state === "idle") {
+        return false;
+      }
+    }
+    // Once this attempt's running marker has advanced the sequence boundary,
+    // ordering alone separates every later event from the previous attempt.
+    if (step.state === "running") return false;
+    if (!step.dispatchedAt) return false;
+    const offset = this.store.eventClockOffsetMs(session.id, step.eventSeqFrom);
+    if (offset === undefined) return false;
+    return Date.parse(event.createdAt) + offset < Date.parse(step.dispatchedAt);
+  }
+
+  /** Applies the bounded notification retention policy and refreshes browsers once. */
+  pruneNotifications(now = Date.now()): number {
+    let pruned = 0;
+    while (true) {
+      const batch = this.store.pruneNotifications(now);
+      pruned += batch;
+      if (batch === 0) break;
+    }
+    if (pruned > 0) {
+      this.broadcast({ type: "snapshot", data: this.snapshot() });
+    }
+    return pruned;
+  }
+
+  private notifySessionEventListeners(event: SessionEvent): void {
+    // After persistence and any accepted transition, so listeners read the fact
+    // they were told about rather than the state that preceded it.
+    for (const listener of this.sessionEventListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        this.log.error({ error, event }, "A session event listener threw");
       }
     }
   }
@@ -909,15 +1564,111 @@ export class FleetService {
     return () => this.sessionEventListeners.delete(listener);
   }
 
+  private transitionSession(
+    sessionId: string,
+    state: SessionState,
+    activity: string | undefined,
+    source: AcceptedSessionTransitionSource,
+    context?: NotificationAttemptContext,
+  ): FleetSession {
+    const before = this.store.getSession(sessionId);
+    if (!before) throw new Error("Session not found");
+    const intent = this.store.getSessionTransitionIntent(sessionId);
+    const completion = this.store.getSessionTurnCompletion(sessionId);
+    const after = this.store.transitionSession(sessionId, state, activity);
+    this.acceptSessionTransition({
+      before,
+      after,
+      source,
+      intent,
+      completion,
+      context: context ?? this.notificationAttemptContext(before),
+    });
+    return after;
+  }
+
+  private acceptSessionTransition(transition: AcceptedSessionTransition): void {
+    const { before, after, source, intent, completion, context } = transition;
+    if (before.state === after.state) return;
+    const attempt = notificationAttemptKey(after, context);
+    const completed =
+      !intent &&
+      completion?.attempt === attempt &&
+      (after.state === "idle" || after.state === "completed") &&
+      (source.type === "session_event" ||
+        (source.type === "reconciliation" && source.outcome === "restored"));
+    const failed =
+      after.state === "failed" &&
+      (source.type === "fatal_command_result" ||
+        (!intent &&
+          (source.type === "session_event" ||
+            (source.type === "reconciliation" && source.outcome === "missing"))));
+    if (!completed && !failed) return;
+
+    const identity =
+      source.type === "session_event"
+        ? {
+            ...source.event,
+            source: "session_event" as const,
+          }
+        : source.type === "fatal_command_result"
+          ? {
+              eventId: `command-result:${source.commandId}`,
+              sequence: this.store.maxEventSequence(after.id),
+              createdAt: source.createdAt,
+              source: "fatal_command_result" as const,
+            }
+          : {
+              eventId: `reconciliation:${source.outcome}:${after.id}:${after.updatedAt}`,
+              sequence: this.store.maxEventSequence(after.id),
+              createdAt: after.updatedAt,
+              source: "reconciliation" as const,
+            };
+    this.notifications.createAgentLifecycle({
+      kind: completed ? "agent_completion" : "agent_failure",
+      session: after,
+      transition: {
+        ...identity,
+        from: before.state,
+        to: after.state,
+      },
+      ...(completed && completion
+        ? {
+            turnComplete: {
+              eventId: completion.eventId,
+              sequence: completion.sequence,
+            },
+          }
+        : {}),
+      context,
+    });
+  }
+
   /** Fails a session whose Node reported the command it was given did not run. */
-  failFromCommandResult(sessionId: string, reason: string): void {
-    const session = this.store.getSession(sessionId);
-    if (!session || terminalSessionStates.has(session.state)) return;
-    this.store.transitionSession(session.id, "failed", reason);
-    this.publishSession(
-      session.stopRequested
-        ? this.store.setSessionControls(session.id, { stopRequested: false })
-        : this.store.getSession(session.id)!,
+  failFromCommandResult(sessionId: string, commandId: string, reason: string): void {
+    this.notifications.commitAtomically(
+      () => {
+        const session = this.store.getSession(sessionId);
+        if (!session || terminalSessionStates.has(session.state)) return undefined;
+        const context = this.notificationAttemptContext(session);
+        let failed = this.transitionSession(session.id, "failed", reason, {
+          type: "fatal_command_result",
+          commandId,
+          createdAt: new Date().toISOString(),
+        });
+        if (session.stopRequested) {
+          failed = this.store.setSessionControls(session.id, {
+            stopRequested: false,
+          });
+        }
+        this.store.consumeSessionTransitionIntent(session.id);
+        this.clearConsumedTurnCompletion(failed, undefined, context);
+        this.resolveSessionPermissionRequests(session.id);
+        return failed;
+      },
+      (failed) => {
+        if (failed) this.publishSession(failed);
+      },
     );
   }
 
@@ -943,4 +1694,22 @@ export class FleetService {
     }
     for (const socket of this.browserSockets) socket.close();
   }
+}
+
+function eventMayAffectNotifications(event: SessionEvent): boolean {
+  return (
+    event.type === "state" ||
+    event.type === "permission" ||
+    event.type === "permission_result"
+  );
+}
+
+function isSqliteConstraintError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as { code?: unknown; errcode?: unknown };
+  return (
+    candidate.code === "ERR_SQLITE_ERROR" &&
+    typeof candidate.errcode === "number" &&
+    (candidate.errcode & 0xff) === 19
+  );
 }

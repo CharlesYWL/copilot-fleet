@@ -813,13 +813,12 @@ export class FleetTools {
     const unreadable = judgeSummary(input.summary);
     if (unreadable) return refuse(unreadable);
 
-    this.store.appendRunNote(
-      run.id,
-      run.phaseIndex,
-      [input.summary.trim(), verdict.record].join(""),
-    );
-    const submitted = this.store.updateRun(run.id, { state: "awaiting_human" })!;
-    this.service.publishRun(submitted);
+    const submitted = this.service.requestRunReview({
+      runId: run.id,
+      note: [input.summary.trim(), verdict.record].join(""),
+      reason: "completed",
+    });
+    if (!submitted) return refuse(`"${run.name}" is already with the person.`);
     return ok(
       [
         `Handed "${submitted.name}" to the person for review.`,
@@ -857,25 +856,25 @@ export class FleetTools {
     }
 
     const unmet = run.successCriteria.filter((criterion) => criterion.essential);
-    this.store.appendRunNote(
-      run.id,
-      run.phaseIndex,
-      [
-        `**Escalated — this task is not finished.**`,
-        "",
-        input.reason.trim(),
-        ...(unmet.length > 0
-          ? [
-              "",
-              "### What it was supposed to satisfy",
-              "",
-              ...unmet.map((c) => `- **${c.id}** — ${c.scenario}`),
-            ]
-          : []),
-      ].join("\n"),
-    );
-    const escalated = this.store.updateRun(run.id, { state: "awaiting_human" })!;
-    this.service.publishRun(escalated);
+    const note = [
+      `**Escalated — this task is not finished.**`,
+      "",
+      input.reason.trim(),
+      ...(unmet.length > 0
+        ? [
+            "",
+            "### What it was supposed to satisfy",
+            "",
+            ...unmet.map((c) => `- **${c.id}** — ${c.scenario}`),
+          ]
+        : []),
+    ].join("\n");
+    const escalated = this.service.requestRunReview({
+      runId: run.id,
+      note,
+      reason: "blocked",
+    });
+    if (!escalated) return refuse(`"${run.name}" is already with the person.`);
     return ok(
       [
         `Escalated "${escalated.name}" to the person.`,
@@ -966,6 +965,7 @@ export class FleetTools {
       run.phaseIndex,
       [held ? `**Taken back before review.**` : `**Reopened.**`, "", reason].join("\n"),
     );
+    if (held) this.service.resolveRunReview(run.id);
     const reopened = this.store.updateRun(run.id, {
       state: "running",
       failureReason: "",

@@ -103,8 +103,15 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
   app.delete("/api/nodes/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!store.getNode(id)) return reply.code(404).send({ error: "Unknown node" });
+    const removedSessionIds = store
+      .listSessions()
+      .filter((session) => session.nodeId === id)
+      .map((session) => session.id);
     try {
       store.deleteNode(id);
+      for (const sessionId of removedSessionIds) {
+        service.resolveSessionPermissionRequests(sessionId);
+      }
       // Deleting a node takes its placements with it, so the catalog moved too.
       service.publishCatalog();
     } catch (error) {

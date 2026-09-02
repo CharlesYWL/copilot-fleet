@@ -5,10 +5,16 @@ import {
   HOST_YOLO_CAPABILITY,
   HostBackupSchema,
   HostToNodeMessageSchema,
+  ListNotificationsRequestSchema,
+  MarkAllNotificationsReadResponseSchema,
   NODE_BACKUP_KIND,
   NodeBackupSchema,
   NodeCommandSchema,
   NodeToHostMessageSchema,
+  OUTBOX_ACK_CAPABILITY,
+  OutboxFlushIdSchema,
+  NotificationPreferenceSchema,
+  NotificationSchema,
   RenameSessionSchema,
   SessionEventSchema,
   SessionSchema,
@@ -69,6 +75,133 @@ describe("protocol validation", () => {
   it("guards malformed WebSocket JSON frames", () => {
     expect(tryParseJson('{"type":"heartbeat"}').ok).toBe(true);
     expect(tryParseJson("{not-json").ok).toBe(false);
+  });
+
+  it("defaults reconnect ordering for older Nodes and accepts an outbox flush", () => {
+    const flushId = OutboxFlushIdSchema.parse("11111111-1111-4111-8111-111111111111");
+    const hello = NodeToHostMessageSchema.parse({
+      type: "hello",
+      nodeId: "n1",
+      secret: "secret",
+      os: "win32",
+      arch: "x64",
+      version: "0.3.0",
+      capabilities: [],
+      maxSessions: 1,
+    });
+    expect(hello).toMatchObject({
+      pendingOutbox: false,
+      pendingOutboxCount: 0,
+    });
+    expect(
+      NodeToHostMessageSchema.parse({
+        type: "hello",
+        nodeId: "n1",
+        secret: "secret",
+        os: "win32",
+        arch: "x64",
+        version: "0.3.0",
+        capabilities: [],
+        maxSessions: 1,
+        pendingOutbox: true,
+        pendingOutboxCount: 2,
+      }),
+    ).toMatchObject({ pendingOutbox: true, pendingOutboxCount: 2 });
+    expect(
+      NodeToHostMessageSchema.parse({
+        type: "hello",
+        nodeId: "n1",
+        secret: "secret",
+        os: "win32",
+        arch: "x64",
+        version: "0.3.0",
+        capabilities: [OUTBOX_ACK_CAPABILITY],
+        maxSessions: 1,
+        pendingOutbox: true,
+        pendingOutboxCount: 2,
+        outboxFlush: { flushId, eventCount: 2 },
+      }),
+    ).toMatchObject({
+      outboxFlush: { flushId, eventCount: 2 },
+    });
+    expect(
+      NodeToHostMessageSchema.parse({
+        type: "event",
+        event: {
+          eventId: "e1",
+          sessionId: "s1",
+          sequence: 1,
+          type: "agent_text",
+          payload: { text: "hello" },
+          createdAt: new Date().toISOString(),
+        },
+        outboxFlush: { flushId, eventCount: 2, eventIndex: 0 },
+      }),
+    ).toMatchObject({
+      outboxFlush: { flushId, eventCount: 2, eventIndex: 0 },
+    });
+    expect(() =>
+      NodeToHostMessageSchema.parse({
+        type: "event",
+        event: {
+          eventId: "e2",
+          sessionId: "s1",
+          sequence: 2,
+          type: "agent_text",
+          payload: { text: "bad index" },
+          createdAt: new Date().toISOString(),
+        },
+        outboxFlush: { flushId, eventCount: 2, eventIndex: 2 },
+      }),
+    ).toThrow();
+    expect(
+      NodeToHostMessageSchema.parse({
+        type: "outbox_flushed",
+        activeSessionIds: ["s1"],
+        busySessionIds: [],
+      }),
+    ).toEqual({
+      type: "outbox_flushed",
+      activeSessionIds: ["s1"],
+      busySessionIds: [],
+    });
+    expect(
+      NodeToHostMessageSchema.parse({
+        type: "outbox_flushed",
+        activeSessionIds: ["s1"],
+        busySessionIds: [],
+        outboxFlush: { flushId, eventCount: 2 },
+      }),
+    ).toEqual({
+      type: "outbox_flushed",
+      activeSessionIds: ["s1"],
+      busySessionIds: [],
+      outboxFlush: { flushId, eventCount: 2 },
+    });
+    expect(HostToNodeMessageSchema.parse({ type: "welcome", nodeId: "n1" })).toEqual({
+      type: "welcome",
+      nodeId: "n1",
+      reconcileAfterOutbox: false,
+      acknowledgeOutbox: false,
+    });
+    expect(
+      HostToNodeMessageSchema.parse({
+        type: "welcome",
+        nodeId: "n1",
+        reconcileAfterOutbox: true,
+        acknowledgeOutbox: true,
+      }),
+    ).toMatchObject({
+      type: "welcome",
+      reconcileAfterOutbox: true,
+      acknowledgeOutbox: true,
+    });
+    expect(
+      HostToNodeMessageSchema.parse({
+        type: "outbox_flush_ack",
+        flushId,
+      }),
+    ).toEqual({ type: "outbox_flush_ack", flushId });
   });
 
   it("carries a picker change to the empty-string choice", () => {
@@ -374,6 +507,8 @@ describe("run orchestration protocol", () => {
       hostRevision: "abc",
     });
     expect(snapshot.runs).toEqual([]);
+    expect(snapshot.notifications).toEqual([]);
+    expect(snapshot.notificationUnreadCount).toBe(0);
   });
 
   it("accepts run and run_steps browser messages", () => {
@@ -396,6 +531,7 @@ describe("run orchestration protocol", () => {
       expect(parsed.run.placementId).toBe("");
       expect(parsed.run.settleSeq).toBe(0);
       expect(parsed.run.wakeSeq).toBe(0);
+      expect(parsed.run.reviewSeq).toBe(0);
     }
 
     expect(
@@ -435,6 +571,9 @@ describe("run orchestration protocol", () => {
     const parsed = HostBackupSchema.parse(backup);
     expect(parsed.runs).toEqual([]);
     expect(parsed.runSteps).toEqual([]);
+    expect(parsed.notifications).toEqual([]);
+    expect(parsed.notificationPreferences).toEqual([]);
+    expect(parsed.defaults.notificationLifecycleEnabled).toBe(true);
   });
 
   it("gates run transitions on approval being the entrance", () => {
@@ -465,5 +604,149 @@ describe("run orchestration protocol", () => {
     // The node vanished before acknowledging it.
     expect(canTransitionRunStep("starting", "failed")).toBe(true);
     expect(canTransitionRunStep("succeeded", "running")).toBe(false);
+  });
+});
+
+describe("notification protocol", () => {
+  const now = "2026-09-01T18:00:00.000Z";
+  const notification = {
+    id: "notification-1",
+    sourceKey: "agent_completion:s1:42",
+    category: "agent_lifecycle",
+    kind: "agent_completion",
+    severity: "info",
+    title: "Agent completed",
+    body: "The implementation agent finished its turn.",
+    subject: {
+      type: "agent",
+      id: "implementation",
+      label: "Implementation",
+      parentId: "s1",
+      parentLabel: "Fix notifications",
+    },
+    navigation: { type: "session", sessionId: "s1" },
+    createdAt: now,
+    updatedAt: now,
+  } as const;
+
+  it("bounds durable notification content and defaults lifecycle fields", () => {
+    const parsed = NotificationSchema.parse(notification);
+    expect(parsed.status).toBe("active");
+    expect(parsed.data).toEqual({});
+    expect(parsed.readAt).toBeNull();
+    expect(parsed.dismissedAt).toBeNull();
+    expect(parsed.resolvedAt).toBeNull();
+    expect(() =>
+      NotificationSchema.parse({ ...notification, title: "x".repeat(201) }),
+    ).toThrow();
+    expect(() =>
+      NotificationSchema.parse({ ...notification, body: "x".repeat(4_001) }),
+    ).toThrow();
+  });
+
+  it("keeps session and agent preference overrides isolated and explicit", () => {
+    expect(
+      NotificationPreferenceSchema.parse({
+        sessionId: "s1",
+        agentId: "implementation",
+        lifecycleEnabled: false,
+        updatedAt: now,
+      }),
+    ).toMatchObject({
+      sessionId: "s1",
+      agentId: "implementation",
+      lifecycleEnabled: false,
+    });
+    expect(() =>
+      NotificationPreferenceSchema.parse({
+        sessionId: "s1",
+        agentId: "implementation",
+        updatedAt: now,
+      }),
+    ).toThrow();
+    expect(
+      NotificationPreferenceSchema.parse({
+        sessionId: "s1",
+        agentId: "a".repeat(300),
+        lifecycleEnabled: true,
+        updatedAt: now,
+      }).agentId,
+    ).toHaveLength(300);
+  });
+
+  it("accepts notification browser messages and validates list pagination", () => {
+    expect(
+      BrowserMessageSchema.parse({
+        type: "notification_upsert",
+        notification,
+      }).type,
+    ).toBe("notification_upsert");
+    expect(
+      BrowserMessageSchema.parse({
+        type: "notification_unread_count",
+        unreadCount: 3,
+      }),
+    ).toEqual({ type: "notification_unread_count", unreadCount: 3 });
+    expect(
+      ListNotificationsRequestSchema.parse({
+        before: { createdAt: now, id: "notification-1" },
+      }),
+    ).toMatchObject({ limit: 50, includeDismissed: true });
+    expect(ListNotificationsRequestSchema.parse({ limit: 201 }).limit).toBe(200);
+    expect(() => ListNotificationsRequestSchema.parse({ limit: 0 })).toThrow();
+    expect(
+      MarkAllNotificationsReadResponseSchema.parse({
+        updated: 1,
+        notifications: [NotificationSchema.parse(notification)],
+        unreadCount: 0,
+      }),
+    ).toMatchObject({ updated: 1, unreadCount: 0 });
+    expect(() =>
+      MarkAllNotificationsReadResponseSchema.parse({
+        updated: 0,
+        notifications: [NotificationSchema.parse(notification)],
+        unreadCount: 0,
+      }),
+    ).toThrow();
+  });
+
+  it("round-trips notification history and preferences in a Host backup", () => {
+    const parsed = HostBackupSchema.parse({
+      kind: HOST_BACKUP_KIND,
+      version: 1,
+      exportedAt: now,
+      enrollmentToken: "t",
+      tunnel: { enabled: false, provider: "cloudflare" },
+      defaults: { yolo: true, autoResume: true },
+      nodes: [],
+      workspaces: [],
+      placements: [],
+      sessions: [],
+      events: [],
+      notifications: [
+        {
+          ...notification,
+          status: "resolved",
+          resolvedAt: "2026-09-01T18:01:00.000Z",
+          data: { sequence: 42 },
+        },
+      ],
+      notificationPreferences: [
+        {
+          sessionId: "s1",
+          agentId: "implementation",
+          lifecycleEnabled: false,
+          updatedAt: now,
+        },
+      ],
+    });
+    expect(parsed.notifications[0]).toMatchObject({
+      sourceKey: "agent_completion:s1:42",
+      subject: { id: "implementation", parentId: "s1" },
+      navigation: { sessionId: "s1" },
+      data: { sequence: 42 },
+      status: "resolved",
+    });
+    expect(parsed.notificationPreferences[0]?.lifecycleEnabled).toBe(false);
   });
 });

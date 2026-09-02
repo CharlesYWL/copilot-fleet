@@ -1,0 +1,209 @@
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { FluentProvider } from "@fluentui/react-components";
+import { describe, expect, it, vi } from "vitest";
+import type { Notification } from "@fleet/protocol";
+import { fleetDarkTheme } from "../theme";
+import { NotificationCenter } from "./NotificationCenter";
+
+const notification = (
+  id: string,
+  createdAt: string,
+  overrides: Partial<Notification> = {},
+): Notification => ({
+  id,
+  sourceKey: id,
+  category: "orchestration",
+  kind: "orchestration_step_failure",
+  severity: "error",
+  status: "active",
+  title: `Title ${id}`,
+  body: `Body ${id}`,
+  subject: { type: "run_step", id, label: id, parentId: "r1" },
+  navigation: { type: "run_step", runId: "r1", stepId: id },
+  data: {},
+  createdAt,
+  updatedAt: createdAt,
+  readAt: null,
+  dismissedAt: null,
+  resolvedAt: null,
+  ...overrides,
+});
+
+const show = (
+  notifications: Notification[] = [],
+  unreadCount = 0,
+  overrides: Partial<Parameters<typeof NotificationCenter>[0]> = {},
+) => {
+  const props = {
+    notifications,
+    unreadCount,
+    browserEnabled: false,
+    onToggleBrowser: vi.fn(),
+    onNavigate: vi.fn(),
+    onMarkRead: vi.fn(),
+    onMarkAllRead: vi.fn(),
+    onDismiss: vi.fn(),
+    ...overrides,
+  };
+  render(
+    <FluentProvider theme={fleetDarkTheme}>
+      <NotificationCenter {...props} />
+    </FluentProvider>,
+  );
+  return props;
+};
+
+const open = (unreadCount: number) =>
+  fireEvent.click(
+    screen.getByRole("button", {
+      name: `Notifications, ${unreadCount} unread notification${
+        unreadCount === 1 ? "" : "s"
+      }`,
+    }),
+  );
+
+describe("NotificationCenter", () => {
+  it("hides the numeric badge at zero and shows it above zero", () => {
+    const { rerender } = render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationCenter
+          notifications={[]}
+          unreadCount={0}
+          browserEnabled={false}
+          onToggleBrowser={vi.fn()}
+          onNavigate={vi.fn()}
+          onMarkRead={vi.fn()}
+          onMarkAllRead={vi.fn()}
+          onDismiss={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+    let bell = screen.getByRole("button", {
+      name: "Notifications, 0 unread notifications",
+    });
+    expect(bell.parentElement?.textContent).toBe("");
+
+    rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationCenter
+          notifications={[]}
+          unreadCount={3}
+          browserEnabled={false}
+          onToggleBrowser={vi.fn()}
+          onNavigate={vi.fn()}
+          onMarkRead={vi.fn()}
+          onMarkAllRead={vi.fn()}
+          onDismiss={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+    bell = screen.getByRole("button", {
+      name: "Notifications, 3 unread notifications",
+    });
+    expect(bell.parentElement?.textContent).toBe("3");
+  });
+
+  it("shows a clear empty state", () => {
+    show();
+    open(0);
+    expect(screen.getByText("No notifications yet.")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Mark all read" }).hasAttribute("disabled"),
+    ).toBe(true);
+  });
+
+  it("orders newest first and exposes truthful kind, severity, and time", () => {
+    show([
+      notification("old", "2026-09-01T18:00:00.000Z"),
+      notification("new", "2026-09-01T19:00:00.000Z", {
+        kind: "permission_request",
+        severity: "warning",
+      }),
+    ]);
+    open(0);
+
+    const items = screen.getAllByRole("listitem");
+    expect(within(items[0]!).getByText("Title new")).toBeTruthy();
+    expect(within(items[0]!).getByText("Permission required")).toBeTruthy();
+    expect(within(items[0]!).getByRole("img", { name: "warning severity" })).toBeTruthy();
+    expect(items[0]!.querySelector("time")?.getAttribute("datetime")).toBe(
+      "2026-09-01T19:00:00.000Z",
+    );
+    expect(within(items[1]!).getByText("Title old")).toBeTruthy();
+  });
+
+  it("marks one or all read, dismisses, and navigates from the item", () => {
+    const unread = notification("unread", "2026-09-01T19:00:00.000Z");
+    const read = notification("read", "2026-09-01T18:00:00.000Z", {
+      readAt: "2026-09-01T18:30:00.000Z",
+    });
+    const props = show([unread, read], 1);
+    open(1);
+
+    expect(screen.getByText("Unread")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Mark Title read read" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Mark Title unread read" }));
+    fireEvent.click(screen.getByRole("button", { name: "Mark all read" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Title unread" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Title unread" }));
+
+    expect(props.onMarkRead).toHaveBeenCalledWith("unread");
+    expect(props.onMarkAllRead).toHaveBeenCalledTimes(1);
+    expect(props.onDismiss).toHaveBeenCalledWith("unread");
+    expect(props.onNavigate).toHaveBeenCalledWith(unread);
+  });
+
+  it("renders resolved permission and review items as no longer actionable", () => {
+    show([
+      notification("permission", "2026-09-01T19:00:00.000Z", {
+        kind: "permission_request",
+        category: "permission",
+        status: "resolved",
+        title: "Permission requested",
+        body: "An agent is waiting for a permission decision.",
+        subject: {
+          type: "permission_request",
+          id: "permission",
+          label: "Tool request",
+        },
+        resolvedAt: "2026-09-01T19:01:00.000Z",
+        updatedAt: "2026-09-01T19:01:00.000Z",
+        readAt: "2026-09-01T19:01:00.000Z",
+      }),
+      notification("review", "2026-09-01T18:00:00.000Z", {
+        kind: "orchestration_needs_review",
+        status: "resolved",
+        title: "Task needs review: Ship it",
+        body: "A human decision is required.",
+        subject: {
+          type: "run",
+          id: "r1",
+          label: "Ship it",
+        },
+        resolvedAt: "2026-09-01T19:01:00.000Z",
+        updatedAt: "2026-09-01T19:01:00.000Z",
+      }),
+    ]);
+    open(0);
+
+    expect(screen.getByText("Permission request resolved")).toBeTruthy();
+    expect(screen.getByText("Review resolved: Ship it")).toBeTruthy();
+    expect(screen.getAllByText("Resolved")).toHaveLength(2);
+    expect(screen.getAllByText("This item no longer needs action.")).toHaveLength(2);
+    expect(screen.queryByText("Permission required")).toBeNull();
+    expect(screen.queryByText("Needs review")).toBeNull();
+    expect(screen.getByText("Read")).toBeTruthy();
+    expect(screen.getByText("Unread")).toBeTruthy();
+  });
+
+  it("offers browser alerts only through an explicit control", () => {
+    const onToggleBrowser = vi.fn();
+    show([], 0, { onToggleBrowser });
+    open(0);
+
+    const toggle = screen.getByRole("button", { name: "Enable browser alerts" });
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(toggle);
+    expect(onToggleBrowser).toHaveBeenCalledTimes(1);
+  });
+});
