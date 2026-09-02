@@ -163,6 +163,19 @@ const useStyles = makeStyles({
     fontSize: "10px",
     fontWeight: tokens.fontWeightBold,
   },
+  stopWarning: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "9px 18px",
+    borderBottom: `1px solid ${statusVisuals.attention.border}`,
+    background: statusVisuals.attention.surface,
+    color: statusVisuals.attention.foreground,
+    fontSize: tokens.fontSizeBase200,
+    lineHeight: tokens.lineHeightBase300,
+    "@media (max-width: 700px)": { padding: "9px 12px" },
+  },
   streamArea: {
     position: "relative",
     display: "flex",
@@ -709,6 +722,7 @@ export const TerminalView = ({
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
   const canResume =
     Boolean(onResume) && !session.stopRequested && isResumableSession(session);
+  const canConfirmStopped = session.stopRequested && session.state === "offline";
 
   const query = slashQuery(prompt);
   const matches = useMemo(
@@ -956,8 +970,23 @@ export const TerminalView = ({
             Dismiss
           </Button>
         ) : (
-          <Button appearance="secondary" icon={<Stop20Regular />} onClick={onStop}>
-            Stop
+          <Button
+            appearance="secondary"
+            icon={<Stop20Regular />}
+            onClick={onStop}
+            disabled={Boolean(session.stopRequested && !canConfirmStopped)}
+            {...(canConfirmStopped
+              ? {
+                  title:
+                    "Confirm that the unavailable node is no longer running this session",
+                }
+              : {})}
+          >
+            {canConfirmStopped
+              ? "Mark stopped"
+              : session.stopRequested
+                ? "Stopping"
+                : "Stop"}
           </Button>
         )}
         {onClose && (
@@ -970,6 +999,17 @@ export const TerminalView = ({
           />
         )}
       </div>
+
+      {canConfirmStopped && (
+        <div className={styles.stopWarning} role="alert">
+          <Warning16Regular aria-hidden="true" />
+          <span>
+            <strong>Stop is waiting for the offline node {session.nodeName}.</strong>{" "}
+            Reconnect that node so it can acknowledge the request, or choose Mark stopped
+            if you know its agent process is no longer running.
+          </span>
+        </div>
+      )}
 
       {permission && (
         <PermissionBanner

@@ -116,6 +116,8 @@ describe("TerminalView composer", () => {
     show({ state: "offline", stopRequested: true });
 
     expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Mark stopped" })).toBeTruthy();
+    expect(screen.getByText("Stop is waiting for the offline node node.")).toBeTruthy();
   });
 
   it("offers Resume after an offline session has finished stopping", () => {

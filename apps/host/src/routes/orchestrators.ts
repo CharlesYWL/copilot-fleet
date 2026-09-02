@@ -107,6 +107,28 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     }
   };
 
+  const settleUnavailableStops = (leadSessionId: string): number => {
+    const ownedRunIds = new Set(
+      store
+        .listRuns()
+        .filter((run) => run.leadSessionId === leadSessionId)
+        .map((run) => run.id),
+    );
+    let settled = 0;
+    for (const candidate of store.listSessions()) {
+      if (candidate.id !== leadSessionId && !ownedRunIds.has(candidate.runId)) continue;
+      if (!candidate.stopRequested || candidate.state !== "offline") continue;
+      if (store.getNode(candidate.nodeId)?.online) continue;
+      service.settleCommandedSession(
+        candidate.id,
+        "stopped",
+        "Confirmed stopped while node unavailable",
+      );
+      settled += 1;
+    }
+    return settled;
+  };
+
   app.get("/api/orchestrators", async () => ({
     orchestrators: conversations().map(({ session, runs }) => ({
       session,
@@ -322,7 +344,15 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       engine.tick();
       return { ok: true, alreadyTerminal: true };
     }
-    if (session.stopRequested) return { ok: true, alreadyStopping: true };
+    if (session.stopRequested) {
+      const settled = settleUnavailableStops(id);
+      engine.tick();
+      return {
+        ok: true,
+        alreadyStopping: settled === 0,
+        confirmedStopped: settled > 0,
+      };
+    }
     service.publishSession(store.setSessionControls(id, { stopRequested: true }));
     // Stopping the session is the revocation: its token only opens anything
     // while it is still a live orchestrator.

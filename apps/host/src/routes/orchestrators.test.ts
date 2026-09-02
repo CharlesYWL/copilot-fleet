@@ -235,6 +235,31 @@ describe("orchestrator lifecycle routes", () => {
     expect(store.getRun(run.id)?.state).toBe("running");
   });
 
+  it("lets an operator confirm Stop when the owning node never reconnects", async () => {
+    const { app, store, service, leadId, worker } = await setup();
+    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    service.disconnectNode(store.getSession(leadId)!.nodeId, "Node unavailable");
+
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/stop`,
+    });
+
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json()).toMatchObject({
+      ok: true,
+      confirmedStopped: true,
+    });
+    expect(store.getSession(leadId)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+    expect(store.getSession(worker.id)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+  });
+
   it("dismisses and restores visibility without mutating or deleting execution", async () => {
     const { app, store, service, leadId, run, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });

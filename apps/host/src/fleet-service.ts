@@ -830,10 +830,15 @@ export class FleetService {
   ): FleetSession {
     return this.notifications.commitAtomically(
       () => {
-        const session = this.transitionSession(sessionId, state, activity, {
+        let session = this.transitionSession(sessionId, state, activity, {
           type: "host",
           cause: "operator_settlement",
         });
+        if (terminalSessionStates.has(state) && session.stopRequested) {
+          session = this.store.setSessionControls(sessionId, {
+            stopRequested: false,
+          });
+        }
         this.store.consumeSessionTransitionIntent(sessionId);
         this.store.clearSessionTurnCompletion(sessionId);
         if (terminalSessionStates.has(state)) {
