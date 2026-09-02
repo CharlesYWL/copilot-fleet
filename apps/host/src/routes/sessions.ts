@@ -230,9 +230,7 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (session.state !== "running") {
       return reply.code(409).send({ error: "Session is not running" });
     }
-    service.publishSession(
-      store.transitionSession(id, "cancelling", "Cancelling active turn"),
-    );
+    service.publishSession(service.beginSessionCancellation(id));
     const dispatched = service.dispatch(
       session.nodeId,
       { type: "cancel", sessionId: id },
@@ -262,10 +260,14 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
 
   app.delete("/api/sessions/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!store.getSession(id)) {
+    const session = store.getSession(id);
+    if (!session) {
       return reply.code(404).send({ error: "Session not found" });
     }
     try {
+      if (terminalSessionStates.has(session.state)) {
+        service.resolveSessionPermissionRequests(id);
+      }
       store.deleteSession(id);
     } catch (error) {
       return reply
@@ -275,7 +277,16 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     return reply.code(204).send();
   });
 
-  app.delete("/api/sessions", async () => ({ removed: store.deleteEndedSessions() }));
+  app.delete("/api/sessions", async () => {
+    const before = store.listSessions();
+    const removed = store.deleteEndedSessions();
+    for (const session of before) {
+      if (!store.getSession(session.id)) {
+        service.resolveSessionPermissionRequests(session.id);
+      }
+    }
+    return { removed };
+  });
 
   app.post("/api/sessions/:id/permission", async (request, reply) => {
     const { id } = request.params as { id: string };

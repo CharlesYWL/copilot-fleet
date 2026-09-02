@@ -52,6 +52,7 @@ export function archiveRun(
   const run = store.getRun(runId);
   if (!run) return;
 
+  service.resolveRunReview(runId);
   if (!terminalRunStates.has(run.state)) {
     const cancelled = store.cancelRunWithUnfinishedSteps(
       runId,
@@ -107,14 +108,16 @@ export function reopenOrchestratorStoppedRun(
 export function purgeRun(service: FleetService, runId: string): boolean {
   const { store } = service;
   if (!store.getRun(runId)) return false;
+  service.resolveRunReview(runId);
   // Sessions are stopped before the rows go, because a deleted run cannot stop
   // anything afterwards — there is nothing left to find them by.
   stopRunSessions(service, runId);
   for (const session of store.listSessions()) {
     if (session.runId !== runId) continue;
     if (!terminalSessionStates.has(session.state)) {
-      store.transitionSession(session.id, "stopped", "Task deleted");
+      service.settleCommandedSession(session.id, "stopped", "Task deleted", false);
     }
+    service.resolveSessionPermissionRequests(session.id);
     store.deleteSession(session.id);
   }
   store.deleteRun(runId);

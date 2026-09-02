@@ -733,6 +733,21 @@ describe("FleetTools success criteria", () => {
     expect(note).toContain("**nice-to-have** *(optional)* — not reported");
   });
 
+  it("creates one controlled review notification for a completed handover", () => {
+    expect(submit([met("logout-invalidates")]).ok).toBe(true);
+    expect(submit([met("logout-invalidates")]).ok).toBe(false);
+
+    const notifications = store.listNotifications().notifications;
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]).toMatchObject({
+      sourceKey: `review:${runId}:1`,
+      kind: "orchestration_needs_review",
+      navigation: { type: "run", runId },
+      data: { reviewSeq: 1, reason: "completed" },
+    });
+    expect(JSON.stringify(notifications[0])).not.toContain("ran the auth suite");
+  });
+
   it("refuses a handover written as a wall of prose", () => {
     /*
      * The review page is this text and two buttons, so an unscannable summary
@@ -832,6 +847,11 @@ describe("FleetTools success criteria", () => {
     // And carries what it was supposed to satisfy, so the person can decide
     // whether to drop that criterion without going to look it up.
     expect(note).toContain("logout-invalidates");
+    expect(store.listNotifications().notifications[0]).toMatchObject({
+      sourceKey: `review:${runId}:1`,
+      data: { reason: "blocked" },
+      body: "The orchestrator is blocked and needs a human decision before work can continue.",
+    });
   });
 
   it("does not escalate a task the person already holds", () => {
@@ -1081,6 +1101,30 @@ describe("FleetTools task lifecycle", () => {
       expect(store.listRunNotes(task().id).at(-1)!.body).toContain(
         "Taken back before review",
       );
+    });
+
+    it("resolves the withdrawn review and creates a new sequence on resubmit", () => {
+      plan();
+      handOver();
+      const run = task();
+      expect(store.getNotificationBySourceKey(`review:${run.id}:1`)).toMatchObject({
+        status: "active",
+      });
+
+      tools().reopenTask({
+        task: "Ship it",
+        reason: "The evidence needs one more focused check.",
+      });
+      expect(store.getNotificationBySourceKey(`review:${run.id}:1`)).toMatchObject({
+        status: "resolved",
+      });
+
+      handOver();
+      expect(store.getRun(run.id)?.reviewSeq).toBe(2);
+      expect(store.getNotificationBySourceKey(`review:${run.id}:2`)).toMatchObject({
+        status: "active",
+      });
+      expect(store.listNotifications().notifications).toHaveLength(2);
     });
 
     it("carries a finished task on from the phase it was on", () => {

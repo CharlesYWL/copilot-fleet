@@ -3,11 +3,14 @@ import type { WebSocket } from "ws";
 import {
   AUTH_FAILED_CLOSE_CODE,
   NodeToHostMessageSchema,
+  OUTBOX_ACK_CAPABILITY,
   SUPERSEDED_CLOSE_CODE,
   decodeFrame,
   resolveNodeName,
+  type OutboxEventPosition,
+  type OutboxFlushIdentity,
 } from "@fleet/protocol";
-import { heartbeatSessionsBelongTo, nodeMessageBelongsTo } from "../node-messages.js";
+import { heartbeatSessionsBelongTo, nodeMessageOwnership } from "../node-messages.js";
 import type { FleetService } from "../fleet-service.js";
 import type { FleetNode } from "@fleet/protocol";
 
@@ -63,6 +66,14 @@ function settleNodeName(
 export function registerNodeGateway(app: FastifyInstance, service: FleetService): void {
   app.get("/ws/node", { websocket: true }, (socket: WebSocket) => {
     let authenticatedNodeId: string | undefined;
+    let awaitingOutboxFlush = false;
+    let acknowledgeOutbox = false;
+    let outboxFlush: TrackedOutboxFlush | undefined;
+
+    const rejectOutbox = (nodeId: string, reason: string): void => {
+      app.log.warn({ nodeId, reason }, "Rejected invalid outbox flush");
+      socket.close(1008, "Invalid outbox flush");
+    };
 
     socket.once("message", (data: unknown) => {
       const frame = decodeFrame(String(data), NodeToHostMessageSchema);
@@ -126,10 +137,42 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
       // Welcome precedes reconciliation because reconciliation can dispatch
       // commands, and a Node should not be told to resume a session before it
       // has been told its hello was accepted.
-      service.send(socket, { type: "welcome", nodeId: hello.nodeId });
-      service.publishSessions(
-        service.reconcile(hello.nodeId, activeSessionIds, hello.busySessionIds),
-      );
+      acknowledgeOutbox = hello.capabilities.includes(OUTBOX_ACK_CAPABILITY);
+      awaitingOutboxFlush =
+        hello.pendingOutbox ||
+        hello.pendingOutboxCount > 0 ||
+        hello.outboxFlush !== undefined;
+      if (acknowledgeOutbox && awaitingOutboxFlush) {
+        if (
+          !hello.outboxFlush ||
+          hello.outboxFlush.eventCount !== hello.pendingOutboxCount
+        ) {
+          rejectOutbox(hello.nodeId, "hello inventory did not identify its batch");
+          return;
+        }
+        outboxFlush = trackOutboxFlush(hello.outboxFlush);
+      } else if (hello.outboxFlush) {
+        rejectOutbox(hello.nodeId, "hello identified a batch it did not advertise");
+        return;
+      }
+      service.send(socket, {
+        type: "welcome",
+        nodeId: hello.nodeId,
+        reconcileAfterOutbox: awaitingOutboxFlush,
+        acknowledgeOutbox,
+      });
+      if (!awaitingOutboxFlush) {
+        try {
+          service.reconcile(hello.nodeId, activeSessionIds, hello.busySessionIds);
+        } catch (error) {
+          app.log.error(
+            { nodeId: hello.nodeId, error },
+            "Failed initial node reconciliation",
+          );
+          socket.close(1011, "Failed to reconcile node");
+          return;
+        }
+      }
 
       socket.on("message", (raw: unknown) => {
         const next = decodeFrame(String(raw), NodeToHostMessageSchema);
@@ -142,73 +185,203 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
           return;
         }
         const message = next.value;
-        if (
-          !nodeMessageBelongsTo(hello.nodeId, message, (id) =>
-            service.store.getSession(id),
-          )
-        ) {
+        const ownership = nodeMessageOwnership(hello.nodeId, message, (id) =>
+          service.store.getSession(id),
+        );
+        const missingReplayEvent =
+          ownership === "missing" &&
+          message.type === "event" &&
+          message.outboxFlush !== undefined;
+        if (ownership === "foreign" || (ownership === "missing" && !missingReplayEvent)) {
           app.log.warn(
-            { nodeId: hello.nodeId, messageType: message.type },
+            { nodeId: hello.nodeId, messageType: message.type, ownership },
             "Rejected cross-node message",
           );
           socket.close(1008, "Session ownership mismatch");
           return;
         }
-        if (message.type === "heartbeat") {
-          if (
-            !heartbeatSessionsBelongTo(hello.nodeId, message.activeSessionIds, (id) =>
-              service.store.getSession(id),
-            )
-          ) {
-            app.log.warn(
-              { nodeId: hello.nodeId },
-              "Rejected cross-node heartbeat inventory",
+        try {
+          if (message.type === "heartbeat") {
+            if (
+              !inventoryBelongsToNode(
+                hello.nodeId,
+                message.activeSessionIds,
+                message.busySessionIds,
+                (id) => service.store.getSession(id),
+              )
+            ) {
+              app.log.warn(
+                { nodeId: hello.nodeId },
+                "Rejected cross-node heartbeat inventory",
+              );
+              socket.close(1008, "Session ownership mismatch");
+              return;
+            }
+            service.recordPresence(
+              hello.nodeId,
+              message.activeSessionIds,
+              message.busySessionIds,
+              !awaitingOutboxFlush,
             );
-            socket.close(1008, "Session ownership mismatch");
             return;
           }
-          service.recordPresence(
-            hello.nodeId,
-            message.activeSessionIds,
-            message.busySessionIds,
-          );
-          return;
-        }
-        if (message.type === "event") {
-          service.handleEvent(message.event);
-          return;
-        }
-        if (message.type === "update_status") {
-          app.log.info(
-            {
-              nodeId: hello.nodeId,
-              updateId: message.updateId,
-              stage: message.stage,
-              detail: message.detail,
-            },
-            "Node self-update progress",
-          );
-          service.publishNodeUpdate(hello.nodeId, message.stage, message.detail);
-          return;
-        }
-        if (message.type === "command_result" && !message.ok) {
-          app.log.warn(
-            { commandId: message.commandId, error: message.error, fatal: message.fatal },
-            "Node command failed",
-          );
-          if (message.fatal) {
-            service.failFromCommandResult(
-              message.sessionId,
-              message.error ?? "Node command failed",
+          if (message.type === "outbox_flushed") {
+            if (message.outboxFlush) {
+              const flush = outboxFlush;
+              if (
+                !acknowledgeOutbox ||
+                !awaitingOutboxFlush ||
+                !flush ||
+                !sameOutboxFlush(flush, message.outboxFlush) ||
+                flush.nextEventIndex !== flush.eventCount ||
+                !inventoryBelongsToNode(
+                  hello.nodeId,
+                  message.activeSessionIds,
+                  message.busySessionIds,
+                  (id) => service.store.getSession(id),
+                )
+              ) {
+                rejectOutbox(hello.nodeId, "completion did not match the received batch");
+                return;
+              }
+              service.recordPresence(
+                hello.nodeId,
+                message.activeSessionIds,
+                message.busySessionIds,
+              );
+              const flushId = flush.flushId;
+              outboxFlush = undefined;
+              awaitingOutboxFlush = false;
+              service.send(socket, { type: "outbox_flush_ack", flushId });
+              return;
+            }
+            if (
+              acknowledgeOutbox ||
+              !awaitingOutboxFlush ||
+              !inventoryBelongsToNode(
+                hello.nodeId,
+                message.activeSessionIds,
+                message.busySessionIds,
+                (id) => service.store.getSession(id),
+              )
+            ) {
+              app.log.warn(
+                { nodeId: hello.nodeId },
+                "Rejected unexpected or cross-node outbox reconciliation",
+              );
+              socket.close(1008, "Invalid outbox reconciliation");
+              return;
+            }
+            awaitingOutboxFlush = false;
+            service.recordPresence(
+              hello.nodeId,
+              message.activeSessionIds,
+              message.busySessionIds,
             );
-          } else {
-            // Refused, not broken. The Node re-announces the session's real
-            // state right behind this, so all that is owed is the reason.
-            service.reportSessionNotice(
-              message.sessionId,
-              message.error ?? "Node refused the command",
-            );
+            return;
           }
+          if (message.type === "event") {
+            if (outboxFlush || message.outboxFlush) {
+              if (!acknowledgeOutbox || !message.outboxFlush) {
+                rejectOutbox(
+                  hello.nodeId,
+                  "an acknowledged batch contained an untagged event",
+                );
+                return;
+              }
+              if (!outboxFlush) {
+                if (message.outboxFlush.eventIndex !== 0) {
+                  rejectOutbox(
+                    hello.nodeId,
+                    "a subsequent batch did not start at event zero",
+                  );
+                  return;
+                }
+                outboxFlush = trackOutboxFlush(message.outboxFlush);
+                awaitingOutboxFlush = true;
+              }
+              const flush = outboxFlush;
+              const eventKey = `${message.event.sessionId}:${message.event.sequence}`;
+              if (
+                !sameOutboxFlush(flush, message.outboxFlush) ||
+                message.outboxFlush.eventIndex !== flush.nextEventIndex ||
+                flush.eventIds.has(message.event.eventId) ||
+                flush.eventSequences.has(eventKey)
+              ) {
+                rejectOutbox(
+                  hello.nodeId,
+                  "event identity, position, or cardinality did not match",
+                );
+                return;
+              }
+              const handled = service.handleEventResult(message.event);
+              if (handled.outcome === "retryable_failure") {
+                socket.close(1011, "Failed to persist outbox event");
+                return;
+              }
+              if (handled.outcome === "permanent_rejection") {
+                app.log.warn(
+                  {
+                    nodeId: hello.nodeId,
+                    flushId: flush.flushId,
+                    eventId: message.event.eventId,
+                    sessionId: message.event.sessionId,
+                    reason: handled.reason,
+                  },
+                  "Skipped permanently unstorable outbox event",
+                );
+              }
+              flush.eventIds.add(message.event.eventId);
+              flush.eventSequences.add(eventKey);
+              flush.nextEventIndex += 1;
+              return;
+            }
+            service.handleEvent(message.event);
+            return;
+          }
+          if (message.type === "update_status") {
+            app.log.info(
+              {
+                nodeId: hello.nodeId,
+                updateId: message.updateId,
+                stage: message.stage,
+                detail: message.detail,
+              },
+              "Node self-update progress",
+            );
+            service.publishNodeUpdate(hello.nodeId, message.stage, message.detail);
+            return;
+          }
+          if (message.type === "command_result" && !message.ok) {
+            app.log.warn(
+              {
+                commandId: message.commandId,
+                error: message.error,
+                fatal: message.fatal,
+              },
+              "Node command failed",
+            );
+            if (message.fatal) {
+              service.failFromCommandResult(
+                message.sessionId,
+                message.commandId,
+                message.error ?? "Node command failed",
+              );
+            } else {
+              // Refused, not broken. The Node re-announces the session's real
+              // state right behind this, so all that is owed is the reason.
+              service.reportSessionNotice(
+                message.sessionId,
+                message.error ?? "Node refused the command",
+              );
+            }
+          }
+        } catch (error) {
+          app.log.error(
+            { nodeId: hello.nodeId, messageType: message.type, error },
+            "Failed to process node message",
+          );
+          socket.close(1011, "Failed to process node message");
         }
       });
     });
@@ -223,4 +396,42 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
       }
     });
   });
+}
+
+type TrackedOutboxFlush = OutboxFlushIdentity & {
+  nextEventIndex: number;
+  eventIds: Set<string>;
+  eventSequences: Set<string>;
+};
+
+function trackOutboxFlush(identity: OutboxFlushIdentity): TrackedOutboxFlush {
+  return {
+    ...identity,
+    nextEventIndex: 0,
+    eventIds: new Set(),
+    eventSequences: new Set(),
+  };
+}
+
+function sameOutboxFlush(
+  tracked: Pick<TrackedOutboxFlush, "flushId" | "eventCount">,
+  received: Pick<OutboxFlushIdentity | OutboxEventPosition, "flushId" | "eventCount">,
+): boolean {
+  return (
+    tracked.flushId === received.flushId && tracked.eventCount === received.eventCount
+  );
+}
+
+function inventoryBelongsToNode(
+  nodeId: string,
+  activeSessionIds: readonly string[],
+  busySessionIds: readonly string[],
+  getSession: Parameters<typeof heartbeatSessionsBelongTo>[2],
+): boolean {
+  const active = new Set(activeSessionIds);
+  return (
+    busySessionIds.every((sessionId) => active.has(sessionId)) &&
+    heartbeatSessionsBelongTo(nodeId, activeSessionIds, getSession) &&
+    heartbeatSessionsBelongTo(nodeId, busySessionIds, getSession)
+  );
 }

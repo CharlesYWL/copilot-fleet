@@ -68,8 +68,15 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
     if (!store.getWorkspace(id)) {
       return reply.code(404).send({ error: "Unknown workspace" });
     }
+    const removedSessionIds = store
+      .listSessions()
+      .filter((session) => session.workspaceId === id)
+      .map((session) => session.id);
     try {
       store.deleteWorkspace(id);
+      for (const sessionId of removedSessionIds) {
+        service.resolveSessionPermissionRequests(sessionId);
+      }
       service.publishCatalog();
       return reply.code(204).send();
     } catch (error) {
@@ -151,8 +158,15 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
     if (!store.getPlacement(id)) {
       return reply.code(404).send({ error: "Unknown placement" });
     }
+    const removedSessionIds = store
+      .listSessions()
+      .filter((session) => session.placementId === id)
+      .map((session) => session.id);
     try {
       store.deletePlacement(id);
+      for (const sessionId of removedSessionIds) {
+        service.resolveSessionPermissionRequests(sessionId);
+      }
       service.publishCatalog();
       return reply.code(204).send();
     } catch (error) {

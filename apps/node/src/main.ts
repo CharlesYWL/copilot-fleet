@@ -7,7 +7,7 @@ import {
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
   NODE_NAME_SYNC_CAPABILITY,
-  NodeToHostMessageSchema,
+  OUTBOX_ACK_CAPABILITY,
   RegisterNodeSchema,
   SELF_UPDATE_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
@@ -53,7 +53,14 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { EventOutbox } from "./outbox.js";
-import { closeQuietly, HOST_DIAL_TIMEOUT_MS, watchHostLiveness } from "./socket.js";
+import {
+  closeQuietly,
+  flushReconnectOutbox,
+  HOST_DIAL_TIMEOUT_MS,
+  reconnectFlushLog,
+  sendNodeMessage,
+  watchHostLiveness,
+} from "./socket.js";
 import { configServerPort, startConfigServer } from "./config-server.js";
 import {
   loadSettings,
@@ -85,6 +92,7 @@ const NODE_CAPABILITIES = [
   NODE_NAME_SYNC_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
   SESSION_CONFIG_CAPABILITY,
+  OUTBOX_ACK_CAPABILITY,
 ];
 const RECONNECT_DELAY_MS = 2_000;
 /**
@@ -315,13 +323,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
+  let outboxReconciliationPending = false;
+  let holdEventsForReconnectFlush = false;
   const router = new CommandRouter(
     factory,
     settings.maxSessions,
     (event) => {
       // Held rather than dropped when the Host is unreachable: the agent keeps
       // working through a Host restart, and these are the only record of it.
-      if (!sendEvent(event)) outbox.add(event);
+      if (!sendEvent(event)) {
+        outbox.add(event);
+        outboxReconciliationPending = true;
+      }
     },
     validateWorkspacePath,
     () => settings.hostUrl,
@@ -627,6 +640,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // Distinguishes "this address does not reach the Host" from "the Host hung
     // up on us", which is what decides whether to try a different address.
     let welcomed = false;
+    let acknowledgeOutbox = false;
     // A dial that replaces one still in flight must not leave its watchdog
     // behind; the only socket worth watching is the one being opened here.
     releaseLiveness();
@@ -643,7 +657,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
             `Host stopped answering for ${Math.round(silentMs / 1000)}s; dropping the connection so it can be rebuilt`,
           ),
       });
-      send({
+      const pendingOutbox = outboxReconciliationPending || outbox.size > 0;
+      const outboxFlush = pendingOutbox
+        ? outbox.prepareFlush(outboxReconciliationPending)
+        : undefined;
+      holdEventsForReconnectFlush = pendingOutbox;
+      sendOn(active, {
         type: "hello",
         nodeId: auth.nodeId,
         secret: auth.secret,
@@ -665,6 +684,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         // socket that drops mid-turn leaves the UI offering a composer over an
         // agent that cannot take another prompt.
         busySessionIds: router.busySessionIds,
+        pendingOutbox,
+        pendingOutboxCount: outboxFlush?.events.length ?? 0,
+        ...(outboxFlush
+          ? {
+              outboxFlush: {
+                flushId: outboxFlush.flushId,
+                eventCount: outboxFlush.events.length,
+              },
+            }
+          : {}),
       });
     });
     active.on("message", async (raw: unknown) => {
@@ -676,9 +705,46 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       }
       if (frame.value.type === "welcome") {
         welcomed = true;
+        acknowledgeOutbox = frame.value.acknowledgeOutbox;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
-        flushOutbox();
+        if (holdEventsForReconnectFlush) {
+          if (acknowledgeOutbox && !frame.value.reconcileAfterOutbox) {
+            errorLog(
+              "Host offered outbox acknowledgment without deferring reconciliation",
+            );
+            active.close(1008, "Invalid outbox acknowledgment handshake");
+            return;
+          }
+          flushOutbox(active, frame.value.reconcileAfterOutbox, acknowledgeOutbox);
+        }
+        return;
+      }
+      if (frame.value.type === "outbox_flush_ack") {
+        if (!acknowledgeOutbox || !holdEventsForReconnectFlush) {
+          errorLog("Host sent an unexpected outbox acknowledgment");
+          active.close(1008, "Unexpected outbox acknowledgment");
+          return;
+        }
+        const acknowledged = outbox.acknowledge(frame.value.flushId);
+        if (!acknowledged.acknowledged) {
+          errorLog("Host acknowledged an outbox batch that is not pending");
+          active.close(1008, "Outbox acknowledgment mismatch");
+          return;
+        }
+        log(
+          `Host acknowledged ${acknowledged.removed} buffered event(s)` +
+            (acknowledged.dropped > 0
+              ? `; ${acknowledged.dropped} older one(s) were dropped for capacity`
+              : ""),
+        );
+        if (outbox.size > 0) {
+          outbox.prepareFlush();
+          flushOutbox(active, true, true);
+          return;
+        }
+        outboxReconciliationPending = false;
+        holdEventsForReconnectFlush = false;
         return;
       }
       if (frame.value.type === "host_url") {
@@ -794,16 +860,24 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     });
   }
 
-  function send(message: NodeToHostMessage): void {
-    NodeToHostMessageSchema.parse(message);
-    if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(message));
+  function send(message: NodeToHostMessage): boolean {
+    const current = socket;
+    return current ? sendOn(current, message) : false;
+  }
+
+  function sendOn(target: WebSocket, message: NodeToHostMessage): boolean {
+    return sendNodeMessage(socket, target, message);
   }
 
   /** Reports whether the event actually left, so the caller can hold it if not. */
   function sendEvent(event: SessionEvent): boolean {
-    if (socket?.readyState !== WebSocket.OPEN) return false;
-    socket.send(JSON.stringify(NodeToHostMessageSchema.parse({ type: "event", event })));
-    return true;
+    if (holdEventsForReconnectFlush) return false;
+    const current = socket;
+    return current ? sendEventOn(current, event) : false;
+  }
+
+  function sendEventOn(target: WebSocket, event: SessionEvent): boolean {
+    return sendOn(target, { type: "event", event });
   }
 
   /**
@@ -812,14 +886,48 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * Runs on `welcome` rather than on `open`, because the Host discards anything
    * that arrives before it has authenticated the hello.
    */
-  function flushOutbox(): void {
-    if (outbox.size === 0) return;
-    const held = outbox.size;
-    const { sent, dropped } = outbox.flush(sendEvent);
+  function flushOutbox(
+    active: WebSocket,
+    reconcileAfterOutbox: boolean,
+    acknowledge: boolean,
+  ): void {
+    const held = acknowledge ? (outbox.currentBatch?.events.length ?? 0) : outbox.size;
+    if (acknowledge) {
+      const result = flushReconnectOutbox(
+        outbox,
+        (event, position) =>
+          sendOn(active, { type: "event", event, outboxFlush: position }),
+        (message) => sendOn(active, message),
+        () => ({
+          activeSessionIds: router.activeSessionIds,
+          busySessionIds: router.busySessionIds,
+        }),
+      );
+      const summary = reconnectFlushLog(result, held);
+      if (summary?.level === "warn") warn(summary.message);
+      else if (summary) log(summary.message);
+      return;
+    }
+
+    const flushed = outbox.flush((event) => sendEventOn(active, event));
+    const reconciliationSent =
+      outbox.size === 0 &&
+      (!reconcileAfterOutbox ||
+        sendOn(active, {
+          type: "outbox_flushed",
+          activeSessionIds: router.activeSessionIds,
+          busySessionIds: router.busySessionIds,
+        }));
+    const result = { ...flushed, reconciliationSent };
     log(
-      `Delivered ${sent}/${held} event(s) buffered while the Host was unreachable` +
-        (dropped > 0 ? `; ${dropped} older one(s) were dropped for capacity` : ""),
+      `Delivered ${result.sent}/${held} event(s) buffered while the Host was unreachable` +
+        (result.dropped > 0
+          ? `; ${result.dropped} older one(s) were dropped for capacity`
+          : ""),
     );
+    if (outbox.size > 0 || !result.reconciliationSent) return;
+    outboxReconciliationPending = false;
+    holdEventsForReconnectFlush = false;
   }
 
   async function register(): Promise<Credentials> {

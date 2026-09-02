@@ -3,8 +3,17 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { canTransition, CHATS_WORKSPACE_ID, CHATS_WORKSPACE_NAME } from "@fleet/protocol";
-import { FleetStore } from "./store.js";
+import {
+  canTransition,
+  CHATS_WORKSPACE_ID,
+  CHATS_WORKSPACE_NAME,
+  type CreateNotification,
+} from "@fleet/protocol";
+import {
+  FleetStore,
+  NOTIFICATION_HYDRATION_LIMIT,
+  NOTIFICATION_RETENTION_MAX_ROWS,
+} from "./store.js";
 
 const stores: FleetStore[] = [];
 const directories: string[] = [];
@@ -32,6 +41,32 @@ function setup() {
   return { store, node, workspace, placement };
 }
 
+function notificationInput(
+  sourceKey: string,
+  createdAt: string,
+  overrides: Partial<CreateNotification> = {},
+): CreateNotification {
+  return {
+    sourceKey,
+    category: "agent_lifecycle",
+    kind: "agent_completion",
+    severity: "info",
+    title: "Agent completed",
+    body: "Implementation finished.",
+    subject: {
+      type: "agent",
+      id: "implementation",
+      label: "Implementation",
+      parentId: "session-1",
+      parentLabel: "Durable notifications",
+    },
+    navigation: { type: "session", sessionId: "session-1" },
+    data: { attempt: 1 },
+    createdAt,
+    ...overrides,
+  };
+}
+
 describe("FleetStore", () => {
   it("learns new capabilities when an upgraded node reconnects", () => {
     // Registration happens once, but agents are upgraded in place; without this
@@ -45,6 +80,491 @@ describe("FleetStore", () => {
     const updated = store.getNode(node.id);
     expect(updated?.capabilities).toEqual(["copilot-acp", "host-yolo"]);
     expect(updated?.version).toBe("0.2.0");
+  });
+
+  describe("FleetStore notifications", () => {
+    it("persists copied notification history across reopen without live subjects", () => {
+      const file = join(mkdtempSync(join(tmpdir(), "fleet-notifications-")), "fleet.db");
+      directories.push(dirname(file));
+      const first = new FleetStore(file);
+      const created = first.insertNotification(
+        notificationInput(
+          "agent_completion:removed-session:1",
+          "2026-09-01T18:00:00.000Z",
+          {
+            subject: {
+              type: "session",
+              id: "removed-session",
+              label: "Deleted session",
+              parentId: "removed-run",
+              parentLabel: "Deleted run",
+            },
+            navigation: {
+              type: "run_step",
+              sessionId: "removed-session",
+              runId: "removed-run",
+              stepId: "removed-step",
+            },
+          },
+        ),
+      ).notification;
+      first.updateNotificationPreference("removed-session", "implementation", false);
+      first.close();
+
+      const reopened = new FleetStore(file);
+      stores.push(reopened);
+      expect(reopened.getNotification(created.id)).toMatchObject({
+        sourceKey: "agent_completion:removed-session:1",
+        subject: {
+          id: "removed-session",
+          label: "Deleted session",
+          parentId: "removed-run",
+        },
+        navigation: {
+          sessionId: "removed-session",
+          runId: "removed-run",
+          stepId: "removed-step",
+        },
+      });
+      expect(
+        reopened.getNotificationPreference("removed-session", "implementation")
+          ?.lifecycleEnabled,
+      ).toBe(false);
+    });
+
+    it("backfills permission context only when legacy context columns are added", () => {
+      const file = join(
+        mkdtempSync(join(tmpdir(), "fleet-notification-context-")),
+        "fleet.db",
+      );
+      directories.push(dirname(file));
+      const first = new FleetStore(file);
+      first.insertNotification(
+        notificationInput("lifecycle-context", "2026-09-01T18:00:00.000Z", {
+          data: { sessionId: "lifecycle-session", attempt: "lifecycle-attempt" },
+        }),
+      );
+      first.insertNotification(
+        notificationInput("permission-context", "2026-09-01T18:01:00.000Z", {
+          category: "permission",
+          kind: "permission_request",
+          subject: {
+            type: "permission_request",
+            id: "request",
+            label: "Permission request",
+          },
+          navigation: {
+            type: "permission_request",
+            sessionId: "permission-session",
+          },
+          data: {
+            sessionId: "permission-session",
+            attempt: "permission-attempt",
+          },
+        }),
+      );
+      first.close();
+
+      const legacy = new DatabaseSync(file);
+      legacy.exec(`
+        DROP INDEX idx_notifications_permission_context;
+        ALTER TABLE notifications DROP COLUMN context_session_id;
+        ALTER TABLE notifications DROP COLUMN context_attempt;
+      `);
+      legacy.close();
+
+      const migrated = new FleetStore(file);
+      migrated.close();
+      const inspected = new DatabaseSync(file);
+      const contexts = inspected
+        .prepare(
+          `SELECT kind,context_session_id,context_attempt
+           FROM notifications ORDER BY kind`,
+        )
+        .all() as {
+        kind: string;
+        context_session_id: string;
+        context_attempt: string;
+      }[];
+      expect(contexts).toEqual([
+        {
+          kind: "agent_completion",
+          context_session_id: "",
+          context_attempt: "",
+        },
+        {
+          kind: "permission_request",
+          context_session_id: "permission-session",
+          context_attempt: "permission-attempt",
+        },
+      ]);
+      inspected
+        .prepare(
+          `UPDATE notifications
+           SET context_session_id='',context_attempt=''
+           WHERE kind='permission_request'`,
+        )
+        .run();
+      inspected.close();
+
+      const reopened = new FleetStore(file);
+      reopened.close();
+      const final = new DatabaseSync(file);
+      expect(
+        final
+          .prepare(
+            `SELECT context_session_id,context_attempt
+             FROM notifications WHERE kind='permission_request'`,
+          )
+          .get(),
+      ).toEqual({
+        context_session_id: "",
+        context_attempt: "",
+      });
+      final.close();
+    });
+
+    it("deduplicates producer retries by stable source key", () => {
+      const { store } = setup();
+      const first = store.insertNotification(
+        notificationInput("agent_failure:s1:7", "2026-09-01T18:00:00.000Z", {
+          kind: "agent_failure",
+          severity: "error",
+          title: "Agent failed",
+        }),
+      );
+      const duplicate = store.insertNotification(
+        notificationInput("agent_failure:s1:7", "2026-09-01T19:00:00.000Z", {
+          kind: "agent_failure",
+          severity: "critical",
+          title: "A retry must not replace history",
+        }),
+      );
+
+      expect(first.created).toBe(true);
+      expect(duplicate.created).toBe(false);
+      expect(duplicate.notification.id).toBe(first.notification.id);
+      expect(duplicate.notification.title).toBe("Agent failed");
+      expect(store.listNotifications().notifications).toHaveLength(1);
+    });
+
+    it("orders newest first and paginates deterministically with a capped limit", () => {
+      const { store } = setup();
+      const times = [
+        "2026-09-01T18:00:00.000Z",
+        "2026-09-01T18:01:00.000Z",
+        "2026-09-01T18:02:00.000Z",
+        "2026-09-01T18:02:00.000Z",
+      ];
+      const inserted = times.map(
+        (createdAt, index) =>
+          store.insertNotification(
+            notificationInput(`agent_completion:s1:${index}`, createdAt, {
+              title: `Notification ${index}`,
+            }),
+          ).notification,
+      );
+      const expected = [...inserted].sort(
+        (left, right) =>
+          right.createdAt.localeCompare(left.createdAt) ||
+          right.id.localeCompare(left.id),
+      );
+      const first = store.listNotifications({ limit: 2 });
+      const second = store.listNotifications({ limit: 2, before: first.nextCursor });
+
+      expect(first.notifications.map((entry) => entry.id)).toEqual(
+        expected.slice(0, 2).map((entry) => entry.id),
+      );
+      expect(second.notifications.map((entry) => entry.id)).toEqual(
+        expected.slice(2).map((entry) => entry.id),
+      );
+      expect(second.nextCursor).toBeUndefined();
+      expect(() => store.listNotifications({ limit: 0 })).toThrow();
+
+      for (let index = 4; index < 205; index += 1) {
+        store.insertNotification(
+          notificationInput(
+            `agent_completion:s1:${index}`,
+            `2026-09-02T00:${String(index % 60).padStart(2, "0")}:00.000Z`,
+          ),
+        );
+      }
+      expect(store.listNotifications({ limit: 10_000 }).notifications).toHaveLength(200);
+      expect(store.listNotificationHydration()).toHaveLength(
+        NOTIFICATION_HYDRATION_LIMIT,
+      );
+    });
+
+    it("keeps read, dismissal, and resolution idempotent with active unread counts", () => {
+      const { store } = setup();
+      const [read, dismissed, resolved, remaining] = [
+        "read",
+        "dismissed",
+        "resolved",
+        "remaining",
+      ].map(
+        (key, index) =>
+          store.insertNotification(
+            notificationInput(
+              `agent_completion:s1:${key}`,
+              `2026-09-01T18:0${index}:00.000Z`,
+            ),
+          ).notification,
+      );
+      const firstAt = "2026-09-01T19:00:00.000Z";
+      const laterAt = "2026-09-01T20:00:00.000Z";
+
+      expect(store.notificationUnreadCount()).toBe(4);
+      const updated = store.updateNotification(read!.id, {
+        severity: "warning",
+        title: "Completed with warnings",
+        data: { attempt: 2 },
+      });
+      expect(updated).toMatchObject({
+        severity: "warning",
+        title: "Completed with warnings",
+        data: { attempt: 2 },
+      });
+      expect(store.updateNotification(read!.id, {})).toEqual(updated);
+
+      const readOnce = store.markNotificationRead(read!.id, firstAt)!;
+      const readTwice = store.markNotificationRead(read!.id, laterAt)!;
+      expect(readTwice.readAt).toBe(firstAt);
+      expect(readTwice.updatedAt).toBe(readOnce.updatedAt);
+      expect(store.notificationUnreadCount()).toBe(3);
+
+      const dismissedOnce = store.dismissNotification(dismissed!.id, firstAt)!;
+      const dismissedTwice = store.dismissNotification(dismissed!.id, laterAt)!;
+      expect(dismissedTwice.status).toBe("dismissed");
+      expect(dismissedTwice.dismissedAt).toBe(firstAt);
+      expect(dismissedTwice.updatedAt).toBe(dismissedOnce.updatedAt);
+      expect(store.notificationUnreadCount()).toBe(2);
+      expect(
+        store
+          .listNotifications({ includeDismissed: false })
+          .notifications.some((entry) => entry.id === dismissed!.id),
+      ).toBe(false);
+
+      const resolvedOnce = store.resolveNotification(resolved!.id, firstAt)!;
+      const resolvedTwice = store.resolveNotification(resolved!.id, laterAt)!;
+      expect(resolvedTwice.status).toBe("resolved");
+      expect(resolvedTwice.resolvedAt).toBe(firstAt);
+      expect(resolvedTwice.readAt).toBe(firstAt);
+      expect(resolvedTwice.updatedAt).toBe(resolvedOnce.updatedAt);
+      expect(store.notificationUnreadCount()).toBe(1);
+
+      const dismissedResolved = store.resolveNotification(dismissed!.id, laterAt)!;
+      expect(dismissedResolved.status).toBe("dismissed");
+      expect(dismissedResolved.resolvedAt).toBe(laterAt);
+      expect(dismissedResolved.readAt).toBe(laterAt);
+
+      const marked = store.markAllNotificationsRead(laterAt);
+      expect(marked).toMatchObject({
+        updated: 1,
+        unreadCount: 0,
+        notifications: [{ id: remaining!.id, readAt: laterAt, updatedAt: laterAt }],
+      });
+      expect(store.markAllNotificationsRead("2026-09-01T21:00:00.000Z")).toEqual({
+        updated: 0,
+        notifications: [],
+        unreadCount: 0,
+      });
+      expect(store.notificationUnreadCount()).toBe(0);
+      expect(store.getNotification(remaining!.id)?.readAt).toBe(laterAt);
+    });
+
+    it("returns only rows changed by mark-all when a notification arrives later", () => {
+      const { store } = setup();
+      const before = store.insertNotification(
+        notificationInput(
+          "agent_completion:s1:before-mark-all",
+          "2026-09-01T18:00:00.000Z",
+        ),
+      ).notification;
+
+      const result = store.markAllNotificationsRead("2026-09-01T19:00:00.000Z");
+      const concurrent = store.insertNotification(
+        notificationInput("agent_completion:s1:concurrent", "2026-09-01T19:00:01.000Z"),
+      ).notification;
+
+      expect(result).toMatchObject({
+        updated: 1,
+        unreadCount: 0,
+        notifications: [
+          {
+            id: before.id,
+            readAt: "2026-09-01T19:00:00.000Z",
+            updatedAt: "2026-09-01T19:00:00.000Z",
+          },
+        ],
+      });
+      expect(result.notifications.map((notification) => notification.id)).not.toContain(
+        concurrent.id,
+      );
+      expect(store.getNotification(concurrent.id)?.readAt).toBeNull();
+      expect(store.notificationUnreadCount()).toBe(1);
+    });
+
+    it("prunes old or excess read history while preserving active records", () => {
+      const { store } = setup();
+      const now = Date.parse("2026-09-01T20:00:00.000Z");
+      store.writeAtomically(() => {
+        for (let index = 0; index < NOTIFICATION_RETENTION_MAX_ROWS + 5; index += 1) {
+          const key = `retention:recent:${index}`;
+          const created = store.insertNotification(
+            notificationInput(
+              key,
+              `2026-09-01T19:${String(index % 60).padStart(2, "0")}:00.000Z`,
+            ),
+          ).notification;
+          store.markNotificationRead(created.id, "2026-09-01T19:59:00.000Z");
+        }
+      });
+      const aged = store.insertNotification(
+        notificationInput("retention:aged", "2026-07-01T00:00:00.000Z"),
+      ).notification;
+      store.markNotificationRead(aged.id, "2026-07-01T00:01:00.000Z");
+      const unread = store.insertNotification(
+        notificationInput("retention:unread", "2026-07-01T00:00:00.000Z"),
+      ).notification;
+      const actionable = store.insertNotification(
+        notificationInput("retention:permission", "2026-07-01T00:00:00.000Z", {
+          category: "permission",
+          kind: "permission_request",
+          subject: {
+            type: "permission_request",
+            id: "permission",
+            label: "Permission request",
+          },
+          navigation: { type: "permission_request", sessionId: "session-1" },
+          data: { sessionId: "session-1", attempt: "session:session-1" },
+        }),
+      ).notification;
+      store.markNotificationRead(actionable.id, "2026-07-01T00:01:00.000Z");
+
+      while (store.pruneNotifications(now) > 0) {
+        // Bounded batches intentionally drain during one maintenance sweep.
+      }
+
+      const history = store.exportHostBackup({ enrollmentToken: "t" }).notifications;
+      const unprotected = history.filter(
+        (notification) =>
+          notification.id !== unread.id && notification.id !== actionable.id,
+      );
+      expect(unprotected).toHaveLength(NOTIFICATION_RETENTION_MAX_ROWS);
+      expect(store.getNotification(aged.id)).toBeUndefined();
+      expect(store.getNotification(unread.id)).toBeDefined();
+      expect(store.getNotification(actionable.id)).toBeDefined();
+      const retainedKey = unprotected[0]!.sourceKey;
+      expect(
+        store.insertNotification(
+          notificationInput(retainedKey, "2026-09-01T20:00:00.000Z"),
+        ).created,
+      ).toBe(false);
+    });
+
+    it("isolates lifecycle preference overrides by both session and agent", () => {
+      const { store } = setup();
+      store.updateNotificationPreference("session-1", "implementation", false);
+      store.updateNotificationPreference("session-1", "review", true);
+      store.updateNotificationPreference("session-2", "implementation", true);
+
+      expect(
+        store.getNotificationPreference("session-1", "implementation")?.lifecycleEnabled,
+      ).toBe(false);
+      expect(
+        store.getNotificationPreference("session-1", "review")?.lifecycleEnabled,
+      ).toBe(true);
+      expect(
+        store.getNotificationPreference("session-2", "implementation")?.lifecycleEnabled,
+      ).toBe(true);
+      expect(store.getNotificationPreference("session-2", "review")).toBeUndefined();
+
+      expect(
+        store.updateNotificationPreference("session-1", "implementation", true)
+          .lifecycleEnabled,
+      ).toBe(true);
+      expect(store.deleteNotificationPreference("session-1", "implementation")).toBe(
+        true,
+      );
+      expect(store.deleteNotificationPreference("session-1", "implementation")).toBe(
+        false,
+      );
+      expect(
+        store.getNotificationPreference("session-1", "implementation"),
+      ).toBeUndefined();
+      expect(store.getNotificationPreference("session-1", "review")).toBeDefined();
+    });
+  });
+
+  it("persists a dispatch watermark and removes it with its session", () => {
+    const file = join(mkdtempSync(join(tmpdir(), "fleet-dispatch-")), "fleet.db");
+    directories.push(dirname(file));
+    const first = new FleetStore(file);
+    const { node } = first.registerNode({
+      name: "node",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 1,
+    });
+    const workspace = first.createWorkspace("repo", "");
+    const placement = first.createPlacement(workspace.id, node.id, "C:\\repo");
+    const session = first.createSession(placement, "work");
+    first.setSessionDispatchAttempt(session.id, {
+      commandId: "command-1",
+      eventSeqFrom: 7,
+      attempt: `session:${session.id}`,
+    });
+    first.close();
+
+    const reopened = new FleetStore(file);
+    stores.push(reopened);
+    expect(reopened.getSessionDispatchAttempt(session.id)).toEqual({
+      commandId: "command-1",
+      eventSeqFrom: 7,
+      attempt: `session:${session.id}`,
+    });
+    reopened.transitionSession(session.id, "failed");
+    reopened.deleteSession(session.id);
+    expect(reopened.getSessionDispatchAttempt(session.id)).toBeUndefined();
+  });
+
+  it("keeps stop and cancel intent durable until an accepted transition consumes it", () => {
+    const file = join(mkdtempSync(join(tmpdir(), "fleet-intent-")), "fleet.db");
+    directories.push(dirname(file));
+    const first = new FleetStore(file);
+    const { node } = first.registerNode({
+      name: "node",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 1,
+    });
+    const workspace = first.createWorkspace("repo", "");
+    const placement = first.createPlacement(workspace.id, node.id, "C:\\repo");
+    const session = first.createSession(placement, "work");
+    first.setSessionTransitionIntent(session.id, "stop");
+    first.setSessionTurnCompletion(session.id, {
+      eventId: "turn-complete",
+      sequence: 3,
+      attempt: `session:${session.id}`,
+    });
+    first.close();
+
+    const reopened = new FleetStore(file);
+    stores.push(reopened);
+    expect(reopened.getSessionTransitionIntent(session.id)).toBe("stop");
+    expect(reopened.getSessionTurnCompletion(session.id)).toEqual({
+      eventId: "turn-complete",
+      sequence: 3,
+      attempt: `session:${session.id}`,
+    });
+    expect(reopened.consumeSessionTransitionIntent(session.id)).toBe("stop");
+    expect(reopened.clearSessionTurnCompletion(session.id)).toBe(true);
+    expect(reopened.getSessionTransitionIntent(session.id)).toBeUndefined();
   });
 
   it("adopts the capacity a reconnecting node reports", () => {
@@ -188,9 +708,11 @@ describe("FleetStore", () => {
 
     const spent = store.createSession(placement, "clear me");
     store.transitionSession(spent.id, "failed", "Never reached the agent");
+    store.updateNotificationPreference(spent.id, spent.id, false);
 
     expect(store.deleteEndedSessions()).toBe(1);
     expect(store.getSession(spent.id)).toBeUndefined();
+    expect(store.getNotificationPreference(spent.id, spent.id)).toBeUndefined();
     const kept = store.getSession(resumable.id);
     expect(kept?.agentSessionId).toBe("copilot-abc");
     // The transcript is the point of keeping it, so it must survive too.
@@ -211,9 +733,11 @@ describe("FleetStore", () => {
       createdAt: new Date().toISOString(),
     });
     store.transitionSession(session.id, "failed", "Node reconnected without this");
+    store.updateNotificationPreference(session.id, session.id, false);
 
     store.deleteSession(session.id);
     expect(store.getSession(session.id)).toBeUndefined();
+    expect(store.getNotificationPreference(session.id, session.id)).toBeUndefined();
   });
 
   it("persists sessions and ordered events", () => {
@@ -284,7 +808,7 @@ describe("FleetStore", () => {
     expect(store.maxEventSequence(session.id)).toBe(10);
   });
 
-  it("still refuses a duplicate, and keeps the preview on the newest event", () => {
+  it("accepts exact replay duplicates, rejects identity conflicts, and keeps the newest preview", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");
     const event = (sequence: number, text: string) => ({
@@ -297,8 +821,21 @@ describe("FleetStore", () => {
     });
 
     store.appendEvent(event(1, "first"));
-    store.appendEvent(event(5, "newest"));
-    expect(store.appendEvent(event(5, "newest")).stored).toBe(false);
+    const newest = event(5, "newest");
+    store.appendEvent(newest);
+    expect(store.appendEvent(newest)).toEqual({ stored: false, skipped: 0 });
+    expect(
+      store.appendEvent({
+        ...newest,
+        payload: { text: "conflicting replay" },
+      }),
+    ).toEqual({ stored: false, skipped: 0, conflict: true });
+    expect(
+      store.appendEvent({
+        ...newest,
+        eventId: "different-id",
+      }),
+    ).toEqual({ stored: false, skipped: 0, conflict: true });
 
     // A straggler that fills an earlier hole belongs in the transcript, but must
     // not drag the tile preview back to something the agent has moved past.
@@ -643,6 +1180,7 @@ describe("FleetStore", () => {
     const raw = new DatabaseSync(file);
     raw.prepare("ALTER TABLE runs DROP COLUMN success_criteria").run();
     raw.prepare("ALTER TABLE runs DROP COLUMN stop_when").run();
+    raw.prepare("ALTER TABLE runs DROP COLUMN review_seq").run();
     raw.close();
 
     const reopened = new FleetStore(file);
@@ -652,6 +1190,9 @@ describe("FleetStore", () => {
     // rather than failing, and is not stuck because of it.
     expect(reopened.getRun(old.id)?.successCriteria).toEqual([]);
     expect(reopened.getRun(old.id)?.stopWhen).toBe("");
+    expect(reopened.getRun(old.id)?.reviewSeq).toBe(0);
+    reopened.setRunState(old.id, "running");
+    expect(reopened.advanceRunToReview(old.id)?.reviewSeq).toBe(1);
 
     // And a task opened after the upgrade can carry one.
     const fresh = reopened.createRun({
@@ -883,10 +1424,12 @@ describe("FleetStore", () => {
     store.transitionSession(live.id, "starting", "boot");
     store.transitionSession(live.id, "running", "go");
     store.transitionSession(live.id, "stopped", "done");
+    store.updateNotificationPreference(live.id, live.id, false);
 
     store.deletePlacement(placement.id);
     expect(store.listPlacements()).toHaveLength(0);
     expect(store.getSession(live.id)).toBeUndefined();
+    expect(store.getNotificationPreference(live.id, live.id)).toBeUndefined();
 
     const replacement = store.createPlacement(workspace.id, node.id, "E:\\repo");
     const archived = store.createSession(replacement, "archive me");
@@ -1073,6 +1616,7 @@ describe("Host backup", () => {
     });
     store.setDefaultYolo(false);
     store.setAutoResume(false);
+    store.setDefaultNotificationLifecycleEnabled(false);
     store.setTunnelEnabled(true);
     store.setTunnelProvider("tailscale");
     store.reorderWorkspaces([workspace.id]);
@@ -1117,6 +1661,7 @@ describe("Host backup", () => {
     expect(restored.authenticateNode(other.id, secret)).toBe(true);
     expect(restored.getDefaultYolo()).toBe(false);
     expect(restored.getAutoResume()).toBe(false);
+    expect(restored.getDefaultNotificationLifecycleEnabled()).toBe(false);
     expect(restored.getTunnelEnabled()).toBe(true);
     expect(restored.getTunnelProvider()).toBe("tailscale");
     expect(restored.getSetting("enrollment.token")).toBe("move-me");
@@ -1206,6 +1751,114 @@ describe("FleetStore runs", () => {
     expect(settled?.wakeSeq).toBe(0);
     const woken = store.recordRunWake(run.id);
     expect(woken?.wakeSeq).toBe(1);
+  });
+
+  it("advances review sequence once per transition into awaiting human", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    store.setRunState(run.id, "running");
+
+    const first = store.advanceRunToReview(run.id);
+    expect(first?.state).toBe("awaiting_human");
+    expect(first?.reviewSeq).toBe(1);
+    expect(store.advanceRunToReview(run.id)).toBeUndefined();
+    expect(store.getRun(run.id)?.reviewSeq).toBe(1);
+
+    store.setRunState(run.id, "running");
+    const second = store.advanceRunToReview(run.id);
+    expect(second?.state).toBe("awaiting_human");
+    expect(second?.reviewSeq).toBe(2);
+  });
+
+  it("rolls back review state and notes when its notification cannot be written", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    store.setRunState(run.id, "running");
+
+    expect(() =>
+      store.advanceRunToReview(run.id, {
+        note: "This note must roll back too.",
+        notification: (advanced) =>
+          ({
+            sourceKey: `review:${advanced.id}:${advanced.reviewSeq}`,
+            category: "orchestration",
+            kind: "orchestration_needs_review",
+            severity: "info",
+            title: "",
+            body: "",
+            subject: { type: "run", id: advanced.id, label: advanced.name },
+            navigation: { type: "run", runId: advanced.id },
+            data: {},
+          }) as CreateNotification,
+      }),
+    ).toThrow();
+    expect(store.getRun(run.id)).toMatchObject({
+      state: "running",
+      reviewSeq: 0,
+    });
+    expect(store.listRunNotes(run.id)).toEqual([]);
+    expect(store.listNotifications().notifications).toEqual([]);
+  });
+
+  it("rolls back nested authoritative and notification writes together", () => {
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "work");
+    const event = {
+      eventId: "atomic-event",
+      sessionId: session.id,
+      sequence: 1,
+      type: "agent_text" as const,
+      payload: { text: "durable" },
+      createdAt: "2026-09-01T20:00:00.000Z",
+    };
+
+    expect(() =>
+      store.writeAtomically(() => {
+        store.appendEvent(event);
+        store.insertNotification(
+          notificationInput("atomic-notification", event.createdAt, {
+            title: "",
+          }),
+        );
+      }),
+    ).toThrow();
+    expect(store.listEvents(session.id)).toEqual([]);
+    expect(store.listNotifications().notifications).toEqual([]);
+
+    store.writeAtomically(() => {
+      store.appendEvent(event);
+      store.insertNotification(notificationInput("atomic-notification", event.createdAt));
+    });
+    expect(store.listEvents(session.id)).toHaveLength(1);
+    expect(store.listNotifications().notifications).toHaveLength(1);
+  });
+
+  it("rolls back run wake and prompt receipts when the Lead receipt cannot be written", () => {
+    const { store, workspace, placement } = setup();
+    const notALead = store.createSession(placement, "ordinary session");
+    const created = store.createRun({
+      workspaceId: workspace.id,
+      name: "r",
+      objective: "o",
+    });
+    store.updateRun(created.id, {
+      leadSessionId: notALead.id,
+      pendingPrompt: "still owed",
+    });
+    store.recordRunSettle(created.id);
+
+    expect(() =>
+      store.recordRunPromptDelivery(created.id, notALead.id, "still owed"),
+    ).toThrow("Run Lead session not found");
+    expect(store.getRun(created.id)?.pendingPrompt).toBe("still owed");
+
+    expect(() => store.recordRunWakePrompt(created.id, notALead.id)).toThrow(
+      "Run Lead session not found",
+    );
+    expect(store.getRun(created.id)).toMatchObject({
+      settleSeq: 1,
+      wakeSeq: 0,
+    });
   });
 
   it("defaults run columns on sessions written before runs existed", () => {
@@ -1309,6 +1962,7 @@ describe("FleetStore runs", () => {
       objective: "o",
       phases: ["Implement", "Review"],
     });
+
     first.updateRun(run.id, { phaseIndex: 1 });
     first.upsertRunStep(run.id, {
       stepKey: "review",
@@ -1342,6 +1996,88 @@ describe("FleetStore runs", () => {
     ]);
     expect(second.listRunSteps(run.id)[0]?.phaseIndex).toBe(1);
     expect(second.getRun(stale.id)).toBeUndefined();
+  });
+
+  it("round-trips review identity, notification history, and preferences", () => {
+    const first = new FleetStore(":memory:");
+    stores.push(first);
+    const workspace = first.createWorkspace("repo", "");
+    const { node } = first.registerNode({
+      name: "node",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 1,
+    });
+    const placement = first.createPlacement(workspace.id, node.id, "C:\\repo");
+    const session = first.createSession(placement, "work");
+    const run = first.createRun({
+      workspaceId: workspace.id,
+      name: "r",
+      objective: "o",
+    });
+    first.setRunState(run.id, "running");
+    first.advanceRunToReview(run.id);
+    first.setRunState(run.id, "running");
+    first.advanceRunToReview(run.id);
+    const notification = first.insertNotification(
+      notificationInput(
+        `orchestration_needs_review:${run.id}:2`,
+        "2026-09-01T18:00:00.000Z",
+        {
+          category: "orchestration",
+          kind: "orchestration_needs_review",
+          severity: "warning",
+          title: "Task needs review",
+          subject: { type: "run", id: run.id, label: "r" },
+          navigation: { type: "run", runId: run.id },
+          data: { reviewSeq: 2 },
+        },
+      ),
+    ).notification;
+    first.markNotificationRead(notification.id, "2026-09-01T18:01:00.000Z");
+    first.resolveNotification(notification.id, "2026-09-01T18:02:00.000Z");
+    first.updateNotificationPreference(session.id, "review", false);
+    first.updateNotificationPreference("removed-session", "review", false);
+
+    const backup = first.exportHostBackup({ enrollmentToken: "t" });
+    expect(backup.notifications).toHaveLength(1);
+    expect(backup.notificationPreferences).toHaveLength(1);
+    expect(backup.runs[0]?.reviewSeq).toBe(2);
+
+    const second = new FleetStore(":memory:");
+    stores.push(second);
+    second.replaceHostBackup({
+      ...backup,
+      notificationPreferences: [
+        ...backup.notificationPreferences,
+        {
+          sessionId: "removed-session",
+          agentId: "review",
+          lifecycleEnabled: false,
+          updatedAt: "2026-09-01T18:00:00.000Z",
+        },
+      ],
+    });
+
+    expect(second.getRun(run.id)).toMatchObject({
+      state: "awaiting_human",
+      reviewSeq: 2,
+    });
+    expect(second.getNotification(notification.id)).toMatchObject({
+      sourceKey: `orchestration_needs_review:${run.id}:2`,
+      status: "resolved",
+      readAt: "2026-09-01T18:01:00.000Z",
+      resolvedAt: "2026-09-01T18:02:00.000Z",
+      subject: { type: "run", id: run.id, label: "r" },
+      navigation: { type: "run", runId: run.id },
+      data: { reviewSeq: 2 },
+    });
+    expect(second.getNotificationPreference(session.id, "review")?.lifecycleEnabled).toBe(
+      false,
+    );
+    expect(second.getNotificationPreference("removed-session", "review")).toBeUndefined();
   });
 
   it("deletes a task's notes along with it", () => {

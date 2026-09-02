@@ -20,6 +20,7 @@ const run = (overrides: Partial<Run> = {}): Run => ({
   settleSeq: 0,
   wakeSeq: 0,
   emptyWakeCount: 0,
+  reviewSeq: 0,
   createdAt: "2026-01-01T00:00:00.000Z",
   updatedAt: "2026-01-01T00:00:00.000Z",
   ...overrides,

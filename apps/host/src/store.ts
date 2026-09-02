@@ -2,10 +2,17 @@ import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { isDeepStrictEqual } from "node:util";
 import {
   type FleetNode,
   type FleetSession,
   type HostBackup,
+  type MarkAllNotificationsReadResponse,
+  type CreateNotification,
+  type Notification,
+  type NotificationCursor,
+  type NotificationPreference,
+  type UpdateNotification,
   type Placement,
   type Run,
   type RunPolicy,
@@ -25,7 +32,12 @@ import {
   CHATS_WORKSPACE_ID,
   CHATS_WORKSPACE_NAME,
   HostBackupSchema,
+  CreateNotificationSchema,
+  ListNotificationsRequestSchema,
   NodeSchema,
+  NotificationPreferenceSchema,
+  NotificationSchema,
+  UpdateNotificationSchema,
   PlacementSchema,
   RunPolicySchema,
   RunSchema,
@@ -37,6 +49,7 @@ import {
   WorkspaceSchema,
   eventPayload,
   canTransition,
+  canTransitionRun,
   isChatsWorkspace,
   liveSessionStates,
   sessionFieldsForHostImport,
@@ -45,6 +58,10 @@ import {
   tryParseJson,
   tunnelProviders,
 } from "@fleet/protocol";
+import {
+  DEFAULT_NOTIFICATION_LIFECYCLE_ENABLED,
+  NOTIFICATION_LIFECYCLE_DEFAULT_SETTING,
+} from "./notifications/policy.js";
 
 /**
  * A policy as it arrives from a request body.
@@ -86,7 +103,61 @@ type Row = Record<string, unknown>;
  * down while the Node kept working — so a caller can say so once instead of
  * treating a hole as corruption.
  */
-export type AppendResult = { stored: boolean; skipped: number };
+export type AppendResult = {
+  stored: boolean;
+  skipped: number;
+  /** An existing identity names different immutable event content. */
+  conflict?: boolean;
+};
+
+export type InsertNotificationResult = {
+  notification: Notification;
+  created: boolean;
+};
+
+export type NotificationPage = {
+  notifications: Notification[];
+  nextCursor?: NotificationCursor;
+};
+
+export type NotificationListInput = {
+  limit?: number | undefined;
+  before?: NotificationCursor | undefined;
+  includeDismissed?: boolean | undefined;
+};
+
+/** Newest durable records included in a browser's initial snapshot. */
+export const NOTIFICATION_HYDRATION_LIMIT = 200;
+/** Read/resolved history retained after each scheduled sweep. */
+export const NOTIFICATION_RETENTION_MAX_ROWS = 5_000;
+/** Read/resolved history older than this is eligible for pruning. */
+export const NOTIFICATION_RETENTION_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+/** Keeps each pruning transaction short on large upgraded databases. */
+export const NOTIFICATION_RETENTION_BATCH_SIZE = 500;
+
+export type SessionTransitionIntent = "cancel" | "stop";
+
+export type SessionTurnCompletion = {
+  eventId: string;
+  sequence: number;
+  attempt: string;
+};
+
+export type SessionDispatchAttempt = {
+  commandId: string;
+  eventSeqFrom: number;
+  attempt: string;
+};
+
+export type AdvanceRunToReviewWrite = {
+  note: string;
+  notification: (run: Run) => CreateNotification;
+};
+
+export type AdvanceRunToReviewResult = {
+  run: Run;
+  notification: InsertNotificationResult;
+};
 
 /**
  * What a Node tells the Host about itself in its `hello` frame.
@@ -136,6 +207,7 @@ const NO_MANUAL_CHECKOUTS =
 
 export class FleetStore {
   private readonly db: DatabaseSync;
+  private transactionDepth = 0;
   /**
    * Compiling the same SQL on every call showed up on the hot path: a node
    * heartbeat arrives every five seconds per node and each one re-prepared the
@@ -175,7 +247,8 @@ export class FleetStore {
       CREATE TABLE IF NOT EXISTS events (
         event_id TEXT PRIMARY KEY, session_id TEXT NOT NULL REFERENCES sessions(id),
         sequence INTEGER NOT NULL, type TEXT NOT NULL, payload TEXT NOT NULL,
-        created_at TEXT NOT NULL, UNIQUE(session_id, sequence)
+        created_at TEXT NOT NULL, received_at TEXT NOT NULL,
+        UNIQUE(session_id, sequence)
       );
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -197,6 +270,7 @@ export class FleetStore {
         settle_seq INTEGER NOT NULL DEFAULT 0,
         wake_seq INTEGER NOT NULL DEFAULT 0,
         empty_wake_count INTEGER NOT NULL DEFAULT 0,
+        review_seq INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS run_steps (
@@ -217,14 +291,66 @@ export class FleetStore {
         phase_index INTEGER NOT NULL DEFAULT 0,
         body TEXT NOT NULL, created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY,
+        source_key TEXT NOT NULL UNIQUE,
+        category TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL,
+        body TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        navigation TEXT NOT NULL,
+        data TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        read_at TEXT,
+        dismissed_at TEXT,
+        resolved_at TEXT,
+        context_session_id TEXT NOT NULL DEFAULT '',
+        context_attempt TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE IF NOT EXISTS notification_preferences (
+        session_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        lifecycle_enabled INTEGER NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(session_id, agent_id)
+      );
+      CREATE TABLE IF NOT EXISTS session_transition_intents (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        intent TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_turn_completions (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        event_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL,
+        attempt TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS session_dispatch_attempts (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        command_id TEXT NOT NULL,
+        event_seq_from INTEGER NOT NULL,
+        attempt TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS idx_run_notes_run ON run_notes(run_id);
       CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id);
       CREATE INDEX IF NOT EXISTS idx_run_steps_session ON run_steps(session_id);
       CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
+      CREATE INDEX IF NOT EXISTS idx_notifications_active_order
+        ON notifications(created_at DESC,id DESC) WHERE status <> 'dismissed';
+      CREATE INDEX IF NOT EXISTS idx_notifications_unread_order
+        ON notifications(created_at DESC,id DESC)
+        WHERE read_at IS NULL AND status <> 'dismissed';
     `);
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "revision", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("events", "received_at", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing(
       "sessions",
       "additional_directories",
@@ -253,6 +379,7 @@ export class FleetStore {
     this.addColumnIfMissing("nodes", "agents", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "success_criteria", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "stop_when", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("runs", "review_seq", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing(
       "run_steps",
@@ -260,6 +387,73 @@ export class FleetStore {
       "INTEGER NOT NULL DEFAULT 0",
     );
     this.addColumnIfMissing("workspaces", "kind", "TEXT NOT NULL DEFAULT 'project'");
+    const addedNotificationSessionContext = this.addColumnIfMissing(
+      "notifications",
+      "context_session_id",
+      "TEXT NOT NULL DEFAULT ''",
+    );
+    const addedNotificationAttemptContext = this.addColumnIfMissing(
+      "notifications",
+      "context_attempt",
+      "TEXT NOT NULL DEFAULT ''",
+    );
+    if (addedNotificationSessionContext || addedNotificationAttemptContext) {
+      this.db.exec(`
+        UPDATE notifications
+        SET context_session_id=CASE
+              WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.sessionId'),'')
+              ELSE ''
+            END,
+            context_attempt=CASE
+              WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.attempt'),'')
+              ELSE ''
+            END
+        WHERE kind='permission_request'
+          AND (context_session_id='' OR context_attempt='');
+      `);
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_notifications_permission_context
+        ON notifications(context_session_id,context_attempt,created_at DESC,id DESC)
+        WHERE kind='permission_request' AND status='active';
+      CREATE TABLE IF NOT EXISTS notification_state (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        unread_count INTEGER NOT NULL DEFAULT 0 CHECK(unread_count>=0)
+      );
+      INSERT INTO notification_state (id,unread_count)
+      VALUES (
+        1,
+        (SELECT COUNT(*) FROM notifications
+         WHERE read_at IS NULL AND status <> 'dismissed')
+      )
+      ON CONFLICT(id) DO UPDATE SET unread_count=excluded.unread_count;
+      CREATE TRIGGER IF NOT EXISTS notifications_unread_insert
+      AFTER INSERT ON notifications
+      WHEN NEW.read_at IS NULL AND NEW.status <> 'dismissed'
+      BEGIN
+        UPDATE notification_state SET unread_count=unread_count+1 WHERE id=1;
+      END;
+      CREATE TRIGGER IF NOT EXISTS notifications_unread_delete
+      AFTER DELETE ON notifications
+      WHEN OLD.read_at IS NULL AND OLD.status <> 'dismissed'
+      BEGIN
+        UPDATE notification_state SET unread_count=unread_count-1 WHERE id=1;
+      END;
+      CREATE TRIGGER IF NOT EXISTS notifications_unread_update
+      AFTER UPDATE OF read_at,status ON notifications
+      WHEN
+        (OLD.read_at IS NULL AND OLD.status <> 'dismissed') <>
+        (NEW.read_at IS NULL AND NEW.status <> 'dismissed')
+      BEGIN
+        UPDATE notification_state
+        SET unread_count=unread_count
+          + CASE
+              WHEN NEW.read_at IS NULL AND NEW.status <> 'dismissed' THEN 1
+              ELSE -1
+            END
+        WHERE id=1;
+      END;
+    `);
     this.ensureChatsWorkspace();
     this.rebuildSessionStateFromEvents();
   }
@@ -405,15 +599,50 @@ export class FleetStore {
 
   /** Groups related writes so a crash cannot leave half of them applied. */
   private transaction<T>(work: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
+    const depth = this.transactionDepth;
+    const savepoint = `fleet_store_${depth}`;
+    if (depth === 0) this.db.exec("BEGIN IMMEDIATE");
+    else this.db.exec(`SAVEPOINT ${savepoint}`);
+    this.transactionDepth = depth + 1;
     try {
       const result = work();
-      this.db.exec("COMMIT");
+      if (
+        typeof result === "object" &&
+        result !== null &&
+        "then" in result &&
+        typeof result.then === "function"
+      ) {
+        throw new Error("FleetStore transactions must be synchronous");
+      }
+      if (depth === 0) this.db.exec("COMMIT");
+      else this.db.exec(`RELEASE ${savepoint}`);
       return result;
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      if (depth === 0) {
+        this.db.exec("ROLLBACK");
+      } else {
+        this.db.exec(`ROLLBACK TO ${savepoint}`);
+        this.db.exec(`RELEASE ${savepoint}`);
+      }
       throw error;
+    } finally {
+      this.transactionDepth = depth;
     }
+  }
+
+  /** Avoids an unnecessary savepoint when a caller already owns the transaction. */
+  private transactionIfNeeded<T>(work: () => T): T {
+    return this.transactionDepth > 0 ? work() : this.transaction(work);
+  }
+
+  /**
+   * Commits cross-domain store writes as one unit.
+   *
+   * @internal Callbacks must only use FleetStore methods. Network publication
+   * belongs after this method returns.
+   */
+  writeAtomically<T>(work: () => T): T {
+    return this.transaction(work);
   }
 
   getSetting(key: string): string | undefined {
@@ -499,6 +728,16 @@ export class FleetStore {
     this.setSetting("defaults.autoResume", enabled ? "1" : "0");
   }
 
+  getDefaultNotificationLifecycleEnabled(): boolean {
+    const stored = this.getSetting(NOTIFICATION_LIFECYCLE_DEFAULT_SETTING);
+    if (stored === undefined) return DEFAULT_NOTIFICATION_LIFECYCLE_ENABLED;
+    return stored !== "0";
+  }
+
+  setDefaultNotificationLifecycleEnabled(enabled: boolean): void {
+    this.setSetting(NOTIFICATION_LIFECYCLE_DEFAULT_SETTING, enabled ? "1" : "0");
+  }
+
   /**
    * The model and reasoning effort new sessions start on.
    *
@@ -549,6 +788,7 @@ export class FleetStore {
       defaults: {
         yolo: this.getDefaultYolo(),
         autoResume: this.getAutoResume(),
+        notificationLifecycleEnabled: this.getDefaultNotificationLifecycleEnabled(),
       },
       nodes: (this.statement("SELECT * FROM nodes ORDER BY name").all() as Row[]).map(
         (row) => ({
@@ -594,6 +834,18 @@ export class FleetStore {
           "SELECT * FROM run_notes ORDER BY run_id,created_at",
         ).all() as Row[]
       ).map(runNoteFromRow),
+      notifications: (
+        this.statement(
+          "SELECT * FROM notifications ORDER BY created_at,id",
+        ).all() as Row[]
+      ).map(notificationFromRow),
+      notificationPreferences: (
+        this.statement(
+          `SELECT p.* FROM notification_preferences p
+           JOIN sessions s ON s.id=p.session_id
+           ORDER BY p.session_id,p.agent_id`,
+        ).all() as Row[]
+      ).map(notificationPreferenceFromRow),
     };
     return HostBackupSchema.parse(backup);
   }
@@ -609,12 +861,15 @@ export class FleetStore {
     const parsed = HostBackupSchema.parse(backup);
     this.transaction(() => {
       this.db.exec(
-        "DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes; DELETE FROM settings",
+        "DELETE FROM session_turn_completions; DELETE FROM session_transition_intents; DELETE FROM notification_preferences; DELETE FROM notifications; DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes; DELETE FROM settings",
       );
       this.setTunnelEnabled(parsed.tunnel.enabled);
       this.setTunnelProvider(parsed.tunnel.provider);
       this.setDefaultYolo(parsed.defaults.yolo);
       this.setAutoResume(parsed.defaults.autoResume);
+      this.setDefaultNotificationLifecycleEnabled(
+        parsed.defaults.notificationLifecycleEnabled,
+      );
       this.setSetting("enrollment.token", parsed.enrollmentToken);
       if (parsed.publicUrl) this.setSetting("host.publicUrl", parsed.publicUrl);
       for (const node of parsed.nodes) {
@@ -695,7 +950,7 @@ export class FleetStore {
       }
       for (const event of parsed.events) {
         this.statement(
-          "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at) VALUES (?,?,?,?,?,?)",
+          "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at,received_at) VALUES (?,?,?,?,?,?,?)",
         ).run(
           event.eventId,
           event.sessionId,
@@ -703,6 +958,7 @@ export class FleetStore {
           event.type,
           JSON.stringify(event.payload),
           event.createdAt,
+          "",
         );
       }
       for (const run of parsed.runs) {
@@ -710,8 +966,9 @@ export class FleetStore {
           `INSERT INTO runs
             (id,workspace_id,name,objective,state,lead_session_id,placement_id,policy,
              phases,phase_index,success_criteria,stop_when,
-             failure_reason,settle_seq,wake_seq,empty_wake_count,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             failure_reason,settle_seq,wake_seq,empty_wake_count,review_seq,
+             created_at,updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         ).run(
           run.id,
           run.workspaceId,
@@ -731,6 +988,7 @@ export class FleetStore {
           run.settleSeq,
           run.wakeSeq,
           run.emptyWakeCount,
+          run.reviewSeq ?? 0,
           run.createdAt,
           run.updatedAt,
         );
@@ -770,6 +1028,21 @@ export class FleetStore {
           "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
         ).run(note.id, note.runId, note.phaseIndex, note.body, note.createdAt);
       }
+      for (const notification of parsed.notifications) {
+        this.insertNotificationRow(notification);
+      }
+      for (const preference of parsed.notificationPreferences) {
+        if (!this.getSession(preference.sessionId)) continue;
+        this.statement(
+          `INSERT INTO notification_preferences
+           (session_id,agent_id,lifecycle_enabled,updated_at) VALUES (?,?,?,?)`,
+        ).run(
+          preference.sessionId,
+          preference.agentId,
+          preference.lifecycleEnabled ? 1 : 0,
+          preference.updatedAt,
+        );
+      }
       // The restore deleted every workspace, and an archive taken before Chats
       // existed has no row to put back — so the Host would come up from a valid
       // backup with the one workspace nothing is written to work without.
@@ -781,10 +1054,11 @@ export class FleetStore {
   }
 
   /** Keeps databases created before a column was introduced usable. */
-  private addColumnIfMissing(table: string, column: string, definition: string): void {
+  private addColumnIfMissing(table: string, column: string, definition: string): boolean {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
-    if (columns.some((row) => String(row.name) === column)) return;
+    if (columns.some((row) => String(row.name) === column)) return false;
     this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    return true;
   }
 
   close(): void {
@@ -1434,6 +1708,59 @@ export class FleetStore {
     return Number(result.changes) > 0;
   }
 
+  setSessionDispatchAttempt(sessionId: string, dispatch: SessionDispatchAttempt): void {
+    if (!this.getSession(sessionId)) throw new Error("Session not found");
+    this.statement(
+      `INSERT INTO session_dispatch_attempts
+       (session_id,command_id,event_seq_from,attempt,created_at) VALUES (?,?,?,?,?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         command_id=excluded.command_id,
+         event_seq_from=excluded.event_seq_from,
+         attempt=excluded.attempt,
+         created_at=excluded.created_at`,
+    ).run(
+      sessionId,
+      dispatch.commandId,
+      dispatch.eventSeqFrom,
+      dispatch.attempt,
+      new Date().toISOString(),
+    );
+  }
+
+  getSessionDispatchAttempt(sessionId: string): SessionDispatchAttempt | undefined {
+    const row = this.statement(
+      `SELECT command_id,event_seq_from,attempt
+       FROM session_dispatch_attempts WHERE session_id=?`,
+    ).get(sessionId) as Row | undefined;
+    return row
+      ? {
+          commandId: String(row.command_id),
+          eventSeqFrom: Number(row.event_seq_from),
+          attempt: String(row.attempt),
+        }
+      : undefined;
+  }
+
+  /** Claims one held run prompt and its Lead delivery receipt together. */
+  recordRunPromptDelivery(
+    runId: string,
+    leadSessionId: string,
+    prompt: string,
+    at = new Date().toISOString(),
+  ): boolean {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (!run || run.leadSessionId !== leadSessionId || run.pendingPrompt !== prompt) {
+        return false;
+      }
+      this.updateRun(run.id, { pendingPrompt: "" });
+      if (!this.recordOrchestratorPrompt(leadSessionId, at)) {
+        throw new Error("Run Lead session not found");
+      }
+      return true;
+    });
+  }
+
   /**
    * Writes the order an operator dragged sessions into.
    *
@@ -1456,6 +1783,390 @@ export class FleetStore {
         });
     });
     return this.listSessions();
+  }
+
+  /**
+   * Inserts one durable notification, or returns the row already written by a
+   * retry of the same producer event.
+   */
+  insertNotification(input: CreateNotification): InsertNotificationResult {
+    const notification = this.prepareNotification(input);
+    return this.transactionIfNeeded(() => this.insertPreparedNotification(notification));
+  }
+
+  private prepareNotification(input: CreateNotification): Notification {
+    const parsed = CreateNotificationSchema.parse(input);
+    const createdAt = parsed.createdAt ?? new Date().toISOString();
+    return NotificationSchema.parse({
+      ...parsed,
+      id: randomUUID(),
+      status: "active",
+      createdAt,
+      updatedAt: createdAt,
+      readAt: null,
+      dismissedAt: null,
+      resolvedAt: null,
+    });
+  }
+
+  private insertPreparedNotification(
+    notification: Notification,
+  ): InsertNotificationResult {
+    const context = notificationContext(notification);
+    const result = this.statement(
+      `INSERT INTO notifications
+       (id,source_key,category,kind,severity,status,title,body,subject,navigation,
+        data,created_at,updated_at,read_at,dismissed_at,resolved_at,
+        context_session_id,context_attempt)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(source_key) DO NOTHING`,
+    ).run(
+      notification.id,
+      notification.sourceKey,
+      notification.category,
+      notification.kind,
+      notification.severity,
+      notification.status,
+      notification.title,
+      notification.body,
+      JSON.stringify(notification.subject),
+      JSON.stringify(notification.navigation),
+      JSON.stringify(notification.data),
+      notification.createdAt,
+      notification.updatedAt,
+      notification.readAt,
+      notification.dismissedAt,
+      notification.resolvedAt,
+      context.sessionId,
+      context.attempt,
+    );
+    if (Number(result.changes) > 0) return { notification, created: true };
+    const duplicate = this.getNotificationBySourceKey(notification.sourceKey);
+    if (!duplicate) {
+      throw new Error("Notification source key conflicted without a stored row");
+    }
+    return { notification: duplicate, created: false };
+  }
+
+  getNotification(id: string): Notification | undefined {
+    const row = this.statement("SELECT * FROM notifications WHERE id=?").get(id) as
+      Row | undefined;
+    return row ? notificationFromRow(row) : undefined;
+  }
+
+  getNotificationBySourceKey(sourceKey: string): Notification | undefined {
+    const row = this.statement("SELECT * FROM notifications WHERE source_key=?").get(
+      sourceKey,
+    ) as Row | undefined;
+    return row ? notificationFromRow(row) : undefined;
+  }
+
+  listNotifications(input: NotificationListInput = {}): NotificationPage {
+    const request = ListNotificationsRequestSchema.parse(input);
+    const conditions: string[] = [];
+    const parameters: Array<string | number> = [];
+    if (!request.includeDismissed) conditions.push("status <> 'dismissed'");
+    if (request.before) {
+      conditions.push("(created_at < ? OR (created_at = ? AND id < ?))");
+      parameters.push(
+        request.before.createdAt,
+        request.before.createdAt,
+        request.before.id,
+      );
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    const rows = this.statement(
+      `SELECT * FROM notifications ${where}
+       ORDER BY created_at DESC,id DESC LIMIT ?`,
+    ).all(...parameters, request.limit + 1) as Row[];
+    const hasMore = rows.length > request.limit;
+    const notifications = rows.slice(0, request.limit).map(notificationFromRow);
+    if (!hasMore || notifications.length === 0) return { notifications };
+    const last = notifications[notifications.length - 1]!;
+    return {
+      notifications,
+      nextCursor: { createdAt: last.createdAt, id: last.id },
+    };
+  }
+
+  /** Bounded newest non-dismissed rows sent in the initial browser snapshot. */
+  listNotificationHydration(): Notification[] {
+    return (
+      this.statement(
+        `SELECT * FROM notifications
+         WHERE status <> 'dismissed'
+         ORDER BY created_at DESC,id DESC
+         LIMIT ?`,
+      ).all(NOTIFICATION_HYDRATION_LIMIT) as Row[]
+    ).map(notificationFromRow);
+  }
+
+  /** Rows whose read timestamp will move in one mark-all operation. */
+  listUnreadNotifications(): Notification[] {
+    return (
+      this.statement(
+        `SELECT * FROM notifications
+         WHERE read_at IS NULL AND status <> 'dismissed'
+         ORDER BY created_at DESC,id DESC`,
+      ).all() as Row[]
+    ).map(notificationFromRow);
+  }
+
+  notificationUnreadCount(): number {
+    const row = this.statement(
+      "SELECT unread_count count FROM notification_state WHERE id=1",
+    ).get() as Row;
+    return Number(row.count ?? 0);
+  }
+
+  /** Updates copied presentation data without changing stable identity or lifecycle. */
+  updateNotification(id: string, patch: UpdateNotification): Notification | undefined {
+    const parsed = UpdateNotificationSchema.parse(patch);
+    const current = this.getNotification(id);
+    if (!current) return undefined;
+    const context =
+      parsed.data === undefined
+        ? undefined
+        : notificationContext({ kind: current.kind, data: parsed.data });
+    const columns: Record<string, unknown> = {
+      severity: parsed.severity,
+      title: parsed.title,
+      body: parsed.body,
+      subject: parsed.subject === undefined ? undefined : JSON.stringify(parsed.subject),
+      navigation:
+        parsed.navigation === undefined ? undefined : JSON.stringify(parsed.navigation),
+      data: parsed.data === undefined ? undefined : JSON.stringify(parsed.data),
+      context_session_id: context?.sessionId,
+      context_attempt: context?.attempt,
+    };
+    const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
+    if (entries.length === 0) return current;
+    const assignments = entries.map(([column]) => `${column}=?`).join(",");
+    const result = this.statement(
+      `UPDATE notifications SET ${assignments},updated_at=? WHERE id=?`,
+    ).run(...entries.map(([, value]) => value as string), new Date().toISOString(), id);
+    return Number(result.changes) > 0 ? this.getNotification(id) : undefined;
+  }
+
+  markNotificationRead(
+    id: string,
+    at = new Date().toISOString(),
+  ): Notification | undefined {
+    const timestamp = NotificationSchema.shape.updatedAt.parse(at);
+    this.statement(
+      `UPDATE notifications SET read_at=?,updated_at=?
+       WHERE id=? AND read_at IS NULL`,
+    ).run(timestamp, timestamp, id);
+    return this.getNotification(id);
+  }
+
+  markAllNotificationsRead(
+    at = new Date().toISOString(),
+  ): MarkAllNotificationsReadResponse {
+    const timestamp = NotificationSchema.shape.updatedAt.parse(at);
+    return this.transactionIfNeeded(() => {
+      const notifications = (
+        this.statement(
+          `UPDATE notifications SET read_at=?,updated_at=?
+           WHERE read_at IS NULL AND status <> 'dismissed'
+           RETURNING *`,
+        ).all(timestamp, timestamp) as Row[]
+      )
+        .map(notificationFromRow)
+        .sort(
+          (left, right) =>
+            right.createdAt.localeCompare(left.createdAt) ||
+            right.id.localeCompare(left.id),
+        );
+      return {
+        updated: notifications.length,
+        notifications,
+        unreadCount: this.notificationUnreadCount(),
+      };
+    });
+  }
+
+  dismissNotification(
+    id: string,
+    at = new Date().toISOString(),
+  ): Notification | undefined {
+    const timestamp = NotificationSchema.shape.updatedAt.parse(at);
+    this.statement(
+      `UPDATE notifications
+       SET status='dismissed',dismissed_at=COALESCE(dismissed_at,?),updated_at=?
+       WHERE id=? AND (status <> 'dismissed' OR dismissed_at IS NULL)`,
+    ).run(timestamp, timestamp, id);
+    return this.getNotification(id);
+  }
+
+  resolveNotification(
+    id: string,
+    at = new Date().toISOString(),
+  ): Notification | undefined {
+    const timestamp = NotificationSchema.shape.updatedAt.parse(at);
+    this.statement(
+      `UPDATE notifications
+       SET status=CASE WHEN status='dismissed' THEN status ELSE 'resolved' END,
+           resolved_at=COALESCE(resolved_at,?),
+           read_at=COALESCE(read_at,?),
+           updated_at=?
+       WHERE id=? AND (resolved_at IS NULL OR read_at IS NULL)`,
+    ).run(timestamp, timestamp, timestamp, id);
+    return this.getNotification(id);
+  }
+
+  findActivePermissionRequest(
+    sessionId: string,
+    attempt: string,
+  ): Notification | undefined {
+    const row = this.statement(
+      `SELECT * FROM notifications
+       WHERE kind='permission_request' AND status='active'
+         AND context_session_id=? AND context_attempt=?
+       ORDER BY created_at DESC,id DESC
+       LIMIT 1`,
+    ).get(sessionId, attempt) as Row | undefined;
+    return row ? notificationFromRow(row) : undefined;
+  }
+
+  resolveActivePermissionRequestsForSession(
+    sessionId: string,
+    at = new Date().toISOString(),
+  ): Notification[] {
+    const timestamp = NotificationSchema.shape.updatedAt.parse(at);
+    return (
+      this.statement(
+        `UPDATE notifications
+         SET status='resolved',
+             resolved_at=COALESCE(resolved_at,?),
+             read_at=COALESCE(read_at,?),
+             updated_at=?
+         WHERE kind='permission_request' AND status='active'
+           AND context_session_id=?
+         RETURNING *`,
+      ).all(timestamp, timestamp, timestamp, sessionId) as Row[]
+    )
+      .map(notificationFromRow)
+      .sort(
+        (left, right) =>
+          right.createdAt.localeCompare(left.createdAt) ||
+          right.id.localeCompare(left.id),
+      );
+  }
+
+  /**
+   * Prunes read/non-actionable history while preserving unread and actionable rows.
+   *
+   * Dedupe remains exact for every retained row; retries outside the 30-day or
+   * 5,000-row history window are treated as new lifecycle records.
+   */
+  pruneNotifications(
+    now = Date.now(),
+    batchSize = NOTIFICATION_RETENTION_BATCH_SIZE,
+  ): number {
+    const cutoff = new Date(now - NOTIFICATION_RETENTION_MAX_AGE_MS).toISOString();
+    return this.transactionIfNeeded(() => {
+      const result = this.statement(
+        `WITH retained AS (
+           SELECT id FROM notifications
+           WHERE NOT (
+             (read_at IS NULL AND status <> 'dismissed')
+             OR (status='active' AND kind IN
+               ('permission_request','orchestration_needs_review'))
+           )
+           ORDER BY updated_at DESC,id DESC
+           LIMIT ?
+         ),
+         candidates AS (
+           SELECT id FROM notifications
+           WHERE NOT (
+             (read_at IS NULL AND status <> 'dismissed')
+             OR (status='active' AND kind IN
+               ('permission_request','orchestration_needs_review'))
+           )
+           AND (updated_at < ? OR id NOT IN (SELECT id FROM retained))
+           ORDER BY updated_at,id
+           LIMIT ?
+         )
+         DELETE FROM notifications WHERE id IN (SELECT id FROM candidates)`,
+      ).run(NOTIFICATION_RETENTION_MAX_ROWS, cutoff, batchSize);
+      return Number(result.changes);
+    });
+  }
+
+  getNotificationPreference(
+    sessionId: string,
+    agentId: string,
+  ): NotificationPreference | undefined {
+    const row = this.statement(
+      `SELECT * FROM notification_preferences
+       WHERE session_id=? AND agent_id=?`,
+    ).get(sessionId, agentId) as Row | undefined;
+    return row ? notificationPreferenceFromRow(row) : undefined;
+  }
+
+  updateNotificationPreference(
+    sessionId: string,
+    agentId: string,
+    lifecycleEnabled: boolean,
+  ): NotificationPreference {
+    const preference = NotificationPreferenceSchema.parse({
+      sessionId,
+      agentId,
+      lifecycleEnabled,
+      updatedAt: new Date().toISOString(),
+    });
+    this.statement(
+      `INSERT INTO notification_preferences
+       (session_id,agent_id,lifecycle_enabled,updated_at) VALUES (?,?,?,?)
+       ON CONFLICT(session_id,agent_id) DO UPDATE SET
+         lifecycle_enabled=excluded.lifecycle_enabled,
+         updated_at=excluded.updated_at`,
+    ).run(
+      preference.sessionId,
+      preference.agentId,
+      preference.lifecycleEnabled ? 1 : 0,
+      preference.updatedAt,
+    );
+    return this.getNotificationPreference(sessionId, agentId)!;
+  }
+
+  deleteNotificationPreference(sessionId: string, agentId: string): boolean {
+    const result = this.statement(
+      "DELETE FROM notification_preferences WHERE session_id=? AND agent_id=?",
+    ).run(sessionId, agentId);
+    return Number(result.changes) > 0;
+  }
+
+  private insertNotificationRow(notification: Notification): void {
+    const parsed = NotificationSchema.parse(notification);
+    const context = notificationContext(parsed);
+    this.statement(
+      `INSERT INTO notifications
+       (id,source_key,category,kind,severity,status,title,body,subject,navigation,
+        data,created_at,updated_at,read_at,dismissed_at,resolved_at,
+        context_session_id,context_attempt)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    ).run(
+      parsed.id,
+      parsed.sourceKey,
+      parsed.category,
+      parsed.kind,
+      parsed.severity,
+      parsed.status,
+      parsed.title,
+      parsed.body,
+      JSON.stringify(parsed.subject),
+      JSON.stringify(parsed.navigation),
+      JSON.stringify(parsed.data),
+      parsed.createdAt,
+      parsed.updatedAt,
+      parsed.readAt,
+      parsed.dismissedAt,
+      parsed.resolvedAt,
+      context.sessionId,
+      context.attempt,
+    );
   }
 
   /**
@@ -1643,6 +2354,62 @@ export class FleetStore {
       id,
     );
     return this.getRun(id);
+  }
+
+  /** Records a run wake and the corresponding Lead prompt receipt together. */
+  recordRunWakePrompt(
+    runId: string,
+    leadSessionId: string,
+    at = new Date().toISOString(),
+  ): Run | undefined {
+    return this.transaction(() => {
+      const run = this.getRun(runId);
+      if (!run || run.leadSessionId !== leadSessionId) return undefined;
+      const woken = this.recordRunWake(run.id);
+      if (!woken) return undefined;
+      if (!this.recordOrchestratorPrompt(leadSessionId, at)) {
+        throw new Error("Run Lead session not found");
+      }
+      return woken;
+    });
+  }
+
+  /**
+   * Produces a new logical human-review request exactly once per transition
+   * into `awaiting_human`.
+   */
+  advanceRunToReview(id: string): Run | undefined;
+  advanceRunToReview(
+    id: string,
+    write: AdvanceRunToReviewWrite,
+  ): AdvanceRunToReviewResult | undefined;
+  advanceRunToReview(
+    id: string,
+    write?: AdvanceRunToReviewWrite,
+  ): Run | AdvanceRunToReviewResult | undefined {
+    return this.transaction(() => {
+      const current = this.getRun(id);
+      if (
+        !current ||
+        current.state === "awaiting_human" ||
+        !canTransitionRun(current.state, "awaiting_human")
+      ) {
+        return undefined;
+      }
+      const result = this.statement(
+        `UPDATE runs
+         SET state='awaiting_human',review_seq=review_seq+1,updated_at=?
+         WHERE id=? AND state=?`,
+      ).run(new Date().toISOString(), id, current.state);
+      if (Number(result.changes) === 0) return undefined;
+      const run = this.getRun(id)!;
+      if (!write) return run;
+      this.appendRunNote(run.id, run.phaseIndex, write.note);
+      const notification = this.insertPreparedNotification(
+        this.prepareNotification(write.notification(run)),
+      );
+      return { run, notification };
+    });
   }
 
   /**
@@ -1855,6 +2622,84 @@ export class FleetStore {
     ).map((row) => String(row.id));
   }
 
+  setSessionTransitionIntent(sessionId: string, intent: SessionTransitionIntent): void {
+    if (!this.getSession(sessionId)) throw new Error("Session not found");
+    this.statement(
+      `INSERT INTO session_transition_intents (session_id,intent,created_at)
+       VALUES (?,?,?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         intent=excluded.intent,
+         created_at=excluded.created_at`,
+    ).run(sessionId, intent, new Date().toISOString());
+  }
+
+  getSessionTransitionIntent(sessionId: string): SessionTransitionIntent | undefined {
+    const row = this.statement(
+      "SELECT intent FROM session_transition_intents WHERE session_id=?",
+    ).get(sessionId) as Row | undefined;
+    const intent = row ? String(row.intent) : "";
+    return intent === "cancel" || intent === "stop" ? intent : undefined;
+  }
+
+  consumeSessionTransitionIntent(sessionId: string): SessionTransitionIntent | undefined {
+    return this.transaction(() => {
+      const intent = this.getSessionTransitionIntent(sessionId);
+      if (intent) {
+        this.statement("DELETE FROM session_transition_intents WHERE session_id=?").run(
+          sessionId,
+        );
+      }
+      return intent;
+    });
+  }
+
+  clearSessionTransitionIntent(sessionId: string): boolean {
+    const result = this.statement(
+      "DELETE FROM session_transition_intents WHERE session_id=?",
+    ).run(sessionId);
+    return Number(result.changes) > 0;
+  }
+
+  setSessionTurnCompletion(sessionId: string, completion: SessionTurnCompletion): void {
+    if (!this.getSession(sessionId)) throw new Error("Session not found");
+    this.statement(
+      `INSERT INTO session_turn_completions
+       (session_id,event_id,sequence,attempt,created_at) VALUES (?,?,?,?,?)
+       ON CONFLICT(session_id) DO UPDATE SET
+         event_id=excluded.event_id,
+         sequence=excluded.sequence,
+         attempt=excluded.attempt,
+         created_at=excluded.created_at`,
+    ).run(
+      sessionId,
+      completion.eventId,
+      completion.sequence,
+      completion.attempt,
+      new Date().toISOString(),
+    );
+  }
+
+  getSessionTurnCompletion(sessionId: string): SessionTurnCompletion | undefined {
+    const row = this.statement(
+      `SELECT event_id,sequence,attempt
+       FROM session_turn_completions WHERE session_id=?`,
+    ).get(sessionId) as Row | undefined;
+    return row
+      ? {
+          eventId: String(row.event_id),
+          sequence: Number(row.sequence),
+          attempt: String(row.attempt),
+        }
+      : undefined;
+  }
+
+  clearSessionTurnCompletion(sessionId: string): boolean {
+    const result = this.statement(
+      "DELETE FROM session_turn_completions WHERE session_id=?",
+    ).run(sessionId);
+    return Number(result.changes) > 0;
+  }
+
   transitionSession(id: string, state: SessionState, activity?: string): FleetSession {
     const current = this.getSession(id);
     if (!current) throw new Error("Session not found");
@@ -1979,18 +2824,28 @@ export class FleetStore {
    * be, and nothing short of restarting the Node recovered it.
    */
   appendEvent(event: SessionEvent): AppendResult {
-    return this.transaction(() => {
+    return this.transactionIfNeeded(() => {
       const duplicate = this.statement(
-        "SELECT 1 found FROM events WHERE event_id=? OR (session_id=? AND sequence=?)",
-      ).get(event.eventId, event.sessionId, event.sequence);
-      if (duplicate) return { stored: false, skipped: 0 };
+        `SELECT event_id,session_id,sequence,type,payload,created_at
+         FROM events WHERE event_id=? OR (session_id=? AND sequence=?)`,
+      ).get(event.eventId, event.sessionId, event.sequence) as Row | undefined;
+      if (duplicate) {
+        const exact = isDeepStrictEqual(
+          eventFromRow(duplicate),
+          SessionEventSchema.parse(event),
+        );
+        return exact
+          ? { stored: false, skipped: 0 }
+          : { stored: false, skipped: 0, conflict: true };
+      }
       const previous = this.statement(
         "SELECT MAX(sequence) sequence FROM events WHERE session_id=?",
       ).get(event.sessionId) as Row;
       const max = Number(previous.sequence ?? 0);
       const skipped = Math.max(0, event.sequence - (max + 1));
+      const receivedAt = new Date().toISOString();
       this.statement(
-        "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at) VALUES (?,?,?,?,?,?)",
+        "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at,received_at) VALUES (?,?,?,?,?,?,?)",
       ).run(
         event.eventId,
         event.sessionId,
@@ -1998,6 +2853,7 @@ export class FleetStore {
         event.type,
         JSON.stringify(event.payload),
         event.createdAt,
+        receivedAt,
       );
       // Only the newest event describes the session now: an event that arrives
       // late and fills a hole must not drag the preview backwards.
@@ -2051,6 +2907,27 @@ export class FleetStore {
     return Number(row?.max ?? 0);
   }
 
+  /**
+   * Estimated Node-to-Host clock offset at an event sequence boundary.
+   *
+   * Both timestamps describe the same event, so their difference can safely
+   * translate a later Node timestamp before comparing it with Host dispatch
+   * time. Imported events have no receipt timestamp and are ignored.
+   */
+  eventClockOffsetMs(sessionId: string, throughSequence: number): number | undefined {
+    if (throughSequence < 1) return undefined;
+    const row = this.statement(
+      `SELECT created_at,received_at FROM events
+       WHERE session_id=? AND sequence<=? AND received_at<>''
+       ORDER BY sequence DESC LIMIT 1`,
+    ).get(sessionId, throughSequence) as Row | undefined;
+    if (!row) return undefined;
+    const createdAt = Date.parse(String(row.created_at));
+    const receivedAt = Date.parse(String(row.received_at));
+    if (!Number.isFinite(createdAt) || !Number.isFinite(receivedAt)) return undefined;
+    return receivedAt - createdAt;
+  }
+
   listEvents(sessionId: string): SessionEvent[] {
     return (
       this.statement("SELECT * FROM events WHERE session_id=? ORDER BY sequence").all(
@@ -2083,6 +2960,7 @@ export class FleetStore {
       throw new Error("Can only dismiss ended sessions");
     }
     this.transaction(() => {
+      this.statement("DELETE FROM notification_preferences WHERE session_id=?").run(id);
       this.statement("DELETE FROM events WHERE session_id=?").run(id);
       this.statement("DELETE FROM sessions WHERE id=?").run(id);
     });
@@ -2106,6 +2984,10 @@ export class FleetStore {
     const disposable = `state IN (${list}) AND agent_session_id = '' AND run_role <> 'lead'`;
     return this.transaction(() => {
       this.statement(
+        `DELETE FROM notification_preferences WHERE session_id IN
+           (SELECT id FROM sessions WHERE ${disposable})`,
+      ).run(...terminalStateList);
+      this.statement(
         `DELETE FROM events WHERE session_id IN
            (SELECT id FROM sessions WHERE ${disposable})`,
       ).run(...terminalStateList);
@@ -2121,6 +3003,10 @@ export class FleetStore {
     id: string,
   ): void {
     this.statement(
+      `DELETE FROM notification_preferences
+       WHERE session_id IN (SELECT id FROM sessions WHERE ${column}=?)`,
+    ).run(id);
+    this.statement(
       `DELETE FROM events WHERE session_id IN (SELECT id FROM sessions WHERE ${column}=?)`,
     ).run(id);
     this.statement(`DELETE FROM sessions WHERE ${column}=?`).run(id);
@@ -2129,6 +3015,21 @@ export class FleetStore {
 
 function hash(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+function notificationContext(notification: Pick<Notification, "kind" | "data">): {
+  sessionId: string;
+  attempt: string;
+} {
+  if (notification.kind !== "permission_request") {
+    return { sessionId: "", attempt: "" };
+  }
+  return {
+    sessionId:
+      typeof notification.data.sessionId === "string" ? notification.data.sessionId : "",
+    attempt:
+      typeof notification.data.attempt === "string" ? notification.data.attempt : "",
+  };
 }
 
 /*
@@ -2231,6 +3132,7 @@ function runFromRow(row: Row): Run {
     settleSeq: Number(row.settle_seq ?? 0),
     wakeSeq: Number(row.wake_seq ?? 0),
     emptyWakeCount: Number(row.empty_wake_count ?? 0),
+    reviewSeq: Number(row.review_seq ?? 0),
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   });
@@ -2267,6 +3169,43 @@ function runNoteFromRow(row: Row): RunNote {
     phaseIndex: Number(row.phase_index ?? 0),
     body: String(row.body ?? ""),
     createdAt: String(row.created_at),
+  });
+}
+
+function notificationFromRow(row: Row): Notification {
+  return NotificationSchema.parse({
+    id: String(row.id),
+    sourceKey: String(row.source_key),
+    category: String(row.category),
+    kind: String(row.kind),
+    severity: String(row.severity),
+    status: String(row.status),
+    title: String(row.title),
+    body: String(row.body),
+    subject: JSON.parse(String(row.subject)) as unknown,
+    navigation: JSON.parse(String(row.navigation)) as unknown,
+    data: JSON.parse(String(row.data ?? "{}")) as unknown,
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    readAt:
+      row.read_at === null || row.read_at === undefined ? null : String(row.read_at),
+    dismissedAt:
+      row.dismissed_at === null || row.dismissed_at === undefined
+        ? null
+        : String(row.dismissed_at),
+    resolvedAt:
+      row.resolved_at === null || row.resolved_at === undefined
+        ? null
+        : String(row.resolved_at),
+  });
+}
+
+function notificationPreferenceFromRow(row: Row): NotificationPreference {
+  return NotificationPreferenceSchema.parse({
+    sessionId: String(row.session_id),
+    agentId: String(row.agent_id),
+    lifecycleEnabled: Number(row.lifecycle_enabled) === 1,
+    updatedAt: String(row.updated_at),
   });
 }
 

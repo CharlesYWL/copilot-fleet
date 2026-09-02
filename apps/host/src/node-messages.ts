@@ -2,19 +2,23 @@ import type { FleetSession, NodeToHostMessage } from "@fleet/protocol";
 
 type SessionLookup = (sessionId: string) => FleetSession | undefined;
 
-export function nodeMessageBelongsTo(
+export type NodeMessageOwnership = "unscoped" | "owned" | "missing" | "foreign";
+
+export function nodeMessageOwnership(
   nodeId: string,
   message: NodeToHostMessage,
   getSession: SessionLookup,
-): boolean {
+): NodeMessageOwnership {
   const sessionId =
     message.type === "event"
       ? message.event.sessionId
       : message.type === "command_result"
         ? message.sessionId
         : undefined;
-  if (!sessionId) return true;
-  return getSession(sessionId)?.nodeId === nodeId;
+  if (!sessionId) return "unscoped";
+  const session = getSession(sessionId);
+  if (!session) return "missing";
+  return session.nodeId === nodeId ? "owned" : "foreign";
 }
 
 export function heartbeatSessionsBelongTo(

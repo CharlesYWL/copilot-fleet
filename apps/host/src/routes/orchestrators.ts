@@ -223,6 +223,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
 
     if (outcome.kind === "approve") {
       if (outcome.note) store.appendRunNote(run!.id, run!.phaseIndex, outcome.note);
+      service.resolveRunReview(run!.id);
       const done = store.setRunState(run!.id, "completed")!;
       service.publishRun(done);
       engine.tick();
@@ -230,6 +231,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     }
 
     store.appendRunNote(run!.id, run!.phaseIndex, `Sent back: ${outcome.note}`);
+    service.resolveRunReview(run!.id);
     /*
      * The note is owed rather than sent. Leaving `awaiting_human` is what takes
      * the approve/send-back controls away, so a prompt dropped because the lead
@@ -367,6 +369,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .send({ error: "Stop the orchestrator before dismissing it" });
     }
 
+    service.resolveSessionPermissionRequests(id);
     service.publishSession(store.setSessionControls(id, { dismissed: true }));
     return reply.code(200).send({ ok: true });
   });

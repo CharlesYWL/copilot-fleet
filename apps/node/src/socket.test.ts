@@ -4,10 +4,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import WebSocket from "ws";
 import {
   closeQuietly,
+  flushReconnectOutbox,
   HOST_DIAL_TIMEOUT_MS,
+  reconnectFlushLog,
+  sendNodeMessage,
   watchHostLiveness,
   type LivenessSocket,
 } from "./socket.js";
+import { EventOutbox } from "./outbox.js";
+import {
+  OutboxFlushIdSchema,
+  type NodeToHostMessage,
+  type SessionEvent,
+} from "@fleet/protocol";
 
 /** A dial that will never be answered, so the socket stays in CONNECTING. */
 function handshakingSocket(): WebSocket {
@@ -29,6 +38,153 @@ describe("closeQuietly", () => {
     expect(socket.listenerCount("error")).toBe(1);
     await delay(50);
     expect(socket.readyState).toBe(WebSocket.CLOSED);
+  });
+
+  it("checks socket availability before parsing an outbound frame", () => {
+    const malformed = { type: "unknown" } as unknown as NodeToHostMessage;
+    const closed = {
+      readyState: WebSocket.CLOSED,
+      send: () => {
+        throw new Error("should not send");
+      },
+    } as unknown as WebSocket;
+    expect(() => sendNodeMessage(closed, closed, malformed)).not.toThrow();
+    expect(sendNodeMessage(closed, closed, malformed)).toBe(false);
+
+    const sent: string[] = [];
+    const open = {
+      readyState: WebSocket.OPEN,
+      send: (message: string) => sent.push(message),
+    } as unknown as WebSocket;
+    expect(() => sendNodeMessage(open, open, malformed)).toThrow();
+    expect(
+      sendNodeMessage(open, open, {
+        type: "heartbeat",
+        activeSessionIds: [],
+        busySessionIds: [],
+        sentAt: new Date().toISOString(),
+      }),
+    ).toBe(true);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("describes a retained batch when the socket accepts no frames", () => {
+    expect(reconnectFlushLog({ sent: 0, reconciliationSent: false }, 3)).toEqual({
+      level: "warn",
+      message:
+        "Could not send any of 3 buffered event(s); the batch is retained for the next connection",
+    });
+  });
+
+  describe("ordered reconnect outbox flush", () => {
+    const flushId = OutboxFlushIdSchema.parse("11111111-1111-4111-8111-111111111111");
+    const event = (sequence: number, type: SessionEvent["type"]): SessionEvent => ({
+      eventId: `event-${sequence}`,
+      sessionId: "session-1",
+      sequence,
+      type,
+      payload: type === "state" ? { state: "idle" } : {},
+      createdAt: "2026-09-01T20:00:00.000Z",
+    });
+
+    it("sends authoritative events before exactly one current inventory", () => {
+      const outbox = new EventOutbox(10, () => flushId);
+      outbox.add(event(1, "turn_complete"));
+      outbox.add(event(2, "state"));
+      outbox.prepareFlush();
+      const sent: NodeToHostMessage[] = [];
+
+      const result = flushReconnectOutbox(
+        outbox,
+        (buffered, position) => {
+          sent.push({ type: "event", event: buffered, outboxFlush: position });
+          return true;
+        },
+        (message) => {
+          sent.push(message);
+          return true;
+        },
+        () => ({
+          activeSessionIds: ["session-1"],
+          busySessionIds: [],
+        }),
+      );
+
+      expect(sent.map((message) => message.type)).toEqual([
+        "event",
+        "event",
+        "outbox_flushed",
+      ]);
+      expect(sent.at(-1)).toEqual({
+        type: "outbox_flushed",
+        activeSessionIds: ["session-1"],
+        busySessionIds: [],
+        outboxFlush: { flushId, eventCount: 2 },
+      });
+      expect(result).toEqual({
+        flushId,
+        sent: 2,
+        dropped: 0,
+        reconciliationSent: true,
+      });
+      expect(outbox.size).toBe(2);
+      expect(
+        sent
+          .slice(0, 2)
+          .map((message) =>
+            message.type === "event" ? message.outboxFlush?.eventIndex : undefined,
+          ),
+      ).toEqual([0, 1]);
+    });
+
+    it("withholds reconciliation when the socket stops accepting the flush", () => {
+      const outbox = new EventOutbox(10, () => flushId);
+      outbox.add(event(1, "turn_complete"));
+      outbox.add(event(2, "state"));
+      outbox.prepareFlush();
+      const reconciliations: NodeToHostMessage[] = [];
+
+      const result = flushReconnectOutbox(
+        outbox,
+        (buffered) => buffered.sequence === 1,
+        (message) => {
+          reconciliations.push(message);
+          return true;
+        },
+        () => ({
+          activeSessionIds: ["session-1"],
+          busySessionIds: [],
+        }),
+      );
+
+      expect(result).toEqual({
+        flushId,
+        sent: 1,
+        dropped: 0,
+        reconciliationSent: false,
+      });
+      expect(outbox.size).toBe(2);
+      expect(reconciliations).toEqual([]);
+    });
+
+    it("can finish a pending handshake after a prior socket emptied the queue", () => {
+      const reconciliations: NodeToHostMessage[] = [];
+      const outbox = new EventOutbox(10, () => flushId);
+      outbox.prepareFlush(true);
+      const result = flushReconnectOutbox(
+        outbox,
+        () => true,
+        (message) => {
+          reconciliations.push(message);
+          return true;
+        },
+        () => ({ activeSessionIds: [], busySessionIds: [] }),
+      );
+
+      expect(result.reconciliationSent).toBe(true);
+      expect(result.flushId).toBe(flushId);
+      expect(reconciliations).toHaveLength(1);
+    });
   });
 
   it("leaves an already open socket to close normally", async () => {

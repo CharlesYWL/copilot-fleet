@@ -209,6 +209,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
 
     const note = input.note.trim();
     store.appendRunNote(id, run.phaseIndex, `Reopened by a person.\n\n${note}`);
+    service.resolveRunReview(id);
     /*
      * Queued rather than sent. Copilot refuses a prompt mid-turn and reports it
      * as a transcript notice rather than an error, so a direct dispatch would

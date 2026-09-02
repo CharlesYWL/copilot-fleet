@@ -1,4 +1,5 @@
 import { Dialog, DialogSurface, makeStyles, tokens } from "@fluentui/react-components";
+import type { ReactNode } from "react";
 import type { FleetSession, PromptAttachment, SessionEvent } from "@fleet/protocol";
 import type { SessionDraft } from "../lib/session-drafts";
 import { TerminalView } from "./TerminalView";
@@ -35,6 +36,7 @@ type SessionFocusDialogProps = {
     optionId?: string,
   ) => void;
   onConfigChange: (configId: string, value: string) => void;
+  notificationPreferenceControl?: ReactNode;
   draft: SessionDraft;
   onDraftChange: (update: (current: SessionDraft) => SessionDraft) => void;
 };
@@ -52,6 +54,7 @@ export const SessionFocusDialog = ({
   onRename,
   onPermission,
   onConfigChange,
+  notificationPreferenceControl,
   draft,
   onDraftChange,
 }: SessionFocusDialogProps) => {
@@ -76,6 +79,7 @@ export const SessionFocusDialog = ({
           onRename={onRename}
           onPermission={onPermission}
           onConfigChange={onConfigChange}
+          notificationPreferenceControl={notificationPreferenceControl}
           onClose={handleClose}
           draft={draft}
           onDraftChange={onDraftChange}

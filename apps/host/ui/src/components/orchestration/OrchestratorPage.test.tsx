@@ -32,6 +32,7 @@ const run = (overrides: Partial<Run> = {}): Run => ({
   settleSeq: 0,
   wakeSeq: 0,
   emptyWakeCount: 0,
+  reviewSeq: 0,
   createdAt: ISO,
   updatedAt: ISO,
   ...overrides,
