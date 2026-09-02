@@ -353,6 +353,20 @@ export function useFleet(notify: Notify) {
     return true;
   }, [applyResponseNotification, applyResponseUnreadCount, request]);
 
+  const dismissAllNotifications = useCallback(async () => {
+    const startedAtRevision = notificationRevision.current;
+    const result = await request<MarkAllNotificationsReadResponse>(
+      "/api/notifications/dismiss-all",
+      { method: "POST" },
+    );
+    if (!result.ok) return false;
+    applyResponseUnreadCount(result.data.unreadCount, startedAtRevision);
+    for (const notification of result.data.notifications) {
+      applyResponseNotification(notification, startedAtRevision);
+    }
+    return true;
+  }, [applyResponseNotification, applyResponseUnreadCount, request]);
+
   const dismissNotification = useCallback(
     async (id: string) => {
       const startedAtRevision = notificationRevision.current;
@@ -572,6 +586,7 @@ export function useFleet(notify: Notify) {
     request,
     markNotificationRead,
     markAllNotificationsRead,
+    dismissAllNotifications,
     dismissNotification,
   };
 }

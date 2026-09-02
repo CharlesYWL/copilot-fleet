@@ -181,6 +181,7 @@ type TopBarProps = {
   onNavigateNotification?: (notification: Notification) => void;
   onMarkNotificationRead?: (id: string) => void;
   onMarkAllNotificationsRead?: () => void;
+  onDismissAllNotifications?: () => void;
   onDismissNotification?: (id: string) => void;
   onSignOut: () => void;
   /** Jumps to whatever needs a person, when anything does. */
@@ -215,6 +216,7 @@ export const TopBar = ({
   onNavigateNotification = () => undefined,
   onMarkNotificationRead = () => undefined,
   onMarkAllNotificationsRead = () => undefined,
+  onDismissAllNotifications = () => undefined,
   onDismissNotification = () => undefined,
   onSignOut,
   onShowAttention,
@@ -314,6 +316,7 @@ export const TopBar = ({
           onNavigate={onNavigateNotification}
           onMarkRead={onMarkNotificationRead}
           onMarkAllRead={onMarkAllNotificationsRead}
+          onDismissAll={onDismissAllNotifications}
           onDismiss={onDismissNotification}
         />
         <Button

@@ -93,6 +93,7 @@ describe("notification shell integration", () => {
             }}
             onMarkRead={(id) => void fleet.markNotificationRead(id)}
             onMarkAllRead={() => void fleet.markAllNotificationsRead()}
+            onDismissAll={() => void fleet.dismissAllNotifications()}
             onDismiss={(id) => void fleet.dismissNotification(id)}
           />
           <output aria-label="Destination">{destination}</output>

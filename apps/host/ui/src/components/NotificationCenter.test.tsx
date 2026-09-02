@@ -42,6 +42,7 @@ const show = (
     onNavigate: vi.fn(),
     onMarkRead: vi.fn(),
     onMarkAllRead: vi.fn(),
+    onDismissAll: vi.fn(),
     onDismiss: vi.fn(),
     ...overrides,
   };
@@ -74,6 +75,7 @@ describe("NotificationCenter", () => {
           onNavigate={vi.fn()}
           onMarkRead={vi.fn()}
           onMarkAllRead={vi.fn()}
+          onDismissAll={vi.fn()}
           onDismiss={vi.fn()}
         />
       </FluentProvider>,
@@ -93,6 +95,7 @@ describe("NotificationCenter", () => {
           onNavigate={vi.fn()}
           onMarkRead={vi.fn()}
           onMarkAllRead={vi.fn()}
+          onDismissAll={vi.fn()}
           onDismiss={vi.fn()}
         />
       </FluentProvider>,
@@ -109,6 +112,9 @@ describe("NotificationCenter", () => {
     expect(screen.getByText("No notifications yet.")).toBeTruthy();
     expect(
       screen.getByRole("button", { name: "Mark all read" }).hasAttribute("disabled"),
+    ).toBe(true);
+    expect(
+      screen.getByRole("button", { name: "Clear all" }).hasAttribute("disabled"),
     ).toBe(true);
   });
 
@@ -151,6 +157,58 @@ describe("NotificationCenter", () => {
     expect(props.onMarkAllRead).toHaveBeenCalledTimes(1);
     expect(props.onDismiss).toHaveBeenCalledWith("unread");
     expect(props.onNavigate).toHaveBeenCalledWith(unread);
+  });
+
+  it("clears every notification through the bulk action", () => {
+    const onDismissAll = vi.fn();
+    show([notification("one", "2026-09-01T19:00:00.000Z")], 1, {
+      onDismissAll,
+    });
+    open(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
+    expect(onDismissAll).toHaveBeenCalledTimes(1);
+  });
+
+  it("aggregates repeated lifecycle messages by agent", () => {
+    const first = notification("first", "2026-09-01T18:00:00.000Z", {
+      category: "agent_lifecycle",
+      kind: "agent_completion",
+      title: "Router cleanup completed a turn",
+      subject: {
+        type: "agent",
+        id: "session-1",
+        label: "Router cleanup",
+      },
+      navigation: { type: "session", sessionId: "session-1" },
+      data: { sessionId: "session-1" },
+    });
+    const second = notification("second", "2026-09-01T19:00:00.000Z", {
+      category: "agent_lifecycle",
+      kind: "agent_completion",
+      title: "Router cleanup completed a turn",
+      subject: {
+        type: "agent",
+        id: "session-1",
+        label: "Router cleanup",
+      },
+      navigation: { type: "session", sessionId: "session-1" },
+      data: { sessionId: "session-1" },
+    });
+    const props = show([first, second], 2);
+    open(2);
+
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText("Router cleanup completed a turn")).toBeTruthy();
+    expect(screen.getByText("2 updates")).toBeTruthy();
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Mark Router cleanup completed a turn read",
+      }),
+    );
+    expect(props.onMarkRead).toHaveBeenCalledWith("first");
+    expect(props.onMarkRead).toHaveBeenCalledWith("second");
   });
 
   it("renders resolved permission and review items as no longer actionable", () => {

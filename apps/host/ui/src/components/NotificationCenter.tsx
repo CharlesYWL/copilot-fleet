@@ -225,10 +225,6 @@ const useStyles = makeStyles({
     borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
     background: tokens.colorNeutralBackground2,
   },
-  footerLabel: {
-    color: tokens.colorNeutralForeground3,
-    fontSize: tokens.fontSizeBase200,
-  },
   warning: { color: statusVisuals.attention.foreground },
   error: { color: statusVisuals.danger.foreground },
   info: { color: statusVisuals.info.foreground },
@@ -288,6 +284,23 @@ function timestamp(value: string): string {
   }).format(new Date(value));
 }
 
+type NotificationGroup = {
+  key: string;
+  latest: Notification;
+  notifications: Notification[];
+};
+
+function notificationGroupKey(notification: Notification): string {
+  if (notification.kind === "agent_completion" || notification.kind === "agent_failure") {
+    const sessionId =
+      typeof notification.data.sessionId === "string"
+        ? notification.data.sessionId
+        : notification.navigation.sessionId;
+    if (sessionId) return `${notification.kind}:${sessionId}`;
+  }
+  return notification.id;
+}
+
 export type NotificationCenterProps = {
   notifications: readonly Notification[];
   unreadCount: number;
@@ -296,6 +309,7 @@ export type NotificationCenterProps = {
   onNavigate: (notification: Notification) => void;
   onMarkRead: (id: string) => void;
   onMarkAllRead: () => void;
+  onDismissAll: () => void;
   onDismiss: (id: string) => void;
 };
 
@@ -307,6 +321,7 @@ export const NotificationCenter = ({
   onNavigate,
   onMarkRead,
   onMarkAllRead,
+  onDismissAll,
   onDismiss,
 }: NotificationCenterProps) => {
   const styles = useStyles();
@@ -320,6 +335,23 @@ export const NotificationCenter = ({
       ),
     [notifications],
   );
+  const groups = useMemo(() => {
+    const grouped = new Map<string, NotificationGroup>();
+    for (const notification of ordered) {
+      const key = notificationGroupKey(notification);
+      const current = grouped.get(key);
+      if (current) {
+        current.notifications.push(notification);
+      } else {
+        grouped.set(key, {
+          key,
+          latest: notification,
+          notifications: [notification],
+        });
+      }
+    }
+    return [...grouped.values()];
+  }, [ordered]);
   const unreadLabel =
     unreadCount === 1 ? "1 unread notification" : `${unreadCount} unread notifications`;
 
@@ -360,10 +392,10 @@ export const NotificationCenter = ({
           <Button
             appearance="subtle"
             size="small"
-            disabled={unreadCount === 0}
-            onClick={onMarkAllRead}
+            disabled={notifications.length === 0}
+            onClick={onDismissAll}
           >
-            Mark all read
+            Clear all
           </Button>
         </div>
         {ordered.length === 0 ? (
@@ -378,14 +410,18 @@ export const NotificationCenter = ({
           </div>
         ) : (
           <ul className={styles.list}>
-            {ordered.map((notification) => {
-              const unread = !notification.readAt;
+            {groups.map((group) => {
+              const notification = group.latest;
+              const unreadNotifications = group.notifications.filter(
+                (item) => !item.readAt,
+              );
+              const unread = unreadNotifications.length > 0;
               const resolved = notification.status === "resolved";
               const title = notificationTitle(notification);
               const body = notificationBody(notification);
               return (
                 <li
-                  key={notification.id}
+                  key={group.key}
                   className={mergeClasses(
                     styles.item,
                     unread && styles.unread,
@@ -398,6 +434,9 @@ export const NotificationCenter = ({
                     className={styles.main}
                     aria-label={`Open ${title}`}
                     onClick={() => {
+                      for (const item of unreadNotifications) {
+                        if (item.id !== notification.id) onMarkRead(item.id);
+                      }
                       onNavigate(notification);
                       setOpen(false);
                     }}
@@ -434,6 +473,11 @@ export const NotificationCenter = ({
                           Resolved
                         </Badge>
                       )}
+                      {group.notifications.length > 1 && (
+                        <Badge size="small" appearance="outline">
+                          {group.notifications.length} updates
+                        </Badge>
+                      )}
                       <time
                         dateTime={notification.createdAt}
                         title={notification.createdAt}
@@ -451,7 +495,11 @@ export const NotificationCenter = ({
                           size="small"
                           icon={<Checkmark16Regular />}
                           aria-label={`Mark ${title} read`}
-                          onClick={() => onMarkRead(notification.id)}
+                          onClick={() => {
+                            for (const item of unreadNotifications) {
+                              onMarkRead(item.id);
+                            }
+                          }}
                         />
                       </Tooltip>
                     )}
@@ -461,7 +509,11 @@ export const NotificationCenter = ({
                         size="small"
                         icon={<Dismiss16Regular />}
                         aria-label={`Dismiss ${title}`}
-                        onClick={() => onDismiss(notification.id)}
+                        onClick={() => {
+                          for (const item of group.notifications) {
+                            onDismiss(item.id);
+                          }
+                        }}
                       />
                     </Tooltip>
                   </span>
@@ -471,7 +523,14 @@ export const NotificationCenter = ({
           </ul>
         )}
         <div className={styles.footer}>
-          <Text className={styles.footerLabel}>Desktop notifications</Text>
+          <Button
+            appearance="subtle"
+            size="small"
+            disabled={unreadCount === 0}
+            onClick={onMarkAllRead}
+          >
+            Mark all read
+          </Button>
           <Button
             appearance={browserEnabled ? "secondary" : "subtle"}
             size="small"

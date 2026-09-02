@@ -222,6 +222,7 @@ export function App() {
     request,
     markNotificationRead,
     markAllNotificationsRead,
+    dismissAllNotifications,
     dismissNotification,
   } = useFleet(notify);
   const catalog = useCatalogOperations({ request, refresh, notify });
@@ -912,6 +913,7 @@ export function App() {
           onNavigateNotification={handleNotificationNavigate}
           onMarkNotificationRead={(id) => void markNotificationRead(id)}
           onMarkAllNotificationsRead={() => void markAllNotificationsRead()}
+          onDismissAllNotifications={() => void dismissAllNotifications()}
           onDismissNotification={(id) => void dismissNotification(id)}
           onSignOut={() => void signOut()}
           onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}

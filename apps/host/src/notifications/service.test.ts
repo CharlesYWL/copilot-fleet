@@ -39,7 +39,7 @@ describe("NotificationService", () => {
   it("uses controlled lifecycle content and deduplicates a producer retry", () => {
     const { store, service, placement, published } = setup();
     const secret = "password=do-not-copy raw stack trace";
-    const session = store.createSession(placement, secret, false, secret);
+    const session = store.createSession(placement, secret, false, "Failure agent");
     const input = {
       kind: "agent_failure" as const,
       session,
@@ -65,9 +65,45 @@ describe("NotificationService", () => {
     expect(serialized).not.toContain(secret);
     expect(first?.notification).toMatchObject({
       kind: "agent_failure",
-      title: "Agent session failed",
+      title: "Failure agent session failed",
       body: "The agent session ended unexpectedly.",
+      subject: {
+        label: "Failure agent",
+        parentLabel: "Agent",
+      },
       navigation: { sessionId: session.id },
+    });
+  });
+
+  it("uses the operator-assigned agent name in lifecycle notifications", () => {
+    const { store, service, placement } = setup();
+    const session = store.createSession(
+      placement,
+      "private prompt",
+      false,
+      "Router cleanup",
+    );
+
+    const created = service.createAgentLifecycle({
+      kind: "agent_completion",
+      session,
+      transition: {
+        eventId: "turn-completed",
+        sequence: 2,
+        createdAt: "2026-09-01T18:00:00.000Z",
+        from: "running",
+        to: "idle",
+        source: "session_event",
+      },
+      turnComplete: { eventId: "turn-completed", sequence: 2 },
+    });
+
+    expect(created?.notification).toMatchObject({
+      title: "Router cleanup completed a turn",
+      subject: {
+        type: "agent",
+        label: "Router cleanup",
+      },
     });
   });
 
@@ -329,6 +365,38 @@ describe("NotificationService", () => {
       notifications: [
         { id: notifications[1]!.id, readAt: expect.any(String) },
         { id: notifications[0]!.id, readAt: expect.any(String) },
+      ],
+    });
+    expect(published.notifications).toEqual(result.notifications);
+    expect(published.counts).toEqual([0]);
+  });
+
+  it("publishes and returns every row changed by clear-all", () => {
+    const { store, service, published } = setup();
+    const notifications = ["first", "second"].map(
+      (key, index) =>
+        store.insertNotification({
+          sourceKey: `clear-all:${key}`,
+          category: "agent_lifecycle",
+          kind: "agent_completion",
+          severity: "info",
+          title: key,
+          body: "",
+          subject: { type: "session", id: key, label: key },
+          navigation: { type: "session", sessionId: key },
+          data: {},
+          createdAt: `2026-09-01T18:0${index}:00.000Z`,
+        }).notification,
+    );
+
+    const result = service.dismissAll();
+
+    expect(result).toMatchObject({
+      updated: 2,
+      unreadCount: 0,
+      notifications: [
+        { id: notifications[1]!.id, status: "dismissed" },
+        { id: notifications[0]!.id, status: "dismissed" },
       ],
     });
     expect(published.notifications).toEqual(result.notifications);
