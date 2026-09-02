@@ -119,12 +119,12 @@ export class OrchestratorEngine {
     if (!session) return;
 
     if (session.state === "failed") {
-      this.store.updateRunStep(step.id, {
+      this.service.reconcileStoppedOrchestrationStep({
+        runId: step.runId,
+        stepId: step.id,
         state: "failed",
         output: session.currentActivity,
-        stoppedByOrchestrator: false,
       });
-      this.service.publishRunSteps(step.runId, this.store.listRunSteps(step.runId));
       return;
     }
 
@@ -152,12 +152,12 @@ export class OrchestratorEngine {
         )
         .map((event) => eventPayload(event, "agent_text")?.text ?? "")
         .join("");
-      this.store.updateRunStep(step.id, {
+      this.service.reconcileStoppedOrchestrationStep({
+        runId: step.runId,
+        stepId: step.id,
         state: "succeeded",
         output,
-        stoppedByOrchestrator: false,
       });
-      this.service.publishRunSteps(step.runId, this.store.listRunSteps(step.runId));
     }
   }
 

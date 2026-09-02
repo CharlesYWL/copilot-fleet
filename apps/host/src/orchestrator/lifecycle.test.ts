@@ -214,6 +214,58 @@ describe("orchestrator task lifecycle", () => {
       output: "finished output",
       stoppedByOrchestrator: false,
     });
+    expect(store.listNotifications().notifications).toEqual([]);
+  });
+
+  it("notifies when a stopped step reports a late authoritative failure", () => {
+    const { store, service } = fleet();
+    const placement = store.listPlacements()[0]!;
+    const run = store.createRun({
+      workspaceId: placement.workspaceId,
+      name: "Racing failure",
+      objective: "fail while stopping",
+    });
+    const [step] = store.replaceRunSteps(run.id, [
+      { stepKey: "work", title: "Risky work", prompt: "work" },
+    ]);
+    store.setRunState(run.id, "running");
+    const session = store.createSession(placement, "work", false, "Worker", {
+      runId: run.id,
+      runRole: "worker",
+    });
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "running");
+    store.updateRunStep(step!.id, {
+      state: "running",
+      sessionId: session.id,
+      eventSeqFrom: 0,
+    });
+    const engine = new OrchestratorEngine(service);
+    service.onSessionEvent((event) => engine.handleSessionEvent(event));
+
+    archiveRun(service, run.id, ORCHESTRATOR_STOP_REASON, {
+      stoppedByOrchestrator: true,
+    });
+    service.handleEvent({
+      eventId: "failed",
+      sessionId: session.id,
+      sequence: 1,
+      type: "state",
+      payload: { state: "failed", activity: "Worker failed during Stop" },
+      createdAt: new Date().toISOString(),
+    });
+
+    expect(store.getRun(run.id)?.state).toBe("cancelled");
+    expect(store.getRunStep(step!.id)).toMatchObject({
+      state: "failed",
+      stoppedByOrchestrator: false,
+    });
+    expect(store.listNotifications().notifications).toMatchObject([
+      {
+        kind: "orchestration_step_failure",
+        data: { runId: run.id, stepId: step!.id, attempts: 1 },
+      },
+    ]);
   });
 
   it("reissues persisted stop intent on reconnect and settles missing sessions", () => {

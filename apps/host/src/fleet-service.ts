@@ -6,6 +6,7 @@ import {
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
   NODE_NAME_SYNC_CAPABILITY,
+  ORCHESTRATOR_STOP_REASON,
   SELF_UPDATE_CAPABILITY,
   canTransition,
   canTransitionRun,
@@ -391,6 +392,55 @@ export class FleetService {
       (result) => {
         if (!result) return;
         this.publishRun(result.run);
+        this.publishRunSteps(result.run.id, this.store.listRunSteps(result.run.id));
+      },
+    );
+    return settled !== undefined;
+  }
+
+  /**
+   * Preserves a late authoritative result for a step cancelled by Stop.
+   *
+   * Cancelled steps are normally terminal, so this narrow reconciliation path
+   * also owns the failure notification that an active run's scheduler creates.
+   */
+  reconcileStoppedOrchestrationStep(input: {
+    runId: string;
+    stepId: string;
+    state: "succeeded" | "failed";
+    output: string;
+  }): boolean {
+    const settled = this.notifications.commitAtomically(
+      () => {
+        const run = this.store.getRun(input.runId);
+        const step = this.store.getRunStep(input.stepId);
+        if (
+          !run ||
+          run.state !== "cancelled" ||
+          run.failureReason !== ORCHESTRATOR_STOP_REASON ||
+          !step ||
+          step.runId !== run.id ||
+          step.state !== "cancelled" ||
+          !step.stoppedByOrchestrator
+        ) {
+          return undefined;
+        }
+        const updatedStep = this.store.updateRunStep(step.id, {
+          state: input.state,
+          output: input.output,
+          stoppedByOrchestrator: false,
+        });
+        if (!updatedStep) return undefined;
+        if (updatedStep.sessionId) {
+          this.store.clearSessionTurnCompletion(updatedStep.sessionId);
+        }
+        if (updatedStep.state === "failed") {
+          this.notifications.createOrchestrationStepFailure(run, updatedStep);
+        }
+        return { run, step: updatedStep };
+      },
+      (result) => {
+        if (!result) return;
         this.publishRunSteps(result.run.id, this.store.listRunSteps(result.run.id));
       },
     );
