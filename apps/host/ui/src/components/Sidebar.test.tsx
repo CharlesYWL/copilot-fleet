@@ -120,6 +120,24 @@ describe("Sidebar drag handles", () => {
     expect(row.getAttribute("draggable")).toBe("true");
   });
 
+  describe("dismissed orchestrators", () => {
+    it("keeps hidden conversations recoverable through a separate restore action", () => {
+      const restore = vi.fn();
+      const lead: FleetSession = {
+        ...session("lead", "w1", "n1", "stopped"),
+        runRole: "lead",
+        dismissed: true,
+      };
+      show([placement], [], {
+        dismissedLeadSessions: [lead],
+        onRestoreLeadSession: restore,
+      });
+
+      fireEvent.click(screen.getByTitle("Restore lead"));
+      expect(restore).toHaveBeenCalledWith("lead");
+    });
+  });
+
   it("makes workspace rows draggable so they can be reordered", () => {
     show([placement]);
     expect(screen.getByTitle(/^repo — drag/i).getAttribute("draggable")).toBe("true");

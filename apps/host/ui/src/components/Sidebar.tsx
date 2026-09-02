@@ -323,9 +323,11 @@ type SidebarProps = {
    * reason a chat app lists them — you pick one up, not "the" one.
    */
   leadSessions: readonly FleetSession[];
+  dismissedLeadSessions?: readonly FleetSession[];
   waitingPermissions: readonly SessionEvent[];
   onSelectSession: (sessionId: string) => void;
   onSelectLeadSession: (sessionId: string) => void;
+  onRestoreLeadSession?: (sessionId: string) => void;
   /** Starts another conversation with the orchestrator. */
   onNewConversation: () => void;
   onNewSession: () => void;
@@ -344,9 +346,11 @@ export const Sidebar = ({
   liveWorkCount,
   attentionCount,
   leadSessions,
+  dismissedLeadSessions = [],
   waitingPermissions,
   onSelectSession,
   onSelectLeadSession,
+  onRestoreLeadSession,
   onNewConversation,
   onNewSession,
   onSelectView,
@@ -528,6 +532,26 @@ export const Sidebar = ({
             <Add20Regular aria-hidden="true" />
             <span className={styles.orchestrationLabel}>New conversation</span>
           </button>
+        )}
+        {dismissedLeadSessions.length > 0 && (
+          <>
+            <Text as="span" className={styles.sectionLabel}>
+              Dismissed orchestrators
+            </Text>
+            {dismissedLeadSessions.map((lead) => (
+              <button
+                key={lead.id}
+                type="button"
+                className={styles.leadRow}
+                title={`Restore ${sessionLabel(lead)}`}
+                onClick={() => onRestoreLeadSession?.(lead.id)}
+              >
+                <Chat20Regular aria-hidden="true" />
+                <span className={styles.orchestrationLabel}>{sessionLabel(lead)}</span>
+                <span>Restore</span>
+              </button>
+            ))}
+          </>
         )}
         <Text as="span" className={styles.sectionLabel}>
           Agents

@@ -957,7 +957,8 @@ describe("FleetTools task lifecycle", () => {
       expect(out.text).toContain("worker conversations are kept");
       expect(store.getRunStep(live[0]!.id)!.state).toBe("cancelled");
       expect(store.getSession(session.id)).toMatchObject({
-        state: "stopped",
+        state: "queued",
+        stopRequested: true,
         agentSessionId: "copilot-worker-1",
       });
       expect(store.listEvents(session.id)).toHaveLength(1);
@@ -979,6 +980,14 @@ describe("FleetTools task lifecycle", () => {
         task: "Ship it",
         reason:
           "The request looked obsolete, but the reviewer confirmed it still matters.",
+      });
+      service.handleEvent({
+        eventId: "worker-stopped",
+        sessionId: step.sessionId,
+        sequence: 2,
+        type: "state",
+        payload: { state: "stopped", activity: "Stopped" },
+        createdAt: new Date().toISOString(),
       });
 
       expect(

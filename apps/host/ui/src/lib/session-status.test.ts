@@ -97,6 +97,12 @@ describe("filterOrchestratorConversations", () => {
 });
 
 describe("session status", () => {
+  it("shows persisted stop intent instead of the stale execution state", () => {
+    const value = session({ state: "offline", stopRequested: true });
+    expect(sessionStatusLabel(value)).toBe("stopping");
+    expect(sessionStatusDescriptor(value).label).toBe("Stopping");
+  });
+
   it("reads an ended-but-recoverable session as resumable, not failed", () => {
     const value = dormant("a");
     expect(isDormantSession(value)).toBe(true);

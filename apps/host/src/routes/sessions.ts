@@ -146,6 +146,9 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       }
       const session = store.getSession(id);
       if (!session) return reply.code(404).send({ error: "Session not found" });
+      if (session.stopRequested) {
+        return reply.code(409).send({ error: "Session is stopping" });
+      }
       if (session.state !== "idle") {
         return reply.code(409).send({ error: "Session must be idle" });
       }
@@ -246,11 +249,14 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (terminalSessionStates.has(session.state)) {
       return reply.code(200).send({ ok: true, alreadyTerminal: true });
     }
-    const dispatched = service.dispatch(
-      session.nodeId,
-      { type: "stop", sessionId: id },
-      { state: "stopped", activity: "Stopped while offline" },
-    );
+    if (session.stopRequested) {
+      return reply.code(200).send({ ok: true, alreadyStopping: true });
+    }
+    service.publishSession(store.setSessionControls(id, { stopRequested: true }));
+    const dispatched = service.dispatch(session.nodeId, {
+      type: "stop",
+      sessionId: id,
+    });
     return reply.code(dispatched.sent ? 202 : 200).send({ ok: true });
   });
 

@@ -1,11 +1,17 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
-import { terminalRunStates, terminalSessionStates } from "@fleet/protocol";
+import {
+  liveSessionStates,
+  ORCHESTRATOR_STOP_REASON,
+  terminalRunStates,
+  terminalSessionStates,
+} from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
 import { orchestratorBriefing } from "../orchestrator/briefing.js";
 import { reviewOutcome } from "../orchestrator/review.js";
+import { archiveRun, reopenOrchestratorStoppedRun } from "../orchestrator/lifecycle.js";
 
 const CreateOrchestratorSchema = z.object({
   /** Where its workers run. The orchestrator itself only talks. */
@@ -90,22 +96,14 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         runs: store.listRuns().filter((run) => run.leadSessionId === session.id),
       }));
 
-  const stopOwnedRuns = (leadSessionId: string, reason: string) => {
+  const stopOwnedRuns = (leadSessionId: string) => {
     const runs = store
       .listRuns()
       .filter((entry) => entry.leadSessionId === leadSessionId);
     for (const run of runs) {
-      if (terminalRunStates.has(run.state)) continue;
-      for (const worker of store.listSessions()) {
-        if (worker.runId !== run.id) continue;
-        if (terminalSessionStates.has(worker.state)) continue;
-        service.dispatch(
-          worker.nodeId,
-          { type: "stop", sessionId: worker.id },
-          { state: "stopped", activity: "Stopped with orchestrator" },
-        );
-      }
-      service.publishRun(store.setRunState(run.id, "completed", reason)!);
+      archiveRun(service, run.id, ORCHESTRATOR_STOP_REASON, {
+        stoppedByOrchestrator: true,
+      });
     }
   };
 
@@ -262,6 +260,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (!lead || lead.runRole !== "lead" || terminalSessionStates.has(lead.state)) {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
+    if (lead.stopRequested) {
+      return reply.code(409).send({ error: "The orchestrator is stopping" });
+    }
     const workspace = store.getWorkspace(input.workspaceId);
     if (!workspace) return reply.code(404).send({ error: "Workspace not found" });
     const reachable = store
@@ -314,26 +315,28 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (!session || session.runRole !== "lead") {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
+    stopOwnedRuns(id);
     if (terminalSessionStates.has(session.state)) {
+      engine.tick();
       return { ok: true, alreadyTerminal: true };
     }
-    stopOwnedRuns(id, "Stopped by operator");
+    if (session.stopRequested) return { ok: true, alreadyStopping: true };
+    service.publishSession(store.setSessionControls(id, { stopRequested: true }));
     // Stopping the session is the revocation: its token only opens anything
     // while it is still a live orchestrator.
-    service.dispatch(
-      session.nodeId,
-      { type: "stop", sessionId: id },
-      { state: "stopped", activity: "Stopped by operator" },
-    );
+    const dispatched = service.dispatch(session.nodeId, {
+      type: "stop",
+      sessionId: id,
+    });
     engine.tick();
-    return { ok: true };
+    return reply.code(dispatched.sent ? 202 : 200).send({
+      ok: true,
+      hostUnavailable: !dispatched.sent,
+    });
   });
 
   /**
-   * Explicitly removes a stopped conversation.
-   *
-   * This is separate from the generic session route so a failed lead cannot
-   * leave live tasks and workers orphaned when its transcript is dismissed.
+   * Hides a stopped conversation without changing execution or deleting history.
    */
   app.delete("/api/orchestrators/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
@@ -346,10 +349,90 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .code(409)
         .send({ error: "Stop the orchestrator before dismissing it" });
     }
+    if (session.stopRequested) {
+      return reply.code(409).send({ error: "The orchestrator is still stopping" });
+    }
+    const ownedRuns = store.listRuns().filter((run) => run.leadSessionId === id);
+    const ownedRunIds = new Set(ownedRuns.map((run) => run.id));
+    const liveWorker = store
+      .listSessions()
+      .some(
+        (worker) =>
+          ownedRunIds.has(worker.runId) &&
+          (worker.stopRequested || !terminalSessionStates.has(worker.state)),
+      );
+    if (ownedRuns.some((run) => !terminalRunStates.has(run.state)) || liveWorker) {
+      return reply
+        .code(409)
+        .send({ error: "Stop the orchestrator before dismissing it" });
+    }
 
-    stopOwnedRuns(id, "Conversation dismissed by operator");
-    store.deleteSession(id);
+    service.publishSession(store.setSessionControls(id, { dismissed: true }));
+    return reply.code(200).send({ ok: true });
+  });
+
+  app.post("/api/orchestrators/:id/restore", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = store.getSession(id);
+    if (!session || session.runRole !== "lead") {
+      return reply.code(404).send({ error: "Orchestrator not found" });
+    }
+    service.publishSession(store.setSessionControls(id, { dismissed: false }));
+    return { ok: true };
+  });
+
+  app.post("/api/orchestrators/:id/resume", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = store.getSession(id);
+    if (!session || session.runRole !== "lead") {
+      return reply.code(404).send({ error: "Orchestrator not found" });
+    }
+    if (session.dismissed) {
+      return reply
+        .code(409)
+        .send({ error: "Restore the orchestrator before resuming it" });
+    }
+    const ownedRuns = store.listRuns().filter((run) => run.leadSessionId === id);
+    const ownedRunIds = new Set(ownedRuns.map((run) => run.id));
+    const resumableRunIds = new Set(
+      ownedRuns
+        .filter(
+          (run) =>
+            run.state === "cancelled" && run.failureReason === ORCHESTRATOR_STOP_REASON,
+        )
+        .map((run) => run.id),
+    );
+    const unsettledWorker = store
+      .listSessions()
+      .find(
+        (worker) =>
+          ownedRunIds.has(worker.runId) &&
+          (worker.stopRequested || !terminalSessionStates.has(worker.state)),
+      );
+    if (session.stopRequested || unsettledWorker) {
+      return reply.code(409).send({
+        error: "Wait for every node to acknowledge Stop before resuming",
+      });
+    }
+
+    /*
+     * A retry may arrive after the lead resume command was sent but before the
+     * stopped runs were reopened. An already-live lead plus resumable runs is
+     * that recovery state; an ordinary Resume on a live lead remains a conflict.
+     */
+    const recoveringInterruptedResume =
+      liveSessionStates.has(session.state) && resumableRunIds.size > 0;
+    if (!recoveringInterruptedResume) {
+      const resumed = service.resumeSession(id, "Resuming orchestrator");
+      if (!resumed.ok) {
+        return reply.code(resumed.status).send({ error: resumed.error });
+      }
+    }
+    for (const run of ownedRuns) reopenOrchestratorStoppedRun(service, run.id);
     engine.tick();
-    return reply.code(204).send();
+    return reply.code(202).send({
+      ok: true,
+      recovered: recoveringInterruptedResume,
+    });
   });
 };
