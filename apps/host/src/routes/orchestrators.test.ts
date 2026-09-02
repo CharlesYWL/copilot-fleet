@@ -206,6 +206,60 @@ describe("orchestrator lifecycle routes", () => {
     ).toHaveLength(2);
   });
 
+  it("resumes after reconnect inventory clears stale persisted Stop intents", async () => {
+    const { app, store, service, leadId, run, worker } = await setup();
+    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+
+    expect(store.getSession(leadId)?.stopRequested).toBe(true);
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+
+    // A restarted Node has no live processes to acknowledge the old commands.
+    // Its empty inventory is the authoritative acknowledgement instead.
+    service.reconcile(store.getSession(leadId)!.nodeId, []);
+
+    expect(store.getSession(leadId)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+    expect(store.getSession(worker.id)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+
+    const resumed = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/resume`,
+    });
+
+    expect(resumed.statusCode).toBe(202);
+    expect(store.getRun(run.id)?.state).toBe("running");
+  });
+
+  it("lets an operator confirm Stop when the owning node never reconnects", async () => {
+    const { app, store, service, leadId, worker } = await setup();
+    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    service.disconnectNode(store.getSession(leadId)!.nodeId, "Node unavailable");
+
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/stop`,
+    });
+
+    expect(confirmed.statusCode).toBe(200);
+    expect(confirmed.json()).toMatchObject({
+      ok: true,
+      confirmedStopped: true,
+    });
+    expect(store.getSession(leadId)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+    expect(store.getSession(worker.id)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+  });
+
   it("dismisses and restores visibility without mutating or deleting execution", async () => {
     const { app, store, service, leadId, run, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });

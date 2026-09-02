@@ -165,10 +165,14 @@ export const OrchestratorPage = ({
           <Button
             size="small"
             appearance="subtle"
-            disabled={stopping}
+            disabled={stopping && conversation.state !== "offline"}
             onClick={onStopOrchestrator}
           >
-            {stopping ? "Stopping orchestrator" : "Stop orchestrator"}
+            {stopping
+              ? conversation.state === "offline"
+                ? "Mark orchestrator stopped"
+                : "Stopping orchestrator"
+              : "Stop orchestrator"}
           </Button>
         )}
       </div>

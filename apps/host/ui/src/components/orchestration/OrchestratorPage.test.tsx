@@ -288,13 +288,15 @@ describe("orchestrator views", () => {
     expect(onDismissOrchestrator).toHaveBeenCalled();
   });
 
-  it("shows Stop progress and prevents repeated actions until acknowledgement", () => {
+  it("offers explicit recovery when an unavailable node cannot acknowledge Stop", () => {
     page("stage", vi.fn(), undefined, {
       conversation: conversation({ state: "offline", stopRequested: true }),
     });
 
-    const stopping = screen.getByRole("button", { name: "Stopping orchestrator" });
-    expect(stopping.hasAttribute("disabled")).toBe(true);
+    const stopping = screen.getByRole("button", {
+      name: "Mark orchestrator stopped",
+    });
+    expect(stopping.hasAttribute("disabled")).toBe(false);
     expect(
       screen
         .getAllByRole("button", { name: "New task" })

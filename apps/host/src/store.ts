@@ -2780,30 +2780,45 @@ export class FleetStore {
     // Runs on every heartbeat, so it must not walk the session table: the
     // filter is an indexed lookup and the common answer is an empty list.
     const rows = this.statement(
-      "SELECT id,agent_session_id,stop_requested FROM sessions WHERE node_id=? AND state=?",
+      `SELECT id,state,agent_session_id,stop_requested FROM sessions
+       WHERE node_id=? AND (state=? OR (stop_requested=1 AND state<>'queued'))`,
     ).all(nodeId, "offline") as Row[];
-    return rows.map((row) => {
+    return rows.flatMap((row) => {
       const id = String(row.id);
       if (active.has(id)) {
-        return busy.has(id)
-          ? this.transitionSession(id, "running", "Reconnected to node; still working")
-          : this.transitionSession(id, "idle", "Reconnected to node");
+        if (
+          row.stop_requested &&
+          terminalSessionStates.has(String(row.state) as SessionState)
+        ) {
+          return [this.setSessionControls(id, { stopRequested: false })];
+        }
+        if (row.state !== "offline") return [];
+        return [
+          busy.has(id)
+            ? this.transitionSession(id, "running", "Reconnected to node; still working")
+            : this.transitionSession(id, "idle", "Reconnected to node"),
+        ];
       }
       if (row.stop_requested) {
+        if (terminalSessionStates.has(String(row.state) as SessionState)) {
+          return [this.setSessionControls(id, { stopRequested: false })];
+        }
         this.transitionSession(
           id,
           "stopped",
           "Node confirmed the session is no longer active",
         );
-        return this.setSessionControls(id, { stopRequested: false });
+        return [this.setSessionControls(id, { stopRequested: false })];
       }
-      return this.transitionSession(
-        id,
-        "failed",
-        row.agent_session_id
-          ? "Node reconnected without this session; Resume re-attaches it"
-          : "Node reconnected without this session; it never reached the agent",
-      );
+      return [
+        this.transitionSession(
+          id,
+          "failed",
+          row.agent_session_id
+            ? "Node reconnected without this session; Resume re-attaches it"
+            : "Node reconnected without this session; it never reached the agent",
+        ),
+      ];
     });
   }
 
