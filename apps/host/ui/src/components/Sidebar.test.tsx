@@ -121,7 +121,7 @@ describe("Sidebar drag handles", () => {
   });
 
   describe("dismissed orchestrators", () => {
-    it("keeps hidden conversations recoverable through a separate restore action", () => {
+    it("collapses hidden conversations by default and restores them after expansion", () => {
       const restore = vi.fn();
       const lead: FleetSession = {
         ...session("lead", "w1", "n1", "stopped"),
@@ -133,6 +133,18 @@ describe("Sidebar drag handles", () => {
         onRestoreLeadSession: restore,
       });
 
+      const disclosure = screen.getByRole("button", {
+        name: "Show dismissed orchestrators",
+      });
+      expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+      expect(screen.queryByTitle("Restore lead")).toBeNull();
+
+      fireEvent.click(disclosure);
+      expect(
+        screen
+          .getByRole("button", { name: "Hide dismissed orchestrators" })
+          .getAttribute("aria-expanded"),
+      ).toBe("true");
       fireEvent.click(screen.getByTitle("Restore lead"));
       expect(restore).toHaveBeenCalledWith("lead");
     });
