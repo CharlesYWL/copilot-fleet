@@ -468,6 +468,21 @@ describe("durable session notifications", () => {
     expect(stopped.store.getSessionTransitionIntent(stopped.session.id)).toBeUndefined();
   });
 
+  it("resolves permissions and clears stop state on an authoritative terminal event", () => {
+    const { store, service, session } = world();
+    service.handleEvent(event(session.id, 1, "permission", { requestId: "request-1" }));
+    store.setSessionControls(session.id, { stopRequested: true });
+    service.dispatch(session.nodeId, { type: "stop", sessionId: session.id });
+
+    service.handleEvent(event(session.id, 2, "state", { state: "stopped" }));
+
+    expect(store.getSession(session.id)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+    expect(store.listNotifications().notifications[0]?.status).toBe("resolved");
+  });
+
   it("rolls back commanded settlement when permission resolution fails", () => {
     const { store, service, session } = world();
     service.handleEvent(event(session.id, 1, "permission", { requestId: "request-1" }));
@@ -527,6 +542,7 @@ describe("durable session notifications", () => {
       kind: "agent_failure",
       data: { transitionSource: "fatal_command_result" },
     });
+    expect(stopped.store.getSession(stopped.session.id)?.stopRequested).toBe(false);
     expect(stopped.store.getSessionTransitionIntent(stopped.session.id)).toBeUndefined();
   });
 

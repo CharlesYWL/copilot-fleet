@@ -1,7 +1,7 @@
 const CLAIM_PREFIX = "fleet.notification.claim.";
 const CLAIM_TTL_MS = 30_000;
-const VISIBLE_ELECTION_DELAY_MS = 50;
-const BROWSER_ELECTION_DELAY_MS = 100;
+export const VISIBLE_ELECTION_DELAY_MS = 50;
+export const BROWSER_ELECTION_DELAY_MS = 100;
 const owner = Math.random().toString(36).slice(2);
 const memoryClaims = new Map<string, number>();
 
@@ -35,11 +35,26 @@ function wait(milliseconds: number): Promise<void> {
 }
 
 function fallbackClaim(id: string, now: number): boolean {
+  for (const [claimedId, claimedAt] of memoryClaims) {
+    if (!recent(claimedAt, now)) memoryClaims.delete(claimedId);
+  }
   const remembered = memoryClaims.get(id);
   if (recent(remembered, now)) return false;
 
   const key = CLAIM_PREFIX + id;
   try {
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const storedKey = localStorage.key(index);
+      if (!storedKey?.startsWith(CLAIM_PREFIX)) continue;
+      try {
+        const claim = JSON.parse(localStorage.getItem(storedKey) ?? "null") as {
+          at?: number;
+        } | null;
+        if (!claim || !recent(claim.at, now)) localStorage.removeItem(storedKey);
+      } catch {
+        localStorage.removeItem(storedKey);
+      }
+    }
     const stored = JSON.parse(localStorage.getItem(key) ?? "null") as {
       owner?: string;
       at?: number;

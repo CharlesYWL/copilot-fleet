@@ -122,6 +122,21 @@ function setup({ attach = true, maxSessions = 4 } = {}) {
 }
 
 describe("OrchestratorEngine", () => {
+  it("skips completion lookups for sessions outside the current run", () => {
+    const { store, engine, placement, planned } = setup();
+    const unrelated = store.createSession(placement, "unrelated");
+    const run = planned([
+      { stepKey: "audit", title: "Audit", prompt: "audit it", category: "explore" },
+    ]);
+    const stepLookup = vi.spyOn(store, "getRunStepBySession");
+    const completionLookup = vi.spyOn(store, "getSessionTurnCompletion");
+
+    engine.tickRun(run.id);
+
+    expect(stepLookup).not.toHaveBeenCalledWith(unrelated.id);
+    expect(completionLookup).not.toHaveBeenCalledWith(unrelated.id);
+  });
+
   it("writes the receipt before the command, and owns the session it starts", () => {
     const { store, engine, commands, planned } = setup();
     const run = planned([

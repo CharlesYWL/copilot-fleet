@@ -1,7 +1,11 @@
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Notification as FleetNotification } from "@fleet/protocol";
-import { resetNotificationClaimsForTest } from "../lib/notification-claim";
+import {
+  BROWSER_ELECTION_DELAY_MS,
+  resetNotificationClaimsForTest,
+  VISIBLE_ELECTION_DELAY_MS,
+} from "../lib/notification-claim";
 import type { LiveNotificationUpdate } from "./useFleet";
 
 const playChime = vi.fn();
@@ -92,6 +96,16 @@ beforeEach(() => {
     value: "visible",
   });
 });
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+const advanceElection = async (milliseconds: number): Promise<void> => {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(milliseconds);
+  });
+};
 
 describe("useNotificationDelivery", () => {
   it("delivers a new record once without redelivering a later upsert", async () => {
@@ -274,6 +288,7 @@ describe("useNotificationDelivery", () => {
   });
 
   it("prefers a visible toast over a hidden browser claimant", async () => {
+    vi.useFakeTimers();
     localStorage.setItem("fleet.browser-notifications", "on");
     MockNotification.permission = "granted";
     Object.defineProperty(document, "visibilityState", {
@@ -290,13 +305,14 @@ describe("useNotificationDelivery", () => {
     const visible = delivery([update(1, item("preferred"))]);
     renderHook(() => useNotificationDelivery(visible));
 
-    await waitFor(() => expect(visible.onToast).toHaveBeenCalledTimes(1));
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    await advanceElection(BROWSER_ELECTION_DELAY_MS);
+    expect(visible.onToast).toHaveBeenCalledTimes(1);
     expect(MockNotification.instances).toHaveLength(0);
     expect(hidden.onToast).not.toHaveBeenCalled();
   });
 
   it("lets a target-visible tab suppress another visible tab", async () => {
+    vi.useFakeTimers();
     const candidate = delivery([update(1, item("visible-suppressed"))]);
     renderHook(() => useNotificationDelivery(candidate));
 
@@ -305,7 +321,7 @@ describe("useNotificationDelivery", () => {
     });
     renderHook(() => useNotificationDelivery(target));
 
-    await new Promise((resolve) => setTimeout(resolve, 75));
+    await advanceElection(VISIBLE_ELECTION_DELAY_MS);
     expect(candidate.onToast).not.toHaveBeenCalled();
     expect(target.onToast).not.toHaveBeenCalled();
     expect(MockNotification.instances).toHaveLength(0);
@@ -313,6 +329,7 @@ describe("useNotificationDelivery", () => {
   });
 
   it("lets a target-visible tab suppress a hidden browser tab", async () => {
+    vi.useFakeTimers();
     localStorage.setItem("fleet.browser-notifications", "on");
     MockNotification.permission = "granted";
     const request = vi.fn(
@@ -346,11 +363,32 @@ describe("useNotificationDelivery", () => {
       value: "hidden",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 125));
+    await advanceElection(BROWSER_ELECTION_DELAY_MS);
     expect(request).toHaveBeenCalledTimes(2);
     expect(target.onToast).not.toHaveBeenCalled();
     expect(MockNotification.instances).toHaveLength(0);
     expect(playChime).not.toHaveBeenCalled();
+  });
+
+  it("keeps an in-flight notification available while old tracking is trimmed", async () => {
+    vi.useFakeTimers();
+    const input = delivery([update(1, item("pending"))]);
+    const { rerender } = renderHook(({ value }) => useNotificationDelivery(value), {
+      initialProps: { value: input },
+    });
+
+    rerender({
+      value: {
+        ...input,
+        notificationUpdates: [],
+        unreadCount: 0,
+      },
+    });
+    await advanceElection(VISIBLE_ELECTION_DELAY_MS);
+
+    expect(input.onToast).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "pending" }),
+    );
   });
 
   it("elects one visible delivery when no tab has the target visible", async () => {

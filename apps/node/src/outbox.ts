@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
+  MAX_OUTBOX_EVENT_COUNT,
   OutboxFlushIdSchema,
   type OutboxFlushId,
   type SessionEvent,
@@ -10,7 +11,7 @@ import {
  * during `tsx watch` interrupts. Past this the oldest go, because the newest
  * describe where the agent actually is.
  */
-export const DEFAULT_OUTBOX_CAPACITY = 2_000;
+export const DEFAULT_OUTBOX_CAPACITY = MAX_OUTBOX_EVENT_COUNT;
 
 export type OutboxFlush = { sent: number; dropped: number };
 

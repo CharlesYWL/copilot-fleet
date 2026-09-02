@@ -649,9 +649,11 @@ export type NodeCommand = z.infer<typeof NodeCommandSchema>;
 export const OutboxFlushIdSchema = z.string().uuid().brand<"OutboxFlushId">();
 export type OutboxFlushId = z.infer<typeof OutboxFlushIdSchema>;
 
+export const MAX_OUTBOX_EVENT_COUNT = 2_000;
+
 export const OutboxFlushIdentitySchema = z.object({
   flushId: OutboxFlushIdSchema,
-  eventCount: z.number().int().nonnegative(),
+  eventCount: z.number().int().nonnegative().max(MAX_OUTBOX_EVENT_COUNT),
 });
 export type OutboxFlushIdentity = z.infer<typeof OutboxFlushIdentitySchema>;
 
@@ -1309,18 +1311,14 @@ export const CreateNotificationSchema = NotificationSchema.omit({
 export type CreateNotification = z.infer<typeof CreateNotificationSchema>;
 
 /** Mutable presentation fields; identity and lifecycle use dedicated methods. */
-export const UpdateNotificationSchema = NotificationSchema.pick({
-  severity: true,
-  title: true,
-  body: true,
-  subject: true,
-  navigation: true,
-  data: true,
-})
-  .partial()
-  .refine((value) => Object.keys(value).length > 0, {
-    message: "At least one notification field is required",
-  });
+export const UpdateNotificationSchema = z.object({
+  severity: NotificationSeveritySchema.optional(),
+  title: z.string().min(1).max(200).optional(),
+  body: z.string().max(4_000).optional(),
+  subject: NotificationSubjectSchema.optional(),
+  navigation: NotificationNavigationSchema.optional(),
+  data: z.record(z.string(), z.unknown()).optional(),
+});
 export type UpdateNotification = z.infer<typeof UpdateNotificationSchema>;
 
 export const NotificationCursorSchema = z.object({

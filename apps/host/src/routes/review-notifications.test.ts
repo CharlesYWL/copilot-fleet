@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import type { FastifyBaseLogger } from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
 import { FleetService } from "../fleet-service.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetStore } from "../store.js";
@@ -116,7 +117,7 @@ describe("review notification lifecycle", () => {
     });
   });
 
-  it("resolves reviews owned by an orchestrator when that conversation stops", async () => {
+  it("resolves reviews while preserving resumable orchestrator cancellation", async () => {
     const { node } = store.registerNode({
       name: "node",
       os: "linux",
@@ -150,7 +151,10 @@ describe("review notification lifecycle", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(store.getRun(run.id)?.state).toBe("completed");
+    expect(store.getRun(run.id)).toMatchObject({
+      state: "cancelled",
+      failureReason: ORCHESTRATOR_STOP_REASON,
+    });
     expect(store.getNotificationBySourceKey(`review:${run.id}:1`)).toMatchObject({
       status: "resolved",
     });

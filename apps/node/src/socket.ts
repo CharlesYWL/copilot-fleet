@@ -1,5 +1,10 @@
 import type WebSocket from "ws";
-import type { NodeToHostMessage, OutboxFlushId, SessionEvent } from "@fleet/protocol";
+import {
+  NodeToHostMessageSchema,
+  type NodeToHostMessage,
+  type OutboxFlushId,
+  type SessionEvent,
+} from "@fleet/protocol";
 import type { EventOutbox, OutboxFlush } from "./outbox.js";
 
 /**
@@ -65,6 +70,40 @@ export type ReconnectFlush = OutboxFlush & {
   flushId?: OutboxFlushId;
   reconciliationSent: boolean;
 };
+
+export type ReconnectFlushLog = {
+  level: "info" | "warn";
+  message: string;
+};
+
+export function reconnectFlushLog(
+  result: Pick<ReconnectFlush, "sent" | "reconciliationSent">,
+  held: number,
+): ReconnectFlushLog | undefined {
+  if (result.sent > 0 || result.reconciliationSent) {
+    return {
+      level: "info",
+      message: `Sent ${result.sent}/${held} buffered event(s); awaiting Host acknowledgment`,
+    };
+  }
+  return held > 0
+    ? {
+        level: "warn",
+        message: `Could not send any of ${held} buffered event(s); the batch is retained for the next connection`,
+      }
+    : undefined;
+}
+
+export function sendNodeMessage(
+  current: WebSocket | undefined,
+  target: WebSocket,
+  message: NodeToHostMessage,
+): boolean {
+  if (current !== target || target.readyState !== SOCKET_OPEN) return false;
+  const parsed = NodeToHostMessageSchema.parse(message);
+  target.send(JSON.stringify(parsed));
+  return true;
+}
 
 /**
  * Flushes buffered events before sending the inventory that unlocks Host

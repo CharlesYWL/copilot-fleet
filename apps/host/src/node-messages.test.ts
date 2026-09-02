@@ -48,6 +48,18 @@ describe("authenticated node message ownership", () => {
         lookup,
       ),
     ).toBe("missing");
+    expect(
+      nodeMessageOwnership(
+        "node-a",
+        {
+          type: "heartbeat",
+          activeSessionIds: [],
+          busySessionIds: [],
+          sentAt: new Date().toISOString(),
+        },
+        lookup,
+      ),
+    ).toBe("unscoped");
   });
 
   it("rejects foreign heartbeat inventory and detects stale nodes", () => {

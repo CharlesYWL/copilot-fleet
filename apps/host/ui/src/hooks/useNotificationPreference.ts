@@ -22,6 +22,7 @@ export function useNotificationPreference(
   const [preference, setPreference] = useState<EffectiveNotificationPreference>();
   const [loading, setLoading] = useState(false);
   const ticket = useRef(0);
+  const mutationQueue = useRef<Promise<void>>(Promise.resolve());
   const session = useRef(sessionId);
   session.current = sessionId;
 
@@ -50,43 +51,44 @@ export function useNotificationPreference(
     void refresh();
   }, [refresh]);
 
-  const setLifecycleEnabled = useCallback(
-    async (lifecycleEnabled: boolean) => {
-      if (!sessionId) return false;
+  const mutate = useCallback(
+    (method: "PUT" | "DELETE", lifecycleEnabled?: boolean): Promise<boolean> => {
+      if (!sessionId) return Promise.resolve(false);
       const targetSessionId = sessionId;
       const current = ++ticket.current;
-      const result = await request<EffectiveNotificationPreference>(
-        `/api/notifications/preferences/${encodeURIComponent(targetSessionId)}`,
-        {
-          method: "PUT",
-          body: JSON.stringify({ lifecycleEnabled }),
-        },
+      setLoading(false);
+      const operation = mutationQueue.current.then(async () => {
+        const result = await request<EffectiveNotificationPreference>(
+          `/api/notifications/preferences/${encodeURIComponent(targetSessionId)}`,
+          method === "PUT"
+            ? {
+                method,
+                body: JSON.stringify({ lifecycleEnabled }),
+              }
+            : { method },
+        );
+        if (ticket.current !== current || session.current !== targetSessionId) {
+          return false;
+        }
+        if (!result.ok) return false;
+        setPreference(result.data);
+        return true;
+      });
+      mutationQueue.current = operation.then(
+        () => undefined,
+        () => undefined,
       );
-      if (ticket.current !== current || session.current !== targetSessionId) {
-        return false;
-      }
-      if (!result.ok) return false;
-      setPreference(result.data);
-      return true;
+      return operation;
     },
     [request, sessionId],
   );
 
-  const reset = useCallback(async () => {
-    if (!sessionId) return false;
-    const targetSessionId = sessionId;
-    const current = ++ticket.current;
-    const result = await request<EffectiveNotificationPreference>(
-      `/api/notifications/preferences/${encodeURIComponent(targetSessionId)}`,
-      { method: "DELETE" },
-    );
-    if (ticket.current !== current || session.current !== targetSessionId) {
-      return false;
-    }
-    if (!result.ok) return false;
-    setPreference(result.data);
-    return true;
-  }, [request, sessionId]);
+  const setLifecycleEnabled = useCallback(
+    (lifecycleEnabled: boolean) => mutate("PUT", lifecycleEnabled),
+    [mutate],
+  );
+
+  const reset = useCallback(() => mutate("DELETE"), [mutate]);
 
   return { preference, loading, refresh, setLifecycleEnabled, reset };
 }

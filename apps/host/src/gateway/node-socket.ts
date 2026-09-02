@@ -151,7 +151,7 @@ export function registerNodeGateway(app: FastifyInstance, service: FleetService)
           return;
         }
         outboxFlush = trackOutboxFlush(hello.outboxFlush);
-      } else if (acknowledgeOutbox && hello.outboxFlush) {
+      } else if (hello.outboxFlush) {
         rejectOutbox(hello.nodeId, "hello identified a batch it did not advertise");
         return;
       }

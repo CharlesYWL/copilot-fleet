@@ -6,6 +6,7 @@ import {
   HostBackupSchema,
   HostToNodeMessageSchema,
   ListNotificationsRequestSchema,
+  MAX_OUTBOX_EVENT_COUNT,
   MarkAllNotificationsReadResponseSchema,
   NODE_BACKUP_KIND,
   NodeBackupSchema,
@@ -20,6 +21,7 @@ import {
   SessionSchema,
   SetSessionConfigSchema,
   SnapshotSchema,
+  UpdateNotificationSchema,
   backupKind,
   canTransition,
   canTransitionRun,
@@ -75,6 +77,13 @@ describe("protocol validation", () => {
   it("guards malformed WebSocket JSON frames", () => {
     expect(tryParseJson('{"type":"heartbeat"}').ok).toBe(true);
     expect(tryParseJson("{not-json").ok).toBe(false);
+  });
+
+  it("keeps omitted notification update fields absent and permits a no-op patch", () => {
+    expect(UpdateNotificationSchema.parse({})).toEqual({});
+    expect(UpdateNotificationSchema.parse({ title: "Updated" })).toEqual({
+      title: "Updated",
+    });
   });
 
   it("defaults reconnect ordering for older Nodes and accepts an outbox flush", () => {
@@ -152,6 +161,24 @@ describe("protocol validation", () => {
           createdAt: new Date().toISOString(),
         },
         outboxFlush: { flushId, eventCount: 2, eventIndex: 2 },
+      }),
+    ).toThrow();
+    expect(() =>
+      NodeToHostMessageSchema.parse({
+        type: "hello",
+        nodeId: "n1",
+        secret: "secret",
+        os: "win32",
+        arch: "x64",
+        version: "0.3.0",
+        capabilities: [OUTBOX_ACK_CAPABILITY],
+        maxSessions: 1,
+        pendingOutbox: true,
+        pendingOutboxCount: MAX_OUTBOX_EVENT_COUNT + 1,
+        outboxFlush: {
+          flushId,
+          eventCount: MAX_OUTBOX_EVENT_COUNT + 1,
+        },
       }),
     ).toThrow();
     expect(

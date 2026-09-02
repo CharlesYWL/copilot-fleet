@@ -132,6 +132,98 @@ describe("FleetStore", () => {
       ).toBe(false);
     });
 
+    it("backfills permission context only when legacy context columns are added", () => {
+      const file = join(
+        mkdtempSync(join(tmpdir(), "fleet-notification-context-")),
+        "fleet.db",
+      );
+      directories.push(dirname(file));
+      const first = new FleetStore(file);
+      first.insertNotification(
+        notificationInput("lifecycle-context", "2026-09-01T18:00:00.000Z", {
+          data: { sessionId: "lifecycle-session", attempt: "lifecycle-attempt" },
+        }),
+      );
+      first.insertNotification(
+        notificationInput("permission-context", "2026-09-01T18:01:00.000Z", {
+          category: "permission",
+          kind: "permission_request",
+          subject: {
+            type: "permission_request",
+            id: "request",
+            label: "Permission request",
+          },
+          navigation: {
+            type: "permission_request",
+            sessionId: "permission-session",
+          },
+          data: {
+            sessionId: "permission-session",
+            attempt: "permission-attempt",
+          },
+        }),
+      );
+      first.close();
+
+      const legacy = new DatabaseSync(file);
+      legacy.exec(`
+        DROP INDEX idx_notifications_permission_context;
+        ALTER TABLE notifications DROP COLUMN context_session_id;
+        ALTER TABLE notifications DROP COLUMN context_attempt;
+      `);
+      legacy.close();
+
+      const migrated = new FleetStore(file);
+      migrated.close();
+      const inspected = new DatabaseSync(file);
+      const contexts = inspected
+        .prepare(
+          `SELECT kind,context_session_id,context_attempt
+           FROM notifications ORDER BY kind`,
+        )
+        .all() as {
+        kind: string;
+        context_session_id: string;
+        context_attempt: string;
+      }[];
+      expect(contexts).toEqual([
+        {
+          kind: "agent_completion",
+          context_session_id: "",
+          context_attempt: "",
+        },
+        {
+          kind: "permission_request",
+          context_session_id: "permission-session",
+          context_attempt: "permission-attempt",
+        },
+      ]);
+      inspected
+        .prepare(
+          `UPDATE notifications
+           SET context_session_id='',context_attempt=''
+           WHERE kind='permission_request'`,
+        )
+        .run();
+      inspected.close();
+
+      const reopened = new FleetStore(file);
+      reopened.close();
+      const final = new DatabaseSync(file);
+      expect(
+        final
+          .prepare(
+            `SELECT context_session_id,context_attempt
+             FROM notifications WHERE kind='permission_request'`,
+          )
+          .get(),
+      ).toEqual({
+        context_session_id: "",
+        context_attempt: "",
+      });
+      final.close();
+    });
+
     it("deduplicates producer retries by stable source key", () => {
       const { store } = setup();
       const first = store.insertNotification(
@@ -233,6 +325,7 @@ describe("FleetStore", () => {
         title: "Completed with warnings",
         data: { attempt: 2 },
       });
+      expect(store.updateNotification(read!.id, {})).toEqual(updated);
 
       const readOnce = store.markNotificationRead(read!.id, firstAt)!;
       const readTwice = store.markNotificationRead(read!.id, laterAt)!;

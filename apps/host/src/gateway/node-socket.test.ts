@@ -2,6 +2,7 @@ import { setTimeout as delay } from "node:timers/promises";
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import {
+  MAX_OUTBOX_EVENT_COUNT,
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
   OutboxFlushIdSchema,
@@ -140,6 +141,73 @@ describe("node reconnect socket ordering", () => {
 
     await waitFor(() => store.getSession(sessionId)?.state === "idle");
     expect(store.listNotifications().notifications).toHaveLength(1);
+  });
+
+  it("rejects a durable batch identity without the acknowledgement capability", async () => {
+    const address = app.server.address();
+    if (!address || typeof address === "string") throw new Error("Missing test port");
+    const client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/node`);
+    clients.push(client);
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    const closed = new Promise<number>((resolve) => client.once("close", resolve));
+
+    send(client, {
+      type: "hello",
+      nodeId,
+      secret,
+      os: "win32",
+      arch: "x64",
+      version: "0.3.0",
+      revision: "",
+      capabilities: [],
+      agents: [],
+      maxSessions: 1,
+      homeDir: "C:\\Users\\node",
+      pendingOutbox: true,
+      pendingOutboxCount: 1,
+      outboxFlush: { flushId: firstFlushId, eventCount: 1 },
+    });
+
+    expect(await closed).toBe(1008);
+  });
+
+  it("rejects an outbox batch larger than the Node retention capacity", async () => {
+    const address = app.server.address();
+    if (!address || typeof address === "string") throw new Error("Missing test port");
+    const client = new WebSocket(`ws://127.0.0.1:${address.port}/ws/node`);
+    clients.push(client);
+    await new Promise<void>((resolve, reject) => {
+      client.once("open", resolve);
+      client.once("error", reject);
+    });
+    const closed = new Promise<number>((resolve) => client.once("close", resolve));
+
+    client.send(
+      JSON.stringify({
+        type: "hello",
+        nodeId,
+        secret,
+        os: "win32",
+        arch: "x64",
+        version: "0.3.0",
+        revision: "",
+        capabilities: [OUTBOX_ACK_CAPABILITY],
+        agents: [],
+        maxSessions: 1,
+        homeDir: "C:\\Users\\node",
+        pendingOutbox: true,
+        pendingOutboxCount: MAX_OUTBOX_EVENT_COUNT + 1,
+        outboxFlush: {
+          flushId: firstFlushId,
+          eventCount: MAX_OUTBOX_EVENT_COUNT + 1,
+        },
+      }),
+    );
+
+    expect(await closed).toBe(1008);
   });
 
   it("does not ack a partial flush and accepts the whole retained batch on retry", async () => {
@@ -514,7 +582,9 @@ describe("node reconnect socket ordering", () => {
         };
         if (message.type === "welcome") {
           expect(message.reconcileAfterOutbox).toBe(
-            hello.pendingOutbox === true || (hello.pendingOutboxCount ?? 0) > 0,
+            hello.pendingOutbox === true ||
+              (hello.pendingOutboxCount ?? 0) > 0 ||
+              hello.outboxFlush !== undefined,
           );
           expect(message.acknowledgeOutbox).toBe(
             hello.capabilities?.includes(OUTBOX_ACK_CAPABILITY) ?? false,

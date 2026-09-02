@@ -78,6 +78,13 @@ type DeferredPublications = {
 const digest = (value: string): string =>
   createHash("sha256").update(value).digest("hex").slice(0, 24);
 
+const NOTIFICATION_TEXT_LIMIT = 200;
+
+const boundedLabel = (value: string): string => value.slice(0, NOTIFICATION_TEXT_LIMIT);
+
+const titledLabel = (prefix: string, value: string): string =>
+  `${prefix}${value.slice(0, NOTIFICATION_TEXT_LIMIT - prefix.length)}`;
+
 export const notificationAttemptKeyForStep = (run: Run, step: RunStep): string =>
   `${run.id}:${step.id}:${step.attempts}`;
 
@@ -105,7 +112,7 @@ const roleLabel = (runRole: RunRole): string => {
 };
 
 const sessionLabel = (session: FleetSession): string =>
-  `${session.workspaceName} on ${session.nodeName}`.slice(0, 200);
+  boundedLabel(`${session.workspaceName} on ${session.nodeName}`);
 
 const subjectForAgent = (session: FleetSession) => ({
   type: "agent" as const,
@@ -118,9 +125,9 @@ const subjectForAgent = (session: FleetSession) => ({
 const subjectForStep = (run: Run, step: RunStep) => ({
   type: "run_step" as const,
   id: step.id,
-  label: step.title,
+  label: boundedLabel(step.title),
   parentId: run.id,
-  parentLabel: run.name,
+  parentLabel: boundedLabel(run.name),
 });
 
 /**
@@ -371,7 +378,7 @@ export class NotificationService {
       category: "orchestration",
       kind: "orchestration_needs_review",
       severity: reason === "completed" ? "info" : "warning",
-      title: `Task needs review: ${run.name}`,
+      title: titledLabel("Task needs review: ", run.name),
       body:
         reason === "completed"
           ? "The orchestrator reports that this task is complete and ready for approval."
@@ -379,7 +386,7 @@ export class NotificationService {
       subject: {
         type: "run",
         id: run.id,
-        label: run.name,
+        label: boundedLabel(run.name),
       },
       navigation: { type: "run", runId: run.id },
       data: {
@@ -404,7 +411,7 @@ export class NotificationService {
       category: "orchestration",
       kind: "orchestration_step_failure",
       severity: "error",
-      title: `Step failed: ${step.title}`,
+      title: titledLabel("Step failed: ", step.title),
       body: `An orchestration step failed during attempt ${step.attempts}.`,
       subject: subjectForStep(run, step),
       navigation: {

@@ -266,6 +266,43 @@ describe("NotificationService", () => {
     expect(published.runs.map((entry) => entry.reviewSeq)).toEqual([1, 2]);
   });
 
+  it("bounds orchestration titles and copied labels before schema validation", () => {
+    const { store, service, workspace } = setup();
+    const longName = "run".repeat(100);
+    const longTitle = "step".repeat(100);
+    const created = store.createRun({
+      workspaceId: workspace.id,
+      name: "run",
+      objective: "exercise copied notification text",
+    });
+    const run = store.updateRun(created.id, {
+      name: longName,
+      state: "running",
+    })!;
+    const step = store.upsertRunStep(run.id, {
+      stepKey: "long-step",
+      title: longTitle,
+      prompt: "work",
+    });
+
+    service.requestRunReview({
+      runId: run.id,
+      note: "ready",
+      reason: "completed",
+    });
+    service.createOrchestrationStepFailure(run, step);
+
+    const review = store.getNotificationBySourceKey(`review:${run.id}:1`)!;
+    const failure = store.getNotificationBySourceKey(
+      `orchestration_step_failure:${run.id}:${step.id}:${step.attempts}`,
+    )!;
+    expect(review.title).toHaveLength(200);
+    expect(review.subject.label).toHaveLength(200);
+    expect(failure.title).toHaveLength(200);
+    expect(failure.subject.label).toHaveLength(200);
+    expect(failure.subject.parentLabel).toHaveLength(200);
+  });
+
   it("publishes and returns the exact rows changed by mark-all", () => {
     const { store, service, published } = setup();
     const notifications = ["first", "second"].map(

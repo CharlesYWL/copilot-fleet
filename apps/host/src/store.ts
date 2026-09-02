@@ -387,27 +387,32 @@ export class FleetStore {
       "INTEGER NOT NULL DEFAULT 0",
     );
     this.addColumnIfMissing("workspaces", "kind", "TEXT NOT NULL DEFAULT 'project'");
-    this.addColumnIfMissing(
+    const addedNotificationSessionContext = this.addColumnIfMissing(
       "notifications",
       "context_session_id",
       "TEXT NOT NULL DEFAULT ''",
     );
-    this.addColumnIfMissing(
+    const addedNotificationAttemptContext = this.addColumnIfMissing(
       "notifications",
       "context_attempt",
       "TEXT NOT NULL DEFAULT ''",
     );
+    if (addedNotificationSessionContext || addedNotificationAttemptContext) {
+      this.db.exec(`
+        UPDATE notifications
+        SET context_session_id=CASE
+              WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.sessionId'),'')
+              ELSE ''
+            END,
+            context_attempt=CASE
+              WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.attempt'),'')
+              ELSE ''
+            END
+        WHERE kind='permission_request'
+          AND (context_session_id='' OR context_attempt='');
+      `);
+    }
     this.db.exec(`
-      UPDATE notifications
-      SET context_session_id=CASE
-            WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.sessionId'),'')
-            ELSE ''
-          END,
-          context_attempt=CASE
-            WHEN json_valid(data) THEN COALESCE(json_extract(data,'$.attempt'),'')
-            ELSE ''
-          END
-      WHERE context_session_id='' OR context_attempt='';
       CREATE INDEX IF NOT EXISTS idx_notifications_permission_context
         ON notifications(context_session_id,context_attempt,created_at DESC,id DESC)
         WHERE kind='permission_request' AND status='active';
@@ -1049,10 +1054,11 @@ export class FleetStore {
   }
 
   /** Keeps databases created before a column was introduced usable. */
-  private addColumnIfMissing(table: string, column: string, definition: string): void {
+  private addColumnIfMissing(table: string, column: string, definition: string): boolean {
     const columns = this.db.prepare(`PRAGMA table_info(${table})`).all() as Row[];
-    if (columns.some((row) => String(row.name) === column)) return;
+    if (columns.some((row) => String(row.name) === column)) return false;
     this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    return true;
   }
 
   close(): void {
@@ -1934,6 +1940,7 @@ export class FleetStore {
       context_attempt: context?.attempt,
     };
     const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
+    if (entries.length === 0) return current;
     const assignments = entries.map(([column]) => `${column}=?`).join(",");
     const result = this.statement(
       `UPDATE notifications SET ${assignments},updated_at=? WHERE id=?`,

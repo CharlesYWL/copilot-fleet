@@ -199,7 +199,7 @@ export async function buildServer(
   registerBrowserGateway(app, service);
   registerNodeGateway(app, service);
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs);
-  const notificationRetentionTimer = startNotificationRetentionMonitor(service);
+  const notificationRetentionTimer = startNotificationRetentionMonitor(service, app.log);
   // Timeouts are the absence of events; without a clock nothing would ever
   // notice one. See the monitor for why this is not the busy-wait the design
   // rules out.

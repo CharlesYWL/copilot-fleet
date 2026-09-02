@@ -1298,7 +1298,7 @@ export class FleetService {
           context,
         );
         const redispatchStop =
-          session.stopRequested && !terminalSessionStates.has(payload.state);
+          session.stopRequested === true && !terminalSessionStates.has(payload.state);
         if (session.stopRequested && terminalSessionStates.has(payload.state)) {
           transitioned = this.store.setSessionControls(session.id, {
             stopRequested: false,
@@ -1311,6 +1311,9 @@ export class FleetService {
           this.store.consumeSessionTransitionIntent(session.id);
         }
         this.clearConsumedTurnCompletion(transitioned, intent, context);
+        if (terminalSessionStates.has(payload.state)) {
+          this.resolveSessionPermissionRequests(session.id);
+        }
         return {
           outcome: "accepted",
           skipped: appended.skipped,

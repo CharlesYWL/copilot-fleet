@@ -7,7 +7,6 @@ import {
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
   NODE_NAME_SYNC_CAPABILITY,
-  NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
   RegisterNodeSchema,
   SELF_UPDATE_CAPABILITY,
@@ -58,6 +57,8 @@ import {
   closeQuietly,
   flushReconnectOutbox,
   HOST_DIAL_TIMEOUT_MS,
+  reconnectFlushLog,
+  sendNodeMessage,
   watchHostLiveness,
 } from "./socket.js";
 import { configServerPort, startConfigServer } from "./config-server.js";
@@ -865,10 +866,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   }
 
   function sendOn(target: WebSocket, message: NodeToHostMessage): boolean {
-    const parsed = NodeToHostMessageSchema.parse(message);
-    if (socket !== target || target.readyState !== WebSocket.OPEN) return false;
-    target.send(JSON.stringify(parsed));
-    return true;
+    return sendNodeMessage(socket, target, message);
   }
 
   /** Reports whether the event actually left, so the caller can hold it if not. */
@@ -905,11 +903,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           busySessionIds: router.busySessionIds,
         }),
       );
-      if (result.sent > 0 || result.reconciliationSent) {
-        log(
-          `Sent ${result.sent}/${held} buffered event(s); awaiting Host acknowledgment`,
-        );
-      }
+      const summary = reconnectFlushLog(result, held);
+      if (summary?.level === "warn") warn(summary.message);
+      else if (summary) log(summary.message);
       return;
     }
 

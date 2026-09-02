@@ -128,8 +128,12 @@ export class OrchestratorEngine {
       return;
     }
 
+    const attempt = notificationAttemptKey(session, {
+      step,
+      run: this.store.getRun(step.runId),
+    });
     const completedTurn =
-      this.turnComplete.has(sessionId) ||
+      this.turnComplete.get(sessionId) === attempt ||
       this.store
         .listEvents(sessionId)
         .some(
@@ -175,12 +179,18 @@ export class OrchestratorEngine {
     const sessions = this.store.listSessions();
     const completedTurns = new Set<string>();
     for (const session of sessions) {
-      const completion = this.store.getSessionTurnCompletion(session.id);
+      if (
+        (session.runId && session.runId !== runId) ||
+        (session.runRole !== "worker" && session.runRole !== "reviewer")
+      ) {
+        continue;
+      }
       const step = this.store.getRunStepBySession(session.id);
-      if (!step) continue;
+      if (!step || step.runId !== runId) continue;
+      const completion = this.store.getSessionTurnCompletion(session.id);
       const attempt = notificationAttemptKey(session, {
         step,
-        run: this.store.getRun(step.runId),
+        run,
       });
       if (
         completion?.attempt === attempt ||

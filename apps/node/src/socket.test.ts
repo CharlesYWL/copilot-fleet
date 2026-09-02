@@ -6,6 +6,8 @@ import {
   closeQuietly,
   flushReconnectOutbox,
   HOST_DIAL_TIMEOUT_MS,
+  reconnectFlushLog,
+  sendNodeMessage,
   watchHostLiveness,
   type LivenessSocket,
 } from "./socket.js";
@@ -36,6 +38,42 @@ describe("closeQuietly", () => {
     expect(socket.listenerCount("error")).toBe(1);
     await delay(50);
     expect(socket.readyState).toBe(WebSocket.CLOSED);
+  });
+
+  it("checks socket availability before parsing an outbound frame", () => {
+    const malformed = { type: "unknown" } as unknown as NodeToHostMessage;
+    const closed = {
+      readyState: WebSocket.CLOSED,
+      send: () => {
+        throw new Error("should not send");
+      },
+    } as unknown as WebSocket;
+    expect(() => sendNodeMessage(closed, closed, malformed)).not.toThrow();
+    expect(sendNodeMessage(closed, closed, malformed)).toBe(false);
+
+    const sent: string[] = [];
+    const open = {
+      readyState: WebSocket.OPEN,
+      send: (message: string) => sent.push(message),
+    } as unknown as WebSocket;
+    expect(() => sendNodeMessage(open, open, malformed)).toThrow();
+    expect(
+      sendNodeMessage(open, open, {
+        type: "heartbeat",
+        activeSessionIds: [],
+        busySessionIds: [],
+        sentAt: new Date().toISOString(),
+      }),
+    ).toBe(true);
+    expect(sent).toHaveLength(1);
+  });
+
+  it("describes a retained batch when the socket accepts no frames", () => {
+    expect(reconnectFlushLog({ sent: 0, reconciliationSent: false }, 3)).toEqual({
+      level: "warn",
+      message:
+        "Could not send any of 3 buffered event(s); the batch is retained for the next connection",
+    });
   });
 
   describe("ordered reconnect outbox flush", () => {

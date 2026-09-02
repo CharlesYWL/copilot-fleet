@@ -138,6 +138,24 @@ export function useNotificationDelivery(input: {
         };
       });
     }
+
+    const retainedSequences = new Set(
+      input.notificationUpdates.map((update) => update.sequence),
+    );
+    const retainedIds = new Set(
+      input.notificationUpdates.map((update) => update.notification.id),
+    );
+    for (const sequence of processedUpdates.current) {
+      if (!retainedSequences.has(sequence)) processedUpdates.current.delete(sequence);
+    }
+    for (const id of delivered.current) {
+      if (!retainedIds.has(id)) delivered.current.delete(id);
+    }
+    for (const id of latestNotifications.current.keys()) {
+      if (!retainedIds.has(id) && !pending.current.has(id)) {
+        latestNotifications.current.delete(id);
+      }
+    }
   }, [input.notificationUpdates, input.isTargetVisible, browserEnabled, soundEnabled]);
 
   const toggleSound = useCallback(() => {
