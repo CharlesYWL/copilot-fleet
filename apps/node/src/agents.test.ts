@@ -11,6 +11,7 @@ import {
   copilotVersionFromOutput,
   supportedAdditionalDirectories,
   toolDetail,
+  toolErrorMessage,
   toolProgress,
   taskCompletionResponse,
   withCopilotStartupTimeout,
@@ -164,6 +165,20 @@ describe("toolDetail", () => {
     expect(toolDetail({ rawInput: { command: "npm test -w @fleet/host" } })).toBe(
       "npm test -w @fleet/host",
     );
+  });
+
+  describe("toolErrorMessage", () => {
+    it("keeps the ACP failure reason without retaining arbitrary output", () => {
+      expect(
+        toolErrorMessage({
+          rawOutput: {
+            message: "MCP server 'fleet': Tool does not exist.",
+            code: "failure",
+          },
+        }),
+      ).toBe("MCP server 'fleet': Tool does not exist.");
+      expect(toolErrorMessage({ rawOutput: { code: "failure" } })).toBeUndefined();
+    });
   });
 
   describe("taskCompletionResponse", () => {

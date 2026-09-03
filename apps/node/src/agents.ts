@@ -919,6 +919,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
         ...toolResponsePayload(update),
+        ...toolErrorPayload(update),
       });
       return;
     }
@@ -930,6 +931,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
         ...toolResponsePayload(update),
+        ...toolErrorPayload(update),
       });
       return;
     }
@@ -1267,6 +1269,20 @@ function toolResponsePayload(update: { title?: string | null; rawInput?: unknown
 } {
   const response = taskCompletionResponse(update);
   return response ? { response } : {};
+}
+
+export function toolErrorMessage(update: { rawOutput?: unknown }): string | undefined {
+  if (typeof update.rawOutput === "string") {
+    return update.rawOutput.trim() || undefined;
+  }
+  if (!update.rawOutput || typeof update.rawOutput !== "object") return undefined;
+  const message = (update.rawOutput as Record<string, unknown>).message;
+  return typeof message === "string" && message.trim() ? message : undefined;
+}
+
+function toolErrorPayload(update: { rawOutput?: unknown }): { error?: string } {
+  const error = toolErrorMessage(update);
+  return error ? { error } : {};
 }
 
 /**

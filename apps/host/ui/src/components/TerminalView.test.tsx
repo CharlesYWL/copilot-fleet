@@ -188,10 +188,12 @@ describe("TerminalView transcript", () => {
         kind: "execute",
         detail: "npm run typecheck",
         status: "failed",
+        error: "TypeScript found an invalid assignment.",
       }),
     ]);
 
     expect(screen.getByText("failed")).toBeTruthy();
+    expect(screen.getByText("TypeScript found an invalid assignment.")).toBeTruthy();
   });
 
   it("stops animating a pending tool when its node is offline", () => {

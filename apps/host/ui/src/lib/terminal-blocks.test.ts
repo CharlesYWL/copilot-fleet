@@ -113,6 +113,27 @@ describe("toTerminalBlocks", () => {
     });
   });
 
+  it("keeps the failure reason on a failed tool row", () => {
+    const blocks = toTerminalBlocks([
+      event("tool", {
+        toolCallId: "fleet",
+        title: "fleet-fleet_list_work",
+        status: "pending",
+      }),
+      event("tool", {
+        toolCallId: "fleet",
+        status: "failed",
+        error: "MCP server 'fleet': Tool does not exist.",
+      }),
+    ]);
+
+    expect(blocks[0]).toMatchObject({
+      text: "fleet-fleet_list_work",
+      status: "failed",
+      body: "MCP server 'fleet': Tool does not exist.",
+    });
+  });
+
   it("promotes user prompts and drops raw protocol noise", () => {
     const blocks = toTerminalBlocks([
       event("system", { text: "User: fix the bug" }),

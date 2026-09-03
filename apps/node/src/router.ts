@@ -41,6 +41,7 @@ type SessionSlot = {
   config: Map<string, string>;
   generation: number;
   sequenceOffset: number;
+  toolTitles: Map<string, string>;
   /**
    * What this slot's session may do, so capacity is counted by kind.
    *
@@ -230,6 +231,7 @@ export class CommandRouter {
       generation: 0,
       kind,
       sequenceOffset: command.type === "resume_session" ? command.sequenceOffset : 0,
+      toolTitles: new Map(),
     };
     this.slots.set(command.sessionId, slot);
     slot.ready = this.initializeSession(command, slot);
@@ -332,6 +334,25 @@ export class CommandRouter {
     for (const option of config?.options ?? []) {
       if (option.currentValue !== undefined) {
         slot.config.set(option.id, option.currentValue);
+      }
+    }
+    const tool = eventPayload(event, "tool");
+    if (tool) {
+      const toolCallId = tool.toolCallId ?? "";
+      if (toolCallId && tool.title) slot.toolTitles.set(toolCallId, tool.title);
+      const title = tool.title || slot.toolTitles.get(toolCallId) || "";
+      if (
+        tool.status === "failed" &&
+        title.startsWith("fleet-fleet_") &&
+        tool.error?.toLowerCase().includes("tool does not exist")
+      ) {
+        slot.refreshMcpPending = true;
+        this.warn(
+          `session ${sessionId.slice(0, 8)}: Fleet MCP tools were lost; restarting Copilot after the current turn`,
+        );
+      }
+      if (toolCallId && (tool.status === "completed" || tool.status === "failed")) {
+        slot.toolTitles.delete(toolCallId);
       }
     }
     this.emit(event);

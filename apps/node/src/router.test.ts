@@ -710,6 +710,85 @@ describe("CommandRouter", () => {
 
     expect(starts).toBe(1);
   });
+
+  it("refreshes a Fleet ACP process after its deferred tool binding is lost", async () => {
+    let starts = 0;
+    let sink: EventSink | undefined;
+    const warnings: string[] = [];
+    const factory: AgentFactory = {
+      async start(sessionId, _cwd, eventSink, options) {
+        starts += 1;
+        sink = eventSink;
+        eventSink({
+          eventId: `${sessionId}-agent-${starts}`,
+          sessionId,
+          sequence: (options?.sequenceOffset ?? 0) + 1,
+          type: "agent_session",
+          payload: { agentSessionId: options?.resumeAgentSessionId ?? "copilot-1" },
+          createdAt: new Date().toISOString(),
+        });
+        return inertAgent(sessionId, eventSink);
+      },
+    };
+    const router = new CommandRouter(
+      factory,
+      1,
+      () => {},
+      async (path) => path,
+      () => "http://127.0.0.1:8787",
+      async () => [],
+      (warning) => warnings.push(warning),
+    );
+    await router.route({
+      type: "start_session",
+      ...START_DEFAULTS,
+      mcpServers: [{ name: "fleet", url: "/mcp", headers: [] }],
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "first",
+    });
+
+    sink?.({
+      eventId: "tool-start",
+      sessionId: "s1",
+      sequence: 2,
+      type: "tool",
+      payload: {
+        toolCallId: "t1",
+        title: "fleet-fleet_list_work",
+        status: "pending",
+      },
+      createdAt: new Date().toISOString(),
+    });
+    sink?.({
+      eventId: "tool-failed",
+      sessionId: "s1",
+      sequence: 3,
+      type: "tool",
+      payload: {
+        toolCallId: "t1",
+        status: "failed",
+        error: "MCP server 'fleet': Tool does not exist.",
+      },
+      createdAt: new Date().toISOString(),
+    });
+    expect(starts).toBe(1);
+
+    sink?.({
+      eventId: "turn-idle",
+      sessionId: "s1",
+      sequence: 4,
+      type: "state",
+      payload: { state: "idle", activity: "Ready for follow-up" },
+      createdAt: new Date().toISOString(),
+    });
+
+    await waitFor(() => starts === 2);
+    expect(warnings).toEqual([
+      "session s1: Fleet MCP tools were lost; restarting Copilot after the current turn",
+    ]);
+  });
 });
 
 function inertAgent(_sessionId: string, _sink: EventSink): SessionAgent {
