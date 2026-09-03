@@ -6,6 +6,7 @@ import {
   type AgentFactory,
   type EventSink,
   type SessionAgent,
+  type StartAgentOptions,
 } from "./agents.js";
 
 /** Waiting on the condition rather than a fixed span survives a loaded machine. */
@@ -486,6 +487,228 @@ describe("CommandRouter", () => {
         })
       ).ok,
     ).toBe(true);
+  });
+
+  it("refreshes retained MCP sessions after reconnect and defers busy ones", async () => {
+    let busy = false;
+    let starts = 0;
+    const stops: boolean[] = [];
+    const startOptions: StartAgentOptions[] = [];
+    const events: SessionEvent[] = [];
+    let sink: EventSink | undefined;
+    const factory: AgentFactory = {
+      async start(sessionId, _cwd, eventSink, options) {
+        starts += 1;
+        startOptions.push(options ?? {});
+        sink = eventSink;
+        eventSink({
+          eventId: `${sessionId}-agent-${starts}`,
+          sessionId,
+          sequence: (options?.sequenceOffset ?? 0) + 1,
+          type: "agent_session",
+          payload: { agentSessionId: options?.resumeAgentSessionId ?? "copilot-1" },
+          createdAt: new Date().toISOString(),
+        });
+        return {
+          ...inertAgent(sessionId, eventSink),
+          get busy() {
+            return busy;
+          },
+          async stop(announce = true) {
+            stops.push(announce);
+          },
+        };
+      },
+    };
+    const router = new CommandRouter(
+      factory,
+      1,
+      (event) => events.push(event),
+      async (path) => path,
+      () => "http://127.0.0.1:8787",
+    );
+    await router.route({
+      type: "start_session",
+      ...START_DEFAULTS,
+      config: [{ id: "model", value: "deep" }],
+      mcpServers: [{ name: "fleet", url: "http://old.example/mcp", headers: [] }],
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "first",
+    });
+
+    const retiredSink = sink;
+    await router.refreshMcpSessions();
+    expect(starts).toBe(2);
+    expect(stops).toEqual([false]);
+    expect(startOptions[1]).toMatchObject({
+      resumeAgentSessionId: "copilot-1",
+      announceLifecycle: false,
+      config: [{ id: "model", value: "deep" }],
+      mcpServers: [{ name: "fleet", url: "http://127.0.0.1:8787/mcp", headers: [] }],
+    });
+    expect(
+      events.some(
+        (event) =>
+          event.type === "state" &&
+          (event.payload.state === "stopped" || event.payload.state === "failed"),
+      ),
+    ).toBe(false);
+    retiredSink?.({
+      eventId: "late-retired-event",
+      sessionId: "s1",
+      sequence: 99,
+      type: "state",
+      payload: { state: "failed", activity: "Late event from retired process" },
+      createdAt: new Date().toISOString(),
+    });
+    expect(events.some((event) => event.eventId === "late-retired-event")).toBe(false);
+
+    busy = true;
+    await router.refreshMcpSessions();
+    expect(starts).toBe(2);
+
+    busy = false;
+    sink?.({
+      eventId: "s1-idle",
+      sessionId: "s1",
+      sequence: 1,
+      type: "state",
+      payload: { state: "idle", activity: "Ready for follow-up" },
+      createdAt: new Date().toISOString(),
+    });
+    await waitFor(() => starts === 3);
+    expect(stops).toEqual([false, false]);
+  });
+
+  it("reports a terminal state when an MCP refresh cannot restart Copilot", async () => {
+    let starts = 0;
+    const warnings: string[] = [];
+    const events: SessionEvent[] = [];
+    const factory: AgentFactory = {
+      async start(sessionId, _cwd, sink) {
+        starts += 1;
+        if (starts === 2) throw new Error("copilot unavailable");
+        sink({
+          eventId: `${sessionId}-agent`,
+          sessionId,
+          sequence: 1,
+          type: "agent_session",
+          payload: { agentSessionId: "copilot-1" },
+          createdAt: new Date().toISOString(),
+        });
+        return inertAgent(sessionId, sink);
+      },
+    };
+    const router = new CommandRouter(
+      factory,
+      1,
+      (event) => events.push(event),
+      async (path) => path,
+      () => "http://127.0.0.1:8787",
+      async () => [],
+      (warning) => warnings.push(warning),
+    );
+    await router.route({
+      type: "start_session",
+      ...START_DEFAULTS,
+      mcpServers: [{ name: "fleet", url: "/mcp", headers: [] }],
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "first",
+    });
+
+    await router.refreshMcpSessions();
+
+    expect(warnings).toEqual([
+      "session s1: could not restore MCP tools: copilot unavailable",
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      sessionId: "s1",
+      type: "state",
+      payload: {
+        state: "failed",
+        activity: "Copilot could not be restarted to restore MCP tools",
+      },
+    });
+    expect(router.activeSessionIds).toEqual([]);
+  });
+
+  it("deduplicates concurrent MCP refreshes", async () => {
+    let starts = 0;
+    let releaseRefresh!: () => void;
+    const refreshGate = new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    });
+    const factory: AgentFactory = {
+      async start(sessionId, _cwd, sink, options) {
+        starts += 1;
+        sink({
+          eventId: `${sessionId}-agent-${starts}`,
+          sessionId,
+          sequence: (options?.sequenceOffset ?? 0) + 1,
+          type: "agent_session",
+          payload: { agentSessionId: options?.resumeAgentSessionId ?? "copilot-1" },
+          createdAt: new Date().toISOString(),
+        });
+        if (starts === 2) await refreshGate;
+        return inertAgent(sessionId, sink);
+      },
+    };
+    const router = new CommandRouter(
+      factory,
+      1,
+      () => {},
+      async (path) => path,
+      () => "http://127.0.0.1:8787",
+    );
+    await router.route({
+      type: "start_session",
+      ...START_DEFAULTS,
+      mcpServers: [{ name: "fleet", url: "http://127.0.0.1:8787/mcp", headers: [] }],
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "first",
+    });
+
+    const first = router.refreshMcpSessions();
+    await waitFor(() => starts === 2);
+    const second = router.refreshMcpSessions();
+    releaseRefresh();
+    await Promise.all([first, second]);
+
+    expect(starts).toBe(2);
+  });
+
+  it("does not restart sessions without MCP servers", async () => {
+    let starts = 0;
+    const factory: AgentFactory = {
+      async start(sessionId, _cwd, sink) {
+        starts += 1;
+        return inertAgent(sessionId, sink);
+      },
+    };
+    const router = new CommandRouter(
+      factory,
+      1,
+      () => {},
+      async (path) => path,
+    );
+    await router.route({
+      type: "start_session",
+      ...START_DEFAULTS,
+      commandId: "c1",
+      sessionId: "s1",
+      localPath: "/one",
+      prompt: "first",
+    });
+
+    await router.refreshMcpSessions();
+
+    expect(starts).toBe(1);
   });
 });
 

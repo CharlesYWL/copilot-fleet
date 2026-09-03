@@ -717,6 +717,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
             return;
           }
           flushOutbox(active, frame.value.reconcileAfterOutbox, acknowledgeOutbox);
+        } else {
+          void router.refreshMcpSessions();
         }
         return;
       }
@@ -745,6 +747,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         }
         outboxReconciliationPending = false;
         holdEventsForReconnectFlush = false;
+        void router.refreshMcpSessions();
         return;
       }
       if (frame.value.type === "host_url") {
@@ -928,6 +931,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     if (outbox.size > 0 || !result.reconciliationSent) return;
     outboxReconciliationPending = false;
     holdEventsForReconnectFlush = false;
+    void router.refreshMcpSessions();
   }
 
   async function register(): Promise<Credentials> {
