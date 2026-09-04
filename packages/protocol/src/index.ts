@@ -427,6 +427,7 @@ export const sessionEventPayloadSchemas = {
     kind: text,
     detail: text,
     response: text,
+    error: text,
   }),
   permission: z.object({
     requestId: text,

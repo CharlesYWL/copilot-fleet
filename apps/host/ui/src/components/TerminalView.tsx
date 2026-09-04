@@ -1280,7 +1280,7 @@ const TerminalLine = memo(function TerminalLine({
           color={failed ? terminal.error : running ? terminal.tool : undefined}
           failed={failed}
         />
-        {block.body && block.status === "completed" ? (
+        {block.body && (block.status === "completed" || block.status === "failed") ? (
           <div className={styles.message}>
             <MarkdownBody text={block.body} copyable />
           </div>

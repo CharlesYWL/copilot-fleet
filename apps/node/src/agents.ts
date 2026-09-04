@@ -115,7 +115,7 @@ export function configRecoveryRequest(
 export interface SessionAgent {
   prompt(text: string, attachments?: readonly PromptAttachment[]): Promise<void>;
   cancel(): Promise<void>;
-  stop(): Promise<void>;
+  stop(announce?: boolean): Promise<void>;
   resolvePermission(requestId: string, decision: PermissionDecision): void;
   denyPendingPermissions(): void;
   /** Changes a session picker (model, mode, reasoning effort) by option id. */
@@ -201,6 +201,8 @@ export type StartAgentOptions = {
    * written as an ACP URL.
    */
   config?: readonly StartupConfig[];
+  /** Suppress transient lifecycle states for an internal process replacement. */
+  announceLifecycle?: boolean;
 };
 
 export interface AgentFactory {
@@ -451,6 +453,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly startupConfig: readonly StartupConfig[] = [],
     /** Workspace roots to restore when loading an existing Copilot session. */
     private readonly additionalDirectories: readonly string[] = [],
+    /** Internal reconnect recovery must not look like an operator restart. */
+    private readonly announceLifecycle = true,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -475,10 +479,12 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   }
 
   async start(cwd: string, resumeAgentSessionId?: string): Promise<void> {
-    this.emit("state", {
-      state: "starting",
-      activity: resumeAgentSessionId ? "Resuming Copilot ACP" : "Starting Copilot ACP",
-    });
+    if (this.announceLifecycle) {
+      this.emit("state", {
+        state: "starting",
+        activity: resumeAgentSessionId ? "Resuming Copilot ACP" : "Starting Copilot ACP",
+      });
+    }
     const executable =
       this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot";
     const args = copilotLaunchArgs(this.yolo, this.contextTier);
@@ -789,7 +795,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.captureConfigOptions(response.configOptions);
   }
 
-  async stop(): Promise<void> {
+  async stop(announce = true): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
     this.unprompted.clear();
@@ -798,7 +804,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (this.child && this.child.exitCode === null) {
       this.child.kill();
     }
-    if (!this.hasTerminated) {
+    if (announce && !this.hasTerminated) {
       this.emit("state", { state: "stopped", activity: "Process stopped" });
     }
   }
@@ -913,6 +919,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
         ...toolResponsePayload(update),
+        ...toolErrorPayload(update),
       });
       return;
     }
@@ -924,6 +931,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         ...(update.kind ? { kind: update.kind } : {}),
         ...toolDetailPayload(update),
         ...toolResponsePayload(update),
+        ...toolErrorPayload(update),
       });
       return;
     }
@@ -985,6 +993,7 @@ export class AcpAgentFactory implements AgentFactory {
       options.agent ?? "",
       options.config ?? [],
       options.additionalDirectories ?? [],
+      options.announceLifecycle ?? true,
     );
     try {
       await withCopilotStartupTimeout(
@@ -1037,11 +1046,13 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     super(fleetSessionId, sink, sequenceOffset);
   }
 
-  start(resumeAgentSessionId?: string): void {
-    this.emit("state", {
-      state: "starting",
-      activity: resumeAgentSessionId ? "Resuming mock agent" : "Starting mock agent",
-    });
+  start(resumeAgentSessionId?: string, announceLifecycle = true): void {
+    if (announceLifecycle) {
+      this.emit("state", {
+        state: "starting",
+        activity: resumeAgentSessionId ? "Resuming mock agent" : "Starting mock agent",
+      });
+    }
     this.emit("agent_session", {
       agentSessionId: resumeAgentSessionId ?? `mock-${this.fleetSessionId}`,
     });
@@ -1115,9 +1126,9 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     this.cancelled = true;
   }
 
-  async stop(): Promise<void> {
+  async stop(announce = true): Promise<void> {
     this.stopped = true;
-    if (!this.hasTerminated) {
+    if (announce && !this.hasTerminated) {
       this.emit("state", { state: "stopped", activity: "Mock process stopped" });
     }
   }
@@ -1169,7 +1180,7 @@ export class MockAgentFactory implements AgentFactory {
     options: StartAgentOptions = {},
   ): Promise<SessionAgent> {
     const agent = new MockAgent(sessionId, sink, options.sequenceOffset ?? 0);
-    agent.start(options.resumeAgentSessionId);
+    agent.start(options.resumeAgentSessionId, options.announceLifecycle);
     return agent;
   }
 }
@@ -1258,6 +1269,20 @@ function toolResponsePayload(update: { title?: string | null; rawInput?: unknown
 } {
   const response = taskCompletionResponse(update);
   return response ? { response } : {};
+}
+
+export function toolErrorMessage(update: { rawOutput?: unknown }): string | undefined {
+  if (typeof update.rawOutput === "string") {
+    return update.rawOutput.trim() || undefined;
+  }
+  if (!update.rawOutput || typeof update.rawOutput !== "object") return undefined;
+  const message = (update.rawOutput as Record<string, unknown>).message;
+  return typeof message === "string" && message.trim() ? message : undefined;
+}
+
+function toolErrorPayload(update: { rawOutput?: unknown }): { error?: string } {
+  const error = toolErrorMessage(update);
+  return error ? { error } : {};
 }
 
 /**

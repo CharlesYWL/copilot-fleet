@@ -5,6 +5,7 @@ import {
   terminalSessionStates,
   type NodeCommand,
   type SessionEvent,
+  type StartupConfig,
 } from "@fleet/protocol";
 import type { AgentFactory, SessionAgent } from "./agents.js";
 import { installRequestedAgent, type CatalogEntry } from "./agent-catalog.js";
@@ -28,8 +29,19 @@ export type CommandResult = {
 export class CommandRefused extends Error {}
 
 type SessionSlot = {
-  agent?: SessionAgent;
+  agent: SessionAgent | undefined;
   ready: Promise<void>;
+  refreshing?: Promise<void>;
+  refreshMcpPending?: boolean;
+  launch?: LaunchCommand;
+  cwd?: string;
+  additionalDirectories?: string[];
+  selectedAgent?: string;
+  agentSessionId: string | undefined;
+  config: Map<string, string>;
+  generation: number;
+  sequenceOffset: number;
+  toolTitles: Map<string, string>;
   /**
    * What this slot's session may do, so capacity is counted by kind.
    *
@@ -115,6 +127,31 @@ export class CommandRouter {
     for (const slot of this.slots.values()) slot.agent?.denyPendingPermissions();
   }
 
+  /**
+   * Restores MCP tools removed by Copilot while the Host was unreachable.
+   *
+   * A session mid-turn is left alone and refreshed when it next reports idle.
+   * Reloading a busy ACP session would interrupt the answer whose buffered
+   * events the reconnect handshake has just protected.
+   */
+  async refreshMcpSessions(): Promise<void> {
+    await Promise.allSettled(
+      [...this.slots].map(async ([sessionId, slot]) => {
+        if (slot.refreshing) {
+          await slot.refreshing;
+          return;
+        }
+        await slot.ready;
+        if (!slot.agent) return;
+        if (slot.agent.busy) {
+          slot.refreshMcpPending = true;
+          return;
+        }
+        await this.refreshMcpSession(sessionId, slot);
+      }),
+    );
+  }
+
   async stopAll(): Promise<void> {
     const slots = [...this.slots.entries()];
     for (const [sessionId] of slots) this.slots.delete(sessionId);
@@ -163,6 +200,7 @@ export class CommandRouter {
       // a mistyped model must not tear down a session that is working fine.
       try {
         await agent.setConfigOption(command.configId, command.value);
+        slot.config.set(command.configId, command.value);
       } catch (error) {
         throw new CommandRefused(
           error instanceof Error ? error.message : "Could not change that option",
@@ -185,7 +223,16 @@ export class CommandRouter {
       return Promise.reject(new Error(`Node is at capacity for ${kind} work`));
     }
 
-    const slot: SessionSlot = { ready: Promise.resolve(), kind };
+    const slot: SessionSlot = {
+      ready: Promise.resolve(),
+      agent: undefined,
+      agentSessionId: undefined,
+      config: new Map(command.config.map((entry) => [entry.id, entry.value])),
+      generation: 0,
+      kind,
+      sequenceOffset: command.type === "resume_session" ? command.sequenceOffset : 0,
+      toolTitles: new Map(),
+    };
     this.slots.set(command.sessionId, slot);
     slot.ready = this.initializeSession(command, slot);
     return slot.ready;
@@ -212,13 +259,9 @@ export class CommandRouter {
           );
         }
       }
-      const sink = (event: SessionEvent) => {
-        this.emit(event);
-        const state = eventPayload(event, "state")?.state;
-        if (state && terminalSessionStates.has(state)) {
-          this.release(command.sessionId, slot);
-        }
-      };
+      const generation = slot.generation;
+      const sink = (event: SessionEvent) =>
+        this.handleSessionEvent(command.sessionId, slot, generation, event);
       const mcpServers = resolveMcpServers(command.mcpServers, this.hostUrl());
       const requested = await installRequestedAgent(
         cwd,
@@ -227,6 +270,13 @@ export class CommandRouter {
       );
       if (requested.reason) {
         this.warn(`session ${command.sessionId.slice(0, 8)}: ${requested.reason}`);
+      }
+      slot.launch = command;
+      slot.cwd = cwd;
+      slot.additionalDirectories = additionalDirectories;
+      slot.selectedAgent = requested.selected;
+      if (command.type === "resume_session") {
+        slot.agentSessionId = command.agentSessionId;
       }
       const agent = await this.factory.start(
         command.sessionId,
@@ -268,6 +318,127 @@ export class CommandRouter {
 
   private release(sessionId: string, slot: SessionSlot): void {
     if (this.slots.get(sessionId) === slot) this.slots.delete(sessionId);
+  }
+
+  private handleSessionEvent(
+    sessionId: string,
+    slot: SessionSlot,
+    generation: number,
+    event: SessionEvent,
+  ): void {
+    if (slot.generation !== generation) return;
+    slot.sequenceOffset = Math.max(slot.sequenceOffset, event.sequence);
+    const agentSession = eventPayload(event, "agent_session");
+    if (agentSession) slot.agentSessionId = agentSession.agentSessionId;
+    const config = eventPayload(event, "config");
+    for (const option of config?.options ?? []) {
+      if (option.currentValue !== undefined) {
+        slot.config.set(option.id, option.currentValue);
+      }
+    }
+    const tool = eventPayload(event, "tool");
+    if (tool) {
+      const toolCallId = tool.toolCallId ?? "";
+      if (toolCallId && tool.title) slot.toolTitles.set(toolCallId, tool.title);
+      const title = tool.title || slot.toolTitles.get(toolCallId) || "";
+      if (
+        tool.status === "failed" &&
+        title.startsWith("fleet-fleet_") &&
+        tool.error?.toLowerCase().includes("tool does not exist")
+      ) {
+        slot.refreshMcpPending = true;
+        this.warn(
+          `session ${sessionId.slice(0, 8)}: Fleet MCP tools were lost; restarting Copilot after the current turn`,
+        );
+      }
+      if (toolCallId && (tool.status === "completed" || tool.status === "failed")) {
+        slot.toolTitles.delete(toolCallId);
+      }
+    }
+    this.emit(event);
+    const state = eventPayload(event, "state")?.state;
+    if (state && terminalSessionStates.has(state)) {
+      this.release(sessionId, slot);
+    } else if (state === "idle" && slot.refreshMcpPending) {
+      slot.refreshMcpPending = false;
+      void this.refreshMcpSession(sessionId, slot);
+    }
+  }
+
+  private async refreshMcpSession(sessionId: string, slot: SessionSlot): Promise<void> {
+    if (slot.refreshing) {
+      await slot.refreshing;
+      return;
+    }
+    const refresh = slot.ready.then(async () => {
+      const current = slot.agent;
+      const launch = slot.launch;
+      if (
+        this.slots.get(sessionId) !== slot ||
+        !current ||
+        !launch ||
+        !slot.cwd ||
+        !slot.agentSessionId ||
+        launch.mcpServers.length === 0
+      ) {
+        return;
+      }
+      if (current.busy) {
+        slot.refreshMcpPending = true;
+        return;
+      }
+      const generation = ++slot.generation;
+      await current.stop(false);
+      slot.agent = undefined;
+      const next = await this.factory.start(
+        sessionId,
+        slot.cwd,
+        (event) => this.handleSessionEvent(sessionId, slot, generation, event),
+        {
+          resumeAgentSessionId: slot.agentSessionId,
+          additionalDirectories: slot.additionalDirectories ?? [],
+          sequenceOffset: slot.sequenceOffset,
+          yolo: launch.yolo,
+          mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
+          agent: slot.selectedAgent ?? "",
+          config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
+          announceLifecycle: false,
+        },
+      );
+      if (this.slots.get(sessionId) !== slot) {
+        await next.stop(false);
+        return;
+      }
+      slot.agent = next;
+    });
+    const handled = refresh.catch((error) => {
+      this.warn(
+        `session ${sessionId.slice(0, 8)}: could not restore MCP tools: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`,
+      );
+      if (this.slots.get(sessionId) === slot) {
+        slot.sequenceOffset += 1;
+        this.handleSessionEvent(sessionId, slot, slot.generation, {
+          eventId: `mcp-refresh-failed-${sessionId}-${slot.sequenceOffset}`,
+          sessionId,
+          sequence: slot.sequenceOffset,
+          type: "state",
+          payload: {
+            state: "failed",
+            activity: "Copilot could not be restarted to restore MCP tools",
+          },
+          createdAt: new Date().toISOString(),
+        });
+      }
+    });
+    slot.refreshing = handled;
+    slot.ready = handled;
+    try {
+      await handled;
+    } finally {
+      if (slot.refreshing === handled) delete slot.refreshing;
+    }
   }
 }
 

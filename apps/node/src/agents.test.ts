@@ -11,6 +11,7 @@ import {
   copilotVersionFromOutput,
   supportedAdditionalDirectories,
   toolDetail,
+  toolErrorMessage,
   toolProgress,
   taskCompletionResponse,
   withCopilotStartupTimeout,
@@ -164,6 +165,20 @@ describe("toolDetail", () => {
     expect(toolDetail({ rawInput: { command: "npm test -w @fleet/host" } })).toBe(
       "npm test -w @fleet/host",
     );
+  });
+
+  describe("toolErrorMessage", () => {
+    it("keeps the ACP failure reason without retaining arbitrary output", () => {
+      expect(
+        toolErrorMessage({
+          rawOutput: {
+            message: "MCP server 'fleet': Tool does not exist.",
+            code: "failure",
+          },
+        }),
+      ).toBe("MCP server 'fleet': Tool does not exist.");
+      expect(toolErrorMessage({ rawOutput: { code: "failure" } })).toBeUndefined();
+    });
   });
 
   describe("taskCompletionResponse", () => {
@@ -373,7 +388,10 @@ describe("UnpromptedTurn", () => {
 });
 
 describe("MockAgentFactory", () => {
-  const collect = async (options?: { resumeAgentSessionId?: string }) => {
+  const collect = async (options?: {
+    resumeAgentSessionId?: string;
+    announceLifecycle?: boolean;
+  }) => {
     const events: SessionEvent[] = [];
     await new MockAgentFactory().start(
       "session-1",
@@ -437,5 +455,24 @@ describe("MockAgentFactory", () => {
     const events = await collect({ resumeAgentSessionId: "mock-earlier-run" });
     expect(events.at(-1)?.payload).toMatchObject({ state: "idle" });
     expect(events[1]?.payload).toMatchObject({ agentSessionId: "mock-earlier-run" });
+  });
+
+  it("suppresses transient lifecycle states during an internal restart", async () => {
+    const events: SessionEvent[] = [];
+    const agent = await new MockAgentFactory().start(
+      "session-1",
+      "/workspace",
+      (event) => events.push(event),
+      { resumeAgentSessionId: "mock-earlier-run", announceLifecycle: false },
+    );
+    await agent.stop(false);
+
+    expect(
+      events.filter(
+        (event) =>
+          event.type === "state" &&
+          (event.payload.state === "starting" || event.payload.state === "stopped"),
+      ),
+    ).toEqual([]);
   });
 });
