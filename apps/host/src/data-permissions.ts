@@ -1,5 +1,5 @@
 import { chmodSync, existsSync } from "node:fs";
-import { dirname } from "node:path";
+import { posix, win32 } from "node:path";
 import { execFileSync } from "node:child_process";
 
 /**
@@ -122,7 +122,7 @@ function windowsAclScript(directory: string): string {
  */
 export function secureHostDataFiles(databasePath: string, deps: SecureDataDeps): void {
   if (databasePath === ":memory:") return;
-  const directory = dirname(databasePath);
+  const directory = (deps.platform === "win32" ? win32 : posix).dirname(databasePath);
   try {
     if (deps.platform === "win32") {
       secureOnWindows(directory, deps);

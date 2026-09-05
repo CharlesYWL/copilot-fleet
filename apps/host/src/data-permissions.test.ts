@@ -43,6 +43,12 @@ describe("securing the Host data directory on Unix", () => {
     ]);
   });
 
+  it("uses Unix path rules even when the filename contains a backslash", () => {
+    const { deps, chmods } = recorder();
+    secureHostDataFiles("/srv/fleet/data/fleet\\archive.db", deps);
+    expect(chmods[0]).toEqual(["/srv/fleet/data", 0o700]);
+  });
+
   /*
    * The write-ahead log carries the same rows as the database until a
    * checkpoint folds it in, so a WAL file that has not been created yet is
@@ -225,11 +231,14 @@ describe("securing the Host data directory on Windows", () => {
    * single-quoted PowerShell literal with its quotes doubled: nothing in a
    * path can then be read as anything but a path.
    */
-  it("quotes the directory rather than interpolating it into the script", () => {
-    const { deps, acls } = windows();
-    secureHostDataFiles("C:\\fleet\\o'brien data\\fleet.db", deps);
-    expect(acls[0]!.join(" ")).toContain("$root='C:\\fleet\\o''brien data'");
-  });
+  it.each(["C:\\fleet\\o'brien data", "\\\\server\\share\\o'brien data"])(
+    "quotes the Windows directory %s rather than interpolating it into the script",
+    (directory) => {
+      const { deps, acls } = windows();
+      secureHostDataFiles(`${directory}\\fleet.db`, deps);
+      expect(acls[0]!.join(" ")).toContain(`$root='${directory.replace(/'/g, "''")}'`);
+    },
+  );
 
   it("says so loudly in production when the ACL cannot be applied", () => {
     const attempts: string[][] = [];
