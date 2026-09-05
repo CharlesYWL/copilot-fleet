@@ -189,4 +189,81 @@ describe("FleetClient credentials", () => {
     expect(calls[0]?.headers.get(NODE_SECRET_HEADER)).toBe("s3cret");
     expect(calls[0]?.headers.has(NODE_PROOF_SIGNATURE_HEADER)).toBe(false);
   });
+
+  it.each(["legacy", "keyed"])(
+    "uses %s node credentials for scoped session lifecycle calls",
+    async (authentication) => {
+      const keys = createIdentityKeyPair();
+      const calls: Array<{
+        url: string;
+        method: string;
+        body: string;
+        headers: Headers;
+      }> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: URL | string, init?: RequestInit) => {
+          calls.push({
+            url: String(input),
+            method: init?.method ?? "GET",
+            body: String(init?.body ?? ""),
+            headers: new Headers(init?.headers),
+          });
+          const body = String(input).endsWith("/api/sessions")
+            ? init?.method === "POST"
+              ? JSON.stringify({ id: "fleet-new", state: "starting", agentSessionId: "" })
+              : "[]"
+            : JSON.stringify({
+                id: "fleet-adopted",
+                state: "starting",
+                agentSessionId: "acp-1",
+              });
+          return new Response(body, { status: 200 });
+        }),
+      );
+      const client = new FleetClient({
+        hostUrl: () => "http://127.0.0.1:8787",
+        nodeId: () => "node-1",
+        nodeSecret: () => "secret",
+        nodeKey: () => (authentication === "keyed" ? keys.privateKey : undefined),
+      });
+
+      await client.listOwnSessions();
+      await client.createOwnSession({ placementId: "p1", prompt: "hello" });
+      await client.adoptOwnSession({
+        placementId: "p1",
+        agentSessionId: "acp-1",
+        additionalDirectories: ["C:\\shared"],
+      });
+
+      expect(calls.map((call) => [call.method, new URL(call.url).pathname])).toEqual([
+        ["GET", "/api/sessions"],
+        ["POST", "/api/sessions"],
+        ["POST", "/api/sessions/adopt"],
+      ]);
+      expect(calls[2]?.body).toContain('"agentSessionId":"acp-1"');
+      expect(calls[2]?.body).toContain('"additionalDirectories":["C:\\\\shared"]');
+      for (const call of calls) {
+        expect(call.headers.get(NODE_ID_HEADER)).toBe("node-1");
+        if (authentication === "legacy") {
+          expect(call.headers.get(NODE_SECRET_HEADER)).toBe("secret");
+          expect(call.headers.has(NODE_PROOF_SIGNATURE_HEADER)).toBe(false);
+        } else {
+          expect(call.headers.has(NODE_SECRET_HEADER)).toBe(false);
+          expect(
+            verifyNodeHttpProof({
+              publicKey: keys.publicKey,
+              nodeId: "node-1",
+              method: call.method,
+              path: new URL(call.url).pathname,
+              body: call.body,
+              timestamp: call.headers.get(NODE_PROOF_TIMESTAMP_HEADER) ?? "",
+              nonce: call.headers.get(NODE_PROOF_NONCE_HEADER) ?? "",
+              signature: call.headers.get(NODE_PROOF_SIGNATURE_HEADER) ?? "",
+            }),
+          ).toEqual({ ok: true });
+        }
+      }
+    },
+  );
 });

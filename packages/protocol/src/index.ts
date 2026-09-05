@@ -46,6 +46,14 @@ export const terminalSessionStates = new Set<SessionState>([
   "completed",
   "failed",
 ]);
+/** States backed by an active or reserved Node slot. */
+export const liveSessionStates = new Set<SessionState>([
+  "queued",
+  "starting",
+  "running",
+  "idle",
+  "cancelling",
+]);
 
 /**
  * A Copilot agent definition a Node can put a session into.
@@ -304,6 +312,8 @@ export const SessionSchema = z.object({
   updatedAt: z.string().datetime(),
   /** Copilot's own ACP session id, needed to resume the conversation. */
   agentSessionId: z.string().default(""),
+  /** Additional workspace roots that ACP must restore with this session. */
+  additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).optional(),
   /** Runs Copilot with --allow-all: no permission prompts for this session. */
   yolo: z.boolean().default(false),
   /**
@@ -328,6 +338,19 @@ export const SessionSchema = z.object({
    */
   runId: z.string().default(""),
   runRole: RunRoleSchema.default(""),
+  /**
+   * Persisted control intent, separate from the worker's last observed state.
+   *
+   * A disconnected Node can leave a session `offline` while a stop request is
+   * still outstanding. Keeping the intent separately lets reconnect recovery
+   * reissue the stop instead of incorrectly resuming the session.
+   */
+  stopRequested: z.boolean().optional(),
+  /**
+   * Visibility is not execution state. Dismissed orchestrators retain their
+   * transcript, runs, and late events and can be restored independently.
+   */
+  dismissed: z.boolean().optional(),
   /**
    * Whether this session was dispatched to read rather than to change things.
    *
@@ -430,13 +453,17 @@ export const sessionEventPayloadSchemas = {
   // line — an icon for the category and a dimmed summary of what it ran on —
   // instead of a paragraph-sized block per step. `detail` is drawn from the
   // few short input fields a tool names (a command, a path, a query); tool
-  // output and file contents are deliberately never carried here.
+  // output and file contents are deliberately never carried here. `response`
+  // is narrower: only the user-facing summary from Copilot's `task_complete`
+  // tool, which is the final answer for some resumed CLI conversations.
   tool: z.object({
     toolCallId: text,
     title: text,
     status: text,
     kind: text,
     detail: text,
+    response: text,
+    error: text,
   }),
   permission: z.object({
     requestId: text,
@@ -581,6 +608,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
     agentSessionId: z.string().min(1),
+    /** Workspace roots originally attached to the Copilot conversation. */
+    additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
     /** Continues the host's event sequence so replayed rows stay ordered. */
     sequenceOffset: z.number().int().nonnegative().default(0),
     yolo: z.boolean().default(false),
@@ -653,6 +682,26 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
 ]);
 export type NodeCommand = z.infer<typeof NodeCommandSchema>;
 
+/** Identifies one immutable batch of buffered Node events. */
+export const OutboxFlushIdSchema = z.string().uuid().brand<"OutboxFlushId">();
+export type OutboxFlushId = z.infer<typeof OutboxFlushIdSchema>;
+
+export const MAX_OUTBOX_EVENT_COUNT = 2_000;
+
+export const OutboxFlushIdentitySchema = z.object({
+  flushId: OutboxFlushIdSchema,
+  eventCount: z.number().int().nonnegative().max(MAX_OUTBOX_EVENT_COUNT),
+});
+export type OutboxFlushIdentity = z.infer<typeof OutboxFlushIdentitySchema>;
+
+export const OutboxEventPositionSchema = OutboxFlushIdentitySchema.extend({
+  eventIndex: z.number().int().nonnegative(),
+}).refine((position) => position.eventIndex < position.eventCount, {
+  message: "Outbox event index must be within the flush",
+  path: ["eventIndex"],
+});
+export type OutboxEventPosition = z.infer<typeof OutboxEventPositionSchema>;
+
 /**
  * What a Node reports about itself when it arrives.
  *
@@ -698,6 +747,22 @@ const nodeInventoryShape = {
    * still working and cannot accept a second prompt.
    */
   busySessionIds: z.array(z.string()).default([]),
+  /**
+   * Whether reconnect reconciliation must wait for buffered events.
+   *
+   * The count is diagnostic; the boolean remains true when a prior socket
+   * emptied the queue but closed before it could send `outbox_flushed`.
+   * Both default for Nodes that predate the ordered reconnect handshake.
+   */
+  pendingOutbox: z.boolean().default(false),
+  pendingOutboxCount: z.number().int().nonnegative().default(0),
+  /**
+   * The exact batch a capable Node will retain until the Host acknowledges it.
+   *
+   * Optional so either end can still speak to versions that predate durable
+   * reconnect acknowledgment.
+   */
+  outboxFlush: OutboxFlushIdentitySchema.optional(),
 } as const;
 
 /**
@@ -741,8 +806,22 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     sentAt: z.string().datetime(),
   }),
   z.object({
+    /**
+     * Completes a deferred reconnect handshake.
+     *
+     * WebSocket ordering guarantees every buffered event sent before this frame
+     * is processed before the Host reconciles against this current inventory.
+     */
+    type: z.literal("outbox_flushed"),
+    activeSessionIds: z.array(z.string()),
+    busySessionIds: z.array(z.string()).default([]),
+    outboxFlush: OutboxFlushIdentitySchema.optional(),
+  }),
+  z.object({
     type: z.literal("event"),
     event: SessionEventSchema,
+    /** Present only while replaying an acknowledged reconnect batch. */
+    outboxFlush: OutboxEventPositionSchema.optional(),
   }),
   z.object({
     type: z.literal("command_result"),
@@ -788,7 +867,28 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
-  z.object({ type: z.literal("welcome"), nodeId: z.string().min(1) }),
+  z.object({
+    type: z.literal("welcome"),
+    nodeId: z.string().min(1),
+    /**
+     * Confirms this Host deferred reconciliation for the advertised outbox.
+     *
+     * Older Hosts omit it, so a newer Node flushes its events without sending
+     * them an `outbox_flushed` frame they do not understand.
+     */
+    reconcileAfterOutbox: z.boolean().default(false),
+    /**
+     * Whether this Host will explicitly acknowledge retained reconnect batches.
+     *
+     * Older Hosts omit it, so a newer Node falls back to the legacy destructive
+     * flush rather than waiting forever for a message that Host cannot send.
+     */
+    acknowledgeOutbox: z.boolean().default(false),
+  }),
+  z.object({
+    type: z.literal("outbox_flush_ack"),
+    flushId: OutboxFlushIdSchema,
+  }),
   z.object({ type: z.literal("command"), command: NodeCommandSchema }),
   /**
    * The Host's address changed and this is where to find it next time.
@@ -902,6 +1002,9 @@ export const NODE_NAME_SYNC_CAPABILITY = "node-name-sync";
  * assuming it is idle and waiting for a prompt.
  */
 export const SESSION_ACTIVITY_CAPABILITY = "session-activity";
+
+/** A Node that retains reconnect batches until `outbox_flush_ack`. */
+export const OUTBOX_ACK_CAPABILITY = "outbox-ack";
 
 /**
  * A Node that reports the agent's slash commands and pickers, and accepts
@@ -1194,6 +1297,8 @@ export const RunSchema = z.object({
   settleSeq: z.number().int().nonnegative().default(0),
   wakeSeq: z.number().int().nonnegative().default(0),
   emptyWakeCount: z.number().int().nonnegative().default(0),
+  /** Monotonic identity for each distinct request for human review. */
+  reviewSeq: z.number().int().nonnegative().default(0),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });
@@ -1226,6 +1331,8 @@ export const RunStepSchema = z.object({
    * the first one's work back to the Lead.
    */
   eventSeqFrom: z.number().int().nonnegative().default(0),
+  /** This attempt was unfinished when its owning orchestrator was stopped. */
+  stoppedByOrchestrator: z.boolean().optional(),
   attempts: z.number().int().nonnegative().default(0),
   /** Which phase of its task this step was dispatched in. */
   phaseIndex: z.number().int().nonnegative().default(0),
@@ -1237,6 +1344,9 @@ export const RunStepSchema = z.object({
 });
 export type RunStep = z.infer<typeof RunStepSchema>;
 
+/** Persisted reason that identifies work cancelled by an orchestration Stop. */
+export const ORCHESTRATOR_STOP_REASON = "Stopped with orchestrator";
+
 /** A line the orchestrator wrote as a phase ended, for the person to read. */
 export const RunNoteSchema = z.object({
   id: z.string().min(1),
@@ -1246,6 +1356,154 @@ export const RunNoteSchema = z.object({
   createdAt: z.string().datetime(),
 });
 export type RunNote = z.infer<typeof RunNoteSchema>;
+
+export const NotificationCategorySchema = z.enum([
+  "agent_lifecycle",
+  "orchestration",
+  "permission",
+]);
+export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
+
+export const NotificationKindSchema = z.enum([
+  "agent_completion",
+  "agent_failure",
+  "orchestration_needs_review",
+  "orchestration_step_failure",
+  "permission_request",
+]);
+export type NotificationKind = z.infer<typeof NotificationKindSchema>;
+
+export const NotificationSeveritySchema = z.enum([
+  "info",
+  "warning",
+  "error",
+  "critical",
+]);
+export type NotificationSeverity = z.infer<typeof NotificationSeveritySchema>;
+
+export const NotificationStatusSchema = z.enum(["active", "resolved", "dismissed"]);
+export type NotificationStatus = z.infer<typeof NotificationStatusSchema>;
+
+/**
+ * A durable copy of what raised a notification.
+ *
+ * These are labels and identifiers captured at production time, not foreign
+ * keys. Notification history therefore remains readable after its live session
+ * or run has been removed.
+ */
+export const NotificationSubjectSchema = z.object({
+  type: z.enum(["session", "agent", "run", "run_step", "permission_request"]),
+  id: z.string().min(1).max(200),
+  label: z.string().min(1).max(200),
+  parentId: z.string().min(1).max(200).optional(),
+  parentLabel: z.string().min(1).max(200).optional(),
+});
+export type NotificationSubject = z.infer<typeof NotificationSubjectSchema>;
+
+/** Where a browser should navigate using identifiers copied into the record. */
+export const NotificationNavigationSchema = z.object({
+  type: z.enum(["fleet", "session", "run", "run_step", "permission_request"]),
+  sessionId: z.string().min(1).max(200).optional(),
+  runId: z.string().min(1).max(200).optional(),
+  stepId: z.string().min(1).max(200).optional(),
+});
+export type NotificationNavigation = z.infer<typeof NotificationNavigationSchema>;
+
+export const NotificationSchema = z.object({
+  id: z.string().min(1).max(200),
+  /** Stable producer identity used to make retries safe. */
+  sourceKey: z.string().min(1).max(500),
+  category: NotificationCategorySchema,
+  kind: NotificationKindSchema,
+  severity: NotificationSeveritySchema,
+  status: NotificationStatusSchema.default("active"),
+  title: z.string().min(1).max(200),
+  body: z.string().max(4_000).default(""),
+  subject: NotificationSubjectSchema,
+  navigation: NotificationNavigationSchema,
+  /**
+   * Bounded schemas own the rendered text and destinations; this bag carries
+   * additional copied producer context without turning it into a live link.
+   */
+  data: z.record(z.string(), z.unknown()).default({}),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  readAt: z.string().datetime().nullable().default(null),
+  dismissedAt: z.string().datetime().nullable().default(null),
+  resolvedAt: z.string().datetime().nullable().default(null),
+});
+export type Notification = z.infer<typeof NotificationSchema>;
+
+export const CreateNotificationSchema = NotificationSchema.omit({
+  id: true,
+  status: true,
+  updatedAt: true,
+  readAt: true,
+  dismissedAt: true,
+  resolvedAt: true,
+}).extend({
+  createdAt: z.string().datetime().optional(),
+});
+export type CreateNotification = z.infer<typeof CreateNotificationSchema>;
+
+/** Mutable presentation fields; identity and lifecycle use dedicated methods. */
+export const UpdateNotificationSchema = z.object({
+  severity: NotificationSeveritySchema.optional(),
+  title: z.string().min(1).max(200).optional(),
+  body: z.string().max(4_000).optional(),
+  subject: NotificationSubjectSchema.optional(),
+  navigation: NotificationNavigationSchema.optional(),
+  data: z.record(z.string(), z.unknown()).optional(),
+});
+export type UpdateNotification = z.infer<typeof UpdateNotificationSchema>;
+
+export const NotificationCursorSchema = z.object({
+  createdAt: z.string().datetime(),
+  id: z.string().min(1).max(200),
+});
+export type NotificationCursor = z.infer<typeof NotificationCursorSchema>;
+
+export const ListNotificationsRequestSchema = z.object({
+  limit: z
+    .number()
+    .int()
+    .positive()
+    .transform((value) => Math.min(value, 200))
+    .default(50),
+  before: NotificationCursorSchema.optional(),
+  /** False is the active hydration view used by a freshly connected browser. */
+  includeDismissed: z.boolean().default(true),
+});
+export type ListNotificationsRequest = z.infer<typeof ListNotificationsRequestSchema>;
+
+export const MarkAllNotificationsReadResponseSchema = z
+  .object({
+    updated: z.number().int().nonnegative(),
+    notifications: z.array(NotificationSchema),
+    unreadCount: z.number().int().nonnegative(),
+  })
+  .refine((value) => value.updated === value.notifications.length, {
+    message: "Updated count must match the returned notifications",
+  });
+export type MarkAllNotificationsReadResponse = z.infer<
+  typeof MarkAllNotificationsReadResponseSchema
+>;
+
+export const NotificationPreferenceSchema = z.object({
+  sessionId: z.string().min(1).max(200),
+  agentId: z.string().min(1).max(500),
+  /** An explicit per-agent override, rather than an inherited tri-state. */
+  lifecycleEnabled: z.boolean(),
+  updatedAt: z.string().datetime(),
+});
+export type NotificationPreference = z.infer<typeof NotificationPreferenceSchema>;
+
+export const UpdateNotificationPreferenceSchema = z.object({
+  lifecycleEnabled: z.boolean(),
+});
+export type UpdateNotificationPreference = z.infer<
+  typeof UpdateNotificationPreferenceSchema
+>;
 
 /**
  * Everything a freshly connected browser needs to render the fleet.
@@ -1260,6 +1518,9 @@ export const SnapshotSchema = z.object({
   sessions: z.array(SessionSchema),
   /** Defaulted so a browser talking to a Host without runs still parses. */
   runs: z.array(RunSchema).default([]),
+  /** Newest non-dismissed durable notifications, defaulted for older Hosts. */
+  notifications: z.array(NotificationSchema).default([]),
+  notificationUnreadCount: z.number().int().nonnegative().default(0),
   /**
    * The commit the Host is running, so a browser can mark Nodes that are behind
    * it. Sent with the fleet rather than fetched separately because the two are
@@ -1324,6 +1585,11 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
    * not been updated.
    */
   z.object({ type: z.literal("run"), run: RunSchema }),
+  z.object({ type: z.literal("notification_upsert"), notification: NotificationSchema }),
+  z.object({
+    type: z.literal("notification_unread_count"),
+    unreadCount: z.number().int().nonnegative(),
+  }),
   /** A run's steps, sent whole: a removed step has no row left to describe. */
   z.object({
     type: z.literal("run_steps"),
@@ -1767,6 +2033,8 @@ export const UpdateDefaultsSchema = z.object({
   yolo: z.boolean().optional(),
   /** Re-attach a session its Node lost, without waiting to be asked. */
   autoResume: z.boolean().optional(),
+  /** Application fallback for lifecycle notifications on top-level agents. */
+  notificationLifecycleEnabled: z.boolean().optional(),
   /**
    * What new sessions start on. Empty means "whatever Copilot picks".
    *
@@ -2005,6 +2273,7 @@ const hostBackupDataShape = {
   defaults: z.object({
     yolo: z.boolean(),
     autoResume: z.boolean(),
+    notificationLifecycleEnabled: z.boolean().default(true),
   }),
   nodes: z.array(HostBackupNodeSchema),
   workspaces: z.array(HostBackupWorkspaceSchema),
@@ -2023,6 +2292,8 @@ const hostBackupDataShape = {
    * task with its steps intact and no memory of why they were run.
    */
   runNotes: z.array(RunNoteSchema).default([]),
+  notifications: z.array(NotificationSchema).default([]),
+  notificationPreferences: z.array(NotificationPreferenceSchema).default([]),
 } as const;
 
 export const HostBackupSchema = z.object({

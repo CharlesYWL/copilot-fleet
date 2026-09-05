@@ -23,6 +23,21 @@ const show = (overrides: Partial<Parameters<typeof TopBar>[0]> = {}) =>
   );
 
 describe("TopBar counts", () => {
+  it("keeps the notification badge numeric and hides zero", () => {
+    const first = show({ notificationUnreadCount: 0 });
+    const emptyBell = screen.getByRole("button", {
+      name: "Notifications, 0 unread notifications",
+    });
+    expect(emptyBell.textContent).toBe("");
+    first.unmount();
+
+    show({ notificationUnreadCount: 2 });
+    const unreadBell = screen.getByRole("button", {
+      name: "Notifications, 2 unread notifications",
+    });
+    expect(unreadBell.textContent).toBe("2");
+  });
+
   it("still says what each number counts, now that the words are icons", () => {
     /*
      * The labels moved into the icons to stop three strings pushing the mode

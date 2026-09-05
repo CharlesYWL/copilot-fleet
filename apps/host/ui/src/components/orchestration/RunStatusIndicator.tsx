@@ -16,10 +16,14 @@ import {
 } from "@fluentui/react-icons";
 import { useState } from "react";
 import type { RunViewModel } from "../../lib/orchestration-view";
-import { runStateLabel } from "../../lib/orchestration-view";
+import {
+  failedStepTokens,
+  isOrchestratorStoppedRun,
+  runStateLabel,
+} from "../../lib/orchestration-view";
 import { statusVisuals, type StatusTone } from "../../theme";
 
-const FAILED_STEP_DISMISS_PREFIX = "fleet.ui.run.failed-step.";
+export const FAILED_STEP_DISMISS_PREFIX = "fleet.ui.run.failed-step.";
 
 const useStyles = makeStyles({
   root: {
@@ -59,15 +63,7 @@ type DismissedFailure = {
   tokens: string[];
 };
 
-const failedStepTokens = (model: RunViewModel): string[] =>
-  model.steps
-    .filter((step) => step.state === "failed" || step.state === "cancelled")
-    // A retry increments attempts. updatedAt is deliberately excluded because
-    // bookkeeping edits to an already-failed step are not a new failure.
-    .map((step) => JSON.stringify([step.id, step.attempts]))
-    .sort();
-
-const readDismissedFailures = (runId: string): string[] => {
+export const readDismissedFailures = (runId: string): string[] => {
   try {
     const stored = localStorage.getItem(FAILED_STEP_DISMISS_PREFIX + runId);
     if (!stored) return [];
@@ -97,6 +93,13 @@ const rememberDismissedFailures = (runId: string, tokens: readonly string[]) => 
  * which one is blocking an agent right now.
  */
 export function runVisual(model: RunViewModel): Visual {
+  if ((model.stoppingSteps ?? 0) > 0) {
+    return {
+      label: model.stoppingUnavailable ? "Stopping · node offline" : "Stopping",
+      tone: "attention",
+      icon: model.stoppingUnavailable ? PlugDisconnectedRegular : ArrowClockwiseRegular,
+    };
+  }
   if (model.attention === "permission") {
     return {
       label: model.run.state === "awaiting_human" ? "Needs review" : "Needs you",
@@ -117,7 +120,11 @@ export function runVisual(model: RunViewModel): Visual {
     return { label: "Done", tone: "neutral", icon: CheckmarkCircleRegular };
   }
   if (model.run.state === "cancelled") {
-    return { label: "Abandoned", tone: "neutral", icon: CircleRegular };
+    return {
+      label: isOrchestratorStoppedRun(model.run) ? "Stopped" : "Abandoned",
+      tone: "neutral",
+      icon: CircleRegular,
+    };
   }
   if (model.run.state === "failed") {
     return { label: "Failed", tone: "danger", icon: ErrorCircleRegular };
@@ -129,10 +136,12 @@ export const RunStatusIndicator = ({
   model,
   className,
   dismissible = false,
+  onDismissFailure,
 }: {
   model: RunViewModel;
   className?: string;
   dismissible?: boolean;
+  onDismissFailure?: () => void;
 }) => {
   const styles = useStyles();
   const [dismissedFailure, setDismissedFailure] = useState<DismissedFailure | undefined>(
@@ -141,7 +150,7 @@ export const RunStatusIndicator = ({
       return tokens.length > 0 ? { runId: model.run.id, tokens } : undefined;
     },
   );
-  const failureTokens = failedStepTokens(model);
+  const failureTokens = failedStepTokens(model.steps);
   const dismissedTokens =
     dismissedFailure?.runId === model.run.id
       ? dismissedFailure.tokens
@@ -161,6 +170,7 @@ export const RunStatusIndicator = ({
     };
     setDismissedFailure(next);
     rememberDismissedFailures(next.runId, next.tokens);
+    onDismissFailure?.();
   };
 
   return (

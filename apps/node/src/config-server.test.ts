@@ -24,6 +24,7 @@ const placement = {
   workspaceId: "ws-1",
   nodeId: "node-1",
   localPath: "/tmp/fleet",
+  workspaceName: "fleet",
 };
 
 /** Everything the router needs except the Host client, which varies by test. */
@@ -50,6 +51,11 @@ const baseOptions = (): Omit<ConfigServerOptions, "fleet"> => ({
     path.trim() === "/tmp/fleet"
       ? { ok: true, kind: "directory" }
       : { ok: false, reason: "No such folder" },
+  sessionDiscovery: {
+    list: vi.fn(async () => ({ sessions: [] })),
+    preview: vi.fn(async () => ({ items: [], truncated: false })),
+    get: vi.fn(() => undefined),
+  },
 });
 
 function router(overrides: Partial<ConfigServerOptions> = {}) {
@@ -60,8 +66,21 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
     updateWorkspace: vi.fn(async () => workspace),
     createOwnPlacement: vi.fn(async () => placement),
     updateOwnPlacementPath: vi.fn(async () => placement),
+    listOwnSessions: vi.fn(async () => []),
+    createOwnSession: vi.fn(async () => ({
+      id: "fleet-new",
+      state: "starting" as const,
+      agentSessionId: "",
+    })),
+    adoptOwnSession: vi.fn(async () => ({
+      id: "fleet-resumed",
+      state: "starting" as const,
+      agentSessionId: "acp-1",
+    })),
   };
+
   const options: ConfigServerOptions = { ...baseOptions(), fleet, ...overrides };
+
   return { route: createConfigRouter(options), fleet, options };
 }
 
@@ -279,6 +298,79 @@ describe("config router", () => {
       expect(calls[0]?.headers.get(NODE_SECRET_HEADER)).toBe("secret");
       expect(calls[0]?.headers.has(NODE_PROOF_SIGNATURE_HEADER)).toBe(false);
     });
+
+    it("signs the session UI's list, create and resume requests", async () => {
+      const paths: string[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: URL | string, init?: RequestInit) => {
+          const path = new URL(input).pathname;
+          const method = init?.method ?? "GET";
+          const headers = new Headers(init?.headers);
+          paths.push(`${method} ${path}`);
+          expect(headers.has(NODE_SECRET_HEADER)).toBe(false);
+          expect(
+            verifyNodeHttpProof({
+              publicKey: keys.publicKey,
+              nodeId: "node-1",
+              method,
+              path,
+              body: String(init?.body ?? ""),
+              timestamp: headers.get(NODE_PROOF_TIMESTAMP_HEADER) ?? "",
+              nonce: headers.get(NODE_PROOF_NONCE_HEADER) ?? "",
+              signature: headers.get(NODE_PROOF_SIGNATURE_HEADER) ?? "",
+            }),
+          ).toEqual({ ok: true });
+          const result =
+            path === "/api/placements"
+              ? [placement]
+              : method === "GET"
+                ? []
+                : { id: "fleet-session", state: "starting", agentSessionId: "acp-1" };
+          return new Response(JSON.stringify(result), { status: 200 });
+        }),
+      );
+      const session = {
+        id: "acp-1",
+        cwd: placement.localPath,
+        additionalDirectories: ["C:\\shared"],
+        loadSupported: true,
+      };
+      const route = relayingRouter({
+        getCredentials: () => keyed,
+        sessionDiscovery: {
+          list: vi.fn(async () => ({ sessions: [session] })),
+          preview: vi.fn(async () => ({ items: [], truncated: false })),
+          get: vi.fn(() => session),
+        },
+      });
+
+      expect(await route("GET", "/api/sessions", "")).toMatchObject({
+        status: 200,
+        body: { sessions: [{ id: "acp-1", workspaceName: "fleet", resumable: true }] },
+      });
+      expect(
+        await route(
+          "POST",
+          "/api/sessions/new",
+          JSON.stringify({
+            placementId: placement.id,
+            prompt: "hello",
+          }),
+        ),
+      ).toMatchObject({ status: 200, body: { sessionId: "fleet-session" } });
+      expect(await route("POST", "/api/sessions/acp-1/resume", "{}")).toMatchObject({
+        status: 200,
+        body: { sessionId: "fleet-session" },
+      });
+      expect(paths).toEqual(
+        expect.arrayContaining([
+          "GET /api/sessions",
+          "POST /api/sessions",
+          "POST /api/sessions/adopt",
+        ]),
+      );
+    });
   });
 
   it("refuses a placement path this machine cannot open", async () => {
@@ -320,6 +412,190 @@ describe("config router", () => {
     const response = await route("POST", "/api/config", "not json");
     expect(response.status).toBe(500);
     expect(log).toHaveBeenCalled();
+  });
+
+  it("maps ACP metadata to owned placements without exposing private paths", async () => {
+    const sessionDiscovery = {
+      list: vi.fn(async () => ({
+        sessions: [
+          {
+            id: "acp-1",
+            cwd: "/tmp/fleet",
+            additionalDirectories: ["/private/other"],
+            loadSupported: true,
+            title: "Continue work",
+            updatedAt: "2026-08-28T12:00:00.000Z",
+          },
+          {
+            id: "legacy",
+            cwd: "/private/missing",
+            additionalDirectories: [],
+            loadSupported: true,
+          },
+        ],
+        nextCursor: "next",
+      })),
+      preview: vi.fn(async () => ({ items: [], truncated: false })),
+      get: vi.fn(() => undefined),
+    };
+    const { route } = router({ sessionDiscovery });
+
+    const response = await route("GET", "/api/sessions?cursor=opaque", "");
+    const serialized = JSON.stringify(response.body);
+
+    expect(sessionDiscovery.list).toHaveBeenCalledWith("opaque");
+    expect(response.body).toMatchObject({
+      nextCursor: "next",
+      sessions: [
+        {
+          id: "acp-1",
+          title: "Continue work",
+          updatedAt: "2026-08-28T12:00:00.000Z",
+          createdAt: null,
+          workspaceName: "fleet",
+          placementId: "pl-1",
+          resumable: true,
+          resumeReason: null,
+          legacy: false,
+        },
+        {
+          id: "legacy",
+          title: null,
+          updatedAt: null,
+          createdAt: null,
+          workspaceName: null,
+          placementId: null,
+          resumable: false,
+          legacy: true,
+          resumeReason: expect.stringContaining("No Fleet placement"),
+        },
+      ],
+    });
+    expect(serialized).not.toContain("/tmp/fleet");
+    expect(serialized).not.toContain("/private");
+  });
+
+  it("loads previews on demand and resumes through the Host adoption API", async () => {
+    const session = {
+      id: "acp-1",
+      cwd: "/tmp/fleet",
+      additionalDirectories: [],
+      loadSupported: true,
+      title: "Continue work",
+    };
+    const sessionDiscovery = {
+      list: vi.fn(async () => ({ sessions: [session] })),
+      preview: vi.fn(async () => ({
+        items: [{ role: "user" as const, text: "hello" }],
+        truncated: false,
+      })),
+      get: vi.fn(() => session),
+    };
+    const { route, fleet } = router({ sessionDiscovery });
+
+    expect(await route("GET", "/api/sessions/acp-1/preview", "")).toMatchObject({
+      status: 200,
+      body: { id: "acp-1", items: [{ text: "hello" }], truncated: false },
+    });
+    const resumed = await route("POST", "/api/sessions/acp-1/resume", "{}");
+
+    expect(resumed).toMatchObject({
+      status: 200,
+      body: { sessionId: "fleet-resumed", state: "starting" },
+    });
+    expect(fleet.adoptOwnSession).toHaveBeenCalledWith({
+      placementId: "pl-1",
+      agentSessionId: "acp-1",
+      additionalDirectories: [],
+      name: "Continue work",
+    });
+  });
+
+  it("refuses duplicate live resume before asking the Host to adopt it", async () => {
+    const session = {
+      id: "acp-1",
+      cwd: "/tmp/fleet",
+      additionalDirectories: [],
+      loadSupported: true,
+    };
+    const { route, fleet } = router({
+      sessionDiscovery: {
+        list: vi.fn(async () => ({ sessions: [session] })),
+        preview: vi.fn(async () => ({ items: [], truncated: false })),
+        get: vi.fn(() => session),
+      },
+    });
+    vi.mocked(fleet.listOwnSessions).mockResolvedValue([
+      {
+        id: "fleet-live",
+        placementId: "pl-1",
+        nodeId: "node-1",
+        state: "idle",
+        agentSessionId: "acp-1",
+      },
+    ]);
+
+    const response = await route("POST", "/api/sessions/acp-1/resume", "{}");
+
+    expect(response.status).toBe(409);
+    expect(fleet.adoptOwnSession).not.toHaveBeenCalled();
+  });
+
+  it("refuses resume when Copilot cannot load the discovered session", async () => {
+    const session = {
+      id: "legacy-only",
+      cwd: "/tmp/fleet",
+      additionalDirectories: [],
+      loadSupported: false,
+    };
+    const { route, fleet } = router({
+      sessionDiscovery: {
+        list: vi.fn(async () => ({ sessions: [session] })),
+        preview: vi.fn(async () => ({ items: [], truncated: false })),
+        get: vi.fn(() => session),
+      },
+    });
+
+    expect(await route("POST", "/api/sessions/legacy-only/resume", "{}")).toMatchObject({
+      status: 409,
+      body: { code: "unsupported_load" },
+    });
+    expect(fleet.adoptOwnSession).not.toHaveBeenCalled();
+  });
+
+  it("creates new sessions only on a placement owned by this node", async () => {
+    const { route, fleet } = router();
+    const response = await route(
+      "POST",
+      "/api/sessions/new",
+      JSON.stringify({ placementId: "pl-1", prompt: "start here", name: "" }),
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ sessionId: "fleet-new", state: "starting" });
+    expect(fleet.createOwnSession).toHaveBeenCalledWith({
+      placementId: "pl-1",
+      prompt: "start here",
+      name: "",
+    });
+
+    vi.mocked(fleet.listOwnPlacements).mockResolvedValueOnce([]);
+    expect(
+      await route(
+        "POST",
+        "/api/sessions/new",
+        JSON.stringify({ placementId: "theirs", prompt: "no" }),
+      ),
+    ).toMatchObject({ status: 403 });
+  });
+
+  it("returns a clear 400 for malformed new-session JSON", async () => {
+    const { route, fleet } = router();
+
+    expect(await route("POST", "/api/sessions/new", "{")).toEqual({
+      status: 400,
+      body: { error: "Not valid JSON." },
+    });
+    expect(fleet.createOwnSession).not.toHaveBeenCalled();
   });
 
   it("exports the stored identity", async () => {

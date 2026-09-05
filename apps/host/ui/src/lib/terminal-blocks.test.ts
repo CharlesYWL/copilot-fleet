@@ -95,6 +95,45 @@ describe("toTerminalBlocks", () => {
     });
   });
 
+  it("keeps a task completion response through the status-only final update", () => {
+    const blocks = toTerminalBlocks([
+      event("tool", {
+        toolCallId: "done",
+        title: "task_complete",
+        response: "The branch is main.",
+        status: "pending",
+      }),
+      event("tool", { toolCallId: "done", status: "completed" }),
+    ]);
+
+    expect(blocks[0]).toMatchObject({
+      text: "task_complete",
+      status: "completed",
+      body: "The branch is main.",
+    });
+  });
+
+  it("keeps the failure reason on a failed tool row", () => {
+    const blocks = toTerminalBlocks([
+      event("tool", {
+        toolCallId: "fleet",
+        title: "fleet-fleet_list_work",
+        status: "pending",
+      }),
+      event("tool", {
+        toolCallId: "fleet",
+        status: "failed",
+        error: "MCP server 'fleet': Tool does not exist.",
+      }),
+    ]);
+
+    expect(blocks[0]).toMatchObject({
+      text: "fleet-fleet_list_work",
+      status: "failed",
+      body: "MCP server 'fleet': Tool does not exist.",
+    });
+  });
+
   it("promotes user prompts and drops raw protocol noise", () => {
     const blocks = toTerminalBlocks([
       event("system", { text: "User: fix the bug" }),

@@ -111,7 +111,11 @@ describe("grants and backups", () => {
       data: {
         exportedAt: new Date().toISOString(),
         tunnel: { enabled: false, provider: "cloudflare" },
-        defaults: { yolo: false, autoResume: true },
+        defaults: {
+          yolo: false,
+          autoResume: true,
+          notificationLifecycleEnabled: true,
+        },
         nodes: [],
         workspaces: [],
         placements: [],
@@ -120,6 +124,8 @@ describe("grants and backups", () => {
         runs: [],
         runSteps: [],
         runNotes: [],
+        notifications: [],
+        notificationPreferences: [],
       },
       security: { ...security, administrators: security.administrators },
     });

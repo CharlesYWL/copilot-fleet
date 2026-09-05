@@ -33,7 +33,7 @@ export const RESUMABLE_ACCENT = semanticColors.permission;
  * inventing their own answer, which is how "running" ended up three colours.
  */
 export type SessionVisualState =
-  "running" | "idle" | "waiting-for-permission" | "failed" | "done";
+  "running" | "stopping" | "idle" | "waiting-for-permission" | "failed" | "done";
 
 export type SessionStatusDescriptor = {
   state: SessionVisualState;
@@ -65,6 +65,14 @@ const DESCRIPTORS: Record<SessionVisualState, Omit<SessionStatusDescriptor, "sta
     tone: "success",
     priority: 30,
     color: statusVisuals.success.foreground,
+  },
+  stopping: {
+    label: "Stopping",
+    shortLabel: "stopping",
+    icon: ArrowClockwiseRegular,
+    tone: "attention",
+    priority: 35,
+    color: statusVisuals.attention.foreground,
   },
   failed: {
     label: "Failed",
@@ -124,6 +132,7 @@ function visualState(
   session: FleetSession,
   awaitingPermission: boolean,
 ): SessionVisualState {
+  if (session.stopRequested) return "stopping";
   if (awaitingPermission) return "waiting-for-permission";
   if (session.state === "failed" || session.state === "offline") return "failed";
   if (session.state === "completed" || session.state === "stopped") {
@@ -156,6 +165,7 @@ export function isDormantSession(session: FleetSession): boolean {
 
 /** The word shown where the session state goes. */
 export function sessionStatusLabel(session: FleetSession): string {
+  if (session.stopRequested) return "stopping";
   return isDormantSession(session) ? "resumable" : session.state;
 }
 

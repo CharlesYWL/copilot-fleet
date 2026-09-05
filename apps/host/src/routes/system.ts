@@ -254,6 +254,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   app.get("/api/defaults", async () => ({
     yolo: store.getDefaultYolo(),
     autoResume: store.getAutoResume(),
+    notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
     model: store.getDefaultModel(),
     reasoningEffort: store.getDefaultReasoningEffort(),
   }));
@@ -264,6 +265,9 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     // reset the others merely by not mentioning them.
     if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
     if (input.autoResume !== undefined) store.setAutoResume(input.autoResume);
+    if (input.notificationLifecycleEnabled !== undefined) {
+      store.setDefaultNotificationLifecycleEnabled(input.notificationLifecycleEnabled);
+    }
     if (input.model !== undefined) store.setDefaultModel(input.model);
     if (input.reasoningEffort !== undefined) {
       store.setDefaultReasoningEffort(input.reasoningEffort);
@@ -271,6 +275,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     return {
       yolo: store.getDefaultYolo(),
       autoResume: store.getAutoResume(),
+      notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
       model: store.getDefaultModel(),
       reasoningEffort: store.getDefaultReasoningEffort(),
     };

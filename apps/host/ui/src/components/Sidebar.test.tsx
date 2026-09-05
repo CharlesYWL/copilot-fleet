@@ -120,6 +120,36 @@ describe("Sidebar drag handles", () => {
     expect(row.getAttribute("draggable")).toBe("true");
   });
 
+  describe("dismissed orchestrators", () => {
+    it("collapses hidden conversations by default and restores them after expansion", () => {
+      const restore = vi.fn();
+      const lead: FleetSession = {
+        ...session("lead", "w1", "n1", "stopped"),
+        runRole: "lead",
+        dismissed: true,
+      };
+      show([placement], [], {
+        dismissedLeadSessions: [lead],
+        onRestoreLeadSession: restore,
+      });
+
+      const disclosure = screen.getByRole("button", {
+        name: "Show dismissed orchestrators",
+      });
+      expect(disclosure.getAttribute("aria-expanded")).toBe("false");
+      expect(screen.queryByTitle("Restore lead")).toBeNull();
+
+      fireEvent.click(disclosure);
+      expect(
+        screen
+          .getByRole("button", { name: "Hide dismissed orchestrators" })
+          .getAttribute("aria-expanded"),
+      ).toBe("true");
+      fireEvent.click(screen.getByTitle("Restore lead"));
+      expect(restore).toHaveBeenCalledWith("lead");
+    });
+  });
+
   it("makes workspace rows draggable so they can be reordered", () => {
     show([placement]);
     expect(screen.getByTitle(/^repo — drag/i).getAttribute("draggable")).toBe("true");

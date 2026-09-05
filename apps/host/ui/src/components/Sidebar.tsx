@@ -89,6 +89,17 @@ const useStyles = makeStyles({
     textTransform: "uppercase",
     color: tokens.colorNeutralForeground4,
   },
+  sectionDisclosure: {
+    width: "100%",
+    display: "flex",
+    alignItems: "center",
+    gap: "4px",
+    ...shorthands.borderStyle("none"),
+    background: "transparent",
+    cursor: "pointer",
+    textAlign: "left",
+    ":hover": { color: tokens.colorNeutralForeground3 },
+  },
   row: {
     borderRadius: tokens.borderRadiusMedium,
     minWidth: 0,
@@ -323,9 +334,11 @@ type SidebarProps = {
    * reason a chat app lists them — you pick one up, not "the" one.
    */
   leadSessions: readonly FleetSession[];
+  dismissedLeadSessions?: readonly FleetSession[];
   waitingPermissions: readonly SessionEvent[];
   onSelectSession: (sessionId: string) => void;
   onSelectLeadSession: (sessionId: string) => void;
+  onRestoreLeadSession?: (sessionId: string) => void;
   /** Starts another conversation with the orchestrator. */
   onNewConversation: () => void;
   onNewSession: () => void;
@@ -344,9 +357,11 @@ export const Sidebar = ({
   liveWorkCount,
   attentionCount,
   leadSessions,
+  dismissedLeadSessions = [],
   waitingPermissions,
   onSelectSession,
   onSelectLeadSession,
+  onRestoreLeadSession,
   onNewConversation,
   onNewSession,
   onSelectView,
@@ -361,6 +376,7 @@ export const Sidebar = ({
    * one conversation never has to open anything.
    */
   const [conversationsClosed, setConversationsClosed] = useState(false);
+  const [dismissedClosed, setDismissedClosed] = useState(true);
   const [dropTarget, setDropTarget] = useState<{ key: string; edge: DropEdge }>();
   const { updatePlacement, reorderPlacements, reorderWorkspaces, reorderSessions } =
     useCatalog();
@@ -528,6 +544,42 @@ export const Sidebar = ({
             <Add20Regular aria-hidden="true" />
             <span className={styles.orchestrationLabel}>New conversation</span>
           </button>
+        )}
+        {dismissedLeadSessions.length > 0 && (
+          <>
+            <button
+              type="button"
+              className={mergeClasses(styles.sectionLabel, styles.sectionDisclosure)}
+              aria-expanded={!dismissedClosed}
+              aria-label={
+                dismissedClosed
+                  ? "Show dismissed orchestrators"
+                  : "Hide dismissed orchestrators"
+              }
+              onClick={() => setDismissedClosed((closed) => !closed)}
+            >
+              {dismissedClosed ? (
+                <ChevronRight20Regular aria-hidden="true" />
+              ) : (
+                <ChevronDown20Regular aria-hidden="true" />
+              )}
+              <span>Dismissed orchestrators</span>
+            </button>
+            {!dismissedClosed &&
+              dismissedLeadSessions.map((lead) => (
+                <button
+                  key={lead.id}
+                  type="button"
+                  className={styles.leadRow}
+                  title={`Restore ${sessionLabel(lead)}`}
+                  onClick={() => onRestoreLeadSession?.(lead.id)}
+                >
+                  <Chat20Regular aria-hidden="true" />
+                  <span className={styles.orchestrationLabel}>{sessionLabel(lead)}</span>
+                  <span>Restore</span>
+                </button>
+              ))}
+          </>
         )}
         <Text as="span" className={styles.sectionLabel}>
           Agents

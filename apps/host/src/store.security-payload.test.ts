@@ -86,7 +86,11 @@ describe("the sealed security payload", () => {
       data: {
         exportedAt: new Date().toISOString(),
         tunnel: { enabled: false, provider: "devtunnel" },
-        defaults: { yolo: false, autoResume: false },
+        defaults: {
+          yolo: false,
+          autoResume: false,
+          notificationLifecycleEnabled: true,
+        },
         nodes: [],
         workspaces: [],
         placements: [],
@@ -95,6 +99,8 @@ describe("the sealed security payload", () => {
         runs: [],
         runSteps: [],
         runNotes: [],
+        notifications: [],
+        notificationPreferences: [],
       },
       security: payload,
     });
@@ -115,7 +121,11 @@ describe("the sealed security payload", () => {
       data: {
         exportedAt: new Date().toISOString(),
         tunnel: { enabled: false, provider: "devtunnel" },
-        defaults: { yolo: false, autoResume: false },
+        defaults: {
+          yolo: false,
+          autoResume: false,
+          notificationLifecycleEnabled: true,
+        },
         nodes: [],
         workspaces: [],
         placements: [],
@@ -124,6 +134,8 @@ describe("the sealed security payload", () => {
         runs: [],
         runSteps: [],
         runNotes: [],
+        notifications: [],
+        notificationPreferences: [],
       },
       security: payload,
     });

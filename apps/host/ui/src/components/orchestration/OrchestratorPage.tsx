@@ -1,6 +1,7 @@
 import { Button, makeStyles, tokens } from "@fluentui/react-components";
 import {
   isResumableSession,
+  terminalRunStates,
   terminalSessionStates,
   type FleetSession,
 } from "@fleet/protocol";
@@ -93,13 +94,17 @@ export const OrchestratorPage = ({
 }: OrchestratorPageProps) => {
   const styles = useStyles();
   const ended = terminalSessionStates.has(conversation.state);
-  const resumable = isResumableSession(conversation);
+  const stopping = Boolean(conversation.stopRequested);
+  const hasActiveWork = models.some(
+    (model) => !terminalRunStates.has(model.run.state) || (model.stoppingSteps ?? 0) > 0,
+  );
+  const resumable = isResumableSession(conversation) && !stopping;
 
   return (
     <section className={styles.page} aria-label="Orchestrator">
       <OrchestratorHeader
         summary={summary}
-        canCreateRun={!ended}
+        canCreateRun={!ended && !stopping}
         onNewRun={onNewRun}
         onOpenLead={onOpenLead}
       />
@@ -111,7 +116,7 @@ export const OrchestratorPage = ({
               ? "This orchestrator conversation is stopped. Resume it to continue, or dismiss it when you no longer need the transcript."
               : "Nothing dispatched yet. Ask the orchestrator for something in its conversation, or open a task here and it will plan the phases itself."}
           </p>
-          <Button appearance="primary" disabled={ended} onClick={onNewRun}>
+          <Button appearance="primary" disabled={ended || stopping} onClick={onNewRun}>
             New task
           </Button>
         </div>
@@ -145,7 +150,7 @@ export const OrchestratorPage = ({
       )}
 
       <div className={styles.footer}>
-        {ended ? (
+        {ended && !stopping && !hasActiveWork ? (
           <>
             {resumable && (
               <Button size="small" appearance="primary" onClick={onResumeOrchestrator}>
@@ -157,8 +162,17 @@ export const OrchestratorPage = ({
             </Button>
           </>
         ) : (
-          <Button size="small" appearance="subtle" onClick={onStopOrchestrator}>
-            Stop orchestrator
+          <Button
+            size="small"
+            appearance="subtle"
+            disabled={stopping && conversation.state !== "offline"}
+            onClick={onStopOrchestrator}
+          >
+            {stopping
+              ? conversation.state === "offline"
+                ? "Mark orchestrator stopped"
+                : "Stopping orchestrator"
+              : "Stop orchestrator"}
           </Button>
         )}
       </div>

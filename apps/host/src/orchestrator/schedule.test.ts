@@ -62,6 +62,7 @@ function run(overrides: Partial<Run> = {}): Run {
     settleSeq: 0,
     wakeSeq: 0,
     emptyWakeCount: 0,
+    reviewSeq: 0,
     createdAt: iso(),
     updatedAt: iso(),
     ...overrides,
@@ -624,6 +625,90 @@ describe("planNextActions", () => {
       steps: [step("audit", { state: "failed" }), step("fix", { dependsOn: ["audit"] })],
     });
     expect(types(input)).toContain("skip_step");
+  });
+
+  it("keeps transitive descendants blocked after a cancelled prerequisite", () => {
+    const policy = RunPolicySchema.parse({
+      wakePolicy: "none",
+      onStepFailure: "continue",
+    });
+    const firstPass = planNextActions(
+      world({
+        run: run({ policy }),
+        steps: [
+          step("a", { state: "cancelled" }),
+          step("b", { dependsOn: ["a"] }),
+          step("c", { dependsOn: ["b"] }),
+        ],
+      }),
+    );
+    expect(firstPass).toContainEqual(
+      expect.objectContaining({ type: "skip_step", stepId: "b" }),
+    );
+    expect(firstPass).not.toContainEqual(
+      expect.objectContaining({ type: "start_step", stepId: "c" }),
+    );
+
+    const secondPass = planNextActions(
+      world({
+        run: run({ policy }),
+        steps: [
+          step("a", { state: "cancelled" }),
+          step("b", { state: "skipped", dependsOn: ["a"] }),
+          step("c", { dependsOn: ["b"] }),
+        ],
+      }),
+    );
+    expect(secondPass).toContainEqual(
+      expect.objectContaining({ type: "skip_step", stepId: "c" }),
+    );
+  });
+
+  it("blocks a fan-in when either branch did not succeed", () => {
+    const actions = planNextActions(
+      world({
+        run: run({
+          policy: RunPolicySchema.parse({
+            wakePolicy: "none",
+            onStepFailure: "continue",
+          }),
+        }),
+        steps: [
+          step("a", { state: "succeeded" }),
+          step("b", { state: "succeeded", dependsOn: ["a"] }),
+          step("c", { state: "cancelled", dependsOn: ["a"] }),
+          step("d", { dependsOn: ["b", "c"] }),
+        ],
+      }),
+    );
+    expect(actions).toContainEqual(
+      expect.objectContaining({ type: "skip_step", stepId: "d" }),
+    );
+  });
+
+  it("continues an independent branch while blocking failed descendants", () => {
+    const actions = planNextActions(
+      world({
+        run: run({
+          policy: RunPolicySchema.parse({
+            wakePolicy: "none",
+            onStepFailure: "continue",
+          }),
+        }),
+        steps: [
+          step("a", { state: "failed" }),
+          step("b", { dependsOn: ["a"] }),
+          step("c", { state: "succeeded" }),
+          step("d", { dependsOn: ["c"] }),
+        ],
+      }),
+    );
+    expect(actions).toContainEqual(
+      expect.objectContaining({ type: "skip_step", stepId: "b" }),
+    );
+    expect(actions).toContainEqual(
+      expect.objectContaining({ type: "start_step", stepId: "d" }),
+    );
   });
 
   it("dispatches with the step's own prompt and sends nothing else", () => {

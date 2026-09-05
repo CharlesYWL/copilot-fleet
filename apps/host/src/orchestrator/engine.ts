@@ -3,6 +3,7 @@ import {
   canTransitionRunStep,
   eventPayload,
   isWritingCategory,
+  ORCHESTRATOR_STOP_REASON,
   terminalRunStates,
   terminalRunStepStates,
   terminalSessionStates,
@@ -11,6 +12,10 @@ import {
   type SessionEvent,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
+import {
+  notificationAttemptKey,
+  notificationAttemptKeyForStep,
+} from "../notifications/service.js";
 import { statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
 import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS } from "./deadlines.js";
 import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./schedule.js";
@@ -25,7 +30,7 @@ import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./sche
  */
 export class OrchestratorEngine {
   /** Sessions whose current turn has ended, per §"completion is two facts". */
-  private readonly turnComplete = new Set<string>();
+  private readonly turnComplete = new Map<string, string>();
   /** When each run was last woken, so an envelope only carries what is new. */
   private readonly wakeWatermarks = new Map<string, number>();
   /**
@@ -54,7 +59,23 @@ export class OrchestratorEngine {
    */
   handleSessionEvent(event: SessionEvent): void {
     if (event.type === "turn_complete") {
-      this.turnComplete.add(event.sessionId);
+      const completion = this.store.getSessionTurnCompletion(event.sessionId);
+      if (completion) {
+        this.turnComplete.set(event.sessionId, completion.attempt);
+      } else {
+        const session = this.store.getSession(event.sessionId);
+        const step = this.store.getRunStepBySession(event.sessionId);
+        if (session && step) {
+          this.turnComplete.set(
+            event.sessionId,
+            notificationAttemptKey(session, {
+              step,
+              run: this.store.getRun(step.runId),
+            }),
+          );
+        }
+      }
+      this.reconcileStoppedAttempt(event.sessionId);
       this.tick();
       return;
     }
@@ -68,7 +89,75 @@ export class OrchestratorEngine {
       if (state === "starting" || state === "running") {
         this.turnComplete.delete(event.sessionId);
       }
+      this.reconcileStoppedAttempt(event.sessionId);
       this.tick();
+    }
+  }
+
+  /**
+   * Applies a late, authoritative outcome without reopening a cancelled run.
+   *
+   * Stop wins over new dispatch, but an attempt that genuinely completed at
+   * the same time keeps its success, and a host-reported failure stays failed.
+   * The event-log lookup also reconstructs the completion receipt after a Host
+   * restart instead of depending only on the in-memory set.
+   */
+  private reconcileStoppedAttempt(sessionId: string): void {
+    const step = this.store
+      .listRuns()
+      .filter(
+        (run) =>
+          run.state === "cancelled" && run.failureReason === ORCHESTRATOR_STOP_REASON,
+      )
+      .flatMap((run) => this.store.listRunSteps(run.id))
+      .find(
+        (candidate) =>
+          candidate.sessionId === sessionId && candidate.stoppedByOrchestrator,
+      );
+    if (!step) return;
+    const session = this.store.getSession(sessionId);
+    if (!session) return;
+
+    if (session.state === "failed") {
+      this.service.reconcileStoppedOrchestrationStep({
+        runId: step.runId,
+        stepId: step.id,
+        state: "failed",
+        output: session.currentActivity,
+      });
+      return;
+    }
+
+    const attempt = notificationAttemptKey(session, {
+      step,
+      run: this.store.getRun(step.runId),
+    });
+    const completedTurn =
+      this.turnComplete.get(sessionId) === attempt ||
+      this.store
+        .listEvents(sessionId)
+        .some(
+          (event) => event.type === "turn_complete" && event.sequence > step.eventSeqFrom,
+        );
+    if (
+      completedTurn &&
+      (session.state === "idle" ||
+        session.state === "completed" ||
+        session.state === "stopped")
+    ) {
+      const output = this.store
+        .listEvents(sessionId)
+        .filter(
+          (event) => event.type === "agent_text" && event.sequence > step.eventSeqFrom,
+        )
+        .map((event) => eventPayload(event, "agent_text")?.text ?? "")
+        .join("");
+      this.service.reconcileStoppedOrchestrationStep({
+        runId: step.runId,
+        stepId: step.id,
+        state: "succeeded",
+        output,
+      });
     }
   }
 
@@ -88,13 +177,35 @@ export class OrchestratorEngine {
 
     const steps = this.store.listRunSteps(runId);
     const sessions = this.store.listSessions();
+    const completedTurns = new Set<string>();
+    for (const session of sessions) {
+      if (
+        (session.runId && session.runId !== runId) ||
+        (session.runRole !== "worker" && session.runRole !== "reviewer")
+      ) {
+        continue;
+      }
+      const step = this.store.getRunStepBySession(session.id);
+      if (!step || step.runId !== runId) continue;
+      const completion = this.store.getSessionTurnCompletion(session.id);
+      const attempt = notificationAttemptKey(session, {
+        step,
+        run,
+      });
+      if (
+        completion?.attempt === attempt ||
+        this.turnComplete.get(session.id) === attempt
+      ) {
+        completedTurns.add(session.id);
+      }
+    }
     const actions = planNextActions({
       run,
       steps,
       sessions,
       nodes: this.store.listNodes(),
       placements: this.store.listPlacements(),
-      turnCompleteSessionIds: this.turnComplete,
+      turnCompleteSessionIds: completedTurns,
       stepOutputs: this.collectOutputs(steps, run.policy.maxOutputChars),
       nowMs,
     });
@@ -154,11 +265,12 @@ export class OrchestratorEngine {
     if (!placement || !step) return false;
     if (!canTransitionRunStep(step.state, "starting")) return false;
 
-    this.store.updateRunStep(step.id, {
+    const starting = this.store.updateRunStep(step.id, {
       state: "starting",
       placementId: placement.id,
       dispatchedAt: new Date().toISOString(),
     });
+    if (!starting) return false;
 
     const result = this.service.createAndStartSession({
       placement,
@@ -170,6 +282,7 @@ export class OrchestratorEngine {
       // Decided here because the step knows the category and the session does
       // not; capacity is read from sessions long after this point.
       readOnly: isReadOnlyCategory(step.category),
+      dispatchAttempt: notificationAttemptKeyForStep(run, starting),
     });
 
     if (!result.ok) {
@@ -219,16 +332,12 @@ export class OrchestratorEngine {
     );
     if (resumed.ok) return true;
 
-    this.store.updateRunStep(step.id, {
-      state: "failed",
-      output: `Could not resume the same worker session: ${resumed.error}`,
-      dispatchedAt: "",
-    });
-    this.store.recordRunSettle(run.id);
-    if (run.state === "running" && canTransitionRun(run.state, "awaiting_lead")) {
-      this.store.setRunState(run.id, "awaiting_lead");
-    }
-    return true;
+    return this.failStep(
+      run,
+      step,
+      `Could not resume the same worker session: ${resumed.error}`,
+      { dispatchedAt: "" },
+    );
   }
 
   /** Sends the retry only after session/load has restored the same conversation. */
@@ -269,16 +378,37 @@ export class OrchestratorEngine {
   ): boolean {
     const step = this.store.getRunStep(action.stepId);
     if (!step || !canTransitionRunStep(step.state, action.state)) return false;
-    this.store.updateRunStep(step.id, { state: action.state, output: action.output });
-    // Counted whatever the wake policy is: the fixture path never reads it, and
-    // a run that later grows a Lead should not start from a stale count.
-    this.store.recordRunSettle(run.id);
-    if (run.policy.wakePolicy !== "none" && run.state === "running") {
-      if (canTransitionRun(run.state, "awaiting_lead")) {
-        this.store.setRunState(run.id, "awaiting_lead");
-      }
+    if (action.state === "failed") {
+      return this.failStep(run, step, action.output);
     }
-    return true;
+    const settled = this.service.settleOrchestrationStep({
+      runId: run.id,
+      stepId: step.id,
+      state: action.state,
+      output: action.output,
+    });
+    if (settled && step.sessionId) this.turnComplete.delete(step.sessionId);
+    return settled;
+  }
+
+  private failStep(
+    run: Run,
+    step: RunStep,
+    output: string,
+    patch: Pick<RunStep, "dispatchedAt"> | undefined = undefined,
+  ): boolean {
+    if (step.state === "failed" || !canTransitionRunStep(step.state, "failed")) {
+      return false;
+    }
+    const settled = this.service.settleOrchestrationStep({
+      runId: run.id,
+      stepId: step.id,
+      state: "failed",
+      output,
+      ...(patch ? { patch } : {}),
+    });
+    if (settled && step.sessionId) this.turnComplete.delete(step.sessionId);
+    return settled;
   }
 
   private stopSession(sessionId: string): void {
@@ -301,8 +431,17 @@ export class OrchestratorEngine {
     if (!lead || lead.state !== "idle") return false;
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
-    this.store.updateRun(run.id, { pendingPrompt: "" });
-    this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+    if (
+      !this.store.recordRunPromptDelivery(
+        run.id,
+        lead.id,
+        prompt,
+        new Date(nowMs).toISOString(),
+      )
+    ) {
+      this.promptedThisTick.delete(lead.id);
+      return false;
+    }
     this.service.dispatch(lead.nodeId, {
       type: "prompt",
       sessionId: lead.id,
@@ -323,8 +462,10 @@ export class OrchestratorEngine {
     if (!lead || lead.state !== "idle") return false;
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
-    this.store.recordRunWake(run.id);
-    this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+    if (!this.store.recordRunWakePrompt(run.id, lead.id, new Date(nowMs).toISOString())) {
+      this.promptedThisTick.delete(lead.id);
+      return false;
+    }
     this.service.dispatch(lead.nodeId, {
       type: "prompt",
       sessionId: lead.id,

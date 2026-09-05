@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from "fastify";
+import { z } from "zod";
 import {
   CreateSessionSchema,
   MAX_ATTACHMENTS_PER_PROMPT,
@@ -7,6 +8,7 @@ import {
   PromptSchema,
   RenameSessionSchema,
   ReorderSessionsSchema,
+  SESSION_NAME_MAX_LENGTH,
   SetSessionConfigSchema,
   base64Bytes,
   errorMessage,
@@ -18,6 +20,15 @@ import { configUnsupportedReason } from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
 
+const AdoptSessionSchema = CreateSessionSchema.pick({
+  placementId: true,
+  yolo: true,
+}).extend({
+  agentSessionId: z.string().min(1).max(500),
+  additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
+  name: z.string().max(SESSION_NAME_MAX_LENGTH).optional(),
+});
+
 /** Session lifecycle: create, prompt, resume, cancel, stop, dismiss. */
 export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
   app,
@@ -25,12 +36,20 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
 ) => {
   const { store } = service;
 
-  app.get("/api/sessions", async () => store.listSessions());
+  app.get("/api/sessions", async (request) => {
+    const sessions = store.listSessions();
+    return request.fleetNodeId
+      ? sessions.filter((session) => session.nodeId === request.fleetNodeId)
+      : sessions;
+  });
 
   app.post("/api/sessions", async (request, reply) => {
     const input = CreateSessionSchema.parse(request.body);
     const placement = store.getPlacement(input.placementId);
     if (!placement) return reply.code(404).send({ error: "Placement not found" });
+    if (request.fleetNodeId && placement.nodeId !== request.fleetNodeId) {
+      return reply.code(403).send({ error: "A node may only start its own sessions" });
+    }
     const result = service.createAndStartSession({
       placement,
       prompt: input.prompt,
@@ -43,6 +62,24 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
         ...(result.session ? { session: result.session } : {}),
       });
     }
+    return reply.code(202).send(result.session);
+  });
+
+  app.post("/api/sessions/adopt", async (request, reply) => {
+    const input = AdoptSessionSchema.parse(request.body);
+    const placement = store.getPlacement(input.placementId);
+    if (!placement) return reply.code(404).send({ error: "Placement not found" });
+    if (request.fleetNodeId && placement.nodeId !== request.fleetNodeId) {
+      return reply.code(403).send({ error: "A node may only resume its own sessions" });
+    }
+    const result = service.adoptAndResumeSession({
+      placement,
+      agentSessionId: input.agentSessionId,
+      additionalDirectories: input.additionalDirectories,
+      yolo: input.yolo ?? store.getDefaultYolo(),
+      ...(input.name === undefined ? {} : { name: input.name }),
+    });
+    if (!result.ok) return reply.code(result.status).send({ error: result.error });
     return reply.code(202).send(result.session);
   });
 
@@ -109,6 +146,9 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       }
       const session = store.getSession(id);
       if (!session) return reply.code(404).send({ error: "Session not found" });
+      if (session.stopRequested) {
+        return reply.code(409).send({ error: "Session is stopping" });
+      }
       if (session.state !== "idle") {
         return reply.code(409).send({ error: "Session must be idle" });
       }
@@ -190,9 +230,7 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (session.state !== "running") {
       return reply.code(409).send({ error: "Session is not running" });
     }
-    service.publishSession(
-      store.transitionSession(id, "cancelling", "Cancelling active turn"),
-    );
+    service.publishSession(service.beginSessionCancellation(id));
     const dispatched = service.dispatch(
       session.nodeId,
       { type: "cancel", sessionId: id },
@@ -209,20 +247,27 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (terminalSessionStates.has(session.state)) {
       return reply.code(200).send({ ok: true, alreadyTerminal: true });
     }
-    const dispatched = service.dispatch(
-      session.nodeId,
-      { type: "stop", sessionId: id },
-      { state: "stopped", activity: "Stopped while offline" },
-    );
+    if (session.stopRequested) {
+      return reply.code(200).send({ ok: true, alreadyStopping: true });
+    }
+    service.publishSession(store.setSessionControls(id, { stopRequested: true }));
+    const dispatched = service.dispatch(session.nodeId, {
+      type: "stop",
+      sessionId: id,
+    });
     return reply.code(dispatched.sent ? 202 : 200).send({ ok: true });
   });
 
   app.delete("/api/sessions/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!store.getSession(id)) {
+    const session = store.getSession(id);
+    if (!session) {
       return reply.code(404).send({ error: "Session not found" });
     }
     try {
+      if (terminalSessionStates.has(session.state)) {
+        service.resolveSessionPermissionRequests(id);
+      }
       store.deleteSession(id);
     } catch (error) {
       return reply
@@ -232,7 +277,16 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     return reply.code(204).send();
   });
 
-  app.delete("/api/sessions", async () => ({ removed: store.deleteEndedSessions() }));
+  app.delete("/api/sessions", async () => {
+    const before = store.listSessions();
+    const removed = store.deleteEndedSessions();
+    for (const session of before) {
+      if (!store.getSession(session.id)) {
+        service.resolveSessionPermissionRequests(session.id);
+      }
+    }
+    return { removed };
+  });
 
   app.post("/api/sessions/:id/permission", async (request, reply) => {
     const { id } = request.params as { id: string };

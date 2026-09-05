@@ -10,6 +10,7 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   NODE_NAME_SYNC_CAPABILITY,
   NodeToHostMessageSchema,
+  OUTBOX_ACK_CAPABILITY,
   SELF_UPDATE_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
   SESSION_CONFIG_CAPABILITY,
@@ -65,7 +66,13 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { EventOutbox } from "./outbox.js";
-import { closeQuietly, HOST_DIAL_TIMEOUT_MS, watchHostLiveness } from "./socket.js";
+import {
+  closeQuietly,
+  flushReconnectOutbox,
+  HOST_DIAL_TIMEOUT_MS,
+  reconnectFlushLog,
+  watchHostLiveness,
+} from "./socket.js";
 import { configServerPort, startConfigServer } from "./config-server.js";
 import {
   loadSettings,
@@ -97,6 +104,7 @@ const NODE_CAPABILITIES = [
   NODE_NAME_SYNC_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
   SESSION_CONFIG_CAPABILITY,
+  OUTBOX_ACK_CAPABILITY,
 ];
 const RECONNECT_DELAY_MS = 2_000;
 /**
@@ -342,13 +350,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
+  let outboxReconciliationPending = false;
+  let holdEventsForReconnectFlush = false;
   const router = new CommandRouter(
     factory,
     settings.maxSessions,
     (event) => {
       // Held rather than dropped when the Host is unreachable: the agent keeps
       // working through a Host restart, and these are the only record of it.
-      if (!sendEvent(event)) outbox.add(event);
+      if (!sendEvent(event)) {
+        outbox.add(event);
+        outboxReconciliationPending = true;
+      }
     },
     validateWorkspacePath,
     () => settings.hostUrl,
@@ -701,6 +714,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       auth.authProtocol === MUTUAL_AUTH_PROTOCOL
         ? openNodeChannel({ credentials: auth, dialedHostUrl: attemptUrl })
         : undefined;
+    let acknowledgeOutbox = false;
     // A dial that replaces one still in flight must not leave its watchdog
     // behind; the only socket worth watching is the one being opened here.
     releaseLiveness();
@@ -717,26 +731,45 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     });
 
     /** What this machine reports about itself, in whichever frame carries it. */
-    const inventory = () => ({
-      os: platform(),
-      arch: arch(),
-      version: VERSION,
-      revision: REVISION,
-      capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
-      agents: advertisedAgents,
-      maxSessions: settings.maxSessions,
-      homeDir: homedir(),
-      name: settings.nodeName,
-      // What the Host last told us it has. A difference from `name` is an
-      // operator edit here; a difference from the Host's row means the Host
-      // was renamed while this node was away, and the Host wins.
-      knownName: auth.name,
-      activeSessionIds: router.activeSessionIds,
-      // What each of those is doing. Without it the Host assumes idle, and a
-      // socket that drops mid-turn leaves the UI offering a composer over an
-      // agent that cannot take another prompt.
-      busySessionIds: router.busySessionIds,
-    });
+    const inventory = () => {
+      // Agents can finish during mutual authentication, after the socket opens
+      // but before `ready`. Include those events in the advertised replay batch.
+      const pendingOutbox = outboxReconciliationPending || outbox.size > 0;
+      const outboxFlush = pendingOutbox
+        ? outbox.prepareFlush(outboxReconciliationPending)
+        : undefined;
+      holdEventsForReconnectFlush = pendingOutbox;
+      return {
+        os: platform(),
+        arch: arch(),
+        version: VERSION,
+        revision: REVISION,
+        capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
+        agents: advertisedAgents,
+        maxSessions: settings.maxSessions,
+        homeDir: homedir(),
+        name: settings.nodeName,
+        // What the Host last told us it has. A difference from `name` is an
+        // operator edit here; a difference from the Host's row means the Host
+        // was renamed while this node was away, and the Host wins.
+        knownName: auth.name,
+        activeSessionIds: router.activeSessionIds,
+        // What each of those is doing. Without it the Host assumes idle, and a
+        // socket that drops mid-turn leaves the UI offering a composer over an
+        // agent that cannot take another prompt.
+        busySessionIds: router.busySessionIds,
+        pendingOutbox,
+        pendingOutboxCount: outboxFlush?.events.length ?? 0,
+        ...(outboxFlush
+          ? {
+              outboxFlush: {
+                flushId: outboxFlush.flushId,
+                eventCount: outboxFlush.events.length,
+              },
+            }
+          : {}),
+      };
+    };
 
     active.on("open", () => {
       stopLiveness = watchHostLiveness(active, {
@@ -752,7 +785,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         return;
       }
       if (auth.authProtocol !== "legacy-secret") return;
-      send({ type: "hello", nodeId: auth.nodeId, secret: auth.secret, ...inventory() });
+      sendOn(active, {
+        type: "hello",
+        nodeId: auth.nodeId,
+        secret: auth.secret,
+        ...inventory(),
+      });
     });
 
     /**
@@ -804,9 +842,49 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       }
       if (frame.value.type === "welcome") {
         welcomed = true;
+        acknowledgeOutbox = frame.value.acknowledgeOutbox;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
-        flushOutbox();
+        if (holdEventsForReconnectFlush) {
+          if (acknowledgeOutbox && !frame.value.reconcileAfterOutbox) {
+            errorLog(
+              "Host offered outbox acknowledgment without deferring reconciliation",
+            );
+            active.close(1008, "Invalid outbox acknowledgment handshake");
+            return;
+          }
+          flushOutbox(active, frame.value.reconcileAfterOutbox, acknowledgeOutbox);
+        } else {
+          void router.refreshMcpSessions();
+        }
+        return;
+      }
+      if (frame.value.type === "outbox_flush_ack") {
+        if (!acknowledgeOutbox || !holdEventsForReconnectFlush) {
+          errorLog("Host sent an unexpected outbox acknowledgment");
+          active.close(1008, "Unexpected outbox acknowledgment");
+          return;
+        }
+        const acknowledged = outbox.acknowledge(frame.value.flushId);
+        if (!acknowledged.acknowledged) {
+          errorLog("Host acknowledged an outbox batch that is not pending");
+          active.close(1008, "Outbox acknowledgment mismatch");
+          return;
+        }
+        log(
+          `Host acknowledged ${acknowledged.removed} buffered event(s)` +
+            (acknowledged.dropped > 0
+              ? `; ${acknowledged.dropped} older one(s) were dropped for capacity`
+              : ""),
+        );
+        if (outbox.size > 0) {
+          outbox.prepareFlush();
+          flushOutbox(active, true, true);
+          return;
+        }
+        outboxReconciliationPending = false;
+        holdEventsForReconnectFlush = false;
+        void router.refreshMcpSessions();
         return;
       }
       if (frame.value.type === "request_node_key") {
@@ -936,36 +1014,28 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     });
   }
 
-  function send(message: NodeToHostMessage): void {
-    NodeToHostMessageSchema.parse(message);
-    writeFrame(JSON.stringify(message));
+  function send(message: NodeToHostMessage): boolean {
+    const current = socket;
+    return current ? sendOn(current, message) : false;
+  }
+
+  function sendOn(target: WebSocket, message: NodeToHostMessage): boolean {
+    if (socket !== target || target.readyState !== WebSocket.OPEN) return false;
+    if (sealedConnection && !channel) return false;
+    const payload = JSON.stringify(NodeToHostMessageSchema.parse(message));
+    target.send(channel ? JSON.stringify(channel.seal(payload)) : payload);
+    return true;
   }
 
   /** Reports whether the event actually left, so the caller can hold it if not. */
   function sendEvent(event: SessionEvent): boolean {
-    return writeFrame(
-      JSON.stringify(NodeToHostMessageSchema.parse({ type: "event", event })),
-    );
+    if (holdEventsForReconnectFlush) return false;
+    const current = socket;
+    return current ? sendEventOn(current, event) : false;
   }
 
-  /**
-   * Puts one frame on the wire, sealed when there is a channel to seal it with.
-   *
-   * One door rather than a choice at each call site: a `send` that forgot to
-   * seal would be a command result or a transcript in the clear, and the whole
-   * point of the channel is that there is no path around it.
-   *
-   * Nothing leaves at all while a mutual handshake is still in flight. The
-   * heartbeat fires on its own timer, and a plaintext beat landing where the
-   * Host expects a proof would cost the connection every time the two coincided
-   * — so the frame is dropped, and events are reported as unsent so the outbox
-   * holds them for the welcome.
-   */
-  function writeFrame(payload: string): boolean {
-    if (socket?.readyState !== WebSocket.OPEN) return false;
-    if (sealedConnection && !channel) return false;
-    socket.send(channel ? JSON.stringify(channel.seal(payload)) : payload);
-    return true;
+  function sendEventOn(target: WebSocket, event: SessionEvent): boolean {
+    return sendOn(target, { type: "event", event });
   }
 
   /**
@@ -1000,14 +1070,49 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * Runs on `welcome` rather than on `open`, because the Host discards anything
    * that arrives before it has authenticated the hello.
    */
-  function flushOutbox(): void {
-    if (outbox.size === 0) return;
-    const held = outbox.size;
-    const { sent, dropped } = outbox.flush(sendEvent);
+  function flushOutbox(
+    active: WebSocket,
+    reconcileAfterOutbox: boolean,
+    acknowledge: boolean,
+  ): void {
+    const held = acknowledge ? (outbox.currentBatch?.events.length ?? 0) : outbox.size;
+    if (acknowledge) {
+      const result = flushReconnectOutbox(
+        outbox,
+        (event, position) =>
+          sendOn(active, { type: "event", event, outboxFlush: position }),
+        (message) => sendOn(active, message),
+        () => ({
+          activeSessionIds: router.activeSessionIds,
+          busySessionIds: router.busySessionIds,
+        }),
+      );
+      const summary = reconnectFlushLog(result, held);
+      if (summary?.level === "warn") warn(summary.message);
+      else if (summary) log(summary.message);
+      return;
+    }
+
+    const flushed = outbox.flush((event) => sendEventOn(active, event));
+    const reconciliationSent =
+      outbox.size === 0 &&
+      (!reconcileAfterOutbox ||
+        sendOn(active, {
+          type: "outbox_flushed",
+          activeSessionIds: router.activeSessionIds,
+          busySessionIds: router.busySessionIds,
+        }));
+    const result = { ...flushed, reconciliationSent };
     log(
-      `Delivered ${sent}/${held} event(s) buffered while the Host was unreachable` +
-        (dropped > 0 ? `; ${dropped} older one(s) were dropped for capacity` : ""),
+      `Delivered ${result.sent}/${held} event(s) buffered while the Host was unreachable` +
+        (result.dropped > 0
+          ? `; ${result.dropped} older one(s) were dropped for capacity`
+          : ""),
     );
+    if (outbox.size > 0 || !result.reconciliationSent) return;
+    outboxReconciliationPending = false;
+    holdEventsForReconnectFlush = false;
+    void router.refreshMcpSessions();
   }
 
   connect();

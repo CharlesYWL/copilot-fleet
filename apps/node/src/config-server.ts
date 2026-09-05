@@ -8,15 +8,29 @@ import {
   NodeBackupSchema,
   backupKind,
   errorMessage,
-  type NodeBackup,
 } from "@fleet/protocol";
-import type { LogEntry } from "@fleet/protocol/log-buffer";
-import { EditableSettingsSchema, type Settings } from "./settings.js";
-import type { Credentials } from "./config.js";
+import { EditableSettingsSchema } from "./settings.js";
 import { configAsset } from "./config-assets.js";
-import { FleetClient, type PlacementLike, type WorkspaceLike } from "./fleet-client.js";
-import { pickFolder as pickFolderDefault, type PickerResult } from "./pick-folder.js";
-import { inspectPath as inspectPathDefault, type PathCheck } from "./path-check.js";
+import { createSessionRouteHandler } from "./config-session-routes.js";
+import type {
+  ConfigReply,
+  ConfigRouter,
+  ConfigServerOptions,
+  FleetApi,
+} from "./config-server-types.js";
+import { FleetClient } from "./fleet-client.js";
+import { pickFolder as pickFolderDefault } from "./pick-folder.js";
+import { inspectPath as inspectPathDefault } from "./path-check.js";
+import { CopilotSessionDiscovery } from "./copilot-sessions.js";
+
+export type {
+  ConfigReply,
+  ConfigRouter,
+  ConfigServerOptions,
+  ConfigStatus,
+  FleetApi,
+  SessionDiscoveryApi,
+} from "./config-server-types.js";
 
 /** An id turns create into update; the page uses one form for both. */
 const WorkspaceInputSchema = z.object({
@@ -31,72 +45,8 @@ const PlacementInputSchema = z.object({
   localPath: z.string().min(1).max(4096),
 });
 
-export type ConfigStatus = {
-  nodeId: string;
-  version: string;
-  connected: boolean;
-  activeSessions: number;
-  mockAgent: boolean;
-  /**
-   * The dev tunnel this node reaches the Host through, when it uses one.
-   *
-   * Present so the page can offer a rebuild only where one means something. A
-   * node dialing the Host directly has no tunnel to rebuild, and a button that
-   * cannot work is worse than no button.
-   */
-  devTunnel?: { id: string; url: string };
-};
-
-/** The slice of {@link FleetClient} the config endpoints use, so tests can
- * stand in for it without a Host to talk to. */
-export type FleetApi = {
-  listWorkspaces: () => Promise<WorkspaceLike[]>;
-  listOwnPlacements: () => Promise<PlacementLike[]>;
-  createWorkspace: (name: string, description: string) => Promise<WorkspaceLike>;
-  updateWorkspace: (
-    id: string,
-    name: string,
-    description: string,
-  ) => Promise<WorkspaceLike>;
-  createOwnPlacement: (workspaceId: string, localPath: string) => Promise<PlacementLike>;
-  updateOwnPlacementPath: (id: string, localPath: string) => Promise<PlacementLike>;
-};
-
-export type ConfigServerOptions = {
-  getSettings: () => Settings;
-  getStatus: () => ConfigStatus;
-  applySettings: (settings: Settings) => Promise<void>;
-  getCredentials: () => Credentials | undefined;
-  applyBackup: (archive: NodeBackup) => Promise<void>;
-  log: (message: string) => void;
-  /**
-   * Rebuilds the dev tunnel forward. Absent when this node does not use one.
-   *
-   * The node's own page is the only place this can live. A node whose tunnel
-   * died cannot reach the Host, so the Host's UI cannot reach it either — the
-   * one screen guaranteed to still work is the one served from loopback on the
-   * machine with the problem.
-   */
-  rebuildDevTunnel?: () => void;
-  /** Recent log lines, newest last, for the page's diagnostics view. */
-  recentLogs?: () => LogEntry[];
-  /** Resolved by the caller so a command-line flag can outrank the variable. */
-  port?: number;
-  fleet?: FleetApi;
-  pickFolder?: (start: string) => Promise<PickerResult>;
-  inspectPath?: (path: string) => PathCheck;
-};
-
-export type ConfigReply = { status: number; body: unknown };
-
 /** A handler answers one method+path; the body arrives already read. */
 type Handler = (body: string) => Promise<ConfigReply>;
-
-export type ConfigRouter = (
-  method: string,
-  url: string,
-  body: string,
-) => Promise<ConfigReply>;
 
 /**
  * A node executes arbitrary commands, so anything that can repoint it at a
@@ -244,6 +194,13 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
     });
   const pickFolder = options.pickFolder ?? pickFolderDefault;
   const inspectPath = options.inspectPath ?? inspectPathDefault;
+  const discovery =
+    options.sessionDiscovery ??
+    new CopilotSessionDiscovery({
+      getCopilotCommand: () => options.getSettings().copilotCommand,
+      getContextTier: () => options.getSettings().contextTier,
+    });
+  const sessionRoute = createSessionRouteHandler(fleet, discovery);
   const state = (): ConfigReply =>
     ok({ settings: options.getSettings(), status: options.getStatus() });
 
@@ -380,11 +337,13 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
   ]);
 
   return async (method, url, body) => {
-    // Query strings belong to the page, not to the route key.
-    const pathname = url.split("?")[0] ?? url;
-    const handler = routes.get(`${method} ${pathname}`);
-    if (!handler) return { status: 404, body: { error: "Not found" } };
     try {
+      const sessionReply = await sessionRoute(method, url, body);
+      if (sessionReply) return sessionReply;
+      // Query strings belong to the page, not to the route key.
+      const pathname = url.split("?")[0] ?? url;
+      const handler = routes.get(`${method} ${pathname}`);
+      if (!handler) return { status: 404, body: { error: "Not found" } };
       return await handler(body);
     } catch (error) {
       const message = errorMessage(error);

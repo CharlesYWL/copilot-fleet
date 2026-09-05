@@ -1,4 +1,11 @@
 import type WebSocket from "ws";
+import {
+  NodeToHostMessageSchema,
+  type NodeToHostMessage,
+  type OutboxFlushId,
+  type SessionEvent,
+} from "@fleet/protocol";
+import type { EventOutbox, OutboxFlush } from "./outbox.js";
 
 /**
  * How long a dial may sit in the opening handshake before it is abandoned.
@@ -51,6 +58,108 @@ export type LivenessSocket = {
 
 /** `ws`'s OPEN, spelled out so the watchdog needs nothing from the class. */
 const SOCKET_OPEN = 1;
+
+type OutboxFlushedMessage = Extract<NodeToHostMessage, { type: "outbox_flushed" }>;
+
+export type ReconnectInventory = {
+  activeSessionIds: readonly string[];
+  busySessionIds: readonly string[];
+};
+
+export type ReconnectFlush = OutboxFlush & {
+  flushId?: OutboxFlushId;
+  reconciliationSent: boolean;
+};
+
+export type ReconnectFlushLog = {
+  level: "info" | "warn";
+  message: string;
+};
+
+export function reconnectFlushLog(
+  result: Pick<ReconnectFlush, "sent" | "reconciliationSent">,
+  held: number,
+): ReconnectFlushLog | undefined {
+  if (result.sent > 0 || result.reconciliationSent) {
+    return {
+      level: "info",
+      message: `Sent ${result.sent}/${held} buffered event(s); awaiting Host acknowledgment`,
+    };
+  }
+  return held > 0
+    ? {
+        level: "warn",
+        message: `Could not send any of ${held} buffered event(s); the batch is retained for the next connection`,
+      }
+    : undefined;
+}
+
+export function sendNodeMessage(
+  current: WebSocket | undefined,
+  target: WebSocket,
+  message: NodeToHostMessage,
+): boolean {
+  if (current !== target || target.readyState !== SOCKET_OPEN) return false;
+  const parsed = NodeToHostMessageSchema.parse(message);
+  target.send(JSON.stringify(parsed));
+  return true;
+}
+
+/**
+ * Flushes buffered events before sending the inventory that unlocks Host
+ * reconciliation. If either send stops accepting frames, the final inventory
+ * is withheld so a partial flush cannot falsely settle the session.
+ */
+export function flushReconnectOutbox(
+  outbox: EventOutbox,
+  sendEvent: (
+    event: SessionEvent,
+    position: {
+      flushId: OutboxFlushId;
+      eventCount: number;
+      eventIndex: number;
+    },
+  ) => boolean,
+  sendReconciliation: (message: OutboxFlushedMessage) => boolean,
+  inventory: () => ReconnectInventory,
+): ReconnectFlush {
+  const batch = outbox.currentBatch;
+  if (!batch) return { sent: 0, dropped: 0, reconciliationSent: false };
+  let sent = 0;
+  for (const [eventIndex, event] of batch.events.entries()) {
+    if (
+      !sendEvent(event, {
+        flushId: batch.flushId,
+        eventCount: batch.events.length,
+        eventIndex,
+      })
+    ) {
+      return {
+        flushId: batch.flushId,
+        sent,
+        dropped: batch.dropped,
+        reconciliationSent: false,
+      };
+    }
+    sent += 1;
+  }
+  const current = inventory();
+  const reconciliationSent = sendReconciliation({
+    type: "outbox_flushed",
+    activeSessionIds: [...current.activeSessionIds],
+    busySessionIds: [...current.busySessionIds],
+    outboxFlush: {
+      flushId: batch.flushId,
+      eventCount: batch.events.length,
+    },
+  });
+  return {
+    flushId: batch.flushId,
+    sent,
+    dropped: batch.dropped,
+    reconciliationSent,
+  };
+}
 
 export type LivenessOptions = {
   intervalMs?: number;

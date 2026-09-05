@@ -32,6 +32,7 @@ const run = (overrides: Partial<Run> = {}): Run => ({
   settleSeq: 0,
   wakeSeq: 0,
   emptyWakeCount: 0,
+  reviewSeq: 0,
   createdAt: ISO,
   updatedAt: ISO,
   ...overrides,
@@ -269,7 +270,7 @@ describe("orchestrator views", () => {
   it("keeps a stopped conversation available to resume or dismiss", () => {
     const onResumeOrchestrator = vi.fn();
     const onDismissOrchestrator = vi.fn();
-    page("stage", vi.fn(), undefined, {
+    page("stage", vi.fn(), models([run({ state: "cancelled" })]), {
       conversation: conversation({ state: "stopped" }),
       onResumeOrchestrator,
       onDismissOrchestrator,
@@ -285,6 +286,33 @@ describe("orchestrator views", () => {
 
     expect(onResumeOrchestrator).toHaveBeenCalled();
     expect(onDismissOrchestrator).toHaveBeenCalled();
+  });
+
+  it("offers explicit recovery when an unavailable node cannot acknowledge Stop", () => {
+    page("stage", vi.fn(), undefined, {
+      conversation: conversation({ state: "offline", stopRequested: true }),
+    });
+
+    const stopping = screen.getByRole("button", {
+      name: "Mark orchestrator stopped",
+    });
+    expect(stopping.hasAttribute("disabled")).toBe(false);
+    expect(
+      screen
+        .getAllByRole("button", { name: "New task" })
+        .every((button) => button.hasAttribute("disabled")),
+    ).toBe(true);
+    expect(screen.queryByRole("button", { name: "Resume orchestrator" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
+  });
+
+  it("still offers Stop when the lead ended before its owned work", () => {
+    page("stage", vi.fn(), undefined, {
+      conversation: conversation({ state: "failed" }),
+    });
+
+    expect(screen.getByRole("button", { name: "Stop orchestrator" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
   });
 
   it("puts what needs a person at the top of its column", () => {
@@ -508,6 +536,7 @@ describe("task detail", () => {
     const firstModel = models([run({ id: runId })], {
       [runId]: [firstFailure, resolvedLater],
     })[0]!;
+    const onDismissFailure = vi.fn();
     const props = {
       model: firstModel,
       notes: [],
@@ -519,12 +548,14 @@ describe("task detail", () => {
       onArchive: vi.fn().mockResolvedValue(true),
       onReopen: vi.fn().mockResolvedValue(true),
       onDelete: vi.fn().mockResolvedValue(true),
+      onDismissFailure,
     };
 
     const firstView = wrap(<OrchestratorTaskDetail {...props} />);
     expect(screen.getByText("A step failed")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Dismiss failed step warning" }));
     expect(screen.queryByText("A step failed")).toBeNull();
+    expect(onDismissFailure).toHaveBeenCalledOnce();
 
     firstView.unmount();
     const reopenedView = wrap(<OrchestratorTaskDetail {...props} />);

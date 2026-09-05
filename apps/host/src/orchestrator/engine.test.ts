@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import { canTransition } from "@fleet/protocol";
@@ -122,6 +122,21 @@ function setup({ attach = true, maxSessions = 4 } = {}) {
 }
 
 describe("OrchestratorEngine", () => {
+  it("skips completion lookups for sessions outside the current run", () => {
+    const { store, engine, placement, planned } = setup();
+    const unrelated = store.createSession(placement, "unrelated");
+    const run = planned([
+      { stepKey: "audit", title: "Audit", prompt: "audit it", category: "explore" },
+    ]);
+    const stepLookup = vi.spyOn(store, "getRunStepBySession");
+    const completionLookup = vi.spyOn(store, "getSessionTurnCompletion");
+
+    engine.tickRun(run.id);
+
+    expect(stepLookup).not.toHaveBeenCalledWith(unrelated.id);
+    expect(completionLookup).not.toHaveBeenCalledWith(unrelated.id);
+  });
+
   it("writes the receipt before the command, and owns the session it starts", () => {
     const { store, engine, commands, planned } = setup();
     const run = planned([
@@ -259,6 +274,104 @@ describe("OrchestratorEngine", () => {
     // Long past the dispatch deadline, on a node that is plainly reachable.
     engine.tickRun(run.id, Date.now() + 10 * 60 * 1000);
     expect(store.listRunSteps(run.id)[0]?.state).toBe("failed");
+  });
+
+  it("creates one failed-step notification per attempt, including resume failure", () => {
+    const { store, engine, planned } = setup();
+    const run = planned([
+      { stepKey: "audit", title: "Audit", prompt: "audit it", category: "explore" },
+    ]);
+    engine.tickRun(run.id);
+    const first = store.listRunSteps(run.id)[0]!;
+    const session = store.getSession(first.sessionId)!;
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "failed", "raw failure output");
+
+    engine.tickRun(run.id);
+    engine.tickRun(run.id);
+    expect(store.listNotifications().notifications).toMatchObject([
+      {
+        kind: "orchestration_step_failure",
+        data: { runId: run.id, stepId: first.id, attempts: 1 },
+      },
+    ]);
+    expect(JSON.stringify(store.listNotifications().notifications[0])).not.toContain(
+      "raw failure output",
+    );
+
+    store.setRunState(run.id, "running");
+    const retried = store.retryRunStepInSession(
+      run.id,
+      {
+        stepKey: first.stepKey,
+        title: first.title,
+        prompt: "retry privately",
+        category: first.category,
+        placementId: first.placementId,
+      },
+      session.id,
+      store.maxEventSequence(session.id),
+    );
+    expect(retried.attempts).toBe(2);
+
+    // The old session has no ACP id, so resume fails through the other engine
+    // path. It must use the same producer and a new attempt identity.
+    engine.tickRun(run.id);
+    engine.tickRun(run.id);
+
+    const notifications = store.listNotifications().notifications;
+    expect(notifications).toHaveLength(2);
+    expect(
+      notifications.map((notification) => notification.data.attempts).sort(),
+    ).toEqual([1, 2]);
+    expect(
+      new Set(notifications.map((notification) => notification.sourceKey)).size,
+    ).toBe(2);
+  });
+
+  it("rolls back failed-step settlement when its notification insert fails", () => {
+    const { store, service, engine, planned } = setup();
+    const run = planned([
+      { stepKey: "audit", title: "Audit", prompt: "audit it", category: "explore" },
+    ]);
+    engine.tickRun(run.id);
+    const starting = store.listRunSteps(run.id)[0]!;
+    const session = store.getSession(starting.sessionId)!;
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "running");
+    engine.tickRun(run.id);
+    const running = store.getRunStep(starting.id)!;
+    expect(running.state).toBe("running");
+    service.handleEvent({
+      eventId: "completion-receipt",
+      sessionId: session.id,
+      sequence: 1,
+      type: "turn_complete",
+      payload: {},
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(session.id, "failed", "worker failed");
+    const beforeRun = store.getRun(run.id)!;
+    const insert = vi.spyOn(store, "insertNotification").mockImplementationOnce(() => {
+      throw new Error("injected notification insert failure");
+    });
+
+    expect(() => engine.tickRun(run.id)).toThrow("injected notification insert failure");
+    expect(store.getRunStep(running.id)?.state).toBe("running");
+    expect(store.getRun(run.id)).toMatchObject({
+      state: beforeRun.state,
+      settleSeq: beforeRun.settleSeq,
+      wakeSeq: beforeRun.wakeSeq,
+    });
+    expect(store.getSessionTurnCompletion(session.id)).toBeDefined();
+    expect(store.listNotifications().notifications).toEqual([]);
+
+    insert.mockRestore();
+    engine.tickRun(run.id);
+    expect(store.getRunStep(running.id)?.state).toBe("failed");
+    expect(store.getRun(run.id)?.settleSeq).toBe(beforeRun.settleSeq + 1);
+    expect(store.getSessionTurnCompletion(session.id)).toBeUndefined();
+    expect(store.listNotifications().notifications).toHaveLength(1);
   });
 });
 

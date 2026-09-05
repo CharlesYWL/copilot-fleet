@@ -31,7 +31,7 @@ const useStyles = makeStyles({
   },
 });
 
-type SettingsTab =
+export type SettingsTab =
   "general" | "security" | "tunnel" | "nodes" | "workspaces" | "diagnostics";
 
 type SettingsPanelProps = {
@@ -42,6 +42,8 @@ type SettingsPanelProps = {
   sessions: FleetSession[];
   hostRevision: string;
   nodeUpdates: NodeUpdateProgress;
+  selectedTab?: SettingsTab;
+  onSelectedTabChange?: (tab: SettingsTab) => void;
 };
 
 /**
@@ -51,7 +53,12 @@ type SettingsPanelProps = {
  */
 export const SettingsPanel = (props: SettingsPanelProps) => {
   const styles = useStyles();
-  const [tab, setTab] = useState<SettingsTab>("general");
+  const [internalTab, setInternalTab] = useState<SettingsTab>("general");
+  const tab = props.selectedTab ?? internalTab;
+  const setTab = (next: SettingsTab) => {
+    setInternalTab(next);
+    props.onSelectedTabChange?.(next);
+  };
 
   return (
     <div className={styles.root}>

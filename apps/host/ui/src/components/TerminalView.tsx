@@ -54,6 +54,7 @@ import {
   isResumableSession,
   terminalSessionStates,
   type FleetSession,
+  type SessionState,
   type SessionEvent,
   type PromptAttachment,
 } from "@fleet/protocol";
@@ -177,6 +178,19 @@ const useStyles = makeStyles({
       paddingLeft: 0,
       paddingRight: 0,
     },
+  },
+  stopWarning: {
+    flexShrink: 0,
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "9px 18px",
+    borderBottom: `1px solid ${statusVisuals.attention.border}`,
+    background: statusVisuals.attention.surface,
+    color: statusVisuals.attention.foreground,
+    fontSize: tokens.fontSizeBase200,
+    lineHeight: tokens.lineHeightBase300,
+    "@media (max-width: 700px)": { padding: "9px 12px" },
   },
   streamArea: {
     position: "relative",
@@ -530,6 +544,7 @@ type TerminalViewProps = {
   onResume?: () => void;
   onClose?: () => void;
   onConfigChange?: (configId: string, value: string) => void;
+  notificationPreferenceControl?: ReactNode;
   draft: SessionDraft;
   onDraftChange: (update: (current: SessionDraft) => SessionDraft) => void;
 };
@@ -546,6 +561,7 @@ export const TerminalView = ({
   onResume,
   onClose,
   onConfigChange,
+  notificationPreferenceControl,
   draft,
   onDraftChange,
 }: TerminalViewProps) => {
@@ -717,10 +733,12 @@ export const TerminalView = ({
     setAttachError(undefined);
   }, [session.id]);
 
-  const canPrompt = session.state === "idle";
+  const canPrompt = session.state === "idle" && !session.stopRequested;
   const isEnded = terminalSessionStates.has(session.state);
   // Offline and terminal sessions can be re-attached via Copilot's session/load.
-  const canResume = Boolean(onResume) && isResumableSession(session);
+  const canResume =
+    Boolean(onResume) && !session.stopRequested && isResumableSession(session);
+  const canConfirmStopped = session.stopRequested && session.state === "offline";
 
   const query = slashQuery(prompt);
   const matches = useMemo(
@@ -940,6 +958,7 @@ export const TerminalView = ({
             {session.currentActivity}
           </Text>
         </div>
+        {notificationPreferenceControl}
         <Button
           className={styles.headerAction}
           appearance="subtle"
@@ -981,14 +1000,26 @@ export const TerminalView = ({
         ) : (
           <Button
             className={styles.headerAction}
-            appearance="subtle"
+            appearance="secondary"
             size="small"
             icon={<Stop20Regular />}
             onClick={onStop}
-            aria-label="Stop session"
-            title="Stop session"
+            disabled={Boolean(session.stopRequested && !canConfirmStopped)}
+            aria-label={canConfirmStopped ? "Mark stopped" : "Stop session"}
+            {...(canConfirmStopped
+              ? {
+                  title:
+                    "Confirm that the unavailable node is no longer running this session",
+                }
+              : { title: "Stop session" })}
           >
-            <span className={styles.headerActionLabel}>Stop</span>
+            <span className={styles.headerActionLabel}>
+              {canConfirmStopped
+                ? "Mark stopped"
+                : session.stopRequested
+                  ? "Stopping"
+                  : "Stop"}
+            </span>
           </Button>
         )}
         {onClose && (
@@ -1001,6 +1032,17 @@ export const TerminalView = ({
           />
         )}
       </div>
+
+      {canConfirmStopped && (
+        <div className={styles.stopWarning} role="alert">
+          <Warning16Regular aria-hidden="true" />
+          <span>
+            <strong>Stop is waiting for the offline node {session.nodeName}.</strong>{" "}
+            Reconnect that node so it can acknowledge the request, or choose Mark stopped
+            if you know its agent process is no longer running.
+          </span>
+        </div>
+      )}
 
       {permission && (
         <PermissionBanner
@@ -1015,7 +1057,9 @@ export const TerminalView = ({
           {blocks.length === 0 ? (
             <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
           ) : (
-            blocks.map((block) => <TerminalLine block={block} key={block.key} />)
+            blocks.map((block) => (
+              <TerminalLine block={block} sessionState={session.state} key={block.key} />
+            ))
           )}
           {session.state === "running" && <div className={styles.working}>working…</div>}
         </div>
@@ -1090,9 +1134,11 @@ export const TerminalView = ({
           resize="none"
           aria-label="Follow-up prompt"
           placeholder={
-            canPrompt
-              ? "Send a follow-up prompt. Type / for commands, paste or attach files · Enter sends"
-              : "Available when the session is idle"
+            session.stopRequested
+              ? "Stopping this session"
+              : canPrompt
+                ? "Send a follow-up prompt. Type / for commands, paste or attach files · Enter sends"
+                : "Available when the session is idle"
           }
         />
         {attachError ? (
@@ -1167,7 +1213,13 @@ export const TerminalView = ({
  * be bordered cards with a timestamp column, which meant a turn that ran ten
  * tools pushed its own answer off the screen.
  */
-const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBlock }) {
+const TerminalLine = memo(function TerminalLine({
+  block,
+  sessionState,
+}: {
+  block: TerminalBlock;
+  sessionState: SessionState;
+}) {
   const styles = useStyles();
   const time = formatTime(block.createdAt);
 
@@ -1243,21 +1295,30 @@ const TerminalLine = memo(function TerminalLine({ block }: { block: TerminalBloc
 
   if (block.kind === "tool") {
     const failed = block.status === "failed";
-    const running = block.status ? runningStatuses.has(block.status) : false;
+    const running =
+      (sessionState === "running" || sessionState === "cancelling") &&
+      Boolean(block.status && runningStatuses.has(block.status));
     const icon = running ? (
-      <SpinnerIos16Regular className={styles.spin} />
+      <SpinnerIos16Regular className={styles.spin} aria-label="Tool running" />
     ) : (
       (toolKindIcons[block.toolKind ?? ""] ?? kindIcons.tool)
     );
     return (
-      <StepRow
-        icon={icon}
-        title={block.text}
-        detail={block.detail}
-        time={time}
-        color={failed ? terminal.error : running ? terminal.tool : undefined}
-        failed={failed}
-      />
+      <div>
+        <StepRow
+          icon={icon}
+          title={block.text}
+          detail={block.detail}
+          time={time}
+          color={failed ? terminal.error : running ? terminal.tool : undefined}
+          failed={failed}
+        />
+        {block.body && (block.status === "completed" || block.status === "failed") ? (
+          <div className={styles.message}>
+            <MarkdownBody text={block.body} copyable />
+          </div>
+        ) : null}
+      </div>
     );
   }
 

@@ -3,7 +3,7 @@ import type { FleetSession, NodeToHostMessage } from "@fleet/protocol";
 import {
   heartbeatSessionsBelongTo,
   isHeartbeatStale,
-  nodeMessageBelongsTo,
+  nodeMessageOwnership,
 } from "./node-messages.js";
 
 const sessions = new Map([
@@ -32,15 +32,34 @@ describe("authenticated node message ownership", () => {
       ok: true,
       fatal: false,
     } satisfies NodeToHostMessage;
-    expect(nodeMessageBelongsTo("node-a", event, lookup)).toBe(false);
-    expect(nodeMessageBelongsTo("node-a", result, lookup)).toBe(false);
+    expect(nodeMessageOwnership("node-a", event, lookup)).toBe("foreign");
+    expect(nodeMessageOwnership("node-a", result, lookup)).toBe("foreign");
     expect(
-      nodeMessageBelongsTo(
+      nodeMessageOwnership(
         "node-a",
         { ...event, event: { ...event.event, sessionId: "owned" } },
         lookup,
       ),
-    ).toBe(true);
+    ).toBe("owned");
+    expect(
+      nodeMessageOwnership(
+        "node-a",
+        { ...event, event: { ...event.event, sessionId: "missing" } },
+        lookup,
+      ),
+    ).toBe("missing");
+    expect(
+      nodeMessageOwnership(
+        "node-a",
+        {
+          type: "heartbeat",
+          activeSessionIds: [],
+          busySessionIds: [],
+          sentAt: new Date().toISOString(),
+        },
+        lookup,
+      ),
+    ).toBe("unscoped");
   });
 
   it("rejects foreign heartbeat inventory and detects stale nodes", () => {

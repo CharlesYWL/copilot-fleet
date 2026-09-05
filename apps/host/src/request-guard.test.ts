@@ -39,13 +39,16 @@ describe("nodeReachable", () => {
     expect(nodeReachable("GET", "/api/placements")).toBe(true);
     expect(nodeReachable("POST", "/api/placements")).toBe(true);
     expect(nodeReachable("patch", "/api/placements/p1")).toBe(true);
+    expect(nodeReachable("GET", "/api/sessions")).toBe(true);
+    expect(nodeReachable("POST", "/api/sessions")).toBe(true);
+    expect(nodeReachable("POST", "/api/sessions/adopt")).toBe(true);
   });
 
   it("keeps a node out of everything else, including the fleet's transcripts", () => {
     expect(nodeReachable("GET", "/api/snapshot")).toBe(false);
     expect(nodeReachable("GET", "/api/enrollment")).toBe(false);
     expect(nodeReachable("GET", "/api/backup")).toBe(false);
-    expect(nodeReachable("POST", "/api/sessions")).toBe(false);
+    expect(nodeReachable("GET", "/api/sessions/s1/events")).toBe(false);
     expect(nodeReachable("DELETE", "/api/workspaces/w1")).toBe(false);
     // Deeper paths must not ride in on a prefix.
     expect(nodeReachable("GET", "/api/placements/p1/sessions")).toBe(false);
@@ -422,6 +425,49 @@ describe("guarded server", () => {
       expect(own.statusCode).toBe(200);
     });
 
+    it("cannot create or adopt a session on another node's placement", async () => {
+      const box = await enroll("box");
+      const other = await enroll("other");
+      const workspace = await app.inject({
+        method: "POST",
+        url: "/api/workspaces",
+        headers: box,
+        payload: { name: "repo", description: "" },
+      });
+      const placement = await app.inject({
+        method: "POST",
+        url: "/api/placements",
+        headers: box,
+        payload: {
+          workspaceId: (workspace.json() as { id: string }).id,
+          nodeId: box.nodeId,
+          localPath: "/tmp/repo",
+        },
+      });
+      const placementId = (placement.json() as { id: string }).id;
+
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/sessions",
+            headers: other,
+            payload: { placementId, prompt: "hijack" },
+          })
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/sessions/adopt",
+            headers: other,
+            payload: { placementId, agentSessionId: "acp-secret" },
+          })
+        ).statusCode,
+      ).toBe(403);
+    });
+
     /**
      * A node relays the catalog for its own config page, and that page only
      * ever shows this machine's checkouts. Handing it the whole fleet's
@@ -436,6 +482,7 @@ describe("guarded server", () => {
       const workspace = await app.inject({
         method: "POST",
         url: "/api/workspaces",
+
         headers: { cookie, "x-csrf-token": csrfToken },
         payload: { name: "repo", description: "" },
       });

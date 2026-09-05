@@ -8,12 +8,15 @@ import {
   NodeFirstFrameSchema,
   NodeProofSchema,
   NodeToHostMessageSchema,
+  OUTBOX_ACK_CAPABILITY,
   SUPERSEDED_CLOSE_CODE,
   decodeFrame,
   resolveNodeName,
+  type OutboxEventPosition,
+  type OutboxFlushIdentity,
 } from "@fleet/protocol";
 import type { AuthenticatedChannel } from "@fleet/protocol/node-auth";
-import { heartbeatSessionsBelongTo, nodeMessageBelongsTo } from "../node-messages.js";
+import { heartbeatSessionsBelongTo, nodeMessageOwnership } from "../node-messages.js";
 import type { FleetService, NodeLink } from "../fleet-service.js";
 import type { FleetNode, NodeReady, NodeToHostMessage } from "@fleet/protocol";
 import type { HostIdentityService } from "../auth/host-identity.js";
@@ -99,6 +102,14 @@ export function registerNodeGateway(
 ): void {
   app.get("/ws/node", { websocket: true }, (socket: WebSocket) => {
     let authenticatedNodeId: string | undefined;
+    let awaitingOutboxFlush = false;
+    let acknowledgeOutbox = false;
+    let outboxFlush: TrackedOutboxFlush | undefined;
+
+    const rejectOutbox = (nodeId: string, reason: string): void => {
+      app.log.warn({ nodeId, reason }, "Rejected invalid outbox flush");
+      socket.close(1008, "Invalid outbox flush");
+    };
 
     /**
      * Wraps a frame handler so a throw ends one connection and nothing else.
@@ -231,100 +242,244 @@ export function registerNodeGateway(
       // Welcome precedes reconciliation because reconciliation can dispatch
       // commands, and a Node should not be told to resume a session before it
       // has been told its hello was accepted.
-      service.send(input.link, { type: "welcome", nodeId });
-      service.publishSessions(
-        service.reconcile(nodeId, activeSessionIds, inventory.busySessionIds),
-      );
+      acknowledgeOutbox = inventory.capabilities.includes(OUTBOX_ACK_CAPABILITY);
+      awaitingOutboxFlush =
+        inventory.pendingOutbox ||
+        inventory.pendingOutboxCount > 0 ||
+        inventory.outboxFlush !== undefined;
+      if (acknowledgeOutbox && awaitingOutboxFlush) {
+        if (
+          !inventory.outboxFlush ||
+          inventory.outboxFlush.eventCount !== inventory.pendingOutboxCount
+        ) {
+          rejectOutbox(nodeId, "node inventory did not identify its batch");
+          return;
+        }
+        outboxFlush = trackOutboxFlush(inventory.outboxFlush);
+      } else if (inventory.outboxFlush) {
+        rejectOutbox(nodeId, "node inventory identified a batch it did not advertise");
+        return;
+      }
+      service.send(input.link, {
+        type: "welcome",
+        nodeId,
+        reconcileAfterOutbox: awaitingOutboxFlush,
+        acknowledgeOutbox,
+      });
+      if (!awaitingOutboxFlush) {
+        try {
+          service.reconcile(nodeId, activeSessionIds, inventory.busySessionIds);
+        } catch (error) {
+          app.log.error({ nodeId, error }, "Failed initial node reconciliation");
+          socket.close(1011, "Failed to reconcile node");
+          return;
+        }
+      }
 
       const onNodeMessage = (raw: unknown) => {
         const message = input.read(String(raw));
         if (!message) return;
-        if (
-          !nodeMessageBelongsTo(nodeId, message, (id) => service.store.getSession(id))
-        ) {
+        const ownership = nodeMessageOwnership(nodeId, message, (id) =>
+          service.store.getSession(id),
+        );
+        const missingReplayEvent =
+          ownership === "missing" &&
+          message.type === "event" &&
+          message.outboxFlush !== undefined;
+        if (ownership === "foreign" || (ownership === "missing" && !missingReplayEvent)) {
           app.log.warn(
-            { nodeId, messageType: message.type },
+            { nodeId, messageType: message.type, ownership },
             "Rejected cross-node message",
           );
           socket.close(1008, "Session ownership mismatch");
           return;
         }
-        if (message.type === "heartbeat") {
-          if (
-            !heartbeatSessionsBelongTo(nodeId, message.activeSessionIds, (id) =>
-              service.store.getSession(id),
-            )
-          ) {
-            app.log.warn({ nodeId }, "Rejected cross-node heartbeat inventory");
-            socket.close(1008, "Session ownership mismatch");
+        try {
+          if (message.type === "heartbeat") {
+            if (
+              !inventoryBelongsToNode(
+                nodeId,
+                message.activeSessionIds,
+                message.busySessionIds,
+                (id) => service.store.getSession(id),
+              )
+            ) {
+              app.log.warn({ nodeId }, "Rejected cross-node heartbeat inventory");
+              socket.close(1008, "Session ownership mismatch");
+              return;
+            }
+            service.recordPresence(
+              nodeId,
+              message.activeSessionIds,
+              message.busySessionIds,
+              !awaitingOutboxFlush,
+            );
             return;
           }
-          service.recordPresence(
-            nodeId,
-            message.activeSessionIds,
-            message.busySessionIds,
-          );
-          return;
-        }
-        if (message.type === "event") {
-          service.handleEvent(message.event);
-          return;
-        }
-        if (message.type === "node_key") {
-          /*
-           * Ignored, and deliberately not answered.
-           *
-           * The Host used to stage this key and acknowledge it, which is how a
-           * legacy machine migrated without being visited. That exchange is
-           * gone: a legacy Node has already disclosed its shared secret to
-           * whatever terminated its connection, so the HMAC that was supposed
-           * to prove the Host is computable by that relay too — and a Node
-           * pinning whichever key arrived would have been owned permanently by
-           * whoever answered. There is no version of this exchange that
-           * authenticates the Host to a machine whose only credential is
-           * already out, so the key a Node offers is recorded nowhere.
-           *
-           * Ignored rather than fatal: a machine running the older build still
-           * offers one unprompted, and dropping its connection for that would
-           * strand it before the operator has had a chance to re-enrol it.
-           */
-          app.log.warn(
-            { nodeId },
-            "Ignored a Node key offered over a legacy connection; migration needs a fresh Connect command",
-          );
-          return;
-        }
-        if (message.type === "update_status") {
-          app.log.info(
-            {
+          if (message.type === "outbox_flushed") {
+            if (message.outboxFlush) {
+              const flush = outboxFlush;
+              if (
+                !acknowledgeOutbox ||
+                !awaitingOutboxFlush ||
+                !flush ||
+                !sameOutboxFlush(flush, message.outboxFlush) ||
+                flush.nextEventIndex !== flush.eventCount ||
+                !inventoryBelongsToNode(
+                  nodeId,
+                  message.activeSessionIds,
+                  message.busySessionIds,
+                  (id) => service.store.getSession(id),
+                )
+              ) {
+                rejectOutbox(nodeId, "completion did not match the received batch");
+                return;
+              }
+              service.recordPresence(
+                nodeId,
+                message.activeSessionIds,
+                message.busySessionIds,
+              );
+              const flushId = flush.flushId;
+              outboxFlush = undefined;
+              awaitingOutboxFlush = false;
+              service.send(input.link, { type: "outbox_flush_ack", flushId });
+              return;
+            }
+            if (
+              acknowledgeOutbox ||
+              !awaitingOutboxFlush ||
+              !inventoryBelongsToNode(
+                nodeId,
+                message.activeSessionIds,
+                message.busySessionIds,
+                (id) => service.store.getSession(id),
+              )
+            ) {
+              app.log.warn(
+                { nodeId },
+                "Rejected unexpected or cross-node outbox reconciliation",
+              );
+              socket.close(1008, "Invalid outbox reconciliation");
+              return;
+            }
+            awaitingOutboxFlush = false;
+            service.recordPresence(
               nodeId,
-              updateId: message.updateId,
-              stage: message.stage,
-              detail: message.detail,
-            },
-            "Node self-update progress",
-          );
-          service.publishNodeUpdate(nodeId, message.stage, message.detail);
-          return;
-        }
-        if (message.type === "command_result" && !message.ok) {
-          app.log.warn(
-            { commandId: message.commandId, error: message.error, fatal: message.fatal },
-            "Node command failed",
-          );
-          if (message.fatal) {
-            service.failFromCommandResult(
-              message.sessionId,
-              message.error ?? "Node command failed",
+              message.activeSessionIds,
+              message.busySessionIds,
             );
-          } else {
-            // Refused, not broken. The Node re-announces the session's real
-            // state right behind this, so all that is owed is the reason.
-            service.reportSessionNotice(
-              message.sessionId,
-              message.error ?? "Node refused the command",
-            );
+            return;
           }
+          if (message.type === "event") {
+            if (outboxFlush || message.outboxFlush) {
+              if (!acknowledgeOutbox || !message.outboxFlush) {
+                rejectOutbox(nodeId, "an acknowledged batch contained an untagged event");
+                return;
+              }
+              if (!outboxFlush) {
+                if (message.outboxFlush.eventIndex !== 0) {
+                  rejectOutbox(nodeId, "a subsequent batch did not start at event zero");
+                  return;
+                }
+                outboxFlush = trackOutboxFlush(message.outboxFlush);
+                awaitingOutboxFlush = true;
+              }
+              const flush = outboxFlush;
+              const eventKey = `${message.event.sessionId}:${message.event.sequence}`;
+              if (
+                !sameOutboxFlush(flush, message.outboxFlush) ||
+                message.outboxFlush.eventIndex !== flush.nextEventIndex ||
+                flush.eventIds.has(message.event.eventId) ||
+                flush.eventSequences.has(eventKey)
+              ) {
+                rejectOutbox(
+                  nodeId,
+                  "event identity, position, or cardinality did not match",
+                );
+                return;
+              }
+              const handled = service.handleEventResult(message.event);
+              if (handled.outcome === "retryable_failure") {
+                socket.close(1011, "Failed to persist outbox event");
+                return;
+              }
+              if (handled.outcome === "permanent_rejection") {
+                app.log.warn(
+                  {
+                    nodeId,
+                    flushId: flush.flushId,
+                    eventId: message.event.eventId,
+                    sessionId: message.event.sessionId,
+                    reason: handled.reason,
+                  },
+                  "Skipped permanently unstorable outbox event",
+                );
+              }
+              flush.eventIds.add(message.event.eventId);
+              flush.eventSequences.add(eventKey);
+              flush.nextEventIndex += 1;
+              return;
+            }
+            service.handleEvent(message.event);
+            return;
+          }
+          if (message.type === "node_key") {
+            /*
+             * A legacy connection has already disclosed its shared secret to
+             * every relay on its path, so no key offered over that connection
+             * can prove which Host received it. Keep older Nodes connected, but
+             * require a fresh Connect command for migration.
+             */
+            app.log.warn(
+              { nodeId },
+              "Ignored a Node key offered over a legacy connection; migration needs a fresh Connect command",
+            );
+            return;
+          }
+          if (message.type === "update_status") {
+            app.log.info(
+              {
+                nodeId,
+                updateId: message.updateId,
+                stage: message.stage,
+                detail: message.detail,
+              },
+              "Node self-update progress",
+            );
+            service.publishNodeUpdate(nodeId, message.stage, message.detail);
+            return;
+          }
+          if (message.type === "command_result" && !message.ok) {
+            app.log.warn(
+              {
+                commandId: message.commandId,
+                error: message.error,
+                fatal: message.fatal,
+              },
+              "Node command failed",
+            );
+            if (message.fatal) {
+              service.failFromCommandResult(
+                message.sessionId,
+                message.commandId,
+                message.error ?? "Node command failed",
+              );
+            } else {
+              // Refused, not broken. The Node re-announces the session's real
+              // state right behind this, so all that is owed is the reason.
+              service.reportSessionNotice(
+                message.sessionId,
+                message.error ?? "Node refused the command",
+              );
+            }
+          }
+        } catch (error) {
+          app.log.error(
+            { nodeId, messageType: message.type, error },
+            "Failed to process node message",
+          );
+          socket.close(1011, "Failed to process node message");
         }
       };
 
@@ -444,4 +599,42 @@ export function registerNodeGateway(
       }
     });
   });
+}
+
+type TrackedOutboxFlush = OutboxFlushIdentity & {
+  nextEventIndex: number;
+  eventIds: Set<string>;
+  eventSequences: Set<string>;
+};
+
+function trackOutboxFlush(identity: OutboxFlushIdentity): TrackedOutboxFlush {
+  return {
+    ...identity,
+    nextEventIndex: 0,
+    eventIds: new Set(),
+    eventSequences: new Set(),
+  };
+}
+
+function sameOutboxFlush(
+  tracked: Pick<TrackedOutboxFlush, "flushId" | "eventCount">,
+  received: Pick<OutboxFlushIdentity | OutboxEventPosition, "flushId" | "eventCount">,
+): boolean {
+  return (
+    tracked.flushId === received.flushId && tracked.eventCount === received.eventCount
+  );
+}
+
+function inventoryBelongsToNode(
+  nodeId: string,
+  activeSessionIds: readonly string[],
+  busySessionIds: readonly string[],
+  getSession: Parameters<typeof heartbeatSessionsBelongTo>[2],
+): boolean {
+  const active = new Set(activeSessionIds);
+  return (
+    busySessionIds.every((sessionId) => active.has(sessionId)) &&
+    heartbeatSessionsBelongTo(nodeId, activeSessionIds, getSession) &&
+    heartbeatSessionsBelongTo(nodeId, busySessionIds, getSession)
+  );
 }

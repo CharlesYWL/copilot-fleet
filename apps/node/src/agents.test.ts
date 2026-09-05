@@ -9,8 +9,11 @@ import {
   copilotLaunchArgs,
   copilotSupportsContextTier,
   copilotVersionFromOutput,
+  supportedAdditionalDirectories,
   toolDetail,
+  toolErrorMessage,
   toolProgress,
+  taskCompletionResponse,
   withCopilotStartupTimeout,
 } from "./agents.js";
 
@@ -21,6 +24,26 @@ afterEach(() => {
 describe("copilotLaunchArgs", () => {
   it("starts ACP over stdio", () => {
     expect(copilotLaunchArgs(false)).toEqual(["--acp", "--stdio"]);
+  });
+
+  describe("supportedAdditionalDirectories", () => {
+    it("sends restored roots only when the agent advertises support", () => {
+      expect(
+        supportedAdditionalDirectories(
+          { sessionCapabilities: { additionalDirectories: {} } },
+          ["/shared"],
+        ),
+      ).toEqual({ additionalDirectories: ["/shared"] });
+      expect(
+        supportedAdditionalDirectories({ sessionCapabilities: {} }, ["/shared"]),
+      ).toEqual({});
+      expect(
+        supportedAdditionalDirectories(
+          { sessionCapabilities: { additionalDirectories: {} } },
+          [],
+        ),
+      ).toEqual({});
+    });
   });
 
   it("adds Copilot's yolo flag when the Host asks for it", () => {
@@ -142,6 +165,46 @@ describe("toolDetail", () => {
     expect(toolDetail({ rawInput: { command: "npm test -w @fleet/host" } })).toBe(
       "npm test -w @fleet/host",
     );
+  });
+
+  describe("toolErrorMessage", () => {
+    it("keeps the ACP failure reason without retaining arbitrary output", () => {
+      expect(
+        toolErrorMessage({
+          rawOutput: {
+            message: "MCP server 'fleet': Tool does not exist.",
+            code: "failure",
+          },
+        }),
+      ).toBe("MCP server 'fleet': Tool does not exist.");
+      expect(toolErrorMessage({ rawOutput: { code: "failure" } })).toBeUndefined();
+    });
+  });
+
+  describe("taskCompletionResponse", () => {
+    it("keeps the final response from a resumed CLI session completion tool", () => {
+      expect(
+        taskCompletionResponse({
+          title: "task_complete",
+          rawInput: { summary: "The current branch is `main`." },
+        }),
+      ).toBe("The current branch is `main`.");
+    });
+
+    it("does not expose arbitrary tool inputs as assistant responses", () => {
+      expect(
+        taskCompletionResponse({
+          title: "write_file",
+          rawInput: { summary: "secret", content: "private bytes" },
+        }),
+      ).toBeUndefined();
+      expect(
+        taskCompletionResponse({
+          title: "task_complete",
+          rawInput: { content: "no user-facing summary" },
+        }),
+      ).toBeUndefined();
+    });
   });
 
   it("flattens a wrapped command onto the one line it will be drawn on", () => {
@@ -325,7 +388,10 @@ describe("UnpromptedTurn", () => {
 });
 
 describe("MockAgentFactory", () => {
-  const collect = async (options?: { resumeAgentSessionId?: string }) => {
+  const collect = async (options?: {
+    resumeAgentSessionId?: string;
+    announceLifecycle?: boolean;
+  }) => {
     const events: SessionEvent[] = [];
     await new MockAgentFactory().start(
       "session-1",
@@ -389,5 +455,24 @@ describe("MockAgentFactory", () => {
     const events = await collect({ resumeAgentSessionId: "mock-earlier-run" });
     expect(events.at(-1)?.payload).toMatchObject({ state: "idle" });
     expect(events[1]?.payload).toMatchObject({ agentSessionId: "mock-earlier-run" });
+  });
+
+  it("suppresses transient lifecycle states during an internal restart", async () => {
+    const events: SessionEvent[] = [];
+    const agent = await new MockAgentFactory().start(
+      "session-1",
+      "/workspace",
+      (event) => events.push(event),
+      { resumeAgentSessionId: "mock-earlier-run", announceLifecycle: false },
+    );
+    await agent.stop(false);
+
+    expect(
+      events.filter(
+        (event) =>
+          event.type === "state" &&
+          (event.payload.state === "starting" || event.payload.state === "stopped"),
+      ),
+    ).toEqual([]);
   });
 });

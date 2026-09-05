@@ -5,6 +5,7 @@ import {
   NODE_PROOF_SIGNATURE_HEADER,
   NODE_PROOF_TIMESTAMP_HEADER,
   NODE_SECRET_HEADER,
+  SessionSchema,
 } from "@fleet/protocol";
 import { signNodeHttpProof } from "@fleet/protocol/node-auth";
 
@@ -28,6 +29,22 @@ const WorkspaceLikeSchema = z.object({
   description: z.string().optional().default(""),
 });
 export type WorkspaceLike = z.infer<typeof WorkspaceLikeSchema>;
+
+const SessionStatusLikeSchema = SessionSchema.pick({
+  id: true,
+  placementId: true,
+  nodeId: true,
+  state: true,
+  agentSessionId: true,
+});
+export type SessionStatusLike = z.infer<typeof SessionStatusLikeSchema>;
+
+const StartedSessionSchema = SessionSchema.pick({
+  id: true,
+  state: true,
+  agentSessionId: true,
+});
+export type StartedSession = z.infer<typeof StartedSessionSchema>;
 
 /**
  * Narrows the fleet's placements to the ones this machine owns.
@@ -246,6 +263,40 @@ export class FleetClient {
         nodeId: this.options.nodeId(),
         localPath,
       }),
+    });
+  }
+
+  async listOwnSessions(): Promise<SessionStatusLike[]> {
+    return request(
+      this.options.hostUrl(),
+      "/api/sessions",
+      z.array(SessionStatusLikeSchema),
+      { credentials: (input) => this.credentials(input) },
+    );
+  }
+
+  async createOwnSession(input: {
+    placementId: string;
+    prompt: string;
+    name?: string;
+  }): Promise<StartedSession> {
+    return request(this.options.hostUrl(), "/api/sessions", StartedSessionSchema, {
+      method: "POST",
+      credentials: (requestInput) => this.credentials(requestInput),
+      body: JSON.stringify(input),
+    });
+  }
+
+  async adoptOwnSession(input: {
+    placementId: string;
+    agentSessionId: string;
+    additionalDirectories: string[];
+    name?: string;
+  }): Promise<StartedSession> {
+    return request(this.options.hostUrl(), "/api/sessions/adopt", StartedSessionSchema, {
+      method: "POST",
+      credentials: (requestInput) => this.credentials(requestInput),
+      body: JSON.stringify(input),
     });
   }
 }

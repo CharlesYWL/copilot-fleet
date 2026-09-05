@@ -90,6 +90,8 @@ describe("host routes", () => {
       workspaces: [{ id: CHATS_WORKSPACE_ID, kind: "chats" }],
       placements: [],
       sessions: [],
+      notifications: [],
+      notificationUnreadCount: 0,
     });
     // Whatever commit the suite runs from, the snapshot has to carry one, or
     // the browser has nothing to compare a node's revision against.
@@ -235,6 +237,7 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       yolo: false,
       autoResume: true,
+      notificationLifecycleEnabled: true,
       model: "",
       reasoningEffort: "",
     });
@@ -245,6 +248,7 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       yolo: true,
       autoResume: true,
+      notificationLifecycleEnabled: true,
       model: "",
       reasoningEffort: "",
     });
@@ -257,9 +261,17 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       yolo: true,
       autoResume: false,
+      notificationLifecycleEnabled: true,
       model: "",
       reasoningEffort: "",
     });
+
+    await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { notificationLifecycleEnabled: false },
+    });
+    expect(await read()).toMatchObject({ notificationLifecycleEnabled: false });
 
     // The model and effort a new session starts on travel the same way, and
     // empty is a real answer: it means the fleet has no opinion and each
@@ -272,6 +284,7 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       yolo: true,
       autoResume: false,
+      notificationLifecycleEnabled: false,
       model: "claude-opus-5",
       reasoningEffort: "xhigh",
     });

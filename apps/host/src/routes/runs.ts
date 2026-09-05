@@ -8,7 +8,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
-import { archiveRun, purgeRun, stopRunSessions } from "../orchestrator/lifecycle.js";
+import { archiveRun, purgeRun } from "../orchestrator/lifecycle.js";
 import { reopenPrompt } from "../orchestrator/review.js";
 
 const CreateRunSchema = z.object({
@@ -161,14 +161,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     if (!run) return reply.code(404).send({ error: "Run not found" });
     if (terminalRunStates.has(run.state)) return withSteps(id);
 
-    stopRunSessions(service, id);
-    for (const step of store.listRunSteps(id)) {
-      if (["succeeded", "failed", "skipped", "cancelled"].includes(step.state)) continue;
-      store.updateRunStep(step.id, { state: "cancelled" });
-    }
-    const cancelled = store.setRunState(id, "cancelled", "Cancelled by an operator")!;
-    service.publishRun(cancelled);
-    service.publishRunSteps(id, store.listRunSteps(id));
+    archiveRun(service, id, "Cancelled by an operator");
     return withSteps(id);
   });
 
@@ -216,6 +209,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
 
     const note = input.note.trim();
     store.appendRunNote(id, run.phaseIndex, `Reopened by a person.\n\n${note}`);
+    service.resolveRunReview(id);
     /*
      * Queued rather than sent. Copilot refuses a prompt mid-turn and reports it
      * as a transcript notice rather than an error, so a direct dispatch would

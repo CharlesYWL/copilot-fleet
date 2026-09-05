@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactElement } from "react";
+import type { Notification } from "@fleet/protocol";
 import {
   Button,
   Text,
@@ -25,6 +26,7 @@ import { BrandMark } from "./BrandMark";
 import { ContextModeToggle, type ContextMode } from "./navigation/ContextModeToggle";
 import { fetchAuthStatus } from "../lib/auth";
 import { semanticColors } from "../theme";
+import { NotificationCenter } from "./NotificationCenter";
 
 const useStyles = makeStyles({
   /**
@@ -182,6 +184,15 @@ type TopBarProps = {
   context: ContextMode;
   soundEnabled: boolean;
   onToggleSound: () => void;
+  notifications?: readonly Notification[];
+  notificationUnreadCount?: number;
+  browserNotificationsEnabled?: boolean;
+  onToggleBrowserNotifications?: () => void;
+  onNavigateNotification?: (notification: Notification) => void;
+  onMarkNotificationRead?: (id: string) => void | Promise<unknown>;
+  onMarkAllNotificationsRead?: () => void;
+  onDismissAllNotifications?: () => void;
+  onDismissNotification?: (id: string) => void | Promise<unknown>;
   onSignOut: () => void;
   /** Jumps to whatever needs a person, when anything does. */
   onShowAttention?: (() => void) | undefined;
@@ -208,6 +219,15 @@ export const TopBar = ({
   context,
   soundEnabled,
   onToggleSound,
+  notifications = [],
+  notificationUnreadCount = 0,
+  browserNotificationsEnabled = false,
+  onToggleBrowserNotifications = () => undefined,
+  onNavigateNotification = () => undefined,
+  onMarkNotificationRead = () => undefined,
+  onMarkAllNotificationsRead = () => undefined,
+  onDismissAllNotifications = () => undefined,
+  onDismissNotification = () => undefined,
   onSignOut,
   onShowAttention,
   onToggleNav,
@@ -313,6 +333,17 @@ export const TopBar = ({
             warn={waitingPermissions > 0}
           />
         )}
+        <NotificationCenter
+          notifications={notifications}
+          unreadCount={notificationUnreadCount}
+          browserEnabled={browserNotificationsEnabled}
+          onToggleBrowser={onToggleBrowserNotifications}
+          onNavigate={onNavigateNotification}
+          onMarkRead={onMarkNotificationRead}
+          onMarkAllRead={onMarkAllNotificationsRead}
+          onDismissAll={onDismissAllNotifications}
+          onDismiss={onDismissNotification}
+        />
         <Button
           appearance="subtle"
           size="small"

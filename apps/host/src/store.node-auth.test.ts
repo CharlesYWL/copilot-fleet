@@ -234,7 +234,7 @@ describe("node authentication in a portable backup", () => {
     const data = {
       exportedAt: new Date().toISOString(),
       tunnel: { enabled: false, provider: "cloudflare" as const },
-      defaults: { yolo: false, autoResume: true },
+      defaults: { yolo: false, autoResume: true, notificationLifecycleEnabled: true },
       nodes: store.listNodes(),
       workspaces: [],
       placements: [],
@@ -243,6 +243,8 @@ describe("node authentication in a portable backup", () => {
       runs: [],
       runSteps: [],
       runNotes: [],
+      notifications: [],
+      notificationPreferences: [],
     };
 
     const target = setup();
@@ -261,7 +263,7 @@ describe("node authentication in a portable backup", () => {
     const data = {
       exportedAt: new Date().toISOString(),
       tunnel: { enabled: false, provider: "cloudflare" as const },
-      defaults: { yolo: false, autoResume: true },
+      defaults: { yolo: false, autoResume: true, notificationLifecycleEnabled: true },
       nodes: store.listNodes(),
       workspaces: [],
       placements: [],
@@ -270,6 +272,8 @@ describe("node authentication in a portable backup", () => {
       runs: [],
       runSteps: [],
       runNotes: [],
+      notifications: [],
+      notificationPreferences: [],
     };
 
     const target = setup();

@@ -1,4 +1,8 @@
-import { terminalRunStates, terminalSessionStates } from "@fleet/protocol";
+import {
+  ORCHESTRATOR_STOP_REASON,
+  terminalRunStates,
+  terminalSessionStates,
+} from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 
 /**
@@ -19,6 +23,10 @@ export function stopRunSessions(service: FleetService, runId: string): void {
   for (const session of service.store.listSessions()) {
     if (session.runId !== runId) continue;
     if (terminalSessionStates.has(session.state)) continue;
+    if (session.stopRequested) continue;
+    service.publishSession(
+      service.store.setSessionControls(session.id, { stopRequested: true }),
+    );
     service.dispatch(session.nodeId, { type: "stop", sessionId: session.id });
   }
 }
@@ -34,37 +42,59 @@ export function stopRunSessions(service: FleetService, runId: string): void {
  * Deliberately not a delete. What a task learned can live in both the run record
  * and a worker conversation; purging the task is the operation that removes both.
  */
-export function archiveRun(service: FleetService, runId: string, reason: string): void {
+export function archiveRun(
+  service: FleetService,
+  runId: string,
+  reason: string,
+  options: { stoppedByOrchestrator?: boolean } = {},
+): void {
   const { store } = service;
   const run = store.getRun(runId);
   if (!run) return;
 
-  // Completed tasks keep their workers open for cheap revisits, so archive must
-  // stop sessions even when the run itself is already terminal.
-  stopRunSessions(service, runId);
+  service.resolveRunReview(runId);
   if (!terminalRunStates.has(run.state)) {
-    for (const step of store.listRunSteps(runId)) {
-      if (["succeeded", "failed", "skipped", "cancelled"].includes(step.state)) continue;
-      store.updateRunStep(step.id, { state: "cancelled" });
-    }
-    const cancelled = store.setRunState(runId, "cancelled", reason)!;
+    const cancelled = store.cancelRunWithUnfinishedSteps(
+      runId,
+      reason,
+      options.stoppedByOrchestrator ?? false,
+    )!;
     service.publishRun(cancelled);
     service.publishRunSteps(runId, store.listRunSteps(runId));
   }
+  // Persist the terminal run before sending commands, so no event or repeated
+  // scheduler tick can dispatch a dependency after Stop has been accepted.
+  // Completed tasks still stop retained workers when explicitly archived.
+  stopRunSessions(service, runId);
 
-  /*
-   * Settled here rather than waited for. `stop` has gone to the Node and its own
-   * terminal event will follow, but the stopped row is intentionally retained:
-   * it releases capacity while keeping the agent id and transcript available to
-   * `fleet_follow_up` after the task is reopened.
-   */
-  for (const session of store.listSessions()) {
-    if (session.runId !== runId) continue;
-    if (!terminalSessionStates.has(session.state)) {
-      service.publishSession(store.transitionSession(session.id, "stopped", reason));
-    }
-  }
   service.broadcast({ type: "snapshot", data: service.snapshot() });
+}
+
+/**
+ * Restores only work that the orchestration stop operation cancelled.
+ *
+ * Successful, failed, skipped, and independently-cancelled steps remain
+ * terminal. Pending steps retain their worker session id so the scheduler uses
+ * `session/load` and continues the same Copilot context.
+ */
+export function reopenOrchestratorStoppedRun(
+  service: FleetService,
+  runId: string,
+): boolean {
+  const { store } = service;
+  const run = store.getRun(runId);
+  if (
+    !run ||
+    run.state !== "cancelled" ||
+    run.failureReason !== ORCHESTRATOR_STOP_REASON
+  ) {
+    return false;
+  }
+  const reopened = store.resumeOrchestratorStoppedRun(runId, ORCHESTRATOR_STOP_REASON);
+  if (!reopened) return false;
+  service.publishRun(reopened);
+  service.publishRunSteps(runId, store.listRunSteps(runId));
+  return true;
 }
 
 /**
@@ -78,14 +108,16 @@ export function archiveRun(service: FleetService, runId: string, reason: string)
 export function purgeRun(service: FleetService, runId: string): boolean {
   const { store } = service;
   if (!store.getRun(runId)) return false;
+  service.resolveRunReview(runId);
   // Sessions are stopped before the rows go, because a deleted run cannot stop
   // anything afterwards — there is nothing left to find them by.
   stopRunSessions(service, runId);
   for (const session of store.listSessions()) {
     if (session.runId !== runId) continue;
     if (!terminalSessionStates.has(session.state)) {
-      store.transitionSession(session.id, "stopped", "Task deleted");
+      service.settleCommandedSession(session.id, "stopped", "Task deleted", false);
     }
+    service.resolveSessionPermissionRequests(session.id);
     store.deleteSession(session.id);
   }
   store.deleteRun(runId);

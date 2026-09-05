@@ -55,6 +55,7 @@ const show = (
         onPrompt={vi.fn()}
         onCancel={vi.fn()}
         onStop={vi.fn()}
+        onResume={vi.fn()}
         onPermission={vi.fn()}
         onConfigChange={vi.fn()}
         draft={draft}
@@ -99,6 +100,30 @@ describe("TerminalView composer", () => {
   it("keeps a reachable send control after losing its label", () => {
     show();
     expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
+  });
+
+  it("does not accept a prompt after Stop is requested from an idle session", () => {
+    show({ stopRequested: true });
+    const box = screen.getByLabelText("Follow-up prompt") as HTMLTextAreaElement;
+    expect(box.disabled).toBe(true);
+    expect(box.placeholder).toBe("Stopping this session");
+    expect(
+      (screen.getByRole("button", { name: "Send" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it("does not offer Resume while Stop acknowledgement is pending", () => {
+    show({ state: "offline", stopRequested: true });
+
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Mark stopped" })).toBeTruthy();
+    expect(screen.getByText("Stop is waiting for the offline node node.")).toBeTruthy();
+  });
+
+  it("offers Resume after an offline session has finished stopping", () => {
+    show({ state: "offline", stopRequested: false });
+
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeTruthy();
   });
 
   it("still offers the pickers on a session that cannot be prompted", () => {
@@ -163,10 +188,60 @@ describe("TerminalView transcript", () => {
         kind: "execute",
         detail: "npm run typecheck",
         status: "failed",
+        error: "TypeScript found an invalid assignment.",
       }),
     ]);
 
     expect(screen.getByText("failed")).toBeTruthy();
+    expect(screen.getByText("TypeScript found an invalid assignment.")).toBeTruthy();
+  });
+
+  it("stops animating a pending tool when its node is offline", () => {
+    const pendingTool = streamEvent("tool", {
+      toolCallId: "t1",
+      title: "Run deployment approval regression tests",
+      kind: "execute",
+      status: "pending",
+    });
+    const running = show({ state: "running" }, EMPTY_DRAFT, [pendingTool]);
+    expect(screen.getByLabelText("Tool running")).toBeTruthy();
+
+    running.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <TerminalView
+          session={session({ state: "offline" })}
+          events={[pendingTool]}
+          onPrompt={vi.fn()}
+          onCancel={vi.fn()}
+          onStop={vi.fn()}
+          onPermission={vi.fn()}
+          onConfigChange={vi.fn()}
+          draft={EMPTY_DRAFT}
+          onDraftChange={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+
+    expect(screen.queryByLabelText("Tool running")).toBeNull();
+    expect(screen.getByText("Run deployment approval regression tests")).toBeTruthy();
+  });
+
+  it("renders the final response carried by a completed task_complete call", () => {
+    show({}, EMPTY_DRAFT, [
+      streamEvent("tool", {
+        toolCallId: "done-1",
+        title: "task_complete",
+        status: "pending",
+        response: "The current branch is `main`.",
+      }),
+      streamEvent("tool", {
+        toolCallId: "done-1",
+        status: "completed",
+      }),
+    ]);
+
+    expect(screen.getByText("task_complete")).toBeTruthy();
+    expect(screen.getByText("main", { selector: "code" })).toBeTruthy();
   });
 
   it("folds reasoning to a preview the reader can open", async () => {

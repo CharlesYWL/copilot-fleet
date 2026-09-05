@@ -69,6 +69,7 @@ const useStyles = makeStyles({
 type Defaults = {
   yolo: boolean;
   autoResume: boolean;
+  notificationLifecycleEnabled: boolean;
   model: string;
   reasoningEffort: string;
 };
@@ -185,7 +186,8 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
     );
   }
 
-  const { yolo, autoResume, model, reasoningEffort } = defaults;
+  const { yolo, autoResume, notificationLifecycleEnabled, model, reasoningEffort } =
+    defaults;
   const modelChoices = observedChoices(sessions, "model");
   const effortChoices = observedChoices(sessions, "reasoning_effort");
 
@@ -250,6 +252,29 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
             disabled={busy}
             label={autoResume ? "On" : "Off"}
             onChange={(_event, data) => void update({ autoResume: data.checked })}
+          />
+        </div>
+      </section>
+
+      <section className={styles.card}>
+        <div className={styles.row}>
+          <div>
+            <Text weight="semibold">Lifecycle notifications</Text>
+            <br />
+            <Text className={styles.caption}>
+              Application fallback for top-level and standalone agents. Dependency workers
+              and reviewers remain Off by default unless you explicitly enable them for
+              that agent.
+            </Text>
+          </div>
+          <Switch
+            checked={notificationLifecycleEnabled}
+            disabled={busy}
+            label={notificationLifecycleEnabled ? "On" : "Off"}
+            aria-label="Lifecycle notifications for top-level agents"
+            onChange={(_event, data) =>
+              void update({ notificationLifecycleEnabled: data.checked })
+            }
           />
         </div>
       </section>
