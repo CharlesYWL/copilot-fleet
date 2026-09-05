@@ -4,6 +4,7 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserMessage, Notification, Snapshot } from "@fleet/protocol";
 import { useFleet } from "../hooks/useFleet";
+import { forgetCsrfToken } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import { NotificationCenter } from "./NotificationCenter";
 
@@ -56,16 +57,18 @@ class MockWebSocket {
 }
 
 beforeEach(() => {
+  forgetCsrfToken();
   vi.stubGlobal("WebSocket", MockWebSocket);
   vi.stubGlobal(
     "fetch",
-    vi.fn(() =>
+    vi.fn((path: string | URL | Request) =>
       Promise.resolve(
         new Response(
-          JSON.stringify({
-            notification: { ...item, readAt: ISO },
-            unreadCount: 0,
-          }),
+          JSON.stringify(
+            String(path) === "/api/auth/csrf"
+              ? { csrfToken: "proof" }
+              : { notification: { ...item, readAt: ISO }, unreadCount: 0 },
+          ),
           { status: 200, headers: { "content-type": "application/json" } },
         ),
       ),
@@ -73,7 +76,10 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  forgetCsrfToken();
+  vi.unstubAllGlobals();
+});
 
 describe("notification shell integration", () => {
   it("renders an authoritative live upsert in the badge and navigates to its session", async () => {
@@ -125,9 +131,11 @@ describe("notification shell integration", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Destination").textContent).toBe("s1"),
     );
-    expect(fetch).toHaveBeenCalledWith(
-      "/api/notifications/authoritative/read",
-      expect.objectContaining({ method: "POST" }),
+    await waitFor(() =>
+      expect(fetch).toHaveBeenCalledWith(
+        "/api/notifications/authoritative/read",
+        expect.objectContaining({ method: "POST" }),
+      ),
     );
   });
 });

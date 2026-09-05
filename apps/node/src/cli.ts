@@ -52,7 +52,31 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
     spec: {
       env: "FLEET_ENROLLMENT_TOKEN",
       placeholder: "<token>",
-      help: "Enrollment token for first registration (FLEET_ENROLLMENT_TOKEN)",
+      help: "Legacy fleet-wide enrollment token (FLEET_ENROLLMENT_TOKEN)",
+    },
+  },
+  {
+    names: ["--enrollment-grant"],
+    spec: {
+      env: "FLEET_ENROLLMENT_GRANT",
+      placeholder: "<id>.<secret>",
+      help: "One-time enrollment grant from the Connect card (FLEET_ENROLLMENT_GRANT)",
+    },
+  },
+  {
+    names: ["--host-id"],
+    spec: {
+      env: "FLEET_HOST_ID",
+      placeholder: "<host-id>",
+      help: "The Host this node is joining (FLEET_HOST_ID)",
+    },
+  },
+  {
+    names: ["--host-fingerprint"],
+    spec: {
+      env: "FLEET_HOST_FINGERPRINT",
+      placeholder: "<sha256>",
+      help: "Host key fingerprint to pin; nothing is sent to a Host that fails it (FLEET_HOST_FINGERPRINT)",
     },
   },
   {

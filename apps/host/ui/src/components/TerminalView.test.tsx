@@ -115,7 +115,7 @@ describe("TerminalView composer", () => {
   it("does not offer Resume while Stop acknowledgement is pending", () => {
     show({ state: "offline", stopRequested: true });
 
-    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     expect(screen.getByRole("button", { name: "Mark stopped" })).toBeTruthy();
     expect(screen.getByText("Stop is waiting for the offline node node.")).toBeTruthy();
   });
@@ -123,7 +123,7 @@ describe("TerminalView composer", () => {
   it("offers Resume after an offline session has finished stopping", () => {
     show({ state: "offline", stopRequested: false });
 
-    expect(screen.getByRole("button", { name: "Resume" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Resume session" })).toBeTruthy();
   });
 
   it("still offers the pickers on a session that cannot be prompted", () => {

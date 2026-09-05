@@ -37,7 +37,7 @@ npm install
 cp .env.example .env
 ```
 
-在 `.env` 中设置一个足够强的随机 `ENROLLMENT_TOKEN`，然后启动开发模式：
+启动开发模式：
 
 ```bash
 npm run dev
@@ -46,13 +46,19 @@ npm run dev
 这一条命令会同时拉起 `http://127.0.0.1:8787` 上的 Fastify API、`http://127.0.0.1:5173`
 上的 Vite，以及本机的 Node 服务。Node 会从 `.env` 读取自己的 `FLEET_*` 配置。
 
-界面在显示任何内容之前会先要一个操作者密码。可以在 `.env` 里用
-`FLEET_OPERATOR_PASSWORD` 指定；不指定时，Host 会在首次启动时生成一个并打印到自己的
-控制台：
+全新的 Host 既没有密码也没有管理员。它只会把一次性的认领码打印到自己的控制台，在有人
+用它之前不会透露任何别的东西：
 
 ```
-No FLEET_OPERATOR_PASSWORD set, so this Host generated one. Sign in with: …
+Copilot Fleet is unclaimed. Claim it at http://127.0.0.1:8787 with this
+one-time code:
+
+    v-0MArasdtNAfxqlM5_pnA
+
+It expires in 30 minutes and is printed only here.
 ```
+
+认领需要两个证据，具体见[首次运行：认领一个 Fleet](#首次运行认领一个-fleet)。
 
 如果希望在改代码时隧道地址保持稳定，就把隧道作为独立进程启动：
 
@@ -67,9 +73,11 @@ npm run dev:tunnel
 打开界面 → **Settings**：
 
 - **General** —— 会话默认值，以及用于迁移 Host 的导出/导入。
-- **Tunnel** —— 运行 Cloudflare、Dev Tunnels、Tailscale Funnel、ngrok 或 bore；
+- **Security** —— 管理员、邀请、密码迁移、Host 指纹、Node 密钥迁移，以及这台 Host 的
+  安全审计。
+- **Tunnel** —— 运行 Dev Tunnels、Cloudflare、Tailscale Funnel、ngrok 或 bore；
   每个已安装的 provider 都有自己的开关和状态。
-- **Nodes** —— 重命名/删除机器，复制注册命令。
+- **Nodes** —— 重命名/删除机器，生成一次性的连接命令。
 - **Workspaces** —— 把项目映射到每台机器上的路径。
 
 ![Settings → Workspaces & placements：三个工作区，各自映射到持有它的机器上的绝对路径。](docs/screenshots/workspaces.png)
@@ -91,6 +99,131 @@ npm start
 或者只跑 Host：`npm run start:host`。打开 `http://127.0.0.1:8787` —— Fastify 会直接托管
 构建好的界面。
 
+## 首次运行：认领一个 Fleet
+
+一台 Fleet Host 能在所有已注册的机器上启动进程、读取全部记录。谁可以做这件事，由
+Microsoft Entra ID 加上这台 Host 自己的管理员名单决定 —— 除此之外没有别的依据。隧道
+决定谁能**够到**这台 Host，它从不决定谁可以**操作**它。
+
+认领一台全新的 Host 需要两个互相独立的证据，任何一个单独都不算数：
+
+1. **控制台上的认领码。** 128 位随机值，只打印到 Host 自己的标准输出，30 分钟过期，
+   第一次成功认领后作废。持有它证明你能访问那台机器 —— 这也是 Host 唯一能对网络调用方
+   确认的事实：目前所有隧道都转发进 `http://127.0.0.1:<port>`，所以来源地址、`Host` 头
+   和 `x-forwarded-proto` 描述的都是中继，而不是浏览器。
+2. **一个 Microsoft 账号。** 登录证明你是谁。Fleet 只记录账号不可变的
+   `(tenant id, object id)`，并签发自己的不透明会话；不会持久化任何 Microsoft 的
+   access、refresh 或 ID 令牌。
+
+第一个同时给出这两样东西的账号成为唯一的管理员。同一租户里之后登录的其他人会收到明确的
+`403`，并且拿不到任何会话。
+
+### Microsoft 登录无需配置
+
+Fleet 默认使用 Microsoft 公司租户，以及 KYC 本地开发所用的 Visual Studio 公共客户端。
+直接点击 **Sign in with Microsoft** 并选择账号即可；Fleet 只保存账号的 tenant/object ID，
+不会保存 Microsoft token。
+
+这个公共客户端使用 `http://localhost:<port>/` 回调，所以即使 Host 在隧道后面，登录仍从
+localhost 完成。
+
+下面两个环境变量只用于测试其他已批准的公共客户端；普通使用无需设置：
+
+```bash
+FLEET_ENTRA_TENANT_ID=<目录（租户）ID>
+FLEET_ENTRA_CLIENT_ID=<应用程序（客户端）ID>
+```
+
+这两个值不是机密，但覆盖值必须对应兼容且已批准的公共客户端。
+
+### 认领本身
+
+1. 启动 Host，从控制台复制认领码。
+2. 打开 `http://localhost:8787` —— 用 `localhost`，不要用 `127.0.0.1`；写错了界面会自己
+   跳转，因为注册的回调地址是按名字匹配的，事务 cookie 也跟着名字走。
+3. 输入认领码，然后点 **Sign in with Microsoft**。
+4. 你现在是这个 Fleet 的管理员。到 **Settings → Nodes** 注册机器。
+
+### 从别处登录
+
+主要流程是带 PKCE 的授权码加环回回调，所以远端浏览器有两个选择：
+
+- **把 Host 转发到自己的机器**，然后用 `http://localhost:<port>`：
+
+  ```bash
+  devtunnel connect <tunnel-id>
+  ```
+
+  任何本地转发都可以 —— SSH `-L`、provider 自己的客户端，用你顺手的那种。这是推荐做法，
+  并且永远可用。
+
+- **设备码登录**，前提是你的租户允许。Microsoft 建议默认阻止设备码流，条件访问策略通常
+  也确实会阻止，所以 Fleet 在亲眼看到一次成功完成之前一直把它**关着**。管理员可以在
+  **Settings → Security → Verify device sign-in** 里打开：这次验证不看当前开关的值，
+  只有真正完成的流程才会写入开关。租户如果阻止了这个流程，开关保持关闭并明确说明原因，
+  而不是给出一个一直转圈的登录。
+
+  设备码是唯一一种攻击者可以让**你**代他输入的凭据。只输入你眼前这个 Fleet 页面显示的
+  码。此外，移除管理员、关闭密码登录、导出可迁移备份之前，Fleet 都要求一次新的授权码
+  登录 —— 设备码登录不算数。
+
+Fleet 会话按来源区分。在 `localhost` 上签发的会话授权的是那个转发出来的界面，不会为公网
+隧道域名设置 cookie。
+
+### 添加和移除管理员
+
+Fleet 不申请任何用于搜索目录的 Graph 权限，所以添加人的方式是邀请：
+
+1. **Settings → Security → Add administrator** 生成一条一次性链接，15 分钟过期。
+2. 收到链接的人打开它并用 Microsoft 账号登录。
+3. 这只是把他记为**候选人** —— 不授予任何权限。界面会显示实际出现的那个账号，连同它的
+   object id 和 tenant id。
+4. 由现有管理员批准或拒绝这个身份。
+
+所以链接泄露并不构成提权：redeem 它的人会出现在待批准列表里，然后被拒绝。
+
+移除管理员会在同一个操作里吊销他持有的所有会话、关闭他打开的浏览器连接，必要时会打断
+正在传输的记录。最后一个在用的管理员不能被移除，并且移除需要最近十分钟内的授权码登录。
+
+### 从共享密码迁移
+
+早于 Microsoft 身份的 Host 仍然可用：密码登录会一直有效，直到管理员关掉它。
+`FLEET_OPERATOR_PASSWORD` 现在是一个显式的、会给出警告的应急通道 —— 全新的 Host 不设置
+它就什么也不会生成。
+
+1. 用这台 Host 已有的密码登录。因为还没有人管理它，控制台显示的是迁移检查点，而不是
+   fleet 本身。
+2. **Claim with Microsoft**。你登录用的账号成为这个 Fleet 的第一个管理员；共享密码会自动
+   删除，使用它的会话会立即失效，然后控制台出现。
+
+认领后默认只允许 Microsoft 登录。确实需要两种方式的管理员可以到
+**Settings → Security → Enable password sign-in**，设置一个至少 16 个字符的新密码。
+
+上面这些都不需要控制台认领码：证明已有的密码，证明的正是认领码所代表的事情，所以 Host 会
+把那个会话换成同样短、同样绑定浏览器的 bootstrap 授权，并以 `bootstrap_password_granted`
+记入审计。从来没有设过密码的 Host，以及在重建机器上做可迁移恢复，仍然需要打印出来的认领码。
+
+关闭会删除存储的校验值，并把这个选择记下来，这样某个 shell 配置里遗留的
+`FLEET_OPERATOR_PASSWORD` 也无法把它重新打开，同时吊销所有密码会话。万一把自己锁在外面，
+Host 控制台上的本地恢复命令可以签发一个临时密码并写入审计事件；回来之后再把它关掉。
+
+### 隧道与谁能看到登录页
+
+| Provider                             | 可达性                             | 操作台                 |
+| ------------------------------------ | ---------------------------------- | ---------------------- |
+| 直连 `localhost`                     | 仅本机                             | 始终允许               |
+| Dev Tunnels（creator-private）       | 隧道处即要求 Microsoft 登录        | **默认且推荐**         |
+| Dev Tunnels（tenant / anonymous）    | 由你的 `devtunnel access` 策略决定 | 允许，附带提醒         |
+| Cloudflare / ngrok / Tailscale HTTPS | 知道地址的人都能到                 | 认领之后允许，附带提醒 |
+| `bore` 及任何明文 HTTP 中继          | 知道地址的人都能到，且是明文       | **拒绝**               |
+
+全新的 Host 默认用 Dev Tunnels，因为它的地址本身够不到任何东西：provider 会先要求
+Microsoft 登录，之后才看得到 Fleet 自己的认领界面。认领之后换成公网 HTTPS provider 也没
+问题 —— 登录页本身不授予任何权限 —— 只是陌生人至少能看到它。
+
+`bore` 是被 Host 自己拒绝的，而不只是在界面上置灰：它中继的是明文 TCP，会话 cookie 和它
+背后的所有记录都会以可读形式经过。这个拒绝对任何客户端都成立，包括从不渲染界面的那种。
+
 ## Windows 上的 Node（PowerShell）
 
 请先安装 Node.js，然后以实际运行 Node 的同一个系统用户执行 `copilot update` 和
@@ -103,20 +236,36 @@ npm start
 ```powershell
 npm install
 npm run build:node
-npm run start:node -- --url="https://fleet.example.com" --token="replace-with-host-token"
+npm run start:node -- --url="https://fleet.example.com" `
+  --host-id="<host-id>" `
+  --host-fingerprint="<sha256>" `
+  --enrollment-grant="<id>.<secret>"
 ```
 
-同样这三行在 bash 里也能用 —— 用命令行参数就绕开了 `$env:` 与 `VAR=value` 在两种 shell
-之间的差异。
+同样这些行在 bash 里也能用 —— 用命令行参数就绕开了 `$env:` 与 `VAR=value` 在两种 shell
+之间的差异。这些值从 **Settings → Nodes → Generate a connect command** 生成：授权是按需
+签发的，只对一台机器有效，15 分钟过期，Host 也不会以能再发一次的形式保存它。
+
+节点会在联系任何东西**之前**先生成自己的 Ed25519 密钥对，并钉住 `--host-fingerprint`。
+应答这个地址的中继或冒充者拿不出对应密钥的签名，所以节点不会向它发送注册完成，也不会接受
+它的任何命令 —— 这正是让中继只能是中继的原因。
 
 节点名默认取机器的主机名，两端都可以改 —— Host 的 Nodes 标签页，或者节点自己的配置页。
 重命名不会改变机器身份，它的放置和会话都会跟着走；名字由 Host 拥有，所以如果节点离线
 期间两端都改过，以 Host 的名字为准并推送回去。想要 10 以外的并发容量就传
 `--max-sessions 4`。
 
-首次注册会用注册令牌换取一个专属的节点密钥。凭据持久化在
-`$env:APPDATA\CopilotFleet\node.json`，之后启动不再需要注册令牌。服务使用向外的 WSS
-连接，因此节点上不需要开放任何入站端口。
+注册会把节点的私钥和 Host 的公钥存到
+`$env:APPDATA\CopilotFleet\node.json`，之后启动不再需要授权，也从不签发任何可重复使用的
+共享密钥。服务使用向外的 WSS 连接，因此节点上不需要开放任何入站端口。
+
+早于 Node 密钥的机器仍然可以用旧的全局 `--token` / `ENROLLMENT_TOKEN`。那是一个可重复
+使用、对任何机器都有效、并且节点在能分辨 Host 与中继之前就会发出去的凭据，所以它已被
+废弃。现有节点**不会**自动升级：共享密钥在认证时就已经交给了转发这条连接的中继，因此
+沿着这条连接发回来的任何内容都无法证明对面是哪一个 Host。请为每台机器重新生成一条
+Connect 命令并在该机器上运行——授权是一次性的，指纹来自你的屏幕而不是网络，按机器原有
+名称重新注册会认领同一个节点，保留它的 id、放置与会话历史。**Settings → Security** 会
+显示还剩多少台，并允许管理员在一台都不剩之后彻底关闭共享密钥。
 
 ### 节点命令行参数
 
@@ -124,18 +273,21 @@ npm run start:node -- --url="https://fleet.example.com" --token="replace-with-ho
 保存的 `settings.json` —— 这正是它有用的地方：不用改那台机器上的文件，就能把某一次运行
 指到另一个 Host。执行 `npm run start:node -- --help` 查看当前完整列表。
 
-| 参数                              | 等价于                   |
-| --------------------------------- | ------------------------ |
-| `--url`, `--host-url`             | `FLEET_HOST_URL`         |
-| `--name`, `--node-name`           | `FLEET_NODE_NAME`        |
-| `--token`, `--enrollment-token`   | `FLEET_ENROLLMENT_TOKEN` |
-| `--max-sessions`                  | `FLEET_MAX_SESSIONS`     |
-| `--copilot-command`               | `FLEET_COPILOT_COMMAND`  |
-| `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`  |
-| `--context-tier`                  | `FLEET_CONTEXT_TIER`     |
-| `--devtunnel`                     | `FLEET_DEVTUNNEL_ID`     |
-| `--config-port`                   | `FLEET_NODE_CONFIG_PORT` |
-| `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`       |
+| 参数                              | 等价于                             |
+| --------------------------------- | ---------------------------------- |
+| `--url`, `--host-url`             | `FLEET_HOST_URL`                   |
+| `--name`, `--node-name`           | `FLEET_NODE_NAME`                  |
+| `--enrollment-grant`              | `FLEET_ENROLLMENT_GRANT`           |
+| `--host-id`                       | `FLEET_HOST_ID`                    |
+| `--host-fingerprint`              | `FLEET_HOST_FINGERPRINT`           |
+| `--token`, `--enrollment-token`   | `FLEET_ENROLLMENT_TOKEN`（已废弃） |
+| `--max-sessions`                  | `FLEET_MAX_SESSIONS`               |
+| `--copilot-command`               | `FLEET_COPILOT_COMMAND`            |
+| `--permission-timeout-ms`         | `PERMISSION_TIMEOUT_MS`            |
+| `--context-tier`                  | `FLEET_CONTEXT_TIER`               |
+| `--devtunnel`                     | `FLEET_DEVTUNNEL_ID`               |
+| `--config-port`                   | `FLEET_NODE_CONFIG_PORT`           |
+| `--mock-agent`, `--no-mock-agent` | `FLEET_MOCK_AGENT`                 |
 
 `--flag value` 和 `--flag=value` 两种写法都支持。npm 脚本名后面的 `--` 是 npm 自己的
 分隔符，不写的话 npm 会把参数吃掉。同样的参数在 `npm run node`、`npm run dev` 和
@@ -257,11 +409,26 @@ Autopilot **Mode**：以 `--allow-all` 启动的会话仍然上报 mode `agent`�
 
 ### 把 Host 或 Node 迁移到另一台机器
 
-fleet 有两类状态，所以有两个文件。
+fleet 有两类状态，所以有两个文件 —— 其中一个现在有两个版本，因为迁移一台 Host 的**数据**
+和迁移它的**身份**是两件风险不同的事。
 
-**Host** —— Settings → General → **Export fleet**。这个 JSON 文件包含工作区、放置、节点
-（身份哈希，不是明文密钥）、会话、对话记录、默认值、注册令牌，以及隧道 provider 与开关
-状态。在新机器上导入会**替换**已有的一切。
+**Host 数据（版本 1）** —— Settings → General → **Export fleet**。这个 JSON 文件包含工作区、
+放置、节点（身份哈希，不是明文密钥）、会话、对话记录、默认值、旧的注册令牌，以及隧道
+provider 与开关状态。在新机器上导入会**替换**目录数据，但会刻意**保留它落地那台 Host 的
+安全边界**：管理员、认证模式与 Entra 配置、Host 签名密钥、CSRF 与 lead token 密钥、密码
+模式都原样保留。数据恢复永远不会把一台已受保护的 Host 退回 `unclaimed`，也不会悄悄换掉
+它的身份。
+
+**Host 身份（可迁移，版本 2）** —— Settings → General → **Portable backup**。这才是把一台
+Host 整体搬到新机器的文件。它的安全部分 —— 管理员、Entra 配置、Host 私钥、CSRF 与 lead
+token 密钥、节点公钥 —— 用你提供的口令加密（scrypt + AES-256-GCM，至少 14 个字符，绝不
+持久化）。导出它、以及把它导入一台已认领的 Host，都需要最近十分钟内的授权码登录；导入
+一台全新的 Host 则改为需要那台 Host 的控制台认领码加上备份口令，并且不会创建任何会话 ——
+恢复之后由管理员通过恢复出来的 Entra 配置登录。
+
+恢复会吊销所有浏览器会话、关闭浏览器与节点连接，并且要么整体生效要么完全不动。**先停掉
+旧的 Host 再启动搬过去的那台**：两个进程共用一个 Host 身份意味着两台机器都能签出同一个
+指纹，节点无法分辨。
 
 现有节点只要还能连到 Host，就会用它们已有的 `node.json` 重新连上。命名主机名 /
 `FLEET_PUBLIC_URL` / Tailscale Funnel 地址会被复制进归档；轮换型 quick tunnel 地址
@@ -333,7 +500,7 @@ Resume。
 那条地址就是 Host，不是另一条「只握手、不管控制面」的通道。隧道转发到
 `http://127.0.0.1:8787`（或 `PORT`）：`/api`、`/ws/node`、`/ws/browser`，以及已构建的
 UI。`npm run dev` 时你点开的页面是 Vite 的 `http://127.0.0.1:5173`，隧道并不指向它。
-在公网 URL 上打开仍然打到 Host，所以 `/api/health` 会应答，其余接口仍然要操作者密码。
+在公网 URL 上打开仍然打到 Host，所以 `/api/health` 会应答，其余接口仍然要求 Microsoft 登录。
 
 当 Host 的公网地址发生变化 —— 隧道启动、轮换，或者切换到另一个 provider —— 它会告诉仍然
 连着的节点。每个节点记录新地址，把旧地址留作回退，并且**不会断开已有的连接**：上面正在
@@ -452,17 +619,20 @@ npm install
 npm run host
 ```
 
-在终端 2 运行一个确定性的、无需登录的 Node：
+先认领它：打开 `http://localhost:8787`，输入 Host 打印的认领码，用 Microsoft 账号登录。
+然后从 **Settings → Nodes** 生成一条连接命令，在终端 2 运行一个确定性的、无需登录的 Node：
 
 ```bash
-npm run node -- --url=http://127.0.0.1:8787 \
-  --token=change-me \
+npm run node -- --url=http://localhost:8787 \
+  --host-id="<host-id>" \
+  --host-fingerprint="<sha256>" \
+  --enrollment-grant="<id>.<secret>" \
   --name=mock-node \
   --max-sessions=2 \
   --mock-agent
 ```
 
-然后打开 `http://127.0.0.1:5173`：
+然后打开 `http://localhost:5173`：
 
 ![Start a session 对话框：工作区放置、可选的会话名、初始提示词，以及决定代理是否在执行工具前询问的 YOLO 开关。](docs/screenshots/new-session.png)
 
@@ -560,19 +730,43 @@ curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
 
 ## 安全说明
 
-- 网页界面和整个 `/api` 面都在一个操作者密码之后。可以设置
-  `FLEET_OPERATOR_PASSWORD`；没有设置时，Host 会在首次启动时生成一个并打印到控制台。
-  登录会写入一个 `HttpOnly`、`SameSite=Strict` 的会话 Cookie，有效期 12 小时。连续
-  猜错会把**整个 Host** 的登录锁上几分钟，而不是按客户端分别计数。`/api/health`
-  保持不鉴权，这样探活一条隧道 URL 并不会变成管理员。
+- 网页界面和整个 `/api` 面都要求一个属于在用管理员的 Fleet 会话。会话只在 Microsoft
+  Entra ID 认证了这个人**并且**这台 Host 自己的管理员表授权了他之后才签发：来自正确租户
+  的合法账号，只要没被添加过，就会收到明确的 `403`，并且拿不到任何会话。会话是 256 位
+  不透明值，只以 SHA-256 摘要存储，`HttpOnly`/`SameSite=Strict`，在已发布的 HTTPS 端点
+  上带 `Secure`，空闲 7 天、绝对 30 天过期。任何 Microsoft 的 access、refresh、ID 或设备
+  令牌都不会被持久化。`/api/health` 和 `/api/auth/status` 保持不鉴权，这样探活一条隧道
+  URL 并不会变成管理员。
+- 认领一台全新的 Host 需要两个互相独立的证据：只打印到 Host 控制台的 128 位一次性认领码，
+  以及一次 Microsoft 登录。单独任何一个都不够，认领本身是一个原子事务，第二个身份来抢会
+  得到 `409` 而不是第二个管理员。请求 IP、看起来像回环、`x-forwarded-proto` 和调用方给出
+  的 `Host` 都不是安全依据 —— 所有隧道都转发进回环地址，它们描述的都是中继。
+- 每个会改变状态的浏览器请求都带一个从会话用 HMAC 派生出来的 `X-CSRF-Token`，因此没有
+  任何按会话存储的机密可以泄露。
+- 影响面大的操作 —— 移除管理员、关闭密码登录、签发注册授权、导出可迁移备份 —— 还额外
+  要求最近十分钟内的**授权码**登录。设备码登录不算数：攻击者可以发起一个设备码流程，再
+  让管理员替他完成。
+- 移除管理员会在同一个操作里吊销他的会话并关闭他打开的浏览器连接；另有 60 秒一次的巡检，
+  用在用的会话与管理员记录重新校验每个打开的连接。
+- 旧的密码登录是显式开启的，全新 Host 上默认关闭。关闭它会删除校验值并记下这个选择，
+  所以遗留的 `FLEET_OPERATOR_PASSWORD` 无法把它重新打开。
 - Host 只应答它认识的名字：回环地址、`FLEET_PUBLIC_URL`、当前在线的隧道地址，以及
   `FLEET_ALLOWED_HOSTS` 中列出的名字。以其他 `Host` 头到达、或来自其他 `Origin` 的
   请求会被拒绝——这正是让操作者随手打开的某个页面无法借助被重绑定的 DNS 名字操作
   整个 fleet 的原因。`FLEET_ALLOWED_HOSTS=*` 会关掉这项检查。
+- 会话或引导授权只会在回环地址、或这台 Host 自己发布过的 HTTPS 端点上签发。像 `bore`
+  这样的明文 HTTP 中继会被 Host 拒绝用于操作台，而不只是在界面上置灰。
+- `/mcp` 是一个独立的机器主体，而不是操作者 Cookie 的例外：它只接受绑定到在用 lead 会话、
+  run 和节点的签名 lead token，拒绝浏览器 `Origin`，并且在不记录该凭据的前提下审计每一次
+  拒绝。
 - 节点自己的凭据只能触及它的配置页需要中转的工作区与放置接口，并且一个节点只能为
   自己创建或改写放置。
-- 生产模式启动时会拒绝缺失的或默认的 `change-me` 注册令牌。
-- 注册成功会创建一个高熵的专属节点密钥；Host 只存储它的 SHA-256 哈希。
+- 新的注册流程不会向未经认证的 Host 发送任何可重复使用的凭据。一次性授权只对一个节点公钥
+  有效、15 分钟过期；节点在完成之前先钉住 Host 指纹，两端都对整个握手签名，连接再派生出
+  按方向分开的 AES-256-GCM 密钥和递增序号 —— 中继可以转发流量，但读不了、伪造不了、也
+  重放不了。
+- 全局的注册令牌只为早于 Node 密钥的机器保留。Settings 会显示还剩多少台；在还有节点需要它
+  的时候，强制启用（会删除已存的密钥）是被拒绝的。
 - Copilot 的认证与令牌留在 Node 上，绝不会出现在 Fleet 的消息中。
 - 会话请求引用的是预先配置好的放置 ID。节点还要求目录是存在的绝对路径，并在创建进程
   之前解析它。
@@ -581,6 +775,9 @@ curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
   每个新会话都是如此。对于无人值守的运行，可在 Node 上设置 `FLEET_YOLO=1`，让 Copilot
   以 `--allow-all` 启动（工具、路径和 URL）。在 YOLO 关闭时，未应答和断连的请求仍然按
   拒绝处理。
+- 与安全相关的决定会写入本地审计（保留最新一万条），可在 Settings → Security 查看。认领码、
+  授权码、设备码、Microsoft 令牌、Fleet Cookie、邀请、注册授权、lead token 和私钥都不会
+  被写进去。
 - 节点本地的配置页绑定在回环地址上，并且还会拒绝这些请求：`Host` 不是本机对应端口上的
   `127.0.0.1`（或 `localhost`）、来自其他来源、或写入时没有带
   `content-type: application/json`。它无法防御登录到同一台机器上的其他用户。

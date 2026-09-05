@@ -27,7 +27,22 @@ export const catalogRoutes: FastifyPluginAsync<CatalogRouteOptions> = async (
   const { store } = service;
 
   app.get("/api/workspaces", async () => store.listWorkspaces());
-  app.get("/api/placements", async () => store.listPlacements());
+  /*
+   * A node relays this for its own config page, and that page shows only this
+   * machine's checkouts. Filtering in the node was filtering in the client:
+   * the Host was still handing every node a map of every other one — absolute
+   * paths, machine names and all — on the strength of a credential that speaks
+   * for exactly one machine. The narrowing belongs here, where the caller's
+   * identity is known. An operator is not narrowed; arranging the whole fleet
+   * is what that console is for.
+   */
+  app.get("/api/placements", async (request) =>
+    request.fleetNodeId
+      ? store
+          .listPlacements()
+          .filter((placement) => placement.nodeId === request.fleetNodeId)
+      : store.listPlacements(),
+  );
 
   app.post("/api/workspaces", async (request, reply) => {
     const input = CreateWorkspaceSchema.parse(request.body);

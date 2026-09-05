@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   BACKUP_VERSION,
   HOST_BACKUP_KIND,
+  MUTUAL_AUTH_PROTOCOL,
   NODE_BACKUP_KIND,
   NodeBackupSchema,
   backupKind,
@@ -172,7 +173,24 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
     new FleetClient({
       hostUrl: () => options.getSettings().hostUrl,
       nodeId: () => options.getStatus().nodeId,
-      nodeSecret: () => options.getCredentials()?.secret,
+      /*
+       * Whichever proof this machine actually has. A legacy Node relays the
+       * secret it was issued; a keyed one signs each call with the same key
+       * that authenticates its WebSocket, so the config page works on both
+       * without a second, weaker credential path existing for either.
+       */
+      nodeSecret: () => {
+        const credentials = options.getCredentials();
+        return credentials?.authProtocol === "legacy-secret"
+          ? credentials.secret
+          : undefined;
+      },
+      nodeKey: () => {
+        const credentials = options.getCredentials();
+        return credentials?.authProtocol === MUTUAL_AUTH_PROTOCOL
+          ? credentials.privateKey
+          : undefined;
+      },
     });
   const pickFolder = options.pickFolder ?? pickFolderDefault;
   const inspectPath = options.inspectPath ?? inspectPathDefault;

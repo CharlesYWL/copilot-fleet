@@ -1,5 +1,32 @@
 import { z } from "zod";
 
+/**
+ * Standard base64, bounded.
+ *
+ * Bounded because most of these are parsed before anybody has authenticated,
+ * and standard rather than base64url because the values are DER keys, nonces
+ * and tags that both ends round-trip through `Buffer`.
+ *
+ * The length check aborts, so an oversized value is refused without the pattern
+ * ever scanning it. That is not a micro-optimisation: the largest of these is a
+ * hundred-megabyte ciphertext field, and running a regular expression across
+ * one an attacker chose the length of is itself the denial of service the bound
+ * exists to prevent.
+ */
+const base64Field = (max: number) =>
+  z
+    .string()
+    .min(1)
+    .max(max, { abort: true })
+    .regex(/^[A-Za-z0-9+/]+={0,2}$/, "expected base64");
+
+const sha256Hex = z.string().regex(/^[a-f0-9]{64}$/, "expected a SHA-256 digest");
+
+/** A DER-encoded Ed25519 or X25519 key is well under this, base64 and all. */
+const MAX_KEY_LENGTH = 1_000;
+/** Signatures are 64 bytes, tags 16, nonces 32; none of them approach this. */
+const MAX_PROOF_LENGTH = 200;
+
 export const sessionStates = [
   "queued",
   "starting",
@@ -72,6 +99,15 @@ export const NodeSchema = z.object({
   online: z.boolean(),
   /** The node's home directory, used to seed placement paths in the UI. */
   homeDir: z.string().default(""),
+  /**
+   * How this machine proves it is itself.
+   *
+   * Defaulted so that a row, an archive or a Node from before Node keys existed
+   * reads as the shared-secret protocol it actually speaks. Settings shows the
+   * split, because enforcing mutual authentication before every machine has
+   * upgraded would lock the stragglers out of their own fleet.
+   */
+  authProtocol: z.enum(["legacy-secret", "mutual-auth-v1"]).default("legacy-secret"),
 });
 export type FleetNode = z.infer<typeof NodeSchema>;
 
@@ -666,64 +702,102 @@ export const OutboxEventPositionSchema = OutboxFlushIdentitySchema.extend({
 });
 export type OutboxEventPosition = z.infer<typeof OutboxEventPositionSchema>;
 
+/**
+ * What a Node reports about itself when it arrives.
+ *
+ * Shared between the legacy `hello` and the sealed `ready` that replaces it,
+ * because the inventory is the same question either way — what this machine is,
+ * what it can do, and what it is still running — and two copies of it is two
+ * copies to keep in step.
+ */
+const nodeInventoryShape = {
+  os: z.string().min(1),
+  arch: z.string().min(1),
+  version: z.string().min(1),
+  revision: z.string().default(""),
+  capabilities: z.array(z.string()),
+  agents: z.array(NodeAgentSchema).default([]),
+  maxSessions: z.number().int().positive(),
+  homeDir: z.string().default(""),
+  /**
+   * What this Node currently calls itself.
+   *
+   * A rename used to be a new identity: the Node re-registered under the new
+   * name and left its placements and sessions behind on the old one. Carrying
+   * the name here instead makes it a label on an identity the `nodeId`
+   * already establishes, so renaming keeps the machine's history.
+   */
+  name: z.string().min(1).max(120).optional(),
+  /**
+   * The name this Node believes the Host has for it.
+   *
+   * Settles the case where both ends were renamed while the Node was offline.
+   * Equal to `name` unless the operator edited it locally, so a difference
+   * from what the Host holds tells the two apart: the Node is proposing a
+   * rename only when the Host still has the name the Node last synced.
+   */
+  knownName: z.string().max(120).optional(),
+  /** Sessions still running on this Node; used to resurrect offline rows. */
+  activeSessionIds: z.array(z.string()).default([]),
+  /**
+   * The subset of `activeSessionIds` with a turn still in flight.
+   *
+   * Without it the Host has to guess what a reconnecting Node was doing, and
+   * it guessed `idle` — which unlocks the composer over an agent that is
+   * still working and cannot accept a second prompt.
+   */
+  busySessionIds: z.array(z.string()).default([]),
+  /**
+   * Whether reconnect reconciliation must wait for buffered events.
+   *
+   * The count is diagnostic; the boolean remains true when a prior socket
+   * emptied the queue but closed before it could send `outbox_flushed`.
+   * Both default for Nodes that predate the ordered reconnect handshake.
+   */
+  pendingOutbox: z.boolean().default(false),
+  pendingOutboxCount: z.number().int().nonnegative().default(0),
+  /**
+   * The exact batch a capable Node will retain until the Host acknowledges it.
+   *
+   * Optional so either end can still speak to versions that predate durable
+   * reconnect acknowledgment.
+   */
+  outboxFlush: OutboxFlushIdentitySchema.optional(),
+} as const;
+
+/**
+ * The first frame a Node holding a shared secret sends.
+ *
+ * Named on its own rather than left inline in the union because the gateway now
+ * has to decide between this and {@link NodeClientHelloSchema} before either
+ * has been accepted — a decision that cannot be expressed by a union whose only
+ * other members are frames that arrive after authentication.
+ */
+export const NodeHelloSchema = z.object({
+  type: z.literal("hello"),
+  nodeId: z.string().min(1),
+  secret: z.string().min(1),
+  ...nodeInventoryShape,
+});
+
+/**
+ * The same inventory, sent sealed, by a Node that has already proved itself.
+ *
+ * The mutual handshake authenticates a connection, not a machine's contents:
+ * capabilities, agents and the sessions still running are things a Node
+ * *claims*, and there is no reason to let it claim them before its key has been
+ * checked. So `client_hello` says only who is dialing, and everything else
+ * arrives here, inside the channel.
+ */
+export const NodeReadySchema = z.object({
+  type: z.literal("ready"),
+  ...nodeInventoryShape,
+});
+export type NodeReady = z.infer<typeof NodeReadySchema>;
+
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
-  z.object({
-    type: z.literal("hello"),
-    nodeId: z.string().min(1),
-    secret: z.string().min(1),
-    os: z.string().min(1),
-    arch: z.string().min(1),
-    version: z.string().min(1),
-    revision: z.string().default(""),
-    capabilities: z.array(z.string()),
-    agents: z.array(NodeAgentSchema).default([]),
-    maxSessions: z.number().int().positive(),
-    homeDir: z.string().default(""),
-    /**
-     * What this Node currently calls itself.
-     *
-     * A rename used to be a new identity: the Node re-registered under the new
-     * name and left its placements and sessions behind on the old one. Carrying
-     * the name here instead makes it a label on an identity the `nodeId`
-     * already establishes, so renaming keeps the machine's history.
-     */
-    name: z.string().min(1).max(120).optional(),
-    /**
-     * The name this Node believes the Host has for it.
-     *
-     * Settles the case where both ends were renamed while the Node was offline.
-     * Equal to `name` unless the operator edited it locally, so a difference
-     * from what the Host holds tells the two apart: the Node is proposing a
-     * rename only when the Host still has the name the Node last synced.
-     */
-    knownName: z.string().max(120).optional(),
-    /** Sessions still running on this Node; used to resurrect offline rows. */
-    activeSessionIds: z.array(z.string()).default([]),
-    /**
-     * The subset of `activeSessionIds` with a turn still in flight.
-     *
-     * Without it the Host has to guess what a reconnecting Node was doing, and
-     * it guessed `idle` — which unlocks the composer over an agent that is
-     * still working and cannot accept a second prompt.
-     */
-    busySessionIds: z.array(z.string()).default([]),
-    /**
-     * Whether reconnect reconciliation must wait for buffered events.
-     *
-     * The count is diagnostic; the boolean remains true when a prior socket
-     * emptied the queue but closed before it could send `outbox_flushed`.
-     * Both default for Nodes that predate the ordered reconnect handshake.
-     */
-    pendingOutbox: z.boolean().default(false),
-    pendingOutboxCount: z.number().int().nonnegative().default(0),
-    /**
-     * The exact batch a capable Node will retain until the Host acknowledges it.
-     *
-     * Optional so either end can still speak to versions that predate durable
-     * reconnect acknowledgment.
-     */
-    outboxFlush: OutboxFlushIdentitySchema.optional(),
-  }),
+  NodeHelloSchema,
+  NodeReadySchema,
   z.object({
     type: z.literal("heartbeat"),
     activeSessionIds: z.array(z.string()),
@@ -775,6 +849,14 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     updateId: z.string().min(1),
     stage: NodeUpdateStageSchema,
     detail: z.string().default(""),
+  }),
+  /**
+   * Retained for older peers. The Host ignores this key: a legacy connection
+   * cannot establish a new identity safely. Migration needs a fresh Connect command.
+   */
+  z.object({
+    type: z.literal("node_key"),
+    publicKey: z.string().min(1).max(1_000),
   }),
 ]);
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
@@ -836,6 +918,26 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
    * on {@link NODE_NAME_SYNC_CAPABILITY} for the same reason `host_url` is.
    */
   z.object({ type: z.literal("node_name"), name: z.string().min(1) }),
+  /**
+   * An obsolete upgrade request, parsed so a Node can refuse it without losing
+   * its connection to an older Host. A relay that saw the legacy secret can also
+   * produce this proof, so the Node logs instructions instead of adopting a key.
+   */
+  z.object({
+    type: z.literal("request_node_key"),
+    hostId: z.string().min(1).max(200),
+    hostPublicKey: base64Field(MAX_KEY_LENGTH),
+    hostFingerprint: sha256Hex,
+    proof: base64Field(MAX_PROOF_LENGTH),
+  }),
+  /**
+   * An obsolete acknowledgement, retained for older peers. The Node logs and
+   * ignores it; no identity is promoted over a legacy connection.
+   */
+  z.object({
+    type: z.literal("node_key_accepted"),
+    publicKey: base64Field(MAX_KEY_LENGTH),
+  }),
 ]);
 export type HostToNodeMessage = z.infer<typeof HostToNodeMessageSchema>;
 
@@ -844,6 +946,12 @@ export const HOST_URL_SYNC_CAPABILITY = "host-url-sync";
 
 /** A Node that can pull, rebuild and restart itself on `update_node`. */
 export const SELF_UPDATE_CAPABILITY = "self-update";
+
+/**
+ * Historical capability retained for compatibility. Current Nodes do not
+ * advertise it; migration requires enrollment using a fresh Connect command.
+ */
+export const NODE_KEY_UPGRADE_CAPABILITY = "node-key-upgrade";
 
 /**
  * A Node willing to launch Copilot with `--allow-all`.
@@ -1464,8 +1572,15 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
 ]);
 export type BrowserMessage = z.infer<typeof BrowserMessageSchema>;
 
-export const RegisterNodeSchema = z.object({
-  enrollmentToken: z.string().min(1),
+/**
+ * What a Node says about itself when it enrolls.
+ *
+ * Separate from the token registration below because the bound enrollment
+ * hashes exactly this object and both ends have to agree, byte for byte, on
+ * what was hashed. A field that exists on one path and not the other is a
+ * completion the Host would reject for a payload the Node thought it sent.
+ */
+export const NodeRegistrationPayloadSchema = z.object({
   name: z.string().min(1).max(100),
   os: z.string().min(1),
   arch: z.string().min(1),
@@ -1476,10 +1591,355 @@ export const RegisterNodeSchema = z.object({
   maxSessions: z.number().int().min(1).max(64),
   homeDir: z.string().max(4096).default(""),
 });
+export type NodeRegistrationPayload = z.infer<typeof NodeRegistrationPayloadSchema>;
+
+export const RegisterNodeSchema = NodeRegistrationPayloadSchema.extend({
+  enrollmentToken: z.string().min(1),
+});
 
 export const RenameNodeSchema = z.object({
   name: z.string().min(1).max(100),
 });
+
+// ---------------------------------------------------------------------------
+// Node identity, enrollment and the authenticated channel.
+//
+// Everything below is a wire shape only: the cryptography that fills these
+// fields lives in `@fleet/protocol/node-auth`, which the browser bundle must
+// not pull in. Keeping the schemas here is what lets the Connect card and the
+// Host routes agree on a contract without either importing `node:crypto`.
+// ---------------------------------------------------------------------------
+
+/** The channel version both ends name in every frame they authenticate. */
+export const MUTUAL_AUTH_PROTOCOL = "mutual-auth-v1" as const;
+
+/**
+ * How a Node proves it is itself.
+ *
+ * `legacy-secret` is the shared secret that predates Node keys; it survives
+ * only until every Node has upgraded, which is why the record names the
+ * protocol rather than inferring it from which column is populated.
+ */
+export const nodeAuthProtocols = ["legacy-secret", MUTUAL_AUTH_PROTOCOL] as const;
+export const NodeAuthProtocolSchema = z.enum(nodeAuthProtocols);
+export type NodeAuthProtocol = z.infer<typeof NodeAuthProtocolSchema>;
+
+/**
+ * A ciphertext bound that fits the largest thing the protocol already carries.
+ *
+ * Six ten-megabyte attachments is the existing prompt ceiling, which is roughly
+ * eighty megabytes of JSON before it is sealed and base64-encoded. The bound
+ * exists so that a peer cannot make the Host allocate without limit; it is not
+ * a policy about attachment size, which is enforced where attachments are.
+ */
+export const MAX_AUTHENTICATED_CIPHERTEXT_LENGTH = 120 * 1024 * 1024;
+
+export const HostIdentitySchema = z.object({
+  hostId: z.string().min(1).max(200),
+  /** Base64 SPKI DER. The private half never leaves the Host. */
+  publicKey: base64Field(MAX_KEY_LENGTH),
+  fingerprint: sha256Hex,
+});
+export type HostIdentity = z.infer<typeof HostIdentitySchema>;
+
+/**
+ * What this Host currently is, from the point of view of "who may drive it".
+ *
+ * Named states rather than a pair of booleans because each one asks the browser
+ * for something different, and a gate that cannot tell `entra-unconfigured`
+ * from `unclaimed` shows a sign-in form that cannot possibly work.
+ */
+export const authStates = [
+  "entra-unconfigured",
+  "unclaimed",
+  "legacy-password",
+  "hybrid",
+  "microsoft-only",
+  "recovery",
+] as const;
+export const AuthStateSchema = z.enum(authStates);
+export type AuthState = z.infer<typeof AuthStateSchema>;
+
+/**
+ * Whether this browser can finish an authorization-code sign-in where it is.
+ *
+ * Entra matches the registered `http://localhost/...` reply URL by name and
+ * ignores the port, so any local port works and no other name does. The Host
+ * answers with which case the caller is in, so the page can move itself to the
+ * canonical name or explain the local forward — rather than starting a
+ * transaction whose callback lands somewhere the transaction cookie is not.
+ */
+export const CodeLoginEndpointSchema = z.object({
+  available: z.boolean(),
+  /** The same Host under the name Entra will redirect back to. */
+  canonicalUrl: z.string().max(2048).optional(),
+  /** No local listener is reachable from here; a forward or device flow is needed. */
+  localForwardRequired: z.boolean().default(false),
+});
+export type CodeLoginEndpoint = z.infer<typeof CodeLoginEndpointSchema>;
+
+export const AuthStatusSchema = z.object({
+  state: AuthStateSchema,
+  authenticated: z.boolean(),
+  passwordEnabled: z.boolean(),
+  entraConfigured: z.boolean(),
+  deviceFlowEnabled: z.boolean(),
+  claimCodeRequired: z.boolean(),
+  /** Whether this endpoint may carry a credential at all. */
+  canSignIn: z.boolean(),
+  codeLogin: CodeLoginEndpointSchema.default({
+    available: true,
+    localForwardRequired: false,
+  }),
+  /** Display metadata for the signed-in administrator; never an authorization input. */
+  identity: z.object({ username: z.string(), displayName: z.string() }).optional(),
+  /** The registration this Host authenticates against. Configuration, not a secret. */
+  entra: z.object({ tenantId: z.string(), clientId: z.string() }).optional(),
+});
+export type AuthStatus = z.infer<typeof AuthStatusSchema>;
+
+/**
+ * Why a Microsoft sign-in ended without a Fleet session.
+ *
+ * A closed set, because it travels back to the app in a URL: the page looks the
+ * code up in its own table and shows its own words, so a crafted link cannot
+ * put a stranger's sentence on Fleet's sign-in screen.
+ */
+export const authErrorCodes = [
+  "claim-required",
+  "already-claimed",
+  "not-authorized",
+  "pending-approval",
+  "wrong-tenant",
+  "expired",
+  "device-blocked",
+  "endpoint-refused",
+  "provider-unavailable",
+  "cancelled",
+] as const;
+export const AuthErrorCodeSchema = z.enum(authErrorCodes);
+export type AuthErrorCode = z.infer<typeof AuthErrorCodeSchema>;
+
+export const AUTH_ERROR_PARAM = "auth_error";
+export const AUTH_ERROR_MESSAGE_PARAM = "auth_error_message";
+/** Long enough for a sentence, short enough that no provider output fits. */
+export const MAX_AUTH_ERROR_MESSAGE_LENGTH = 300;
+
+/**
+ * Strips the characters that would let a message become markup or a new
+ * parameter, and bounds it.
+ *
+ * The page renders this as text, so this is belt and braces — but the value
+ * also lands in an address bar and a server log, and neither is a good place
+ * for a caller's angle brackets.
+ */
+function safeAuthErrorMessage(message: string): string {
+  return message
+    .replace(/[<>"'`\\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, MAX_AUTH_ERROR_MESSAGE_LENGTH);
+}
+
+/**
+ * Where the callback sends a browser whose sign-in did not produce a session.
+ *
+ * A refusal used to answer with a JSON body, which left the operator looking at
+ * `{"error":...}` in the address bar with no way back to the console. The app
+ * is the only thing that can explain a refusal and offer the next step, so
+ * every outcome returns to it.
+ */
+export function authErrorRedirect(code: AuthErrorCode, message?: string): string {
+  const params = new URLSearchParams({ [AUTH_ERROR_PARAM]: code });
+  const safe = message ? safeAuthErrorMessage(message) : "";
+  if (safe) params.set(AUTH_ERROR_MESSAGE_PARAM, safe);
+  return `/?${params.toString()}`;
+}
+
+/** Reads back a redirect this build understands, or nothing. */
+export function parseAuthError(
+  search: string,
+): { code: AuthErrorCode; message: string | undefined } | undefined {
+  const params = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search);
+  const parsed = AuthErrorCodeSchema.safeParse(params.get(AUTH_ERROR_PARAM));
+  if (!parsed.success) return undefined;
+  const raw = params.get(AUTH_ERROR_MESSAGE_PARAM);
+  const message = raw ? safeAuthErrorMessage(raw) : "";
+  return { code: parsed.data, message: message || undefined };
+}
+
+/**
+ * What the Connect card hands an operator to paste onto a new machine.
+ *
+ * The fleet-wide enrollment token is deliberately absent and stripped if
+ * offered: a Node that has a Host id and fingerprint to pin has no use for a
+ * reusable fleet credential, and carrying one here is how it would end up sent
+ * to whatever answers the URL.
+ */
+export const ConnectCommandSchema = z
+  .object({
+    hostUrl: z.string().url().max(2048),
+    hostId: z.string().min(1).max(200),
+    hostFingerprint: sha256Hex,
+    /** `<grant-id>.<grant-secret>`, one Node, fifteen minutes, one use. */
+    enrollmentGrant: z.string().min(3).max(400),
+    tunnelId: z.string().max(200).optional(),
+  })
+  .strip();
+export type ConnectCommand = z.infer<typeof ConnectCommandSchema>;
+
+export function formatEnrollmentGrant(id: string, secret: string): string {
+  return `${id}.${secret}`;
+}
+
+/**
+ * Splits a grant, or reports that it is not one.
+ *
+ * The id is public and the secret is a key, so they travel joined and are used
+ * apart: the challenge endpoint is given only the id, and the secret never
+ * leaves the Node except as an HMAC over a transcript.
+ */
+export function parseEnrollmentGrant(
+  value: string,
+): { id: string; secret: string } | undefined {
+  const separator = value.indexOf(".");
+  if (separator <= 0) return undefined;
+  const id = value.slice(0, separator);
+  const secret = value.slice(separator + 1);
+  if (!id || !secret) return undefined;
+  return { id, secret };
+}
+
+export const NodeEnrollmentChallengeSchema = z
+  .object({
+    grantId: z.string().min(1).max(200),
+    nodeNonce: base64Field(MAX_PROOF_LENGTH),
+    nodePublicKey: base64Field(MAX_KEY_LENGTH),
+    /** SHA-256 of the canonical registration payload, committed to up front. */
+    registrationHash: sha256Hex,
+    /** The address the Node actually dialed, so a relay cannot rewrite it. */
+    dialedHostUrl: z.string().url().max(2048),
+  })
+  .strip();
+export type NodeEnrollmentChallenge = z.infer<typeof NodeEnrollmentChallengeSchema>;
+
+export const NodeEnrollmentChallengeResponseSchema = z.object({
+  challengeId: z.string().min(1).max(200),
+  hostId: z.string().min(1).max(200),
+  hostPublicKey: base64Field(MAX_KEY_LENGTH),
+  hostFingerprint: sha256Hex,
+  hostNonce: base64Field(MAX_PROOF_LENGTH),
+  expiresAt: z.string().datetime(),
+  signature: base64Field(MAX_PROOF_LENGTH),
+});
+export type NodeEnrollmentChallengeResponse = z.infer<
+  typeof NodeEnrollmentChallengeResponseSchema
+>;
+
+export const EnrollNodeSchema = z.object({
+  challengeId: z.string().min(1).max(200),
+  registration: NodeRegistrationPayloadSchema,
+  nodeSignature: base64Field(MAX_PROOF_LENGTH),
+  /** HMAC-SHA256 under the grant digest, over the same transcript. */
+  grantProof: base64Field(MAX_PROOF_LENGTH),
+});
+export type EnrollNode = z.infer<typeof EnrollNodeSchema>;
+
+/**
+ * What a newly enrolled Node is told, which is deliberately not a credential.
+ *
+ * The Node already holds the only secret in the exchange — its private key —
+ * so there is nothing here to steal and nothing to replay.
+ *
+ * Signed over the transcript the challenge and the completion were signed over,
+ * plus the id being issued. It is the last frame of enrolment and the first
+ * thing the Node writes to disk: it names the Host key that machine pins
+ * forever after, so an unsigned one would hand a relay the last word in an
+ * exchange it could not otherwise touch.
+ */
+export const NodeEnrollmentReceiptSchema = z
+  .object({
+    nodeId: z.string().min(1).max(200),
+    /** The challenge this answers, so a receipt cannot be moved to another. */
+    challengeId: z.string().min(1).max(200),
+    authProtocol: z.literal(MUTUAL_AUTH_PROTOCOL),
+    hostId: z.string().min(1).max(200),
+    hostPublicKey: base64Field(MAX_KEY_LENGTH),
+    hostFingerprint: sha256Hex,
+    signature: base64Field(MAX_PROOF_LENGTH),
+  })
+  .strip();
+export type NodeEnrollmentReceipt = z.infer<typeof NodeEnrollmentReceiptSchema>;
+
+export const NodeClientHelloSchema = z
+  .object({
+    type: z.literal("client_hello"),
+    protocol: z.literal(MUTUAL_AUTH_PROTOCOL),
+    nodeId: z.string().min(1).max(200),
+    /** The Host this Node believes it is dialing, echoed back in the proof. */
+    hostId: z.string().min(1).max(200),
+    nodeNonce: base64Field(MAX_PROOF_LENGTH),
+    nodeEphemeralPublicKey: base64Field(MAX_KEY_LENGTH),
+    dialedHostUrl: z.string().max(2048).default(""),
+  })
+  .strip();
+export type NodeClientHello = z.infer<typeof NodeClientHelloSchema>;
+
+export const HostChallengeSchema = z.object({
+  type: z.literal("host_challenge"),
+  protocol: z.literal(MUTUAL_AUTH_PROTOCOL),
+  hostId: z.string().min(1).max(200),
+  hostPublicKey: base64Field(MAX_KEY_LENGTH),
+  hostFingerprint: sha256Hex,
+  hostNonce: base64Field(MAX_PROOF_LENGTH),
+  connectionId: z.string().min(1).max(200),
+  hostEphemeralPublicKey: base64Field(MAX_KEY_LENGTH),
+  signature: base64Field(MAX_PROOF_LENGTH),
+});
+export type HostChallenge = z.infer<typeof HostChallengeSchema>;
+
+export const NodeProofSchema = z.object({
+  type: z.literal("node_proof"),
+  signature: base64Field(MAX_PROOF_LENGTH),
+});
+export type NodeProof = z.infer<typeof NodeProofSchema>;
+
+/**
+ * Every frame either end sends once the handshake is done.
+ *
+ * The sequence is authenticated rather than merely present: it is part of the
+ * additional data and of the nonce, so an envelope moved to another position in
+ * the stream fails to open rather than arriving early.
+ */
+export const AuthenticatedEnvelopeSchema = z.object({
+  type: z.literal("envelope"),
+  connectionId: z.string().min(1).max(200),
+  sequence: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+  ciphertext: base64Field(MAX_AUTHENTICATED_CIPHERTEXT_LENGTH),
+  authenticationTag: base64Field(MAX_PROOF_LENGTH),
+});
+export type AuthenticatedEnvelope = z.infer<typeof AuthenticatedEnvelopeSchema>;
+
+/**
+ * The one frame the gateway has to read before it knows which protocol it is
+ * speaking. Rejecting everything else here is what keeps a command or an event
+ * from ever being read on an unauthenticated connection.
+ */
+export const NodeFirstFrameSchema = z.discriminatedUnion("type", [
+  NodeHelloSchema,
+  NodeClientHelloSchema,
+]);
+export type NodeFirstFrame = z.infer<typeof NodeFirstFrameSchema>;
+
+/** What a Node may send while the Host is still waiting for its proof. */
+export const NodeHandshakeFrameSchema = NodeProofSchema;
+
+/** What a Node accepts from a Host it has not finished authenticating. */
+export const HostHandshakeFrameSchema = z.discriminatedUnion("type", [
+  HostChallengeSchema,
+  AuthenticatedEnvelopeSchema,
+]);
+export type HostHandshakeFrame = z.infer<typeof HostHandshakeFrameSchema>;
 
 /** Updating a busy Node is a deliberate act, so stopping its work is opt-in. */
 export const UpdateNodeSchema = z.object({
@@ -1594,6 +2054,26 @@ export type TunnelProvider = z.infer<typeof TunnelProviderSchema>;
 export const TunnelStatusSchema = z.enum(["off", "starting", "on", "stopping", "error"]);
 export type TunnelStatus = z.infer<typeof TunnelStatusSchema>;
 
+/**
+ * Who can reach a provider's URL before Fleet has authenticated anybody.
+ *
+ * `creator-private` means the provider itself demands a sign-in — the URL alone
+ * reaches nothing. `public` means the URL is the whole address: it lands on
+ * Fleet's own sign-in page, which is a defence, but a thinner one.
+ */
+export const tunnelAccessKinds = ["creator-private", "public"] as const;
+export const TunnelAccessSchema = z.enum(tunnelAccessKinds);
+export type TunnelAccess = z.infer<typeof TunnelAccessSchema>;
+
+/**
+ * What a Host offers first when nobody has chosen.
+ *
+ * The private provider, because the first thing a fresh Host publishes is a
+ * claim screen: an anonymous public URL would put that screen — and the race to
+ * claim the Host — in front of anyone who found the address.
+ */
+export const DEFAULT_TUNNEL_PROVIDER: TunnelProvider = "devtunnel";
+
 export const TunnelProviderInfoSchema = z.object({
   id: TunnelProviderSchema,
   label: z.string().min(1),
@@ -1605,6 +2085,17 @@ export const TunnelProviderInfoSchema = z.object({
   /** Upstream documentation link. */
   docsUrl: z.string().optional(),
   caveat: z.string().optional(),
+  /** The scheme this provider publishes externally. */
+  externalScheme: z.enum(["http", "https"]).default("https"),
+  access: TunnelAccessSchema.default("public"),
+  /**
+   * Whether the operator console may be exposed through this provider at all.
+   *
+   * False for a plain-TCP relay: the Fleet session cookie and every transcript
+   * it fetches would cross it in clear text, so the Host refuses to issue a
+   * session there and refuses to start it for that purpose.
+   */
+  controlPlaneEligible: z.boolean().default(true),
 });
 export type TunnelProviderInfo = z.infer<typeof TunnelProviderInfoSchema>;
 
@@ -1668,10 +2159,47 @@ export const HOST_BACKUP_KIND = "copilot-fleet-host" as const;
 export const NODE_BACKUP_KIND = "copilot-fleet-node" as const;
 export const BACKUP_VERSION = 1 as const;
 
+/**
+ * A shared-secret Node must arrive with the secret's digest and nothing else
+ * will do.
+ *
+ * Restoring a legacy row with an empty hash produces a Node that cannot
+ * authenticate by either protocol: the gateway refuses an empty stored hash on
+ * purpose, so it would be a machine silently dropped out of the fleet by a
+ * move that reported success.
+ */
+function requireSecretHashUnlessKeyed(
+  value: { authProtocol: NodeAuthProtocol; secretHash: string },
+  context: z.RefinementCtx,
+): void {
+  if (value.authProtocol === MUTUAL_AUTH_PROTOCOL) return;
+  if (/^[a-f0-9]{64}$/.test(value.secretHash)) return;
+  context.addIssue({
+    code: "custom",
+    path: ["secretHash"],
+    message:
+      "A Node that authenticates with a shared secret needs the SHA-256 digest of it.",
+  });
+}
+
+/**
+ * A Node row, plus the proof that lets it back in.
+ *
+ * An empty hash is meaningful rather than merely permitted: it says this
+ * machine proves itself with a key instead. On a legacy row it would restore a
+ * Node nothing can authenticate — a machine the operator has to re-enrol
+ * without ever being told why — so the two are checked against each other.
+ */
 export const HostBackupNodeSchema = NodeSchema.extend({
-  /** SHA-256 hex of the Node secret; enough to authenticate, never to impersonate. */
-  secretHash: z.string().regex(/^[a-f0-9]{64}$/),
-});
+  /**
+   * SHA-256 hex of the Node secret; enough to authenticate, never to impersonate.
+   *
+   * Empty for a Node that authenticates with a key pair instead. The public key
+   * is not here: a version 1 archive has no security envelope to put it in, so
+   * a key-based Node is restored by the portable format or re-enrolled.
+   */
+  secretHash: z.string().regex(/^([a-f0-9]{64})?$/),
+}).superRefine(requireSecretHashUnlessKeyed);
 export type HostBackupNode = z.infer<typeof HostBackupNodeSchema>;
 
 export const HostBackupWorkspaceSchema = WorkspaceSchema.extend({
@@ -1689,11 +2217,26 @@ export const HostBackupSessionSchema = SessionSchema.extend({
 });
 export type HostBackupSession = z.infer<typeof HostBackupSessionSchema>;
 
-export const HostBackupSchema = z.object({
+/**
+ * Everything a Host archive carries that is not its format version.
+ *
+ * Shared rather than extended so that the two versions are two literals over
+ * one shape: a field added to a data archive cannot be left out of a portable
+ * one, and neither schema can drift into accepting the other's version.
+ */
+const hostBackupDataShape = {
   kind: z.literal(HOST_BACKUP_KIND),
-  version: z.literal(BACKUP_VERSION),
   exportedAt: z.string().datetime(),
-  enrollmentToken: z.string().min(1),
+  /**
+   * Empty on a Host that never had one.
+   *
+   * The fleet-wide token is a migration artefact: a grant-only install has
+   * nothing for it to do, and requiring one here would make the default
+   * install the single configuration that cannot be archived. Older files
+   * still carry a real value, which is why this is defaulted rather than
+   * dropped.
+   */
+  enrollmentToken: z.string().max(1_000).default(""),
   /** Omitted when the live URL would not survive a move (loopback / quick tunnel). */
   publicUrl: z.string().url().optional(),
   tunnel: z.object({
@@ -1724,15 +2267,216 @@ export const HostBackupSchema = z.object({
   runNotes: z.array(RunNoteSchema).default([]),
   notifications: z.array(NotificationSchema).default([]),
   notificationPreferences: z.array(NotificationPreferenceSchema).default([]),
+} as const;
+
+export const HostBackupSchema = z.object({
+  ...hostBackupDataShape,
+  version: z.literal(BACKUP_VERSION),
 });
 export type HostBackup = z.infer<typeof HostBackupSchema>;
 
-export const NodeBackupCredentialsSchema = z.object({
-  hostUrl: z.string().url(),
-  nodeId: z.string().min(1),
-  secret: z.string().min(1),
-  name: z.string().min(1),
+/** A Host archive's contents, with nothing said about which version wrote it. */
+export type HostBackupData = Omit<HostBackup, "kind" | "version">;
+
+/**
+ * The portable archive: the same data, plus the Host's authority under a key
+ * nobody has unless they were given the passphrase.
+ */
+export const PORTABLE_BACKUP_VERSION = 2 as const;
+
+/** The envelope layout, so a later one can be told apart rather than guessed. */
+export const SECURITY_ENVELOPE_FORMAT = 1 as const;
+
+/**
+ * The work factor this Host writes, and the floor it will read.
+ *
+ * A file names the parameters its key was derived with, which is also a way to
+ * ask for cheap ones; the floor is what keeps an archive from choosing how
+ * hard it is to attack.
+ */
+export const MIN_SECURITY_ENVELOPE_SCRYPT_N = 32_768;
+
+/**
+ * A bound on the sealed section, which holds keys and identities rather than
+ * transcripts. An archive is parsed before anybody has authenticated, so the
+ * parse itself must not be a way to spend the Host's memory.
+ */
+export const MAX_SECURITY_ENVELOPE_BYTES = 1_000_000;
+
+export const SecurityEnvelopeKdfSchema = z.object({
+  algorithm: z.literal("scrypt"),
+  version: z.literal(1),
+  N: z.literal(MIN_SECURITY_ENVELOPE_SCRYPT_N),
+  r: z.literal(8),
+  p: z.literal(1),
+  keyLength: z.literal(32),
 });
+export type SecurityEnvelopeKdf = z.infer<typeof SecurityEnvelopeKdfSchema>;
+
+export const SecurityEnvelopeSchema = z.object({
+  format: z.literal(SECURITY_ENVELOPE_FORMAT),
+  cipher: z.literal("aes-256-gcm"),
+  kdf: SecurityEnvelopeKdfSchema,
+  /** Base64, and random per export: one passphrase must not derive one key. */
+  salt: z.string().min(1).max(128),
+  nonce: z.string().min(1).max(128),
+  authTag: z.string().min(1).max(128),
+  ciphertext: z.string().min(1).max(MAX_SECURITY_ENVELOPE_BYTES),
+});
+export type SecurityEnvelope = z.infer<typeof SecurityEnvelopeSchema>;
+
+export const SecurityBackupAdministratorSchema = z.object({
+  id: z.string().min(1).max(200),
+  tenantId: z.string().min(1).max(200),
+  objectId: z.string().min(1).max(200),
+  username: z.string().max(320).default(""),
+  displayName: z.string().max(320).default(""),
+  addedVia: z.string().max(40).default(""),
+  addedByAdminId: z.string().max(200).default(""),
+  createdAt: z.string().max(64).default(""),
+  lastLoginAt: z.string().max(64).default(""),
+  disabledAt: z.string().max(64).default(""),
+});
+export type SecurityBackupAdministrator = z.infer<
+  typeof SecurityBackupAdministratorSchema
+>;
+
+/**
+ * What a Node authenticates with, named rather than assumed.
+ *
+ * Nodes hold a shared secret today and will hold a key pair; recording which
+ * protocol a row is for means the archive that moves a fleet before that
+ * change can still be read by the Host that comes after it — and means an
+ * empty hash can be held to meaning "this one has a key" rather than "this one
+ * has nothing".
+ */
+export const SecurityBackupNodeAuthSchema = z
+  .object({
+    nodeId: z.string().min(1).max(200),
+    authProtocol: NodeAuthProtocolSchema.default("legacy-secret"),
+    secretHash: z.string().max(200).default(""),
+    publicKey: z.string().max(1_000).default(""),
+  })
+  .superRefine(requireSecretHashUnlessKeyed);
+export type SecurityBackupNodeAuth = z.infer<typeof SecurityBackupNodeAuthSchema>;
+
+export const SecurityBackupHostIdentitySchema = z.object({
+  id: z.string().max(200).default(""),
+  privateKey: z.string().max(4_000).default(""),
+  publicKey: z.string().max(4_000).default(""),
+  fingerprint: z.string().max(200).default(""),
+});
+
+/**
+ * The sealed contents: who owns a Host, and every key it proves things with.
+ *
+ * There is deliberately nowhere in here for an operator session, an admin
+ * invitation, an enrollment grant, or a half-finished login. They belong to
+ * the machine that issued them, and a format with no field for them cannot
+ * resurrect one on another machine by accident.
+ */
+export const SecurityBackupPayloadSchema = z.object({
+  version: z.literal(1),
+  /**
+   * Legacy only, and empty on a Host that enrols with one-time grants.
+   *
+   * A fleet that has retired the shared Node secret has no fleet-wide token to
+   * carry, and an archive that insisted on one would make the grant-only
+   * install unbackupable.
+   */
+  enrollmentToken: z.string().max(1_000).default(""),
+  auth: z.object({
+    mode: z.string().max(40).default(""),
+    passwordEnabled: z.boolean(),
+    passwordExplicitlyEnabled: z.boolean().default(false),
+    /** Only present while the migration password is still switched on. */
+    passwordVerifier: z.string().max(500).default(""),
+    passwordIsRecovery: z.boolean().default(false),
+    entraTenantId: z.string().max(200).default(""),
+    entraClientId: z.string().max(200).default(""),
+    deviceFlowEnabled: z.boolean().default(false),
+    csrfKey: z.string().min(1).max(200),
+  }),
+  /**
+   * Whether the shared Node secret is over, which travels with the fleet.
+   *
+   * Enforcement is as much a part of who may talk to a Host as the
+   * administrator table is: an archive that left it behind would restore a
+   * fleet quietly accepting the credential its operator had retired. Defaulted
+   * so an archive written before the field existed restores as unenforced,
+   * which is what those fleets actually were.
+   */
+  node: z
+    .object({ mutualAuthenticationRequired: z.boolean().default(false) })
+    .default({ mutualAuthenticationRequired: false }),
+  leadTokenKey: z.string().min(1).max(200),
+  /** Absent until the Host has an identity key pair of its own to move. */
+  hostIdentity: SecurityBackupHostIdentitySchema.optional(),
+  administrators: z.array(SecurityBackupAdministratorSchema).max(100),
+  nodeAuth: z.array(SecurityBackupNodeAuthSchema).max(1_000).default([]),
+});
+export type SecurityBackupPayload = z.infer<typeof SecurityBackupPayloadSchema>;
+
+const {
+  enrollmentToken: _portableEnrollmentToken,
+  nodes: _portableNodes,
+  ...portableBackupDataShape
+} = hostBackupDataShape;
+
+export const HostPortableBackupSchema = z
+  .object({
+    ...portableBackupDataShape,
+    nodes: z.array(NodeSchema.strict()),
+    version: z.literal(PORTABLE_BACKUP_VERSION),
+    security: SecurityEnvelopeSchema,
+  })
+  .strict();
+export type HostPortableBackup = z.infer<typeof HostPortableBackupSchema>;
+export type HostPortableBackupData = Omit<
+  HostPortableBackup,
+  "kind" | "version" | "security"
+>;
+
+/**
+ * The identity half of a Node archive, in either protocol.
+ *
+ * Mirrors what the Node writes to disk: a machine restored from an archive has
+ * to come back as the same Node, and a key-based one whose private half was
+ * dropped in transit would come back as a stranger.
+ *
+ * The discriminator is defaulted before the union sees it, because an archive
+ * exported before Node keys existed has no `authProtocol` and every one of them
+ * is by construction a shared-secret machine — refusing those would break the
+ * import path for exactly the fleet the migration is for.
+ */
+export const NodeBackupCredentialsSchema = z.preprocess(
+  (value) =>
+    value && typeof value === "object" && !("authProtocol" in value)
+      ? { ...(value as Record<string, unknown>), authProtocol: "legacy-secret" }
+      : value,
+  z.discriminatedUnion("authProtocol", [
+    z.object({
+      hostUrl: z.string().url(),
+      nodeId: z.string().min(1),
+      name: z.string().min(1),
+      authProtocol: z.literal("legacy-secret"),
+      secret: z.string().min(1),
+    }),
+    z.object({
+      hostUrl: z.string().url(),
+      nodeId: z.string().min(1),
+      name: z.string().min(1),
+      authProtocol: z.literal(MUTUAL_AUTH_PROTOCOL),
+      privateKey: z.string().min(1).max(4_000),
+      publicKey: z.string().min(1).max(4_000),
+      host: z.object({
+        hostId: z.string().min(1).max(200),
+        publicKey: z.string().min(1).max(4_000),
+        fingerprint: sha256Hex,
+      }),
+    }),
+  ]),
+);
 export type NodeBackupCredentials = z.infer<typeof NodeBackupCredentialsSchema>;
 
 export const NodeBackupSettingsSchema = z.object({
@@ -1818,6 +2562,20 @@ export function backupKind(
   const kind = (value as { kind: unknown }).kind;
   if (kind === HOST_BACKUP_KIND || kind === NODE_BACKUP_KIND) return kind;
   return undefined;
+}
+
+/**
+ * Reads the format version off an unknown archive.
+ *
+ * Read before anything is applied, because the endpoint that restores data is
+ * not the endpoint that may change who owns a Host: a portable archive posted
+ * to the data restore has to be named rather than merely rejected as
+ * malformed, or the operator is told their file is corrupt when it is not.
+ */
+export function backupFormatVersion(value: unknown): number | undefined {
+  if (!value || typeof value !== "object" || !("version" in value)) return undefined;
+  const version = (value as { version: unknown }).version;
+  return typeof version === "number" && Number.isInteger(version) ? version : undefined;
 }
 
 const transitions: Record<SessionState, ReadonlySet<SessionState>> = {
@@ -1977,6 +2735,18 @@ export const AUTH_FAILED_CLOSE_CODE = 4003;
  */
 export const NODE_ID_HEADER = "x-fleet-node-id";
 export const NODE_SECRET_HEADER = "x-fleet-node-secret";
+
+/*
+ * The same question, answered by a Node that has a key pair instead.
+ *
+ * A shared secret answers "who is calling" by handing the answer over on every
+ * request, so anything that sees one call can make every other. These carry a
+ * signature over just the call being made — the method, the exact path, the
+ * body, and a timestamp and nonce that keep it from being made twice.
+ */
+export const NODE_PROOF_TIMESTAMP_HEADER = "x-fleet-node-timestamp";
+export const NODE_PROOF_NONCE_HEADER = "x-fleet-node-nonce";
+export const NODE_PROOF_SIGNATURE_HEADER = "x-fleet-node-signature";
 
 export type JsonParseResult = { ok: true; value: unknown } | { ok: false; error: string };
 

@@ -5,6 +5,7 @@ import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { NodesPanel } from "./NodesPanel";
 import { GeneralPanel } from "./GeneralPanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
+import { SecurityPanel } from "./SecurityPanel";
 import { TunnelPanel } from "./TunnelPanel";
 import { WorkspacesPanel } from "./WorkspacesPanel";
 
@@ -30,7 +31,8 @@ const useStyles = makeStyles({
   },
 });
 
-export type SettingsTab = "general" | "tunnel" | "nodes" | "workspaces" | "diagnostics";
+export type SettingsTab =
+  "general" | "security" | "tunnel" | "nodes" | "workspaces" | "diagnostics";
 
 type SettingsPanelProps = {
   workspaces: Workspace[];
@@ -67,6 +69,7 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
           aria-label="Settings sections"
         >
           <Tab value="general">General</Tab>
+          <Tab value="security">Security</Tab>
           <Tab value="tunnel">Tunnel</Tab>
           <Tab value="nodes">Nodes</Tab>
           <Tab value="workspaces">Workspaces</Tab>
@@ -75,6 +78,7 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
       </div>
       <div className={styles.body}>
         {tab === "general" && <GeneralPanel sessions={props.sessions} />}
+        {tab === "security" && <SecurityPanel />}
         {tab === "diagnostics" && <DiagnosticsPanel />}
         {tab === "tunnel" && <TunnelPanel />}
         {tab === "nodes" && (

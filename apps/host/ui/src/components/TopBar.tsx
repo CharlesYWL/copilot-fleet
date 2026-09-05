@@ -1,4 +1,4 @@
-import type { ReactElement } from "react";
+import { useEffect, useState, type ReactElement } from "react";
 import type { Notification } from "@fleet/protocol";
 import {
   Button,
@@ -24,6 +24,7 @@ import {
 } from "@fluentui/react-icons";
 import { BrandMark } from "./BrandMark";
 import { ContextModeToggle, type ContextMode } from "./navigation/ContextModeToggle";
+import { fetchAuthStatus } from "../lib/auth";
 import { semanticColors } from "../theme";
 import { NotificationCenter } from "./NotificationCenter";
 
@@ -120,6 +121,15 @@ const useStyles = makeStyles({
   connectionLost: { color: semanticColors.permission },
   soundButton: {
     "@media (max-width: 600px)": { display: "none" },
+  },
+  operator: {
+    maxWidth: "180px",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    color: tokens.colorBrandForeground1,
+    fontWeight: tokens.fontWeightSemibold,
+    "@media (max-width: 900px)": { display: "none" },
   },
 });
 
@@ -227,6 +237,21 @@ export const TopBar = ({
 }: TopBarProps) => {
   const styles = useStyles();
   const collapseLabel = navCollapsed ? "Show sidebar" : "Hide sidebar";
+  const [operator, setOperator] = useState<{
+    username: string;
+    displayName: string;
+  }>();
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchAuthStatus().then((status) => {
+      if (!cancelled) setOperator(status.identity);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <header className={styles.bar}>
       <div className={styles.left}>
@@ -344,6 +369,14 @@ export const TopBar = ({
             {connected ? <PlugConnected20Regular /> : <PlugDisconnected20Regular />}
           </span>
         </Tooltip>
+        {operator && (
+          <Text
+            className={styles.operator}
+            title={operator.displayName || operator.username}
+          >
+            {operator.displayName || operator.username}
+          </Text>
+        )}
         <Button
           appearance="subtle"
           size="small"

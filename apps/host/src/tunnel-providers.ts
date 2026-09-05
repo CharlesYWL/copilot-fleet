@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promisify } from "node:util";
-import type { TunnelProvider } from "@fleet/protocol";
+import type { TunnelAccess, TunnelProvider } from "@fleet/protocol";
 
 const execFileAsync = promisify(execFile);
 
@@ -30,8 +30,7 @@ export type ProviderSpec = {
   /** Binary that must exist on PATH. */
   binary: string;
   /** Arguments used to probe whether the binary is installed. */
-  versionArgs: string[];
-  /** Builds the argv that starts the tunnel for a loopback target. */
+  versionArgs: string[]; /** Builds the argv that starts the tunnel for a loopback target. */
   args: (target: LocalTarget, tunnelId?: string) => string[];
   /**
    * Registers whatever the provider needs before `args` can be spawned, and
@@ -70,6 +69,19 @@ export type ProviderSpec = {
    * enrollment has a command for it — but must never be pushed to live nodes.
    */
   nodeDialable?: boolean;
+  /** The scheme this provider publishes externally. */
+  externalScheme: "http" | "https";
+  /** Whether the provider itself demands a sign-in before the URL reaches Fleet. */
+  access: TunnelAccess;
+  /**
+   * Whether the operator console may be exposed through this provider.
+   *
+   * False means the Host refuses to start it for that purpose, not merely that
+   * the panel greys the switch out: a provider with no TLS would carry the
+   * Fleet session cookie and every transcript behind it in clear text, and the
+   * refusal has to hold for a caller who never renders the panel.
+   */
+  controlPlaneEligible: boolean;
 };
 
 export type LocalTarget = {
@@ -126,6 +138,9 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     docsUrl:
       "https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/do-more-with-tunnels/trycloudflare/",
     caveat: "Quick tunnel URLs change on every restart.",
+    externalScheme: "https",
+    access: "public",
+    controlPlaneEligible: true,
   },
   tailscale: {
     id: "tailscale",
@@ -143,6 +158,9 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
       "The URL is a stable name on your tailnet, so it survives restarts.",
     ],
     docsUrl: "https://tailscale.com/kb/1223/funnel",
+    externalScheme: "https",
+    access: "public",
+    controlPlaneEligible: true,
   },
   ngrok: {
     id: "ngrok",
@@ -161,6 +179,9 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     ],
     docsUrl: "https://ngrok.com/docs/getting-started/",
     caveat: "Free ngrok domains change on every restart.",
+    externalScheme: "https",
+    access: "public",
+    controlPlaneEligible: true,
   },
   bore: {
     id: "bore",
@@ -189,6 +210,12 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     ],
     docsUrl: "https://github.com/ekzhang/bore",
     caveat: "bore relays plain TCP, so traffic is not encrypted in transit.",
+    externalScheme: "http",
+    access: "public",
+    // Every operator request would cross this relay readable — session cookie,
+    // prompts and transcripts alike — so it is not a door the console may
+    // stand behind, whoever is asking for it.
+    controlPlaneEligible: false,
   },
   devtunnel: {
     id: "devtunnel",
@@ -238,6 +265,9 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     // A node handed this URL would be redirected to a login it cannot answer,
     // and would then be unreachable for a correction.
     nodeDialable: false,
+    externalScheme: "https",
+    access: "creator-private",
+    controlPlaneEligible: true,
   },
 };
 

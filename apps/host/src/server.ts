@@ -1,4 +1,5 @@
 import { config as loadEnv } from "dotenv";
+import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
@@ -7,12 +8,26 @@ import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { errorMessage } from "@fleet/protocol";
 import { cachedGitRevision } from "./host-revision.js";
-import { OperatorAuth, PASSWORD_SETTING_KEY, SESSION_KEY_SETTING } from "./auth.js";
+import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
+import { FleetAuth } from "./auth/service.js";
+import { EnrollmentGrants } from "./auth/enrollment-grants.js";
+import { HostIdentityService } from "./auth/host-identity.js";
+import { NodeEnrollment } from "./auth/node-enrollment.js";
+import {
+  BUILT_IN_ENTRA_CONFIG,
+  type EntraConfig,
+  type EntraProvider,
+} from "./auth/entra.js";
+import {
+  BrowserSessionRegistry,
+  SESSION_REVALIDATION_MS,
+} from "./gateway/browser-registry.js";
 import {
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
-  resolveEnrollmentToken,
+  resolveLegacyEnrollmentToken,
   resolvePublicHostUrl,
+  type LegacyEnrollment,
 } from "./config.js";
 import { FleetService } from "./fleet-service.js";
 import { registerBrowserGateway } from "./gateway/browser-socket.js";
@@ -28,6 +43,7 @@ import { registerRequestGuard } from "./request-guard.js";
 import { authRoutes } from "./routes/auth.js";
 import { catalogRoutes } from "./routes/catalog.js";
 import { nodeRoutes } from "./routes/nodes.js";
+import { portableBackupRoutes } from "./routes/portable-backup.js";
 import { notificationRoutes } from "./routes/notifications.js";
 import { startNotificationRetentionMonitor } from "./notifications/retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
@@ -46,7 +62,7 @@ const VERSION = packageVersion();
 export {
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
-  resolveEnrollmentToken,
+  resolveLegacyEnrollmentToken,
   resolvePublicHostUrl,
 } from "./config.js";
 export { yoloUnsupportedReason } from "./session-policy.js";
@@ -63,37 +79,48 @@ export async function buildServer(
     databasePath?: string;
     enrollmentToken?: string;
     /**
-     * The operator password. Defaults to `FLEET_OPERATOR_PASSWORD`, and to one
-     * generated on first boot when neither is set.
+     * The operator password. Defaults to `FLEET_OPERATOR_PASSWORD`.
+     *
+     * A Host given neither generates nothing: password sign-in is a migration
+     * escape hatch now, not the default way in.
      */
     operatorPassword?: string;
+    /**
+     * Where the one-time claim code is written.
+     *
+     * Defaults to stdout directly rather than through the logger, because the
+     * logger's buffer is served over HTTP at `/api/logs` and this is the one
+     * string that must never be readable that way.
+     */
+    announceClaimCode?: (code: string) => void;
+    /** Injected in tests; production builds the MSAL-backed provider. */
+    entraProvider?: (config: EntraConfig) => EntraProvider;
+    /** Tests opt in explicitly; real local and production Hosts use it by default. */
+    useBuiltInEntra?: boolean;
   } = {},
 ): Promise<FastifyInstance> {
   const logs = createLogBuffer();
   const app = Fastify({ logger: { stream: recordingLogStream(logs) } });
   const store = new FleetStore(
     options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH),
+    {
+      // The Host database holds this Host's private key and its administrator
+      // table, so what the filesystem says about it is part of the security
+      // boundary rather than a detail of where it happens to live.
+      secureFiles: (databasePath) =>
+        secureHostDataFiles(
+          databasePath,
+          defaultSecureDataDeps((message) => app.log.warn(message)),
+        ),
+    },
   );
   store.resetConnectivity();
-  const enrollment = {
+  const enrollment: LegacyEnrollment = {
     token: resolveRuntimeEnrollmentToken(store, options.enrollmentToken),
   };
-  const auth = new OperatorAuth({
-    getStoredHash: () => store.getSetting(PASSWORD_SETTING_KEY),
-    setStoredHash: (hash) => store.setSetting(PASSWORD_SETTING_KEY, hash),
-    // Persisted so a restart does not sign the operator out. In development the
-    // Host restarts on every file save, which made that constant.
-    getSessionKey: () => store.getSetting(SESSION_KEY_SETTING),
-    setSessionKey: (key) => store.setSetting(SESSION_KEY_SETTING, key),
-    configuredPassword: options.operatorPassword ?? process.env.FLEET_OPERATOR_PASSWORD,
-    // Info rather than warn: the buffer behind /api/logs keeps warnings and
-    // errors, and this is the one line that must never be readable over HTTP.
-    announce: (password) =>
-      app.log.info(
-        `No FLEET_OPERATOR_PASSWORD set, so this Host generated one. Sign in with: ${password}`,
-      ),
-  });
-  const service = new FleetService(store, app.log, cachedGitRevision());
+  // Written only when there is one. A fresh Host must not leave a fleet-wide
+  // credential in its settings table for a path it does not accept.
+  if (enrollment.token) store.setSetting("enrollment.token", enrollment.token);
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
   const listenPort = process.env.PORT ?? "8787";
 
@@ -113,6 +140,68 @@ export async function buildServer(
       process.env.HOST,
       process.env.PORT,
     );
+
+  /*
+   * Bound after the auth service so a revocation can reach the live sockets,
+   * and constructed before it so the service can call into it. The lookup is
+   * the database rather than a cached copy, so a row changed by any path — a
+   * removal, a logout, an expiry — is what the timer sees.
+   */
+  const browsers: BrowserSessionRegistry = new BrowserSessionRegistry({
+    lookup: (tokenHash) => {
+      const session = auth.sessions.inspect(tokenHash);
+      if (!session) return undefined;
+      return {
+        administratorId: session.administratorId,
+        expiresAt: session.expiresAt,
+      };
+    },
+  });
+
+  const auth = new FleetAuth({
+    store,
+    configuredPassword: options.operatorPassword ?? process.env.FLEET_OPERATOR_PASSWORD,
+    envEntra:
+      process.env.FLEET_ENTRA_TENANT_ID && process.env.FLEET_ENTRA_CLIENT_ID
+        ? {
+            tenantId: process.env.FLEET_ENTRA_TENANT_ID,
+            clientId: process.env.FLEET_ENTRA_CLIENT_ID,
+          }
+        : (options.useBuiltInEntra ?? process.env.NODE_ENV !== "test")
+          ? BUILT_IN_ENTRA_CONFIG
+          : undefined,
+    announceClaimCode:
+      options.announceClaimCode ??
+      ((code) =>
+        process.stdout.write(
+          `\nCopilot Fleet is unclaimed. Claim it at ${fallbackPublicUrl()} with this one-time code:\n\n    ${code}\n\nIt expires in 30 minutes and is printed only here.\n\n`,
+        )),
+    warn: (message) => app.log.warn(message),
+    externalScheme: {
+      publicUrl: () => process.env.FLEET_PUBLIC_URL || store.getSetting("host.publicUrl"),
+      tunnels: () => tunnel.allTunnelEndpoints(),
+    },
+    ...(options.entraProvider ? { entraProvider: options.entraProvider } : {}),
+    onSessionsRevoked: (revoked) =>
+      browsers.revokeSessions(revoked.map((row) => row.tokenHash)),
+    onAdministratorRemoved: (administratorId) =>
+      browsers.revokeAdministrator(administratorId),
+  });
+  const service = new FleetService(store, app.log, cachedGitRevision());
+  const leadTokens = new LeadTokens(store);
+  /*
+   * Minted on the first boot that needs one and kept for the life of the fleet:
+   * every enrolled Node has pinned this fingerprint, so a Host that came back
+   * with a different identity would be a Host none of its machines will speak to.
+   */
+  const hostIdentity = new HostIdentityService(store);
+  const enrollmentGrants = new EnrollmentGrants({ store });
+  const nodeEnrollment = new NodeEnrollment({
+    store,
+    identity: hostIdentity,
+    grants: enrollmentGrants,
+    audit: (entry) => auth.audit(entry),
+  });
   const enrollmentHostUrl = () =>
     resolveEnrollmentHostUrl(tunnel.activeTunnelUrl(), fallbackPublicUrl());
   /**
@@ -150,17 +239,44 @@ export async function buildServer(
       tunnelUrls: () => tunnel.allTunnelUrls(),
     },
   });
-  await app.register(authRoutes, { auth });
+  await app.register(authRoutes, {
+    auth,
+    loopbackCallbackOrigin: `http://localhost:${listenPort}`,
+    ...(process.env.npm_lifecycle_event === "dev"
+      ? { uiOrigin: "http://localhost:5173" }
+      : {}),
+  });
   await app.register(systemRoutes, {
     service,
     tunnel,
     version: VERSION,
     enrollment,
+    auth,
+    identity: hostIdentity,
+    grants: enrollmentGrants,
     fallbackPublicUrl,
     enrollmentHostUrl,
     recentLogs: () => logs.entries(),
   });
-  await app.register(nodeRoutes, { service, enrollment });
+  await app.register(nodeRoutes, {
+    service,
+    enrollment,
+    nodeEnrollment,
+    // "Owned by somebody", not "owned by a Microsoft identity": a Host still
+    // running on a migration password can enrol machines as it always could.
+    enrollable: () => {
+      const state = auth.state();
+      return state !== "unclaimed" && state !== "entra-unconfigured";
+    },
+  });
+  await app.register(portableBackupRoutes, {
+    service,
+    auth,
+    enrollment,
+    enrollmentHostUrl,
+    leadTokens,
+    identity: hostIdentity,
+  });
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
   await app.register(notificationRoutes, { service });
@@ -179,7 +295,6 @@ export async function buildServer(
    * which means the Node has to be able to dial it. The Host names the path;
    * the Node resolves it against the address it is connected on.
    */
-  const leadTokens = new LeadTokens(store);
   service.attachOrchestration({
     leadTokens,
     /*
@@ -192,18 +307,36 @@ export async function buildServer(
     mcpUrl: () => new URL(MCP_PATH, enrollmentHostUrl()).toString(),
     tickRun: (runId) => engine.tickRun(runId),
   });
-  await app.register(mcpRoutes, { service, tokens: leadTokens });
+  await app.register(mcpRoutes, {
+    service,
+    tokens: leadTokens,
+    // A refused tool call is a security event: the endpoint is reachable
+    // through whatever tunnel this Host is published on, so a run of them is
+    // something an administrator has to be able to see.
+    audit: (entry) => auth.audit(entry),
+  });
   await app.register(runRoutes, { service, engine });
   await app.register(orchestratorRoutes, { service, engine });
 
-  registerBrowserGateway(app, service);
-  registerNodeGateway(app, service);
+  registerBrowserGateway(app, { service, auth, registry: browsers });
+  registerNodeGateway(app, service, { identity: hostIdentity });
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs);
   const notificationRetentionTimer = startNotificationRetentionMonitor(service, app.log);
   // Timeouts are the absence of events; without a clock nothing would ever
   // notice one. See the monitor for why this is not the busy-wait the design
   // rules out.
   const runDeadlineTimer = startRunDeadlineMonitor(engine);
+  /*
+   * A socket authorised an hour ago is not authorised now just because nobody
+   * has said otherwise. Revocation closes matching sockets immediately; this
+   * catches what immediacy cannot know about — an idle session lapsing, a row
+   * changed by another process — and prunes the sessions nothing can use.
+   */
+  const sessionTimer = setInterval(() => {
+    browsers.revalidate();
+    auth.sessions.pruneExpired();
+  }, SESSION_REVALIDATION_MS);
+  sessionTimer.unref?.();
 
   const uiRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../ui");
   if (existsSync(uiRoot)) {
@@ -235,6 +368,7 @@ export async function buildServer(
     clearInterval(notificationRetentionTimer);
     clearInterval(runDeadlineTimer);
     clearInterval(hostUrlMonitor);
+    clearInterval(sessionTimer);
     await tunnel.stop();
     service.shutdown();
     store.close();
@@ -253,16 +387,21 @@ function hasIssues(value: unknown): value is { issues: unknown[] } {
 
 /**
  * Tests pass a token explicitly; a moved Host reads the one restored into the
- * database; a first boot falls through to the environment.
+ * database; an upgrade with legacy machines gets one minted; a fresh install
+ * gets none, because it enrols with one-time grants instead.
  */
 function resolveRuntimeEnrollmentToken(
   store: FleetStore,
   optionsToken: string | undefined,
-): string {
-  if (optionsToken) return resolveEnrollmentToken(optionsToken, process.env.NODE_ENV);
-  const stored = store.getSetting("enrollment.token");
-  if (stored) return stored;
-  return resolveEnrollmentToken(process.env.ENROLLMENT_TOKEN, process.env.NODE_ENV);
+): string | undefined {
+  return resolveLegacyEnrollmentToken({
+    explicit: optionsToken,
+    stored: store.getSetting("enrollment.token") || undefined,
+    env: process.env.ENROLLMENT_TOKEN,
+    legacyNodes: store.nodeAuthenticationSummary().legacy,
+    nodeEnv: process.env.NODE_ENV,
+    generate: () => randomBytes(32).toString("base64url"),
+  });
 }
 
 function getStatusCode(value: unknown): number {

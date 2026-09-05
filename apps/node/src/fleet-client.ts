@@ -1,5 +1,13 @@
 import { z } from "zod";
-import { NODE_ID_HEADER, NODE_SECRET_HEADER, SessionSchema } from "@fleet/protocol";
+import {
+  NODE_ID_HEADER,
+  NODE_PROOF_NONCE_HEADER,
+  NODE_PROOF_SIGNATURE_HEADER,
+  NODE_PROOF_TIMESTAMP_HEADER,
+  NODE_SECRET_HEADER,
+  SessionSchema,
+} from "@fleet/protocol";
+import { signNodeHttpProof } from "@fleet/protocol/node-auth";
 
 /**
  * The subset of a placement this page needs. Declared locally rather than
@@ -59,46 +67,18 @@ export type FleetClientOptions = {
   nodeId: () => string;
   /**
    * This node's secret, which is how the Host tells a relayed call from an
-   * anonymous one. Absent before enrollment, when there is nothing to say.
+   * anonymous one. Absent before enrollment, and on a node that has a key.
    */
   nodeSecret?: () => string | undefined;
+  /**
+   * This node's private key, for a machine that has one instead of a secret.
+   *
+   * Preferred over the secret when both somehow exist: a signature authorises
+   * the one call it was made for, and a secret authorises every call anyone
+   * who sees it cares to make.
+   */
+  nodeKey?: () => string | undefined;
 };
-
-/** The identity headers a relayed call carries, or nothing before enrollment. */
-type NodeCredentialHeaders = Record<string, string>;
-
-async function request<T>(
-  base: string,
-  path: string,
-  schema: z.ZodType<T>,
-  init: { method?: string; body?: string; credentials?: NodeCredentialHeaders } = {},
-): Promise<T> {
-  const response = await fetch(new URL(path, base), {
-    ...(init.method ? { method: init.method } : {}),
-    ...(init.body ? { body: init.body } : {}),
-    headers: {
-      ...(init.body ? { "content-type": "application/json" } : {}),
-      ...init.credentials,
-    },
-    signal: AbortSignal.timeout(10_000),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    // The Host replies with {error} on failure; fall back to the raw body so a
-    // proxy error page does not surface as an empty message.
-    let message = text;
-    try {
-      const parsed: unknown = JSON.parse(text);
-      if (parsed && typeof parsed === "object" && "error" in parsed) {
-        message = String((parsed as { error: unknown }).error);
-      }
-    } catch {
-      // Keep the raw text.
-    }
-    throw new Error(`Host responded ${response.status}: ${message}`);
-  }
-  return schema.parse(text ? JSON.parse(text) : undefined);
-}
 
 /**
  * Talks to the Host's HTTP API on behalf of the local config page.
@@ -111,43 +91,91 @@ async function request<T>(
 export class FleetClient {
   constructor(private readonly options: FleetClientOptions) {}
 
+  private async request<T>(
+    path: string,
+    schema: z.ZodType<T>,
+    init: { method?: string; body?: string } = {},
+  ): Promise<T> {
+    const method = init.method ?? "GET";
+    const url = new URL(path, this.options.hostUrl());
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        ...(init.body ? { "content-type": "application/json" } : {}),
+        // Sign the resolved request here so no endpoint can forget its proof.
+        ...this.credentials({ ...init, method, path: url.pathname }),
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      // The Host replies with {error}; proxies may return an ordinary text body.
+      let message = text;
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && "error" in parsed) {
+          message = String((parsed as { error: unknown }).error);
+        }
+      } catch {
+        // Keep the raw text.
+      }
+      throw new Error(`Host responded ${response.status}: ${message}`);
+    }
+    return schema.parse(text ? JSON.parse(text) : undefined);
+  }
+
   /**
    * What identifies this node to the Host, when it has an identity yet.
    *
    * Sent on every call rather than only the writes: the Host's API is not open
    * to anonymous callers any more, so a read without this is a 401.
+   *
+   * A keyed node signs the call instead of presenting anything reusable. That
+   * is the whole difference: a secret observed once authorises every future
+   * call, and a signature authorises the one that carried it.
    */
-  private credentials(): NodeCredentialHeaders {
+  private credentials(input: {
+    method: string;
+    path: string;
+    body?: string;
+  }): Record<string, string> {
     const nodeId = this.options.nodeId();
+    if (!nodeId) return {};
+    const privateKey = this.options.nodeKey?.();
+    if (privateKey) {
+      const proof = signNodeHttpProof({
+        ...input,
+        privateKey,
+        nodeId,
+      });
+      return {
+        [NODE_ID_HEADER]: nodeId,
+        [NODE_PROOF_TIMESTAMP_HEADER]: proof.timestamp,
+        [NODE_PROOF_NONCE_HEADER]: proof.nonce,
+        [NODE_PROOF_SIGNATURE_HEADER]: proof.signature,
+      };
+    }
     const secret = this.options.nodeSecret?.();
-    if (!nodeId || !secret) return {};
+    if (!secret) return {};
     return { [NODE_ID_HEADER]: nodeId, [NODE_SECRET_HEADER]: secret };
   }
 
   async listWorkspaces(): Promise<WorkspaceLike[]> {
-    return request(
-      this.options.hostUrl(),
-      "/api/workspaces",
-      z.array(WorkspaceLikeSchema),
-      { credentials: this.credentials() },
-    );
+    return this.request("/api/workspaces", z.array(WorkspaceLikeSchema));
   }
 
   async listOwnPlacements(): Promise<PlacementLike[]> {
-    const placements = await request(
-      this.options.hostUrl(),
+    const placements = await this.request(
       "/api/placements",
       z.array(PlacementLikeSchema),
-      { credentials: this.credentials() },
     );
     return ownPlacements(placements, this.options.nodeId());
   }
 
   async createWorkspace(name: string, description: string): Promise<WorkspaceLike> {
-    return request(this.options.hostUrl(), "/api/workspaces", WorkspaceLikeSchema, {
+    return this.request("/api/workspaces", WorkspaceLikeSchema, {
       method: "POST",
       body: JSON.stringify({ name, description }),
-      credentials: this.credentials(),
     });
   }
 
@@ -156,14 +184,12 @@ export class FleetClient {
     name: string,
     description: string,
   ): Promise<WorkspaceLike> {
-    return request(
-      this.options.hostUrl(),
+    return this.request(
       `/api/workspaces/${encodeURIComponent(id)}`,
       WorkspaceLikeSchema,
       {
         method: "PATCH",
         body: JSON.stringify({ name, description }),
-        credentials: this.credentials(),
       },
     );
   }
@@ -180,14 +206,12 @@ export class FleetClient {
     if (!mine.some((placement) => placement.id === id)) {
       throw new Error("That placement belongs to a different node");
     }
-    return request(
-      this.options.hostUrl(),
+    return this.request(
       `/api/placements/${encodeURIComponent(id)}`,
       PlacementLikeSchema,
       {
         method: "PATCH",
         body: JSON.stringify({ localPath }),
-        credentials: this.credentials(),
       },
     );
   }
@@ -196,9 +220,8 @@ export class FleetClient {
     workspaceId: string,
     localPath: string,
   ): Promise<PlacementLike> {
-    return request(this.options.hostUrl(), "/api/placements", PlacementLikeSchema, {
+    return this.request("/api/placements", PlacementLikeSchema, {
       method: "POST",
-      credentials: this.credentials(),
       body: JSON.stringify({
         workspaceId,
         nodeId: this.options.nodeId(),
@@ -208,12 +231,7 @@ export class FleetClient {
   }
 
   async listOwnSessions(): Promise<SessionStatusLike[]> {
-    return request(
-      this.options.hostUrl(),
-      "/api/sessions",
-      z.array(SessionStatusLikeSchema),
-      { credentials: this.credentials() },
-    );
+    return this.request("/api/sessions", z.array(SessionStatusLikeSchema));
   }
 
   async createOwnSession(input: {
@@ -221,9 +239,8 @@ export class FleetClient {
     prompt: string;
     name?: string;
   }): Promise<StartedSession> {
-    return request(this.options.hostUrl(), "/api/sessions", StartedSessionSchema, {
+    return this.request("/api/sessions", StartedSessionSchema, {
       method: "POST",
-      credentials: this.credentials(),
       body: JSON.stringify(input),
     });
   }
@@ -234,9 +251,8 @@ export class FleetClient {
     additionalDirectories: string[];
     name?: string;
   }): Promise<StartedSession> {
-    return request(this.options.hostUrl(), "/api/sessions/adopt", StartedSessionSchema, {
+    return this.request("/api/sessions/adopt", StartedSessionSchema, {
       method: "POST",
-      credentials: this.credentials(),
       body: JSON.stringify(input),
     });
   }

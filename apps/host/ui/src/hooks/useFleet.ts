@@ -10,7 +10,7 @@ import {
   type SessionEvent,
   type Snapshot,
 } from "@fleet/protocol";
-import { announceSignedOut } from "../lib/auth";
+import { announceSignedOut, csrfToken, forgetCsrfToken } from "../lib/auth";
 import { reconnectDelay } from "./reconnect-delay";
 import { mergeEvents } from "../lib/merge-events";
 
@@ -635,11 +635,21 @@ export async function api<T = unknown>(path: string, init?: RequestInit): Promis
   if (init?.body !== undefined && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
+  /*
+   * The Host requires a CSRF proof on every state-changing operator request.
+   * It is derived from the session rather than stored, so one fetch serves the
+   * whole session and a sign-out is what invalidates it.
+   */
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "HEAD" && !headers.has("x-csrf-token")) {
+    headers.set("x-csrf-token", await csrfToken());
+  }
   const response = await fetch(path, { ...init, headers });
   if (response.status === 401) {
     // The session ended under us — expired, or the Host restarted and forgot
     // it. Saying so once puts the sign-in screen back up rather than leaving
     // every subsequent call to fail into a toast.
+    forgetCsrfToken();
     announceSignedOut();
   }
   if (!response.ok) {

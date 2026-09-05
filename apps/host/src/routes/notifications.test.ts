@@ -13,11 +13,15 @@ describe("notification routes", () => {
   let app: FastifyInstance;
   let directory: string;
   let cookie = "";
+  let csrfToken = "";
   let sessionId = "";
   let seeded: Notification[] = [];
 
   const inject = (options: InjectOptions) =>
-    app.inject({ ...options, headers: { ...options.headers, cookie } });
+    app.inject({
+      ...options,
+      headers: { cookie, "x-csrf-token": csrfToken, ...options.headers },
+    });
 
   beforeEach(async () => {
     directory = mkdtempSync(join(tmpdir(), "fleet-notification-routes-"));
@@ -68,6 +72,13 @@ describe("notification routes", () => {
       payload: { password: PASSWORD },
     });
     cookie = (login.headers["set-cookie"] as string).split(";")[0] ?? "";
+    const csrf = await app.inject({
+      method: "GET",
+      url: "/api/auth/csrf",
+      headers: { cookie },
+    });
+    expect(csrf.statusCode).toBe(200);
+    csrfToken = (csrf.json() as { csrfToken: string }).csrfToken;
   });
 
   afterEach(async () => {
@@ -78,6 +89,18 @@ describe("notification routes", () => {
   it("requires the existing operator authentication guard", async () => {
     const response = await app.inject({ method: "GET", url: "/api/notifications" });
     expect(response.statusCode).toBe(401);
+  });
+
+  it("rejects notification mutations without a session CSRF token", async () => {
+    for (const url of [
+      "/api/notifications/read-all",
+      "/api/notifications/dismiss-all",
+      `/api/notifications/${seeded[0]!.id}/read`,
+      `/api/notifications/${seeded[0]!.id}/dismiss`,
+    ]) {
+      const response = await app.inject({ method: "POST", url, headers: { cookie } });
+      expect(response.statusCode).toBe(403);
+    }
   });
 
   it("lists and paginates the non-dismissed hydration view", async () => {

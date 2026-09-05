@@ -115,6 +115,9 @@ const useStyles = makeStyles({
     padding: "12px 18px",
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
     background: tokens.colorNeutralBackground2,
+    "@media (max-width: 1400px)": {
+      gap: "6px",
+    },
     // Below this the name and the actions cannot share a line without one of
     // them being squeezed into a column of single letters.
     "@media (max-width: 700px)": {
@@ -162,6 +165,19 @@ const useStyles = makeStyles({
     letterSpacing: "1px",
     fontSize: "10px",
     fontWeight: tokens.fontWeightBold,
+  },
+  headerActionLabel: {
+    "@media (max-width: 1400px)": { display: "none" },
+  },
+  headerAction: {
+    "@media (max-width: 1400px)": {
+      minWidth: "28px",
+      width: "28px",
+      maxWidth: "28px",
+      height: "28px",
+      paddingLeft: 0,
+      paddingRight: 0,
+    },
   },
   stopWarning: {
     flexShrink: 0,
@@ -944,49 +960,66 @@ export const TerminalView = ({
         </div>
         {notificationPreferenceControl}
         <Button
-          appearance="secondary"
+          className={styles.headerAction}
+          appearance="subtle"
+          size="small"
           icon={<RecordStop20Regular />}
           disabled={session.state !== "running"}
           onClick={onCancel}
+          aria-label="Cancel turn"
+          title="Cancel turn"
         >
-          Cancel turn
+          <span className={styles.headerActionLabel}>Cancel turn</span>
         </Button>
         {canResume && (
           <Button
-            appearance="primary"
+            className={styles.headerAction}
+            appearance="subtle"
+            size="small"
             icon={<ArrowClockwise20Regular />}
             onClick={onResume}
+            aria-label="Resume session"
+            title="Resume session"
           >
-            Resume
+            <span className={styles.headerActionLabel}>Resume</span>
           </Button>
         )}
         {isEnded ? (
           <Button
-            appearance="secondary"
+            className={styles.headerAction}
+            appearance="subtle"
+            size="small"
             icon={<Dismiss20Regular />}
             onClick={onDismiss}
             disabled={!onDismiss}
+            aria-label="Dismiss session"
+            title="Dismiss session"
           >
-            Dismiss
+            <span className={styles.headerActionLabel}>Dismiss</span>
           </Button>
         ) : (
           <Button
+            className={styles.headerAction}
             appearance="secondary"
+            size="small"
             icon={<Stop20Regular />}
             onClick={onStop}
             disabled={Boolean(session.stopRequested && !canConfirmStopped)}
+            aria-label={canConfirmStopped ? "Mark stopped" : "Stop session"}
             {...(canConfirmStopped
               ? {
                   title:
                     "Confirm that the unavailable node is no longer running this session",
                 }
-              : {})}
+              : { title: "Stop session" })}
           >
-            {canConfirmStopped
-              ? "Mark stopped"
-              : session.stopRequested
-                ? "Stopping"
-                : "Stop"}
+            <span className={styles.headerActionLabel}>
+              {canConfirmStopped
+                ? "Mark stopped"
+                : session.stopRequested
+                  ? "Stopping"
+                  : "Stop"}
+            </span>
           </Button>
         )}
         {onClose && (

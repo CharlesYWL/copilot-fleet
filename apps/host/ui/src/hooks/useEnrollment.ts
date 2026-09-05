@@ -3,7 +3,22 @@ import { api } from "./useFleet";
 
 export type Enrollment = {
   hostUrl: string;
-  enrollmentToken: string;
+  hostId: string;
+  hostFingerprint: string;
+  hostPublicKey: string;
+  /** How far the fleet is through the move from shared secrets to Node keys. */
+  nodeAuthentication: { total: number; mutualAuth: number; legacy: number };
+  mutualAuthenticationRequired: boolean;
+  /**
+   * The fleet-wide credential that predates Node keys, when this Host still has
+   * one.
+   *
+   * Absent on a fresh Host, which never had one, and on a fleet that has
+   * enforced mutual Node authentication, which retired the one it had. Never
+   * used to build a Connect command in any case: a new machine has no use for a
+   * reusable secret, and pasting one is how it reaches a stranger's relay.
+   */
+  enrollmentToken?: string;
   /** Present for providers whose public URL does not encode the tunnel id. */
   tunnelId?: string;
 };

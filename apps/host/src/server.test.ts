@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { resolve } from "node:path";
 import {
+  buildServer,
   resolveDatabasePath,
   resolveEnrollmentHostUrl,
-  resolveEnrollmentToken,
+  resolveLegacyEnrollmentToken,
   resolvePublicHostUrl,
   yoloUnsupportedReason,
 } from "./server.js";
@@ -54,20 +55,82 @@ describe("yolo capability guard", () => {
 });
 
 describe("production enrollment token", () => {
-  it("rejects missing and default production tokens", () => {
-    expect(() => resolveEnrollmentToken(undefined, "production")).toThrow(
-      /ENROLLMENT_TOKEN/,
-    );
-    expect(() => resolveEnrollmentToken("change-me", "production")).toThrow(
-      /ENROLLMENT_TOKEN/,
-    );
+  const generate = () => "minted";
+
+  /*
+   * The absence of a token used to stop a production Host from booting. It no
+   * longer does: a fresh install enrols machines with one-time grants, so
+   * demanding a fleet-wide secret would be demanding a credential that
+   * authorises nothing anybody wanted.
+   */
+  it("lets a fresh production Host start with no token at all", () => {
+    expect(
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: undefined,
+        legacyNodes: 0,
+        nodeEnv: "production",
+        generate,
+      }),
+    ).toBeUndefined();
+  });
+
+  describe("built-in Microsoft sign-in", () => {
+    it("preconfigures the local Host without asking for tenant or client IDs", async () => {
+      const app = await buildServer({
+        databasePath: ":memory:",
+        operatorPassword: "test-password",
+        useBuiltInEntra: true,
+        announceClaimCode: () => {},
+      });
+      try {
+        const status = await app.inject({
+          method: "GET",
+          url: "/api/auth/status",
+          headers: { host: "localhost:8787" },
+        });
+        expect(status.json()).toMatchObject({
+          state: "legacy-password",
+          entraConfigured: true,
+          passwordEnabled: true,
+        });
+      } finally {
+        await app.close();
+      }
+    });
+  });
+
+  it("still rejects the shipped placeholder in production", () => {
+    expect(() =>
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: "change-me",
+        legacyNodes: 0,
+        nodeEnv: "production",
+        generate,
+      }),
+    ).toThrow(/ENROLLMENT_TOKEN/);
   });
 
   it("allows an explicit non-default production token", () => {
-    expect(resolveEnrollmentToken("production-secret", "production")).toBe(
-      "production-secret",
-    );
-    expect(resolveEnrollmentToken(undefined, "test")).toBe("change-me");
+    expect(
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: "production-secret",
+        legacyNodes: 0,
+        nodeEnv: "production",
+        generate,
+      }),
+    ).toBe("production-secret");
+    expect(
+      resolveLegacyEnrollmentToken({
+        stored: undefined,
+        env: "change-me",
+        legacyNodes: 0,
+        nodeEnv: "test",
+        generate,
+      }),
+    ).toBe("change-me");
   });
 });
 

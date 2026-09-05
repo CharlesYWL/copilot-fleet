@@ -16,6 +16,7 @@ const node = (id: string, name: string, online = true): FleetNode => ({
   lastHeartbeat: "2026-08-08T00:00:00.000Z",
   online,
   homeDir: "/Users/me",
+  authProtocol: "legacy-secret",
 });
 
 const workspace = (

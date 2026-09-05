@@ -1,6 +1,6 @@
 {
   "name": "@fleet/protocol",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -15,6 +15,10 @@
     "./log-buffer": {
       "types": "./dist/log-buffer.d.ts",
       "default": "./dist/log-buffer.js"
+    },
+    "./node-auth": {
+      "types": "./dist/node-auth.d.ts",
+      "default": "./dist/node-auth.js"
     }
   },
   "scripts": {

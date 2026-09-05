@@ -4,12 +4,63 @@ import {
   enrollCommand,
   isDevTunnelUrl,
   isLocalOnlyHostUrl,
+  keyEnrollCommand,
 } from "./enroll-command";
 
 const URL = "https://fleet.example.com";
 const TOKEN = "abc123";
 const DEVTUNNEL_URL = "https://7m667npm-8790.usw2.devtunnels.ms";
 const TUNNEL_ID = "neat-lake-7x8gj9s.usw2";
+const FINGERPRINT = "a".repeat(64);
+const GRANT = "grant-1.Zm9vYmFyc2VjcmV0";
+
+/**
+ * The Connect command is the only place a Host fingerprint is handed to a
+ * person, and pasting it is what pins that Host on the new machine. A command
+ * missing any of the three parts is a Node that would enrol with whatever
+ * answers the URL — which is the failure the whole protocol exists to prevent.
+ */
+describe("keyEnrollCommand", () => {
+  const command = keyEnrollCommand({
+    hostUrl: URL,
+    hostId: "host-1",
+    hostFingerprint: FINGERPRINT,
+    enrollmentGrant: GRANT,
+  });
+
+  it("carries the URL, the Host identity and the one-time grant", () => {
+    expect(command).toContain(`--url="${URL}"`);
+    expect(command).toContain(`--host-id="host-1"`);
+    expect(command).toContain(`--host-fingerprint="${FINGERPRINT}"`);
+    expect(command).toContain(`--enrollment-grant="${GRANT}"`);
+  });
+
+  it("never carries the fleet-wide token, which it replaces", () => {
+    expect(command).not.toContain("--token");
+    expect(command).not.toContain(TOKEN);
+  });
+
+  it("uses the same paste-anywhere shape as the legacy command", () => {
+    expect(command).toContain("npm install");
+    expect(command).toContain("npm run build:node");
+    expect(command).not.toContain("$env:");
+    expect(command).not.toContain("\\");
+  });
+
+  it("lets a dev tunnel node open the tunnel itself", () => {
+    const tunnelled = keyEnrollCommand({
+      hostUrl: DEVTUNNEL_URL,
+      hostId: "host-1",
+      hostFingerprint: FINGERPRINT,
+      enrollmentGrant: GRANT,
+      tunnelId: TUNNEL_ID,
+    });
+    expect(tunnelled).toContain(`--devtunnel="${TUNNEL_ID}"`);
+    // The private URL is one a node cannot authenticate to, so it never appears.
+    expect(tunnelled).not.toContain(DEVTUNNEL_URL);
+    expect(tunnelled).toContain(`--host-fingerprint="${FINGERPRINT}"`);
+  });
+});
 
 describe("enrollCommand", () => {
   it("uses the short root aliases and carries host url + token", () => {

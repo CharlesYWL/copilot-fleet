@@ -10,6 +10,7 @@ import { defineConfig, loadEnv } from "vite";
 export default defineConfig(({ mode }) => {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
   const hostPort = loadEnv(mode, repoRoot, "").PORT || "8787";
+  const apiOrigin = `http://127.0.0.1:${hostPort}`;
 
   return {
     plugins: [react()],
@@ -21,9 +22,15 @@ export default defineConfig(({ mode }) => {
     server: {
       port: 5173,
       proxy: {
-        "/api": `http://127.0.0.1:${hostPort}`,
+        "/api": {
+          target: apiOrigin,
+          // Keep the browser-facing Host. Auth needs to know which local URL
+          // owns the cookie, not which internal port Vite forwarded to.
+          changeOrigin: false,
+        },
         "/ws": {
           target: `ws://127.0.0.1:${hostPort}`,
+          changeOrigin: false,
           ws: true,
         },
       },

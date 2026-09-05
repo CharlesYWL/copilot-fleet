@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fleetDarkTheme } from "../theme";
+import { forgetCsrfToken } from "../lib/auth";
 import { GeneralPanel } from "./GeneralPanel";
 
 const response = (body: unknown) =>
@@ -12,7 +13,11 @@ const response = (body: unknown) =>
     }),
   );
 
-afterEach(() => vi.unstubAllGlobals());
+beforeEach(forgetCsrfToken);
+afterEach(() => {
+  forgetCsrfToken();
+  vi.unstubAllGlobals();
+});
 
 describe("GeneralPanel", () => {
   it("loads and updates the application lifecycle notification default", async () => {
@@ -23,7 +28,8 @@ describe("GeneralPanel", () => {
       model: "",
       reasoningEffort: "",
     };
-    const fetchMock = vi.fn(async (_path: string | URL | Request, init?: RequestInit) => {
+    const fetchMock = vi.fn(async (path: string | URL | Request, init?: RequestInit) => {
+      if (String(path) === "/api/auth/csrf") return response({ csrfToken: "proof" });
       if (init?.method === "POST") {
         defaults = {
           ...defaults,
@@ -59,5 +65,31 @@ describe("GeneralPanel", () => {
       ),
     );
     await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(false));
+  });
+
+  it("names the fleet archive as data only and points at the portable one", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        response({
+          yolo: false,
+          autoResume: false,
+          notificationLifecycleEnabled: true,
+          model: "",
+          reasoningEffort: "",
+        }),
+      ),
+    );
+
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel sessions={[]} />
+      </FluentProvider>,
+    );
+
+    const card = await screen.findByRole("region", { name: /fleet data/i });
+    expect(within(card).getByText(/does not carry/i)).toBeTruthy();
+    expect(within(card).getByText(/settings → security/i)).toBeTruthy();
+    expect(within(card).getByRole("button", { name: /export fleet data/i })).toBeTruthy();
   });
 });

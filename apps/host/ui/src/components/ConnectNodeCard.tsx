@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Button,
   Field,
@@ -10,15 +10,17 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
+import { errorMessage, type ConnectCommand } from "@fleet/protocol";
 import { useEnrollment } from "../hooks/useEnrollment";
+import { api } from "../hooks/useFleet";
 import {
   devTunnelLoginCommand,
-  enrollCommand,
   isDevTunnelUrl,
   isLocalOnlyHostUrl,
+  keyEnrollCommand,
 } from "../lib/enroll-command";
 import { terminal } from "../theme";
+import { CopyButton } from "./CopyButton";
 
 const useStyles = makeStyles({
   card: {
@@ -56,46 +58,77 @@ const useStyles = makeStyles({
     wordBreak: "break-all",
     overflowX: "auto",
   },
+  actions: {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    flexWrap: "wrap",
+  },
+  fingerprint: {
+    fontFamily: terminal.font,
+    fontSize: "11px",
+    color: tokens.colorNeutralForeground3,
+    wordBreak: "break-all",
+  },
 });
 
+type IssuedGrant = {
+  id: string;
+  grant: string;
+  expiresAt: string;
+  command: ConnectCommand;
+};
+
+/** Local time: the operator is deciding whether they have time to walk over. */
+function expiryLabel(expiresAt: string): string {
+  const at = new Date(expiresAt);
+  if (Number.isNaN(at.getTime())) return "shortly";
+  return at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
+ * The command that joins one machine to this fleet.
+ *
+ * Nothing is minted until somebody asks. A grant is a live credential with a
+ * fifteen-minute life and a single use, so creating one on every render would
+ * spend them on nobody, fill the audit log, and leave a usable credential on
+ * screen for anyone who walked past a console left open on the Nodes tab.
+ *
+ * What it prints is not the old fleet-wide token. That token was reusable, it
+ * authorised any machine, and a Node sent it to whatever answered the URL
+ * before it had any way to tell that from the Host. This command carries the
+ * Host's id and fingerprint — so the machine can refuse an impostor — and a
+ * grant that authorises exactly the key it is about to generate.
+ */
 export const ConnectNodeCard = () => {
   const styles = useStyles();
   const enrollment = useEnrollment();
   const [editedUrl, setEditedUrl] = useState<string>();
-  const [copied, setCopied] = useState<string>();
+  const [grant, setGrant] = useState<IssuedGrant>();
+  const [error, setError] = useState<string>();
+  const [busy, setBusy] = useState(false);
 
   // Until the field is touched it tracks the polled value, so a rotated tunnel
   // URL reaches the command without wiping out whatever was typed over it.
-  const hostUrl = editedUrl ?? enrollment?.hostUrl ?? "";
-
-  useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(undefined), 2000);
-    return () => clearTimeout(timer);
-  }, [copied]);
+  const hostUrl = editedUrl ?? grant?.command.hostUrl ?? enrollment?.hostUrl ?? "";
 
   if (!enrollment) return null;
 
   const devTunnel = isDevTunnelUrl(hostUrl);
-  const command = enrollCommand(hostUrl, enrollment.enrollmentToken, enrollment.tunnelId);
+  const command = grant ? keyEnrollCommand({ ...grant.command, hostUrl }) : "";
 
-  const copy = async (key: string, text: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(key);
+  const issue = async () => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      setGrant(await api<IssuedGrant>("/api/enrollment-grants", { method: "POST" }));
+    } catch (reason) {
+      setGrant(undefined);
+      setError(errorMessage(reason, "Could not create a connect command"));
+    } finally {
+      setBusy(false);
+    }
   };
-
-  const commandBox = (key: string, text: string) => (
-    <div className={styles.commandRow}>
-      <pre className={styles.command}>{text}</pre>
-      <Button
-        appearance={copied === key ? "subtle" : "primary"}
-        icon={copied === key ? <Checkmark20Regular /> : <Copy20Regular />}
-        onClick={() => void copy(key, text)}
-      >
-        {copied === key ? "Copied" : "Copy"}
-      </Button>
-    </div>
-  );
 
   return (
     <section className={styles.card} aria-label="Connect a machine">
@@ -105,7 +138,8 @@ export const ConnectNodeCard = () => {
         <Text className={styles.caption}>
           Run this from a Copilot Fleet checkout that has Node.js and a signed-in Copilot
           CLI — the same lines work in bash and PowerShell. The node registers itself
-          under the machine&apos;s own hostname.
+          under the machine&apos;s own hostname, generates its own key, and pins this
+          Host&apos;s fingerprint.
         </Text>
       </div>
 
@@ -122,8 +156,9 @@ export const ConnectNodeCard = () => {
           <MessageBarBody>
             This tunnel is private, so a node cannot dial the URL directly — it would be
             redirected to a Microsoft login it has no way to answer. Sign the machine in
-            once, then start the node: it opens the tunnel itself and finds the forwarded
-            port, so no second terminal is needed.
+            once with <code>{devTunnelLoginCommand()}</code>, then start the node: it
+            opens the tunnel itself and finds the forwarded port, so no second terminal is
+            needed.
           </MessageBarBody>
         </MessageBar>
       )}
@@ -137,17 +172,53 @@ export const ConnectNodeCard = () => {
         </MessageBar>
       )}
 
-      {devTunnel && (
-        <div>
-          <Text weight="semibold">1. Sign this machine in (once)</Text>
-          {commandBox("login", devTunnelLoginCommand())}
-        </div>
+      <Text className={styles.caption}>
+        Host fingerprint{" "}
+        <span className={styles.fingerprint}>{enrollment.hostFingerprint}</span>
+      </Text>
+
+      {error && (
+        <MessageBar intent="error">
+          <MessageBarBody>{error}</MessageBarBody>
+        </MessageBar>
       )}
 
-      <div>
-        {devTunnel && <Text weight="semibold">2. Start the node</Text>}
-        {commandBox("enroll", command)}
-      </div>
+      {!grant ? (
+        <div className={styles.actions}>
+          <Button appearance="primary" disabled={busy} onClick={() => void issue()}>
+            {busy ? "Creating…" : "Generate a connect command"}
+          </Button>
+          <Text className={styles.caption}>One machine, one use, fifteen minutes.</Text>
+        </div>
+      ) : (
+        <>
+          <div className={styles.commandRow}>
+            <pre className={styles.command} aria-label="Connect command">
+              {command}
+            </pre>
+            <CopyButton
+              text={command}
+              label="Copy the connect command"
+              appearance="primary"
+              showText
+            />
+          </div>
+          <div className={styles.actions}>
+            <Text className={styles.caption}>
+              Expires at {expiryLabel(grant.expiresAt)}, or as soon as one machine uses
+              it.
+            </Text>
+            <Button
+              appearance="secondary"
+              size="small"
+              disabled={busy}
+              onClick={() => void issue()}
+            >
+              {busy ? "Creating…" : "New command"}
+            </Button>
+          </div>
+        </>
+      )}
     </section>
   );
 };

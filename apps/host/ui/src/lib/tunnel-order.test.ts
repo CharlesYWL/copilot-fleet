@@ -9,6 +9,9 @@ const spec = (id: TunnelProvider, binaryPresent: boolean): TunnelProviderInfo =>
   binaryPresent,
   installHint: "",
   setupSteps: [],
+  externalScheme: "https",
+  access: "public",
+  controlPlaneEligible: true,
 });
 
 const state = (

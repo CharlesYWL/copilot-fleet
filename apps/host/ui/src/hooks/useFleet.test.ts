@@ -8,6 +8,7 @@ import type {
   Snapshot,
 } from "@fleet/protocol";
 import { useFleet } from "./useFleet";
+import { csrfToken, forgetCsrfToken } from "../lib/auth";
 
 const ISO = "2026-09-01T18:00:00.000Z";
 
@@ -86,12 +87,14 @@ const response = (body: unknown) =>
     headers: { "content-type": "application/json" },
   });
 
-beforeEach(() => {
+beforeEach(async () => {
+  forgetCsrfToken();
   MockWebSocket.instances = [];
   vi.stubGlobal("WebSocket", MockWebSocket);
   vi.stubGlobal(
     "fetch",
     vi.fn((path: string | URL | Request) => {
+      if (String(path) === "/api/auth/csrf") return json({ csrfToken: "proof" });
       if (String(path) === "/api/snapshot") return json(snapshot());
       if (String(path) === "/api/runs") {
         return json({ stepsByRunId: {}, notesByRunId: {} });
@@ -99,9 +102,11 @@ beforeEach(() => {
       throw new Error(`Unexpected fetch ${String(path)}`);
     }),
   );
+  await csrfToken();
 });
 
 afterEach(() => {
+  forgetCsrfToken();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
