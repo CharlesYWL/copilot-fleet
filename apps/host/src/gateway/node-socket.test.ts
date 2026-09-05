@@ -753,6 +753,22 @@ describe("node gateway mutual authentication", () => {
     expect(keys.publicKey).toBeTruthy();
   });
 
+  it.each([
+    ["not JSON", 1007],
+    [JSON.stringify({ type: "unknown" }), 1008],
+  ])(
+    "validates sealed plaintext %s with the usual close code",
+    async (plaintext, code) => {
+      const { keys, receipt } = await enrollNode();
+      const { socket, channel } = await handshake({ nodeId: receipt.nodeId, keys });
+      channel.open((await nextFrame(socket)) as unknown as AuthenticatedEnvelope);
+
+      socket.send(JSON.stringify(channel.seal(String(plaintext))));
+
+      expect(await closeCode(socket)).toBe(code);
+    },
+  );
+
   it("closes the connection on a replayed envelope", async () => {
     const { keys, receipt } = await enrollNode();
     const { socket, channel } = await handshake({ nodeId: receipt.nodeId, keys });

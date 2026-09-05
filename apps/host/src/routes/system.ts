@@ -155,7 +155,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     const summary = store.nodeAuthenticationSummary();
     if (input.required && summary.legacy > 0) {
       return reply.code(409).send({
-        error: `${summary.legacy} of ${summary.total} Nodes still authenticate with a shared secret. Let each one reconnect and upgrade before enforcing mutual authentication.`,
+        error: `${summary.legacy} of ${summary.total} Nodes still authenticate with a shared secret. Re-enrol each one with a fresh Connect command before enforcing mutual authentication.`,
         nodeAuthentication: summary,
       });
     }

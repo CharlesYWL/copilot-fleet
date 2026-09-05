@@ -1,6 +1,6 @@
 {
   "name": "@fleet/host",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,7 +14,7 @@
     "@azure/msal-node": "^5.6.0",
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
-    "@fleet/protocol": "0.3.0",
+    "@fleet/protocol": "0.4.0",
     "@fluentui/react-components": "^9.74.4",
     "@fluentui/react-icons": "^2.0.334",
     "@modelcontextprotocol/sdk": "^1.30.0",

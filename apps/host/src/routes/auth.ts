@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
@@ -20,13 +21,9 @@ import {
 import { BOOTSTRAP_GRANT_TTL_MS } from "../auth/claim.js";
 import { VISUAL_STUDIO_PUBLIC_CLIENT_ID } from "../auth/entra.js";
 import { OPERATOR_SESSION_ABSOLUTE_MS } from "../auth/sessions.js";
-import {
-  MIN_OPERATOR_PASSWORD_LENGTH,
-  newBinding,
-  type FleetAuth,
-} from "../auth/service.js";
+import { MIN_OPERATOR_PASSWORD_LENGTH, type FleetAuth } from "../auth/service.js";
 import { hostnameOf } from "../request-guard.js";
-import { requireAdministrator as administratorFor } from "./require-administrator.js";
+import { requireAdministrator } from "./require-administrator.js";
 
 const LoginSchema = z.object({ password: z.string().min(1).max(512) });
 const BootstrapSchema = z.object({ code: z.string().min(1).max(256) });
@@ -66,17 +63,7 @@ export type AuthRouteOptions = {
 function binding(request: FastifyRequest): { id: string; fresh: boolean } {
   const existing = readCookie(request.headers.cookie, BINDING_COOKIE);
   if (existing) return { id: existing, fresh: false };
-  return { id: newBinding(), fresh: true };
-}
-
-function appendCookie(reply: FastifyReply, cookie: string): void {
-  const existing = reply.getHeader("set-cookie");
-  const list = Array.isArray(existing)
-    ? existing.map(String)
-    : existing === undefined
-      ? []
-      : [String(existing)];
-  reply.header("set-cookie", [...list, cookie]);
+  return { id: randomUUID(), fresh: true };
 }
 
 /**
@@ -206,10 +193,13 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     const input = BootstrapSchema.parse(request.body);
     const browser = binding(request);
     const secure = auth.secureCookies(request.headers.host);
-    if (browser.fresh) appendCookie(reply, bindingCookie(browser.id, secure));
+    if (browser.fresh) reply.header("set-cookie", bindingCookie(browser.id, secure));
     const outcome = auth.redeemClaimCode(input.code, browser.id, request.headers.host);
     if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
-    appendCookie(reply, bootstrapCookie(outcome.token, secure, BOOTSTRAP_GRANT_TTL_MS));
+    reply.header(
+      "set-cookie",
+      bootstrapCookie(outcome.token, secure, BOOTSTRAP_GRANT_TTL_MS),
+    );
     return reply.send({ ok: true, expiresAt: new Date(outcome.expiresAt).toISOString() });
   });
 
@@ -236,8 +226,11 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
     // Only once the grant exists, so a refusal leaves the browser exactly as it
     // was rather than handing it an identity it never earned anything with.
-    if (browser.fresh) appendCookie(reply, bindingCookie(browser.id, secure));
-    appendCookie(reply, bootstrapCookie(outcome.token, secure, BOOTSTRAP_GRANT_TTL_MS));
+    if (browser.fresh) reply.header("set-cookie", bindingCookie(browser.id, secure));
+    reply.header(
+      "set-cookie",
+      bootstrapCookie(outcome.token, secure, BOOTSTRAP_GRANT_TTL_MS),
+    );
     return reply.send({ ok: true, expiresAt: new Date(outcome.expiresAt).toISOString() });
   });
 
@@ -255,7 +248,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     const input = CodeStartSchema.parse(request.body ?? {});
     const browser = binding(request);
     const secure = auth.secureCookies(request.headers.host);
-    if (browser.fresh) appendCookie(reply, bindingCookie(browser.id, secure));
+    if (browser.fresh) reply.header("set-cookie", bindingCookie(browser.id, secure));
     const outcome = await auth.startCodeLogin({
       binding: browser.id,
       bootstrapToken: readCookie(request.headers.cookie, BOOTSTRAP_COOKIE),
@@ -323,9 +316,9 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     if (!outcome.ok) {
       return fail(outcome.code ?? "provider-unavailable", outcome.error);
     }
-    appendCookie(reply, clearedBootstrapCookie(secure));
-    appendCookie(
-      reply,
+    reply.header("set-cookie", clearedBootstrapCookie(secure));
+    reply.header(
+      "set-cookie",
       sessionCookie(outcome.session.token, secure, OPERATOR_SESSION_ABSOLUTE_MS),
     );
     return reply.redirect(appLocation("/"), 302);
@@ -349,7 +342,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     const input = CodeStartSchema.parse(request.body ?? {});
     const browser = binding(request);
     const secure = auth.secureCookies(request.headers.host);
-    if (browser.fresh) appendCookie(reply, bindingCookie(browser.id, secure));
+    if (browser.fresh) reply.header("set-cookie", bindingCookie(browser.id, secure));
     const outcome = await auth.startDeviceLogin({
       binding: browser.id,
       bootstrapToken: readCookie(request.headers.cookie, BOOTSTRAP_COOKIE),
@@ -374,9 +367,9 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     });
     const secure = auth.secureCookies(request.headers.host);
     if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
-    appendCookie(reply, clearedBootstrapCookie(secure));
-    appendCookie(
-      reply,
+    reply.header("set-cookie", clearedBootstrapCookie(secure));
+    reply.header(
+      "set-cookie",
       sessionCookie(outcome.session.token, secure, OPERATOR_SESSION_ABSOLUTE_MS),
     );
     return reply.send({ ok: true });
@@ -410,27 +403,11 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
       .send({ ok: true });
   });
 
-  /**
-   * The administrator behind a request, for the decisions only a person may
-   * make.
-   *
-   * A password session deliberately fails this: a shared secret identifies
-   * nobody, so it cannot be the thing that decides who else gets in or which
-   * administrator is removed. `recent` additionally demands an
-   * authorization-code sign-in within the last ten minutes, because a device
-   * flow can be started by an attacker and finished by a phished administrator.
-   */
-  const requireAdministrator = (
-    request: FastifyRequest,
-    reply: FastifyReply,
-    recent: boolean,
-  ) => administratorFor(auth, request, reply, recent);
-
   app.get("/api/auth/administrators", async (request, reply) => {
     // Listed by an administrator, not merely by an operator: in hybrid mode a
     // shared password is still a way in, and who else holds authority is the
     // administrators' own business.
-    if (!requireAdministrator(request, reply, false)) return reply;
+    if (!requireAdministrator(auth, request, reply, false)) return reply;
     return reply.send({
       administrators: auth.listAdministrators(),
       pending: auth.listPendingCandidates().map((invitation) => ({
@@ -445,14 +422,14 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.post("/api/auth/administrator-invitations", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, true);
+    const administrator = requireAdministrator(auth, request, reply, true);
     if (!administrator) return reply;
     const invitation = auth.createInvitation(administrator.id);
     return reply.code(201).send(invitation);
   });
 
   app.delete("/api/auth/administrator-invitations/:id", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, false);
+    const administrator = requireAdministrator(auth, request, reply, false);
     if (!administrator) return reply;
     const { id } = request.params as { id: string };
     if (!auth.revokeInvitation(id)) {
@@ -462,7 +439,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.post("/api/auth/administrator-invitations/:id/approve", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, true);
+    const administrator = requireAdministrator(auth, request, reply, true);
     if (!administrator) return reply;
     const { id } = request.params as { id: string };
     const approved = auth.approveCandidate(id, administrator.id);
@@ -475,7 +452,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.post("/api/auth/administrator-invitations/:id/reject", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, true);
+    const administrator = requireAdministrator(auth, request, reply, true);
     if (!administrator) return reply;
     const { id } = request.params as { id: string };
     if (!auth.rejectCandidate(id, administrator.id)) {
@@ -487,7 +464,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.delete("/api/auth/administrators/:id", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, true);
+    const administrator = requireAdministrator(auth, request, reply, true);
     if (!administrator) return reply;
     const { id } = request.params as { id: string };
     if (!auth.removeAdministrator(id)) {
@@ -500,7 +477,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.post("/api/auth/password/disable", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, true);
+    const administrator = requireAdministrator(auth, request, reply, true);
     if (!administrator) return reply;
     if (!auth.passwordEnabled()) {
       return reply.send({ ok: true, alreadyDisabled: true });
@@ -510,7 +487,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.post("/api/auth/password/enable", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, true);
+    const administrator = requireAdministrator(auth, request, reply, true);
     if (!administrator) return reply;
     const input = EnablePasswordSchema.parse(request.body);
     auth.enablePassword(input.password, administrator.id);
@@ -518,7 +495,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.get("/api/security/audit", async (request, reply) => {
-    if (!requireAdministrator(request, reply, false)) return reply;
+    if (!requireAdministrator(auth, request, reply, false)) return reply;
     const query = request.query as { limit?: string };
     const limit = Math.min(Number(query.limit ?? 200) || 200, 1_000);
     return reply.send({ events: auth.securityAudit(limit) });
@@ -534,12 +511,12 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
    * gets a named answer rather than a login that hangs.
    */
   app.post("/api/auth/device/verify", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, false);
+    const administrator = requireAdministrator(auth, request, reply, false);
     if (!administrator) return reply;
     const browser = binding(request);
     if (browser.fresh) {
-      appendCookie(
-        reply,
+      reply.header(
+        "set-cookie",
         bindingCookie(browser.id, auth.secureCookies(request.headers.host)),
       );
     }
@@ -557,7 +534,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.post("/api/auth/device/verify/:flowId", async (request, reply) => {
-    const administrator = requireAdministrator(request, reply, false);
+    const administrator = requireAdministrator(auth, request, reply, false);
     if (!administrator) return reply;
     const { flowId } = request.params as { flowId: string };
     const outcome = await auth.completeDeviceVerification({

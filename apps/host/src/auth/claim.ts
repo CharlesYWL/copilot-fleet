@@ -173,10 +173,11 @@ export class ClaimCodeService {
     binding?: string,
   ): BootstrapGrant | undefined {
     if (!token) return undefined;
-    const grant = this.grants.get(digest(token));
+    const hash = digest(token);
+    const grant = this.grants.get(hash);
     if (!grant) return undefined;
     if (grant.expiresAt <= this.now()) {
-      this.grants.delete(digest(token));
+      this.grants.delete(hash);
       return undefined;
     }
     if (binding !== undefined && grant.binding !== binding) return undefined;
@@ -190,9 +191,8 @@ export class ClaimCodeService {
     const grant = this.grants.get(hash);
     if (!grant || grant.expiresAt <= this.now()) return false;
     this.grants.delete(hash);
-    for (const record of this.bindings.values()) {
-      if (record.grantHash === hash) record.grantHash = undefined;
-    }
+    const record = this.bindings.get(grant.binding);
+    if (record?.grantHash === hash) record.grantHash = undefined;
     return true;
   }
 

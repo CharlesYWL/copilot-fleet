@@ -1,5 +1,31 @@
 # Microsoft identity auth: why ~32k lines, what to cut
 
+## 2026-09-05 implementation update
+
+The current cleanup follows **Track 1: keep every working feature**. The feature
+removals and PR splits proposed below are historical alternatives, not the plan
+being applied.
+
+Before cleanup, PR #18 contained 33,686 additions: 17,099 test lines, 14,093
+runtime/config lines, 2,372 documentation lines, and 122 lockfile lines.
+Its size primarily comes from shipping Microsoft authentication, Node mutual
+authentication, and portable backup together, not generated files.
+
+Removed the unused signed-cookie backend and duplicate password bootstrap
+resolver; `OperatorAuth` now only checks the selected verifier and enforces
+lockout. Current sessions, password-mode resolution, and recovery remain.
+Removed unused in-band migration helpers, but kept older wire messages and their
+safe refusal handling. Consolidated auth checks, cookies, device-flow bookkeeping,
+Node request signing, SQLite writes, auth forms, password dialogs, and copy buttons.
+Fixed duplicate `Set-Cookie` headers and false "Copied" feedback when the clipboard
+rejects a command. Vite's native header forwarding replaces the no-op proxy wrapper.
+All workspace versions and internal dependencies are now 0.4.0.
+
+The review below describes the earlier snapshot; removed symbols and line-count
+estimates are not a description of the current implementation.
+
+---
+
 **Branch:** `feat/microsoft-identity-auth` vs `main`
 **Scope:** committed + uncommitted (no code was changed for this review)
 **Lens:** ponytail — keep current login working, delete ceremony, split what is not Microsoft sign-in

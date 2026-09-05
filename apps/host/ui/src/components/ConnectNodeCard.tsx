@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import {
   Button,
   Field,
@@ -10,7 +10,6 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
 import { errorMessage, type ConnectCommand } from "@fleet/protocol";
 import { useEnrollment } from "../hooks/useEnrollment";
 import { api } from "../hooks/useFleet";
@@ -21,6 +20,7 @@ import {
   keyEnrollCommand,
 } from "../lib/enroll-command";
 import { terminal } from "../theme";
+import { CopyButton } from "./CopyButton";
 
 const useStyles = makeStyles({
   card: {
@@ -107,21 +107,15 @@ export const ConnectNodeCard = () => {
   const [grant, setGrant] = useState<IssuedGrant>();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
-  const [copied, setCopied] = useState<string>();
 
   // Until the field is touched it tracks the polled value, so a rotated tunnel
   // URL reaches the command without wiping out whatever was typed over it.
   const hostUrl = editedUrl ?? grant?.command.hostUrl ?? enrollment?.hostUrl ?? "";
 
-  useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(undefined), 2000);
-    return () => clearTimeout(timer);
-  }, [copied]);
-
   if (!enrollment) return null;
 
   const devTunnel = isDevTunnelUrl(hostUrl);
+  const command = grant ? keyEnrollCommand({ ...grant.command, hostUrl }) : "";
 
   const issue = async () => {
     setBusy(true);
@@ -134,11 +128,6 @@ export const ConnectNodeCard = () => {
     } finally {
       setBusy(false);
     }
-  };
-
-  const copy = async (key: string, text: string) => {
-    await navigator.clipboard.writeText(text).catch(() => undefined);
-    setCopied(key);
   };
 
   return (
@@ -205,31 +194,14 @@ export const ConnectNodeCard = () => {
         <>
           <div className={styles.commandRow}>
             <pre className={styles.command} aria-label="Connect command">
-              {keyEnrollCommand({
-                ...grant.command,
-                hostUrl,
-                ...(grant.command.tunnelId ? { tunnelId: grant.command.tunnelId } : {}),
-              })}
+              {command}
             </pre>
-            <Button
-              appearance={copied === "enroll" ? "subtle" : "primary"}
-              icon={copied === "enroll" ? <Checkmark20Regular /> : <Copy20Regular />}
-              aria-label="Copy the connect command"
-              onClick={() =>
-                void copy(
-                  "enroll",
-                  keyEnrollCommand({
-                    ...grant.command,
-                    hostUrl,
-                    ...(grant.command.tunnelId
-                      ? { tunnelId: grant.command.tunnelId }
-                      : {}),
-                  }),
-                )
-              }
-            >
-              {copied === "enroll" ? "Copied" : "Copy"}
-            </Button>
+            <CopyButton
+              text={command}
+              label="Copy the connect command"
+              appearance="primary"
+              showText
+            />
           </div>
           <div className={styles.actions}>
             <Text className={styles.caption}>

@@ -11,7 +11,6 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
 import { errorMessage } from "@fleet/protocol";
 import {
   browserNavigation,
@@ -27,6 +26,7 @@ import {
 } from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
 import { BrandMark } from "./BrandMark";
+import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
 import { TrustRail, type TrustStage } from "./auth/TrustRail";
@@ -451,44 +451,56 @@ function RefusedIdentity({
   );
 }
 
-/** The console code, which is the only proof a fresh Host will accept. */
-function ClaimCodeForm({ action, onDone }: { action: string; onDone: () => void }) {
-  const styles = useStyles();
-  const [code, setCode] = useState("");
+/** These signed-out forms use their submitted proof, not an operator CSRF token. */
+function useAuthForm(path: string, refused: string, onDone: () => void | Promise<void>) {
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
 
-  const submit = async () => {
+  const submit = async (values: Record<string, string>) => {
     setBusy(true);
     setError(undefined);
     try {
-      const response = await fetch("/api/auth/bootstrap", {
+      const response = await fetch(path, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ code }),
+        body: JSON.stringify(values),
       });
       if (response.ok) {
-        // Never echoed back: it is a one-time secret, and a field still holding
-        // it is a field a screenshot or a shoulder can read.
-        setCode("");
-        onDone();
+        await onDone();
         return;
       }
       const body = (await response.json().catch(() => ({}))) as { error?: string };
-      setError(body.error ?? `That code was refused (${response.status})`);
+      setError(body.error ?? `${refused} (${response.status})`);
     } catch (reason) {
       setError(errorMessage(reason, "Could not reach the Host"));
     } finally {
       setBusy(false);
     }
   };
+  return { busy, error, submit };
+}
+
+/** The console code, which is the only proof a fresh Host will accept. */
+function ClaimCodeForm({ action, onDone }: { action: string; onDone: () => void }) {
+  const styles = useStyles();
+  const [code, setCode] = useState("");
+  const { busy, error, submit } = useAuthForm(
+    "/api/auth/bootstrap",
+    "That code was refused",
+    () => {
+      // Never echoed back: it is a one-time secret, and a field still holding
+      // it is a field a screenshot or a shoulder can read.
+      setCode("");
+      onDone();
+    },
+  );
 
   return (
     <form
       className={styles.body}
       onSubmit={(event) => {
         event.preventDefault();
-        void submit();
+        void submit({ code });
       }}
     >
       <Field
@@ -523,37 +535,18 @@ function EntraConfigForm({
   const styles = useStyles();
   const [tenantId, setTenantId] = useState("");
   const [clientId, setClientId] = useState("");
-  const [error, setError] = useState<string>();
-  const [busy, setBusy] = useState(false);
-
-  const save = async () => {
-    setBusy(true);
-    setError(undefined);
-    try {
-      const response = await fetch("/api/auth/configure", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ tenantId, clientId }),
-      });
-      if (response.ok) {
-        onConfigured();
-        return;
-      }
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
-      setError(body.error ?? `That configuration was refused (${response.status})`);
-    } catch (reason) {
-      setError(errorMessage(reason, "Could not reach the Host"));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const { busy, error, submit } = useAuthForm(
+    "/api/auth/configure",
+    "That configuration was refused",
+    onConfigured,
+  );
 
   return (
     <form
       className={styles.body}
       onSubmit={(event) => {
         event.preventDefault();
-        void save();
+        void submit({ tenantId, clientId });
       }}
     >
       <Text className={styles.caption}>
@@ -892,38 +885,21 @@ function PasswordForm({
 }) {
   const styles = useStyles();
   const [password, setPassword] = useState("");
-  const [error, setError] = useState<string>();
-  const [busy, setBusy] = useState(false);
-
-  const submit = async () => {
-    setBusy(true);
-    setError(undefined);
-    try {
-      const response = await fetch("/api/auth/login", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ password }),
-      });
-      if (response.ok) {
-        setPassword("");
-        await onSignedIn();
-        return;
-      }
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
-      setError(body.error ?? `Sign-in failed (${response.status})`);
-    } catch (reason) {
-      setError(errorMessage(reason, "Could not reach the Host"));
-    } finally {
-      setBusy(false);
-    }
-  };
+  const { busy, error, submit } = useAuthForm(
+    "/api/auth/login",
+    "Sign-in failed",
+    async () => {
+      setPassword("");
+      await onSignedIn();
+    },
+  );
 
   return (
     <form
       className={styles.body}
       onSubmit={(event) => {
         event.preventDefault();
-        void submit();
+        void submit({ password });
       }}
     >
       <Field
@@ -950,13 +926,6 @@ const FORWARD_COMMAND = "devtunnel connect <tunnel-id>";
 
 function LocalForward() {
   const styles = useStyles();
-  const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 2_000);
-    return () => clearTimeout(timer);
-  }, [copied]);
 
   return (
     <>
@@ -968,19 +937,11 @@ function LocalForward() {
       </Text>
       <div className={styles.commandRow}>
         <pre className={styles.command}>{FORWARD_COMMAND}</pre>
-        <Button
-          appearance={copied ? "subtle" : "secondary"}
-          icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
-          aria-label="Copy the local forward command"
-          onClick={() => {
-            void navigator.clipboard
-              .writeText(FORWARD_COMMAND)
-              .then(() => setCopied(true))
-              .catch(() => undefined);
-          }}
-        >
-          {copied ? "Copied" : "Copy"}
-        </Button>
+        <CopyButton
+          text={FORWARD_COMMAND}
+          label="Copy the local forward command"
+          showText
+        />
       </div>
       <Text className={styles.caption}>
         Then open the forwarded <code>http://localhost:&lt;port&gt;</code> address. Any

@@ -851,13 +851,8 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     detail: z.string().default(""),
   }),
   /**
-   * The public key a legacy Node has generated for itself.
-   *
-   * Sent over a connection the Node has *already* authenticated with its shared
-   * secret, which is what makes it safe: the Host is not being asked to trust a
-   * key from a stranger, it is being told which key an established Node will
-   * use from now on. This is the whole of the migration path — the alternative
-   * was re-enrolling every machine by hand.
+   * Retained for older peers. The Host ignores this key: a legacy connection
+   * cannot establish a new identity safely. Migration needs a fresh Connect command.
    */
   z.object({
     type: z.literal("node_key"),
@@ -924,19 +919,9 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
    */
   z.object({ type: z.literal("node_name"), name: z.string().min(1) }),
   /**
-   * Asks a legacy Node to generate a key pair and report its public half.
-   *
-   * Carries the Host's identity and a proof of it keyed with `SHA-256(node
-   * secret)` — the one thing this Host and this Node both know and a relay
-   * does not. Without that the upgrade would be trust-on-first-use over a
-   * connection the Node has never authenticated, which is precisely the hole
-   * the key pair exists to close: a relay could pin its own key and impersonate
-   * the Host to that machine forever.
-   *
-   * Sent only to a Node advertising {@link NODE_KEY_UPGRADE_CAPABILITY}, for the
-   * same reason `host_url` is gated: an older Node validates every frame
-   * against its own copy of this union and hangs up on anything it does not
-   * recognise, so asking one to upgrade would cost it the connection instead.
+   * An obsolete upgrade request, parsed so a Node can refuse it without losing
+   * its connection to an older Host. A relay that saw the legacy secret can also
+   * produce this proof, so the Node logs instructions instead of adopting a key.
    */
   z.object({
     type: z.literal("request_node_key"),
@@ -946,19 +931,8 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
     proof: base64Field(MAX_PROOF_LENGTH),
   }),
   /**
-   * Confirms which key the Host recorded, naming it.
-   *
-   * The second half of a two-phase migration, and the reason there is one. A
-   * Node that wrote its key pair over its shared secret the moment it generated
-   * one would be betting its only way back into the fleet on a frame arriving:
-   * one dropped `node_key` and that machine holds a private key the Host has
-   * never seen and no secret to prove itself with, on a box someone has to
-   * visit. So the Node holds the proposal in memory, stays legacy, and promotes
-   * only when this says the Host has the matching public half.
-   *
-   * The key is named rather than implied because a Host mid-migration may have
-   * staged a key from an earlier attempt whose acknowledgement was lost, and an
-   * unqualified "yes" would promote the Node onto the wrong one.
+   * An obsolete acknowledgement, retained for older peers. The Node logs and
+   * ignores it; no identity is promoted over a legacy connection.
    */
   z.object({
     type: z.literal("node_key_accepted"),
@@ -974,9 +948,8 @@ export const HOST_URL_SYNC_CAPABILITY = "host-url-sync";
 export const SELF_UPDATE_CAPABILITY = "self-update";
 
 /**
- * A Node that can generate an identity key pair and report it over an already
- * authenticated legacy connection. Absent from a Node that predates Node keys,
- * which is exactly the set that must not be asked.
+ * Historical capability retained for compatibility. Current Nodes do not
+ * advertise it; migration requires enrollment using a fresh Connect command.
  */
 export const NODE_KEY_UPGRADE_CAPABILITY = "node-key-upgrade";
 

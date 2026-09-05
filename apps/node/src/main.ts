@@ -142,7 +142,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    */
   const logs = createLogBuffer();
 
-  const startupLog = (message: string): void => {
+  const log = (message: string): void => {
     logs.record("info", message);
     console.log(`${new Date().toISOString()} [node] ${message}`);
   };
@@ -153,13 +153,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     console.error(message);
   };
 
-  /**
-   * A problem raised before the main `warn` exists.
-   *
-   * The tunnel comes up before settings are read, so its failures need somewhere
-   * to go while the rest of the process is still being assembled.
-   */
-  const startupWarn = (message: string): void => {
+  /** A problem the page should show without the operator opening a terminal. */
+  const warn = (message: string): void => {
     logs.record("warn", message);
     console.log(`${new Date().toISOString()} [node] ${message}`);
   };
@@ -191,12 +186,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    */
   const tunnelMode: TunnelMode = devTunnelId ? "devtunnel" : "direct";
   if (devTunnelId) {
-    startupLog(`Connecting to dev tunnel ${devTunnelId}`);
+    log(`Connecting to dev tunnel ${devTunnelId}`);
     devTunnel = await connectDevTunnel(devTunnelId, {
-      log: startupLog,
+      log,
       // A tunnel that will not come up is the thing being debugged, so its
       // failures have to clear the page's problems-only filter.
-      warn: startupWarn,
+      warn,
       onUrlChanged: (url) => onTunnelUrlChanged(url),
     });
     // Seeds the first run only. The stored address is adopted below instead of
@@ -224,17 +219,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   };
 
   const mockAgent = env.FLEET_MOCK_AGENT === "1";
-
-  const log = (message: string): void => {
-    logs.record("info", message);
-    console.log(`${new Date().toISOString()} [node] ${message}`);
-  };
-
-  /** A problem the page should show without the operator opening a terminal. */
-  const warn = (message: string): void => {
-    logs.record("warn", message);
-    console.log(`${new Date().toISOString()} [node] ${message}`);
-  };
 
   log(`copilot-fleet node ${VERSION}${REVISION ? ` (${REVISION})` : ""} starting`);
   log(`  name        ${settings.nodeName}`);
@@ -793,28 +777,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       });
     });
 
-    /**
-     * The Host's answer to `client_hello`, checked before anything is sent.
-     *
-     * A refusal here is not a retry: it means whatever answered that address
-     * could not sign for the fingerprint printed on the Connect card, and the
-     * only correct thing to do with it is to say so and hang up.
-     */
-    const acceptChallenge = (frame: unknown): boolean => {
-      if (!session) return false;
-      const opened = session.accept(frame as never);
-      if (!opened.ok) {
-        errorLog(`Refused the Host's identity: ${opened.reason}`);
-        active.close(AUTH_FAILED_CLOSE_CODE, "Host identity refused");
-        return false;
-      }
-      channel = opened.channel;
-      active.send(JSON.stringify(opened.proof));
-      // The inventory a legacy node put in `hello` goes here, sealed.
-      send({ type: "ready", ...inventory() });
-      return true;
-    };
-
     active.on("message", async (raw: unknown) => {
       const text = String(raw);
       if (session && !channel) {
@@ -829,7 +791,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           active.close(AUTH_FAILED_CLOSE_CODE, "Host identity refused");
           return;
         }
-        acceptChallenge(handshake.value);
+        // Prove the pinned Host before sending a proof or this machine's inventory.
+        const opened = session.accept(handshake.value);
+        if (!opened.ok) {
+          errorLog(`Refused the Host's identity: ${opened.reason}`);
+          active.close(AUTH_FAILED_CLOSE_CODE, "Host identity refused");
+          return;
+        }
+        channel = opened.channel;
+        active.send(JSON.stringify(opened.proof));
+        send({ type: "ready", ...inventory() });
         return;
       }
       const plaintext = channel ? openSealed(text, active) : text;

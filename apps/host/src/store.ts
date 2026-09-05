@@ -1195,7 +1195,7 @@ export class FleetStore {
      */
     this.statement(
       `DELETE FROM settings WHERE key NOT IN (${placeholders(PRESERVED_SETTING_KEYS)})`,
-    ).run(...(PRESERVED_SETTING_KEYS as unknown as string[]));
+    ).run(...PRESERVED_SETTING_KEYS);
     this.setTunnelEnabled(parsed.tunnel.enabled);
     this.setTunnelProvider(parsed.tunnel.provider);
     this.setDefaultYolo(parsed.defaults.yolo);
@@ -1419,21 +1419,7 @@ export class FleetStore {
       this.statement(
         "SELECT * FROM administrators ORDER BY created_at, id",
       ).all() as Row[]
-    ).map((row) => {
-      const administrator = toAdministrator(row);
-      return {
-        id: administrator.id,
-        tenantId: administrator.tenantId,
-        objectId: administrator.objectId,
-        username: administrator.username,
-        displayName: administrator.displayName,
-        addedVia: administrator.addedVia,
-        addedByAdminId: administrator.addedByAdminId,
-        createdAt: administrator.createdAt,
-        lastLoginAt: administrator.lastLoginAt,
-        disabledAt: administrator.disabledAt,
-      };
-    });
+    ).map(toAdministrator);
     const nodeAuth = (
       this.statement(
         "SELECT id, secret_hash, public_key, auth_protocol FROM nodes ORDER BY name",
@@ -1881,18 +1867,14 @@ export class FleetStore {
 
   /** Ends every session that was authenticated a particular way. */
   revokeSessionsByMethod(authMethod: OperatorAuthMethod): RevokedSession[] {
-    return this.transaction(() => {
-      const rows = this.statement(
-        "SELECT token_hash, administrator_id FROM operator_sessions WHERE auth_method=? AND revoked_at=''",
-      ).all(authMethod) as Row[];
-      this.statement(
-        "UPDATE operator_sessions SET revoked_at=? WHERE auth_method=? AND revoked_at=''",
-      ).run(new Date().toISOString(), authMethod);
-      return rows.map((row) => ({
-        tokenHash: String(row.token_hash),
-        administratorId: String(row.administrator_id),
-      }));
-    });
+    const rows = this.statement(
+      `UPDATE operator_sessions SET revoked_at=? WHERE auth_method=? AND revoked_at=''
+       RETURNING token_hash, administrator_id`,
+    ).all(new Date().toISOString(), authMethod) as Row[];
+    return rows.map((row) => ({
+      tokenHash: String(row.token_hash),
+      administratorId: String(row.administrator_id),
+    }));
   }
 
   countOperatorSessions(): number {
@@ -1904,23 +1886,17 @@ export class FleetStore {
 
   /** Drops rows that can no longer authenticate anything. */
   deleteExpiredOperatorSessions(nowIso: string): number {
-    const rows = this.statement(
-      "SELECT token_hash FROM operator_sessions WHERE expires_at<=? OR revoked_at<>''",
-    ).all(nowIso) as Row[];
-    if (rows.length === 0) return 0;
-    this.statement(
+    const { changes } = this.statement(
       "DELETE FROM operator_sessions WHERE expires_at<=? OR revoked_at<>''",
     ).run(nowIso);
-    return rows.length;
+    return Number(changes);
   }
 
   private revokeSessionsForAdministratorRow(administratorId: string): RevokedSession[] {
     const rows = this.statement(
-      "SELECT token_hash FROM operator_sessions WHERE administrator_id=? AND revoked_at=''",
-    ).all(administratorId) as Row[];
-    this.statement(
-      "UPDATE operator_sessions SET revoked_at=? WHERE administrator_id=? AND revoked_at=''",
-    ).run(new Date().toISOString(), administratorId);
+      `UPDATE operator_sessions SET revoked_at=? WHERE administrator_id=? AND revoked_at=''
+       RETURNING token_hash`,
+    ).all(new Date().toISOString(), administratorId) as Row[];
     return rows.map((row) => ({
       tokenHash: String(row.token_hash),
       administratorId,
@@ -2046,16 +2022,12 @@ export class FleetStore {
 
   revokeInvitation(invitationId: string): boolean {
     const now = new Date().toISOString();
-    const row = this.statement(
-      "SELECT id FROM administrator_invitations WHERE id=? AND decision=''",
-    ).get(invitationId) as Row | undefined;
-    if (!row) return false;
-    this.statement(
+    const { changes } = this.statement(
       `UPDATE administrator_invitations
        SET decision='revoked', decided_at=?, consumed_at=CASE consumed_at WHEN '' THEN ? ELSE consumed_at END
-       WHERE id=?`,
+       WHERE id=? AND decision=''`,
     ).run(now, now, invitationId);
-    return true;
+    return Number(changes) === 1;
   }
 
   private decidePendingRow(
@@ -2324,52 +2296,33 @@ export class FleetStore {
     if (!input.publicKey) {
       throw new Error("A key-based Node registration needs a public key.");
     }
-    const now = new Date().toISOString();
-    const existing = this.statement("SELECT id FROM nodes WHERE name=?").get(
+    const row = this.statement(
+      `INSERT INTO nodes
+         (id,name,secret_hash,public_key,auth_protocol,os,arch,version,revision,
+          capabilities,agents,max_sessions,last_heartbeat,online,home_dir)
+       VALUES (?,?,'',?,?,?,?,?,?,?,?,?,?,0,?)
+       ON CONFLICT(name) DO UPDATE SET
+         secret_hash='', public_key=excluded.public_key, auth_protocol=excluded.auth_protocol,
+         os=excluded.os, arch=excluded.arch, version=excluded.version, revision=excluded.revision,
+         capabilities=excluded.capabilities, agents=excluded.agents, max_sessions=excluded.max_sessions,
+         last_heartbeat=excluded.last_heartbeat, home_dir=excluded.home_dir
+       RETURNING id`,
+    ).get(
+      randomUUID(),
       input.name,
-    ) as { id: string } | undefined;
-    const id = existing?.id ?? randomUUID();
-    if (existing) {
-      this.statement(
-        `UPDATE nodes SET secret_hash='', public_key=?, auth_protocol=?, os=?, arch=?,
-           version=?, revision=?, capabilities=?, agents=?, max_sessions=?,
-           last_heartbeat=?, home_dir=? WHERE id=?`,
-      ).run(
-        input.publicKey,
-        MUTUAL_AUTH_PROTOCOL,
-        input.os,
-        input.arch,
-        input.version,
-        input.revision ?? "",
-        JSON.stringify(input.capabilities),
-        JSON.stringify(input.agents ?? []),
-        input.maxSessions,
-        now,
-        input.homeDir ?? "",
-        id,
-      );
-    } else {
-      this.statement(
-        `INSERT INTO nodes
-          (id,name,secret_hash,public_key,auth_protocol,os,arch,version,revision,
-           capabilities,agents,max_sessions,last_heartbeat,online,home_dir)
-         VALUES (?,?,'',?,?,?,?,?,?,?,?,?,?,0,?)`,
-      ).run(
-        id,
-        input.name,
-        input.publicKey,
-        MUTUAL_AUTH_PROTOCOL,
-        input.os,
-        input.arch,
-        input.version,
-        input.revision ?? "",
-        JSON.stringify(input.capabilities),
-        JSON.stringify(input.agents ?? []),
-        input.maxSessions,
-        now,
-        input.homeDir ?? "",
-      );
-    }
+      input.publicKey,
+      MUTUAL_AUTH_PROTOCOL,
+      input.os,
+      input.arch,
+      input.version,
+      input.revision ?? "",
+      JSON.stringify(input.capabilities),
+      JSON.stringify(input.agents ?? []),
+      input.maxSessions,
+      new Date().toISOString(),
+      input.homeDir ?? "",
+    ) as Row;
+    const id = String(row.id);
     this.syncChatPlacement(id);
     return this.getNode(id)!;
   }

@@ -173,6 +173,24 @@ describe("ConnectNodeCard", () => {
     );
   });
 
+  it("copies exactly the displayed command after the Host URL is edited", async () => {
+    host();
+    show();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /generate a connect command/i }),
+    );
+    const command = await screen.findByLabelText("Connect command");
+    fireEvent.change(screen.getByLabelText("Host URL the node should dial"), {
+      target: { value: "https://fleet.example.com" },
+    });
+    expect(command.textContent).toContain('--url="https://fleet.example.com"');
+    expect(command.textContent).not.toContain("--devtunnel=");
+    fireEvent.click(screen.getByRole("button", { name: /copy the connect command/i }));
+    await waitFor(() =>
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(command.textContent),
+    );
+  });
+
   it("says why a private tunnel needs the machine signed in first", async () => {
     host();
     show();

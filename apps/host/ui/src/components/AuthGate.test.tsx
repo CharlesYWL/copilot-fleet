@@ -250,6 +250,84 @@ describe("AuthGate", () => {
       ).toBeTruthy();
     });
 
+    it.each([
+      {
+        path: "/api/auth/bootstrap",
+        fields: { "Claim code": "console-code" },
+        action: /^unlock setup$/i,
+        fallback: "That code was refused (503)",
+        configure: false,
+        overrides: {
+          state: "entra-unconfigured",
+          entraConfigured: false,
+          claimCodeRequired: true,
+        },
+      },
+      {
+        path: "/api/auth/configure",
+        fields: {
+          "Directory (tenant) ID": "tenant-guid",
+          "Application (client) ID": "client-guid",
+        },
+        action: /save and continue/i,
+        fallback: "That configuration was refused (503)",
+        configure: true,
+        overrides: {
+          state: "entra-unconfigured",
+          entraConfigured: false,
+          claimCodeRequired: true,
+        },
+      },
+      {
+        path: "/api/auth/login",
+        fields: { "Operator password": "operator-password" },
+        action: /^sign in$/i,
+        fallback: "Sign-in failed (503)",
+        configure: false,
+        overrides: { state: "hybrid", passwordEnabled: true },
+      },
+    ])(
+      "keeps $path form input and permits retry after a non-JSON error",
+      async (test) => {
+        let attempts = 0;
+        const fetchMock = host(
+          {
+            "/api/auth/bootstrap": () => answer({ ok: true }),
+            [test.path]: () =>
+              ++attempts === 1
+                ? new Response("Unavailable", { status: 503 })
+                : answer({ ok: true }),
+          },
+          test.overrides,
+        );
+        show();
+        if (test.configure) {
+          fireEvent.change(await screen.findByLabelText("Claim code"), {
+            target: { value: "console-code" },
+          });
+          fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
+        }
+        for (const [label, value] of Object.entries(test.fields)) {
+          fireEvent.change(await screen.findByLabelText(label), { target: { value } });
+        }
+        const submit = screen.getByRole("button", {
+          name: test.action,
+        }) as HTMLButtonElement;
+        fireEvent.click(submit);
+        expect(submit.disabled).toBe(true);
+        expect(await screen.findByText(test.fallback)).toBeTruthy();
+        expect(submit.disabled).toBe(false);
+        for (const [label, value] of Object.entries(test.fields)) {
+          expect((screen.getByLabelText(label) as HTMLInputElement).value).toBe(value);
+        }
+        fireEvent.click(submit);
+        await waitFor(() => expect(attempts).toBe(2));
+        expect(
+          fetchMock.mock.calls.some(([url]) => String(url).includes("/api/auth/csrf")),
+        ).toBe(false);
+      },
+    );
+
     /*
      * The same door, on a Host that is configured but has no administrators.
      * Restoring an archive here is how a rebuilt machine takes over from the

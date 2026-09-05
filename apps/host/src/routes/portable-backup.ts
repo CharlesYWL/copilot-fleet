@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
+import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { HostPortableBackupSchema, PORTABLE_BACKUP_VERSION } from "@fleet/protocol";
 import {
@@ -19,6 +19,7 @@ import type { LegacyEnrollment } from "../config.js";
 import type { FleetService } from "../fleet-service.js";
 import { isTransferableHostUrl } from "../host-url.js";
 import type { LeadTokens } from "../orchestrator/lead-tokens.js";
+import { requireAdministrator } from "./require-administrator.js";
 
 /** The same ceiling the data restore uses; the security half adds kilobytes. */
 export const PORTABLE_BACKUP_BODY_LIMIT = 50 * 1024 * 1024;
@@ -82,45 +83,12 @@ export const portableBackupRoutes: FastifyPluginAsync<
 ) => {
   const { store } = service;
 
-  /**
-   * The person, not merely the session.
-   *
-   * A legacy password proves that somebody knows a shared string, which is
-   * not an authority to hand over the administrator table and the Host's
-   * keys in one file — so this asks for an administrator whose Microsoft
-   * sign-in is recent enough to have been done on purpose.
-   */
-  const recentAdministrator = (
-    request: FastifyRequest,
-    reply: FastifyReply,
-  ): { id: string } | undefined => {
-    const session = auth.verifySession(
-      readCookie(request.headers.cookie, OPERATOR_COOKIE),
-    );
-    if (!session || !auth.sessionStillAuthorized(session)) {
-      reply.code(401).send({ error: "Sign in to use this Host" });
-      return undefined;
-    }
-    const administrator = auth.administratorFor(session);
-    if (!administrator) {
-      reply.code(403).send({ error: "Only a Microsoft administrator can do that." });
-      return undefined;
-    }
-    if (!auth.requireRecentReauth(session)) {
-      reply
-        .code(403)
-        .send({ error: "Sign in with Microsoft again to confirm this change." });
-      return undefined;
-    }
-    return { id: administrator.id };
-  };
-
   app.post(
     PORTABLE_BACKUP_PATH,
     {
       bodyLimit: PORTABLE_BACKUP_BODY_LIMIT,
       onRequest: async (request, reply) => {
-        if (!recentAdministrator(request, reply)) return reply;
+        if (!requireAdministrator(auth, request, reply, true)) return reply;
       },
     },
     async (request, reply) => {
@@ -165,13 +133,19 @@ export const portableBackupRoutes: FastifyPluginAsync<
       bodyLimit: PORTABLE_BACKUP_BODY_LIMIT,
       onRequest: async (request, reply) => {
         if (auth.claimed()) {
-          if (!recentAdministrator(request, reply)) return reply;
+          // Import also accepts bootstrap grants, so the global guard leaves
+          // its session and CSRF checks to this route.
           const session = auth.verifySession(
             readCookie(request.headers.cookie, OPERATOR_COOKIE),
           );
+          if (!session || !auth.sessionStillAuthorized(session)) {
+            return reply.code(401).send({ error: "Sign in to use this Host" });
+          }
+          request.fleetSession = session;
+          if (!requireAdministrator(auth, request, reply, true)) return reply;
           const presented = request.headers["x-csrf-token"];
           const token = Array.isArray(presented) ? presented[0] : presented;
-          if (!session || !auth.sessions.verifyCsrf(session.tokenHash, token)) {
+          if (!auth.sessions.verifyCsrf(session.tokenHash, token)) {
             return reply.code(403).send({ error: "Missing or invalid CSRF token" });
           }
           request.fleetPortableRestoreAuthorization = "administrator";

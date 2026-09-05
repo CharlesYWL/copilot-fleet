@@ -156,19 +156,10 @@ export class NodeEnrollment {
         error: "The registration does not match the one this enrollment committed to.",
       };
     }
-    const fields: EnrollmentTranscriptInput = {
-      challengeId: challenge.challengeId,
-      hostId: challenge.hostId,
-      hostNonce: challenge.hostNonce,
-      nodeNonce: challenge.nodeNonce,
-      nodePublicKey: challenge.nodePublicKey,
-      registrationHash: challenge.registrationHash,
-      dialedHostUrl: challenge.dialedHostUrl,
-    };
     if (
       !verifyIdentitySignature(
         challenge.nodePublicKey,
-        enrollmentTranscript(ENROLLMENT_COMPLETION_LABEL, fields),
+        enrollmentTranscript(ENROLLMENT_COMPLETION_LABEL, challenge),
         input.nodeSignature,
       )
     ) {
@@ -184,7 +175,7 @@ export class NodeEnrollment {
     if (!grant) return { ok: false, status: 401, error: REFUSED };
     const expected = grantProof(
       grant.tokenHash,
-      enrollmentTranscript(ENROLLMENT_GRANT_LABEL, fields),
+      enrollmentTranscript(ENROLLMENT_GRANT_LABEL, challenge),
     );
     if (!sameProof(expected, input.grantProof)) {
       this.audit({
@@ -227,7 +218,7 @@ export class NodeEnrollment {
         // transcript; without this the receipt was the one frame a relay could
         // still compose — and it names the Host key the Node pins for life.
         signature: this.identity.sign(
-          enrollmentReceiptTranscript({ ...fields, nodeId: node.id }),
+          enrollmentReceiptTranscript({ ...challenge, nodeId: node.id }),
         ),
       },
     };

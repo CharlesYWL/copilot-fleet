@@ -43,12 +43,13 @@ describe("FleetClient credentials", () => {
   });
 
   const capture = () => {
-    const calls: { url: string; headers: Headers; body: string }[] = [];
+    const calls: { url: string; method: string; headers: Headers; body: string }[] = [];
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: URL | string, init?: RequestInit) => {
         calls.push({
           url: String(input),
+          method: init?.method ?? "GET",
           headers: new Headers(init?.headers ?? {}),
           body: typeof init?.body === "string" ? init.body : "",
         });
@@ -61,9 +62,17 @@ describe("FleetClient credentials", () => {
           workspaceId: "w1",
           nodeId: "node-1",
           localPath: "/a",
+          state: "starting",
+          agentSessionId: "",
         };
         const method = (init?.method ?? "GET").toUpperCase();
-        return new Response(JSON.stringify(method === "GET" ? [] : single), {
+        const body =
+          method !== "GET"
+            ? single
+            : new URL(input).pathname === "/api/placements"
+              ? [single]
+              : [];
+        return new Response(JSON.stringify(body), {
           status: 200,
         });
       }),
@@ -71,23 +80,55 @@ describe("FleetClient credentials", () => {
     return calls;
   };
 
-  it("identifies this node on every call it relays", async () => {
-    const calls = capture();
-    const client = new FleetClient({
-      hostUrl: () => "http://127.0.0.1:8787",
-      nodeId: () => "node-1",
-      nodeSecret: () => "s3cret",
-    });
+  it.each(["legacy", "keyed"])(
+    "uses %s credentials on every relayed endpoint",
+    async (auth) => {
+      const calls = capture();
+      const keys = createIdentityKeyPair();
+      const client = new FleetClient({
+        hostUrl: () => "http://127.0.0.1:8787",
+        nodeId: () => "node-1",
+        nodeSecret: () => "s3cret",
+        nodeKey: () => (auth === "keyed" ? keys.privateKey : undefined),
+      });
 
-    await client.listWorkspaces();
-    await client.listOwnPlacements();
+      await client.listWorkspaces();
+      await client.listOwnPlacements();
+      await client.createWorkspace("fleet", "");
+      await client.updateWorkspace("w 1", "fleet", "");
+      await client.createOwnPlacement("w1", "/a");
+      await client.updateOwnPlacementPath("w1", "/b");
+      await client.listOwnSessions();
+      await client.createOwnSession({ placementId: "w1", prompt: "hello" });
+      await client.adoptOwnSession({
+        placementId: "w1",
+        agentSessionId: "acp-1",
+        additionalDirectories: [],
+      });
 
-    expect(calls).toHaveLength(2);
-    for (const call of calls) {
-      expect(call.headers.get(NODE_ID_HEADER)).toBe("node-1");
-      expect(call.headers.get(NODE_SECRET_HEADER)).toBe("s3cret");
-    }
-  });
+      expect(calls).toHaveLength(10);
+      for (const call of calls) {
+        expect(call.headers.get(NODE_ID_HEADER)).toBe("node-1");
+        if (auth === "legacy") {
+          expect(call.headers.get(NODE_SECRET_HEADER)).toBe("s3cret");
+        } else {
+          expect(call.headers.has(NODE_SECRET_HEADER)).toBe(false);
+          expect(
+            verifyNodeHttpProof({
+              publicKey: keys.publicKey,
+              nodeId: "node-1",
+              method: call.method,
+              path: new URL(call.url).pathname,
+              body: call.body,
+              timestamp: call.headers.get(NODE_PROOF_TIMESTAMP_HEADER) ?? "",
+              nonce: call.headers.get(NODE_PROOF_NONCE_HEADER) ?? "",
+              signature: call.headers.get(NODE_PROOF_SIGNATURE_HEADER) ?? "",
+            }),
+          ).toEqual({ ok: true });
+        }
+      }
+    },
+  );
 
   it("says nothing about an identity it does not have yet", async () => {
     const calls = capture();

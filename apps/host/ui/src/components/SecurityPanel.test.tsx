@@ -314,25 +314,43 @@ describe("SecurityPanel", () => {
   });
 
   it("lets an administrator explicitly enable password sign-in", async () => {
-    const fetchMock = host(
-      {},
-      {
-        "/api/auth/status": {
+    let passwordEnabled = false;
+    const fetchMock = host({
+      "/api/auth/status": () =>
+        answer({
           ...(defaults["/api/auth/status"] as object),
-          state: "microsoft-only",
-          passwordEnabled: false,
-        },
+          state: passwordEnabled ? "hybrid" : "microsoft-only",
+          passwordEnabled,
+        }),
+      "POST /api/auth/password/enable": () => {
+        passwordEnabled = true;
+        return answer({ ok: true });
       },
-    );
+      "POST /api/auth/password/disable": () => {
+        passwordEnabled = false;
+        return answer({ ok: true });
+      },
+    });
     show();
 
     fireEvent.click(
       await screen.findByRole("button", { name: /enable password sign-in/i }),
     );
     const dialog = await screen.findByRole("dialog");
+    const enable = within(dialog).getByRole("button", { name: /^enable$/i });
+    expect((enable as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(within(dialog).getByLabelText(/^new operator password$/i), {
+      target: { value: "too-short" },
+    });
+    expect(within(dialog).getByText("Use at least 16 characters.")).toBeTruthy();
     fireEvent.change(within(dialog).getByLabelText(/^new operator password$/i), {
       target: { value: "a-new-operator-password" },
     });
+    fireEvent.change(within(dialog).getByLabelText(/confirm operator password/i), {
+      target: { value: "different" },
+    });
+    expect(within(dialog).getByText("The passwords do not match.")).toBeTruthy();
+    expect((enable as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(within(dialog).getByLabelText(/confirm operator password/i), {
       target: { value: "a-new-operator-password" },
     });
@@ -348,6 +366,29 @@ describe("SecurityPanel", () => {
         ),
       ).toBe(true),
     );
+    fireEvent.click(
+      await screen.findByRole("button", { name: /disable password sign-in/i }),
+    );
+    fireEvent.click(
+      within(await screen.findByRole("dialog")).getByRole("button", {
+        name: /^disable$/i,
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: /enable password sign-in/i }),
+    );
+    const reopened = await screen.findByRole("dialog");
+    for (const field of within(reopened).getAllByLabelText(/operator password/i)) {
+      expect((field as HTMLInputElement).value).toBe("");
+    }
+    const writes = fetchMock.mock.calls.filter(([url]) =>
+      String(url).includes("/api/auth/password/"),
+    );
+    expect(writes).toHaveLength(2);
+    expect(writes[1]?.[1]?.body).toBeUndefined();
+    for (const [, init] of writes) {
+      expect(new Headers(init?.headers).get("x-csrf-token")).toBe("proof");
+    }
   });
 
   it("reports how far the Node key migration has got, and blocks enforcement until it is done", async () => {

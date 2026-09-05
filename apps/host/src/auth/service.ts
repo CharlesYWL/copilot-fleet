@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { AuthErrorCode } from "@fleet/protocol";
 import { OperatorAuth, generatePassword, hashPassword } from "../auth.js";
 import type {
@@ -105,6 +105,13 @@ export type LoginSuccess = {
   ok: true;
   session: IssuedSession;
   administrator?: Administrator;
+};
+
+type MicrosoftLoginInput = {
+  binding: string;
+  bootstrapToken: string | undefined;
+  host: string | undefined;
+  invitation?: string | undefined;
 };
 
 export type FleetAuthOptions = {
@@ -388,12 +395,7 @@ export class FleetAuth {
     this.store.setSetting(PASSWORD_RECOVERY_SETTING, "0");
     this.store.setSetting(PASSWORD_EXPLICIT_SETTING, "1");
     this.store.setSetting(AUTH_MODE_SETTING, "hybrid");
-    this.passwordAuth = new OperatorAuth({
-      getStoredHash: () => hash,
-      setStoredHash: () => {},
-      announce: () => {},
-      now: this.now,
-    });
+    this.passwordAuth = new OperatorAuth(hash, this.now);
     this.audit({
       eventType: "password_login_enabled",
       actorKind: "administrator",
@@ -418,12 +420,7 @@ export class FleetAuth {
     this.store.setSetting(PASSWORD_ENABLED_SETTING, "1");
     this.store.setSetting(PASSWORD_RECOVERY_SETTING, "1");
     this.store.setSetting(PASSWORD_EXPLICIT_SETTING, "0");
-    this.passwordAuth = new OperatorAuth({
-      getStoredHash: () => hash,
-      setStoredHash: () => {},
-      announce: () => {},
-      now: this.now,
-    });
+    this.passwordAuth = new OperatorAuth(hash, this.now);
     this.audit({
       eventType: "recovery_password_enabled",
       actorKind: "console",
@@ -553,13 +550,37 @@ export class FleetAuth {
    * that a `SameSite=Strict` bootstrap cookie is deliberately not sent with.
    * The transaction carries the grant across that gap and spends it on success.
    */
-  async startCodeLogin(input: {
-    binding: string;
-    bootstrapToken: string | undefined;
-    host: string | undefined;
-    redirectUri: string;
-    invitation?: string | undefined;
-  }): Promise<{ ok: true; authorizationUrl: string } | AuthFailure> {
+  async startCodeLogin(
+    input: MicrosoftLoginInput & {
+      redirectUri: string;
+    },
+  ): Promise<{ ok: true; authorizationUrl: string } | AuthFailure> {
+    const prepared = this.prepareMicrosoftLogin(input);
+    if (!prepared.ok) return prepared;
+    const transaction = this.transactions.start({
+      binding: input.binding,
+      bootstrap: prepared.bootstrap,
+      grantToken: prepared.bootstrap ? input.bootstrapToken : undefined,
+      invitation: input.invitation,
+      redirectUri: input.redirectUri,
+    });
+    try {
+      const authorizationUrl = await this.provider(prepared.config).authorizationUrl({
+        redirectUri: input.redirectUri,
+        state: transaction.state,
+        nonce: transaction.nonce,
+        codeChallenge: transaction.codeChallenge,
+      });
+      return { ok: true, authorizationUrl };
+    } catch (error) {
+      this.transactions.consume(transaction.state);
+      return this.providerFailure(error);
+    }
+  }
+
+  private prepareMicrosoftLogin(
+    input: MicrosoftLoginInput,
+  ): { ok: true; config: EntraConfig; bootstrap: boolean } | AuthFailure {
     if (!this.mayIssueCredential(input.host)) return this.refuseEndpoint(input.host);
     const config = this.entraConfig();
     if (!config) {
@@ -579,25 +600,7 @@ export class FleetAuth {
         error: "Enter the claim code printed on the Host console before signing in.",
       };
     }
-    const transaction = this.transactions.start({
-      binding: input.binding,
-      bootstrap: grant !== undefined,
-      grantToken: grant ? input.bootstrapToken : undefined,
-      invitation: input.invitation,
-      redirectUri: input.redirectUri,
-    });
-    try {
-      const authorizationUrl = await this.provider(config).authorizationUrl({
-        redirectUri: input.redirectUri,
-        state: transaction.state,
-        nonce: transaction.nonce,
-        codeChallenge: transaction.codeChallenge,
-      });
-      return { ok: true, authorizationUrl };
-    } catch (error) {
-      this.transactions.consume(transaction.state);
-      return this.providerFailure(error);
-    }
+    return { ok: true, config, bootstrap: grant !== undefined };
   }
 
   /**
@@ -805,58 +808,25 @@ export class FleetAuth {
    * attacker who watched a code being displayed could poll for the session it
    * produced, which is the phishing shape this flow already invites.
    */
-  async startDeviceLogin(input: {
-    binding: string;
-    bootstrapToken: string | undefined;
-    host: string | undefined;
-    /** Carried from a link, so a public-origin candidate leaves a trace. */
-    invitation?: string | undefined;
-  }): Promise<{ ok: true; flow: DeviceFlowStartedResponse } | AuthFailure> {
-    if (!this.mayIssueCredential(input.host)) return this.refuseEndpoint(input.host);
-    const config = this.entraConfig();
-    if (!config) {
-      return {
-        ok: false,
-        status: 409,
-        error: "This Host has no Microsoft sign-in configuration yet.",
-      };
-    }
-    const grant = this.claimed()
-      ? undefined
-      : this.claim.verifyBootstrap(input.bootstrapToken, input.binding);
-    if (!this.claimed() && !grant) {
-      return {
-        ok: false,
-        status: 401,
-        error: "Enter the claim code printed on the Host console before signing in.",
-      };
-    }
+  async startDeviceLogin(
+    input: MicrosoftLoginInput,
+  ): Promise<{ ok: true; flow: DeviceFlowStartedResponse } | AuthFailure> {
+    const prepared = this.prepareMicrosoftLogin(input);
+    if (!prepared.ok) return prepared;
     let started: DeviceCodeStarted;
     try {
-      started = await this.provider(config).startDeviceCode();
+      started = await this.provider(prepared.config).startDeviceCode();
     } catch (error) {
       return this.providerFailure(error);
     }
-    this.sweepDeviceFlows();
-    if (this.deviceFlows.size >= MAX_DEVICE_FLOWS) this.evictOldestDeviceFlow();
-    const flowId = randomBytes(24).toString("base64url");
-    this.deviceFlows.set(flowId, {
-      binding: input.binding,
-      providerFlowId: started.flowId,
-      bootstrap: grant !== undefined,
-      grantToken: grant ? input.bootstrapToken : undefined,
-      invitation: input.invitation,
-      expiresAt: started.expiresAt,
-    });
     return {
       ok: true,
-      flow: {
-        flowId,
-        userCode: started.userCode,
-        verificationUri: started.verificationUri,
-        message: started.message,
-        expiresAt: new Date(started.expiresAt).toISOString(),
-      },
+      flow: this.trackDeviceFlow(started, {
+        binding: input.binding,
+        bootstrap: prepared.bootstrap,
+        grantToken: prepared.bootstrap ? input.bootstrapToken : undefined,
+        invitation: input.invitation,
+      }),
     };
   }
 
@@ -953,28 +923,16 @@ export class FleetAuth {
     } catch (error) {
       return this.deviceUnavailable(error, input.administratorId);
     }
-    this.sweepDeviceFlows();
-    if (this.deviceFlows.size >= MAX_DEVICE_FLOWS) this.evictOldestDeviceFlow();
-    const flowId = randomBytes(24).toString("base64url");
-    this.deviceFlows.set(flowId, {
-      binding: input.binding,
-      providerFlowId: started.flowId,
-      bootstrap: false,
-      grantToken: undefined,
-      invitation: undefined,
-      expiresAt: started.expiresAt,
-      verifying: true,
-      administratorId: input.administratorId,
-    });
     return {
       ok: true,
-      flow: {
-        flowId,
-        userCode: started.userCode,
-        verificationUri: started.verificationUri,
-        message: started.message,
-        expiresAt: new Date(started.expiresAt).toISOString(),
-      },
+      flow: this.trackDeviceFlow(started, {
+        binding: input.binding,
+        bootstrap: false,
+        grantToken: undefined,
+        invitation: undefined,
+        verifying: true,
+        administratorId: input.administratorId,
+      }),
     };
   }
 
@@ -1112,11 +1070,30 @@ export class FleetAuth {
     };
   }
 
-  private evictOldestDeviceFlow(): void {
-    const oldest = [...this.deviceFlows].sort(
-      (a, b) => a[1].expiresAt - b[1].expiresAt,
-    )[0];
-    if (oldest) this.discardDeviceFlow(oldest[0]);
+  private trackDeviceFlow(
+    started: DeviceCodeStarted,
+    context: Omit<DeviceFlowRecord, "providerFlowId" | "expiresAt">,
+  ): DeviceFlowStartedResponse {
+    this.sweepDeviceFlows();
+    if (this.deviceFlows.size >= MAX_DEVICE_FLOWS) {
+      const oldest = [...this.deviceFlows].sort(
+        (a, b) => a[1].expiresAt - b[1].expiresAt,
+      )[0];
+      if (oldest) this.discardDeviceFlow(oldest[0]);
+    }
+    const flowId = randomBytes(24).toString("base64url");
+    this.deviceFlows.set(flowId, {
+      ...context,
+      providerFlowId: started.flowId,
+      expiresAt: started.expiresAt,
+    });
+    return {
+      flowId,
+      userCode: started.userCode,
+      verificationUri: started.verificationUri,
+      message: started.message,
+      expiresAt: new Date(started.expiresAt).toISOString(),
+    };
   }
 
   /**
@@ -1144,7 +1121,7 @@ export class FleetAuth {
   /** Removes the flows whose codes have died, whatever any browser is doing. */
   private sweepDeviceFlows(): void {
     const now = this.now();
-    for (const [flowId, flow] of [...this.deviceFlows]) {
+    for (const [flowId, flow] of this.deviceFlows) {
       if (flow.expiresAt <= now) this.discardDeviceFlow(flowId);
     }
   }
@@ -1320,24 +1297,13 @@ export class FleetAuth {
       configuredPassword,
     });
     if (mode.warning) this.warn(mode.warning);
-    this.store.setSetting(
-      PASSWORD_ENABLED_SETTING,
-      mode.persist.passwordEnabled ? "1" : "0",
-    );
-    this.store.setSetting("auth.operatorPassword", mode.persist.hash ?? "");
+    this.store.setSetting(PASSWORD_ENABLED_SETTING, mode.enabled ? "1" : "0");
+    this.store.setSetting("auth.operatorPassword", mode.hash ?? "");
     if (!mode.enabled || !mode.hash) {
       this.passwordAuth = undefined;
       return;
     }
-    const hash = mode.hash;
-    this.passwordAuth = new OperatorAuth({
-      getStoredHash: () => hash,
-      setStoredHash: () => {},
-      // Nothing is ever generated: the hash above is always present here, so
-      // the branch that used to invent a password is unreachable by design.
-      announce: () => {},
-      now: this.now,
-    });
+    this.passwordAuth = new OperatorAuth(mode.hash, this.now);
   }
 
   // -- restore ---------------------------------------------------------------
@@ -1380,9 +1346,4 @@ export class FleetAuth {
 /** Only the digest is stored, so a database read is not a set of live links. */
 export function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
-}
-
-/** A per-browser identifier for the limits that must not key on an IP. */
-export function newBinding(): string {
-  return randomUUID();
 }

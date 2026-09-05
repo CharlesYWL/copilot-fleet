@@ -14,11 +14,7 @@ import {
   verify,
   type KeyObject,
 } from "node:crypto";
-import {
-  MUTUAL_AUTH_PROTOCOL,
-  type AuthenticatedEnvelope,
-  type NodeAuthProtocol,
-} from "./index.js";
+import type { AuthenticatedEnvelope } from "./index.js";
 
 /**
  * The cryptography behind Node enrollment and the authenticated channel.
@@ -390,28 +386,6 @@ export const HOST_CHALLENGE_LABEL = "fleet-node-channel-host-challenge-v1";
 export const NODE_PROOF_LABEL = "fleet-node-channel-node-proof-v1";
 export const CHANNEL_KEY_LABEL = "fleet-node-channel-keys-v1";
 const CHANNEL_AAD_LABEL = "fleet-node-channel-aad-v1";
-const NODE_KEY_UPGRADE_LABEL = "fleet-node-key-upgrade-v1";
-
-/**
- * What a Host proves when it asks a legacy Node to upgrade.
- *
- * Keyed with `SHA-256(node secret)` — the one thing the Host and that Node both
- * hold and a relay does not — because the alternative is the Node pinning
- * whatever key arrives on a connection it has never authenticated. A relay that
- * pinned its own key there would own that machine permanently, which would make
- * the migration a downgrade rather than the point of it.
- */
-export function nodeKeyUpgradeTranscript(input: {
-  hostId: string;
-  hostPublicKey: string;
-  nodeId: string;
-}): Buffer {
-  return transcriptBytes(NODE_KEY_UPGRADE_LABEL, [
-    ["hostId", input.hostId],
-    ["hostPublicKey", input.hostPublicKey],
-    ["nodeId", input.nodeId],
-  ]);
-}
 
 export type HandshakeTranscriptInput = {
   protocol: string;
@@ -638,6 +612,3 @@ export class AuthenticatedChannel {
     return { ok: false, reason };
   }
 }
-
-/** Named here so neither side spells the protocol string itself. */
-export const MUTUAL_AUTH: NodeAuthProtocol = MUTUAL_AUTH_PROTOCOL;

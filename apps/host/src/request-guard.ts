@@ -126,12 +126,7 @@ export function originAllowed(
 ): boolean {
   if (origin === undefined) return true;
   if (!host || decision.kind === "unknown") return false;
-  const scheme =
-    decision.kind === "external-https"
-      ? "https"
-      : decision.kind === "external-http"
-        ? "http"
-        : "http";
+  const scheme = decision.kind === "external-https" ? "https" : "http";
   try {
     return new URL(origin).origin === new URL(`${scheme}://${host}`).origin;
   } catch {

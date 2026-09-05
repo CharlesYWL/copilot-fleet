@@ -330,128 +330,111 @@ function PasswordCard({
   run: (work: () => Promise<unknown>) => Promise<void>;
 }) {
   const styles = useStyles();
-  const [open, setOpen] = useState(false);
-  const [enableOpen, setEnableOpen] = useState(false);
+  const [dialog, setDialog] = useState<"enable" | "disable">();
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
+  const enabling = !status.passwordEnabled;
+  const action = enabling ? "enable" : "disable";
   const enableError =
     password.length > 0 && password.length < 16
       ? "Use at least 16 characters."
       : confirmation.length > 0 && password !== confirmation
         ? "The passwords do not match."
         : undefined;
-  if (!status.passwordEnabled) {
-    return (
-      <section className={styles.card} aria-label="Password sign-in">
-        <Text weight="semibold">Password sign-in</Text>
+  return (
+    <section className={styles.card} aria-label="Password sign-in">
+      <Text weight="semibold">Password sign-in</Text>
+      {enabling ? (
         <Text className={styles.caption}>
           Disabled by default after this Host was claimed. Only approved Microsoft
           accounts can sign in.
         </Text>
-        <div className={styles.row}>
-          <Button appearance="secondary" onClick={() => setEnableOpen(true)}>
-            Enable password sign-in
-          </Button>
-        </div>
-        <Dialog
-          open={enableOpen}
-          onOpenChange={(_event, data) => setEnableOpen(data.open)}
-        >
-          <DialogSurface>
-            <DialogBody>
-              <DialogTitle>Enable shared password sign-in?</DialogTitle>
-              <DialogContent>
-                <Text>
-                  This adds a second way to control every Node. Anyone who knows this
-                  password has full Fleet access and is not identified as a Microsoft
-                  account.
-                </Text>
-                <Field
-                  label="New operator password"
-                  hint="At least 16 characters."
-                  validationState={enableError ? "error" : "none"}
-                  {...(enableError ? { validationMessage: enableError } : {})}
-                >
-                  <Input
-                    type="password"
-                    value={password}
-                    autoComplete="new-password"
-                    onChange={(_event, data) => setPassword(data.value)}
-                  />
-                </Field>
-                <Field label="Confirm operator password">
-                  <Input
-                    type="password"
-                    value={confirmation}
-                    autoComplete="new-password"
-                    onChange={(_event, data) => setConfirmation(data.value)}
-                  />
-                </Field>
-              </DialogContent>
-              <DialogActions>
-                <Button appearance="secondary" onClick={() => setEnableOpen(false)}>
-                  Cancel
-                </Button>
-                <Button
-                  appearance="primary"
-                  disabled={!password || !confirmation || Boolean(enableError)}
-                  onClick={() => {
-                    const chosen = password;
-                    setPassword("");
-                    setConfirmation("");
-                    setEnableOpen(false);
-                    void run(() =>
-                      api("/api/auth/password/enable", {
-                        method: "POST",
-                        body: JSON.stringify({ password: chosen }),
-                      }),
-                    );
-                  }}
-                >
-                  Enable
-                </Button>
-              </DialogActions>
-            </DialogBody>
-          </DialogSurface>
-        </Dialog>
-      </section>
-    );
-  }
-  return (
-    <section className={styles.card} aria-label="Password sign-in">
-      <Text weight="semibold">Password sign-in</Text>
-      <MessageBar intent="warning">
-        <MessageBarBody>{AUTH_MODE_COPY[status.state]}</MessageBarBody>
-      </MessageBar>
+      ) : (
+        <MessageBar intent="warning">
+          <MessageBarBody>{AUTH_MODE_COPY[status.state]}</MessageBarBody>
+        </MessageBar>
+      )}
       <div className={styles.row}>
-        <Button appearance="primary" onClick={() => setOpen(true)}>
-          Disable password sign-in
+        <Button
+          appearance={enabling ? "secondary" : "primary"}
+          onClick={() => setDialog(action)}
+        >
+          {enabling ? "Enable password sign-in" : "Disable password sign-in"}
         </Button>
       </div>
-      <Dialog open={open} onOpenChange={(_event, data) => setOpen(data.open)}>
+      <Dialog
+        open={dialog === action}
+        onOpenChange={(_event, data) => setDialog(data.open ? action : undefined)}
+      >
         <DialogSurface>
           <DialogBody>
-            <DialogTitle>Disable password sign-in?</DialogTitle>
+            <DialogTitle>
+              {enabling ? "Enable shared password sign-in?" : "Disable password sign-in?"}
+            </DialogTitle>
             <DialogContent>
-              <Text>
-                The stored password is deleted and every session that used it is revoked
-                immediately, closing their browser connections. Anyone who signs in after
-                this needs a Microsoft account you have added. A local recovery command
-                can issue a temporary password if you lock yourself out.
-              </Text>
+              {enabling ? (
+                <>
+                  <Text>
+                    This adds a second way to control every Node. Anyone who knows this
+                    password has full Fleet access and is not identified as a Microsoft
+                    account.
+                  </Text>
+                  <Field
+                    label="New operator password"
+                    hint="At least 16 characters."
+                    validationState={enableError ? "error" : "none"}
+                    {...(enableError ? { validationMessage: enableError } : {})}
+                  >
+                    <Input
+                      type="password"
+                      value={password}
+                      autoComplete="new-password"
+                      onChange={(_event, data) => setPassword(data.value)}
+                    />
+                  </Field>
+                  <Field label="Confirm operator password">
+                    <Input
+                      type="password"
+                      value={confirmation}
+                      autoComplete="new-password"
+                      onChange={(_event, data) => setConfirmation(data.value)}
+                    />
+                  </Field>
+                </>
+              ) : (
+                <Text>
+                  The stored password is deleted and every session that used it is revoked
+                  immediately, closing their browser connections. Anyone who signs in
+                  after this needs a Microsoft account you have added. A local recovery
+                  command can issue a temporary password if you lock yourself out.
+                </Text>
+              )}
             </DialogContent>
             <DialogActions>
-              <Button appearance="secondary" onClick={() => setOpen(false)}>
+              <Button appearance="secondary" onClick={() => setDialog(undefined)}>
                 Cancel
               </Button>
               <Button
                 appearance="primary"
+                disabled={
+                  enabling && (!password || !confirmation || Boolean(enableError))
+                }
                 onClick={() => {
-                  setOpen(false);
-                  void run(() => api("/api/auth/password/disable", { method: "POST" }));
+                  const chosen = password;
+                  if (enabling) {
+                    setPassword("");
+                    setConfirmation("");
+                  }
+                  setDialog(undefined);
+                  void run(() =>
+                    api(`/api/auth/password/${action}`, {
+                      method: "POST",
+                      ...(enabling ? { body: JSON.stringify({ password: chosen }) } : {}),
+                    }),
+                  );
                 }}
               >
-                Disable
+                {enabling ? "Enable" : "Disable"}
               </Button>
             </DialogActions>
           </DialogBody>

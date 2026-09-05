@@ -1,5 +1,4 @@
 import {
-  Button,
   Link,
   MessageBar,
   MessageBarBody,
@@ -7,10 +6,9 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
-import { useEffect, useState } from "react";
 import type { DeviceFlow } from "../../lib/device-login";
 import { terminal } from "../../theme";
+import { CopyButton } from "../CopyButton";
 
 const useStyles = makeStyles({
   panel: {
@@ -68,13 +66,6 @@ export type DeviceCodePanelProps = {
  */
 export const DeviceCodePanel = ({ flow, error }: DeviceCodePanelProps) => {
   const styles = useStyles();
-  const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 2_000);
-    return () => clearTimeout(timer);
-  }, [copied]);
 
   return (
     <div className={styles.panel}>
@@ -87,19 +78,7 @@ export const DeviceCodePanel = ({ flow, error }: DeviceCodePanelProps) => {
       </Text>
       <div className={styles.codeRow}>
         <pre className={styles.code}>{flow.userCode}</pre>
-        <Button
-          appearance={copied ? "subtle" : "secondary"}
-          icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
-          aria-label="Copy the device code"
-          onClick={() => {
-            void navigator.clipboard
-              .writeText(flow.userCode)
-              .then(() => setCopied(true))
-              .catch(() => undefined);
-          }}
-        >
-          {copied ? "Copied" : "Copy"}
-        </Button>
+        <CopyButton text={flow.userCode} label="Copy the device code" showText />
       </div>
       <Text className={styles.caption}>Expires at {expiryLabel(flow.expiresAt)}.</Text>
       <MessageBar intent="warning">

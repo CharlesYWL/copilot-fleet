@@ -4,7 +4,6 @@ import {
   AUTH_FAILED_CLOSE_CODE,
   AuthenticatedEnvelopeSchema,
   INVALID_MESSAGE_CLOSE_CODE,
-  MUTUAL_AUTH_PROTOCOL,
   NodeFirstFrameSchema,
   NodeProofSchema,
   NodeToHostMessageSchema,
@@ -142,7 +141,7 @@ export function registerNodeGateway(
         }
       };
 
-    /** Plain JSON in: the protocol a legacy Node speaks. */
+    /** Validates application JSON, directly received or opened from an envelope. */
     const readPlain = (raw: string): NodeToHostMessage | undefined => {
       const next = decodeFrame(raw, NodeToHostMessageSchema);
       if (!next.ok) {
@@ -175,13 +174,7 @@ export function registerNodeGateway(
           socket.close(AUTH_FAILED_CLOSE_CODE, "Channel authentication failed");
           return undefined;
         }
-        const message = decodeFrame(opened.plaintext, NodeToHostMessageSchema);
-        if (!message.ok) {
-          app.log.warn({ error: message.detail }, "Rejected node message");
-          socket.close(message.code, message.reason);
-          return undefined;
-        }
-        return message.value;
+        return readPlain(opened.plaintext);
       };
 
     /**
@@ -198,8 +191,6 @@ export function registerNodeGateway(
       inventory: NodeInventory;
       link: NodeLink;
       read: (raw: string) => NodeToHostMessage | undefined;
-      /** Which protocol authenticated *this* connection, not what the row says. */
-      protocol: "legacy-secret" | typeof MUTUAL_AUTH_PROTOCOL;
     }): void => {
       const { nodeId, inventory } = input;
       authenticatedNodeId = nodeId;
@@ -520,7 +511,6 @@ export function registerNodeGateway(
             inventory,
             link: new SealedNodeLink(socket, channel),
             read,
-            protocol: MUTUAL_AUTH_PROTOCOL,
           });
         };
         socket.once("message", guarded("node inventory", onInventory));
@@ -557,7 +547,6 @@ export function registerNodeGateway(
           inventory,
           link: socket,
           read: readPlain,
-          protocol: "legacy-secret",
         });
         return;
       }

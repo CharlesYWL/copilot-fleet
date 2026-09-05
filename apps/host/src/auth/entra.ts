@@ -605,7 +605,6 @@ type ProviderDeviceFlow = {
   request: DeviceCodeRequest;
   expiresAt: number;
   timer: NodeJS.Timeout | undefined;
-  settled: boolean;
 };
 
 /**
@@ -665,8 +664,8 @@ export function createMsalAdapter(_config: EntraConfig, client: MsalClient): Msa
 
   const sweep = (): void => {
     const now = Date.now();
-    for (const [flowId, flow] of [...flows]) {
-      if (flow.settled || flow.expiresAt <= now) cancel(flowId);
+    for (const [flowId, flow] of flows) {
+      if (flow.expiresAt <= now) cancel(flowId);
     }
   };
 
@@ -762,7 +761,6 @@ export function createMsalAdapter(_config: EntraConfig, client: MsalClient): Msa
         request,
         expiresAt,
         timer: undefined,
-        settled: false,
       };
       flows.set(flowId, record);
       arm(record, flowId, expiresAt);
@@ -773,12 +771,8 @@ export function createMsalAdapter(_config: EntraConfig, client: MsalClient): Msa
        * this map is that nobody may ever come back for the answer.
        */
       result.then(
-        () => {
-          record.settled = true;
-          forget(flowId);
-        },
+        () => forget(flowId),
         (error: unknown) => {
-          record.settled = true;
           forget(flowId);
           rejectStart?.(error);
         },
@@ -823,9 +817,4 @@ async function loadMsalNode(config: EntraConfig): Promise<MsalAdapter> {
         .getTokenCache()
         .removeAccount(account as AuthenticationResult["account"] & MsalAccount),
   });
-}
-
-/** A flow id for a device login, distinct from the user code Microsoft shows. */
-export function newDeviceFlowId(): string {
-  return randomUUID();
 }

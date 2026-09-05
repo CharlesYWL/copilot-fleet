@@ -284,20 +284,28 @@ describe("device flow bookkeeping", () => {
     expect(again).toMatchObject({ ok: false, code: "expired" });
   });
 
-  it("cancels the provider's flow when one is evicted to make room", async () => {
-    const harness = setup({ deviceEnabled: true });
-    await claim(harness);
-    for (let index = 0; index <= MAX_DEVICE_FLOWS; index += 1) {
-      const started = await harness.auth.startDeviceLogin({
-        binding: `browser-${index}`,
-        bootstrapToken: undefined,
-        host: "localhost:8787",
-      });
-      expect(started.ok).toBe(true);
-    }
-    expect(harness.cancelled).toHaveLength(1);
-    expect(harness.live.size).toBe(MAX_DEVICE_FLOWS);
-  });
+  it.each(["login", "verification"] as const)(
+    "cancels an evicted %s flow",
+    async (kind) => {
+      const harness = setup({ deviceEnabled: true });
+      await claim(harness);
+      const administratorId = harness.auth.listAdministrators()[0]!.id;
+      for (let index = 0; index <= MAX_DEVICE_FLOWS; index += 1) {
+        const binding = `browser-${index}`;
+        const started =
+          kind === "login"
+            ? await harness.auth.startDeviceLogin({
+                binding,
+                bootstrapToken: undefined,
+                host: "localhost:8787",
+              })
+            : await harness.auth.startDeviceVerification({ binding, administratorId });
+        expect(started.ok).toBe(true);
+      }
+      expect(harness.cancelled).toHaveLength(1);
+      expect(harness.live.size).toBe(MAX_DEVICE_FLOWS);
+    },
+  );
 
   it("forgets a settled login on both sides", async () => {
     const harness = setup({ deviceEnabled: true });

@@ -80,60 +80,6 @@ export type FleetClientOptions = {
   nodeKey?: () => string | undefined;
 };
 
-/** The identity headers a relayed call carries, or nothing before enrollment. */
-type NodeCredentialHeaders = Record<string, string>;
-
-async function request<T>(
-  base: string,
-  path: string,
-  schema: z.ZodType<T>,
-  init: {
-    method?: string;
-    body?: string;
-    credentials?: (input: {
-      method: string;
-      path: string;
-      body?: string;
-    }) => NodeCredentialHeaders;
-  } = {},
-): Promise<T> {
-  const method = init.method ?? "GET";
-  const url = new URL(path, base);
-  const response = await fetch(url, {
-    ...(init.method ? { method: init.method } : {}),
-    ...(init.body ? { body: init.body } : {}),
-    headers: {
-      ...(init.body ? { "content-type": "application/json" } : {}),
-      // Built here rather than passed in, because a signature covers the exact
-      // call being made — the method, the path the URL resolved to, and the
-      // body — and a caller assembling it separately is a caller that will
-      // eventually sign one request and send another.
-      ...init.credentials?.({
-        method,
-        path: url.pathname,
-        ...(init.body === undefined ? {} : { body: init.body }),
-      }),
-    },
-    signal: AbortSignal.timeout(10_000),
-  });
-  const text = await response.text();
-  if (!response.ok) {
-    // The Host replies with {error} on failure; fall back to the raw body so a
-    // proxy error page does not surface as an empty message.
-    let message = text;
-    try {
-      const parsed: unknown = JSON.parse(text);
-      if (parsed && typeof parsed === "object" && "error" in parsed) {
-        message = String((parsed as { error: unknown }).error);
-      }
-    } catch {
-      // Keep the raw text.
-    }
-    throw new Error(`Host responded ${response.status}: ${message}`);
-  }
-  return schema.parse(text ? JSON.parse(text) : undefined);
-}
-
 /**
  * Talks to the Host's HTTP API on behalf of the local config page.
  *
@@ -144,6 +90,39 @@ async function request<T>(
  */
 export class FleetClient {
   constructor(private readonly options: FleetClientOptions) {}
+
+  private async request<T>(
+    path: string,
+    schema: z.ZodType<T>,
+    init: { method?: string; body?: string } = {},
+  ): Promise<T> {
+    const method = init.method ?? "GET";
+    const url = new URL(path, this.options.hostUrl());
+    const response = await fetch(url, {
+      ...init,
+      headers: {
+        ...(init.body ? { "content-type": "application/json" } : {}),
+        // Sign the resolved request here so no endpoint can forget its proof.
+        ...this.credentials({ ...init, method, path: url.pathname }),
+      },
+      signal: AbortSignal.timeout(10_000),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      // The Host replies with {error}; proxies may return an ordinary text body.
+      let message = text;
+      try {
+        const parsed: unknown = JSON.parse(text);
+        if (parsed && typeof parsed === "object" && "error" in parsed) {
+          message = String((parsed as { error: unknown }).error);
+        }
+      } catch {
+        // Keep the raw text.
+      }
+      throw new Error(`Host responded ${response.status}: ${message}`);
+    }
+    return schema.parse(text ? JSON.parse(text) : undefined);
+  }
 
   /**
    * What identifies this node to the Host, when it has an identity yet.
@@ -159,17 +138,15 @@ export class FleetClient {
     method: string;
     path: string;
     body?: string;
-  }): NodeCredentialHeaders {
+  }): Record<string, string> {
     const nodeId = this.options.nodeId();
     if (!nodeId) return {};
     const privateKey = this.options.nodeKey?.();
     if (privateKey) {
       const proof = signNodeHttpProof({
+        ...input,
         privateKey,
         nodeId,
-        method: input.method,
-        path: input.path,
-        ...(input.body === undefined ? {} : { body: input.body }),
       });
       return {
         [NODE_ID_HEADER]: nodeId,
@@ -184,29 +161,21 @@ export class FleetClient {
   }
 
   async listWorkspaces(): Promise<WorkspaceLike[]> {
-    return request(
-      this.options.hostUrl(),
-      "/api/workspaces",
-      z.array(WorkspaceLikeSchema),
-      { credentials: (input) => this.credentials(input) },
-    );
+    return this.request("/api/workspaces", z.array(WorkspaceLikeSchema));
   }
 
   async listOwnPlacements(): Promise<PlacementLike[]> {
-    const placements = await request(
-      this.options.hostUrl(),
+    const placements = await this.request(
       "/api/placements",
       z.array(PlacementLikeSchema),
-      { credentials: (input) => this.credentials(input) },
     );
     return ownPlacements(placements, this.options.nodeId());
   }
 
   async createWorkspace(name: string, description: string): Promise<WorkspaceLike> {
-    return request(this.options.hostUrl(), "/api/workspaces", WorkspaceLikeSchema, {
+    return this.request("/api/workspaces", WorkspaceLikeSchema, {
       method: "POST",
       body: JSON.stringify({ name, description }),
-      credentials: (input) => this.credentials(input),
     });
   }
 
@@ -215,14 +184,12 @@ export class FleetClient {
     name: string,
     description: string,
   ): Promise<WorkspaceLike> {
-    return request(
-      this.options.hostUrl(),
+    return this.request(
       `/api/workspaces/${encodeURIComponent(id)}`,
       WorkspaceLikeSchema,
       {
         method: "PATCH",
         body: JSON.stringify({ name, description }),
-        credentials: (input) => this.credentials(input),
       },
     );
   }
@@ -239,14 +206,12 @@ export class FleetClient {
     if (!mine.some((placement) => placement.id === id)) {
       throw new Error("That placement belongs to a different node");
     }
-    return request(
-      this.options.hostUrl(),
+    return this.request(
       `/api/placements/${encodeURIComponent(id)}`,
       PlacementLikeSchema,
       {
         method: "PATCH",
         body: JSON.stringify({ localPath }),
-        credentials: (input) => this.credentials(input),
       },
     );
   }
@@ -255,9 +220,8 @@ export class FleetClient {
     workspaceId: string,
     localPath: string,
   ): Promise<PlacementLike> {
-    return request(this.options.hostUrl(), "/api/placements", PlacementLikeSchema, {
+    return this.request("/api/placements", PlacementLikeSchema, {
       method: "POST",
-      credentials: (input) => this.credentials(input),
       body: JSON.stringify({
         workspaceId,
         nodeId: this.options.nodeId(),
@@ -267,12 +231,7 @@ export class FleetClient {
   }
 
   async listOwnSessions(): Promise<SessionStatusLike[]> {
-    return request(
-      this.options.hostUrl(),
-      "/api/sessions",
-      z.array(SessionStatusLikeSchema),
-      { credentials: (input) => this.credentials(input) },
-    );
+    return this.request("/api/sessions", z.array(SessionStatusLikeSchema));
   }
 
   async createOwnSession(input: {
@@ -280,9 +239,8 @@ export class FleetClient {
     prompt: string;
     name?: string;
   }): Promise<StartedSession> {
-    return request(this.options.hostUrl(), "/api/sessions", StartedSessionSchema, {
+    return this.request("/api/sessions", StartedSessionSchema, {
       method: "POST",
-      credentials: (requestInput) => this.credentials(requestInput),
       body: JSON.stringify(input),
     });
   }
@@ -293,9 +251,8 @@ export class FleetClient {
     additionalDirectories: string[];
     name?: string;
   }): Promise<StartedSession> {
-    return request(this.options.hostUrl(), "/api/sessions/adopt", StartedSessionSchema, {
+    return this.request("/api/sessions/adopt", StartedSessionSchema, {
       method: "POST",
-      credentials: (requestInput) => this.credentials(requestInput),
       body: JSON.stringify(input),
     });
   }

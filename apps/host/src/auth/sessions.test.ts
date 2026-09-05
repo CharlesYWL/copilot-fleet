@@ -71,18 +71,54 @@ describe("OperatorSessions", () => {
     expect(restarted.verify(issued.token)).toBeDefined();
   });
 
+  it("refuses a session issued by another Host", () => {
+    const first = setup();
+    const second = setup();
+    const issued = first.sessions.issue({ administratorId: "", authMethod: "password" });
+    expect(second.sessions.verify(issued.token)).toBeUndefined();
+  });
+
   it("lets an idle session lapse after seven days", () => {
-    const { sessions, advance } = setup();
+    const { sessions, store, advance, at } = setup();
     const issued = sessions.issue({ administratorId: "", authMethod: "password" });
+    const originalLastSeen = store.getOperatorSession(issued.tokenHash)?.lastSeenAt;
     advance(OPERATOR_SESSION_IDLE_MS - 1);
+    expect(sessions.inspect(issued.tokenHash)).toBeDefined();
+    expect(store.getOperatorSession(issued.tokenHash)?.lastSeenAt).toBe(originalLastSeen);
     expect(sessions.verify(issued.token)).toBeDefined();
+    expect(store.getOperatorSession(issued.tokenHash)?.lastSeenAt).toBe(
+      new Date(at()).toISOString(),
+    );
     // Verifying just now moved the idle clock, so another almost-seven days is
     // still fine — that is what "idle" means.
     advance(OPERATOR_SESSION_IDLE_MS - 1);
     expect(sessions.verify(issued.token)).toBeDefined();
     advance(OPERATOR_SESSION_IDLE_MS + 1);
+    expect(sessions.inspect(issued.tokenHash)).toBeUndefined();
     expect(sessions.verify(issued.token)).toBeUndefined();
   });
+
+  it.each(["expiresAt", "lastSeenAt"] as const)(
+    "refuses invalid %s in both session verification paths without touching the row",
+    (field) => {
+      const { sessions, store, at } = setup();
+      const tokenHash = createHash("sha256").update("invalid-clock").digest("hex");
+      const row = {
+        tokenHash,
+        administratorId: "",
+        authMethod: "password" as const,
+        authenticatedAt: new Date(at()).toISOString(),
+        lastSeenAt: new Date(at()).toISOString(),
+        expiresAt: new Date(at() + OPERATOR_SESSION_ABSOLUTE_MS).toISOString(),
+        [field]: "invalid",
+      };
+      store.insertOperatorSession(row);
+
+      expect(sessions.inspect(tokenHash)).toBeUndefined();
+      expect(sessions.verify("invalid-clock")).toBeUndefined();
+      expect(store.getOperatorSession(tokenHash)?.lastSeenAt).toBe(row.lastSeenAt);
+    },
+  );
 
   it("ends a session at thirty days however busy it was", () => {
     const { sessions, advance } = setup();
@@ -101,6 +137,7 @@ describe("OperatorSessions", () => {
     const first = sessions.issue({ administratorId: "", authMethod: "password" });
     const second = sessions.issue({ administratorId: "", authMethod: "password" });
     sessions.revoke(first.token);
+    expect(sessions.inspect(first.tokenHash)).toBeUndefined();
     expect(sessions.verify(first.token)).toBeUndefined();
     expect(sessions.verify(second.token)).toBeDefined();
   });

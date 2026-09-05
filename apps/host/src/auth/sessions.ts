@@ -99,16 +99,11 @@ export class OperatorSessions {
   verify(token: string | undefined): ActiveSession | undefined {
     if (!token) return undefined;
     const tokenHash = digest(token);
-    const row = this.store.getOperatorSession(tokenHash);
-    if (!row || row.revokedAt !== "") return undefined;
-    const now = this.now();
-    const absolute = Date.parse(row.expiresAt);
-    const lastSeen = Date.parse(row.lastSeenAt);
-    if (!Number.isFinite(absolute) || !Number.isFinite(lastSeen)) return undefined;
-    if (now >= absolute) return undefined;
-    if (now - lastSeen >= OPERATOR_SESSION_IDLE_MS) return undefined;
-    this.store.touchOperatorSession(tokenHash, new Date(now).toISOString());
-    return toActive(row, absolute);
+    const session = this.inspect(tokenHash);
+    if (session) {
+      this.store.touchOperatorSession(tokenHash, new Date(this.now()).toISOString());
+    }
+    return session;
   }
 
   /** The same question without moving the idle clock, for revalidation. */

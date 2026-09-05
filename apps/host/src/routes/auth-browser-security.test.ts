@@ -86,6 +86,18 @@ describe("browser authorization-code safety", () => {
       }),
     );
     expect(bootstrap.statusCode).toBe(200);
+    const cookies = bootstrap.headers["set-cookie"];
+    expect(cookies).toEqual([
+      expect.stringContaining("fleet_bind="),
+      expect.stringContaining("fleet_bootstrap="),
+    ]);
+    const values = cookies as string[];
+    expect(values[0]).toContain("SameSite=Lax; Max-Age=3600");
+    expect(values[1]).toContain("SameSite=Strict; Max-Age=600");
+    for (const value of values) {
+      expect(value).toContain("Path=/; HttpOnly;");
+      expect(value.endsWith("; Secure")).toBe(host === "fleet.example.com");
+    }
     const configure = await app.inject({
       method: "POST",
       url: "/api/auth/configure",

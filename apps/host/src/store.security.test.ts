@@ -124,6 +124,30 @@ describe("operator sessions", () => {
     expect(closed).toEqual([{ tokenHash: "hash-b", administratorId: other.id }]);
     expect(store.getOperatorSession("hash-b")?.revokedAt).not.toBe("");
     expect(store.getOperatorSession("hash-a")?.revokedAt).toBe("");
+    expect(store.revokeSessionsForAdministrator(other.id)).toEqual([]);
+    expect(store.revokeSessionsByMethod("microsoft-code")).toEqual([
+      { tokenHash: "hash-a", administratorId: admin.id },
+    ]);
+    expect(store.revokeSessionsByMethod("microsoft-code")).toEqual([]);
+  });
+
+  it("prunes expired and revoked sessions once, leaving active sessions alone", () => {
+    const store = setup();
+    const now = new Date().toISOString();
+    for (const tokenHash of ["expired", "revoked", "active"]) {
+      store.insertOperatorSession({
+        tokenHash,
+        administratorId: "",
+        authMethod: "password",
+        authenticatedAt: now,
+        lastSeenAt: now,
+        expiresAt: tokenHash === "expired" ? now : "2999-01-01T00:00:00.000Z",
+      });
+    }
+    store.revokeOperatorSession("revoked");
+    expect(store.deleteExpiredOperatorSessions(now)).toBe(2);
+    expect(store.deleteExpiredOperatorSessions(now)).toBe(0);
+    expect(store.getOperatorSession("active")?.revokedAt).toBe("");
   });
 });
 
@@ -190,6 +214,27 @@ describe("administrator invitations", () => {
     expect(store.countActiveAdministrators()).toBe(1);
     expect(store.listPendingCandidates()).toHaveLength(0);
     expect(store.approveCandidate(created.id, admin.id)).toBeUndefined();
+  });
+
+  it.each([false, true])("revokes an invitation once (consumed: %s)", (consumed) => {
+    const store = setup();
+    const admin = store.insertAdministrator({ ...identity("a"), addedVia: "claim" });
+    const invitation = store.createInvitation({
+      tokenHash: "hash",
+      createdByAdminId: admin.id,
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const candidate = consumed
+      ? store.consumeInvitation("hash", identity("b"))
+      : undefined;
+    expect(store.revokeInvitation(invitation.id)).toBe(true);
+    const revoked = store.getInvitation(invitation.id);
+    expect(revoked?.decision).toBe("revoked");
+    expect(revoked?.consumedAt).toBe(candidate?.consumedAt ?? revoked?.decidedAt);
+    expect(store.revokeInvitation(invitation.id)).toBe(false);
+    expect(store.revokeInvitation("missing")).toBe(false);
+    expect(store.consumeInvitation("hash", identity("c"))).toBeUndefined();
+    expect(store.approveCandidate(invitation.id, admin.id)).toBeUndefined();
   });
 });
 

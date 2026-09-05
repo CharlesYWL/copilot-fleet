@@ -12,17 +12,25 @@ type CopyButtonProps = {
   text: string;
   label?: string;
   size?: "small" | "medium";
+  showText?: boolean;
+  appearance?: "primary" | "secondary" | "subtle";
 };
 
-export const CopyButton = ({ text, label = "Copy", size = "small" }: CopyButtonProps) => {
+export const CopyButton = ({
+  text,
+  label = "Copy",
+  showText = false,
+  size = showText ? "medium" : "small",
+  appearance = showText ? "secondary" : "subtle",
+}: CopyButtonProps) => {
   const styles = useStyles();
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
     if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 1_600);
+    const timer = setTimeout(() => setCopied(false), showText ? 2_000 : 1_600);
     return () => clearTimeout(timer);
-  }, [copied]);
+  }, [copied, showText]);
 
   const handleCopy = async () => {
     if (!text) return;
@@ -36,13 +44,15 @@ export const CopyButton = ({ text, label = "Copy", size = "small" }: CopyButtonP
 
   return (
     <Button
-      className={styles.button}
-      appearance="subtle"
+      className={showText ? undefined : styles.button}
+      appearance={copied ? "subtle" : appearance}
       size={size}
       icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
-      aria-label={copied ? "Copied" : label}
-      title={copied ? "Copied" : label}
+      aria-label={copied && !showText ? "Copied" : label}
+      title={showText ? undefined : copied ? "Copied" : label}
       onClick={() => void handleCopy()}
-    />
+    >
+      {showText ? (copied ? "Copied" : "Copy") : null}
+    </Button>
   );
 };

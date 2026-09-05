@@ -43,159 +43,35 @@ describe("password storage", () => {
 });
 
 describe("OperatorAuth", () => {
-  /** Stands in for the settings table, so a "restart" can reuse the same one. */
-  const settings = () => {
-    const values = new Map<string, string>();
-    return {
-      getSessionKey: () => values.get("key"),
-      setSessionKey: (key: string) => void values.set("key", key),
-    };
-  };
-
-  const setup = (
-    overrides: Partial<{
-      stored: string | undefined;
-      configured: string | undefined;
-      now: () => number;
-      keys: ReturnType<typeof settings>;
-    }> = {},
-  ) => {
-    const announced: string[] = [];
-    let stored = overrides.stored;
-    const keys = overrides.keys ?? settings();
-    const auth = new OperatorAuth({
-      getStoredHash: () => stored,
-      setStoredHash: (hash) => {
-        stored = hash;
-      },
-      ...keys,
-      configuredPassword: overrides.configured,
-      announce: (password) => announced.push(password),
-      ...(overrides.now ? { now: overrides.now } : {}),
-    });
-    return { auth, announced, keys, storedHash: () => stored };
-  };
-
-  it("accepts the configured password and nothing else", () => {
-    const { auth, announced } = setup({ configured: "from-env" });
-    expect(auth.login("from-env").ok).toBe(true);
-    expect(auth.login("from-envy").ok).toBe(false);
-    // Nothing was invented, so nothing was announced.
-    expect(announced).toEqual([]);
-  });
-
-  it("prefers the configured password over a stored verifier", () => {
-    const { auth } = setup({ configured: "from-env", stored: hashPassword("from-db") });
-    expect(auth.login("from-env").ok).toBe(true);
-    expect(auth.login("from-db").ok).toBe(false);
-  });
-
-  it("reuses the stored verifier across restarts", () => {
-    const { auth, announced } = setup({ stored: hashPassword("from-db") });
-    expect(auth.login("from-db").ok).toBe(true);
-    expect(announced).toEqual([]);
-  });
-
-  it("invents a password once when there is none, and says so", () => {
-    const { auth, announced, storedHash } = setup();
-    expect(announced).toHaveLength(1);
-    expect(auth.login(announced[0]!).ok).toBe(true);
-    // Persisted, so the next boot does not invent a second one.
-    expect(verifyPassword(announced[0]!, storedHash()!)).toBe(true);
-  });
-
-  it("issues a session the cookie can be checked against, and revokes it", () => {
-    const { auth } = setup({ configured: "pw" });
-    const outcome = auth.login("pw");
-    if (!outcome.ok) throw new Error("expected a successful login");
-
-    expect(auth.verify(outcome.token)).toBe(true);
-    expect(auth.verify(`${outcome.token}x`)).toBe(false);
-    expect(auth.verify(undefined)).toBe(false);
-
-    auth.revoke(outcome.token);
-    expect(auth.verify(outcome.token)).toBe(false);
-  });
-
-  it("keeps a session valid across a Host restart", () => {
-    /*
-     * The reported problem: every refresh asked for the password again. The
-     * cookie was fine — the sessions were a Map, and a Host under `tsx watch`
-     * restarts on every file save, so each one signed the operator out.
-     */
-    const keys = settings();
-    const stored = hashPassword("pw");
-    const first = setup({ configured: "pw", stored, keys });
-    const outcome = first.auth.login("pw");
-    if (!outcome.ok) throw new Error("expected a successful login");
-
-    const afterRestart = setup({ configured: "pw", stored: first.storedHash(), keys });
-
-    expect(afterRestart.auth.verify(outcome.token)).toBe(true);
-  });
-
-  it("signs everyone out when the password changes", () => {
-    const keys = settings();
-    const before = setup({ configured: "old", keys });
-    const outcome = before.auth.login("old");
-    if (!outcome.ok) throw new Error("expected a successful login");
-
-    const after = setup({ configured: "new", stored: before.storedHash(), keys });
-
-    expect(after.auth.verify(outcome.token)).toBe(false);
-  });
-
-  it("will not take a cookie another Host signed", () => {
-    const outcome = setup({ configured: "pw" }).auth.login("pw");
-    if (!outcome.ok) throw new Error("expected a successful login");
-
-    // Same password, different signing key: the token is not transferable.
-    expect(setup({ configured: "pw" }).auth.verify(outcome.token)).toBe(false);
-  });
-
-  it("keeps one verifier for a configured password, so its salt is stable", () => {
-    // Re-hashing on every boot salts anew, and anything derived from the
-    // verifier — including which password a cookie was issued for — moved with
-    // it. Reusing the stored one is what makes a session outlive a restart.
-    const first = setup({ configured: "pw" });
-    const second = setup({ configured: "pw", stored: first.storedHash() });
-
-    expect(second.storedHash()).toBe(first.storedHash());
-    expect(second.auth.login("pw").ok).toBe(true);
-  });
-
-  it("replaces the verifier when the configured password no longer matches it", () => {
-    const first = setup({ configured: "old" });
-    const second = setup({ configured: "new", stored: first.storedHash() });
-
-    expect(second.storedHash()).not.toBe(first.storedHash());
-    expect(second.auth.login("new").ok).toBe(true);
-    expect(second.auth.login("old").ok).toBe(false);
+  it("checks the selected verifier without issuing a session", () => {
+    const auth = new OperatorAuth(hashPassword("pw"));
+    expect(auth.check("pw")).toEqual({ ok: true });
+    expect(auth.check("wrong")).toMatchObject({ ok: false, status: 401 });
   });
 
   it("stops answering guesses once there have been too many", () => {
     let now = 0;
-    const { auth } = setup({ configured: "pw", now: () => now });
+    const auth = new OperatorAuth(hashPassword("pw"), () => now);
     for (let attempt = 0; attempt < MAX_LOGIN_FAILURES; attempt += 1) {
-      expect(auth.login("wrong")).toMatchObject({ ok: false, status: 401 });
+      expect(auth.check("wrong")).toMatchObject({ ok: false, status: 401 });
     }
-    expect(auth.login("wrong")).toMatchObject({ ok: false, status: 429 });
+    expect(auth.check("wrong")).toMatchObject({ ok: false, status: 429 });
     // Locked out means locked out: the right password does not reopen it,
     // or a guesser could use one to test whether it had found the other.
-    expect(auth.login("pw")).toMatchObject({ ok: false, status: 429 });
+    expect(auth.check("pw")).toMatchObject({ ok: false, status: 429 });
 
     now += LOCKOUT_WINDOW_MS + 1;
-    expect(auth.login("pw").ok).toBe(true);
+    expect(auth.check("pw").ok).toBe(true);
   });
 
   it("forgets earlier failures after a successful sign-in", () => {
-    const { auth } = setup({ configured: "pw" });
+    const auth = new OperatorAuth(hashPassword("pw"));
     for (let attempt = 0; attempt < MAX_LOGIN_FAILURES - 1; attempt += 1) {
-      auth.login("wrong");
+      auth.check("wrong");
     }
-    expect(auth.login("pw").ok).toBe(true);
+    expect(auth.check("pw").ok).toBe(true);
     for (let attempt = 0; attempt < MAX_LOGIN_FAILURES - 1; attempt += 1) {
-      expect(auth.login("wrong")).toMatchObject({ ok: false, status: 401 });
+      expect(auth.check("wrong")).toMatchObject({ ok: false, status: 401 });
     }
   });
 });

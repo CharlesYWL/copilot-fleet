@@ -46,8 +46,6 @@ export type PasswordMode = {
   /** The verifier to check against; absent whenever `enabled` is false. */
   hash: string | undefined;
   source: PasswordSource;
-  /** Whether the resolution needs to be written back to settings. */
-  persist: { passwordEnabled: boolean; hash: string | undefined };
   warning: string | undefined;
 };
 
@@ -86,7 +84,6 @@ export function resolvePasswordMode(input: PasswordModeInput): PasswordMode {
       enabled: false,
       hash: undefined,
       source: "disabled",
-      persist: { passwordEnabled: false, hash: undefined },
       warning: input.configuredPassword ? STALE_WARNING : undefined,
     };
   }
@@ -99,7 +96,6 @@ export function resolvePasswordMode(input: PasswordModeInput): PasswordMode {
       enabled: true,
       hash: input.storedHash,
       source: "stored",
-      persist: { passwordEnabled: true, hash: input.storedHash },
       warning: undefined,
     };
   }
@@ -116,7 +112,6 @@ export function resolvePasswordMode(input: PasswordModeInput): PasswordMode {
       enabled: true,
       hash,
       source: "configured",
-      persist: { passwordEnabled: true, hash },
       // Only worth saying on the boot that turns it on; a Host already running
       // in this mode has been told.
       warning: input.persistedEnabled === undefined ? OPT_IN_WARNING : undefined,
@@ -130,7 +125,6 @@ export function resolvePasswordMode(input: PasswordModeInput): PasswordMode {
       // An upgraded Host has a verifier but never had the flag, and must keep
       // working until an administrator has a Microsoft identity to replace it.
       source: input.persistedEnabled === undefined ? "migrated" : "stored",
-      persist: { passwordEnabled: true, hash: input.storedHash },
       warning: undefined,
     };
   }
@@ -141,7 +135,6 @@ export function resolvePasswordMode(input: PasswordModeInput): PasswordMode {
     enabled: false,
     hash: undefined,
     source: "none",
-    persist: { passwordEnabled: false, hash: undefined },
     warning: undefined,
   };
 }

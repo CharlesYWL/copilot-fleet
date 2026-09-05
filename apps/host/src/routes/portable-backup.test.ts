@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../server.js";
 import type { EntraIdentity } from "../auth/entra.js";
+import { RECENT_REAUTH_MS } from "../auth/sessions.js";
 
 const TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 const CLIENT = "11111111-2222-3333-4444-555555555555";
@@ -168,12 +169,14 @@ describe("portable security backup", () => {
   };
 
   beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     origin = await startHost();
     owner = makeBrowser();
     await claim(origin, owner);
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await origin.app.close();
   });
 
@@ -256,6 +259,37 @@ describe("portable security backup", () => {
     });
 
     expect(refused.statusCode).toBe(400);
+  });
+
+  it.each(["/api/backup/portable", "/api/backup/portable/import"])(
+    "requires recent Microsoft reauthentication before parsing %s",
+    async (url) => {
+      const csrf = await csrfFor(origin, owner);
+      vi.setSystemTime(Date.now() + RECENT_REAUTH_MS + 1);
+      const refused = await origin.app.inject({
+        method: "POST",
+        url,
+        headers: {
+          cookie: owner.cookie(),
+          "x-csrf-token": csrf,
+          "content-type": "application/json",
+        },
+        payload: "{",
+      });
+      expect(refused.statusCode).toBe(403);
+      expect(refused.json()).toMatchObject({ reauthRequired: true });
+    },
+  );
+
+  it("requires CSRF proof before parsing a claimed Host's portable restore", async () => {
+    const refused = await origin.app.inject({
+      method: "POST",
+      url: "/api/backup/portable/import",
+      headers: { cookie: owner.cookie(), "content-type": "application/json" },
+      payload: "{",
+    });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json()).toEqual({ error: "Missing or invalid CSRF token" });
   });
 
   it("claims a fresh Host with the console code and the passphrase", async () => {

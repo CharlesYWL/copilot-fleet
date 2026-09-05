@@ -85,9 +85,6 @@ export function parseCredentials(value: unknown): Credentials {
   return CredentialsSchema.parse(withProtocol);
 }
 
-/** The same shape the archive format carries, so both readers agree. */
-export const NodeCredentialsSchema = CredentialsSchema;
-
 export async function loadCredentials(): Promise<Credentials | undefined> {
   let content: string;
   try {

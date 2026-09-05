@@ -154,11 +154,15 @@ describe("node authentication records", () => {
   it("reclaims a name a key-based Node already holds, replacing its key", () => {
     const store = setup();
     const first = keyed(store);
+    store.setNodeOnline(first.node.id, true, 1);
+    const placements = store.listPlacements();
     const second = keyed(store);
 
     // Re-enrolling the same machine name is how a rebuilt box keeps its
     // placements; the row's key has to become the new machine's.
     expect(second.node.id).toBe(first.node.id);
+    expect(second.node).toMatchObject({ online: true, activeSessions: 1 });
+    expect(store.listPlacements()).toEqual(placements);
     expect(store.nodePublicKey(second.node.id)).toBe(second.identity.publicKey);
     expect(store.nodePublicKey(second.node.id)).not.toBe(first.identity.publicKey);
   });
