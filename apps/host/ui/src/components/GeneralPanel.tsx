@@ -55,6 +55,12 @@ const useStyles = makeStyles({
     flexWrap: "wrap",
     gap: "8px",
   },
+  warning: {
+    flexShrink: 0,
+    gridTemplateRows: "auto",
+    paddingTop: tokens.spacingVerticalS,
+    paddingBottom: tokens.spacingVerticalS,
+  },
   hidden: {
     display: "none",
   },
@@ -220,7 +226,7 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
       </section>
 
       {yolo && (
-        <MessageBar intent="warning">
+        <MessageBar className={styles.warning} intent="warning" layout="multiline">
           <MessageBarBody>
             New sessions will execute commands on their node without approval. You can
             still turn this off for an individual session when starting it.
