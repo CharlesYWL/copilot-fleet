@@ -68,7 +68,8 @@ export function useAppNotifications() {
   const add = useCallback(
     (message: string, intent: NotificationIntent = "error") => {
       if (!message.trim()) return;
-      const id = `app:${instanceId}:${sequence.current++}`;
+      // Equal timestamps are ordered by lexical ID in the notification center.
+      const id = `app:${instanceId}:${String(sequence.current++).padStart(16, "0")}`;
       const now = new Date().toISOString();
       setNotifications((current) => {
         if (

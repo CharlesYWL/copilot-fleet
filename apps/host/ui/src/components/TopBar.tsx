@@ -359,7 +359,9 @@ export const TopBar = ({
           }}
           onDismissAll={() => {
             appNotifications?.dismissAll();
-            if (notifications.length > 0) onDismissAllNotifications();
+            if (notifications.length > 0 || notificationUnreadCount > 0) {
+              onDismissAllNotifications();
+            }
           }}
           onDismiss={(id) =>
             appNotifications?.notifications.some((item) => item.id === id)

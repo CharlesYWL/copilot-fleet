@@ -249,7 +249,13 @@ describe("TopBar application notifications", () => {
     resolvedAt: null,
   };
 
-  const setup = (notifications: Notification[] = []) => {
+  const setup = (
+    notifications: Notification[] = [],
+    {
+      unreadCount,
+      localMessages = ["Local error"],
+    }: { unreadCount?: number; localMessages?: string[] } = {},
+  ) => {
     const server = {
       onMarkNotificationRead: vi.fn(),
       onDismissNotification: vi.fn(),
@@ -261,7 +267,9 @@ describe("TopBar application notifications", () => {
       const local = useAppNotifications();
       return (
         <FluentProvider theme={fleetDarkTheme}>
-          <button onClick={() => local.add("Local error")}>Add local error</button>
+          <button onClick={() => localMessages.forEach((message) => local.add(message))}>
+            Add local error
+          </button>
           <TopBar
             nodesOnline={0}
             liveSessions={0}
@@ -272,7 +280,9 @@ describe("TopBar application notifications", () => {
             onToggleSound={vi.fn()}
             onSignOut={vi.fn()}
             notifications={items}
-            notificationUnreadCount={items.filter((item) => !item.readAt).length}
+            notificationUnreadCount={
+              unreadCount ?? items.filter((item) => !item.readAt).length
+            }
             appNotifications={local}
             {...server}
           />
@@ -334,6 +344,40 @@ describe("TopBar application notifications", () => {
     fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
     expect(server.onDismissAllNotifications).toHaveBeenCalledTimes(1);
     expect(screen.queryByText("Local error")).toBeNull();
+  });
+
+  it("clears local history and requests durable dismissal for unread rows outside the loaded list", () => {
+    const { server } = setup([], { unreadCount: 1 });
+    openNotifications(2);
+    fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
+    expect(server.onDismissAllNotifications).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Local error")).toBeNull();
+  });
+
+  it("can clear authoritative unread history even when neither list has loaded rows", () => {
+    const { server } = setup([], { unreadCount: 1, localMessages: [] });
+    openNotifications(1);
+    const clear = screen.getByRole("button", { name: "Clear all" });
+    expect(clear.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(clear);
+    expect(server.onDismissAllNotifications).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders same-millisecond local arrivals newest first across decimal sequence boundaries", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T19:00:00.000Z"));
+    try {
+      const messages = Array.from({ length: 11 }, (_, index) => `Local message ${index}`);
+      setup([], { localMessages: messages });
+      openNotifications(11);
+      const rows = screen.getAllByRole("listitem");
+      expect(rows).toHaveLength(11);
+      for (const [index, message] of messages.toReversed().entries()) {
+        expect(within(rows[index]!).getByText(message, { exact: true })).toBeTruthy();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reads and clears offline local-only notifications without server mutations", () => {

@@ -399,7 +399,7 @@ export const NotificationCenter = ({
           <Button
             appearance="subtle"
             size="small"
-            disabled={notifications.length === 0}
+            disabled={notifications.length === 0 && unreadCount === 0}
             onClick={onDismissAll}
           >
             Clear all
