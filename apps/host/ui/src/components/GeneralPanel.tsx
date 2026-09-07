@@ -21,6 +21,7 @@ import {
 import type { SessionConfigChoice, SessionConfigOption } from "@fleet/protocol";
 import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
+import { useMessageNotification } from "../hooks/useAppNotifications";
 
 const useStyles = makeStyles({
   panel: {
@@ -95,6 +96,9 @@ export type GeneralPanelProps = {
   sessions: readonly { configOptions: SessionConfigOption[] }[];
 };
 
+const YOLO_WARNING =
+  "New sessions will execute commands on their node without approval. You can still turn this off for an individual session when starting it.";
+
 export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
   const styles = useStyles();
   const [defaults, setDefaults] = useState<Defaults>();
@@ -103,6 +107,8 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [pendingArchive, setPendingArchive] = useState<unknown>();
   const fileInput = useRef<HTMLInputElement>(null);
+  useMessageNotification(error);
+  useMessageNotification(defaults?.yolo ? YOLO_WARNING : undefined, "warning");
 
   const refresh = useCallback(async () => {
     try {
@@ -181,7 +187,13 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
   if (!defaults) {
     return (
       <div className={styles.panel}>
-        <Spinner label="Loading defaults…" />
+        {error ? (
+          <MessageBar intent="error">
+            <MessageBarBody>{error}</MessageBarBody>
+          </MessageBar>
+        ) : (
+          <Spinner label="Loading defaults…" />
+        )}
       </div>
     );
   }
@@ -229,10 +241,7 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
 
       {yolo && (
         <MessageBar className={styles.warning} intent="warning" layout="multiline">
-          <MessageBarBody>
-            New sessions will execute commands on their node without approval. You can
-            still turn this off for an individual session when starting it.
-          </MessageBarBody>
+          <MessageBarBody>{YOLO_WARNING}</MessageBarBody>
         </MessageBar>
       )}
 

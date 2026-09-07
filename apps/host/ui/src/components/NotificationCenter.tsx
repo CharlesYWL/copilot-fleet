@@ -20,12 +20,9 @@ import {
   Open16Regular,
   Warning16Regular,
 } from "@fluentui/react-icons";
-import type {
-  Notification,
-  NotificationKind,
-  NotificationSeverity,
-} from "@fleet/protocol";
+import type { NotificationSeverity } from "@fleet/protocol";
 import { useMemo, useState } from "react";
+import type { AppNotification } from "../hooks/useAppNotifications";
 import { statusVisuals } from "../theme";
 
 const useStyles = makeStyles({
@@ -190,10 +187,8 @@ const useStyles = makeStyles({
     color: tokens.colorNeutralForeground2,
     fontSize: tokens.fontSizeBase200,
     lineHeight: "1.45",
-    display: "-webkit-box",
-    WebkitLineClamp: 2,
-    WebkitBoxOrient: "vertical",
-    overflow: "hidden",
+    whiteSpace: "pre-wrap",
+    overflowWrap: "anywhere",
   },
   meta: {
     display: "flex",
@@ -230,7 +225,8 @@ const useStyles = makeStyles({
   info: { color: statusVisuals.info.foreground },
 });
 
-const kindLabels: Record<NotificationKind, string> = {
+const kindLabels: Record<AppNotification["kind"], string> = {
+  app_message: "Application message",
   agent_completion: "Agent completed",
   agent_failure: "Agent failed",
   orchestration_needs_review: "Needs review",
@@ -247,14 +243,14 @@ function severityIcon(severity: NotificationSeverity, resolved: boolean) {
   return <Info16Regular />;
 }
 
-function notificationKindLabel(notification: Notification): string {
+function notificationKindLabel(notification: AppNotification): string {
   if (notification.status !== "resolved") return kindLabels[notification.kind];
   if (notification.kind === "permission_request") return "Permission";
   if (notification.kind === "orchestration_needs_review") return "Review";
   return kindLabels[notification.kind];
 }
 
-function notificationTitle(notification: Notification): string {
+function notificationTitle(notification: AppNotification): string {
   if (notification.status !== "resolved") return notification.title;
   if (notification.kind === "permission_request") {
     return "Permission request resolved";
@@ -266,7 +262,7 @@ function notificationTitle(notification: Notification): string {
   return notification.title;
 }
 
-function notificationBody(notification: Notification): string {
+function notificationBody(notification: AppNotification): string {
   if (
     notification.status === "resolved" &&
     (notification.kind === "permission_request" ||
@@ -286,14 +282,14 @@ function timestamp(value: string): string {
 
 type NotificationGroup = {
   key: string;
-  latest: Notification;
-  notifications: Notification[];
+  latest: AppNotification;
+  notifications: AppNotification[];
 };
 
 type NotificationAction = (id: string) => void | Promise<unknown>;
 
 async function applySequentially(
-  notifications: readonly Notification[],
+  notifications: readonly AppNotification[],
   action: NotificationAction,
 ): Promise<void> {
   for (const notification of notifications) {
@@ -301,7 +297,7 @@ async function applySequentially(
   }
 }
 
-function notificationGroupKey(notification: Notification): string {
+function notificationGroupKey(notification: AppNotification): string {
   if (notification.kind === "agent_completion" || notification.kind === "agent_failure") {
     const sessionId =
       typeof notification.data.sessionId === "string"
@@ -313,11 +309,11 @@ function notificationGroupKey(notification: Notification): string {
 }
 
 export type NotificationCenterProps = {
-  notifications: readonly Notification[];
+  notifications: readonly AppNotification[];
   unreadCount: number;
   browserEnabled: boolean;
   onToggleBrowser: () => void;
-  onNavigate: (notification: Notification) => void;
+  onNavigate: (notification: AppNotification) => void;
   onMarkRead: NotificationAction;
   onMarkAllRead: () => void;
   onDismissAll: () => void;
@@ -443,8 +439,16 @@ export const NotificationCenter = ({
                   <button
                     type="button"
                     className={styles.main}
-                    aria-label={`Open ${title}`}
+                    aria-label={
+                      notification.navigation.type === "none"
+                        ? `Read ${title}`
+                        : `Open ${title}`
+                    }
                     onClick={() => {
+                      if (notification.navigation.type === "none") {
+                        void applySequentially(unreadNotifications, onMarkRead);
+                        return;
+                      }
                       void (async () => {
                         await applySequentially(
                           unreadNotifications.filter(
@@ -477,7 +481,9 @@ export const NotificationCenter = ({
                         {severityIcon(notification.severity, resolved)}
                       </span>
                       <span className={styles.title}>{title}</span>
-                      <Open16Regular className={styles.openIcon} aria-hidden="true" />
+                      {notification.navigation.type !== "none" && (
+                        <Open16Regular className={styles.openIcon} aria-hidden="true" />
+                      )}
                     </span>
                     {body && <span className={styles.body}>{body}</span>}
                     <span className={styles.meta}>

@@ -4,6 +4,7 @@ import { FluentProvider } from "@fluentui/react-components";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { forgetCsrfToken } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
+import { NotificationContext } from "../hooks/useAppNotifications";
 
 const answer = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -56,10 +57,12 @@ const host = (overrides: Record<string, () => Response> = {}) => {
   return fetchMock;
 };
 
-const show = () =>
+const show = (notify = vi.fn()) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <ConnectNodeCard />
+      <NotificationContext.Provider value={notify}>
+        <ConnectNodeCard />
+      </NotificationContext.Provider>
     </FluentProvider>,
   );
 
@@ -202,7 +205,8 @@ describe("ConnectNodeCard", () => {
       "POST /api/enrollment-grants": () =>
         answer({ error: "Sign in with Microsoft again before adding a machine." }, 403),
     });
-    show();
+    const notify = vi.fn();
+    show(notify);
 
     fireEvent.click(
       await screen.findByRole("button", { name: /generate a connect command/i }),
@@ -212,5 +216,13 @@ describe("ConnectNodeCard", () => {
       await screen.findByText(/sign in with microsoft again before adding a machine/i),
     ).toBeTruthy();
     expect(screen.queryByLabelText("Connect command")).toBeNull();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      "Sign in with Microsoft again before adding a machine.",
+      "error",
+    );
+    fireEvent.change(screen.getByLabelText("Host URL the node should dial"), {
+      target: { value: "http://localhost:8787" },
+    });
+    expect(notify).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,13 +1,16 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { fleetDarkTheme } from "../theme";
+import { NotificationContext } from "../hooks/useAppNotifications";
 
-const show = () =>
+const show = (notify = vi.fn()) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <DiagnosticsPanel />
+      <NotificationContext.Provider value={notify}>
+        <DiagnosticsPanel />
+      </NotificationContext.Provider>
     </FluentProvider>,
   );
 
@@ -25,9 +28,32 @@ const respondWith = (body: unknown) =>
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
 describe("DiagnosticsPanel", () => {
+  it("reports poll failures once until recovery, without replacing inline feedback", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn().mockRejectedValue(new Error("Logs unavailable"));
+    vi.stubGlobal("fetch", fetchMock);
+    const notify = vi.fn();
+    await act(async () => {
+      show(notify);
+    });
+    expect(screen.getByText("Logs unavailable")).toBeTruthy();
+    expect(notify).toHaveBeenCalledExactlyOnceWith("Logs unavailable", "error");
+    await act(async () => vi.advanceTimersByTimeAsync(15_000));
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockImplementation(respondWith({ entries: [] }));
+    await act(async () => vi.advanceTimersByTimeAsync(5_000));
+    expect(screen.queryByText("Logs unavailable")).toBeNull();
+    fetchMock.mockRejectedValue(new Error("Logs unavailable"));
+    await act(async () => vi.advanceTimersByTimeAsync(5_000));
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
   it("shows the problems the Host has logged", async () => {
     vi.stubGlobal(
       "fetch",

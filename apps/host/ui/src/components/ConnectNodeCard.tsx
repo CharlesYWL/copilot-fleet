@@ -12,6 +12,7 @@ import {
 } from "@fluentui/react-components";
 import { errorMessage, type ConnectCommand } from "@fleet/protocol";
 import { useEnrollment } from "../hooks/useEnrollment";
+import { useMessageNotification } from "../hooks/useAppNotifications";
 import { api } from "../hooks/useFleet";
 import {
   devTunnelLoginCommand,
@@ -107,6 +108,7 @@ export const ConnectNodeCard = () => {
   const [grant, setGrant] = useState<IssuedGrant>();
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
+  useMessageNotification(error);
 
   // Until the field is touched it tracks the polled value, so a rotated tunnel
   // URL reaches the command without wiping out whatever was typed over it.

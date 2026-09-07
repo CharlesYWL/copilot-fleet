@@ -5,7 +5,7 @@ import {
   claimLiveNotification,
   type LiveNotificationClaim,
 } from "../lib/notification-claim";
-import type { LiveNotificationUpdate } from "./useFleet";
+import type { LiveNotificationUpdate, Notify } from "./useFleet";
 
 const SOUND_STORAGE_KEY = "fleet.sound";
 const BROWSER_STORAGE_KEY = "fleet.browser-notifications";
@@ -41,6 +41,7 @@ export function useNotificationDelivery(input: {
   isTargetVisible: (notification: FleetNotification) => boolean;
   onToast: (notification: FleetNotification) => void;
   onNavigate: (notification: FleetNotification) => void;
+  onNotify?: Notify;
 }): NotificationDeliveryControls {
   const [soundEnabled, setSoundEnabled] = useState(() =>
     storedFlag(SOUND_STORAGE_KEY, true),
@@ -173,11 +174,23 @@ export function useNotificationDelivery(input: {
       setBrowserEnabled(false);
       return;
     }
-    if (typeof Notification === "undefined") return;
+    if (typeof Notification === "undefined") {
+      inputRef.current.onNotify?.(
+        "Browser notifications are not supported in this browser.",
+        "warning",
+      );
+      return;
+    }
     const enable = (permission: NotificationPermission) => {
       const granted = permission === "granted";
       persistFlag(BROWSER_STORAGE_KEY, granted);
       setBrowserEnabled(granted);
+      if (!granted) {
+        inputRef.current.onNotify?.(
+          "Browser notifications are blocked. Allow notifications in your browser settings; in-app notifications remain available.",
+          "warning",
+        );
+      }
     };
     if (Notification.permission === "default") {
       void Notification.requestPermission().then(enable, () => enable("denied"));
