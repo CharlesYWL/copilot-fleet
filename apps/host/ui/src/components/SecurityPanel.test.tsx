@@ -610,9 +610,11 @@ describe("SecurityPanel", () => {
       expect(
         await screen.findByText("Microsoft refused this verification."),
       ).toBeTruthy();
-      expect(notify).toHaveBeenCalledWith(
-        "Microsoft refused this verification.",
-        "error",
+      await waitFor(() =>
+        expect(notify).toHaveBeenCalledWith(
+          "Microsoft refused this verification.",
+          "error",
+        ),
       );
     });
 

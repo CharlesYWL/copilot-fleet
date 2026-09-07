@@ -10,6 +10,24 @@ import {
 } from "./useAppNotifications";
 
 describe("useAppNotifications", () => {
+  it("creates unique tab-local IDs without randomUUID in insecure HTTP contexts", () => {
+    vi.stubGlobal("crypto", {});
+    try {
+      const { result } = renderHook(useAppNotifications);
+      act(() => {
+        result.current.add("First error");
+        result.current.add("Second error");
+      });
+      const ids = result.current.notifications.map((item) => item.id);
+      expect(ids).toHaveLength(2);
+      expect(new Set(ids).size).toBe(2);
+      expect(ids.every((id) => id.startsWith("app:"))).toBe(true);
+      expect(result.current.unreadCount).toBe(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it.each([
     ["error", "error"],
     ["warning", "warning"],

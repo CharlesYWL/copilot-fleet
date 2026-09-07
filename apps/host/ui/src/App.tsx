@@ -715,6 +715,7 @@ export function App() {
     isTargetVisible: isNotificationTargetVisible,
     onToast: notifyDurable,
     onNavigate: handleNotificationNavigate,
+    onNotify: notify,
   });
   /**
    * The tasks of the conversation on screen, if the session on screen is one.
