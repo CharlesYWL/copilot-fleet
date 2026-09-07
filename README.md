@@ -144,8 +144,9 @@ public client.
 1. Start the Host. It attempts to copy the claim code to the local clipboard
    (Windows, macOS, or Linux with `wl-copy`/`xclip`); if unavailable, copy it
    from the console manually. The printed claim link opens the Vite UI at
-   `http://127.0.0.1:5173` during `npm run dev`, or the Host URL in production.
-2. Open `http://localhost:8787` — use `localhost`, not `127.0.0.1`; the UI
+   `http://localhost:5173` during `npm run dev`, or the Host URL in production.
+2. Open `http://localhost:5173` for development, or `http://localhost:8787`
+   for production (default port) — use `localhost`, not `127.0.0.1`; the UI
    redirects if you get it wrong, because the registered reply URL is matched by
    name and the transaction cookie follows it.
 3. Enter the claim code, then **Sign in with Microsoft**.

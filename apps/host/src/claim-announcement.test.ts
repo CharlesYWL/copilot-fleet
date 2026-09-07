@@ -6,10 +6,11 @@ const clipboard = vi.hoisted(() => ({
   execFile: vi.fn(),
 }));
 vi.mock("node:child_process", () => ({ execFile: clipboard.execFile }));
+vi.unmock("./claim-announcement.js");
 
 describe("claim announcement", () => {
   it.each([
-    [true, "http://127.0.0.1:5173"],
+    [true, "http://localhost:5173"],
     [false, "https://fleet.example"],
   ])("uses the browser URL (development=%s)", async (development, expectedUrl) => {
     const write = vi.fn();
@@ -69,9 +70,9 @@ describe("local clipboard", () => {
   let complete: (error: Error | null) => void;
 
   beforeEach(() => {
-    stdin = new PassThrough();
     clipboard.execFile.mockImplementation(
       (_command, _args, _options, callback: typeof complete) => {
+        stdin = new PassThrough();
         complete = callback;
         return { stdin };
       },
@@ -105,6 +106,48 @@ describe("local clipboard", () => {
       expect(clipboard.execFile).not.toHaveBeenCalled();
     },
   );
+
+  it.each(["ENOENT", "nonzero exit", "timeout"])(
+    "falls back to X11 when Wayland fails with %s",
+    async (message) => {
+      const result = copyClaimCode("test-claim-code", "linux", {
+        WAYLAND_DISPLAY: "wayland-0",
+        DISPLAY: ":0",
+      });
+      expect(clipboard.execFile.mock.calls[0]?.[0]).toBe("wl-copy");
+      complete(new Error(message));
+      await vi.waitFor(() => expect(clipboard.execFile).toHaveBeenCalledTimes(2));
+      expect(clipboard.execFile.mock.calls[1]?.slice(0, 3)).toEqual([
+        "xclip",
+        ["-selection", "clipboard"],
+        { timeout: 2_000, windowsHide: true },
+      ]);
+      expect(stdin.read().toString()).toBe("test-claim-code");
+      complete(null);
+      await expect(result).resolves.toBe(true);
+    },
+  );
+
+  it("stops after a successful Wayland copy", async () => {
+    const result = copyClaimCode("test-claim-code", "linux", {
+      WAYLAND_DISPLAY: "wayland-0",
+      DISPLAY: ":0",
+    });
+    complete(null);
+    await expect(result).resolves.toBe(true);
+    expect(clipboard.execFile).toHaveBeenCalledOnce();
+  });
+
+  it("returns false after all eligible backends fail", async () => {
+    const result = copyClaimCode("test-claim-code", "linux", {
+      WAYLAND_DISPLAY: "wayland-0",
+      DISPLAY: ":0",
+    });
+    complete(new Error("ENOENT"));
+    await vi.waitFor(() => expect(clipboard.execFile).toHaveBeenCalledTimes(2));
+    complete(new Error("ENOENT"));
+    await expect(result).resolves.toBe(false);
+  });
 
   it.each(["ENOENT", "timeout", "nonzero exit"])(
     "handles %s without failing startup",

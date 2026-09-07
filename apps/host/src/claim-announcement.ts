@@ -5,32 +5,33 @@ export async function copyClaimCode(
   platform = process.platform,
   env = process.env,
 ): Promise<boolean> {
-  let command: string;
-  let args: string[] = [];
+  const backends: { command: string; args: string[] }[] = [];
   if (platform === "win32") {
-    command = "clip.exe";
+    backends.push({ command: "clip.exe", args: [] });
   } else if (platform === "darwin") {
-    command = "pbcopy";
-  } else if (platform === "linux" && env.WAYLAND_DISPLAY) {
-    command = "wl-copy";
-  } else if (platform === "linux" && env.DISPLAY) {
-    command = "xclip";
-    args = ["-selection", "clipboard"];
-  } else {
-    return false;
+    backends.push({ command: "pbcopy", args: [] });
+  } else if (platform === "linux") {
+    if (env.WAYLAND_DISPLAY) backends.push({ command: "wl-copy", args: [] });
+    if (env.DISPLAY) {
+      backends.push({ command: "xclip", args: ["-selection", "clipboard"] });
+    }
   }
 
-  return new Promise((resolve) => {
-    // Send the secret over stdin, never through a shell or process arguments.
-    const child = execFile(
-      command,
-      args,
-      { timeout: 2_000, windowsHide: true },
-      (error) => resolve(!error),
-    );
-    child.stdin?.on("error", () => resolve(false));
-    child.stdin?.end(code);
-  });
+  for (const { command, args } of backends) {
+    const copied = await new Promise<boolean>((resolve) => {
+      // Send the secret over stdin, never through a shell or process arguments.
+      const child = execFile(
+        command,
+        args,
+        { timeout: 2_000, windowsHide: true },
+        (error) => resolve(!error),
+      );
+      child.stdin?.on("error", () => resolve(false));
+      child.stdin?.end(code);
+    });
+    if (copied) return true;
+  }
+  return false;
 }
 
 export async function announceClaimCode(
@@ -42,7 +43,7 @@ export async function announceClaimCode(
     copy?: (code: string) => Promise<boolean>;
   },
 ): Promise<void> {
-  const url = options.development ? "http://127.0.0.1:5173" : options.publicUrl;
+  const url = options.development ? "http://localhost:5173" : options.publicUrl;
   // Keep both the code and clipboard output out of the HTTP-visible log buffer.
   const write = options.write ?? ((message) => process.stdout.write(message));
   write(
