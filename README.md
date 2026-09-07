@@ -141,7 +141,10 @@ public client.
 
 ### The claim itself
 
-1. Start the Host and copy the claim code from its console.
+1. Start the Host. It attempts to copy the claim code to the local clipboard
+   (Windows, macOS, or Linux with `wl-copy`/`xclip`); if unavailable, copy it
+   from the console manually. The printed claim link opens the Vite UI at
+   `http://127.0.0.1:5173` during `npm run dev`, or the Host URL in production.
 2. Open `http://localhost:8787` — use `localhost`, not `127.0.0.1`; the UI
    redirects if you get it wrong, because the registered reply URL is matched by
    name and the transaction cookie follows it.

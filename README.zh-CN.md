@@ -138,7 +138,9 @@ FLEET_ENTRA_CLIENT_ID=<应用程序（客户端）ID>
 
 ### 认领本身
 
-1. 启动 Host，从控制台复制认领码。
+1. 启动 Host。它会尝试将认领码复制到本机剪贴板（Windows、macOS，或安装了
+   `wl-copy`/`xclip` 的 Linux）；如果不可用，请从控制台手动复制。打印的认领链接在
+   `npm run dev` 下指向 Vite UI `http://127.0.0.1:5173`，生产模式下则指向 Host URL。
 2. 打开 `http://localhost:8787` —— 用 `localhost`，不要用 `127.0.0.1`；写错了界面会自己
    跳转，因为注册的回调地址是按名字匹配的，事务 cookie 也跟着名字走。
 3. 输入认领码，然后点 **Sign in with Microsoft**。

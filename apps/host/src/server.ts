@@ -8,6 +8,7 @@ import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { errorMessage } from "@fleet/protocol";
 import { cachedGitRevision } from "./host-revision.js";
+import { announceClaimCode } from "./claim-announcement.js";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
 import { FleetAuth } from "./auth/service.js";
 import { EnrollmentGrants } from "./auth/enrollment-grants.js";
@@ -172,10 +173,12 @@ export async function buildServer(
           : undefined,
     announceClaimCode:
       options.announceClaimCode ??
-      ((code) =>
-        process.stdout.write(
-          `\nCopilot Fleet is unclaimed. Claim it at ${fallbackPublicUrl()} with this one-time code:\n\n    ${code}\n\nIt expires in 30 minutes and is printed only here.\n\n`,
-        )),
+      ((code) => {
+        void announceClaimCode(code, {
+          development: process.argv.includes("--dev"),
+          publicUrl: fallbackPublicUrl(),
+        });
+      }),
     warn: (message) => app.log.warn(message),
     externalScheme: {
       publicUrl: () => process.env.FLEET_PUBLIC_URL || store.getSetting("host.publicUrl"),
