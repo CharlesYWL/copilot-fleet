@@ -372,7 +372,7 @@ describe("TopBar application notifications", () => {
       openNotifications(11);
       const rows = screen.getAllByRole("listitem");
       expect(rows).toHaveLength(11);
-      for (const [index, message] of messages.toReversed().entries()) {
+      for (const [index, message] of [...messages].reverse().entries()) {
         expect(within(rows[index]!).getByText(message, { exact: true })).toBeTruthy();
       }
     } finally {
