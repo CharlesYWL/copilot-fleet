@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { resolve } from "node:path";
+import { announceClaimCode } from "./claim-announcement.js";
 import {
   buildServer,
   resolveDatabasePath,
@@ -8,6 +9,33 @@ import {
   resolvePublicHostUrl,
   yoloUnsupportedReason,
 } from "./server.js";
+
+vi.mock("./claim-announcement.js", () => ({ announceClaimCode: vi.fn() }));
+
+describe("startup claim instructions", () => {
+  it.each([true, false])("selects the browser URL with --dev=%s", async (development) => {
+    const originalArgv = process.argv;
+    process.argv = ["node", "server.js", ...(development ? ["--dev"] : [])];
+    vi.mocked(announceClaimCode).mockClear();
+    try {
+      const app = await buildServer({
+        databasePath: ":memory:",
+        operatorPassword: "",
+        useBuiltInEntra: true,
+      });
+      try {
+        expect(announceClaimCode).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({ development, publicUrl: expect.any(String) }),
+        );
+      } finally {
+        await app.close();
+      }
+    } finally {
+      process.argv = originalArgv;
+    }
+  });
+});
 
 describe("resolveDatabasePath", () => {
   const root = resolve("repo", "apps", "host");
