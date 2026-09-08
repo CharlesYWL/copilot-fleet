@@ -30,6 +30,7 @@ import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
 import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
+import { MicrosoftSignInSetupGuide } from "./auth/MicrosoftSignInSetupGuide";
 import { TrustRail, type TrustStage } from "./auth/TrustRail";
 import { terminal } from "../theme";
 
@@ -626,6 +627,7 @@ function ConfigureStep({
           client ID is bundled; its publisher or operator must provide an approved
           application registration.
         </Text>
+        <MicrosoftSignInSetupGuide />
         <ClaimCodeForm action="Unlock setup" onDone={onBootstrapped} />
       </>
     );

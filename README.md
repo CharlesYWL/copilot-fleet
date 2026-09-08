@@ -136,6 +136,31 @@ to the borrowed Visual Studio client. Users of a distribution that supplies
 legitimate configuration need no tenant setup of their own — the publisher has
 already done the one-time registration work.
 
+**New to app registrations?** The first-run page includes **First-time setup:
+personal or corporate account** before you enter the claim code. Get the
+registration ready first; the same help follows your account-type selection in
+the configuration form, and all help links open in a new tab without losing
+your entries.
+
+Start in the [Microsoft Entra admin center](https://entra.microsoft.com), and
+check which directory is selected before registering anything:
+
+| Sign-in you want                                                         | Setup links                                                                                                                                                                                                                                                                                                                                                         | IDs to copy into Fleet                                                                                                                                                                          |
+| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Personal Outlook/Hotmail/Live, or both personal and work/school accounts | [Create the application/client ID](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app) in a directory you own or may manage. Choose **Any Entra ID Tenant + Personal Microsoft accounts** (also labeled **Accounts in any organizational directory and personal Microsoft accounts**).                                               | From the app's **Overview**, copy **Application (client) ID**. Select **Work/school and personal Microsoft accounts** in Fleet; it uses `common` automatically, with no tenant ID field.        |
+| Corporate/work/school accounts restricted to one directory               | [Create an approved corporate application/client ID](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app) and [find the directory/tenant ID](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-find-tenant). Choose **Single tenant only - your tenant** (also labeled **Accounts in this organizational directory only**). | Copy **Directory (tenant) ID** and **Application (client) ID** from the app's **Overview**. Select **One organization (fixed directory)** and paste both GUIDs, not a domain name or Object ID. |
+
+A personal Microsoft account alone is not an Entra directory and does not
+automatically grant registration permissions. See Microsoft's
+[directory setup and eligibility guide](https://learn.microsoft.com/en-us/entra/fundamentals/create-new-tenant)
+if you need one; tenant creation has subscription and permission requirements.
+Alternatively, ask the Fleet publisher/operator for an approved client ID.
+Do not register a private Fleet in your employer's directory. For a
+company-owned Fleet, follow the organization's app-registration process; if it
+asks for a Service Tree ID or other ownership metadata, ask the owning team or
+tenant administrator. A corporate account can also use the public option when
+the registration and organization policies allow it.
+
 The publisher/operator registers once in a directory they legitimately control:
 
 1. Register an application with supported account types **Accounts in any
@@ -143,6 +168,7 @@ The publisher/operator registers once in a directory they legitimately control:
 2. Under **Mobile and desktop applications**, register the native/public-client
    redirect `http://localhost:<port>/api/auth/entra/callback`, for example
    `http://localhost:8787/api/auth/entra/callback`. Use **neither Web nor SPA**.
+   Use the **Host API port** (8787 by default), not the Vite UI port (5173).
    The localhost name and callback path must match; native localhost redirects
    allow the local listener port to vary.
 3. Use authorization code with PKCE, **without a client secret**. Fleet requests

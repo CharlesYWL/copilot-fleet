@@ -186,6 +186,72 @@ describe("AuthGate", () => {
       });
     });
 
+    it("offers registration setup links before the claim code is entered", async () => {
+      const fetchMock = host({}, fresh);
+      show();
+      fireEvent.click(
+        await screen.findByText("First-time setup: personal or corporate account"),
+      );
+      expect(
+        screen.getByRole("link", { name: "Personal-account client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("link", { name: "Corporate client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("link", { name: "Find your corporate tenant ID" }),
+      ).toBeTruthy();
+      expect(screen.queryByLabelText("Application (client) ID")).toBeNull();
+      expect(screen.queryByText("console")).toBeNull();
+      expect(fetchMock.mock.calls.every(([url]) => url === "/api/auth/status")).toBe(
+        true,
+      );
+    });
+
+    it("switches setup guidance with the account type without losing the entered IDs", async () => {
+      host({ "/api/auth/bootstrap": () => answer({ ok: true }) }, fresh);
+      show();
+      fireEvent.change(await screen.findByLabelText("Claim code"), {
+        target: { value: "console-code" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
+      fireEvent.change(await screen.findByLabelText("Application (client) ID"), {
+        target: { value: clientId },
+      });
+      fireEvent.click(screen.getByText("Personal accounts: get your client ID"));
+      expect(
+        screen.getByRole("link", { name: "Personal-account client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        screen.queryByRole("link", { name: "Find your corporate tenant ID" }),
+      ).toBeNull();
+
+      fireEvent.click(
+        screen.getByRole("radio", { name: "One organization (fixed directory)" }),
+      );
+      expect(
+        screen.getByRole("link", { name: "Find your corporate tenant ID" }),
+      ).toBeTruthy();
+      fireEvent.change(screen.getByLabelText("Directory (tenant) ID"), {
+        target: { value: tenantId },
+      });
+      expect(
+        (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+      ).toBe(clientId);
+      fireEvent.click(
+        screen.getByRole("radio", {
+          name: "Work/school and personal Microsoft accounts",
+        }),
+      );
+      expect(screen.queryByLabelText("Directory (tenant) ID")).toBeNull();
+      expect(
+        screen.getByRole("link", { name: "Personal-account client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+      ).toBe(clientId);
+    });
+
     it("requires valid GUIDs when a fixed directory is explicitly selected", async () => {
       const fetchMock = host(
         {

@@ -131,6 +131,24 @@ Fleet 自有客户端 ID。全新安装在未提供客户端 ID 时会要求完�
 Visual Studio 客户端。如果某个发行版本已经提供了合法配置，普通使用者无需再配置自己的
 租户 —— 一次性的应用注册工作已经由发布者完成。
 
+**第一次注册应用？** 首次设置页在输入认领码之前就提供 **First-time setup: personal or
+corporate account** 指引。先准备好应用注册，再解锁设置；配置表单中的帮助会随账号类型
+切换，所有帮助链接都在新标签页打开，不会丢失已填写的内容。
+
+先打开 [Microsoft Entra 管理中心](https://entra.microsoft.com)，确认选中了正确的目录：
+
+| 希望支持的登录账号                                       | 设置链接                                                                                                                                                                                                                                                                                                                                  | 需要复制到 Fleet 的 ID                                                                                                                                                               |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 个人 Outlook/Hotmail/Live，或同时支持个人和工作/学校账号 | 在自己拥有或有权管理的目录中[注册应用、获取客户端 ID](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)。选择 **Any Entra ID Tenant + Personal Microsoft accounts**（也可能显示为 **Accounts in any organizational directory and personal Microsoft accounts**）。                                       | 从应用的 **Overview** 复制 **Application (client) ID**。在 Fleet 选择 **Work/school and personal Microsoft accounts**；系统自动使用 `common`，无需填写租户 ID。                      |
+| 仅一个目录中的公司/工作/学校账号                         | [注册获准使用的公司应用、获取客户端 ID](https://learn.microsoft.com/en-us/entra/identity-platform/quickstart-register-app)，并[查找目录/租户 ID](https://learn.microsoft.com/en-us/entra/fundamentals/how-to-find-tenant)。选择 **Single tenant only - your tenant**（也可能显示为 **Accounts in this organizational directory only**）。 | 从应用的 **Overview** 复制 **Directory (tenant) ID** 和 **Application (client) ID**。在 Fleet 选择 **One organization (fixed directory)**，填写两个 GUID，不要填写域名或 Object ID。 |
+
+拥有个人 Microsoft 账号不等于已经拥有 Entra 目录或应用注册权限。需要目录时，请参阅
+Microsoft 的[目录创建与资格要求](https://learn.microsoft.com/en-us/entra/fundamentals/create-new-tenant)；
+创建租户受订阅资格和权限限制。也可以向 Fleet 发布者或运维者索取获准使用的客户端 ID。
+不要为了私人 Fleet 在雇主的目录中注册应用；公司拥有的 Fleet 应遵循组织的注册流程。
+如果要求 Service Tree ID 或其他所有权信息，请联系所属团队或租户管理员。公司账号也可以
+使用公共账号选项，前提是注册应用和组织策略允许。
+
 发布者或运维者在自己合法控制的目录中完成一次注册：
 
 1. 为公共使用注册应用，支持的账号类型选为 **Accounts in any organizational directory
@@ -138,6 +156,7 @@ Visual Studio 客户端。如果某个发行版本已经提供了合法配置，
 2. 在 **Mobile and desktop applications**（移动和桌面应用程序）平台下注册原生/公共客户端
    回调 `http://localhost:<port>/api/auth/entra/callback`，例如
    `http://localhost:8787/api/auth/entra/callback`。**不要选择 Web 或 SPA**。
+   使用 **Host API 端口**（默认 8787），不是 Vite UI 端口（5173）。
    `localhost` 名称和回调路径必须匹配；原生 localhost 回调允许本地监听端口变化。
 3. 使用带 PKCE 的授权码流程，**不需要客户端机密**。Fleet 请求 `openid`、`profile` 和
    `email`，MSAL 还会加入 `offline_access`。不需要 Graph API 访问，也不会持久化 Microsoft

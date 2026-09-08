@@ -12,6 +12,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import type { AuthStatus } from "@fleet/protocol";
+import { MicrosoftSignInSetupGuide } from "./MicrosoftSignInSetupGuide";
 
 type Configuration = NonNullable<AuthStatus["entra"]>;
 
@@ -85,6 +86,7 @@ export function MicrosoftSignInForm({
         The registration&apos;s supported account types must match this choice. Consent
         and Conditional Access policies still apply.
       </Text>
+      <MicrosoftSignInSetupGuide audience={fixedDirectory ? "enterprise" : "public"} />
       {fixedDirectory && (
         <Field
           label="Directory (tenant) ID"
