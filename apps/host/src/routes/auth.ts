@@ -41,6 +41,7 @@ const ConfigureSchema = z.object({
 const CodeStartSchema = z.object({
   invitation: z.string().min(1).max(256).optional(),
 });
+const AdministratorAddStartSchema = z.strictObject({});
 const EnablePasswordSchema = z.object({
   password: OperatorPasswordSchema,
 });
@@ -272,6 +273,30 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     return reply.send({ authorizationUrl: outcome.authorizationUrl });
   });
 
+  app.post("/api/auth/administrators/add/start", async (request, reply) => {
+    if (!requireAdministrator(auth, request, reply, true)) return reply;
+    const session = request.fleetSession;
+    if (!session) return reply.code(401).send({ error: "Sign in to use this Host" });
+    const endpoint = codeLoginEndpoint(request.headers.host);
+    if (!endpoint.available) return reply.code(409).send(refuseCodeLogin(endpoint));
+    AdministratorAddStartSchema.parse(request.body);
+    const browser = binding(request);
+    if (browser.fresh) {
+      reply.header(
+        "set-cookie",
+        bindingCookie(browser.id, auth.secureCookies(request.headers.host)),
+      );
+    }
+    const outcome = await auth.startAdministratorAddition({
+      session,
+      binding: browser.id,
+      host: request.headers.host,
+      redirectUri: callbackUri(request, auth.entraConfig(), loopbackCallbackOrigin),
+    });
+    if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
+    return reply.send({ authorizationUrl: outcome.authorizationUrl });
+  });
+
   app.post("/api/auth/code/start", async (request, reply) => {
     const endpoint = codeLoginEndpoint(request.headers.host);
     if (!endpoint.available) {
@@ -354,6 +379,14 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     }
     if (!outcome.ok) {
       return fail(outcome.code ?? "provider-unavailable", outcome.error);
+    }
+    if ("addedAdministrator" in outcome) {
+      return reply.redirect(
+        appLocation(
+          `/?administrator_added=${encodeURIComponent(outcome.addedAdministrator.id)}`,
+        ),
+        302,
+      );
     }
     reply.header("set-cookie", clearedBootstrapCookie(secure));
     reply.header(
@@ -446,8 +479,10 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     // Listed by an administrator, not merely by an operator: in hybrid mode a
     // shared password is still a way in, and who else holds authority is the
     // administrators' own business.
-    if (!requireAdministrator(auth, request, reply, false)) return reply;
+    const administrator = requireAdministrator(auth, request, reply, false);
+    if (!administrator) return reply;
     return reply.send({
+      currentAdministratorId: administrator.id,
       administrators: auth.listAdministrators(),
       pending: auth.listPendingCandidates().map((invitation) => ({
         id: invitation.id,
@@ -506,6 +541,11 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     const administrator = requireAdministrator(auth, request, reply, true);
     if (!administrator) return reply;
     const { id } = request.params as { id: string };
+    if (id === administrator.id) {
+      return reply
+        .code(409)
+        .send({ error: "You cannot remove your own administrator account." });
+    }
     if (!auth.removeAdministrator(id)) {
       return reply.code(409).send({
         error:

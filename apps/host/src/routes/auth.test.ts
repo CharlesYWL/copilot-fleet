@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../server.js";
+import { BOOTSTRAP_GRANT_TTL_MS } from "../auth/claim.js";
 import type { EntraConfig, EntraIdentity } from "../auth/entra.js";
 
 const TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
@@ -26,6 +27,7 @@ const bob: EntraIdentity = {
 describe("Microsoft identity routes", () => {
   let app: FastifyInstance;
   let claimCode = "";
+  let elapsedMs = 0;
   /** What the injected provider will say the browser authenticated as. */
   let nextIdentity: EntraIdentity = alice;
   let authorization: { config: EntraConfig; redirectUri: string } | undefined;
@@ -57,6 +59,9 @@ describe("Microsoft identity routes", () => {
     );
 
   beforeEach(async () => {
+    elapsedMs = 0;
+    const realNow = Date.now;
+    vi.spyOn(Date, "now").mockImplementation(() => realNow() + elapsedMs);
     jar.clear();
     nextIdentity = alice;
     authorization = undefined;
@@ -90,6 +95,7 @@ describe("Microsoft identity routes", () => {
 
   afterEach(async () => {
     await app.close();
+    vi.restoreAllMocks();
   });
 
   const status = async () =>
@@ -169,6 +175,51 @@ describe("Microsoft identity routes", () => {
       expect(configured.json()).toMatchObject(publicConfig);
       await signIn();
       expect(await status()).toMatchObject({ authenticated: true, entra: publicConfig });
+    });
+
+    it("renews expired setup only after the console code is proved again", async () => {
+      const save = () =>
+        app.inject({
+          method: "POST",
+          url: "/api/auth/configure",
+          headers: { cookie: cookieHeader() },
+          payload: publicConfig,
+        });
+      expect((await bootstrap()).statusCode).toBe(200);
+      const oldGrant = jar.get("fleet_bootstrap");
+      elapsedMs += BOOTSTRAP_GRANT_TTL_MS + 1;
+
+      const expired = await save();
+      expect(expired.statusCode).toBe(401);
+      expect(expired.json()).toMatchObject({
+        error: "Enter the claim code printed on the Host console first.",
+      });
+      expect((await bootstrap("wrong-code")).statusCode).toBe(401);
+      expect((await save()).statusCode).toBe(401);
+      expect(await status()).toMatchObject({
+        state: "entra-unconfigured",
+        authenticated: false,
+      });
+
+      expect((await bootstrap()).statusCode).toBe(200);
+      expect(jar.get("fleet_bootstrap")).not.toBe(oldGrant);
+      expect((await save()).statusCode).toBe(200);
+      expect(await status()).toMatchObject({
+        state: "unclaimed",
+        authenticated: false,
+      });
+      nextIdentity = {
+        tenantId: "9188040d-6c67-4c5b-b112-36a304b66dad",
+        objectId: "personal-account-object-id",
+        username: "personal@example.com",
+        displayName: "Personal account",
+      };
+      expect((await signIn()).statusCode).toBe(302);
+      expect(await status()).toMatchObject({
+        authenticated: true,
+        entra: publicConfig,
+        identity: { username: nextIdentity.username },
+      });
     });
 
     it("requires an administrator and CSRF proof to start a registration switch", async () => {

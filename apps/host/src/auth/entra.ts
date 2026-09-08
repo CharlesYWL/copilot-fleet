@@ -394,6 +394,13 @@ export type AuthTransaction = {
         sessionTokenHash: string;
       }
     | undefined;
+  /** A separate, preauthorized addition; never an ordinary login or invitation. */
+  administratorAddition?:
+    | {
+        administratorId: string;
+        sessionTokenHash: string;
+      }
+    | undefined;
   expiresAt: number;
 };
 
@@ -405,6 +412,7 @@ export type StartTransactionInput = {
   redirectUri?: string | undefined;
   configurationKey?: string | undefined;
   migration?: AuthTransaction["migration"];
+  administratorAddition?: AuthTransaction["administratorAddition"];
 };
 
 /**
@@ -445,6 +453,7 @@ export class EntraTransactions {
       redirectUri: input.redirectUri ?? "",
       configurationKey: input.configurationKey ?? "",
       migration: input.migration,
+      administratorAddition: input.administratorAddition,
       expiresAt: this.now() + AUTH_TRANSACTION_TTL_MS,
     };
     this.byState.set(transaction.state, transaction);

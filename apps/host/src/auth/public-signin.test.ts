@@ -114,7 +114,11 @@ function setup(
   };
   const login = async (identity = CORP, binding = "browser", invitation?: string) => {
     nextIdentity = identity;
-    return auth.completeCodeLogin(await beginLogin(binding, invitation));
+    const outcome = await auth.completeCodeLogin(await beginLogin(binding, invitation));
+    if (outcome.ok && !("session" in outcome)) {
+      throw new Error("Expected a login, not an administrator addition");
+    }
+    return outcome;
   };
   const beginMigration = async (login: LoginSuccess, config = PUBLIC) => {
     const session = auth.verifySession(login.session.token);
@@ -364,7 +368,9 @@ describe("verified registration changes", () => {
     expect(h.auth.listAdministrators()).toHaveLength(1);
     expect(h.revoked).toContain(owner.session.tokenHash);
     expect(h.auth.verifySession(owner.session.token)).toBeUndefined();
-    if (!migrated.ok) throw new Error(migrated.error);
+    if (!migrated.ok || !("session" in migrated)) {
+      throw new Error("Expected a new session after migration");
+    }
     expect(h.auth.verifySession(migrated.session.token)).toBeDefined();
     expect(await h.auth.completeCodeLogin(oldLogin)).toMatchObject({
       ok: false,

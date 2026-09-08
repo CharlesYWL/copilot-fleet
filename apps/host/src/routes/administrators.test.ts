@@ -320,6 +320,50 @@ describe("administrator management", () => {
     ).toBe(401);
   });
 
+  it("identifies the current administrator and refuses self-removal even with other admins", async () => {
+    const invitation = await invite();
+    nextIdentity = bob;
+    await signIn(makeBrowser(), invitation.token);
+    await post(owner, `/api/auth/administrator-invitations/${invitation.id}/approve`);
+    const bobBrowser = makeBrowser();
+    await signIn(bobBrowser);
+
+    for (const { browser, identity } of [
+      { browser: owner, identity: alice },
+      { browser: bobBrowser, identity: bob },
+    ]) {
+      const listed = await app.inject({
+        method: "GET",
+        url: "/api/auth/administrators",
+        headers: { cookie: browser.cookie() },
+      });
+      const body = listed.json<{
+        currentAdministratorId: string;
+        administrators: { id: string; objectId: string }[];
+      }>();
+      const ownId = body.administrators.find(
+        (administrator) => administrator.objectId === identity.objectId,
+      )?.id;
+      expect(ownId).toBeTruthy();
+      expect(body.administrators).toHaveLength(2);
+      expect(body.currentAdministratorId).toBe(ownId);
+      const refused = await del(browser, `/api/auth/administrators/${ownId}`);
+      expect(refused.statusCode).toBe(409);
+      expect(refused.json()).toEqual({
+        error: "You cannot remove your own administrator account.",
+      });
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/api/snapshot",
+            headers: { cookie: browser.cookie() },
+          })
+        ).statusCode,
+      ).toBe(200);
+    }
+  });
+
   it("refuses to remove the last administrator", async () => {
     const administrators = (
       (

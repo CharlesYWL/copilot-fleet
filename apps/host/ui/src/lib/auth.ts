@@ -74,6 +74,21 @@ export const browserNavigation = {
   assign(url: string): void {
     window.location.assign(url);
   },
+  openTab():
+    | { readonly closed: boolean; assign: (url: string) => void; close: () => void }
+    | undefined {
+    const tab = window.open("about:blank", "_blank");
+    if (!tab) return undefined;
+    // Open during the click, then detach before any provider page can load.
+    tab.opener = null;
+    return {
+      get closed() {
+        return tab.closed;
+      },
+      assign: (url) => tab.location.replace(url),
+      close: () => tab.close(),
+    };
+  },
 };
 
 /**

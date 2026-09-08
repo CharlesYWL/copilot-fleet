@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { AuthGate } from "./AuthGate";
@@ -226,6 +227,111 @@ describe("AuthGate", () => {
         expect(JSON.parse(String(call?.[1]?.body))).toEqual({ tenantId, clientId });
       });
     });
+
+    it.each(["common", tenantId])(
+      "recovers expired setup authorization without losing the %s registration",
+      async (authority) => {
+        let configured = false;
+        let bootstrapAttempts = 0;
+        let configureAttempts = 0;
+        const fetchMock = host(
+          {
+            "/api/auth/status": () =>
+              answer(
+                statusBody(
+                  configured ? { state: "unclaimed", claimCodeRequired: true } : fresh,
+                ),
+              ),
+            "/api/auth/bootstrap": () =>
+              ++bootstrapAttempts === 2
+                ? answer({ error: "Invalid claim code" }, 401)
+                : answer({ ok: true }),
+            "/api/auth/configure": () => {
+              if (++configureAttempts === 1) {
+                return answer(
+                  { error: "Enter the claim code printed on the Host console first." },
+                  401,
+                );
+              }
+              configured = true;
+              return answer({ ok: true });
+            },
+            "/api/auth/code/start": () =>
+              answer({ authorizationUrl: "https://login.microsoftonline.com/authorize" }),
+          },
+          fresh,
+        );
+        show();
+        fireEvent.change(await screen.findByLabelText("Claim code"), {
+          target: { value: "console-code" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
+        fireEvent.change(await screen.findByLabelText("Application (client) ID"), {
+          target: { value: clientId },
+        });
+        if (authority !== "common") {
+          fireEvent.click(
+            screen.getByRole("radio", { name: "One organization (fixed directory)" }),
+          );
+          fireEvent.change(screen.getByLabelText("Directory (tenant) ID"), {
+            target: { value: authority },
+          });
+        }
+        fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
+
+        const claimCode = await screen.findByLabelText("Claim code");
+        expect(
+          screen.getByText(/setup authorization has expired or was lost/i),
+        ).toBeTruthy();
+        expect((claimCode as HTMLInputElement).value).toBe("");
+        expect(claimCode.getAttribute("type")).toBe("password");
+        const save = screen.getByRole("button", {
+          name: /unlock setup to continue/i,
+        }) as HTMLButtonElement;
+        expect(save.disabled).toBe(true);
+        expect(
+          (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+        ).toBe(clientId);
+        expect(screen.queryByText("console")).toBeNull();
+        expect(assign).not.toHaveBeenCalled();
+
+        fireEvent.change(claimCode, { target: { value: "wrong-code" } });
+        fireEvent.click(screen.getByRole("button", { name: /unlock setup again/i }));
+        expect(await screen.findByText("Invalid claim code")).toBeTruthy();
+        expect(save.disabled).toBe(true);
+        expect(configureAttempts).toBe(1);
+
+        fireEvent.change(claimCode, { target: { value: "console-code" } });
+        fireEvent.click(screen.getByRole("button", { name: /unlock setup again/i }));
+        await waitFor(() => expect(screen.queryByLabelText("Claim code")).toBeNull());
+        expect(save.disabled).toBe(false);
+        expect(
+          screen.queryByText("Enter the claim code printed on the Host console first."),
+        ).toBeNull();
+        if (authority !== "common") {
+          expect(
+            (screen.getByLabelText("Directory (tenant) ID") as HTMLInputElement).value,
+          ).toBe(authority);
+        }
+        fireEvent.click(save);
+        const claim = await screen.findByRole("button", {
+          name: /claim with microsoft/i,
+        });
+        const saves = fetchMock.mock.calls.filter(
+          ([url]) => url === "/api/auth/configure",
+        );
+        expect(saves.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+          { tenantId: authority, clientId },
+          { tenantId: authority, clientId },
+        ]);
+        fireEvent.click(claim);
+        await waitFor(() =>
+          expect(assign).toHaveBeenCalledWith(
+            "https://login.microsoftonline.com/authorize",
+          ),
+        );
+      },
+    );
 
     it("says why the code was refused and keeps the field", async () => {
       host(
@@ -503,6 +609,68 @@ describe("AuthGate", () => {
   });
 
   describe("an account this Fleet does not know", () => {
+    it.each([
+      ["not-authorized", /account not authorized/i, /that account is not authorized/i],
+      [
+        "organization-policy",
+        /microsoft sign-in could not be completed/i,
+        /your organization blocked microsoft sign-in/i,
+      ],
+      [
+        "unsupported-account",
+        /microsoft sign-in could not be completed/i,
+        /not supported by this host's sign-in registration/i,
+      ],
+      ["pending-approval", /waiting for approval/i, /your request was recorded/i],
+    ])(
+      "retains %s feedback when StrictMode replays effects",
+      async (code, title, message) => {
+        window.history.replaceState({}, "", `/?auth_error=${code}`);
+        host({});
+        render(
+          <StrictMode>
+            <FluentProvider theme={fleetDarkTheme}>
+              <AuthGate>
+                <div>console</div>
+              </AuthGate>
+            </FluentProvider>
+          </StrictMode>,
+        );
+
+        expect(await screen.findByRole("heading", { name: title })).toBeTruthy();
+        expect(screen.getByText(message)).toBeTruthy();
+        expect(window.location.search).toBe("");
+        expect(screen.queryByText("console")).toBeNull();
+        fireEvent.click(screen.getByRole("button", { name: /try another account/i }));
+        expect(
+          await screen.findByRole("heading", { name: /sign in with microsoft/i }),
+        ).toBeTruthy();
+      },
+    );
+
+    it("keeps callback feedback visible in StrictMode even with a live administrator session", async () => {
+      window.history.replaceState({}, "", "/?auth_error=not-authorized");
+      const fetchMock = host({}, { authenticated: true });
+      render(
+        <StrictMode>
+          <FluentProvider theme={fleetDarkTheme}>
+            <AuthGate>
+              <div>console</div>
+            </AuthGate>
+          </FluentProvider>
+        </StrictMode>,
+      );
+      expect(
+        await screen.findByRole("heading", { name: /account not authorized/i }),
+      ).toBeTruthy();
+      expect(screen.queryByText("console")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /return to fleet/i }));
+      expect(await screen.findByText("console")).toBeTruthy();
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/logout"),
+      ).toBe(false);
+    });
+
     it("names the refusal instead of looping on the login that caused it", async () => {
       window.history.replaceState(
         {},

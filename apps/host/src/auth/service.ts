@@ -111,6 +111,10 @@ export type LoginSuccess = {
   session: IssuedSession;
   administrator?: Administrator;
 };
+export type AdministratorAddedSuccess = {
+  ok: true;
+  addedAdministrator: Administrator;
+};
 
 type MicrosoftLoginInput = {
   binding: string;
@@ -699,6 +703,61 @@ export class FleetAuth {
 
   // -- Microsoft login -------------------------------------------------------
 
+  async startAdministratorAddition(input: {
+    session: ActiveSession;
+    binding: string;
+    host: string | undefined;
+    redirectUri: string;
+  }): Promise<{ ok: true; authorizationUrl: string } | AuthFailure> {
+    if (!this.mayIssueCredential(input.host)) return this.refuseEndpoint(input.host);
+    const session = this.sessions.inspect(input.session.tokenHash);
+    const administrator = session ? this.administratorFor(session) : undefined;
+    if (!session || !administrator || !this.requireRecentReauth(session)) {
+      return {
+        ok: false,
+        status: 403,
+        code: "not-authorized",
+        error: "Sign in with Microsoft again before adding another administrator.",
+      };
+    }
+    const config = this.entraConfig();
+    if (!config) {
+      return {
+        ok: false,
+        status: 409,
+        code: "provider-unavailable",
+        error: "Microsoft sign-in is not configured.",
+      };
+    }
+    const transaction = this.transactions.start({
+      binding: input.binding,
+      bootstrap: false,
+      redirectUri: input.redirectUri,
+      configurationKey: this.configurationKey(config),
+      administratorAddition: {
+        administratorId: administrator.id,
+        sessionTokenHash: session.tokenHash,
+      },
+    });
+    try {
+      // The shared provider always uses select_account, including with browser SSO.
+      const authorizationUrl = await this.provider(config).authorizationUrl({
+        redirectUri: transaction.redirectUri,
+        state: transaction.state,
+        nonce: transaction.nonce,
+        codeChallenge: transaction.codeChallenge,
+      });
+      if (transaction.configurationKey !== this.configurationKey()) {
+        this.transactions.consume(transaction.state);
+        return this.configurationChanged();
+      }
+      return { ok: true, authorizationUrl };
+    } catch (error) {
+      this.transactions.consume(transaction.state);
+      return this.providerFailure(error);
+    }
+  }
+
   /**
    * Begins an authorization-code login.
    *
@@ -778,7 +837,7 @@ export class FleetAuth {
     code: string;
     binding: string;
     host: string | undefined;
-  }): Promise<LoginSuccess | AuthFailure> {
+  }): Promise<LoginSuccess | AdministratorAddedSuccess | AuthFailure> {
     if (!this.mayIssueCredential(input.host)) return this.refuseEndpoint(input.host);
     const transaction = this.transactions.consume(input.state);
     if (!transaction) {
@@ -836,6 +895,13 @@ export class FleetAuth {
         input.host,
       );
     }
+    if (transaction.administratorAddition) {
+      return this.completeAdministratorAddition(
+        transaction.administratorAddition,
+        identity,
+        input.host,
+      );
+    }
     return this.authorize(identity, "microsoft-code", {
       bootstrap: transaction.bootstrap,
       grantToken: transaction.grantToken,
@@ -846,6 +912,51 @@ export class FleetAuth {
 
   cancelCodeLogin(state: string | undefined, binding: string): void {
     this.transactions.cancel(state, binding);
+  }
+
+  private completeAdministratorAddition(
+    addition: NonNullable<AuthTransaction["administratorAddition"]>,
+    identity: EntraIdentity,
+    host: string | undefined,
+  ): AdministratorAddedSuccess | AuthFailure {
+    return this.store.writeAtomically(() => {
+      // The Strict operator cookie need not accompany Microsoft's redirect.
+      // Revalidate its original server-side session instead of creating a new one.
+      const session = this.sessions.inspect(addition.sessionTokenHash);
+      const authorizer = this.store.getAdministrator(addition.administratorId);
+      if (
+        !session ||
+        !authorizer ||
+        session.administratorId !== authorizer.id ||
+        !this.requireRecentReauth(session)
+      ) {
+        return {
+          ok: false,
+          status: 403,
+          code: "not-authorized",
+          error:
+            "The administrator who started this addition must still be signed in with a recent Microsoft sign-in. Start again.",
+        };
+      }
+      const existing = this.store.findAdministrator(identity.tenantId, identity.objectId);
+      const addedAdministrator =
+        existing ??
+        this.store.insertAdministrator({
+          ...identity,
+          addedVia: "administrator-add",
+          addedByAdminId: authorizer.id,
+        });
+      this.audit({
+        eventType: "administrator_addition_completed",
+        actorKind: "administrator",
+        actorId: authorizer.id,
+        targetId: addedAdministrator.id,
+        outcome: "allowed",
+        requestHost: endpointLabel(this.classify(host)),
+        detail: `${existing ? "already active" : "added"}; tenant ${identity.tenantId}; object ${identity.objectId}`,
+      });
+      return { ok: true, addedAdministrator };
+    });
   }
 
   private completeConfigurationChange(
