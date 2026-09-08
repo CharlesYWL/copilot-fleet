@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { AuthErrorCode } from "@fleet/protocol";
+import { OperatorPasswordSchema, type AuthErrorCode } from "@fleet/protocol";
 import { OperatorAuth, generatePassword, hashPassword } from "../auth.js";
 import type {
   Administrator,
@@ -55,7 +55,7 @@ export const CSRF_KEY_SETTING = "auth.csrfKey";
 
 /** An admin invitation is short-lived and single-use by construction. */
 export const INVITATION_TTL_MS = 15 * 60 * 1000;
-export const MIN_OPERATOR_PASSWORD_LENGTH = 16;
+export { MIN_OPERATOR_PASSWORD_LENGTH } from "@fleet/protocol";
 
 /** A ceiling on concurrent device logins, per the design's bounds. */
 export const MAX_DEVICE_FLOWS = 50;
@@ -138,6 +138,8 @@ export type FleetAuthOptions = {
   onSessionsRevoked?: ((revoked: readonly RevokedSession[]) => void) | undefined;
   /** Called when an administrator is removed, for the same reason. */
   onAdministratorRemoved?: ((administratorId: string) => void) | undefined;
+  /** Ends every browser connection, including sessions already pruned from storage. */
+  onAuthenticationReset?: (() => void) | undefined;
 };
 
 /**
@@ -163,12 +165,14 @@ export class FleetAuth {
   private readonly providerFactory: (config: EntraConfig) => EntraProvider;
   private readonly onSessionsRevoked: (revoked: readonly RevokedSession[]) => void;
   private readonly onAdministratorRemoved: (administratorId: string) => void;
+  private readonly onAuthenticationReset: () => void;
   private readonly envEntra: EntraConfigInput | undefined;
   private readonly legacyEntra: EntraConfig | undefined;
   private readonly configuredPassword: string | undefined;
   private readonly deviceFlows = new Map<string, DeviceFlowRecord>();
   private providerCache: { key: string; provider: EntraProvider } | undefined;
   private configurationGeneration = 0;
+  private ignoreAuthEnvironment = false;
   private passwordAuth: OperatorAuth | undefined;
 
   constructor(options: FleetAuthOptions) {
@@ -181,6 +185,7 @@ export class FleetAuth {
     this.configuredPassword = options.configuredPassword;
     this.onSessionsRevoked = options.onSessionsRevoked ?? (() => {});
     this.onAdministratorRemoved = options.onAdministratorRemoved ?? (() => {});
+    this.onAuthenticationReset = options.onAuthenticationReset ?? (() => {});
     this.providerFactory =
       options.entraProvider ??
       /*
@@ -239,7 +244,7 @@ export class FleetAuth {
   entraConfig(): EntraConfig | undefined {
     return entraConfigFrom({
       stored: this.storedEntraConfig(),
-      env: this.envEntra,
+      env: this.ignoreAuthEnvironment ? undefined : this.envEntra,
     });
   }
 
@@ -258,7 +263,10 @@ export class FleetAuth {
       EntraConfigSchema.parse(stored);
       return;
     }
-    const configured = this.envEntra ? EntraConfigSchema.parse(this.envEntra) : undefined;
+    const configured =
+      !this.ignoreAuthEnvironment && this.envEntra
+        ? EntraConfigSchema.parse(this.envEntra)
+        : undefined;
     if (!this.claimed()) return;
     const previous = configured?.tenantId !== "common" ? (configured ?? legacy) : legacy;
     if (configured?.tenantId === "common") {
@@ -303,6 +311,33 @@ export class FleetAuth {
     this.store.setSetting(ENTRA_TENANT_SETTING, config.tenantId);
     this.store.setSetting(ENTRA_CLIENT_SETTING, config.clientId);
     this.store.setSetting(DEVICE_FLOW_SETTING, "0");
+  }
+
+  eraseAuthentication(session: ActiveSession): { ok: true } | AuthFailure {
+    const current = this.sessions.inspect(session.tokenHash);
+    const administrator = current ? this.administratorFor(current) : undefined;
+    if (!current || !administrator || !this.requireRecentReauth(current)) {
+      return {
+        ok: false,
+        status: 403,
+        error:
+          "Sign in with your current Microsoft administrator account to erase authentication.",
+      };
+    }
+    const csrfKey = randomBytes(32);
+    const revoked = this.store.eraseOperatorAuthentication(
+      csrfKey.toString("base64"),
+      administrator.id,
+    );
+    this.ignoreAuthEnvironment = true;
+    this.passwordAuth = undefined;
+    this.clearPendingAuthentication();
+    this.sessions.adoptCsrfKey(csrfKey);
+    this.claim.clear();
+    this.claim.issue();
+    this.onSessionsRevoked(revoked);
+    this.onAuthenticationReset();
+    return { ok: true };
   }
 
   deviceFlowEnabled(): boolean {
@@ -455,11 +490,7 @@ export class FleetAuth {
 
   /** Explicitly restores the optional shared-password login path. */
   enablePassword(password: string, actorId: string): void {
-    if (password.length < MIN_OPERATOR_PASSWORD_LENGTH) {
-      throw new Error(
-        `An operator password must be at least ${MIN_OPERATOR_PASSWORD_LENGTH} characters.`,
-      );
-    }
+    OperatorPasswordSchema.parse(password);
     const hash = hashPassword(password);
     this.store.setSetting("auth.operatorPassword", hash);
     this.store.setSetting(PASSWORD_ENABLED_SETTING, "1");
@@ -485,7 +516,7 @@ export class FleetAuth {
    * ordinary password mode.
    */
   enableRecoveryPassword(): string {
-    const password = generatePassword();
+    const password = `A!${generatePassword()}`;
     const hash = hashPassword(password);
     this.store.setSetting("auth.operatorPassword", hash);
     this.store.setSetting(PASSWORD_ENABLED_SETTING, "1");
@@ -1530,7 +1561,7 @@ export class FleetAuth {
     const mode = resolvePasswordMode({
       persistedEnabled: persisted === undefined ? undefined : persisted === "1",
       storedHash,
-      configuredPassword,
+      configuredPassword: this.ignoreAuthEnvironment ? undefined : configuredPassword,
     });
     if (mode.warning) this.warn(mode.warning);
     this.store.setSetting(PASSWORD_ENABLED_SETTING, mode.enabled ? "1" : "0");

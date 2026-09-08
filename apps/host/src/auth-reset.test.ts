@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { FastifyInstance } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ERASE_AUTH_CONFIRMATION } from "@fleet/protocol";
 import { createIdentityKeyPair } from "@fleet/protocol/node-auth";
 import { HostIdentityService } from "./auth/host-identity.js";
 import { hashPassword } from "./auth.js";
@@ -156,6 +157,214 @@ function workingData(store: FleetStore) {
 }
 
 describe("auth-only Host reset", () => {
+  it("requires administrator, CSRF and confirmation proofs for a live erase", async () => {
+    const h = fixture(false);
+    close(h.store);
+    vi.stubEnv("FLEET_ENTRA_TENANT_ID", "old-invalid-tenant");
+    vi.stubEnv("FLEET_ENTRA_CLIENT_ID", "old-invalid-client");
+    vi.stubEnv("FLEET_OPERATOR_PASSWORD", "old-env-password");
+    const announced: string[] = [];
+    app = await buildServer({
+      databasePath: h.path,
+      announceClaimCode: (code) => announced.push(code),
+    });
+    app.log.level = "silent";
+    const headers = { host: "localhost:8787", cookie: `fleet_operator=${h.token}` };
+    const token = (
+      await app.inject({
+        method: "GET",
+        url: "/api/auth/csrf",
+        headers,
+      })
+    ).json<{ csrfToken: string }>().csrfToken;
+    const payload = { confirmation: ERASE_AUTH_CONFIRMATION };
+
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/erase",
+          payload,
+        })
+      ).statusCode,
+    ).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/erase",
+          headers,
+          payload,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/erase",
+          headers: { ...headers, "x-csrf-token": token },
+          payload: {},
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/erase",
+          headers: { ...headers, "x-csrf-token": token, origin: "https://other.example" },
+          payload,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(announced).toHaveLength(0);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/auth/status",
+          headers,
+        })
+      ).json(),
+    ).toMatchObject({ authenticated: true });
+
+    const erased = await app.inject({
+      method: "POST",
+      url: "/api/auth/erase",
+      headers: { ...headers, "x-csrf-token": token },
+      payload,
+    });
+    expect(erased.statusCode).toBe(200);
+    expect(erased.json()).toEqual({ ok: true });
+    expect(announced).toHaveLength(1);
+    expect(erased.body).not.toContain(announced[0]);
+    expect(erased.headers["set-cookie"]).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/fleet_operator=;.*Max-Age=0/),
+        expect.stringMatching(/fleet_bootstrap=;.*Max-Age=0/),
+      ]),
+    );
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/auth/status",
+          headers,
+        })
+      ).json(),
+    ).toMatchObject({
+      state: "entra-unconfigured",
+      authenticated: false,
+      entraConfigured: false,
+      passwordEnabled: false,
+      deviceFlowEnabled: false,
+      claimCodeRequired: true,
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/erase",
+          headers: { ...headers, "x-csrf-token": token },
+          payload,
+        })
+      ).statusCode,
+    ).toBe(401);
+
+    await app.close();
+    app = undefined;
+    const store = open(h.path, false);
+    for (const [key, value] of Object.entries(h.keptSettings)) {
+      expect(store.getSetting(key), key).toBe(value);
+    }
+    expect(store.nodePublicKey(h.keyed.id)).toBe(h.nodeKeys.publicKey);
+    expect(store.getEnrollmentGrant(h.enrollment.id)).toEqual(h.enrollment);
+    expect(store.getSession(h.session.id)?.initialPrompt).toBe("Keep this agent session");
+  });
+
+  it("does not let a shared password session erase administrator identities", async () => {
+    const h = fixture(false);
+    close(h.store);
+    app = await buildServer({ databasePath: h.path, announceClaimCode: () => {} });
+    app.log.level = "silent";
+    const signed = await app.inject({
+      method: "POST",
+      url: "/api/auth/login",
+      payload: { password: "old-password" },
+    });
+    expect(signed.statusCode).toBe(200);
+    const cookie = String(signed.headers["set-cookie"]).split(";")[0];
+    const token = (
+      await app.inject({
+        method: "GET",
+        url: "/api/auth/csrf",
+        headers: { cookie },
+      })
+    ).json<{ csrfToken: string }>().csrfToken;
+    const denied = await app.inject({
+      method: "POST",
+      url: "/api/auth/erase",
+      headers: { cookie, "x-csrf-token": token },
+      payload: { confirmation: ERASE_AUTH_CONFIRMATION },
+    });
+    expect(denied.statusCode).toBe(403);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/auth/status",
+          headers: { cookie: `fleet_operator=${h.token}` },
+        })
+      ).json(),
+    ).toMatchObject({ authenticated: true });
+  });
+
+  it("leaves live authentication usable when another database connection blocks erasure", async () => {
+    const h = fixture(false);
+    close(h.store);
+    const announced: string[] = [];
+    app = await buildServer({
+      databasePath: h.path,
+      announceClaimCode: (code) => announced.push(code),
+    });
+    app.log.level = "silent";
+    const headers = { cookie: `fleet_operator=${h.token}` };
+    const token = (
+      await app.inject({
+        method: "GET",
+        url: "/api/auth/csrf",
+        headers,
+      })
+    ).json<{ csrfToken: string }>().csrfToken;
+    const reader = open(h.path, false);
+    const request = {
+      method: "POST" as const,
+      url: "/api/auth/erase",
+      headers: { ...headers, "x-csrf-token": token },
+      payload: { confirmation: ERASE_AUTH_CONFIRMATION },
+    };
+    const refused = await app.inject(request);
+    expect(refused.statusCode).toBe(409);
+    expect(refused.json()).toMatchObject({
+      error: expect.stringMatching(/Another process/),
+    });
+    expect(announced).toHaveLength(0);
+    expect(
+      (
+        await app.inject({
+          method: "GET",
+          url: "/api/auth/status",
+          headers,
+        })
+      ).json(),
+    ).toMatchObject({ authenticated: true, entraConfigured: true });
+    expect(reader.countActiveAdministrators()).toBe(1);
+    close(reader);
+    expect((await app.inject(request)).statusCode).toBe(200);
+    expect(announced).toHaveLength(1);
+  });
+
   it("clears browser identity and credentials without deleting Nodes or working data", () => {
     const h = fixture();
     const before = workingData(h.store);

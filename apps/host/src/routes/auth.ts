@@ -3,6 +3,8 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   authErrorRedirect,
+  EraseAuthRequestSchema,
+  OperatorPasswordSchema,
   type AuthErrorCode,
   type AuthStatus,
   type CodeLoginEndpoint,
@@ -26,7 +28,7 @@ import {
   classifyEntraFailure,
 } from "../auth/entra.js";
 import { OPERATOR_SESSION_ABSOLUTE_MS } from "../auth/sessions.js";
-import { MIN_OPERATOR_PASSWORD_LENGTH, type FleetAuth } from "../auth/service.js";
+import type { FleetAuth } from "../auth/service.js";
 import { hostnameOf } from "../request-guard.js";
 import { requireAdministrator } from "./require-administrator.js";
 
@@ -40,7 +42,7 @@ const CodeStartSchema = z.object({
   invitation: z.string().min(1).max(256).optional(),
 });
 const EnablePasswordSchema = z.object({
-  password: z.string().min(MIN_OPERATOR_PASSWORD_LENGTH).max(512),
+  password: OperatorPasswordSchema,
 });
 
 export const ENTRA_CALLBACK_PATH = "/api/auth/entra/callback";
@@ -529,6 +531,18 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     const input = EnablePasswordSchema.parse(request.body);
     auth.enablePassword(input.password, administrator.id);
     return reply.send({ ok: true, passwordEnabled: true, state: auth.state() });
+  });
+
+  app.post("/api/auth/erase", async (request, reply) => {
+    if (!requireAdministrator(auth, request, reply, true)) return reply;
+    EraseAuthRequestSchema.parse(request.body);
+    const session = request.fleetSession;
+    if (!session) return reply.code(401).send({ error: "Sign in to use this Host" });
+    const outcome = auth.eraseAuthentication(session);
+    if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
+    const secure = auth.secureCookies(request.headers.host);
+    reply.header("set-cookie", [clearedCookie(secure), clearedBootstrapCookie(secure)]);
+    return reply.send({ ok: true });
   });
 
   app.get("/api/security/audit", async (request, reply) => {

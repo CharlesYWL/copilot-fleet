@@ -49,6 +49,7 @@ describe("requiredPrincipal", () => {
       ["DELETE", "/api/auth/administrators/abc"],
       ["POST", "/api/auth/password/disable"],
       ["POST", "/api/auth/configuration/start"],
+      ["POST", "/api/auth/erase"],
       ["GET", "/api/security/audit"],
       ["GET", "/ws/browser"],
       ["GET", "/api/enrollment"],

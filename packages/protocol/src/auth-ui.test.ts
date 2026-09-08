@@ -3,6 +3,10 @@ import {
   AUTH_ERROR_MESSAGE_PARAM,
   AUTH_ERROR_PARAM,
   AuthStatusSchema,
+  ERASE_AUTH_CONFIRMATION,
+  EraseAuthRequestSchema,
+  MIN_OPERATOR_PASSWORD_LENGTH,
+  OperatorPasswordSchema,
   DEFAULT_TUNNEL_PROVIDER,
   MAX_AUTH_ERROR_MESSAGE_LENGTH,
   TunnelProviderInfoSchema,
@@ -10,6 +14,41 @@ import {
   authStates,
   parseAuthError,
 } from "./index.js";
+
+describe("new operator password requirements", () => {
+  it("accepts twelve characters with uppercase and punctuation, without capping length", () => {
+    expect("Abcdefghij!1").toHaveLength(MIN_OPERATOR_PASSWORD_LENGTH);
+    for (const password of [
+      "Abcdefghij!1",
+      "AAAAAAAAAAA!",
+      "A-much-longer-operator-password",
+      "Abcdefghijk\u{1f642}",
+    ]) {
+      expect(OperatorPasswordSchema.safeParse(password).success).toBe(true);
+    }
+  });
+
+  it.each([
+    ["too short", "Abcdefghi!1"],
+    ["missing uppercase", "abcdefghij!1"],
+    ["missing special character", "Abcdefghijk1"],
+    ["space is not special", "Abcdefghijk "],
+    ["code units are not characters", "Abcdefghij\u{1f642}"],
+    ["too long", `A!${"x".repeat(511)}`],
+  ])("rejects %s", (_reason, password) => {
+    expect(OperatorPasswordSchema.safeParse(password).success).toBe(false);
+  });
+
+  it("requires explicit confirmation for an authentication erase request", () => {
+    expect(
+      EraseAuthRequestSchema.safeParse({ confirmation: ERASE_AUTH_CONFIRMATION }).success,
+    ).toBe(true);
+    expect(EraseAuthRequestSchema.safeParse({}).success).toBe(false);
+    expect(EraseAuthRequestSchema.safeParse({ confirmation: "erase auth" }).success).toBe(
+      false,
+    );
+  });
+});
 
 describe("auth error transport", () => {
   it("names every state the front door can be in", () => {

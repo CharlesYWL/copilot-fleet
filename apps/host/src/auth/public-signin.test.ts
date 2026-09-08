@@ -39,7 +39,10 @@ afterEach(() => {
   for (const store of stores.splice(0)) store.close();
 });
 
-function setup(config: EntraConfig = PUBLIC) {
+function setup(
+  config: EntraConfig = PUBLIC,
+  environment: { envEntra?: EntraConfig; configuredPassword?: string } = {},
+) {
   const store = new FleetStore(":memory:");
   stores.push(store);
   store.setSetting("auth.entraTenantId", config.tenantId);
@@ -51,7 +54,9 @@ function setup(config: EntraConfig = PUBLIC) {
   let flowSequence = 0;
   const cancelled: string[] = [];
   const revoked: string[] = [];
+  let authenticationResets = 0;
   const auth = new FleetAuth({
+    ...environment,
     store,
     now: () => now,
     announceClaimCode: (code) => {
@@ -61,6 +66,9 @@ function setup(config: EntraConfig = PUBLIC) {
     externalScheme: { publicUrl: () => undefined, tunnels: () => [] },
     onSessionsRevoked: (sessions) =>
       revoked.push(...sessions.map((row) => row.tokenHash)),
+    onAuthenticationReset: () => {
+      authenticationResets += 1;
+    },
     entraProvider: (providerConfig) =>
       createEntraProvider(providerConfig, {
         deviceFlowEnabled: () => store.getSetting("auth.deviceFlowEnabled") === "1",
@@ -134,6 +142,8 @@ function setup(config: EntraConfig = PUBLIC) {
     beginLogin,
     login,
     beginMigration,
+    claimCode: () => claimCode,
+    authenticationResets: () => authenticationResets,
     setIdentity: (identity: EntraIdentity) => {
       nextIdentity = identity;
     },
@@ -145,6 +155,112 @@ function setup(config: EntraConfig = PUBLIC) {
     },
   };
 }
+
+describe("live authentication erasure", () => {
+  it("clears stored and in-memory browser authority while keeping the Host usable", async () => {
+    const h = setup(PUBLIC, {
+      envEntra: ENTERPRISE,
+      configuredPassword: "legacy-env-password",
+    });
+    const owner = await h.login();
+    if (!owner.ok || !owner.administrator) throw new Error("Expected a claimed Host");
+    const session = h.auth.verifySession(owner.session.token);
+    if (!session) throw new Error("Expected an active session");
+    const oldClaimCode = h.claimCode();
+    const csrf = h.auth.sessions.csrfToken(session.tokenHash);
+    h.auth.enablePassword("Abcdefghij!1", owner.administrator.id);
+    const password = h.auth.passwordLogin("Abcdefghij!1", HOST);
+    if (!password.ok) throw new Error(password.error);
+    const grant = h.auth.claim.grantTrusted("previous-bootstrap");
+    const transaction = await h.beginLogin("pending-code");
+    h.store.setSetting("auth.deviceFlowEnabled", "1");
+    const device = await h.auth.startDeviceLogin({
+      binding: "pending-device",
+      bootstrapToken: undefined,
+      host: HOST,
+    });
+    if (!device.ok) throw new Error(device.error);
+    h.store.setSetting("host.publicUrl", "https://keep.example");
+
+    expect(h.auth.eraseAuthentication(session)).toEqual({ ok: true });
+    expect(h.authenticationResets()).toBe(1);
+    expect(h.auth.state()).toBe("entra-unconfigured");
+    expect(h.auth.passwordEnabled()).toBe(false);
+    expect(h.auth.deviceFlowEnabled()).toBe(false);
+    expect(h.auth.claim.verifyBootstrap(grant.token)).toBeUndefined();
+    expect(h.auth.sessions.verifyCsrf(session.tokenHash, csrf)).toBe(false);
+    expect(h.auth.verifySession(owner.session.token)).toBeUndefined();
+    expect(h.auth.verifySession(password.session.token)).toBeUndefined();
+    expect(h.revoked).toEqual(
+      expect.arrayContaining([owner.session.tokenHash, password.session.tokenHash]),
+    );
+    expect(h.auth.passwordLogin("legacy-env-password", HOST)).toMatchObject({
+      ok: false,
+    });
+    expect(h.claimCode()).not.toBe(oldClaimCode);
+    expect(h.store.getSetting("host.publicUrl")).toBe("https://keep.example");
+    expect(await h.auth.completeCodeLogin(transaction)).toMatchObject({
+      ok: false,
+      code: "expired",
+    });
+    expect(
+      await h.auth.pollDeviceLogin({
+        flowId: device.flow.flowId,
+        binding: "pending-device",
+        host: HOST,
+      }),
+    ).toMatchObject({ ok: false, code: "expired" });
+    expect(h.cancelled).toHaveLength(1);
+
+    h.auth.configureEntra(PUBLIC);
+    expect((await h.login(PERSONAL)).ok).toBe(true);
+    expect(h.auth.listAdministrators()).toMatchObject([{ objectId: PERSONAL.objectId }]);
+  });
+
+  it("refuses device, stale and revoked sessions without clearing authentication", async () => {
+    const h = setup();
+    const owner = await h.login();
+    if (!owner.ok || !owner.administrator) throw new Error("Expected an administrator");
+    const active = h.auth.verifySession(owner.session.token);
+    if (!active) throw new Error("Expected a session");
+    const device = h.auth.sessions.issue({
+      administratorId: owner.administrator.id,
+      authMethod: "microsoft-device",
+    });
+    const deviceSession = h.auth.verifySession(device.token);
+    if (!deviceSession) throw new Error("Expected a session");
+    expect(h.auth.eraseAuthentication(deviceSession)).toMatchObject({
+      ok: false,
+      status: 403,
+    });
+    h.advance(RECENT_REAUTH_MS + 1);
+    expect(h.auth.eraseAuthentication(active)).toMatchObject({ ok: false, status: 403 });
+    h.auth.logout(owner.session.token);
+    expect(h.auth.eraseAuthentication(active)).toMatchObject({ ok: false, status: 403 });
+    expect(h.auth.listAdministrators()).toHaveLength(1);
+    expect(h.auth.entraConfig()).toEqual(PUBLIC);
+  });
+
+  it("will not let a token redemption in flight reclaim the erased Host", async () => {
+    const h = setup();
+    const owner = await h.login();
+    if (!owner.ok) throw new Error(owner.error);
+    const active = h.auth.verifySession(owner.session.token);
+    if (!active) throw new Error("Expected a session");
+    const transaction = await h.beginLogin("pending");
+    let resolve: (identity: EntraIdentity) => void = () => {};
+    h.setRedemption(
+      new Promise((done) => {
+        resolve = done;
+      }),
+    );
+    const finishing = h.auth.completeCodeLogin(transaction);
+    expect(h.auth.eraseAuthentication(active)).toEqual({ ok: true });
+    resolve(CORP);
+    expect(await finishing).toMatchObject({ ok: false, code: "expired" });
+    expect(h.auth.listAdministrators()).toHaveLength(0);
+  });
+});
 
 describe("public Microsoft account authorization", () => {
   it.each([CORP, PERSONAL])(

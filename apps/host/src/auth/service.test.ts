@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { OperatorPasswordSchema } from "@fleet/protocol";
 import { verifyPassword } from "../auth.js";
 import { FleetStore } from "../store.js";
 import { FleetAuth } from "./service.js";
@@ -89,11 +90,11 @@ describe("FleetAuth", () => {
       addedVia: "claim",
     });
 
-    auth.enablePassword("a-new-operator-password", "admin");
+    auth.enablePassword("A-new-operator-password", "admin");
 
     expect(auth.state()).toBe("hybrid");
     expect(auth.passwordEnabled()).toBe(true);
-    expect(auth.passwordLogin("a-new-operator-password", "localhost:8787").ok).toBe(true);
+    expect(auth.passwordLogin("A-new-operator-password", "localhost:8787").ok).toBe(true);
   });
 
   it("retires a legacy password when a claimed Host restarts", () => {
@@ -125,13 +126,13 @@ describe("FleetAuth", () => {
       addedVia: "claim",
     });
     const first = setup({ store });
-    first.auth.enablePassword("a-new-operator-password", "admin");
+    first.auth.enablePassword("A-new-operator-password", "admin");
 
     const restarted = setup({ store, configuredPassword: "stale-env-password" });
 
     expect(restarted.auth.state()).toBe("hybrid");
     expect(
-      restarted.auth.passwordLogin("a-new-operator-password", "localhost:8787").ok,
+      restarted.auth.passwordLogin("A-new-operator-password", "localhost:8787").ok,
     ).toBe(true);
   });
 
@@ -173,6 +174,7 @@ describe("FleetAuth", () => {
 
     const password = auth.enableRecoveryPassword();
 
+    expect(OperatorPasswordSchema.safeParse(password).success).toBe(true);
     expect(password.length).toBeGreaterThanOrEqual(20);
     expect(auth.state()).toBe("recovery");
     expect(
@@ -187,6 +189,21 @@ describe("FleetAuth", () => {
 
     auth.disablePassword();
     expect(auth.state()).toBe("microsoft-only");
+  });
+
+  it("enforces the new-password rules before writing a verifier", () => {
+    const { auth, store } = setup();
+    for (const password of [
+      "short",
+      "lowercase-only-password",
+      "UppercaseNoSpecial123",
+    ]) {
+      expect(() => auth.enablePassword(password, "admin")).toThrow();
+      expect(auth.passwordEnabled()).toBe(false);
+      expect(store.getSetting("auth.operatorPassword")).toBe("");
+    }
+    auth.enablePassword("Abcdefghij!1", "admin");
+    expect(auth.passwordLogin("Abcdefghij!1", "localhost:8787").ok).toBe(true);
   });
 
   it("stops honouring a session whose administrator was removed", () => {

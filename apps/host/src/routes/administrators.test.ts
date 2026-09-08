@@ -436,7 +436,7 @@ describe("administrator management", () => {
       expect(
         (
           await post(admin, "/api/auth/password/enable", {
-            password: "re-enabled-operator-password",
+            password: "Re-enabled-operator-password",
           })
         ).statusCode,
       ).toBe(200);
@@ -455,7 +455,7 @@ describe("administrator management", () => {
       const afterwards = await app.inject({
         method: "POST",
         url: "/api/auth/login",
-        payload: { password: "re-enabled-operator-password" },
+        payload: { password: "Re-enabled-operator-password" },
       });
       expect(afterwards.statusCode).toBe(409);
     } finally {
@@ -466,7 +466,7 @@ describe("administrator management", () => {
 
   it("lets a recently authenticated Microsoft administrator enable password sign-in", async () => {
     const response = await post(owner, "/api/auth/password/enable", {
-      password: "a-new-operator-password",
+      password: "Abcdefghij!1",
     });
 
     expect(response.statusCode).toBe(200);
@@ -475,8 +475,26 @@ describe("administrator management", () => {
     const password = await app.inject({
       method: "POST",
       url: "/api/auth/login",
-      payload: { password: "a-new-operator-password" },
+      payload: { password: "Abcdefghij!1" },
     });
     expect(password.statusCode).toBe(200);
   });
+
+  it.each(["Abcdefghi!1", "abcdefghij!1", "Abcdefghijk1"])(
+    "refuses a new password that does not meet every requirement",
+    async (password) => {
+      const response = await post(owner, "/api/auth/password/enable", { password });
+      expect(response.statusCode).toBe(400);
+      expect(response.body).not.toContain(password);
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/api/auth/status",
+            headers: { cookie: owner.cookie() },
+          })
+        ).json(),
+      ).toMatchObject({ passwordEnabled: false });
+    },
+  );
 });

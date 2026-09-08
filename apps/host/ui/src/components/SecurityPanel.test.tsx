@@ -5,6 +5,7 @@ import { SecurityPanel } from "./SecurityPanel";
 import { browserNavigation, forgetCsrfToken } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import { NotificationContext } from "../hooks/useAppNotifications";
+import { ERASE_AUTH_CONFIRMATION } from "@fleet/protocol";
 
 const answer = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -108,6 +109,151 @@ const show = (notify = vi.fn()) =>
   );
 
 describe("SecurityPanel", () => {
+  describe("erase auth settings", () => {
+    const openErase = async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /^erase auth settings$/i }),
+      );
+      return screen.findByRole("dialog", { name: /erase all host authentication/i });
+    };
+
+    it("places the reset at the bottom and requires exact confirmation before submitting", async () => {
+      const fetchMock = host();
+      show();
+      const card = await screen.findByRole("region", { name: "Erase auth settings" });
+      expect(card.parentElement?.querySelector(":scope > section:last-of-type")).toBe(
+        card,
+      );
+      const dialog = await openErase();
+      expect(
+        within(dialog).getByText(/must have access to the host console/i),
+      ).toBeTruthy();
+      expect(
+        within(dialog).getByText(/node processes and connections stay running/i),
+      ).toBeTruthy();
+      const submit = await within(dialog).findByRole("button", {
+        name: /erase and sign out/i,
+      });
+      expect((submit as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.change(within(dialog).getByLabelText(/type erase auth to confirm/i), {
+        target: { value: "erase auth" },
+      });
+      expect((submit as HTMLButtonElement).disabled).toBe(true);
+      fireEvent.change(within(dialog).getByLabelText(/type erase auth to confirm/i), {
+        target: { value: ERASE_AUTH_CONFIRMATION },
+      });
+      expect((submit as HTMLButtonElement).disabled).toBe(false);
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/erase"),
+      ).toBe(false);
+    });
+
+    it("cancels without erasing and clears confirmation before another attempt", async () => {
+      const fetchMock = host();
+      show();
+      const dialog = await openErase();
+      fireEvent.change(within(dialog).getByLabelText(/type erase auth to confirm/i), {
+        target: { value: ERASE_AUTH_CONFIRMATION },
+      });
+      fireEvent.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/erase"),
+      ).toBe(false);
+      const reopened = await openErase();
+      expect(
+        (
+          within(reopened).getByLabelText(
+            /type erase auth to confirm/i,
+          ) as HTMLInputElement
+        ).value,
+      ).toBe("");
+    });
+
+    it("erases with CSRF, then returns to setup without reloading protected data", async () => {
+      const fetchMock = host();
+      show();
+      const dialog = await openErase();
+      const reads = fetchMock.mock.calls.filter(
+        ([url]) => String(url) === "/api/auth/administrators",
+      ).length;
+      fireEvent.change(within(dialog).getByLabelText(/type erase auth to confirm/i), {
+        target: { value: ERASE_AUTH_CONFIRMATION },
+      });
+      fireEvent.click(
+        await within(dialog).findByRole("button", { name: /erase and sign out/i }),
+      );
+      await waitFor(() => expect(browserNavigation.assign).toHaveBeenCalledWith("/"));
+      const request = fetchMock.mock.calls.find(
+        ([url]) => String(url) === "/api/auth/erase",
+      );
+      expect(request?.[1]?.method).toBe("POST");
+      expect(JSON.parse(String(request?.[1]?.body))).toEqual({
+        confirmation: ERASE_AUTH_CONFIRMATION,
+      });
+      expect(new Headers(request?.[1]?.headers).get("x-csrf-token")).toBe("proof");
+      expect(
+        fetchMock.mock.calls.filter(
+          ([url]) => String(url) === "/api/auth/administrators",
+        ),
+      ).toHaveLength(reads);
+    });
+
+    it("offers fresh Microsoft confirmation without erasing or navigating on a stale session", async () => {
+      host({
+        "POST /api/auth/erase": () =>
+          answer(
+            {
+              error: "Sign in with Microsoft again to confirm this change.",
+              reauthRequired: true,
+            },
+            403,
+          ),
+      });
+      show();
+      const dialog = await openErase();
+      fireEvent.change(within(dialog).getByLabelText(/type erase auth to confirm/i), {
+        target: { value: ERASE_AUTH_CONFIRMATION },
+      });
+      fireEvent.click(
+        await within(dialog).findByRole("button", { name: /erase and sign out/i }),
+      );
+      expect(
+        await screen.findByRole("button", { name: /confirm with microsoft/i }),
+      ).toBeTruthy();
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+    });
+
+    it("shows a refused reset and leaves the current settings in place", async () => {
+      host({
+        "POST /api/auth/erase": () =>
+          answer({ error: "Another process is using this Host database." }, 409),
+      });
+      show();
+      const dialog = await openErase();
+      fireEvent.change(within(dialog).getByLabelText(/type erase auth to confirm/i), {
+        target: { value: ERASE_AUTH_CONFIRMATION },
+      });
+      fireEvent.click(
+        await within(dialog).findByRole("button", { name: /erase and sign out/i }),
+      );
+      expect(
+        await screen.findByText("Another process is using this Host database."),
+      ).toBeTruthy();
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+      fireEvent.click(await screen.findByRole("button", { name: /^close$/i }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+      expect(screen.getByText("client-1")).toBeTruthy();
+      expect(
+        (
+          screen.getByRole("button", {
+            name: /^erase auth settings$/i,
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false);
+    });
+  });
+
   it("reports a security settings failure while retaining the inline error", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Security unavailable")));
     const notify = vi.fn();
@@ -804,9 +950,23 @@ describe("SecurityPanel", () => {
     fireEvent.change(within(dialog).getByLabelText(/^new operator password$/i), {
       target: { value: "too-short" },
     });
-    expect(within(dialog).getByText("Use at least 16 characters.")).toBeTruthy();
+    expect(within(dialog).getByText("Use at least 12 characters.")).toBeTruthy();
     fireEvent.change(within(dialog).getByLabelText(/^new operator password$/i), {
-      target: { value: "a-new-operator-password" },
+      target: { value: "abcdefghij!1" },
+    });
+    expect(
+      within(dialog).getByText("Include at least one uppercase letter."),
+    ).toBeTruthy();
+    expect((enable as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(within(dialog).getByLabelText(/^new operator password$/i), {
+      target: { value: "Abcdefghijk1" },
+    });
+    expect(
+      within(dialog).getByText("Include at least one special character (not a space)."),
+    ).toBeTruthy();
+    expect((enable as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.change(within(dialog).getByLabelText(/^new operator password$/i), {
+      target: { value: "Abcdefghij!1" },
     });
     fireEvent.change(within(dialog).getByLabelText(/confirm operator password/i), {
       target: { value: "different" },
@@ -814,7 +974,7 @@ describe("SecurityPanel", () => {
     expect(within(dialog).getByText("The passwords do not match.")).toBeTruthy();
     expect((enable as HTMLButtonElement).disabled).toBe(true);
     fireEvent.change(within(dialog).getByLabelText(/confirm operator password/i), {
-      target: { value: "a-new-operator-password" },
+      target: { value: "Abcdefghij!1" },
     });
     fireEvent.click(within(dialog).getByRole("button", { name: /^enable$/i }));
 
@@ -823,8 +983,7 @@ describe("SecurityPanel", () => {
         fetchMock.mock.calls.some(
           ([url, init]) =>
             String(url).includes("/api/auth/password/enable") &&
-            JSON.parse(String((init as RequestInit).body)).password ===
-              "a-new-operator-password",
+            JSON.parse(String((init as RequestInit).body)).password === "Abcdefghij!1",
         ),
       ).toBe(true),
     );

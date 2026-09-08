@@ -222,8 +222,20 @@ The command refuses to reset a database already in use. It is intentionally
 destructive to **browser authentication only** and runs without a file watcher,
 so edits cannot repeatedly erase a newly claimed administrator. For this run it
 ignores `FLEET_ENTRA_TENANT_ID`, `FLEET_ENTRA_CLIENT_ID` and
-`FLEET_OPERATOR_PASSWORD`, without editing `.env`. A later normal startup uses
-those environment settings again if you have not saved a replacement configuration.
+`FLEET_OPERATOR_PASSWORD`, without editing `.env`. A later normal startup can use
+the Microsoft registration environment settings again if you have not saved a
+replacement configuration; password sign-in remains disabled until explicitly enabled.
+
+For the same reset **without restarting the Host or Nodes**, use **Erase auth
+settings** at the bottom of **Settings → Security**. It requires a current
+Microsoft administrator, authorization-code reauthentication within ten minutes,
+and typing `ERASE AUTH` in the confirmation dialog. Have access to the Host
+console first: all browsers are signed out, and the new claim code is printed
+only there, never returned to the browser. Pending Microsoft/device/bootstrap
+transactions are retired and browser authentication keys are rotated. Live Node
+connections and their keys, settings and working data are untouched. Close any
+other Host instance or database viewer using the same database before erasing;
+the running Host acquires exclusive database access and keeps it until shutdown.
 
 ### Signing in from somewhere else
 
@@ -337,7 +349,11 @@ Host without one generates nothing.
 
 Microsoft-only is the secure default after claim. An administrator who
 explicitly needs both methods can go to **Settings → Security → Enable password
-sign-in** and choose a new password of at least 16 characters.
+sign-in** and choose a new password of at least **12 characters**, including an
+**uppercase letter** and a **special character** (punctuation or a symbol, not
+just whitespace). Longer passwords remain supported. The UI and API enforce
+the same rule for newly configured passwords; existing passwords and the
+environment-based migration path remain compatible.
 
 The console claim code is not needed for any of that: proving the existing
 password proves the same thing it stands for, so the Host trades that session

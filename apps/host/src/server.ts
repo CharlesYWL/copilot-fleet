@@ -203,6 +203,7 @@ export async function buildServer(
       browsers.revokeSessions(revoked.map((row) => row.tokenHash)),
     onAdministratorRemoved: (administratorId) =>
       browsers.revokeAdministrator(administratorId),
+    onAuthenticationReset: () => browsers.closeAll(),
   });
   const service = new FleetService(store, app.log, cachedGitRevision());
   const leadTokens = new LeadTokens(store);

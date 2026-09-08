@@ -347,6 +347,20 @@ const settledStateList = [...terminalStateList, "offline"];
 const placeholders = (values: readonly unknown[]): string =>
   values.map(() => "?").join(",");
 
+function isDatabaseBusy(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "errcode" in error &&
+    typeof error.errcode === "number" &&
+    [5, 6].includes(error.errcode & 0xff)
+  );
+}
+
+class AuthenticationResetBusyError extends Error {
+  readonly statusCode = 409;
+}
+
 /**
  * Refuses an edit aimed at the reserved Chats workspace.
  *
@@ -411,13 +425,7 @@ export class FleetStore {
       if (options.exclusive) this.db.exec("BEGIN EXCLUSIVE; COMMIT;");
     } catch (error) {
       this.db.close();
-      if (
-        options.exclusive &&
-        typeof error === "object" &&
-        error !== null &&
-        "errcode" in error &&
-        (error.errcode === 5 || error.errcode === 6)
-      ) {
+      if (options.exclusive && isDatabaseBusy(error)) {
         throw new Error(
           "Cannot reset Host sign-in while its database is in use. Stop the Host and any database tools, then rerun npm run host:fresh.",
           { cause: error },
@@ -947,8 +955,37 @@ export class FleetStore {
     if (this.statement("PRAGMA locking_mode").get()?.locking_mode !== "exclusive") {
       throw new Error("Resetting Host sign-in requires an exclusive, offline database.");
     }
+    this.clearOperatorAuthenticationRows();
+  }
+
+  /** The running auth service coordinates the in-memory half after this commit. */
+  eraseOperatorAuthentication(
+    csrfKey: string,
+    administratorId: string,
+  ): RevokedSession[] {
+    const previousMode = this.statement("PRAGMA locking_mode").get()?.locking_mode;
+    try {
+      this.db.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;");
+      return this.clearOperatorAuthenticationRows({ csrfKey, administratorId });
+    } catch (error) {
+      // A refused reset must leave the live Host usable, including its old credentials.
+      if (previousMode !== "exclusive") this.db.exec("PRAGMA locking_mode=NORMAL;");
+      if (isDatabaseBusy(error)) {
+        throw new AuthenticationResetBusyError(
+          "Another process is using this Host database. Close other Host instances and database tools, then retry.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  private clearOperatorAuthenticationRows(
+    options: { csrfKey?: string; administratorId?: string } = {},
+  ): RevokedSession[] {
     const keys = PRESERVED_SETTING_KEYS.filter((key) => key.startsWith("auth."));
-    this.transaction(() => {
+    return this.transaction(() => {
+      const revoked = this.revokeAllOperatorSessions();
       this.db.exec(`
         DELETE FROM operator_sessions;
         DELETE FROM administrator_invitations;
@@ -957,13 +994,19 @@ export class FleetStore {
       this.statement(`DELETE FROM settings WHERE key IN (${placeholders(keys)})`).run(
         ...keys,
       );
+      if (options.csrfKey) {
+        this.setSetting("auth.csrfKey", options.csrfKey);
+        this.setSetting("auth.passwordEnabled", "0");
+      }
       this.recordSecurityAudit({
         eventType: "operator_authentication_reset",
-        actorKind: "console",
+        actorKind: options.administratorId ? "administrator" : "console",
+        actorId: options.administratorId,
         outcome: "allowed",
         detail:
           "Browser authentication reset; Node credentials and connection settings retained.",
       });
+      return revoked;
     });
   }
 

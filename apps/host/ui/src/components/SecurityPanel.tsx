@@ -26,7 +26,13 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { errorMessage, type AuthStatus } from "@fleet/protocol";
+import {
+  ERASE_AUTH_CONFIRMATION,
+  OPERATOR_PASSWORD_REQUIREMENTS,
+  OperatorPasswordSchema,
+  errorMessage,
+  type AuthStatus,
+} from "@fleet/protocol";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { api, ApiError } from "../hooks/useFleet";
 import { browserNavigation, csrfToken, startCodeLogin } from "../lib/auth";
@@ -206,12 +212,12 @@ export const SecurityPanel = () => {
    * it.
    */
   const run = useCallback(
-    async (work: () => Promise<unknown>) => {
+    async (work: () => Promise<unknown>, refresh = true) => {
       setError(undefined);
       setReauth(undefined);
       try {
         await work();
-        await load();
+        if (refresh) await load();
       } catch (reason) {
         if (
           reason instanceof ApiError &&
@@ -286,6 +292,7 @@ export const SecurityPanel = () => {
         onImported={() => window.location.reload()}
       />
       <AuditCard events={data.audit} />
+      <EraseAuthCard run={run} />
       <Dialog
         open={Boolean(error || reauth)}
         onOpenChange={(_event, data) => {
@@ -497,9 +504,10 @@ function PasswordCard({
   const [confirmation, setConfirmation] = useState("");
   const enabling = !status.passwordEnabled;
   const action = enabling ? "enable" : "disable";
+  const parsedPassword = OperatorPasswordSchema.safeParse(password);
   const enableError =
-    password.length > 0 && password.length < 16
-      ? "Use at least 16 characters."
+    password.length > 0 && !parsedPassword.success
+      ? parsedPassword.error.issues[0]?.message
       : confirmation.length > 0 && password !== confirmation
         ? "The passwords do not match."
         : undefined;
@@ -543,13 +551,14 @@ function PasswordCard({
                   </Text>
                   <Field
                     label="New operator password"
-                    hint="At least 16 characters."
+                    hint={OPERATOR_PASSWORD_REQUIREMENTS}
                     validationState={enableError ? "error" : "none"}
                     {...(enableError ? { validationMessage: enableError } : {})}
                   >
                     <Input
                       type="password"
                       value={password}
+                      maxLength={512}
                       autoComplete="new-password"
                       onChange={(_event, data) => setPassword(data.value)}
                     />
@@ -558,6 +567,7 @@ function PasswordCard({
                     <Input
                       type="password"
                       value={confirmation}
+                      maxLength={512}
                       autoComplete="new-password"
                       onChange={(_event, data) => setConfirmation(data.value)}
                     />
@@ -597,6 +607,104 @@ function PasswordCard({
                 }}
               >
                 {enabling ? "Enable" : "Disable"}
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+    </section>
+  );
+}
+
+function EraseAuthCard({
+  run,
+}: {
+  run: (work: () => Promise<unknown>, refresh?: boolean) => Promise<void>;
+}) {
+  const styles = useStyles();
+  const [open, setOpen] = useState(false);
+  const [confirmation, setConfirmation] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const close = () => {
+    setOpen(false);
+    setConfirmation("");
+  };
+  const erase = async () => {
+    close();
+    setBusy(true);
+    let navigating = false;
+    try {
+      await run(async () => {
+        await api("/api/auth/erase", {
+          method: "POST",
+          body: JSON.stringify({ confirmation: ERASE_AUTH_CONFIRMATION }),
+        });
+        browserNavigation.assign("/");
+        navigating = true;
+      }, false);
+    } finally {
+      if (!navigating) setBusy(false);
+    }
+  };
+
+  return (
+    <section className={styles.card} aria-label="Erase auth settings">
+      <Text weight="semibold">Erase auth settings</Text>
+      <Text className={styles.caption}>
+        Return this Host to sign-in setup without restarting the Host or Nodes. Node
+        connections, keys, enrollment, tunnels and other settings are kept.
+      </Text>
+      <div className={styles.row}>
+        <Button disabled={busy} onClick={() => setOpen(true)}>
+          {busy ? "Erasing authentication…" : "Erase auth settings"}
+        </Button>
+      </div>
+      <Dialog
+        open={open}
+        onOpenChange={(_event, data) => {
+          if (!data.open) close();
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Erase all Host authentication?</DialogTitle>
+            <DialogContent>
+              <MessageBar intent="warning" layout="multiline">
+                <MessageBarBody>
+                  This removes Microsoft client/tenant configuration, all administrators
+                  and invitations, browser sessions, passwords and device sign-in
+                  settings. Every browser is signed out.
+                </MessageBarBody>
+              </MessageBar>
+              <Text>
+                You must have access to the Host console to read the new claim code and
+                set up sign-in again. The code is not shown in this browser. A recent
+                Microsoft authorization-code sign-in is required to confirm the reset.
+              </Text>
+              <Text className={styles.caption}>
+                Existing authentication environment values are ignored for the rest of
+                this Host process; .env is not edited. Node processes and connections stay
+                running, and their data is not erased.
+              </Text>
+              <Field label={`Type ${ERASE_AUTH_CONFIRMATION} to confirm`}>
+                <Input
+                  value={confirmation}
+                  autoComplete="off"
+                  onChange={(_event, data) => setConfirmation(data.value)}
+                />
+              </Field>
+            </DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={close}>
+                Cancel
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={confirmation !== ERASE_AUTH_CONFIRMATION || busy}
+                onClick={() => void erase()}
+              >
+                Erase and sign out
               </Button>
             </DialogActions>
           </DialogBody>
