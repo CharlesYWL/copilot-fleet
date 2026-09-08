@@ -32,7 +32,12 @@ export const StartOrchestrator = ({ canStart, onStart }: StartOrchestratorProps)
         back when they finish. Ask it for a review and it sends one to the same checkout
         the work happened in.
       </Text>
-      <Button appearance="primary" disabled={!canStart} onClick={onStart}>
+      <Button
+        appearance="primary"
+        disabled={!canStart}
+        onClick={onStart}
+        data-tour="start-orchestrator"
+      >
         Start orchestrator
       </Button>
       {!canStart && (

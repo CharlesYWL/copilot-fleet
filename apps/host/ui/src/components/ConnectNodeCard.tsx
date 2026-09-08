@@ -135,7 +135,9 @@ export const ConnectNodeCard = () => {
   return (
     <section className={styles.card} aria-label="Connect a machine">
       <div>
-        <Title3 as="h2">Connect a machine</Title3>
+        <Title3 as="h2" data-tour="connect-node">
+          Connect a machine
+        </Title3>
         <br />
         <Text className={styles.caption}>
           Run this from a Copilot Fleet checkout that has Node.js and a signed-in Copilot

@@ -32,7 +32,12 @@ export const EmptySessions = ({ onNewSession }: EmptySessionsProps) => {
         Register a node, add a workspace placement, then launch an agent to watch its
         stream here.
       </Text>
-      <Button appearance="primary" icon={<Add20Regular />} onClick={onNewSession}>
+      <Button
+        appearance="primary"
+        icon={<Add20Regular />}
+        onClick={onNewSession}
+        data-tour="new-session"
+      >
         New session
       </Button>
     </div>

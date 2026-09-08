@@ -110,6 +110,8 @@ export type LoginSuccess = {
   ok: true;
   session: IssuedSession;
   administrator?: Administrator;
+  /** Only the successful first claim starts the browser's setup walkthrough. */
+  claimedHost?: true;
 };
 export type AdministratorAddedSuccess = {
   ok: true;
@@ -1069,7 +1071,10 @@ export class FleetAuth {
         outcome: "allowed",
         requestHost,
       });
-      return this.sessionFor(administrator, authMethod, requestHost);
+      return {
+        ...this.sessionFor(administrator, authMethod, requestHost),
+        claimedHost: true,
+      };
     }
 
     const administrator = this.store.findAdministrator(

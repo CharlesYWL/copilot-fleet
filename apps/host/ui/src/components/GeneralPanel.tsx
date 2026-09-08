@@ -19,6 +19,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import type { SessionConfigChoice, SessionConfigOption } from "@fleet/protocol";
+import { BookOpen20Regular } from "@fluentui/react-icons";
 import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
@@ -50,7 +51,9 @@ const useStyles = makeStyles({
     alignItems: "center",
     justifyContent: "space-between",
     gap: "16px",
+    "@media (max-width: 600px)": { flexWrap: "wrap" },
   },
+  dropdown: { minWidth: 0, width: "250px", maxWidth: "100%" },
   actions: {
     display: "flex",
     flexWrap: "wrap",
@@ -94,12 +97,13 @@ const downloadJson = (value: unknown, filename: string) => {
 export type GeneralPanelProps = {
   /** Live sessions, read only to learn which models this fleet's Copilot offers. */
   sessions: readonly { configOptions: SessionConfigOption[] }[];
+  onStartTour?: (() => void) | undefined;
 };
 
 const YOLO_WARNING =
   "New sessions will execute commands on their node without approval. You can still turn this off for an individual session when starting it.";
 
-export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
+export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
   const styles = useStyles();
   const active = useSettingsActive();
   const [defaults, setDefaults] = useState<Defaults>();
@@ -220,10 +224,34 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
         </MessageBar>
       )}
 
+      {onStartTour && (
+        <section className={styles.card} aria-label="Getting started">
+          <Text weight="semibold" data-tour="tour-help">
+            Getting started
+          </Text>
+          <Text className={styles.caption}>
+            Walk from connecting a machine to your first session and Orchestrator task.
+            The guide points out the controls without changing settings or starting agents
+            for you.
+          </Text>
+          <div className={styles.actions}>
+            <Button
+              appearance="secondary"
+              icon={<BookOpen20Regular />}
+              onClick={onStartTour}
+            >
+              Take the tour
+            </Button>
+          </div>
+        </section>
+      )}
+
       <section className={styles.card}>
         <div className={styles.row}>
           <div>
-            <Text weight="semibold">YOLO mode</Text>
+            <Text weight="semibold" data-tour="session-defaults">
+              YOLO mode
+            </Text>
             <br />
             <Text className={styles.caption}>
               Starts Copilot with --allow-all so it runs tools, reads paths, and fetches
@@ -300,6 +328,7 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
             </Text>
           </div>
           <Dropdown
+            className={styles.dropdown}
             disabled={busy || modelChoices.length === 0}
             value={labelFor(modelChoices, model)}
             selectedOptions={[model]}
@@ -325,6 +354,7 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
             </Text>
           </div>
           <Dropdown
+            className={styles.dropdown}
             disabled={busy || effortChoices.length === 0}
             value={labelFor(effortChoices, reasoningEffort)}
             selectedOptions={[reasoningEffort]}

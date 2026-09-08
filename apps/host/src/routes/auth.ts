@@ -393,7 +393,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
       "set-cookie",
       sessionCookie(outcome.session.token, secure, OPERATOR_SESSION_ABSOLUTE_MS),
     );
-    return reply.redirect(appLocation("/"), 302);
+    return reply.redirect(appLocation(outcome.claimedHost ? "/?welcome=1" : "/"), 302);
   };
 
   app.get(ENTRA_CALLBACK_PATH, completeCallback);
@@ -444,7 +444,10 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
       "set-cookie",
       sessionCookie(outcome.session.token, secure, OPERATOR_SESSION_ABSOLUTE_MS),
     );
-    return reply.send({ ok: true });
+    return reply.send({
+      ok: true,
+      ...(outcome.claimedHost ? { claimedHost: true } : {}),
+    });
   });
 
   app.post("/api/auth/login", async (request, reply) => {

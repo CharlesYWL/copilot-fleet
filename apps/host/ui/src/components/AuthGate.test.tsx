@@ -6,6 +6,7 @@ import { AuthGate } from "./AuthGate";
 import { announceSignedOut, browserNavigation } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import markUrl from "../assets/copilot-fleet-mark.svg";
+import { TOUR_STORAGE_KEY } from "../lib/onboarding";
 
 const tenantId = "11111111-1111-4111-8111-111111111111";
 const clientId = "22222222-2222-4222-8222-222222222222";
@@ -73,6 +74,7 @@ describe("AuthGate", () => {
   let assign: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
+    sessionStorage.clear();
     assign = vi.spyOn(browserNavigation, "assign").mockImplementation(() => undefined);
     Object.defineProperty(navigator, "clipboard", {
       value: { writeText: vi.fn(async () => undefined) },
@@ -84,12 +86,22 @@ describe("AuthGate", () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     window.history.replaceState({}, "", "/");
+    sessionStorage.clear();
   });
 
   it("shows the console to a session the Host recognises", async () => {
     host({}, { authenticated: true });
     show();
     expect(await screen.findByText("console")).toBeTruthy();
+  });
+
+  it("discards an unfinished tour when the previous session is no longer signed in", async () => {
+    sessionStorage.setItem(TOUR_STORAGE_KEY, "placement");
+    host({});
+    show();
+
+    await screen.findByRole("region", { name: /sign in to copilot fleet/i });
+    await waitFor(() => expect(sessionStorage.getItem(TOUR_STORAGE_KEY)).toBeNull());
   });
 
   it("announces what it is doing while it asks the Host who is calling", async () => {
@@ -848,38 +860,44 @@ describe("AuthGate", () => {
       expect(screen.getByText(/expires at/i)).toBeTruthy();
     });
 
-    it("reveals the console once Microsoft answers the code", async () => {
-      let signedIn = false;
-      vi.stubGlobal(
-        "fetch",
-        vi.fn(async (input: URL | RequestInfo, _init?: RequestInit) => {
-          const url = String(input);
-          if (url.includes("/api/auth/device/start")) {
-            return answer({
-              flowId: "flow-1",
-              userCode: "FLEET-123",
-              verificationUri: "https://microsoft.com/devicelogin",
-              message: "Enter FLEET-123",
-              expiresAt: new Date(Date.now() + 900_000).toISOString(),
-            });
-          }
-          if (url.includes("/api/auth/device/poll/")) {
-            signedIn = true;
-            return answer({ ok: true });
-          }
-          return answer(
-            statusBody({ ...remote, deviceFlowEnabled: true, authenticated: signedIn }),
-          );
-        }),
-      );
-      show();
+    it.each([false, true])(
+      "reveals the console and forwards claimedHost=%s after device sign-in",
+      async (claimedHost) => {
+        let signedIn = false;
+        vi.stubGlobal(
+          "fetch",
+          vi.fn(async (input: URL | RequestInfo, _init?: RequestInit) => {
+            const url = String(input);
+            if (url.includes("/api/auth/device/start")) {
+              return answer({
+                flowId: "flow-1",
+                userCode: "FLEET-123",
+                verificationUri: "https://microsoft.com/devicelogin",
+                message: "Enter FLEET-123",
+                expiresAt: new Date(Date.now() + 900_000).toISOString(),
+              });
+            }
+            if (url.includes("/api/auth/device/poll/")) {
+              signedIn = true;
+              return answer({ ok: true, ...(claimedHost ? { claimedHost: true } : {}) });
+            }
+            return answer(
+              statusBody({ ...remote, deviceFlowEnabled: true, authenticated: signedIn }),
+            );
+          }),
+        );
+        show();
 
-      fireEvent.click(
-        await screen.findByRole("button", { name: /sign in with a device code/i }),
-      );
+        fireEvent.click(
+          await screen.findByRole("button", { name: /sign in with a device code/i }),
+        );
 
-      expect(await screen.findByText("console")).toBeTruthy();
-    });
+        expect(await screen.findByText("console")).toBeTruthy();
+        expect(new URLSearchParams(window.location.search).get("welcome")).toBe(
+          claimedHost ? "1" : null,
+        );
+      },
+    );
 
     it("says who refused when a device sign-in is denied", async () => {
       host(

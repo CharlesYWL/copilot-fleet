@@ -12,6 +12,31 @@ const answer = (body: unknown, status = 200) =>
   });
 
 describe("bounded device polling", () => {
+  it("carries the first successful claim signal back to the gate", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => answer({ ok: true, claimedHost: true })),
+    );
+
+    await expect(
+      pollUntilSignedIn({ flowId: "claim", expiresAt: Date.now() + 60_000 }),
+    ).resolves.toEqual({ outcome: "signed-in", claimedHost: true });
+  });
+
+  it.each([false, "true", 1])(
+    "does not treat claimedHost=%s as a first claim",
+    async (claimedHost) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => answer({ ok: true, claimedHost })),
+      );
+
+      await expect(
+        pollUntilSignedIn({ flowId: "login", expiresAt: Date.now() + 60_000 }),
+      ).resolves.toEqual({ outcome: "signed-in" });
+    },
+  );
+
   it("stops as soon as the Host says the browser is signed in", async () => {
     const fetch = vi.fn(async () => answer({ ok: true }));
     vi.stubGlobal("fetch", fetch);

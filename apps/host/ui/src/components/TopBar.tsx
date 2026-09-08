@@ -256,7 +256,7 @@ export const TopBar = ({
   }, []);
 
   return (
-    <header className={styles.bar}>
+    <header className={styles.bar} data-tour="fleet-header" tabIndex={-1}>
       <div className={styles.left}>
         {onToggleNav && (
           <Button
@@ -288,13 +288,13 @@ export const TopBar = ({
             />
           </Tooltip>
         )}
-        <div className={styles.brand}>
+        <div className={styles.brand} data-tour="fleet-brand">
           <BrandMark size={30} />
           <Text weight="semibold">Copilot Fleet</Text>
         </div>
       </div>
 
-      <div className={styles.centre}>
+      <div className={styles.centre} data-tour="view-controls">
         <ContextModeToggle context={context} />
       </div>
 

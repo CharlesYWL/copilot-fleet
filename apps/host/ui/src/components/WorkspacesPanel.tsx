@@ -273,7 +273,11 @@ export const WorkspacesPanel = ({
 
       <div className={styles.columns}>
         <section className={styles.card}>
-          <Text weight="semibold" className={styles.cardTitle}>
+          <Text
+            weight="semibold"
+            className={styles.cardTitle}
+            data-tour="create-workspace"
+          >
             Create workspace
           </Text>
           <form className={styles.form} onSubmit={handleCreateWorkspace}>
@@ -303,7 +307,7 @@ export const WorkspacesPanel = ({
         </section>
 
         <section className={styles.card}>
-          <Text weight="semibold" className={styles.cardTitle}>
+          <Text weight="semibold" className={styles.cardTitle} data-tour="add-placement">
             Add placement
           </Text>
           <form className={styles.form} onSubmit={handleCreatePlacement}>

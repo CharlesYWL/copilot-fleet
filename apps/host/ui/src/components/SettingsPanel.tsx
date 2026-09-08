@@ -22,6 +22,7 @@ const useStyles = makeStyles({
   },
   tabs: {
     flexShrink: 0,
+    overflowX: "auto",
     padding: "12px 24px 0",
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
   },
@@ -58,6 +59,7 @@ type SettingsPanelProps = {
   active?: boolean;
   selectedTab?: SettingsTab;
   onSelectedTabChange?: (tab: SettingsTab) => void;
+  onStartTour?: (() => void) | undefined;
 };
 
 /**
@@ -82,7 +84,7 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
   };
 
   const panels: Record<SettingsTab, ReactNode> = {
-    general: <GeneralPanel sessions={props.sessions} />,
+    general: <GeneralPanel sessions={props.sessions} onStartTour={props.onStartTour} />,
     security: <SecurityPanel />,
     diagnostics: <DiagnosticsPanel />,
     tunnel: <TunnelPanel />,
@@ -116,6 +118,7 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
               value={value}
               id={`${id}-${value}-tab`}
               aria-controls={`${id}-${value}-panel`}
+              data-tour={`settings-${value}`}
             >
               {label}
             </Tab>

@@ -10,7 +10,7 @@ export type DeviceFlow = {
 };
 
 export type DevicePollOutcome =
-  | { outcome: "signed-in" }
+  | { outcome: "signed-in"; claimedHost?: true }
   | { outcome: "expired" }
   | { outcome: "abandoned" }
   | { outcome: "denied"; message: string };
@@ -68,7 +68,18 @@ export async function pollUntilSignedIn(
       // has not been answered yet, and treating it as success would sign the
       // page in on a flow nobody has completed.
       if (response.status !== 202) {
-        if (response.ok) return { outcome: "signed-in" };
+        if (response.ok) {
+          const body: unknown = await response.json();
+          if (
+            body &&
+            typeof body === "object" &&
+            "claimedHost" in body &&
+            body.claimedHost === true
+          ) {
+            return { outcome: "signed-in", claimedHost: true };
+          }
+          return { outcome: "signed-in" };
+        }
         const body = (await response.json().catch(() => ({}))) as { error?: string };
         return {
           outcome: "denied",

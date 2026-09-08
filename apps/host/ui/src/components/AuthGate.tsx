@@ -25,6 +25,7 @@ import {
   type BrowserAuthStatus,
 } from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
+import { markFirstClaimTour, saveTourProgress } from "../lib/onboarding";
 import { BrandMark } from "./BrandMark";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
@@ -175,6 +176,16 @@ export function AuthGate({ children }: { children: ReactNode }) {
       }),
     [],
   );
+
+  useEffect(() => {
+    if (
+      status &&
+      !status.unreachable &&
+      (!status.authenticated || status.claimCodeRequired)
+    ) {
+      saveTourProgress();
+    }
+  }, [status]);
 
   /*
    * `authenticated` alone is not enough to hand over the console.
@@ -1030,6 +1041,7 @@ function DeviceStep({ onSignedIn }: { onSignedIn: () => Promise<void> }) {
         expiresAt: Date.parse(body.expiresAt),
       });
       if (outcome.outcome === "signed-in") {
+        if (outcome.claimedHost) markFirstClaimTour();
         await onSignedIn();
         return;
       }

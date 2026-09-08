@@ -411,7 +411,7 @@ describe("Microsoft identity routes", () => {
     const finished = await signIn();
 
     expect(finished.statusCode).toBe(302);
-    expect(finished.headers.location).toBe("/");
+    expect(finished.headers.location).toBe("/?welcome=1");
     expect(jar.get("fleet_operator")).toBeTruthy();
     expect(await status()).toMatchObject({
       state: "microsoft-only",
@@ -427,6 +427,17 @@ describe("Microsoft identity routes", () => {
         })
       ).statusCode,
     ).toBe(200);
+  });
+
+  it("does not restart the setup tour for an ordinary administrator login", async () => {
+    await bootstrap();
+    await configure();
+    expect((await signIn()).headers.location).toBe("/?welcome=1");
+
+    const signedIn = await signIn();
+    expect(signedIn.statusCode).toBe(302);
+    expect(signedIn.headers.location).toBe("/");
+    expect(await status()).toMatchObject({ authenticated: true });
   });
 
   it("consumes the bootstrap grant, so a second claim cannot ride on it", async () => {

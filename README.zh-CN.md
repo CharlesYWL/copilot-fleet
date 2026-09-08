@@ -18,35 +18,87 @@ Copilot Fleet 是一个自托管的控制平面，用于在多台机器上运行
 
 ![单个会话：完整的提示词与回复，下方是输入框、模型和模式选择器。](docs/screenshots/session-detail.png)
 
-> 截图取自 [可复现的最小验证](#可复现的最小验证) 中那套确定性的 `--mock-agent` 演示，
+> 上面的截图取自 [可复现的最小验证](#可复现的最小验证) 中那套确定性的 `--mock-agent` 演示，
 > 因此任何人都能在没有 Copilot 登录态的机器上复现。真实节点会在完全相同的界面里
 > 输出真实的 Copilot 内容。
 
+## 功能地图与目录
+
+第一次使用时，请先按下方的首次使用指南完成设置；之后可以从这里查找具体功能。
+
+- **安装并认领 Host：** [环境要求](#环境要求)、[设置 Host](#设置-hostwindowsmacoslinux)、
+  [首次使用指南](#首次使用指南)、[认领细节](#首次运行认领一个-fleet)。
+- **配置 Microsoft 登录与管理员：** [注册与账号范围](#microsoft-登录注册与账号范围)、
+  [从别处登录](#从别处登录)、[添加和移除管理员](#添加和移除管理员)、[安全说明](#安全说明)。
+- **选择访问方式与隧道：** [隧道与谁能看到登录页](#隧道与谁能看到登录页)、
+  [跟随 Host 迁移到新地址](#跟随-host-迁移到新地址)。
+- **连接和维护机器：** [Windows Node](#windows-上的-nodepowershell)、
+  [节点命令行参数](#节点命令行参数)、[节点配置页](#节点配置页)、[让节点保持最新](#让节点保持最新)。
+- **创建项目并启动日常会话：** [工作区和放置](#首次使用指南)、
+  [可复现的最小验证](#可复现的最小验证)、[附加文件与图片](#附加文件与图片)、
+  [斜杠命令与会话选择器](#斜杠命令与会话选择器)。
+- **监控和整理活跃工作：** [自动收起的分支](#空闲分支会自动收起)、
+  [拖拽排序和归类](#用拖拽排序和归类)、[提示音和通知](#提示音)。
+- **协调多代理任务：** [Orchestrator 快速指南](#orchestrator-快速指南)、
+  [Run：多个会话朝一个目标](#run多个会话朝一个目标)、
+  [Chats as a destination](#chats-as-a-destination)。
+- **恢复、迁移、备份、排障：** [迁移 Host 或 Node](#把-host-或-node-迁移到另一台机器)、
+  [重启之后恢复会话](#重启之后恢复会话)、[Diagnostics 与排障](#diagnostics-与排障)、
+  [本地验证与测试监控](#本地验证与测试监控)。
+
 ## 环境要求
 
-- Node.js 22.5 或更高版本，npm 10 或更高版本
-- 每台真实 Node 上都已安装并登录 GitHub Copilot CLI 1.0.69 或更高版本
-- 每个工作区放置（placement）都需要一个绝对本地路径
+- [Node.js](https://nodejs.org/en/download) 22.5 或更高版本、npm 10 或更高版本，以及 Git
+- 每台真实 Node 上都已安装并登录
+  [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli)
+  1.0.69 或更高版本，且订阅与组织策略允许使用 Copilot
+- 每个工作区放置（placement）都需要一个已经存在的绝对本地目录；这个目录在运行会话的
+  Node 上，而不一定在 Host 上
 - Host 登录需要发布者或运维者合法拥有并获准使用的 Microsoft 应用注册，见
   [注册与账号范围](#microsoft-登录注册与账号范围)
+- 多机器访问推荐使用 Microsoft Dev Tunnels（`devtunnel`）：Host 需要登录隧道服务；私有
+  隧道下，远端 Node 也需要登录同一个隧道 provider
 
-## Mac/Linux 上的 Host
+## 设置 Host（Windows、macOS、Linux）
+
+Host 可以运行在 Windows、macOS 或 Linux 上。Node 可以和 Host 是同一台机器，也可以在别的
+机器上；真正拥有工作目录和 Copilot 登录态的是 Node。
+
+请用有权限的账号克隆当前私有仓库：
 
 ```bash
-git clone <repository-url> copilot-fleet
+git clone https://github.com/charlesyin_microsoft/copilot-fleet.git
 cd copilot-fleet
 npm install
+```
+
+如果还没有 `.env`，复制一份本地配置：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+```bash
 cp .env.example .env
 ```
 
-启动开发模式：
+第一次只启动 Host 时，先构建共享协议包，再运行 API 和 UI：
 
 ```bash
-npm run dev
+npm run build -w @fleet/protocol
+npm run host
 ```
 
-这一条命令会同时拉起 `http://127.0.0.1:8787` 上的 Fastify API、`http://127.0.0.1:5173`
-上的 Vite，以及本机的 Node 服务。Node 会从 `.env` 读取自己的 `FLEET_*` 配置。
+全新安装后不能跳过协议包构建：`npm run host` 不会自动构建它。默认 API 地址为
+`http://127.0.0.1:8787`，Vite 界面地址为 `http://localhost:5173`；开发时打开后者。
+如果修改了 `.env` 的 `PORT`，后续配置和示例中也要使用对应的 API 端口。
+
+先按[首次使用指南](#首次使用指南)认领 Host 并注册第一台 Node。本机 Node 完成注册且
+Copilot CLI 已登录后，可以用 `npm run dev` 同时启动 Host、UI 和该 Node。单纯启动 Node
+进程并不会完成注册。Node 第一次从 `.env` 读取 `FLEET_*` 初始设置，之后将可编辑设置保存到
+自己的 `settings.json`。
+一次只选择一种启动方式；切换到组合开发命令或生产模式前，先停止已经运行的 Host/Node
+进程，避免重复占用端口。
 
 全新的 Host 既没有密码也没有管理员。它只会把一次性的认领码打印到自己的控制台，在有人
 用它之前不会透露任何别的东西：
@@ -60,9 +112,11 @@ one-time code:
 It expires in 30 minutes and is printed only here.
 ```
 
-认领需要两个证据，具体见[首次运行：认领一个 Fleet](#首次运行认领一个-fleet)。
+认领需要两个证据，具体见[首次运行：认领一个 Fleet](#首次运行认领一个-fleet)。普通的全新
+公共 Microsoft 登录需要运维者或发布者提供已注册的 public client/config；本仓库没有内置可
+公开使用的默认客户端。
 
-如果希望在改代码时隧道地址保持稳定，就把隧道作为独立进程启动：
+本机 Node 注册完成后，可以使用下面的组合开发命令，把隧道保持为独立进程：
 
 ```bash
 npm run dev:tunnel
@@ -71,22 +125,30 @@ npm run dev:tunnel
 这样隧道就不会随 `tsx watch` 的重载而重建，公网地址不再每次 Host 重启都轮换，远端节点
 也就不会掉线。Host 会检测到它并且不去干预它的生命周期；隧道运行期间设置页里的开关是
 禁用的。照常用 Ctrl+C 结束全部进程。
+如果只开发 Host，保持 `npm run host` 运行，并在第二个终端运行 `npm run tunnel`；
+这不会启动 Node。
 
 打开界面 → **Settings**：
 
-- **General** —— 会话默认值，以及用于迁移 Host 的导出/导入。
-- **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移，
-  以及这台 Host 的安全审计。
-- **Tunnel** —— 运行 Dev Tunnels、Cloudflare、Tailscale Funnel、ngrok 或 bore；
-  每个已安装的 provider 都有自己的开关和状态。
-- **Nodes** —— 重命名/删除机器，生成一次性的连接命令。
-- **Workspaces** —— 把项目映射到每台机器上的路径。
+- **General** —— 会话默认值、**Take the tour** 按钮，以及数据导出/导入。
+- **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移、
+  可迁移 Host 备份/恢复，以及这台 Host 的安全审计。
+- **Tunnel** —— 管理 Dev Tunnels、Cloudflare、Tailscale Funnel 或 ngrok。
+  bore 等明文 HTTP 提供程序会显示在列表中，但不能用于操作台。
+- **Nodes** —— 重命名/删除机器，查看更新状态，生成一次性的连接命令。
+- **Workspaces** —— 创建逻辑项目，并映射到每台机器上的路径。
+- **Diagnostics** —— 查看 Host 自启动以来捕获的 warning 和 error。
+
+Settings 里的各个 section 访问后会保留自己的状态，所以切换 tab 不会清掉填了一半的表单。
+静态警告（例如 YOLO 风险）会留在对应卡片里，而不是变成转瞬即逝的 toast。窄屏上 Settings
+的 tab 条会横向滚动，所以一直到手机尺寸都能进入每个 section。
 
 ![Settings → Workspaces & placements：三个工作区，各自映射到持有它的机器上的绝对路径。](docs/screenshots/workspaces.png)
 
 工作区是逻辑概念，放置（placement）才是物理的 `(工作区, 节点) → 路径` 对。同一个项目在
 每台机器上可以位于不同的绝对路径；会话始终从已存储的放置启动，绝不会使用请求里传来的
-路径。
+路径。添加 placement 只是记录 Node 上一个已经存在的目录；它不会 clone 仓库，也不会替你
+创建目录。
 
 Host 的公网地址变化时会通知已连接的节点，所以轮换过的隧道不会把它们困住 —— 见
 [跟随 Host 迁移到新地址](#跟随-host-迁移到新地址)。
@@ -100,6 +162,102 @@ npm start
 
 或者只跑 Host：`npm run start:host`。打开 `http://127.0.0.1:8787` —— Fastify 会直接托管
 构建好的界面。
+
+## 首次使用指南
+
+第一次搭建 fleet 时按这个顺序走。所有步骤可以在一台 Windows 机器上完成，也可以把 Host
+和 Node 分在不同机器上。
+
+1. **启动 Host。** 完成[Host 设置](#设置-hostwindowsmacoslinux)，第一次执行
+   `npm run host` 前先运行 `npm run build -w @fleet/protocol`。也可以运行
+   `npm run build`，再用 `npm run start:host` 启动生产构建。保持 Host 控制台打开：
+   认领码只打印在那里，30 分钟后过期。
+2. **认领 Host。** 开发模式打开 `http://localhost:5173`，生产模式打开
+   `http://localhost:8787`。如果显示 **Configure Microsoft sign-in**，输入认领码并点击
+   **Unlock setup**。填写获准使用的 Microsoft Application (client) ID，选择
+   **Work/school and personal Microsoft accounts** 或 **One organization (fixed
+   directory)**，再点击 **Save and continue**。如果已配置好登录，则输入认领码并使用
+   **Unlock claim**。最后点击 **Claim with Microsoft**，用将要管理这台 Host 的账号完成
+   登录。**认领成功也就完成了登录**；之后访问时使用已获授权的账号 **Sign in with
+   Microsoft**，不需要再次认领。
+3. **跟随教学气泡，或继续阅读下面的步骤。** 引导会在第一次认领成功后自动打开，不会在
+   每次登录时重复出现。10 个步骤会高亮隧道、Node、工作区、放置、会话、权限、
+   Orchestrator、任务审查和其他设置的相关控件。用 **Back** 和 **Next** 浏览，不会自动
+   更改设置或启动代理。需要实际操作时，点击 **Let me do this step** 暂时收起气泡，完成
+   后用 **Resume tour** 继续。**Open New session** 只打开会话表单，不会提交。
+   关闭气泡或按 **Escape** 可以跳过，最后点击 **Finish tour** 结束。当前位置会保留在
+   当前浏览器标签页中，刷新后仍在；跳过、结束或退出登录时会清除。随时可以从
+   **Settings → General → Take the tour** 重看，无需重置或重新认领 Host。小屏幕上可以滚动
+   较长的气泡来查看其按钮。
+
+![第一次成功认领后自动出现的欢迎 tour：非模态 setup 气泡锚定在 Copilot Fleet 标识附近，Back 处于禁用状态，Show me around 可继续。](docs/screenshots/setup-tour-welcome.png)
+
+![填写 workspace 时的 setup tour：Workspaces 设置页被选中，Create workspace 表单里是合成演示数据，气泡提供 Let me do this step、Back 和 Next。](docs/screenshots/setup-tour.png)
+
+> 这些 tour 截图来自隔离的只读本地预览，使用假的演示身份和数据；没有展示或使用真实凭据。
+
+4. **选择可达方式。** 只在本机使用时，loopback 就够了。远端 Node 推荐
+   **Settings → Tunnel → Dev Tunnels**。先在 Host 机器上运行 `devtunnel user login` 登录
+   隧道 provider，再启用 provider。这里的 Microsoft 登录属于隧道服务，和 Fleet 自己的
+   管理员授权是两回事。
+5. **准备 Node 机器。** 在将要运行代理的机器上安装 Node.js，并以运行 Node 的同一个
+   系统用户安装、登录 Copilot CLI。一种安装方法是：
+
+   ```bash
+   npm install -g @github/copilot
+   copilot
+   ```
+
+   在 Copilot 提示符下输入 `/login` 并完成登录，随后退出 Copilot，再执行 Node 的启动命令。
+   WinGet、Homebrew 或禁用了 npm 安装脚本的环境，请参阅
+   [官方安装指南](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli)。
+   Copilot CLI 的登录态和订阅留在 Node 上，和 Host 登录无关。
+   Node 上也需要 Fleet 代码：使用 [Host 设置](#设置-hostwindowsmacoslinux)中的克隆命令，
+   或者在 Host 和 Node 同机时复用已有的代码目录。
+
+6. **连接 Node。** 在 **Settings → Nodes** 点击 **Generate a connect command**。只要现有
+   Microsoft 管理员会话仍然有效，就不需要再次登录。把命令复制到 Node，在
+   Fleet checkout 中运行。一次性 grant 15 分钟过期，只授权一个 Node key，并绑定 Host
+   ID/指纹。私有 Dev Tunnel 下，还要先在这台 Node 上运行 `devtunnel user login`；连接命令
+   会使用 `--devtunnel=<id>`，而不是让 Node 去回答浏览器登录。
+7. **添加 workspace。** 在 **Settings → Workspaces** 中用 **Create workspace** 创建逻辑
+   项目名，例如 `checkout-service`。这一步只创建 Fleet 元数据。
+8. **添加 placement。** 仍在 **Workspaces & placements** 下，用 **Add placement** 选择
+   workspace、在线 Node，以及该 Node 上已经存在的绝对本地路径，例如
+   `C:\code\checkout-service` 或 `/srv/checkout-service`。
+9. **启动 session。** 点击 **New session**，选择 **Where to run**，可选填写
+   **Session name**，写好 **Initial prompt**，并决定 **YOLO mode** 是每次工具调用前询问，
+   还是用 `--allow-all` 直接运行。刚上手时建议保持 YOLO 关闭。会话卡片会实时滚动输出；
+   打开后可以继续发提示词、粘贴或附加图片/文件、取消本轮、停止进程、重命名 session，或在
+   代理上报时调整 **Model**、**Mode**、**Reasoning Effort**。
+10. **用 Orchestrator 做多代理工作。** 打开 **Orchestrator**，当在线 Node 持有一个
+    workspace 后点击 **Start orchestrator**。之后可以在它的 **Conversation** 里直接描述
+    目标，也可以点 **New task**。给出清楚的 objective，选择 workspace，让 lead 规划阶段、
+    派发 worker session，并把结果带回来。用 **Stages**、**List** 或 **Dependency** 视图
+    查看并行任务，打开 worker transcript，处理权限请求，审查任务。当任务显示 **Ready for
+    you** 时，点击 **Approve** 或 **Send back**；之后可按情况 **Archive**、**Reopen**、
+    **Delete**、**Stop orchestrator**、**Resume orchestrator** 或 **Dismiss
+    orchestrator**。
+
+### Diagnostics 与排障
+
+- **没有 setup 页面，或 Microsoft 登录失败：** 确认 Host 配置了获准使用的 public-client
+  注册，原生回调使用 Host API 端口，并且 authorization-code 登录时用 `localhost` 打开。
+  远端浏览器需要本地 forward，或使用已验证的 device 登录。
+- **认领码或 setup 授权过期：** 未认领 Host 可以重启来获得新的控制台认领码。如果 setup
+  授权过期，用 **Unlock setup again**；不要为了重试而删除数据库。
+- **Connect command 按钮失败：** 使用已获授权的 Microsoft 管理员账号，而不是旧的共享
+  密码。如果会话已过期，请重新登录；会话仍然有效时，这项操作不要求近期重新认证，浏览器
+  会自动处理请求保护。
+- **Node 连不上私有 Dev Tunnel：** 在 Node 机器上运行 `devtunnel user login` 登录隧道
+  provider；它不是 Fleet 管理员登录，也不是 Copilot CLI 登录。
+- **Node 在线但 session 启动不了：** 给这个 Node 添加 placement，并确认路径是绝对路径、
+  在 Node 上已经存在且是目录。
+- **代理一直等待或报告认证问题：** 把 Copilot CLI 更新到至少 1.0.69，并用 Node 服务用户
+  运行 `copilot login`。
+- **有事项需要处理：** 看通知铃铛、Orchestrator/task 的琥珀色状态、session 内的权限横幅，
+  以及 **Settings → Diagnostics** 里的 Host warning/error。能访问 Node 机器时，它自己的
+  `http://127.0.0.1:8788` 配置页会显示 Node 侧日志。
 
 ## 首次运行：认领一个 Fleet
 
@@ -362,6 +520,19 @@ Microsoft 登录，之后才看得到 Fleet 自己的认领界面。认领之后
 
 `bore` 是被 Host 自己拒绝的，而不只是在界面上置灰：它中继的是明文 TCP，会话 cookie 和它
 背后的所有记录都会以可读形式经过。这个拒绝对任何客户端都成立，包括从不渲染界面的那种。
+
+### Chats
+
+并不是每个问题都关于某个 checkout。**Chats** 是 Host 自己创建的工作区，固定在侧边栏的
+项目列表上方，用来承载只需要一个 agent 和一台机器的会话：提问、阅读、调研尚未写成代码的
+方案。每个上报了 home directory 的 Node 都会自动得到一个 Chats placement，因此无需额外
+配置；在 **New session** 里选择 **Chats**，会话就会在那台机器的 home directory 中运行。
+
+因为它是派生出来的，而不是用户手动归档出来的，所以它也是唯一不能编辑的 workspace：不能
+重命名、不能删除，也不能新增、移动或删除 placement。如果你原来已经有一个项目叫 Chats，
+它的内容会保留，只是标签会变成 `Chats (2)`，把保留名称空出来。
+
+Orchestrator 也可以使用它，见 [Chats as a destination](#chats-as-a-destination)。
 
 ## Windows 上的 Node（PowerShell）
 
@@ -716,9 +887,9 @@ spawn 一个 detached 的后继进程，它会自带一个控制台窗口，并�
 `tsx watch` 下它每次都输：拉取改变了源码，watcher 重启了它自己的子进程，后继进程发现锁
 已被占用于是退出 —— 表现出来就是终端一闪而过，而节点只是靠 watcher 的意外才回来。
 
-`npm run dev:watch` 仍然用 `tsx watch` 运行节点，用于迭代节点代码。不要在你依赖的机器上
-使用它：**watcher 不会重启一个已经退出的子进程**，所以在它下面做更新会让机器上什么都不
-剩。
+`npm run dev:watch -w @fleet/node` 仍然用 `tsx watch` 运行节点，用于迭代节点代码。不要在
+你依赖的机器上使用它：**watcher 不会重启一个已经退出的子进程**，所以在它下面做更新会让
+机器上什么都不剩。
 
 supervisor 只在状态码 75 时重启，别的一律不重启 —— 崩溃的节点会以它崩溃时的状态码退出，
 所以坏掉的构建是可见的，而不是陷入循环。如果节点在二十秒内请求重启五次，它也会放弃。
@@ -823,19 +994,52 @@ npm test
 提示词；**Stop** 结束进程，是终态。而 `failed` 并不是一回事：抵达过代理的会话保留着它的
 agent session id，会被作为**可恢复**提供出来；而从未走到那一步的会话就是结束了。
 
+### Orchestrator 快速指南
+
+当你希望一个 lead 协调多个 Fleet session 时，使用 **Orchestrator**。它本质上仍是运行在
+某个 Node 上的普通 session，但 Host 会给它一组受限工具，用来规划 task、派发 worker、在
+worker 有结果后唤醒自己，并把交付记录留给你审查。
+
+1. 在侧边栏打开 **Orchestrator**，点击 **Start orchestrator**。只有当在线 Node 持有至少
+   一个 workspace 时按钮才可用。lead 会从一个可达 placement 启动，以无人值守方式运行以便
+   后续唤醒自己，并被明确要求不要自己写代码。
+2. 可以在 **Conversation** 里直接发起工作，也可以点 **New task**。对话框会记录
+   **What should be done?**、**Workspace** 和可选的 **Name**；objective 是 lead 规划阶段
+   和成功标准的依据。lead 和 worker 使用该 workspace 的 placements；纯研究任务可以派到
+   [Chats](#chats-as-a-destination)。
+3. 用顶部的任务视图观察进度：**Stages** 把 task 分成 Planning、In progress、Validation、
+   Done；**List** 用表格比较多个 task；**Dependency** 展示已派发 worker step 之间的依赖。
+   页头数字会显示全部 task、正在运行的 task，以及哪些 task **needs you**。
+4. 打开单个 task，可以看到 **Phases**、**What done means**、**What happened** 和
+   **Dispatched work**。worker 链接会打开对应 session transcript，便于查看输出、权限请求
+   和该 Node 上的文件变更。
+5. task 显示 **Ready for you** 时，阅读最新 handoff，然后选择 **Approve** 或带说明的
+   **Send back**。Approve 会完成 task；Send back 会用你的 note 唤醒 lead，并保留原有阶段、
+   成功标准、记录和 worker 历史。
+6. 生命周期操作要有意识地使用。**Archive** 会停止仍在运行的 worker，但保留 task 记录；
+   已结束的 task 可以用 **Reopen** 说明还想要什么，也可以用 **Delete** 丢弃记录。
+   **Stop orchestrator** 会停止 lead 和它的 tasks；当 session 可恢复时，**Resume
+   orchestrator** 会重开被停止的工作；**Dismiss orchestrator** 只隐藏已停止的 lead，不删除
+   普通 session 历史。
+
+如果只是一次不需要 checkout 的问题，请从 **New session** 直接启动 **Chats** session。
+如果是共享的多代理目标，请使用 Orchestrator 的 lead **Conversation** 和 task board，让计划、
+worker、审查和归档状态留在同一处。
+
 ### Run：多个会话朝一个目标
 
 把多个 agent 放到同一件事上，有两条路。
 
-**跟 orchestrator 对话。** 侧边栏第一行就是 **Orchestration**，在所有 workspace 之上——
+**跟 orchestrator 对话。** 侧边栏第一行就是 **Orchestrator**，在所有 workspace 之上——
 因为它是整个 fleet 的界面，不属于任何单个仓库。开一个，你就得到一个可以聊天的会话。
 它自己不写代码——它启动别的 agent 去写。你交代一件事，它挑机器、派一个 worker，然后
 **结束自己这一轮**。那个 worker 干完时，Host 会带着摘要把 orchestrator 叫醒，由它决定
 下一步。你让它找人 review，它会把 reviewer 派到工作实际发生的那个 checkout 上，所以
 reviewer 看得见真实改动。
 
-界面就是那段对话，旁边一条 rail 列着撒在 fleet 上的活；点某一步就进到那个 worker 的
-transcript。
+你会在三个地方看到这些工作：侧边栏列出 lead conversations；**Orchestrator** 页面用任务板
+回答“fleet 正在做什么”；打开某个 lead 的 **Conversation** 时，旁边也会列出它自己的 tasks。
+点一个 dispatched step 就会进入对应 worker 的 transcript。
 
 它从不干等，这正是重点：对话是持久的，一个跑二十分钟的 worker 期间不占任何东西，Host
 重启也不会把这条线索弄丢。
@@ -868,6 +1072,17 @@ curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
 
 批准是唯一的闸门，这是有意为之：人批准的是目标和预算，之后每一次派发不再单独审批——
 真正拦住一个 run 的是预算，而不是每次都弹一个提示。
+
+### Chats as a destination
+
+Orchestrator 也可以把 worker 派到 [Chats](#chats)：在任务里把 `workspace` 指向 Chats，
+就会让 worker 在该 Node 的 home directory 中运行，而不是在某个 checkout 中运行。这样，
+“查资料、比较方案、读一圈背景”这类问题不需要先虚构一个项目才能派发。
+
+这是 Host 会主动约束的目标：会写代码或 review 代码的 step 不会被派到 Chats。否则一次在
+home directory 里发生的修改会把整个 task 钉在那里，后续步骤——尤其是 review——就会被送到
+一个从未发生真实改动的位置。拒绝信息会说明原因，并给出替代做法：研究型工作发到 Chats，
+涉及仓库的工作指定具体 workspace。
 
 ## 安全说明
 
@@ -914,10 +1129,10 @@ curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
 - 会话请求引用的是预先配置好的放置 ID。节点还要求目录是存在的绝对路径，并在创建进程
   之前解析它。
 - Copilot 以参数数组、`shell: false` 和选定的放置作为 `cwd` 直接启动。
-- 权限在界面上是显式且可审计的（只有 allow-once / deny）。YOLO 默认关闭，Host 层面和
-  每个新会话都是如此。对于无人值守的运行，可在 Node 上设置 `FLEET_YOLO=1`，让 Copilot
-  以 `--allow-all` 启动（工具、路径和 URL）。在 YOLO 关闭时，未应答和断连的请求仍然按
-  拒绝处理。
+- 权限在界面上是显式且可审计的（只有 allow-once / deny）。新会话默认关闭 YOLO。只有在
+  你明确希望 Host 为该会话以 `--allow-all` 启动 Copilot（工具、路径和 URL 都不再询问）
+  时，才从 **Settings → General** 或 **Start a session** 对话框打开它。在 YOLO 关闭时，
+  未应答和断连的请求仍然按拒绝处理。
 - 与安全相关的决定会写入本地审计（保留最新一万条），可在 Settings → Security 查看。认领码、
   授权码、设备码、Microsoft 令牌、Fleet Cookie、邀请、注册授权、lead token 和私钥都不会
   被写进去。

@@ -21,37 +21,108 @@ pickers along the bottom.
 
 ![A single session: prompts and responses in full, with the composer, model and mode pickers underneath.](docs/screenshots/session-detail.png)
 
-> Screenshots come from the deterministic `--mock-agent` demo described under
+> The screenshots above come from the deterministic `--mock-agent` demo described under
 > [Exact proof of concept](#exact-proof-of-concept), so they can be reproduced on
 > any machine without a Copilot login. A real node streams real Copilot output in
 > exactly the same surfaces.
 
+## Feature map and contents
+
+Start with the walkthrough, then use this map when you need a specific surface.
+
+- **Install and claim a Host:** [Requirements](#requirements),
+  [Set up the Host](#set-up-the-host-windows-macos-linux),
+  [First-run walkthrough](#first-run-walkthrough), and
+  [claim details](#first-run-claiming-a-fleet).
+- **Configure Microsoft sign-in and administrators:**
+  [registration and account support](#microsoft-sign-in-registration-and-account-support),
+  [signing in remotely](#signing-in-from-somewhere-else),
+  [adding/removing administrators](#adding-and-removing-administrators), and
+  [security notes](#security-notes).
+- **Choose access and tunnel model:**
+  [tunnels and who can reach the sign-in page](#tunnels-and-who-can-reach-the-sign-in-page)
+  and [following a moved Host URL](#following-the-host-to-a-new-url).
+- **Connect or maintain machines:** [Windows Node](#windows-node-powershell),
+  [Node command-line flags](#node-command-line-flags),
+  [Node config page](#node-config-page), and
+  [keeping nodes up to date](#keeping-nodes-up-to-date).
+- **Create projects and start everyday sessions:**
+  [workspaces and placements](#first-run-walkthrough),
+  [Exact proof of concept](#exact-proof-of-concept),
+  [attachments and images](#attaching-files-and-images), and
+  [slash commands and session pickers](#slash-commands-and-session-pickers).
+- **Monitor and organize active work:**
+  [rows that fold themselves away](#rows-that-fold-themselves-away),
+  [drag ordering and filing](#ordering-and-filing-by-dragging), and
+  [alerts, sounds, and notifications](#alerts).
+- **Coordinate multi-agent work:**
+  [Orchestrator quick guide](#orchestrator-quick-guide),
+  [Runs: several sessions toward one objective](#runs-several-sessions-toward-one-objective),
+  and [Chats as a destination](#chats-as-a-destination).
+- **Recover, move, back up, or troubleshoot:**
+  [Moving a Host or Node](#moving-a-host-or-a-node-to-another-machine),
+  [recovering sessions](#recovering-sessions-after-a-restart),
+  [Diagnostics](#diagnostics-and-troubleshooting), and
+  [local verification](#local-verification-and-test-monitoring).
+
 ## Requirements
 
-- Node.js 22.5 or newer and npm 10 or newer
-- GitHub Copilot CLI 1.0.69 or newer installed and authenticated on each real Node
-- An absolute local path for every workspace placement
+- [Node.js](https://nodejs.org/en/download) 22.5 or newer, npm 10 or newer, and Git
+- [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli)
+  1.0.69 or newer installed and authenticated on each real Node, with Copilot
+  access permitted by your subscription and organization
+- An existing absolute local directory for every workspace placement on the Node
+  that will run it
 - An approved publisher- or operator-owned Microsoft app registration for Host
   sign-in; see [registration and account support](#microsoft-sign-in-registration-and-account-support)
+- Optional but recommended for multi-machine access: Microsoft Dev Tunnels
+  (`devtunnel`) signed in on the Host and, for private tunnels, on each remote
+  Node that will dial through it
 
-## Mac/Linux Host
+## Set up the Host (Windows, macOS, Linux)
+
+The Host can run on Windows, macOS, or Linux. A Node may be the same machine as
+the Host or a separate machine; the Node is the side that owns working
+directories and Copilot authentication.
+
+Clone the intended private repository with an account that can read it:
 
 ```bash
-git clone <repository-url> copilot-fleet
+git clone https://github.com/charlesyin_microsoft/copilot-fleet.git
 cd copilot-fleet
 npm install
+```
+
+Create a local `.env` if one is not already present:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+```bash
 cp .env.example .env
 ```
 
-Start development mode:
+For a first Host-only run, build the shared protocol, then start the API and UI:
 
 ```bash
-npm run dev
+npm run build -w @fleet/protocol
+npm run host
 ```
 
-This single command runs the Fastify API on `http://127.0.0.1:8787`, Vite on
-`http://127.0.0.1:5173`, and the local Node service. The Node reads its
-`FLEET_*` settings from `.env`.
+The protocol build is required after a clean install: `npm run host` does not
+build that workspace for you. By default, the API listens on
+`http://127.0.0.1:8787` and Vite serves the UI on `http://localhost:5173`.
+Use the Vite URL while developing. If you change `PORT` in `.env`, use that
+API port in the configuration and examples below.
+
+Follow the [walkthrough](#first-run-walkthrough) to claim the Host and enroll
+your first Node. Once a local Node is enrolled and Copilot CLI is signed in,
+`npm run dev` starts Host, UI, and that Node together. Starting a Node process
+alone does not enroll it. The Node reads initial `FLEET_*` settings from `.env`,
+then persists editable settings in its own `settings.json`.
+Choose one launch mode at a time: stop the existing Host/Node processes before
+switching to a combined development command or a production launch.
 
 A fresh Host has no password and no administrator. It prints a one-time claim
 code to its own console and admits to nothing else until somebody uses it:
@@ -66,10 +137,12 @@ It expires in 30 minutes and is printed only here.
 ```
 
 See [First run: claiming a Fleet](#first-run-claiming-a-fleet) for the two
-proofs a claim takes and how to register the Entra app it needs.
+proofs a claim takes and how to register the Entra app it needs. A normal fresh
+public sign-in needs a registered public client/config supplied by the operator
+or publisher; this repository does not bundle a working public default.
 
-To keep a tunnel URL stable while you edit code, start the tunnel as its own
-process instead:
+After enrolling a local Node, use the combined development command below to
+keep the tunnel in a separate process while editing:
 
 ```bash
 npm run dev:tunnel
@@ -79,24 +152,170 @@ The tunnel then survives `tsx watch` reloads, so the public URL stops rotating
 every time the Host restarts and remote nodes stay connected. The Host detects
 it and leaves its lifecycle alone; the Settings toggle is disabled while it
 runs. Stop everything with Ctrl+C as usual.
+For a Host-only development setup, keep `npm run host` running and use
+`npm run tunnel` in a second terminal instead; it does not start a Node.
 
 Open the UI → **Settings**:
 
-- **General** — session defaults, plus export/import to move this Host.
+- **General** — session defaults, the **Take the tour** button, and data export/import.
 - **Security** — administrators, invitations, Microsoft sign-in configuration,
-  password migration, the Host fingerprint, Node key migration, and this Host's
-  security audit.
-- **Tunnel** — run Dev Tunnels, Cloudflare, Tailscale Funnel, ngrok, or bore;
-  each installed provider has its own switch and status.
-- **Nodes** — rename/delete machines and mint a one-time connect command.
-- **Workspaces** — map projects to per-machine paths.
+  password migration, the Host fingerprint, Node key migration, portable Host
+  backup/restore, and this Host's security audit.
+- **Tunnel** — manage Dev Tunnels, Cloudflare, Tailscale Funnel, or ngrok.
+  Plain-HTTP providers such as bore are shown but cannot be enabled for the
+  operator console.
+- **Nodes** — rename/delete machines, see update status, and mint a one-time
+  connect command.
+- **Workspaces** — create logical projects and map them to per-machine paths.
+- **Diagnostics** — read Host warnings and errors captured since the Host started.
+
+Settings sections keep their state after you visit them, so switching tabs does
+not wipe an in-progress form. Static warnings, such as YOLO risk, stay inline on
+their card instead of appearing as transient toasts. On narrow screens the
+Settings tab strip scrolls, so every section remains reachable down to a phone
+viewport.
 
 ![Settings → Workspaces & placements: three workspaces, each mapped to an absolute path on the machines that hold it.](docs/screenshots/workspaces.png)
 
 A workspace is logical; a placement is the physical `(workspace, node) → path`
 pair. The same project can sit at a different absolute path on every machine, and
 a session is always started from a stored placement — never from a path typed
-into a request.
+into a request. Adding a placement records an existing directory on that Node; it
+does not clone a repository or create the directory for you.
+
+Connected nodes are told when the Host's public URL changes, so a rotated tunnel
+does not strand them — see
+[Following the Host to a new URL](#following-the-host-to-a-new-url).
+
+For production (built Host + local Node together):
+
+```bash
+npm run build
+npm start
+```
+
+Or just the Host: `npm run start:host`. Open `http://127.0.0.1:8787` —
+Fastify serves the built UI.
+
+## First-run walkthrough
+
+Follow these steps in order the first time you bring up a fleet. You can do all
+of them on one Windows machine, or split Host and Node across machines.
+
+1. **Start the Host.** Complete [Host setup](#set-up-the-host-windows-macos-linux),
+   including `npm run build -w @fleet/protocol` before the first `npm run host`.
+   Alternatively, run `npm run build` then `npm run start:host` for a built Host.
+   Keep the Host console open; the claim code is printed only there and expires
+   after 30 minutes.
+2. **Claim the Host.** Open `http://localhost:5173` in development or
+   `http://localhost:8787` in production. If Fleet shows
+   **Configure Microsoft sign-in**, enter the code and select **Unlock setup**.
+   Paste an approved Microsoft Application (client) ID, choose **Work/school and
+   personal Microsoft accounts** or **One organization (fixed directory)**,
+   then **Save and continue**. If sign-in was already configured, enter the
+   code and select **Unlock claim** instead. Choose **Claim with Microsoft** and finish sign-in
+   with the account that should administer this Host. **Claiming also signs you
+   in**; on later visits, use **Sign in with Microsoft** with an authorized
+   account rather than claiming again.
+3. **Follow the teaching tour, or continue with the steps below.** The tour opens
+   after the first successful claim, not on every login. Its 10 stops highlight
+   the controls for tunnels, Nodes, workspaces, placements, sessions,
+   permissions, Orchestrator, task review, and the rest of Settings.
+   **Back** and **Next** move through the guide without changing settings or
+   starting agents. Choose **Let me do this step** to put a bubble aside while
+   you work, then **Resume tour** to continue. **Open New session** opens the
+   session form without submitting it. Close the bubble or press **Escape** to
+   skip, or choose **Finish tour** at the end. Your place survives a refresh in
+   this tab; skipping, finishing, or signing out clears it. Replay it from
+   **Settings → General → Take the tour**, without resetting or reclaiming the
+   Host. On small screens, scroll a long bubble to reach its controls.
+
+![Automatic first-claim welcome tour: a nonmodal setup bubble anchored near the Copilot Fleet brand, with Back disabled and Show me around ready.](docs/screenshots/setup-tour-welcome.png)
+
+![Setup tour while naming a workspace: the Workspaces settings tab is selected, the Create workspace form contains synthetic demo data, and the bubble offers Let me do this step plus Back and Next.](docs/screenshots/setup-tour.png)
+
+> These tour screenshots come from an isolated read-only local preview with fake
+> demo identity and data. No real credentials are shown or used.
+
+4. **Choose reachability.** For a local-only fleet, loopback is enough. For a
+   remote Node, prefer **Settings → Tunnel → Dev Tunnels**. Sign the Host machine
+   into the tunnel provider with `devtunnel user login`, then enable the
+   provider. This Microsoft sign-in belongs to the tunnel provider; it is
+   separate from Fleet's own administrator authorization.
+5. **Prepare the Node machine.** Install Node.js and Copilot CLI as the same OS
+   user that will run the Node. One installation option is:
+
+   ```bash
+   npm install -g @github/copilot
+   copilot
+   ```
+
+   At the Copilot prompt, use `/login` and complete sign-in, then exit Copilot
+   before running the Node commands. See the
+   [official installation guide](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli)
+   for WinGet/Homebrew alternatives or environments that disable npm install
+   scripts. Copilot authentication and subscription stay on the Node and are
+   separate from Host sign-in.
+   Clone this Fleet repository on the Node too, using the same clone command
+   from [Host setup](#set-up-the-host-windows-macos-linux), or reuse the checkout
+   if Host and Node share a machine.
+
+6. **Connect the Node.** In **Settings → Nodes**, choose **Generate a connect
+   command**. Your existing Microsoft administrator session is enough; you do
+   not need to sign in again. Copy the command to the Node and run it from a
+   Fleet checkout. The one-time grant expires after 15 minutes, authorizes
+   exactly one Node key, and pins the Host ID/fingerprint. For a private Dev Tunnel, first run
+   `devtunnel user login` on that Node too; the connect command will use
+   `--devtunnel=<id>` instead of making the Node answer a browser login.
+7. **Add a workspace.** In **Settings → Workspaces**, use **Create workspace**
+   to name the logical project, for example `checkout-service`. This only creates
+   Fleet metadata.
+8. **Add a placement.** Still under **Workspaces & placements**, use
+   **Add placement** to choose the workspace, an online Node, and an absolute
+   local path that already exists on that Node, such as `C:\code\checkout-service`
+   or `/srv/checkout-service`.
+9. **Start a session.** Choose **New session**, pick **Where to run**, optionally
+   set **Session name**, write the **Initial prompt**, and decide whether **YOLO
+   mode** should ask before each tool or run with `--allow-all`. Keep YOLO off
+   while learning. The session card streams live output; open it to send
+   follow-ups, paste or attach images/files, cancel a turn, stop the process,
+   rename the session, or change the agent-reported **Model**, **Mode**, and
+   **Reasoning Effort** pickers where available.
+10. **Use Orchestrator for multi-agent work.** Open **Orchestrator**, choose
+    **Start orchestrator** once an online Node holds a workspace, then either
+    talk in its **Conversation** or choose **New task**. Give a clear objective,
+    select the workspace, and let the lead plan phases, dispatch worker sessions,
+    and report back. Use **Stages**, **List**, or **Dependency** views to watch
+    parallel work, open worker transcripts, handle permission prompts, and review
+    tasks. When a task is **Ready for you**, choose **Approve** or **Send back**;
+    later you can **Archive**, **Reopen**, **Delete**, **Stop orchestrator**,
+    **Resume orchestrator**, or **Dismiss orchestrator** as appropriate.
+
+### Diagnostics and troubleshooting
+
+- **No setup appears / Microsoft sign-in fails:** confirm the Host has an
+  approved public-client registration, uses the Host API port in the native
+  redirect, and is opened as `localhost` for authorization-code sign-in. Remote
+  browsers need a local forward or verified device sign-in.
+- **Claim code expired or setup timed out:** restart an unclaimed Host for a new
+  console code. If setup authorization expires, use **Unlock setup again**; do
+  not delete the database just to retry.
+- **Connect command button fails:** use an authorized Microsoft administrator
+  account, not the legacy shared password. If your session has expired, sign
+  in again. A valid session does not need recent reauthentication for this
+  action; the browser handles its request protection automatically.
+- **Node cannot reach a private Dev Tunnel:** sign the Node machine into the
+  tunnel provider with `devtunnel user login`; that is not the same credential as
+  Fleet administrator sign-in or Copilot CLI login.
+- **Node is online but sessions cannot start:** add a placement on that Node and
+  make sure the path is absolute, exists on the Node, and is a directory.
+- **Agent waits forever or reports auth problems:** update Copilot CLI to at
+  least 1.0.69 and run `copilot login` as the Node's service user.
+- **Something needs attention:** use the notification bell, the amber
+  Orchestrator/task state, the permission banner in the session, and
+  **Settings → Diagnostics** for Host warnings/errors. The Node's own
+  `http://127.0.0.1:8788` config page shows Node-side logs when you can reach
+  that machine.
 
 ## First run: claiming a Fleet
 
@@ -458,20 +677,6 @@ to `Chats (2)` so the reserved name is free.
 
 An orchestrator can use it too — see
 [Chats as a destination](#chats-as-a-destination).
-
-Connected nodes are told when the Host's public URL changes, so a rotated tunnel
-does not strand them — see
-[Following the Host to a new URL](#following-the-host-to-a-new-url).
-
-For production (built Host + local Node together):
-
-```bash
-npm run build
-npm start
-```
-
-Or just the Host: `npm run start:host`. Open `http://127.0.0.1:8787` —
-Fastify serves the built UI.
 
 ## Windows Node (PowerShell)
 
@@ -939,10 +1144,10 @@ its own child, and the successor found the lock taken and exited — which looke
 like a terminal flashing open and vanishing, with the node coming back only by
 the watcher's accident.
 
-`npm run dev:watch` still runs the node under `tsx watch` for iterating on node
-code. Do not use it for a machine you rely on: **a watcher does not restart a
-child that exits**, so an update under one leaves the machine with nothing
-running.
+`npm run dev:watch -w @fleet/node` still runs the node under `tsx watch` for
+iterating on node code. Do not use it for a machine you rely on: **a watcher does
+not restart a child that exits**, so an update under one leaves the machine with
+nothing running.
 
 The supervisor restarts on status 75 and nothing else — a node that crashes
 exits with the code it crashed with, so a broken build is visible instead of
@@ -1067,6 +1272,45 @@ so the session lands back on `idle` ready for a follow-up; **stop** ends the
 process and is terminal. And `failed` is not one thing: a session that reached
 the agent keeps its agent session id and is offered as **resumable**, while one
 that never got that far is simply over.
+
+### Orchestrator quick guide
+
+Use **Orchestrator** when one lead should coordinate several Fleet sessions.
+It is still a normal session on a Node, but the Host gives it scoped tools for
+planning tasks, dispatching workers, waking itself after worker results, and
+recording the handoff for you to review.
+
+1. Open **Orchestrator** in the sidebar and choose **Start orchestrator**. The
+   button is enabled only when an online Node holds at least one workspace.
+   The lead starts on one reachable placement, runs unattended so it can wake
+   itself, and is instructed not to write code itself.
+2. Start work either by talking in **Conversation** or by pressing **New task**.
+   The dialog records **What should be done?**, **Workspace**, and optional
+   **Name**; the objective is what the lead uses to plan phases and success
+   criteria. The lead and workers use the workspace's placements, while a task
+   that is pure research can target [Chats](#chats-as-a-destination).
+3. Watch work in the top-bar task views: **Stages** groups tasks as Planning,
+   In progress, Validation, and Done; **List** compares tasks in rows; and
+   **Dependency** shows how dispatched worker steps relate. Counts in the header
+   show all tasks, running tasks, and tasks that **need you**.
+4. Open a task to see **Phases**, **What done means**, **What happened**, and
+   **Dispatched work**. Worker links open the exact session transcript, so you
+   can inspect output, permission prompts, and files changed on that Node.
+5. When a task is **Ready for you**, read the latest handoff and choose
+   **Approve** or **Send back** with instructions. Approval completes the task;
+   sending it back wakes the lead with your note and keeps the existing phases,
+   criteria, notes, and worker history.
+6. Use lifecycle controls deliberately. **Archive** stops live workers but keeps
+   the task record; a finished task can be **Reopen**ed with what is still
+   wanted or **Delete**d if nothing should be kept. **Stop orchestrator** stops
+   the lead and its tasks; **Resume orchestrator** reopens stopped work when its
+   sessions are resumable; **Dismiss orchestrator** hides a stopped lead without
+   deleting ordinary session history.
+
+For one-off questions that do not need a checkout, start a direct **Chats**
+session from **New session**. For shared multi-agent goals, use Orchestrator's
+lead **Conversation** and task board so the plan, workers, review, and archive
+state stay together.
 
 ### Runs: several sessions toward one objective
 
@@ -1225,10 +1469,11 @@ stops a run rather than a prompt each time.
 - Copilot is spawned directly with argument arrays, `shell: false`, and the
   selected placement as `cwd`.
 - Permissions are explicit and auditable in the UI (allow-once / deny only).
-  YOLO is off by default, on the Host and on each new session. For unattended
-  runs, set `FLEET_YOLO=1` on the Node so Copilot starts with `--allow-all`
-  (tools, paths, and URLs). Unanswered and disconnected requests still fail
-  closed when YOLO is off.
+  YOLO is off by default for new sessions. Turn it on from **Settings →
+  General** or in the **Start a session** dialog when you deliberately want the
+  Host to start Copilot with `--allow-all` (tools, paths, and URLs) for that
+  session. Unanswered and disconnected requests still fail closed when YOLO is
+  off.
 - Security-relevant decisions are recorded in a local audit kept to the newest
   10,000 rows, readable from Settings → Security. Claim codes, authorization
   codes, device codes, Microsoft tokens, Fleet cookies, invitations, enrollment

@@ -181,6 +181,7 @@ describe("device flow", () => {
       payload: {},
     });
     expect(polled.statusCode).toBe(200);
+    expect(polled.json()).toEqual({ ok: true, claimedHost: true });
     const session = [polled.headers["set-cookie"] ?? []]
       .flat()
       .map(String)
@@ -189,6 +190,22 @@ describe("device flow", () => {
 
     const status = await app.inject({ method: "GET", url: "/api/auth/status" });
     expect((status.json() as { state: string }).state).toBe("microsoft-only");
+
+    const next = await app.inject({
+      method: "POST",
+      url: "/api/auth/device/start",
+      headers: { cookie: cookies.join("; ") },
+      payload: {},
+    });
+    expect(next.statusCode).toBe(200);
+    const normalLogin = await app.inject({
+      method: "POST",
+      url: `/api/auth/device/poll/${next.json<{ flowId: string }>().flowId}`,
+      headers: { cookie: cookies.join("; ") },
+      payload: {},
+    });
+    expect(normalLogin.statusCode).toBe(200);
+    expect(normalLogin.json()).toEqual({ ok: true });
   });
 
   it("allows enrollment grants but not high-impact actions after device sign-in", async () => {

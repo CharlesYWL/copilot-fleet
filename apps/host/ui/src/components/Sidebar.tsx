@@ -488,7 +488,12 @@ export const Sidebar = ({
             onClick={() => onSelectView("orchestrator")}
           >
             <Flow20Regular aria-hidden="true" />
-            <span className={styles.orchestrationLabel}>Orchestrator</span>
+            <span
+              className={styles.orchestrationLabel}
+              data-tour="orchestrator-navigation"
+            >
+              Orchestrator
+            </span>
             {attentionCount > 0 && (
               <span
                 className={styles.attentionBadge}
@@ -899,7 +904,12 @@ export const Sidebar = ({
       </div>
 
       <div className={styles.footer}>
-        <Button appearance="primary" icon={<Add20Regular />} onClick={onNewSession}>
+        <Button
+          appearance="primary"
+          icon={<Add20Regular />}
+          onClick={onNewSession}
+          data-tour="new-session"
+        >
           New session
         </Button>
         {endedCount > 0 && (

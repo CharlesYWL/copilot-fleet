@@ -234,7 +234,7 @@ describe("password bootstrap", () => {
       expect((await configure()).statusCode).toBe(200);
       const claimed = await signIn();
       expect(claimed.statusCode).toBe(302);
-      expect(claimed.headers.location).toBe("/");
+      expect(claimed.headers.location).toBe("/?welcome=1");
 
       expect(await status()).toMatchObject({
         state: "microsoft-only",

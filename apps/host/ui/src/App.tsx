@@ -25,6 +25,8 @@ import { useNotificationDelivery } from "./hooks/useNotificationDelivery";
 import { useNotificationPreference } from "./hooks/useNotificationPreference";
 import { NotificationContext, useAppNotifications } from "./hooks/useAppNotifications";
 import { useStickyFlag } from "./hooks/useStickyFlag";
+import { useOnboardingTour } from "./hooks/useOnboardingTour";
+import type { TourStep } from "./lib/onboarding";
 import { signOut } from "./lib/auth";
 import { notificationTarget } from "./lib/notification-navigation";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
@@ -66,6 +68,7 @@ import { Sidebar } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
 import { TopBar } from "./components/TopBar";
 import { LifecycleNotificationControl } from "./components/LifecycleNotificationControl";
+import { OnboardingTour } from "./components/OnboardingTour";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
@@ -99,6 +102,10 @@ const useStyles = makeStyles({
     flexDirection: "column",
     background: tokens.colorNeutralBackground2,
     color: tokens.colorNeutralForeground1,
+    "& [data-tour-highlighted]": {
+      outline: `2px solid ${tokens.colorBrandStroke1}`,
+      outlineOffset: "4px",
+    },
   },
   body: {
     flexGrow: 1,
@@ -256,6 +263,13 @@ export function App() {
   /** The task list beside a conversation, folded away or not. */
   const [tasksOpen, setTasksOpen] = useStickyFlag("conversation.tasks", true);
   const [defaultYolo, setDefaultYolo] = useState(false);
+  const navigateTour = useCallback((step: TourStep) => {
+    setView(step.view);
+    setNavOpen(false);
+    if (step.settingsTab) setSettingsTab(step.settingsTab);
+    if (step.id === "review") setOrchestratorViewMode("stage");
+  }, []);
+  const tour = useOnboardingTour(navigateTour);
   /**
    * Unsent composer text, per session.
    *
@@ -1200,6 +1214,7 @@ export function App() {
             nodeUpdates={nodeUpdates}
             selectedTab={settingsTab}
             onSelectedTabChange={setSettingsTab}
+            onStartTour={tour.start}
           />
         </div>
 
@@ -1268,6 +1283,24 @@ export function App() {
           onOpenChange={setOrchestrationDialogOpen}
           onCreate={handleCreateRun}
         />
+        {tour.step && (
+          <OnboardingTour
+            step={tour.step}
+            index={tour.index}
+            paused={tour.paused}
+            onPage={
+              view === tour.step.view &&
+              (!tour.step.settingsTab || settingsTab === tour.step.settingsTab)
+            }
+            blocked={dialogOpen || orchestrationDialogOpen || focusOpen}
+            onNext={tour.next}
+            onBack={tour.back}
+            onDismiss={tour.dismiss}
+            onResume={tour.resume}
+            onPause={tour.pause}
+            onNewSession={() => setDialogOpen(true)}
+          />
+        )}
         <Toaster toasterId={toasterId} />
       </div>
     </CatalogProvider>
