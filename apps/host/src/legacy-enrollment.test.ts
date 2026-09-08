@@ -211,12 +211,18 @@ describe("a fresh production Host", () => {
   let app: FastifyInstance | undefined;
   let previousEnv: string | undefined;
   let previousToken: string | undefined;
+  let previousTenant: string | undefined;
+  let previousClient: string | undefined;
 
   beforeEach(() => {
     previousEnv = process.env.NODE_ENV;
     previousToken = process.env.ENROLLMENT_TOKEN;
+    previousTenant = process.env.FLEET_ENTRA_TENANT_ID;
+    previousClient = process.env.FLEET_ENTRA_CLIENT_ID;
     process.env.NODE_ENV = "production";
     delete process.env.ENROLLMENT_TOKEN;
+    delete process.env.FLEET_ENTRA_TENANT_ID;
+    delete process.env.FLEET_ENTRA_CLIENT_ID;
   });
 
   afterEach(async () => {
@@ -226,6 +232,10 @@ describe("a fresh production Host", () => {
     else process.env.NODE_ENV = previousEnv;
     if (previousToken === undefined) delete process.env.ENROLLMENT_TOKEN;
     else process.env.ENROLLMENT_TOKEN = previousToken;
+    if (previousTenant === undefined) delete process.env.FLEET_ENTRA_TENANT_ID;
+    else process.env.FLEET_ENTRA_TENANT_ID = previousTenant;
+    if (previousClient === undefined) delete process.env.FLEET_ENTRA_CLIENT_ID;
+    else process.env.FLEET_ENTRA_CLIENT_ID = previousClient;
     rmSync(scratchRoot, { recursive: true, force: true });
   });
 
@@ -236,7 +246,11 @@ describe("a fresh production Host", () => {
     await app.ready();
     const status = await app.inject({ method: "GET", url: "/api/auth/status" });
     expect(status.statusCode).toBe(200);
-    expect((status.json() as { state: string }).state).toBe("unclaimed");
+    expect(status.json()).toMatchObject({
+      state: "entra-unconfigured",
+      entraConfigured: false,
+      claimCodeRequired: true,
+    });
   });
 
   it("persists no fleet-wide enrollment token", async () => {

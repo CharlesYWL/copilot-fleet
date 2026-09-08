@@ -42,13 +42,13 @@ describe("Entra configuration", () => {
     expect(parsed.clientId).toBe(CLIENT);
   });
 
-  it("ignores a stored domain rather than pointing the Host at one", () => {
-    expect(
+  it("refuses invalid stored configuration rather than falling back to another audience", () => {
+    expect(() =>
       entraConfigFrom({
         stored: { tenantId: "contoso.com", clientId: CLIENT },
         env: { tenantId: TENANT_UPPER, clientId: CLIENT },
       }),
-    ).toEqual({ tenantId: TENANT_LOWER, clientId: CLIENT });
+    ).toThrow();
   });
 });
 

@@ -95,7 +95,7 @@ export async function buildServer(
     announceClaimCode?: (code: string) => void;
     /** Injected in tests; production builds the MSAL-backed provider. */
     entraProvider?: (config: EntraConfig) => EntraProvider;
-    /** Tests opt in explicitly; real local and production Hosts use it by default. */
+    /** Legacy pinning only; never configures a fresh Host with the borrowed client. */
     useBuiltInEntra?: boolean;
   } = {},
 ): Promise<FastifyInstance> {
@@ -162,14 +162,17 @@ export async function buildServer(
     store,
     configuredPassword: options.operatorPassword ?? process.env.FLEET_OPERATOR_PASSWORD,
     envEntra:
-      process.env.FLEET_ENTRA_TENANT_ID && process.env.FLEET_ENTRA_CLIENT_ID
+      process.env.FLEET_ENTRA_TENANT_ID !== undefined ||
+      process.env.FLEET_ENTRA_CLIENT_ID !== undefined
         ? {
-            tenantId: process.env.FLEET_ENTRA_TENANT_ID,
-            clientId: process.env.FLEET_ENTRA_CLIENT_ID,
+            tenantId: process.env.FLEET_ENTRA_TENANT_ID ?? "common",
+            clientId: process.env.FLEET_ENTRA_CLIENT_ID ?? "",
           }
-        : (options.useBuiltInEntra ?? process.env.NODE_ENV !== "test")
-          ? BUILT_IN_ENTRA_CONFIG
-          : undefined,
+        : undefined,
+    legacyEntra:
+      (options.useBuiltInEntra ?? process.env.NODE_ENV !== "test")
+        ? BUILT_IN_ENTRA_CONFIG
+        : undefined,
     announceClaimCode:
       options.announceClaimCode ??
       ((code) =>
@@ -241,9 +244,11 @@ export async function buildServer(
   });
   await app.register(authRoutes, {
     auth,
-    loopbackCallbackOrigin: `http://localhost:${listenPort}`,
     ...(process.env.npm_lifecycle_event === "dev"
-      ? { uiOrigin: "http://localhost:5173" }
+      ? {
+          uiOrigin: "http://localhost:5173",
+          loopbackCallbackOrigin: `http://localhost:${listenPort}`,
+        }
       : {}),
   });
   await app.register(systemRoutes, {

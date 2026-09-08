@@ -1693,7 +1693,7 @@ export const AuthStatusSchema = z.object({
   }),
   /** Display metadata for the signed-in administrator; never an authorization input. */
   identity: z.object({ username: z.string(), displayName: z.string() }).optional(),
-  /** The registration this Host authenticates against. Configuration, not a secret. */
+  /** `tenantId` is the authority selector: `common` or a fixed directory GUID. */
   entra: z.object({ tenantId: z.string(), clientId: z.string() }).optional(),
 });
 export type AuthStatus = z.infer<typeof AuthStatusSchema>;
@@ -1711,6 +1711,10 @@ export const authErrorCodes = [
   "not-authorized",
   "pending-approval",
   "wrong-tenant",
+  "unsupported-account",
+  "organization-policy",
+  "invalid-configuration",
+  "invalid-identity",
   "expired",
   "device-blocked",
   "endpoint-refused",

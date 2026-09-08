@@ -222,6 +222,275 @@ describe("SecurityPanel", () => {
     expect(within(card).getByText(/password sign-in is still enabled/i)).toBeTruthy();
     expect(within(card).getByText("tenant-1")).toBeTruthy();
     expect(within(card).getByText("client-1")).toBeTruthy();
+    expect(within(card).getByText("Accounts in one fixed directory")).toBeTruthy();
+    expect(within(card).getByText("Directory (tenant) ID")).toBeTruthy();
+  });
+
+  describe("Microsoft sign-in configuration", () => {
+    const clientId = "22222222-2222-4222-8222-222222222222";
+    const authorizationUrl = "https://login.microsoftonline.com/common/authorize?new";
+    const edit = async (tenantId = "common") => {
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: /change microsoft sign-in configuration/i,
+        }),
+      );
+      fireEvent.click(
+        screen.getByRole("radio", {
+          name:
+            tenantId === "common"
+              ? "Work/school and personal Microsoft accounts"
+              : "One organization (fixed directory)",
+        }),
+      );
+      if (tenantId !== "common") {
+        fireEvent.change(screen.getByLabelText(/directory \(tenant\) id/i), {
+          target: { value: tenantId },
+        });
+      }
+      fireEvent.change(screen.getByLabelText(/application \(client\) id/i), {
+        target: { value: clientId },
+      });
+      return screen.getByRole("button", {
+        name: /verify new configuration with microsoft/i,
+      }) as HTMLButtonElement;
+    };
+
+    it("shows public account support without presenting common as a directory ID", async () => {
+      host(
+        {},
+        {
+          "/api/auth/status": {
+            ...(defaults["/api/auth/status"] as object),
+            entra: { tenantId: "common", clientId },
+          },
+        },
+      );
+      show();
+
+      const card = await screen.findByRole("region", { name: /^this host$/i });
+      expect(within(card).getByText("Supported accounts")).toBeTruthy();
+      expect(
+        within(card).getByText("Work/school and personal Microsoft accounts"),
+      ).toBeTruthy();
+      expect(within(card).queryByText("Directory (tenant) ID")).toBeNull();
+      expect(within(card).queryByText("common")).toBeNull();
+
+      fireEvent.click(
+        screen.getByRole("button", { name: /change microsoft sign-in configuration/i }),
+      );
+      expect(
+        (
+          screen.getByRole("radio", {
+            name: "Work/school and personal Microsoft accounts",
+          }) as HTMLInputElement
+        ).checked,
+      ).toBe(true);
+      expect(screen.queryByLabelText(/directory \(tenant\) id/i)).toBeNull();
+    });
+
+    it("initializes the editor from an existing fixed-directory configuration", async () => {
+      host();
+      show();
+      fireEvent.click(
+        await screen.findByRole("button", {
+          name: /change microsoft sign-in configuration/i,
+        }),
+      );
+
+      expect(
+        (
+          screen.getByRole("radio", {
+            name: "One organization (fixed directory)",
+          }) as HTMLInputElement
+        ).checked,
+      ).toBe(true);
+      expect(
+        (screen.getByLabelText(/directory \(tenant\) id/i) as HTMLInputElement).value,
+      ).toBe("tenant-1");
+      expect(
+        (screen.getByLabelText(/application \(client\) id/i) as HTMLInputElement).value,
+      ).toBe("client-1");
+      expect(screen.getByText(/current configuration stays active/i)).toBeTruthy();
+      expect(
+        screen.getByText(/successful switch signs out other sessions/i),
+      ).toBeTruthy();
+      expect(
+        screen.getByText(/narrowing to a fixed directory can prevent administrators/i),
+      ).toBeTruthy();
+      expect(screen.getByText(/never merges accounts by email/i)).toBeTruthy();
+    });
+
+    it.each(["common", "11111111-1111-4111-8111-111111111111"])(
+      "starts a verified switch to %s with CSRF and follows the returned URL",
+      async (tenantId) => {
+        const fetchMock = host({
+          "POST /api/auth/configuration/start": () => answer({ authorizationUrl }),
+        });
+        show();
+
+        const submit = await edit(tenantId);
+        fireEvent.click(submit);
+        expect(submit.disabled).toBe(true);
+        fireEvent.click(submit);
+        await waitFor(() =>
+          expect(browserNavigation.assign).toHaveBeenCalledExactlyOnceWith(
+            authorizationUrl,
+          ),
+        );
+        const starts = fetchMock.mock.calls.filter(
+          ([url]) => String(url) === "/api/auth/configuration/start",
+        );
+        expect(starts).toHaveLength(1);
+        const request = starts[0]?.[1];
+        expect(request?.method).toBe("POST");
+        expect(JSON.parse(String(request?.body))).toEqual({ tenantId, clientId });
+        expect(new Headers(request?.headers).get("x-csrf-token")).toBe("proof");
+        expect(new Headers(request?.headers).get("content-type")).toBe(
+          "application/json",
+        );
+        expect(
+          fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/configure"),
+        ).toBe(false);
+        const current = screen.getByRole("region", { name: /^this host$/i });
+        expect(within(current).getByText("tenant-1")).toBeTruthy();
+        expect(within(current).getByText("client-1")).toBeTruthy();
+      },
+    );
+
+    it("cancels an unsent change without changing the current configuration", async () => {
+      const fetchMock = host();
+      show();
+      await edit();
+      fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+
+      expect(
+        screen.queryByRole("button", { name: /verify new configuration/i }),
+      ).toBeNull();
+      expect(
+        fetchMock.mock.calls.some(([url]) =>
+          String(url).includes("/api/auth/configuration/start"),
+        ),
+      ).toBe(false);
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+      fireEvent.click(
+        screen.getByRole("button", { name: /change microsoft sign-in configuration/i }),
+      );
+      expect(
+        (screen.getByLabelText(/application \(client\) id/i) as HTMLInputElement).value,
+      ).toBe("client-1");
+    });
+
+    it.each([
+      {
+        name: "a refused configuration",
+        response: () => answer({ error: "That registration is not allowed." }, 400),
+        message: /that registration is not allowed/i,
+      },
+      {
+        name: "a rejected CSRF proof",
+        response: () => answer({ error: "CSRF proof was refused." }, 403),
+        message: /csrf proof was refused/i,
+      },
+      {
+        name: "a non-JSON response",
+        response: () => new Response("Unavailable", { status: 503 }),
+        message: /503/,
+      },
+      {
+        name: "a missing verification URL",
+        response: () => answer({ ok: true }),
+        message: /host returned no microsoft verification url/i,
+      },
+    ])("reports $name without navigating and permits retry", async (test) => {
+      let refused = true;
+      host({
+        "POST /api/auth/configuration/start": () =>
+          refused ? test.response() : answer({ authorizationUrl }),
+      });
+      const notify = vi.fn();
+      show(notify);
+      const submit = await edit();
+      fireEvent.click(submit);
+
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByText(test.message)).toBeTruthy();
+      expect(notify).toHaveBeenCalledWith(expect.stringMatching(test.message), "error");
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+      expect(submit.disabled).toBe(false);
+      fireEvent.click(within(dialog).getByRole("button", { name: /^close$/i }));
+      expect(
+        (screen.getByLabelText(/application \(client\) id/i) as HTMLInputElement).value,
+      ).toBe(clientId);
+      expect(
+        within(screen.getByRole("region", { name: /^this host$/i })).getByText(
+          "client-1",
+        ),
+      ).toBeTruthy();
+
+      refused = false;
+      fireEvent.click(submit);
+      await waitFor(() =>
+        expect(browserNavigation.assign).toHaveBeenCalledWith(authorizationUrl),
+      );
+    });
+
+    it("does not start a change when the CSRF token cannot be loaded", async () => {
+      const fetchMock = host({
+        "GET /api/auth/csrf": () => answer({}, 503),
+      });
+      show();
+      fireEvent.click(await edit());
+
+      const dialog = await screen.findByRole("dialog");
+      expect(within(dialog).getByText(/could not load csrf token/i)).toBeTruthy();
+      expect(
+        fetchMock.mock.calls.some(([url]) =>
+          String(url).includes("/api/auth/configuration/start"),
+        ),
+      ).toBe(false);
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+    });
+
+    it("uses the existing recent-authentication prompt before retrying a change", async () => {
+      const fetchMock = host({
+        "POST /api/auth/configuration/start": () =>
+          answer(
+            {
+              error: "Confirm your current administrator account.",
+              reauthRequired: true,
+            },
+            403,
+          ),
+        "POST /api/auth/code/start": () =>
+          answer({ authorizationUrl: "https://login.microsoftonline.com/current" }),
+      });
+      const notify = vi.fn();
+      show(notify);
+      fireEvent.click(await edit());
+
+      const dialog = await screen.findByRole("dialog", { name: /confirm.*microsoft/i });
+      expect(notify).toHaveBeenCalledWith(
+        "Confirm your current administrator account.",
+        "warning",
+      );
+      expect(
+        within(dialog).getByText(/return to settings.*retry the action/i),
+      ).toBeTruthy();
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+      fireEvent.click(
+        await screen.findByRole("button", { name: /confirm with microsoft/i }),
+      );
+      await waitFor(() =>
+        expect(browserNavigation.assign).toHaveBeenCalledWith(
+          "https://login.microsoftonline.com/current",
+        ),
+      );
+      const reauth = fetchMock.mock.calls.find(
+        ([url]) => String(url) === "/api/auth/code/start",
+      );
+      expect(JSON.parse(String(reauth?.[1]?.body))).toEqual({});
+    });
   });
 
   it("shows the Host fingerprint a Node is asked to pin", async () => {

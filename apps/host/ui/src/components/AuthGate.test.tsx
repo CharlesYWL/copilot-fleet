@@ -6,6 +6,9 @@ import { announceSignedOut, browserNavigation } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import markUrl from "../assets/copilot-fleet-mark.svg";
 
+const tenantId = "11111111-1111-4111-8111-111111111111";
+const clientId = "22222222-2222-4222-8222-222222222222";
+
 const show = () =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
@@ -126,7 +129,7 @@ describe("AuthGate", () => {
       claimCodeRequired: true,
     } as const;
 
-    it("asks for the console code before it will take a tenant", async () => {
+    it("asks for the console code before it will take a registration", async () => {
       host({}, fresh);
       show();
 
@@ -137,9 +140,11 @@ describe("AuthGate", () => {
       // Printed once on a console and never echoed back.
       expect(code.getAttribute("type")).toBe("password");
       expect(screen.queryByLabelText(/directory \(tenant\) id/i)).toBeNull();
+      expect(screen.queryByLabelText(/application \(client\) id/i)).toBeNull();
+      expect(screen.getByText(/no approved fleet client id is bundled/i)).toBeTruthy();
     });
 
-    it("takes the tenant and client id once the code is accepted", async () => {
+    it("defaults to public accounts and submits common with only a client ID", async () => {
       const fetchMock = host(
         {
           "/api/auth/bootstrap": () =>
@@ -155,10 +160,17 @@ describe("AuthGate", () => {
       });
       fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
 
-      const tenant = await screen.findByLabelText(/directory \(tenant\) id/i);
-      fireEvent.change(tenant, { target: { value: "tenant-guid" } });
-      fireEvent.change(screen.getByLabelText(/application \(client\) id/i), {
-        target: { value: "client-guid" },
+      const client = await screen.findByLabelText(/application \(client\) id/i);
+      expect(
+        (
+          screen.getByRole("radio", {
+            name: "Work/school and personal Microsoft accounts",
+          }) as HTMLInputElement
+        ).checked,
+      ).toBe(true);
+      expect(screen.queryByLabelText(/directory \(tenant\) id/i)).toBeNull();
+      fireEvent.change(client, {
+        target: { value: ` ${clientId} ` },
       });
       fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
 
@@ -167,9 +179,51 @@ describe("AuthGate", () => {
           String(url).includes("/api/auth/configure"),
         );
         expect(JSON.parse(String(call?.[1]?.body))).toEqual({
-          tenantId: "tenant-guid",
-          clientId: "client-guid",
+          tenantId: "common",
+          clientId,
         });
+      });
+    });
+
+    it("requires valid GUIDs when a fixed directory is explicitly selected", async () => {
+      const fetchMock = host(
+        {
+          "/api/auth/bootstrap": () => answer({ ok: true }),
+          "/api/auth/configure": () => answer({ ok: true }),
+        },
+        fresh,
+      );
+      show();
+      fireEvent.change(await screen.findByLabelText(/claim code/i), {
+        target: { value: "console-code" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
+
+      const client = await screen.findByLabelText(/application \(client\) id/i);
+      const save = screen.getByRole("button", {
+        name: /save and continue/i,
+      }) as HTMLButtonElement;
+      expect(save.disabled).toBe(true);
+      fireEvent.change(client, { target: { value: "not-a-client-guid" } });
+      expect(screen.getByText(/enter a valid application/i)).toBeTruthy();
+      expect(save.disabled).toBe(true);
+      fireEvent.change(client, { target: { value: clientId } });
+      fireEvent.click(
+        screen.getByRole("radio", { name: "One organization (fixed directory)" }),
+      );
+      const tenant = screen.getByLabelText(/directory \(tenant\) id/i);
+      expect(save.disabled).toBe(true);
+      fireEvent.change(tenant, { target: { value: "example.com" } });
+      expect(screen.getByText(/enter a valid directory guid/i)).toBeTruthy();
+      expect(save.disabled).toBe(true);
+      fireEvent.change(tenant, { target: { value: tenantId } });
+      fireEvent.click(save);
+
+      await waitFor(() => {
+        const call = fetchMock.mock.calls.find(([url]) =>
+          String(url).includes("/api/auth/configure"),
+        );
+        expect(JSON.parse(String(call?.[1]?.body))).toEqual({ tenantId, clientId });
       });
     });
 
@@ -266,8 +320,7 @@ describe("AuthGate", () => {
       {
         path: "/api/auth/configure",
         fields: {
-          "Directory (tenant) ID": "tenant-guid",
-          "Application (client) ID": "client-guid",
+          "Application (client) ID": clientId,
         },
         action: /save and continue/i,
         fallback: "That configuration was refused (503)",
@@ -372,6 +425,10 @@ describe("AuthGate", () => {
           String(url).includes("/api/auth/code/start"),
         ),
       ).toBe(true);
+      expect(
+        screen.getByText(/supported account types depend on this host/i),
+      ).toBeTruthy();
+      expect(screen.queryByText(/this host supports work\/school/i)).toBeNull();
     });
 
     it("moves a 127.0.0.1 page to localhost before it starts a sign-in", async () => {
@@ -461,6 +518,39 @@ describe("AuthGate", () => {
       expect(screen.getByText(/that account is not authorized/i)).toBeTruthy();
       expect(screen.getByRole("button", { name: /try another account/i })).toBeTruthy();
     });
+
+    it.each([
+      {
+        code: "invalid-configuration",
+        message: /this host's microsoft sign-in registration is invalid or unavailable/i,
+      },
+      { code: "cancelled", message: /microsoft sign-in was cancelled/i },
+    ])(
+      "shows $code verification feedback while retaining the administrator session",
+      async ({ code, message }) => {
+        window.history.replaceState({}, "", `/?auth_error=${code}`);
+        const fetchMock = host({}, { authenticated: true });
+        show();
+
+        expect(
+          await screen.findByRole("heading", {
+            name: /microsoft sign-in could not be completed/i,
+          }),
+        ).toBeTruthy();
+        expect(
+          screen.getByText(/leaves the previous configuration in place/i),
+        ).toBeTruthy();
+        expect(screen.getByText(message)).toBeTruthy();
+        expect(screen.queryByText("console")).toBeNull();
+        expect(window.location.search).toBe("");
+        fireEvent.click(screen.getByRole("button", { name: /return to fleet/i }));
+        expect(await screen.findByText("console")).toBeTruthy();
+        expect(assign).not.toHaveBeenCalled();
+        expect(
+          fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/logout"),
+        ).toBe(false);
+      },
+    );
 
     it("says an invitation is waiting on an administrator, not that it failed", async () => {
       window.history.replaceState({}, "", "/?auth_error=pending-approval");
@@ -591,6 +681,7 @@ describe("AuthGate", () => {
       expect(
         await screen.findByText(/only enter a code this page is showing you/i),
       ).toBeTruthy();
+      expect(screen.getByText(/your organization can still block it/i)).toBeTruthy();
     });
   });
 

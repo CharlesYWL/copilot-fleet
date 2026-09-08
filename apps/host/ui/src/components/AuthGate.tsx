@@ -29,6 +29,7 @@ import { BrandMark } from "./BrandMark";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
+import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
 import { TrustRail, type TrustStage } from "./auth/TrustRail";
 import { terminal } from "../theme";
 
@@ -203,7 +204,7 @@ function viewFor(
   if (!status) return "checking";
   if (status.unreachable) return "unreachable";
   if (notice?.code === "pending-approval") return "pending";
-  if (notice && notice.code !== "cancelled") return "denied";
+  if (notice && (notice.code !== "cancelled" || status.authenticated)) return "denied";
   if (!status.canSignIn) return "endpoint-refused";
   /*
    * The migration checkpoint: signed in, and still nobody's Host.
@@ -295,6 +296,12 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
   const [configured, setConfigured] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const view = viewFor(status, notice);
+  const title =
+    view === "denied" &&
+    notice?.code !== "not-authorized" &&
+    notice?.code !== "wrong-tenant"
+      ? "Microsoft sign-in could not be completed"
+      : HEADINGS[view];
 
   useEffect(() => {
     heading.current?.focus();
@@ -316,11 +323,11 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
       <div className={styles.divider} />
 
       <h1 className={styles.heading} tabIndex={-1} ref={heading}>
-        {HEADINGS[view]}
+        {title}
       </h1>
 
       <div className={styles.liveRegion} role="status" aria-live="polite">
-        {view === "checking" ? "Checking sign-in…" : HEADINGS[view]}
+        {view === "checking" ? "Checking sign-in…" : title}
       </div>
 
       <div className={styles.body}>
@@ -341,6 +348,7 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
           <RefusedIdentity
             pending={view === "pending"}
             notice={notice}
+            authenticated={Boolean(status?.authenticated)}
             onRetry={() => {
               onDismissNotice();
               void onChanged();
@@ -422,10 +430,12 @@ function EndpointRefused() {
 function RefusedIdentity({
   pending,
   notice,
+  authenticated,
   onRetry,
 }: {
   pending: boolean;
   notice: AuthErrorNotice | undefined;
+  authenticated: boolean;
   onRetry: () => void;
 }) {
   const styles = useStyles();
@@ -434,18 +444,22 @@ function RefusedIdentity({
       <MessageBar intent={pending ? "info" : "error"}>
         <MessageBarBody>
           {notice?.message ??
-            (pending
-              ? "Your request was recorded. An existing administrator has to approve it before you can sign in."
-              : "That account is not authorized to use this Fleet.")}
+            (notice?.code === "cancelled"
+              ? "Microsoft sign-in was cancelled."
+              : pending
+                ? "Your request was recorded. An existing administrator has to approve it before you can sign in."
+                : "That account is not authorized to use this Fleet.")}
         </MessageBarBody>
       </MessageBar>
       <Text className={styles.caption}>
         {pending
           ? "Microsoft authenticated you; this Fleet has not authorized you yet. Ask an administrator to approve the request in Settings → Security."
-          : "Signing in with Microsoft proves who you are. It does not make you an administrator of this Fleet — an existing administrator has to add you."}
+          : authenticated
+            ? "If you were changing Microsoft sign-in configuration, a failed or cancelled verification leaves the previous configuration in place. Return to Settings → Security to retry."
+            : "Signing in with Microsoft proves who you are. It does not make you an administrator of this Fleet — an existing administrator has to add you."}
       </Text>
       <Button appearance="primary" onClick={onRetry}>
-        Try another account
+        {authenticated ? "Return to Fleet" : "Try another account"}
       </Button>
     </>
   );
@@ -532,9 +546,6 @@ function EntraConfigForm({
   saved: boolean;
   onConfigured: () => void;
 }) {
-  const styles = useStyles();
-  const [tenantId, setTenantId] = useState("");
-  const [clientId, setClientId] = useState("");
   const { busy, error, submit } = useAuthForm(
     "/api/auth/configure",
     "That configuration was refused",
@@ -542,42 +553,14 @@ function EntraConfigForm({
   );
 
   return (
-    <form
-      className={styles.body}
-      onSubmit={(event) => {
-        event.preventDefault();
-        void submit({ tenantId, clientId });
-      }}
-    >
-      <Text className={styles.caption}>
-        Register a single-tenant public client in your own directory with the reply URL{" "}
-        <code>http://localhost/api/auth/entra/callback</code>. It needs no client secret
-        and no API permissions. Both values are the GUIDs Entra shows on the app&apos;s
-        overview — a tenant domain will not do, because the identities Microsoft returns
-        are stamped with the directory ID and would never match one.
-      </Text>
-      <Field label="Directory (tenant) ID">
-        <Input
-          value={tenantId}
-          autoFocus
-          placeholder="00000000-0000-0000-0000-000000000000"
-          onChange={(_event, data) => setTenantId(data.value)}
-        />
-      </Field>
-      <Field
-        label="Application (client) ID"
-        validationState={error ? "error" : "none"}
-        {...(error ? { validationMessage: error } : {})}
-      >
-        <Input value={clientId} onChange={(_event, data) => setClientId(data.value)} />
-      </Field>
-      <Button
-        type="submit"
-        appearance="primary"
-        disabled={busy || !tenantId || !clientId}
-      >
-        {busy ? "Saving…" : "Save and continue"}
-      </Button>
+    <>
+      <MicrosoftSignInForm
+        busy={busy}
+        error={error}
+        submitLabel="Save and continue"
+        busyLabel="Saving…"
+        onSubmit={submit}
+      />
       {saved && (
         <MessageBar intent="success">
           <MessageBarBody>
@@ -585,7 +568,7 @@ function EntraConfigForm({
           </MessageBarBody>
         </MessageBar>
       )}
-    </form>
+    </>
   );
 }
 
@@ -607,7 +590,9 @@ function ConfigureStep({
       <>
         <Text className={styles.caption}>
           This Host has no Microsoft sign-in configuration yet. The code on its own
-          console is what proves you are the person setting it up.
+          console is what proves you are the person setting it up. No approved Fleet
+          client ID is bundled; its publisher or operator must provide an approved
+          application registration.
         </Text>
         <ClaimCodeForm action="Unlock setup" onDone={onBootstrapped} />
       </>
@@ -813,7 +798,8 @@ function PasswordOnlySignIn({ onSignedIn }: { onSignedIn: () => Promise<void> })
       <Text className={styles.caption}>
         This Host was protected by an operator password before Microsoft sign-in was
         added. Sign in with that password once; Fleet then asks you to claim it with your
-        Microsoft account. There are no tenant or client IDs to enter.
+        Microsoft account. If no approved registration is configured, setup asks for an
+        application client ID first.
       </Text>
       <PasswordForm onSignedIn={onSignedIn} appearance="primary" />
     </>
@@ -867,6 +853,14 @@ function MicrosoftButton({
           <MessageBarBody>{error}</MessageBarBody>
         </MessageBar>
       )}
+      <Text className={styles.caption}>
+        {status?.entra?.tenantId === "common"
+          ? "This Host supports work/school and personal Microsoft accounts, including Microsoft corporate accounts where organization policy permits. "
+          : status?.entra
+            ? "This Host uses a fixed organizational directory; only accounts in that directory can authenticate. "
+            : "Supported account types depend on this Host's Microsoft sign-in registration. "}
+        Organization consent and Conditional Access still apply.
+      </Text>
       <Text className={styles.caption}>
         Fleet keeps no Microsoft token. It records only the account&apos;s directory and
         object id, and issues its own session.
@@ -1014,7 +1008,8 @@ function DeviceStep({ onSignedIn }: { onSignedIn: () => Promise<void> }) {
     <>
       <Text className={styles.caption}>
         This browser cannot reach a loopback listener, so Microsoft cannot redirect a
-        sign-in back to it. This Host has verified that its tenant permits device sign-in.
+        sign-in back to it. An administrator enabled device sign-in after one successful
+        verification. Your organization can still block it.
         {invitation
           ? " Signing in records which account turned up; an existing administrator approves that exact identity before you get access."
           : ""}

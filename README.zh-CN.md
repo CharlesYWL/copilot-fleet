@@ -27,6 +27,8 @@ Copilot Fleet 是一个自托管的控制平面，用于在多台机器上运行
 - Node.js 22.5 或更高版本，npm 10 或更高版本
 - 每台真实 Node 上都已安装并登录 GitHub Copilot CLI 1.0.69 或更高版本
 - 每个工作区放置（placement）都需要一个绝对本地路径
+- Host 登录需要发布者或运维者合法拥有并获准使用的 Microsoft 应用注册，见
+  [注册与账号范围](#microsoft-登录注册与账号范围)
 
 ## Mac/Linux 上的 Host
 
@@ -73,8 +75,8 @@ npm run dev:tunnel
 打开界面 → **Settings**：
 
 - **General** —— 会话默认值，以及用于迁移 Host 的导出/导入。
-- **Security** —— 管理员、邀请、密码迁移、Host 指纹、Node 密钥迁移，以及这台 Host 的
-  安全审计。
+- **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移，
+  以及这台 Host 的安全审计。
 - **Tunnel** —— 运行 Dev Tunnels、Cloudflare、Tailscale Funnel、ngrok 或 bore；
   每个已安装的 provider 都有自己的开关和状态。
 - **Nodes** —— 重命名/删除机器，生成一次性的连接命令。
@@ -115,38 +117,75 @@ Microsoft Entra ID 加上这台 Host 自己的管理员名单决定 —— 除�
    `(tenant id, object id)`，并签发自己的不透明会话；不会持久化任何 Microsoft 的
    access、refresh 或 ID 令牌。
 
-第一个同时给出这两样东西的账号成为唯一的管理员。同一租户里之后登录的其他人会收到明确的
-`403`，并且拿不到任何会话。
+第一个同时给出这两样东西的账号成为唯一的管理员。任何其他账号，即使来自同一租户，只要
+没有得到管理员批准，都会收到明确的 `403`，并且拿不到任何会话。
 
-### Microsoft 登录无需配置
+### Microsoft 登录：注册与账号范围
 
-Fleet 默认使用 Microsoft 公司租户，以及 KYC 本地开发所用的 Visual Studio 公共客户端。
-直接点击 **Sign in with Microsoft** 并选择账号即可；Fleet 只保存账号的 tenant/object ID，
-不会保存 Microsoft token。
+公共配置支持**任意组织目录中的工作或学校账号（包括 Microsoft 公司账号），以及个人
+Microsoft 账号**。组织的同意策略和条件访问仍可能拒绝登录；Fleet 不会绕过这些策略。
+企业配置则可以把认证范围限定在一个目录内。
 
-这个公共客户端使用 `http://localhost:<port>/` 回调，所以即使 Host 在隧道后面，登录仍从
-localhost 完成。
+**发布者或运维者必须先提供合法拥有并获准使用的应用注册。** 本仓库目前没有内置获准使用的
+Fleet 自有客户端 ID。全新安装在未提供客户端 ID 时会要求完成设置，绝不会悄悄退回借用的
+Visual Studio 客户端。如果某个发行版本已经提供了合法配置，普通使用者无需再配置自己的
+租户 —— 一次性的应用注册工作已经由发布者完成。
 
-下面两个环境变量只用于测试其他已批准的公共客户端；普通使用无需设置：
+发布者或运维者在自己合法控制的目录中完成一次注册：
+
+1. 为公共使用注册应用，支持的账号类型选为 **Accounts in any organizational directory
+   and personal Microsoft accounts**（任意组织目录中的账号和个人 Microsoft 账号）。
+2. 在 **Mobile and desktop applications**（移动和桌面应用程序）平台下注册原生/公共客户端
+   回调 `http://localhost:<port>/api/auth/entra/callback`，例如
+   `http://localhost:8787/api/auth/entra/callback`。**不要选择 Web 或 SPA**。
+   `localhost` 名称和回调路径必须匹配；原生 localhost 回调允许本地监听端口变化。
+3. 使用带 PKCE 的授权码流程，**不需要客户端机密**。Fleet 请求 `openid`、`profile` 和
+   `email`，MSAL 还会加入 `offline_access`。不需要 Graph API 访问，也不会持久化 Microsoft
+   的 access、refresh 或 ID 令牌。设备码登录是单独验证的可选功能，不是 PKCE 的前提。
+4. 维护注册的所有权、恢复安排和发布者支持信息；分发配置或迁移生产 Host 之前，先使用有权
+   使用的个人账号和组织账号验证实际登录。Fleet 配置只包含公开的客户端 ID 和 authority。
+
+公共账号配置如下；把占位符替换为获准使用的应用程序（客户端）GUID：
 
 ```bash
-FLEET_ENTRA_TENANT_ID=<目录（租户）ID>
-FLEET_ENTRA_CLIENT_ID=<应用程序（客户端）ID>
+FLEET_ENTRA_CLIENT_ID=<approved-application-client-guid>
+FLEET_ENTRA_TENANT_ID=common
 ```
 
-这两个值不是机密，但覆盖值必须对应兼容且已批准的公共客户端。
+提供客户端 ID 时，省略 `FLEET_ENTRA_TENANT_ID` 也会选择 `common`；空值或无效值会被拒绝。
+`common` 是 **authority 选择器**，绝不是管理员身份中的租户 ID。Fleet 仍以经过验证的目录
+ID 和对象 ID 标识管理员，不按邮箱合并账号。
+
+固定目录的企业部署使用目录 GUID 和兼容且获准使用的应用注册：
+
+```bash
+FLEET_ENTRA_TENANT_ID=<directory-tenant-guid>
+FLEET_ENTRA_CLIENT_ID=<approved-enterprise-application-client-guid>
+```
+
+把两个占位符替换为应用注册中的 GUID。已有的目录 GUID/客户端配置仍表示固定目录的企业
+模式。借用的 Visual Studio 客户端不能与 `common` 搭配；只改 authority 并不等于拥有了
+可供公共使用的注册。
+
+Microsoft 登录只决定谁能进入这台 Fleet Host；它与每台 Node 上的 GitHub Copilot 凭据和
+订阅、以及隧道提供者自己的认证相互独立。能用个人账号登录 Fleet，不代表这个账号已经
+取得另外两种服务的使用资格或登录状态。
 
 ### 认领本身
 
 1. 启动 Host，从控制台复制认领码。
 2. 打开 `http://localhost:8787` —— 用 `localhost`，不要用 `127.0.0.1`；写错了界面会自己
    跳转，因为注册的回调地址是按名字匹配的，事务 cookie 也跟着名字走。
-3. 输入认领码，然后点 **Sign in with Microsoft**。
+3. 输入认领码。如果出现设置页，提供获准使用的 Application (client) ID；默认的
+   **Work/school and personal Microsoft accounts** 不要求输入租户 ID。企业部署才显式选择
+   固定目录选项。然后点 **Claim with Microsoft**。
 4. 你现在是这个 Fleet 的管理员。到 **Settings → Nodes** 注册机器。
 
 ### 从别处登录
 
-主要流程是带 PKCE 的授权码加环回回调，所以远端浏览器有两个选择：
+主要流程是带 PKCE 的授权码加环回回调，所以远端浏览器有两个选择。公共账号支持**并没有**
+解决只用浏览器访问公网隧道就能完成登录的问题：回调里的 localhost 指浏览器所在的机器，
+不是远端 Host。
 
 - **把 Host 转发到自己的机器**，然后用 `http://localhost:<port>`：
 
@@ -154,18 +193,18 @@ FLEET_ENTRA_CLIENT_ID=<应用程序（客户端）ID>
   devtunnel connect <tunnel-id>
   ```
 
-  任何本地转发都可以 —— SSH `-L`、provider 自己的客户端，用你顺手的那种。这是推荐做法，
-  并且永远可用。
+  可以使用 SSH `-L` 或 provider 自己的客户端，让转发端口能到达 Host 的 localhost 回调。
+  能建立这条转发时，这是推荐做法；开发模式仍需遵循现有的 Vite UI/API 端口分离方式。
 
-- **设备码登录**，前提是你的租户允许。Microsoft 建议默认阻止设备码流，条件访问策略通常
+- **设备码登录**，前提是你的组织允许。Microsoft 建议默认阻止设备码流，条件访问策略通常
   也确实会阻止，所以 Fleet 在亲眼看到一次成功完成之前一直把它**关着**。管理员可以在
   **Settings → Security → Verify device sign-in** 里打开：这次验证不看当前开关的值，
-  只有真正完成的流程才会写入开关。租户如果阻止了这个流程，开关保持关闭并明确说明原因，
-  而不是给出一个一直转圈的登录。
+  只有真正完成的流程才会写入开关。开启只表示 Host 在一次成功验证后愿意提供这个流程，
+  不代表已确认所有组织都允许它。被拒绝的验证不会开启此功能，其他组织仍可能拒绝后续登录。
 
   设备码是唯一一种攻击者可以让**你**代他输入的凭据。只输入你眼前这个 Fleet 页面显示的
-  码。此外，移除管理员、关闭密码登录、导出可迁移备份之前，Fleet 都要求一次新的授权码
-  登录 —— 设备码登录不算数。
+  码。此外，移除管理员、关闭密码登录、更改 Microsoft 登录配置、导出可迁移备份之前，
+  Fleet 都要求一次新的授权码登录 —— 设备码登录不算数。
 
 Fleet 会话按来源区分。在 `localhost` 上签发的会话授权的是那个转发出来的界面，不会为公网
 隧道域名设置 cookie。
@@ -185,6 +224,32 @@ Fleet 不申请任何用于搜索目录的 Graph 权限，所以添加人的方�
 移除管理员会在同一个操作里吊销他持有的所有会话、关闭他打开的浏览器连接，必要时会打断
 正在传输的记录。最后一个在用的管理员不能被移除，并且移除需要最近十分钟内的授权码登录。
 
+### 更改 Microsoft 登录配置
+
+升级会保守地固定已认领 Host 之前使用的配置，包括旧版的 Microsoft 公司固定目录配置。
+单独更改环境变量不会切换已认领的 Host，也不会扩大它接受的账号范围。
+
+1. 保留控制台访问能力，记录当前客户端 ID 和目录/authority。切换前，从 **Settings →
+   Security → Move this Host** 导出带口令加密的可迁移备份。General 页的数据导出不备份
+   安全配置。妥善保护可迁移备份，把口令单独保存；不要将任何一项提交到仓库或附在 issue 中。
+2. 先在另一台全新的 Host 上测试目标注册。确认当前管理员通过新旧注册登录时，得到的是
+   **同一个 `(tenant ID, object ID)`**。来宾身份和归属目录中的身份可能不同，即使邮箱相同。
+   如果无法证明身份一致，就保留旧配置；其他身份需要显式邀请和管理员批准，不能自动迁移，
+   也不能靠修改管理员表来强行匹配。
+3. 以现有 Microsoft 管理员身份，通过 localhost 或本地转发打开 **Settings → Security →
+   Change Microsoft sign-in configuration**。选择账号范围并输入获准使用的客户端 ID，再点
+   **Verify new configuration with Microsoft**。这需要最近十分钟内的授权码登录。如果出现
+   确认提示，先在当前配置下用 Microsoft 确认身份，再返回 Security 重试。
+4. 通过目标注册使用同一个管理员账号登录。**只有成功验证身份一致之后，才会保存新配置。**
+   失败、取消或换成其他身份，都会保留旧配置。成功后会清除待完成的登录/设备事务、关闭设备
+   码登录直到重新验证、吊销旧会话，并为执行迁移的管理员签发新会话。其他管理员仍保留在
+   名单中，但新注册必须支持他们的账号。重新收窄到固定目录后，其他目录的管理员可能无法
+   再登录，即使他们的管理员记录仍然保留。Node 身份和工作区放置不变。
+
+**回滚：** 如果旧注册仍允许同一个管理员登录，就用同样的 Settings 验证流程切回去。
+改环境变量不等于回滚。保留可迁移备份和控制台访问能力；无法恢复正常登录时，遵循
+[可迁移恢复流程](#把-host-或-node-迁移到另一台机器)。不要同时运行两台使用同一恢复身份的 Host。
+
 ### 从共享密码迁移
 
 早于 Microsoft 身份的 Host 仍然可用：密码登录会一直有效，直到管理员关掉它。
@@ -193,7 +258,8 @@ Fleet 不申请任何用于搜索目录的 Graph 权限，所以添加人的方�
 
 1. 用这台 Host 已有的密码登录。因为还没有人管理它，控制台显示的是迁移检查点，而不是
    fleet 本身。
-2. **Claim with Microsoft**。你登录用的账号成为这个 Fleet 的第一个管理员；共享密码会自动
+2. 如果尚未配置获准使用的 Microsoft 应用注册，先完成设置。然后 **Claim with Microsoft**。
+   你登录用的账号成为这个 Fleet 的第一个管理员；共享密码会自动
    删除，使用它的会话会立即失效，然后控制台出现。
 
 认领后默认只允许 Microsoft 登录。确实需要两种方式的管理员可以到
@@ -619,7 +685,8 @@ npm install
 npm run host
 ```
 
-先认领它：打开 `http://localhost:8787`，输入 Host 打印的认领码，用 Microsoft 账号登录。
+先认领它：打开 `http://localhost:8787`，输入 Host 打印的认领码；如果要求设置，先提供获准
+使用的应用注册，再用 Microsoft 账号登录。
 然后从 **Settings → Nodes** 生成一条连接命令，在终端 2 运行一个确定性的、无需登录的 Node：
 
 ```bash
@@ -731,8 +798,8 @@ curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
 ## 安全说明
 
 - 网页界面和整个 `/api` 面都要求一个属于在用管理员的 Fleet 会话。会话只在 Microsoft
-  Entra ID 认证了这个人**并且**这台 Host 自己的管理员表授权了他之后才签发：来自正确租户
-  的合法账号，只要没被添加过，就会收到明确的 `403`，并且拿不到任何会话。会话是 256 位
+  Entra ID 认证了这个人**并且**这台 Host 自己的管理员表授权了他之后才签发：即使属于支持的
+  Microsoft 账号类型，只要没被添加过，就会收到明确的 `403`，并且拿不到任何会话。会话是 256 位
   不透明值，只以 SHA-256 摘要存储，`HttpOnly`/`SameSite=Strict`，在已发布的 HTTPS 端点
   上带 `Secure`，空闲 7 天、绝对 30 天过期。任何 Microsoft 的 access、refresh、ID 或设备
   令牌都不会被持久化。`/api/health` 和 `/api/auth/status` 保持不鉴权，这样探活一条隧道
@@ -743,9 +810,9 @@ curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
   的 `Host` 都不是安全依据 —— 所有隧道都转发进回环地址，它们描述的都是中继。
 - 每个会改变状态的浏览器请求都带一个从会话用 HMAC 派生出来的 `X-CSRF-Token`，因此没有
   任何按会话存储的机密可以泄露。
-- 影响面大的操作 —— 移除管理员、关闭密码登录、签发注册授权、导出可迁移备份 —— 还额外
-  要求最近十分钟内的**授权码**登录。设备码登录不算数：攻击者可以发起一个设备码流程，再
-  让管理员替他完成。
+- 影响面大的操作 —— 移除管理员、关闭密码登录、更改 Microsoft 登录配置、签发注册授权、
+  导出可迁移备份 —— 还额外要求最近十分钟内的**授权码**登录。设备码登录不算数：攻击者
+  可以发起一个设备码流程，再让管理员替他完成。
 - 移除管理员会在同一个操作里吊销他的会话并关闭他打开的浏览器连接；另有 60 秒一次的巡检，
   用在用的会话与管理员记录重新校验每个打开的连接。
 - 旧的密码登录是显式开启的，全新 Host 上默认关闭。关闭它会删除校验值并记下这个选择，

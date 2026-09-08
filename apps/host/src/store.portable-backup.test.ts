@@ -270,6 +270,38 @@ describe("version 1 data restore with key-based Nodes", () => {
  * what it carries.
  */
 describe("portable security backup", () => {
+  it("round-trips a public authority without changing administrator or Node identities", () => {
+    const source = secured(setup());
+    source.setSetting("auth.entraTenantId", "common");
+    const keyed = keyedNode(source);
+    const security = source.exportSecurityBackup();
+    const target = secured(setup());
+    target.importPortableBackup({ data: portableData(source), security });
+    expect(target.getSetting("auth.entraTenantId")).toBe("common");
+    expect(target.getSetting("auth.entraClientId")).toBe(security.auth.entraClientId);
+    expect(target.listAdministrators()[0]?.tenantId).toBe(identity("alice").tenantId);
+    expect(target.nodePublicKey(keyed.node.id)).toBe(keyed.identity.publicKey);
+    expect(target.getSetting("host.identity.privateKey")).toBe("host-private-key");
+
+    target.replaceHostBackup(foreignBackup());
+    expect(target.getSetting("auth.entraTenantId")).toBe("common");
+  });
+
+  it("rejects an invalid registration before replacing any security state", () => {
+    const source = secured(setup());
+    const security = source.exportSecurityBackup();
+    security.auth.entraTenantId = "";
+    const target = secured(setup());
+    const original = target.exportSecurityBackup();
+    expect(() =>
+      target.importPortableBackup({
+        data: portableData(source),
+        security,
+      }),
+    ).toThrow();
+    expect(target.exportSecurityBackup()).toEqual(original);
+  });
+
   it("exports the authority a Host needs in order to be itself elsewhere", () => {
     const store = secured(setup());
     const node = store.registerNode({

@@ -133,6 +133,29 @@ export async function fetchAuthStatus(): Promise<BrowserAuthStatus> {
 
 export type AuthErrorNotice = { code: AuthErrorCode; message: string | undefined };
 
+// Preserve existing callback notices; provider classifications use fixed copy so
+// neither provider details nor a crafted URL can supply their explanation.
+const AUTH_ERROR_MESSAGES: Record<AuthErrorCode, string | undefined> = {
+  "claim-required": undefined,
+  "already-claimed": undefined,
+  "not-authorized": undefined,
+  "pending-approval": undefined,
+  "wrong-tenant": undefined,
+  expired: undefined,
+  "device-blocked": undefined,
+  "endpoint-refused": undefined,
+  "provider-unavailable": undefined,
+  cancelled: undefined,
+  "unsupported-account":
+    "This Microsoft account is not supported by this Host's sign-in registration. Choose a supported account or ask the Host operator to check the registration's supported account types.",
+  "organization-policy":
+    "Your organization blocked Microsoft sign-in or requires administrator consent. Ask your organization's administrator about consent or Conditional Access; Fleet cannot bypass those policies.",
+  "invalid-configuration":
+    "This Host's Microsoft sign-in registration is invalid or unavailable. Ask the Host operator to check the client ID, supported account types and localhost redirect URI.",
+  "invalid-identity":
+    "Microsoft did not return a trusted, complete account identity. Sign-in was refused and no Fleet access was granted. Try again or contact the Host operator.",
+};
+
 /** The invitation this page was opened with, if it was opened by one. */
 export function readInvitation(): string | undefined {
   return new URLSearchParams(window.location.search).get("invitation") ?? undefined;
@@ -152,7 +175,7 @@ export function readAuthError(): AuthErrorNotice | undefined {
   url.searchParams.delete("auth_error");
   url.searchParams.delete("auth_error_message");
   window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
-  return notice;
+  return { ...notice, message: AUTH_ERROR_MESSAGES[notice.code] ?? notice.message };
 }
 
 /**

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance } from "fastify";
 import { buildServer } from "../server.js";
-import type { EntraIdentity } from "../auth/entra.js";
+import type { EntraConfig, EntraIdentity } from "../auth/entra.js";
 
 const TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 const CLIENT = "11111111-2222-3333-4444-555555555555";
@@ -28,6 +28,7 @@ describe("Microsoft identity routes", () => {
   let claimCode = "";
   /** What the injected provider will say the browser authenticated as. */
   let nextIdentity: EntraIdentity = alice;
+  let authorization: { config: EntraConfig; redirectUri: string } | undefined;
 
   const cookiesOf = (response: { headers: Record<string, unknown> }) => {
     const raw = response.headers["set-cookie"];
@@ -58,6 +59,7 @@ describe("Microsoft identity routes", () => {
   beforeEach(async () => {
     jar.clear();
     nextIdentity = alice;
+    authorization = undefined;
     app = await buildServer({
       databasePath: ":memory:",
       enrollmentToken: "test-token",
@@ -68,9 +70,11 @@ describe("Microsoft identity routes", () => {
       announceClaimCode: (code) => {
         claimCode = code;
       },
-      entraProvider: () => ({
-        authorizationUrl: async ({ state }) =>
-          `https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/authorize?state=${state}`,
+      entraProvider: (config) => ({
+        authorizationUrl: async ({ state, redirectUri }) => {
+          authorization = { config, redirectUri };
+          return `https://login.microsoftonline.com/${config.tenantId}/oauth2/v2.0/authorize?state=${state}`;
+        },
         redeemAuthorizationCode: async () => nextIdentity,
         startDeviceCode: async () => {
           throw new Error("device flow is not enabled on this Host");
@@ -137,6 +141,151 @@ describe("Microsoft identity routes", () => {
       }),
     );
   };
+
+  const csrf = async () =>
+    (
+      await app.inject({
+        method: "GET",
+        url: "/api/auth/csrf",
+        headers: { cookie: cookieHeader() },
+      })
+    ).json<{ csrfToken: string }>().csrfToken;
+
+  describe("public configuration routes", () => {
+    const publicConfig = {
+      tenantId: "common",
+      clientId: "99999999-2222-3333-4444-555555555555",
+    };
+
+    it("accepts client-only public setup after console possession", async () => {
+      await bootstrap();
+      const configured = await app.inject({
+        method: "POST",
+        url: "/api/auth/configure",
+        headers: { cookie: cookieHeader() },
+        payload: { clientId: publicConfig.clientId },
+      });
+      expect(configured.statusCode).toBe(200);
+      expect(configured.json()).toMatchObject(publicConfig);
+      await signIn();
+      expect(await status()).toMatchObject({ authenticated: true, entra: publicConfig });
+    });
+
+    it("requires an administrator and CSRF proof to start a registration switch", async () => {
+      const change = () =>
+        app.inject({
+          method: "POST",
+          url: "/api/auth/configuration/start",
+          headers: { cookie: cookieHeader() },
+          payload: publicConfig,
+        });
+      expect((await change()).statusCode).toBe(401);
+      await bootstrap();
+      await configure();
+      await signIn();
+      expect((await change()).statusCode).toBe(403);
+      expect(await status()).toMatchObject({
+        entra: { tenantId: TENANT, clientId: CLIENT },
+      });
+    });
+
+    it("switches only after the administrator returns through the new callback", async () => {
+      await bootstrap();
+      await configure();
+      await signIn();
+      const oldCookies = cookieHeader();
+      const started = await app.inject({
+        method: "POST",
+        url: "/api/auth/configuration/start",
+        headers: { cookie: cookieHeader(), "x-csrf-token": await csrf() },
+        payload: publicConfig,
+      });
+      expect(started.statusCode).toBe(200);
+      expect(authorization?.config).toEqual(publicConfig);
+      expect(await status()).toMatchObject({
+        entra: { tenantId: TENANT, clientId: CLIENT },
+      });
+      const state = new URL(
+        started.json<{ authorizationUrl: string }>().authorizationUrl,
+      ).searchParams.get("state");
+      const completed = remember(
+        await app.inject({
+          method: "GET",
+          url: `/api/auth/entra/callback?code=code&state=${state}`,
+          // SameSite=Strict does not return the old operator cookie from Microsoft.
+          headers: { cookie: `fleet_bind=${jar.get("fleet_bind")}` },
+        }),
+      );
+      expect(completed.statusCode).toBe(302);
+      expect(completed.headers.location).toBe("/");
+      expect(await status()).toMatchObject({ authenticated: true, entra: publicConfig });
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/api/snapshot",
+            headers: { cookie: oldCookies },
+          })
+        ).statusCode,
+      ).toBe(401);
+    });
+
+    it("leaves the existing registration usable after a cancelled switch", async () => {
+      await bootstrap();
+      await configure();
+      await signIn();
+      const started = await app.inject({
+        method: "POST",
+        url: "/api/auth/configuration/start",
+        headers: { cookie: cookieHeader(), "x-csrf-token": await csrf() },
+        payload: publicConfig,
+      });
+      const state = new URL(
+        started.json<{ authorizationUrl: string }>().authorizationUrl,
+      ).searchParams.get("state");
+      const cancelled = await app.inject({
+        method: "GET",
+        url: `/api/auth/entra/callback?error=access_denied&state=${state}`,
+        headers: { cookie: cookieHeader() },
+      });
+      expect(deniedAs(cancelled)).toBe("cancelled");
+      expect(await status()).toMatchObject({
+        authenticated: true,
+        entra: { tenantId: TENANT, clientId: CLIENT },
+      });
+      const replay = await app.inject({
+        method: "GET",
+        url: `/api/auth/entra/callback?code=code&state=${state}`,
+        headers: { cookie: cookieHeader() },
+      });
+      expect(deniedAs(replay)).toBe("expired");
+    });
+
+    it("uses the browser's localhost forwarding port instead of the remote listener port", async () => {
+      await bootstrap();
+      await configure();
+      const started = await app.inject({
+        method: "POST",
+        url: "/api/auth/code/start",
+        headers: { host: "localhost:9876", cookie: cookieHeader() },
+        payload: {},
+      });
+      expect(started.statusCode).toBe(200);
+      expect(authorization?.redirectUri).toBe(
+        "http://localhost:9876/api/auth/entra/callback",
+      );
+    });
+
+    it("does not put a provider account address in an audience-error redirect", async () => {
+      const response = await app.inject({
+        method: "GET",
+        url: `/api/auth/entra/callback?error=access_denied&error_description=${encodeURIComponent("AADSTS50020: user personal@example.com is not in the tenant")}`,
+      });
+      expect(deniedAs(response)).toBe("unsupported-account");
+      expect(response.headers.location).not.toContain("personal%40example.com");
+      expect(response.headers.location).not.toContain("AADSTS50020");
+    });
+  });
 
   it("prints a claim code and admits to nothing else", async () => {
     expect(claimCode.length).toBeGreaterThanOrEqual(22);

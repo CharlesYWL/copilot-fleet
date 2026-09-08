@@ -71,14 +71,24 @@ describe("classifyEntraFailure", () => {
     }
   });
 
-  it("reads a misconfigured registration as the provider being unavailable", () => {
+  it("distinguishes a misconfigured registration from a provider outage", () => {
     expect(
       failure(
         Object.assign(new Error("AADSTS700016: application not found"), {
           errorCode: "unauthorized_client",
         }),
       ),
-    ).toBeInstanceOf(EntraProviderUnavailableError);
+    ).toMatchObject({ code: "invalid-configuration" });
+  });
+
+  it.each([
+    ["AADSTS50020: personal user is not in this tenant", "unsupported-account"],
+    ["AADSTS50194: application is not configured as multi-tenant", "unsupported-account"],
+    ["AADSTS53003: conditional access refused sign-in", "organization-policy"],
+    ["AADSTS65001: admin consent required", "organization-policy"],
+    ["AADSTS90094: administrator approval required", "organization-policy"],
+  ])("names the policy or account refusal %s", (message, code) => {
+    expect(failure(new Error(message))).toMatchObject({ code });
   });
 
   /*

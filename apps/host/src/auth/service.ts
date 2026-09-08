@@ -20,8 +20,10 @@ import {
   createEntraProvider,
   entraConfigFrom,
   entraFailureText,
+  type AuthTransaction,
   type DeviceCodeStarted,
   type EntraConfig,
+  type EntraConfigInput,
   type EntraIdentity,
   type EntraProvider,
 } from "./entra.js";
@@ -70,6 +72,9 @@ export type DeviceFlowStartedResponse = {
 type DeviceFlowRecord = {
   binding: string;
   providerFlowId: string;
+  provider: EntraProvider;
+  configurationKey: string;
+  polling?: boolean;
   bootstrap: boolean;
   grantToken: string | undefined;
   /** An admin invitation being redeemed, if the login started from a link. */
@@ -119,7 +124,9 @@ export type FleetAuthOptions = {
   /** `FLEET_OPERATOR_PASSWORD`, when the operator set one. */
   configuredPassword?: string | undefined;
   /** `FLEET_ENTRA_*`, for a distribution that ships a registration. */
-  envEntra?: { tenantId: string; clientId: string } | undefined;
+  envEntra?: EntraConfigInput | undefined;
+  /** Only pins previously claimed Hosts that relied on the old packaged default. */
+  legacyEntra?: EntraConfig | undefined;
   /** Writes the claim code somewhere only console access reaches. */
   announceClaimCode: (code: string) => void;
   warn: (message: string) => void;
@@ -156,10 +163,12 @@ export class FleetAuth {
   private readonly providerFactory: (config: EntraConfig) => EntraProvider;
   private readonly onSessionsRevoked: (revoked: readonly RevokedSession[]) => void;
   private readonly onAdministratorRemoved: (administratorId: string) => void;
-  private readonly envEntra: { tenantId: string; clientId: string } | undefined;
+  private readonly envEntra: EntraConfigInput | undefined;
+  private readonly legacyEntra: EntraConfig | undefined;
   private readonly configuredPassword: string | undefined;
   private readonly deviceFlows = new Map<string, DeviceFlowRecord>();
   private providerCache: { key: string; provider: EntraProvider } | undefined;
+  private configurationGeneration = 0;
   private passwordAuth: OperatorAuth | undefined;
 
   constructor(options: FleetAuthOptions) {
@@ -168,6 +177,7 @@ export class FleetAuth {
     this.warn = options.warn;
     this.externalScheme = options.externalScheme;
     this.envEntra = options.envEntra;
+    this.legacyEntra = options.legacyEntra;
     this.configuredPassword = options.configuredPassword;
     this.onSessionsRevoked = options.onSessionsRevoked ?? (() => {});
     this.onAdministratorRemoved = options.onAdministratorRemoved ?? (() => {});
@@ -184,6 +194,7 @@ export class FleetAuth {
           deviceFlowEnabled: () => this.deviceFlowEnabled(),
         }));
 
+    this.pinLegacyEntra(options.legacyEntra);
     this.applyPasswordMode(options.configuredPassword);
     this.sessions = new OperatorSessions({
       store: this.store,
@@ -226,12 +237,72 @@ export class FleetAuth {
   }
 
   entraConfig(): EntraConfig | undefined {
-    const tenantId = this.store.getSetting(ENTRA_TENANT_SETTING);
-    const clientId = this.store.getSetting(ENTRA_CLIENT_SETTING);
     return entraConfigFrom({
-      stored: tenantId && clientId ? { tenantId, clientId } : undefined,
+      stored: this.storedEntraConfig(),
       env: this.envEntra,
     });
+  }
+
+  private storedEntraConfig(): EntraConfigInput | undefined {
+    const tenantId = this.store.getSetting(ENTRA_TENANT_SETTING);
+    const clientId = this.store.getSetting(ENTRA_CLIENT_SETTING);
+    // A half-written legacy pair is invalid, not permission to use the public default.
+    return tenantId || clientId
+      ? { tenantId: tenantId ?? "", clientId: clientId ?? "" }
+      : undefined;
+  }
+
+  private pinLegacyEntra(legacy: EntraConfig | undefined): void {
+    const stored = this.storedEntraConfig();
+    if (stored) {
+      EntraConfigSchema.parse(stored);
+      return;
+    }
+    const configured = this.envEntra ? EntraConfigSchema.parse(this.envEntra) : undefined;
+    if (!this.claimed()) return;
+    const previous = configured?.tenantId !== "common" ? (configured ?? legacy) : legacy;
+    if (configured?.tenantId === "common") {
+      if (!previous) {
+        throw new EntraProviderUnavailableError(
+          "a claimed Host must retain its previous registration before switching to public sign-in",
+        );
+      }
+      this.warn(
+        "Public Microsoft sign-in was not applied to this claimed Host. Switch registrations through Settings -> Security after signing in with the existing configuration.",
+      );
+    }
+    if (previous) {
+      this.store.writeAtomically(() => {
+        this.store.setSetting(ENTRA_TENANT_SETTING, previous.tenantId);
+        this.store.setSetting(ENTRA_CLIENT_SETTING, previous.clientId);
+      });
+    }
+  }
+
+  private configurationKey(config = this.entraConfig()): string {
+    return `${this.configurationGeneration}:${config?.tenantId ?? ""}:${config?.clientId ?? ""}`;
+  }
+
+  private configurationChanged(): AuthFailure {
+    return {
+      ok: false,
+      status: 409,
+      code: "expired",
+      error: "The Microsoft sign-in configuration changed. Start a new sign-in.",
+    };
+  }
+
+  private clearPendingAuthentication(): void {
+    this.configurationGeneration += 1;
+    this.transactions.clear();
+    for (const flowId of this.deviceFlows.keys()) this.discardDeviceFlow(flowId);
+    this.providerCache = undefined;
+  }
+
+  private saveEntra(config: EntraConfig): void {
+    this.store.setSetting(ENTRA_TENANT_SETTING, config.tenantId);
+    this.store.setSetting(ENTRA_CLIENT_SETTING, config.clientId);
+    this.store.setSetting(DEVICE_FLOW_SETTING, "0");
   }
 
   deviceFlowEnabled(): boolean {
@@ -528,9 +599,15 @@ export class FleetAuth {
   }
 
   configureEntra(input: unknown): EntraConfig {
+    if (this.claimed()) {
+      throw new EntraAuthenticationFailedError(
+        "invalid-configuration",
+        "A claimed Host must verify a configuration change from Settings -> Security.",
+      );
+    }
     const config = EntraConfigSchema.parse(input);
-    this.store.setSetting(ENTRA_TENANT_SETTING, config.tenantId);
-    this.store.setSetting(ENTRA_CLIENT_SETTING, config.clientId);
+    this.store.writeAtomically(() => this.saveEntra(config));
+    this.clearPendingAuthentication();
     this.audit({
       eventType: "entra_configuration_changed",
       actorKind: "bootstrap",
@@ -538,6 +615,55 @@ export class FleetAuth {
       detail: `tenant ${config.tenantId}`,
     });
     return config;
+  }
+
+  async startConfigurationChange(input: {
+    config: unknown;
+    session: ActiveSession;
+    binding: string;
+    host: string | undefined;
+    redirectUri: string;
+  }): Promise<{ ok: true; authorizationUrl: string } | AuthFailure> {
+    if (!this.mayIssueCredential(input.host)) return this.refuseEndpoint(input.host);
+    const session = this.sessions.inspect(input.session.tokenHash);
+    const administrator = session ? this.administratorFor(session) : undefined;
+    if (!session || !administrator || !this.requireRecentReauth(session)) {
+      return {
+        ok: false,
+        status: 403,
+        code: "not-authorized",
+        error:
+          "Sign in with your current Microsoft administrator account to confirm this change.",
+      };
+    }
+    const config = EntraConfigSchema.parse(input.config);
+    const transaction = this.transactions.start({
+      binding: input.binding,
+      bootstrap: false,
+      redirectUri: input.redirectUri,
+      configurationKey: this.configurationKey(),
+      migration: {
+        config,
+        administratorId: administrator.id,
+        sessionTokenHash: session.tokenHash,
+      },
+    });
+    try {
+      const authorizationUrl = await this.providerFactory(config).authorizationUrl({
+        redirectUri: input.redirectUri,
+        state: transaction.state,
+        nonce: transaction.nonce,
+        codeChallenge: transaction.codeChallenge,
+      });
+      if (transaction.configurationKey !== this.configurationKey()) {
+        this.transactions.consume(transaction.state);
+        return this.configurationChanged();
+      }
+      return { ok: true, authorizationUrl };
+    } catch (error) {
+      this.transactions.consume(transaction.state);
+      return this.providerFailure(error);
+    }
   }
 
   // -- Microsoft login -------------------------------------------------------
@@ -563,6 +689,7 @@ export class FleetAuth {
       grantToken: prepared.bootstrap ? input.bootstrapToken : undefined,
       invitation: input.invitation,
       redirectUri: input.redirectUri,
+      configurationKey: this.configurationKey(prepared.config),
     });
     try {
       const authorizationUrl = await this.provider(prepared.config).authorizationUrl({
@@ -571,6 +698,10 @@ export class FleetAuth {
         nonce: transaction.nonce,
         codeChallenge: transaction.codeChallenge,
       });
+      if (transaction.configurationKey !== this.configurationKey()) {
+        this.transactions.consume(transaction.state);
+        return this.configurationChanged();
+      }
       return { ok: true, authorizationUrl };
     } catch (error) {
       this.transactions.consume(transaction.state);
@@ -644,9 +775,15 @@ export class FleetAuth {
         error: "Microsoft sign-in is not configured.",
       };
     }
+    if (transaction.configurationKey !== this.configurationKey(config)) {
+      return this.configurationChanged();
+    }
     let identity: EntraIdentity;
     try {
-      identity = await this.provider(config).redeemAuthorizationCode({
+      const provider = transaction.migration
+        ? this.providerFactory(transaction.migration.config)
+        : this.provider(config);
+      identity = await provider.redeemAuthorizationCode({
         code: input.code,
         codeVerifier: transaction.codeVerifier,
         nonce: transaction.nonce,
@@ -655,12 +792,77 @@ export class FleetAuth {
     } catch (error) {
       return this.providerFailure(error);
     }
+    if (
+      transaction.configurationKey !== this.configurationKey() ||
+      transaction.expiresAt <= this.now()
+    ) {
+      return this.configurationChanged();
+    }
+    if (transaction.migration) {
+      return this.completeConfigurationChange(
+        transaction.migration,
+        identity,
+        input.host,
+      );
+    }
     return this.authorize(identity, "microsoft-code", {
       bootstrap: transaction.bootstrap,
       grantToken: transaction.grantToken,
       invitation: transaction.invitation,
       host: input.host,
     });
+  }
+
+  cancelCodeLogin(state: string | undefined, binding: string): void {
+    this.transactions.cancel(state, binding);
+  }
+
+  private completeConfigurationChange(
+    migration: NonNullable<AuthTransaction["migration"]>,
+    identity: EntraIdentity,
+    host: string | undefined,
+  ): LoginSuccess | AuthFailure {
+    const session = this.sessions.inspect(migration.sessionTokenHash);
+    const administrator = this.store.getAdministrator(migration.administratorId);
+    if (
+      !session ||
+      !this.requireRecentReauth(session) ||
+      session.administratorId !== administrator?.id ||
+      !administrator ||
+      administrator.tenantId !== identity.tenantId ||
+      administrator.objectId !== identity.objectId
+    ) {
+      return {
+        ok: false,
+        status: 403,
+        code: "not-authorized",
+        error:
+          "Sign in as the same administrator in the same directory. The existing Microsoft configuration has not changed.",
+      };
+    }
+
+    const { revoked, result } = this.store.writeAtomically(() => {
+      this.saveEntra(migration.config);
+      const revoked = this.store.revokeAllOperatorSessions();
+      this.audit({
+        eventType: "entra_configuration_changed",
+        actorKind: "administrator",
+        actorId: administrator.id,
+        outcome: "allowed",
+        detail: `authority ${migration.config.tenantId}`,
+      });
+      return {
+        revoked,
+        result: this.sessionFor(
+          administrator,
+          "microsoft-code",
+          endpointLabel(this.classify(host)),
+        ),
+      };
+    });
+    this.clearPendingAuthentication();
+    this.onSessionsRevoked(revoked);
+    return result;
   }
 
   /**
@@ -697,7 +899,16 @@ export class FleetAuth {
           error: "Enter the claim code printed on the Host console before signing in.",
         };
       }
-      const administrator = this.store.claimFirstAdministrator(identity);
+      const config = this.entraConfig();
+      const administrator = this.store.writeAtomically(() => {
+        const claimed = this.store.claimFirstAdministrator(identity);
+        // Pin env/built-in configuration in the same commit as the first owner.
+        if (claimed && config) {
+          this.store.setSetting(ENTRA_TENANT_SETTING, config.tenantId);
+          this.store.setSetting(ENTRA_CLIENT_SETTING, config.clientId);
+        }
+        return claimed;
+      });
       if (!administrator) {
         return {
           ok: false,
@@ -813,11 +1024,17 @@ export class FleetAuth {
   ): Promise<{ ok: true; flow: DeviceFlowStartedResponse } | AuthFailure> {
     const prepared = this.prepareMicrosoftLogin(input);
     if (!prepared.ok) return prepared;
+    const provider = this.provider(prepared.config);
+    const configurationKey = this.configurationKey(prepared.config);
     let started: DeviceCodeStarted;
     try {
-      started = await this.provider(prepared.config).startDeviceCode();
+      started = await provider.startDeviceCode();
     } catch (error) {
       return this.providerFailure(error);
+    }
+    if (configurationKey !== this.configurationKey()) {
+      provider.cancelDeviceCode({ flowId: started.flowId });
+      return this.configurationChanged();
     }
     return {
       ok: true,
@@ -826,6 +1043,8 @@ export class FleetAuth {
         bootstrap: prepared.bootstrap,
         grantToken: prepared.bootstrap ? input.bootstrapToken : undefined,
         invitation: input.invitation,
+        provider,
+        configurationKey,
       }),
     };
   }
@@ -843,6 +1062,7 @@ export class FleetAuth {
       // so redeeming one for a session would be exactly the bypass the gate is
       // there to prevent.
       flow.verifying ||
+      flow.polling ||
       flow.binding !== input.binding ||
       flow.expiresAt <= this.now()
     ) {
@@ -855,18 +1075,14 @@ export class FleetAuth {
         error: "That sign-in is not available.",
       };
     }
-    const config = this.entraConfig();
-    if (!config) {
-      return {
-        ok: false,
-        status: 409,
-        code: "provider-unavailable",
-        error: "Microsoft sign-in is not configured.",
-      };
+    if (flow.configurationKey !== this.configurationKey()) {
+      this.discardDeviceFlow(input.flowId);
+      return this.configurationChanged();
     }
+    flow.polling = true;
     let identity: EntraIdentity;
     try {
-      identity = await this.provider(config).pollDeviceCode({
+      identity = await flow.provider.pollDeviceCode({
         flowId: flow.providerFlowId,
       });
     } catch (error) {
@@ -876,10 +1092,16 @@ export class FleetAuth {
        * provider has already discarded; leaving the provider's behind would
        * keep a loop running for a sign-in nobody is waiting for.
        */
-      this.discardDeviceFlow(input.flowId, config);
+      this.discardDeviceFlow(input.flowId);
       return this.providerFailure(error);
     }
-    this.discardDeviceFlow(input.flowId, config);
+    this.discardDeviceFlow(input.flowId);
+    if (
+      flow.configurationKey !== this.configurationKey() ||
+      flow.expiresAt <= this.now()
+    ) {
+      return this.configurationChanged();
+    }
     return this.authorize(identity, "microsoft-device", {
       bootstrap: flow.bootstrap,
       grantToken: flow.grantToken,
@@ -915,13 +1137,27 @@ export class FleetAuth {
         error: "This Host has no Microsoft sign-in configuration yet.",
       };
     }
+    if (!this.store.getAdministrator(input.administratorId)) {
+      return {
+        ok: false,
+        status: 403,
+        code: "not-authorized",
+        error: "Only a current administrator may verify device sign-in.",
+      };
+    }
+    const provider = this.provider(config);
+    const configurationKey = this.configurationKey(config);
     let started: DeviceCodeStarted;
     try {
       // The allowance is an argument to this one call, so nothing else running
       // at the same moment is affected by it.
-      started = await this.provider(config).startDeviceCode({ verification: true });
+      started = await provider.startDeviceCode({ verification: true });
     } catch (error) {
       return this.deviceUnavailable(error, input.administratorId);
+    }
+    if (configurationKey !== this.configurationKey()) {
+      provider.cancelDeviceCode({ flowId: started.flowId });
+      return this.configurationChanged();
     }
     return {
       ok: true,
@@ -932,6 +1168,8 @@ export class FleetAuth {
         invitation: undefined,
         verifying: true,
         administratorId: input.administratorId,
+        provider,
+        configurationKey,
       }),
     };
   }
@@ -953,6 +1191,7 @@ export class FleetAuth {
     const flow = this.deviceFlows.get(input.flowId);
     if (
       !flow?.verifying ||
+      flow.polling ||
       flow.binding !== input.binding ||
       // The allowance belongs to the administrator who asked the question, so
       // nobody else may spend it — not even another administrator.
@@ -966,33 +1205,35 @@ export class FleetAuth {
         error: "That verification is no longer available. Start another.",
       };
     }
-    const config = this.entraConfig();
-    if (!config) {
-      return {
-        ok: false,
-        status: 409,
-        code: "provider-unavailable",
-        error: "Microsoft sign-in is not configured.",
-      };
+    if (flow.configurationKey !== this.configurationKey()) {
+      this.discardDeviceFlow(input.flowId);
+      return this.configurationChanged();
     }
+    flow.polling = true;
     let identity: EntraIdentity;
     try {
-      identity = await this.provider(config).pollDeviceCode({
+      identity = await flow.provider.pollDeviceCode({
         flowId: flow.providerFlowId,
         options: { verification: true },
       });
     } catch (error) {
-      this.discardDeviceFlow(input.flowId, config);
+      this.discardDeviceFlow(input.flowId);
       return this.deviceUnavailable(error, input.administratorId);
     }
-    this.discardDeviceFlow(input.flowId, config);
+    this.discardDeviceFlow(input.flowId);
+    if (
+      flow.configurationKey !== this.configurationKey() ||
+      flow.expiresAt <= this.now()
+    ) {
+      return this.configurationChanged();
+    }
     // Whoever answered the code has to be an administrator of this Host, or the
     // proof is that some tenant user can sign in — which was never in doubt.
     const administrator = this.store.findAdministrator(
       identity.tenantId,
       identity.objectId,
     );
-    if (!administrator) {
+    if (!administrator || administrator.id !== input.administratorId) {
       this.audit({
         eventType: "device_flow_verification_denied",
         actorKind: "administrator",
@@ -1005,7 +1246,7 @@ export class FleetAuth {
         status: 403,
         code: "not-authorized",
         error:
-          "The account that answered that code is not an administrator of this Fleet, so device sign-in stays off.",
+          "The account that answered that code is not the administrator verifying this Fleet, so device sign-in stays off.",
       };
     }
     this.store.setSetting(DEVICE_FLOW_SETTING, "1");
@@ -1047,7 +1288,9 @@ export class FleetAuth {
       actorKind: "administrator",
       actorId: administratorId,
       outcome: "denied",
-      detail: detail.slice(0, 200),
+      detail: blocked
+        ? "organization policy refused device sign-in"
+        : "device verification failed",
     });
     if (!blocked) {
       return {
@@ -1066,7 +1309,7 @@ export class FleetAuth {
       code: "device-blocked",
       blocked: true,
       error:
-        "Conditional Access blocks device sign-in in this tenant, so it stays off. Reach this Host through a local forward and sign in with Microsoft there instead.",
+        "Organization policy blocks this device sign-in, so it stays off. Reach this Host through a local forward and sign in with Microsoft there instead.",
     };
   }
 
@@ -1104,18 +1347,11 @@ export class FleetAuth {
    * polling something that can never answer, and a loop with no record is the
    * Host asking Microsoft about a sign-in it has already forgotten.
    */
-  private discardDeviceFlow(flowId: string, config?: EntraConfig): void {
+  private discardDeviceFlow(flowId: string): void {
     const flow = this.deviceFlows.get(flowId);
     if (!flow) return;
     this.deviceFlows.delete(flowId);
-    const resolved = config ?? this.entraConfig();
-    if (!resolved) return;
-    try {
-      this.provider(resolved).cancelDeviceCode({ flowId: flow.providerFlowId });
-    } catch {
-      // Cancelling is best effort; a provider that cannot be built has no
-      // loop to stop, and this must never be why a login fails.
-    }
+    flow.provider.cancelDeviceCode({ flowId: flow.providerFlowId });
   }
 
   /** Removes the flows whose codes have died, whatever any browser is doing. */
@@ -1319,10 +1555,11 @@ export class FleetAuth {
    * a restore that only half happened.
    */
   adoptRestoredSecurity(revoked: readonly RevokedSession[]): void {
+    this.clearPendingAuthentication();
     this.sessions.adoptCsrfKey(this.csrfKey());
     this.applyPasswordMode(this.configuredPassword);
     // The Entra registration may be a different one entirely.
-    this.providerCache = undefined;
+    this.pinLegacyEntra(this.legacyEntra);
     if (this.claimed()) this.claim.clear();
     else this.claim.issue();
     this.onSessionsRevoked(revoked);

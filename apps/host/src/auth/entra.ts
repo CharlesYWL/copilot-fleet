@@ -8,54 +8,53 @@ import {
 } from "@azure/msal-node";
 import { z } from "zod";
 import type { AuthErrorCode } from "@fleet/protocol";
-
-/**
- * A tenant is named by its directory GUID, and only by its GUID.
- *
- * Entra returns the directory id in every token; it never returns the domain
- * an operator typed. Fleet compares the two, so a Host configured with
- * `contoso.com` would authenticate people correctly and then refuse every one
- * of them for belonging to "a different tenant" — a configuration that can
- * never work, accepted at the point where it is still cheap to reject.
- */
-const GUID_RE = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+import { errors, type LocalJWKSet, type RemoteJWKSet } from "jose";
+import {
+  GUID_RE,
+  MICROSOFT_AUTHORITY,
+  MicrosoftIdentityValidationError,
+  verifyMicrosoftIdentity,
+} from "./entra-token.js";
 
 const TENANT_MESSAGE =
-  "Tenant ID must be the directory (tenant) GUID from Entra, not a domain name";
+  "Use common for work/school and personal Microsoft accounts, or a directory (tenant) GUID";
 
-/**
- * The two values that identify this Host's app registration.
- *
- * Neither is a secret — a public client has none — which is why they can be
- * typed into a first-run form and stored in the clear. What they are is
- * authorisation-relevant: the tenant decides whose identities this Host will
- * even consider. Both are lower-cased on the way in, because a GUID's casing
- * carries no meaning and a case-sensitive comparison against one Entra
- * returned would fail for a reason nobody could see.
- */
-export const EntraConfigSchema = z.object({
-  tenantId: z
-    .string()
-    .trim()
-    .regex(GUID_RE, TENANT_MESSAGE)
-    .transform((value) => value.toLowerCase()),
-  clientId: z
-    .string()
-    .trim()
-    .regex(GUID_RE, "Client ID must be an application GUID")
-    .transform((value) => value.toLowerCase()),
-});
-
-export type EntraConfig = z.infer<typeof EntraConfigSchema>;
-
-/**
- * The same public client KYC uses for local development.
- *
- * It accepts a hostless localhost redirect and carries no client secret. Fleet
- * asks only for identity scopes and never keeps the Microsoft token.
- */
 export const MICROSOFT_CORP_TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 export const VISUAL_STUDIO_PUBLIC_CLIENT_ID = "aebc6443-996d-45c2-90f0-388ff96faa56";
+
+/**
+ * `tenantId` retains its wire/storage name for existing Hosts. It selects an
+ * authority, not a principal: `common` means public, a GUID means enterprise.
+ * Administrators always retain Microsoft's concrete (tid, oid) identity.
+ */
+export const EntraConfigSchema = z
+  .object({
+    tenantId: z
+      .string()
+      .trim()
+      .toLowerCase()
+      .refine((value) => value === "common" || GUID_RE.test(value), TENANT_MESSAGE)
+      .default("common"),
+    clientId: z
+      .string()
+      .trim()
+      .regex(GUID_RE, "Client ID must be an application GUID")
+      .transform((value) => value.toLowerCase()),
+  })
+  .refine(
+    (config) =>
+      config.tenantId !== "common" || config.clientId !== VISUAL_STUDIO_PUBLIC_CLIENT_ID,
+    {
+      path: ["clientId"],
+      message:
+        "Public sign-in requires your approved Fleet app registration, not the legacy Visual Studio client.",
+    },
+  );
+
+export type EntraConfig = z.infer<typeof EntraConfigSchema>;
+export type EntraConfigInput = z.input<typeof EntraConfigSchema>;
+
+/** Legacy compatibility only; never the public-account or fresh-install default. */
 export const BUILT_IN_ENTRA_CONFIG: EntraConfig = EntraConfigSchema.parse({
   tenantId: MICROSOFT_CORP_TENANT_ID,
   clientId: VISUAL_STUDIO_PUBLIC_CLIENT_ID,
@@ -114,9 +113,8 @@ export type RedeemAuthorizationCodeInput = {
  *
  * An interface rather than a direct MSAL dependency so the authorisation rules
  * around it can be tested without a tenant, and so the one place that talks
- * OAuth stays one place. Fleet never validates a token itself: signature,
- * issuer, audience, nonce, and expiry are MSAL's job, and re-implementing them
- * is how subtle acceptance bugs get written.
+ * OAuth stays one place. MSAL performs acquisition and PKCE; a supported JWT
+ * library verifies the ID token before Fleet accepts its principal.
  */
 export type EntraProvider = {
   authorizationUrl: (input: AuthorizationUrlInput) => Promise<string>;
@@ -164,6 +162,7 @@ type MsalAccount = {
 type MsalResult = {
   tenantId: string;
   uniqueId: string;
+  idToken: string;
   account: MsalAccount | null;
 };
 
@@ -245,7 +244,11 @@ const SPENT_OR_STALE =
   /invalid_grant|AADSTS(54005|70008|70000|50173|9002313)|nonce[_ ]?mismatch|state[_ ]?mismatch|invalid[_ ]?state|invalid[_ ]?nonce|invalid[_ ]?token|token.{0,20}(expired|validation)|expired[_ ]?token|authorization[_ ]?pending/i;
 
 /** The person said no, which is an answer rather than a failure. */
-const DECLINED = /access_denied|AADSTS(65004|65001)|user_cancelled|consent_required/i;
+const DECLINED = /access_denied|AADSTS65004|user_cancelled/i;
+
+const UNSUPPORTED_ACCOUNT = /AADSTS(50020|500200|500202|50194|9002332)/i;
+const ORGANIZATION_POLICY =
+  /AADSTS(53003|50199|65001|90094)|consent_required|conditional access/i;
 
 /** Nothing to talk to: DNS, TCP, TLS, proxy, or a bare fetch failure. */
 const UNREACHABLE =
@@ -253,7 +256,7 @@ const UNREACHABLE =
 
 /** A registration or tenant policy problem: nothing the operator can retry. */
 const MISCONFIGURED =
-  /unauthorized_client|invalid_client|invalid_request|AADSTS(700016|7000215|700051|900023|50011|50194|53003|50199)|conditional access|blocked|not allowed|disabled/i;
+  /unauthorized_client|invalid_client|invalid_request|AADSTS(700016|7000215|700051|900023|50011)|blocked|not allowed|disabled/i;
 
 /** Anything Microsoft numbered is Microsoft's answer, not a fault in Fleet. */
 const MICROSOFT_ORIGIN = /AADSTS\d+/i;
@@ -283,6 +286,20 @@ export function classifyEntraFailure(error: unknown): unknown {
     return error;
   }
   const text = entraFailureText(error);
+  if (UNSUPPORTED_ACCOUNT.test(text)) {
+    return new EntraAuthenticationFailedError(
+      "unsupported-account",
+      "This Microsoft app registration does not support that account. Use a registration for work/school and personal Microsoft accounts.",
+      error,
+    );
+  }
+  if (ORGANIZATION_POLICY.test(text)) {
+    return new EntraAuthenticationFailedError(
+      "organization-policy",
+      "Your organization requires approval or blocks this sign-in. Fleet cannot override its consent or Conditional Access policy.",
+      error,
+    );
+  }
   if (DECLINED.test(text)) {
     return new EntraAuthenticationFailedError(
       "cancelled",
@@ -304,8 +321,9 @@ export function classifyEntraFailure(error: unknown): unknown {
     );
   }
   if (MISCONFIGURED.test(text)) {
-    return new EntraProviderUnavailableError(
-      "Microsoft refused this Host's sign-in configuration",
+    return new EntraAuthenticationFailedError(
+      "invalid-configuration",
+      "Microsoft refused this Host's app registration or callback. Check its client ID, supported accounts, and public-client redirect URI.",
       error,
     );
   }
@@ -333,26 +351,20 @@ async function named<T>(work: Promise<T>): Promise<T> {
 }
 
 export type EntraConfigSources = {
-  stored: { tenantId: string; clientId: string } | undefined;
-  env: { tenantId: string; clientId: string } | undefined;
+  stored: EntraConfigInput | undefined;
+  env: EntraConfigInput | undefined;
 };
 
 /**
  * What an administrator saved, or failing that what the distribution shipped.
  *
  * Stored wins so that an administrator who reconfigures a Host is not silently
- * overruled by a variable left in the environment. A half-filled pair is
- * treated as no configuration at all: a client ID without a tenant cannot
- * authorise anybody, and pretending otherwise produces a login form that
- * always fails.
+ * overruled by a variable left in the environment. Invalid stored configuration
+ * must fail closed, never silently fall through to a broader public audience.
  */
 export function entraConfigFrom(sources: EntraConfigSources): EntraConfig | undefined {
-  for (const candidate of [sources.stored, sources.env]) {
-    if (!candidate) continue;
-    const parsed = EntraConfigSchema.safeParse(candidate);
-    if (parsed.success) return parsed.data;
-  }
-  return undefined;
+  const candidate = sources.stored ?? sources.env;
+  return candidate ? EntraConfigSchema.parse(candidate) : undefined;
 }
 
 /** How long a started login has to come back before it is forgotten. */
@@ -374,6 +386,14 @@ export type AuthTransaction = {
   /** An admin invitation being redeemed, if the login started from a link. */
   invitation: string | undefined;
   redirectUri: string;
+  configurationKey: string;
+  migration?:
+    | {
+        config: EntraConfig;
+        administratorId: string;
+        sessionTokenHash: string;
+      }
+    | undefined;
   expiresAt: number;
 };
 
@@ -383,6 +403,8 @@ export type StartTransactionInput = {
   grantToken?: string | undefined;
   invitation?: string | undefined;
   redirectUri?: string | undefined;
+  configurationKey?: string | undefined;
+  migration?: AuthTransaction["migration"];
 };
 
 /**
@@ -421,6 +443,8 @@ export class EntraTransactions {
       grantToken: input.grantToken,
       invitation: input.invitation,
       redirectUri: input.redirectUri ?? "",
+      configurationKey: input.configurationKey ?? "",
+      migration: input.migration,
       expiresAt: this.now() + AUTH_TRANSACTION_TTL_MS,
     };
     this.byState.set(transaction.state, transaction);
@@ -441,8 +465,17 @@ export class EntraTransactions {
     return transaction;
   }
 
+  cancel(state: string | undefined, binding: string): void {
+    if (state && this.byState.get(state)?.binding === binding) this.consume(state);
+  }
+
   size(): number {
     return this.byState.size;
+  }
+
+  clear(): void {
+    this.byState.clear();
+    this.byBinding.clear();
   }
 
   private sweep(): void {
@@ -487,9 +520,10 @@ export type EntraProviderDeps = {
  * it could not obtain, and none that downgrades to a weaker check.
  */
 export function createEntraProvider(
-  config: EntraConfig,
+  input: EntraConfig,
   deps: EntraProviderDeps = {},
 ): EntraProvider {
+  const config = EntraConfigSchema.parse(input);
   const load = deps.loadMsal ?? loadMsalNode;
   const deviceFlowEnabled = deps.deviceFlowEnabled ?? (() => false);
   let adapterPromise: Promise<MsalAdapter> | undefined;
@@ -509,17 +543,27 @@ export function createEntraProvider(
   const checkTenant = (identity: EntraIdentity): EntraIdentity => {
     // GUID casing is not meaningful, and Entra is not obliged to echo back the
     // spelling this Host was configured with.
-    if (identity.tenantId.toLowerCase() !== config.tenantId.toLowerCase()) {
+    if (!GUID_RE.test(identity.tenantId) || !identity.objectId) {
+      throw new EntraAuthenticationFailedError(
+        "invalid-identity",
+        "Microsoft returned no valid tenant or object id for that account.",
+      );
+    }
+    if (
+      config.tenantId !== "common" &&
+      identity.tenantId.toLowerCase() !== config.tenantId
+    ) {
       throw new EntraIdentityRejectedError(
         "That account belongs to a different tenant than this Host is configured for.",
       );
     }
-    if (!identity.objectId) {
-      throw new EntraIdentityRejectedError(
-        "Microsoft returned no object id for that account.",
-      );
-    }
-    return identity;
+    return {
+      ...identity,
+      tenantId: identity.tenantId.toLowerCase(),
+      objectId: GUID_RE.test(identity.objectId)
+        ? identity.objectId.toLowerCase()
+        : identity.objectId,
+    };
   };
 
   /*
@@ -617,26 +661,66 @@ type ProviderDeviceFlow = {
  * that trips it at expiry, a handler attached before anybody can await it, and
  * a place in a bounded, rate-limited map that removes it the moment it settles.
  */
-export function createMsalAdapter(_config: EntraConfig, client: MsalClient): MsalAdapter {
+export function createMsalAdapter(
+  config: EntraConfig,
+  client: MsalClient,
+  signingKeys?: LocalJWKSet | RemoteJWKSet,
+): MsalAdapter {
   const flows = new Map<string, ProviderDeviceFlow>();
   let burst = PROVIDER_DEVICE_START_BURST;
   let refilledAt = Date.now();
 
-  const identity = async (result: MsalResult | null): Promise<EntraIdentity> => {
-    if (!result) throw new Error("Microsoft returned no authentication result");
-    const objectId = result.uniqueId || result.account?.localAccountId || "";
-    if (!result.tenantId || !objectId) {
-      throw new Error("Microsoft returned no tenant or object id");
+  const identity = async (
+    result: MsalResult | null,
+    nonce?: string,
+  ): Promise<EntraIdentity> => {
+    try {
+      if (!result?.idToken) {
+        throw new MicrosoftIdentityValidationError("Microsoft returned no ID token.");
+      }
+      const resolved = await verifyMicrosoftIdentity(
+        result.idToken,
+        config,
+        nonce,
+        signingKeys,
+      );
+      if (
+        typeof result.tenantId !== "string" ||
+        typeof result.uniqueId !== "string" ||
+        result.tenantId.toLowerCase() !== resolved.tenantId ||
+        result.uniqueId.toLowerCase() !== resolved.objectId ||
+        (result.account &&
+          (typeof result.account.tenantId !== "string" ||
+            typeof result.account.localAccountId !== "string" ||
+            result.account.tenantId.toLowerCase() !== resolved.tenantId ||
+            result.account.localAccountId.toLowerCase() !== resolved.objectId))
+      ) {
+        throw new MicrosoftIdentityValidationError(
+          "Microsoft returned inconsistent identity identifiers.",
+        );
+      }
+      return resolved;
+    } catch (error) {
+      if (error instanceof errors.JWKSTimeout) {
+        throw new EntraProviderUnavailableError(
+          "Microsoft's signing keys timed out",
+          error,
+        );
+      }
+      if (
+        error instanceof errors.JOSEError ||
+        error instanceof MicrosoftIdentityValidationError
+      ) {
+        throw new EntraAuthenticationFailedError(
+          "invalid-identity",
+          "Microsoft returned an identity this Host could not validate. No access was granted.",
+          error,
+        );
+      }
+      throw error;
+    } finally {
+      if (result?.account) await client.removeAccount(result.account);
     }
-    const account = result.account;
-    const resolved = {
-      tenantId: result.tenantId,
-      objectId,
-      username: account?.username ?? "",
-      displayName: account?.name ?? "",
-    };
-    if (account) await client.removeAccount(account);
-    return resolved;
   };
 
   const forget = (flowId: string): void => {
@@ -706,7 +790,7 @@ export function createMsalAdapter(_config: EntraConfig, client: MsalClient): Msa
           codeVerifier: input.codeVerifier,
           nonce: input.nonce,
         })
-        .then(identity),
+        .then((result) => identity(result, input.nonce)),
     deviceCode: async () => {
       sweep();
       if (flows.size >= MAX_PROVIDER_DEVICE_FLOWS) {
@@ -805,7 +889,7 @@ async function loadMsalNode(config: EntraConfig): Promise<MsalAdapter> {
   const application = new PublicClientApplication({
     auth: {
       clientId: config.clientId,
-      authority: `https://login.microsoftonline.com/${config.tenantId}`,
+      authority: `${MICROSOFT_AUTHORITY}/${config.tenantId}`,
     },
   });
   return createMsalAdapter(config, {

@@ -19,7 +19,12 @@ import {
   sessionCookie,
 } from "../auth.js";
 import { BOOTSTRAP_GRANT_TTL_MS } from "../auth/claim.js";
-import { VISUAL_STUDIO_PUBLIC_CLIENT_ID } from "../auth/entra.js";
+import {
+  EntraAuthenticationFailedError,
+  EntraConfigSchema,
+  VISUAL_STUDIO_PUBLIC_CLIENT_ID,
+  classifyEntraFailure,
+} from "../auth/entra.js";
 import { OPERATOR_SESSION_ABSOLUTE_MS } from "../auth/sessions.js";
 import { MIN_OPERATOR_PASSWORD_LENGTH, type FleetAuth } from "../auth/service.js";
 import { hostnameOf } from "../request-guard.js";
@@ -28,7 +33,7 @@ import { requireAdministrator } from "./require-administrator.js";
 const LoginSchema = z.object({ password: z.string().min(1).max(512) });
 const BootstrapSchema = z.object({ code: z.string().min(1).max(256) });
 const ConfigureSchema = z.object({
-  tenantId: z.string().min(1).max(256),
+  tenantId: z.string().min(1).max(256).optional(),
   clientId: z.string().min(1).max(256),
 });
 const CodeStartSchema = z.object({
@@ -84,13 +89,13 @@ export function entraCallbackUri(
 
 function callbackUri(
   request: FastifyRequest,
-  auth: FleetAuth,
+  config: { clientId: string } | undefined,
   loopbackCallbackOrigin: string | undefined,
 ): string {
   const host = request.headers.host ?? "";
   const port = host.includes(":") ? host.slice(host.lastIndexOf(":") + 1) : "";
   return entraCallbackUri(
-    auth.entraConfig(),
+    config,
     loopbackCallbackOrigin ?? `http://localhost${port ? `:${port}` : ""}`,
   );
 }
@@ -240,6 +245,31 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     return reply.send({ ok: true, tenantId: config.tenantId, clientId: config.clientId });
   });
 
+  app.post("/api/auth/configuration/start", async (request, reply) => {
+    if (!requireAdministrator(auth, request, reply, true)) return reply;
+    const session = request.fleetSession;
+    if (!session) return reply.code(401).send({ error: "Sign in to use this Host" });
+    const endpoint = codeLoginEndpoint(request.headers.host);
+    if (!endpoint.available) return reply.code(409).send(refuseCodeLogin(endpoint));
+    const config = EntraConfigSchema.parse(ConfigureSchema.parse(request.body));
+    const browser = binding(request);
+    if (browser.fresh) {
+      reply.header(
+        "set-cookie",
+        bindingCookie(browser.id, auth.secureCookies(request.headers.host)),
+      );
+    }
+    const outcome = await auth.startConfigurationChange({
+      config,
+      session,
+      binding: browser.id,
+      host: request.headers.host,
+      redirectUri: callbackUri(request, config, loopbackCallbackOrigin),
+    });
+    if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
+    return reply.send({ authorizationUrl: outcome.authorizationUrl });
+  });
+
   app.post("/api/auth/code/start", async (request, reply) => {
     const endpoint = codeLoginEndpoint(request.headers.host);
     if (!endpoint.available) {
@@ -253,7 +283,7 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
       binding: browser.id,
       bootstrapToken: readCookie(request.headers.cookie, BOOTSTRAP_COOKIE),
       host: request.headers.host,
-      redirectUri: callbackUri(request, auth, loopbackCallbackOrigin),
+      redirectUri: callbackUri(request, auth.entraConfig(), loopbackCallbackOrigin),
       invitation: input.invitation,
     });
     if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
@@ -283,9 +313,16 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     }
     const query = request.query as Record<string, string | undefined>;
     if (query.error) {
-      // `access_denied` is the person saying no, which is not a malfunction and
-      // must not read as one. Microsoft's own description is not repeated: it
-      // is provider output, and this value lands in an address bar.
+      auth.cancelCodeLogin(
+        query.state,
+        readCookie(request.headers.cookie, BINDING_COOKIE) ?? "",
+      );
+      const named = classifyEntraFailure(
+        new Error(`${query.error} ${query.error_description ?? ""}`),
+      );
+      if (named instanceof EntraAuthenticationFailedError) {
+        return fail(named.code, named.message);
+      }
       return fail(
         query.error === "access_denied" ? "cancelled" : "provider-unavailable",
         query.error === "access_denied"

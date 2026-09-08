@@ -29,9 +29,10 @@ import {
 import { errorMessage, type AuthStatus } from "@fleet/protocol";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { api, ApiError } from "../hooks/useFleet";
-import { csrfToken, startCodeLogin } from "../lib/auth";
+import { browserNavigation, csrfToken, startCodeLogin } from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
+import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { terminal } from "../theme";
@@ -269,6 +270,7 @@ export const SecurityPanel = () => {
       </div>
 
       <IdentityCard status={data.status} enrollment={data.enrollment} />
+      <MicrosoftConfigurationCard status={data.status} run={run} />
       <PasswordCard status={data.status} run={run} />
       <DeviceFlowCard status={data.status} onChanged={load} />
       <PendingCard pending={data.pending} run={run} />
@@ -362,8 +364,21 @@ function IdentityCard({
         <Text className={styles.caption}>Authentication mode</Text>
         <Text>{AUTH_MODE_COPY[status.state]}</Text>
 
-        <Text className={styles.caption}>Directory (tenant) ID</Text>
-        <Text className={styles.mono}>{status.entra?.tenantId ?? "not configured"}</Text>
+        <Text className={styles.caption}>Supported accounts</Text>
+        <Text>
+          {!status.entra
+            ? "not configured"
+            : status.entra.tenantId === "common"
+              ? "Work/school and personal Microsoft accounts"
+              : "Accounts in one fixed directory"}
+        </Text>
+
+        {status.entra && status.entra.tenantId !== "common" && (
+          <>
+            <Text className={styles.caption}>Directory (tenant) ID</Text>
+            <Text className={styles.mono}>{status.entra.tenantId}</Text>
+          </>
+        )}
 
         <Text className={styles.caption}>Application (client) ID</Text>
         <Text className={styles.mono}>{status.entra?.clientId ?? "not configured"}</Text>
@@ -381,6 +396,90 @@ function IdentityCard({
         A Node that has pinned this fingerprint sends nothing to anything that cannot sign
         for the matching key, which is what makes a relay merely a relay.
       </Text>
+    </section>
+  );
+}
+
+function MicrosoftConfigurationCard({
+  status,
+  run,
+}: {
+  status: AuthStatus;
+  run: (work: () => Promise<unknown>) => Promise<void>;
+}) {
+  const styles = useStyles();
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const change = async (configuration: NonNullable<AuthStatus["entra"]>) => {
+    setBusy(true);
+    let navigating = false;
+    try {
+      await run(async () => {
+        const result = await api<{ authorizationUrl: string } | undefined>(
+          "/api/auth/configuration/start",
+          { method: "POST", body: JSON.stringify(configuration) },
+        );
+        if (typeof result?.authorizationUrl !== "string" || !result.authorizationUrl) {
+          throw new Error("The Host returned no Microsoft verification URL. Try again.");
+        }
+        browserNavigation.assign(result.authorizationUrl);
+        navigating = true;
+      });
+    } finally {
+      if (!navigating) setBusy(false);
+    }
+  };
+
+  return (
+    <section className={styles.card} aria-label="Microsoft sign-in configuration">
+      <Text weight="semibold">Microsoft sign-in configuration</Text>
+      <Text className={styles.caption}>
+        The current configuration stays active until you sign in through the new
+        registration as the same administrator, with the same directory and object IDs.
+        Failed or cancelled verification leaves it unchanged.
+      </Text>
+      {editing ? (
+        <>
+          <MessageBar intent="warning" layout="multiline">
+            <MessageBarBody>
+              A successful switch signs out other sessions, clears pending sign-in and
+              device transactions, and turns device sign-in off until reverified. Other
+              administrator records stay in place; narrowing to a fixed directory can
+              prevent administrators from other directories from signing in.
+            </MessageBarBody>
+          </MessageBar>
+          <Text className={styles.caption}>
+            Use this Host on localhost or through a local forward. This change requires a
+            recent Microsoft authorization-code sign-in, not a device code or shared
+            password. If prompted, confirm your current administrator account, then return
+            here and retry.
+          </Text>
+          <Text className={styles.caption}>
+            A guest account and its home account may have different identities even with
+            the same email. A different identity needs administrator approval; Fleet never
+            merges accounts by email.
+          </Text>
+          <MicrosoftSignInForm
+            configuration={status.entra}
+            busy={busy}
+            submitLabel="Verify new configuration with Microsoft"
+            busyLabel="Opening Microsoft…"
+            onSubmit={change}
+          />
+          <div className={styles.row}>
+            <Button disabled={busy} onClick={() => setEditing(false)}>
+              Cancel
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className={styles.row}>
+          <Button appearance="secondary" onClick={() => setEditing(true)}>
+            Change Microsoft sign-in configuration
+          </Button>
+        </div>
+      )}
     </section>
   );
 }
@@ -589,7 +688,9 @@ function DeviceFlowCard({
       <Text className={styles.caption}>
         The fallback for a browser that cannot reach a loopback listener. Microsoft
         recommends blocking it by default and a tenant&apos;s Conditional Access may, so
-        Fleet keeps it off until a verification has actually completed here.
+        Fleet keeps it off until a verification has actually completed here. Enabling it
+        offers the flow; it does not prove every organization permits it. Sensitive
+        changes still require a recent authorization-code sign-in.
       </Text>
       {flow ? (
         <DeviceCodePanel flow={flow} error={message} />
