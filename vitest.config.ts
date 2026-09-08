@@ -14,6 +14,7 @@ export default defineConfig({
         test: {
           name: "services",
           environment: "node",
+          setupFiles: ["apps/host/src/test-setup.ts"],
           include: [
             "apps/host/src/**/*.test.ts",
             "apps/node/src/**/*.test.ts",
