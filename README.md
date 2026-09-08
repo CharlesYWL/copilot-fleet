@@ -1247,14 +1247,42 @@ stops a run rather than a prompt each time.
 npm run dev
 npm run dev:tunnel
 npm test
+npm run test:watch
+npm run test:coverage
 npm run typecheck
 npm run build
-npm run verify   # everything CI runs, in CI's order
+npm run verify   # lint, format, types, tests, then production builds
 ```
 
-`npm run verify` is the one to run before pushing: CI also checks formatting
-(`prettier --check`), which `lint` does not cover, and a red build there has
-more than once been nothing but unformatted source.
+### Local verification and test monitoring
+
+The primary repository is
+[`charlesyin_microsoft/copilot-fleet`](https://github.com/charlesyin_microsoft/copilot-fleet).
+It is private; open it with the corporate GitHub account. Its user-owned
+managed-account hosting does not provide GitHub-hosted Actions runners, so this
+repository no longer includes a GitHub Actions workflow.
+
+Run **`npm run verify` before pushing**. It retains every validation step from
+the former CI workflow and stops with a nonzero exit code on failure. This
+includes formatting (`prettier --check`), which `lint` does not cover.
+
+For live feedback while editing, run **`npm run test:watch`** in a terminal.
+Vitest displays passing/failing tests and reruns affected tests when files change.
+The shared protocol package is rebuilt alongside it; changes to its built
+output rerun the selected tests so consumers do not keep testing stale code.
+Press **Ctrl+C** to stop both watchers. To focus on an area:
+
+```bash
+npm run test:watch -- --project=services apps/host/src/auth/public-signin.test.ts
+```
+
+For a browser-readable coverage report, run **`npm run test:coverage`** and open
+`coverage/index.html`. Coverage output is local and ignored by Git.
+
+These commands provide local monitoring, not automatic remote push/PR checks or
+a Linux runner. A hosted equivalent requires a separately configured CI system,
+such as an approved Azure DevOps pipeline, or an organization-owned Microsoft
+GitHub repository with suitable runners. No external pipeline is provisioned here.
 
 Startup is seed-free. SQLite creates its schema and empty data file on first
 launch.
