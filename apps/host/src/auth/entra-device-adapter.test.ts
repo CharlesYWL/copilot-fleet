@@ -1,4 +1,5 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair } from "jose";
 import {
   MAX_PROVIDER_DEVICE_FLOWS,
   PROVIDER_DEVICE_START_BURST,
@@ -10,6 +11,32 @@ const CONFIG = {
   tenantId: "72f988bf-86f1-41af-91ab-2d7cd011db47",
   clientId: "11111111-2222-3333-4444-555555555555",
 };
+const OBJECT = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+let idToken = "";
+let keys: ReturnType<typeof createLocalJWKSet>;
+
+beforeAll(async () => {
+  const pair = await generateKeyPair("RS256", { extractable: true });
+  const jwk = {
+    ...(await exportJWK(pair.publicKey)),
+    kid: "device-test",
+    issuer: "https://login.microsoftonline.com/{tenantid}/v2.0",
+  };
+  keys = createLocalJWKSet({ keys: [jwk] });
+  idToken = await new SignJWT({
+    tid: CONFIG.tenantId,
+    oid: OBJECT,
+    sub: "pairwise-subject",
+    ver: "2.0",
+  })
+    .setProtectedHeader({ alg: "RS256", kid: jwk.kid })
+    .setIssuer(`https://login.microsoftonline.com/${CONFIG.tenantId}/v2.0`)
+    .setAudience(CONFIG.clientId)
+    .setIssuedAt()
+    .setNotBefore("0s")
+    .setExpirationTime("1h")
+    .sign(pair.privateKey);
+});
 
 type Pending = {
   request: { cancel?: boolean };
@@ -30,7 +57,8 @@ function fakeClient(): { client: MsalClient; pending: Pending[] } {
       getAuthCodeUrl: async () => "https://login.example/authorize",
       acquireTokenByCode: async () => ({
         tenantId: CONFIG.tenantId,
-        uniqueId: "object-id",
+        uniqueId: OBJECT,
+        idToken,
         account: null,
       }),
       acquireTokenByDeviceCode: (request) =>
@@ -45,7 +73,7 @@ function fakeClient(): { client: MsalClient; pending: Pending[] } {
           });
           pending.push({
             request: request as { cancel?: boolean },
-            settle: (identity) => resolve({ ...identity, account: null }),
+            settle: (identity) => resolve({ ...identity, idToken, account: null }),
             fail: reject,
           });
         }),
@@ -66,7 +94,7 @@ function fakeClient(): { client: MsalClient; pending: Pending[] } {
 describe("the MSAL device-code adapter", () => {
   it("cancels the underlying request when a flow is cancelled", async () => {
     const { client, pending } = fakeClient();
-    const adapter = createMsalAdapter(CONFIG, client);
+    const adapter = createMsalAdapter(CONFIG, client, keys);
     const started = await adapter.deviceCode!();
     expect(pending[0]!.request.cancel).toBe(false);
 
@@ -80,7 +108,7 @@ describe("the MSAL device-code adapter", () => {
     vi.useFakeTimers();
     try {
       const { client, pending } = fakeClient();
-      const adapter = createMsalAdapter(CONFIG, client);
+      const adapter = createMsalAdapter(CONFIG, client, keys);
       const started = await adapter.deviceCode!();
       expect(pending[0]!.request.cancel).toBe(false);
 
@@ -94,19 +122,19 @@ describe("the MSAL device-code adapter", () => {
 
   it("forgets a flow once it settles", async () => {
     const { client, pending } = fakeClient();
-    const adapter = createMsalAdapter(CONFIG, client);
+    const adapter = createMsalAdapter(CONFIG, client, keys);
     const started = await adapter.deviceCode!();
-    pending[0]!.settle({ tenantId: CONFIG.tenantId, uniqueId: "object-id" });
+    pending[0]!.settle({ tenantId: CONFIG.tenantId, uniqueId: OBJECT });
 
     await expect(adapter.pollDevice!({ flowId: started.flowId })).resolves.toMatchObject({
-      objectId: "object-id",
+      objectId: OBJECT,
     });
     await expect(adapter.pollDevice!({ flowId: started.flowId })).rejects.toThrow();
   });
 
   it("caps how many flows may be open at once", async () => {
     const { client } = fakeClient();
-    const adapter = createMsalAdapter(CONFIG, client);
+    const adapter = createMsalAdapter(CONFIG, client, keys);
     for (let index = 0; index < MAX_PROVIDER_DEVICE_FLOWS; index += 1) {
       await adapter.deviceCode!();
     }
@@ -122,7 +150,7 @@ describe("the MSAL device-code adapter", () => {
     vi.useFakeTimers();
     try {
       const { client } = fakeClient();
-      const adapter = createMsalAdapter(CONFIG, client);
+      const adapter = createMsalAdapter(CONFIG, client, keys);
       for (let index = 0; index < PROVIDER_DEVICE_START_BURST; index += 1) {
         const started = await adapter.deviceCode!();
         adapter.cancelDevice!({ flowId: started.flowId });
@@ -144,7 +172,7 @@ describe("the MSAL device-code adapter", () => {
     process.on("unhandledRejection", listener);
     try {
       const { client, pending } = fakeClient();
-      const adapter = createMsalAdapter(CONFIG, client);
+      const adapter = createMsalAdapter(CONFIG, client, keys);
       await adapter.deviceCode!();
       pending[0]!.fail(new Error("AADSTS70016: expired_token"));
       await new Promise((resolve) => setImmediate(resolve));

@@ -107,24 +107,24 @@ describe("AuthGate, migrating a legacy-password Host", () => {
     expect(screen.queryByLabelText(/claim code/i)).toBeNull();
   });
 
-  it("collects the tenant and client id when this Host has no registration", async () => {
+  it("collects a public client ID when this Host has no registration", async () => {
     const fetchMock = host({
       "/api/auth/bootstrap/password": () => answer({ ok: true }),
       "/api/auth/configure": () => answer({ ok: true }),
     });
     show();
 
-    const tenant = await screen.findByLabelText(/directory \(tenant\) id/i);
-    fireEvent.change(tenant, { target: { value: "tenant-guid" } });
-    fireEvent.change(screen.getByLabelText(/application \(client\) id/i), {
-      target: { value: "client-guid" },
+    const clientId = "22222222-2222-4222-8222-222222222222";
+    fireEvent.change(await screen.findByLabelText(/application \(client\) id/i), {
+      target: { value: clientId },
     });
+    expect(screen.queryByLabelText(/directory \(tenant\) id/i)).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
 
     await waitFor(() => {
       expect(
         JSON.parse(String(called(fetchMock, "/api/auth/configure")?.[1]?.body)),
-      ).toEqual({ tenantId: "tenant-guid", clientId: "client-guid" });
+      ).toEqual({ tenantId: "common", clientId });
     });
     // Configuration done, the remaining proof is a Microsoft account.
     expect(
@@ -150,6 +150,59 @@ describe("AuthGate, migrating a legacy-password Host", () => {
       expect(browserNavigation.assign).toHaveBeenCalledWith("https://login/x"),
     );
     expect(called(fetchMock, "/api/auth/code/start")).toBeTruthy();
+  });
+
+  it("renews expired setup through the password session and keeps the registration", async () => {
+    let configureAttempts = 0;
+    let renewalAttempts = 0;
+    const fetchMock = host({
+      "/api/auth/bootstrap/password": () => {
+        renewalAttempts += 1;
+        return renewalAttempts === 2
+          ? answer({ error: "Could not renew setup" }, 503)
+          : answer({ ok: true });
+      },
+      "/api/auth/configure": () =>
+        ++configureAttempts === 1
+          ? answer(
+              { error: "Enter the claim code printed on the Host console first." },
+              401,
+            )
+          : answer({ ok: true }),
+    });
+    show();
+
+    const clientId = "22222222-2222-4222-8222-222222222222";
+    fireEvent.change(await screen.findByLabelText("Application (client) ID"), {
+      target: { value: clientId },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
+
+    expect(await screen.findByText("Could not renew setup")).toBeTruthy();
+    const save = screen.getByRole("button", {
+      name: /unlock setup to continue/i,
+    }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(
+      (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+    ).toBe(clientId);
+    expect(screen.queryByLabelText("Claim code")).toBeNull();
+    expect(configureAttempts).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+
+    await waitFor(() => expect(save.disabled).toBe(false));
+    expect(renewalAttempts).toBe(3);
+    const renewals = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/auth/bootstrap/password",
+    );
+    for (const [, init] of renewals) {
+      expect(init?.headers).toMatchObject({ "x-csrf-token": "csrf-proof" });
+    }
+    fireEvent.click(save);
+    expect(
+      await screen.findByRole("button", { name: /claim with microsoft/i }),
+    ).toBeTruthy();
+    expect(configureAttempts).toBe(2);
   });
 
   it("shows the console once an administrator exists", async () => {
@@ -199,10 +252,12 @@ describe("AuthGate, signed out of a legacy-password Host", () => {
     expect(await screen.findByLabelText(/operator password/i)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /sign in with microsoft/i })).toBeNull();
     expect(screen.getByRole("button", { name: /^sign in$/i })).toBeTruthy();
-    expect(screen.getByText(/no tenant or client ids to enter/i)).toBeTruthy();
+    expect(
+      screen.getByText(/setup asks for an application client id first/i),
+    ).toBeTruthy();
   });
 
-  it("still requires the legacy password before first claim when Microsoft is built in", async () => {
+  it("still requires the legacy password before first claim when Microsoft is configured", async () => {
     host(
       {},
       {
@@ -241,7 +296,7 @@ describe("AuthGate, signed out of a legacy-password Host", () => {
     expect(
       await screen.findByRole("heading", { name: /finish claiming this host/i }),
     ).toBeTruthy();
-    expect(await screen.findByLabelText(/directory \(tenant\) id/i)).toBeTruthy();
+    expect(await screen.findByLabelText(/application \(client\) id/i)).toBeTruthy();
     expect(screen.queryByText("console")).toBeNull();
   });
 

@@ -1,6 +1,7 @@
 import { config as loadEnv } from "dotenv";
 import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
+import { createServer as createPortProbe } from "node:net";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
@@ -96,8 +97,10 @@ export async function buildServer(
     announceClaimCode?: (code: string) => void;
     /** Injected in tests; production builds the MSAL-backed provider. */
     entraProvider?: (config: EntraConfig) => EntraProvider;
-    /** Tests opt in explicitly; real local and production Hosts use it by default. */
+    /** Legacy pinning only; never configures a fresh Host with the borrowed client. */
     useBuiltInEntra?: boolean;
+    /** Destructive, console-only startup. Never exposed through an HTTP route. */
+    resetOperatorAuth?: boolean;
   } = {},
 ): Promise<FastifyInstance> {
   const logs = createLogBuffer();
@@ -105,6 +108,7 @@ export async function buildServer(
   const store = new FleetStore(
     options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH),
     {
+      exclusive: options.resetOperatorAuth === true,
       // The Host database holds this Host's private key and its administrator
       // table, so what the filesystem says about it is part of the security
       // boundary rather than a detail of where it happens to live.
@@ -119,6 +123,12 @@ export async function buildServer(
   const enrollment: LegacyEnrollment = {
     token: resolveRuntimeEnrollmentToken(store, options.enrollmentToken),
   };
+  if (options.resetOperatorAuth) {
+    store.resetOperatorAuthentication();
+    app.log.warn(
+      "Host sign-in was reset. Nodes, Host identity, connection settings and working data were retained. Claim this Host again using its new console code.",
+    );
+  }
   // Written only when there is one. A fresh Host must not leave a fleet-wide
   // credential in its settings table for a path it does not accept.
   if (enrollment.token) store.setSetting("enrollment.token", enrollment.token);
@@ -161,16 +171,23 @@ export async function buildServer(
 
   const auth = new FleetAuth({
     store,
-    configuredPassword: options.operatorPassword ?? process.env.FLEET_OPERATOR_PASSWORD,
+    configuredPassword: options.resetOperatorAuth
+      ? ""
+      : (options.operatorPassword ?? process.env.FLEET_OPERATOR_PASSWORD),
     envEntra:
-      process.env.FLEET_ENTRA_TENANT_ID && process.env.FLEET_ENTRA_CLIENT_ID
+      !options.resetOperatorAuth &&
+      (process.env.FLEET_ENTRA_TENANT_ID !== undefined ||
+        process.env.FLEET_ENTRA_CLIENT_ID !== undefined)
         ? {
-            tenantId: process.env.FLEET_ENTRA_TENANT_ID,
-            clientId: process.env.FLEET_ENTRA_CLIENT_ID,
+            tenantId: process.env.FLEET_ENTRA_TENANT_ID ?? "common",
+            clientId: process.env.FLEET_ENTRA_CLIENT_ID ?? "",
           }
-        : (options.useBuiltInEntra ?? process.env.NODE_ENV !== "test")
-          ? BUILT_IN_ENTRA_CONFIG
-          : undefined,
+        : undefined,
+    legacyEntra:
+      !options.resetOperatorAuth &&
+      (options.useBuiltInEntra ?? process.env.NODE_ENV !== "test")
+        ? BUILT_IN_ENTRA_CONFIG
+        : undefined,
     announceClaimCode:
       options.announceClaimCode ??
       ((code) => {
@@ -189,6 +206,7 @@ export async function buildServer(
       browsers.revokeSessions(revoked.map((row) => row.tokenHash)),
     onAdministratorRemoved: (administratorId) =>
       browsers.revokeAdministrator(administratorId),
+    onAuthenticationReset: () => browsers.closeAll(),
   });
   const service = new FleetService(store, app.log, cachedGitRevision());
   const leadTokens = new LeadTokens(store);
@@ -244,9 +262,11 @@ export async function buildServer(
   });
   await app.register(authRoutes, {
     auth,
-    loopbackCallbackOrigin: `http://localhost:${listenPort}`,
     ...(process.env.npm_lifecycle_event === "dev"
-      ? { uiOrigin: "http://localhost:5173" }
+      ? {
+          uiOrigin: "http://localhost:5173",
+          loopbackCallbackOrigin: `http://localhost:${listenPort}`,
+        }
       : {}),
   });
   await app.register(systemRoutes, {
@@ -420,8 +440,25 @@ function getStatusCode(value: unknown): number {
 }
 
 if (process.env.NODE_ENV !== "test") {
-  const app = await buildServer();
   const port = Number(process.env.PORT ?? 8787);
   const host = process.env.HOST ?? "127.0.0.1";
-  await app.listen({ port, host });
+  const resetOperatorAuth = process.argv.includes("--reset-auth");
+  if (resetOperatorAuth) {
+    // Refuse an occupied listener before deleting credentials. Exclusive SQLite
+    // access separately protects against a Host using this DB on another port.
+    const probe = createPortProbe();
+    await new Promise<void>((resolve, reject) => {
+      probe.once("error", reject);
+      probe.listen({ port, host, exclusive: true }, () => {
+        probe.close((error) => (error ? reject(error) : resolve()));
+      });
+    });
+  }
+  const app = await buildServer({ resetOperatorAuth });
+  try {
+    await app.listen({ port, host });
+  } catch (error) {
+    await app.close();
+    throw error;
+  }
 }

@@ -1,8 +1,22 @@
 # Public Microsoft sign-in without per-user tenant configuration
 
-**Status: Proposed — feasibility and security review required; not implemented.**
+**Status: Implemented in source — owned registration and live-account release gates remain pending.**
 **Date:** 2026-09-06. **Baseline:** main `48e13c628198ce3e234ef38fb3a5e2e446aff12d` (0.4.0).
-**Scope:** authentication design only. This document does not change code, provision an application, grant permissions, or resume demo recording.
+**Implementation:** 2026-09-08. No application was provisioned, no external permissions were granted, and no live-account sign-in or demo was recorded.
+
+## Implementation outcome
+
+The Host now accepts an approved public-client registration for organizational accounts (including Microsoft corporate accounts) and personal Microsoft accounts. `FLEET_ENTRA_CLIENT_ID` selects that registration; an omitted `FLEET_ENTRA_TENANT_ID` selects `common`. An explicit directory GUID retains the enterprise restriction. No approved Fleet-owned client ID is bundled yet: a fresh unconfigured Host shows setup rather than falling back to the borrowed registration.
+
+For wire and backup compatibility, the existing `tenantId` configuration field remains the **authority selector**, not the administrator's identity tenant. The provider separately enforces a concrete GUID restriction for enterprise mode. Administrator keys come exclusively from verified concrete `tid` and `oid` claims; neither `common`, `sub`, email, nor a fallback account identifier becomes an administrator key.
+
+MSAL Node performs token acquisition. `jose` verifies the ID token's RS256 signature against Microsoft's fixed public-cloud JWKS endpoint, signing-key issuer scope, concrete issuer/tenant relationship, audience, validity and transaction nonce. Required identity claims are checked before comparing them with MSAL's result. Cache removal also runs after rejected results. MSAL adds `offline_access` to the identity scopes; no provider cache is persisted.
+
+Previously claimed Hosts pin their effective legacy configuration, and first claim persists the configuration used. Settings offers a verified registration switch: the old configuration stays active until the same administrator's stable identity is authenticated by the replacement registration. Success revokes old sessions, retires pending code/device transactions and disables device flow until reverified. A different guest/home identity, expired initiating session, cancellation or failed sign-in leaves the old configuration intact. Email-based re-enrollment is deliberately not implemented.
+
+Production loopback callbacks follow the browser's localhost forwarding port; the Vite development path retains its explicit API callback port. Public tunnel callbacks and cross-origin session transfer remain out of scope. Portable backups preserve the authority selection and reject malformed configuration before replacing security data; Node identities are unchanged.
+
+Automated coverage includes signed-token negative cases, corporate/personal claim and administrator approval, fixed-tenant refusal, configuration pinning, verified cutover, transaction races, session revocation, localhost callback routing and backup round trips. **Live personal-account, external-organization and corporate-policy results: not tested.** Publishing a registration and completing the real-account matrix below remain release prerequisites.
 
 ## 1. Decision requested
 
@@ -10,13 +24,13 @@ Can Copilot Fleet offer Microsoft sign-in to organizational **and personal Micro
 
 **Proposed answer:** use a maintainer-owned, appropriately registered public client with an account audience covering both kinds of account and the `common` authority. Keep a separate, explicit single-tenant enterprise configuration. This removes per-user tenant configuration, not application registration or Host authorization.
 
-Reviewers should approve, amend, or reject this proposal before implementation. In particular, validate whether a shared public-client registration and localhost authorization-code flow are supported and appropriate for a distributed self-hosted Node.js Host. A client ID is public identification, not proof that a caller is the official Fleet binary.
+The implementation follows this direction; release review must still confirm registration ownership, consent and live-account behavior for the distributed self-hosted Node.js Host. A client ID is public identification, not proof that a caller is the official Fleet binary.
 
-## 2. Observed problem and current behavior
+## 2. Observed problem and baseline behavior
 
 A fresh Host claim with a personal Microsoft account failed with **AADSTS50020**: its `live.com` identity was not in the configured Microsoft tenant. A corporate account had worked (operator report). No account address, authorization code, token, or private organization material is included here.
 
-The current source establishes the following:
+The baseline source (before the implementation above) established the following:
 
 - [`apps/host/src/auth/entra.ts`](../../../apps/host/src/auth/entra.ts) defines `MICROSOFT_CORP_TENANT_ID`, `VISUAL_STUDIO_PUBLIC_CLIENT_ID`, and `BUILT_IN_ENTRA_CONFIG`. Its comment describes reuse of the public client used by KYC for local development. That comment is not evidence of permission to redistribute the registration for an unrelated application.
 - `EntraConfigSchema` accepts a tenant **GUID only**. `common`, `organizations`, and `consumers` are rejected today.

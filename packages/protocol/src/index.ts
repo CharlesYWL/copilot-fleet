@@ -1693,10 +1693,28 @@ export const AuthStatusSchema = z.object({
   }),
   /** Display metadata for the signed-in administrator; never an authorization input. */
   identity: z.object({ username: z.string(), displayName: z.string() }).optional(),
-  /** The registration this Host authenticates against. Configuration, not a secret. */
+  /** `tenantId` is the authority selector: `common` or a fixed directory GUID. */
   entra: z.object({ tenantId: z.string(), clientId: z.string() }).optional(),
 });
 export type AuthStatus = z.infer<typeof AuthStatusSchema>;
+
+export const ERASE_AUTH_CONFIRMATION = "ERASE AUTH";
+export const EraseAuthRequestSchema = z.object({
+  confirmation: z.literal(ERASE_AUTH_CONFIRMATION),
+});
+
+export const MIN_OPERATOR_PASSWORD_LENGTH = 12;
+export const OPERATOR_PASSWORD_REQUIREMENTS =
+  "At least 12 characters, including an uppercase letter and a special character.";
+export const OperatorPasswordSchema = z
+  .string()
+  .max(512)
+  .refine(
+    (value) => [...value].length >= MIN_OPERATOR_PASSWORD_LENGTH,
+    "Use at least 12 characters.",
+  )
+  .regex(/\p{Lu}/u, "Include at least one uppercase letter.")
+  .regex(/[\p{P}\p{S}]/u, "Include at least one special character (not a space).");
 
 /**
  * Why a Microsoft sign-in ended without a Fleet session.
@@ -1711,6 +1729,10 @@ export const authErrorCodes = [
   "not-authorized",
   "pending-approval",
   "wrong-tenant",
+  "unsupported-account",
+  "organization-policy",
+  "invalid-configuration",
+  "invalid-identity",
   "expired",
   "device-blocked",
   "endpoint-refused",

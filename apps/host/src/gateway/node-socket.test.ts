@@ -6,6 +6,7 @@ import { WebSocket } from "ws";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AUTH_FAILED_CLOSE_CODE,
+  ERASE_AUTH_CONFIRMATION,
   MAX_OUTBOX_EVENT_COUNT,
   MUTUAL_AUTH_PROTOCOL,
   NodeToHostMessageSchema,
@@ -46,6 +47,7 @@ import { HostIdentityService } from "../auth/host-identity.js";
 import { FleetService } from "../fleet-service.js";
 import { FleetStore } from "../store.js";
 import { registerNodeGateway } from "./node-socket.js";
+import { AUTHENTICATION_CLOSE_CODE } from "./browser-registry.js";
 
 const TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 const CLIENT = "11111111-2222-3333-4444-555555555555";
@@ -504,6 +506,66 @@ describe("node gateway mutual authentication", () => {
       acknowledgeOutbox: false,
     });
     socket.close();
+  });
+
+  it("erases browser authentication without restarting the Host or closing the Node channel", async () => {
+    const { keys, receipt } = await enrollNode();
+    const { socket, channel } = await handshake({ nodeId: receipt.nodeId, keys });
+    expect(
+      channel.open((await nextFrame(socket)) as unknown as AuthenticatedEnvelope).ok,
+    ).toBe(true);
+    const oldClaimCode = claimCode;
+    const browser = await new Promise<WebSocket>((resolve, reject) => {
+      const connected = new WebSocket(`${baseUrl}/ws/browser`, {
+        headers: { cookie: owner.cookie() },
+      });
+      connected.once("open", () => resolve(connected));
+      connected.once("error", reject);
+    });
+    try {
+      const browserClosed = closeCode(browser);
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/auth/erase",
+        headers: { cookie: owner.cookie(), "x-csrf-token": await csrfFor(owner) },
+        payload: { confirmation: ERASE_AUTH_CONFIRMATION },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(await browserClosed).toBe(AUTHENTICATION_CLOSE_CODE);
+      expect(app.server.listening).toBe(true);
+      expect(claimCode).not.toBe(oldClaimCode);
+      expect(response.body).not.toContain(claimCode);
+      socket.send(
+        JSON.stringify(
+          channel.seal(
+            JSON.stringify({
+              type: "heartbeat",
+              activeSessionIds: [],
+              busySessionIds: [],
+              sentAt: new Date().toISOString(),
+            }),
+          ),
+        ),
+      );
+      await noFrameWithin(socket);
+      expect(socket.readyState).toBe(WebSocket.OPEN);
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/api/auth/status",
+            headers: { cookie: owner.cookie() },
+          })
+        ).json(),
+      ).toMatchObject({
+        state: "entra-unconfigured",
+        authenticated: false,
+        claimCodeRequired: true,
+      });
+    } finally {
+      browser.close();
+      socket.close();
+    }
   });
 
   it("carries heartbeats and events over the sealed channel", async () => {

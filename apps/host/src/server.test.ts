@@ -103,8 +103,8 @@ describe("production enrollment token", () => {
     ).toBeUndefined();
   });
 
-  describe("built-in Microsoft sign-in", () => {
-    it("preconfigures the local Host without asking for tenant or client IDs", async () => {
+  describe("Microsoft sign-in configuration", () => {
+    it("does not give a fresh Host the borrowed corporate registration", async () => {
       const app = await buildServer({
         databasePath: ":memory:",
         operatorPassword: "test-password",
@@ -119,7 +119,7 @@ describe("production enrollment token", () => {
         });
         expect(status.json()).toMatchObject({
           state: "legacy-password",
-          entraConfigured: true,
+          entraConfigured: false,
           passwordEnabled: true,
         });
       } finally {

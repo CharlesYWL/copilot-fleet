@@ -26,12 +26,19 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { errorMessage, type AuthStatus } from "@fleet/protocol";
-import { useMessageNotification } from "../hooks/useAppNotifications";
+import {
+  ERASE_AUTH_CONFIRMATION,
+  OPERATOR_PASSWORD_REQUIREMENTS,
+  OperatorPasswordSchema,
+  errorMessage,
+  type AuthStatus,
+} from "@fleet/protocol";
+import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
 import { api, ApiError } from "../hooks/useFleet";
-import { csrfToken, startCodeLogin } from "../lib/auth";
+import { browserNavigation, csrfToken, startCodeLogin } from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
+import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { terminal } from "../theme";
@@ -135,6 +142,7 @@ type Enrollment = {
 
 type Security = {
   status: AuthStatus;
+  currentAdministratorId: string;
   administrators: Administrator[];
   pending: PendingCandidate[];
   audit: AuditEvent[];
@@ -173,7 +181,7 @@ export const SecurityPanel = () => {
     try {
       const [status, admins, audit, enrollment] = await Promise.all([
         api<AuthStatus>("/api/auth/status"),
-        api<{ administrators: Administrator[]; pending: PendingCandidate[] }>(
+        api<Pick<Security, "currentAdministratorId" | "administrators" | "pending">>(
           "/api/auth/administrators",
         ),
         api<{ events: AuditEvent[] }>("/api/security/audit?limit=100"),
@@ -181,6 +189,7 @@ export const SecurityPanel = () => {
       ]);
       setData({
         status,
+        currentAdministratorId: admins.currentAdministratorId,
         administrators: admins.administrators,
         pending: admins.pending,
         audit: audit.events,
@@ -193,6 +202,9 @@ export const SecurityPanel = () => {
 
   useEffect(() => {
     void load();
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, [load]);
 
   /**
@@ -205,12 +217,12 @@ export const SecurityPanel = () => {
    * it.
    */
   const run = useCallback(
-    async (work: () => Promise<unknown>) => {
+    async (work: () => Promise<unknown>, refresh = true) => {
       setError(undefined);
       setReauth(undefined);
       try {
         await work();
-        await load();
+        if (refresh) await load();
       } catch (reason) {
         if (
           reason instanceof ApiError &&
@@ -269,10 +281,15 @@ export const SecurityPanel = () => {
       </div>
 
       <IdentityCard status={data.status} enrollment={data.enrollment} />
+      <MicrosoftConfigurationCard status={data.status} run={run} />
       <PasswordCard status={data.status} run={run} />
       <DeviceFlowCard status={data.status} onChanged={load} />
       <PendingCard pending={data.pending} run={run} />
-      <AdministratorsCard administrators={data.administrators} run={run} />
+      <AdministratorsCard
+        currentAdministratorId={data.currentAdministratorId}
+        administrators={data.administrators}
+        run={run}
+      />
       <NodeMigrationCard enrollment={data.enrollment} run={run} />
       {/*
        * Placed with the administrators rather than with session defaults,
@@ -284,6 +301,7 @@ export const SecurityPanel = () => {
         onImported={() => window.location.reload()}
       />
       <AuditCard events={data.audit} />
+      <EraseAuthCard run={run} />
       <Dialog
         open={Boolean(error || reauth)}
         onOpenChange={(_event, data) => {
@@ -362,8 +380,21 @@ function IdentityCard({
         <Text className={styles.caption}>Authentication mode</Text>
         <Text>{AUTH_MODE_COPY[status.state]}</Text>
 
-        <Text className={styles.caption}>Directory (tenant) ID</Text>
-        <Text className={styles.mono}>{status.entra?.tenantId ?? "not configured"}</Text>
+        <Text className={styles.caption}>Supported accounts</Text>
+        <Text>
+          {!status.entra
+            ? "not configured"
+            : status.entra.tenantId === "common"
+              ? "Work/school and personal Microsoft accounts"
+              : "Accounts in one fixed directory"}
+        </Text>
+
+        {status.entra && status.entra.tenantId !== "common" && (
+          <>
+            <Text className={styles.caption}>Directory (tenant) ID</Text>
+            <Text className={styles.mono}>{status.entra.tenantId}</Text>
+          </>
+        )}
 
         <Text className={styles.caption}>Application (client) ID</Text>
         <Text className={styles.mono}>{status.entra?.clientId ?? "not configured"}</Text>
@@ -385,6 +416,90 @@ function IdentityCard({
   );
 }
 
+function MicrosoftConfigurationCard({
+  status,
+  run,
+}: {
+  status: AuthStatus;
+  run: (work: () => Promise<unknown>) => Promise<void>;
+}) {
+  const styles = useStyles();
+  const [editing, setEditing] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  const change = async (configuration: NonNullable<AuthStatus["entra"]>) => {
+    setBusy(true);
+    let navigating = false;
+    try {
+      await run(async () => {
+        const result = await api<{ authorizationUrl: string } | undefined>(
+          "/api/auth/configuration/start",
+          { method: "POST", body: JSON.stringify(configuration) },
+        );
+        if (typeof result?.authorizationUrl !== "string" || !result.authorizationUrl) {
+          throw new Error("The Host returned no Microsoft verification URL. Try again.");
+        }
+        browserNavigation.assign(result.authorizationUrl);
+        navigating = true;
+      });
+    } finally {
+      if (!navigating) setBusy(false);
+    }
+  };
+
+  return (
+    <section className={styles.card} aria-label="Microsoft sign-in configuration">
+      <Text weight="semibold">Microsoft sign-in configuration</Text>
+      <Text className={styles.caption}>
+        The current configuration stays active until you sign in through the new
+        registration as the same administrator, with the same directory and object IDs.
+        Failed or cancelled verification leaves it unchanged.
+      </Text>
+      {editing ? (
+        <>
+          <MessageBar intent="warning" layout="multiline">
+            <MessageBarBody>
+              A successful switch signs out other sessions, clears pending sign-in and
+              device transactions, and turns device sign-in off until reverified. Other
+              administrator records stay in place; narrowing to a fixed directory can
+              prevent administrators from other directories from signing in.
+            </MessageBarBody>
+          </MessageBar>
+          <Text className={styles.caption}>
+            Use this Host on localhost or through a local forward. This change requires a
+            recent Microsoft authorization-code sign-in, not a device code or shared
+            password. If prompted, confirm your current administrator account, then return
+            here and retry.
+          </Text>
+          <Text className={styles.caption}>
+            A guest account and its home account may have different identities even with
+            the same email. A different identity needs administrator approval; Fleet never
+            merges accounts by email.
+          </Text>
+          <MicrosoftSignInForm
+            configuration={status.entra}
+            busy={busy}
+            submitLabel="Verify new configuration with Microsoft"
+            busyLabel="Opening Microsoft…"
+            onSubmit={change}
+          />
+          <div className={styles.row}>
+            <Button disabled={busy} onClick={() => setEditing(false)}>
+              Cancel
+            </Button>
+          </div>
+        </>
+      ) : (
+        <div className={styles.row}>
+          <Button appearance="secondary" onClick={() => setEditing(true)}>
+            Change Microsoft sign-in configuration
+          </Button>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function PasswordCard({
   status,
   run,
@@ -398,9 +513,10 @@ function PasswordCard({
   const [confirmation, setConfirmation] = useState("");
   const enabling = !status.passwordEnabled;
   const action = enabling ? "enable" : "disable";
+  const parsedPassword = OperatorPasswordSchema.safeParse(password);
   const enableError =
-    password.length > 0 && password.length < 16
-      ? "Use at least 16 characters."
+    password.length > 0 && !parsedPassword.success
+      ? parsedPassword.error.issues[0]?.message
       : confirmation.length > 0 && password !== confirmation
         ? "The passwords do not match."
         : undefined;
@@ -444,13 +560,14 @@ function PasswordCard({
                   </Text>
                   <Field
                     label="New operator password"
-                    hint="At least 16 characters."
+                    hint={OPERATOR_PASSWORD_REQUIREMENTS}
                     validationState={enableError ? "error" : "none"}
                     {...(enableError ? { validationMessage: enableError } : {})}
                   >
                     <Input
                       type="password"
                       value={password}
+                      maxLength={512}
                       autoComplete="new-password"
                       onChange={(_event, data) => setPassword(data.value)}
                     />
@@ -459,6 +576,7 @@ function PasswordCard({
                     <Input
                       type="password"
                       value={confirmation}
+                      maxLength={512}
                       autoComplete="new-password"
                       onChange={(_event, data) => setConfirmation(data.value)}
                     />
@@ -498,6 +616,104 @@ function PasswordCard({
                 }}
               >
                 {enabling ? "Enable" : "Disable"}
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+    </section>
+  );
+}
+
+function EraseAuthCard({
+  run,
+}: {
+  run: (work: () => Promise<unknown>, refresh?: boolean) => Promise<void>;
+}) {
+  const styles = useStyles();
+  const [open, setOpen] = useState(false);
+  const [confirmation, setConfirmation] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const close = () => {
+    setOpen(false);
+    setConfirmation("");
+  };
+  const erase = async () => {
+    close();
+    setBusy(true);
+    let navigating = false;
+    try {
+      await run(async () => {
+        await api("/api/auth/erase", {
+          method: "POST",
+          body: JSON.stringify({ confirmation: ERASE_AUTH_CONFIRMATION }),
+        });
+        browserNavigation.assign("/");
+        navigating = true;
+      }, false);
+    } finally {
+      if (!navigating) setBusy(false);
+    }
+  };
+
+  return (
+    <section className={styles.card} aria-label="Erase auth settings">
+      <Text weight="semibold">Erase auth settings</Text>
+      <Text className={styles.caption}>
+        Return this Host to sign-in setup without restarting the Host or Nodes. Node
+        connections, keys, enrollment, tunnels and other settings are kept.
+      </Text>
+      <div className={styles.row}>
+        <Button disabled={busy} onClick={() => setOpen(true)}>
+          {busy ? "Erasing authentication…" : "Erase auth settings"}
+        </Button>
+      </div>
+      <Dialog
+        open={open}
+        onOpenChange={(_event, data) => {
+          if (!data.open) close();
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Erase all Host authentication?</DialogTitle>
+            <DialogContent>
+              <MessageBar intent="warning" layout="multiline">
+                <MessageBarBody>
+                  This removes Microsoft client/tenant configuration, all administrators
+                  and invitations, browser sessions, passwords and device sign-in
+                  settings. Every browser is signed out.
+                </MessageBarBody>
+              </MessageBar>
+              <Text>
+                You must have access to the Host console to read the new claim code and
+                set up sign-in again. The code is not shown in this browser. A recent
+                Microsoft authorization-code sign-in is required to confirm the reset.
+              </Text>
+              <Text className={styles.caption}>
+                Existing authentication environment values are ignored for the rest of
+                this Host process; .env is not edited. Node processes and connections stay
+                running, and their data is not erased.
+              </Text>
+              <Field label={`Type ${ERASE_AUTH_CONFIRMATION} to confirm`}>
+                <Input
+                  value={confirmation}
+                  autoComplete="off"
+                  onChange={(_event, data) => setConfirmation(data.value)}
+                />
+              </Field>
+            </DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={close}>
+                Cancel
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={confirmation !== ERASE_AUTH_CONFIRMATION || busy}
+                onClick={() => void erase()}
+              >
+                Erase and sign out
               </Button>
             </DialogActions>
           </DialogBody>
@@ -589,7 +805,9 @@ function DeviceFlowCard({
       <Text className={styles.caption}>
         The fallback for a browser that cannot reach a loopback listener. Microsoft
         recommends blocking it by default and a tenant&apos;s Conditional Access may, so
-        Fleet keeps it off until a verification has actually completed here.
+        Fleet keeps it off until a verification has actually completed here. Enabling it
+        offers the flow; it does not prove every organization permits it. Sensitive
+        changes still require a recent authorization-code sign-in.
       </Text>
       {flow ? (
         <DeviceCodePanel flow={flow} error={message} />
@@ -697,17 +915,70 @@ function PendingCard({
 }
 
 function AdministratorsCard({
+  currentAdministratorId,
   administrators,
   run,
 }: {
+  currentAdministratorId: string;
   administrators: Administrator[];
   run: (work: () => Promise<unknown>) => Promise<void>;
 }) {
   const styles = useStyles();
+  const notify = useNotify();
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [openingAccount, setOpeningAccount] = useState(false);
   const [invitation, setInvitation] = useState<string>();
   const [inviting, setInviting] = useState(false);
   const [removing, setRemoving] = useState<Administrator>();
   const last = administrators.length <= 1;
+  const canRemove = (id: string | undefined) =>
+    Boolean(currentAdministratorId) &&
+    id !== undefined &&
+    id !== currentAdministratorId &&
+    !last;
+  const unidentified = !currentAdministratorId
+    ? "The current administrator could not be identified. Refresh Security before removing accounts."
+    : undefined;
+  useMessageNotification(unidentified, "warning");
+
+  const addAccount = async () => {
+    setAddingAccount(false);
+    setOpeningAccount(true);
+    try {
+      await run(async () => {
+        const tab = browserNavigation.openTab();
+        if (!tab) {
+          throw new Error(
+            "Allow popups for this Host, then try adding the account again.",
+          );
+        }
+        try {
+          const result = await api<{ authorizationUrl: string } | undefined>(
+            "/api/auth/administrators/add/start",
+            { method: "POST", body: "{}" },
+          );
+          if (typeof result?.authorizationUrl !== "string" || !result.authorizationUrl) {
+            throw new Error("The Host returned no Microsoft sign-in URL. Try again.");
+          }
+          if (tab.closed) {
+            throw new Error(
+              "The sign-in tab was closed. Start adding the account again.",
+            );
+          }
+          tab.assign(result.authorizationUrl);
+        } catch (reason) {
+          tab.close();
+          throw reason;
+        }
+        notify(
+          "Choose the account in the new tab, then return here. Your current Fleet session stays signed in.",
+          "info",
+        );
+      });
+    } finally {
+      setOpeningAccount(false);
+    }
+  };
 
   const invite = async () => {
     setInviting(true);
@@ -775,7 +1046,7 @@ function AdministratorsCard({
                   <Button
                     size="small"
                     appearance="secondary"
-                    disabled={last}
+                    disabled={!canRemove(administrator.id)}
                     aria-label={`Remove ${administrator.username}`}
                     onClick={() => setRemoving(administrator)}
                   >
@@ -787,10 +1058,20 @@ function AdministratorsCard({
           </TableBody>
         </Table>
       </div>
+      <Text className={styles.caption}>
+        {unidentified ?? "You cannot remove your current administrator account."}
+      </Text>
 
       <div className={styles.row}>
-        <Button appearance="primary" disabled={inviting} onClick={() => void invite()}>
-          {inviting ? "Creating invitation…" : "Add administrator"}
+        <Button
+          appearance="primary"
+          disabled={openingAccount}
+          onClick={() => setAddingAccount(true)}
+        >
+          {openingAccount ? "Opening Microsoft…" : "Add another account"}
+        </Button>
+        <Button appearance="secondary" disabled={inviting} onClick={() => void invite()}>
+          {inviting ? "Creating invitation…" : "Invite someone else"}
         </Button>
         {last && (
           <Text className={styles.caption}>
@@ -798,13 +1079,17 @@ function AdministratorsCard({
           </Text>
         )}
       </div>
+      <Text className={styles.caption}>
+        Add an account you control in a new tab, or invite someone else with a link that
+        still requires your approval.
+      </Text>
 
       {invitation && (
         <>
           <Text>
-            Open this link in a private browser window or a different browser profile to
-            sign in with the second Microsoft account. Then refresh this Security page and
-            approve that account under Waiting for approval.
+            Send this link to the person you want to invite. After they sign in, approve
+            that account under Waiting for approval. For another account you control, use
+            Add another account instead.
           </Text>
           <div className={styles.row}>
             <Input
@@ -822,6 +1107,37 @@ function AdministratorsCard({
           </Text>
         </>
       )}
+
+      <Dialog
+        open={addingAccount}
+        onOpenChange={(_event, data) => setAddingAccount(data.open)}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Add another administrator account?</DialogTitle>
+            <DialogContent>
+              <Text>
+                You are authorizing the Microsoft account you choose next to become a full
+                Fleet administrator without a separate approval. It will be able to
+                control every Node and read every transcript.
+              </Text>
+              <Text>
+                Microsoft will open an account picker in a new tab. Choose another Outlook
+                or work/school account supported by this Host&apos;s app registration. No
+                private window is needed, and your current Fleet session stays signed in.
+              </Text>
+            </DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={() => setAddingAccount(false)}>
+                Cancel
+              </Button>
+              <Button appearance="primary" onClick={() => void addAccount()}>
+                Choose account in new tab
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
 
       <Dialog
         open={removing !== undefined}
@@ -846,6 +1162,7 @@ function AdministratorsCard({
               </Button>
               <Button
                 appearance="primary"
+                disabled={!canRemove(removing?.id)}
                 onClick={() => {
                   const target = removing;
                   setRemoving(undefined);

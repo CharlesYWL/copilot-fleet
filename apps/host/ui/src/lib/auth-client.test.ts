@@ -96,4 +96,25 @@ describe("auth error hand-back", () => {
     window.history.replaceState({}, "", "/?auth_error=administrator");
     expect(readAuthError()).toBeUndefined();
   });
+
+  it.each([
+    ["unsupported-account", /not supported.*supported account types/i],
+    ["organization-policy", /administrator consent.*conditional access/i],
+    ["invalid-configuration", /client id.*localhost redirect uri/i],
+    ["invalid-identity", /trusted, complete account identity.*refused/i],
+  ])("explains %s without echoing provider details", (code, message) => {
+    window.history.replaceState(
+      {},
+      "",
+      `/?auth_error=${code}&auth_error_message=raw-provider-detail&tab=security#settings`,
+    );
+
+    const notice = readAuthError();
+    expect(notice?.code).toBe(code);
+    expect(notice?.message).toMatch(message);
+    expect(notice?.message).not.toContain("raw-provider-detail");
+    expect(window.location.search).toBe("?tab=security");
+    expect(window.location.hash).toBe("#settings");
+    expect(readAuthError()).toBeUndefined();
+  });
 });

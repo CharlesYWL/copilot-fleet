@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { AuthGate } from "./AuthGate";
 import { announceSignedOut, browserNavigation } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import markUrl from "../assets/copilot-fleet-mark.svg";
+
+const tenantId = "11111111-1111-4111-8111-111111111111";
+const clientId = "22222222-2222-4222-8222-222222222222";
 
 const show = () =>
   render(
@@ -126,7 +130,7 @@ describe("AuthGate", () => {
       claimCodeRequired: true,
     } as const;
 
-    it("asks for the console code before it will take a tenant", async () => {
+    it("asks for the console code before it will take a registration", async () => {
       host({}, fresh);
       show();
 
@@ -137,9 +141,11 @@ describe("AuthGate", () => {
       // Printed once on a console and never echoed back.
       expect(code.getAttribute("type")).toBe("password");
       expect(screen.queryByLabelText(/directory \(tenant\) id/i)).toBeNull();
+      expect(screen.queryByLabelText(/application \(client\) id/i)).toBeNull();
+      expect(screen.getByText(/no approved fleet client id is bundled/i)).toBeTruthy();
     });
 
-    it("takes the tenant and client id once the code is accepted", async () => {
+    it("defaults to public accounts and submits common with only a client ID", async () => {
       const fetchMock = host(
         {
           "/api/auth/bootstrap": () =>
@@ -155,10 +161,17 @@ describe("AuthGate", () => {
       });
       fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
 
-      const tenant = await screen.findByLabelText(/directory \(tenant\) id/i);
-      fireEvent.change(tenant, { target: { value: "tenant-guid" } });
-      fireEvent.change(screen.getByLabelText(/application \(client\) id/i), {
-        target: { value: "client-guid" },
+      const client = await screen.findByLabelText(/application \(client\) id/i);
+      expect(
+        (
+          screen.getByRole("radio", {
+            name: "Work/school and personal Microsoft accounts",
+          }) as HTMLInputElement
+        ).checked,
+      ).toBe(true);
+      expect(screen.queryByLabelText(/directory \(tenant\) id/i)).toBeNull();
+      fireEvent.change(client, {
+        target: { value: ` ${clientId} ` },
       });
       fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
 
@@ -167,11 +180,224 @@ describe("AuthGate", () => {
           String(url).includes("/api/auth/configure"),
         );
         expect(JSON.parse(String(call?.[1]?.body))).toEqual({
-          tenantId: "tenant-guid",
-          clientId: "client-guid",
+          tenantId: "common",
+          clientId,
         });
       });
     });
+
+    it("offers registration setup links before the claim code is entered", async () => {
+      const fetchMock = host({}, fresh);
+      show();
+      fireEvent.click(
+        await screen.findByText("First-time setup: personal or corporate account"),
+      );
+      expect(
+        screen.getByRole("link", { name: "Personal-account client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("link", { name: "Corporate client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        screen.getByRole("link", { name: "Find your corporate tenant ID" }),
+      ).toBeTruthy();
+      expect(screen.queryByLabelText("Application (client) ID")).toBeNull();
+      expect(screen.queryByText("console")).toBeNull();
+      expect(fetchMock.mock.calls.every(([url]) => url === "/api/auth/status")).toBe(
+        true,
+      );
+    });
+
+    it("switches setup guidance with the account type without losing the entered IDs", async () => {
+      host({ "/api/auth/bootstrap": () => answer({ ok: true }) }, fresh);
+      show();
+      fireEvent.change(await screen.findByLabelText("Claim code"), {
+        target: { value: "console-code" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
+      fireEvent.change(await screen.findByLabelText("Application (client) ID"), {
+        target: { value: clientId },
+      });
+      fireEvent.click(screen.getByText("Personal accounts: get your client ID"));
+      expect(
+        screen.getByRole("link", { name: "Personal-account client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        screen.queryByRole("link", { name: "Find your corporate tenant ID" }),
+      ).toBeNull();
+
+      fireEvent.click(
+        screen.getByRole("radio", { name: "One organization (fixed directory)" }),
+      );
+      expect(
+        screen.getByRole("link", { name: "Find your corporate tenant ID" }),
+      ).toBeTruthy();
+      fireEvent.change(screen.getByLabelText("Directory (tenant) ID"), {
+        target: { value: tenantId },
+      });
+      expect(
+        (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+      ).toBe(clientId);
+      fireEvent.click(
+        screen.getByRole("radio", {
+          name: "Work/school and personal Microsoft accounts",
+        }),
+      );
+      expect(screen.queryByLabelText("Directory (tenant) ID")).toBeNull();
+      expect(
+        screen.getByRole("link", { name: "Personal-account client ID setup guide" }),
+      ).toBeTruthy();
+      expect(
+        (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+      ).toBe(clientId);
+    });
+
+    it("requires valid GUIDs when a fixed directory is explicitly selected", async () => {
+      const fetchMock = host(
+        {
+          "/api/auth/bootstrap": () => answer({ ok: true }),
+          "/api/auth/configure": () => answer({ ok: true }),
+        },
+        fresh,
+      );
+      show();
+      fireEvent.change(await screen.findByLabelText(/claim code/i), {
+        target: { value: "console-code" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
+
+      const client = await screen.findByLabelText(/application \(client\) id/i);
+      const save = screen.getByRole("button", {
+        name: /save and continue/i,
+      }) as HTMLButtonElement;
+      expect(save.disabled).toBe(true);
+      fireEvent.change(client, { target: { value: "not-a-client-guid" } });
+      expect(screen.getByText(/enter a valid application/i)).toBeTruthy();
+      expect(save.disabled).toBe(true);
+      fireEvent.change(client, { target: { value: clientId } });
+      fireEvent.click(
+        screen.getByRole("radio", { name: "One organization (fixed directory)" }),
+      );
+      const tenant = screen.getByLabelText(/directory \(tenant\) id/i);
+      expect(save.disabled).toBe(true);
+      fireEvent.change(tenant, { target: { value: "example.com" } });
+      expect(screen.getByText(/enter a valid directory guid/i)).toBeTruthy();
+      expect(save.disabled).toBe(true);
+      fireEvent.change(tenant, { target: { value: tenantId } });
+      fireEvent.click(save);
+
+      await waitFor(() => {
+        const call = fetchMock.mock.calls.find(([url]) =>
+          String(url).includes("/api/auth/configure"),
+        );
+        expect(JSON.parse(String(call?.[1]?.body))).toEqual({ tenantId, clientId });
+      });
+    });
+
+    it.each(["common", tenantId])(
+      "recovers expired setup authorization without losing the %s registration",
+      async (authority) => {
+        let configured = false;
+        let bootstrapAttempts = 0;
+        let configureAttempts = 0;
+        const fetchMock = host(
+          {
+            "/api/auth/status": () =>
+              answer(
+                statusBody(
+                  configured ? { state: "unclaimed", claimCodeRequired: true } : fresh,
+                ),
+              ),
+            "/api/auth/bootstrap": () =>
+              ++bootstrapAttempts === 2
+                ? answer({ error: "Invalid claim code" }, 401)
+                : answer({ ok: true }),
+            "/api/auth/configure": () => {
+              if (++configureAttempts === 1) {
+                return answer(
+                  { error: "Enter the claim code printed on the Host console first." },
+                  401,
+                );
+              }
+              configured = true;
+              return answer({ ok: true });
+            },
+            "/api/auth/code/start": () =>
+              answer({ authorizationUrl: "https://login.microsoftonline.com/authorize" }),
+          },
+          fresh,
+        );
+        show();
+        fireEvent.change(await screen.findByLabelText("Claim code"), {
+          target: { value: "console-code" },
+        });
+        fireEvent.click(screen.getByRole("button", { name: /^unlock setup$/i }));
+        fireEvent.change(await screen.findByLabelText("Application (client) ID"), {
+          target: { value: clientId },
+        });
+        if (authority !== "common") {
+          fireEvent.click(
+            screen.getByRole("radio", { name: "One organization (fixed directory)" }),
+          );
+          fireEvent.change(screen.getByLabelText("Directory (tenant) ID"), {
+            target: { value: authority },
+          });
+        }
+        fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
+
+        const claimCode = await screen.findByLabelText("Claim code");
+        expect(
+          screen.getByText(/setup authorization has expired or was lost/i),
+        ).toBeTruthy();
+        expect((claimCode as HTMLInputElement).value).toBe("");
+        expect(claimCode.getAttribute("type")).toBe("password");
+        const save = screen.getByRole("button", {
+          name: /unlock setup to continue/i,
+        }) as HTMLButtonElement;
+        expect(save.disabled).toBe(true);
+        expect(
+          (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+        ).toBe(clientId);
+        expect(screen.queryByText("console")).toBeNull();
+        expect(assign).not.toHaveBeenCalled();
+
+        fireEvent.change(claimCode, { target: { value: "wrong-code" } });
+        fireEvent.click(screen.getByRole("button", { name: /unlock setup again/i }));
+        expect(await screen.findByText("Invalid claim code")).toBeTruthy();
+        expect(save.disabled).toBe(true);
+        expect(configureAttempts).toBe(1);
+
+        fireEvent.change(claimCode, { target: { value: "console-code" } });
+        fireEvent.click(screen.getByRole("button", { name: /unlock setup again/i }));
+        await waitFor(() => expect(screen.queryByLabelText("Claim code")).toBeNull());
+        expect(save.disabled).toBe(false);
+        expect(
+          screen.queryByText("Enter the claim code printed on the Host console first."),
+        ).toBeNull();
+        if (authority !== "common") {
+          expect(
+            (screen.getByLabelText("Directory (tenant) ID") as HTMLInputElement).value,
+          ).toBe(authority);
+        }
+        fireEvent.click(save);
+        const claim = await screen.findByRole("button", {
+          name: /claim with microsoft/i,
+        });
+        const saves = fetchMock.mock.calls.filter(
+          ([url]) => url === "/api/auth/configure",
+        );
+        expect(saves.map(([, init]) => JSON.parse(String(init?.body)))).toEqual([
+          { tenantId: authority, clientId },
+          { tenantId: authority, clientId },
+        ]);
+        fireEvent.click(claim);
+        await waitFor(() =>
+          expect(assign).toHaveBeenCalledWith(
+            "https://login.microsoftonline.com/authorize",
+          ),
+        );
+      },
+    );
 
     it("says why the code was refused and keeps the field", async () => {
       host(
@@ -266,8 +492,7 @@ describe("AuthGate", () => {
       {
         path: "/api/auth/configure",
         fields: {
-          "Directory (tenant) ID": "tenant-guid",
-          "Application (client) ID": "client-guid",
+          "Application (client) ID": clientId,
         },
         action: /save and continue/i,
         fallback: "That configuration was refused (503)",
@@ -372,6 +597,10 @@ describe("AuthGate", () => {
           String(url).includes("/api/auth/code/start"),
         ),
       ).toBe(true);
+      expect(
+        screen.getByText(/supported account types depend on this host/i),
+      ).toBeTruthy();
+      expect(screen.queryByText(/this host supports work\/school/i)).toBeNull();
     });
 
     it("moves a 127.0.0.1 page to localhost before it starts a sign-in", async () => {
@@ -446,6 +675,68 @@ describe("AuthGate", () => {
   });
 
   describe("an account this Fleet does not know", () => {
+    it.each([
+      ["not-authorized", /account not authorized/i, /that account is not authorized/i],
+      [
+        "organization-policy",
+        /microsoft sign-in could not be completed/i,
+        /your organization blocked microsoft sign-in/i,
+      ],
+      [
+        "unsupported-account",
+        /microsoft sign-in could not be completed/i,
+        /not supported by this host's sign-in registration/i,
+      ],
+      ["pending-approval", /waiting for approval/i, /your request was recorded/i],
+    ])(
+      "retains %s feedback when StrictMode replays effects",
+      async (code, title, message) => {
+        window.history.replaceState({}, "", `/?auth_error=${code}`);
+        host({});
+        render(
+          <StrictMode>
+            <FluentProvider theme={fleetDarkTheme}>
+              <AuthGate>
+                <div>console</div>
+              </AuthGate>
+            </FluentProvider>
+          </StrictMode>,
+        );
+
+        expect(await screen.findByRole("heading", { name: title })).toBeTruthy();
+        expect(screen.getByText(message)).toBeTruthy();
+        expect(window.location.search).toBe("");
+        expect(screen.queryByText("console")).toBeNull();
+        fireEvent.click(screen.getByRole("button", { name: /try another account/i }));
+        expect(
+          await screen.findByRole("heading", { name: /sign in with microsoft/i }),
+        ).toBeTruthy();
+      },
+    );
+
+    it("keeps callback feedback visible in StrictMode even with a live administrator session", async () => {
+      window.history.replaceState({}, "", "/?auth_error=not-authorized");
+      const fetchMock = host({}, { authenticated: true });
+      render(
+        <StrictMode>
+          <FluentProvider theme={fleetDarkTheme}>
+            <AuthGate>
+              <div>console</div>
+            </AuthGate>
+          </FluentProvider>
+        </StrictMode>,
+      );
+      expect(
+        await screen.findByRole("heading", { name: /account not authorized/i }),
+      ).toBeTruthy();
+      expect(screen.queryByText("console")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: /return to fleet/i }));
+      expect(await screen.findByText("console")).toBeTruthy();
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/logout"),
+      ).toBe(false);
+    });
+
     it("names the refusal instead of looping on the login that caused it", async () => {
       window.history.replaceState(
         {},
@@ -461,6 +752,39 @@ describe("AuthGate", () => {
       expect(screen.getByText(/that account is not authorized/i)).toBeTruthy();
       expect(screen.getByRole("button", { name: /try another account/i })).toBeTruthy();
     });
+
+    it.each([
+      {
+        code: "invalid-configuration",
+        message: /this host's microsoft sign-in registration is invalid or unavailable/i,
+      },
+      { code: "cancelled", message: /microsoft sign-in was cancelled/i },
+    ])(
+      "shows $code verification feedback while retaining the administrator session",
+      async ({ code, message }) => {
+        window.history.replaceState({}, "", `/?auth_error=${code}`);
+        const fetchMock = host({}, { authenticated: true });
+        show();
+
+        expect(
+          await screen.findByRole("heading", {
+            name: /microsoft sign-in could not be completed/i,
+          }),
+        ).toBeTruthy();
+        expect(
+          screen.getByText(/leaves the previous configuration in place/i),
+        ).toBeTruthy();
+        expect(screen.getByText(message)).toBeTruthy();
+        expect(screen.queryByText("console")).toBeNull();
+        expect(window.location.search).toBe("");
+        fireEvent.click(screen.getByRole("button", { name: /return to fleet/i }));
+        expect(await screen.findByText("console")).toBeTruthy();
+        expect(assign).not.toHaveBeenCalled();
+        expect(
+          fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/logout"),
+        ).toBe(false);
+      },
+    );
 
     it("says an invitation is waiting on an administrator, not that it failed", async () => {
       window.history.replaceState({}, "", "/?auth_error=pending-approval");
@@ -591,6 +915,7 @@ describe("AuthGate", () => {
       expect(
         await screen.findByText(/only enter a code this page is showing you/i),
       ).toBeTruthy();
+      expect(screen.getByText(/your organization can still block it/i)).toBeTruthy();
     });
   });
 

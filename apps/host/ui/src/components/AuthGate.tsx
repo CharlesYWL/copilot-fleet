@@ -29,6 +29,8 @@ import { BrandMark } from "./BrandMark";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
+import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
+import { MicrosoftSignInSetupGuide } from "./auth/MicrosoftSignInSetupGuide";
 import { TrustRail, type TrustStage } from "./auth/TrustRail";
 import { terminal } from "../theme";
 
@@ -156,7 +158,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
   useEffect(() => {
     // Why the last callback sent us back here, read before the first status
     // arrives so a refusal is never replaced by a plain sign-in form.
-    setNotice(readAuthError());
+    const returnedNotice = readAuthError();
+    // The first read scrubs the URL; StrictMode's effect replay must not erase it.
+    if (returnedNotice) setNotice(returnedNotice);
     void refresh();
   }, [refresh]);
 
@@ -203,7 +207,7 @@ function viewFor(
   if (!status) return "checking";
   if (status.unreachable) return "unreachable";
   if (notice?.code === "pending-approval") return "pending";
-  if (notice && notice.code !== "cancelled") return "denied";
+  if (notice && (notice.code !== "cancelled" || status.authenticated)) return "denied";
   if (!status.canSignIn) return "endpoint-refused";
   /*
    * The migration checkpoint: signed in, and still nobody's Host.
@@ -295,6 +299,12 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
   const [configured, setConfigured] = useState(false);
   const heading = useRef<HTMLHeadingElement>(null);
   const view = viewFor(status, notice);
+  const title =
+    view === "denied" &&
+    notice?.code !== "not-authorized" &&
+    notice?.code !== "wrong-tenant"
+      ? "Microsoft sign-in could not be completed"
+      : HEADINGS[view];
 
   useEffect(() => {
     heading.current?.focus();
@@ -316,11 +326,11 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
       <div className={styles.divider} />
 
       <h1 className={styles.heading} tabIndex={-1} ref={heading}>
-        {HEADINGS[view]}
+        {title}
       </h1>
 
       <div className={styles.liveRegion} role="status" aria-live="polite">
-        {view === "checking" ? "Checking sign-in…" : HEADINGS[view]}
+        {view === "checking" ? "Checking sign-in…" : title}
       </div>
 
       <div className={styles.body}>
@@ -341,6 +351,7 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
           <RefusedIdentity
             pending={view === "pending"}
             notice={notice}
+            authenticated={Boolean(status?.authenticated)}
             onRetry={() => {
               onDismissNotice();
               void onChanged();
@@ -422,10 +433,12 @@ function EndpointRefused() {
 function RefusedIdentity({
   pending,
   notice,
+  authenticated,
   onRetry,
 }: {
   pending: boolean;
   notice: AuthErrorNotice | undefined;
+  authenticated: boolean;
   onRetry: () => void;
 }) {
   const styles = useStyles();
@@ -434,18 +447,22 @@ function RefusedIdentity({
       <MessageBar intent={pending ? "info" : "error"}>
         <MessageBarBody>
           {notice?.message ??
-            (pending
-              ? "Your request was recorded. An existing administrator has to approve it before you can sign in."
-              : "That account is not authorized to use this Fleet.")}
+            (notice?.code === "cancelled"
+              ? "Microsoft sign-in was cancelled."
+              : pending
+                ? "Your request was recorded. An existing administrator has to approve it before you can sign in."
+                : "That account is not authorized to use this Fleet.")}
         </MessageBarBody>
       </MessageBar>
       <Text className={styles.caption}>
         {pending
           ? "Microsoft authenticated you; this Fleet has not authorized you yet. Ask an administrator to approve the request in Settings → Security."
-          : "Signing in with Microsoft proves who you are. It does not make you an administrator of this Fleet — an existing administrator has to add you."}
+          : authenticated
+            ? "If you were changing Microsoft sign-in configuration, a failed or cancelled verification leaves the previous configuration in place. Return to Settings → Security to retry."
+            : "Signing in with Microsoft proves who you are. It does not make you an administrator of this Fleet — an existing administrator has to add you."}
       </Text>
       <Button appearance="primary" onClick={onRetry}>
-        Try another account
+        {authenticated ? "Return to Fleet" : "Try another account"}
       </Button>
     </>
   );
@@ -454,11 +471,16 @@ function RefusedIdentity({
 /** These signed-out forms use their submitted proof, not an operator CSRF token. */
 function useAuthForm(path: string, refused: string, onDone: () => void | Promise<void>) {
   const [error, setError] = useState<string>();
+  const [errorStatus, setErrorStatus] = useState<number>();
   const [busy, setBusy] = useState(false);
+  const clearError = useCallback(() => {
+    setError(undefined);
+    setErrorStatus(undefined);
+  }, []);
 
   const submit = async (values: Record<string, string>) => {
     setBusy(true);
-    setError(undefined);
+    clearError();
     try {
       const response = await fetch(path, {
         method: "POST",
@@ -470,6 +492,7 @@ function useAuthForm(path: string, refused: string, onDone: () => void | Promise
         return;
       }
       const body = (await response.json().catch(() => ({}))) as { error?: string };
+      setErrorStatus(response.status);
       setError(body.error ?? `${refused} (${response.status})`);
     } catch (reason) {
       setError(errorMessage(reason, "Could not reach the Host"));
@@ -477,7 +500,7 @@ function useAuthForm(path: string, refused: string, onDone: () => void | Promise
       setBusy(false);
     }
   };
-  return { busy, error, submit };
+  return { busy, error, errorStatus, clearError, submit };
 }
 
 /** The console code, which is the only proof a fresh Host will accept. */
@@ -527,57 +550,50 @@ function ClaimCodeForm({ action, onDone }: { action: string; onDone: () => void 
 /** The registration this Host will authenticate against. */
 function EntraConfigForm({
   saved,
+  bootstrapWithPassword = false,
   onConfigured,
 }: {
   saved: boolean;
+  bootstrapWithPassword?: boolean;
   onConfigured: () => void;
 }) {
   const styles = useStyles();
-  const [tenantId, setTenantId] = useState("");
-  const [clientId, setClientId] = useState("");
-  const { busy, error, submit } = useAuthForm(
+  const { busy, error, errorStatus, clearError, submit } = useAuthForm(
     "/api/auth/configure",
     "That configuration was refused",
     onConfigured,
   );
+  const needsBootstrap = errorStatus === 401;
 
   return (
-    <form
-      className={styles.body}
-      onSubmit={(event) => {
-        event.preventDefault();
-        void submit({ tenantId, clientId });
-      }}
-    >
-      <Text className={styles.caption}>
-        Register a single-tenant public client in your own directory with the reply URL{" "}
-        <code>http://localhost/api/auth/entra/callback</code>. It needs no client secret
-        and no API permissions. Both values are the GUIDs Entra shows on the app&apos;s
-        overview — a tenant domain will not do, because the identities Microsoft returns
-        are stamped with the directory ID and would never match one.
-      </Text>
-      <Field label="Directory (tenant) ID">
-        <Input
-          value={tenantId}
-          autoFocus
-          placeholder="00000000-0000-0000-0000-000000000000"
-          onChange={(_event, data) => setTenantId(data.value)}
-        />
-      </Field>
-      <Field
-        label="Application (client) ID"
-        validationState={error ? "error" : "none"}
-        {...(error ? { validationMessage: error } : {})}
-      >
-        <Input value={clientId} onChange={(_event, data) => setClientId(data.value)} />
-      </Field>
-      <Button
-        type="submit"
-        appearance="primary"
-        disabled={busy || !tenantId || !clientId}
-      >
-        {busy ? "Saving…" : "Save and continue"}
-      </Button>
+    <>
+      {/* Keep the form mounted so renewing the proof never loses the registration. */}
+      <MicrosoftSignInForm
+        busy={busy || needsBootstrap}
+        error={error}
+        submitLabel="Save and continue"
+        busyLabel={needsBootstrap ? "Unlock setup to continue" : "Saving…"}
+        onSubmit={submit}
+      />
+      {needsBootstrap && (
+        <>
+          <Text className={styles.caption}>
+            Setup authorization has expired or was lost. Your registration details are
+            still here; unlock setup again, then save and continue.
+          </Text>
+          {bootstrapWithPassword ? (
+            <PasswordBootstrap onDone={clearError} />
+          ) : (
+            <>
+              <Text className={styles.caption}>
+                Enter the claim code from the Host&apos;s terminal again. If that code has
+                expired, restart the unclaimed Host to print a new one.
+              </Text>
+              <ClaimCodeForm action="Unlock setup again" onDone={clearError} />
+            </>
+          )}
+        </>
+      )}
       {saved && (
         <MessageBar intent="success">
           <MessageBarBody>
@@ -585,7 +601,7 @@ function EntraConfigForm({
           </MessageBarBody>
         </MessageBar>
       )}
-    </form>
+    </>
   );
 }
 
@@ -607,8 +623,11 @@ function ConfigureStep({
       <>
         <Text className={styles.caption}>
           This Host has no Microsoft sign-in configuration yet. The code on its own
-          console is what proves you are the person setting it up.
+          console is what proves you are the person setting it up. No approved Fleet
+          client ID is bundled; its publisher or operator must provide an approved
+          application registration.
         </Text>
+        <MicrosoftSignInSetupGuide />
         <ClaimCodeForm action="Unlock setup" onDone={onBootstrapped} />
       </>
     );
@@ -635,62 +654,11 @@ function MigrationStep({
 }) {
   const styles = useStyles();
   const [granted, setGranted] = useState(false);
-  const [error, setError] = useState<string>();
-  const [attempt, setAttempt] = useState(0);
   const [configured, setConfigured] = useState(false);
-
-  useEffect(() => {
-    let abandoned = false;
-    const request = async () => {
-      setError(undefined);
-      try {
-        const response = await fetch("/api/auth/bootstrap/password", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-csrf-token": await csrfToken(),
-          },
-          body: "{}",
-        });
-        if (abandoned) return;
-        if (response.ok) {
-          setGranted(true);
-          return;
-        }
-        const body = (await response.json().catch(() => ({}))) as { error?: string };
-        setError(
-          body.error ?? `This Host would not start the migration (${response.status})`,
-        );
-      } catch (reason) {
-        if (!abandoned) setError(errorMessage(reason, "Could not reach the Host"));
-      }
-    };
-    void request();
-    return () => {
-      abandoned = true;
-    };
-  }, [attempt]);
-
-  if (error) {
-    return (
-      <>
-        <MessageBar intent="error">
-          <MessageBarBody>{error}</MessageBarBody>
-        </MessageBar>
-        <Text className={styles.caption}>
-          The password signed you in, but this Host would not let that stand in for the
-          claim. Reload once whatever changed has settled, or claim it from the
-          Host&apos;s own console instead.
-        </Text>
-        <Button appearance="primary" onClick={() => setAttempt((count) => count + 1)}>
-          Try again
-        </Button>
-      </>
-    );
-  }
+  const onGranted = useCallback(() => setGranted(true), []);
 
   if (!granted) {
-    return <Spinner size="small" label="Confirming this Host…" />;
+    return <PasswordBootstrap onDone={onGranted} />;
   }
 
   if (!configured && !status?.entraConfigured) {
@@ -703,6 +671,7 @@ function MigrationStep({
         </Text>
         <EntraConfigForm
           saved={false}
+          bootstrapWithPassword
           onConfigured={() => {
             setConfigured(true);
             void onChanged();
@@ -722,6 +691,64 @@ function MigrationStep({
       <MicrosoftButton status={status} label="Claim with Microsoft" />
     </>
   );
+}
+
+function PasswordBootstrap({ onDone }: { onDone: () => void }) {
+  const styles = useStyles();
+  const [error, setError] = useState<string>();
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let abandoned = false;
+    const request = async () => {
+      setError(undefined);
+      try {
+        const response = await fetch("/api/auth/bootstrap/password", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-csrf-token": await csrfToken(),
+          },
+          body: "{}",
+        });
+        if (abandoned) return;
+        if (response.ok) {
+          onDone();
+          return;
+        }
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        setError(
+          body.error ?? `This Host would not start the migration (${response.status})`,
+        );
+      } catch (reason) {
+        if (!abandoned) setError(errorMessage(reason, "Could not reach the Host"));
+      }
+    };
+    void request();
+    return () => {
+      abandoned = true;
+    };
+  }, [attempt, onDone]);
+
+  if (error) {
+    return (
+      <>
+        <MessageBar intent="error">
+          <MessageBarBody>{error}</MessageBarBody>
+        </MessageBar>
+        <Text className={styles.caption}>
+          The password signed you in, but this Host would not let that stand in for the
+          claim. Reload once whatever changed has settled, or claim it from the
+          Host&apos;s own console instead.
+        </Text>
+        <Button appearance="primary" onClick={() => setAttempt((count) => count + 1)}>
+          Try again
+        </Button>
+      </>
+    );
+  }
+
+  return <Spinner size="small" label="Confirming this Host…" />;
 }
 
 function ClaimStep({
@@ -813,7 +840,8 @@ function PasswordOnlySignIn({ onSignedIn }: { onSignedIn: () => Promise<void> })
       <Text className={styles.caption}>
         This Host was protected by an operator password before Microsoft sign-in was
         added. Sign in with that password once; Fleet then asks you to claim it with your
-        Microsoft account. There are no tenant or client IDs to enter.
+        Microsoft account. If no approved registration is configured, setup asks for an
+        application client ID first.
       </Text>
       <PasswordForm onSignedIn={onSignedIn} appearance="primary" />
     </>
@@ -867,6 +895,14 @@ function MicrosoftButton({
           <MessageBarBody>{error}</MessageBarBody>
         </MessageBar>
       )}
+      <Text className={styles.caption}>
+        {status?.entra?.tenantId === "common"
+          ? "This Host supports work/school and personal Microsoft accounts, including Microsoft corporate accounts where organization policy permits. "
+          : status?.entra
+            ? "This Host uses a fixed organizational directory; only accounts in that directory can authenticate. "
+            : "Supported account types depend on this Host's Microsoft sign-in registration. "}
+        Organization consent and Conditional Access still apply.
+      </Text>
       <Text className={styles.caption}>
         Fleet keeps no Microsoft token. It records only the account&apos;s directory and
         object id, and issues its own session.
@@ -1014,7 +1050,8 @@ function DeviceStep({ onSignedIn }: { onSignedIn: () => Promise<void> }) {
     <>
       <Text className={styles.caption}>
         This browser cannot reach a loopback listener, so Microsoft cannot redirect a
-        sign-in back to it. This Host has verified that its tenant permits device sign-in.
+        sign-in back to it. An administrator enabled device sign-in after one successful
+        verification. Your organization can still block it.
         {invitation
           ? " Signing in records which account turned up; an existing administrator approves that exact identity before you get access."
           : ""}

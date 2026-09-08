@@ -3,6 +3,7 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
+import { EntraConfigSchema } from "./auth/entra.js";
 import { isDeepStrictEqual } from "node:util";
 import {
   type FleetNode,
@@ -346,6 +347,20 @@ const settledStateList = [...terminalStateList, "offline"];
 const placeholders = (values: readonly unknown[]): string =>
   values.map(() => "?").join(",");
 
+function isDatabaseBusy(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "errcode" in error &&
+    typeof error.errcode === "number" &&
+    [5, 6].includes(error.errcode & 0xff)
+  );
+}
+
+class AuthenticationResetBusyError extends Error {
+  readonly statusCode = 409;
+}
+
 /**
  * Refuses an edit aimed at the reserved Chats workspace.
  *
@@ -383,7 +398,10 @@ export class FleetStore {
    */
   private readonly statements = new Map<string, StatementSync>();
 
-  constructor(path: string, options: { secureFiles?: SecureFiles } = {}) {
+  constructor(
+    path: string,
+    options: { secureFiles?: SecureFiles; exclusive?: boolean } = {},
+  ) {
     /*
      * The default writes to stderr rather than to a logger, because the store
      * is constructed before anything that has one — and a Host that could not
@@ -399,7 +417,22 @@ export class FleetStore {
         ));
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+    try {
+      if (options.exclusive) this.db.exec("PRAGMA locking_mode=EXCLUSIVE;");
+      this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+      // Retain exclusive ownership until close, including between transactions.
+      // An ordinary WAL write transaction would not exclude an idle live Host.
+      if (options.exclusive) this.db.exec("BEGIN EXCLUSIVE; COMMIT;");
+    } catch (error) {
+      this.db.close();
+      if (options.exclusive && isDatabaseBusy(error)) {
+        throw new Error(
+          "Cannot reset Host sign-in while its database is in use. Stop the Host and any database tools, then rerun npm run host:fresh.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     /*
      * After the first pragma, not before: WAL mode is what creates the `-wal`
      * and `-shm` sidecars, and those carry the same rows the database does. A
@@ -915,6 +948,66 @@ export class FleetStore {
     this.statement(
       "INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
     ).run(key, value);
+  }
+
+  /** Console-only fresh start; Node credentials and working data are not browser auth. */
+  resetOperatorAuthentication(): void {
+    if (this.statement("PRAGMA locking_mode").get()?.locking_mode !== "exclusive") {
+      throw new Error("Resetting Host sign-in requires an exclusive, offline database.");
+    }
+    this.clearOperatorAuthenticationRows();
+  }
+
+  /** The running auth service coordinates the in-memory half after this commit. */
+  eraseOperatorAuthentication(
+    csrfKey: string,
+    administratorId: string,
+  ): RevokedSession[] {
+    const previousMode = this.statement("PRAGMA locking_mode").get()?.locking_mode;
+    try {
+      this.db.exec("PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE; COMMIT;");
+      return this.clearOperatorAuthenticationRows({ csrfKey, administratorId });
+    } catch (error) {
+      // A refused reset must leave the live Host usable, including its old credentials.
+      if (previousMode !== "exclusive") this.db.exec("PRAGMA locking_mode=NORMAL;");
+      if (isDatabaseBusy(error)) {
+        throw new AuthenticationResetBusyError(
+          "Another process is using this Host database. Close other Host instances and database tools, then retry.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  private clearOperatorAuthenticationRows(
+    options: { csrfKey?: string; administratorId?: string } = {},
+  ): RevokedSession[] {
+    const keys = PRESERVED_SETTING_KEYS.filter((key) => key.startsWith("auth."));
+    return this.transaction(() => {
+      const revoked = this.revokeAllOperatorSessions();
+      this.db.exec(`
+        DELETE FROM operator_sessions;
+        DELETE FROM administrator_invitations;
+        DELETE FROM administrators;
+      `);
+      this.statement(`DELETE FROM settings WHERE key IN (${placeholders(keys)})`).run(
+        ...keys,
+      );
+      if (options.csrfKey) {
+        this.setSetting("auth.csrfKey", options.csrfKey);
+        this.setSetting("auth.passwordEnabled", "0");
+      }
+      this.recordSecurityAudit({
+        eventType: "operator_authentication_reset",
+        actorKind: options.administratorId ? "administrator" : "console",
+        actorId: options.administratorId,
+        outcome: "allowed",
+        detail:
+          "Browser authentication reset; Node credentials and connection settings retained.",
+      });
+      return revoked;
+    });
   }
 
   getTunnelEnabled(): boolean {
@@ -1502,6 +1595,14 @@ export class FleetStore {
       version: BACKUP_VERSION,
     });
     const security = SecurityBackupPayloadSchema.parse(input.security);
+    if (security.auth.entraTenantId || security.auth.entraClientId) {
+      const config = EntraConfigSchema.parse({
+        tenantId: security.auth.entraTenantId,
+        clientId: security.auth.entraClientId,
+      });
+      security.auth.entraTenantId = config.tenantId;
+      security.auth.entraClientId = config.clientId;
+    }
     if (security.administrators.every((row) => row.disabledAt !== "")) {
       // A restore that left nobody able to sign in would be a Host locked
       // against its own operator, recoverable only from the console.
@@ -1857,6 +1958,17 @@ export class FleetStore {
     this.statement(
       "UPDATE operator_sessions SET revoked_at=? WHERE token_hash=? AND revoked_at=''",
     ).run(new Date().toISOString(), tokenHash);
+  }
+
+  revokeAllOperatorSessions(): RevokedSession[] {
+    const rows = this.statement(
+      `UPDATE operator_sessions SET revoked_at=? WHERE revoked_at=''
+       RETURNING token_hash, administrator_id`,
+    ).all(new Date().toISOString()) as Row[];
+    return rows.map((row) => ({
+      tokenHash: String(row.token_hash),
+      administratorId: String(row.administrator_id),
+    }));
   }
 
   revokeSessionsForAdministrator(administratorId: string): RevokedSession[] {

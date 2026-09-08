@@ -1,7 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
+import { SignJWT, createLocalJWKSet, exportJWK, generateKeyPair } from "jose";
 import {
   AUTH_TRANSACTION_TTL_MS,
   EntraConfigSchema,
+  VISUAL_STUDIO_PUBLIC_CLIENT_ID,
   EntraProviderUnavailableError,
   EntraTransactions,
   createMsalAdapter,
@@ -10,6 +12,42 @@ import {
 } from "./entra.js";
 
 describe("EntraConfigSchema", () => {
+  it("defaults an owned client to the work/school and personal audience", () => {
+    expect(
+      EntraConfigSchema.parse({
+        clientId: "11111111-2222-3333-4444-555555555555",
+      }),
+    ).toEqual({
+      tenantId: "common",
+      clientId: "11111111-2222-3333-4444-555555555555",
+    });
+  });
+
+  it("normalizes the explicit common authority without accepting arbitrary authorities", () => {
+    const clientId = "11111111-2222-3333-4444-555555555555";
+    expect(EntraConfigSchema.parse({ tenantId: " COMMON ", clientId }).tenantId).toBe(
+      "common",
+    );
+    for (const tenantId of [
+      "",
+      "organizations",
+      "consumers",
+      "https://other.example",
+      "contoso.com",
+    ]) {
+      expect(EntraConfigSchema.safeParse({ tenantId, clientId }).success).toBe(false);
+    }
+  });
+
+  it("does not reuse the borrowed registration for public-account sign-in", () => {
+    expect(() =>
+      EntraConfigSchema.parse({
+        tenantId: "common",
+        clientId: VISUAL_STUDIO_PUBLIC_CLIENT_ID,
+      }),
+    ).toThrow(/approved Fleet/);
+  });
+
   it("accepts a tenant and client id and rejects anything shaped like a secret", () => {
     const parsed = EntraConfigSchema.parse({
       tenantId: "72f988bf-86f1-41af-91ab-2d7cd011db47",
@@ -45,11 +83,15 @@ describe("entraConfigFrom", () => {
     });
   });
 
-  it("is undefined when neither half is present, rather than half-configured", () => {
+  it("is undefined only when no configuration is present", () => {
     expect(entraConfigFrom({ stored: undefined, env: undefined })).toBeUndefined();
-    expect(
+    expect(() =>
       entraConfigFrom({ stored: undefined, env: { tenantId, clientId: "" } }),
-    ).toBeUndefined();
+    ).toThrow();
+    expect(entraConfigFrom({ stored: undefined, env: { clientId } })).toEqual({
+      tenantId: "common",
+      clientId,
+    });
   });
 });
 
@@ -199,27 +241,59 @@ describe("MSAL adapter", () => {
   };
   const account = {
     tenantId: config.tenantId,
-    localAccountId: "object-id",
+    localAccountId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
     username: "person@example.com",
     name: "Person",
   };
   const result = {
     tenantId: config.tenantId,
-    uniqueId: "object-id",
+    uniqueId: account.localAccountId,
+    idToken: "",
     account,
   };
+  let keys: ReturnType<typeof createLocalJWKSet>;
+
+  beforeAll(async () => {
+    const pair = await generateKeyPair("RS256", { extractable: true });
+    const jwk = {
+      ...(await exportJWK(pair.publicKey)),
+      kid: "adapter-test",
+      issuer: "https://login.microsoftonline.com/{tenantid}/v2.0",
+    };
+    keys = createLocalJWKSet({ keys: [jwk] });
+    result.idToken = await new SignJWT({
+      tid: config.tenantId,
+      oid: account.localAccountId,
+      sub: "pairwise-subject",
+      ver: "2.0",
+      nonce: "nonce",
+      preferred_username: account.username,
+      name: account.name,
+    })
+      .setProtectedHeader({ alg: "RS256", kid: jwk.kid })
+      .setIssuer(`https://login.microsoftonline.com/${config.tenantId}/v2.0`)
+      .setAudience(config.clientId)
+      .setIssuedAt()
+      .setNotBefore("0s")
+      .setExpirationTime("1h")
+      .sign(pair.privateKey);
+  });
 
   it("builds the authorization URL with identity scopes, PKCE, state, and nonce", async () => {
     let request: Record<string, unknown> | undefined;
-    const adapter = createMsalAdapter(config, {
-      getAuthCodeUrl: async (input) => {
-        request = input;
-        return "https://login.microsoftonline.com/authorize";
+    const adapter = createMsalAdapter(
+      config,
+      {
+        getAuthCodeUrl: async (input) => {
+          request = input;
+          return "https://login.microsoftonline.com/authorize";
+        },
+        acquireTokenByCode: async () => result,
+        acquireTokenByDeviceCode: async () => result,
+        removeAccount: async () => {},
       },
-      acquireTokenByCode: async () => result,
-      acquireTokenByDeviceCode: async () => result,
-      removeAccount: async () => {},
-    });
+      keys,
+    );
 
     await adapter.authorizationUrl?.({
       redirectUri: "http://localhost:8787/api/auth/entra/callback",
@@ -243,15 +317,19 @@ describe("MSAL adapter", () => {
   it("redeems the code with the same PKCE values and removes tokens from cache", async () => {
     let request: Record<string, unknown> | undefined;
     const removed: unknown[] = [];
-    const adapter = createMsalAdapter(config, {
-      getAuthCodeUrl: async () => "",
-      acquireTokenByCode: async (input) => {
-        request = input;
-        return result;
+    const adapter = createMsalAdapter(
+      config,
+      {
+        getAuthCodeUrl: async () => "",
+        acquireTokenByCode: async (input) => {
+          request = input;
+          return result;
+        },
+        acquireTokenByDeviceCode: async () => result,
+        removeAccount: async (value) => void removed.push(value),
       },
-      acquireTokenByDeviceCode: async () => result,
-      removeAccount: async (value) => void removed.push(value),
-    });
+      keys,
+    );
 
     await expect(
       adapter.redeem({
@@ -262,7 +340,7 @@ describe("MSAL adapter", () => {
       }),
     ).resolves.toEqual({
       tenantId: config.tenantId,
-      objectId: "object-id",
+      objectId: account.localAccountId,
       username: "person@example.com",
       displayName: "Person",
     });
@@ -277,22 +355,26 @@ describe("MSAL adapter", () => {
   });
 
   it("starts one background device flow and exposes its eventual identity by flow id", async () => {
-    const adapter = createMsalAdapter(config, {
-      getAuthCodeUrl: async () => "",
-      acquireTokenByCode: async () => result,
-      acquireTokenByDeviceCode: async (input) => {
-        input.deviceCodeCallback({
-          userCode: "ABCD-EFGH",
-          deviceCode: "device-code",
-          verificationUri: "https://microsoft.com/devicelogin",
-          expiresIn: 900,
-          interval: 5,
-          message: "Enter ABCD-EFGH",
-        });
-        return result;
+    const adapter = createMsalAdapter(
+      config,
+      {
+        getAuthCodeUrl: async () => "",
+        acquireTokenByCode: async () => result,
+        acquireTokenByDeviceCode: async (input) => {
+          input.deviceCodeCallback({
+            userCode: "ABCD-EFGH",
+            deviceCode: "device-code",
+            verificationUri: "https://microsoft.com/devicelogin",
+            expiresIn: 900,
+            interval: 5,
+            message: "Enter ABCD-EFGH",
+          });
+          return result;
+        },
+        removeAccount: async () => {},
       },
-      removeAccount: async () => {},
-    });
+      keys,
+    );
 
     const started = await adapter.deviceCode?.();
     expect(started).toMatchObject({
@@ -304,7 +386,7 @@ describe("MSAL adapter", () => {
       adapter.pollDevice?.({ flowId: started!.flowId }),
     ).resolves.toMatchObject({
       tenantId: config.tenantId,
-      objectId: "object-id",
+      objectId: account.localAccountId,
     });
   });
 });
