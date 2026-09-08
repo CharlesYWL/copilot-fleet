@@ -157,7 +157,9 @@ export function AuthGate({ children }: { children: ReactNode }) {
   useEffect(() => {
     // Why the last callback sent us back here, read before the first status
     // arrives so a refusal is never replaced by a plain sign-in form.
-    setNotice(readAuthError());
+    const returnedNotice = readAuthError();
+    // The first read scrubs the URL; StrictMode's effect replay must not erase it.
+    if (returnedNotice) setNotice(returnedNotice);
     void refresh();
   }, [refresh]);
 
@@ -468,11 +470,16 @@ function RefusedIdentity({
 /** These signed-out forms use their submitted proof, not an operator CSRF token. */
 function useAuthForm(path: string, refused: string, onDone: () => void | Promise<void>) {
   const [error, setError] = useState<string>();
+  const [errorStatus, setErrorStatus] = useState<number>();
   const [busy, setBusy] = useState(false);
+  const clearError = useCallback(() => {
+    setError(undefined);
+    setErrorStatus(undefined);
+  }, []);
 
   const submit = async (values: Record<string, string>) => {
     setBusy(true);
-    setError(undefined);
+    clearError();
     try {
       const response = await fetch(path, {
         method: "POST",
@@ -484,6 +491,7 @@ function useAuthForm(path: string, refused: string, onDone: () => void | Promise
         return;
       }
       const body = (await response.json().catch(() => ({}))) as { error?: string };
+      setErrorStatus(response.status);
       setError(body.error ?? `${refused} (${response.status})`);
     } catch (reason) {
       setError(errorMessage(reason, "Could not reach the Host"));
@@ -491,7 +499,7 @@ function useAuthForm(path: string, refused: string, onDone: () => void | Promise
       setBusy(false);
     }
   };
-  return { busy, error, submit };
+  return { busy, error, errorStatus, clearError, submit };
 }
 
 /** The console code, which is the only proof a fresh Host will accept. */
@@ -541,26 +549,50 @@ function ClaimCodeForm({ action, onDone }: { action: string; onDone: () => void 
 /** The registration this Host will authenticate against. */
 function EntraConfigForm({
   saved,
+  bootstrapWithPassword = false,
   onConfigured,
 }: {
   saved: boolean;
+  bootstrapWithPassword?: boolean;
   onConfigured: () => void;
 }) {
-  const { busy, error, submit } = useAuthForm(
+  const styles = useStyles();
+  const { busy, error, errorStatus, clearError, submit } = useAuthForm(
     "/api/auth/configure",
     "That configuration was refused",
     onConfigured,
   );
+  const needsBootstrap = errorStatus === 401;
 
   return (
     <>
+      {/* Keep the form mounted so renewing the proof never loses the registration. */}
       <MicrosoftSignInForm
-        busy={busy}
+        busy={busy || needsBootstrap}
         error={error}
         submitLabel="Save and continue"
-        busyLabel="Saving…"
+        busyLabel={needsBootstrap ? "Unlock setup to continue" : "Saving…"}
         onSubmit={submit}
       />
+      {needsBootstrap && (
+        <>
+          <Text className={styles.caption}>
+            Setup authorization has expired or was lost. Your registration details are
+            still here; unlock setup again, then save and continue.
+          </Text>
+          {bootstrapWithPassword ? (
+            <PasswordBootstrap onDone={clearError} />
+          ) : (
+            <>
+              <Text className={styles.caption}>
+                Enter the claim code from the Host&apos;s terminal again. If that code has
+                expired, restart the unclaimed Host to print a new one.
+              </Text>
+              <ClaimCodeForm action="Unlock setup again" onDone={clearError} />
+            </>
+          )}
+        </>
+      )}
       {saved && (
         <MessageBar intent="success">
           <MessageBarBody>
@@ -620,62 +652,11 @@ function MigrationStep({
 }) {
   const styles = useStyles();
   const [granted, setGranted] = useState(false);
-  const [error, setError] = useState<string>();
-  const [attempt, setAttempt] = useState(0);
   const [configured, setConfigured] = useState(false);
-
-  useEffect(() => {
-    let abandoned = false;
-    const request = async () => {
-      setError(undefined);
-      try {
-        const response = await fetch("/api/auth/bootstrap/password", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-csrf-token": await csrfToken(),
-          },
-          body: "{}",
-        });
-        if (abandoned) return;
-        if (response.ok) {
-          setGranted(true);
-          return;
-        }
-        const body = (await response.json().catch(() => ({}))) as { error?: string };
-        setError(
-          body.error ?? `This Host would not start the migration (${response.status})`,
-        );
-      } catch (reason) {
-        if (!abandoned) setError(errorMessage(reason, "Could not reach the Host"));
-      }
-    };
-    void request();
-    return () => {
-      abandoned = true;
-    };
-  }, [attempt]);
-
-  if (error) {
-    return (
-      <>
-        <MessageBar intent="error">
-          <MessageBarBody>{error}</MessageBarBody>
-        </MessageBar>
-        <Text className={styles.caption}>
-          The password signed you in, but this Host would not let that stand in for the
-          claim. Reload once whatever changed has settled, or claim it from the
-          Host&apos;s own console instead.
-        </Text>
-        <Button appearance="primary" onClick={() => setAttempt((count) => count + 1)}>
-          Try again
-        </Button>
-      </>
-    );
-  }
+  const onGranted = useCallback(() => setGranted(true), []);
 
   if (!granted) {
-    return <Spinner size="small" label="Confirming this Host…" />;
+    return <PasswordBootstrap onDone={onGranted} />;
   }
 
   if (!configured && !status?.entraConfigured) {
@@ -688,6 +669,7 @@ function MigrationStep({
         </Text>
         <EntraConfigForm
           saved={false}
+          bootstrapWithPassword
           onConfigured={() => {
             setConfigured(true);
             void onChanged();
@@ -707,6 +689,64 @@ function MigrationStep({
       <MicrosoftButton status={status} label="Claim with Microsoft" />
     </>
   );
+}
+
+function PasswordBootstrap({ onDone }: { onDone: () => void }) {
+  const styles = useStyles();
+  const [error, setError] = useState<string>();
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let abandoned = false;
+    const request = async () => {
+      setError(undefined);
+      try {
+        const response = await fetch("/api/auth/bootstrap/password", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-csrf-token": await csrfToken(),
+          },
+          body: "{}",
+        });
+        if (abandoned) return;
+        if (response.ok) {
+          onDone();
+          return;
+        }
+        const body = (await response.json().catch(() => ({}))) as { error?: string };
+        setError(
+          body.error ?? `This Host would not start the migration (${response.status})`,
+        );
+      } catch (reason) {
+        if (!abandoned) setError(errorMessage(reason, "Could not reach the Host"));
+      }
+    };
+    void request();
+    return () => {
+      abandoned = true;
+    };
+  }, [attempt, onDone]);
+
+  if (error) {
+    return (
+      <>
+        <MessageBar intent="error">
+          <MessageBarBody>{error}</MessageBarBody>
+        </MessageBar>
+        <Text className={styles.caption}>
+          The password signed you in, but this Host would not let that stand in for the
+          claim. Reload once whatever changed has settled, or claim it from the
+          Host&apos;s own console instead.
+        </Text>
+        <Button appearance="primary" onClick={() => setAttempt((count) => count + 1)}>
+          Try again
+        </Button>
+      </>
+    );
+  }
+
+  return <Spinner size="small" label="Confirming this Host…" />;
 }
 
 function ClaimStep({

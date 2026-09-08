@@ -46,7 +46,11 @@ const defaults: Record<string, unknown> = {
     identity: { username: "alice@example.com", displayName: "Alice" },
     entra: { tenantId: "tenant-1", clientId: "client-1" },
   },
-  "/api/auth/administrators": { administrators: [alice, bob], pending: [] },
+  "/api/auth/administrators": {
+    currentAdministratorId: alice.id,
+    administrators: [alice, bob],
+    pending: [],
+  },
   "/api/security/audit": {
     events: [
       {
@@ -528,7 +532,7 @@ describe("SecurityPanel", () => {
     });
     show();
 
-    const add = await screen.findByRole("button", { name: /add administrator/i });
+    const add = await screen.findByRole("button", { name: /invite someone else/i });
     fireEvent.click(add);
     expect((add as HTMLButtonElement).disabled).toBe(true);
     expect(add.textContent).toBe("Creating invitation…");
@@ -540,7 +544,9 @@ describe("SecurityPanel", () => {
       screen.getByRole("button", { name: /copy the invitation link/i }),
     ).toBeTruthy();
     expect(screen.getByText(/single use, fifteen minutes/i)).toBeTruthy();
-    expect(screen.getByText(/private.*second microsoft account/i)).toBeTruthy();
+    expect(
+      screen.getByText(/send this link to the person you want to invite/i),
+    ).toBeTruthy();
     await waitFor(() => expect((add as HTMLButtonElement).disabled).toBe(false));
     expect(
       fetchMock.mock.calls.filter(
@@ -559,11 +565,129 @@ describe("SecurityPanel", () => {
     );
   });
 
+  describe("adding another account in the same browser", () => {
+    const authorizationUrl = "https://login.microsoftonline.com/common/authorize?add";
+
+    const confirm = async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: /add another account/i }),
+      );
+      const dialog = await screen.findByRole("dialog", {
+        name: /add another administrator account/i,
+      });
+      expect(within(dialog).getByText(/without a separate approval/i)).toBeTruthy();
+      return within(dialog).getByRole("button", { name: /choose account in new tab/i });
+    };
+
+    it("opens the account picker in a detached tab only after explicit authorization", async () => {
+      const tab = { closed: false, assign: vi.fn(), close: vi.fn() };
+      const open = vi.spyOn(browserNavigation, "openTab").mockReturnValue(tab);
+      const fetchMock = host({
+        "POST /api/auth/administrators/add/start": () => answer({ authorizationUrl }),
+      });
+      const notify = vi.fn();
+      show(notify);
+      const choose = await confirm();
+      expect(open).not.toHaveBeenCalled();
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => url === "/api/auth/administrators/add/start",
+        ),
+      ).toBe(false);
+      fireEvent.click(choose);
+      expect(open).toHaveBeenCalledTimes(1);
+      await waitFor(() => expect(tab.assign).toHaveBeenCalledWith(authorizationUrl));
+      expect(tab.close).not.toHaveBeenCalled();
+      expect(browserNavigation.assign).not.toHaveBeenCalled();
+      const started = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/auth/administrators/add/start",
+      );
+      expect(new Headers(started?.[1]?.headers).get("x-csrf-token")).toBe("proof");
+      expect(
+        fetchMock.mock.calls.some(([url]) =>
+          String(url).includes("/administrator-invitations"),
+        ),
+      ).toBe(false);
+      expect(notify).toHaveBeenCalledWith(expect.stringMatching(/new tab/i), "info");
+    });
+
+    it("reports blocked popups without starting an authorization transaction", async () => {
+      vi.spyOn(browserNavigation, "openTab").mockReturnValue(undefined);
+      const fetchMock = host();
+      show();
+      fireEvent.click(await confirm());
+      expect(await screen.findByText(/allow popups for this host/i)).toBeTruthy();
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => url === "/api/auth/administrators/add/start",
+        ),
+      ).toBe(false);
+    });
+
+    it.each([
+      [
+        403,
+        { error: "Confirm your current administrator account.", reauthRequired: true },
+      ],
+      [503, { error: "Microsoft sign-in is unavailable." }],
+      [200, {}],
+    ])("closes the blank tab when starting sign-in fails (%s)", async (status, body) => {
+      const tab = { closed: false, assign: vi.fn(), close: vi.fn() };
+      vi.spyOn(browserNavigation, "openTab").mockReturnValue(tab);
+      host({
+        "POST /api/auth/administrators/add/start": () => answer(body, status),
+      });
+      show();
+      fireEvent.click(await confirm());
+      await waitFor(() => expect(tab.close).toHaveBeenCalledOnce());
+      expect(tab.assign).not.toHaveBeenCalled();
+      expect(await screen.findByRole("dialog")).toBeTruthy();
+      if (status === 403) {
+        expect(
+          screen.getByRole("button", { name: /confirm with microsoft/i }),
+        ).toBeTruthy();
+      }
+    });
+
+    it("does not open a tab or start a request when the administrator cancels", async () => {
+      const open = vi.spyOn(browserNavigation, "openTab");
+      const fetchMock = host();
+      show();
+      await confirm();
+      fireEvent.click(screen.getByRole("button", { name: /^cancel$/i }));
+      expect(open).not.toHaveBeenCalled();
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) => url === "/api/auth/administrators/add/start",
+        ),
+      ).toBe(false);
+    });
+
+    it("refreshes the administrator list when returning from the sign-in tab", async () => {
+      let added = false;
+      host({
+        "GET /api/auth/administrators": () =>
+          answer({
+            currentAdministratorId: alice.id,
+            administrators: added ? [alice, bob] : [alice],
+            pending: [],
+          }),
+      });
+      show();
+      const table = await screen.findByRole("table", { name: /^administrators$/i });
+      expect(within(table).queryByText(bob.username)).toBeNull();
+      added = true;
+      fireEvent(window, new Event("focus"));
+      expect(await within(table).findByText(bob.username)).toBeTruthy();
+    });
+  });
+
   it("shows a pending candidate's exact identity before anyone approves it", async () => {
     host(
       {},
       {
         "/api/auth/administrators": {
+          currentAdministratorId: alice.id,
           administrators: [alice],
           pending: [
             {
@@ -596,6 +720,7 @@ describe("SecurityPanel", () => {
       {},
       {
         "/api/auth/administrators": {
+          currentAdministratorId: alice.id,
           administrators: [alice],
           pending: [
             {
@@ -623,6 +748,87 @@ describe("SecurityPanel", () => {
         ),
       ).toBe(true),
     );
+  });
+
+  it.each([alice, bob])(
+    "disables removal of the current administrator $id",
+    async (current) => {
+      const fetchMock = host(
+        {},
+        {
+          "/api/auth/administrators": {
+            currentAdministratorId: current.id,
+            administrators: [alice, bob],
+            pending: [],
+          },
+        },
+      );
+      show();
+
+      const ownButton = await screen.findByRole("button", {
+        name: `Remove ${current.username}`,
+      });
+      const other = current.id === alice.id ? bob : alice;
+      expect((ownButton as HTMLButtonElement).disabled).toBe(true);
+      expect(
+        (
+          screen.getByRole("button", {
+            name: `Remove ${other.username}`,
+          }) as HTMLButtonElement
+        ).disabled,
+      ).toBe(false);
+      fireEvent.click(ownButton);
+      expect(screen.queryByRole("dialog")).toBeNull();
+      expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(
+        false,
+      );
+      expect(
+        screen.getByText(/you cannot remove your current administrator account/i),
+      ).toBeTruthy();
+    },
+  );
+
+  it("disables an open removal confirmation if that account becomes the current user", async () => {
+    let currentAdministratorId = alice.id;
+    const fetchMock = host({
+      "GET /api/auth/administrators": () =>
+        answer({ currentAdministratorId, administrators: [alice, bob], pending: [] }),
+    });
+    show();
+    fireEvent.click(
+      await screen.findByRole("button", { name: `Remove ${bob.username}` }),
+    );
+    const dialog = await screen.findByRole("dialog");
+    const remove = within(dialog).getByRole("button", { name: /^remove$/i });
+    expect((remove as HTMLButtonElement).disabled).toBe(false);
+    currentAdministratorId = bob.id;
+    fireEvent(window, new Event("focus"));
+
+    await waitFor(() => expect((remove as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(remove);
+    expect(fetchMock.mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(
+      false,
+    );
+  });
+
+  it("keeps removal disabled when the current administrator cannot be identified", async () => {
+    host(
+      {},
+      {
+        "/api/auth/administrators": {
+          administrators: [alice, bob],
+          pending: [],
+        },
+      },
+    );
+    show();
+    const table = await screen.findByRole("table", { name: /^administrators$/i });
+    for (const button of within(table).getAllByRole("button", { name: /^remove /i })) {
+      expect((button as HTMLButtonElement).disabled).toBe(true);
+    }
+    expect(
+      screen.getByText(/current administrator could not be identified/i),
+    ).toBeTruthy();
   });
 
   it("names the person and the consequence before removing them", async () => {
@@ -667,7 +873,7 @@ describe("SecurityPanel", () => {
     const notify = vi.fn();
     show(notify);
 
-    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /invite someone else/i }));
 
     const dialog = await screen.findByRole("dialog", {
       name: /confirm.*microsoft/i,
@@ -697,14 +903,14 @@ describe("SecurityPanel", () => {
     });
     show();
 
-    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /invite someone else/i }));
 
     const dialog = await screen.findByRole("dialog");
     expect(within(dialog).getByText(/could not create an invitation/i)).toBeTruthy();
     fireEvent.click(within(dialog).getByRole("button", { name: /^close$/i }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
     expect(
-      (screen.getByRole("button", { name: /add administrator/i }) as HTMLButtonElement)
+      (screen.getByRole("button", { name: /invite someone else/i }) as HTMLButtonElement)
         .disabled,
     ).toBe(false);
   });
@@ -721,7 +927,7 @@ describe("SecurityPanel", () => {
     });
     show();
 
-    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /invite someone else/i }));
     const dialog = await screen.findByRole("dialog", { name: /confirm.*microsoft/i });
     const confirm = within(dialog).getByRole("button", {
       name: /confirm with microsoft/i,
@@ -749,7 +955,7 @@ describe("SecurityPanel", () => {
     });
     show();
 
-    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /invite someone else/i }));
     const dialog = await screen.findByRole("dialog");
     fireEvent.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
     await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());

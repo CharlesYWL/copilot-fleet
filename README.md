@@ -198,6 +198,12 @@ eligibility or authentication for either of those services.
 4. You are now this Fleet's administrator. Enrol machines from
    **Settings → Nodes**.
 
+The setup authorization lasts ten minutes. If **Save and continue** asks for the
+claim code again, use **Unlock setup again** on the same page; your client ID and
+account-type selection are retained. Then save again. The console code itself
+expires after thirty minutes; restart the unclaimed Host for a new one if needed.
+There is no need to delete the database or recreate the app registration.
+
 ### Signing in from somewhere else
 
 Authorization code with PKCE and a loopback callback is the primary flow, so a
@@ -236,10 +242,26 @@ forwarded UI and does not set a cookie for a public tunnel domain.
 
 ### Adding and removing administrators
 
-Fleet asks for no Graph permission to search your directory, so an invitation is
-how somebody is added:
+Fleet asks for no Graph permission to search your directory. There are two ways
+to add an administrator, depending on who will sign in.
 
-1. **Settings → Security → Add administrator** mints a single-use link that
+**Another account you control:** choose **Settings → Security → Add another
+account**, then **Choose account in new tab**. This explicitly authorizes the
+account you select to become a full administrator, with no separate approval.
+Microsoft's account picker opens in a normal new tab; no private window or
+logout is needed. Your original Fleet session stays signed in. After success,
+close the new tab and return to Security; the administrator list refreshes.
+If popups are blocked, allow them for this Host and retry.
+
+This flow requires a recent Microsoft authorization-code sign-in by an existing
+administrator, plus that administrator's still-live session when the new account
+finishes signing in. It is a short-lived, single-use, browser-bound operation,
+not a link to share. Both accounts must be supported by the Host's registration;
+organization consent and Conditional Access still apply.
+
+**Someone else's account:** use an invitation with explicit approval:
+
+1. **Settings → Security → Invite someone else** mints a single-use link that
    expires in 15 minutes.
 2. The recipient opens it and signs in with Microsoft.
 3. That records them as a **candidate** — it grants nothing. The exact account
@@ -253,6 +275,9 @@ Removing an administrator revokes every session they hold and closes their open
 browser connections in the same operation, mid-transcript if necessary. The last
 active administrator cannot be removed, and removal needs a Microsoft
 authorization-code sign-in from the last ten minutes.
+You cannot remove your own currently signed-in administrator account: its Remove
+button is disabled, and the API refuses self-removal too. Another administrator
+can remove that account while signed in as themselves.
 
 ### Changing Microsoft sign-in configuration
 
@@ -269,8 +294,8 @@ variables alone does not switch a claimed Host or broaden its account audience.
    current administrator can authenticate through both registrations with the
    **same `(tenant ID, object ID)`**. A guest identity and its home identity can
    differ even with the same email. If continuity cannot be proved, keep the
-   old configuration; other identities need explicit administrator invitation
-   and approval, not automatic migration or edits to the administrator table.
+   old configuration; other identities must be added separately by an existing
+   administrator, not by automatic migration or edits to the administrator table.
 3. As an existing Microsoft administrator, use localhost or a local forward and
    open **Settings → Security → Change Microsoft sign-in configuration**.
    Choose the supported accounts and approved client ID, then **Verify new

@@ -152,6 +152,59 @@ describe("AuthGate, migrating a legacy-password Host", () => {
     expect(called(fetchMock, "/api/auth/code/start")).toBeTruthy();
   });
 
+  it("renews expired setup through the password session and keeps the registration", async () => {
+    let configureAttempts = 0;
+    let renewalAttempts = 0;
+    const fetchMock = host({
+      "/api/auth/bootstrap/password": () => {
+        renewalAttempts += 1;
+        return renewalAttempts === 2
+          ? answer({ error: "Could not renew setup" }, 503)
+          : answer({ ok: true });
+      },
+      "/api/auth/configure": () =>
+        ++configureAttempts === 1
+          ? answer(
+              { error: "Enter the claim code printed on the Host console first." },
+              401,
+            )
+          : answer({ ok: true }),
+    });
+    show();
+
+    const clientId = "22222222-2222-4222-8222-222222222222";
+    fireEvent.change(await screen.findByLabelText("Application (client) ID"), {
+      target: { value: clientId },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /save and continue/i }));
+
+    expect(await screen.findByText("Could not renew setup")).toBeTruthy();
+    const save = screen.getByRole("button", {
+      name: /unlock setup to continue/i,
+    }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    expect(
+      (screen.getByLabelText("Application (client) ID") as HTMLInputElement).value,
+    ).toBe(clientId);
+    expect(screen.queryByLabelText("Claim code")).toBeNull();
+    expect(configureAttempts).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: /try again/i }));
+
+    await waitFor(() => expect(save.disabled).toBe(false));
+    expect(renewalAttempts).toBe(3);
+    const renewals = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/auth/bootstrap/password",
+    );
+    for (const [, init] of renewals) {
+      expect(init?.headers).toMatchObject({ "x-csrf-token": "csrf-proof" });
+    }
+    fireEvent.click(save);
+    expect(
+      await screen.findByRole("button", { name: /claim with microsoft/i }),
+    ).toBeTruthy();
+    expect(configureAttempts).toBe(2);
+  });
+
   it("shows the console once an administrator exists", async () => {
     host({}, { state: "hybrid", claimCodeRequired: false });
     show();

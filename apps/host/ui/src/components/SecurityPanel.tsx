@@ -27,7 +27,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { errorMessage, type AuthStatus } from "@fleet/protocol";
-import { useMessageNotification } from "../hooks/useAppNotifications";
+import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
 import { api, ApiError } from "../hooks/useFleet";
 import { browserNavigation, csrfToken, startCodeLogin } from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
@@ -136,6 +136,7 @@ type Enrollment = {
 
 type Security = {
   status: AuthStatus;
+  currentAdministratorId: string;
   administrators: Administrator[];
   pending: PendingCandidate[];
   audit: AuditEvent[];
@@ -174,7 +175,7 @@ export const SecurityPanel = () => {
     try {
       const [status, admins, audit, enrollment] = await Promise.all([
         api<AuthStatus>("/api/auth/status"),
-        api<{ administrators: Administrator[]; pending: PendingCandidate[] }>(
+        api<Pick<Security, "currentAdministratorId" | "administrators" | "pending">>(
           "/api/auth/administrators",
         ),
         api<{ events: AuditEvent[] }>("/api/security/audit?limit=100"),
@@ -182,6 +183,7 @@ export const SecurityPanel = () => {
       ]);
       setData({
         status,
+        currentAdministratorId: admins.currentAdministratorId,
         administrators: admins.administrators,
         pending: admins.pending,
         audit: audit.events,
@@ -194,6 +196,9 @@ export const SecurityPanel = () => {
 
   useEffect(() => {
     void load();
+    const onFocus = () => void load();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, [load]);
 
   /**
@@ -274,7 +279,11 @@ export const SecurityPanel = () => {
       <PasswordCard status={data.status} run={run} />
       <DeviceFlowCard status={data.status} onChanged={load} />
       <PendingCard pending={data.pending} run={run} />
-      <AdministratorsCard administrators={data.administrators} run={run} />
+      <AdministratorsCard
+        currentAdministratorId={data.currentAdministratorId}
+        administrators={data.administrators}
+        run={run}
+      />
       <NodeMigrationCard enrollment={data.enrollment} run={run} />
       {/*
        * Placed with the administrators rather than with session defaults,
@@ -798,17 +807,70 @@ function PendingCard({
 }
 
 function AdministratorsCard({
+  currentAdministratorId,
   administrators,
   run,
 }: {
+  currentAdministratorId: string;
   administrators: Administrator[];
   run: (work: () => Promise<unknown>) => Promise<void>;
 }) {
   const styles = useStyles();
+  const notify = useNotify();
+  const [addingAccount, setAddingAccount] = useState(false);
+  const [openingAccount, setOpeningAccount] = useState(false);
   const [invitation, setInvitation] = useState<string>();
   const [inviting, setInviting] = useState(false);
   const [removing, setRemoving] = useState<Administrator>();
   const last = administrators.length <= 1;
+  const canRemove = (id: string | undefined) =>
+    Boolean(currentAdministratorId) &&
+    id !== undefined &&
+    id !== currentAdministratorId &&
+    !last;
+  const unidentified = !currentAdministratorId
+    ? "The current administrator could not be identified. Refresh Security before removing accounts."
+    : undefined;
+  useMessageNotification(unidentified, "warning");
+
+  const addAccount = async () => {
+    setAddingAccount(false);
+    setOpeningAccount(true);
+    try {
+      await run(async () => {
+        const tab = browserNavigation.openTab();
+        if (!tab) {
+          throw new Error(
+            "Allow popups for this Host, then try adding the account again.",
+          );
+        }
+        try {
+          const result = await api<{ authorizationUrl: string } | undefined>(
+            "/api/auth/administrators/add/start",
+            { method: "POST", body: "{}" },
+          );
+          if (typeof result?.authorizationUrl !== "string" || !result.authorizationUrl) {
+            throw new Error("The Host returned no Microsoft sign-in URL. Try again.");
+          }
+          if (tab.closed) {
+            throw new Error(
+              "The sign-in tab was closed. Start adding the account again.",
+            );
+          }
+          tab.assign(result.authorizationUrl);
+        } catch (reason) {
+          tab.close();
+          throw reason;
+        }
+        notify(
+          "Choose the account in the new tab, then return here. Your current Fleet session stays signed in.",
+          "info",
+        );
+      });
+    } finally {
+      setOpeningAccount(false);
+    }
+  };
 
   const invite = async () => {
     setInviting(true);
@@ -876,7 +938,7 @@ function AdministratorsCard({
                   <Button
                     size="small"
                     appearance="secondary"
-                    disabled={last}
+                    disabled={!canRemove(administrator.id)}
                     aria-label={`Remove ${administrator.username}`}
                     onClick={() => setRemoving(administrator)}
                   >
@@ -888,10 +950,20 @@ function AdministratorsCard({
           </TableBody>
         </Table>
       </div>
+      <Text className={styles.caption}>
+        {unidentified ?? "You cannot remove your current administrator account."}
+      </Text>
 
       <div className={styles.row}>
-        <Button appearance="primary" disabled={inviting} onClick={() => void invite()}>
-          {inviting ? "Creating invitation…" : "Add administrator"}
+        <Button
+          appearance="primary"
+          disabled={openingAccount}
+          onClick={() => setAddingAccount(true)}
+        >
+          {openingAccount ? "Opening Microsoft…" : "Add another account"}
+        </Button>
+        <Button appearance="secondary" disabled={inviting} onClick={() => void invite()}>
+          {inviting ? "Creating invitation…" : "Invite someone else"}
         </Button>
         {last && (
           <Text className={styles.caption}>
@@ -899,13 +971,17 @@ function AdministratorsCard({
           </Text>
         )}
       </div>
+      <Text className={styles.caption}>
+        Add an account you control in a new tab, or invite someone else with a link that
+        still requires your approval.
+      </Text>
 
       {invitation && (
         <>
           <Text>
-            Open this link in a private browser window or a different browser profile to
-            sign in with the second Microsoft account. Then refresh this Security page and
-            approve that account under Waiting for approval.
+            Send this link to the person you want to invite. After they sign in, approve
+            that account under Waiting for approval. For another account you control, use
+            Add another account instead.
           </Text>
           <div className={styles.row}>
             <Input
@@ -923,6 +999,37 @@ function AdministratorsCard({
           </Text>
         </>
       )}
+
+      <Dialog
+        open={addingAccount}
+        onOpenChange={(_event, data) => setAddingAccount(data.open)}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Add another administrator account?</DialogTitle>
+            <DialogContent>
+              <Text>
+                You are authorizing the Microsoft account you choose next to become a full
+                Fleet administrator without a separate approval. It will be able to
+                control every Node and read every transcript.
+              </Text>
+              <Text>
+                Microsoft will open an account picker in a new tab. Choose another Outlook
+                or work/school account supported by this Host&apos;s app registration. No
+                private window is needed, and your current Fleet session stays signed in.
+              </Text>
+            </DialogContent>
+            <DialogActions>
+              <Button appearance="secondary" onClick={() => setAddingAccount(false)}>
+                Cancel
+              </Button>
+              <Button appearance="primary" onClick={() => void addAccount()}>
+                Choose account in new tab
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
 
       <Dialog
         open={removing !== undefined}
@@ -947,6 +1054,7 @@ function AdministratorsCard({
               </Button>
               <Button
                 appearance="primary"
+                disabled={!canRemove(removing?.id)}
                 onClick={() => {
                   const target = removing;
                   setRemoving(undefined);
