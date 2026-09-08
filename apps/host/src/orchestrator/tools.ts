@@ -204,17 +204,20 @@ export const PlanTaskSchema = z.object({
   /**
    * The stages this task will go through, in order.
    *
-   * Chosen per task rather than fixed. Most changes want something like
-   * plan / implement / review; a question may want one. The list is what the
-   * person sees as progress, so the names should mean something to them.
+   * Chosen per task rather than fixed. A small fix can use one phase including
+   * verification; add investigation or independent review when warranted.
+   * The list is what the person sees as progress, so use meaningful names.
    */
   phases: z
     .array(z.string().min(1).max(40))
     .min(1)
     .max(8)
     .describe(
-      'The stages, in order — for example ["Plan", "Implement", "Review"]. Names are shown ' +
-        "to the person as progress. Between one and eight.",
+      "The stages, in order. Choose the fewest justified by complexity, uncertainty and risk: " +
+        '["Implement and verify"] for a simple fix, ["Inspect", "Implement and verify"] or ' +
+        '["Implement and verify", "Review"] when one extra handoff adds value, ' +
+        '["Plan", "Implement and verify", "Review"] for substantial or high-risk work. ' +
+        "Names are shown to the person as progress. Between one and eight.",
     ),
   /**
    * What has to be observably true for this task to be finished.
