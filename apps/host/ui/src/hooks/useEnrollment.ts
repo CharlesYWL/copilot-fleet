@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
+import { errorMessage } from "@fleet/protocol";
 import { api } from "./useFleet";
+import { useMessageNotification } from "./useAppNotifications";
 
 export type Enrollment = {
   hostUrl: string;
@@ -33,16 +35,24 @@ export type Enrollment = {
  */
 export function useEnrollment(intervalMs = 3_000): Enrollment | undefined {
   const [enrollment, setEnrollment] = useState<Enrollment>();
+  const [error, setError] = useState<string>();
+  useMessageNotification(error);
 
   useEffect(() => {
     let cancelled = false;
     const pull = () => {
       void api<Enrollment>("/api/enrollment")
         .then((result) => {
-          if (!cancelled) setEnrollment(result);
+          if (cancelled) return;
+          setEnrollment(result);
+          setError(undefined);
         })
         // A failed poll keeps the last good answer; the next one retries.
-        .catch(() => undefined);
+        .catch((reason: unknown) => {
+          if (!cancelled) {
+            setError(`Could not refresh enrollment settings: ${errorMessage(reason)}`);
+          }
+        });
     };
     pull();
     const timer = setInterval(pull, intervalMs);

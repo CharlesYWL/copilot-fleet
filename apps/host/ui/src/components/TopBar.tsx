@@ -27,6 +27,7 @@ import { ContextModeToggle, type ContextMode } from "./navigation/ContextModeTog
 import { fetchAuthStatus } from "../lib/auth";
 import { semanticColors } from "../theme";
 import { NotificationCenter } from "./NotificationCenter";
+import type { useAppNotifications } from "../hooks/useAppNotifications";
 
 const useStyles = makeStyles({
   /**
@@ -185,6 +186,7 @@ type TopBarProps = {
   soundEnabled: boolean;
   onToggleSound: () => void;
   notifications?: readonly Notification[];
+  appNotifications?: ReturnType<typeof useAppNotifications>;
   notificationUnreadCount?: number;
   browserNotificationsEnabled?: boolean;
   onToggleBrowserNotifications?: () => void;
@@ -220,6 +222,7 @@ export const TopBar = ({
   soundEnabled,
   onToggleSound,
   notifications = [],
+  appNotifications,
   notificationUnreadCount = 0,
   browserNotificationsEnabled = false,
   onToggleBrowserNotifications = () => undefined,
@@ -334,15 +337,37 @@ export const TopBar = ({
           />
         )}
         <NotificationCenter
-          notifications={notifications}
-          unreadCount={notificationUnreadCount}
+          notifications={[...notifications, ...(appNotifications?.notifications ?? [])]}
+          unreadCount={notificationUnreadCount + (appNotifications?.unreadCount ?? 0)}
           browserEnabled={browserNotificationsEnabled}
           onToggleBrowser={onToggleBrowserNotifications}
-          onNavigate={onNavigateNotification}
-          onMarkRead={onMarkNotificationRead}
-          onMarkAllRead={onMarkAllNotificationsRead}
-          onDismissAll={onDismissAllNotifications}
-          onDismiss={onDismissNotification}
+          onNavigate={(notification) => {
+            if (notification.kind === "app_message") {
+              appNotifications?.markRead(notification.id);
+              return;
+            }
+            onNavigateNotification(notification);
+          }}
+          onMarkRead={(id) =>
+            appNotifications?.notifications.some((item) => item.id === id)
+              ? appNotifications.markRead(id)
+              : onMarkNotificationRead(id)
+          }
+          onMarkAllRead={() => {
+            appNotifications?.markAllRead();
+            if (notificationUnreadCount > 0) onMarkAllNotificationsRead();
+          }}
+          onDismissAll={() => {
+            appNotifications?.dismissAll();
+            if (notifications.length > 0 || notificationUnreadCount > 0) {
+              onDismissAllNotifications();
+            }
+          }}
+          onDismiss={(id) =>
+            appNotifications?.notifications.some((item) => item.id === id)
+              ? appNotifications.dismiss(id)
+              : onDismissNotification(id)
+          }
         />
         <Button
           appearance="subtle"

@@ -9,6 +9,7 @@ import {
 } from "@fluentui/react-components";
 import { ArrowClockwise20Regular } from "@fluentui/react-icons";
 import { api } from "../hooks/useFleet";
+import { useMessageNotification } from "../hooks/useAppNotifications";
 
 /**
  * What the Host has complained about lately.
@@ -97,6 +98,7 @@ export const DiagnosticsPanel = () => {
   const styles = useStyles();
   const [entries, setEntries] = useState<LogEntry[]>();
   const [error, setError] = useState<string>();
+  useMessageNotification(error);
   const viewRef = useRef<HTMLDivElement>(null);
   // Whether the reader is sitting at the newest line decides whether the poll
   // may scroll; otherwise every refresh drags them off what they were reading.

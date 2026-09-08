@@ -1,4 +1,3 @@
-import { useEffect, useState } from "react";
 import {
   Badge,
   Button,
@@ -19,11 +18,7 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import {
-  Checkmark20Regular,
-  Copy20Regular,
-  QuestionCircle20Regular,
-} from "@fluentui/react-icons";
+import { QuestionCircle20Regular } from "@fluentui/react-icons";
 import type {
   TunnelInfo,
   TunnelProvider,
@@ -31,7 +26,9 @@ import type {
   TunnelState,
 } from "@fleet/protocol";
 import { useTunnel } from "../hooks/useTunnel";
+import { useMessageNotification } from "../hooks/useAppNotifications";
 import { orderTunnelProviders } from "../lib/tunnel-order";
+import { CopyButton } from "./CopyButton";
 
 const useStyles = makeStyles({
   panel: {
@@ -180,13 +177,13 @@ const ProviderCard = ({
   onMakePrimary,
 }: CardProps) => {
   const styles = useStyles();
-  const [copied, setCopied] = useState(false);
-
-  useEffect(() => {
-    if (!copied) return;
-    const timer = setTimeout(() => setCopied(false), 2_000);
-    return () => clearTimeout(timer);
-  }, [copied]);
+  useMessageNotification(state.error ? `${spec.label}: ${state.error}` : undefined);
+  useMessageNotification(
+    !spec.binaryPresent && !state.error
+      ? `${spec.label}: ${spec.binary} is not installed. ${spec.installHint}`.trim()
+      : undefined,
+    "warning",
+  );
 
   const switching = busy || state.status === "starting" || state.status === "stopping";
   const url = state.url;
@@ -286,16 +283,7 @@ const ProviderCard = ({
       {online && url && (
         <div className={styles.urlRow}>
           <code className={styles.mono}>{url}</code>
-          <Button
-            size="small"
-            appearance="secondary"
-            icon={copied ? <Checkmark20Regular /> : <Copy20Regular />}
-            onClick={() => {
-              void navigator.clipboard.writeText(url).then(() => setCopied(true));
-            }}
-          >
-            {copied ? "Copied" : "Copy"}
-          </Button>
+          <CopyButton text={url} size="small" showText />
           {!isPrimary && (
             <Button size="small" appearance="subtle" onClick={onMakePrimary}>
               Use for enrollment
@@ -341,12 +329,19 @@ const TunnelSummary = ({ info }: { info: TunnelInfo }) => {
 
 export const TunnelPanel = () => {
   const styles = useStyles();
-  const { info, busy, error: actionError, setEnabled } = useTunnel();
+  const { info, busy, error: actionError, refreshError, setEnabled } = useTunnel();
+  useMessageNotification(actionError);
 
   if (!info) {
     return (
       <div className={styles.panel}>
-        <Spinner label="Loading tunnel status…" />
+        {refreshError ? (
+          <MessageBar intent="error">
+            <MessageBarBody>{refreshError}</MessageBarBody>
+          </MessageBar>
+        ) : (
+          <Spinner label="Loading tunnel status…" />
+        )}
       </div>
     );
   }
@@ -385,6 +380,11 @@ export const TunnelPanel = () => {
       {actionError && (
         <MessageBar intent="error">
           <MessageBarBody>{actionError}</MessageBarBody>
+        </MessageBar>
+      )}
+      {refreshError && (
+        <MessageBar intent="error">
+          <MessageBarBody>{refreshError}</MessageBarBody>
         </MessageBar>
       )}
 

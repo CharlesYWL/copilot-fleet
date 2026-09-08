@@ -27,6 +27,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { errorMessage, type AuthStatus } from "@fleet/protocol";
+import { useMessageNotification } from "../hooks/useAppNotifications";
 import { api, ApiError } from "../hooks/useFleet";
 import { csrfToken, startCodeLogin } from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
@@ -165,6 +166,8 @@ export const SecurityPanel = () => {
   const [error, setError] = useState<string>();
   const [reauth, setReauth] = useState<string>();
   const [signingIn, setSigningIn] = useState(false);
+  useMessageNotification(error);
+  useMessageNotification(reauth, "warning");
 
   const load = useCallback(async () => {
     try {
@@ -340,6 +343,10 @@ function IdentityCard({
   enrollment: Enrollment;
 }) {
   const styles = useStyles();
+  useMessageNotification(
+    status.state === "microsoft-only" ? undefined : AUTH_MODE_COPY[status.state],
+    "warning",
+  );
   return (
     <section className={styles.card} aria-label="This Host">
       <Text weight="semibold">This Host</Text>
@@ -520,6 +527,7 @@ function DeviceFlowCard({
   const [message, setMessage] = useState<string>();
   const [blocked, setBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
+  useMessageNotification(message, blocked ? "warning" : "error");
 
   const verify = async () => {
     setBusy(true);
@@ -866,6 +874,12 @@ function NodeMigrationCard({
 }) {
   const styles = useStyles();
   const { total, mutualAuth, legacy } = enrollment.nodeAuthentication;
+  useMessageNotification(
+    legacy > 0
+      ? `${legacy} Node${legacy === 1 ? "" : "s"} still authenticate with a shared secret. Run a fresh Connect command on each machine before requiring mutual Node authentication.`
+      : undefined,
+    "warning",
+  );
   return (
     <section className={styles.card} aria-label="Node authentication">
       <Text weight="semibold">Node authentication</Text>

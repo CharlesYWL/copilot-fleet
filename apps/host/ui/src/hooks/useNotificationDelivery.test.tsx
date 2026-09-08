@@ -133,7 +133,8 @@ describe("useNotificationDelivery", () => {
 
   it("keeps in-app delivery working when browser permission is denied", async () => {
     MockNotification.requestPermission.mockResolvedValue("denied");
-    const input = delivery([]);
+    const notify = vi.fn();
+    const input = delivery([], { onNotify: notify });
     const { result, rerender } = renderHook(
       ({ value }) => useNotificationDelivery(value),
       { initialProps: { value: input } },
@@ -142,6 +143,10 @@ describe("useNotificationDelivery", () => {
     act(() => result.current.toggleBrowser());
     await waitFor(() => expect(MockNotification.requestPermission).toHaveBeenCalled());
     expect(result.current.browserEnabled).toBe(false);
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("Browser notifications are blocked"),
+      "warning",
+    );
 
     rerender({
       value: {
@@ -153,6 +158,20 @@ describe("useNotificationDelivery", () => {
       expect(input.onToast).toHaveBeenCalledWith(expect.objectContaining({ id: "n1" })),
     );
     expect(MockNotification.instances).toHaveLength(0);
+  });
+
+  it("reports unsupported browser alerts without disabling in-app notifications", () => {
+    vi.stubGlobal("Notification", undefined);
+    const notify = vi.fn();
+    const { result } = renderHook(() =>
+      useNotificationDelivery(delivery([], { onNotify: notify })),
+    );
+    act(() => result.current.toggleBrowser());
+    expect(result.current.browserEnabled).toBe(false);
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      "Browser notifications are not supported in this browser.",
+      "warning",
+    );
   });
 
   it("uses the fallback claim to avoid duplicate transient delivery", async () => {

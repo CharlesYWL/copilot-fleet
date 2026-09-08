@@ -4,9 +4,11 @@ import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BrowserMessage, Notification, Snapshot } from "@fleet/protocol";
 import { useFleet } from "../hooks/useFleet";
+import { useAppNotifications } from "../hooks/useAppNotifications";
 import { forgetCsrfToken } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import { NotificationCenter } from "./NotificationCenter";
+import { TopBar } from "./TopBar";
 
 const ISO = "2026-09-01T19:00:00.000Z";
 
@@ -94,6 +96,7 @@ describe("notification shell integration", () => {
             browserEnabled={false}
             onToggleBrowser={vi.fn()}
             onNavigate={(notification) => {
+              if (notification.kind === "app_message") return;
               void fleet.markNotificationRead(notification.id);
               setDestination(notification.navigation.sessionId ?? "fleet");
             }}
@@ -137,5 +140,70 @@ describe("notification shell integration", () => {
         expect.objectContaining({ method: "POST" }),
       ),
     );
+  });
+
+  it("keeps local operation messages through live server snapshots without posting them", async () => {
+    const Harness = () => {
+      const local = useAppNotifications();
+      const fleet = useFleet(local.add);
+      return (
+        <>
+          <button onClick={() => local.add("Offline operation failed")}>Notify</button>
+          <TopBar
+            nodesOnline={0}
+            liveSessions={0}
+            waitingPermissions={0}
+            connected={fleet.connected}
+            context={{ kind: "none" }}
+            soundEnabled={false}
+            onToggleSound={vi.fn()}
+            onSignOut={vi.fn()}
+            notifications={fleet.snapshot.notifications}
+            notificationUnreadCount={fleet.snapshot.notificationUnreadCount}
+            appNotifications={local}
+            onMarkNotificationRead={fleet.markNotificationRead}
+            onDismissNotification={fleet.dismissNotification}
+            onMarkAllNotificationsRead={() => void fleet.markAllNotificationsRead()}
+            onDismissAllNotifications={() => void fleet.dismissAllNotifications()}
+          />
+        </>
+      );
+    };
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <Harness />
+      </FluentProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Notify" }));
+    act(() => {
+      MockWebSocket.instance.send({
+        type: "snapshot",
+        data: { ...empty, notifications: [item], notificationUnreadCount: 1 },
+      });
+    });
+    fireEvent.click(
+      screen.getByRole("button", { name: "Notifications, 2 unread notifications" }),
+    );
+    expect(screen.getByText("Offline operation failed")).toBeTruthy();
+    expect(screen.getByText("Permission needed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Read Application error" }));
+    await waitFor(() => expect(screen.getByText("Read")).toBeTruthy());
+    act(() => {
+      MockWebSocket.instance.send({ type: "snapshot", data: empty });
+    });
+    expect(screen.getByText("Offline operation failed")).toBeTruthy();
+    expect(screen.queryByText("Permission needed")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Application error" }));
+    expect(screen.queryByText("Offline operation failed")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Notify" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: "Notifications, 1 unread notification" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Mark all read" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
+    expect(screen.getByText("No notifications yet.")).toBeTruthy();
+    expect(
+      vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === "POST"),
+    ).toEqual([]);
   });
 });

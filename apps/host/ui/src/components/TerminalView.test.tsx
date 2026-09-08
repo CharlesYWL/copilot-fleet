@@ -1,10 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
+import type { ComponentProps } from "react";
 import type { FleetSession, SessionEvent } from "@fleet/protocol";
 import { TerminalView } from "./TerminalView";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { fleetDarkTheme } from "../theme";
+import { NotificationContext } from "../hooks/useAppNotifications";
 
 const session = (values: Partial<FleetSession> = {}): FleetSession => ({
   id: "s1",
@@ -46,21 +48,25 @@ const show = (
   overrides: Partial<FleetSession> = {},
   draft: SessionDraft = EMPTY_DRAFT,
   events: SessionEvent[] = [],
+  notify = vi.fn(),
+  onDraftChange: ComponentProps<typeof TerminalView>["onDraftChange"] = vi.fn(),
 ) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <TerminalView
-        session={session(overrides)}
-        events={events}
-        onPrompt={vi.fn()}
-        onCancel={vi.fn()}
-        onStop={vi.fn()}
-        onResume={vi.fn()}
-        onPermission={vi.fn()}
-        onConfigChange={vi.fn()}
-        draft={draft}
-        onDraftChange={vi.fn()}
-      />
+      <NotificationContext.Provider value={notify}>
+        <TerminalView
+          session={session(overrides)}
+          events={events}
+          onPrompt={vi.fn()}
+          onCancel={vi.fn()}
+          onStop={vi.fn()}
+          onResume={vi.fn()}
+          onPermission={vi.fn()}
+          onConfigChange={vi.fn()}
+          draft={draft}
+          onDraftChange={onDraftChange}
+        />
+      </NotificationContext.Provider>
     </FluentProvider>,
   );
 
@@ -79,6 +85,23 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
+  it("adds attachment read errors to notifications and keeps the inline error", async () => {
+    const notify = vi.fn();
+    const { container } = show({}, EMPTY_DRAFT, [], notify, (update) => {
+      update(EMPTY_DRAFT);
+    });
+    fireEvent.change(container.querySelector('input[type="file"]')!, {
+      target: { files: [new File([], "empty.txt", { type: "text/plain" })] },
+    });
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        'Could not read "empty.txt"',
+        "error",
+      ),
+    );
+    expect(screen.getByRole("alert").textContent).toBe('Could not read "empty.txt"');
+  });
+
   it("keeps the pickers inside the composer, under the text box", () => {
     // They used to sit in a band above it; the point of the move is that the
     // composer is one object, so a picker outside the form is the regression.
@@ -113,11 +136,16 @@ describe("TerminalView composer", () => {
   });
 
   it("does not offer Resume while Stop acknowledgement is pending", () => {
-    show({ state: "offline", stopRequested: true });
+    const notify = vi.fn();
+    show({ state: "offline", stopRequested: true }, EMPTY_DRAFT, [], notify);
 
     expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     expect(screen.getByRole("button", { name: "Mark stopped" })).toBeTruthy();
     expect(screen.getByText("Stop is waiting for the offline node node.")).toBeTruthy();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("is waiting for the offline node node"),
+      "warning",
+    );
   });
 
   it("offers Resume after an offline session has finished stopping", () => {

@@ -16,6 +16,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { errorMessage } from "@fleet/protocol";
+import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
 import { csrfToken } from "../lib/auth";
 
 /** The floor the Host enforces, repeated here so the form can refuse first. */
@@ -75,6 +76,14 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
   const [notice, setNotice] = useState<string>();
   const [pending, setPending] = useState<unknown>();
   const fileInput = useRef<HTMLInputElement>(null);
+  useMessageNotification(error);
+  const notify = useNotify();
+
+  const reportSuccess = (message: string) => {
+    setNotice(message);
+    // Restoring can immediately reload or unmount this card.
+    notify(message, "success");
+  };
 
   const tooShort = passphrase.length < MIN_BACKUP_PASSPHRASE_LENGTH;
   const refuseShort = (): boolean => {
@@ -118,7 +127,7 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
         return;
       }
       download(body);
-      setNotice(
+      reportSuccess(
         "Archive downloaded. Keep the passphrase somewhere separate — it is not stored here and cannot be recovered.",
       );
     } catch (reason) {
@@ -181,7 +190,7 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
         setError(body.error ?? `Could not restore this Host (${response.status})`);
         return;
       }
-      setNotice(
+      reportSuccess(
         `Restored. ${body.administrators ?? 0} administrator(s) can sign in through the restored Microsoft configuration; every session this Host had issued is over.`,
       );
       onImported();

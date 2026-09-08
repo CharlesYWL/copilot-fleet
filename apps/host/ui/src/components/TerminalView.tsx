@@ -62,6 +62,7 @@ import { blockColor, semanticColors, statusVisuals, terminal } from "../theme";
 import { sessionLabel } from "../lib/session-label";
 import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
 import { transcriptNotice } from "../lib/transcript-notice";
+import { useMessageNotification } from "../hooks/useAppNotifications";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -572,6 +573,7 @@ export const TerminalView = ({
   const [menuDismissed, setMenuDismissed] = useState(false);
   const [highlight, setHighlight] = useState(0);
   const [attachError, setAttachError] = useState<string>();
+  useMessageNotification(attachError);
   const streamRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -739,6 +741,12 @@ export const TerminalView = ({
   const canResume =
     Boolean(onResume) && !session.stopRequested && isResumableSession(session);
   const canConfirmStopped = session.stopRequested && session.state === "offline";
+  useMessageNotification(
+    canConfirmStopped
+      ? `Stop for ${sessionLabel(session)} is waiting for the offline node ${session.nodeName}. Reconnect that node or mark the session stopped if its agent process is no longer running.`
+      : undefined,
+    "warning",
+  );
 
   const query = slashQuery(prompt);
   const matches = useMemo(

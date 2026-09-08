@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fleetDarkTheme } from "../theme";
 import { forgetCsrfToken } from "../lib/auth";
 import { GeneralPanel } from "./GeneralPanel";
+import { NotificationContext } from "../hooks/useAppNotifications";
 
 const response = (body: unknown) =>
   Promise.resolve(
@@ -20,6 +21,72 @@ afterEach(() => {
 });
 
 describe("GeneralPanel", () => {
+  it("reports enabled YOLO mode once until the setting is disabled and enabled again", async () => {
+    let defaults = {
+      yolo: true,
+      autoResume: false,
+      notificationLifecycleEnabled: true,
+      model: "",
+      reasoningEffort: "",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string | URL | Request, init?: RequestInit) => {
+        if (String(path) === "/api/auth/csrf") return response({ csrfToken: "proof" });
+        if (init?.method === "POST") {
+          defaults = {
+            ...defaults,
+            ...(JSON.parse(String(init.body)) as typeof defaults),
+          };
+        }
+        return response(defaults);
+      }),
+    );
+    const notify = vi.fn();
+    const panel = () => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={notify}>
+          <GeneralPanel sessions={[]} />
+        </NotificationContext.Provider>
+      </FluentProvider>
+    );
+    const view = render(panel());
+    const warning = /New sessions will execute commands on their node without approval/;
+    expect(await screen.findByText(warning)).toBeTruthy();
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        expect.stringMatching(warning),
+        "warning",
+      ),
+    );
+    view.rerender(panel());
+    expect(notify).toHaveBeenCalledTimes(1);
+    const toggle = screen.getAllByRole("switch")[0]!;
+    fireEvent.click(toggle);
+    await waitFor(() => expect(screen.queryByText(warning)).toBeNull());
+    fireEvent.click(toggle);
+    await screen.findByText(warning);
+    await waitFor(() => expect(notify).toHaveBeenCalledTimes(2));
+  });
+
+  it("reports loading errors once and keeps the inline explanation", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Defaults unavailable")));
+    const notify = vi.fn();
+    const panel = (
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={notify}>
+          <GeneralPanel sessions={[]} />
+        </NotificationContext.Provider>
+      </FluentProvider>
+    );
+    const view = render(panel);
+    expect(await screen.findByText("Defaults unavailable")).toBeTruthy();
+    expect(notify).toHaveBeenCalledExactlyOnceWith("Defaults unavailable", "error");
+    view.rerender(panel);
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Defaults unavailable")).toBeTruthy();
+  });
+
   it("loads and updates the application lifecycle notification default", async () => {
     let defaults = {
       yolo: false,

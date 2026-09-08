@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Button, makeStyles } from "@fluentui/react-components";
 import { Checkmark20Regular, Copy20Regular } from "@fluentui/react-icons";
+import { useNotify } from "../hooks/useAppNotifications";
 
 const useStyles = makeStyles({
   button: {
@@ -25,6 +26,7 @@ export const CopyButton = ({
 }: CopyButtonProps) => {
   const styles = useStyles();
   const [copied, setCopied] = useState(false);
+  const notify = useNotify();
 
   useEffect(() => {
     if (!copied) return;
@@ -38,7 +40,7 @@ export const CopyButton = ({
       await navigator.clipboard.writeText(text);
       setCopied(true);
     } catch {
-      // Clipboard can be blocked in insecure contexts; ignore quietly.
+      notify("Could not copy to the clipboard.", "error");
     }
   };
 

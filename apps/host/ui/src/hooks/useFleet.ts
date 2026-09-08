@@ -16,7 +16,10 @@ import { mergeEvents } from "../lib/merge-events";
 
 export type { Snapshot };
 
-export type Notify = (message: string, intent?: "error" | "success") => void;
+export type Notify = (
+  message: string,
+  intent?: "error" | "success" | "warning" | "info",
+) => void;
 
 export type LiveNotificationUpdate = {
   sequence: number;
@@ -425,6 +428,7 @@ export function useFleet(notify: Notify) {
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let attempt = 0;
     let closed = false;
+    let connectionLost = false;
 
     const connect = () => {
       if (closed) return;
@@ -434,6 +438,10 @@ export function useFleet(notify: Notify) {
       socket.onopen = () => {
         attempt = 0;
         setConnected(true);
+        if (connectionLost) {
+          connectionLost = false;
+          notifyRef.current("Connection to the Host restored.", "info");
+        }
         // Anything that changed while the socket was down was never delivered,
         // so start again from the Host's current truth rather than from state
         // that stopped being updated at an arbitrary moment.
@@ -444,6 +452,13 @@ export function useFleet(notify: Notify) {
       socket.onclose = () => {
         setConnected(false);
         if (closed) return;
+        if (!connectionLost) {
+          connectionLost = true;
+          notifyRef.current(
+            "Connection to the Host lost. Live updates are paused while reconnecting.",
+            "warning",
+          );
+        }
         // Without this the page goes permanently deaf after any restart of the
         // Host and only a manual reload brings it back.
         retryTimer = setTimeout(connect, reconnectDelay(attempt));

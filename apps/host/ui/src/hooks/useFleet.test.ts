@@ -112,6 +112,38 @@ afterEach(() => {
 });
 
 describe("useFleet durable notifications", () => {
+  it("reports connection loss once per outage and reports recovery, but not initial connection or unmount", async () => {
+    vi.useFakeTimers();
+    const notify = vi.fn();
+    const { unmount } = renderHook(() => useFleet(notify));
+    const first = MockWebSocket.instances[0]!;
+    await act(async () => first.open());
+    expect(notify).not.toHaveBeenCalled();
+
+    act(() => first.disconnect());
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      "Connection to the Host lost. Live updates are paused while reconnecting.",
+      "warning",
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    const second = MockWebSocket.instances[1]!;
+    act(() => second.disconnect());
+    expect(notify).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    const third = MockWebSocket.instances[2]!;
+    await act(async () => third.open());
+    expect(notify).toHaveBeenLastCalledWith("Connection to the Host restored.", "info");
+    expect(notify).toHaveBeenCalledTimes(2);
+
+    unmount();
+    act(() => third.disconnect());
+    expect(notify).toHaveBeenCalledTimes(2);
+  });
+
   it("hydrates notifications and unread count without treating them as live delivery", () => {
     const notify = vi.fn();
     const { result, rerender } = renderHook(({ onNotify }) => useFleet(onNotify), {
