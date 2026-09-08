@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
+import type { Notification } from "@fleet/protocol";
+import { useAppNotifications } from "../hooks/useAppNotifications";
 import { fleetDarkTheme } from "../theme";
 import markUrl from "../assets/copilot-fleet-mark.svg";
 import { TopBar } from "./TopBar";
@@ -224,5 +226,169 @@ describe("TopBar sidebar fold", () => {
   it("offers nothing to fold where there is no sidebar", () => {
     show();
     expect(screen.queryByRole("button", { name: /sidebar/ })).toBeNull();
+  });
+});
+
+describe("TopBar application notifications", () => {
+  const serverNotification: Notification = {
+    id: "server",
+    sourceKey: "server",
+    category: "orchestration",
+    kind: "orchestration_step_failure",
+    severity: "error",
+    status: "active",
+    title: "Server failure",
+    body: "Authoritative event",
+    subject: { type: "run", id: "run", label: "Run" },
+    navigation: { type: "run", runId: "run" },
+    data: {},
+    createdAt: "2026-09-01T19:00:00.000Z",
+    updatedAt: "2026-09-01T19:00:00.000Z",
+    readAt: null,
+    dismissedAt: null,
+    resolvedAt: null,
+  };
+
+  const setup = (
+    notifications: Notification[] = [],
+    {
+      unreadCount,
+      localMessages = ["Local error"],
+    }: { unreadCount?: number; localMessages?: string[] } = {},
+  ) => {
+    const server = {
+      onMarkNotificationRead: vi.fn(),
+      onDismissNotification: vi.fn(),
+      onMarkAllNotificationsRead: vi.fn(),
+      onDismissAllNotifications: vi.fn(),
+      onNavigateNotification: vi.fn(),
+    };
+    const Harness = ({ items }: { items: Notification[] }) => {
+      const local = useAppNotifications();
+      return (
+        <FluentProvider theme={fleetDarkTheme}>
+          <button onClick={() => localMessages.forEach((message) => local.add(message))}>
+            Add local error
+          </button>
+          <TopBar
+            nodesOnline={0}
+            liveSessions={0}
+            waitingPermissions={0}
+            connected={false}
+            context={{ kind: "none" }}
+            soundEnabled={false}
+            onToggleSound={vi.fn()}
+            onSignOut={vi.fn()}
+            notifications={items}
+            notificationUnreadCount={
+              unreadCount ?? items.filter((item) => !item.readAt).length
+            }
+            appNotifications={local}
+            {...server}
+          />
+        </FluentProvider>
+      );
+    };
+    const rendered = render(<Harness items={notifications} />);
+    fireEvent.click(screen.getByRole("button", { name: "Add local error" }));
+    return {
+      server,
+      snapshot: (items: Notification[]) => rendered.rerender(<Harness items={items} />),
+    };
+  };
+
+  const openNotifications = (count: number) =>
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `Notifications, ${count} unread notification${count === 1 ? "" : "s"}`,
+      }),
+    );
+
+  it("merges authoritative and local items and preserves local history across snapshots", async () => {
+    const { server, snapshot } = setup([serverNotification]);
+    openNotifications(2);
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "Read Application error" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /Notifications, 1 unread/ }),
+      ).toBeTruthy(),
+    );
+    expect(server.onMarkNotificationRead).not.toHaveBeenCalled();
+    expect(server.onNavigateNotification).not.toHaveBeenCalled();
+    snapshot([{ ...serverNotification, body: "Updated by snapshot" }]);
+    expect(screen.getByText("Local error")).toBeTruthy();
+    expect(screen.getByText("Read")).toBeTruthy();
+    expect(screen.getByText("Updated by snapshot")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Application error" }));
+    expect(screen.queryByText("Local error")).toBeNull();
+    expect(server.onDismissNotification).not.toHaveBeenCalled();
+    snapshot([{ ...serverNotification }]);
+    expect(screen.queryByText("Local error")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Mark Server failure read" }));
+    expect(server.onMarkNotificationRead).toHaveBeenCalledExactlyOnceWith("server");
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Server failure" }));
+    expect(server.onDismissNotification).toHaveBeenCalledExactlyOnceWith("server");
+    fireEvent.click(screen.getByRole("button", { name: "Open Server failure" }));
+    await waitFor(() =>
+      expect(server.onNavigateNotification).toHaveBeenCalledWith(serverNotification),
+    );
+  });
+
+  it("routes mixed bulk actions to both stores", () => {
+    const { server } = setup([serverNotification]);
+    openNotifications(2);
+    fireEvent.click(screen.getByRole("button", { name: "Mark all read" }));
+    expect(server.onMarkAllNotificationsRead).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("Read")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
+    expect(server.onDismissAllNotifications).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Local error")).toBeNull();
+  });
+
+  it("clears local history and requests durable dismissal for unread rows outside the loaded list", () => {
+    const { server } = setup([], { unreadCount: 1 });
+    openNotifications(2);
+    fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
+    expect(server.onDismissAllNotifications).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Local error")).toBeNull();
+  });
+
+  it("can clear authoritative unread history even when neither list has loaded rows", () => {
+    const { server } = setup([], { unreadCount: 1, localMessages: [] });
+    openNotifications(1);
+    const clear = screen.getByRole("button", { name: "Clear all" });
+    expect(clear.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(clear);
+    expect(server.onDismissAllNotifications).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders same-millisecond local arrivals newest first across decimal sequence boundaries", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-09-01T19:00:00.000Z"));
+    try {
+      const messages = Array.from({ length: 11 }, (_, index) => `Local message ${index}`);
+      setup([], { localMessages: messages });
+      openNotifications(11);
+      const rows = screen.getAllByRole("listitem");
+      expect(rows).toHaveLength(11);
+      for (const [index, message] of [...messages].reverse().entries()) {
+        expect(within(rows[index]!).getByText(message, { exact: true })).toBeTruthy();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads and clears offline local-only notifications without server mutations", () => {
+    const { server } = setup();
+    openNotifications(1);
+    fireEvent.click(screen.getByRole("button", { name: "Mark all read" }));
+    expect(screen.getByRole("button", { name: /Notifications, 0 unread/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Clear all" }));
+    expect(screen.getByText("No notifications yet.")).toBeTruthy();
+    for (const callback of Object.values(server)) {
+      expect(callback).not.toHaveBeenCalled();
+    }
   });
 });

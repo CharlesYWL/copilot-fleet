@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { errorMessage, type TunnelInfo, type TunnelProvider } from "@fleet/protocol";
 import { api } from "./useFleet";
+import { useMessageNotification } from "./useAppNotifications";
 
 export type TunnelControls = {
   info: TunnelInfo | undefined;
   busy: TunnelProvider | undefined;
   error: string | undefined;
+  refreshError?: string | undefined;
   setEnabled: (
     provider: TunnelProvider,
     enabled: boolean,
@@ -27,12 +29,16 @@ export function useTunnel(intervalMs = 2_000): TunnelControls {
   // one tunnel does not disable the switches of the others.
   const [busy, setBusy] = useState<TunnelProvider>();
   const [error, setError] = useState<string>();
+  const [refreshError, setRefreshError] = useState<string>();
+  useMessageNotification(refreshError);
 
   const refresh = useCallback(async () => {
     try {
       setInfo(await api<TunnelInfo>("/api/tunnel"));
-    } catch {
+      setRefreshError(undefined);
+    } catch (reason) {
       // Keep the last good snapshot; the next poll retries.
+      setRefreshError(`Could not refresh tunnel status: ${errorMessage(reason)}`);
     }
   }, []);
 
@@ -67,5 +73,5 @@ export function useTunnel(intervalMs = 2_000): TunnelControls {
     [refresh],
   );
 
-  return { info, busy, error, setEnabled };
+  return { info, busy, error, refreshError, setEnabled };
 }

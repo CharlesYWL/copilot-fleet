@@ -4,6 +4,7 @@ import { FluentProvider } from "@fluentui/react-components";
 import { PortableBackupCard } from "./PortableBackupCard";
 import { forgetCsrfToken } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
+import { NotificationContext } from "../hooks/useAppNotifications";
 
 const answer = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -11,10 +12,15 @@ const answer = (body: unknown, status = 200) =>
     headers: { "content-type": "application/json" },
   });
 
-const show = (props: Partial<React.ComponentProps<typeof PortableBackupCard>> = {}) =>
+const show = (
+  props: Partial<React.ComponentProps<typeof PortableBackupCard>> = {},
+  notify = vi.fn(),
+) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <PortableBackupCard claimed={true} onImported={() => {}} {...props} />
+      <NotificationContext.Provider value={notify}>
+        <PortableBackupCard claimed={true} onImported={() => {}} {...props} />
+      </NotificationContext.Provider>
     </FluentProvider>,
   );
 
@@ -46,12 +52,18 @@ describe("PortableBackupCard", () => {
       return answer({ csrfToken: "proof" });
     });
     vi.stubGlobal("fetch", fetchMock);
-    show();
+    const notify = vi.fn();
+    show({}, notify);
 
     fireEvent.change(passphraseField(), { target: { value: "too-short" } });
+    expect(notify).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: /export portable backup/i }));
 
     expect(await screen.findByText(/at least 14 characters/i)).toBeTruthy();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("at least 14 characters"),
+      "error",
+    );
     expect(
       fetchMock.mock.calls.some((call) =>
         String(call[0]).includes("/api/backup/portable"),
@@ -86,7 +98,8 @@ describe("PortableBackupCard", () => {
       return answer({ ok: true });
     });
     vi.stubGlobal("fetch", fetchMock);
-    show();
+    const notify = vi.fn();
+    show({}, notify);
 
     fireEvent.change(passphraseField(), {
       target: { value: "correct horse battery staple" },
@@ -96,6 +109,11 @@ describe("PortableBackupCard", () => {
     await waitFor(() => expect(created).toHaveLength(1));
     expect(created[0]!.name).toMatch(/portable/);
     expect(objectUrl).toHaveBeenCalled();
+    expect(screen.getByText(/archive downloaded/i)).toBeTruthy();
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining("Archive downloaded."),
+      "success",
+    );
     click.mockRestore();
   });
 
@@ -159,8 +177,14 @@ describe("PortableBackupCard", () => {
       return answer({ ok: true });
     });
     vi.stubGlobal("fetch", fetchMock);
-    const onImported = vi.fn();
-    show({ onImported });
+    const notify = vi.fn();
+    const onImported = vi.fn(() => {
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        expect.stringContaining("Restored. 2 administrator(s)"),
+        "success",
+      );
+    });
+    show({ onImported }, notify);
 
     fireEvent.change(passphraseField(), {
       target: { value: "correct horse battery staple" },
@@ -182,6 +206,7 @@ describe("PortableBackupCard", () => {
       backup: { kind: "copilot-fleet-host", version: 2 },
     });
     await waitFor(() => expect(onImported).toHaveBeenCalled());
+    expect(screen.getByText(/restored. 2 administrator/i)).toBeTruthy();
   });
 
   it("says so plainly when the picked file is not an archive", async () => {

@@ -3,11 +3,14 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { CopyButton } from "./CopyButton";
 import { fleetDarkTheme } from "../theme";
+import { NotificationContext } from "../hooks/useAppNotifications";
 
-const show = (showText: boolean) =>
+const show = (showText: boolean, notify = vi.fn()) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <CopyButton text="the complete command" label="Copy sample" showText={showText} />
+      <NotificationContext.Provider value={notify}>
+        <CopyButton text="the complete command" label="Copy sample" showText={showText} />
+      </NotificationContext.Provider>
     </FluentProvider>,
   );
 
@@ -48,12 +51,35 @@ describe("CopyButton", () => {
   it.each([false, true])(
     "does not claim success when the clipboard refuses, showText=%s",
     async (showText) => {
-      vi.mocked(navigator.clipboard.writeText).mockRejectedValue(new Error("blocked"));
-      show(showText);
+      vi.mocked(navigator.clipboard.writeText).mockRejectedValue(
+        new Error("blocked: the complete command"),
+      );
+      const notify = vi.fn();
+      show(showText, notify);
       const button = screen.getByRole("button", { name: "Copy sample" });
       await act(async () => fireEvent.click(button));
       expect(button.getAttribute("aria-label")).toBe("Copy sample");
       expect(button.textContent).toBe(showText ? "Copy" : "");
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        "Could not copy to the clipboard.",
+        "error",
+      );
     },
   );
+
+  it("reports an unavailable clipboard without exposing the value", async () => {
+    Object.defineProperty(navigator, "clipboard", {
+      value: undefined,
+      configurable: true,
+    });
+    const notify = vi.fn();
+    show(false, notify);
+    await act(async () =>
+      fireEvent.click(screen.getByRole("button", { name: "Copy sample" })),
+    );
+    expect(notify).toHaveBeenCalledExactlyOnceWith(
+      "Could not copy to the clipboard.",
+      "error",
+    );
+  });
 });

@@ -23,6 +23,7 @@ import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
 import { useNotificationDelivery } from "./hooks/useNotificationDelivery";
 import { useNotificationPreference } from "./hooks/useNotificationPreference";
+import { NotificationContext, useAppNotifications } from "./hooks/useAppNotifications";
 import { useStickyFlag } from "./hooks/useStickyFlag";
 import { signOut } from "./lib/auth";
 import { notificationTarget } from "./lib/notification-navigation";
@@ -195,9 +196,12 @@ export function App() {
   const styles = useStyles();
   const toasterId = useId("fleet-toaster");
   const { dispatchToast } = useToastController(toasterId);
+  const appNotifications = useAppNotifications();
+  const { add: addAppNotification } = appNotifications;
 
   const notify = useCallback<Notify>(
     (message, intent = "error") => {
+      addAppNotification(message, intent);
       dispatchToast(
         <Toast>
           <ToastTitle>{message}</ToastTitle>
@@ -205,7 +209,7 @@ export function App() {
         { intent, position: "bottom-end" },
       );
     },
-    [dispatchToast],
+    [addAppNotification, dispatchToast],
   );
 
   const {
@@ -707,10 +711,11 @@ export function App() {
   );
   const delivery = useNotificationDelivery({
     notificationUpdates: liveNotificationUpdates,
-    unreadCount: snapshot.notificationUnreadCount,
+    unreadCount: snapshot.notificationUnreadCount + appNotifications.unreadCount,
     isTargetVisible: isNotificationTargetVisible,
     onToast: notifyDurable,
     onNavigate: handleNotificationNavigate,
+    onNotify: notify,
   });
   /**
    * The tasks of the conversation on screen, if the session on screen is one.
@@ -881,7 +886,7 @@ export function App() {
       body: JSON.stringify({ name }),
     });
 
-  return (
+  const content = (
     <CatalogProvider value={catalog}>
       <div className={styles.app}>
         <TopBar
@@ -907,6 +912,7 @@ export function App() {
           soundEnabled={delivery.soundEnabled}
           onToggleSound={delivery.toggleSound}
           notifications={snapshot.notifications}
+          appNotifications={appNotifications}
           notificationUnreadCount={snapshot.notificationUnreadCount}
           browserNotificationsEnabled={delivery.browserEnabled}
           onToggleBrowserNotifications={delivery.toggleBrowser}
@@ -1267,5 +1273,8 @@ export function App() {
         <Toaster toasterId={toasterId} />
       </div>
     </CatalogProvider>
+  );
+  return (
+    <NotificationContext.Provider value={notify}>{content}</NotificationContext.Provider>
   );
 }

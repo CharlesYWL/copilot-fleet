@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { FluentProvider } from "@fluentui/react-components";
 import { describe, expect, it, vi } from "vitest";
 import type { Notification } from "@fleet/protocol";
+import type { AppNotification } from "../hooks/useAppNotifications";
 import { fleetDarkTheme } from "../theme";
 import { NotificationCenter } from "./NotificationCenter";
 
@@ -30,7 +31,7 @@ const notification = (
 });
 
 const show = (
-  notifications: Notification[] = [],
+  notifications: AppNotification[] = [],
   unreadCount = 0,
   overrides: Partial<Parameters<typeof NotificationCenter>[0]> = {},
 ) => {
@@ -116,6 +117,37 @@ describe("NotificationCenter", () => {
     expect(
       screen.getByRole("button", { name: "Clear all" }).hasAttribute("disabled"),
     ).toBe(true);
+  });
+
+  it("shows full application messages with severity and reads without navigating", () => {
+    const body = "A long operation error. ".repeat(100) + "Final diagnostic detail.";
+    const local: AppNotification = {
+      ...notification("local", "2026-09-01T19:00:00.000Z"),
+      kind: "app_message",
+      category: "application",
+      intent: "warning",
+      severity: "warning",
+      title: "Application warning",
+      body,
+      navigation: { type: "none" },
+      subject: { type: "application", id: "local", label: "Application" },
+    };
+    const props = show([local], 1);
+    open(1);
+    expect(screen.getByText("Application message")).toBeTruthy();
+    expect(screen.getByRole("img", { name: "warning severity" })).toBeTruthy();
+    const text = screen.getByText(body);
+    expect(getComputedStyle(text).overflow).not.toBe("hidden");
+    expect(getComputedStyle(text).getPropertyValue("-webkit-line-clamp")).not.toBe("2");
+    expect(screen.queryByRole("button", { name: "Open Application warning" })).toBeNull();
+    const read = screen.getByRole("button", { name: "Read Application warning" });
+    expect(read.querySelectorAll("svg")).toHaveLength(1);
+    fireEvent.click(read);
+    expect(props.onMarkRead).toHaveBeenCalledWith("local");
+    expect(props.onNavigate).not.toHaveBeenCalled();
+    expect(screen.getByText(body)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss Application warning" }));
+    expect(props.onDismiss).toHaveBeenCalledWith("local");
   });
 
   it("orders newest first and exposes truthful kind, severity, and time", () => {

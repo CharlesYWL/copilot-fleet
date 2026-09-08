@@ -4,6 +4,7 @@ import { FluentProvider } from "@fluentui/react-components";
 import { SecurityPanel } from "./SecurityPanel";
 import { browserNavigation, forgetCsrfToken } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
+import { NotificationContext } from "../hooks/useAppNotifications";
 
 const answer = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -97,14 +98,104 @@ const host = (
   return fetchMock;
 };
 
-const show = () =>
+const show = (notify = vi.fn()) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <SecurityPanel />
+      <NotificationContext.Provider value={notify}>
+        <SecurityPanel />
+      </NotificationContext.Provider>
     </FluentProvider>,
   );
 
 describe("SecurityPanel", () => {
+  it("reports a security settings failure while retaining the inline error", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("Security unavailable")));
+    const notify = vi.fn();
+    show(notify);
+    expect(await screen.findByText("Security unavailable")).toBeTruthy();
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith("Security unavailable", "error"),
+    );
+  });
+
+  it("reports legacy Node authentication as an operational warning", async () => {
+    host();
+    const notify = vi.fn();
+    show(notify);
+    expect(await screen.findByText(/1 Node still authenticate/i)).toBeTruthy();
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("1 Node still authenticate with a shared secret."),
+      "warning",
+    );
+    expect(
+      notify.mock.calls.filter(([message]) =>
+        String(message).includes("1 Node still authenticate with a shared secret."),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    ["entra-unconfigured", "No Microsoft sign-in is configured on this Host."],
+    ["legacy-password", "Password sign-in only."],
+    ["hybrid", "Password sign-in is still enabled alongside Microsoft accounts."],
+    ["recovery", "A temporary recovery password is enabled from the Host console."],
+  ])(
+    "reports the %s authentication warning without repeating it for dialog changes",
+    async (state, message) => {
+      host(
+        {},
+        {
+          "/api/auth/status": {
+            ...(defaults["/api/auth/status"] as Record<string, unknown>),
+            state,
+          },
+          "/api/enrollment": {
+            ...(defaults["/api/enrollment"] as Record<string, unknown>),
+            nodeAuthentication: { total: 3, mutualAuth: 3, legacy: 0 },
+          },
+        },
+      );
+      const notify = vi.fn();
+      show(notify);
+      const button = await screen.findByRole("button", {
+        name: /disable password sign-in/i,
+      });
+      await waitFor(() =>
+        expect(notify).toHaveBeenCalledExactlyOnceWith(
+          expect.stringContaining(message),
+          "warning",
+        ),
+      );
+      expect(
+        screen.getAllByText((text) => text.includes(message)).length,
+      ).toBeGreaterThan(0);
+      fireEvent.click(button);
+      fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
+      expect(notify).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("does not notify for Microsoft-only authentication or static help", async () => {
+    host(
+      {},
+      {
+        "/api/auth/status": {
+          ...(defaults["/api/auth/status"] as Record<string, unknown>),
+          state: "microsoft-only",
+          passwordEnabled: false,
+        },
+        "/api/enrollment": {
+          ...(defaults["/api/enrollment"] as Record<string, unknown>),
+          nodeAuthentication: { total: 3, mutualAuth: 3, legacy: 0 },
+        },
+      },
+    );
+    const notify = vi.fn();
+    show(notify);
+    await screen.findByText(/Microsoft accounts only/);
+    expect(notify).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     forgetCsrfToken();
     vi.spyOn(browserNavigation, "assign").mockImplementation(() => undefined);
@@ -279,11 +370,16 @@ describe("SecurityPanel", () => {
       "/api/auth/code/start": () =>
         answer({ authorizationUrl: "https://login/authorize" }),
     });
-    show();
+    const notify = vi.fn();
+    show(notify);
 
     fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
 
     const prompt = await screen.findByRole("button", { name: /confirm with microsoft/i });
+    expect(notify).toHaveBeenCalledWith(
+      "Sign in with Microsoft again before changing this.",
+      "warning",
+    );
     fireEvent.click(prompt);
 
     await waitFor(() =>
@@ -501,6 +597,27 @@ describe("SecurityPanel", () => {
       expect(await screen.findByText(/device sign-in is enabled/i)).toBeTruthy();
     });
 
+    it("reports a nested device verification refusal while leaving it inline", async () => {
+      host({
+        "POST /api/auth/device/verify": () =>
+          answer({ error: "Microsoft refused this verification." }, 500),
+      });
+      const notify = vi.fn();
+      show(notify);
+      fireEvent.click(
+        await screen.findByRole("button", { name: /verify device sign-in/i }),
+      );
+      expect(
+        await screen.findByText("Microsoft refused this verification."),
+      ).toBeTruthy();
+      await waitFor(() =>
+        expect(notify).toHaveBeenCalledWith(
+          "Microsoft refused this verification.",
+          "error",
+        ),
+      );
+    });
+
     it("keeps it disabled and explains a Conditional Access block", async () => {
       host({
         "POST /api/auth/device/verify": () =>
@@ -513,7 +630,8 @@ describe("SecurityPanel", () => {
             409,
           ),
       });
-      show();
+      const notify = vi.fn();
+      show(notify);
 
       fireEvent.click(
         await screen.findByRole("button", { name: /verify device sign-in/i }),
@@ -523,6 +641,10 @@ describe("SecurityPanel", () => {
         await screen.findByText(/conditional access blocks device sign-in/i),
       ).toBeTruthy();
       expect(await screen.findByText(/device sign-in is off/i)).toBeTruthy();
+      expect(notify).toHaveBeenCalledWith(
+        "Conditional Access blocks device sign-in in this tenant. Use a local forward instead.",
+        "warning",
+      );
     });
   });
 });
