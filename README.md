@@ -309,8 +309,12 @@ of them on one Windows machine, or split Host and Node across machines.
   Fleet administrator sign-in or Copilot CLI login.
 - **Node is online but sessions cannot start:** add a placement on that Node and
   make sure the path is absolute, exists on the Node, and is a directory.
-- **Agent waits forever or reports auth problems:** update Copilot CLI to at
-  least 1.0.69 and run `copilot login` as the Node's service user.
+- **Agent reports an authentication problem:** update Copilot CLI to at least
+  1.0.69 and run `copilot login` as the Node's service user.
+- **ACP startup times out:** Fleet allows up to 180 seconds for cold Copilot and
+  MCP initialization. Retry once; if it persists, inspect the Node's Copilot and
+  MCP logs for a slow, unavailable, or misconfigured service. The timeout alone
+  does not mean Copilot is signed out.
 - **Something needs attention:** use the notification bell, the amber
   Orchestrator/task state, the permission banner in the session, and
   **Settings → Diagnostics** for Host warnings/errors. The Node's own

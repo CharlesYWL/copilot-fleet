@@ -253,8 +253,11 @@ npm start
   provider；它不是 Fleet 管理员登录，也不是 Copilot CLI 登录。
 - **Node 在线但 session 启动不了：** 给这个 Node 添加 placement，并确认路径是绝对路径、
   在 Node 上已经存在且是目录。
-- **代理一直等待或报告认证问题：** 把 Copilot CLI 更新到至少 1.0.69，并用 Node 服务用户
-  运行 `copilot login`。
+- **代理报告认证问题：** 把 Copilot CLI 更新到至少 1.0.69，并用 Node 服务用户运行
+  `copilot login`。
+- **ACP 启动超时：** Fleet 最多等待 180 秒，以便 Copilot 和 MCP 完成冷启动。先重试一次；
+  如果仍然失败，请检查 Node 上的 Copilot 和 MCP 日志，确认是否有服务缓慢、不可用或配置
+  错误。仅凭这个超时不能判断 Copilot 已退出登录。
 - **有事项需要处理：** 看通知铃铛、Orchestrator/task 的琥珀色状态、session 内的权限横幅，
   以及 **Settings → Diagnostics** 里的 Host warning/error。能访问 Node 机器时，它自己的
   `http://127.0.0.1:8788` 配置页会显示 Node 侧日志。

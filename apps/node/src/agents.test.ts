@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { SessionEvent } from "@fleet/protocol";
 import {
+  ACP_START_TIMEOUT_MS,
+  AcpAgentFactory,
   MockAgentFactory,
   UnpromptedTurn,
   configRecoveryRequest,
@@ -122,13 +124,78 @@ describe("Copilot ACP startup", () => {
     );
   });
 
-  it("fails a silent ACP startup instead of waiting forever", async () => {
+  it("wires the ACP factory to the bounded default", () => {
+    const factory = new AcpAgentFactory(60_000, "copilot");
+    expect(Reflect.get(factory, "startTimeoutMs")).toBe(ACP_START_TIMEOUT_MS);
+  });
+
+  it("allows a cold ACP startup to finish after 60 seconds", async () => {
+    vi.useFakeTimers();
+    let settled = false;
+    const startup = withCopilotStartupTimeout(
+      new Promise<string>((resolve) => {
+        setTimeout(() => resolve("ready"), 61_000);
+      }),
+    ).then(
+      (value) => {
+        settled = true;
+        return { value };
+      },
+      (error: unknown) => {
+        settled = true;
+        return { error };
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(startup).resolves.toEqual({ value: "ready" });
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fails a silent ACP startup at the bounded default", async () => {
+    vi.useFakeTimers();
+    expect(ACP_START_TIMEOUT_MS).toBe(180_000);
+    let settled = false;
+    const startup = withCopilotStartupTimeout(new Promise<void>(() => {})).then(
+      () => {
+        settled = true;
+        return undefined;
+      },
+      (error: unknown) => {
+        settled = true;
+        return error;
+      },
+    );
+
+    await vi.advanceTimersByTimeAsync(179_999);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const failure = await startup;
+    expect(failure).toBeInstanceOf(Error);
+    if (!(failure instanceof Error)) throw new Error("expected startup failure");
+    expect(failure.message).toMatch(/within 180s.*startup.*MCP/i);
+    expect(failure.message).not.toMatch(/copilot (?:update|login)/i);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("keeps an injected shorter startup timeout", async () => {
     vi.useFakeTimers();
     const assertion = expect(
       withCopilotStartupTimeout(new Promise<void>(() => {}), 1_000),
-    ).rejects.toThrow(/copilot update.*copilot login/);
+    ).rejects.toThrow(/within 1s/);
     await vi.advanceTimersByTimeAsync(1_000);
     await assertion;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("clears the timeout when startup rejects for another reason", async () => {
+    vi.useFakeTimers();
+    await expect(
+      withCopilotStartupTimeout(Promise.reject(new Error("Authentication required"))),
+    ).rejects.toThrow("Authentication required");
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
