@@ -19,6 +19,7 @@
     "start:host": "node --input-type=module -e \"process.env.NODE_ENV='production'; await import('./apps/host/dist/server/server.js')\" --",
     "start:node": "npm run start -w @fleet/node --",
     "test": "npm run build -w @fleet/protocol && vitest run",
+    "test:watch": "npm run build -w @fleet/protocol && node scripts/watch-tests.mjs",
     "test:coverage": "npm run build -w @fleet/protocol && vitest run --coverage",
     "typecheck": "npm run build -w @fleet/protocol && npm run typecheck -w @fleet/host && npm run typecheck -w @fleet/node && npm run typecheck -w @fleet/protocol",
     "lint": "eslint .",

@@ -1,4 +1,4 @@
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 /**
  * One runner for the whole workspace.
@@ -9,6 +9,12 @@ import { defineConfig } from "vitest/config";
  */
 export default defineConfig({
   test: {
+    // Host and Node tests consume the built workspace package. Rebuilding it
+    // must also rerun consumers, not just the protocol's own source tests.
+    forceRerunTriggers: [
+      ...configDefaults.forceRerunTriggers,
+      "**/packages/protocol/dist/**",
+    ],
     projects: [
       {
         test: {
@@ -19,6 +25,7 @@ export default defineConfig({
             "apps/host/src/**/*.test.ts",
             "apps/node/src/**/*.test.ts",
             "packages/**/src/**/*.test.ts",
+            "scripts/**/*.test.js",
           ],
         },
       },

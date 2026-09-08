@@ -930,12 +930,37 @@ curl -X POST http://127.0.0.1:8787/api/runs/<runId>/approve
 npm run dev
 npm run dev:tunnel
 npm test
+npm run test:watch
+npm run test:coverage
 npm run typecheck
 npm run build
-npm run verify   # CI 会跑的全部内容，按 CI 的顺序
+npm run verify   # 依次检查 lint、格式、类型、测试以及生产构建
 ```
 
-`npm run verify` 是推送前该跑的那一条：CI 还会检查格式（`prettier --check`），而 `lint`
-并不覆盖它，那边构建变红不止一次仅仅是因为源码没格式化。
+### 本地验证与测试监控
+
+主仓库是
+[`charlesyin_microsoft/copilot-fleet`](https://github.com/charlesyin_microsoft/copilot-fleet)，
+属于私有仓库，需要使用公司 GitHub 账号访问。托管用户账号直接拥有的仓库不提供
+GitHub 托管的 Actions runner，因此这里已移除 GitHub Actions 工作流。
+
+**推送前运行 `npm run verify`**。它保留原 CI 工作流的全部验证步骤，失败时返回非零
+退出码，包括 `lint` 没有覆盖的格式检查（`prettier --check`）。
+
+开发时在终端运行 **`npm run test:watch`**：Vitest 显示测试通过/失败情况，并在文件
+变化后重跑受影响的测试。共享协议包同时自动重建，其构建输出变化也会触发所选测试，
+避免 Host/Node 测试继续使用旧协议代码。按 **Ctrl+C** 同时停止两个监视进程。
+也可以只关注某个范围：
+
+```bash
+npm run test:watch -- --project=services apps/host/src/auth/public-signin.test.ts
+```
+
+运行 **`npm run test:coverage`** 后打开 `coverage/index.html`，可在浏览器查看覆盖率。
+这些报告仅保存在本地，并被 Git 忽略。
+
+这些命令提供本地监控，不会自动检查远程 push/PR，也不是 Linux runner。若需要托管
+CI，应另行配置经批准的 Azure DevOps pipeline，或将仓库放入支持相应 runner 的
+Microsoft GitHub organization。这里没有创建外部流水线。
 
 启动过程无需种子数据。SQLite 会在首次启动时创建 schema 和空数据文件。
