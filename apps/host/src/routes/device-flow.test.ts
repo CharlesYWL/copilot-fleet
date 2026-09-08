@@ -191,7 +191,7 @@ describe("device flow", () => {
     expect((status.json() as { state: string }).state).toBe("microsoft-only");
   });
 
-  it("does not accept a device sign-in as recent reauthentication", async () => {
+  it("allows enrollment grants but not high-impact actions after device sign-in", async () => {
     deviceEnabled = true;
     const cookies: string[] = [];
     await configure(cookies);
@@ -228,6 +228,17 @@ describe("device flow", () => {
       ).json() as { csrfToken: string }
     ).csrfToken;
 
+    const grant = await app.inject({
+      method: "POST",
+      url: "/api/enrollment-grants",
+      headers: { cookie: sessionCookie, "x-csrf-token": csrf },
+      payload: {},
+    });
+    expect(grant.statusCode).toBe(201);
+    expect(grant.json()).toMatchObject({
+      command: { enrollmentGrant: expect.any(String) },
+    });
+
     // A device login can be started by an attacker and finished by a phished
     // administrator, which is exactly when removing everyone else is most
     // attractive. So it authenticates, and it does not authorise this.
@@ -238,5 +249,6 @@ describe("device flow", () => {
       payload: {},
     });
     expect(invited.statusCode).toBe(403);
+    expect(invited.json()).toMatchObject({ reauthRequired: true });
   });
 });

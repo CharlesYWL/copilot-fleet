@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import {
   MUTUAL_AUTH_PROTOCOL,
@@ -23,6 +23,8 @@ import {
 import { randomBytes } from "node:crypto";
 import { buildServer } from "../server.js";
 import type { EntraIdentity } from "../auth/entra.js";
+import { ENROLLMENT_GRANT_TTL_MS } from "../auth/enrollment-grants.js";
+import { OPERATOR_SESSION_IDLE_MS, RECENT_REAUTH_MS } from "../auth/sessions.js";
 
 const TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 const CLIENT = "11111111-2222-3333-4444-555555555555";
@@ -102,6 +104,7 @@ describe("bound node enrollment", () => {
     });
 
   beforeEach(async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     app = await buildServer({
       databasePath: ":memory:",
       enrollmentToken: "test-token",
@@ -162,6 +165,7 @@ describe("bound node enrollment", () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await app.close();
   });
 
@@ -253,6 +257,79 @@ describe("bound node enrollment", () => {
     expect(parseEnrollmentGrant(issued.grant)?.id).toBe(issued.id);
     // A key-based Connect command carries no fleet-wide token to leak.
     expect(JSON.stringify(issued.command)).not.toContain("test-token");
+  });
+
+  it.each([RECENT_REAUTH_MS, RECENT_REAUTH_MS + 1, OPERATOR_SESSION_IDLE_MS - 1])(
+    "generates a usable Connect command %i ms after sign-in without reauthentication",
+    async (elapsedMs) => {
+      vi.setSystemTime(Date.now() + elapsedMs);
+
+      const issued = await createGrant();
+      expect(Date.parse(issued.expiresAt)).toBe(Date.now() + ENROLLMENT_GRANT_TTL_MS);
+      const enrolled = await enroll({ grant: issued.command.enrollmentGrant });
+      expect(enrolled.completed?.statusCode).toBe(201);
+    },
+  );
+
+  it("still requires recent reauthentication to change Node authentication", async () => {
+    vi.setSystemTime(Date.now() + RECENT_REAUTH_MS);
+
+    const refused = await post(owner, "/api/nodes/mutual-authentication", {
+      required: true,
+    });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json()).toMatchObject({ reauthRequired: true });
+  });
+
+  it.each([undefined, "invalid-csrf"])(
+    "refuses to mint a grant with CSRF token %s",
+    async (csrfToken) => {
+      vi.setSystemTime(Date.now() + RECENT_REAUTH_MS);
+
+      const refused = await app.inject({
+        method: "POST",
+        url: "/api/enrollment-grants",
+        headers: {
+          cookie: owner.cookie(),
+          ...(csrfToken ? { "x-csrf-token": csrfToken } : {}),
+        },
+        payload: {},
+      });
+      expect(refused.statusCode).toBe(403);
+      expect(refused.json()).toEqual({ error: "Missing or invalid CSRF token" });
+    },
+  );
+
+  it("refuses to mint a grant after the session expires", async () => {
+    const headers = {
+      cookie: owner.cookie(),
+      "x-csrf-token": await csrfFor(owner),
+    };
+    vi.setSystemTime(Date.now() + OPERATOR_SESSION_IDLE_MS);
+
+    const refused = await app.inject({
+      method: "POST",
+      url: "/api/enrollment-grants",
+      headers,
+      payload: {},
+    });
+    expect(refused.statusCode).toBe(401);
+  });
+
+  it("refuses to mint a grant with a revoked session", async () => {
+    const headers = {
+      cookie: owner.cookie(),
+      "x-csrf-token": await csrfFor(owner),
+    };
+    expect((await post(owner, "/api/auth/logout")).statusCode).toBe(200);
+
+    const refused = await app.inject({
+      method: "POST",
+      url: "/api/enrollment-grants",
+      headers,
+      payload: {},
+    });
+    expect(refused.statusCode).toBe(401);
   });
 
   it("never publishes the Host private key", async () => {

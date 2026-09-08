@@ -494,8 +494,10 @@ npm run start:node -- --url="https://fleet.example.com" `
 
 The same lines work in bash — flags avoid the `$env:` / `VAR=value` split
 between shells. Generate them from **Settings → Nodes → Generate a connect
-command**: the grant is minted on request, is good for one machine and fifteen
-minutes, and is never stored by the Host in a form it could hand out again.
+command**. A signed-in Microsoft administrator can generate or replace a command
+without signing in again. The grant is minted on request, is good for one machine
+and fifteen minutes, and is never stored by the Host in a form it could hand out
+again.
 
 The node generates its own Ed25519 key pair _before_ it contacts anything, and
 pins `--host-fingerprint`. A relay or an impostor that answers the URL cannot
@@ -1173,11 +1175,13 @@ stops a run rather than a prompt each time.
 - Every state-changing browser request carries an `X-CSRF-Token` derived from
   the session with an HMAC, so nothing per-session is stored to leak.
 - High-impact changes — removing an administrator, disabling the password,
-  changing Microsoft sign-in configuration, minting an enrollment grant,
-  exporting a portable backup — additionally
-  require an **authorization-code** sign-in from the last ten minutes. A device
+  changing Microsoft sign-in configuration, exporting a portable backup —
+  additionally require an **authorization-code** sign-in from the last ten minutes. A device
   sign-in does not satisfy it, because an attacker can start a device flow and
   have an administrator finish it.
+- Generating a connect command requires a live Microsoft administrator session
+  and CSRF protection, but no recent reauthentication. Authorization-code and
+  device sign-ins both work for this operation.
 - Removing an administrator revokes their sessions and closes their live browser
   sockets in the same operation; a 60-second sweep re-checks every open socket
   against the live session and administrator rows.

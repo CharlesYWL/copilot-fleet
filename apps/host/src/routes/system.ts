@@ -109,12 +109,11 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   /**
    * Mints the one-time authority for a single new machine.
    *
-   * A recent authorization-code login is required because this is how a machine
-   * joins a fleet that can run commands on all of them, and because the grant
-   * it returns is printed once and never stored.
+   * A live administrator session is sufficient; the grant remains single-use,
+   * expires after fifteen minutes, and is audited under that administrator.
    */
   app.post("/api/enrollment-grants", async (request, reply) => {
-    const administrator = requireAdministrator(auth, request, reply, true);
+    const administrator = requireAdministrator(auth, request, reply, false);
     if (!administrator) return reply;
     const host = identity.identity();
     const issued = grants.create(administrator.id);

@@ -5,12 +5,9 @@ import type { FleetAuth } from "../auth/service.js";
 /**
  * The administrator behind a request, or the refusal that has already been sent.
  *
- * Shared between the auth routes and the Connect card because the rule is the
- * same in both places and a second copy of it is a second place for the recency
- * check to be forgotten. `recent` asks for an authorization-code login within
- * the last few minutes: it is required for anything that cannot be undone by
- * the person it was done to, which includes minting the authority for a new
- * machine to join the fleet.
+ * High-impact actions opt into a recent authorization-code login. Routine
+ * actions, such as generating a Connect command, need only a live
+ * administrator session.
  */
 export function requireAdministrator(
   auth: FleetAuth,
