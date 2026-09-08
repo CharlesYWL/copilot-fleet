@@ -204,6 +204,33 @@ account-type selection are retained. Then save again. The console code itself
 expires after thirty minutes; restart the unclaimed Host for a new one if needed.
 There is no need to delete the database or recreate the app registration.
 
+### Reset Host sign-in without deleting Nodes
+
+Stop the Host, then run:
+
+```bash
+npm run host:fresh
+```
+
+This rebuilds and starts **only the Host**, using the existing `DATABASE_PATH`
+and serving the built UI on the Host port. It clears the Microsoft client/tenant
+configuration, administrators, administrator invitations, browser sessions,
+password/recovery settings, device-flow setting and browser authentication keys.
+The new console claim code lets you configure sign-in and claim the Host again.
+
+**Nodes and connection data are retained:** Node IDs, keys and legacy credentials,
+the Host signing identity/fingerprint, enrollment data, saved URL/tunnel settings,
+orchestrator keys, workspaces, placements and agent sessions. The security audit
+is retained and records the reset. Nodes reconnect normally without re-enrollment;
+their processes and Copilot/tunnel login credentials are not reset.
+
+The command refuses to reset a database already in use. It is intentionally
+destructive to **browser authentication only** and runs without a file watcher,
+so edits cannot repeatedly erase a newly claimed administrator. For this run it
+ignores `FLEET_ENTRA_TENANT_ID`, `FLEET_ENTRA_CLIENT_ID` and
+`FLEET_OPERATOR_PASSWORD`, without editing `.env`. A later normal startup uses
+those environment settings again if you have not saved a replacement configuration.
+
 ### Signing in from somewhere else
 
 Authorization code with PKCE and a loopback callback is the primary flow, so a
