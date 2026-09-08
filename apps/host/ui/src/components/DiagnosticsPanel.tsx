@@ -31,7 +31,6 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     gap: "16px",
-    maxWidth: "860px",
     minHeight: 0,
   },
   caption: {

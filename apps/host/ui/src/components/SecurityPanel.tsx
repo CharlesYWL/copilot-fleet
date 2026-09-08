@@ -38,14 +38,17 @@ import { terminal } from "../theme";
 const useStyles = makeStyles({
   panel: {
     flexGrow: 1,
+    minWidth: 0,
+    minHeight: 0,
     overflowY: "auto",
     padding: "28px 32px",
     display: "flex",
     flexDirection: "column",
     gap: "20px",
-    maxWidth: "860px",
   },
   card: {
+    flexShrink: 0,
+    minWidth: 0,
     border: `1px solid ${tokens.colorNeutralStroke2}`,
     borderRadius: tokens.borderRadiusLarge,
     background: tokens.colorNeutralBackground1,
@@ -60,7 +63,7 @@ const useStyles = makeStyles({
   },
   facts: {
     display: "grid",
-    gridTemplateColumns: "minmax(150px, auto) 1fr",
+    gridTemplateColumns: "minmax(150px, auto) minmax(0, 1fr)",
     gap: "6px 16px",
     alignItems: "baseline",
   },
@@ -78,6 +81,15 @@ const useStyles = makeStyles({
   identity: {
     display: "flex",
     flexDirection: "column",
+    overflowWrap: "anywhere",
+  },
+  tableScroll: {
+    overflowX: "auto",
+  },
+  table: {
+    tableLayout: "auto",
+    minWidth: "640px",
+    overflowWrap: "anywhere",
   },
 });
 
@@ -152,6 +164,7 @@ export const SecurityPanel = () => {
   const [data, setData] = useState<Security>();
   const [error, setError] = useState<string>();
   const [reauth, setReauth] = useState<string>();
+  const [signingIn, setSigningIn] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -210,11 +223,28 @@ export const SecurityPanel = () => {
     [load],
   );
 
+  const confirmIdentity = async () => {
+    setSigningIn(true);
+    setError(undefined);
+    try {
+      await startCodeLogin();
+    } catch (reason) {
+      setError(errorMessage(reason, "Could not start Microsoft sign-in"));
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
+  const dismissFeedback = () => {
+    setError(undefined);
+    setReauth(undefined);
+  };
+
   if (!data) {
     return (
       <div className={styles.panel}>
         {error ? (
-          <MessageBar intent="error">
+          <MessageBar intent="error" layout="multiline">
             <MessageBarBody>{error}</MessageBarBody>
           </MessageBar>
         ) : (
@@ -235,27 +265,6 @@ export const SecurityPanel = () => {
         </Text>
       </div>
 
-      {error && (
-        <MessageBar intent="error">
-          <MessageBarBody>{error}</MessageBarBody>
-        </MessageBar>
-      )}
-
-      {reauth && (
-        <MessageBar intent="warning">
-          <MessageBarBody>
-            {reauth}{" "}
-            <Button
-              size="small"
-              appearance="primary"
-              onClick={() => void startCodeLogin()}
-            >
-              Confirm with Microsoft
-            </Button>
-          </MessageBarBody>
-        </MessageBar>
-      )}
-
       <IdentityCard status={data.status} enrollment={data.enrollment} />
       <PasswordCard status={data.status} run={run} />
       <DeviceFlowCard status={data.status} onChanged={load} />
@@ -272,6 +281,53 @@ export const SecurityPanel = () => {
         onImported={() => window.location.reload()}
       />
       <AuditCard events={data.audit} />
+      <Dialog
+        open={Boolean(error || reauth)}
+        onOpenChange={(_event, data) => {
+          if (!data.open && !signingIn) dismissFeedback();
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>
+              {reauth
+                ? "Confirm this change with Microsoft"
+                : "Could not complete the change"}
+            </DialogTitle>
+            <DialogContent>
+              {reauth && (
+                <Text>
+                  {reauth} Use your current administrator account, then return to Settings
+                  → Security and retry the action.
+                </Text>
+              )}
+              {error && (
+                <MessageBar intent="error" layout="multiline">
+                  <MessageBarBody>{error}</MessageBarBody>
+                </MessageBar>
+              )}
+            </DialogContent>
+            <DialogActions>
+              <Button
+                appearance="secondary"
+                disabled={signingIn}
+                onClick={dismissFeedback}
+              >
+                {reauth ? "Cancel" : "Close"}
+              </Button>
+              {reauth && (
+                <Button
+                  appearance="primary"
+                  disabled={signingIn}
+                  onClick={() => void confirmIdentity()}
+                >
+                  {signingIn ? "Opening Microsoft…" : "Confirm with Microsoft"}
+                </Button>
+              )}
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
     </div>
   );
 };
@@ -350,7 +406,7 @@ function PasswordCard({
           accounts can sign in.
         </Text>
       ) : (
-        <MessageBar intent="warning">
+        <MessageBar intent="warning" layout="multiline">
           <MessageBarBody>{AUTH_MODE_COPY[status.state]}</MessageBarBody>
         </MessageBar>
       )}
@@ -537,7 +593,7 @@ function DeviceFlowCard({
             </Button>
           </div>
           {message && (
-            <MessageBar intent={blocked ? "warning" : "error"}>
+            <MessageBar intent={blocked ? "warning" : "error"} layout="multiline">
               <MessageBarBody>{message}</MessageBarBody>
             </MessageBar>
           )}
@@ -564,68 +620,70 @@ function PendingCard({
         person you invited — an invitation that leaked would show up here as somebody
         else.
       </Text>
-      <Table aria-label="Waiting for approval" size="small">
-        <TableHeader>
-          <TableRow>
-            <TableHeaderCell>Account</TableHeaderCell>
-            <TableHeaderCell>Object ID</TableHeaderCell>
-            <TableHeaderCell>Directory</TableHeaderCell>
-            <TableHeaderCell>Decision</TableHeaderCell>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {pending.map((candidate) => (
-            <TableRow key={candidate.id}>
-              <TableCell>
-                <span className={styles.identity}>
-                  <Text>{candidate.username}</Text>
-                  <Text className={styles.caption}>{candidate.displayName}</Text>
-                </span>
-              </TableCell>
-              <TableCell>
-                <Text className={styles.mono}>{candidate.objectId}</Text>
-              </TableCell>
-              <TableCell>
-                <Text className={styles.mono}>{candidate.tenantId}</Text>
-              </TableCell>
-              <TableCell>
-                <div className={styles.row}>
-                  <Button
-                    size="small"
-                    appearance="primary"
-                    aria-label={`Approve ${candidate.username}`}
-                    onClick={() =>
-                      void run(() =>
-                        api(
-                          `/api/auth/administrator-invitations/${candidate.id}/approve`,
-                          { method: "POST" },
-                        ),
-                      )
-                    }
-                  >
-                    Approve
-                  </Button>
-                  <Button
-                    size="small"
-                    appearance="secondary"
-                    aria-label={`Reject ${candidate.username}`}
-                    onClick={() =>
-                      void run(() =>
-                        api(
-                          `/api/auth/administrator-invitations/${candidate.id}/reject`,
-                          { method: "POST" },
-                        ),
-                      )
-                    }
-                  >
-                    Reject
-                  </Button>
-                </div>
-              </TableCell>
+      <div className={styles.tableScroll}>
+        <Table className={styles.table} aria-label="Waiting for approval" size="small">
+          <TableHeader>
+            <TableRow>
+              <TableHeaderCell>Account</TableHeaderCell>
+              <TableHeaderCell>Object ID</TableHeaderCell>
+              <TableHeaderCell>Directory</TableHeaderCell>
+              <TableHeaderCell>Decision</TableHeaderCell>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {pending.map((candidate) => (
+              <TableRow key={candidate.id}>
+                <TableCell>
+                  <span className={styles.identity}>
+                    <Text>{candidate.username}</Text>
+                    <Text className={styles.caption}>{candidate.displayName}</Text>
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <Text className={styles.mono}>{candidate.objectId}</Text>
+                </TableCell>
+                <TableCell>
+                  <Text className={styles.mono}>{candidate.tenantId}</Text>
+                </TableCell>
+                <TableCell>
+                  <div className={styles.row}>
+                    <Button
+                      size="small"
+                      appearance="primary"
+                      aria-label={`Approve ${candidate.username}`}
+                      onClick={() =>
+                        void run(() =>
+                          api(
+                            `/api/auth/administrator-invitations/${candidate.id}/approve`,
+                            { method: "POST" },
+                          ),
+                        )
+                      }
+                    >
+                      Approve
+                    </Button>
+                    <Button
+                      size="small"
+                      appearance="secondary"
+                      aria-label={`Reject ${candidate.username}`}
+                      onClick={() =>
+                        void run(() =>
+                          api(
+                            `/api/auth/administrator-invitations/${candidate.id}/reject`,
+                            { method: "POST" },
+                          ),
+                        )
+                      }
+                    >
+                      Reject
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
     </section>
   );
 }
@@ -639,19 +697,27 @@ function AdministratorsCard({
 }) {
   const styles = useStyles();
   const [invitation, setInvitation] = useState<string>();
+  const [inviting, setInviting] = useState(false);
   const [removing, setRemoving] = useState<Administrator>();
   const last = administrators.length <= 1;
 
-  const invite = () =>
-    void run(async () => {
-      const created = await api<{ id: string; token: string }>(
-        "/api/auth/administrator-invitations",
-        { method: "POST" },
-      );
-      setInvitation(
-        `${window.location.origin}/?invitation=${encodeURIComponent(created.token)}`,
-      );
-    });
+  const invite = async () => {
+    setInviting(true);
+    setInvitation(undefined);
+    try {
+      await run(async () => {
+        const created = await api<{ id: string; token: string }>(
+          "/api/auth/administrator-invitations",
+          { method: "POST" },
+        );
+        setInvitation(
+          `${window.location.origin}/?invitation=${encodeURIComponent(created.token)}`,
+        );
+      });
+    } finally {
+      setInviting(false);
+    }
+  };
 
   return (
     <section className={styles.card} aria-label="Administrators">
@@ -664,57 +730,59 @@ function AdministratorsCard({
         id, never by email — a renamed or re-created account is a different identity.
       </Text>
 
-      <Table aria-label="Administrators" size="small">
-        <TableHeader>
-          <TableRow>
-            <TableHeaderCell>Account</TableHeaderCell>
-            <TableHeaderCell>Object ID</TableHeaderCell>
-            <TableHeaderCell>Added</TableHeaderCell>
-            <TableHeaderCell>Last signed in</TableHeaderCell>
-            <TableHeaderCell>Remove</TableHeaderCell>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {administrators.map((administrator) => (
-            <TableRow key={administrator.id}>
-              <TableCell>
-                <span className={styles.identity}>
-                  <Text>{administrator.username}</Text>
-                  <Text className={styles.caption}>{administrator.displayName}</Text>
-                </span>
-              </TableCell>
-              <TableCell>
-                <Text className={styles.mono}>{administrator.objectId}</Text>
-              </TableCell>
-              <TableCell>
-                <Text className={styles.caption}>{administrator.addedVia}</Text>
-              </TableCell>
-              <TableCell>
-                <Text className={styles.caption}>
-                  {administrator.lastLoginAt
-                    ? new Date(administrator.lastLoginAt).toLocaleString()
-                    : "never"}
-                </Text>
-              </TableCell>
-              <TableCell>
-                <Button
-                  size="small"
-                  appearance="secondary"
-                  disabled={last}
-                  aria-label={`Remove ${administrator.username}`}
-                  onClick={() => setRemoving(administrator)}
-                >
-                  Remove
-                </Button>
-              </TableCell>
+      <div className={styles.tableScroll}>
+        <Table className={styles.table} aria-label="Administrators" size="small">
+          <TableHeader>
+            <TableRow>
+              <TableHeaderCell>Account</TableHeaderCell>
+              <TableHeaderCell>Object ID</TableHeaderCell>
+              <TableHeaderCell>Added</TableHeaderCell>
+              <TableHeaderCell>Last signed in</TableHeaderCell>
+              <TableHeaderCell>Remove</TableHeaderCell>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+          </TableHeader>
+          <TableBody>
+            {administrators.map((administrator) => (
+              <TableRow key={administrator.id}>
+                <TableCell>
+                  <span className={styles.identity}>
+                    <Text>{administrator.username}</Text>
+                    <Text className={styles.caption}>{administrator.displayName}</Text>
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <Text className={styles.mono}>{administrator.objectId}</Text>
+                </TableCell>
+                <TableCell>
+                  <Text className={styles.caption}>{administrator.addedVia}</Text>
+                </TableCell>
+                <TableCell>
+                  <Text className={styles.caption}>
+                    {administrator.lastLoginAt
+                      ? new Date(administrator.lastLoginAt).toLocaleString()
+                      : "never"}
+                  </Text>
+                </TableCell>
+                <TableCell>
+                  <Button
+                    size="small"
+                    appearance="secondary"
+                    disabled={last}
+                    aria-label={`Remove ${administrator.username}`}
+                    onClick={() => setRemoving(administrator)}
+                  >
+                    Remove
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </div>
 
       <div className={styles.row}>
-        <Button appearance="primary" onClick={invite}>
-          Add administrator
+        <Button appearance="primary" disabled={inviting} onClick={() => void invite()}>
+          {inviting ? "Creating invitation…" : "Add administrator"}
         </Button>
         {last && (
           <Text className={styles.caption}>
@@ -725,6 +793,11 @@ function AdministratorsCard({
 
       {invitation && (
         <>
+          <Text>
+            Open this link in a private browser window or a different browser profile to
+            sign in with the second Microsoft account. Then refresh this Security page and
+            approve that account under Waiting for approval.
+          </Text>
           <div className={styles.row}>
             <Input
               readOnly
@@ -806,7 +879,7 @@ function NodeMigrationCard({
         the shared secret sends a reusable credential instead.
       </Text>
       {legacy > 0 && (
-        <MessageBar intent="warning">
+        <MessageBar intent="warning" layout="multiline">
           <MessageBarBody>
             {legacy} Node{legacy === 1 ? "" : "s"} still authenticate with a shared
             secret. Each one migrates by running a fresh Connect command on that machine:
@@ -848,45 +921,47 @@ function AuditCard({ events }: { events: AuditEvent[] }) {
       {events.length === 0 ? (
         <Text className={styles.caption}>Nothing recorded yet.</Text>
       ) : (
-        <Table aria-label="Security audit" size="small">
-          <TableHeader>
-            <TableRow>
-              <TableHeaderCell>When</TableHeaderCell>
-              <TableHeaderCell>Event</TableHeaderCell>
-              <TableHeaderCell>Actor</TableHeaderCell>
-              <TableHeaderCell>Outcome</TableHeaderCell>
-              <TableHeaderCell>Detail</TableHeaderCell>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {events.map((event) => (
-              <TableRow key={event.id}>
-                <TableCell>
-                  <Text className={styles.caption}>
-                    {new Date(event.createdAt).toLocaleString()}
-                  </Text>
-                </TableCell>
-                <TableCell>
-                  <Text className={styles.mono}>{event.eventType}</Text>
-                </TableCell>
-                <TableCell>
-                  <Text className={styles.caption}>{event.actorKind}</Text>
-                </TableCell>
-                <TableCell>
-                  <Badge
-                    appearance="outline"
-                    color={event.outcome === "allowed" ? "success" : "danger"}
-                  >
-                    {event.outcome}
-                  </Badge>
-                </TableCell>
-                <TableCell>
-                  <Text className={styles.caption}>{event.detail}</Text>
-                </TableCell>
+        <div className={styles.tableScroll}>
+          <Table className={styles.table} aria-label="Security audit" size="small">
+            <TableHeader>
+              <TableRow>
+                <TableHeaderCell>When</TableHeaderCell>
+                <TableHeaderCell>Event</TableHeaderCell>
+                <TableHeaderCell>Actor</TableHeaderCell>
+                <TableHeaderCell>Outcome</TableHeaderCell>
+                <TableHeaderCell>Detail</TableHeaderCell>
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+            </TableHeader>
+            <TableBody>
+              {events.map((event) => (
+                <TableRow key={event.id}>
+                  <TableCell>
+                    <Text className={styles.caption}>
+                      {new Date(event.createdAt).toLocaleString()}
+                    </Text>
+                  </TableCell>
+                  <TableCell>
+                    <Text className={styles.mono}>{event.eventType}</Text>
+                  </TableCell>
+                  <TableCell>
+                    <Text className={styles.caption}>{event.actorKind}</Text>
+                  </TableCell>
+                  <TableCell>
+                    <Badge
+                      appearance="outline"
+                      color={event.outcome === "allowed" ? "success" : "danger"}
+                    >
+                      {event.outcome}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>
+                    <Text className={styles.caption}>{event.detail}</Text>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
       )}
       <Text className={styles.caption}>
         <Link

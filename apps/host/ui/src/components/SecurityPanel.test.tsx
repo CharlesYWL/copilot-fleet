@@ -149,6 +149,18 @@ describe("SecurityPanel", () => {
     expect(within(table).getAllByText("bob-oid").length).toBeGreaterThan(0);
   });
 
+  it("leaves panel width uncapped and scrolls tables locally on narrow screens", async () => {
+    host();
+    show();
+
+    const table = await screen.findByRole("table", { name: /administrators/i });
+    const card = screen.getByRole("region", { name: /^administrators$/i });
+    expect(getComputedStyle(card.parentElement!).maxWidth).toMatch(/^(none)?$/);
+    expect(getComputedStyle(table).tableLayout).toBe("auto");
+    expect(getComputedStyle(table).overflowWrap).toBe("anywhere");
+    expect(getComputedStyle(table.parentElement!).overflowX).toBe("auto");
+  });
+
   it("creates an invitation and offers the link exactly once", async () => {
     const fetchMock = host({
       "POST /api/auth/administrator-invitations": () =>
@@ -156,7 +168,11 @@ describe("SecurityPanel", () => {
     });
     show();
 
-    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+    const add = await screen.findByRole("button", { name: /add administrator/i });
+    fireEvent.click(add);
+    expect((add as HTMLButtonElement).disabled).toBe(true);
+    expect(add.textContent).toBe("Creating invitation…");
+    fireEvent.click(add);
 
     const link = await screen.findByLabelText("Invitation link");
     expect((link as HTMLInputElement).value).toContain("invite-secret");
@@ -164,6 +180,15 @@ describe("SecurityPanel", () => {
       screen.getByRole("button", { name: /copy the invitation link/i }),
     ).toBeTruthy();
     expect(screen.getByText(/single use, fifteen minutes/i)).toBeTruthy();
+    expect(screen.getByText(/private.*second microsoft account/i)).toBeTruthy();
+    await waitFor(() => expect((add as HTMLButtonElement).disabled).toBe(false));
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/api/auth/administrator-invitations") &&
+          init?.method === "POST",
+      ),
+    ).toHaveLength(1);
     const created = fetchMock.mock.calls.find(
       ([url, init]) =>
         String(url).includes("/api/auth/administrator-invitations") &&
@@ -283,7 +308,13 @@ describe("SecurityPanel", () => {
 
     fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
 
-    const prompt = await screen.findByRole("button", { name: /confirm with microsoft/i });
+    const dialog = await screen.findByRole("dialog", {
+      name: /confirm.*microsoft/i,
+    });
+    const prompt = within(dialog).getByRole("button", {
+      name: /confirm with microsoft/i,
+    });
+    await waitFor(() => expect(dialog.contains(document.activeElement)).toBe(true));
     fireEvent.click(prompt);
 
     await waitFor(() =>
@@ -292,6 +323,72 @@ describe("SecurityPanel", () => {
     expect(
       fetchMock.mock.calls.some(([url]) => String(url).includes("/api/auth/code/start")),
     ).toBe(true);
+  });
+
+  it("shows invitation failures in a dismissible dialog instead of above the viewport", async () => {
+    host({
+      "POST /api/auth/administrator-invitations": () =>
+        answer({ error: "Could not create an invitation. Try again." }, 500),
+    });
+    show();
+
+    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/could not create an invitation/i)).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: /^close$/i }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(
+      (screen.getByRole("button", { name: /add administrator/i }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  it("keeps sign-in failures visible and lets the administrator retry", async () => {
+    let failed = true;
+    host({
+      "POST /api/auth/administrator-invitations": () =>
+        answer({ error: "Confirm your identity.", reauthRequired: true }, 403),
+      "POST /api/auth/code/start": () =>
+        failed
+          ? answer({ error: "Microsoft sign-in is unavailable. Try again." }, 503)
+          : answer({ authorizationUrl: "https://login/authorize" }),
+    });
+    show();
+
+    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+    const dialog = await screen.findByRole("dialog", { name: /confirm.*microsoft/i });
+    const confirm = within(dialog).getByRole("button", {
+      name: /confirm with microsoft/i,
+    });
+    fireEvent.click(confirm);
+    expect((confirm as HTMLButtonElement).disabled).toBe(true);
+
+    expect(
+      await within(dialog).findByText(/microsoft sign-in is unavailable/i),
+    ).toBeTruthy();
+    expect(browserNavigation.assign).not.toHaveBeenCalled();
+    expect((confirm as HTMLButtonElement).disabled).toBe(false);
+    failed = false;
+    fireEvent.click(confirm);
+
+    await waitFor(() =>
+      expect(browserNavigation.assign).toHaveBeenCalledWith("https://login/authorize"),
+    );
+  });
+
+  it("lets the administrator cancel re-confirmation without starting sign-in", async () => {
+    host({
+      "POST /api/auth/administrator-invitations": () =>
+        answer({ error: "Confirm your identity.", reauthRequired: true }, 403),
+    });
+    show();
+
+    fireEvent.click(await screen.findByRole("button", { name: /add administrator/i }));
+    const dialog = await screen.findByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: /^cancel$/i }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(browserNavigation.assign).not.toHaveBeenCalled();
   });
 
   it("disables password sign-in once a Microsoft administrator exists", async () => {

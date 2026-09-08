@@ -30,7 +30,6 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     gap: "16px",
-    maxWidth: "720px",
   },
   caption: {
     color: tokens.colorNeutralForeground3,
