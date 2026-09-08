@@ -384,7 +384,10 @@ export class FleetStore {
    */
   private readonly statements = new Map<string, StatementSync>();
 
-  constructor(path: string, options: { secureFiles?: SecureFiles } = {}) {
+  constructor(
+    path: string,
+    options: { secureFiles?: SecureFiles; exclusive?: boolean } = {},
+  ) {
     /*
      * The default writes to stderr rather than to a logger, because the store
      * is constructed before anything that has one — and a Host that could not
@@ -400,7 +403,28 @@ export class FleetStore {
         ));
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
-    this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+    try {
+      if (options.exclusive) this.db.exec("PRAGMA locking_mode=EXCLUSIVE;");
+      this.db.exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+      // Retain exclusive ownership until close, including between transactions.
+      // An ordinary WAL write transaction would not exclude an idle live Host.
+      if (options.exclusive) this.db.exec("BEGIN EXCLUSIVE; COMMIT;");
+    } catch (error) {
+      this.db.close();
+      if (
+        options.exclusive &&
+        typeof error === "object" &&
+        error !== null &&
+        "errcode" in error &&
+        (error.errcode === 5 || error.errcode === 6)
+      ) {
+        throw new Error(
+          "Cannot reset Host sign-in while its database is in use. Stop the Host and any database tools, then rerun npm run host:fresh.",
+          { cause: error },
+        );
+      }
+      throw error;
+    }
     /*
      * After the first pragma, not before: WAL mode is what creates the `-wal`
      * and `-shm` sidecars, and those carry the same rows the database does. A
@@ -916,6 +940,31 @@ export class FleetStore {
     this.statement(
       "INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
     ).run(key, value);
+  }
+
+  /** Console-only fresh start; Node credentials and working data are not browser auth. */
+  resetOperatorAuthentication(): void {
+    if (this.statement("PRAGMA locking_mode").get()?.locking_mode !== "exclusive") {
+      throw new Error("Resetting Host sign-in requires an exclusive, offline database.");
+    }
+    const keys = PRESERVED_SETTING_KEYS.filter((key) => key.startsWith("auth."));
+    this.transaction(() => {
+      this.db.exec(`
+        DELETE FROM operator_sessions;
+        DELETE FROM administrator_invitations;
+        DELETE FROM administrators;
+      `);
+      this.statement(`DELETE FROM settings WHERE key IN (${placeholders(keys)})`).run(
+        ...keys,
+      );
+      this.recordSecurityAudit({
+        eventType: "operator_authentication_reset",
+        actorKind: "console",
+        outcome: "allowed",
+        detail:
+          "Browser authentication reset; Node credentials and connection settings retained.",
+      });
+    });
   }
 
   getTunnelEnabled(): boolean {
