@@ -10,6 +10,7 @@ import {
 import { ArrowClockwise20Regular } from "@fluentui/react-icons";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
+import { useSettingsActive, useSettingsPolling } from "../hooks/useSettingsActivity";
 
 /**
  * What the Host has complained about lately.
@@ -96,6 +97,7 @@ const clockTime = (at: string): string => {
 
 export const DiagnosticsPanel = () => {
   const styles = useStyles();
+  const active = useSettingsActive();
   const [entries, setEntries] = useState<LogEntry[]>();
   const [error, setError] = useState<string>();
   useMessageNotification(error);
@@ -114,21 +116,17 @@ export const DiagnosticsPanel = () => {
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => void refresh(), 5000);
-    return () => clearInterval(timer);
-  }, [refresh]);
+  useSettingsPolling(refresh, 5000);
 
   useEffect(() => {
     const element = viewRef.current;
-    if (!element || !pinnedRef.current) return;
+    if (!active || !element || !pinnedRef.current) return;
     element.scrollTop = element.scrollHeight;
-  }, [entries]);
+  }, [active, entries]);
 
   const handleScroll = () => {
     const element = viewRef.current;
-    if (!element) return;
+    if (!active || !element) return;
     pinnedRef.current =
       element.scrollHeight - element.scrollTop - element.clientHeight < 32;
   };

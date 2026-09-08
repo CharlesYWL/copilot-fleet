@@ -268,20 +268,12 @@ describe("SecurityPanel", () => {
     );
   });
 
-  it("reports legacy Node authentication as an operational warning", async () => {
+  it("keeps the legacy Node authentication warning inline", async () => {
     host();
     const notify = vi.fn();
     show(notify);
     expect(await screen.findByText(/1 Node still authenticate/i)).toBeTruthy();
-    expect(notify).toHaveBeenCalledWith(
-      expect.stringContaining("1 Node still authenticate with a shared secret."),
-      "warning",
-    );
-    expect(
-      notify.mock.calls.filter(([message]) =>
-        String(message).includes("1 Node still authenticate with a shared secret."),
-      ),
-    ).toHaveLength(1);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -290,7 +282,7 @@ describe("SecurityPanel", () => {
     ["hybrid", "Password sign-in is still enabled alongside Microsoft accounts."],
     ["recovery", "A temporary recovery password is enabled from the Host console."],
   ])(
-    "reports the %s authentication warning without repeating it for dialog changes",
+    "keeps the %s authentication explanation inline without notifying",
     async (state, message) => {
       host(
         {},
@@ -310,18 +302,13 @@ describe("SecurityPanel", () => {
       const button = await screen.findByRole("button", {
         name: /disable password sign-in/i,
       });
-      await waitFor(() =>
-        expect(notify).toHaveBeenCalledExactlyOnceWith(
-          expect.stringContaining(message),
-          "warning",
-        ),
-      );
+      expect(notify).not.toHaveBeenCalled();
       expect(
         screen.getAllByText((text) => text.includes(message)).length,
       ).toBeGreaterThan(0);
       fireEvent.click(button);
       fireEvent.click(await screen.findByRole("button", { name: "Cancel" }));
-      expect(notify).toHaveBeenCalledTimes(1);
+      expect(notify).not.toHaveBeenCalled();
     },
   );
 
@@ -967,7 +954,8 @@ describe("SecurityPanel", () => {
         },
       },
     );
-    show();
+    const notify = vi.fn();
+    show(notify);
     const table = await screen.findByRole("table", { name: /^administrators$/i });
     for (const button of within(table).getAllByRole("button", { name: /^remove /i })) {
       expect((button as HTMLButtonElement).disabled).toBe(true);
@@ -975,6 +963,7 @@ describe("SecurityPanel", () => {
     expect(
       screen.getByText(/current administrator could not be identified/i),
     ).toBeTruthy();
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it("names the person and the consequence before removing them", async () => {

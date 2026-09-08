@@ -35,6 +35,7 @@ import {
 } from "@fleet/protocol";
 import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
 import { api, ApiError } from "../hooks/useFleet";
+import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { browserNavigation, csrfToken, startCodeLogin } from "../lib/auth";
 import { pollUntilSignedIn, type DeviceFlow } from "../lib/device-login";
 import { DeviceCodePanel } from "./auth/DeviceCodePanel";
@@ -170,6 +171,7 @@ const AUTH_MODE_COPY: Record<AuthStatus["state"], string> = {
  */
 export const SecurityPanel = () => {
   const styles = useStyles();
+  const active = useSettingsActive();
   const [data, setData] = useState<Security>();
   const [error, setError] = useState<string>();
   const [reauth, setReauth] = useState<string>();
@@ -303,7 +305,7 @@ export const SecurityPanel = () => {
       <AuditCard events={data.audit} />
       <EraseAuthCard run={run} />
       <Dialog
-        open={Boolean(error || reauth)}
+        open={active && Boolean(error || reauth)}
         onOpenChange={(_event, data) => {
           if (!data.open && !signingIn) dismissFeedback();
         }}
@@ -361,10 +363,6 @@ function IdentityCard({
   enrollment: Enrollment;
 }) {
   const styles = useStyles();
-  useMessageNotification(
-    status.state === "microsoft-only" ? undefined : AUTH_MODE_COPY[status.state],
-    "warning",
-  );
   return (
     <section className={styles.card} aria-label="This Host">
       <Text weight="semibold">This Host</Text>
@@ -508,6 +506,7 @@ function PasswordCard({
   run: (work: () => Promise<unknown>) => Promise<void>;
 }) {
   const styles = useStyles();
+  const active = useSettingsActive();
   const [dialog, setDialog] = useState<"enable" | "disable">();
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
@@ -542,7 +541,7 @@ function PasswordCard({
         </Button>
       </div>
       <Dialog
-        open={dialog === action}
+        open={active && dialog === action}
         onOpenChange={(_event, data) => setDialog(data.open ? action : undefined)}
       >
         <DialogSurface>
@@ -631,6 +630,7 @@ function EraseAuthCard({
   run: (work: () => Promise<unknown>, refresh?: boolean) => Promise<void>;
 }) {
   const styles = useStyles();
+  const active = useSettingsActive();
   const [open, setOpen] = useState(false);
   const [confirmation, setConfirmation] = useState("");
   const [busy, setBusy] = useState(false);
@@ -670,7 +670,7 @@ function EraseAuthCard({
         </Button>
       </div>
       <Dialog
-        open={open}
+        open={active && open}
         onOpenChange={(_event, data) => {
           if (!data.open) close();
         }}
@@ -924,6 +924,7 @@ function AdministratorsCard({
   run: (work: () => Promise<unknown>) => Promise<void>;
 }) {
   const styles = useStyles();
+  const active = useSettingsActive();
   const notify = useNotify();
   const [addingAccount, setAddingAccount] = useState(false);
   const [openingAccount, setOpeningAccount] = useState(false);
@@ -939,7 +940,6 @@ function AdministratorsCard({
   const unidentified = !currentAdministratorId
     ? "The current administrator could not be identified. Refresh Security before removing accounts."
     : undefined;
-  useMessageNotification(unidentified, "warning");
 
   const addAccount = async () => {
     setAddingAccount(false);
@@ -1109,7 +1109,7 @@ function AdministratorsCard({
       )}
 
       <Dialog
-        open={addingAccount}
+        open={active && addingAccount}
         onOpenChange={(_event, data) => setAddingAccount(data.open)}
       >
         <DialogSurface>
@@ -1140,7 +1140,7 @@ function AdministratorsCard({
       </Dialog>
 
       <Dialog
-        open={removing !== undefined}
+        open={active && removing !== undefined}
         onOpenChange={(_event, data) => {
           if (!data.open) setRemoving(undefined);
         }}
@@ -1191,12 +1191,6 @@ function NodeMigrationCard({
 }) {
   const styles = useStyles();
   const { total, mutualAuth, legacy } = enrollment.nodeAuthentication;
-  useMessageNotification(
-    legacy > 0
-      ? `${legacy} Node${legacy === 1 ? "" : "s"} still authenticate with a shared secret. Run a fresh Connect command on each machine before requiring mutual Node authentication.`
-      : undefined,
-    "warning",
-  );
   return (
     <section className={styles.card} aria-label="Node authentication">
       <Text weight="semibold">Node authentication</Text>

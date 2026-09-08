@@ -106,7 +106,7 @@ describe("TunnelPanel policy", () => {
     expect(notify).toHaveBeenCalledTimes(1);
   });
 
-  it("reports a missing CLI once across polls without promoting setup help", async () => {
+  it("keeps missing CLI and setup advice inline across polls", async () => {
     vi.useFakeTimers();
     vi.stubGlobal(
       "fetch",
@@ -130,12 +130,9 @@ describe("TunnelPanel policy", () => {
       show(notify);
     });
     expect(screen.getByText(/Not installed/)).toBeTruthy();
-    expect(notify).toHaveBeenCalledExactlyOnceWith(
-      "Dev Tunnels: devtunnel is not installed. Install devtunnel, then run devtunnel user login.",
-      "warning",
-    );
+    expect(notify).not.toHaveBeenCalled();
     await act(async () => vi.advanceTimersByTimeAsync(6_000));
-    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it("captures an operational login refusal without emitting generic provider advice", async () => {

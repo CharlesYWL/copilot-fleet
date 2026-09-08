@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   Badge,
   Button,
@@ -27,6 +28,7 @@ import type {
 } from "@fleet/protocol";
 import { useTunnel } from "../hooks/useTunnel";
 import { useMessageNotification } from "../hooks/useAppNotifications";
+import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { orderTunnelProviders } from "../lib/tunnel-order";
 import { CopyButton } from "./CopyButton";
 
@@ -100,8 +102,10 @@ const useStyles = makeStyles({
 /** Setup steps and a link out, so a provider can be adopted without leaving. */
 const ProviderHelpDialog = ({ spec }: { spec: TunnelProviderInfo }) => {
   const styles = useStyles();
+  const active = useSettingsActive();
+  const [open, setOpen] = useState(false);
   return (
-    <Dialog>
+    <Dialog open={active && open} onOpenChange={(_event, data) => setOpen(data.open)}>
       <DialogTrigger disableButtonEnhancement>
         <Button
           size="small"
@@ -178,12 +182,6 @@ const ProviderCard = ({
 }: CardProps) => {
   const styles = useStyles();
   useMessageNotification(state.error ? `${spec.label}: ${state.error}` : undefined);
-  useMessageNotification(
-    !spec.binaryPresent && !state.error
-      ? `${spec.label}: ${spec.binary} is not installed. ${spec.installHint}`.trim()
-      : undefined,
-    "warning",
-  );
 
   const switching = busy || state.status === "starting" || state.status === "stopping";
   const url = state.url;

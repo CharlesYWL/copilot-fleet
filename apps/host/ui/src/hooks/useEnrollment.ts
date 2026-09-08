@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { errorMessage } from "@fleet/protocol";
 import { api } from "./useFleet";
 import { useMessageNotification } from "./useAppNotifications";
+import { useSettingsPolling } from "./useSettingsActivity";
 
 export type Enrollment = {
   hostUrl: string;
@@ -38,29 +39,21 @@ export function useEnrollment(intervalMs = 3_000): Enrollment | undefined {
   const [error, setError] = useState<string>();
   useMessageNotification(error);
 
-  useEffect(() => {
-    let cancelled = false;
-    const pull = () => {
-      void api<Enrollment>("/api/enrollment")
-        .then((result) => {
-          if (cancelled) return;
-          setEnrollment(result);
-          setError(undefined);
-        })
-        // A failed poll keeps the last good answer; the next one retries.
-        .catch((reason: unknown) => {
-          if (!cancelled) {
-            setError(`Could not refresh enrollment settings: ${errorMessage(reason)}`);
-          }
-        });
-    };
-    pull();
-    const timer = setInterval(pull, intervalMs);
-    return () => {
-      cancelled = true;
-      clearInterval(timer);
-    };
-  }, [intervalMs]);
+  const refresh = useCallback(async (signal: AbortSignal) => {
+    try {
+      const result = await api<Enrollment>("/api/enrollment", { signal });
+      if (signal.aborted) return;
+      setEnrollment(result);
+      setError(undefined);
+    } catch (reason) {
+      // A failed poll keeps the last good answer; the next one retries.
+      if (!signal.aborted) {
+        setError(`Could not refresh enrollment settings: ${errorMessage(reason)}`);
+      }
+    }
+  }, []);
+
+  useSettingsPolling(refresh, intervalMs);
 
   return enrollment;
 }

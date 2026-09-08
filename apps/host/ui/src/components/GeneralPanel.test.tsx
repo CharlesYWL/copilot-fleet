@@ -21,7 +21,7 @@ afterEach(() => {
 });
 
 describe("GeneralPanel", () => {
-  it("reports enabled YOLO mode once until the setting is disabled and enabled again", async () => {
+  it("keeps the YOLO explanation inline without notifying on load or setting changes", async () => {
     let defaults = {
       yolo: true,
       autoResume: false,
@@ -53,20 +53,15 @@ describe("GeneralPanel", () => {
     const view = render(panel());
     const warning = /New sessions will execute commands on their node without approval/;
     expect(await screen.findByText(warning)).toBeTruthy();
-    await waitFor(() =>
-      expect(notify).toHaveBeenCalledExactlyOnceWith(
-        expect.stringMatching(warning),
-        "warning",
-      ),
-    );
+    expect(notify).not.toHaveBeenCalled();
     view.rerender(panel());
-    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).not.toHaveBeenCalled();
     const toggle = screen.getAllByRole("switch")[0]!;
     fireEvent.click(toggle);
     await waitFor(() => expect(screen.queryByText(warning)).toBeNull());
     fireEvent.click(toggle);
     await screen.findByText(warning);
-    await waitFor(() => expect(notify).toHaveBeenCalledTimes(2));
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it("reports loading errors once and keeps the inline explanation", async () => {

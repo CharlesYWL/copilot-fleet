@@ -17,6 +17,7 @@ import {
 } from "@fluentui/react-components";
 import { errorMessage } from "@fleet/protocol";
 import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
+import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { csrfToken } from "../lib/auth";
 
 /** The floor the Host enforces, repeated here so the form can refuse first. */
@@ -70,6 +71,7 @@ const stamp = () => new Date().toISOString().slice(0, 10);
  */
 export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardProps) => {
   const styles = useStyles();
+  const active = useSettingsActive();
   const [passphrase, setPassphrase] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -286,7 +288,7 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
       />
 
       <Dialog
-        open={pending !== undefined}
+        open={active && pending !== undefined}
         onOpenChange={(_event, data) => {
           if (!data.open) setPending(undefined);
         }}

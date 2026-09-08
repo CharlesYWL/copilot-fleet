@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useState } from "react";
 import { errorMessage, type TunnelInfo, type TunnelProvider } from "@fleet/protocol";
 import { api } from "./useFleet";
 import { useMessageNotification } from "./useAppNotifications";
+import { useSettingsPolling } from "./useSettingsActivity";
 
 export type TunnelControls = {
   info: TunnelInfo | undefined;
@@ -42,11 +43,7 @@ export function useTunnel(intervalMs = 2_000): TunnelControls {
     }
   }, []);
 
-  useEffect(() => {
-    void refresh();
-    const timer = setInterval(() => void refresh(), intervalMs);
-    return () => clearInterval(timer);
-  }, [refresh, intervalMs]);
+  useSettingsPolling(refresh, intervalMs);
 
   const setEnabled = useCallback(
     async (provider: TunnelProvider, enabled: boolean, primary?: boolean) => {

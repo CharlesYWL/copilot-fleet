@@ -1095,19 +1095,6 @@ export function App() {
                 />
               )}
 
-              {view === "settings" && (
-                <SettingsPanel
-                  workspaces={snapshot.workspaces}
-                  placements={snapshot.placements}
-                  nodes={snapshot.nodes}
-                  sessions={snapshot.sessions}
-                  hostRevision={snapshot.hostRevision}
-                  nodeUpdates={nodeUpdates}
-                  selectedTab={settingsTab}
-                  onSelectedTabChange={setSettingsTab}
-                />
-              )}
-
               {view === "session" &&
                 (activeSession ? (
                   <>
@@ -1203,6 +1190,17 @@ export function App() {
                 ))}
             </>
           )}
+          <SettingsPanel
+            active={view === "settings"}
+            workspaces={snapshot.workspaces}
+            placements={snapshot.placements}
+            nodes={snapshot.nodes}
+            sessions={snapshot.sessions}
+            hostRevision={snapshot.hostRevision}
+            nodeUpdates={nodeUpdates}
+            selectedTab={settingsTab}
+            onSelectedTabChange={setSettingsTab}
+          />
         </div>
 
         {view === "overview" && activeSession && (

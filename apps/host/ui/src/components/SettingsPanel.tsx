@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { Tab, TabList, makeStyles, tokens } from "@fluentui/react-components";
 import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
 import type { NodeUpdateProgress } from "../hooks/useFleet";
+import { SettingsActivityContext } from "../hooks/useSettingsActivity";
 import { NodesPanel } from "./NodesPanel";
 import { GeneralPanel } from "./GeneralPanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
@@ -17,6 +18,7 @@ const useStyles = makeStyles({
     display: "flex",
     flexDirection: "column",
     background: tokens.colorNeutralBackground1,
+    "&[hidden]": { display: "none" },
   },
   tabs: {
     flexShrink: 0,
@@ -25,14 +27,25 @@ const useStyles = makeStyles({
   },
   body: {
     flexGrow: 1,
+    minWidth: 0,
     minHeight: 0,
     display: "flex",
     flexDirection: "column",
+    "&[hidden]": { display: "none" },
   },
 });
 
 export type SettingsTab =
   "general" | "security" | "tunnel" | "nodes" | "workspaces" | "diagnostics";
+
+const sections: readonly { value: SettingsTab; label: string }[] = [
+  { value: "general", label: "General" },
+  { value: "security", label: "Security" },
+  { value: "tunnel", label: "Tunnel" },
+  { value: "nodes", label: "Nodes" },
+  { value: "workspaces", label: "Workspaces" },
+  { value: "diagnostics", label: "Diagnostics" },
+];
 
 type SettingsPanelProps = {
   workspaces: Workspace[];
@@ -42,6 +55,7 @@ type SettingsPanelProps = {
   sessions: FleetSession[];
   hostRevision: string;
   nodeUpdates: NodeUpdateProgress;
+  active?: boolean;
   selectedTab?: SettingsTab;
   onSelectedTabChange?: (tab: SettingsTab) => void;
 };
@@ -53,48 +67,76 @@ type SettingsPanelProps = {
  */
 export const SettingsPanel = (props: SettingsPanelProps) => {
   const styles = useStyles();
+  const id = useId();
+  const active = props.active ?? true;
   const [internalTab, setInternalTab] = useState<SettingsTab>("general");
+  const [visitedTabs, setVisitedTabs] = useState<SettingsTab[]>([]);
   const tab = props.selectedTab ?? internalTab;
+  // Retain only visited sections, including when navigation selects a tab externally.
+  if (active && !visitedTabs.includes(tab)) {
+    setVisitedTabs([...visitedTabs, tab]);
+  }
   const setTab = (next: SettingsTab) => {
     setInternalTab(next);
     props.onSelectedTabChange?.(next);
   };
 
+  const panels: Record<SettingsTab, ReactNode> = {
+    general: <GeneralPanel sessions={props.sessions} />,
+    security: <SecurityPanel />,
+    diagnostics: <DiagnosticsPanel />,
+    tunnel: <TunnelPanel />,
+    nodes: (
+      <NodesPanel
+        nodes={props.nodes}
+        hostRevision={props.hostRevision}
+        nodeUpdates={props.nodeUpdates}
+      />
+    ),
+    workspaces: (
+      <WorkspacesPanel
+        workspaces={props.workspaces}
+        placements={props.placements}
+        nodes={props.nodes}
+      />
+    ),
+  };
+
   return (
-    <div className={styles.root}>
+    <div className={styles.root} hidden={!active}>
       <div className={styles.tabs}>
         <TabList
           selectedValue={tab}
           onTabSelect={(_event, data) => setTab(data.value as SettingsTab)}
           aria-label="Settings sections"
         >
-          <Tab value="general">General</Tab>
-          <Tab value="security">Security</Tab>
-          <Tab value="tunnel">Tunnel</Tab>
-          <Tab value="nodes">Nodes</Tab>
-          <Tab value="workspaces">Workspaces</Tab>
-          <Tab value="diagnostics">Diagnostics</Tab>
+          {sections.map(({ value, label }) => (
+            <Tab
+              key={value}
+              value={value}
+              id={`${id}-${value}-tab`}
+              aria-controls={`${id}-${value}-panel`}
+            >
+              {label}
+            </Tab>
+          ))}
         </TabList>
       </div>
       <div className={styles.body}>
-        {tab === "general" && <GeneralPanel sessions={props.sessions} />}
-        {tab === "security" && <SecurityPanel />}
-        {tab === "diagnostics" && <DiagnosticsPanel />}
-        {tab === "tunnel" && <TunnelPanel />}
-        {tab === "nodes" && (
-          <NodesPanel
-            nodes={props.nodes}
-            hostRevision={props.hostRevision}
-            nodeUpdates={props.nodeUpdates}
-          />
-        )}
-        {tab === "workspaces" && (
-          <WorkspacesPanel
-            workspaces={props.workspaces}
-            placements={props.placements}
-            nodes={props.nodes}
-          />
-        )}
+        {visitedTabs.map((value) => (
+          <div
+            key={value}
+            id={`${id}-${value}-panel`}
+            role="tabpanel"
+            aria-labelledby={`${id}-${value}-tab`}
+            className={styles.body}
+            hidden={!active || tab !== value}
+          >
+            <SettingsActivityContext.Provider value={active && tab === value}>
+              {panels[value]}
+            </SettingsActivityContext.Provider>
+          </div>
+        ))}
       </div>
     </div>
   );

@@ -22,6 +22,7 @@ import type { SessionConfigChoice, SessionConfigOption } from "@fleet/protocol";
 import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
+import { useSettingsActive } from "../hooks/useSettingsActivity";
 
 const useStyles = makeStyles({
   panel: {
@@ -100,6 +101,7 @@ const YOLO_WARNING =
 
 export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
   const styles = useStyles();
+  const active = useSettingsActive();
   const [defaults, setDefaults] = useState<Defaults>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
@@ -107,7 +109,6 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
   const [pendingArchive, setPendingArchive] = useState<unknown>();
   const fileInput = useRef<HTMLInputElement>(null);
   useMessageNotification(error);
-  useMessageNotification(defaults?.yolo ? YOLO_WARNING : undefined, "warning");
 
   const refresh = useCallback(async () => {
     try {
@@ -400,7 +401,7 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
       </section>
 
       <Dialog
-        open={confirmOpen}
+        open={active && confirmOpen}
         onOpenChange={(_event, data) => {
           if (!data.open) {
             setConfirmOpen(false);

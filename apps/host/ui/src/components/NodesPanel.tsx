@@ -38,6 +38,7 @@ import {
 } from "@fleet/protocol";
 import { useCatalog } from "../hooks/useCatalog";
 import type { NodeUpdateProgress } from "../hooks/useFleet";
+import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { sessionLabel } from "../lib/session-label";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { StatusDot } from "./StatusDot";
@@ -176,6 +177,7 @@ const busyStages = new Set<NodeUpdateStage>([
 
 export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps) => {
   const styles = useStyles();
+  const active = useSettingsActive();
   const { renameNode, deleteNode, updateNode, updateAllNodes } = useCatalog();
   /** The node whose update is waiting on a decision about its live sessions. */
   const [blocked, setBlocked] = useState<{
@@ -258,7 +260,7 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
       </div>
 
       <Dialog
-        open={Boolean(blocked)}
+        open={active && Boolean(blocked)}
         onOpenChange={(_event, data) => {
           if (!data.open) setBlocked(undefined);
         }}
