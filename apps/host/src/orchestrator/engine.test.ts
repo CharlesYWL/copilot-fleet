@@ -276,6 +276,39 @@ describe("OrchestratorEngine", () => {
     expect(store.listRunSteps(run.id)[0]?.state).toBe("failed");
   });
 
+  it.each(["error event", "command result"])(
+    "preserves a startup failure from a %s in the settled step",
+    (source) => {
+      const { store, service, engine, planned } = setup();
+      const run = planned([
+        { stepKey: "audit", title: "Audit", prompt: "audit it", category: "explore" },
+      ]);
+      engine.tickRun(run.id);
+      const step = store.listRunSteps(run.id)[0]!;
+      const reason = "Copilot ACP did not become ready within 60s.";
+      if (source === "error event") {
+        store.appendEvent({
+          eventId: "startup-error",
+          sessionId: step.sessionId,
+          sequence: 1,
+          type: "error",
+          payload: { message: reason },
+          createdAt: new Date().toISOString(),
+        });
+        store.transitionSession(step.sessionId, "failed", "Copilot failed to start");
+      } else {
+        service.failFromCommandResult(step.sessionId, "launch-command", reason);
+      }
+
+      engine.tickRun(run.id);
+
+      expect(store.getRunStep(step.id)).toMatchObject({
+        state: "failed",
+        output: expect.stringContaining(reason),
+      });
+    },
+  );
+
   it("creates one failed-step notification per attempt, including resume failure", () => {
     const { store, engine, planned } = setup();
     const run = planned([

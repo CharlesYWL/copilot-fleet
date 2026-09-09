@@ -5,7 +5,6 @@ import {
   isChatsWorkspace,
   RunCriterionSchema,
   canTransitionRun,
-  eventPayload,
   isWritingCategory,
   terminalRunStates,
   terminalRunStepStates,
@@ -22,7 +21,7 @@ import { reservedSessionCount } from "../session-policy.js";
 import { HANDOVER_SHAPE } from "./briefing.js";
 import { archiveRun, purgeRun } from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
-import { truncateMiddle } from "./engine.js";
+import { truncateMiddle, workerOutput } from "./engine.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export const WORKER_CATEGORIES = [
@@ -1233,11 +1232,7 @@ export class FleetTools {
   transcript(input: z.infer<typeof SessionRefSchema>): ToolResult {
     const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
     if (typeof owned === "string") return refuse(owned);
-    const text = this.store
-      .listEvents(owned.id)
-      .filter((event) => event.type === "agent_text")
-      .map((event) => eventPayload(event, "agent_text")?.text ?? "")
-      .join("");
+    const text = workerOutput(this.store.listEvents(owned.id), owned);
     return ok(
       text ? truncateMiddle(text, 24_000) : "That worker has not said anything yet.",
     );
