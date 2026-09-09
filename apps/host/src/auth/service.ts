@@ -16,6 +16,7 @@ import {
   EntraIdentityRejectedError,
   EntraProviderUnavailableError,
   EntraTransactions,
+  MICROSOFT_CORP_TENANT_ID,
   classifyEntraFailure,
   createEntraProvider,
   entraConfigFrom,
@@ -400,6 +401,22 @@ export class FleetAuth {
   administratorFor(session: ActiveSession): Administrator | undefined {
     if (!session.administratorId) return undefined;
     return this.store.getAdministrator(session.administratorId);
+  }
+
+  agencyAvailableFor(session: ActiveSession | undefined): boolean {
+    if (
+      !session ||
+      (session.authMethod !== "microsoft-code" &&
+        session.authMethod !== "microsoft-device")
+    ) {
+      return false;
+    }
+    const administrator = this.administratorFor(session);
+    // A display address alone is not proof of a Microsoft corporate identity.
+    return (
+      administrator?.tenantId.toLowerCase() === MICROSOFT_CORP_TENANT_ID &&
+      /^[^@\s]+@microsoft\.com$/i.test(administrator.username.trim())
+    );
   }
 
   /**

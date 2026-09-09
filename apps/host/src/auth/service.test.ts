@@ -3,6 +3,7 @@ import { OperatorPasswordSchema } from "@fleet/protocol";
 import { verifyPassword } from "../auth.js";
 import { FleetStore } from "../store.js";
 import { FleetAuth } from "./service.js";
+import { MICROSOFT_CORP_TENANT_ID } from "./entra.js";
 
 const stores: FleetStore[] = [];
 
@@ -35,6 +36,96 @@ function setup(
 }
 
 describe("FleetAuth", () => {
+  describe("Agency staff eligibility", () => {
+    it.each([
+      ["alias@microsoft.com", MICROSOFT_CORP_TENANT_ID, true],
+      [" Alias@MICROSOFT.COM ", MICROSOFT_CORP_TENANT_ID.toUpperCase(), true],
+      ["alias@outlook.com", MICROSOFT_CORP_TENANT_ID, false],
+      ["alias@example.com", MICROSOFT_CORP_TENANT_ID, false],
+      ["alias@microosft.com", MICROSOFT_CORP_TENANT_ID, false],
+      ["alias@notmicrosoft.com", MICROSOFT_CORP_TENANT_ID, false],
+      ["alias@microsoft.com.example.com", MICROSOFT_CORP_TENANT_ID, false],
+      [
+        "alias_microsoft.com#EXT#@example.onmicrosoft.com",
+        MICROSOFT_CORP_TENANT_ID,
+        false,
+      ],
+      ["alias@example.com@microsoft.com", MICROSOFT_CORP_TENANT_ID, false],
+      ["@microsoft.com", MICROSOFT_CORP_TENANT_ID, false],
+      ["", MICROSOFT_CORP_TENANT_ID, false],
+      ["alias@microsoft.com", "9188040d-6c67-4c5b-b112-36a304b66dad", false],
+      ["alias@microsoft.com", "11111111-2222-3333-4444-555555555555", false],
+    ] as const)(
+      "checks verified tenant and exact domain for %s in %s",
+      (username, tenantId, expected) => {
+        const { auth, store } = setup();
+        const administrator = store.insertAdministrator({
+          tenantId,
+          objectId: "staff",
+          username,
+          displayName: "Staff",
+          addedVia: "claim",
+        });
+        const issued = auth.sessions.issue({
+          administratorId: administrator.id,
+          authMethod: "microsoft-code",
+        });
+        expect(auth.agencyAvailableFor(auth.verifySession(issued.token))).toBe(expected);
+      },
+    );
+
+    it.each([
+      ["microsoft-code", true],
+      ["microsoft-device", true],
+      ["password", false],
+      ["recovery", false],
+    ] as const)(
+      "requires a corporate sign-in, not just a linked administrator (%s)",
+      (authMethod, expected) => {
+        const { auth, store } = setup();
+        const administrator = store.insertAdministrator({
+          tenantId: MICROSOFT_CORP_TENANT_ID,
+          objectId: "staff",
+          username: "alias@microsoft.com",
+          displayName: "Staff",
+          addedVia: "claim",
+        });
+        const issued = auth.sessions.issue({
+          administratorId: administrator.id,
+          authMethod,
+        });
+        expect(auth.agencyAvailableFor(auth.verifySession(issued.token))).toBe(expected);
+      },
+    );
+
+    it("fails closed without a current administrator or signed-in session", () => {
+      const { auth, store } = setup();
+      expect(auth.agencyAvailableFor(undefined)).toBe(false);
+      const administrator = store.insertAdministrator({
+        tenantId: MICROSOFT_CORP_TENANT_ID,
+        objectId: "staff",
+        username: "alias@microsoft.com",
+        displayName: "Staff",
+        addedVia: "claim",
+      });
+      const issued = auth.sessions.issue({
+        administratorId: administrator.id,
+        authMethod: "microsoft-code",
+      });
+      const session = auth.verifySession(issued.token);
+      expect(auth.agencyAvailableFor(session)).toBe(true);
+      store.insertAdministrator({
+        tenantId: MICROSOFT_CORP_TENANT_ID,
+        objectId: "remaining-administrator",
+        username: "remaining@microsoft.com",
+        displayName: "Remaining administrator",
+        addedVia: "invitation",
+      });
+      expect(auth.removeAdministrator(administrator.id)).toBe(true);
+      expect(auth.agencyAvailableFor(session)).toBe(false);
+    });
+  });
+
   it("prints a claim code on an unclaimed Host and generates no password", () => {
     const { auth, announced, store } = setup();
     expect(announced).toHaveLength(1);

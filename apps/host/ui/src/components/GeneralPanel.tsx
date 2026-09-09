@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Badge,
   Button,
   Dialog,
   DialogActions,
@@ -16,6 +17,7 @@ import {
   Text,
   Title3,
   makeStyles,
+  shorthands,
   tokens,
 } from "@fluentui/react-components";
 import type { SessionConfigChoice, SessionConfigOption } from "@fleet/protocol";
@@ -53,6 +55,24 @@ const useStyles = makeStyles({
     gap: "16px",
     "@media (max-width: 600px)": { flexWrap: "wrap" },
   },
+  settingTitle: {
+    display: "flex",
+    alignItems: "center",
+    flexWrap: "wrap",
+    gap: "8px",
+  },
+  staffBadge: {
+    flexShrink: 0,
+    color: tokens.colorNeutralForeground2,
+    ...shorthands.border("1px", "solid", "transparent"),
+    backgroundImage: `linear-gradient(${tokens.colorNeutralBackground1}, ${tokens.colorNeutralBackground1}), linear-gradient(120deg, ${tokens.colorPaletteDarkOrangeBorderActive}, ${tokens.colorPaletteGreenBorderActive}, ${tokens.colorPaletteBlueBorderActive}, ${tokens.colorPalettePurpleBorderActive})`,
+    backgroundOrigin: "border-box",
+    backgroundClip: "padding-box, border-box",
+    "@media (forced-colors: active)": {
+      ...shorthands.borderColor("CanvasText"),
+      backgroundImage: "none",
+    },
+  },
   dropdown: { minWidth: 0, width: "250px", maxWidth: "100%" },
   actions: {
     display: "flex",
@@ -72,6 +92,8 @@ const useStyles = makeStyles({
 
 type Defaults = {
   yolo: boolean;
+  agencyMode: boolean;
+  agencyModeAvailable: boolean;
   autoResume: boolean;
   notificationLifecycleEnabled: boolean;
   model: string;
@@ -202,8 +224,15 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
     );
   }
 
-  const { yolo, autoResume, notificationLifecycleEnabled, model, reasoningEffort } =
-    defaults;
+  const {
+    yolo,
+    agencyMode = false,
+    agencyModeAvailable = false,
+    autoResume,
+    notificationLifecycleEnabled,
+    model,
+    reasoningEffort,
+  } = defaults;
   const modelChoices = observedChoices(sessions, "model");
   const effortChoices = observedChoices(sessions, "reasoning_effort");
 
@@ -213,8 +242,8 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
         <Title3 as="h1">Session defaults</Title3>
         <br />
         <Text className={styles.caption}>
-          Applied when you open the new-session dialog. Each session keeps the value it
-          was created with, so changing this never affects a running agent.
+          Defaults for new sessions and fleet-wide launch behavior. Changing these
+          settings never interrupts a running agent.
         </Text>
       </div>
 
@@ -271,6 +300,44 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
         <MessageBar className={styles.warning} intent="warning" layout="multiline">
           <MessageBarBody>{YOLO_WARNING}</MessageBarBody>
         </MessageBar>
+      )}
+
+      {agencyModeAvailable && (
+        <section className={styles.card} aria-label="Agency mode">
+          <div className={styles.row}>
+            <div>
+              <div className={styles.settingTitle}>
+                <Text weight="semibold">Agency mode</Text>
+                <Badge
+                  className={styles.staffBadge}
+                  appearance="outline"
+                  size="medium"
+                  title="Internal feature for Microsoft corporate accounts"
+                >
+                  Staff
+                </Badge>
+              </div>
+              <Text className={styles.caption}>
+                Use Agency Copilot for all new and resumed sessions, including Chats,
+                orchestrators, and workers. Each node uses its own Agency configuration
+                and MCP servers. Nodes without Agency on PATH fall back to standard
+                Copilot and report it in the session log.
+              </Text>
+            </div>
+            <Switch
+              aria-label="Agency mode"
+              checked={agencyMode}
+              disabled={busy}
+              label={agencyMode ? "On" : "Off"}
+              onChange={(_event, data) => void update({ agencyMode: data.checked })}
+            />
+          </div>
+          <Text className={styles.caption}>
+            Running sessions are not interrupted. Stop and resume them to change
+            launchers. Install and sign in to Agency on each node before enabling this;
+            authentication or startup errors are reported, not silently downgraded.
+          </Text>
+        </section>
       )}
 
       <section className={styles.card}>

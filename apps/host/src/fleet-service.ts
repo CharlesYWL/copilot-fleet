@@ -843,7 +843,15 @@ export class FleetService {
             attempt,
           });
         });
-        const command = { ...request, commandId } as NodeCommand;
+        // The current fleet preference also applies to adopted conversations,
+        // automatic recovery, and orchestration, not just the new-session UI.
+        const command = {
+          ...request,
+          ...(request.type === "start_session" || request.type === "resume_session"
+            ? { agencyMode: this.store.getAgencyMode() }
+            : {}),
+          commandId,
+        } as NodeCommand;
         this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
         return { sent: true };
       }

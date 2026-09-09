@@ -1068,6 +1068,14 @@ export class FleetStore {
     this.setSetting("defaults.yolo", yolo ? "1" : "0");
   }
 
+  getAgencyMode(): boolean {
+    return this.getSetting("defaults.agencyMode") === "1";
+  }
+
+  setAgencyMode(enabled: boolean): void {
+    this.setSetting("defaults.agencyMode", enabled ? "1" : "0");
+  }
+
   /**
    * Whether a session a Node lost is re-attached without being asked.
    *
@@ -1154,6 +1162,7 @@ export class FleetStore {
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
       defaults: {
         yolo: this.getDefaultYolo(),
+        agencyMode: this.getAgencyMode(),
         autoResume: this.getAutoResume(),
         notificationLifecycleEnabled: this.getDefaultNotificationLifecycleEnabled(),
       },
@@ -1319,6 +1328,7 @@ export class FleetStore {
       this.setSetting("tunnel.devtunnel.id", tunnelIds.devtunnel);
     }
     this.setDefaultYolo(parsed.defaults.yolo);
+    this.setAgencyMode(parsed.defaults.agencyMode);
     this.setAutoResume(parsed.defaults.autoResume);
     this.setDefaultNotificationLifecycleEnabled(
       parsed.defaults.notificationLifecycleEnabled,

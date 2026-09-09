@@ -21,6 +21,130 @@ afterEach(() => {
 });
 
 describe("GeneralPanel", () => {
+  it("shows the fleet-wide Agency toggle and saves changes in both directions", async () => {
+    let defaults = {
+      yolo: false,
+      agencyMode: false,
+      agencyModeAvailable: true,
+      autoResume: true,
+      notificationLifecycleEnabled: true,
+      model: "",
+      reasoningEffort: "",
+    };
+    const fetchMock = vi.fn(async (path: string | URL | Request, init?: RequestInit) => {
+      if (String(path) === "/api/auth/csrf") return response({ csrfToken: "proof" });
+      if (init?.method === "POST") {
+        defaults = {
+          ...defaults,
+          ...(JSON.parse(String(init.body)) as Partial<typeof defaults>),
+        };
+      }
+      return response(defaults);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel sessions={[]} />
+      </FluentProvider>,
+    );
+
+    const toggle = await screen.findByRole<HTMLInputElement>("switch", {
+      name: "Agency mode",
+    });
+    expect(toggle.checked).toBe(false);
+    expect(screen.getByText("Staff").getAttribute("title")).toBe(
+      "Internal feature for Microsoft corporate accounts",
+    );
+    expect(getComputedStyle(screen.getByText("Staff")).borderTopWidth).toBe("1px");
+    expect(screen.getByText(/Nodes without Agency on PATH fall back/)).toBeTruthy();
+    expect(screen.getByText(/Running sessions are not interrupted/)).toBeTruthy();
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.checked).toBe(true));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ agencyMode: true }),
+      }),
+    );
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.checked).toBe(false));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ agencyMode: false }),
+      }),
+    );
+  });
+
+  it("keeps the saved Agency preference and surfaces a rejected change", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string | URL | Request, init?: RequestInit) => {
+        if (String(path) === "/api/auth/csrf") return response({ csrfToken: "proof" });
+        if (init?.method === "POST") {
+          return new Response(JSON.stringify({ error: "Settings could not be saved" }), {
+            status: 503,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return response({
+          yolo: false,
+          agencyMode: true,
+          agencyModeAvailable: true,
+          autoResume: true,
+          notificationLifecycleEnabled: true,
+          model: "",
+          reasoningEffort: "",
+        });
+      }),
+    );
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel sessions={[]} />
+      </FluentProvider>,
+    );
+    const toggle = await screen.findByRole<HTMLInputElement>("switch", {
+      name: "Agency mode",
+    });
+    expect(toggle.checked).toBe(true);
+    fireEvent.click(toggle);
+    await screen.findByText("Settings could not be saved");
+    expect(toggle.checked).toBe(true);
+  });
+
+  it.each([false, undefined])(
+    "hides the entire Agency card when staff eligibility is %s, even if Agency is enabled",
+    async (agencyModeAvailable) => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () =>
+          response({
+            yolo: false,
+            agencyMode: true,
+            agencyModeAvailable,
+            autoResume: true,
+            notificationLifecycleEnabled: true,
+            model: "",
+            reasoningEffort: "",
+          }),
+        ),
+      );
+      render(
+        <FluentProvider theme={fleetDarkTheme}>
+          <GeneralPanel sessions={[]} />
+        </FluentProvider>,
+      );
+      expect(screen.queryByRole("region", { name: "Agency mode" })).toBeNull();
+      await screen.findByRole("heading", { name: "Session defaults" });
+      expect(screen.queryByRole("region", { name: "Agency mode" })).toBeNull();
+      expect(screen.queryByRole("switch", { name: "Agency mode" })).toBeNull();
+      expect(screen.queryByText("Staff")).toBeNull();
+      expect(screen.getByText("YOLO mode")).toBeTruthy();
+    },
+  );
+
   it("keeps the YOLO explanation inline without notifying on load or setting changes", async () => {
     let defaults = {
       yolo: true,

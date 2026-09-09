@@ -109,6 +109,9 @@ describe("Copilot ACP startup", () => {
   it("reads release versions while ignoring build suffixes", () => {
     expect(copilotVersionFromOutput("GitHub Copilot CLI 1.0.81-12.")).toBe("1.0.81");
     expect(copilotVersionFromOutput("unexpected output")).toBeUndefined();
+    expect(copilotVersionFromOutput("Agency 2026.9.4.3\nGitHub Copilot CLI 1.0.68")).toBe(
+      "1.0.68",
+    );
   });
 
   it("rejects the ACP build that could claim login before checking it", () => {
@@ -122,6 +125,15 @@ describe("Copilot ACP startup", () => {
     expect(copilotFailureMessage(new Error("Authentication required"))).toContain(
       "copilot login",
     );
+    expect(
+      copilotFailureMessage(new Error("Authentication required"), "", "agency"),
+    ).toMatch(/agency copilot.*\/login/);
+    expect(
+      copilotAcpAuthVersionError(
+        "Agency 2026.9.4.3\nGitHub Copilot CLI 1.0.68",
+        "agency",
+      ),
+    ).toMatch(/Agency's Copilot CLI 1\.0\.68.*minimum 1\.0\.69/);
   });
 
   it("wires the ACP factory to the bounded default", () => {

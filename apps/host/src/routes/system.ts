@@ -253,19 +253,29 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     },
   );
 
-  app.get("/api/defaults", async () => ({
+  app.get("/api/defaults", async (request) => ({
     yolo: store.getDefaultYolo(),
+    agencyMode: store.getAgencyMode(),
+    agencyModeAvailable: auth.agencyAvailableFor(request.fleetSession),
     autoResume: store.getAutoResume(),
     notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
     model: store.getDefaultModel(),
     reasoningEffort: store.getDefaultReasoningEffort(),
   }));
 
-  app.post("/api/defaults", async (request) => {
+  app.post("/api/defaults", async (request, reply) => {
     const input = UpdateDefaultsSchema.parse(request.body);
+    const agencyModeAvailable = auth.agencyAvailableFor(request.fleetSession);
+    if (input.agencyMode !== undefined && !agencyModeAvailable) {
+      return reply.code(403).send({
+        error:
+          "Agency mode is an internal feature for Microsoft employees. Sign in with your @microsoft.com corporate account to change it.",
+      });
+    }
     // Each field is optional so a client that knows about one setting cannot
     // reset the others merely by not mentioning them.
     if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
+    if (input.agencyMode !== undefined) store.setAgencyMode(input.agencyMode);
     if (input.autoResume !== undefined) store.setAutoResume(input.autoResume);
     if (input.notificationLifecycleEnabled !== undefined) {
       store.setDefaultNotificationLifecycleEnabled(input.notificationLifecycleEnabled);
@@ -276,6 +286,8 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     }
     return {
       yolo: store.getDefaultYolo(),
+      agencyMode: store.getAgencyMode(),
+      agencyModeAvailable,
       autoResume: store.getAutoResume(),
       notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
       model: store.getDefaultModel(),

@@ -15,6 +15,11 @@ import {
   toSessionConfigOptions,
 } from "./acp-config.js";
 import { toPromptBlocks } from "./prompt-content.js";
+import {
+  copilotSpawnTarget,
+  resolveCopilotLaunch,
+  type CopilotLaunch,
+} from "./copilot-launch.js";
 
 export type PermissionDecision = {
   outcome: "allow_once" | "deny";
@@ -181,6 +186,8 @@ export type StartAgentOptions = {
   sequenceOffset?: number;
   /** Launch Copilot with --allow-all. The Host owns this decision. */
   yolo?: boolean;
+  /** Prefer this Node's Agency installation, falling back only when it is absent. */
+  agencyMode?: boolean;
   /**
    * MCP servers to hand this session, supplied on both `session/new` and
    * `session/load`. Empty for every ordinary session.
@@ -444,7 +451,11 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly permissionTimeoutMs: number,
     sequenceOffset = 0,
     private readonly yolo = false,
-    private readonly copilotCommand = "",
+    private readonly launch: CopilotLaunch = {
+      command: "copilot",
+      args: [],
+      provider: "copilot",
+    },
     private readonly contextTier: ContextTier | undefined = undefined,
     private readonly mcpServerConfigs: readonly McpHttpServer[] = [],
     /** A custom agent to select once the session exists. Empty for workers. */
@@ -485,18 +496,14 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         activity: resumeAgentSessionId ? "Resuming Copilot ACP" : "Starting Copilot ACP",
       });
     }
-    const executable =
-      this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot";
-    const args = copilotLaunchArgs(this.yolo, this.contextTier);
-    // npm installs a CLI on Windows as a .cmd shim, which CreateProcess cannot
-    // launch directly; the shell can, but then the path has to be quoted.
-    const viaShell = process.platform === "win32";
-    const command = viaShell && executable.includes(" ") ? `"${executable}"` : executable;
+    if (this.launch.notice) this.emit("system", { message: this.launch.notice });
+    const args = [...this.launch.args, ...copilotLaunchArgs(this.yolo, this.contextTier)];
+    const { command, shell } = copilotSpawnTarget(this.launch.command);
     const child = spawn(command, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
-      shell: viaShell,
+      shell,
     });
     this.child = child;
     child.stderr.setEncoding("utf8");
@@ -811,7 +818,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
 
   /** Ends an incomplete startup as a failure before its process is torn down. */
   failStartup(error: unknown): Error {
-    const failure = new Error(copilotFailureMessage(error, this.stderrTail));
+    const failure = new Error(
+      copilotFailureMessage(error, this.stderrTail, this.launch.provider),
+    );
     if (!this.hasTerminated) {
       this.emit("error", { message: failure.message });
       this.emit("state", { state: "failed", activity: failure.message });
@@ -948,8 +957,8 @@ export class AcpAgentFactory implements AgentFactory {
    * Cleared whenever the command changes, since the answer belongs to the
    * binary that was asked.
    */
-  private contextTierSupport: Promise<boolean> | undefined;
-  private copilotValidation: Promise<void> | undefined;
+  private readonly contextTierSupport = new Map<string, Promise<boolean>>();
+  private readonly copilotValidation = new Map<string, Promise<void>>();
 
   /** Values are injected: settings.ts is the only place that reads the env. */
   constructor(
@@ -966,8 +975,8 @@ export class AcpAgentFactory implements AgentFactory {
     contextTier: ContextTier = this.contextTier,
   ): void {
     if (copilotCommand !== this.copilotCommand) {
-      this.contextTierSupport = undefined;
-      this.copilotValidation = undefined;
+      this.contextTierSupport.clear();
+      this.copilotValidation.clear();
     }
     this.permissionTimeoutMs = permissionTimeoutMs;
     this.copilotCommand = copilotCommand;
@@ -980,15 +989,19 @@ export class AcpAgentFactory implements AgentFactory {
     sink: EventSink,
     options: StartAgentOptions = {},
   ): Promise<SessionAgent> {
-    await this.validateCopilot();
+    const launch = await resolveCopilotLaunch(
+      options.agencyMode ?? false,
+      this.copilotCommand,
+    );
+    await this.validateCopilot(launch);
     const agent = new AcpAgent(
       sessionId,
       sink,
       this.permissionTimeoutMs,
       options.sequenceOffset ?? 0,
       options.yolo ?? false,
-      this.copilotCommand,
-      (await this.acceptsContextTier()) ? this.contextTier : undefined,
+      launch,
+      (await this.acceptsContextTier(launch)) ? this.contextTier : undefined,
       options.mcpServers ?? [],
       options.agent ?? "",
       options.config ?? [],
@@ -1008,27 +1021,43 @@ export class AcpAgentFactory implements AgentFactory {
     }
   }
 
-  private validateCopilot(): Promise<void> {
-    const command = this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot";
-    this.copilotValidation ??= copilotOutput(command, ["--version"])
+  private validateCopilot(launch: CopilotLaunch): Promise<void> {
+    const key = JSON.stringify([launch.command, launch.args]);
+    const cached = this.copilotValidation.get(key);
+    if (cached) return cached;
+    const validation = this.metadata(launch, "--version")
       .then((output) => {
-        const failure = copilotAcpAuthVersionError(output);
+        const failure = copilotAcpAuthVersionError(output, launch.provider);
         if (failure) throw new Error(failure);
       })
       .catch((error) => {
         // An operator can update or repair Copilot without restarting the Node.
         // A failed probe must therefore be retried by the next session.
-        this.copilotValidation = undefined;
+        this.copilotValidation.delete(key);
         throw error;
       });
-    return this.copilotValidation;
+    this.copilotValidation.set(key, validation);
+    return validation;
   }
 
-  private acceptsContextTier(): Promise<boolean> {
-    this.contextTierSupport ??= copilotSupportsContextTier(
-      this.copilotCommand || process.env.FLEET_COPILOT_COMMAND || "copilot",
+  private acceptsContextTier(launch: CopilotLaunch): Promise<boolean> {
+    const key = JSON.stringify([launch.command, launch.args]);
+    const cached = this.contextTierSupport.get(key);
+    if (cached) return cached;
+    const support = copilotSupportsContextTier(launch.command, () =>
+      this.metadata(launch, "--help"),
     );
-    return this.contextTierSupport;
+    this.contextTierSupport.set(key, support);
+    return support;
+  }
+
+  private metadata(launch: CopilotLaunch, flag: string): Promise<string> {
+    return copilotOutput(
+      launch.command,
+      [...launch.args, ...(launch.provider === "agency" ? ["--"] : []), flag],
+      // Agency may need to acquire its Copilot binary on the first invocation.
+      launch.provider === "agency" ? this.startTimeoutMs : 15_000,
+    );
   }
 }
 
@@ -1328,14 +1357,26 @@ export async function copilotSupportsContextTier(
 }
 
 export function copilotVersionFromOutput(output: string): string | undefined {
-  const match = output.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?\b/);
+  const match =
+    output.match(/\bGitHub Copilot(?: CLI)?\s+(\d+)\.(\d+)\.(\d+)/i) ??
+    output.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?\b/);
   return match ? `${match[1]}.${match[2]}.${match[3]}` : undefined;
 }
 
-export function copilotAcpAuthVersionError(output: string): string | undefined {
+export function copilotAcpAuthVersionError(
+  output: string,
+  provider: CopilotLaunch["provider"] = "copilot",
+): string | undefined {
   const version = copilotVersionFromOutput(output);
   if (!version || compareVersions(version, MIN_COPILOT_ACP_AUTH_VERSION) >= 0) {
     return undefined;
+  }
+  if (provider === "agency") {
+    return (
+      `Agency's Copilot CLI ${version} is too old for reliable ACP authentication. ` +
+      `Update Agency and its Copilot CLI on this node (minimum ${MIN_COPILOT_ACP_AUTH_VERSION}), ` +
+      "then run `agency copilot` and use `/login` before retrying."
+    );
   }
   return (
     `Copilot CLI ${version} is too old for reliable ACP authentication. ` +
@@ -1354,7 +1395,11 @@ function compareVersions(left: string, right: string): number {
   return 0;
 }
 
-export function copilotFailureMessage(error: unknown, stderr = ""): string {
+export function copilotFailureMessage(
+  error: unknown,
+  stderr = "",
+  provider: CopilotLaunch["provider"] = "copilot",
+): string {
   const primary = errorMessage(error, "Copilot ACP failed to start");
   const detail = stderr
     .split(/\r?\n/)
@@ -1368,7 +1413,9 @@ export function copilotFailureMessage(error: unknown, stderr = ""): string {
     ) &&
     !message.includes("copilot login")
   ) {
-    return `${message}. Run \`copilot login\` on this node, then retry.`;
+    return provider === "agency"
+      ? `${message}. Run \`agency copilot\` on this node and use \`/login\`, then retry.`
+      : `${message}. Run \`copilot login\` on this node, then retry.`;
   }
   return message;
 }
@@ -1401,26 +1448,45 @@ function copilotHelp(command: string): Promise<string> {
 }
 
 /** Captures one short Copilot metadata command without leaving a hung child. */
-function copilotOutput(command: string, args: string[]): Promise<string> {
+function copilotOutput(
+  command: string,
+  args: string[],
+  timeoutMs = 15_000,
+): Promise<string> {
   return new Promise((done, fail) => {
-    const viaShell = process.platform === "win32";
-    const executable = viaShell && command.includes(" ") ? `"${command}"` : command;
+    const { command: executable, shell } = copilotSpawnTarget(command);
     const child = spawn(executable, args, {
-      shell: viaShell,
+      shell,
       windowsHide: true,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
-    child.stdout?.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
-    child.stderr?.on("data", (chunk: Buffer) => (output += chunk.toString("utf8")));
-    child.once("error", fail);
-    child.once("close", () => done(output));
-    // A help screen that has not arrived in this long is not going to, and the
-    // session waiting behind it should not be held up over an optional flag.
-    setTimeout(() => {
+    const capture = (chunk: Buffer) => {
+      output = `${output}${chunk.toString("utf8")}`.slice(-64_000);
+    };
+    child.stdout?.on("data", capture);
+    child.stderr?.on("data", capture);
+    const timer = setTimeout(() => {
+      fail(new Error(`${command} ${args.join(" ")} timed out`));
       child.kill();
-      fail(new Error(`copilot ${args.join(" ")} timed out`));
-    }, 15_000).unref();
+    }, timeoutMs);
+    timer.unref();
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      fail(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        fail(
+          new Error(
+            `${command} ${args.join(" ")} failed (${signal ?? code ?? "unknown"}): ${output.trim()}`,
+          ),
+        );
+      } else {
+        done(output);
+      }
+    });
   });
 }
 

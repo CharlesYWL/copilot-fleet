@@ -262,6 +262,34 @@ npm start
   以及 **Settings → Diagnostics** 里的 Host warning/error。能访问 Node 机器时，它自己的
   `http://127.0.0.1:8788` 配置页会显示 Node 侧日志。
 
+## Agency 模式
+
+在 **Settings → General → Agency mode** 中打开开关，即可在整个 Fleet 中优先使用
+[Agency Copilot](https://aka.ms/agency)。默认关闭；使用前请将 Fleet Host 和所有 Node
+更新到支持此设置的版本。
+
+设置旁会显示 **Staff** 标记，仅对使用 Microsoft 公司租户中的 `@microsoft.com`
+账号登录的员工显示。其他账号或仅使用密码登录的用户看不到此设置，也不能修改它。
+
+每个 Node 在自己的 `PATH` 中查找 `agency`，使用 `agency copilot --acp --stdio`
+代替普通 `copilot`。此设置覆盖新建、恢复、自动重连和导入的会话，包括 Chats、
+orchestrator 和 worker。正在运行的会话不会被中断；停止并恢复后才切换启动方式。
+关闭开关后，后续启动重新使用普通 Copilot。
+
+请用运行 Node 的同一用户安装 Agency，并先交互运行 `agency copilot`，需要时使用
+`/login` 登录，在 Agency 中配置需要的 MCP 服务。修改 `PATH` 后要重启 Node。
+Fleet 使用各 Node 自己的 Agency 配置，不会从 Host 复制凭据或 MCP 配置，也不会因为
+打开开关就自动启用全部 MCP 服务或授予内部系统访问权限。
+
+大量 MCP 工具可能超出小模型的上下文预算。如果 Copilot 提示静态指令或工具定义放不下，
+请改用支持更大上下文的模型；Fleet 不会静默更改你选择的模型。
+
+Node 的 `PATH` 中没有 Agency 时，会回退到它配置的 Copilot 命令
+（`FLEET_COPILOT_COMMAND`，或 `copilot`），并在会话日志中说明。Agency 已安装但启动或
+认证失败时会直接报错，不会静默回退。原有 Copilot 最低版本要求、YOLO 权限、
+模型和上下文窗口设置，以及 Fleet 的编排 MCP 工具仍然适用。开关会随 Host 持久保存，
+并包含在 Host 备份中。
+
 ## 首次运行：认领一个 Fleet
 
 一台 Fleet Host 能在所有已注册的机器上启动进程、读取全部记录。谁可以做这件事，由

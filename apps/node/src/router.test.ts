@@ -40,6 +40,47 @@ const START_DEFAULTS: Pick<
 > = { yolo: false, mcpServers: [], agent: "", readOnly: false, config: [] };
 
 describe("CommandRouter", () => {
+  it.each(["start_session", "resume_session"] as const)(
+    "passes the Host's Agency preference through %s",
+    async (type) => {
+      const start = vi.fn<AgentFactory["start"]>(async (sessionId, _cwd, sink) =>
+        inertAgent(sessionId, sink),
+      );
+      const router = new CommandRouter(
+        { start },
+        1,
+        () => {},
+        async (path) => path,
+      );
+      const command = {
+        ...START_DEFAULTS,
+        commandId: "agency-launch",
+        sessionId: "s1",
+        localPath: "/repo",
+        agencyMode: true,
+      };
+      const result = await router.route(
+        type === "start_session"
+          ? { ...command, type, prompt: "hello" }
+          : {
+              ...command,
+              type,
+              agentSessionId: "copilot-1",
+              sequenceOffset: 0,
+              additionalDirectories: [],
+            },
+      );
+      expect(result.ok).toBe(true);
+      expect(start).toHaveBeenCalledWith(
+        "s1",
+        "/repo",
+        expect.any(Function),
+        expect.objectContaining({ agencyMode: true, yolo: false }),
+      );
+      await router.stopAll();
+    },
+  );
+
   it("streams two sessions independently and deduplicates commands", async () => {
     const events: SessionEvent[] = [];
     const router = new CommandRouter(
@@ -532,6 +573,7 @@ describe("CommandRouter", () => {
       ...START_DEFAULTS,
       config: [{ id: "model", value: "deep" }],
       mcpServers: [{ name: "fleet", url: "http://old.example/mcp", headers: [] }],
+      agencyMode: true,
       commandId: "c1",
       sessionId: "s1",
       localPath: "/one",
@@ -544,6 +586,7 @@ describe("CommandRouter", () => {
     expect(stops).toEqual([false]);
     expect(startOptions[1]).toMatchObject({
       resumeAgentSessionId: "copilot-1",
+      agencyMode: true,
       announceLifecycle: false,
       config: [{ id: "model", value: "deep" }],
       mcpServers: [{ name: "fleet", url: "http://127.0.0.1:8787/mcp", headers: [] }],

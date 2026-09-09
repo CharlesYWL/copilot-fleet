@@ -637,6 +637,21 @@ describe("FleetStore", () => {
     expect(store.getDefaultYolo()).toBe(false);
   });
 
+  it("keeps Agency mode opt-in and persists the preference across Host restarts", () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-agency-mode-"));
+    directories.push(directory);
+    const file = join(directory, "fleet.db");
+    const first = new FleetStore(file);
+    expect(first.getAgencyMode()).toBe(false);
+    first.setAgencyMode(true);
+    first.close();
+    const reopened = new FleetStore(file);
+    stores.push(reopened);
+    expect(reopened.getAgencyMode()).toBe(true);
+    reopened.setAgencyMode(false);
+    expect(reopened.getAgencyMode()).toBe(false);
+  });
+
   it("resumes a stopped session all the way to idle", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "hello");
@@ -1616,6 +1631,7 @@ describe("Host backup", () => {
     });
     store.setDefaultYolo(false);
     store.setAutoResume(false);
+    store.setAgencyMode(true);
     store.setDefaultNotificationLifecycleEnabled(false);
     store.setTunnelEnabled(true);
     store.setTunnelProvider("tailscale");
@@ -1661,6 +1677,7 @@ describe("Host backup", () => {
     expect(restored.authenticateNode(other.id, secret)).toBe(true);
     expect(restored.getDefaultYolo()).toBe(false);
     expect(restored.getAutoResume()).toBe(false);
+    expect(restored.getAgencyMode()).toBe(true);
     expect(restored.getDefaultNotificationLifecycleEnabled()).toBe(false);
     expect(restored.getTunnelEnabled()).toBe(true);
     expect(restored.getTunnelProvider()).toBe("tailscale");

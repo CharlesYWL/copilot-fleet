@@ -88,6 +88,7 @@ describe("the sealed security payload", () => {
         tunnel: { enabled: false, provider: "devtunnel" },
         defaults: {
           yolo: false,
+          agencyMode: false,
           autoResume: false,
           notificationLifecycleEnabled: true,
         },
@@ -123,6 +124,7 @@ describe("the sealed security payload", () => {
         tunnel: { enabled: false, provider: "devtunnel" },
         defaults: {
           yolo: false,
+          agencyMode: false,
           autoResume: false,
           notificationLifecycleEnabled: true,
         },

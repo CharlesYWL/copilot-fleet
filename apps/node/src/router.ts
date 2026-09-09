@@ -288,12 +288,14 @@ export class CommandRouter {
               additionalDirectories,
               sequenceOffset: command.sequenceOffset,
               yolo: command.yolo,
+              agencyMode: command.agencyMode ?? false,
               mcpServers,
               agent: requested.selected,
               config: command.config,
             }
           : {
               yolo: command.yolo,
+              agencyMode: command.agencyMode ?? false,
               mcpServers,
               agent: requested.selected,
               config: command.config,
@@ -399,6 +401,7 @@ export class CommandRouter {
           additionalDirectories: slot.additionalDirectories ?? [],
           sequenceOffset: slot.sequenceOffset,
           yolo: launch.yolo,
+          agencyMode: launch.agencyMode ?? false,
           mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
           agent: slot.selectedAgent ?? "",
           config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),

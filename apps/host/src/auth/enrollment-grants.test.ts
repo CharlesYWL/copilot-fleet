@@ -113,6 +113,7 @@ describe("grants and backups", () => {
         tunnel: { enabled: false, provider: "cloudflare" },
         defaults: {
           yolo: false,
+          agencyMode: false,
           autoResume: true,
           notificationLifecycleEnabled: true,
         },

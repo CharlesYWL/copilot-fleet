@@ -573,6 +573,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     prompt: z.string().min(1),
     /** Launches Copilot with --allow-all; decided by the Host. */
     yolo: z.boolean().default(false),
+    /** Prefer Agency on this Node; absent on older Hosts means standard Copilot. */
+    agencyMode: z.boolean().optional(),
     /**
      * Tools this session may call back into the Host with.
      *
@@ -613,6 +615,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     /** Continues the host's event sequence so replayed rows stay ordered. */
     sequenceOffset: z.number().int().nonnegative().default(0),
     yolo: z.boolean().default(false),
+    agencyMode: z.boolean().optional(),
     /**
      * Re-supplied on resume, because `session/load` takes its own `mcpServers`
      * and a session reloaded without them comes back with no tools — an
@@ -2026,6 +2029,8 @@ export const RenameSessionSchema = z.object({
 
 export const UpdateDefaultsSchema = z.object({
   yolo: z.boolean().optional(),
+  /** Fleet-wide launcher preference, applied to every new or resumed session. */
+  agencyMode: z.boolean().optional(),
   /** Re-attach a session its Node lost, without waiting to be asked. */
   autoResume: z.boolean().optional(),
   /** Application fallback for lifecycle notifications on top-level agents. */
@@ -2301,6 +2306,7 @@ const hostBackupDataShape = {
   tunnel: HostBackupTunnelSchema,
   defaults: z.object({
     yolo: z.boolean(),
+    agencyMode: z.boolean().default(false),
     autoResume: z.boolean(),
     notificationLifecycleEnabled: z.boolean().default(true),
   }),

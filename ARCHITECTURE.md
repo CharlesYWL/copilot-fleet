@@ -33,6 +33,14 @@ Windows Node App
 copilot --acp --stdio
 ```
 
+Agency mode is an opt-in Host setting applied at the common command-dispatch
+boundary to every session start and resume. The executing Node resolves Agency
+on its own PATH and uses `agency copilot --acp --stdio`, preserving the ACP
+transport, permissions, and per-session Fleet MCP injection. Only a missing
+Agency installation falls back to the Node's standard Copilot command, with a
+session-log notice; Agency startup errors are not hidden by a fallback.
+Already-running sessions keep their launcher until stopped and resumed.
+
 ## Domain model
 
 - **Node**: registered machine, capabilities, capacity, active count, and liveness.

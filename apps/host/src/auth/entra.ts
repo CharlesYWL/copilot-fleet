@@ -65,8 +65,8 @@ export const BUILT_IN_ENTRA_CONFIG: EntraConfig = EntraConfigSchema.parse({
  *
  * `tenantId` and `objectId` are the authorisation keys. The other two are
  * display metadata: the `email` scope does not guarantee an `email` claim, and
- * `preferred_username` is mutable, so neither is ever compared against
- * anything.
+ * `preferred_username` is mutable, so neither can identify an administrator
+ * or grant access to Fleet.
  */
 export type EntraIdentity = {
   tenantId: string;

@@ -22,6 +22,7 @@ import {
   SetSessionConfigSchema,
   SnapshotSchema,
   UpdateNotificationSchema,
+  UpdateDefaultsSchema,
   backupKind,
   canTransition,
   canTransitionRun,
@@ -36,6 +37,28 @@ import {
 } from "./index.js";
 
 describe("protocol validation", () => {
+  it.each(["start_session", "resume_session"] as const)(
+    "carries Agency mode on %s and accepts launches from older Hosts",
+    (type) => {
+      const command = {
+        type,
+        commandId: "c1",
+        sessionId: "s1",
+        localPath: "C:\\repo",
+        prompt: "work",
+        agentSessionId: "acp-1",
+      };
+      expect(NodeCommandSchema.parse(command)).not.toHaveProperty("agencyMode");
+      expect(NodeCommandSchema.parse({ ...command, agencyMode: true })).toMatchObject({
+        agencyMode: true,
+      });
+      expect(
+        NodeCommandSchema.safeParse({ ...command, agencyMode: "true" }).success,
+      ).toBe(false);
+      expect(UpdateDefaultsSchema.parse({})).not.toHaveProperty("agencyMode");
+    },
+  );
+
   it("accepts a valid streamed event", () => {
     expect(
       NodeToHostMessageSchema.parse({
@@ -601,6 +624,7 @@ describe("run orchestration protocol", () => {
     expect(parsed.notifications).toEqual([]);
     expect(parsed.notificationPreferences).toEqual([]);
     expect(parsed.defaults.notificationLifecycleEnabled).toBe(true);
+    expect(parsed.defaults.agencyMode).toBe(false);
   });
 
   it("gates run transitions on approval being the entrance", () => {

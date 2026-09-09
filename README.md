@@ -48,6 +48,7 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [keeping nodes up to date](#keeping-nodes-up-to-date).
 - **Create projects and start everyday sessions:**
   [workspaces and placements](#first-run-walkthrough),
+  [Agency mode](#agency-mode),
   [Exact proof of concept](#exact-proof-of-concept),
   [attachments and images](#attaching-files-and-images), and
   [slash commands and session pickers](#slash-commands-and-session-pickers).
@@ -320,6 +321,40 @@ of them on one Windows machine, or split Host and Node across machines.
   **Settings → Diagnostics** for Host warnings/errors. The Node's own
   `http://127.0.0.1:8788` config page shows Node-side logs when you can reach
   that machine.
+
+## Agency mode
+
+Enable **Settings → General → Agency mode** to prefer
+[Agency Copilot](https://aka.ms/agency) across the fleet. It is off by default.
+The setting is marked **Staff** and is only shown to Microsoft employees signed
+in with an `@microsoft.com` account in Microsoft's corporate tenant. Other
+accounts and password-only logins cannot see or change it.
+Update the Fleet Host and Nodes to a version with this setting before using it.
+
+Each Node looks for `agency` on its own `PATH` and launches
+`agency copilot --acp --stdio` instead of plain `copilot`. This applies to new
+and resumed sessions, including Chats, orchestrators, workers, adopted
+conversations, and automatic recovery. Existing running sessions are left alone;
+stop and resume them to switch launchers. Turning the setting off uses standard
+Copilot again on the next launch.
+
+Install Agency and run `agency copilot` interactively as the same user that runs
+the Node; use `/login` if prompted, and configure the MCP servers you need in
+Agency. Restart the Node after changing its `PATH`. Fleet uses that Node's Agency
+configuration rather than copying credentials or MCP configuration from the Host.
+Enabling this setting does not automatically enable every Agency MCP server or
+grant access to internal services.
+
+Large MCP catalogs can exceed a small model's context budget. If Copilot reports
+that its static instructions or tool definitions do not fit, select a
+larger-context model; Fleet does not silently override your model choice.
+
+If Agency is absent from a Node's `PATH`, that Node falls back to its configured
+Copilot command (`FLEET_COPILOT_COMMAND`, or `copilot`) and records the fallback in
+the session log. A broken or unauthenticated Agency installation reports an error
+instead of silently switching providers. The existing minimum Copilot version,
+YOLO permissions, model/context choices, and Fleet orchestration MCP tools still
+apply. Agency mode is saved with the Host and included in Host backups.
 
 ## First run: claiming a Fleet
 

@@ -236,6 +236,8 @@ describe("host routes", () => {
       (await inject({ method: "GET", url: "/api/defaults" })).json();
     expect(await read()).toEqual({
       yolo: false,
+      agencyMode: false,
+      agencyModeAvailable: false,
       autoResume: true,
       notificationLifecycleEnabled: true,
       model: "",
@@ -247,6 +249,8 @@ describe("host routes", () => {
     // not mentioning it.
     expect(await read()).toEqual({
       yolo: true,
+      agencyMode: false,
+      agencyModeAvailable: false,
       autoResume: true,
       notificationLifecycleEnabled: true,
       model: "",
@@ -260,6 +264,8 @@ describe("host routes", () => {
     });
     expect(await read()).toEqual({
       yolo: true,
+      agencyMode: false,
+      agencyModeAvailable: false,
       autoResume: false,
       notificationLifecycleEnabled: true,
       model: "",
@@ -283,6 +289,8 @@ describe("host routes", () => {
     });
     expect(await read()).toEqual({
       yolo: true,
+      agencyMode: false,
+      agencyModeAvailable: false,
       autoResume: false,
       notificationLifecycleEnabled: false,
       model: "claude-opus-5",
@@ -292,6 +300,38 @@ describe("host routes", () => {
     // Clearing one is a choice, not an omission, so it has to be honoured.
     await inject({ method: "POST", url: "/api/defaults", payload: { model: "" } });
     expect(await read()).toMatchObject({ model: "", reasoningEffort: "xhigh" });
+  });
+
+  it("refuses staff-only Agency changes from a password login before changing any defaults", async () => {
+    const refused = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { agencyMode: true, agencyModeAvailable: true, yolo: true },
+    });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.json().error).toContain("@microsoft.com");
+    const unrelated = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { model: "deep" },
+    });
+    expect(unrelated.statusCode).toBe(200);
+    expect(unrelated.json()).toMatchObject({
+      agencyMode: false,
+      agencyModeAvailable: false,
+      yolo: false,
+      model: "deep",
+    });
+    const invalid = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { agencyMode: "true" },
+    });
+    expect(invalid.statusCode).toBe(400);
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      agencyMode: false,
+      agencyModeAvailable: false,
+    });
   });
 
   it("serves the enrollment command inputs", async () => {
