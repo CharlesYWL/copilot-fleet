@@ -155,6 +155,7 @@ describe("orchestrator tools over the wire", () => {
       result?: {
         tools?: {
           name: string;
+          description?: string;
           inputSchema: { properties?: Record<string, JsonSchemaField> };
         }[];
         content?: { text: string }[];
@@ -217,6 +218,23 @@ describe("orchestrator tools over the wire", () => {
     expect(Object.keys(planTool.inputSchema.properties ?? {})).toEqual(
       expect.arrayContaining(["successCriteria", "stopWhen"]),
     );
+  });
+
+  it("advertises adaptive phases for changes instead of a fixed pipeline", async () => {
+    const listed = await rpc("tools/list");
+    const planTool = listed.result!.tools!.find((t) => t.name === "fleet_plan_task")!;
+    const phasesDescription = planTool.inputSchema.properties?.phases?.description;
+
+    expect(planTool.description).toContain("one for a simple fix");
+    expect(planTool.description).toContain(
+      "two when discovery or independent review adds value",
+    );
+    expect(planTool.description).toContain("three for substantial or high-risk work");
+    expect(planTool.description).not.toContain("three or four for a change");
+    expect(phasesDescription).toContain('["Implement and verify"]');
+    expect(phasesDescription).toContain('["Inspect", "Implement and verify"]');
+    expect(phasesDescription).toContain('["Implement and verify", "Review"]');
+    expect(phasesDescription).toContain('["Plan", "Implement and verify", "Review"]');
   });
 
   it("refuses to open a task with no criteria at all", async () => {

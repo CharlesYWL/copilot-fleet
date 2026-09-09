@@ -433,6 +433,33 @@ describe("FleetTools", () => {
     expect(store.getSession(first.sessionId)?.state).toBe("starting");
   });
 
+  it.each(["", "Inspection started."])(
+    "reports startup failures in the transcript with prior output %j",
+    (text) => {
+      start({ task: "Inspect startup" });
+      const sessionId = store.listRunSteps(tasks()[0]!.id)[0]!.sessionId;
+      if (text) {
+        store.appendEvent({
+          eventId: "worker-text",
+          sessionId,
+          sequence: 1,
+          type: "agent_text",
+          payload: { text },
+          createdAt: new Date().toISOString(),
+        });
+      }
+      const reason = "Copilot ACP did not become ready within 60s.";
+      service.failFromCommandResult(sessionId, "launch-command", reason);
+
+      const result = tools().transcript({ sessionId });
+
+      expect(result.ok).toBe(true);
+      expect(result.text).toContain(reason);
+      expect(result.text).not.toContain("has not said anything");
+      if (text) expect(result.text).toContain(text);
+    },
+  );
+
   it("will not touch a session belonging to somebody else", () => {
     const mine = store.createSession(store.listPlacements()[0]!, "hand-made");
 

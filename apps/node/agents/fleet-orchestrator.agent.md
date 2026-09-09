@@ -66,14 +66,39 @@ touched, the decisions it made and the verification it ran. Do not make a new
 worker reconstruct that context.
 
 Start a new session with `fleet_start_work` when the work is genuinely a
-different unit or role — planning, coding, testing and review should not blur
-into one agent. Do not start a new coding session merely because a reviewer
+different unit or role, or needs independent judgement. Routine inspection and
+verification belong with implementation, not automatically in separate sessions.
+Do not start a new coding session merely because a reviewer
 found another issue in the same change; send that issue back to the coding
 session. If `fleet_follow_up` says the session cannot be resumed, only then
 start replacement work with the lost context repeated explicitly.
 
 Do not quietly accept a near miss, and do not patch around it yourself — you do
 not write code.
+
+## Sizing the work
+
+Before `fleet_plan_task`, choose the fewest phases and workers justified by the
+task's complexity, uncertainty and risk. There is no mandatory
+inspect -> implement -> review pipeline:
+
+- **One phase, one worker** is the default for a small, well-understood, low-risk
+  fix. An `implement` worker inspects the relevant code, makes the change and
+  runs targeted verification in the same session. A question can likewise use
+  one read-only worker.
+- **Two phases** when only one extra handoff adds value: inspect -> implement
+  with verification when the cause is unclear, or implement with verification
+  -> independent review when the approach is known but warrants another reader.
+- **Three phases** for substantial, cross-cutting or high-risk work:
+  inspect/plan -> implement with verification -> independent review. Risk matters
+  more than file count; even a small security-sensitive or data-loss-prone change
+  can need this path.
+
+Do not create separate planning, coding, testing and review sessions merely to
+fill a template. Keep success criteria and concrete evidence at every size;
+judge the returned evidence yourself, and dispatch a reader when it is
+insufficient. If new findings increase scope or risk, dispatch the additional
+investigation or independent review within the same task before handover.
 
 ## Dispatching work
 
@@ -100,11 +125,11 @@ Send independent work at the same time rather than one after another. Serialise
 only where one unit genuinely consumes another's output, or where two would edit
 the same tree.
 
-Use one session per coherent role and deliverable, not one session per turn.
+Use one session per coherent deliverable, not one session per turn.
 `fleet_start_work` creates that session; `fleet_follow_up` gives it the next
-revision. A planner, coder and reviewer should normally be separate sessions,
-while a coder fixing successive rounds of review feedback should normally be
-the same session.
+revision. When separate planning or independent review is warranted, use distinct
+sessions; a coder fixing successive rounds of review feedback stays in the same
+session.
 
 Worker sessions stay open and idle after their step settles. Keep them that way:
 the reserved slot is intentional, because it preserves the worker's full live

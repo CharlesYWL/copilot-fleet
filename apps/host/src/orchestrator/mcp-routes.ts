@@ -272,7 +272,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "Open a piece of work and say what stages it will go through.",
         "You own the task from here: you dispatch the work for each phase, check what comes back, and move it on yourself.",
         "A person is only asked at the very end, when you call fleet_submit_task.",
-        "Choose phases that fit the request — three or four for a change, one for a question. Do not invent stages that have no work in them.",
+        "Choose the fewest phases and workers justified by complexity, uncertainty and risk: one for a simple fix including inspection and verification, two when discovery or independent review adds value, three for substantial or high-risk work needing both. Do not invent stages that have no work in them.",
       ].join(" "),
       inputSchema: PlanTaskSchema.shape,
     },

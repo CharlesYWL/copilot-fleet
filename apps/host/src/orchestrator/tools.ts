@@ -5,7 +5,6 @@ import {
   isChatsWorkspace,
   RunCriterionSchema,
   canTransitionRun,
-  eventPayload,
   isWritingCategory,
   terminalRunStates,
   terminalRunStepStates,
@@ -22,7 +21,7 @@ import { reservedSessionCount } from "../session-policy.js";
 import { HANDOVER_SHAPE } from "./briefing.js";
 import { archiveRun, purgeRun } from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
-import { truncateMiddle } from "./engine.js";
+import { truncateMiddle, workerOutput } from "./engine.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export const WORKER_CATEGORIES = [
@@ -204,17 +203,20 @@ export const PlanTaskSchema = z.object({
   /**
    * The stages this task will go through, in order.
    *
-   * Chosen per task rather than fixed. Most changes want something like
-   * plan / implement / review; a question may want one. The list is what the
-   * person sees as progress, so the names should mean something to them.
+   * Chosen per task rather than fixed. A small fix can use one phase including
+   * verification; add investigation or independent review when warranted.
+   * The list is what the person sees as progress, so use meaningful names.
    */
   phases: z
     .array(z.string().min(1).max(40))
     .min(1)
     .max(8)
     .describe(
-      'The stages, in order — for example ["Plan", "Implement", "Review"]. Names are shown ' +
-        "to the person as progress. Between one and eight.",
+      "The stages, in order. Choose the fewest justified by complexity, uncertainty and risk: " +
+        '["Implement and verify"] for a simple fix, ["Inspect", "Implement and verify"] or ' +
+        '["Implement and verify", "Review"] when one extra handoff adds value, ' +
+        '["Plan", "Implement and verify", "Review"] for substantial or high-risk work. ' +
+        "Names are shown to the person as progress. Between one and eight.",
     ),
   /**
    * What has to be observably true for this task to be finished.
@@ -1230,11 +1232,7 @@ export class FleetTools {
   transcript(input: z.infer<typeof SessionRefSchema>): ToolResult {
     const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
     if (typeof owned === "string") return refuse(owned);
-    const text = this.store
-      .listEvents(owned.id)
-      .filter((event) => event.type === "agent_text")
-      .map((event) => eventPayload(event, "agent_text")?.text ?? "")
-      .join("");
+    const text = workerOutput(this.store.listEvents(owned.id), owned);
     return ok(
       text ? truncateMiddle(text, 24_000) : "That worker has not said anything yet.",
     );

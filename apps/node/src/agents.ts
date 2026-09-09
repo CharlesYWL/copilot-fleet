@@ -48,8 +48,8 @@ export type ContextTier = "default" | "long_context";
  */
 export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
 
-/** Long enough for a cold ACP process, bounded so startup cannot fail silently. */
-export const ACP_START_TIMEOUT_MS = 60_000;
+/** Long enough for cold ACP and MCP setup, bounded so startup cannot fail silently. */
+export const ACP_START_TIMEOUT_MS = 180_000;
 
 /**
  * The permissions picker, whose value the Host already knows.
@@ -1383,7 +1383,8 @@ export function withCopilotStartupTimeout<T>(
       reject(
         new Error(
           `Copilot ACP did not become ready within ${Math.round(timeoutMs / 1000)}s. ` +
-            "Run `copilot update` and `copilot login` on this node, then retry.",
+            "ACP startup or MCP server initialization may be slow or hung; retry, " +
+            "and inspect this node's Copilot and MCP logs if it persists.",
         ),
       );
     }, timeoutMs);

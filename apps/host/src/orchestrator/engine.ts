@@ -7,6 +7,7 @@ import {
   terminalRunStates,
   terminalRunStepStates,
   terminalSessionStates,
+  type FleetSession,
   type Run,
   type RunStep,
   type SessionEvent,
@@ -145,13 +146,12 @@ export class OrchestratorEngine {
         session.state === "completed" ||
         session.state === "stopped")
     ) {
-      const output = this.store
-        .listEvents(sessionId)
-        .filter(
-          (event) => event.type === "agent_text" && event.sequence > step.eventSeqFrom,
-        )
-        .map((event) => eventPayload(event, "agent_text")?.text ?? "")
-        .join("");
+      const output = workerOutput(
+        this.store
+          .listEvents(sessionId)
+          .filter((event) => event.sequence > step.eventSeqFrom),
+        session,
+      );
       this.service.reconcileStoppedOrchestrationStep({
         runId: step.runId,
         stepId: step.id,
@@ -614,13 +614,12 @@ export class OrchestratorEngine {
     for (const step of steps) {
       if (!step.sessionId) continue;
       if (step.state !== "running" && step.state !== "starting") continue;
-      const text = this.store
-        .listEvents(step.sessionId)
-        .filter(
-          (event) => event.type === "agent_text" && event.sequence > step.eventSeqFrom,
-        )
-        .map((event) => eventPayload(event, "agent_text")?.text ?? "")
-        .join("");
+      const text = workerOutput(
+        this.store
+          .listEvents(step.sessionId)
+          .filter((event) => event.sequence > step.eventSeqFrom),
+        this.store.getSession(step.sessionId),
+      );
       outputs.set(step.id, truncateMiddle(text, maxChars));
     }
     return outputs;
@@ -631,6 +630,26 @@ export class OrchestratorEngine {
     if (run) this.service.publishRun(run);
     this.service.publishRunSteps(runId, this.store.listRunSteps(runId));
   }
+}
+
+/** Startup can fail before agent text exists, including outside the event stream. */
+export function workerOutput(
+  events: readonly SessionEvent[],
+  session?: Pick<FleetSession, "state" | "currentActivity">,
+): string {
+  let text = "";
+  const errors = new Set<string>();
+  for (const event of events) {
+    text += eventPayload(event, "agent_text")?.text ?? "";
+    const error = eventPayload(event, "error")?.message;
+    if (error) errors.add(error);
+  }
+  if (session?.state === "failed" && session.currentActivity) {
+    errors.add(session.currentActivity);
+  }
+  return [text, ...[...errors].map((message) => `[Runtime error] ${message}`)]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 /** Keeps the head for context and the tail for the error that ended it. */

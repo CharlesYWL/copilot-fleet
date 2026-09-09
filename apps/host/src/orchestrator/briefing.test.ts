@@ -85,6 +85,7 @@ describe("what the orchestrator is told", () => {
 
     expect(attached).not.toContain("A worker's report is a lead");
     expect(attached).not.toContain("What done means");
+    expect(attached).not.toContain("Sizing the work");
     expect(attached).not.toContain("Reading your own history");
   });
 
@@ -129,6 +130,35 @@ describe("what the orchestrator is told", () => {
     expect(agentFile).toContain("stay open and idle");
     expect(agentFile).toContain("Archiving stops them");
     expect(agentFile).toContain("after reopening");
+  });
+
+  it("scales phases and workers without dropping evidence or independent review for risky work", () => {
+    for (const text of [agentFile, orchestratorBriefing("nodes", { hasAgent: false })]) {
+      const normalized = text.replace(/\s+/g, " ");
+      expect(normalized).toContain("**One phase, one worker** is the default");
+      expect(normalized).toContain("small, well-understood, low-risk fix");
+      expect(normalized).toContain("runs targeted verification in the same session");
+      expect(normalized).toContain(
+        "**Two phases** when only one extra handoff adds value",
+      );
+      expect(normalized).toContain(
+        "**Three phases** for substantial, cross-cutting or high-risk work",
+      );
+      expect(normalized).toContain(
+        "inspect/plan -> implement with verification -> independent review",
+      );
+      expect(normalized).toContain(
+        "Keep success criteria and concrete evidence at every size",
+      );
+      expect(normalized).toContain("If new findings increase scope or risk");
+    }
+
+    for (const hasAgent of [true, false]) {
+      const text = orchestratorBriefing("nodes", { hasAgent });
+      expect(text).toContain("Choose the fewest phases and workers");
+      expect(text).not.toContain("Three or four phases for a change");
+      expect(text).not.toContain("should normally have separate sessions");
+    }
   });
 
   it("makes periodic status checks read-only for dispatched workers", () => {
