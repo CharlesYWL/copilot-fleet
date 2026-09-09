@@ -1,6 +1,10 @@
 import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
-import { HostPortableBackupSchema, PORTABLE_BACKUP_VERSION } from "@fleet/protocol";
+import {
+  errorMessage,
+  HostPortableBackupSchema,
+  PORTABLE_BACKUP_VERSION,
+} from "@fleet/protocol";
 import {
   BINDING_COOKIE,
   BOOTSTRAP_COOKIE,
@@ -19,6 +23,7 @@ import type { LegacyEnrollment } from "../config.js";
 import type { FleetService } from "../fleet-service.js";
 import { isTransferableHostUrl } from "../host-url.js";
 import type { LeadTokens } from "../orchestrator/lead-tokens.js";
+import type { TunnelSupervisor } from "../tunnel.js";
 import { requireAdministrator } from "./require-administrator.js";
 
 /** The same ceiling the data restore uses; the security half adds kilobytes. */
@@ -39,6 +44,7 @@ const SHORT_PASSPHRASE = `A backup passphrase must be at least ${MIN_BACKUP_PASS
 
 export type PortableBackupRouteOptions = {
   service: FleetService;
+  tunnel: TunnelSupervisor;
   auth: FleetAuth;
   enrollment: LegacyEnrollment;
   enrollmentHostUrl: () => string;
@@ -79,7 +85,7 @@ export const portableBackupRoutes: FastifyPluginAsync<
   PortableBackupRouteOptions
 > = async (
   app,
-  { service, auth, enrollment, enrollmentHostUrl, leadTokens, identity },
+  { service, tunnel, auth, enrollment, enrollmentHostUrl, leadTokens, identity },
 ) => {
   const { store } = service;
 
@@ -100,6 +106,7 @@ export const portableBackupRoutes: FastifyPluginAsync<
       const url = enrollmentHostUrl();
       const data = store.exportHostBackup({
         enrollmentToken: enrollment.token ?? "",
+        tunnel: tunnel.backupSettings(store.getTunnelBackupSettings()),
         ...(isTransferableHostUrl(url) ? { publicUrl: url } : {}),
       });
       const {
@@ -201,6 +208,11 @@ export const portableBackupRoutes: FastifyPluginAsync<
         security: _security,
         ...data
       } = archive.data;
+      try {
+        tunnel.assertCanRestore(data.tunnel);
+      } catch (error) {
+        return reply.code(409).send({ error: errorMessage(error) });
+      }
       const { revokedSessions } = service.importPortableBackup({
         data,
         security: opened.payload,
@@ -227,6 +239,15 @@ export const portableBackupRoutes: FastifyPluginAsync<
       leadTokens.adoptKey(opened.payload.leadTokenKey);
       auth.adoptRestoredSecurity(revokedSessions);
       service.publishSnapshot();
+      try {
+        await tunnel.restoreSettings(store.getTunnelBackupSettings());
+      } catch (error) {
+        request.log.error({ err: error }, "Host restored, but tunnel setup failed");
+        return reply.code(503).send({
+          error: `This Host was restored, but tunnel setup failed: ${errorMessage(error)}. Sign in through the restored Microsoft configuration, then check the provider's login and retry from Settings -> Tunnel; do not import the backup again.`,
+          restored: true,
+        });
+      }
       /*
        * No session is issued here, on either path. The identities that may
        * operate this Host are the ones the archive named, and they sign in

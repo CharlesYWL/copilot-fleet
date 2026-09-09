@@ -90,6 +90,86 @@ function keyedNode(store: FleetStore, name = "keyed-box") {
   return { identity, node };
 }
 
+describe("stable tunnel backup settings", () => {
+  it.each(["data", "portable"] as const)(
+    "moves the source tunnel IDs and enabled providers through a %s restore",
+    (format) => {
+      const source = secured(setup());
+      source.setSetting("tunnel.devtunnel.id", "fleet-source.usw2");
+      source.setTunnelProviderEnabled("devtunnel", true);
+      source.setTunnelProviderEnabled("ngrok", true);
+      source.setTunnelProvider("devtunnel");
+      const backup = source.exportHostBackup({ enrollmentToken: "legacy-token" });
+      expect(backup.tunnel).toEqual({
+        provider: "devtunnel",
+        enabled: true,
+        enabledProviders: ["ngrok", "devtunnel"],
+        ids: { devtunnel: "fleet-source.usw2" },
+      });
+
+      const target = secured(setup());
+      target.setSetting("tunnel.devtunnel.id", "fleet-destination.use");
+      target.setTunnelProviderEnabled("cloudflare", true);
+      if (format === "portable") {
+        target.importPortableBackup({
+          data: portableData(source),
+          security: source.exportSecurityBackup(),
+        });
+      } else {
+        target.replaceHostBackup(backup);
+      }
+
+      expect(target.getSetting("tunnel.devtunnel.id")).toBe("fleet-source.usw2");
+      expect(target.getEnabledTunnelProviders()).toEqual(["ngrok", "devtunnel"]);
+      expect(target.getTunnelProvider()).toBe("devtunnel");
+      expect(target.exportHostBackup({ enrollmentToken: "" }).tunnel).toEqual(
+        backup.tunnel,
+      );
+    },
+  );
+
+  it("keeps a saved ID even when that provider is disabled and not primary", () => {
+    const source = setup();
+    source.setSetting("tunnel.devtunnel.id", "fleet-source.usw2");
+    source.setTunnelProviderEnabled("ngrok", true);
+    const backup = source.exportHostBackup({ enrollmentToken: "" });
+    const target = setup();
+    target.replaceHostBackup(backup);
+
+    expect(target.getSetting("tunnel.devtunnel.id")).toBe("fleet-source.usw2");
+    expect(target.getEnabledTunnelProviders()).toEqual(["ngrok"]);
+  });
+
+  it.each(["data", "portable"] as const)(
+    "retains the destination ID when an older %s archive has no IDs to restore",
+    (format) => {
+      const target = setup();
+      target.setSetting("tunnel.devtunnel.id", "fleet-existing.usw2");
+      if (format === "portable") {
+        const source = secured(setup());
+        const data = portableData(source);
+        data.tunnel = { enabled: true, provider: "devtunnel" };
+        target.importPortableBackup({ data, security: source.exportSecurityBackup() });
+      } else {
+        const archive = foreignBackup();
+        archive.tunnel = { enabled: true, provider: "devtunnel" };
+        target.replaceHostBackup(archive);
+      }
+
+      expect(target.getSetting("tunnel.devtunnel.id")).toBe("fleet-existing.usw2");
+      expect(target.getEnabledTunnelProviders()).toEqual(["devtunnel"]);
+    },
+  );
+
+  it("does not inherit a destination ID when a new archive explicitly has none", () => {
+    const source = setup();
+    const target = setup();
+    target.setSetting("tunnel.devtunnel.id", "fleet-destination.use");
+    target.replaceHostBackup(source.exportHostBackup({ enrollmentToken: "" }));
+    expect(target.getSetting("tunnel.devtunnel.id")).toBeUndefined();
+  });
+});
+
 /**
  * A data restore is not a change of ownership.
  *

@@ -929,7 +929,8 @@ are different operations with different risks.
 **Host data (version 1)** — Settings → General → **Export fleet data**. The JSON
 file holds workspaces, placements, nodes (identity hashes, not plaintext
 secrets), sessions, transcripts, defaults, any legacy enrollment token, and
-tunnel provider/enabled. It is **data only**: import on the new machine
+configured tunnel providers, enabled flags, and stable Dev Tunnel IDs. It is
+**data only**: import on the new machine
 **replaces** the catalog, but deliberately **preserves the security envelope of
 the Host it lands in** — administrators, authentication mode and Entra
 configuration, the Host signing key, the CSRF and lead-token keys, and password
@@ -948,15 +949,61 @@ authorization-code sign-in from the last ten minutes; importing into a fresh
 Host instead takes that Host's console claim code plus the passphrase, and
 creates no session — an administrator signs in afterwards through the restored
 configuration.
+The portable archive already includes the Host data; **import this one file
+for a Host move**, not a portable archive followed by a separate data archive.
 
 A fleet that had already retired the shared Node secret restores that way too:
 enforcement travels in the sealed section, and the fleet-wide enrollment token
 it retired is not written back.
 
-Restoring revokes every browser session and closes browser and Node sockets, and
-either applies whole or not at all. **Stop the old Host before starting the moved
+Restoring revokes every browser session and closes browser and Node sockets.
+The data and security settings are applied together in one transaction.
+**Stop the old Host before starting the moved
 one**: two processes sharing one Host identity is a fingerprint two machines can
 sign for, and Nodes cannot tell them apart.
+
+**Keeping the same Dev Tunnel during a move**
+
+New data and portable backups include the saved Dev Tunnel ID, including its
+region suffix (for example, `fleet-ab123456.usw2`). They retain IDs even for a
+disabled provider, and capture a live externally hosted tunnel's ID as well.
+Restore restarts Host-managed tunnels with the archived IDs and enabled-provider
+settings rather than leaving the destination's old tunnel running.
+
+1. On the source, use a version that supports tunnel-ID backups and wait for
+   Dev Tunnels to be ready before exporting the portable backup. Then stop the
+   source Host and its separately started tunnel, if any.
+2. On the destination, install `devtunnel` and run `devtunnel user login` with
+   the account that owns or can host the original tunnel. Keep the same Host
+   API `PORT` if existing URLs and Node forwards must continue to work.
+   Provider login credentials and port configuration are not moved by the archive.
+3. Open the destination Host on `localhost`, then import the portable backup.
+   Do not restore through the tunnel being replaced. If a separately managed
+   destination tunnel conflicts with the archive, Fleet asks you to stop it
+   before restoring; it never kills a process owned by another terminal.
+4. Sign in through the restored Microsoft configuration and check
+   **Settings → Tunnel**. Existing Nodes can keep their old `--devtunnel=<id>`
+   command and `node.json` identity once that tunnel is serving the moved Host.
+   Their own Dev Tunnels account still needs permission to connect.
+
+If provider setup fails after the data was restored, the response says so
+explicitly and keeps the archived ID for retry. Fix the provider installation
+or account, then retry from **Settings → Tunnel**; do not import the backup
+again. An ID does not recreate a deleted tunnel, transfer its ownership, or make
+an expired cloud resource usable.
+
+Older backups remain readable, but have no source tunnel ID to recover. They
+keep an existing destination ID where available; otherwise a new tunnel may be
+created. Re-export from the updated source Host to preserve its original ID.
+Fleet does not infer the ID from a public URL, because Dev Tunnels can use a
+different name in the browser URL.
+
+If the destination is also a Node, start that Node separately under its original
+OS account/config directory. It can use the preserved tunnel, or connect directly
+to the local Host with `npm run start:node -- --url=http://127.0.0.1:8787`
+(substitute the actual API port). For the direct route, omit `--devtunnel` and
+unset `FLEET_DEVTUNNEL_ID`. Keep the Node's existing `node.json`; restoring Host
+history does not itself start a Node or move its Copilot session files.
 
 Existing nodes reconnect with the `node.json` they already have, as long as they
 can still reach the Host. A named hostname / `FLEET_PUBLIC_URL` / Tailscale Funnel

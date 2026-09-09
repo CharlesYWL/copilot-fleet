@@ -187,6 +187,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       // Empty on a Host that has none, which the archive format allows: a
       // grant-only install has nothing here to carry.
       enrollmentToken: enrollment.token ?? "",
+      tunnel: tunnel.backupSettings(store.getTunnelBackupSettings()),
       ...(isTransferableHostUrl(url) ? { publicUrl: url } : {}),
     });
   });
@@ -222,6 +223,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       const publicUrl =
         archivedUrl && isTransferableHostUrl(archivedUrl) ? archivedUrl : undefined;
       try {
+        tunnel.assertCanRestore(backup.tunnel);
         service.importHostBackup(publicUrl ? { ...rest, publicUrl } : rest);
       } catch (error) {
         /*
@@ -238,12 +240,13 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       // empty string as one would be a credential that matches an empty body.
       enrollment.token = backup.enrollmentToken || undefined;
       try {
-        await tunnel.setEnabled(backup.tunnel.provider, backup.tunnel.enabled);
+        await tunnel.restoreSettings(store.getTunnelBackupSettings());
       } catch (error) {
-        store.setTunnelProviderEnabled(backup.tunnel.provider, false);
+        request.log.error({ err: error }, "Fleet restored, but tunnel setup failed");
         return reply.code(503).send({
-          error: errorMessage(error, "Fleet restored, but the tunnel failed to start"),
+          error: `Fleet data was restored, but tunnel setup failed: ${errorMessage(error)}. Check the provider's login and retry from Settings -> Tunnel; do not import the backup again.`,
           kind: HOST_BACKUP_KIND,
+          restored: true,
         });
       }
       return { ok: true };

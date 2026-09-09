@@ -1,11 +1,14 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { promisify } from "node:util";
-import type {
-  TunnelInfo,
-  TunnelProvider,
-  TunnelProviderInfo,
-  TunnelState,
-  TunnelStatus,
+import {
+  enabledBackupTunnelProviders,
+  errorMessage,
+  type HostBackupTunnel,
+  type TunnelInfo,
+  type TunnelProvider,
+  type TunnelProviderInfo,
+  type TunnelState,
+  type TunnelStatus,
 } from "@fleet/protocol";
 import { readExternalTunnel, type ExternalTunnel } from "./external-tunnel.js";
 import {
@@ -137,7 +140,7 @@ type TunnelManagerOptions = {
    */
   provider?: TunnelProvider;
   /** Called when enabled is cleared after an unrecoverable failure. */
-  onEnabledCleared?: () => void;
+  onEnabledCleared?: (provider: TunnelProvider) => void;
   /** Injected so tests can run without real timers. */
   setTimer?: (fn: () => void, ms: number) => NodeJS.Timeout;
   clearTimer?: (timer: NodeJS.Timeout) => void;
@@ -166,7 +169,7 @@ export class TunnelManager {
   private buffer = "";
   private provider: TunnelProvider = "cloudflare";
   private readonly target: LocalTarget;
-  private readonly onEnabledCleared: (() => void) | undefined;
+  private readonly onEnabledCleared: TunnelManagerOptions["onEnabledCleared"];
   private readonly setTimer: (fn: () => void, ms: number) => NodeJS.Timeout;
   private readonly clearTimer: (timer: NodeJS.Timeout) => void;
   /** Desired enabled flag while a start/stop is in flight. */
@@ -176,6 +179,9 @@ export class TunnelManager {
   private readonly readExternal: () => ExternalTunnel | undefined;
   private readonly probe: BinaryProbe;
   private readonly persistedTunnelId: TunnelManagerOptions["persistedTunnelId"];
+  /** Invalidates setup/output still arriving from a pre-restore start. */
+  private generation = 0;
+  private stopping: Promise<void> | undefined;
 
   constructor(options: TunnelManagerOptions) {
     this.target = parseLocalTarget(options.localTarget);
@@ -286,7 +292,10 @@ export class TunnelManager {
     // A separately running tunnel owns its own lifecycle; toggling here would
     // either kill a process this manager never started or start a second one
     // competing for the same local port.
-    if (this.readExternal()) return;
+    if (this.readExternal()?.provider === (provider ?? this.provider)) return;
+    const generation = this.generation;
+    if (this.stopping) await this.stopping;
+    if (generation !== this.generation) return;
     // Switching providers while running has to tear the old process down first.
     if (provider && provider !== this.provider && this.child) await this.stop();
     if (provider && provider !== this.provider) this.probe.invalidate();
@@ -297,8 +306,11 @@ export class TunnelManager {
   }
 
   private async start(): Promise<void> {
+    if (this.stopping) await this.stopping;
+    if (!this.wantEnabled) return;
     if (this.status === "on" || this.status === "starting") return;
     this.cancelRestart();
+    const generation = this.generation;
 
     const spec = providerSpecs[this.provider];
     /*
@@ -314,21 +326,23 @@ export class TunnelManager {
       this.status = "error";
       this.error = ineligibleProviderMessage(this.provider);
       this.wantEnabled = false;
-      this.onEnabledCleared?.();
+      this.onEnabledCleared?.(this.provider);
       throw new Error(this.error);
     }
-    if (!(await this.probe.present(spec))) {
+    this.status = "starting";
+    const present = await this.probe.present(spec);
+    if (generation !== this.generation) return;
+    if (!present) {
       this.status = "error";
       this.error = `${spec.binary} is not installed or not on PATH`;
       this.wantEnabled = false;
       // The operator's likely next move is to install it, so do not let a
       // remembered "missing" answer make the retry fail without looking.
       this.probe.invalidate();
-      this.onEnabledCleared?.();
+      this.onEnabledCleared?.(this.provider);
       throw new Error(this.error);
     }
 
-    this.status = "starting";
     this.error = undefined;
     this.tunnelUrl = undefined;
     this.inspectUrl = undefined;
@@ -342,12 +356,14 @@ export class TunnelManager {
       reusedId = this.persistedTunnelId.get(this.provider) ?? spec.newTunnelId();
       try {
         await spec.prepare(this.target, reusedId);
+        if (generation !== this.generation) return;
         this.persistedTunnelId.set(this.provider, reusedId);
       } catch (error) {
+        if (generation !== this.generation) return;
         this.status = "error";
         this.error = error instanceof Error ? error.message : String(error);
         this.wantEnabled = false;
-        this.onEnabledCleared?.();
+        this.onEnabledCleared?.(this.provider);
         throw error;
       }
       // Reported straight away: the connect command depends on it, and for a
@@ -365,6 +381,7 @@ export class TunnelManager {
     this.child = child;
 
     const onChunk = (chunk: Buffer) => {
+      if (this.child !== child) return;
       this.buffer += chunk.toString("utf8");
       if (this.buffer.length > 64_000) this.buffer = this.buffer.slice(-32_000);
       // The id can be printed after the URL, so it is parsed on its own
@@ -403,7 +420,7 @@ export class TunnelManager {
       this.status = "error";
       this.error = err.message;
       this.wantEnabled = false;
-      this.onEnabledCleared?.();
+      this.onEnabledCleared?.(this.provider);
     });
 
     child.on("exit", (code, signal) => {
@@ -421,7 +438,7 @@ export class TunnelManager {
       this.error = `${spec.binary} exited (code=${code ?? "null"} signal=${signal ?? "null"})`;
       // The operator still wants the tunnel, so recover instead of giving up.
       if (this.wantEnabled) this.scheduleRestart();
-      else this.onEnabledCleared?.();
+      else this.onEnabledCleared?.(this.provider);
     });
   }
 
@@ -446,11 +463,14 @@ export class TunnelManager {
 
   async stop(): Promise<void> {
     // Never signal a process this manager did not spawn.
-    if (this.readExternal()) return;
+    if (this.readExternal()?.provider === this.provider) return;
+    if (this.stopping) return this.stopping;
+    this.generation += 1;
     this.wantEnabled = false;
     this.cancelRestart();
     this.restartAttempt = 0;
     const child = this.child;
+    this.child = undefined;
     if (!child) {
       this.status = "off";
       this.tunnelUrl = undefined;
@@ -461,20 +481,21 @@ export class TunnelManager {
     }
 
     this.status = "stopping";
-    await new Promise<void>((resolve) => {
+    this.stopping = new Promise<void>((resolve) => {
       const done = () => {
         clearTimeout(timer);
         resolve();
       };
-      child.once("exit", done);
-      child.kill("SIGTERM");
       const timer = setTimeout(() => {
-        if (!child.killed) child.kill("SIGKILL");
+        // `killed` means a signal was sent, not that the process has exited.
+        child.kill("SIGKILL");
         done();
       }, 5_000);
+      child.once("exit", done);
+      child.kill("SIGTERM");
     });
-
-    this.child = undefined;
+    await this.stopping;
+    this.stopping = undefined;
     this.tunnelUrl = undefined;
     this.inspectUrl = undefined;
     this.tunnelId = undefined;
@@ -497,6 +518,7 @@ export class TunnelSupervisor {
   /** One probe cache across providers, so a poll costs at most one spawn each. */
   private readonly probe: BinaryProbe;
   private primaryProvider: TunnelProvider | undefined;
+  private generation = 0;
 
   constructor(private readonly options: TunnelManagerOptions) {
     this.probe = options.probe ?? new BinaryProbe();
@@ -522,12 +544,75 @@ export class TunnelSupervisor {
     this.primaryProvider = provider;
   }
 
+  /** Include externally hosted IDs too, without copying their login state. */
+  backupSettings(stored: HostBackupTunnel): HostBackupTunnel {
+    const enabled = new Set(enabledBackupTunnelProviders(stored));
+    const ids = { ...stored.ids };
+    for (const spec of providerList) {
+      const state = this.manager(spec.id).state();
+      if (state.external && state.enabled) enabled.add(spec.id);
+      if (spec.id === "devtunnel" && state.enabled && state.tunnelId) {
+        ids.devtunnel = state.tunnelId;
+      }
+    }
+    return {
+      ...stored,
+      enabled: enabled.size > 0,
+      enabledProviders: providerList
+        .map((spec) => spec.id)
+        .filter((id) => enabled.has(id)),
+      ids,
+    };
+  }
+
+  /** A restore may not replace a tunnel owned by another terminal. */
+  assertCanRestore(settings: HostBackupTunnel): void {
+    const external = this.options.readExternal
+      ? this.options.readExternal()
+      : readExternalTunnel();
+    if (!external) return;
+    const enabled = enabledBackupTunnelProviders(settings);
+    const id = external.provider === "devtunnel" ? settings.ids?.devtunnel : undefined;
+    if (
+      !enabled.includes(external.provider) ||
+      (id !== undefined && id !== external.tunnelId)
+    ) {
+      throw new Error(
+        `Stop the separately managed ${providerSpecs[external.provider].label} tunnel before restoring this backup. Fleet cannot replace a tunnel started in another terminal.`,
+      );
+    }
+  }
+
+  /**
+   * Restart managed providers after the store has adopted the archive. Merely
+   * enabling a running manager keeps its old ID and URL for the rest of its life.
+   */
+  async restoreSettings(settings: HostBackupTunnel): Promise<void> {
+    this.assertCanRestore(settings);
+    await this.stop();
+    this.setPrimary(settings.provider);
+    if (settings.ids?.devtunnel) {
+      this.options.persistedTunnelId?.set("devtunnel", settings.ids.devtunnel);
+    }
+    const errors: string[] = [];
+    for (const provider of enabledBackupTunnelProviders(settings)) {
+      try {
+        await this.manager(provider).setEnabled(true);
+      } catch (error) {
+        errors.push(`${providerSpecs[provider].label}: ${errorMessage(error)}`);
+      }
+    }
+    if (errors.length > 0) throw new Error(errors.join("; "));
+  }
+
   async setEnabled(
     provider: TunnelProvider,
     enabled: boolean,
     makePrimary = true,
   ): Promise<void> {
+    const generation = this.generation;
     await this.manager(provider).setEnabled(enabled, provider);
+    if (generation !== this.generation) return;
     if (enabled && makePrimary) this.primaryProvider = provider;
     else if (!enabled && this.primaryProvider === provider) {
       this.primaryProvider = this.onlineProviders()[0];
@@ -637,6 +722,7 @@ export class TunnelSupervisor {
   }
 
   async stop(): Promise<void> {
+    this.generation += 1;
     await Promise.all([...this.managers.values()].map((manager) => manager.stop()));
   }
 }

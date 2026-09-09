@@ -137,7 +137,7 @@ export async function buildServer(
 
   const tunnel = new TunnelSupervisor({
     localTarget: `http://127.0.0.1:${listenPort}`,
-    onEnabledCleared: () => store.setTunnelEnabled(false),
+    onEnabledCleared: (provider) => store.setTunnelProviderEnabled(provider, false),
     persistedTunnelId: {
       get: (provider) => store.getSetting(`tunnel.${provider}.id`),
       set: (provider, id) => store.setSetting(`tunnel.${provider}.id`, id),
@@ -294,6 +294,7 @@ export async function buildServer(
   });
   await app.register(portableBackupRoutes, {
     service,
+    tunnel,
     auth,
     enrollment,
     enrollmentHostUrl,

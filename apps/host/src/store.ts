@@ -9,6 +9,7 @@ import {
   type FleetNode,
   type FleetSession,
   type HostBackup,
+  type HostBackupTunnel,
   type HostPortableBackupData,
   type MarkAllNotificationsReadResponse,
   type CreateNotification,
@@ -55,6 +56,7 @@ import {
   TunnelProviderSchema,
   WorkspaceSchema,
   eventPayload,
+  enabledBackupTunnelProviders,
   canTransition,
   canTransitionRun,
   isChatsWorkspace,
@@ -1122,22 +1124,34 @@ export class FleetStore {
     this.setSetting("tunnel.provider", provider);
   }
 
+  getTunnelBackupSettings(): HostBackupTunnel {
+    const enabledProviders = this.getEnabledTunnelProviders();
+    const devtunnel = this.getSetting("tunnel.devtunnel.id");
+    return {
+      enabled: enabledProviders.length > 0,
+      provider: this.getTunnelProvider(),
+      enabledProviders,
+      ids: devtunnel ? { devtunnel } : {},
+    };
+  }
+
   /**
    * A portable snapshot of this Host: catalog, transcripts, settings, and the
    * hashes Nodes authenticate with. The caller supplies the enrollment token
    * and (optionally) a public URL because those live outside the catalog tables.
    */
-  exportHostBackup(input: { enrollmentToken: string; publicUrl?: string }): HostBackup {
+  exportHostBackup(input: {
+    enrollmentToken: string;
+    publicUrl?: string;
+    tunnel?: HostBackupTunnel;
+  }): HostBackup {
     const backup = {
       kind: HOST_BACKUP_KIND,
       version: BACKUP_VERSION,
       exportedAt: new Date().toISOString(),
       enrollmentToken: input.enrollmentToken,
       ...(input.publicUrl ? { publicUrl: input.publicUrl } : {}),
-      tunnel: {
-        enabled: this.getTunnelEnabled(),
-        provider: this.getTunnelProvider(),
-      },
+      tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
       defaults: {
         yolo: this.getDefaultYolo(),
         autoResume: this.getAutoResume(),
@@ -1252,6 +1266,9 @@ export class FleetStore {
     suppliedKeys?: ReadonlyMap<string, string>,
   ): void {
     const keys = suppliedKeys ?? this.currentNodePublicKeys();
+    // An older backup cannot supply the source ID. Do not erase a usable
+    // destination ID merely because that archive predates the field.
+    const tunnelIds = parsed.tunnel.ids ?? this.getTunnelBackupSettings().ids;
     /*
      * Checked before a single row is deleted, and it is a refusal rather than a
      * repair.
@@ -1289,8 +1306,18 @@ export class FleetStore {
     this.statement(
       `DELETE FROM settings WHERE key NOT IN (${placeholders(PRESERVED_SETTING_KEYS)})`,
     ).run(...PRESERVED_SETTING_KEYS);
-    this.setTunnelEnabled(parsed.tunnel.enabled);
+    const enabledProviders = enabledBackupTunnelProviders(parsed.tunnel);
+    for (const provider of tunnelProviders) {
+      this.setSetting(
+        `tunnel.${provider}.enabled`,
+        enabledProviders.includes(provider) ? "1" : "0",
+      );
+    }
+    this.setTunnelEnabled(enabledProviders.length > 0);
     this.setTunnelProvider(parsed.tunnel.provider);
+    if (tunnelIds?.devtunnel) {
+      this.setSetting("tunnel.devtunnel.id", tunnelIds.devtunnel);
+    }
     this.setDefaultYolo(parsed.defaults.yolo);
     this.setAutoResume(parsed.defaults.autoResume);
     this.setDefaultNotificationLifecycleEnabled(

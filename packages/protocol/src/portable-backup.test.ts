@@ -41,6 +41,74 @@ const envelope = {
  * restores data is not the endpoint that may change who owns a Host.
  */
 describe("portable host archives", () => {
+  it.each([1, PORTABLE_BACKUP_VERSION])(
+    "keeps stable tunnel IDs and enabled providers in a version %i archive",
+    (version) => {
+      const tunnel = {
+        enabled: true,
+        provider: "devtunnel",
+        ids: { devtunnel: "fleet-source.usw2" },
+        enabledProviders: ["devtunnel", "ngrok"],
+      };
+      const schema = version === 1 ? HostBackupSchema : HostPortableBackupSchema;
+      const parsed = schema.parse({
+        ...data,
+        version,
+        tunnel,
+        ...(version === PORTABLE_BACKUP_VERSION ? { security: envelope } : {}),
+      });
+      expect(parsed.tunnel).toEqual(tunnel);
+    },
+  );
+
+  it.each(["", "--help", "fleet source", "fleet/other", "a".repeat(201)])(
+    "refuses an invalid stable tunnel ID %s",
+    (id) => {
+      expect(
+        HostBackupSchema.safeParse({
+          ...data,
+          version: 1,
+          tunnel: { ...data.tunnel, ids: { devtunnel: id } },
+        }).success,
+      ).toBe(false);
+    },
+  );
+
+  it("does not invent IDs or enabled-provider lists for older backups", () => {
+    expect(HostBackupSchema.parse({ ...data, version: 1 }).tunnel).toEqual(data.tunnel);
+    expect(
+      HostPortableBackupSchema.parse({
+        ...data,
+        version: PORTABLE_BACKUP_VERSION,
+        security: envelope,
+      }).tunnel,
+    ).toEqual(data.tunnel);
+  });
+
+  it.each([
+    { enabled: false, enabledProviders: ["devtunnel"] },
+    { enabled: true, enabledProviders: [] },
+    { enabled: true, enabledProviders: ["devtunnel", "devtunnel"] },
+  ])("refuses an inconsistent provider list: %j", (settings) => {
+    expect(
+      HostBackupSchema.safeParse({
+        ...data,
+        version: 1,
+        tunnel: { ...data.tunnel, ...settings },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("does not accept arbitrary provider credentials as tunnel identifiers", () => {
+    expect(
+      HostBackupSchema.safeParse({
+        ...data,
+        version: 1,
+        tunnel: { ...data.tunnel, ids: { accessToken: "not-an-id" } },
+      }).success,
+    ).toBe(false);
+  });
+
   it("parses a version 2 archive with its sealed security envelope", () => {
     const parsed = HostPortableBackupSchema.parse({
       ...data,

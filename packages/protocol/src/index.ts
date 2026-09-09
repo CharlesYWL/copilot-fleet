@@ -2239,6 +2239,43 @@ export const HostBackupSessionSchema = SessionSchema.extend({
 });
 export type HostBackupSession = z.infer<typeof HostBackupSessionSchema>;
 
+export const HostBackupTunnelSchema = z
+  .object({
+    enabled: z.boolean(),
+    provider: TunnelProviderSchema,
+    /** Optional so older archives retain their single-provider behavior. */
+    enabledProviders: z
+      .array(TunnelProviderSchema)
+      .max(tunnelProviders.length)
+      .refine((providers) => new Set(providers).size === providers.length)
+      .optional(),
+    /**
+     * Provider identifiers, never login credentials. Keep the cluster suffix:
+     * a bare Dev Tunnel name can resolve differently on another machine.
+     */
+    ids: z
+      .object({
+        devtunnel: z
+          .string()
+          .min(1)
+          .max(200)
+          .regex(/^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9]+)?$/i)
+          .optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .refine(
+    ({ enabled, enabledProviders }) =>
+      enabledProviders === undefined || enabled === enabledProviders.length > 0,
+    "Tunnel enabled flag must match the enabled providers.",
+  );
+export type HostBackupTunnel = z.infer<typeof HostBackupTunnelSchema>;
+
+export function enabledBackupTunnelProviders(tunnel: HostBackupTunnel): TunnelProvider[] {
+  return tunnel.enabledProviders ?? (tunnel.enabled ? [tunnel.provider] : []);
+}
+
 /**
  * Everything a Host archive carries that is not its format version.
  *
@@ -2261,10 +2298,7 @@ const hostBackupDataShape = {
   enrollmentToken: z.string().max(1_000).default(""),
   /** Omitted when the live URL would not survive a move (loopback / quick tunnel). */
   publicUrl: z.string().url().optional(),
-  tunnel: z.object({
-    enabled: z.boolean(),
-    provider: TunnelProviderSchema,
-  }),
+  tunnel: HostBackupTunnelSchema,
   defaults: z.object({
     yolo: z.boolean(),
     autoResume: z.boolean(),
