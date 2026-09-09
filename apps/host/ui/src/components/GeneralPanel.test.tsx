@@ -5,6 +5,7 @@ import { fleetDarkTheme } from "../theme";
 import { forgetCsrfToken } from "../lib/auth";
 import { GeneralPanel } from "./GeneralPanel";
 import { NotificationContext } from "../hooks/useAppNotifications";
+import { degradedDriBackup } from "@fleet/protocol";
 
 const response = (body: unknown) =>
   Promise.resolve(
@@ -21,6 +22,39 @@ afterEach(() => {
 });
 
 describe("GeneralPanel", () => {
+  it("warns that a downloaded Host backup has degraded DRI coverage", async () => {
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:fixture"),
+      revokeObjectURL: vi.fn(),
+    });
+    const click = vi
+      .spyOn(HTMLAnchorElement.prototype, "click")
+      .mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) =>
+        String(input) === "/api/backup"
+          ? response({ dri: degradedDriBackup() })
+          : response({
+              yolo: false,
+              autoResume: false,
+              notificationLifecycleEnabled: true,
+              model: "",
+              reasoningEffort: "",
+            }),
+      ),
+    );
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel sessions={[]} />
+      </FluentProvider>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: /export/i }));
+    expect(await screen.findByText(/DRI backup is incomplete/)).toBeTruthy();
+    expect(click).toHaveBeenCalledOnce();
+    click.mockRestore();
+  });
   it("keeps the YOLO explanation inline without notifying on load or setting changes", async () => {
     let defaults = {
       yolo: true,

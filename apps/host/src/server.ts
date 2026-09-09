@@ -53,6 +53,8 @@ import { runRoutes } from "./routes/runs.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
 import { systemRoutes } from "./routes/system.js";
 import { FleetStore } from "./store.js";
+import { DriCoordinator, type DriCoordinatorOptions } from "./dri/coordinator.js";
+import { driRoutes } from "./routes/dri.js";
 import { TunnelSupervisor } from "./tunnel.js";
 import { recordingLogStream } from "./log-stream.js";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
@@ -101,6 +103,7 @@ export async function buildServer(
     useBuiltInEntra?: boolean;
     /** Destructive, console-only startup. Never exposed through an HTTP route. */
     resetOperatorAuth?: boolean;
+    dri?: DriCoordinatorOptions;
   } = {},
 ): Promise<FastifyInstance> {
   const logs = createLogBuffer();
@@ -209,6 +212,11 @@ export async function buildServer(
     onAuthenticationReset: () => browsers.closeAll(),
   });
   const service = new FleetService(store, app.log, cachedGitRevision());
+  const dri = new DriCoordinator(service, {
+    allowFixtures: process.env.FLEET_DRI_FIXTURES === "true",
+    ...options.dri,
+  });
+  dri.recover();
   const leadTokens = new LeadTokens(store);
   /*
    * Minted on the first boot that needs one and kept for the life of the fleet:
@@ -303,6 +311,7 @@ export async function buildServer(
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
   await app.register(notificationRoutes, { service });
+  await app.register(driRoutes, { service, coordinator: dri });
 
   /*
    * Constructed after the service and subscribed to its events, so the engine
@@ -345,6 +354,12 @@ export async function buildServer(
   registerNodeGateway(app, service, { identity: hostIdentity });
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs);
   const notificationRetentionTimer = startNotificationRetentionMonitor(service, app.log);
+  const driTimer = setInterval(() => {
+    for (const investigation of store.dri.runnable()) void dri.execute(investigation.id);
+  }, 5_000);
+  driTimer.unref();
+  const driRetentionTimer = setInterval(() => store.dri.cleanup(), 3_600_000);
+  driRetentionTimer.unref();
   // Timeouts are the absence of events; without a clock nothing would ever
   // notice one. See the monitor for why this is not the busy-wait the design
   // rules out.
@@ -387,6 +402,9 @@ export async function buildServer(
   });
 
   app.addHook("onClose", async () => {
+    clearInterval(driTimer);
+    clearInterval(driRetentionTimer);
+    await dri.shutdown();
     clearInterval(presenceTimer);
     clearInterval(notificationRetentionTimer);
     clearInterval(runDeadlineTimer);

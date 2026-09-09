@@ -196,6 +196,7 @@ type TopBarProps = {
   onDismissAllNotifications?: () => void;
   onDismissNotification?: (id: string) => void | Promise<unknown>;
   onSignOut: () => void;
+  onOpenDri?: () => void;
   /** Jumps to whatever needs a person, when anything does. */
   onShowAttention?: (() => void) | undefined;
   /** Only meaningful below the width where the tree becomes a drawer. */
@@ -232,6 +233,7 @@ export const TopBar = ({
   onDismissAllNotifications = () => undefined,
   onDismissNotification = () => undefined,
   onSignOut,
+  onOpenDri,
   onShowAttention,
   onToggleNav,
   navOpen = false,
@@ -258,6 +260,11 @@ export const TopBar = ({
   return (
     <header className={styles.bar}>
       <div className={styles.left}>
+        {onOpenDri && (
+          <Button size="small" onClick={onOpenDri}>
+            DRI investigations
+          </Button>
+        )}
         {onToggleNav && (
           <Button
             appearance="subtle"

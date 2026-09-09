@@ -181,14 +181,17 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
 
   app.get("/api/snapshot", async () => service.snapshot());
 
-  app.get("/api/backup", async () => {
+  app.get("/api/backup", async (_request, reply) => {
     const url = enrollmentHostUrl();
-    return store.exportHostBackup({
+    const backup = store.exportHostBackup({
       // Empty on a Host that has none, which the archive format allows: a
       // grant-only install has nothing here to carry.
       enrollmentToken: enrollment.token ?? "",
       ...(isTransferableHostUrl(url) ? { publicUrl: url } : {}),
     });
+    return reply
+      .header("x-fleet-dri-backup-state", backup.dri?.coverage?.state ?? "complete")
+      .send(backup);
   });
 
   app.post(

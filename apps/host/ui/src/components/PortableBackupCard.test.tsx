@@ -5,6 +5,7 @@ import { PortableBackupCard } from "./PortableBackupCard";
 import { forgetCsrfToken } from "../lib/auth";
 import { fleetDarkTheme } from "../theme";
 import { NotificationContext } from "../hooks/useAppNotifications";
+import { degradedDriBackup } from "@fleet/protocol";
 
 const answer = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -36,6 +37,30 @@ const passphraseField = () => screen.getByLabelText(/backup passphrase/i);
  * on rather than a silent no-op.
  */
 describe("PortableBackupCard", () => {
+  it("warns when a portable archive omits DRI data instead of announcing a complete export", async () => {
+    vi.stubGlobal("URL", {
+      ...URL,
+      createObjectURL: vi.fn(() => "blob:fixture"),
+      revokeObjectURL: vi.fn(),
+    });
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: URL | RequestInfo) =>
+        String(input).includes("/api/auth/csrf")
+          ? answer({ csrfToken: "proof" })
+          : answer({ kind: "copilot-fleet-host", version: 2, dri: degradedDriBackup() }),
+      ),
+    );
+    const notify = vi.fn();
+    show({}, notify);
+    fireEvent.change(passphraseField(), {
+      target: { value: "synthetic-backup-passphrase" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /export portable backup/i }));
+    expect(await screen.findByText(/Archive downloaded with limitations/)).toBeTruthy();
+    expect(notify.mock.calls.some((call) => call[1] === "success")).toBe(false);
+  });
   beforeEach(() => {
     forgetCsrfToken();
   });

@@ -108,6 +108,7 @@ export function reopenOrchestratorStoppedRun(
 export function purgeRun(service: FleetService, runId: string): boolean {
   const { store } = service;
   if (!store.getRun(runId)) return false;
+  store.assertRunPurgeAllowed(runId);
   service.resolveRunReview(runId);
   // Sessions are stopped before the rows go, because a deleted run cannot stop
   // anything afterwards — there is nothing left to find them by.

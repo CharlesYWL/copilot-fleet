@@ -51,6 +51,14 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
   { service, engine },
 ) => {
   const { store } = service;
+  app.addHook("preHandler", async (request, reply) => {
+    const { id } = request.params as { id?: string };
+    if (!id || !store.getRun(id)?.investigationId || request.method === "GET") return;
+    if (request.method === "POST" && /\/(?:archive|cancel)$/.test(request.url)) return;
+    return reply
+      .code(409)
+      .send({ error: "Use the typed DRI investigation controls for this Run" });
+  });
 
   const withSteps = (runId: string) => ({
     run: store.getRun(runId),

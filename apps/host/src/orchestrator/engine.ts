@@ -172,7 +172,10 @@ export class OrchestratorEngine {
   }
 
   tickRun(runId: string, nowMs = Date.now()): void {
+    // Provider workers have no ambient ACP tools. Their typed domain coordinator
+    // executes these steps; the session scheduler must never dispatch them.
     const run = this.store.getRun(runId);
+    if (run?.investigationId) return;
     if (!run || terminalRunStates.has(run.state)) return;
 
     const steps = this.store.listRunSteps(runId);

@@ -55,6 +55,10 @@ copilot --acp --stdio
 - **Permission request**: ACP request waiting for an allow-once or deny browser decision; timeout/disconnect denies it.
 - **Run**: one approved objective plus the budget it may spend. Owns its Sessions.
 - **RunStep**: one unit of a Run's work, executed by one Session on one Placement.
+- **DRI investigation**: additive typed evidence authority linked one-to-one to a
+  Run. Its capability-scoped provider workers execute on the Host without ambient
+  ACP write tools; RunSteps track progress, not evidence/query/report content.
+  See [the DRI architecture and provider guide](docs/DRI_INVESTIGATION.md).
 
 ## Orchestration
 

@@ -65,6 +65,7 @@ import type {
 import { Sidebar } from "./components/Sidebar";
 import { TerminalView } from "./components/TerminalView";
 import { TopBar } from "./components/TopBar";
+import { DriWorkbench } from "./components/dri/DriWorkbench";
 import { LifecycleNotificationControl } from "./components/LifecycleNotificationControl";
 
 const noEvents: SessionEvent[] = [];
@@ -80,7 +81,7 @@ const noNotes: RunNote[] = [];
  * is what the old `layout === "grid" → view = "session"` line did.
  */
 export type AppView =
-  "session" | "overview" | "orchestrator" | "orchestrator-task" | "settings";
+  "session" | "overview" | "orchestrator" | "orchestrator-task" | "settings" | "dri";
 
 /**
  * Where a conversation was opened from, so leaving it goes back there.
@@ -230,7 +231,10 @@ export function App() {
     dismissNotification,
   } = useFleet(notify);
   const catalog = useCatalogOperations({ request, refresh, notify });
-  const [view, setView] = useState<AppView>("session");
+  const [view, setView] = useState<AppView>(
+    new URLSearchParams(window.location.search).has("dri") ? "dri" : "session",
+  );
+  const [selectedDriId, setSelectedDriId] = useState("");
   const [orchestratorViewMode, setOrchestratorViewMode] =
     useState<OrchestratorViewMode>("stage");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
@@ -381,13 +385,24 @@ export function App() {
   };
 
   /** Opens one task's detail, from any of the three orchestrator views. */
-  const handleOpenRun = useCallback((runId: string, fromConversationId?: string) => {
-    setSelectedRunId(runId);
-    // Cleared unless the task was opened from a conversation, so Back keeps
-    // meaning "where I was" rather than "wherever I last came from".
-    setTaskOrigin(fromConversationId);
-    setView("orchestrator-task");
-  }, []);
+  const handleOpenRun = useCallback(
+    (runId: string, fromConversationId?: string) => {
+      const investigationId = snapshot.runs.find(
+        (run) => run.id === runId,
+      )?.investigationId;
+      if (investigationId) {
+        setSelectedDriId(investigationId);
+        setView("dri");
+        return;
+      }
+      setSelectedRunId(runId);
+      // Cleared unless the task was opened from a conversation, so Back keeps
+      // meaning "where I was" rather than "wherever I last came from".
+      setTaskOrigin(fromConversationId);
+      setView("orchestrator-task");
+    },
+    [snapshot.runs],
+  );
 
   /** Leaves a task for whatever opened it: a conversation, or the board. */
   const handleBackFromTask = () => {
@@ -610,6 +625,10 @@ export function App() {
     () => runModels.find((model) => model.run.id === selectedRunId),
     [runModels, selectedRunId],
   );
+  const notificationRuns = useMemo(
+    () => [...orchestratorRuns, ...snapshot.runs.filter((run) => run.investigationId)],
+    [orchestratorRuns, snapshot.runs],
+  );
   const handleNotificationNavigate = useCallback(
     (notification: Notification) => {
       void markNotificationRead(notification.id);
@@ -617,7 +636,7 @@ export function App() {
         notification,
         runSteps,
         snapshot.sessions,
-        orchestratorRuns,
+        notificationRuns,
       );
       if (target.kind === "session") {
         if (target.returnRunId) {
@@ -650,7 +669,7 @@ export function App() {
       handleOpenRun,
       handleSelectSession,
       markNotificationRead,
-      orchestratorRuns,
+      notificationRuns,
       runSteps,
       snapshot.sessions,
     ],
@@ -661,7 +680,7 @@ export function App() {
         notification,
         runSteps,
         snapshot.sessions,
-        orchestratorRuns,
+        notificationRuns,
       );
       if (target.kind === "session") {
         return (
@@ -670,6 +689,10 @@ export function App() {
         );
       }
       if (target.kind === "run") {
+        if (view === "dri")
+          return snapshot.runs.some(
+            (run) => run.id === target.runId && run.investigationId === selectedDriId,
+          );
         return view === "orchestrator-task" && selectedRunId === target.runId;
       }
       if (target.kind === "node") {
@@ -680,7 +703,9 @@ export function App() {
     },
     [
       focusOpen,
-      orchestratorRuns,
+      notificationRuns,
+      snapshot.runs,
+      selectedDriId,
       runSteps,
       selectedRunId,
       selectedSessionId,
@@ -890,6 +915,7 @@ export function App() {
     <CatalogProvider value={catalog}>
       <div className={styles.app}>
         <TopBar
+          onOpenDri={() => setView("dri")}
           nodesOnline={snapshot.nodes.filter((node) => node.online).length}
           liveSessions={liveSessions.length}
           waitingPermissions={attentionCount}
@@ -938,7 +964,9 @@ export function App() {
           }
         />
         <div className={styles.body}>
-          {view === "overview" ? (
+          {view === "dri" ? (
+            <DriWorkbench key={selectedDriId} initialId={selectedDriId} />
+          ) : view === "overview" ? (
             <SessionGrid
               sessions={visibleSessions}
               workspaces={snapshot.workspaces}

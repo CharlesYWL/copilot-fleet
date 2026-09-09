@@ -2,6 +2,8 @@ import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
+import { DriStore } from "./dri/store.js";
+import { DriError } from "./dri/safety.js";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
 import { EntraConfigSchema } from "./auth/entra.js";
 import { isDeepStrictEqual } from "node:util";
@@ -9,6 +11,8 @@ import {
   type FleetNode,
   type FleetSession,
   type HostBackup,
+  DriBackupSchema,
+  degradedDriBackup,
   type HostPortableBackupData,
   type MarkAllNotificationsReadResponse,
   type CreateNotification,
@@ -388,6 +392,7 @@ const NO_MANUAL_CHECKOUTS =
 export type SecureFiles = (databasePath: string) => void;
 
 export class FleetStore {
+  readonly dri: DriStore;
   private readonly db: DatabaseSync;
   private transactionDepth = 0;
   /**
@@ -673,6 +678,7 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "success_criteria", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "stop_when", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("runs", "review_seq", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("runs", "dri_id", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing(
       "run_steps",
@@ -747,6 +753,7 @@ export class FleetStore {
         WHERE id=1;
       END;
     `);
+    this.dri = new DriStore(this.db, (work) => this.writeAtomically(work));
     this.ensureChatsWorkspace();
     this.rebuildSessionStateFromEvents();
   }
@@ -1128,7 +1135,14 @@ export class FleetStore {
    * and (optionally) a public URL because those live outside the catalog tables.
    */
   exportHostBackup(input: { enrollmentToken: string; publicUrl?: string }): HostBackup {
+    let dri: HostBackup["dri"];
+    try {
+      dri = DriBackupSchema.parse(this.dri.export());
+    } catch {
+      dri = degradedDriBackup();
+    }
     const backup = {
+      dri,
       kind: HOST_BACKUP_KIND,
       version: BACKUP_VERSION,
       exportedAt: new Date().toISOString(),
@@ -1174,9 +1188,11 @@ export class FleetStore {
       events: (
         this.statement("SELECT * FROM events ORDER BY session_id,sequence").all() as Row[]
       ).map(eventFromRow),
-      runs: (this.statement("SELECT * FROM runs ORDER BY created_at").all() as Row[]).map(
-        runFromRow,
-      ),
+      runs: (
+        this.statement(
+          "SELECT *,NULLIF(dri_id,'') investigation_id FROM runs ORDER BY created_at",
+        ).all() as Row[]
+      ).map(runFromRow),
       runSteps: (
         this.statement(
           "SELECT * FROM run_steps ORDER BY run_id,position,created_at",
@@ -1251,6 +1267,10 @@ export class FleetStore {
     parsed: HostBackup,
     suppliedKeys?: ReadonlyMap<string, string>,
   ): void {
+    const driRunIds = new Set([
+      ...parsed.runs.filter((run) => run.investigationId).map((run) => run.id),
+      ...(parsed.dri?.investigations.map((investigation) => investigation.runId) ?? []),
+    ]);
     const keys = suppliedKeys ?? this.currentNodePublicKeys();
     /*
      * Checked before a single row is deleted, and it is a refusal rather than a
@@ -1376,7 +1396,7 @@ export class FleetStore {
         session.runId,
         session.runRole,
         JSON.stringify(session.additionalDirectories ?? []),
-        session.stopRequested ? 1 : 0,
+        session.stopRequested || driRunIds.has(session.runId) ? 1 : 0,
         session.dismissed ? 1 : 0,
       );
     }
@@ -1406,7 +1426,7 @@ export class FleetStore {
         run.workspaceId,
         run.name,
         run.objective,
-        runStateForHostImport(run.state),
+        driRunIds.has(run.id) ? "cancelled" : runStateForHostImport(run.state),
         run.leadSessionId,
         run.placementId,
         JSON.stringify(run.policy),
@@ -1416,7 +1436,9 @@ export class FleetStore {
         run.phaseIndex,
         JSON.stringify(run.successCriteria),
         run.stopWhen,
-        run.failureReason,
+        driRunIds.has(run.id)
+          ? "DRI restored paused; complete source data and explicit Resume required"
+          : run.failureReason,
         run.settleSeq,
         run.wakeSeq,
         run.emptyWakeCount,
@@ -1424,6 +1446,11 @@ export class FleetStore {
         run.createdAt,
         run.updatedAt,
       );
+      if (run.investigationId)
+        this.statement("UPDATE runs SET dri_id=? WHERE id=?").run(
+          run.investigationId,
+          run.id,
+        );
     }
     for (const step of parsed.runSteps) {
       this.statement(
@@ -1440,7 +1467,10 @@ export class FleetStore {
         step.prompt,
         step.category,
         JSON.stringify(step.dependsOn),
-        runStepStateForHostImport(step.state),
+        driRunIds.has(step.runId) &&
+          ["pending", "starting", "running"].includes(step.state)
+          ? "cancelled"
+          : runStepStateForHostImport(step.state),
         step.sessionId,
         step.placementId,
         step.output,
@@ -1479,6 +1509,16 @@ export class FleetStore {
     // existed has no row to put back — so the Host would come up from a valid
     // backup with the one workspace nothing is written to work without.
     this.seedChatsWorkspace();
+    this.dri.restore(
+      parsed.dri ?? {
+        version: 1,
+        investigations: [],
+        decisions: [],
+        records: [],
+        attempts: [],
+        tombstones: [],
+      },
+    );
   }
 
   /**
@@ -3553,14 +3593,17 @@ export class FleetStore {
   }
 
   getRun(id: string): Run | undefined {
-    const row = this.statement("SELECT * FROM runs WHERE id=?").get(id) as
-      Row | undefined;
+    const row = this.statement(
+      "SELECT *,NULLIF(dri_id,'') investigation_id FROM runs WHERE id=?",
+    ).get(id) as Row | undefined;
     return row ? runFromRow(row) : undefined;
   }
 
   listRuns(): Run[] {
     return (
-      this.statement("SELECT * FROM runs ORDER BY created_at DESC").all() as Row[]
+      this.statement(
+        "SELECT *,NULLIF(dri_id,'') investigation_id FROM runs ORDER BY created_at DESC",
+      ).all() as Row[]
     ).map(runFromRow);
   }
 
@@ -3633,6 +3676,10 @@ export class FleetStore {
     if (!run || terminalRunStates.has(run.state)) return run;
     return this.transaction(() => {
       const now = new Date().toISOString();
+      const investigation = this.dri.forRun(id);
+      if (investigation && !["stopped", "completed"].includes(investigation.status)) {
+        this.dri.pause(investigation.id, "operator");
+      }
       this.statement(
         "UPDATE runs SET state='cancelled',failure_reason=?,updated_at=? WHERE id=?",
       ).run(reason, now, id);
@@ -3667,6 +3714,14 @@ export class FleetStore {
       this.statement(
         "UPDATE runs SET state='running',failure_reason='',updated_at=? WHERE id=?",
       ).run(now, id);
+      const investigation = this.dri.forRun(id);
+      if (investigation?.status === "stopped") {
+        this.dri.update(investigation.id, investigation.revision, {
+          status: "blocked",
+          limitation:
+            "Resume the DRI investigation explicitly after checking provider readiness",
+        });
+      }
       return this.getRun(id)!;
     });
   }
@@ -3938,6 +3993,7 @@ export class FleetStore {
   deleteRun(id: string): boolean {
     return this.transaction(() => {
       if (!this.getRun(id)) return false;
+      this.assertRunPurgeAllowed(id);
       // Notes reference the run, so they have to go first or the foreign key
       // rejects the delete and takes the whole transaction with it.
       this.statement("DELETE FROM run_notes WHERE run_id=?").run(id);
@@ -3945,6 +4001,13 @@ export class FleetStore {
       this.statement("DELETE FROM runs WHERE id=?").run(id);
       return true;
     });
+  }
+  assertRunPurgeAllowed(id: string): void {
+    if (this.getRun(id)?.investigationId)
+      throw new DriError(
+        "DRI Run evidence is retained; use Stop/Archive and retention policy, not generic Delete",
+        409,
+      );
   }
 
   private sessionQuery(suffix: string): StatementSync {
@@ -4471,6 +4534,7 @@ function runFromRow(row: Row): Run {
   const stored = tryParseJson(String(row.policy ?? ""));
   return RunSchema.parse({
     id: String(row.id),
+    ...(row.investigation_id ? { investigationId: String(row.investigation_id) } : {}),
     workspaceId: String(row.workspace_id),
     name: String(row.name),
     objective: String(row.objective),

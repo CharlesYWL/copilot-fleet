@@ -1,5 +1,10 @@
 # Copilot Fleet
 
+Evidence-driven DRI investigations are available from **DRI investigations** in
+the Host header. See the [DRI guide](docs/DRI_INVESTIGATION.md) for synthetic
+fixtures, embedding-only provider boundaries (live CLI adapters are not shipped),
+architecture, and validation.
+
 **English** · [简体中文](README.zh-CN.md)
 
 Copilot Fleet is a self-hosted control plane for supervising GitHub Copilot CLI

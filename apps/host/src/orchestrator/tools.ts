@@ -608,7 +608,7 @@ export class FleetTools {
   private runs(): Run[] {
     return this.store
       .listRuns()
-      .filter((run) => run.leadSessionId === this.leadSessionId)
+      .filter((run) => run.leadSessionId === this.leadSessionId && !run.investigationId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 

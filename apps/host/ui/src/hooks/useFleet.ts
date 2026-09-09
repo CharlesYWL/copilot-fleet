@@ -532,6 +532,10 @@ export function useFleet(notify: Notify) {
           });
           return;
         }
+        if (message.type === "dri_changed") {
+          window.dispatchEvent(new CustomEvent("fleet:dri-changed", { detail: message }));
+          return;
+        }
         if (message.type === "notification_upsert") {
           const { notification } = message;
           const inserted = !knownNotificationIds.current.has(notification.id);

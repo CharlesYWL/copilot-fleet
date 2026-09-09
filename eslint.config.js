@@ -59,12 +59,17 @@ export default tseslint.config(
     // The supervisor is plain JavaScript on purpose — it has to start when the
     // build it supervises does not — so it needs the Node globals the TypeScript
     // block above grants, and printing is the only reporting it has.
-    files: ["apps/node/supervisor.mjs"],
+    files: ["apps/node/supervisor.mjs", "scripts/dri-smoke.mjs"],
     languageOptions: {
       globals: { ...globals.node },
       sourceType: "module",
     },
     rules: { "no-console": "off" },
+  },
+  {
+    files: ["scripts/dri-validation-guard.cjs"],
+    languageOptions: { globals: { ...globals.node }, sourceType: "commonjs" },
+    rules: { "@typescript-eslint/no-require-imports": "off" },
   },
   {
     files: ["**/*.test.{ts,tsx}"],

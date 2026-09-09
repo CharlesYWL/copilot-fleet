@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { DriBackupSchema } from "./dri.js";
+export * from "./dri.js";
 
 /**
  * Standard base64, bounded.
@@ -1200,6 +1202,8 @@ export type CriterionOutcome = z.infer<typeof CriterionOutcomeSchema>;
 
 export const RunSchema = z.object({
   id: z.string().min(1),
+  /** Bounded navigation link; DRI evidence/state lives in its own domain. */
+  investigationId: z.string().max(160).optional(),
   workspaceId: z.string().min(1),
   name: z.string().min(1),
   objective: z.string().min(1),
@@ -1505,6 +1509,12 @@ export const SnapshotSchema = z.object({
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
 export const BrowserMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("dri_changed"),
+    investigationId: z.string().max(160),
+    runId: z.string().max(160),
+    revision: z.number().int().nonnegative(),
+  }),
   z.object({ type: z.literal("snapshot"), data: SnapshotSchema }),
   z.object({ type: z.literal("node"), node: NodeSchema }),
   z.object({ type: z.literal("session"), session: SessionSchema }),
@@ -2247,6 +2257,7 @@ export type HostBackupSession = z.infer<typeof HostBackupSessionSchema>;
  * one, and neither schema can drift into accepting the other's version.
  */
 const hostBackupDataShape = {
+  dri: DriBackupSchema.optional(),
   kind: z.literal(HOST_BACKUP_KIND),
   exportedAt: z.string().datetime(),
   /**

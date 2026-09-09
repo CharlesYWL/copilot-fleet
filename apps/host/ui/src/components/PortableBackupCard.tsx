@@ -15,7 +15,7 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import { errorMessage } from "@fleet/protocol";
+import { driBackupWarning, errorMessage } from "@fleet/protocol";
 import { useMessageNotification, useNotify } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { csrfToken } from "../lib/auth";
@@ -129,9 +129,12 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
         return;
       }
       download(body);
-      reportSuccess(
-        "Archive downloaded. Keep the passphrase somewhere separate — it is not stored here and cannot be recovered.",
-      );
+      const warning = driBackupWarning(body);
+      if (warning) setError(`Archive downloaded with limitations. ${warning}`);
+      else
+        reportSuccess(
+          "Archive downloaded. Keep the passphrase somewhere separate — it is not stored here and cannot be recovered.",
+        );
     } catch (reason) {
       setError(errorMessage(reason, "Could not reach the Host"));
     } finally {
@@ -297,6 +300,9 @@ export const PortableBackupCard = ({ claimed, onImported }: PortableBackupCardPr
           <DialogBody>
             <DialogTitle>Become the Host in that archive?</DialogTitle>
             <DialogContent>
+              {driBackupWarning(pending) && (
+                <p role="alert">{driBackupWarning(pending)}</p>
+              )}
               <Text>
                 This replaces the administrators, the Microsoft registration and this
                 machine&apos;s identity with the ones in the file, ends every browser

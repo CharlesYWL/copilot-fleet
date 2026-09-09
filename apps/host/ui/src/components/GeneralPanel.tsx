@@ -18,7 +18,11 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import type { SessionConfigChoice, SessionConfigOption } from "@fleet/protocol";
+import {
+  driBackupWarning,
+  type SessionConfigChoice,
+  type SessionConfigOption,
+} from "@fleet/protocol";
 import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
@@ -147,6 +151,8 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
       const backup = await api<unknown>("/api/backup");
       const stamp = new Date().toISOString().slice(0, 10);
       downloadJson(backup, `copilot-fleet-host-${stamp}.json`);
+      const warning = driBackupWarning(backup);
+      if (warning) setError(warning);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -413,6 +419,9 @@ export const GeneralPanel = ({ sessions }: GeneralPanelProps) => {
           <DialogBody>
             <DialogTitle>Replace this fleet&apos;s data?</DialogTitle>
             <DialogContent>
+              {driBackupWarning(pendingArchive) && (
+                <p role="alert">{driBackupWarning(pendingArchive)}</p>
+              )}
               <Text>
                 Importing wipes workspaces, nodes, sessions and session settings on this
                 machine and restores the archive. Who may administer this Host is left

@@ -118,12 +118,14 @@ export const portableBackupRoutes: FastifyPluginAsync<
         actorId: administrator.id,
         outcome: "allowed",
       });
-      return reply.send({
-        ...portable,
-        nodes,
-        version: PORTABLE_BACKUP_VERSION,
-        security,
-      });
+      return reply
+        .header("x-fleet-dri-backup-state", data.dri?.coverage?.state ?? "complete")
+        .send({
+          ...portable,
+          nodes,
+          version: PORTABLE_BACKUP_VERSION,
+          security,
+        });
     },
   );
 
