@@ -14,11 +14,13 @@ import {
   EscalateSchema,
   FleetTools,
   FollowUpSchema,
+  ListWorkSchema,
   PlanTaskSchema,
   ReopenTaskSchema,
   SessionRefSchema,
   StartWorkSchema,
   SubmitTaskSchema,
+  TaskRefSchema,
   WORKER_CATEGORIES,
   explainInvalidArgs,
   type ToolResult,
@@ -253,6 +255,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       title: "Start work on a node",
       description: [
         "Start one worker agent on a node and return immediately.",
+        "This creates a NEW session. For follow-up requests, first find the prior task with fleet_list_work and read fleet_get_task; use fleet_follow_up for the same deliverable.",
         "Say what must come back, where to work, and what will show it is real — the Host writes the worker's brief from those, so a dispatch with no way to check it is refused before a machine is spent on it.",
         "The Host picks the machine; a review always lands on the same checkout the implementation used, so it can see the changes.",
         "Group related steps under one `task`, and start a separate task for an unrelated request.",
@@ -270,6 +273,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       title: "Open a task and name its phases",
       description: [
         "Open a piece of work and say what stages it will go through.",
+        "Before opening follow-up work, search fleet_list_work (including closed tasks). A failed exact-name lookup does not mean the prior task or worker was deleted.",
         "You own the task from here: you dispatch the work for each phase, check what comes back, and move it on yourself.",
         "A person is only asked at the very end, when you call fleet_submit_task.",
         "Choose the fewest phases and workers justified by complexity, uncertainty and risk: one for a simple fix including inspection and verification, two when discovery or independent review adds value, three for substantial or high-risk work needing both. Do not invent stages that have no work in them.",
@@ -346,7 +350,8 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "For a task that turns out not to be over — either one you handed over and the person has not answered yet, or one that is already closed and the next thing to do belongs with it.",
         "Reopening keeps the task's criteria, notes and steps, which is the point: a new task would start with none of that context.",
         "Taking one back from review means the person is no longer being asked, so only do it when what you learned makes the question different.",
-        "The task returns to the phase it was on. Dispatch what it needs, then end your turn.",
+        "Use its stable task ID from fleet_list_work, not a remembered title.",
+        "The task returns to the phase it was on. Read fleet_get_task, then use fleet_follow_up to continue a retained worker whose role matches.",
       ].join(" "),
       inputSchema: ReopenTaskSchema.shape,
     },
@@ -369,12 +374,31 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
   server.registerTool(
     "fleet_list_work",
     {
-      title: "List this run's work",
-      description:
-        "Every task you have open, the phase each is on, its steps, and the budget left.",
-      inputSchema: {},
+      title: "Find tasks and reusable workers",
+      description: [
+        "Search or browse this orchestrator's open AND closed tasks, with stable task/session IDs, workspace and checkout, step and session states, and the next continuation action.",
+        "Use a short query such as a PR number before deciding to create a task or worker. Results are paginated.",
+        "Only this orchestrator's records are visible; no match does not prove a previous conversation was deleted or that another orchestrator's work can be replaced.",
+      ].join(" "),
+      inputSchema: ListWorkSchema.shape,
+      annotations: { readOnlyHint: true },
     },
-    async () => reply(tools.listWork()),
+    guard("fleet_list_work", ListWorkSchema, (input) => tools.listWork(input)),
+  );
+
+  server.registerTool(
+    "fleet_get_task",
+    {
+      title: "Read task context and continuation options",
+      description: [
+        "Read one owned task by stable ID or exact name: objective, phases, success criteria, notes, worker briefs/output, original checkout and continuation actions.",
+        "Use this after fleet_list_work to decide whether the same worker should continue, the task must reopen, or genuinely different work needs a new session.",
+        "Long notes and worker output are bounded; use fleet_transcript for more worker output.",
+      ].join(" "),
+      inputSchema: TaskRefSchema.shape,
+      annotations: { readOnlyHint: true },
+    },
+    guard("fleet_get_task", TaskRefSchema, (input) => tools.getTask(input)),
   );
 
   server.registerTool(
@@ -395,7 +419,9 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       description: [
         "Give the same worker another turn. Settled task workers normally stay open and idle, so revisits continue immediately in the same live session; interrupted sessions are resumed when possible.",
         "Use this for another revision of the same deliverable or another round of feedback for the same coder.",
-        "Use fleet_start_work instead for a genuinely different unit or role, such as planning, coding, testing or review.",
+        "Use the sessionId from fleet_list_work or fleet_get_task. A closed task must first be reopened with fleet_reopen_task.",
+        "Accepted follow-ups are persisted and scheduled; queued means accepted, not failed. Repeating the same pending follow-up does not resend it; a different prompt cannot overwrite it.",
+        "Busy, stopping or offline is not a reason to replace a worker. Use fleet_start_work only for genuinely different work or a confirmed non-resumable conversation.",
       ].join(" "),
       inputSchema: FollowUpSchema.shape,
     },

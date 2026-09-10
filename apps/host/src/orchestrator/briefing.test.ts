@@ -3,7 +3,7 @@ import Fastify from "fastify";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { orchestratorBriefing, statusCheckEnvelope } from "./briefing.js";
+import { orchestratorBriefing, statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
 import { fleet } from "./fleet-harness.js";
 import { LeadTokens } from "./lead-tokens.js";
 import { MCP_PATH, mcpRoutes } from "./mcp-routes.js";
@@ -130,6 +130,44 @@ describe("what the orchestrator is told", () => {
     expect(agentFile).toContain("stay open and idle");
     expect(agentFile).toContain("Archiving stops them");
     expect(agentFile).toContain("after reopening");
+  });
+
+  it("teaches discovery before replacement and distinguishes queued work from failure", () => {
+    for (const text of [
+      agentFile,
+      orchestratorBriefing("nodes", { hasAgent: true }),
+      orchestratorBriefing("nodes", { hasAgent: false }),
+    ]) {
+      const normalized = text.replace(/\s+/g, " ");
+      expect(normalized).toContain("fleet_get_task");
+      expect(normalized).toContain("closed tasks");
+      expect(normalized).toContain("does not prove");
+      expect(normalized).toContain("persisted");
+      expect(normalized).toContain("do not resend");
+    }
+  });
+
+  it("carries stable task and worker IDs in wake messages", () => {
+    const message = wakeEnvelope({
+      runId: "stable-task-id",
+      task: "A display name that can change",
+      wakes: 1,
+      maxWakes: 12,
+      settled: [
+        {
+          title: "Rename the helper",
+          category: "implement",
+          state: "succeeded",
+          output: "The rename is complete.",
+          sessionId: "same-worker-id",
+        },
+      ],
+      running: [],
+    });
+
+    expect(message).toContain('taskId="stable-task-id"');
+    expect(message).toContain("same-worker-id");
+    expect(message).toContain("fleet_follow_up");
   });
 
   it("scales phases and workers without dropping evidence or independent review for risky work", () => {

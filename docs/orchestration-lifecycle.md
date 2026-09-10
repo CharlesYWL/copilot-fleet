@@ -53,3 +53,23 @@ databases remain active and visible. Backups preserve the fields. On reconnect,
 a stopped session still present on the Node receives Stop again; a session no
 longer present is confirmed `stopped`. Resume resets only steps explicitly
 marked by the orchestration Stop transaction.
+
+## MCP follow-up decisions
+
+Task identity and worker identity are separate. `fleet_list_work` searches the
+current orchestrator's open and closed tasks and returns stable task IDs, worker
+session IDs, original checkouts, session states and continuation actions.
+`fleet_get_task` reads the task's criteria, notes and worker context. Task tools
+accept a stable ID or an exact, unambiguous name; a name lookup miss does not
+establish that the conversation was deleted. Neither tool crosses into another
+orchestrator's records.
+
+For another revision of the same deliverable, reuse the worker with
+`fleet_follow_up`. Reopen a closed or handed-over task first. An accepted
+follow-up is persisted in its existing step and passes through the scheduler,
+including parallel limits and the original checkout's writer lock. Repeating
+the same queued or in-flight prompt does not send another turn, and a different
+prompt cannot overwrite it. Busy, stopping and offline are temporary states,
+not evidence that the conversation must be replaced. A confirmed terminal
+worker without a resumable conversation needs replacement with the retained
+task context supplied explicitly.

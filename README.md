@@ -1439,6 +1439,22 @@ fleet doing" is a fleet-wide question; and a conversation carries its own tasks
 in a panel beside it, so what you just asked for is next to where you asked.
 Clicking a dispatched step opens that worker's transcript.
 
+For a later review comment or another revision of the same deliverable, the
+orchestrator should reuse the original worker, not start from scratch.
+`fleet_list_work` searches its open and closed tasks by a short query such as
+a PR number and returns stable task/session IDs, original checkouts, actual
+session states, and continuation guidance. `fleet_get_task` supplies the
+criteria, notes and worker context needed to make that decision. Use the task
+ID in later calls because display names can change or be ambiguous.
+
+These tools are scoped to the current orchestrator, not the whole Host.
+A failed name lookup does not establish that the old conversation was deleted;
+search first, or return to the owning orchestrator. For a closed task, call
+`fleet_reopen_task`, then `fleet_follow_up` on its retained worker. Accepted
+follow-ups are persisted and scheduled in the same session. Queued, busy,
+stopping or offline does not mean replacement is needed; a repeated pending
+follow-up is not sent twice, and a different prompt cannot overwrite it.
+
 ### Chats as a destination
 
 An orchestrator picks where each worker runs, and [Chats](#chats) is one of the

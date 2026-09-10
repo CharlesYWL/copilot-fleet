@@ -211,6 +211,53 @@ describe("orchestrator tools over the wire", () => {
       ...over,
     });
 
+  it("advertises scoped history search and stable task references", async () => {
+    const listed = await rpc("tools/list");
+    const search = listed.result!.tools!.find((tool) => tool.name === "fleet_list_work")!;
+    const inspect = listed.result!.tools!.find((tool) => tool.name === "fleet_get_task")!;
+    const reopen = listed.result!.tools!.find(
+      (tool) => tool.name === "fleet_reopen_task",
+    )!;
+
+    expect(search.inputSchema.properties).toHaveProperty("query");
+    expect(search.inputSchema.properties).toHaveProperty("limit");
+    expect(search.inputSchema.properties).toHaveProperty("offset");
+    expect(search.description).toContain("closed tasks");
+    expect(inspect.inputSchema.properties?.task?.description).toContain("stable ID");
+    expect(reopen.inputSchema.properties?.task?.description).toContain("stable ID");
+  });
+
+  it("searches and inspects retained task context over the wire, then reopens by ID", async () => {
+    const planned = await plan({ objective: "Address feedback for PR 1066416" });
+    const id = task()!.id;
+    expect(planned.text).toContain(id);
+    store.setRunState(id, "completed");
+    store.appendRunNote(id, 0, "The previous worker inspected the wizard.");
+
+    const listed = await call("fleet_list_work", { query: "1066416", limit: 5 });
+    expect(listed.refused, listed.text).toBe(false);
+    expect(listed.text).toContain(id);
+    const details = await call("fleet_get_task", { task: id });
+    expect(details.refused, details.text).toBe(false);
+    expect(details.text).toContain("The previous worker inspected the wizard.");
+    expect(details.text).toContain("logout-invalidates");
+
+    const reopened = await call("fleet_reopen_task", {
+      task: id,
+      reason: "The reviewer requested another change to the same helper.",
+    });
+    expect(reopened.refused, reopened.text).toBe(false);
+    expect(store.getRun(id)?.state).toBe("running");
+    expect(store.listRuns()).toHaveLength(1);
+  });
+
+  it("validates discovery bounds rather than accepting unbounded result requests", async () => {
+    expect((await call("fleet_list_work", { limit: 101 })).refused).toBe(true);
+    expect((await call("fleet_list_work", { offset: -1 })).refused).toBe(true);
+    expect((await call("fleet_list_work", { query: "   " })).refused).toBe(true);
+    expect((await call("fleet_list_work", {})).refused).toBe(false);
+  });
+
   it("tells a caller that planning needs a definition of done", async () => {
     const listed = await rpc("tools/list");
     const planTool = listed.result!.tools!.find((t) => t.name === "fleet_plan_task")!;

@@ -348,6 +348,7 @@ export class OrchestratorEngine {
     const step = this.store.getRunStep(action.stepId);
     const session = this.store.getSession(action.sessionId);
     if (!step || step.state !== "pending" || session?.state !== "idle") return false;
+    if (session.stopRequested || session.dismissed) return false;
 
     this.store.updateRunStep(step.id, {
       state: "starting",

@@ -219,6 +219,102 @@ describe("planNextActions", () => {
     expect(actions.map((action) => action.type)).not.toContain("prompt_step");
   });
 
+  it.each(["idle", "completed"] as const)(
+    "recognizes a fast retry that is already %s with a current-attempt completion",
+    (state) => {
+      const actions = planNextActions(
+        world({
+          steps: [
+            step("retry", {
+              state: "starting",
+              sessionId: "sess1",
+              placementId: "p1",
+              attempts: 2,
+              dispatchedAt: iso(-100),
+            }),
+          ],
+          sessions: [session("sess1", { state })],
+          turnCompleteSessionIds: new Set(["sess1"]),
+          stepOutputs: new Map([["retry", "The rename is complete."]]),
+        }),
+      );
+
+      expect(actions).toContainEqual({ type: "advance_step", stepId: "retry" });
+      expect(actions).toContainEqual({
+        type: "settle_step",
+        stepId: "retry",
+        state: "succeeded",
+        output: "The rename is complete.",
+      });
+    },
+  );
+
+  it("reports a rejected retry promptly instead of waiting for a dispatch timeout", () => {
+    const actions = planNextActions(
+      world({
+        steps: [
+          step("retry", {
+            state: "starting",
+            sessionId: "sess1",
+            placementId: "p1",
+            attempts: 2,
+            dispatchedAt: iso(-100),
+          }),
+        ],
+        sessions: [session("sess1", { state: "failed" })],
+        stepOutputs: new Map([
+          ["retry", "The Copilot conversation could not be loaded."],
+        ]),
+      }),
+    );
+
+    expect(actions).toContainEqual({
+      type: "settle_step",
+      stepId: "retry",
+      state: "failed",
+      output: "The Copilot conversation could not be loaded.",
+    });
+  });
+
+  it.each([{ stopRequested: true }, { dismissed: true }])(
+    "does not send a queued follow-up while a control blocks it: %j",
+    (controls) => {
+      const actions = planNextActions(
+        world({
+          steps: [step("retry", { sessionId: "sess1", placementId: "p1", attempts: 2 })],
+          sessions: [session("sess1", { state: "idle", ...controls })],
+        }),
+      );
+
+      expect(actions.map((action) => action.type)).not.toContain("prompt_step");
+    },
+  );
+
+  it("does not report a prompt action for an idle worker on an offline Node", () => {
+    const actions = planNextActions(
+      world({
+        steps: [step("retry", { sessionId: "sess1", placementId: "p1", attempts: 2 })],
+        sessions: [session("sess1", { state: "idle" })],
+        nodes: [node("n1", { online: false }), node("n2")],
+      }),
+    );
+
+    expect(actions.map((action) => action.type)).not.toContain("prompt_step");
+  });
+
+  it("surfaces a lost queued worker instead of waiting forever or starting a replacement", () => {
+    const actions = planNextActions(
+      world({
+        steps: [step("retry", { sessionId: "missing", placementId: "p1", attempts: 2 })],
+      }),
+    );
+
+    expect(actions).toContainEqual(
+      expect.objectContaining({ type: "settle_step", stepId: "retry", state: "failed" }),
+    );
+    expect(actions.map((action) => action.type)).not.toContain("start_step");
+  });
+
   it("settles a retry whose resume attempt ended instead of resuming forever", () => {
     const actions = planNextActions(
       world({
