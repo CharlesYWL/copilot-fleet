@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { TunnelInfo, TunnelProviderInfo } from "@fleet/protocol";
 import { TunnelPanel } from "./TunnelPanel";
@@ -156,9 +156,11 @@ describe("TunnelPanel policy", () => {
     expect(
       await screen.findByText("Sign in with devtunnel user login before hosting."),
     ).toBeTruthy();
-    expect(notify).toHaveBeenCalledExactlyOnceWith(
-      "Dev Tunnels: Sign in with devtunnel user login before hosting.",
-      "error",
+    await waitFor(() =>
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        "Dev Tunnels: Sign in with devtunnel user login before hosting.",
+        "error",
+      ),
     );
   });
 
