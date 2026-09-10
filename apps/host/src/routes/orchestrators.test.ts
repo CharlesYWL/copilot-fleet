@@ -206,6 +206,100 @@ describe("orchestrator lifecycle routes", () => {
     ).toHaveLength(2);
   });
 
+  it("resumes while retained child agents are idle", async () => {
+    const { app, store, service, leadId, run, worker } = await setup();
+    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    service.handleEvent({
+      eventId: "lead-stopped-idle-worker",
+      sessionId: leadId,
+      sequence: 2,
+      type: "state",
+      payload: { state: "stopped", activity: "Stopped" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(worker.id, "idle", "Ready for follow-up");
+    store.setSessionControls(worker.id, { stopRequested: false });
+
+    const resumed = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/resume`,
+    });
+
+    expect(resumed.statusCode).toBe(202);
+    expect(store.getRun(run.id)?.state).toBe("running");
+    expect(store.getSession(worker.id)?.state).toBe("idle");
+  });
+
+  it("bulk stops only agents owned by the selected orchestrator", async () => {
+    const { app, store, leadId, worker } = await setup();
+    const lead = store.getSession(leadId)!;
+    const unrelated = store.createSession(
+      store.getPlacement(lead.placementId)!,
+      "unrelated",
+      false,
+      "Unrelated",
+    );
+    store.transitionSession(unrelated.id, "starting");
+    store.transitionSession(unrelated.id, "idle");
+
+    const stopped = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/agents/stop`,
+      payload: { sessionIds: [worker.id] },
+    });
+
+    expect(stopped.statusCode).toBe(202);
+    expect(stopped.json()).toMatchObject({ matched: 1, requested: 1 });
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+    expect(store.getSession(leadId)?.stopRequested).toBe(false);
+    expect(store.getSession(unrelated.id)?.stopRequested).toBe(false);
+  });
+
+  it("bulk stops all non-orchestrator agents without stopping leads", async () => {
+    const { app, store, leadId, worker } = await setup();
+    const lead = store.getSession(leadId)!;
+    const manual = store.createSession(
+      store.getPlacement(lead.placementId)!,
+      "manual",
+      false,
+      "Manual",
+    );
+    store.transitionSession(manual.id, "starting");
+    store.transitionSession(manual.id, "idle");
+
+    const stopped = await app.inject({
+      method: "POST",
+      url: "/api/sessions/stop",
+      payload: { sessionIds: [worker.id, manual.id] },
+    });
+
+    expect(stopped.statusCode).toBe(202);
+    expect(stopped.json()).toMatchObject({ matched: 2, requested: 2 });
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+    expect(store.getSession(manual.id)?.stopRequested).toBe(true);
+    expect(store.getSession(leadId)?.stopRequested).toBe(false);
+  });
+
+  it("favorites agents and orchestrator conversations persistently", async () => {
+    const { app, store, leadId, worker } = await setup();
+
+    const favoriteLead = await app.inject({
+      method: "PUT",
+      url: `/api/sessions/${leadId}/favorite`,
+      payload: { favorite: true },
+    });
+    const favoriteWorker = await app.inject({
+      method: "PUT",
+      url: `/api/sessions/${worker.id}/favorite`,
+      payload: { favorite: true },
+    });
+
+    expect(favoriteLead.statusCode).toBe(200);
+    expect(favoriteWorker.statusCode).toBe(200);
+    expect(store.getSession(leadId)?.favorite).toBe(true);
+    expect(store.getSession(worker.id)?.favorite).toBe(true);
+  });
+
   it("resumes after reconnect inventory clears stale persisted Stop intents", async () => {
     const { app, store, service, leadId, run, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
@@ -295,6 +389,83 @@ describe("orchestrator lifecycle routes", () => {
     expect(restored.statusCode).toBe(200);
     expect(store.getSession(leadId)?.dismissed).toBe(false);
     expect(store.getRun(run.id)?.state).toBe("cancelled");
+  });
+
+  it("bulk cleans up selected stopped orchestrators without deleting history", async () => {
+    const { app, store, service, leadId, run, worker } = await setup();
+    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    service.handleEvent({
+      eventId: "worker-stopped-for-cleanup",
+      sessionId: worker.id,
+      sequence: 2,
+      type: "state",
+      payload: { state: "stopped", activity: "Stopped" },
+      createdAt: new Date().toISOString(),
+    });
+    service.handleEvent({
+      eventId: "lead-stopped-for-cleanup",
+      sessionId: leadId,
+      sequence: 2,
+      type: "state",
+      payload: { state: "stopped", activity: "Stopped" },
+      createdAt: new Date().toISOString(),
+    });
+
+    const cleaned = await app.inject({
+      method: "POST",
+      url: "/api/orchestrators/cleanup",
+      payload: { sessionIds: [leadId] },
+    });
+
+    expect(cleaned.statusCode).toBe(200);
+    expect(cleaned.json()).toMatchObject({ ok: true, cleaned: 1 });
+    expect(store.getSession(leadId)?.dismissed).toBe(true);
+    expect(store.getRun(run.id)?.state).toBe("cancelled");
+    expect(store.listRunSteps(run.id)).toHaveLength(3);
+  });
+
+  it("refuses a bulk cleanup if any selected orchestrator still has live work", async () => {
+    const { app, store, leadId } = await setup();
+    store.transitionSession(leadId, "stopped");
+
+    const cleaned = await app.inject({
+      method: "POST",
+      url: "/api/orchestrators/cleanup",
+      payload: { sessionIds: [leadId] },
+    });
+
+    expect(cleaned.statusCode).toBe(409);
+    expect(store.getSession(leadId)?.dismissed).toBe(false);
+  });
+
+  it("validates every selected orchestrator before cleaning up any of them", async () => {
+    const { app, store, service, leadId, worker } = await setup();
+    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    service.handleEvent({
+      eventId: "worker-stopped-before-validation",
+      sessionId: worker.id,
+      sequence: 2,
+      type: "state",
+      payload: { state: "stopped", activity: "Stopped" },
+      createdAt: new Date().toISOString(),
+    });
+    service.handleEvent({
+      eventId: "lead-stopped-before-validation",
+      sessionId: leadId,
+      sequence: 2,
+      type: "state",
+      payload: { state: "stopped", activity: "Stopped" },
+      createdAt: new Date().toISOString(),
+    });
+
+    const cleaned = await app.inject({
+      method: "POST",
+      url: "/api/orchestrators/cleanup",
+      payload: { sessionIds: [leadId, "missing-orchestrator"] },
+    });
+
+    expect(cleaned.statusCode).toBe(409);
+    expect(store.getSession(leadId)?.dismissed).toBe(false);
   });
 
   it("finishes run reopening after a restart interrupted lead resume", async () => {

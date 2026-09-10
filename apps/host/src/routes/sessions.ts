@@ -10,12 +10,15 @@ import {
   ReorderSessionsSchema,
   SESSION_NAME_MAX_LENGTH,
   SetSessionConfigSchema,
+  SetSessionFavoriteSchema,
+  StopSessionsSchema,
   base64Bytes,
   errorMessage,
   terminalSessionStates,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { conversationTitle, isUnnamed } from "../orchestrator/conversation-title.js";
+import { stopSessions } from "../orchestrator/lifecycle.js";
 import { configUnsupportedReason } from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
@@ -101,6 +104,27 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     return { ok: true };
   });
 
+  /**
+   * Stops the selected non-orchestrator agents.
+   *
+   * Leads are deliberately excluded: a bulk agent action should not also end
+   * the conversations coordinating them.
+   */
+  app.post("/api/sessions/stop", async (_request, reply) => {
+    const input = StopSessionsSchema.parse(_request.body);
+    const requestedIds = new Set(input.sessionIds);
+    const selected = store
+      .listSessions()
+      .filter((session) => requestedIds.has(session.id));
+    if (selected.some((session) => session.runRole === "lead")) {
+      return reply
+        .code(400)
+        .send({ error: "Orchestrator conversations cannot be bulk stopped as agents" });
+    }
+    const result = stopSessions(service, selected);
+    return reply.code(result.requested > 0 ? 202 : 200).send({ ok: true, ...result });
+  });
+
   app.get("/api/sessions/:id/events", async (request, reply) => {
     const { id } = request.params as { id: string };
     if (!store.getSession(id)) {
@@ -118,6 +142,17 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const input = RenameSessionSchema.parse(request.body);
     const session = store.renameSession(id, input.name);
     if (!session) return reply.code(404).send({ error: "Session not found" });
+    service.publishSession(session);
+    return session;
+  });
+
+  app.put("/api/sessions/:id/favorite", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = SetSessionFavoriteSchema.parse(request.body);
+    if (!store.getSession(id)) {
+      return reply.code(404).send({ error: "Session not found" });
+    }
+    const session = store.setSessionFavorite(id, input.favorite);
     service.publishSession(session);
     return session;
   });

@@ -27,8 +27,11 @@ import {
   Flow16Regular,
   Flow20Regular,
   Folder20Regular,
+  MoreHorizontal20Regular,
   Server20Regular,
   Settings20Regular,
+  Star20Filled,
+  Stop20Regular,
 } from "@fluentui/react-icons";
 import type {
   FleetNode,
@@ -312,6 +315,47 @@ const useStyles = makeStyles({
     "> svg": { flexShrink: 0 },
     ":hover": { background: tokens.colorNeutralBackground1Hover },
   },
+  favoriteHeader: {
+    display: "flex",
+    alignItems: "center",
+  },
+  favoriteManage: {
+    flexShrink: 0,
+    display: "grid",
+    placeItems: "center",
+    width: "30px",
+    height: "30px",
+    padding: 0,
+    ...shorthands.borderStyle("none"),
+    borderRadius: tokens.borderRadiusMedium,
+    background: "transparent",
+    color: tokens.colorNeutralForeground3,
+    cursor: "pointer",
+    ":hover": { background: tokens.colorNeutralBackground1Hover },
+  },
+  favoriteEntry: {
+    display: "flex",
+    alignItems: "center",
+    minWidth: 0,
+    padding: "1px 4px 1px 28px",
+  },
+  favoriteLink: {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    flexGrow: 1,
+    minWidth: 0,
+    minHeight: "32px",
+    padding: "0 6px",
+    ...shorthands.borderStyle("none"),
+    borderRadius: tokens.borderRadiusMedium,
+    background: "transparent",
+    color: tokens.colorNeutralForeground2,
+    font: "inherit",
+    textAlign: "left",
+    cursor: "pointer",
+    ":hover": { background: tokens.colorNeutralBackground1Hover },
+  },
 });
 
 type SidebarProps = {
@@ -322,6 +366,9 @@ type SidebarProps = {
   selectedSessionId: string | undefined;
   view: AppView;
   endedCount: number;
+  /** Live non-lead sessions that the fleet-wide bulk Stop would affect. */
+  liveAgentCount: number;
+  cleanupOrchestratorCount: number;
   /** Live work across the fleet, shown beside the Orchestrator row. */
   liveWorkCount: number;
   /** Tasks waiting on a person; drawn separately because amber means act. */
@@ -335,6 +382,7 @@ type SidebarProps = {
    */
   leadSessions: readonly FleetSession[];
   dismissedLeadSessions?: readonly FleetSession[];
+  favoriteSessions: readonly FleetSession[];
   waitingPermissions: readonly SessionEvent[];
   onSelectSession: (sessionId: string) => void;
   onSelectLeadSession: (sessionId: string) => void;
@@ -343,6 +391,9 @@ type SidebarProps = {
   onNewConversation: () => void;
   onNewSession: () => void;
   onSelectView: (view: Exclude<AppView, "session" | "overview">) => void;
+  onStopAllAgents: () => void;
+  onCleanupOrchestrators: () => void;
+  onManageFavorites: () => void;
   onClearEnded: () => void;
 };
 
@@ -354,10 +405,13 @@ export const Sidebar = ({
   selectedSessionId,
   view,
   endedCount,
+  liveAgentCount,
+  cleanupOrchestratorCount,
   liveWorkCount,
   attentionCount,
   leadSessions,
   dismissedLeadSessions = [],
+  favoriteSessions,
   waitingPermissions,
   onSelectSession,
   onSelectLeadSession,
@@ -365,6 +419,9 @@ export const Sidebar = ({
   onNewConversation,
   onNewSession,
   onSelectView,
+  onStopAllAgents,
+  onCleanupOrchestrators,
+  onManageFavorites,
   onClearEnded,
 }: SidebarProps) => {
   const styles = useStyles();
@@ -376,6 +433,7 @@ export const Sidebar = ({
    * one conversation never has to open anything.
    */
   const [conversationsClosed, setConversationsClosed] = useState(false);
+  const [favoritesClosed, setFavoritesClosed] = useState(false);
   const [dismissedClosed, setDismissedClosed] = useState(true);
   const [dropTarget, setDropTarget] = useState<{ key: string; edge: DropEdge }>();
   const { updatePlacement, reorderPlacements, reorderWorkspaces, reorderSessions } =
@@ -445,6 +503,61 @@ export const Sidebar = ({
         <Text as="span" className={styles.sectionLabel}>
           Fleet
         </Text>
+        <div className={styles.favoriteHeader}>
+          <button
+            type="button"
+            className={mergeClasses(styles.sectionLabel, styles.sectionDisclosure)}
+            aria-expanded={!favoritesClosed}
+            aria-label={favoritesClosed ? "Show favorites" : "Hide favorites"}
+            onClick={() => setFavoritesClosed((closed) => !closed)}
+          >
+            {favoritesClosed ? (
+              <ChevronRight20Regular aria-hidden="true" />
+            ) : (
+              <ChevronDown20Regular aria-hidden="true" />
+            )}
+            <Star20Filled aria-hidden="true" />
+            <span>Favorites</span>
+          </button>
+          <button
+            type="button"
+            className={styles.favoriteManage}
+            aria-label="Manage favorites"
+            title="Manage favorites"
+            onClick={onManageFavorites}
+          >
+            <MoreHorizontal20Regular aria-hidden="true" />
+          </button>
+        </div>
+        {!favoritesClosed &&
+          (favoriteSessions.length > 0 ? (
+            favoriteSessions.map((favorite) => {
+              const lead = favorite.runRole === "lead";
+              return (
+                <div className={styles.favoriteEntry} key={`favorite:${favorite.id}`}>
+                  <button
+                    type="button"
+                    className={styles.favoriteLink}
+                    title={sessionLabel(favorite)}
+                    onClick={() =>
+                      lead
+                        ? onSelectLeadSession(favorite.id)
+                        : onSelectSession(favorite.id)
+                    }
+                  >
+                    {lead ? (
+                      <Chat20Regular aria-hidden="true" />
+                    ) : (
+                      <StatusDot state={favorite.state} color={sessionAccent(favorite)} />
+                    )}
+                    <span className={styles.sessionName}>{sessionLabel(favorite)}</span>
+                  </button>
+                </div>
+              );
+            })
+          ) : (
+            <p className={styles.empty}>No favorites yet.</p>
+          ))}
         {/*
           The orchestrator sits above the workspaces rather than inside one.
           It is the fleet-wide surface — the session you brief, and the work it
@@ -902,6 +1015,28 @@ export const Sidebar = ({
         <Button appearance="primary" icon={<Add20Regular />} onClick={onNewSession}>
           New session
         </Button>
+        {liveAgentCount > 0 && (
+          <Button
+            appearance="subtle"
+            className={styles.navButton}
+            icon={<Stop20Regular />}
+            onClick={onStopAllAgents}
+            title="Choose agents to stop across all workspaces"
+          >
+            Stop agents ({liveAgentCount})
+          </Button>
+        )}
+        {cleanupOrchestratorCount > 0 && (
+          <Button
+            appearance="subtle"
+            className={styles.navButton}
+            icon={<Delete20Regular />}
+            onClick={onCleanupOrchestrators}
+            title="Move selected stopped orchestrators to Dismissed"
+          >
+            Clean up orchestrators ({cleanupOrchestratorCount})
+          </Button>
+        )}
         {endedCount > 0 && (
           <Button
             appearance="subtle"

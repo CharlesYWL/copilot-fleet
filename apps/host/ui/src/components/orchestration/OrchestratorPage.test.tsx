@@ -124,6 +124,8 @@ const page = (
       onOpenWorker={vi.fn()}
       onOpenLead={vi.fn()}
       onNewRun={vi.fn()}
+      activeAgentCount={0}
+      onStopAgents={vi.fn()}
       onStopOrchestrator={vi.fn()}
       onResumeOrchestrator={vi.fn()}
       onDismissOrchestrator={vi.fn()}
@@ -257,6 +259,8 @@ describe("orchestrator views", () => {
         onOpenWorker={vi.fn()}
         onOpenLead={vi.fn()}
         onNewRun={onNewRun}
+        activeAgentCount={0}
+        onStopAgents={vi.fn()}
         onStopOrchestrator={vi.fn()}
         onResumeOrchestrator={vi.fn()}
         onDismissOrchestrator={vi.fn()}
@@ -286,6 +290,18 @@ describe("orchestrator views", () => {
 
     expect(onResumeOrchestrator).toHaveBeenCalled();
     expect(onDismissOrchestrator).toHaveBeenCalled();
+  });
+
+  it("stops every agent owned by this orchestrator from one action", () => {
+    const onStopAgents = vi.fn();
+    page("stage", vi.fn(), models([run()]), {
+      activeAgentCount: 4,
+      onStopAgents,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop agents (4)" }));
+
+    expect(onStopAgents).toHaveBeenCalledOnce();
   });
 
   it("offers explicit recovery when an unavailable node cannot acknowledge Stop", () => {
