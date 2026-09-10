@@ -351,6 +351,8 @@ export const SessionSchema = z.object({
    * transcript, runs, and late events and can be restored independently.
    */
   dismissed: z.boolean().optional(),
+  /** Pinned by the operator for quick access in the navigation. */
+  favorite: z.boolean().optional(),
   /**
    * Whether this session was dispatched to read rather than to change things.
    *
@@ -2005,6 +2007,10 @@ export const ReorderSessionsSchema = z.object({
   sessionIds: z.array(z.string().min(1)).max(2000),
 });
 
+export const StopSessionsSchema = z.object({
+  sessionIds: z.array(z.string().min(1)).min(1).max(2000),
+});
+
 export const ReorderWorkspacesSchema = z.object({
   workspaceIds: z.array(z.string().min(1)).max(500),
 });
@@ -2025,6 +2031,10 @@ export const CreateSessionSchema = z.object({
 /** Empty clears the name, so the label falls back to the initial prompt. */
 export const RenameSessionSchema = z.object({
   name: z.string().max(SESSION_NAME_MAX_LENGTH),
+});
+
+export const SetSessionFavoriteSchema = z.object({
+  favorite: z.boolean(),
 });
 
 export const UpdateDefaultsSchema = z.object({

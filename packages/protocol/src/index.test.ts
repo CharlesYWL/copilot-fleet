@@ -21,6 +21,7 @@ import {
   SessionSchema,
   SetSessionConfigSchema,
   SnapshotSchema,
+  StopSessionsSchema,
   UpdateNotificationSchema,
   UpdateDefaultsSchema,
   backupKind,
@@ -288,11 +289,20 @@ describe("protocol validation", () => {
       updatedAt: "2026-08-08T09:00:00.000Z",
     });
     expect(session.name).toBe("");
+    expect(session.favorite).toBeUndefined();
   });
 
   it("accepts a rename that clears the name", () => {
     expect(RenameSessionSchema.parse({ name: "" }).name).toBe("");
     expect(() => RenameSessionSchema.parse({ name: "x".repeat(121) })).toThrow();
+  });
+
+  it("requires at least one session for a bulk Stop", () => {
+    expect(StopSessionsSchema.parse({ sessionIds: ["s1", "s2"] }).sessionIds).toEqual([
+      "s1",
+      "s2",
+    ]);
+    expect(() => StopSessionsSchema.parse({ sessionIds: [] })).toThrow();
   });
 
   it("carries a new Host address to the node", () => {

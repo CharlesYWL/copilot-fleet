@@ -65,6 +65,8 @@ export type OrchestratorPageProps = {
   onOpenWorker: (sessionId: string) => void;
   onOpenLead: () => void;
   onNewRun: () => void;
+  activeAgentCount: number;
+  onStopAgents: () => void;
   onStopOrchestrator: () => void;
   onResumeOrchestrator: () => void;
   onDismissOrchestrator: () => void;
@@ -88,6 +90,8 @@ export const OrchestratorPage = ({
   onOpenWorker,
   onOpenLead,
   onNewRun,
+  activeAgentCount,
+  onStopAgents,
   onStopOrchestrator,
   onResumeOrchestrator,
   onDismissOrchestrator,
@@ -150,6 +154,16 @@ export const OrchestratorPage = ({
       )}
 
       <div className={styles.footer}>
+        {activeAgentCount > 0 && (
+          <Button
+            size="small"
+            appearance="subtle"
+            onClick={onStopAgents}
+            title="Stop every worker and reviewer owned by this orchestrator"
+          >
+            Stop agents ({activeAgentCount})
+          </Button>
+        )}
         {ended && !stopping && !hasActiveWork ? (
           <>
             {resumable && (

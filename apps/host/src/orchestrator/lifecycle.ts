@@ -2,6 +2,7 @@ import {
   ORCHESTRATOR_STOP_REASON,
   terminalRunStates,
   terminalSessionStates,
+  type FleetSession,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 
@@ -18,17 +19,53 @@ import type { FleetService } from "../fleet-service.js";
  * both of those stay with the caller. What is here is the mechanics.
  */
 
-/** Stops every session a run still holds. Idempotent, so cancel-then-delete is safe. */
-export function stopRunSessions(service: FleetService, runId: string): void {
-  for (const session of service.store.listSessions()) {
-    if (session.runId !== runId) continue;
-    if (terminalSessionStates.has(session.state)) continue;
-    if (session.stopRequested) continue;
+export type StopSessionsResult = {
+  matched: number;
+  requested: number;
+  alreadyStopping: number;
+  alreadyTerminal: number;
+};
+
+/**
+ * Requests Stop for a known set of sessions.
+ *
+ * Shared by one-task cleanup and the two bulk controls so every entry point has
+ * the same idempotency and publishes the same durable Stop intent.
+ */
+export function stopSessions(
+  service: FleetService,
+  sessions: readonly FleetSession[],
+): StopSessionsResult {
+  const result: StopSessionsResult = {
+    matched: sessions.length,
+    requested: 0,
+    alreadyStopping: 0,
+    alreadyTerminal: 0,
+  };
+  for (const session of sessions) {
+    if (terminalSessionStates.has(session.state)) {
+      result.alreadyTerminal += 1;
+      continue;
+    }
+    if (session.stopRequested) {
+      result.alreadyStopping += 1;
+      continue;
+    }
     service.publishSession(
       service.store.setSessionControls(session.id, { stopRequested: true }),
     );
     service.dispatch(session.nodeId, { type: "stop", sessionId: session.id });
+    result.requested += 1;
   }
+  return result;
+}
+
+/** Stops every session a run still holds. Idempotent, so cancel-then-delete is safe. */
+export function stopRunSessions(service: FleetService, runId: string): void {
+  stopSessions(
+    service,
+    service.store.listSessions().filter((session) => session.runId === runId),
+  );
 }
 
 /**

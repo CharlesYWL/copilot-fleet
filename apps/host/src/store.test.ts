@@ -1656,6 +1656,7 @@ describe("Host backup", () => {
       createdAt: new Date().toISOString(),
     });
     store.setSessionControls(live.id, { stopRequested: true });
+    store.setSessionFavorite(live.id, true);
     const stopped = store.createSession(placement, "already done");
     store.transitionSession(stopped.id, "stopped", "done");
     store.setSessionControls(stopped.id, { dismissed: true });
@@ -1696,6 +1697,7 @@ describe("Host backup", () => {
     expect(importedLive.name).toBe("alpha");
     expect(importedLive.yolo).toBe(true);
     expect(importedLive.stopRequested).toBe(true);
+    expect(importedLive.favorite).toBe(true);
     expect(restored.listEvents(live.id)).toHaveLength(2);
     expect(restored.getSession(stopped.id)).toMatchObject({
       state: "stopped",

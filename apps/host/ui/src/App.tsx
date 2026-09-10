@@ -16,6 +16,7 @@ import {
   terminalSessionStates,
   type FleetSession,
   type Notification,
+  type Run,
   type RunNote,
   type SessionEvent,
 } from "@fleet/protocol";
@@ -43,6 +44,9 @@ import {
   type SessionDraft,
 } from "./lib/session-drafts";
 import { EmptySessions } from "./components/EmptySessions";
+import { AgentBulkStopDialog } from "./components/AgentBulkStopDialog";
+import { ManageFavoritesDialog } from "./components/ManageFavoritesDialog";
+import { OrchestratorCleanupDialog } from "./components/OrchestratorCleanupDialog";
 import { NewSessionDialog } from "./components/NewSessionDialog";
 import { SessionFocusDialog } from "./components/SessionFocusDialog";
 import { SessionGrid } from "./components/SessionGrid";
@@ -254,6 +258,11 @@ export function App() {
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [orchestrationDialogOpen, setOrchestrationDialogOpen] = useState(false);
+  const [bulkStopScope, setBulkStopScope] = useState<
+    { kind: "all" } | { kind: "orchestrator"; sessionId: string }
+  >();
+  const [manageFavoritesOpen, setManageFavoritesOpen] = useState(false);
+  const [cleanupOrchestratorsOpen, setCleanupOrchestratorsOpen] = useState(false);
   const [attentionOnly, setAttentionOnly] = useState(false);
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   /** Narrow screens show the tree as a drawer; wide ones ignore this. */
@@ -310,6 +319,16 @@ export function App() {
   const liveSessions = useMemo(
     () =>
       snapshot.sessions.filter((session) => !terminalSessionStates.has(session.state)),
+    [snapshot.sessions],
+  );
+  const liveAgentCount = useMemo(
+    () =>
+      snapshot.sessions.filter(
+        (session) =>
+          session.runRole !== "lead" &&
+          !terminalSessionStates.has(session.state) &&
+          !session.stopRequested,
+      ).length,
     [snapshot.sessions],
   );
   // Only what Clear ended will actually remove: resumable sessions are kept, so
@@ -539,6 +558,26 @@ export function App() {
     () => orchestrators.filter((session) => !terminalSessionStates.has(session.state)),
     [orchestrators],
   );
+  const cleanupOrchestrators = useMemo(() => {
+    const runsByLead = new Map<string, Run[]>();
+    for (const run of snapshot.runs) {
+      runsByLead.set(run.leadSessionId, [
+        ...(runsByLead.get(run.leadSessionId) ?? []),
+        run,
+      ]);
+    }
+    return orchestrators.filter((lead) => {
+      if (!terminalSessionStates.has(lead.state) || lead.stopRequested) return false;
+      const runs = runsByLead.get(lead.id) ?? [];
+      if (runs.some((run) => !terminalRunStates.has(run.state))) return false;
+      const runIds = new Set(runs.map((run) => run.id));
+      return !snapshot.sessions.some(
+        (session) =>
+          runIds.has(session.runId) &&
+          (session.stopRequested || !terminalSessionStates.has(session.state)),
+      );
+    });
+  }, [orchestrators, snapshot.runs, snapshot.sessions]);
   const [openConversationId, setOpenConversationId] = useState<string>();
   const orchestrator = useMemo(
     () =>
@@ -601,6 +640,35 @@ export function App() {
       acknowledgedFailedSteps,
     ],
   );
+  const orchestratorAgentCount = useMemo(() => {
+    if (!orchestrator) return 0;
+    const ownedRunIds = new Set(
+      runModels
+        .filter((model) => model.run.leadSessionId === orchestrator.id)
+        .map((model) => model.run.id),
+    );
+    return snapshot.sessions.filter(
+      (session) =>
+        ownedRunIds.has(session.runId) &&
+        !terminalSessionStates.has(session.state) &&
+        !session.stopRequested,
+    ).length;
+  }, [orchestrator, runModels, snapshot.sessions]);
+  const bulkStopAgents = useMemo(() => {
+    const stoppable = snapshot.sessions.filter(
+      (session) =>
+        session.runRole !== "lead" &&
+        !terminalSessionStates.has(session.state) &&
+        !session.stopRequested,
+    );
+    if (!bulkStopScope || bulkStopScope.kind === "all") return stoppable;
+    const ownedRunIds = new Set(
+      runModels
+        .filter((model) => model.run.leadSessionId === bulkStopScope.sessionId)
+        .map((model) => model.run.id),
+    );
+    return stoppable.filter((session) => ownedRunIds.has(session.runId));
+  }, [bulkStopScope, runModels, snapshot.sessions]);
   const orchestratorSummary = useMemo(() => summarise(runModels), [runModels]);
   /**
    * One number for "waiting on you", counting each thing once.
@@ -808,6 +876,56 @@ export function App() {
     return true;
   };
 
+  const handleStopSelectedAgents = async (sessionIds: string[]) => {
+    if (!bulkStopScope) return false;
+    const url =
+      bulkStopScope.kind === "all"
+        ? "/api/sessions/stop"
+        : `/api/orchestrators/${bulkStopScope.sessionId}/agents/stop`;
+    const stopped = await request(url, {
+      method: "POST",
+      body: JSON.stringify({ sessionIds }),
+    });
+    if (!stopped.ok) return false;
+    await refresh();
+    return true;
+  };
+
+  const handleSaveFavorites = async (sessionIds: string[]) => {
+    const selected = new Set(sessionIds);
+    const changed = snapshot.sessions.filter(
+      (session) => Boolean(session.favorite) !== selected.has(session.id),
+    );
+    const updates = await Promise.all(
+      changed.map((session) =>
+        request(`/api/sessions/${session.id}/favorite`, {
+          method: "PUT",
+          body: JSON.stringify({ favorite: selected.has(session.id) }),
+        }),
+      ),
+    );
+    if (updates.some((result) => !result.ok)) return false;
+    await refresh();
+    return true;
+  };
+
+  const handleCleanupOrchestrators = async (sessionIds: string[]) => {
+    const cleaned = await request("/api/orchestrators/cleanup", {
+      method: "POST",
+      body: JSON.stringify({ sessionIds }),
+    });
+    if (!cleaned.ok) return false;
+    if (selectedSessionId && sessionIds.includes(selectedSessionId)) {
+      setSelectedSessionId(undefined);
+      setFocusOpen(false);
+    }
+    setOpenConversationId((current) =>
+      current && sessionIds.includes(current) ? undefined : current,
+    );
+    await refresh();
+    return true;
+  };
+
   const handleDismissOrchestrator = async (sessionId: string) => {
     const dismissed = await request(`/api/orchestrators/${sessionId}`, {
       method: "DELETE",
@@ -996,6 +1114,8 @@ export function App() {
                   selectedSessionId={selectedSessionId}
                   view={view}
                   endedCount={endedCount}
+                  liveAgentCount={liveAgentCount}
+                  cleanupOrchestratorCount={cleanupOrchestrators.length}
                   liveWorkCount={
                     // What is happening plus what is waiting on the person: both
                     // are reasons to look, and a task handed over is the more
@@ -1006,6 +1126,12 @@ export function App() {
                   attentionCount={orchestratorSummary.needsYou}
                   leadSessions={orchestrators}
                   dismissedLeadSessions={dismissedOrchestrators}
+                  favoriteSessions={snapshot.sessions.filter(
+                    (session) =>
+                      session.favorite &&
+                      !session.dismissed &&
+                      (session.runRole === "" || session.runRole === "lead"),
+                  )}
                   waitingPermissions={waitingPermissions}
                   onSelectSession={handleSelectSession}
                   onSelectLeadSession={(sessionId) => {
@@ -1027,6 +1153,9 @@ export function App() {
                     setView(next);
                     setNavOpen(false);
                   }}
+                  onStopAllAgents={() => setBulkStopScope({ kind: "all" })}
+                  onCleanupOrchestrators={() => setCleanupOrchestratorsOpen(true)}
+                  onManageFavorites={() => setManageFavoritesOpen(true)}
                   onClearEnded={() => void handleClearEnded()}
                 />
               </div>
@@ -1047,6 +1176,13 @@ export function App() {
                       handleSelectSession(sessionId, { kind: "orchestrator" })
                     }
                     onNewRun={() => setOrchestrationDialogOpen(true)}
+                    activeAgentCount={orchestratorAgentCount}
+                    onStopAgents={() =>
+                      setBulkStopScope({
+                        kind: "orchestrator",
+                        sessionId: orchestrator.id,
+                      })
+                    }
                     onStopOrchestrator={() =>
                       void handleStopOrchestrator(orchestrator.id)
                     }
@@ -1108,6 +1244,29 @@ export function App() {
                   }
                 />
               )}
+              <AgentBulkStopDialog
+                open={Boolean(bulkStopScope)}
+                title={
+                  bulkStopScope?.kind === "orchestrator"
+                    ? "Stop orchestrator agents"
+                    : "Stop agents"
+                }
+                agents={bulkStopAgents}
+                onClose={() => setBulkStopScope(undefined)}
+                onStop={handleStopSelectedAgents}
+              />
+              <ManageFavoritesDialog
+                open={manageFavoritesOpen}
+                sessions={snapshot.sessions.filter((session) => !session.dismissed)}
+                onClose={() => setManageFavoritesOpen(false)}
+                onSave={handleSaveFavorites}
+              />
+              <OrchestratorCleanupDialog
+                open={cleanupOrchestratorsOpen}
+                orchestrators={cleanupOrchestrators}
+                onClose={() => setCleanupOrchestratorsOpen(false)}
+                onCleanup={handleCleanupOrchestrators}
+              />
 
               {view === "session" &&
                 (activeSession ? (

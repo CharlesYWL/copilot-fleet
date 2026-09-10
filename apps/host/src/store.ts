@@ -663,6 +663,7 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "read_only", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "stop_requested", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "dismissed", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("sessions", "favorite", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing(
       "sessions",
       "last_lead_prompt_at",
@@ -1391,8 +1392,8 @@ export class FleetStore {
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
-            stop_requested,dismissed)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            stop_requested,dismissed,favorite)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -1415,6 +1416,7 @@ export class FleetStore {
         JSON.stringify(session.additionalDirectories ?? []),
         session.stopRequested ? 1 : 0,
         session.dismissed ? 1 : 0,
+        session.favorite ? 1 : 0,
       );
     }
     for (const event of parsed.events) {
@@ -4121,6 +4123,16 @@ export class FleetStore {
     return this.getSession(id)!;
   }
 
+  setSessionFavorite(id: string, favorite: boolean): FleetSession {
+    if (!this.getSession(id)) throw new Error("Session not found");
+    this.statement("UPDATE sessions SET favorite=?,updated_at=? WHERE id=?").run(
+      favorite ? 1 : 0,
+      new Date().toISOString(),
+      id,
+    );
+    return this.getSession(id)!;
+  }
+
   /** Soft disconnect: sessions stay recoverable if the Node still has them. */
   markNodeSessionsOffline(nodeId: string, activity: string): FleetSession[] {
     const ids = this.sessionIdsWhere(
@@ -4496,6 +4508,7 @@ function sessionFromRow(row: Row): FleetSession {
     runRole: String(row.run_role ?? ""),
     stopRequested: Boolean(row.stop_requested),
     dismissed: Boolean(row.dismissed),
+    favorite: Boolean(row.favorite),
     readOnly: Boolean(row.read_only),
   });
 }

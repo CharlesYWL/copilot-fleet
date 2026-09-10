@@ -88,15 +88,21 @@ const tree = (
         selectedSessionId={undefined}
         view="session"
         endedCount={0}
+        liveAgentCount={0}
+        cleanupOrchestratorCount={0}
         liveWorkCount={0}
         attentionCount={0}
         leadSessions={[]}
+        favoriteSessions={[]}
         waitingPermissions={[]}
         onSelectSession={vi.fn()}
         onSelectLeadSession={vi.fn()}
         onNewConversation={vi.fn()}
         onNewSession={vi.fn()}
         onSelectView={vi.fn()}
+        onStopAllAgents={vi.fn()}
+        onCleanupOrchestrators={vi.fn()}
+        onManageFavorites={vi.fn()}
         onClearEnded={vi.fn()}
         {...overrides}
       />
@@ -219,6 +225,98 @@ describe("Sidebar folding", () => {
   });
 });
 
+describe("Sidebar bulk Stop", () => {
+  it("opens agent selection from one fleet-wide action", () => {
+    const onStopAllAgents = vi.fn();
+    show([placement], [session("s1", "w1", "n1")], {
+      liveAgentCount: 3,
+      onStopAllAgents,
+    });
+
+    describe("Sidebar orchestration cleanup", () => {
+      it("opens bulk cleanup when stopped orchestrators are eligible", () => {
+        const onCleanupOrchestrators = vi.fn();
+        show([placement], [], {
+          cleanupOrchestratorCount: 2,
+          onCleanupOrchestrators,
+        });
+
+        fireEvent.click(
+          screen.getByRole("button", { name: "Clean up orchestrators (2)" }),
+        );
+
+        expect(onCleanupOrchestrators).toHaveBeenCalledOnce();
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop agents (3)" }));
+
+    expect(onStopAllAgents).toHaveBeenCalledOnce();
+  });
+});
+
+describe("Sidebar favorites", () => {
+  it("opens favorited agents from a compact dedicated section", () => {
+    const onSelectSession = vi.fn();
+    const favorite = { ...session("fav", "w1", "n1"), favorite: true };
+    show([placement], [favorite], {
+      favoriteSessions: [favorite],
+      onSelectSession,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "fav" }));
+
+    expect(onSelectSession).toHaveBeenCalledWith("fav");
+  });
+
+  it("manages favorites from one section action instead of every row", () => {
+    const onManageFavorites = vi.fn();
+    const lead: FleetSession = {
+      ...session("lead", "w1", "n1"),
+      runRole: "lead",
+    };
+    show([placement], [], {
+      leadSessions: [lead],
+      onManageFavorites,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Manage favorites" }));
+
+    expect(onManageFavorites).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("button", { name: /Add lead to favorites/ })).toBeNull();
+  });
+
+  it("opens a favorited orchestrator from the Favorites section", () => {
+    const onSelectLeadSession = vi.fn();
+    const lead: FleetSession = {
+      ...session("lead", "w1", "n1"),
+      name: "Release coordinator",
+      runRole: "lead",
+      favorite: true,
+    };
+    show([placement], [], {
+      leadSessions: [lead],
+      favoriteSessions: [lead],
+      onSelectLeadSession,
+    });
+
+    fireEvent.click(screen.getAllByTitle("Release coordinator")[0]!);
+
+    expect(onSelectLeadSession).toHaveBeenCalledWith("lead");
+  });
+
+  it("collapses favorites without affecting the rest of the navigation", () => {
+    const favorite = { ...session("fav", "w1", "n1"), favorite: true };
+    show([placement], [favorite], { favoriteSessions: [favorite] });
+
+    fireEvent.click(screen.getByRole("button", { name: "Hide favorites" }));
+
+    expect(screen.queryByRole("button", { name: "fav" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Show favorites" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Manage favorites" })).toBeTruthy();
+  });
+});
+
 describe("Sidebar orchestrator row", () => {
   const lead = (
     id = "lead1",
@@ -268,7 +366,7 @@ describe("Sidebar orchestrator row", () => {
       onSelectLeadSession,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: /Audit the auth/ }));
+    fireEvent.click(screen.getByTitle("Audit the auth"));
 
     expect(onSelectLeadSession).toHaveBeenCalledWith("lead2");
   });
@@ -295,7 +393,7 @@ describe("Sidebar orchestrator row", () => {
       ],
     });
 
-    expect(screen.getByRole("button", { name: /Rate limiting/ })).toBeTruthy();
+    expect(screen.getByTitle("Rate limiting")).toBeTruthy();
   });
 
   it("keeps a long conversation name on one line", () => {
@@ -332,17 +430,17 @@ describe("Sidebar orchestrator row", () => {
     });
 
     expect(screen.getByRole("button", { name: "Orchestrator" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: /Rate limiting/ })).toBeTruthy();
+    expect(screen.getByTitle("Rate limiting")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Hide conversations" }));
 
-    expect(screen.queryByRole("button", { name: /Rate limiting/ })).toBeNull();
+    expect(screen.queryByTitle("Rate limiting")).toBeNull();
     expect(screen.queryByRole("button", { name: /New conversation/ })).toBeNull();
     // The board is still one click away with the list folded.
     expect(screen.getByRole("button", { name: "Orchestrator" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Show conversations" }));
-    expect(screen.getByRole("button", { name: /Rate limiting/ })).toBeTruthy();
+    expect(screen.getByTitle("Rate limiting")).toBeTruthy();
   });
 
   it("offers nothing to fold when there are no conversations", () => {
