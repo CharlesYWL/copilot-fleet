@@ -97,6 +97,8 @@ function mechanics(): string[] {
   return [
     "## The loop",
     "",
+    "For follow-up requests, discover before dispatching: call `fleet_list_work` with a short query such as the PR number, then `fleet_get_task` with the returned stable task ID. Discovery includes closed tasks but only those owned by this orchestrator. An exact-name lookup miss does not prove that a task or conversation was deleted; it may have another name or belong to another orchestrator. Never create replacement work solely because a remembered title was not found.",
+    "",
     "A request from the human becomes a **task**. `fleet_plan_task` opens one: you name the phases it will go through and the success criteria that decide when it is done. Choose the fewest phases and workers justified by complexity, uncertainty and risk, not a fixed inspect -> implement -> review pipeline. Only name a phase you will actually dispatch work for.",
     "",
     "From then on the task is yours to move, not the human's:",
@@ -107,6 +109,7 @@ function mechanics(): string[] {
     "4. When the last phase is done, `fleet_submit_task` hands the result to the human, who approves it or sends it back with a note.",
     "",
     "`fleet_transcript` gets a worker's full output when the wake summary is not enough to judge by.",
+    "`fleet_get_task` reads its objective, criteria, notes, worker context and continuation actions. Use task IDs as `task` in later calls: display names can change or be ambiguous.",
     "",
     "## How a task ends",
     "",
@@ -131,6 +134,8 @@ function mechanics(): string[] {
     "`fleet_start_work` takes no free-text prompt. It asks for the **deliverable** that must come back, the **scope** to work in, how to **verify** it, and any **context** the worker cannot discover — and the Host writes the brief from those. A dispatch with no way to check it is refused before a machine is spent on it.",
     "",
     "`fleet_follow_up` gives an existing worker another turn. Workers stay open and idle after settling, so a normal revisit continues immediately in the same live session. Archiving stops them but keeps their conversations: after `fleet_reopen_task`, use `fleet_follow_up` to resume a prior worker when the role still matches. Deleting the task removes them. Use the session id in the wake or `fleet_list_work` when sending another round of feedback back to the same worker. Use `fleet_start_work` for a genuinely different deliverable or independent judgement; routine inspection and verification belong with implementation, not automatically in separate sessions.",
+    "",
+    "Read the reported next action. `follow_up` or `resume` uses `fleet_follow_up`; `reopen_task` needs reopening first; `queued` and `in_flight` already have accepted work. A busy worker, Stop acknowledgement, offline Node or full capacity is a wait, not a reason to start a replacement. An accepted queued follow-up is persisted: do not resend it or overwrite it with a different prompt. Only a confirmed non-resumable conversation calls for replacement, with the old task context repeated explicitly.",
     "",
     "The worker cannot see this conversation, the human's messages, or other workers' output. Anything decided elsewhere has to be repeated in `context` or it does not exist as far as the worker is concerned.",
     "",
@@ -256,7 +261,7 @@ export function wakeEnvelope(input: {
   const lines = [
     // The task is named because an orchestrator running several at once has no
     // other way to tell which one this result belongs to.
-    `<fleet-wake task=${JSON.stringify(input.task ?? input.runId)}${phase} wakes=${input.wakes}/${input.maxWakes}>`,
+    `<fleet-wake task=${JSON.stringify(input.task ?? input.runId)} taskId=${JSON.stringify(input.runId)}${phase} wakes=${input.wakes}/${input.maxWakes}>`,
     "Just finished:",
   ];
   for (const step of input.settled) {
@@ -292,11 +297,14 @@ function nextMove(input: {
     return ["Other work is still out. If this changes nothing, say so briefly and stop."];
   }
   if (!input.phase) {
-    return ["Nothing else is running. Dispatch the next step, or report and stop."];
+    return [
+      "Nothing else is running. Use fleet_follow_up for the same deliverable, dispatch distinct work, or report and stop.",
+    ];
   }
   return [
     `Nothing else is running in "${input.phase}". Judge what came back — read the`,
     "transcript if the summary is not enough to tell.",
+    "If the same worker needs another revision, use fleet_follow_up with its session ID rather than starting a new session.",
     input.isLastPhase
       ? "If the phase is done, call fleet_submit_task to hand the task to the person. If not, dispatch what is missing."
       : "If the phase is done, call fleet_advance_task. If not, dispatch what is missing.",

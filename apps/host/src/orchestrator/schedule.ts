@@ -145,7 +145,13 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       const acknowledged =
         pending &&
         (step.attempts > 1
-          ? pending.state === "running"
+          ? pending.state === "running" ||
+            terminalSessionStates.has(pending.state) ||
+            // A fast retry may finish between ticks (or during a Host restart).
+            // Only a dispatched prompt's current-attempt receipt proves it ran.
+            (Boolean(step.dispatchedAt) &&
+              pending.state === "idle" &&
+              input.turnCompleteSessionIds.has(pending.id))
           : pending.state !== "queued" && pending.state !== "offline");
       if (acknowledged) {
         settled.set(step.id, "running");
@@ -307,8 +313,22 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
      */
     if (step.sessionId) {
       const session = sessionById.get(step.sessionId);
-      const placementId = step.placementId || session?.placementId;
-      if (!session || !placementId) continue;
+      const placementId = step.placementId || session?.placementId || "";
+      const placement = placementId ? placementById.get(placementId) : undefined;
+      const node = placement ? nodeById.get(placement.nodeId) : undefined;
+      if (!session || !placement || !node) {
+        settled.set(step.id, "failed");
+        actions.push({
+          type: "settle_step",
+          stepId: step.id,
+          state: "failed",
+          output:
+            "The queued follow-up's original session, placement or Node was removed. " +
+            "Read the task context before deciding on replacement work.",
+        });
+        continue;
+      }
+      if (session.stopRequested || session.dismissed || !node.online) continue;
       const anotherWriter =
         isWritingCategory(step.category) &&
         input.sessions.some(
@@ -355,9 +375,6 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         continue;
       }
 
-      const placement = placementById.get(placementId);
-      const node = placement ? nodeById.get(placement.nodeId) : undefined;
-      if (!placement || !node?.online) continue;
       const kind: SessionKind = session.readOnly ? "read-only" : "writing";
       if (remainingCapacity(node, reservedFor(node.id, kind), kind) <= 0) continue;
 

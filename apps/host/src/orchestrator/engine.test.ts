@@ -362,6 +362,69 @@ describe("OrchestratorEngine", () => {
     ).toBe(2);
   });
 
+  it("recovers a fast follow-up completion after restart without replaying the previous turn", () => {
+    const { store, service, engine, planned, finishTurn, commands } = setup();
+    const run = planned([
+      { stepKey: "fix", title: "Fix", prompt: "make the change", category: "explore" },
+    ]);
+    engine.tickRun(run.id);
+    const step = store.listRunSteps(run.id)[0]!;
+    finishTurn(step.sessionId, "First revision.");
+    engine.tickRun(run.id);
+    expect(store.getRunStep(step.id)?.state).toBe("succeeded");
+    store.setRunState(run.id, "running");
+    store.retryRunStepInSession(
+      run.id,
+      {
+        stepKey: step.stepKey,
+        title: step.title,
+        prompt: "Rename the helper.",
+        category: step.category,
+        placementId: step.placementId,
+      },
+      step.sessionId,
+      store.maxEventSequence(step.sessionId),
+    );
+    engine.tickRun(run.id);
+    expect(commands("prompt")).toHaveLength(1);
+    expect(store.getRunStep(step.id)?.state).toBe("starting");
+
+    const restarted = new OrchestratorEngine(service);
+    restarted.tickRun(run.id);
+    expect(store.getRunStep(step.id)?.state).toBe("starting");
+
+    let sequence = store.maxEventSequence(step.sessionId);
+    const event = (
+      type: "state" | "agent_text" | "turn_complete",
+      payload: Record<string, string>,
+    ) =>
+      service.handleEvent({
+        eventId: `follow-up-${++sequence}`,
+        sessionId: step.sessionId,
+        sequence,
+        type,
+        payload,
+        createdAt: new Date().toISOString(),
+      });
+    // The entire turn arrives before the recovered engine observes a running state.
+    event("state", { state: "running", activity: "Renaming" });
+    event("agent_text", { text: "Helper renamed." });
+    event("turn_complete", {});
+    event("state", { state: "idle", activity: "Ready for follow-up" });
+    expect(store.getSessionTurnCompletion(step.sessionId)).toBeDefined();
+
+    restarted.tickRun(run.id);
+    expect(store.getRunStep(step.id)).toMatchObject({
+      state: "succeeded",
+      sessionId: step.sessionId,
+      attempts: 2,
+      output: "Helper renamed.",
+    });
+    expect(commands("start_session")).toHaveLength(1);
+    expect(commands("prompt")).toHaveLength(1);
+    store.close();
+  });
+
   it("rolls back failed-step settlement when its notification insert fails", () => {
     const { store, service, engine, planned } = setup();
     const run = planned([

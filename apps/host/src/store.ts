@@ -3615,6 +3615,8 @@ export class FleetStore {
         | "failureReason"
         | "emptyWakeCount"
         | "name"
+        | "objective"
+        | "workspaceId"
         | "phaseIndex"
         | "pendingPrompt"
         | "stopWhen"
@@ -3632,6 +3634,8 @@ export class FleetStore {
       failure_reason: patch.failureReason,
       empty_wake_count: patch.emptyWakeCount,
       name: patch.name,
+      objective: patch.objective,
+      workspace_id: patch.workspaceId,
       phase_index: patch.phaseIndex,
       pending_prompt: patch.pendingPrompt,
       stop_when: patch.stopWhen,

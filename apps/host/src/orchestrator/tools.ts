@@ -155,8 +155,10 @@ export const StartWorkSchema = z.object({
     .max(80)
     .optional()
     .describe(
-      "Which piece of work this belongs to. Reuse a name to add to that task; pass a new name " +
-        "to start a separate one. Omit to continue the task you started last.",
+      "The task's stable ID from fleet_list_work, or its exact name. Prefer the ID. " +
+        "A new name opens a separate task; never use that as a fallback for a failed lookup. " +
+        "Omit to continue the most recent open task. This creates a NEW worker: use " +
+        "fleet_follow_up for another revision by an existing worker.",
     ),
 });
 
@@ -253,7 +255,41 @@ export const PlanTaskSchema = z.object({
 });
 
 export const TaskRefSchema = z.object({
-  task: z.string().min(1).max(80).describe("The task this is about, by name."),
+  task: z
+    .string()
+    .min(1)
+    .max(80)
+    .describe(
+      "The task's stable ID from fleet_list_work, or its exact name. Prefer the ID: " +
+        "names can change or be ambiguous. Only tasks owned by this orchestrator are accessible.",
+    ),
+});
+
+export const ListWorkSchema = z.object({
+  query: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      "Search this orchestrator's open AND closed tasks by keywords, PR number, task/session ID, " +
+        "workspace, objective, worker briefs/output or notes. All words must match. " +
+        "Omit to browse; this is not a host-wide session search.",
+    ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe("Tasks per page, from 1 to 100. Defaults to 20."),
+  offset: z
+    .number()
+    .int()
+    .min(0)
+    .optional()
+    .describe("Number of matching tasks to skip. Defaults to 0."),
 });
 
 export const AdvanceTaskSchema = TaskRefSchema.extend({
@@ -403,6 +439,20 @@ export const DiscardTaskSchema = TaskRefSchema.extend({
 
 export type ToolResult = { ok: boolean; text: string };
 
+type Continuation = {
+  action:
+    | "follow_up"
+    | "resume"
+    | "reopen_task"
+    | "queued"
+    | "in_flight"
+    | "wait"
+    | "restore_session"
+    | "replace_worker"
+    | "unavailable";
+  reason: string;
+};
+
 const ok = (text: string): ToolResult => ({ ok: true, text });
 const refuse = (text: string): ToolResult => ({ ok: false, text });
 
@@ -464,13 +514,11 @@ export function explainInvalidArgs(
 }
 
 /** What the orchestrator is told once a task has its phases. */
-function planTaskReply(
-  name: string,
-  phases: readonly string[],
-  criteria: readonly RunCriterion[],
-): string {
+function planTaskReply(run: Run): string {
+  const { name, phases, successCriteria: criteria } = run;
   return [
     `Planned "${name}".`,
+    `  task id: ${run.id} (use this as task in later calls)`,
     `  phases: ${phases.join(" → ")}`,
     `  now on: ${phases[0]}`,
     `  done when: ${criteria.length} criteria are met`,
@@ -622,29 +670,72 @@ export class FleetTools {
    * things over its life, and putting those in one bucket meant they shared a
    * budget and a checkout for no reason anyone could see.
    */
-  private run(task?: string): Run | undefined {
+  private run(task?: string): Run | ToolResult | undefined {
     const runs = this.runs();
     if (!task) {
       const live = runs.filter((run) => !terminalRunStates.has(run.state));
       return live[live.length - 1] ?? runs[runs.length - 1];
     }
     const wanted = task.trim().toLowerCase();
-    return runs.find((run) => run.name.trim().toLowerCase() === wanted);
+    const byId = runs.find((run) => run.id.toLowerCase() === wanted);
+    if (byId) return byId;
+    const matches = runs.filter((run) => run.name.trim().toLowerCase() === wanted);
+    if (matches.length > 1) {
+      return refuse(
+        [
+          `The task name "${task}" is ambiguous in this orchestrator. Nothing was changed.`,
+          "Use one of these stable task IDs as task; no match was chosen automatically:",
+          ...matches.map(
+            (run) => `  ${run.id}: ${JSON.stringify(run.name)} (${run.state})`,
+          ),
+        ].join("\n"),
+      );
+    }
+    return matches[0];
+  }
+
+  private missingTask(task: string): ToolResult {
+    const recent = this.runs().slice(-10).reverse();
+    return refuse(
+      [
+        `No task matching "${task}" is visible to this orchestrator (${this.leadSessionId}). Nothing was changed.`,
+        "This is an exact ID/name lookup, not a search. It does not prove that the earlier worker conversation was deleted.",
+        "Call fleet_list_work with a short query such as the PR number, then fleet_get_task with the returned task ID.",
+        "Closed tasks are included. Tasks owned by another orchestrator are not: use the owning orchestrator rather than recreating its work here.",
+        ...(recent.length
+          ? [
+              "Recent tasks in this scope (use the ID as task):",
+              ...recent.map(
+                (run) => `  ${run.id}: ${JSON.stringify(run.name)} (${run.state})`,
+              ),
+            ]
+          : ["There are no task records in this orchestrator's scope."]),
+      ].join("\n"),
+    );
+  }
+
+  private requireTask(task: string): Run | ToolResult {
+    return this.run(task) ?? this.missingTask(task);
   }
 
   /** Opens a task, so the orchestrator can start one without asking a human. */
   private openTask(
     name: string,
     phases: readonly string[] = [],
-    done: { successCriteria?: readonly RunCriterion[]; stopWhen?: string } = {},
+    done: {
+      successCriteria?: readonly RunCriterion[];
+      stopWhen?: string;
+      objective?: string;
+      workspaceId?: string;
+    } = {},
   ): Run | undefined {
     const lead = this.store.getSession(this.leadSessionId);
     if (!lead) return undefined;
     const template = this.runs()[0];
     const run = this.store.createRun({
-      workspaceId: lead.workspaceId,
+      workspaceId: done.workspaceId ?? lead.workspaceId,
       name,
-      objective: name,
+      objective: done.objective ?? name,
       phases,
       successCriteria: done.successCriteria ?? [],
       stopWhen: done.stopWhen ?? "",
@@ -676,6 +767,42 @@ export class FleetTools {
    */
   planTask(input: z.infer<typeof PlanTaskSchema>): ToolResult {
     const existing = this.run(input.task);
+    if (existing && "ok" in existing) return existing;
+    if (existing?.state === "awaiting_human") {
+      return refuse(
+        `"${existing.name}" is with the person for review. Take it back with ` +
+          `fleet_reopen_task (task: "${existing.id}") before changing its plan or workers.`,
+      );
+    }
+    const workspaceName = input.workspace?.trim().toLowerCase();
+    const workspaces = input.workspace
+      ? this.store
+          .listWorkspaces()
+          .filter((workspace) => workspace.name.trim().toLowerCase() === workspaceName)
+      : [];
+    if (input.workspace && workspaces.length !== 1) {
+      return refuse(
+        `Workspace "${input.workspace}" is ${workspaces.length ? "ambiguous" : "unknown"}. ` +
+          "Nothing was planned. Use fleet_list_nodes to find the exact workspace name.",
+      );
+    }
+    const workspaceId =
+      workspaces[0]?.id ??
+      existing?.workspaceId ??
+      this.store.getSession(this.leadSessionId)?.workspaceId;
+    if (!workspaceId) {
+      return refuse("Could not open that task. Ask a human to restart the orchestrator.");
+    }
+    if (
+      existing &&
+      existing.workspaceId !== workspaceId &&
+      this.store.listRunSteps(existing.id).length > 0
+    ) {
+      return refuse(
+        "That task already has workers in its original workspace. Do not move its context " +
+          "to another checkout; name workspace on distinct work instead.",
+      );
+    }
     /*
      * A task a person opened arrives here already created — the Host makes the
      * run and briefs the orchestrator in one call, so the record cannot go
@@ -688,13 +815,15 @@ export class FleetTools {
       !terminalRunStates.has(existing.state)
     ) {
       const planned = this.store.updateRun(existing.id, {
+        objective: input.objective,
+        workspaceId,
         phases: input.phases,
         phaseIndex: 0,
         successCriteria: input.successCriteria,
         stopWhen: input.stopWhen,
       })!;
       this.service.publishRun(planned);
-      return ok(planTaskReply(planned.name, input.phases, input.successCriteria));
+      return ok(planTaskReply(planned));
     }
     if (existing) {
       /*
@@ -713,18 +842,21 @@ export class FleetTools {
       }
       return refuse(
         `"${existing.name}" already exists (${this.phaseLine(existing)}). ` +
-          `Use a different name, or dispatch into it with fleet_start_work.`,
+          `Read it with fleet_get_task (task: "${existing.id}"). Use fleet_follow_up for ` +
+          `the same deliverable, or fleet_start_work for a genuinely different unit of work.`,
       );
     }
     const run = this.openTask(input.task, input.phases, {
       successCriteria: input.successCriteria,
       stopWhen: input.stopWhen,
+      objective: input.objective,
+      workspaceId,
     });
     if (!run) {
       return refuse("Could not open that task. Ask a human to restart the orchestrator.");
     }
     this.service.publishRun(run);
-    return ok(planTaskReply(run.name, input.phases, input.successCriteria));
+    return ok(planTaskReply(run));
   }
 
   /**
@@ -735,8 +867,8 @@ export class FleetTools {
    * answer is more work rather than this.
    */
   advanceTask(input: z.infer<typeof AdvanceTaskSchema>): ToolResult {
-    const run = this.run(input.task);
-    if (!run) return refuse(`No task called "${input.task}".`);
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
     if (terminalRunStates.has(run.state)) {
       return refuse(`"${run.name}" is already closed.`);
     }
@@ -786,8 +918,8 @@ export class FleetTools {
    * — is the orchestrator's to do.
    */
   submitTask(input: z.infer<typeof SubmitTaskSchema>): ToolResult {
-    const run = this.run(input.task);
-    if (!run) return refuse(`No task called "${input.task}".`);
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
     if (terminalRunStates.has(run.state)) {
       return refuse(`"${run.name}" is already closed.`);
     }
@@ -845,8 +977,8 @@ export class FleetTools {
    * to wait for the thing that is stuck.
    */
   escalate(input: z.infer<typeof EscalateSchema>): ToolResult {
-    const run = this.run(input.task);
-    if (!run) return refuse(`No task called "${input.task}".`);
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
     if (terminalRunStates.has(run.state)) {
       return refuse(`"${run.name}" is already closed.`);
     }
@@ -900,8 +1032,8 @@ export class FleetTools {
    * it says so.
    */
   closeTask(input: z.infer<typeof CloseTaskSchema>): ToolResult {
-    const run = this.run(input.task);
-    if (!run) return refuse(`No task called "${input.task}".`);
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
     if (terminalRunStates.has(run.state)) {
       return refuse(`"${run.name}" is already closed (${run.state}).`);
     }
@@ -948,12 +1080,13 @@ export class FleetTools {
    * that happened, and waking it would be talking to itself.
    */
   reopenTask(input: z.infer<typeof ReopenTaskSchema>): ToolResult {
-    const run = this.run(input.task);
-    if (!run) return refuse(`No task called "${input.task}".`);
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
     if (!terminalRunStates.has(run.state) && run.state !== "awaiting_human") {
       return refuse(
         `"${run.name}" is still open (${this.phaseLine(run)}), so there is nothing to ` +
-          `reopen. Dispatch the work with fleet_start_work.`,
+          `reopen. Read fleet_get_task, then use fleet_follow_up for the same worker's ` +
+          `next revision. Use fleet_start_work only for distinct work.`,
       );
     }
     if (!canTransitionRun(run.state, "running")) {
@@ -979,9 +1112,11 @@ export class FleetTools {
         held
           ? `Took "${reopened.name}" back from review; the person is no longer being asked.`
           : `Reopened "${reopened.name}" on ${this.phaseLine(reopened)}.`,
-        "Its criteria and notes are unchanged and still apply — read them before deciding",
-        "anything, because they describe work you already did.",
-        "Dispatch what this needs, then end your turn. Call fleet_submit_task again once",
+        `  task id: ${reopened.id}`,
+        "Its criteria and earlier notes still apply. Read fleet_get_task for those and",
+        "the retained workers, then use fleet_follow_up on the worker whose role matches.",
+        "Do not start a replacement merely because this task was closed.",
+        "Send what this needs, then end your turn. Call fleet_submit_task again once",
         "it is addressed.",
       ].join("\n"),
     );
@@ -997,8 +1132,8 @@ export class FleetTools {
    * caught before any work went out.
    */
   discardTask(input: z.infer<typeof DiscardTaskSchema>): ToolResult {
-    const run = this.run(input.task);
-    if (!run) return refuse(`No task called "${input.task}".`);
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
 
     const steps = this.store.listRunSteps(run.id).length;
     const notes = this.store.listRunNotes(run.id).length;
@@ -1086,6 +1221,10 @@ export class FleetTools {
    */
   startWork(input: z.infer<typeof StartWorkSchema>): ToolResult {
     const existing = this.run(input.task);
+    if (existing && "ok" in existing) return existing;
+    if (!existing && input.task && z.uuid().safeParse(input.task.trim()).success) {
+      return this.missingTask(input.task);
+    }
     const run = existing ?? (input.task ? this.openTask(input.task) : undefined);
     if (!run) {
       return refuse(
@@ -1096,13 +1235,15 @@ export class FleetTools {
     }
     if (terminalRunStates.has(run.state)) {
       return refuse(
-        `The task "${run.name}" is closed. Pass a new \`task\` name to start another.`,
+        `The task "${run.name}" is closed. Use fleet_reopen_task (task: "${run.id}"), ` +
+          "then fleet_follow_up for another revision in its existing worker. " +
+          "A new task is only for unrelated work.",
       );
     }
     if (run.state === "awaiting_human") {
       return refuse(
         `"${run.name}" is with the person for review, so nothing more goes out ` +
-          `until they answer. Wait, or start a separate task.`,
+          `until they answer or you take it back with fleet_reopen_task (task: "${run.id}").`,
       );
     }
 
@@ -1117,7 +1258,8 @@ export class FleetTools {
     if (steps.length >= run.policy.maxSessions) {
       return refuse(
         `"${run.name}" has spent its budget of ${run.policy.maxSessions} sessions. ` +
-          `Report what you have, or start a separate task.`,
+          "Use fleet_follow_up for an existing worker's next revision, or report what you have. " +
+          "Do not open another task to bypass this budget.",
       );
     }
 
@@ -1141,10 +1283,18 @@ export class FleetTools {
     this.service.tickRun(run.id);
 
     const dispatched = this.store.getRunStep(step.id);
-    if (!dispatched || dispatched.state === "pending") {
+    if (!dispatched) {
       return refuse(
-        `Queued "${input.title}" but no node could take it yet. ` +
-          `It will start when one frees up.`,
+        "The step record is no longer available. Read fleet_list_work before retrying.",
+      );
+    }
+    if (dispatched.state === "pending") {
+      this.service.publishRun(run);
+      this.service.publishRunSteps(run.id, this.store.listRunSteps(run.id));
+      return ok(
+        `Queued "${input.title}" in task "${run.name}" (task id: ${run.id}, step: ${stepKey}). ` +
+          "The request is recorded and will start when scheduling allows. " +
+          "Do not dispatch it again; you will be woken when it finishes.",
       );
     }
     const session = dispatched.sessionId
@@ -1153,6 +1303,7 @@ export class FleetTools {
     return ok(
       [
         `Started "${input.title}" (${input.category}) in task "${run.name}".`,
+        `  task id: ${run.id}`,
         `  ${this.phaseLine(run)}`,
         `  step: ${stepKey}`,
         `  session: ${dispatched.sessionId}`,
@@ -1207,25 +1358,238 @@ export class FleetTools {
     });
   }
 
-  listWork(): ToolResult {
-    const runs = this.runs();
-    if (runs.length === 0) return ok("Nothing dispatched yet.");
-    const blocks = runs.map((run) => {
-      const steps = this.store.listRunSteps(run.id);
-      const lines = steps.map((step) => {
-        const session = step.sessionId
-          ? this.store.getSession(step.sessionId)
-          : undefined;
-        return `  ${step.stepKey} · ${step.title} (${step.category}) — ${step.state}${
-          session ? ` on ${session.nodeName}, session ${session.id}` : ""
-        }`;
+  listWork(input: z.infer<typeof ListWorkSchema> = {}): ToolResult {
+    const words = input.query?.trim().toLowerCase().split(/\s+/) ?? [];
+    const runs = this.runs()
+      .reverse()
+      .filter((run) => {
+        if (!words.length) return true;
+        const steps = this.store.listRunSteps(run.id);
+        const searchable = [
+          run.id,
+          run.name,
+          run.objective,
+          this.store.getWorkspace(run.workspaceId)?.name ?? "",
+          ...steps.flatMap((step) => [
+            step.title,
+            step.sessionId,
+            step.prompt,
+            step.output,
+            this.store.getSession(step.sessionId)?.initialPrompt ?? "",
+          ]),
+          ...this.store.listRunNotes(run.id).map((note) => note.body),
+        ]
+          .join("\n")
+          .toLowerCase();
+        return words.every((word) => searchable.includes(word));
       });
-      return [
-        `${run.name} — ${run.state} · ${this.phaseLine(run)} · ${steps.length}/${run.policy.maxSessions} sessions, ${run.wakeSeq}/${run.policy.maxWakes} wakes`,
-        ...(lines.length > 0 ? lines : ["  (nothing dispatched)"]),
-      ].join("\n");
-    });
-    return ok(blocks.join("\n"));
+    const offset = input.offset ?? 0;
+    const limit = input.limit ?? 20;
+    const page = runs.slice(offset, offset + limit);
+    const nextOffset = offset + page.length;
+    return ok(
+      [
+        `Scope: this orchestrator (${this.leadSessionId}) only; open AND closed tasks are included.`,
+        "This is not a host-wide session search. A missing match does not prove a conversation was deleted.",
+        ...(page.length
+          ? [
+              `Showing ${offset + 1}-${nextOffset} of ${runs.length} matching tasks.`,
+              ...page.map((run) =>
+                this.taskSummary(run, this.store.listRunSteps(run.id)),
+              ),
+            ]
+          : [
+              runs.length
+                ? `No tasks on this page; ${runs.length} match. Use a smaller offset.`
+                : input.query
+                  ? "No matching tasks. Try fewer keywords or browse without query before creating replacement work."
+                  : "Nothing dispatched yet. There are no task records in this scope.",
+            ]),
+        ...(nextOffset < runs.length
+          ? [
+              `More tasks: call fleet_list_work with the same query/limit and offset: ${nextOffset}.`,
+            ]
+          : []),
+        "Use the stable task ID as task in later calls. Read fleet_get_task for criteria, notes and worker context before deciding.",
+        "Same deliverable: fleet_follow_up. Closed task: fleet_reopen_task, then follow up. Busy/offline/queued is a wait, not a reason to create a replacement.",
+      ].join("\n\n"),
+    );
+  }
+
+  /** The persisted context needed to choose between a revisit and distinct work. */
+  getTask(input: z.infer<typeof TaskRefSchema>): ToolResult {
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
+    const steps = this.store.listRunSteps(run.id);
+    const notes = this.store.listRunNotes(run.id);
+    return ok(
+      [
+        this.taskSummary(run, steps),
+        `Objective:\n${truncateMiddle(run.objective, 4_000)}`,
+        `Phases: ${run.phases.join(" -> ") || "(not planned)"}`,
+        `Stop when: ${run.stopWhen || "(not recorded)"}`,
+        "Success criteria:",
+        ...run.successCriteria.map(
+          (criterion) =>
+            `  ${criterion.id}${criterion.essential ? "" : " (optional)"}: ${criterion.scenario}\n` +
+            `    expected evidence: ${criterion.expectedEvidence}`,
+        ),
+        ...(run.failureReason ? [`Task failure: ${run.failureReason}`] : []),
+        "Task notes (oldest first; long history is truncated in the middle):",
+        truncateMiddle(
+          notes
+            .map(
+              (note) => `${note.createdAt} [phase ${note.phaseIndex + 1}]\n${note.body}`,
+            )
+            .join("\n\n"),
+          16_000,
+        ) || "(none)",
+        ...steps.map((step) => {
+          const session = this.store.getSession(step.sessionId);
+          const originalBrief = session?.initialPrompt ?? step.prompt;
+          return [
+            `Worker context: ${step.stepKey}, session ${step.sessionId || "(not started)"}`,
+            `Original brief:\n${truncateMiddle(originalBrief, 3_000)}`,
+            ...(step.prompt !== originalBrief
+              ? [`Current turn brief:\n${truncateMiddle(step.prompt, 3_000)}`]
+              : []),
+            `Latest step output:\n${truncateMiddle(step.output, 3_000) || "(none yet)"}`,
+          ].join("\n");
+        }),
+        "Read fleet_transcript with a worker's sessionId when its output is not enough. " +
+          "A recorded Copilot conversation ID permits a resume attempt; it does not prove the Node still has that conversation on disk.",
+      ].join("\n\n"),
+    );
+  }
+
+  private taskSummary(run: Run, steps: readonly RunStep[]): string {
+    const placement = this.store.getPlacement(run.placementId);
+    return [
+      `task: ${JSON.stringify(run.name)} - ${run.state} - ${this.phaseLine(run)}`,
+      `  task id: ${run.id}`,
+      `  updated: ${run.updatedAt}`,
+      `  workspace: ${this.store.getWorkspace(run.workspaceId)?.name ?? run.workspaceId}`,
+      `  objective: ${truncateMiddle(run.objective, 600)}`,
+      ...(placement
+        ? [`  pinned checkout: ${placement.nodeName}, ${placement.localPath}`]
+        : []),
+      `  budget: ${steps.length}/${run.policy.maxSessions} sessions, ${run.wakeSeq}/${run.policy.maxWakes} wakes`,
+      ...(steps.length
+        ? steps.map((step) => {
+            const session = this.store.getSession(step.sessionId);
+            const checkout = this.store.getPlacement(
+              step.placementId || session?.placementId || "",
+            );
+            const continuation = this.continuation(run, step, session);
+            return [
+              `  ${step.stepKey}: ${step.title} (${step.category}) - step state: ${step.state}, attempt: ${step.attempts}`,
+              `    session: ${step.sessionId || "(not started)"}; session state: ${session?.state ?? "unavailable"}`,
+              ...(session
+                ? [
+                    `    node: ${session.nodeName} (${this.store.getNode(session.nodeId)?.online ? "online" : "offline"}); workspace: ${session.workspaceName}; path: ${checkout?.localPath ?? "(placement removed)"}`,
+                    `    resumable conversation recorded: ${session.agentSessionId ? "yes" : "no"}`,
+                  ]
+                : []),
+              `    next action: ${continuation.action} - ${continuation.reason}`,
+            ].join("\n");
+          })
+        : ["  (nothing dispatched)"]),
+    ].join("\n");
+  }
+
+  /** Shared by discovery and dispatch so their advice cannot contradict each other. */
+  private continuation(run: Run, step: RunStep, session?: FleetSession): Continuation {
+    if (terminalRunStates.has(run.state) || run.state === "awaiting_human") {
+      return {
+        action: "reopen_task",
+        reason: `The task is ${run.state}. Call fleet_reopen_task with task: "${run.id}", then fleet_follow_up on the matching worker.`,
+      };
+    }
+    if (run.state === "awaiting_approval") {
+      return {
+        action: "wait",
+        reason: "The task needs human approval before work can continue.",
+      };
+    }
+    if (!session) {
+      return step.sessionId
+        ? {
+            action: "unavailable",
+            reason:
+              "The tracked session record is missing. Read the task context before deciding on replacement work.",
+          }
+        : {
+            action: "wait",
+            reason:
+              "This step has not started a worker yet. Do not dispatch a duplicate.",
+          };
+    }
+    if (session.dismissed) {
+      return {
+        action: "restore_session",
+        reason: "Restore the dismissed session in Fleet before sending it more work.",
+      };
+    }
+    if (session.stopRequested) {
+      return {
+        action: "wait",
+        reason:
+          "The worker is still stopping. Wait for the Stop acknowledgement; do not start a replacement.",
+      };
+    }
+    if (!terminalRunStepStates.has(step.state)) {
+      if (step.attempts > 1) {
+        return step.state === "pending"
+          ? {
+              action: "queued",
+              reason:
+                "A follow-up is already queued durably in this session. Wait for scheduling; do not resend or replace it.",
+            }
+          : {
+              action: "in_flight",
+              reason:
+                "A follow-up is already dispatched in this session. Wait to be woken; do not send another turn yet.",
+            };
+      }
+      return {
+        action: "wait",
+        reason: `The worker's step is ${step.state}. Wait to be woken, then use fleet_follow_up for the next revision.`,
+      };
+    }
+    if (session.state === "offline" && !session.agentSessionId) {
+      return {
+        action: "wait",
+        reason:
+          "The worker is offline and its conversation identity is unknown. Wait for the Node to reconnect before deciding it cannot resume.",
+      };
+    }
+    const needsResume =
+      terminalSessionStates.has(session.state) || session.state === "offline";
+    if (session.state !== "idle" && !needsResume) {
+      return {
+        action: "wait",
+        reason: `The worker is ${session.state}. Wait for it to become idle; do not start a replacement.`,
+      };
+    }
+    if (needsResume && !session.agentSessionId) {
+      return {
+        action: "replace_worker",
+        reason:
+          "That ended worker has no resumable Copilot conversation. Read fleet_get_task and fleet_transcript, then use fleet_start_work in the same task and repeat the lost context explicitly.",
+      };
+    }
+    const placement = this.store.getPlacement(step.placementId || session.placementId);
+    if (!placement || !this.store.getNode(session.nodeId)) {
+      return {
+        action: "unavailable",
+        reason:
+          "The worker's original placement or Node was removed. Restore it before resuming; do not silently move this work to another checkout.",
+      };
+    }
+    return {
+      action: needsResume ? "resume" : "follow_up",
+      reason: `Use fleet_follow_up with sessionId: "${session.id}". It will ${needsResume ? "resume the original conversation" : "reuse the open worker"} when the Node and scheduling allow.`,
+    };
   }
 
   /** The full transcript of one worker, for when the summary was not enough. */
@@ -1249,75 +1613,65 @@ export class FleetTools {
   followUp(input: z.infer<typeof FollowUpSchema>): ToolResult {
     const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
     if (typeof owned === "string") return refuse(owned);
-    const step = this.stepFor(owned.id);
-    if (!step) return refuse("That worker is not attached to a tracked step.");
-    if (terminalRunStepStates.has(step.state)) {
-      const run = this.store.getRun(step.runId);
-      if (!run || terminalRunStates.has(run.state) || run.state === "awaiting_human") {
-        return refuse("That worker's task is not open for more work.");
-      }
-      const placementId = step.placementId || owned.placementId;
-      const needsResume =
-        terminalSessionStates.has(owned.state) || owned.state === "offline";
-      if (owned.state !== "idle" && !needsResume) {
-        return refuse(
-          `That worker is ${owned.state}, so it cannot take a follow-up yet. Wait for it to become idle.`,
-        );
-      }
-      if (needsResume && !owned.agentSessionId) {
-        return refuse(
-          "That worker has no resumable Copilot conversation. Start replacement work and repeat the lost context explicitly.",
-        );
-      }
-
-      this.store.retryRunStepInSession(
-        run.id,
-        {
-          stepKey: step.stepKey,
-          title: step.title,
-          prompt: input.prompt,
-          category: step.category,
-          dependsOn: step.dependsOn,
-          placementId,
-          phaseIndex: run.phaseIndex,
-          position: step.position,
-        },
-        owned.id,
-        this.store.maxEventSequence(owned.id),
+    const step = this.store.getRunStepBySession(owned.id);
+    if (!step || step.runId !== owned.runId) {
+      return refuse(
+        "That worker is not attached to a tracked step. Read fleet_list_work before deciding on replacement work.",
       );
-      this.service.tickRun(run.id);
+    }
+    const run = this.store.getRun(step.runId);
+    if (!run) return refuse("That worker's task record is no longer available.");
+    const next = this.continuation(run, step, owned);
+    if (
+      (next.action === "queued" || next.action === "in_flight") &&
+      step.prompt === input.prompt
+    ) {
       return ok(
-        needsResume
+        `${next.reason} No duplicate was sent. Task: ${run.id}; session: ${owned.id}.`,
+      );
+    }
+    if (next.action !== "follow_up" && next.action !== "resume") {
+      return refuse(`${next.reason} This call did not send or overwrite a prompt.`);
+    }
+
+    this.store.retryRunStepInSession(
+      run.id,
+      {
+        stepKey: step.stepKey,
+        title: step.title,
+        prompt: input.prompt,
+        category: step.category,
+        dependsOn: step.dependsOn,
+        placementId: step.placementId || owned.placementId,
+        phaseIndex: run.phaseIndex,
+        position: step.position,
+      },
+      owned.id,
+      this.store.maxEventSequence(owned.id),
+    );
+    this.service.publishRunSteps(run.id, this.store.listRunSteps(run.id));
+    this.service.tickRun(run.id);
+    const retried = this.store.getRunStep(step.id);
+    if (!retried) {
+      return refuse(
+        "The follow-up's step record is no longer available. Read fleet_list_work before retrying.",
+      );
+    }
+    if (retried.state === "failed" || retried.state === "skipped") {
+      return refuse(
+        `The follow-up was recorded but could not start in session ${owned.id}: ${retried.output}. ` +
+          `Read fleet_get_task (task: "${run.id}") before deciding what to do next.`,
+      );
+    }
+    return ok(
+      [
+        next.action === "resume"
           ? "Queued the follow-up in the same worker session. It will resume when scheduling allows, and you will be woken when it finishes."
           : "Queued the follow-up in the same open worker session. It will start when scheduling allows, and you will be woken when it finishes.",
-      );
-    }
-    if (owned.state !== "idle") {
-      return refuse(
-        `That worker is ${owned.state}, so it cannot take a follow-up yet. ` +
-          `Wait for it to finish, or stop it.`,
-      );
-    }
-    const sent = this.service.dispatch(owned.nodeId, {
-      type: "prompt",
-      sessionId: owned.id,
-      prompt: input.prompt,
-      attachments: [],
-    });
-    return sent.sent
-      ? ok(`Sent. You will be woken when it finishes.`)
-      : refuse("That worker's node is not reachable right now.");
-  }
-
-  /** The step a worker session was started for, across every task. */
-  private stepFor(sessionId: string): RunStep | undefined {
-    for (const run of this.runs()) {
-      const step = this.store
-        .listRunSteps(run.id)
-        .find((entry) => entry.sessionId === sessionId);
-      if (step) return step;
-    }
-    return undefined;
+        `Task: ${run.id}; session: ${owned.id}; step: ${step.stepKey}; state: ${retried.state}.`,
+        "The request is persisted. Do not send it again or create a replacement while it is queued.",
+      ].join("\n"),
+    );
   }
 
   stopWork(input: z.infer<typeof SessionRefSchema>): ToolResult {
