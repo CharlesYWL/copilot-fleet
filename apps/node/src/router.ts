@@ -2,6 +2,8 @@ import { isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import {
   eventPayload,
+  isSessionActivityEvent,
+  sessionRetentionCutoff,
   terminalSessionStates,
   type NodeCommand,
   type SessionEvent,
@@ -28,9 +30,25 @@ export type CommandResult = {
  */
 export class CommandRefused extends Error {}
 
+export type CommandRouterOptions = {
+  deleteInactiveSession?: (
+    agentSessionId: string,
+    inactiveBefore: number,
+    beforeDelete: () => Promise<void>,
+  ) => Promise<void>;
+};
+
+type SessionActivity = {
+  lastActivityAt: number;
+  inFlightCommands: number;
+  agentSessionId?: string;
+};
+
 type SessionSlot = {
   agent: SessionAgent | undefined;
   ready: Promise<void>;
+  initializing: boolean;
+  activity: SessionActivity;
   refreshing?: Promise<void>;
   refreshMcpPending?: boolean;
   launch?: LaunchCommand;
@@ -53,10 +71,16 @@ type SessionSlot = {
 };
 
 type LaunchCommand = Extract<NodeCommand, { type: "start_session" | "resume_session" }>;
+type DeleteSessionCommand = Extract<NodeCommand, { type: "delete_session" }>;
 
 export class CommandRouter {
   private readonly slots = new Map<string, SessionSlot>();
   private readonly handled = new Map<string, Promise<CommandResult>>();
+  private readonly handledBySession = new Map<string, Set<string>>();
+  // Small activity records survive terminal slot release until cleanup succeeds.
+  private readonly sessionActivity = new Map<string, SessionActivity>();
+  private readonly deleting = new Map<string, string>();
+  private readonly deleted = new Map<string, string>();
 
   constructor(
     private readonly factory: AgentFactory,
@@ -79,6 +103,7 @@ export class CommandRouter {
     > = async () => [],
     /** Where a refused agent is reported; a session still starts without one. */
     private readonly warn: (message: string) => void = () => {},
+    private readonly options: CommandRouterOptions = {},
   ) {}
 
   /**
@@ -96,9 +121,17 @@ export class CommandRouter {
   async route(command: NodeCommand): Promise<CommandResult> {
     const previous = this.handled.get(command.commandId);
     if (previous) return previous;
+    const commands = this.handledBySession.get(command.sessionId) ?? new Set<string>();
+    commands.add(command.commandId);
+    this.handledBySession.set(command.sessionId, commands);
     const pending = this.run(command);
     this.handled.set(command.commandId, pending);
-    return pending;
+    const result = await pending;
+    if (command.type === "delete_session" && !result.ok) {
+      this.handled.delete(command.commandId);
+      this.handledBySession.get(command.sessionId)?.delete(command.commandId);
+    }
+    return result;
   }
 
   private async run(command: NodeCommand): Promise<CommandResult> {
@@ -111,7 +144,7 @@ export class CommandRouter {
         ok: false,
         error: error instanceof Error ? error.message : "Command failed",
         // A refusal leaves the session healthy, so the Host must not bury it.
-        fatal: !(error instanceof CommandRefused),
+        fatal: command.type !== "delete_session" && !(error instanceof CommandRefused),
       };
     }
   }
@@ -137,12 +170,18 @@ export class CommandRouter {
   async refreshMcpSessions(): Promise<void> {
     await Promise.allSettled(
       [...this.slots].map(async ([sessionId, slot]) => {
+        if (this.deleting.has(sessionId)) return;
         if (slot.refreshing) {
           await slot.refreshing;
           return;
         }
         await slot.ready;
-        if (!slot.agent) return;
+        if (
+          this.deleting.has(sessionId) ||
+          this.slots.get(sessionId) !== slot ||
+          !slot.agent
+        )
+          return;
         if (slot.agent.busy) {
           slot.refreshMcpPending = true;
           return;
@@ -164,14 +203,24 @@ export class CommandRouter {
   }
 
   private async execute(command: NodeCommand): Promise<void> {
+    if (command.type === "delete_session") return this.deleteSession(command);
+    this.assertNotDeleting(
+      command.sessionId,
+      command.type === "resume_session"
+        ? command.agentSessionId
+        : this.slots.get(command.sessionId)?.agentSessionId,
+    );
     if (command.type === "start_session" || command.type === "resume_session") {
       return this.startSession(command);
     }
 
     const slot = this.slots.get(command.sessionId);
     await slot?.ready;
+    this.assertNotDeleting(command.sessionId, slot?.agentSessionId);
     const agent = slot?.agent;
-    if (!agent) throw new Error("Session is not active on this node");
+    if (!agent || this.slots.get(command.sessionId) !== slot) {
+      throw new Error("Session is not active on this node");
+    }
     if (command.type === "prompt") {
       // Refused rather than dropped. This used to be `.catch(() => undefined)`
       // over a promise that rejects immediately when a turn is already in
@@ -186,53 +235,259 @@ export class CommandRouter {
           "Copilot is still working on the previous turn; wait for it to finish or cancel it",
         );
       }
-      void agent.prompt(command.prompt, command.attachments).catch(() => undefined);
-    } else if (command.type === "cancel") {
-      await agent.cancel();
-    } else if (command.type === "stop") {
-      await agent.stop();
-      if (this.slots.get(command.sessionId) === slot) {
-        this.slots.delete(command.sessionId);
-      }
-    } else if (command.type === "set_config_option") {
-      // Awaited, unlike a prompt, and refused rather than failed: the agent
-      // rejects an unknown value with a message naming the ones it takes, and
-      // a mistyped model must not tear down a session that is working fine.
-      try {
-        await agent.setConfigOption(command.configId, command.value);
-        slot.config.set(command.configId, command.value);
-      } catch (error) {
-        throw new CommandRefused(
-          error instanceof Error ? error.message : "Could not change that option",
-        );
-      }
+      void this.withActivity(slot, () =>
+        agent.prompt(command.prompt, command.attachments),
+      ).catch(() => undefined);
     } else {
-      agent.resolvePermission(command.requestId, {
-        outcome: command.outcome,
-        ...(command.optionId ? { optionId: command.optionId } : {}),
+      await this.withActivity(slot, async () => {
+        if (command.type === "cancel") {
+          await agent.cancel();
+        } else if (command.type === "stop") {
+          await agent.stop();
+          this.release(command.sessionId, slot);
+        } else if (command.type === "set_config_option") {
+          // A rejected picker change must not tear down an otherwise healthy session.
+          try {
+            await agent.setConfigOption(command.configId, command.value);
+            slot.config.set(command.configId, command.value);
+          } catch (error) {
+            throw new CommandRefused(
+              error instanceof Error ? error.message : "Could not change that option",
+            );
+          }
+        } else {
+          agent.resolvePermission(command.requestId, {
+            outcome: command.outcome,
+            ...(command.optionId ? { optionId: command.optionId } : {}),
+          });
+        }
       });
     }
   }
 
+  private assertNotDeleting(sessionId: string, agentSessionId?: string): void {
+    if (
+      this.deleting.has(sessionId) ||
+      this.deleted.has(sessionId) ||
+      (agentSessionId && [...this.deleting.values()].includes(agentSessionId))
+    ) {
+      throw new CommandRefused(
+        "session_cleanup_in_progress: This session is being deleted or was deleted",
+      );
+    }
+  }
+
+  private noteActivity(slot: SessionSlot, at = Date.now()): void {
+    slot.activity.lastActivityAt = Math.max(slot.activity.lastActivityAt, at);
+  }
+
+  private async withActivity(
+    slot: SessionSlot,
+    work: () => Promise<void>,
+  ): Promise<void> {
+    this.noteActivity(slot);
+    slot.activity.inFlightCommands += 1;
+    try {
+      await work();
+    } finally {
+      this.noteActivity(slot);
+      slot.activity.inFlightCommands -= 1;
+    }
+  }
+
+  private assertInactive(
+    command: DeleteSessionCommand,
+    slot: SessionSlot | undefined,
+    cutoff: number,
+  ): void {
+    if (this.slots.get(command.sessionId) !== slot) {
+      throw new CommandRefused(
+        "session_active: The local session changed during cleanup",
+      );
+    }
+    const activity = this.sessionActivity.get(command.sessionId);
+    if (
+      (activity && (activity.lastActivityAt > cutoff || activity.inFlightCommands > 0)) ||
+      (slot && (slot.initializing || slot.refreshing || !slot.agent || slot.agent.busy))
+    ) {
+      throw new CommandRefused(
+        "session_active: The local session is active, recent, or has work in flight",
+      );
+    }
+    const agentSessionId = slot?.agentSessionId ?? activity?.agentSessionId;
+    if (slot && !slot.agentSessionId) {
+      throw new CommandRefused(
+        "session_identity_mismatch: The local Copilot session id is not known",
+      );
+    }
+    if (agentSessionId !== undefined && agentSessionId !== command.agentSessionId) {
+      throw new CommandRefused(
+        "session_identity_mismatch: The local Copilot session id does not match",
+      );
+    }
+    if (command.agentSessionId) {
+      for (const [sessionId, other] of this.slots) {
+        if (
+          sessionId !== command.sessionId &&
+          other.agentSessionId === command.agentSessionId
+        ) {
+          throw new CommandRefused(
+            "session_active: Another local session is using this Copilot conversation",
+          );
+        }
+      }
+      for (const [sessionId, other] of this.sessionActivity) {
+        if (
+          sessionId !== command.sessionId &&
+          other.agentSessionId === command.agentSessionId &&
+          (other.lastActivityAt > cutoff || other.inFlightCommands > 0)
+        ) {
+          throw new CommandRefused(
+            "session_active: This Copilot conversation has recent local activity",
+          );
+        }
+      }
+    }
+  }
+
+  private clearHandledSession(sessionId: string, keepCommandId: string): void {
+    for (const commandId of this.handledBySession.get(sessionId) ?? []) {
+      if (commandId !== keepCommandId) this.handled.delete(commandId);
+    }
+    this.handledBySession.set(sessionId, new Set([keepCommandId]));
+  }
+
+  private async deleteSession(command: DeleteSessionCommand): Promise<void> {
+    const localCutoff = sessionRetentionCutoff(Date.now(), command.retentionDays);
+    const hostCutoff = Date.parse(command.inactiveBefore);
+    if (localCutoff === undefined || !Number.isFinite(hostCutoff)) {
+      throw new CommandRefused("delete_failed: Invalid session inactivity cutoff");
+    }
+    const cutoff = Math.min(hostCutoff, localCutoff);
+    if (this.deleted.has(command.sessionId)) {
+      if (this.deleted.get(command.sessionId) !== command.agentSessionId) {
+        throw new CommandRefused(
+          "session_identity_mismatch: This session was already deleted with a different Copilot id",
+        );
+      }
+      this.clearHandledSession(command.sessionId, command.commandId);
+      return;
+    }
+    if (
+      this.deleting.has(command.sessionId) ||
+      (command.agentSessionId &&
+        [...this.deleting.values()].includes(command.agentSessionId))
+    ) {
+      throw new CommandRefused(
+        "session_cleanup_in_progress: A cleanup is already in flight",
+      );
+    }
+
+    const slot = this.slots.get(command.sessionId);
+    this.assertInactive(command, slot, cutoff);
+    this.deleting.set(command.sessionId, command.agentSessionId);
+    let stopped = false;
+    try {
+      let prepared = false;
+      const beforeDelete = async (): Promise<void> => {
+        if (prepared) return;
+        // ACP listing may have waited while the retained process produced output.
+        this.assertInactive(command, slot, cutoff);
+        if (slot) {
+          await slot.agent!.stop(false);
+          stopped = true;
+          try {
+            this.assertInactive(command, slot, cutoff);
+          } finally {
+            this.release(command.sessionId, slot);
+          }
+        }
+        prepared = true;
+      };
+      if (command.agentSessionId === "") {
+        await beforeDelete();
+      } else {
+        if (!this.options.deleteInactiveSession) {
+          throw new CommandRefused(
+            "unsupported_delete: Copilot session deletion is not configured",
+          );
+        }
+        await this.options.deleteInactiveSession(
+          command.agentSessionId,
+          cutoff,
+          beforeDelete,
+        );
+      }
+      if (!prepared) {
+        throw new CommandRefused(
+          "delete_failed: Cleanup did not verify local inactivity",
+        );
+      }
+      this.deleted.set(command.sessionId, command.agentSessionId);
+      this.sessionActivity.delete(command.sessionId);
+      this.clearHandledSession(command.sessionId, command.commandId);
+    } catch (error) {
+      // The process may be gone even though its persisted conversation survived.
+      if (stopped && slot) {
+        this.emit({
+          eventId: `cleanup-stopped-${command.commandId}`,
+          sessionId: command.sessionId,
+          sequence: ++slot.sequenceOffset,
+          type: "state",
+          payload: {
+            state: "stopped",
+            activity: "Stopped for cleanup; persisted session deletion failed",
+          },
+          createdAt: new Date().toISOString(),
+        });
+      }
+      throw error;
+    } finally {
+      this.deleting.delete(command.sessionId);
+    }
+  }
+
   private startSession(command: LaunchCommand): Promise<void> {
+    let lastActivityAt = Date.now();
+    if (command.type === "resume_session" && command.lastActivityAt !== undefined) {
+      const restoredActivity = Date.parse(command.lastActivityAt);
+      if (!Number.isFinite(restoredActivity)) {
+        return Promise.reject(
+          new CommandRefused("Invalid automatic resume activity timestamp"),
+        );
+      }
+      lastActivityAt = Math.min(lastActivityAt, restoredActivity);
+    }
     const existing = this.slots.get(command.sessionId);
-    if (existing) return existing.ready;
+    if (existing) {
+      this.noteActivity(existing, lastActivityAt);
+      return existing.ready;
+    }
     const kind: SessionKind = command.readOnly ? "read-only" : "writing";
     const held = [...this.slots.values()].filter((slot) => slot.kind === kind).length;
     if (held >= this.maxSessions) {
       return Promise.reject(new Error(`Node is at capacity for ${kind} work`));
     }
 
+    const activity = this.sessionActivity.get(command.sessionId) ?? {
+      lastActivityAt,
+      inFlightCommands: 0,
+    };
     const slot: SessionSlot = {
       ready: Promise.resolve(),
+      initializing: true,
+      activity,
       agent: undefined,
-      agentSessionId: undefined,
+      agentSessionId:
+        command.type === "resume_session" ? command.agentSessionId : undefined,
       config: new Map(command.config.map((entry) => [entry.id, entry.value])),
       generation: 0,
       kind,
       sequenceOffset: command.type === "resume_session" ? command.sequenceOffset : 0,
       toolTitles: new Map(),
     };
+    this.noteActivity(slot, lastActivityAt);
+    this.sessionActivity.set(command.sessionId, activity);
     this.slots.set(command.sessionId, slot);
     slot.ready = this.initializeSession(command, slot);
     return slot.ready;
@@ -242,6 +497,9 @@ export class CommandRouter {
     command: LaunchCommand,
     slot: SessionSlot,
   ): Promise<void> {
+    const automaticResume =
+      command.type === "resume_session" && command.lastActivityAt !== undefined;
+    let replaying = automaticResume;
     try {
       const cwd = await this.validatePath(command.localPath);
       let additionalDirectories: string[] = [];
@@ -261,7 +519,14 @@ export class CommandRouter {
       }
       const generation = slot.generation;
       const sink = (event: SessionEvent) =>
-        this.handleSessionEvent(command.sessionId, slot, generation, event);
+        this.handleSessionEvent(
+          command.sessionId,
+          slot,
+          generation,
+          replaying
+            ? { ...event, payload: { ...event.payload, historyReplay: true } }
+            : event,
+        );
       const mcpServers = resolveMcpServers(command.mcpServers, this.hostUrl());
       const requested = await installRequestedAgent(
         cwd,
@@ -277,30 +542,35 @@ export class CommandRouter {
       slot.selectedAgent = requested.selected;
       if (command.type === "resume_session") {
         slot.agentSessionId = command.agentSessionId;
+        slot.activity.agentSessionId = command.agentSessionId;
       }
-      const agent = await this.factory.start(
-        command.sessionId,
-        cwd,
-        sink,
-        command.type === "resume_session"
-          ? {
-              resumeAgentSessionId: command.agentSessionId,
-              additionalDirectories,
-              sequenceOffset: command.sequenceOffset,
-              yolo: command.yolo,
-              agencyMode: command.agencyMode ?? false,
-              mcpServers,
-              agent: requested.selected,
-              config: command.config,
-            }
-          : {
-              yolo: command.yolo,
-              agencyMode: command.agencyMode ?? false,
-              mcpServers,
-              agent: requested.selected,
-              config: command.config,
-            },
-      );
+      const agent = await this.factory
+        .start(
+          command.sessionId,
+          cwd,
+          sink,
+          command.type === "resume_session"
+            ? {
+                resumeAgentSessionId: command.agentSessionId,
+                additionalDirectories,
+                sequenceOffset: command.sequenceOffset,
+                yolo: command.yolo,
+                agencyMode: command.agencyMode ?? false,
+                mcpServers,
+                agent: requested.selected,
+                config: command.config,
+              }
+            : {
+                yolo: command.yolo,
+                agencyMode: command.agencyMode ?? false,
+                mcpServers,
+                agent: requested.selected,
+                config: command.config,
+              },
+        )
+        .finally(() => {
+          replaying = false;
+        });
       slot.agent = agent;
       if (this.slots.get(command.sessionId) !== slot) {
         await agent.stop();
@@ -308,13 +578,16 @@ export class CommandRouter {
       }
       // A resumed session waits for the operator's next prompt.
       if (command.type === "start_session") {
-        void agent
-          .prompt(command.prompt)
-          .catch(() => this.release(command.sessionId, slot));
+        void this.withActivity(slot, () => agent.prompt(command.prompt)).catch(() =>
+          this.release(command.sessionId, slot),
+        );
       }
     } catch (error) {
       this.release(command.sessionId, slot);
       throw error;
+    } finally {
+      if (!automaticResume) this.noteActivity(slot);
+      slot.initializing = false;
     }
   }
 
@@ -328,10 +601,14 @@ export class CommandRouter {
     generation: number,
     event: SessionEvent,
   ): void {
-    if (slot.generation !== generation) return;
+    if (slot.generation !== generation || this.slots.get(sessionId) !== slot) return;
+    if (isSessionActivityEvent(event)) this.noteActivity(slot);
     slot.sequenceOffset = Math.max(slot.sequenceOffset, event.sequence);
     const agentSession = eventPayload(event, "agent_session");
-    if (agentSession) slot.agentSessionId = agentSession.agentSessionId;
+    if (agentSession?.agentSessionId) {
+      slot.agentSessionId = agentSession.agentSessionId;
+      slot.activity.agentSessionId = agentSession.agentSessionId;
+    }
     const config = eventPayload(event, "config");
     for (const option of config?.options ?? []) {
       if (option.currentValue !== undefined) {
@@ -361,13 +638,18 @@ export class CommandRouter {
     const state = eventPayload(event, "state")?.state;
     if (state && terminalSessionStates.has(state)) {
       this.release(sessionId, slot);
-    } else if (state === "idle" && slot.refreshMcpPending) {
+    } else if (
+      state === "idle" &&
+      slot.refreshMcpPending &&
+      !this.deleting.has(sessionId)
+    ) {
       slot.refreshMcpPending = false;
       void this.refreshMcpSession(sessionId, slot);
     }
   }
 
   private async refreshMcpSession(sessionId: string, slot: SessionSlot): Promise<void> {
+    if (this.deleting.has(sessionId)) return;
     if (slot.refreshing) {
       await slot.refreshing;
       return;
@@ -377,6 +659,7 @@ export class CommandRouter {
       const launch = slot.launch;
       if (
         this.slots.get(sessionId) !== slot ||
+        this.deleting.has(sessionId) ||
         !current ||
         !launch ||
         !slot.cwd ||
@@ -392,22 +675,36 @@ export class CommandRouter {
       const generation = ++slot.generation;
       await current.stop(false);
       slot.agent = undefined;
-      const next = await this.factory.start(
-        sessionId,
-        slot.cwd,
-        (event) => this.handleSessionEvent(sessionId, slot, generation, event),
-        {
-          resumeAgentSessionId: slot.agentSessionId,
-          additionalDirectories: slot.additionalDirectories ?? [],
-          sequenceOffset: slot.sequenceOffset,
-          yolo: launch.yolo,
-          agencyMode: launch.agencyMode ?? false,
-          mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
-          agent: slot.selectedAgent ?? "",
-          config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
-          announceLifecycle: false,
-        },
-      );
+      // Only load-time replay is historical; the retained sink goes live once startup settles.
+      let replaying = true;
+      const next = await this.factory
+        .start(
+          sessionId,
+          slot.cwd,
+          (event) =>
+            this.handleSessionEvent(
+              sessionId,
+              slot,
+              generation,
+              replaying
+                ? { ...event, payload: { ...event.payload, historyReplay: true } }
+                : event,
+            ),
+          {
+            resumeAgentSessionId: slot.agentSessionId,
+            additionalDirectories: slot.additionalDirectories ?? [],
+            sequenceOffset: slot.sequenceOffset,
+            yolo: launch.yolo,
+            agencyMode: launch.agencyMode ?? false,
+            mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
+            agent: slot.selectedAgent ?? "",
+            config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
+            announceLifecycle: false,
+          },
+        )
+        .finally(() => {
+          replaying = false;
+        });
       if (this.slots.get(sessionId) !== slot) {
         await next.stop(false);
         return;

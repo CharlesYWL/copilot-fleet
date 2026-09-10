@@ -11,6 +11,8 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
+  SESSION_RETENTION_CAPABILITY,
+  SESSION_RETENTION_DAY_MS,
   OutboxFlushIdSchema,
   parseEnrollmentGrant,
   type AuthenticatedEnvelope,
@@ -1362,6 +1364,77 @@ describe("node reconnect socket ordering", () => {
 
     await waitFor(() => store.getSession(sessionId)?.state === "idle");
     expect(store.listNotifications().notifications).toEqual([]);
+  });
+
+  it("deletes an expired session only after its owning Node acknowledges over the socket", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31 * SESSION_RETENTION_DAY_MS);
+    try {
+      const sent = vi.spyOn(service, "send");
+      const client = await connect({
+        capabilities: [SESSION_RETENTION_CAPABILITY],
+        activeSessionIds: [sessionId],
+        busySessionIds: [],
+      });
+      await waitFor(() => store.getSession(sessionId)?.cleanupRequested === true);
+      const request = store.listSessionCleanupRequests()[0]!;
+      expect(sent).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          type: "command",
+          command: expect.objectContaining({
+            type: "delete_session",
+            sessionId,
+            commandId: request.commandId,
+            retentionDays: 30,
+          }),
+        }),
+      );
+      const result = {
+        type: "session_cleanup_result",
+        commandId: request.commandId,
+        sessionId,
+        ok: true,
+      };
+      send(client, result);
+      await waitFor(() => store.getSession(sessionId) === undefined);
+      send(client, result);
+      await delay(20);
+      expect(client.readyState).toBe(WebSocket.OPEN);
+      expect(store.listSessionCleanupRequests()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("processes buffered recent work before deciding whether a session has expired", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 31 * SESSION_RETENTION_DAY_MS);
+    try {
+      const client = await connect({
+        capabilities: [OUTBOX_ACK_CAPABILITY, SESSION_RETENTION_CAPABILITY],
+        pendingOutbox: true,
+        pendingOutboxCount: 1,
+        outboxFlush: { flushId: firstFlushId, eventCount: 1 },
+        activeSessionIds: [sessionId],
+        busySessionIds: [],
+      });
+      expect(store.listSessionCleanupRequests()).toEqual([]);
+      const acknowledged = nextMessage(client, "outbox_flush_ack");
+      send(client, event(1, "agent_text", { text: "Recent work" }, firstFlushId, 1, 0));
+      send(client, {
+        type: "outbox_flushed",
+        activeSessionIds: [sessionId],
+        busySessionIds: [],
+        outboxFlush: { flushId: firstFlushId, eventCount: 1 },
+      });
+      await acknowledged;
+      expect(store.getSession(sessionId)?.lastActivityAt).toBe(new Date().toISOString());
+      expect(service.sessionRetention.sweep()).toBe(0);
+      expect(store.listSessionCleanupRequests()).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("keeps the legacy ordered reconnect handshake for older Nodes", async () => {

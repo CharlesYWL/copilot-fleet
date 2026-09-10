@@ -1,10 +1,12 @@
 import { randomBytes } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   MUTUAL_AUTH_PROTOCOL,
   OUTBOX_ACK_CAPABILITY,
+  SESSION_RETENTION_CAPABILITY,
   type HostToNodeMessage,
+  type NodeCommand,
   type NodeClientHello,
   type NodeToHostMessage,
   type SessionEvent,
@@ -23,6 +25,9 @@ import { settingsFromEnv } from "./settings.js";
 import type * as SettingsModule from "./settings.js";
 import type * as AgentCatalogModule from "./agent-catalog.js";
 import type * as InstanceLockModule from "./instance-lock.js";
+import type * as ConfigServerModule from "./config-server.js";
+import type { CopilotSessionDiscoveryOptions } from "./copilot-sessions.js";
+import type { CommandResult, CommandRouterOptions } from "./router.js";
 
 class TestSocket extends EventEmitter {
   static OPEN = 1;
@@ -49,6 +54,18 @@ class TestSocket extends EventEmitter {
 const sockets: TestSocket[] = [];
 let emitEvent: (event: SessionEvent) => void;
 const refreshMcpSessions = vi.fn(async () => {});
+const route = vi.fn<(command: NodeCommand) => Promise<CommandResult>>(
+  async (command) => ({ commandId: command.commandId, ok: true }),
+);
+let routerOptions: CommandRouterOptions;
+let discoveryOptions: CopilotSessionDiscoveryOptions;
+let configOptions: Parameters<typeof ConfigServerModule.startConfigServer>[0];
+const createDiscovery = vi.fn();
+const deleteInactiveSession = vi.fn<
+  NonNullable<CommandRouterOptions["deleteInactiveSession"]>
+>(async (_id, _cutoff, beforeDelete) => {
+  await beforeDelete();
+});
 const hostKeys = createIdentityKeyPair();
 const nodeKeys = createIdentityKeyPair();
 const credentials = {
@@ -87,7 +104,19 @@ vi.mock("./instance-lock.js", async (original) => ({
 }));
 vi.mock("./config-server.js", () => ({
   configServerPort: () => 8788,
-  startConfigServer: () => ({ close: vi.fn() }),
+  startConfigServer: (options: typeof configOptions) => {
+    configOptions = options;
+    return { close: vi.fn() };
+  },
+}));
+vi.mock("./copilot-sessions.js", () => ({
+  CopilotSessionDiscovery: class {
+    deleteInactiveSession = deleteInactiveSession;
+    constructor(options: CopilotSessionDiscoveryOptions) {
+      discoveryOptions = options;
+      createDiscovery(options);
+    }
+  },
 }));
 vi.mock("./router.js", () => ({
   validateWorkspacePath: vi.fn(),
@@ -95,16 +124,29 @@ vi.mock("./router.js", () => ({
     activeSessionIds = ["session-1"];
     busySessionIds = ["session-1"];
     refreshMcpSessions = refreshMcpSessions;
+    route = route;
+    setMaxSessions = vi.fn();
     stopAll = vi.fn(async () => {});
     constructor(
       _factory: unknown,
       _capacity: number,
       onEvent: (event: SessionEvent) => void,
+      _validatePath: unknown,
+      _hostUrl: unknown,
+      _catalog: unknown,
+      _warn: unknown,
+      options: CommandRouterOptions,
     ) {
       emitEvent = onEvent;
+      routerOptions = options;
     }
   },
 }));
+
+beforeEach(() => {
+  sockets.length = 0;
+  vi.clearAllMocks();
+});
 
 afterEach(() => {
   vi.useRealTimers();
@@ -182,7 +224,10 @@ it("replays events produced during mutual authentication before refreshing MCP s
     const ready = open(2);
     expect(ready).toMatchObject({
       type: "ready",
-      capabilities: expect.arrayContaining([OUTBOX_ACK_CAPABILITY]),
+      capabilities: expect.arrayContaining([
+        OUTBOX_ACK_CAPABILITY,
+        SESSION_RETENTION_CAPABILITY,
+      ]),
       pendingOutbox: true,
       pendingOutboxCount: 1,
       outboxFlush: { eventCount: 1 },
@@ -219,6 +264,103 @@ it("replays events produced during mutual authentication before refreshing MCP s
     expect(refreshMcpSessions).not.toHaveBeenCalled();
     await receive({ type: "outbox_flush_ack", flushId: nextBatch.outboxFlush.flushId });
     expect(refreshMcpSessions).toHaveBeenCalledOnce();
+
+    const beforeDelete = vi.fn(async () => {});
+    await routerOptions.deleteInactiveSession!("mock-session", Date.now(), beforeDelete);
+    expect(beforeDelete).toHaveBeenCalledOnce();
+    expect(createDiscovery).not.toHaveBeenCalled();
+    expect(deleteInactiveSession).not.toHaveBeenCalled();
+
+    const cleanup: Extract<NodeCommand, { type: "delete_session" }> = {
+      type: "delete_session",
+      commandId: "cleanup-1",
+      sessionId: "session-1",
+      agentSessionId: "mock-session",
+      inactiveBefore: new Date(Date.now() - 30 * 86_400_000).toISOString(),
+      retentionDays: 30,
+    };
+    let responseIndex = socket.send.mock.calls.length;
+    await receive({ type: "command", command: cleanup });
+    expect(open(responseIndex)).toEqual({
+      type: "session_cleanup_result",
+      commandId: "cleanup-1",
+      sessionId: "session-1",
+      ok: true,
+    });
+    route.mockResolvedValueOnce({
+      commandId: "cleanup-2",
+      ok: false,
+      fatal: false,
+      error: "session_active",
+    });
+    responseIndex = socket.send.mock.calls.length;
+    await receive({
+      type: "command",
+      command: { ...cleanup, commandId: "cleanup-2" },
+    });
+    expect(open(responseIndex)).toEqual({
+      type: "session_cleanup_result",
+      commandId: "cleanup-2",
+      sessionId: "session-1",
+      ok: false,
+      error: "session_active",
+    });
+    responseIndex = socket.send.mock.calls.length;
+    await receive({
+      type: "command",
+      command: {
+        type: "prompt",
+        commandId: "normal-prompt",
+        sessionId: "session-1",
+        prompt: "hello",
+        attachments: [],
+      },
+    });
+    expect(open(responseIndex)).toEqual({
+      type: "command_result",
+      commandId: "normal-prompt",
+      sessionId: "session-1",
+      ok: true,
+      fatal: true,
+    });
+  } finally {
+    await runtime.shutdown();
+    for (const listener of process.listeners("exit")) {
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  }
+});
+
+it("uses current Copilot launch settings for persisted cleanup without starting agents", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "0");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    expect(createDiscovery).toHaveBeenCalledOnce();
+    const settings = configOptions.getSettings();
+    expect(discoveryOptions.getCopilotCommand()).toBe(settings.copilotCommand);
+    expect(discoveryOptions.getContextTier()).toBe(settings.contextTier);
+    await configOptions.applySettings({
+      ...settings,
+      copilotCommand: "updated-copilot",
+      contextTier: "long_context",
+    });
+    expect(discoveryOptions.getCopilotCommand()).toBe("updated-copilot");
+    expect(discoveryOptions.getContextTier()).toBe("long_context");
+    expect(configOptions.sessionDiscovery).toMatchObject({ deleteInactiveSession });
+    const beforeDelete = vi.fn(async () => {});
+    await routerOptions.deleteInactiveSession!("expired", 123, beforeDelete);
+    expect(deleteInactiveSession).toHaveBeenCalledExactlyOnceWith(
+      "expired",
+      123,
+      beforeDelete,
+    );
+    expect(beforeDelete).toHaveBeenCalledOnce();
   } finally {
     await runtime.shutdown();
     for (const listener of process.listeners("exit")) {

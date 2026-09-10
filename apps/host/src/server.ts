@@ -29,6 +29,7 @@ import {
   resolveEnrollmentHostUrl,
   resolveLegacyEnrollmentToken,
   resolvePublicHostUrl,
+  resolveSessionRetentionDays,
   type LegacyEnrollment,
 } from "./config.js";
 import { FleetService } from "./fleet-service.js";
@@ -48,6 +49,7 @@ import { nodeRoutes } from "./routes/nodes.js";
 import { portableBackupRoutes } from "./routes/portable-backup.js";
 import { notificationRoutes } from "./routes/notifications.js";
 import { startNotificationRetentionMonitor } from "./notifications/retention.js";
+import { startSessionRetentionMonitor } from "./session-retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { runRoutes } from "./routes/runs.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
@@ -103,6 +105,9 @@ export async function buildServer(
     resetOperatorAuth?: boolean;
   } = {},
 ): Promise<FastifyInstance> {
+  const sessionRetentionDays = resolveSessionRetentionDays(
+    process.env.FLEET_SESSION_RETENTION_DAYS,
+  );
   const logs = createLogBuffer();
   const app = Fastify({ logger: { stream: recordingLogStream(logs) } });
   const store = new FleetStore(
@@ -208,7 +213,12 @@ export async function buildServer(
       browsers.revokeAdministrator(administratorId),
     onAuthenticationReset: () => browsers.closeAll(),
   });
-  const service = new FleetService(store, app.log, cachedGitRevision());
+  const service = new FleetService(
+    store,
+    app.log,
+    cachedGitRevision(),
+    sessionRetentionDays,
+  );
   const leadTokens = new LeadTokens(store);
   /*
    * Minted on the first boot that needs one and kept for the life of the fleet:
@@ -259,6 +269,26 @@ export async function buildServer(
       publicUrl: () => process.env.FLEET_PUBLIC_URL || store.getSetting("host.publicUrl"),
       tunnelUrls: () => tunnel.allTunnelUrls(),
     },
+  });
+  app.addHook("preHandler", async (request) => {
+    if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return;
+    const params = request.params;
+    if (
+      typeof params !== "object" ||
+      params === null ||
+      !("id" in params) ||
+      typeof params.id !== "string"
+    ) {
+      return;
+    }
+    const route = request.routeOptions.url ?? "";
+    if (route.startsWith("/api/sessions/")) {
+      store.assertSessionMutable(params.id);
+    } else if (route.startsWith("/api/orchestrators/")) {
+      store.assertOrchestratorMutable(params.id);
+    } else if (route.startsWith("/api/runs/")) {
+      store.assertRunMutable(params.id);
+    }
   });
   await app.register(authRoutes, {
     auth,
@@ -346,6 +376,10 @@ export async function buildServer(
   registerNodeGateway(app, service, { identity: hostIdentity });
   const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs);
   const notificationRetentionTimer = startNotificationRetentionMonitor(service, app.log);
+  const sessionRetentionTimer = startSessionRetentionMonitor(
+    service.sessionRetention,
+    app.log,
+  );
   // Timeouts are the absence of events; without a clock nothing would ever
   // notice one. See the monitor for why this is not the busy-wait the design
   // rules out.
@@ -390,6 +424,7 @@ export async function buildServer(
   app.addHook("onClose", async () => {
     clearInterval(presenceTimer);
     clearInterval(notificationRetentionTimer);
+    clearInterval(sessionRetentionTimer);
     clearInterval(runDeadlineTimer);
     clearInterval(hostUrlMonitor);
     clearInterval(sessionTimer);

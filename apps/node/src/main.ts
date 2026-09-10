@@ -14,6 +14,7 @@ import {
   SELF_UPDATE_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
   SESSION_CONFIG_CAPABILITY,
+  SESSION_RETENTION_CAPABILITY,
   decodeFrame,
   errorMessage,
   sameHostUrl,
@@ -65,6 +66,7 @@ import {
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
+import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { EventOutbox } from "./outbox.js";
 import {
   closeQuietly,
@@ -104,6 +106,7 @@ const NODE_CAPABILITIES = [
   NODE_NAME_SYNC_CAPABILITY,
   SESSION_ACTIVITY_CAPABILITY,
   SESSION_CONFIG_CAPABILITY,
+  SESSION_RETENTION_CAPABILITY,
   OUTBOX_ACK_CAPABILITY,
 ];
 const RECONNECT_DELAY_MS = 2_000;
@@ -336,6 +339,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   const outbox = new EventOutbox();
   let outboxReconciliationPending = false;
   let holdEventsForReconnectFlush = false;
+  const sessionDiscovery = mockAgent
+    ? undefined
+    : new CopilotSessionDiscovery({
+        getCopilotCommand: () => settings.copilotCommand,
+        getContextTier: () => settings.contextTier,
+      });
   const router = new CommandRouter(
     factory,
     settings.maxSessions,
@@ -351,6 +360,19 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     () => settings.hostUrl,
     agentCatalog,
     warn,
+    {
+      deleteInactiveSession: async (agentSessionId, inactiveBefore, beforeDelete) => {
+        if (mockAgent) {
+          await beforeDelete();
+        } else {
+          await sessionDiscovery!.deleteInactiveSession(
+            agentSessionId,
+            inactiveBefore,
+            beforeDelete,
+          );
+        }
+      },
+    },
   );
 
   /**
@@ -627,6 +649,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   }
 
   const configServer = startConfigServer({
+    ...(sessionDiscovery ? { sessionDiscovery } : {}),
     getSettings: () => settings,
     getStatus: () => ({
       nodeId: credentials.nodeId,
@@ -889,14 +912,24 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           ? `> ${command.type} ok session=${command.sessionId.slice(0, 8)}`
           : `> ${command.type} FAILED session=${command.sessionId.slice(0, 8)}: ${result.error}`,
       );
-      send({
-        type: "command_result",
-        commandId: result.commandId,
-        sessionId: command.sessionId,
-        ok: result.ok,
-        fatal: result.fatal ?? true,
-        ...(result.error ? { error: result.error } : {}),
-      });
+      if (command.type === "delete_session") {
+        send({
+          type: "session_cleanup_result",
+          commandId: result.commandId,
+          sessionId: command.sessionId,
+          ok: result.ok,
+          ...(result.error ? { error: result.error } : {}),
+        });
+      } else {
+        send({
+          type: "command_result",
+          commandId: result.commandId,
+          sessionId: command.sessionId,
+          ok: result.ok,
+          fatal: result.fatal ?? true,
+          ...(result.error ? { error: result.error } : {}),
+        });
+      }
     });
     active.on("close", async (code) => {
       // A settings change swaps the socket out; the stale one must not tear down

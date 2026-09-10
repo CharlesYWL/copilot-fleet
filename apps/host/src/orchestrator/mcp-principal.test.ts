@@ -160,6 +160,14 @@ describe("mcp lead principal", () => {
     expect((await call(token)).statusCode).toBe(401);
   });
 
+  it("revokes fleet tools while an idle lead is being deleted", async () => {
+    const token = new LeadTokens(store).mint(lead);
+    sessions.set("lead-1", session({ cleanupRequested: true }));
+
+    expect((await call(token)).statusCode).toBe(401);
+    expect(audited[0]).toMatchObject({ outcome: "denied" });
+  });
+
   it("refuses a request that carries a browser origin", async () => {
     // A browser must never be able to reach this at all, however good the
     // token is: `/mcp` is a machine principal, and an `Origin` header is the

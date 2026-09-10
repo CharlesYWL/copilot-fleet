@@ -1,5 +1,20 @@
 import { resolve, isAbsolute, basename } from "node:path";
 import { packageRoot } from "./paths.js";
+import {
+  DEFAULT_SESSION_RETENTION_DAYS,
+  SessionRetentionDaysSchema,
+} from "@fleet/protocol";
+
+export function resolveSessionRetentionDays(configured: string | undefined): number {
+  if (configured === undefined) return DEFAULT_SESSION_RETENTION_DAYS;
+  const parsed = SessionRetentionDaysSchema.safeParse(Number(configured));
+  if (!/^\d+$/.test(configured.trim()) || !parsed.success) {
+    throw new Error(
+      "FLEET_SESSION_RETENTION_DAYS must be 0 (disabled) or a whole number from 30 to 36500",
+    );
+  }
+  return parsed.data;
+}
 
 /**
  * Existing .env files carry a repo-root-relative DATABASE_PATH, so a bare

@@ -60,9 +60,11 @@ import {
   canTransition,
   canTransitionRun,
   isChatsWorkspace,
+  isSessionActivityEvent,
   liveSessionStates,
   sessionFieldsForHostImport,
   terminalRunStates,
+  terminalRunStepStates,
   terminalSessionStates,
   tryParseJson,
   tunnelProviders,
@@ -105,6 +107,26 @@ export type RunStepInput = {
 };
 
 type Row = Record<string, unknown>;
+
+export type SessionCleanupRequest = {
+  sessionId: string;
+  nodeId: string;
+  commandId: string;
+  inactiveBefore: string;
+  retentionDays: number;
+  requestedAt: string;
+  inFlight: boolean;
+};
+
+export class SessionCleanupPendingError extends Error {
+  readonly statusCode = 409;
+
+  constructor() {
+    super(
+      "Session is being deleted after inactivity; wait for its Node to finish cleanup",
+    );
+  }
+}
 
 /**
  * What happened to an event offered to the log.
@@ -559,6 +581,14 @@ export class FleetStore {
         attempt TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS session_cleanup_requests (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+        command_id TEXT NOT NULL UNIQUE,
+        inactive_before TEXT NOT NULL,
+        retention_days INTEGER NOT NULL,
+        requested_at TEXT NOT NULL,
+        in_flight INTEGER NOT NULL DEFAULT 1
+      );
       CREATE INDEX IF NOT EXISTS idx_run_notes_run ON run_notes(run_id);
       CREATE INDEX IF NOT EXISTS idx_run_steps_run ON run_steps(run_id);
       CREATE INDEX IF NOT EXISTS idx_run_steps_session ON run_steps(session_id);
@@ -664,6 +694,22 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "stop_requested", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "dismissed", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "favorite", "INTEGER NOT NULL DEFAULT 0");
+    if (
+      this.addColumnIfMissing("sessions", "last_activity_at", "TEXT NOT NULL DEFAULT ''")
+    ) {
+      this.db.exec(`
+        UPDATE sessions SET last_activity_at=MAX(
+          created_at,updated_at,
+          COALESCE((
+            SELECT MAX(CASE WHEN received_at<>'' THEN received_at ELSE created_at END)
+            FROM events WHERE session_id=sessions.id
+          ),'')
+        );
+      `);
+    }
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_sessions_retention ON sessions(last_activity_at,state)",
+    );
     this.addColumnIfMissing(
       "sessions",
       "last_lead_prompt_at",
@@ -1235,6 +1281,7 @@ export class FleetStore {
    * so machines that still have `node.json` can authenticate without re-enrolling.
    */
   replaceHostBackup(backup: HostBackup): void {
+    this.assertNoSessionCleanup();
     const parsed = HostBackupSchema.parse(backup);
 
     this.transaction(() => this.replaceHostBackupRows(parsed));
@@ -1392,8 +1439,8 @@ export class FleetStore {
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
-            stop_requested,dismissed,favorite)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            stop_requested,dismissed,favorite,last_activity_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -1417,6 +1464,7 @@ export class FleetStore {
         session.stopRequested ? 1 : 0,
         session.dismissed ? 1 : 0,
         session.favorite ? 1 : 0,
+        session.lastActivityAt ?? session.updatedAt,
       );
     }
     for (const event of parsed.events) {
@@ -1606,6 +1654,7 @@ export class FleetStore {
     data: HostPortableBackupData;
     security: SecurityBackupPayload;
   }): { revokedSessions: RevokedSession[] } {
+    this.assertNoSessionCleanup();
     const authByNode = new Map(
       input.security.nodeAuth.map((node) => [node.nodeId, node]),
     );
@@ -2905,12 +2954,13 @@ export class FleetStore {
     name = "",
     run: { runId?: string; runRole?: RunRole; readOnly?: boolean } = {},
   ): FleetSession {
+    if (run.runId) this.assertRunMutable(run.runId);
     const now = new Date().toISOString();
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -2927,6 +2977,7 @@ export class FleetStore {
       run.runId ?? "",
       run.runRole ?? "",
       run.readOnly ? 1 : 0,
+      now,
     );
     return this.getSession(id)!;
   }
@@ -2953,6 +3004,7 @@ export class FleetStore {
       ).get(agentSessionId) as Row | undefined;
       if (existingRow) {
         let session = sessionFromRow(existingRow);
+        this.assertSessionMutable(session.id);
         const alreadyLive = liveSessionStates.has(session.state);
         if (!alreadyLive) {
           this.statement(
@@ -2972,6 +3024,8 @@ export class FleetStore {
             session.id,
           );
           session = this.getSession(session.id)!;
+          this.touchSessionActivity(session.id);
+          session = this.getSession(session.id)!;
         }
         return {
           session,
@@ -2984,8 +3038,8 @@ export class FleetStore {
       const id = randomUUID();
       this.statement(
         `INSERT INTO sessions
-         (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,agent_session_id,additional_directories,yolo,name,run_id,run_role,read_only)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,agent_session_id,additional_directories,yolo,name,run_id,run_role,read_only,last_activity_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         id,
         placement.workspaceId,
@@ -3004,6 +3058,7 @@ export class FleetStore {
         "",
         "",
         0,
+        now,
       );
       return { session: this.getSession(id)!, created: true, alreadyLive: false };
     });
@@ -3018,11 +3073,13 @@ export class FleetStore {
    */
   renameSession(id: string, name: string): FleetSession | undefined {
     if (!this.getSession(id)) return undefined;
+    this.assertSessionMutable(id);
     this.statement("UPDATE sessions SET name=?,updated_at=? WHERE id=?").run(
       name.trim(),
       new Date().toISOString(),
       id,
     );
+    this.touchSessionActivity(id);
     return this.getSession(id);
   }
 
@@ -3040,6 +3097,163 @@ export class FleetStore {
     ).map(sessionFromRow);
   }
 
+  touchSessionActivity(id: string, at = new Date().toISOString()): void {
+    const timestamp = SessionSchema.shape.updatedAt.parse(at);
+    this.statement(
+      "UPDATE sessions SET last_activity_at=MAX(last_activity_at,?) WHERE id=?",
+    ).run(timestamp, id);
+  }
+
+  listInactiveSessions(inactiveBefore: string): FleetSession[] {
+    return (
+      this.sessionQuery(
+        `WHERE s.last_activity_at<=? AND s.state IN ('idle','stopped','completed','failed')
+         AND s.favorite=0 AND s.stop_requested=0
+         ORDER BY s.last_activity_at,s.id`,
+      ).all(inactiveBefore) as Row[]
+    ).map(sessionFromRow);
+  }
+
+  hasSessionRetentionBlockers(sessionId: string, inactiveBefore: string): boolean {
+    const sharedConversation = this.statement(
+      `SELECT 1 FROM sessions current JOIN sessions other
+         ON other.node_id=current.node_id
+        AND other.agent_session_id=current.agent_session_id
+       WHERE current.id=? AND current.agent_session_id<>''
+         AND other.id<>current.id LIMIT 1`,
+    ).get(sessionId);
+    if (sharedConversation) return true;
+    const relatedRun = this.statement(
+      `SELECT 1 FROM runs r WHERE
+         (r.id=(SELECT run_id FROM sessions WHERE id=?) OR r.lead_session_id=?
+          OR r.id IN (SELECT run_id FROM run_steps WHERE session_id=?))
+         AND (r.state NOT IN (${placeholders([...terminalRunStates])})
+          OR r.updated_at>? OR r.pending_prompt<>''
+          OR EXISTS(SELECT 1 FROM run_steps step WHERE step.run_id=r.id
+                    AND step.state NOT IN (${placeholders([...terminalRunStepStates])})))
+       LIMIT 1`,
+    ).get(
+      sessionId,
+      sessionId,
+      sessionId,
+      ...terminalRunStates,
+      inactiveBefore,
+      ...terminalRunStepStates,
+    );
+    if (relatedRun) return true;
+    return Boolean(
+      this.statement(
+        `SELECT 1 FROM sessions worker JOIN runs r ON r.id=worker.run_id
+         WHERE r.lead_session_id=? AND worker.id<>?
+           AND (worker.state NOT IN (${placeholders(terminalStateList)})
+                OR worker.favorite=1 OR worker.stop_requested=1
+                OR worker.last_activity_at>?
+                OR EXISTS(SELECT 1 FROM session_cleanup_requests c
+                          WHERE c.session_id=worker.id AND c.in_flight=1))
+         LIMIT 1`,
+      ).get(sessionId, sessionId, ...terminalStateList, inactiveBefore),
+    );
+  }
+
+  listSessionCleanupRequests(): SessionCleanupRequest[] {
+    return (
+      this.statement(
+        `SELECT c.*,s.node_id FROM session_cleanup_requests c
+         JOIN sessions s ON s.id=c.session_id ORDER BY c.requested_at,c.session_id`,
+      ).all() as Row[]
+    ).map((row) => ({
+      sessionId: String(row.session_id),
+      nodeId: String(row.node_id),
+      commandId: String(row.command_id),
+      inactiveBefore: String(row.inactive_before),
+      retentionDays: Number(row.retention_days),
+      requestedAt: String(row.requested_at),
+      inFlight: Boolean(row.in_flight),
+    }));
+  }
+
+  requestSessionCleanup(request: SessionCleanupRequest): void {
+    this.statement(
+      `INSERT INTO session_cleanup_requests
+       (session_id,command_id,inactive_before,retention_days,requested_at,in_flight)
+       VALUES (?,?,?,?,?,1)
+       ON CONFLICT(session_id) DO UPDATE SET
+         command_id=excluded.command_id,inactive_before=excluded.inactive_before,
+         retention_days=excluded.retention_days,requested_at=excluded.requested_at,
+         in_flight=1`,
+    ).run(
+      request.sessionId,
+      request.commandId,
+      request.inactiveBefore,
+      request.retentionDays,
+      request.requestedAt,
+    );
+  }
+
+  failSessionCleanup(commandId: string, at: string): void {
+    this.statement(
+      "UPDATE session_cleanup_requests SET in_flight=0,requested_at=? WHERE command_id=?",
+    ).run(at, commandId);
+  }
+
+  assertSessionMutable(id: string): void {
+    if (
+      this.statement(
+        "SELECT 1 FROM session_cleanup_requests WHERE session_id=? AND in_flight=1",
+      ).get(id)
+    ) {
+      throw new SessionCleanupPendingError();
+    }
+  }
+
+  assertNoSessionCleanup(): void {
+    if (
+      this.statement(
+        "SELECT 1 FROM session_cleanup_requests WHERE in_flight=1 LIMIT 1",
+      ).get()
+    ) {
+      throw new SessionCleanupPendingError();
+    }
+  }
+
+  assertRunMutable(id: string): void {
+    if (
+      this.statement(
+        `SELECT 1 FROM session_cleanup_requests c JOIN sessions s ON s.id=c.session_id
+         WHERE c.in_flight=1 AND
+           (s.run_id=? OR s.id IN (SELECT lead_session_id FROM runs WHERE id=?)
+            OR s.id IN (SELECT session_id FROM run_steps WHERE run_id=?))
+         LIMIT 1`,
+      ).get(id, id, id)
+    ) {
+      throw new SessionCleanupPendingError();
+    }
+  }
+
+  assertOrchestratorMutable(id: string): void {
+    this.assertSessionMutable(id);
+    for (const run of this.listRuns()) {
+      if (run.leadSessionId === id) this.assertRunMutable(run.id);
+    }
+  }
+
+  /** Only an acknowledged request may remove a still-idle session. */
+  completeSessionCleanup(commandId: string): boolean {
+    return this.transaction(() => {
+      const row = this.statement(
+        "SELECT session_id FROM session_cleanup_requests WHERE command_id=? AND in_flight=1",
+      ).get(commandId) as Row | undefined;
+      if (!row) return false;
+      const id = String(row.session_id);
+      this.statement("UPDATE runs SET lead_session_id='' WHERE lead_session_id=?").run(
+        id,
+      );
+      this.statement("UPDATE run_steps SET session_id='' WHERE session_id=?").run(id);
+      this.deleteSessionRecords(id);
+      return true;
+    });
+  }
+
   /** When the engine last sent this Lead any automated prompt. */
   lastOrchestratorPromptAt(id: string): string {
     const row = this.statement(
@@ -3053,9 +3267,11 @@ export class FleetStore {
    * on every deadline sweep after restart.
    */
   recordOrchestratorPrompt(id: string, at = new Date().toISOString()): boolean {
+    this.assertSessionMutable(id);
     const result = this.statement(
       "UPDATE sessions SET last_lead_prompt_at=? WHERE id=? AND run_role='lead'",
     ).run(at, id);
+    if (Number(result.changes) > 0) this.touchSessionActivity(id, at);
     return Number(result.changes) > 0;
   }
 
@@ -3627,6 +3843,8 @@ export class FleetStore {
     },
   ): Run | undefined {
     if (!this.getRun(id)) return undefined;
+    this.assertRunMutable(id);
+    if (patch.leadSessionId) this.assertSessionMutable(patch.leadSessionId);
     const columns: Record<string, unknown> = {
       state: patch.state,
       lead_session_id: patch.leadSessionId,
@@ -3700,6 +3918,7 @@ export class FleetStore {
     if (!run || run.state !== "cancelled" || run.failureReason !== stopReason) {
       return undefined;
     }
+    this.assertRunMutable(id);
     return this.transaction(() => {
       const now = new Date().toISOString();
       this.statement(
@@ -3804,6 +4023,7 @@ export class FleetStore {
    * moves, rather than the run growing a second step that means the same thing.
    */
   upsertRunStep(runId: string, input: RunStepInput): RunStep {
+    this.assertRunMutable(runId);
     const now = new Date().toISOString();
     const existing = this.statement(
       "SELECT * FROM run_steps WHERE run_id=? AND step_key=?",
@@ -3909,6 +4129,7 @@ export class FleetStore {
    * this exists to save them.
    */
   appendRunNote(runId: string, phaseIndex: number, body: string): RunNote {
+    this.assertRunMutable(runId);
     const id = randomUUID();
     const createdAt = new Date().toISOString();
     this.statement(
@@ -3940,7 +4161,10 @@ export class FleetStore {
       >
     >,
   ): RunStep | undefined {
-    if (!this.getRunStep(id)) return undefined;
+    const current = this.getRunStep(id);
+    if (!current) return undefined;
+    this.assertRunMutable(current.runId);
+    if (patch.sessionId) this.assertSessionMutable(patch.sessionId);
     const columns: Record<string, unknown> = {
       state: patch.state,
       session_id: patch.sessionId,
@@ -3968,6 +4192,7 @@ export class FleetStore {
 
   /** Replaces a run's whole plan. Used by the handwritten-DAG fixture. */
   replaceRunSteps(runId: string, steps: readonly RunStepInput[]): RunStep[] {
+    this.assertRunMutable(runId);
     return this.transaction(() => {
       this.statement("DELETE FROM run_steps WHERE run_id=?").run(runId);
       steps.forEach((step, index) => {
@@ -3981,6 +4206,7 @@ export class FleetStore {
   deleteRun(id: string): boolean {
     return this.transaction(() => {
       if (!this.getRun(id)) return false;
+      this.assertRunMutable(id);
       // Notes reference the run, so they have to go first or the foreign key
       // rejects the delete and takes the whole transaction with it.
       this.statement("DELETE FROM run_notes WHERE run_id=?").run(id);
@@ -3992,7 +4218,10 @@ export class FleetStore {
 
   private sessionQuery(suffix: string): StatementSync {
     return this.statement(
-      `SELECT s.*,w.name workspace_name,n.name node_name FROM sessions s
+      `SELECT s.*,w.name workspace_name,n.name node_name,
+       EXISTS(SELECT 1 FROM session_cleanup_requests c
+              WHERE c.session_id=s.id AND c.in_flight=1) cleanup_requested
+       FROM sessions s
        JOIN workspaces w ON w.id=s.workspace_id JOIN nodes n ON n.id=s.node_id ${suffix}`,
     );
   }
@@ -4129,11 +4358,13 @@ export class FleetStore {
 
   setSessionFavorite(id: string, favorite: boolean): FleetSession {
     if (!this.getSession(id)) throw new Error("Session not found");
+    this.assertSessionMutable(id);
     this.statement("UPDATE sessions SET favorite=?,updated_at=? WHERE id=?").run(
       favorite ? 1 : 0,
       new Date().toISOString(),
       id,
     );
+    this.touchSessionActivity(id);
     return this.getSession(id)!;
   }
 
@@ -4264,6 +4495,9 @@ export class FleetStore {
         event.createdAt,
         receivedAt,
       );
+      if (isSessionActivityEvent(event)) {
+        this.touchSessionActivity(event.sessionId, receivedAt);
+      }
       // Only the newest event describes the session now: an event that arrives
       // late and fills a hole must not drag the preview backwards.
       if (event.sequence > max) {
@@ -4350,6 +4584,11 @@ export class FleetStore {
     id: string,
     label: string,
   ): void {
+    const pending = this.statement(
+      `SELECT 1 FROM sessions s JOIN session_cleanup_requests c ON c.session_id=s.id
+       WHERE s.${column}=? AND c.in_flight=1 LIMIT 1`,
+    ).get(id);
+    if (pending) throw new SessionCleanupPendingError();
     // Offline rows are leftover after a host/node restart; cascade-delete is fine.
     const row = this.statement(
       `SELECT COUNT(*) live FROM sessions
@@ -4365,14 +4604,17 @@ export class FleetStore {
   deleteSession(id: string): void {
     const session = this.getSession(id);
     if (!session) throw new Error("Session not found");
+    this.assertSessionMutable(id);
     if (!terminalSessionStates.has(session.state)) {
       throw new Error("Can only dismiss ended sessions");
     }
-    this.transaction(() => {
-      this.statement("DELETE FROM notification_preferences WHERE session_id=?").run(id);
-      this.statement("DELETE FROM events WHERE session_id=?").run(id);
-      this.statement("DELETE FROM sessions WHERE id=?").run(id);
-    });
+    this.transaction(() => this.deleteSessionRecords(id));
+  }
+
+  private deleteSessionRecords(id: string): void {
+    this.statement("DELETE FROM notification_preferences WHERE session_id=?").run(id);
+    this.statement("DELETE FROM events WHERE session_id=?").run(id);
+    this.statement("DELETE FROM sessions WHERE id=?").run(id);
   }
 
   /**
@@ -4390,7 +4632,9 @@ export class FleetStore {
    */
   deleteEndedSessions(): number {
     const list = placeholders(terminalStateList);
-    const disposable = `state IN (${list}) AND agent_session_id = '' AND run_role <> 'lead'`;
+    const disposable = `state IN (${list}) AND agent_session_id = '' AND run_role <> 'lead'
+      AND NOT EXISTS (SELECT 1 FROM session_cleanup_requests c
+                      WHERE c.session_id=sessions.id AND c.in_flight=1)`;
     return this.transaction(() => {
       this.statement(
         `DELETE FROM notification_preferences WHERE session_id IN
@@ -4504,6 +4748,8 @@ function sessionFromRow(row: Row): FleetSession {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     agentSessionId: String(row.agent_session_id ?? ""),
+    lastActivityAt: String(row.last_activity_at || row.updated_at),
+    cleanupRequested: Boolean(row.cleanup_requested),
     additionalDirectories: parseJsonList(row.additional_directories),
     yolo: Number(row.yolo ?? 0) === 1,
     commands: parseJsonList(row.commands),

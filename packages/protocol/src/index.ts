@@ -46,6 +46,23 @@ export const terminalSessionStates = new Set<SessionState>([
   "completed",
   "failed",
 ]);
+
+export const DEFAULT_SESSION_RETENTION_DAYS = 30;
+export const SESSION_RETENTION_DAY_MS = 24 * 60 * 60 * 1000;
+export const SessionRetentionDaysSchema = z
+  .number()
+  .int()
+  .min(0)
+  .max(36_500)
+  .refine((days) => days === 0 || days >= DEFAULT_SESSION_RETENTION_DAYS, {
+    message: "Session retention must be 0 (disabled) or at least 30 days",
+  });
+
+export function sessionRetentionCutoff(now: number, days: number): number | undefined {
+  SessionRetentionDaysSchema.parse(days);
+  if (!Number.isFinite(now)) throw new Error("Invalid session retention clock");
+  return days === 0 ? undefined : now - days * SESSION_RETENTION_DAY_MS;
+}
 /** States backed by an active or reserved Node slot. */
 export const liveSessionStates = new Set<SessionState>([
   "queued",
@@ -310,6 +327,10 @@ export const SessionSchema = z.object({
   lastText: z.string(),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
+  /** Actual session use, independent of connectivity and inventory refreshes. */
+  lastActivityAt: z.string().datetime().optional(),
+  /** A durable deletion request is awaiting the owning Node's confirmation. */
+  cleanupRequested: z.boolean().optional(),
   /** Copilot's own ACP session id, needed to resume the conversation. */
   agentSessionId: z.string().default(""),
   /** Additional workspace roots that ACP must restore with this session. */
@@ -398,6 +419,25 @@ export const SessionEventSchema = z.object({
 });
 export type SessionEvent = z.infer<typeof SessionEventSchema>;
 export type SessionEventType = SessionEvent["type"];
+
+/** Inventory, picker replay and connectivity notices must not renew retention. */
+export function isSessionActivityEvent(event: SessionEvent): boolean {
+  if (event.payload.historyReplay === true) return false;
+  return (
+    [
+      "agent_text",
+      "agent_thought",
+      "tool",
+      "permission",
+      "permission_result",
+      "turn_complete",
+      "error",
+    ].includes(event.type) ||
+    (event.type === "system" &&
+      typeof event.payload.text === "string" &&
+      event.payload.text.startsWith("User: "))
+  );
+}
 
 /**
  * What each event type carries.
@@ -616,6 +656,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
     /** Continues the host's event sequence so replayed rows stay ordered. */
     sequenceOffset: z.number().int().nonnegative().default(0),
+    /** Automatic recovery preserves inactivity; explicit Resume omits this. */
+    lastActivityAt: z.string().datetime().optional(),
     yolo: z.boolean().default(false),
     agencyMode: z.boolean().optional(),
     /**
@@ -659,6 +701,14 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     type: z.literal("stop"),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
+  }),
+  z.object({
+    type: z.literal("delete_session"),
+    commandId: z.string().min(1),
+    sessionId: z.string().min(1),
+    agentSessionId: z.string(),
+    inactiveBefore: z.string().datetime(),
+    retentionDays: SessionRetentionDaysSchema.refine((days) => days > 0),
   }),
   z.object({
     type: z.literal("permission_response"),
@@ -844,6 +894,13 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
      */
     fatal: z.boolean().default(true),
   }),
+  z.object({
+    type: z.literal("session_cleanup_result"),
+    commandId: z.string().min(1),
+    sessionId: z.string().min(1),
+    ok: z.boolean(),
+    error: z.string().optional(),
+  }),
   /**
    * Progress of a self-update, which belongs to the machine rather than to any
    * session — so it cannot travel as a `command_result`, whose every field is
@@ -980,6 +1037,9 @@ export const NODE_NAME_SYNC_CAPABILITY = "node-name-sync";
  * assuming it is idle and waiting for a prompt.
  */
 export const SESSION_ACTIVITY_CAPABILITY = "session-activity";
+
+/** Supports guarded deletion of an explicitly identified Fleet-owned session. */
+export const SESSION_RETENTION_CAPABILITY = "session-retention";
 
 /** A Node that retains reconnect batches until `outbox_flush_ack`. */
 export const OUTBOX_ACK_CAPABILITY = "outbox-ack";
@@ -2779,9 +2839,13 @@ const resumableStates = new Set<SessionState>([...terminalSessionStates, "offlin
  * the same: one is worth showing and keeping, the other is only worth clearing.
  */
 export function isResumableSession(
-  session: Pick<FleetSession, "state" | "agentSessionId">,
+  session: Pick<FleetSession, "state" | "agentSessionId" | "cleanupRequested">,
 ): boolean {
-  return Boolean(session.agentSessionId) && resumableStates.has(session.state);
+  return (
+    !session.cleanupRequested &&
+    Boolean(session.agentSessionId) &&
+    resumableStates.has(session.state)
+  );
 }
 
 /*
