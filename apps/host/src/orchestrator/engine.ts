@@ -197,6 +197,27 @@ export class OrchestratorEngine {
         this.turnComplete.get(session.id) === attempt
       ) {
         completedTurns.add(session.id);
+        continue;
+      }
+      /*
+       * Copilot can finish a prompted turn while background subagents are still
+       * running, then wake itself when their results arrive. ACP exposes that
+       * continuation only as session updates followed by idle; there is no
+       * second prompt response from which the Node can emit `turn_complete`.
+       *
+       * Do not settle on idle alone: session/load also lands on idle before a
+       * queued retry starts. Require output from this attempt and leave one
+       * stale window for another autonomous wake before accepting the idle as
+       * the missing completion receipt.
+       */
+      const idleSince = Date.parse(session.lastActivityAt ?? session.updatedAt);
+      if (
+        session.state === "idle" &&
+        Number.isFinite(idleSince) &&
+        nowMs - idleSince >= run.policy.staleAfterMs &&
+        this.store.hasEventAfter(session.id, step.eventSeqFrom, "agent_text")
+      ) {
+        completedTurns.add(session.id);
       }
     }
     const actions = planNextActions({
