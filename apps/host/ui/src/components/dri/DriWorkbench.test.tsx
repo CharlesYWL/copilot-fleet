@@ -175,7 +175,9 @@ describe("DRI workbench", () => {
     mount();
     expect(screen.getByText(/98%/).textContent).toContain("Verified ICM");
     expect(screen.getByRole("link", { name: "run-test" })).toBeTruthy();
-    expect(screen.getByText(/No providers configured/)).toBeTruthy();
+    expect(screen.getByText(/No active provider snapshot/).textContent).toContain(
+      "Capability readiness is the last observed result",
+    );
     for (const name of [
       "Overview",
       "Timeline (UTC)",

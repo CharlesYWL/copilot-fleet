@@ -153,7 +153,7 @@ export function assertReadOnlyTool(capability: DriCapability, name: string): voi
 
 export class ProviderRegistry {
   private readonly providers = new Map<string, InvestigationProvider>();
-  constructor(providers: InvestigationProvider[] = []) {
+  constructor(providers: readonly InvestigationProvider[] = []) {
     for (const provider of providers) this.register(provider);
   }
   register(provider: InvestigationProvider): void {
@@ -189,6 +189,11 @@ export class ProviderRegistry {
     return [...this.providers.values()].map((provider) => provider.definition);
   }
 }
+
+export type ReadonlyProviderRegistry = Pick<
+  ProviderRegistry,
+  "get" | "forCapability" | "list"
+>;
 
 export type DiscoveredReadTool = {
   name: string;

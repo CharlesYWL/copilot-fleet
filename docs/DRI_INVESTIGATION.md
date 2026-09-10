@@ -1,7 +1,7 @@
 # Evidence-driven DRI investigations
 
 See [automatic-routing delivery and validation](DRI_AUTO_ROUTING_VALIDATION.md)
-for the current final gates and changed-file manifest.
+for the automatic-routing release's gates and changed-file manifest.
 
 The [deep-review repair report](DRI_REVIEW_FIXES.md) and
 [initial report](DRI_VALIDATION.md) record the previous implementation's validation.
@@ -18,8 +18,8 @@ an operator can approve it or resume eligible incomplete collection.
 The built-in catalog adapter reuses Fleet's HTTP MCP contract and SDK discovery;
 it requires an operator-approved capability manifest and normalized response
 contract. It does not guess how to execute arbitrary stock tool schemas.
-`/api/dri/profiles` and investigation heads advertise
-`liveRegistration: "mcp_catalog"` and discovered availability. Missing or incompatible
+`/api/dri/profiles` advertises `liveRegistration: "mcp_catalog"`; investigation
+heads expose their own last observed discovered availability. Missing or incompatible
 providers produce a durable blocked/partial investigation, per-capability setup
 guidance, and retained evidence. The Host never falls back to synthetic data.
 No DRI environment flag or provider mode is required for normal creation or UI visibility.
@@ -361,6 +361,23 @@ blocks intake; missing later evidence produces a partial report, not corroborati
 or fixture success. Fix configuration and Resume; completed accepted queries,
 citations, reports, generation fencing and stop semantics remain intact.
 
+Discovery registries and issues are scoped to one investigation execution and
+generation. Concurrent investigations never replace each other's readers,
+readiness or evidence provenance. Only the constructor's static embedding/fixture
+providers are shared through read-only registry views. Each live execution
+captures its own discovered overlay and copies its issues; role collection,
+profile/readiness decisions and proposal checks use that scoped snapshot.
+Snapshot cleanup is identity-qualified so an older execution cannot clear a newer
+retry's context.
+
+Provider clients are released when their execution finishes. Persisted readiness
+remains the **last observed** result, not a reusable authorization grant. Stop,
+Resume and Host restart do not carry live discovery clients forward: Resume
+rediscovers for the new generation while preserving completed accepted work.
+The global profile catalog lists only static provider definitions; the
+investigation head exposes its active snapshot (or static registrations when
+inactive) and its own persisted readiness.
+
 ## DMS provenance and reference decisions
 
 This implementation uses the reference investigation supplied for this task; it
@@ -408,7 +425,7 @@ envelopes.
 | Route                                                                                                            | Purpose                                                                         |
 | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `GET/POST /api/dri`                                                                                              | Bounded listing / create and start                                              |
-| `GET /api/dri/profiles`                                                                                          | Profile catalog; discovered MCP readiness and explicit test/demo availability   |
+| `GET /api/dri/profiles`                                                                                          | Profile catalog; static provider definitions and explicit test/demo availability |
 | `GET /api/dri/by-run/:runId`                                                                                     | One-to-one Run lookup                                                           |
 | `GET /api/dri/:id`                                                                                               | Bounded investigation / worker / readiness head                                 |
 | `GET/PATCH /api/dri/:id/profile`                                                                                 | Decision history / correction and pause                                         |

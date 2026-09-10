@@ -478,8 +478,8 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
                 </ul>
               ) : (
                 <p>
-                  No providers configured. The investigation will remain blocked, without
-                  live calls.
+                  No active provider snapshot. Capability readiness is the last observed
+                  result; Resume rediscovers configured read-only providers.
                 </p>
               )}
             </section>

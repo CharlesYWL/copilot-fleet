@@ -30,6 +30,7 @@ import {
   type InvestigationProvider,
   type ProviderContext,
   type ProviderPage,
+  type ReadonlyProviderRegistry,
 } from "./providers.js";
 import {
   buildReport,
@@ -82,11 +83,21 @@ export type DriCoordinatorOptions = {
   ) => Promise<Readonly<Record<string, string>>>;
 };
 
+type ProviderScope = Pick<DriInvestigation, "id" | "generation" | "mode">;
+type ProviderSnapshot = Readonly<
+  ProviderScope & {
+    registry: ReadonlyProviderRegistry;
+    issues: Readonly<DriProviderDiscovery["issues"]>;
+  }
+>;
+
 /** Host-executed provider workers, not ACP sessions with ambient filesystem or write tools. */
 export class DriCoordinator {
   readonly profiles: ProfileRegistry;
-  readonly live: ProviderRegistry;
-  readonly fixtures: ProviderRegistry;
+  readonly live: ReadonlyProviderRegistry;
+  readonly fixtures: ReadonlyProviderRegistry;
+  private readonly baseLiveProviders: readonly InvestigationProvider[];
+  private readonly providerSnapshots = new Map<string, ProviderSnapshot>();
   private readonly active = new Map<string, Promise<void>>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly privateInputs = new Map<
@@ -94,14 +105,14 @@ export class DriCoordinator {
     { values: Record<string, string>; expiresAt: number }
   >();
   private closed = false;
-  private providerIssues: DriProviderDiscovery["issues"] = {};
 
   constructor(
     private readonly service: FleetService,
     private readonly options: DriCoordinatorOptions = {},
   ) {
     this.profiles = options.profiles ?? new ProfileRegistry();
-    this.live = new ProviderRegistry(options.liveProviders);
+    this.baseLiveProviders = Object.freeze([...(options.liveProviders ?? [])]);
+    this.live = new ProviderRegistry(this.baseLiveProviders);
     this.fixtures = new ProviderRegistry(options.fixtures ?? fixtureProviders({}));
   }
   private get store() {
@@ -110,28 +121,39 @@ export class DriCoordinator {
   private get dri() {
     return this.store.dri;
   }
-  registry(investigation: DriInvestigation): ProviderRegistry {
-    return investigation.mode === "fixture" ? this.fixtures : this.live;
+  private providerSnapshot(investigation: ProviderScope): ProviderSnapshot | undefined {
+    const snapshot = this.providerSnapshots.get(investigation.id);
+    return snapshot?.generation === investigation.generation &&
+      snapshot.mode === investigation.mode
+      ? snapshot
+      : undefined;
   }
-  availability(): DriAvailability {
+  registry(investigation: ProviderScope): ReadonlyProviderRegistry {
+    return (
+      this.providerSnapshot(investigation)?.registry ??
+      (investigation.mode === "fixture" ? this.fixtures : this.live)
+    );
+  }
+  availability(investigation?: DriInvestigation): DriAvailability {
     return {
       fixtureEnabled: this.options.allowFixtures === true,
       liveRegistration: "mcp_catalog",
-      liveProvidersConfigured: this.live
-        .list()
-        .some((provider) => provider.readiness === "ready"),
+      liveProvidersConfigured:
+        investigation?.mode === "live"
+          ? investigation.readiness.some((entry) => entry.state === "ready")
+          : this.live.list().some((provider) => provider.readiness === "ready"),
     };
   }
 
   private readiness(
-    mode: DriInvestigation["mode"],
-    profileId: string,
+    investigation: ProviderScope & Pick<DriInvestigation, "profile">,
+    snapshot = this.providerSnapshot(investigation),
   ): DriCapabilityReadiness[] {
-    const registry = mode === "fixture" ? this.fixtures : this.live;
-    const profile = this.profiles.get(profileId);
+    const registry = snapshot?.registry ?? this.registry(investigation);
+    const profile = this.profiles.get(investigation.profile.profileId);
     return DriCapabilitySchema.options.map((capability) => {
       const ready = Boolean(registry.forCapability(capability));
-      const issue = this.providerIssues[capability];
+      const issue = snapshot?.issues[capability];
       return {
         capability,
         required:
@@ -141,7 +163,7 @@ export class DriCoordinator {
           ? "Approved read-only provider available."
           : (issue?.reason ?? `No configured read-only provider for ${capability}.`),
         setup:
-          mode === "fixture"
+          investigation.mode === "fixture"
             ? "Synthetic test/demo providers only."
             : "Configure the Host MCP catalog's _meta fleet/dri manifest; see docs/DRI_INVESTIGATION.md#mcp-setup. Then Resume.",
       };
@@ -176,21 +198,19 @@ export class DriCoordinator {
       });
       const now = new Date().toISOString();
       const profile = this.profiles.resolve(parsed.profile, undefined, []);
+      const identity = { id: randomUUID(), generation: 1, mode: parsed.mode, profile };
       const unavailableLive =
         parsed.mode === "live" &&
         !this.live.forCapability("incident.read") &&
         !this.options.discoverProviders;
       const investigation = this.dri.create({
-        id: randomUUID(),
+        ...identity,
         version: 1,
         revision: 0,
-        generation: 1,
         runId: run.id,
         leadSessionId: parsed.leadSessionId ?? "",
         incident: parsed.icm,
         requestedProfile: parsed.profile,
-        profile,
-        mode: parsed.mode,
         phase: "intake",
         status:
           profile.method === "unavailable" || unavailableLive ? "blocked" : "intake",
@@ -219,7 +239,7 @@ export class DriCoordinator {
         limitation: unavailableLive
           ? "incident.read is unavailable. Configure approved read-only MCP providers; see capability readiness and the MCP setup guide, then Resume."
           : "",
-        readiness: this.readiness(parsed.mode, profile.profileId),
+        readiness: this.readiness(identity),
       });
       this.audit(
         investigation,
@@ -442,8 +462,10 @@ export class DriCoordinator {
         this.notify(id, "failed");
       })
       .finally(() => {
-        this.active.delete(id);
-        this.controllers.delete(id);
+        if (this.active.get(id) === work) {
+          this.active.delete(id);
+          this.controllers.delete(id);
+        }
         if (this.dri.get(id)) this.publish(id);
       });
     this.active.set(id, work);
@@ -454,6 +476,14 @@ export class DriCoordinator {
     const generation = started.generation;
     const controller = new AbortController();
     this.controllers.set(id, controller);
+    let snapshot: ProviderSnapshot = {
+      id,
+      generation,
+      mode: started.mode,
+      registry: started.mode === "fixture" ? this.fixtures : this.live,
+      issues: {},
+    };
+    this.providerSnapshots.set(id, snapshot);
     const deadline = setTimeout(() => controller.abort(), started.limits.deadlineMs);
     try {
       if (started.mode === "live" && this.options.discoverProviders) {
@@ -480,14 +510,20 @@ export class DriCoordinator {
           };
         }
         if (!this.current(id, generation)) return;
-        this.live.replace([
-          ...(this.options.liveProviders ?? []),
-          ...discovered.providers,
-        ]);
-        this.providerIssues = discovered.issues;
+        snapshot = {
+          id,
+          generation,
+          mode: started.mode,
+          registry: new ProviderRegistry([
+            ...this.baseLiveProviders,
+            ...discovered.providers,
+          ]),
+          issues: structuredClone(discovered.issues),
+        };
+        this.providerSnapshots.set(id, snapshot);
       }
       this.dri.update(id, this.dri.require(id).revision, {
-        readiness: this.readiness(started.mode, started.profile.profileId),
+        readiness: this.readiness(started, snapshot),
       });
       for (const readiness of this.dri
         .require(id)
@@ -497,7 +533,7 @@ export class DriCoordinator {
           readiness.capability,
           `${readiness.capability}: ${readiness.reason}`,
         );
-      await this.collectRole(id, "intake", controller.signal);
+      await this.collectRole(id, "intake", controller.signal, snapshot);
       if (!this.current(id, generation)) return;
       const incident = this.dri.all(id, "incidents")[0];
       if (!incident) {
@@ -525,7 +561,7 @@ export class DriCoordinator {
           this.dri.decision(id, decision);
           this.dri.update(id, this.dri.require(id).revision, {
             profile: decision,
-            readiness: this.readiness(started.mode, decision.profileId),
+            readiness: this.readiness({ ...started, profile: decision }, snapshot),
           });
         });
       }
@@ -536,13 +572,13 @@ export class DriCoordinator {
         const results = await Promise.allSettled(
           roles
             .slice(i, i + parallelism)
-            .map((role) => this.collectRole(id, role, controller.signal)),
+            .map((role) => this.collectRole(id, role, controller.signal, snapshot)),
         );
         if (!this.current(id, generation)) return;
         if (results.some((result) => result.status === "rejected"))
           throw new DriError("Provider work could not be committed", 422);
       }
-      await this.collectRole(id, "similar", controller.signal);
+      await this.collectRole(id, "similar", controller.signal, snapshot);
       if (!this.current(id, generation)) return;
       this.transition(id, "analyze", "analyze");
       this.workState(id, "analyze", "running");
@@ -577,6 +613,7 @@ export class DriCoordinator {
       this.review(id, "completed");
     } finally {
       clearTimeout(deadline);
+      if (this.providerSnapshots.get(id) === snapshot) this.providerSnapshots.delete(id);
     }
   }
 
@@ -584,14 +621,20 @@ export class DriCoordinator {
     id: string,
     role: DriWork["role"],
     signal: AbortSignal,
+    snapshot: ProviderSnapshot,
   ): Promise<void> {
     const investigation = this.dri.require(id);
-    if (!this.current(id, investigation.generation)) return;
+    if (
+      snapshot.id !== id ||
+      investigation.generation !== snapshot.generation ||
+      !this.current(id, snapshot.generation)
+    )
+      return;
     const work = this.dri.head(id, "work", role)!;
     if (work.state === "completed") return;
     const capability = roleCapabilities[role]!;
     const profile = this.profiles.get(investigation.profile.profileId);
-    const provider = this.registry(investigation).forCapability(capability);
+    const provider = snapshot.registry.forCapability(capability);
     const incident = this.dri.all(id, "incidents")[0];
     const template =
       role === "telemetry" ? profile?.queryTemplates[0]?.id : `${capability}.v1`;
@@ -783,7 +826,14 @@ export class DriCoordinator {
         const eligible =
           this.current(id, investigation.generation) &&
           this.dri.record(id, "queries", query.id)?.state === "running";
-        this.ingest(investigation, query, page, eligible, pages);
+        this.ingest(
+          investigation,
+          query,
+          page,
+          eligible,
+          pages,
+          provider.definition.version,
+        );
         state = page.state;
         cursor = page.nextCursor;
         if (!eligible) {
@@ -971,6 +1021,7 @@ export class DriCoordinator {
     page: ProviderPage,
     promote: boolean,
     pageNumber: number,
+    providerVersion: string,
   ): void {
     this.store.writeAtomically(() => {
       const evidenceIds: string[] = [];
@@ -1017,8 +1068,7 @@ export class DriCoordinator {
           sensitivity: investigation.mode === "fixture" ? "synthetic" : "redacted",
           redactionVersion: DRI_REDACTION_VERSION,
           provenance: {
-            sourceVersion: this.registry(investigation).get(query.providerId)!.definition
-              .version,
+            sourceVersion: providerVersion,
             collectedAt: now,
             contentHash: contentHash(item),
           },

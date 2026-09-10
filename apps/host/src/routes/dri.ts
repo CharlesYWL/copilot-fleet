@@ -75,7 +75,7 @@ export const driRoutes: FastifyPluginAsync<{
       providers: coordinator.registry(investigation).list(),
       work: store.all(id, "work"),
       run: service.store.getRun(investigation.runId),
-      availability: coordinator.availability(),
+      availability: coordinator.availability(investigation),
     });
   });
   app.get("/api/dri/:id/profile", async (request) => {
