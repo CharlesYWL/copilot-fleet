@@ -286,6 +286,10 @@ export function registerNodeGateway(
           return;
         }
         try {
+          if (message.type === "session_cleanup_result") {
+            service.sessionRetention.handleResult(nodeId, message);
+            return;
+          }
           if (message.type === "heartbeat") {
             if (
               !inventoryBelongsToNode(

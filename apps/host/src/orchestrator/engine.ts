@@ -323,7 +323,9 @@ export class OrchestratorEngine {
   ): boolean {
     const step = this.store.getRunStep(action.stepId);
     const session = this.store.getSession(action.sessionId);
-    if (!step || step.state !== "pending" || !session) return false;
+    if (!step || step.state !== "pending" || !session || session.cleanupRequested) {
+      return false;
+    }
     if (!terminalSessionStates.has(session.state)) return false;
     this.store.updateRunStep(step.id, { dispatchedAt: new Date().toISOString() });
     const resumed = this.service.resumeSession(
@@ -348,7 +350,8 @@ export class OrchestratorEngine {
     const step = this.store.getRunStep(action.stepId);
     const session = this.store.getSession(action.sessionId);
     if (!step || step.state !== "pending" || session?.state !== "idle") return false;
-    if (session.stopRequested || session.dismissed) return false;
+    if (session.stopRequested || session.dismissed || session.cleanupRequested)
+      return false;
 
     this.store.updateRunStep(step.id, {
       state: "starting",
@@ -414,7 +417,13 @@ export class OrchestratorEngine {
 
   private stopSession(sessionId: string): void {
     const session = this.store.getSession(sessionId);
-    if (!session || terminalSessionStates.has(session.state)) return;
+    if (
+      !session ||
+      session.cleanupRequested ||
+      terminalSessionStates.has(session.state)
+    ) {
+      return;
+    }
     // Stop, not cancel: cancel ends the turn and leaves the process holding a
     // slot on its node.
     this.service.dispatch(session.nodeId, { type: "stop", sessionId });
@@ -429,7 +438,7 @@ export class OrchestratorEngine {
    */
   private deliverPrompt(run: Run, prompt: string, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
-    if (!lead || lead.state !== "idle") return false;
+    if (!lead || lead.state !== "idle" || lead.cleanupRequested) return false;
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     if (
@@ -460,7 +469,7 @@ export class OrchestratorEngine {
    */
   private wakeLead(run: Run, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
-    if (!lead || lead.state !== "idle") return false;
+    if (!lead || lead.state !== "idle" || lead.cleanupRequested) return false;
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     if (!this.store.recordRunWakePrompt(run.id, lead.id, new Date(nowMs).toISOString())) {
@@ -504,7 +513,14 @@ export class OrchestratorEngine {
 
     for (const [leadSessionId, runs] of activeByLead) {
       const lead = sessionById.get(leadSessionId);
-      if (!lead || lead.runRole !== "lead" || lead.state !== "idle") continue;
+      if (
+        !lead ||
+        lead.runRole !== "lead" ||
+        lead.state !== "idle" ||
+        lead.cleanupRequested
+      ) {
+        continue;
+      }
       if (this.promptedThisTick.has(lead.id)) continue;
 
       const lastAutomatedPrompt = Date.parse(

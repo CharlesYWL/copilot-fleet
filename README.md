@@ -63,6 +63,7 @@ Start with the walkthrough, then use this map when you need a specific surface.
 - **Recover, move, back up, or troubleshoot:**
   [Moving a Host or Node](#moving-a-host-or-a-node-to-another-machine),
   [recovering sessions](#recovering-sessions-after-a-restart),
+  [automatic session retention](#automatic-session-retention),
   [Diagnostics](#diagnostics-and-troubleshooting), and
   [local verification](#local-verification-and-test-monitoring).
 
@@ -1101,6 +1102,46 @@ they produce, so a Host restart mid-turn no longer costs that part of the
 transcript. If the outage outlasts the buffer the Host records the gap and keeps
 going; it never refuses the events that follow, because a session that cannot
 report its own state again is a session nobody can use.
+
+### Automatic session retention
+
+By default Fleet automatically deletes **idle or ended sessions after at least
+30 days without activity**, including orchestrator conversations. The Host checks
+at startup, after a Node has reconciled its inventory and buffered events, and
+every six hours. It does not revive expired conversations just to clean them up.
+
+Set `FLEET_SESSION_RETENTION_DAYS` on the **Host** to a whole number of days
+from 30 to 36500, or `0` to disable new cleanup. Restart the Host after changing
+it. Nodes follow that Host policy; no per-Node timer or setting is needed.
+Favorites, running/queued/starting/cancelling sessions, unfinished tasks (including
+human review), and recently updated task history are protected. An orchestrator
+is also retained while its workers are active, recently used, or favorited.
+
+Activity means opening a conversation, sending a prompt, resuming it, editing
+its name/favorite or live options, and actual agent/tool output. Heartbeats,
+Host restarts, inventory reconciliation and internal history replay do not
+reset that clock. The Node independently checks for current work and recent
+local/Copilot activity before deleting anything.
+
+**Deletion is permanent on both sides:** the Node stops an eligible idle process
+and uses Copilot's public ACP `session/list` and `session/delete` APIs for that
+specific Fleet conversation. Only after its acknowledgement does the Host remove
+the session, transcript and per-session preferences. Completed task outputs and
+notes remain, without dangling session links. Workspaces, checkouts, credentials,
+and unrelated Copilot sessions are never swept.
+
+Offline Nodes are unknown, not inactive. Their sessions remain until they
+reconnect. Older Node agents, a Copilot build without the required ACP
+capabilities, missing activity metadata, or a failed deletion defer cleanup and
+produce a diagnostic instead of falling back to deleting files. Requests and
+retries survive Host restarts; a deletion already in progress finishes even if
+new cleanup is subsequently disabled. While it is pending, the session and its
+associated task cannot be resumed or edited.
+
+Fleet still needs this policy even though Copilot CLI owns conversation storage:
+the CLI cannot retire Fleet's SQLite history or understand its orchestrator/task
+relationships. Fleet decides **which** sessions may expire; Copilot remains
+responsible for deleting its own data through its supported API.
 
 ### Node config page
 

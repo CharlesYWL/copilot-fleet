@@ -462,6 +462,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (!session || session.runRole !== "lead") {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
+    store.assertOrchestratorMutable(id);
     if (session.dismissed) {
       return reply
         .code(409)

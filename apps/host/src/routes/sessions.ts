@@ -127,9 +127,11 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
 
   app.get("/api/sessions/:id/events", async (request, reply) => {
     const { id } = request.params as { id: string };
-    if (!store.getSession(id)) {
+    const session = store.getSession(id);
+    if (!session) {
       return reply.code(404).send({ error: "Session not found" });
     }
+    if (!session.cleanupRequested) store.touchSessionActivity(id);
     return store.listEvents(id);
   });
 

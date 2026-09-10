@@ -2,6 +2,7 @@ import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { errorMessage } from "@fleet/protocol";
+import { z } from "zod";
 import { copilotLaunchArgs, type ContextTier } from "./agents.js";
 import {
   boundedSessionPreview,
@@ -18,9 +19,12 @@ export type {
 export type DiscoveryErrorCode =
   | "unsupported_list"
   | "unsupported_load"
+  | "unsupported_delete"
   | "list_failed"
   | "session_not_found"
-  | "load_failed";
+  | "load_failed"
+  | "delete_failed"
+  | "session_active";
 
 export class CopilotSessionDiscoveryError extends Error {
   constructor(
@@ -39,6 +43,7 @@ type DiscoveryConnection = {
     session: DiscoveredCopilotSession,
     includeAdditionalDirectories: boolean,
   ) => Promise<void>;
+  delete?: (sessionId: string) => Promise<void>;
   close: () => void;
 };
 
@@ -67,6 +72,7 @@ const OPERATION_TIMEOUT_MS = 60_000;
 const DEFAULT_CACHE_TTL_MS = 30_000;
 const DEFAULT_PREVIEW_CHARACTERS = 12_000;
 const DEFAULT_PREVIEW_ITEMS = 12;
+const SESSION_UPDATED_AT_SCHEMA = z.iso.datetime({ offset: true });
 
 function withTimeout<T>(work: Promise<T>, message: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -224,6 +230,95 @@ export class CopilotSessionDiscovery {
     }
   }
 
+  async deleteInactiveSession(
+    agentSessionId: string,
+    inactiveBefore: number,
+    beforeDelete?: () => Promise<void>,
+  ): Promise<void> {
+    if (!agentSessionId || !Number.isFinite(inactiveBefore)) {
+      throw new CopilotSessionDiscoveryError(
+        "delete_failed",
+        "Deleting a Copilot session requires an exact id and a valid inactivity cutoff",
+      );
+    }
+
+    let connection: DiscoveryConnection | undefined;
+    try {
+      connection = await this.open(() => {});
+      const capabilities = await this.initialize(connection);
+      this.assertListCapability(capabilities);
+      if (
+        capabilities?.sessionCapabilities?.delete == null ||
+        typeof connection.delete !== "function"
+      ) {
+        throw new CopilotSessionDiscoveryError(
+          "unsupported_delete",
+          "This Copilot connection does not support ACP session deletion",
+        );
+      }
+
+      // Destructive checks never use the picker/preview cache or load a session.
+      const cursors = new Set<string>();
+      let cursor: string | undefined;
+      let found: acp.SessionInfo | undefined;
+      while (true) {
+        const key = cursor ?? "";
+        if (cursors.has(key)) {
+          throw new CopilotSessionDiscoveryError(
+            "list_failed",
+            "Copilot session listing repeated a pagination cursor",
+          );
+        }
+        cursors.add(key);
+        let page: acp.ListSessionsResponse;
+        try {
+          page = await withTimeout(
+            connection.list(cursor),
+            "Copilot session listing timed out",
+          );
+        } catch (error) {
+          throw new CopilotSessionDiscoveryError(
+            "list_failed",
+            `Copilot could not list sessions: ${errorMessage(error)}`,
+          );
+        }
+        found = page.sessions.find((session) => session.sessionId === agentSessionId);
+        if (found || page.nextCursor == null) break;
+        cursor = page.nextCursor;
+      }
+
+      if (found) {
+        const timestamp = SESSION_UPDATED_AT_SCHEMA.safeParse(found.updatedAt);
+        const updatedAt = timestamp.success ? Date.parse(timestamp.data) : NaN;
+        const cutoff = Math.min(inactiveBefore, (this.options.now ?? Date.now)());
+        if (!Number.isFinite(updatedAt) || updatedAt > cutoff) {
+          throw new CopilotSessionDiscoveryError(
+            "session_active",
+            "Copilot session activity is recent or cannot be verified from updatedAt",
+          );
+        }
+      }
+
+      await beforeDelete?.();
+      if (found) {
+        await withTimeout(
+          connection.delete(agentSessionId),
+          "Copilot session deletion timed out",
+        );
+      }
+      this.pages.clear();
+      this.sessions.clear();
+    } catch (error) {
+      if (error instanceof CopilotSessionDiscoveryError) throw error;
+      throw new CopilotSessionDiscoveryError(
+        "delete_failed",
+        `Copilot could not delete this session: ${errorMessage(error)}`,
+      );
+    } finally {
+      connection?.close();
+    }
+  }
+
   private async initialize(
     connection: DiscoveryConnection,
   ): Promise<acp.AgentCapabilities | undefined> {
@@ -329,6 +424,15 @@ export class CopilotSessionDiscovery {
                 : {}),
               mcpServers: [],
             }),
+          );
+        } catch (error) {
+          throw new Error(`${errorMessage(error)}${suffix()}`, { cause: error });
+        }
+      },
+      delete: async (sessionId) => {
+        try {
+          await request(
+            connection.agent.request(acp.methods.agent.session.delete, { sessionId }),
           );
         } catch (error) {
           throw new Error(`${errorMessage(error)}${suffix()}`, { cause: error });

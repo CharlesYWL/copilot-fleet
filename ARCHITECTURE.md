@@ -64,6 +64,30 @@ Already-running sessions keep their launcher until stopped and resumed.
 - **Run**: one approved objective plus the budget it may spend. Owns its Sessions.
 - **RunStep**: one unit of a Run's work, executed by one Session on one Placement.
 
+### Session retention
+
+The Host owns the retention decision (30 inactive days by default); the Node
+owns the last activity check and Copilot deletion. `last_activity_at` is separate
+from `updated_at`, so connectivity recovery cannot renew an abandoned session.
+Real input/output uses Host receipt time; internally replayed history is tagged
+and does not count. Existing records migrate conservatively and activity travels
+in Host backups.
+
+Only idle/terminal sessions qualify. Favorites, unfinished or recently updated
+tasks, and orchestrators with protected workers are retained. No deletion is sent
+until the Node has reconciled its inventory and buffered events. Expired sessions
+are excluded from automatic resume.
+
+`session_cleanup_requests` persists a correlated command before dispatch and
+locks the affected session/task against new work. The `session-retention`
+capability gates the command for mixed-version fleets. One deletion runs at a
+time per Node, which rechecks inactivity and uses ACP listing/deletion rather
+than manipulating Copilot's private files. Failed operations retain the Host
+record and back off; lost acknowledgements replay the same idempotent request.
+The Host deletes its record only on a matching `session_cleanup_result`, clears
+references in terminal tasks, and publishes a fresh snapshot. Task outputs and
+notes survive session expiry.
+
 ## Orchestration
 
 A Run is an objective a human approved once, together with hard budgets. The

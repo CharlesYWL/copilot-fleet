@@ -36,6 +36,7 @@ export function stopSessions(
   service: FleetService,
   sessions: readonly FleetSession[],
 ): StopSessionsResult {
+  for (const session of sessions) service.store.assertSessionMutable(session.id);
   const result: StopSessionsResult = {
     matched: sessions.length,
     requested: 0,

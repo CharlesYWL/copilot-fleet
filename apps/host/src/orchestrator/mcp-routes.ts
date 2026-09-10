@@ -64,6 +64,7 @@ type LeadRefusal =
   | "session is not a lead"
   | "lead has finished"
   | "run has finished"
+  | "lead is being deleted"
   | "run no longer matches"
   | "node no longer matches";
 
@@ -111,6 +112,9 @@ function authorizeLead(
     return { ok: false, status: 401, why: "session is not a lead" };
   if (terminalSessionStates.has(lead.state)) {
     return { ok: false, status: 401, why: "lead has finished" };
+  }
+  if (lead.cleanupRequested) {
+    return { ok: false, status: 401, why: "lead is being deleted" };
   }
   if (lead.runId !== claims.runId) {
     return { ok: false, status: 401, why: "run no longer matches" };

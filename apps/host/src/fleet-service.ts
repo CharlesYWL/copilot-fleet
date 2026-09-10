@@ -43,6 +43,7 @@ import type {
   SessionTurnCompletion,
 } from "./store.js";
 import { isBroadcastableHostUrl } from "./host-url.js";
+import { SessionRetention } from "./session-retention.js";
 import {
   NotificationService,
   notificationAttemptKey,
@@ -192,6 +193,7 @@ export class FleetService {
   private mcpUrl: (() => string) | undefined;
   private runTicker: ((runId: string) => void) | undefined;
   readonly notifications: NotificationService;
+  readonly sessionRetention: SessionRetention;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -223,6 +225,7 @@ export class FleetService {
      * marking every node that updated correctly as out of date.
      */
     private readonly revisionSource: string | (() => string) = "",
+    sessionRetentionDays?: number,
   ) {
     this.notifications = new NotificationService(store, {
       notificationUpsert: (notification) => this.publishNotification(notification),
@@ -230,6 +233,7 @@ export class FleetService {
         this.publishNotificationUnreadCount(unreadCount),
       runUpsert: (run) => this.publishRun(run),
     });
+    this.sessionRetention = new SessionRetention(this, log, sessionRetentionDays);
   }
 
   snapshot(): Snapshot {
@@ -264,6 +268,7 @@ export class FleetService {
   }
 
   attachNode(nodeId: string, socket: NodeLink): void {
+    this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeSockets.set(nodeId, socket);
   }
 
@@ -284,6 +289,7 @@ export class FleetService {
    */
   evictAllNodes(code: number, reason: string): void {
     for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
+      this.sessionRetention.nodeDisconnected(nodeId);
       this.nodeSockets.delete(nodeId);
       socket.close(code, reason);
     }
@@ -296,6 +302,7 @@ export class FleetService {
    * under ids that no longer mean what they did a moment ago.
    */
   importHostBackup(backup: HostBackup): void {
+    this.store.assertNoSessionCleanup();
     this.evictAllNodes(4002, "Host restored from backup");
     this.store.replaceHostBackup(backup);
     this.broadcast({ type: "snapshot", data: this.snapshot() });
@@ -314,6 +321,7 @@ export class FleetService {
     data: HostPortableBackupData;
     security: SecurityBackupPayload;
   }): { revokedSessions: RevokedSession[] } {
+    this.store.assertNoSessionCleanup();
     this.evictAllNodes(4002, "Host restored from a portable backup");
     return this.store.importPortableBackup(input);
   }
@@ -656,6 +664,9 @@ export class FleetService {
   ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
+    if (session.cleanupRequested) {
+      return { ok: false, status: 409, error: "Session deletion is awaiting its Node" };
+    }
     if (session.stopRequested) {
       return { ok: false, status: 409, error: "Session is still stopping" };
     }
@@ -810,6 +821,9 @@ export class FleetService {
     fallback?: DispatchFallback,
     attemptOverride?: string,
   ): DispatchResult {
+    if (request.type !== "delete_session") {
+      this.store.assertSessionMutable(request.sessionId);
+    }
     const lifecycleIntent =
       request.type === "cancel" || request.type === "stop" ? request.type : undefined;
     const socket = this.nodeSockets.get(nodeId);
@@ -842,6 +856,9 @@ export class FleetService {
             eventSeqFrom,
             attempt,
           });
+          if (request.type !== "resume_session" || request.lastActivityAt === undefined) {
+            this.store.touchSessionActivity(request.sessionId);
+          }
         });
         // The current fleet preference also applies to adopted conversations,
         // automatic recovery, and orchestration, not just the new-session UI.
@@ -854,6 +871,9 @@ export class FleetService {
         } as NodeCommand;
         this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
         return { sent: true };
+      }
+      if (request.type !== "delete_session") {
+        this.store.touchSessionActivity(request.sessionId);
       }
       const command = { ...request, commandId: randomUUID() } as NodeCommand;
       this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
@@ -1181,6 +1201,7 @@ export class FleetService {
       if (!session.stopRequested || terminalSessionStates.has(session.state)) continue;
       this.dispatch(nodeId, { type: "stop", sessionId: session.id });
     }
+    this.sessionRetention.nodeReconciled(nodeId);
     this.autoResume(nodeId, settled);
     return settled;
   }
@@ -1212,7 +1233,8 @@ export class FleetService {
           session.state === "failed" &&
           session.agentSessionId &&
           !session.stopRequested &&
-          !session.dismissed,
+          !session.dismissed &&
+          !this.sessionRetention.shouldExpire(session),
       )
       // Newest first, by creation: when capacity cannot cover them all, the
       // most recently started work is the likeliest to still matter. Last
@@ -1240,6 +1262,7 @@ export class FleetService {
       const dispatched = this.dispatch(nodeId, {
         type: "resume_session",
         sessionId: session.id,
+        lastActivityAt: session.lastActivityAt ?? session.updatedAt,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
         additionalDirectories: session.additionalDirectories ?? [],
@@ -1277,6 +1300,7 @@ export class FleetService {
   }
 
   disconnectNode(nodeId: string, activity: string): void {
+    this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeSockets.delete(nodeId);
     const node = this.store.setNodeOnline(nodeId, false, 0);
     if (node) this.publishNode(node);
