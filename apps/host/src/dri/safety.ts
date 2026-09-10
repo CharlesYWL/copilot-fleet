@@ -23,6 +23,45 @@ export const stableId = (prefix: string, value: unknown): string =>
 export const fingerprint = (value: string): string =>
   `hash:${contentHash(value).slice(0, 24)}`;
 
+export function boundedDriRead<T>(
+  operation: (signal: AbortSignal) => Promise<T>,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DriError("Read-only operation interrupted", 408));
+      return;
+    }
+    const controller = new AbortController();
+    const cleanup = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", aborted);
+    };
+    const fail = (error: DriError) => {
+      cleanup();
+      controller.abort();
+      reject(error);
+    };
+    const aborted = () => fail(new DriError("Read-only operation interrupted", 408));
+    const timeout = setTimeout(
+      () => fail(new DriError("Read-only operation timed out", 408)),
+      timeoutMs,
+    );
+    signal.addEventListener("abort", aborted, { once: true });
+    void (async () => operation(AbortSignal.any([signal, controller.signal])))().then(
+      (result) => {
+        cleanup();
+        resolve(result);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
+}
+
 export function redactText(input: string, limit = 2_000): string {
   return input
     .slice(0, 16_000)

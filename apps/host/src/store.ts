@@ -51,6 +51,7 @@ import {
   PlacementSchema,
   RunPolicySchema,
   RunSchema,
+  RunCreationReceiptSchema,
   RunStepSchema,
   RunNoteSchema,
   SecurityBackupPayloadSchema,
@@ -679,6 +680,11 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "stop_when", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("runs", "review_seq", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("runs", "dri_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("runs", "creation_receipt", "TEXT NOT NULL DEFAULT ''");
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_creation_key
+      ON runs(json_extract(creation_receipt,'$.keyHash')) WHERE creation_receipt<>'';
+    `);
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing(
       "run_steps",
@@ -1449,6 +1455,11 @@ export class FleetStore {
       if (run.investigationId)
         this.statement("UPDATE runs SET dri_id=? WHERE id=?").run(
           run.investigationId,
+          run.id,
+        );
+      if (run.creationReceipt)
+        this.statement("UPDATE runs SET creation_receipt=? WHERE id=?").run(
+          JSON.stringify(RunCreationReceiptSchema.parse(run.creationReceipt)),
           run.id,
         );
     }
@@ -3568,14 +3579,15 @@ export class FleetStore {
     successCriteria?: readonly RunCriterion[] | undefined;
     /** One line naming the observable state that ends the task. */
     stopWhen?: string | undefined;
+    creationReceipt?: Run["creationReceipt"];
   }): Run {
     const now = new Date().toISOString();
     const id = randomUUID();
     const policy = RunPolicySchema.parse(input.policy ?? {});
     this.statement(
       `INSERT INTO runs
-       (id,workspace_id,name,objective,state,policy,phases,success_criteria,stop_when,created_at,updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,name,objective,state,policy,phases,success_criteria,stop_when,created_at,updated_at,creation_receipt)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       input.workspaceId,
@@ -3588,6 +3600,9 @@ export class FleetStore {
       input.stopWhen ?? "",
       now,
       now,
+      input.creationReceipt
+        ? JSON.stringify(RunCreationReceiptSchema.parse(input.creationReceipt))
+        : "",
     );
     return this.getRun(id)!;
   }
@@ -3596,6 +3611,13 @@ export class FleetStore {
     const row = this.statement(
       "SELECT *,NULLIF(dri_id,'') investigation_id FROM runs WHERE id=?",
     ).get(id) as Row | undefined;
+    return row ? runFromRow(row) : undefined;
+  }
+
+  runForCreationKey(keyHash: string): Run | undefined {
+    const row = this.statement(
+      "SELECT *,NULLIF(dri_id,'') investigation_id FROM runs WHERE creation_receipt<>'' AND json_extract(creation_receipt,'$.keyHash')=?",
+    ).get(keyHash) as Row | undefined;
     return row ? runFromRow(row) : undefined;
   }
 
@@ -4535,6 +4557,9 @@ function runFromRow(row: Row): Run {
   return RunSchema.parse({
     id: String(row.id),
     ...(row.investigation_id ? { investigationId: String(row.investigation_id) } : {}),
+    ...(row.creation_receipt
+      ? { creationReceipt: JSON.parse(String(row.creation_receipt)) }
+      : {}),
     workspaceId: String(row.workspace_id),
     name: String(row.name),
     objective: String(row.objective),

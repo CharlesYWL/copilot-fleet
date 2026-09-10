@@ -55,6 +55,9 @@ import { systemRoutes } from "./routes/system.js";
 import { FleetStore } from "./store.js";
 import { DriCoordinator, type DriCoordinatorOptions } from "./dri/coordinator.js";
 import { driRoutes } from "./routes/dri.js";
+import { DriMcpCatalog, type DriMcpOptions } from "./dri/mcp.js";
+import { OrchestrationCreationService } from "./orchestrator/creation.js";
+import { orchestrationCreationRoutes } from "./routes/orchestration-creation.js";
 import { TunnelSupervisor } from "./tunnel.js";
 import { recordingLogStream } from "./log-stream.js";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
@@ -104,8 +107,20 @@ export async function buildServer(
     /** Destructive, console-only startup. Never exposed through an HTTP route. */
     resetOperatorAuth?: boolean;
     dri?: DriCoordinatorOptions;
+    mcp?: DriMcpOptions;
+    /** Isolated test/demo injection, never a request field or an environment setting. */
+    testDriRouting?: boolean;
   } = {},
 ): Promise<FastifyInstance> {
+  if (
+    options.testDriRouting &&
+    (options.databasePath !== ":memory:" ||
+      !options.dri?.allowFixtures ||
+      !options.dri.fixtures)
+  )
+    throw new Error(
+      "Synthetic automatic routing requires an in-memory Host and explicitly injected fixture providers.",
+    );
   const logs = createLogBuffer();
   const app = Fastify({ logger: { stream: recordingLogStream(logs) } });
   const store = new FleetStore(
@@ -212,9 +227,14 @@ export async function buildServer(
     onAuthenticationReset: () => browsers.closeAll(),
   });
   const service = new FleetService(store, app.log, cachedGitRevision());
+  const mcpCatalog = new DriMcpCatalog(
+    options.mcp ??
+      (process.env.NODE_ENV === "test" ? { catalog: { mcpServers: {} } } : {}),
+  );
   const dri = new DriCoordinator(service, {
-    allowFixtures: process.env.FLEET_DRI_FIXTURES === "true",
     ...options.dri,
+    discoverProviders:
+      options.dri?.discoverProviders ?? ((signal) => mcpCatalog.discover(signal)),
   });
   dri.recover();
   const leadTokens = new LeadTokens(store);
@@ -347,8 +367,15 @@ export async function buildServer(
     // something an administrator has to be able to see.
     audit: (entry) => auth.audit(entry),
   });
-  await app.register(runRoutes, { service, engine });
-  await app.register(orchestratorRoutes, { service, engine });
+  const creation = new OrchestrationCreationService(
+    service,
+    engine,
+    dri,
+    options.testDriRouting,
+  );
+  await app.register(orchestrationCreationRoutes, { creation });
+  await app.register(runRoutes, { service, engine, creation });
+  await app.register(orchestratorRoutes, { service, engine, creation });
 
   registerBrowserGateway(app, { service, auth, registry: browsers });
   registerNodeGateway(app, service, { identity: hostIdentity });

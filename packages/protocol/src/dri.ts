@@ -59,6 +59,66 @@ export const IcmReferenceSchema = z
     }
   });
 
+export const DriRoutingInputSchema = z.object({
+  objective: z.string().min(1).max(4_000),
+  workflow: z.enum(["auto", "regular", "dri"]).default("auto"),
+  dri: z
+    .object({
+      icm: z
+        .string()
+        .min(1)
+        .max(512)
+        .refine(
+          (value) => IcmReferenceSchema.safeParse(value).success,
+          "Invalid ICM reference",
+        )
+        .optional(),
+      artifactRef: DriKey.optional(),
+    })
+    .strict()
+    .optional(),
+});
+export type DriRoutingInput = z.infer<typeof DriRoutingInputSchema>;
+export const DriClassificationSchema = z.object({
+  route: z.enum(["dri", "regular", "ambiguous"]),
+  confidence,
+  source: z.enum(["explicit", "detected"]),
+  reasons: z
+    .array(
+      z.enum([
+        "explicit_regular",
+        "explicit_dri",
+        "implementation_task",
+        "structured_icm",
+        "icm_url",
+        "icm_investigation",
+        "explicit_intent",
+        "unconfirmed_incident",
+        "multiple_incidents",
+        "missing_reference",
+        "insufficient_intent",
+        "regular_request",
+      ]),
+    )
+    .min(1)
+    .max(4),
+  explanation: short,
+  incident: z
+    .object({ id: z.string().regex(/^[1-9]\d{0,17}$/), url: z.string().max(512) })
+    .optional(),
+  candidateIncidentId: z
+    .string()
+    .regex(/^[1-9]\d{0,17}$/)
+    .optional(),
+  suggestedProfile: z.literal("auto"),
+  suggestedEvidence: z
+    .array(z.enum(["incident", "har", "telemetry", "similar", "change"]))
+    .max(5),
+  requiresConfirmation: z.boolean(),
+  needsIncident: z.boolean(),
+});
+export type DriClassification = z.infer<typeof DriClassificationSchema>;
+
 export const DriTimeRangeSchema = z
   .object({ start: utc, end: utc })
   .strict()
@@ -143,6 +203,24 @@ export const DriProfileDecisionSchema = z
   .strict();
 export type DriProfileDecision = z.infer<typeof DriProfileDecisionSchema>;
 
+export const DriCapabilitySchema = z.enum([
+  "incident.read",
+  "artifact.read",
+  "har.analyze",
+  "telemetry.query",
+  "similar.search",
+  "change.read",
+]);
+export type DriCapability = z.infer<typeof DriCapabilitySchema>;
+export const DriCapabilityReadinessSchema = z.object({
+  capability: DriCapabilitySchema,
+  required: z.boolean(),
+  state: z.enum(["ready", "unavailable", "access_denied", "incompatible"]),
+  reason: short,
+  setup: short,
+});
+export type DriCapabilityReadiness = z.infer<typeof DriCapabilityReadinessSchema>;
+
 export const DriInvestigationSchema = z
   .object({
     id: DriKey,
@@ -181,6 +259,7 @@ export const DriInvestigationSchema = z
       "finished",
     ]),
     limitation: short,
+    readiness: z.array(DriCapabilityReadinessSchema).max(6).default([]),
   })
   .strict();
 export type DriInvestigation = z.infer<typeof DriInvestigationSchema>;
@@ -287,15 +366,6 @@ export const DriEvidenceSchema = z.object({
   signals: z.array(short).max(30),
 });
 export type DriEvidence = z.infer<typeof DriEvidenceSchema>;
-export const DriCapabilitySchema = z.enum([
-  "incident.read",
-  "artifact.read",
-  "har.analyze",
-  "telemetry.query",
-  "similar.search",
-  "change.read",
-]);
-export type DriCapability = z.infer<typeof DriCapabilitySchema>;
 export const DriProviderDefinitionSchema = z
   .object({
     id: DriKey,
@@ -644,7 +714,7 @@ export function driBackupWarning(archive: unknown): string {
 
 export const DriAvailabilitySchema = z.object({
   fixtureEnabled: z.boolean(),
-  liveRegistration: z.literal("embedding_only"),
+  liveRegistration: z.literal("mcp_catalog"),
   liveProvidersConfigured: z.boolean(),
 });
 export type DriAvailability = z.infer<typeof DriAvailabilitySchema>;

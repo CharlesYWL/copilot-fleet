@@ -5,6 +5,7 @@ import {
   DriLimitsSchema,
   DriQuerySchema,
   DriRecordSchema,
+  DriCapabilitySchema,
   type DriCapability,
   type DriEvidence,
   type DriInvestigation,
@@ -14,9 +15,12 @@ import {
   type DriWork,
   type DriProposalScope,
   type DriAvailability,
+  type DriCapabilityReadiness,
+  type RunCreationReceipt,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { fixtureProviders } from "./fixtures.js";
+import type { DriProviderDiscovery } from "./mcp.js";
 import { assessProfileRule, ProfileRegistry } from "./profiles.js";
 import {
   assertProviderPageCapability,
@@ -35,6 +39,7 @@ import {
 } from "./reports.js";
 import {
   canonical,
+  boundedDriRead,
   contentHash,
   DriError,
   fingerprint,
@@ -68,6 +73,7 @@ export type DriCoordinatorOptions = {
   liveProviders?: InvestigationProvider[];
   fixtures?: InvestigationProvider[];
   allowFixtures?: boolean;
+  discoverProviders?: (signal: AbortSignal) => Promise<DriProviderDiscovery>;
   limits?: Partial<DriLimits>;
   resolvePrivateBindings?: (
     investigation: DriInvestigation,
@@ -88,6 +94,7 @@ export class DriCoordinator {
     { values: Record<string, string>; expiresAt: number }
   >();
   private closed = false;
+  private providerIssues: DriProviderDiscovery["issues"] = {};
 
   constructor(
     private readonly service: FleetService,
@@ -109,14 +116,39 @@ export class DriCoordinator {
   availability(): DriAvailability {
     return {
       fixtureEnabled: this.options.allowFixtures === true,
-      liveRegistration: "embedding_only",
+      liveRegistration: "mcp_catalog",
       liveProvidersConfigured: this.live
         .list()
         .some((provider) => provider.readiness === "ready"),
     };
   }
 
-  create(input: unknown): DriInvestigation {
+  private readiness(
+    mode: DriInvestigation["mode"],
+    profileId: string,
+  ): DriCapabilityReadiness[] {
+    const registry = mode === "fixture" ? this.fixtures : this.live;
+    const profile = this.profiles.get(profileId);
+    return DriCapabilitySchema.options.map((capability) => {
+      const ready = Boolean(registry.forCapability(capability));
+      const issue = this.providerIssues[capability];
+      return {
+        capability,
+        required:
+          profile?.requirements.includes(capability) ?? capability === "incident.read",
+        state: ready ? "ready" : (issue?.state ?? "unavailable"),
+        reason: ready
+          ? "Approved read-only provider available."
+          : (issue?.reason ?? `No configured read-only provider for ${capability}.`),
+        setup:
+          mode === "fixture"
+            ? "Synthetic test/demo providers only."
+            : "Configure the Host MCP catalog's _meta fleet/dri manifest; see docs/DRI_INVESTIGATION.md#mcp-setup. Then Resume.",
+      };
+    });
+  }
+
+  create(input: unknown, creationReceipt?: RunCreationReceipt): DriInvestigation {
     const parsed = CreateDriSchema.parse(input);
     if (parsed.mode === "fixture" && !this.options.allowFixtures)
       throw new DriError("Fixture providers are disabled on this Host", 403);
@@ -136,6 +168,7 @@ export class DriCoordinator {
         policy: { yolo: false, wakePolicy: "none", onStepFailure: "continue" },
         phases: phases.map((phase) => phase[0]!.toUpperCase() + phase.slice(1)),
         stopWhen: "An immutable evidence-linked report is ready for human review.",
+        ...(creationReceipt ? { creationReceipt } : {}),
       });
       this.store.updateRun(run.id, {
         state: "running",
@@ -144,7 +177,9 @@ export class DriCoordinator {
       const now = new Date().toISOString();
       const profile = this.profiles.resolve(parsed.profile, undefined, []);
       const unavailableLive =
-        parsed.mode === "live" && !this.availability().liveProvidersConfigured;
+        parsed.mode === "live" &&
+        !this.live.forCapability("incident.read") &&
+        !this.options.discoverProviders;
       const investigation = this.dri.create({
         id: randomUUID(),
         version: 1,
@@ -182,8 +217,9 @@ export class DriCoordinator {
         updatedAt: now,
         lifecycleCause: "created",
         limitation: unavailableLive
-          ? "Live adapters are embedding-only and are not shipped or configured by the production CLI. Use an explicitly enabled synthetic fixture."
+          ? "incident.read is unavailable. Configure approved read-only MCP providers; see capability readiness and the MCP setup guide, then Resume."
           : "",
+        readiness: this.readiness(parsed.mode, profile.profileId),
       });
       this.audit(
         investigation,
@@ -192,6 +228,17 @@ export class DriCoordinator {
         "Operator authorized bounded read-only investigation",
       );
       this.plan(investigation);
+      if (unavailableLive) {
+        for (const readiness of investigation.readiness.filter(
+          (entry) => entry.state !== "ready",
+        ))
+          this.limitation(
+            investigation,
+            readiness.capability,
+            `${readiness.capability}: ${readiness.reason}`,
+          );
+        this.workState(investigation.id, "intake", "blocked");
+      }
       return this.dri.require(investigation.id);
     });
     this.privateInputs.set(investigation.id, {
@@ -409,6 +456,47 @@ export class DriCoordinator {
     this.controllers.set(id, controller);
     const deadline = setTimeout(() => controller.abort(), started.limits.deadlineMs);
     try {
+      if (started.mode === "live" && this.options.discoverProviders) {
+        let discovered: DriProviderDiscovery;
+        try {
+          discovered = await boundedDriRead(
+            (signal) => this.options.discoverProviders!(signal),
+            controller.signal,
+            started.limits.timeoutMs,
+          );
+        } catch {
+          discovered = {
+            providers: [],
+            issues: Object.fromEntries(
+              DriCapabilitySchema.options.map((capability) => [
+                capability,
+                {
+                  state: "unavailable",
+                  reason:
+                    "MCP discovery failed. Check the Host catalog, read-only credentials and connectivity; then Resume.",
+                },
+              ]),
+            ),
+          };
+        }
+        if (!this.current(id, generation)) return;
+        this.live.replace([
+          ...(this.options.liveProviders ?? []),
+          ...discovered.providers,
+        ]);
+        this.providerIssues = discovered.issues;
+      }
+      this.dri.update(id, this.dri.require(id).revision, {
+        readiness: this.readiness(started.mode, started.profile.profileId),
+      });
+      for (const readiness of this.dri
+        .require(id)
+        .readiness.filter((entry) => entry.state !== "ready"))
+        this.limitation(
+          this.dri.require(id),
+          readiness.capability,
+          `${readiness.capability}: ${readiness.reason}`,
+        );
       await this.collectRole(id, "intake", controller.signal);
       if (!this.current(id, generation)) return;
       const incident = this.dri.all(id, "incidents")[0];
@@ -418,7 +506,7 @@ export class DriCoordinator {
           "intake",
           "blocked",
           "provider_unavailable",
-          "Incident details inaccessible; scope and profile cannot be established",
+          "incident.read is unavailable or returned no usable incident. Scope cannot be established. Check capability readiness and MCP setup, then Resume.",
         );
         this.review(id, "blocked");
         return;
@@ -435,7 +523,10 @@ export class DriCoordinator {
         );
         this.store.writeAtomically(() => {
           this.dri.decision(id, decision);
-          this.dri.update(id, this.dri.require(id).revision, { profile: decision });
+          this.dri.update(id, this.dri.require(id).revision, {
+            profile: decision,
+            readiness: this.readiness(started.mode, decision.profileId),
+          });
         });
       }
       this.transition(id, "collect", "collect");
@@ -504,16 +595,20 @@ export class DriCoordinator {
     const incident = this.dri.all(id, "incidents")[0];
     const template =
       role === "telemetry" ? profile?.queryTemplates[0]?.id : `${capability}.v1`;
-    const harAvailable =
-      investigation.artifactRef ||
-      incident?.attachments.some((attachment) => attachment.availability === "available");
-    if (!profile || !provider || !template || (role === "har" && !harAvailable)) {
+    const artifactRef =
+      investigation.artifactRef ??
+      incident?.attachments.find(
+        (attachment) =>
+          attachment.availability === "available" &&
+          ["application/har+json", "application/json"].includes(attachment.mediaType),
+      )?.reference;
+    if (!profile || !provider || !template || (role === "har" && !artifactRef)) {
       this.limitation(
         investigation,
         role,
         role === "har"
           ? "HAR attachment missing or inaccessible; client-side evidence unavailable"
-          : "Required read-only provider or profile template unavailable",
+          : `${capability}: required read-only provider or vetted profile template unavailable. See capability readiness and MCP setup.`,
       );
       this.workState(id, role, "blocked");
       return;
@@ -609,6 +704,7 @@ export class DriCoordinator {
       bytes = 0,
       pages = 0;
     let cursor: string | undefined;
+    let observedData = false;
     let state: DriQuery["state"] = "succeeded";
     let error: DriQuery["error"] = "none";
     const seen = new Set<string>();
@@ -616,7 +712,10 @@ export class DriCoordinator {
       do {
         if (signal.aborted) throw new DriError("Deadline or Stop interrupted query", 408);
         const context: ProviderContext = {
-          investigation,
+          investigation:
+            !investigation.artifactRef && artifactRef
+              ? { ...investigation, artifactRef }
+              : investigation,
           profile,
           query,
           cursor,
@@ -653,6 +752,14 @@ export class DriCoordinator {
         };
         const page = await this.readBounded(provider, context);
         assertProviderPageCapability(capability, page);
+        observedData ||= Boolean(
+          page.incident ||
+          page.evidence.length ||
+          page.timeline.length ||
+          page.similar.length ||
+          page.changes.length ||
+          page.artifacts.length,
+        );
         const size = Buffer.byteLength(JSON.stringify(page));
         const pageRows = Math.max(
           page.evidence.length,
@@ -726,6 +833,7 @@ export class DriCoordinator {
                 : "invalid_data";
     }
     if (state === "access_denied") error = "authorization";
+    if (state === "no_results" && observedData) state = "succeeded";
     if (state === "failed" && error === "none") error = "provider";
     const accepted = this.current(id, investigation.generation);
     this.store.writeAtomically(() => {
@@ -752,6 +860,25 @@ export class DriCoordinator {
       );
       if (accepted) {
         const complete = state === "succeeded" || state === "no_results";
+        if (["failed", "access_denied", "unavailable"].includes(state)) {
+          const current = this.dri.require(id);
+          this.dri.update(id, current.revision, {
+            readiness: current.readiness.map((entry) =>
+              entry.capability !== capability
+                ? entry
+                : {
+                    ...entry,
+                    state:
+                      state === "access_denied"
+                        ? "access_denied"
+                        : state === "failed" && error === "invalid_data"
+                          ? "incompatible"
+                          : "unavailable",
+                    reason: `The ${capability} read ${state}. Inspect its query receipt and verify the authorized normalized MCP mapping before Resume.`,
+                  },
+            ),
+          });
+        }
         if (!complete)
           this.limitation(
             investigation,
@@ -769,22 +896,9 @@ export class DriCoordinator {
     provider: InvestigationProvider,
     context: ProviderContext,
   ): Promise<ProviderPage> {
-    return new Promise((resolve, reject) => {
-      const controller = new AbortController();
-      const aborted = () => {
-        controller.abort();
-        reject(new DriError("Provider interrupted", 408));
-      };
-      context.signal.addEventListener("abort", aborted, { once: true });
-      const timeout = setTimeout(() => {
-        controller.abort();
-        reject(new DriError("Provider timed out", 408));
-      }, context.query.bounds.timeoutMs);
-      const boundedContext = {
-        ...context,
-        signal: AbortSignal.any([context.signal, controller.signal]),
-      };
-      void (async () => {
+    return boundedDriRead(
+      async (signal) => {
+        const boundedContext = { ...context, signal };
         if (this.options.resolvePrivateBindings)
           boundedContext.privateBindings = {
             ...context.privateBindings,
@@ -794,27 +908,21 @@ export class DriCoordinator {
               boundedContext.signal,
             )),
           };
-        return provider.read(boundedContext);
-      })()
-        .then((raw) => {
-          if (Buffer.byteLength(JSON.stringify(raw)) > context.query.bounds.maxBytes)
-            throw new DriError("Provider exceeded byte budget", 413);
-          const parsed = ProviderPageSchema.safeParse(raw);
-          if (!parsed.success)
-            throw new DriError("Invalid normalized provider data", 422);
-          resolve(parsed.data);
-        })
-        .catch((reason: unknown) =>
-          reject(
-            reason instanceof DriError
-              ? reason
-              : new DriError("Read-only provider failed", 502),
-          ),
-        )
-        .finally(() => {
-          clearTimeout(timeout);
-          context.signal.removeEventListener("abort", aborted);
-        });
+        if (boundedContext.signal.aborted)
+          throw new DriError("Read-only operation interrupted", 408);
+        const raw = await provider.read(boundedContext);
+        if (Buffer.byteLength(JSON.stringify(raw)) > context.query.bounds.maxBytes)
+          throw new DriError("Provider exceeded byte budget", 413);
+        const parsed = ProviderPageSchema.safeParse(raw);
+        if (!parsed.success) throw new DriError("Invalid normalized provider data", 422);
+        return parsed.data;
+      },
+      context.signal,
+      context.query.bounds.timeoutMs,
+    ).catch((reason: unknown) => {
+      throw reason instanceof DriError
+        ? reason
+        : new DriError("Read-only provider failed", 502);
     });
   }
   private limitation(
@@ -833,7 +941,8 @@ export class DriCoordinator {
         type: "limitation",
         providerId: query?.providerId ?? "unavailable",
         source: role,
-        reference: "fixture:metadata",
+        reference:
+          investigation.mode === "fixture" ? "fixture:metadata" : "evidence:unavailable",
         observedAt: now,
         identifiers: [],
         finding,
@@ -932,6 +1041,13 @@ export class DriCoordinator {
             0,
             40,
           ),
+          attachments: [
+            ...new Map(
+              [...(previous?.attachments ?? []), ...page.incident.attachments].map(
+                (attachment) => [attachment.reference, attachment],
+              ),
+            ).values(),
+          ].slice(0, 40),
           completeness: page.nextCursor
             ? ("partial" as const)
             : page.incident.completeness,

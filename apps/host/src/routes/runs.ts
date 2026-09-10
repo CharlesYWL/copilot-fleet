@@ -5,18 +5,20 @@ import {
   canTransitionRun,
   terminalRunStates,
   terminalSessionStates,
+  CreateOrchestrationSchema,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { archiveRun, purgeRun } from "../orchestrator/lifecycle.js";
 import { reopenPrompt } from "../orchestrator/review.js";
+import { OrchestrationCreationService } from "../orchestrator/creation.js";
+import { creationError, sendCreation } from "./orchestration-creation.js";
 
-const CreateRunSchema = z.object({
-  workspaceId: z.string().min(1),
+const CreateRunSchema = CreateOrchestrationSchema.extend({
   name: z.string().min(1).max(120),
   objective: z.string().min(1).max(4_000),
   policy: RunPolicySchema.partial().optional(),
-});
+}).strip();
 
 const PlanStepSchema = z.object({
   stepKey: z
@@ -37,7 +39,11 @@ const ReopenSchema = z.object({
   note: z.string().min(1).max(4_000),
 });
 
-export type RunRouteOptions = { service: FleetService; engine: OrchestratorEngine };
+export type RunRouteOptions = {
+  service: FleetService;
+  engine: OrchestratorEngine;
+  creation?: OrchestrationCreationService;
+};
 
 /**
  * The operator's side of orchestration.
@@ -48,9 +54,11 @@ export type RunRouteOptions = { service: FleetService; engine: OrchestratorEngin
  */
 export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
   app,
-  { service, engine },
+  { service, engine, creation: providedCreation },
 ) => {
   const { store } = service;
+  const creation = providedCreation ?? new OrchestrationCreationService(service, engine);
+  if (!providedCreation) app.addHook("onClose", () => creation.shutdown());
   app.addHook("preHandler", async (request, reply) => {
     const { id } = request.params as { id?: string };
     if (!id || !store.getRun(id)?.investigationId || request.method === "GET") return;
@@ -78,20 +86,16 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     return { runs, stepsByRunId, notesByRunId };
   });
 
-  app.post("/api/runs", async (request, reply) => {
-    const input = CreateRunSchema.parse(request.body);
-    if (!store.getWorkspace(input.workspaceId)) {
-      return reply.code(404).send({ error: "Workspace not found" });
-    }
-    const run = store.createRun({
-      workspaceId: input.workspaceId,
-      name: input.name,
-      objective: input.objective,
-      ...(input.policy ? { policy: input.policy } : {}),
-    });
-    service.publishRun(run);
-    return reply.code(201).send(run);
-  });
+  app.post(
+    "/api/runs",
+    { bodyLimit: 32_768, errorHandler: creationError },
+    async (request, reply) => {
+      const input = CreateRunSchema.parse(request.body);
+      const result = creation.create(input, { standalone: true });
+      if (result.kind === "confirmation_required") return sendCreation(reply, result);
+      return reply.code(result.replayed ? 200 : 201).send(result.run);
+    },
+  );
 
   app.get("/api/runs/:id", async (request, reply) => {
     const { id } = request.params as { id: string };

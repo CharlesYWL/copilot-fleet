@@ -127,6 +127,29 @@ describe("read-only provider adapters", () => {
     });
     expect(() => assertProviderPageCapability("incident.read", page)).toThrow(/scope/);
   });
+  it("does not treat an explicitly destructive tool annotation as read-only", async () => {
+    const listTools = vi.fn<Client["listTools"]>(async () => ({
+      tools: [
+        {
+          name: "get_incident_details_by_id",
+          inputSchema: { type: "object" },
+          annotations: { readOnlyHint: true, destructiveHint: true },
+        },
+      ],
+    }));
+    const callTool = vi.fn<Client["callTool"]>(async () => ({ content: [] }));
+    const tools = await new SdkMcpReadClient({ listTools, callTool }).discover(
+      new AbortController().signal,
+    );
+    expect(tools).toEqual([
+      {
+        name: "get_incident_details_by_id",
+        readOnly: false,
+        inputSchema: { type: "object" },
+      },
+    ]);
+    expect(callTool).not.toHaveBeenCalled();
+  });
   it("reads only bounded approved local artifacts and rejects traversal, expiry and absence", async () => {
     const directory = join(process.cwd(), ".dri-test-work", randomUUID());
     mkdirSync(directory, { recursive: true });

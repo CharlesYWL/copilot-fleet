@@ -130,7 +130,29 @@ export const genericProfile = InvestigationProfileSchema.parse({
       },
     },
   ],
-  queryTemplates: [],
+  queryTemplates: [
+    {
+      id: "generic.operation-cohorts.v1",
+      purpose: "Compare scoped failures with successful and unaffected operations",
+      pivots: ["environment", "correlation", "operation"],
+      selectedColumns: [
+        "Timestamp",
+        "Operation",
+        "Outcome",
+        "DurationMs",
+        "ErrorSignature",
+        "Cohort",
+      ],
+      comparisons: ["failed_success", "affected_unaffected"],
+      filterOrder: ["environment", "utc_time", "correlation"],
+      provenance: {
+        ...provenance,
+        source: "fleet",
+        commit: "03435b71ccf7426a793c0fad5aadfc7c416b7683",
+        freshness: "requires_live_verification",
+      },
+    },
+  ],
   providerMappings: {
     repository: "repository.read",
     pipeline: "pipeline.read",

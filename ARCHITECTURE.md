@@ -60,6 +60,16 @@ copilot --acp --stdio
   ACP write tools; RunSteps track progress, not evidence/query/report content.
   See [the DRI architecture and provider guide](docs/DRI_INVESTIGATION.md).
 
+Normal task creation passes through the Host's `OrchestrationCreationService`.
+The generic DRI core owns a bounded, deterministic intent classifier; Auto routes
+only strong DRI intent, while explicit choices win and ambiguity returns a
+confirmation response without creating work. Hashed creation receipts are indexed
+on Runs and travel through backup/restore. The existing lead and standalone Run
+routes share this service without changing regular briefing, approval or policy
+behavior. DRI provider execution reuses the MCP SDK discovery bridge and Host-side
+HTTP catalog metadata, requiring both an operator-approved capability manifest
+and exact read-only tool names/annotations. Request text cannot grant tool authority.
+
 ## Orchestration
 
 A Run is an objective a human approved once, together with hard budgets. The

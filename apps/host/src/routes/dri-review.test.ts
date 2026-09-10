@@ -345,18 +345,24 @@ describe("DRI review fixes through authenticated Host routes", () => {
     expect((await post(scope)).statusCode).toBe(200);
     expect(store.dri.record(first.id, "evidence", record.id)).toBeDefined();
   });
-  it("advertises the shipped fixture path and embedding-only live registration accurately", async () => {
+  it("advertises MCP registration and explicit test fixtures without hiding missing live capabilities", async () => {
     const availability = (await request({ url: "/api/dri/profiles" })).json<{
       availability: unknown;
     }>().availability;
     expect(availability).toEqual({
       fixtureEnabled: true,
-      liveRegistration: "embedding_only",
+      liveRegistration: "mcp_catalog",
       liveProvidersConfigured: false,
     });
-    const item = await create("live");
+    const item = await settle((await create("live")).id);
     expect(item.status).toBe("blocked");
-    expect(item.limitation).toContain("not shipped");
+    expect(item.limitation).toContain("incident.read");
+    expect(item.readiness).toHaveLength(6);
+    expect(
+      item.readiness.every(
+        (entry) => entry.state === "unavailable" && entry.setup.includes("MCP"),
+      ),
+    ).toBe(true);
     expect(store.dri.invocationCount(item.id)).toBe(0);
   });
 });

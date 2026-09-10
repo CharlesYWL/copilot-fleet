@@ -18,6 +18,8 @@ import {
   type Notification,
   type RunNote,
   type SessionEvent,
+  type CreateOrchestration,
+  type OrchestrationCreationResult,
 } from "@fleet/protocol";
 import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
@@ -235,6 +237,13 @@ export function App() {
     new URLSearchParams(window.location.search).has("dri") ? "dri" : "session",
   );
   const [selectedDriId, setSelectedDriId] = useState("");
+  useEffect(() => {
+    if (view === "dri") return;
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has("dri")) return;
+    url.searchParams.delete("dri");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  }, [view]);
   const [orchestratorViewMode, setOrchestratorViewMode] =
     useState<OrchestratorViewMode>("stage");
   const [selectedSessionId, setSelectedSessionId] = useState<string>();
@@ -886,18 +895,18 @@ export function App() {
    * same request. Doing it as two calls from here would leave a run with no
    * orchestrator aware of it whenever the second one failed.
    */
-  const handleCreateRun = async (input: {
-    workspaceId: string;
-    name: string;
-    objective: string;
-  }) => {
-    if (!orchestrator || terminalSessionStates.has(orchestrator.state)) return false;
-    const created = await request<{ run: { id: string } }>(
-      `/api/orchestrators/${orchestrator.id}/runs`,
+  const handleCreateRun = async (input: CreateOrchestration) => {
+    const created = await request<OrchestrationCreationResult>(
+      orchestrator ? `/api/orchestrators/${orchestrator.id}/runs` : "/api/orchestrations",
       { method: "POST", body: JSON.stringify(input) },
     );
-    if (!created.ok) return false;
+    if (!created.ok || created.data.kind !== "created") return false;
     await refresh();
+    if (created.data.workflow === "dri") {
+      setSelectedDriId(created.data.investigation.id);
+      setView("dri");
+      return true;
+    }
     setSelectedRunId(created.data.run.id);
     setView("orchestrator-task");
     return true;

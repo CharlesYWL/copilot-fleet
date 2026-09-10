@@ -18,6 +18,7 @@ function fakeSocket() {
     // silently reads as closed and every command is "sent to a dead node".
     OPEN: 1,
     send: () => {},
+    close: () => {},
   } as unknown as Parameters<FleetService["attachNode"]>[1];
 }
 

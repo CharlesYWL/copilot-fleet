@@ -1,9 +1,13 @@
 # Copilot Fleet
 
-Evidence-driven DRI investigations are available from **DRI investigations** in
-the Host header. See the [DRI guide](docs/DRI_INVESTIGATION.md) for synthetic
-fixtures, embedding-only provider boundaries (live CLI adapters are not shipped),
-architecture, and validation.
+**New task** defaults to **Auto**: confident ICM/DRI investigation requests start
+the typed, read-only investigation workflow and open its linked Run in the DRI
+workbench. Coding/documentation requests stay regular; ambiguous requests require
+confirmation. **Regular** and **DRI investigation** override detection.
+No DRI environment flag or provider-mode picker is needed. Configured MCP
+providers require approved read-only capability manifests; missing capabilities
+remain durably blocked/partial, never synthetic success. See the
+[DRI guide](docs/DRI_INVESTIGATION.md) for examples, MCP setup, manual use and validation.
 
 **English** · [简体中文](README.zh-CN.md)
 

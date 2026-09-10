@@ -16,6 +16,7 @@ import { FleetService } from "../fleet-service.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { archiveRun } from "../orchestrator/lifecycle.js";
 import { DriCoordinator, type DriCoordinatorOptions } from "./coordinator.js";
+import type { DriProviderDiscovery } from "./mcp.js";
 import { fixtureHar, fixtureProviders } from "./fixtures.js";
 import { analyzeHar } from "./har.js";
 import { ProfileRegistry, dmsProfile, genericProfile } from "./profiles.js";
@@ -58,6 +59,69 @@ afterEach(async () => {
 });
 const create = (coordinator: DriCoordinator, extra: Record<string, unknown> = {}) =>
   coordinator.create({ icm: "42", mode: "fixture", ...extra });
+
+describe("multi-source read outcomes", () => {
+  it("bounds discovery that ignores abort without selecting fixtures or hanging shutdown", async () => {
+    const { store, coordinator } = harness({
+      discoverProviders: async () => new Promise(() => {}),
+      limits: { timeoutMs: 50 },
+    });
+    const item = create(coordinator, { mode: "live" });
+    await coordinator.execute(item.id);
+    expect(store.dri.require(item.id)).toMatchObject({ status: "blocked", mode: "live" });
+    expect(store.dri.invocationCount(item.id)).toBe(0);
+    expect(store.dri.all(item.id, "reports")).toHaveLength(0);
+    await coordinator.shutdown();
+  });
+  it("stops during discovery and fences a late discovery result", async () => {
+    let finish!: (value: DriProviderDiscovery) => void;
+    const pending = new Promise<DriProviderDiscovery>((resolve) => {
+      finish = resolve;
+    });
+    const { store, coordinator } = harness({ discoverProviders: () => pending });
+    const item = create(coordinator, { mode: "live" });
+    const running = coordinator.execute(item.id);
+    coordinator.stop(item.id, store.dri.require(item.id).revision);
+    await running;
+    finish({ providers: [], issues: {} });
+    await Promise.resolve();
+    expect(store.dri.require(item.id).status).toBe("stopped");
+    expect(store.dri.invocationCount(item.id)).toBe(0);
+  });
+  it("does not relabel collected changes as no-results when the final source is empty", async () => {
+    const providers = fixtureProviders({});
+    const changes = providers.find((provider) =>
+      provider.definition.capabilities.includes("change.read"),
+    )!;
+    const { store, coordinator } = harness({
+      fixtures: providers.map((provider) =>
+        provider !== changes
+          ? provider
+          : {
+              definition: changes.definition,
+              read: async (context) =>
+                context.cursor
+                  ? ProviderPageSchema.parse({
+                      state: "no_results",
+                      summary: "Empty final bounded source",
+                    })
+                  : {
+                      ...(await changes.read(context)),
+                      nextCursor: "empty-final-source",
+                    },
+            },
+      ),
+    });
+    const item = create(coordinator);
+    await coordinator.execute(item.id);
+    expect(store.dri.all(item.id, "changes").length).toBeGreaterThan(0);
+    expect(
+      store.dri
+        .all(item.id, "queries")
+        .find((query) => query.capability === "change.read"),
+    ).toMatchObject({ state: "succeeded", pages: 2 });
+  });
+});
 
 describe("DRI input and profiles", () => {
   it.each([

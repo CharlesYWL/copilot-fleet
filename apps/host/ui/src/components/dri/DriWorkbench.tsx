@@ -62,10 +62,11 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
   const [profiles, setProfiles] = useState<ProfileChoice[]>([]);
   const [availability, setAvailability] = useState<DriAvailability>({
     fixtureEnabled: false,
-    liveRegistration: "embedding_only",
+    liveRegistration: "mcp_catalog",
     liveProvidersConfigured: false,
   });
   const [creating, setCreating] = useState(false);
+  const [syntheticDemo, setSyntheticDemo] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [section, setSection] = useState<DriRecordKind | "overview">("overview");
@@ -100,6 +101,12 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
   useEffect(() => {
     if (citation) citationHeading.current?.focus();
   }, [citation]);
+  useEffect(() => {
+    if (!initialId) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set("dri", initialId);
+    window.history.replaceState(null, "", `${url.pathname}${url.search}`);
+  }, [initialId]);
 
   const open = (nextId: string) => {
     citationTicket.current++;
@@ -121,6 +128,7 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
       const input: Record<string, unknown> = Object.fromEntries(
         [...values].filter(([, value]) => value !== ""),
       );
+      input.mode = syntheticDemo ? "fixture" : "live";
       const start = input.start,
         end = input.end;
       delete input.start;
@@ -130,13 +138,9 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
         throw new Error(
           "Enter a valid ICM ID/URL and an ordered UTC time range of at most 24 hours.",
         );
-      if (
-        !input.mode ||
-        (input.mode === "fixture" && !availability.fixtureEnabled) ||
-        (input.mode === "live" && !availability.liveProvidersConfigured)
-      )
+      if (syntheticDemo && !availability.fixtureEnabled)
         throw new Error(
-          "Select an available provider mode. Live adapters are embedding-only, not shipped with the CLI.",
+          "Synthetic demo providers are not enabled by this test/demo Host.",
         );
       const investigation = await api<DriInvestigation>("/api/dri", {
         method: "POST",
@@ -203,9 +207,25 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
     >
       <div className={styles.row}>
         <h1>DRI investigations</h1>
-        <Button appearance="primary" onClick={() => setCreating(true)}>
+        <Button
+          appearance="primary"
+          onClick={() => {
+            setSyntheticDemo(false);
+            setCreating(true);
+          }}
+        >
           Create DRI Investigation
         </Button>
+        {availability.fixtureEnabled && (
+          <Button
+            onClick={() => {
+              setSyntheticDemo(true);
+              setCreating(true);
+            }}
+          >
+            Synthetic DRI demo
+          </Button>
+        )}
         {id && <Button onClick={() => open("")}>All investigations</Button>}
       </div>
       <p>
@@ -213,8 +233,9 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
         incident content.
       </p>
       <p>
-        Production CLI live adapters are not shipped. Synthetic fixtures require Host
-        opt-in; live-provider registration is embedding-only.
+        Normal task creation detects DRI requests automatically. Approved read-only MCP
+        providers are discovered from the Host catalog. Missing capabilities remain
+        blocked or partial; configure them and Resume.
       </p>
       {(error || view.error) && (
         <div role="alert">
@@ -235,6 +256,11 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
           onSubmit={(event) => void create(event)}
           aria-label="Create DRI Investigation"
         >
+          {syntheticDemo && (
+            <p role="status">
+              Synthetic demo only. No real incident or production evidence is used.
+            </p>
+          )}
           <div className={styles.fields}>
             <label className={styles.field}>
               ICM URL or ID (required)
@@ -249,20 +275,6 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
                     {profile.label}
                   </option>
                 ))}
-              </select>
-            </label>
-            <label className={styles.field}>
-              Provider mode
-              <select name="mode" defaultValue="" required>
-                <option value="" disabled>
-                  Choose an available provider mode
-                </option>
-                <option value="live" disabled={!availability.liveProvidersConfigured}>
-                  Live (embedding-only adapters; not shipped)
-                </option>
-                <option value="fixture" disabled={!availability.fixtureEnabled}>
-                  Synthetic fixture (Host must enable)
-                </option>
               </select>
             </label>
             <label className={styles.field}>
@@ -297,13 +309,7 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
             Hints are fingerprinted, not placed in public query context. Do not enter
             credentials or personal/customer content.
           </p>
-          <Button
-            type="submit"
-            disabled={
-              busy ||
-              (!availability.fixtureEnabled && !availability.liveProvidersConfigured)
-            }
-          >
+          <Button type="submit" disabled={busy}>
             Start investigation
           </Button>{" "}
           <Button onClick={() => setCreating(false)}>Cancel</Button>
@@ -336,6 +342,11 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
       {current && view.detail && (
         <>
           <h2>Investigation {current.id.slice(0, 8)}</h2>
+          {current.mode === "fixture" && (
+            <p role="status">
+              Synthetic demo investigation. Findings are not production evidence.
+            </p>
+          )}
           <p>
             <strong>
               {current.phase.toUpperCase()} · {current.status}
@@ -443,6 +454,19 @@ export function DriWorkbench({ initialId = "" }: { initialId?: string }) {
                 ))}
               </ul>
               <h3>Provider readiness</h3>
+              {current.readiness.length > 0 && (
+                <ul aria-label="Capability readiness">
+                  {current.readiness.map((entry) => (
+                    <li key={entry.capability}>
+                      <strong>
+                        {entry.capability}: {entry.state}
+                      </strong>{" "}
+                      ({entry.required ? "required" : "optional"}). {entry.reason}
+                      {entry.state !== "ready" && <p>{entry.setup}</p>}
+                    </li>
+                  ))}
+                </ul>
+              )}
               {view.detail.providers.length ? (
                 <ul>
                   {view.detail.providers.map((provider) => (

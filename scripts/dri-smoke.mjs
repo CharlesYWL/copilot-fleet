@@ -23,6 +23,8 @@ const app = await buildServer({
   operatorPassword: "synthetic-loopback-smoke-password",
   announceClaimCode: () => {},
   useBuiltInEntra: false,
+  mcp: { catalog: { mcpServers: {} } },
+  testDriRouting: true,
   dri: {
     allowFixtures: true,
     fixtures: fixtureProviders({
@@ -37,6 +39,7 @@ const app = await buildServer({
   },
 });
 app.log.level = "silent";
+let syntheticNode;
 try {
   const address = await app.listen({ host: "127.0.0.1", port: 0 });
   const { stdout: html } = await promisify(execFile)(
@@ -49,7 +52,10 @@ try {
   assert.ok(asset, "Production browser asset is linked");
   const browserAsset = await fetch(`${address}${asset}`);
   assert.equal(browserAsset.status, 200);
-  assert.match(await browserAsset.text(), /Create DRI Investigation/);
+  const browserCode = await browserAsset.text();
+  assert.match(browserCode, /Create DRI Investigation/);
+  assert.match(browserCode, /Detected DRI investigation/);
+  assert.match(browserCode, /Use Regular/);
   assert.equal((await fetch(`${address}/api/dri`)).status, 401);
   const login = await fetch(`${address}/api/auth/login`, {
     method: "POST",
@@ -80,15 +86,6 @@ try {
     assert.equal(response.ok, true, `HTTP ${response.status} from ${path}`);
     return response.json();
   };
-  const created = await api("/api/dri", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: '{"icm":"42","mode":"fixture"}',
-  });
-  const availability = await api("/api/dri/profiles");
-  assert.equal(availability.availability.liveRegistration, "embedding_only");
-  assert.equal(availability.availability.liveProvidersConfigured, false);
-  const head = async () => (await api(`/api/dri/${created.id}`)).investigation;
   const until = async (predicate) => {
     for (let attempt = 0; attempt < 100; attempt++) {
       if (await predicate()) return;
@@ -96,6 +93,99 @@ try {
     }
     throw new Error("Fixture smoke deadline exceeded");
   };
+  const inventory = {
+    name: "synthetic-dri-smoke",
+    os: "win32",
+    arch: "x64",
+    version: "0.4.0",
+    capabilities: ["copilot-acp", "host-yolo"],
+    maxSessions: 8,
+    homeDir: "C:\\synthetic-dri-smoke-no-process",
+  };
+  const registration = await api("/api/nodes/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      ...inventory,
+      enrollmentToken: "synthetic-loopback-smoke-token",
+    }),
+  });
+  // This socket advertises a synthetic Node; it never executes a command or starts Copilot.
+  syntheticNode = new WebSocket(`${address.replace("http:", "ws:")}/ws/node`);
+  await new Promise((resolve, reject) => {
+    syntheticNode.addEventListener("open", resolve, { once: true });
+    syntheticNode.addEventListener("error", reject, { once: true });
+  });
+  syntheticNode.send(
+    JSON.stringify({
+      ...inventory,
+      type: "hello",
+      nodeId: registration.nodeId,
+      secret: registration.secret,
+    }),
+  );
+  await until(async () =>
+    (await api("/api/nodes")).some(
+      (node) => node.id === registration.nodeId && node.online,
+    ),
+  );
+  const lead = await api("/api/orchestrators", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: '{"workspaceId":"chats","name":"Synthetic lead - no process"}',
+  });
+  const createPath = `/api/orchestrators/${lead.session.id}/runs`;
+  const driRequest = {
+    workspaceId: "chats",
+    name: "Synthetic automatic DRI",
+    requestId: "smoke-auto-dri",
+    objective:
+      "Investigate ICM 42, analyze the HAR and telemetry, and determine root cause.",
+  };
+  const creation = await api(createPath, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(driRequest),
+  });
+  assert.equal(creation.workflow, "dri");
+  const created = creation.investigation;
+  const replay = await api(createPath, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(driRequest),
+  });
+  assert.equal(replay.replayed, true);
+  assert.equal(replay.run.id, creation.run.id);
+  const regular = await api(createPath, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      workspaceId: "chats",
+      name: "Regular smoke",
+      requestId: "smoke-regular",
+      objective: "Update the README with instructions for investigating ICM incidents.",
+    }),
+  });
+  assert.equal(regular.workflow, "regular");
+  assert.equal(regular.run.investigationId, undefined);
+  assert.equal(regular.run.policy.yolo, true);
+  assert.match(regular.run.pendingPrompt, /fleet-task/);
+  const ambiguous = await fetch(`${address}${createPath}`, {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({
+      ...driRequest,
+      requestId: "smoke-ambiguous",
+      objective: "Investigate incident 42.",
+    }),
+  });
+  assert.equal(ambiguous.status, 409);
+  assert.equal((await ambiguous.json()).kind, "confirmation_required");
+  assert.equal((await api("/api/runs")).runs.length, 2);
+  const availability = await api("/api/dri/profiles");
+  assert.equal(availability.availability.liveRegistration, "mcp_catalog");
+  assert.equal(availability.availability.liveProvidersConfigured, false);
+  const head = async () => (await api(`/api/dri/${created.id}`)).investigation;
   await until(async () =>
     (await api(`/api/dri/${created.id}/queries`)).items.some(
       (query) => query.capability === "telemetry.query" && query.state === "running",
@@ -166,6 +256,10 @@ try {
       unauthenticated: 401,
       csrf: 403,
       fixture: "DMS report and citations verified",
+      normalAutoRouting: "one linked synthetic Investigation+Run",
+      regularRouting: "legacy briefing and policy preserved",
+      ambiguous: "409; no creation",
+      idempotency: "same Run on replay",
       stopResume: "passed",
       completedCallsReplayed: 0,
       genericPurge: 409,
@@ -175,5 +269,6 @@ try {
   );
 } finally {
   release();
+  syntheticNode?.close();
   await app.close();
 }

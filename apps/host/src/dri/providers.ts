@@ -170,6 +170,11 @@ export class ProviderRegistry {
     }
     this.providers.set(definition.id, provider);
   }
+  replace(providers: InvestigationProvider[]): void {
+    const checked = new ProviderRegistry(providers);
+    this.providers.clear();
+    for (const [id, provider] of checked.providers) this.providers.set(id, provider);
+  }
   get(id: string): InvestigationProvider | undefined {
     return this.providers.get(id);
   }
@@ -185,7 +190,11 @@ export class ProviderRegistry {
   }
 }
 
-export type DiscoveredReadTool = { name: string; readOnly: boolean };
+export type DiscoveredReadTool = {
+  name: string;
+  readOnly: boolean;
+  inputSchema?: Record<string, unknown>;
+};
 export interface DiscoveredMcpClient {
   discover(signal: AbortSignal): Promise<DiscoveredReadTool[]>;
   call(

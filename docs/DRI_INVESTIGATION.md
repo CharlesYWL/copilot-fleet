@@ -1,24 +1,76 @@
 # Evidence-driven DRI investigations
 
-See [the deep-review repair report](DRI_REVIEW_FIXES.md) for current validation
-and [the historical initial report](DRI_VALIDATION.md) for the original delivery.
+See [automatic-routing delivery and validation](DRI_AUTO_ROUTING_VALIDATION.md)
+for the current final gates and changed-file manifest.
+
+The [deep-review repair report](DRI_REVIEW_FIXES.md) and
+[initial report](DRI_VALIDATION.md) record the previous implementation's validation.
+The automatic-routing delivery retains that evidence/lifecycle implementation.
 
 DRI is an additive, typed domain linked one-to-one to an ordinary Fleet Run.
 `packages/protocol/src/dri.ts` is the versioned, bounded Zod contract. The Host
 coordinator executes **Intake → Collect → Analyze → Validate → Report**. The
-browser's **DRI investigations → Create DRI Investigation** entry requires an ICM
-ID or approved HTTPS incident URL. A validated report enters **Needs review**;
+browser's normal **New task** entry detects DRI requests automatically. A DRI
+investigation requires an ICM ID or approved HTTPS incident URL. A validated report enters **Needs review**;
 an operator can approve it or resume eligible incomplete collection.
 
-**Shipped availability:** the synthetic fixture workflow is implemented.
-**Production CLI live adapters are not shipped.** There is no CLI/settings/env
-manifest for installing live providers. The typed provider boundary, MCP bridge,
-local HAR reader and telemetry compiler are building blocks for an embedding
-application; deployment-specific live normalization and authorization remain
-deferred. `/api/dri/profiles` and investigation heads advertise
-`liveRegistration: "embedding_only"` and whether an embedding supplied providers.
-The UI disables unconfigured live selection and requires explicit fixture choice.
-Unconfigured live API requests remain blocked without provider calls.
+**Shipped availability:** normal creation uses configured read-only MCP providers.
+The built-in catalog adapter reuses Fleet's HTTP MCP contract and SDK discovery;
+it requires an operator-approved capability manifest and normalized response
+contract. It does not guess how to execute arbitrary stock tool schemas.
+`/api/dri/profiles` and investigation heads advertise
+`liveRegistration: "mcp_catalog"` and discovered availability. Missing or incompatible
+providers produce a durable blocked/partial investigation, per-capability setup
+guidance, and retained evidence. The Host never falls back to synthetic data.
+No DRI environment flag or provider mode is required for normal creation or UI visibility.
+
+## Automatic routing
+
+**New task → Workflow** offers **Auto** (default), **Regular**, and
+**DRI investigation**. The Host-owned generic classifier examines at most 4,000
+characters plus bounded structured `dri.icm` / `dri.artifactRef` hints.
+It returns `dri | regular | ambiguous`, confidence, fixed safe reasons, a canonical
+incident reference when established, and suggested evidence. It never copies
+request prose into its explanation or uses wording to select the DMS profile.
+
+| Request | Auto behavior |
+| --- | --- |
+| `Investigate ICM 123456789, analyze the HAR and telemetry, and determine root cause.` | DRI; create/start typed investigation and linked Run/steps |
+| `Update the README with instructions for investigating ICM incidents.` | Regular; unchanged orchestrator briefing and dispatch |
+| `Investigate incident 123456789.` | Confirmation required; no Run or investigation created |
+| The ambiguous request plus `dri: { "icm": "123456789" }` | DRI; structured input establishes ICM |
+| Any valid request plus `workflow: "regular"` | Regular, even when DRI was detected |
+| `workflow: "dri"` without a usable ICM reference | Ask for the reference; never invent an incident |
+
+Auto displays its DRI/ambiguous explanation before submission. **Use Regular**
+corrects a false positive; **Use DRI investigation** confirms an ambiguous ICM
+candidate. The ICM field is keyboard accessible. Preview results are fenced to
+the current input so a delayed reply cannot route a newer coding request.
+The routed response opens `DriWorkbench` with the investigation ID and linked Run.
+The optional dedicated DRI entry remains available, without a provider-mode picker.
+
+`OrchestrationCreationService` is the single Host creation boundary for
+`POST /api/orchestrators/:id/runs`, `POST /api/orchestrations`, and the standalone
+`POST /api/runs`. `POST /api/orchestrations/preview` is side-effect free.
+Creation reclassifies independently of preview; ambiguity/missing reference
+returns HTTP 409 with `kind: "confirmation_required"` and the typed classification.
+The generic/lead success response includes `kind: "created"`, `workflow`, `run`,
+`classification`, `replayed`, and, for DRI, `investigation`. The standalone route
+retains its legacy Run response (with `investigationId` when routed).
+
+The browser retains one `requestId` across double-submit, reconnect/reload and
+uncertain-response retries using session storage containing only an input digest
+and opaque key, not request text. Edited input gets a new key; confirmed creation
+clears it. Run creation, DRI state/steps, and a hashed
+creation receipt commit together. An indexed key returns the same retained Run
+on replay (HTTP 200; initial creation is 201); different input with the same key
+returns 409. Replay does not resume stopped work. Receipts survive Host restart
+and both backup formats. A restored receipt with omitted DRI source data returns
+410, never a new investigation. DRI clients omitting a key get deterministic
+request-content deduplication; legacy regular clients without keys retain
+create-every-time behavior. Deduplication lasts as long as the Run is retained.
+Regular tasks still require their existing live lead/online placement; Host-only
+DRI does not need a Node. A supplied stopping/terminal lead cannot acquire new work.
 
 ## Authority and execution
 
@@ -130,14 +182,14 @@ Fleet's separate destructive administrator operation, not a selective DRI purge.
    capabilities. Return a bounded `ProviderPage`: technical normalized facts,
    safe metadata, explicit completion/error state and an optional continuation.
    Do not return untrusted customer prose or raw tool envelopes as findings.
-3. **Embedding/development integration only:** an application can supply
+3. For an embedding application, supply
    `buildServer({ dri: { liveProviders, profiles } })` at its composition root.
-   This is **not an operator configuration path in the shipped production CLI**.
-   No arbitrary module loading, runtime plugin registration or live adapter
-   credential configuration is implemented. The CLI server module auto-starts
+   The shipped CLI instead uses the declarative MCP catalog described below.
+   No arbitrary module loading or request-selected configuration is implemented.
+   The CLI server module auto-starts
    on import outside test mode; see the smoke's suppressed-start factory import,
    rather than importing it into a second production launcher unguarded.
-   Operator authorization must precede each future production invocation.
+   Operator authorization must precede each production invocation.
    Optional `limits` configure bounded policy. Optional `resolvePrivateBindings`
    reacquires authorized private parameters after restart. Initial operator hints
    and adapter-recorded correlation/environment pivots are retained only in
@@ -157,8 +209,8 @@ projection, explicit authorization and exact allowlisted tool names.
 Discovery/readOnlyHint alone never grants access; both declared capability and
 authorization must also pass. No update, post, mitigate, close, transfer, or
 arbitrary tool-name path exists. Tool schema mappers must be verified against the
-actual deployed MCP server. No deployment-specific live ICM/source/telemetry
-adapter is claimed as implemented or validated by these interfaces.
+actual deployed MCP server. Deployment-specific raw ICM/source/telemetry envelopes still require verified
+normalization. The shipped adapter accepts only the declared normalized page contract.
 
 Incident adapters should normalize all pages of details, discussion, handoffs,
 linked incidents/resources and attachment metadata; they must report partial
@@ -181,6 +233,133 @@ relationships, first meaningful failure, HTTP/app failures, cancellation/stalls,
 CORS/auth/cookie-presence signals, timing phases and hashed correlation IDs.
 Neither raw URLs, cookie values, credential headers nor response bodies survive.
 There is no upload endpoint or browser-supplied filesystem path.
+
+## MCP setup
+
+Run the Host under an account with access to its existing Copilot MCP catalog:
+`%USERPROFILE%\.copilot\mcp-config.json` on Windows (`~/.copilot/mcp-config.json`
+elsewhere). Fleet reads this bounded catalog on DRI intake/Resume. Only HTTP
+entries with operator-installed `_meta["fleet/dri"]` metadata are eligible.
+Existing unrelated MCP servers remain untouched. Stdio processes, arbitrary
+module loading, remote plain HTTP, credential-bearing URLs, query-string URLs,
+redirects and unmanifested tools are not executed by this adapter.
+
+Each manifest binds an exact allowlisted tool to one capability, a versioned
+argument mapping, and **`provider-page-v1` normalized results**. For example,
+this placeholder is a configuration shape, not a deployed endpoint or credential:
+
+```json
+{
+  "mcpServers": {
+    "approved-investigation-reads": {
+      "type": "http",
+      "url": "https://mcp.example.invalid/readonly",
+      "headers": {},
+      "_meta": {
+        "fleet/dri": {
+          "version": 1,
+          "bindings": [
+            {
+              "capability": "incident.read",
+              "tool": "get_incident_details_by_id",
+              "arguments": { "scope": "scope" },
+              "response": "provider-page-v1"
+            },
+            {
+              "capability": "telemetry.query",
+              "tool": "telemetry_query_readonly",
+              "arguments": { "scope": "scope" },
+              "response": "provider-page-v1"
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
+
+The server must expose the declared input schema (in this example, an object
+with a `scope` object property) and annotate the tool `readOnlyHint: true`, without
+`destructiveHint: true`. Both are checked during discovery and again before
+each invocation. Catalog authorization is reread before each call; revocation,
+credential/endpoint changes, missing tools and incompatible schemas fail closed.
+Only the local catalog grants authorization: incident text and tool descriptions
+cannot install a manifest or enable writes.
+
+The exact capability/tool vocabulary is intentionally small:
+
+| Capability | Exact permitted tools |
+| --- | --- |
+| `incident.read` | `get_incident_details_by_id`, `get_incident_discussion_entries_and_insights`, `get_incident_context` |
+| `artifact.read` | `artifact_metadata_read`, `artifact_bounded_read` |
+| `har.analyze` | `har_analyze_local` |
+| `telemetry.query` | `telemetry_query_readonly` |
+| `similar.search` | `get_similar_incidents`, `search_incidents` |
+| `change.read` | `get_commit`, `get_file_contents`, `actions_get`, `actions_list` |
+
+Source-control, pipeline and deployment evidence can use several declared change
+tools; they are collected serially within the same page/query budgets. Any missing
+declared source makes that capability unavailable rather than advertising partial
+discovery as full coverage. No substring/prefix matching is used. An annotated
+`update_incident`, admin tool or similarly named write tool is still rejected.
+
+Argument values are selected only from `scope`, `incidentId`, `artifactRef`,
+`timeRange`, `queryPlan`, `profileId`, `cursor`, `maxRows`, `maxBytes`, and
+`timeoutMs`. `scope` packages these safe fields. It never includes the request
+question, credentials, private customer bindings, a tool name, an endpoint or
+arbitrary KQL. All bindings must carry incident scope; telemetry must carry the
+trusted bounded query plan (directly or within `scope`). Mapping keys/types must
+match the discovered tool's required schema. Unknown required arguments are not
+filled with guessed values.
+
+The server returns a `ProviderPageSchema` object in MCP `structuredContent` or
+one JSON text content item. It declares `succeeded`, `no_results`, `access_denied`,
+`unavailable`, `failed`, or `truncated`, a bounded summary, and normalized incident,
+evidence, timeline, similar/change or artifact metadata for its capability.
+Optional continuation tokens are bounded; repeated/undeclared pagination fails.
+For an empty successful bounded read, for example:
+
+```json
+{
+  "structuredContent": {
+    "state": "no_results",
+    "summary": "No results in the authorized bounded scope."
+  },
+  "content": []
+}
+```
+
+**Verify normalization before adding the manifest.** Stock ICM/GitHub/Kusto tool
+envelopes are not generally this contract. Where they differ, configure an
+authorized read-only MCP facade that projects the deployed schema into
+`ProviderPageSchema`; a manifest is an attestation of that verified mapping,
+not permission to treat free-form text as evidence. For Kusto, implement the
+allowlisted `telemetry_query_readonly` facade with installation-verified
+table/column mappings, parameterized queries and the profile's bounded cohort
+plan. The existing `compileTelemetryReadPlan` is available for this purpose.
+Raw Kusto execution/management tools are not allowlisted. Incident ownership must
+come from verified service/component fields, never a title or the request's DMS
+wording. Normalize attachment references and timeline/discussion coverage honestly;
+report partial coverage when any source is incomplete.
+
+Use existing secure catalog headers and least-privilege credentials managed by the
+operator; Fleet does not hardcode, issue or persist provider credentials in Runs,
+backups or browser state. Automatic OAuth login and arbitrary transport setup are
+not implemented. HTTP is permitted only for local loopback facades; otherwise use
+HTTPS. Catalogs are capped at 256 KiB, 20 servers and 20 bindings/server; SDK
+discovery is bounded to 10 pages of at most 200 tools. Raw HTTP JSON/SSE bytes are
+bounded before parsing. Discovery shares the call timeout and Stop signal; a
+hung discovery becomes blocked and cannot hold Host shutdown indefinitely.
+Each read also inherits the DRI call, row, byte, page,
+concurrency and deadline limits.
+
+After configuration, create a normal DRI request or **Resume unfinished work**.
+The durable **Capability readiness** list names every required/optional capability,
+its state, safe reason and setup instructions. An unavailable incident reader
+blocks intake; missing later evidence produces a partial report, not corroboration
+or fixture success. Fix configuration and Resume; completed accepted queries,
+citations, reports, generation fencing and stop semantics remain intact.
 
 ## DMS provenance and reference decisions
 
@@ -229,7 +408,7 @@ envelopes.
 | Route                                                                                                            | Purpose                                                                         |
 | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `GET/POST /api/dri`                                                                                              | Bounded listing / create and start                                              |
-| `GET /api/dri/profiles`                                                                                          | Profile catalog; fixture flag and embedding-only live availability              |
+| `GET /api/dri/profiles`                                                                                          | Profile catalog; discovered MCP readiness and explicit test/demo availability   |
 | `GET /api/dri/by-run/:runId`                                                                                     | One-to-one Run lookup                                                           |
 | `GET /api/dri/:id`                                                                                               | Bounded investigation / worker / readiness head                                 |
 | `GET/PATCH /api/dri/:id/profile`                                                                                 | Decision history / correction and pause                                         |
@@ -290,7 +469,7 @@ $guard = (Join-Path (Get-Location) 'scripts\dri-validation-guard.cjs').Replace('
 $env:NODE_OPTIONS = '--require "' + $guard + '"'
 Remove-Item Env:npm_lifecycle_event -ErrorAction SilentlyContinue
 npm run build -w @fleet/protocol
-npx vitest run apps\host\src\dri apps\host\src\routes\dri.test.ts apps\host\src\routes\dri-review.test.ts apps\host\ui\src\components\dri apps\host\ui\src\hooks\useDri.test.tsx apps\host\ui\src\hooks\useDri.integration.test.tsx
+npx vitest run apps\host\src\dri apps\host\src\orchestrator\creation.test.ts apps\host\src\routes\dri.test.ts apps\host\src\routes\dri-review.test.ts apps\host\src\routes\orchestration-creation.test.ts apps\host\ui\src\components\dri apps\host\ui\src\components\orchestration\CreateOrchestrationDialog.test.tsx apps\host\ui\src\hooks\useDri.test.tsx apps\host\ui\src\hooks\useDri.integration.test.tsx
 npm run lint
 npm run format:check
 npm run typecheck
@@ -301,20 +480,38 @@ if (Test-Path $env:DATABASE_PATH) { throw 'Unexpected default store access' }
 ```
 
 The smoke launches a real ephemeral loopback production Host, fetches the actual
-HTML with curl and its browser asset, checks authentication/CSRF, runs fixture DMS
-collection, stops/resumes without replaying completed intake, and verifies report
+HTML with curl and its browser asset, checks authentication/CSRF, automatically
+routes an ordinary request using explicitly injected synthetic test providers,
+keeps a regular request on its legacy path, stops/resumes without replaying completed intake, and verifies report
 citations and change/similar conclusions. It closes the Host afterward. It does
 not require browser E2E dependencies or a Node/Copilot login.
 
-For a manual synthetic browser demonstration, set `FLEET_DRI_FIXTURES=true` on a
-local Host and select fixture mode. It is disabled by default. Any valid numeric
-ICM input in fixture mode selects **synthetic data only**, not a real incident.
+### Manual use without environment flags
+
+Run ordinary `npm run dev`, sign in, open **New task**, and leave **Workflow: Auto**.
+Use a real authorized ICM request to open its DRI workbench; without configured
+providers it must become blocked with explicit MCP setup guidance. Try the README
+example above to keep a regular task, then the ambiguous incident example to
+exercise **Use Regular** / **Use DRI investigation** correction. Inspect the linked
+Run, readiness, evidence and queries. Stop and Resume via DRI controls, not ordinary
+Run planning or purge.
+
+Fixtures are test/demo-only composition: the smoke injects
+`buildServer({ databasePath: ":memory:", dri: { allowFixtures: true, fixtures },
+testDriRouting: true, mcp: { catalog: { mcpServers: {} } } })`.
+`testDriRouting` is not an API input and is refused without an in-memory store and
+explicit fixture providers. Enabling fixtures alone does **not** change normal
+Auto routing from live to synthetic. A test/demo Host may expose a separate
+**Synthetic DRI demo** action; every such investigation is labeled synthetic.
+The production launcher has no environment switch for fixture selection.
 
 **Live validation: not_tested.** No authorized non-sensitive live incident or
 production credentials were supplied. The MCP transport/authorization boundary,
 local HAR adapter and telemetry compiler are tested; deployment-specific ICM
 schema projection, telemetry/environment bindings, source/pipeline mapping and
-credentialed live adapters **are not shipped**. They require an embedding
-implementation plus authorized read-only validation of permissions, attachment
-retrieval and service freshness. Missing implementation/configuration blocks collection.
+credentialed production mappings **have not been validated**. The shipped generic
+MCP catalog adapter is exercised with mock discovery and an actual synthetic
+loopback HTTP MCP server. Authorized production normalization, permission,
+attachment, Kusto mapping and freshness checks remain the operator's responsibility.
+Missing implementation/configuration blocks collection.
 No production or ICM mutations are performed.

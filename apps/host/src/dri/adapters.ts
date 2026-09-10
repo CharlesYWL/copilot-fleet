@@ -33,11 +33,16 @@ export class SdkMcpReadClient implements DiscoveredMcpClient {
         signal,
         timeout: 15_000,
       });
-      for (const tool of response.tools.slice(0, 200)) {
+      if (response.tools.length > 200)
+        throw new DriError("MCP discovery tool budget exceeded", 422);
+      for (const tool of response.tools) {
         if (Object.values(READ_ONLY_TOOLS).some((names) => names.includes(tool.name))) {
           result.push({
             name: tool.name,
-            readOnly: tool.annotations?.readOnlyHint === true,
+            readOnly:
+              tool.annotations?.readOnlyHint === true &&
+              tool.annotations?.destructiveHint !== true,
+            inputSchema: tool.inputSchema,
           });
         }
       }

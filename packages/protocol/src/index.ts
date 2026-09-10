@@ -1,5 +1,10 @@
 import { z } from "zod";
-import { DriBackupSchema } from "./dri.js";
+import {
+  DriBackupSchema,
+  DriRoutingInputSchema,
+  type DriClassification,
+  type DriInvestigation,
+} from "./dri.js";
 export * from "./dri.js";
 
 /**
@@ -1102,6 +1107,38 @@ export const RunPolicySchema = z.object({
   staleAfterMs: z.number().int().positive().default(60_000),
 });
 export type RunPolicy = z.infer<typeof RunPolicySchema>;
+const OrchestrationPolicySchema = z.object({
+  maxParallel: RunPolicySchema.shape.maxParallel.removeDefault().optional(),
+  maxSessions: RunPolicySchema.shape.maxSessions.removeDefault().optional(),
+  maxWakes: RunPolicySchema.shape.maxWakes.removeDefault().optional(),
+  maxOutputChars: RunPolicySchema.shape.maxOutputChars.removeDefault().optional(),
+  yolo: RunPolicySchema.shape.yolo.removeDefault().optional(),
+  onStepFailure: RunPolicySchema.shape.onStepFailure.removeDefault().optional(),
+  wakePolicy: RunPolicySchema.shape.wakePolicy.removeDefault().optional(),
+  stepTimeoutMs: RunPolicySchema.shape.stepTimeoutMs.removeDefault().optional(),
+  startingTimeoutMs: RunPolicySchema.shape.startingTimeoutMs.removeDefault().optional(),
+  staleAfterMs: RunPolicySchema.shape.staleAfterMs.removeDefault().optional(),
+});
+
+export const CreateOrchestrationSchema = DriRoutingInputSchema.extend({
+  workspaceId: z.string().min(1).max(160),
+  name: z.string().min(1).max(120),
+  leadSessionId: z.string().min(1).max(160).optional(),
+  requestId: z
+    .string()
+    .min(1)
+    .max(160)
+    .regex(/^[A-Za-z0-9:._-]+$/)
+    .optional(),
+  policy: OrchestrationPolicySchema.optional(),
+}).strict();
+export type CreateOrchestration = z.input<typeof CreateOrchestrationSchema>;
+export const RunCreationReceiptSchema = z.object({
+  keyHash: z.string().regex(/^[a-f0-9]{64}$/),
+  inputHash: z.string().regex(/^[a-f0-9]{64}$/),
+  workflow: z.enum(["regular", "dri"]),
+});
+export type RunCreationReceipt = z.infer<typeof RunCreationReceiptSchema>;
 
 export const RunStateSchema = z.enum([
   "awaiting_approval",
@@ -1204,6 +1241,8 @@ export const RunSchema = z.object({
   id: z.string().min(1),
   /** Bounded navigation link; DRI evidence/state lives in its own domain. */
   investigationId: z.string().max(160).optional(),
+  /** Hashed creation identity only; survives reconnect, restart and portable restore. */
+  creationReceipt: RunCreationReceiptSchema.optional(),
   workspaceId: z.string().min(1),
   name: z.string().min(1),
   objective: z.string().min(1),
@@ -1280,6 +1319,23 @@ export const RunSchema = z.object({
   updatedAt: z.string().datetime(),
 });
 export type Run = z.infer<typeof RunSchema>;
+export type OrchestrationCreationResult =
+  | { kind: "confirmation_required"; classification: DriClassification }
+  | {
+      kind: "created";
+      workflow: "regular";
+      classification: DriClassification;
+      replayed: boolean;
+      run: Run;
+    }
+  | {
+      kind: "created";
+      workflow: "dri";
+      classification: DriClassification;
+      replayed: boolean;
+      run: Run;
+      investigation: DriInvestigation;
+    };
 
 export const RunStepSchema = z.object({
   id: z.string().min(1),

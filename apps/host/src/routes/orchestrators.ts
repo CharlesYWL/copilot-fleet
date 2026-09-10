@@ -5,6 +5,7 @@ import {
   ORCHESTRATOR_STOP_REASON,
   terminalRunStates,
   terminalSessionStates,
+  CreateOrchestrationSchema,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
@@ -12,6 +13,8 @@ import { FleetTools } from "../orchestrator/tools.js";
 import { orchestratorBriefing } from "../orchestrator/briefing.js";
 import { reviewOutcome } from "../orchestrator/review.js";
 import { archiveRun, reopenOrchestratorStoppedRun } from "../orchestrator/lifecycle.js";
+import { OrchestrationCreationService } from "../orchestrator/creation.js";
+import { creationError, sendCreation } from "./orchestration-creation.js";
 
 const CreateOrchestratorSchema = z.object({
   /** Where its workers run. The orchestrator itself only talks. */
@@ -32,10 +35,8 @@ const ReviewSchema = z.object({
   note: z.string().max(4_000).optional(),
 });
 
-const CreateRunSchema = z.object({
-  workspaceId: z.string().min(1),
+const CreateRunSchema = CreateOrchestrationSchema.extend({
   name: z.string().min(1).max(80),
-  objective: z.string().min(1).max(4_000),
   policy: z
     .object({
       maxParallel: z.number().int().positive().max(10).optional(),
@@ -43,29 +44,12 @@ const CreateRunSchema = z.object({
       maxWakes: z.number().int().positive().max(100).optional(),
     })
     .optional(),
-});
-
-/**
- * The turn a new task arrives as.
- *
- * Shaped like the wake envelopes, because that is the form the orchestrator has
- * been treating as "a fact to act on" since its first turn. A bare sentence
- * from a person reads as something to reply to instead.
- */
-function taskBrief(name: string, objective: string, workspace: string): string {
-  return [
-    `<fleet-task name=${JSON.stringify(name)} workspace=${JSON.stringify(workspace)}>`,
-    objective,
-    "</fleet-task>",
-    "",
-    `Plan this with fleet_plan_task using the task name "${name}", then dispatch the`,
-    "work for its first phase and end your turn.",
-  ].join("\n");
-}
+}).strip();
 
 export type OrchestratorRouteOptions = {
   service: FleetService;
   engine: OrchestratorEngine;
+  creation?: OrchestrationCreationService;
 };
 
 /**
@@ -77,9 +61,11 @@ export type OrchestratorRouteOptions = {
  */
 export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = async (
   app,
-  { service, engine },
+  { service, engine, creation: providedCreation },
 ) => {
   const { store } = service;
+  const creation = providedCreation ?? new OrchestrationCreationService(service, engine);
+  if (!providedCreation) app.addHook("onClose", () => creation.shutdown());
 
   /**
    * Every orchestrator conversation not explicitly dismissed, newest first.
@@ -277,60 +263,15 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
    * succeeds and the second does not, leaving a task in the list that no
    * orchestrator knows about and nothing will ever move.
    */
-  app.post("/api/orchestrators/:id/runs", async (request, reply) => {
-    const { id } = request.params as { id: string };
-    const input = CreateRunSchema.parse(request.body);
-    const lead = store.getSession(id);
-    if (!lead || lead.runRole !== "lead" || terminalSessionStates.has(lead.state)) {
-      return reply.code(404).send({ error: "Orchestrator not found" });
-    }
-    if (lead.stopRequested) {
-      return reply.code(409).send({ error: "The orchestrator is stopping" });
-    }
-    const workspace = store.getWorkspace(input.workspaceId);
-    if (!workspace) return reply.code(404).send({ error: "Workspace not found" });
-    const reachable = store
-      .listPlacements()
-      .some(
-        (placement) =>
-          placement.workspaceId === workspace.id &&
-          store.getNode(placement.nodeId)?.online,
-      );
-    if (!reachable) {
-      return reply
-        .code(409)
-        .send({ error: "No online node holds that workspace, so a task cannot run" });
-    }
-
-    const template = store.listRuns().find((entry) => entry.leadSessionId === lead.id);
-    const created = store.createRun({
-      workspaceId: workspace.id,
-      name: input.name,
-      objective: input.objective,
-      policy: {
-        ...(template ? template.policy : {}),
-        ...(input.policy ?? {}),
-        wakePolicy: "on_any_settle",
-        onStepFailure: "wake",
-      },
-    });
-    const run = store.updateRun(created.id, {
-      leadSessionId: lead.id,
-      state: "running",
-      /*
-       * The brief is owed rather than sent. It goes out on the first tick where
-       * the orchestrator is free; an orchestrator running another task is the
-       * ordinary case, and a prompt pushed at it mid-turn is refused by the
-       * Node and reported only as a transcript notice — so a direct send here
-       * would create a task nothing had been told about, and return 201.
-       */
-      pendingPrompt: taskBrief(created.name, created.objective, workspace.name),
-    })!;
-
-    service.publishRun(run);
-    engine.tick();
-    return reply.code(201).send({ run: store.getRun(run.id) ?? run });
-  });
+  app.post(
+    "/api/orchestrators/:id/runs",
+    { bodyLimit: 32_768, errorHandler: creationError },
+    async (request, reply) => {
+      const { id } = request.params as { id: string };
+      const input = CreateRunSchema.parse(request.body);
+      return sendCreation(reply, creation.create(input, { leadSessionId: id }));
+    },
+  );
 
   /** Ends an orchestrator and everything it started. */
   app.post("/api/orchestrators/:id/stop", async (request, reply) => {

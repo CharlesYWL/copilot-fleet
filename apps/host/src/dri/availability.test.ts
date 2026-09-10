@@ -8,7 +8,7 @@ import { FleetService } from "../fleet-service.js";
 import { DriCoordinator } from "./coordinator.js";
 
 describe("shipped DRI availability contract", () => {
-  it("does not advertise a CLI live-provider installation path", async () => {
+  it("advertises MCP catalog registration without pretending unconfigured providers are ready", async () => {
     const store = new FleetStore(":memory:");
     const service = new FleetService(store, {
       info() {},
@@ -20,7 +20,7 @@ describe("shipped DRI availability contract", () => {
     try {
       expect(coordinator.availability()).toEqual({
         fixtureEnabled: false,
-        liveRegistration: "embedding_only",
+        liveRegistration: "mcp_catalog",
         liveProvidersConfigured: false,
       });
       const item = coordinator.create({ icm: "42", mode: "live" });
@@ -43,13 +43,14 @@ describe("shipped DRI availability contract", () => {
       store.close();
     }
   });
-  it("documents embedding-only live adapters and operator-authorized proposal receipts", () => {
+  it("documents fail-closed MCP setup and operator-authorized proposal receipts", () => {
     const guide = readFileSync(
       join(process.cwd(), "docs", "DRI_INVESTIGATION.md"),
       "utf8",
     );
-    expect(guide).toContain("Production CLI live adapters are not shipped");
-    expect(guide).toContain("not an operator configuration path");
+    expect(guide).toContain("## MCP setup");
+    expect(guide).toContain("provider-page-v1");
+    expect(guide).toContain("never falls back to synthetic");
     expect(guide).toContain(
       "caller authorization is the independently authenticated operator",
     );

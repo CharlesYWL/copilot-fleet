@@ -73,10 +73,10 @@ const view = () => ({
   next: vi.fn(),
   atStart: true,
 });
-const mount = () =>
+const mount = (initialId = "") =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
-      <DriWorkbench />
+      <DriWorkbench initialId={initialId} />
     </FluentProvider>,
   );
 
@@ -89,7 +89,7 @@ beforeEach(() => {
       return {
         availability: {
           fixtureEnabled: true,
-          liveRegistration: "embedding_only",
+          liveRegistration: "mcp_catalog",
           liveProvidersConfigured: false,
         },
         profiles: [
@@ -101,16 +101,24 @@ beforeEach(() => {
   });
 });
 describe("DRI workbench", () => {
-  it("labels live registration embedding-only and does not default to synthetic data", async () => {
+  it("opens the routed investigation with its linked Run and a reloadable URL", () => {
+    vi.mocked(useDri).mockReturnValue({ ...view(), detail });
+    mount("dri-test");
+    expect(useDri).toHaveBeenCalledWith("dri-test", "overview");
+    expect(new URLSearchParams(window.location.search).get("dri")).toBe("dri-test");
+    expect(screen.getByRole("link", { name: "run-test" })).toBeTruthy();
+  });
+  it("discovers live providers without a mode picker or configuration gate, and labels demos separately", async () => {
     mount();
     fireEvent.click(screen.getByRole("button", { name: "Create DRI Investigation" }));
     await screen.findByRole("option", { name: "DMS" });
-    expect(screen.getByText(/Production CLI live adapters are not shipped/)).toBeTruthy();
+    expect(screen.getByText(/Approved read-only MCP/)).toBeTruthy();
+    expect(screen.queryByLabelText("Provider mode")).toBeNull();
+    expect(screen.getByRole("button", { name: "Synthetic DRI demo" })).toBeTruthy();
     expect(
-      (screen.getByRole("option", { name: /Live \(embedding-only/ }) as HTMLOptionElement)
+      (screen.getByRole("button", { name: "Start investigation" }) as HTMLButtonElement)
         .disabled,
-    ).toBe(true);
-    expect((screen.getByLabelText("Provider mode") as HTMLSelectElement).value).toBe("");
+    ).toBe(false);
   });
   it("provides accessible creation, validates ICM and sends optional inputs without authority in prompts", async () => {
     mount();
@@ -127,9 +135,6 @@ describe("DRI workbench", () => {
     fireEvent.change(screen.getByLabelText("ICM URL or ID (required)"), {
       target: { value: "42" },
     });
-    fireEvent.change(screen.getByLabelText("Provider mode"), {
-      target: { value: "fixture" },
-    });
     vi.mocked(api).mockResolvedValueOnce(investigation);
     fireEvent.submit(screen.getByRole("form"));
     await waitFor(() =>
@@ -139,6 +144,28 @@ describe("DRI workbench", () => {
           method: "POST",
           body: expect.stringContaining('"icm":"42"'),
         }),
+      ),
+    );
+    const body = vi
+      .mocked(api)
+      .mock.calls.find(
+        ([url, options]) => url === "/api/dri" && options?.method === "POST",
+      )?.[1]?.body;
+    expect(JSON.parse(String(body))).toMatchObject({ mode: "live", icm: "42" });
+  });
+  it("uses fixtures only after a clearly labeled synthetic demo action", async () => {
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "Synthetic DRI demo" }));
+    expect(screen.getByRole("status").textContent).toContain("Synthetic demo only");
+    fireEvent.change(screen.getByLabelText("ICM URL or ID (required)"), {
+      target: { value: "42" },
+    });
+    vi.mocked(api).mockResolvedValueOnce(investigation);
+    fireEvent.submit(screen.getByRole("form"));
+    await waitFor(() =>
+      expect(api).toHaveBeenCalledWith(
+        "/api/dri",
+        expect.objectContaining({ body: expect.stringContaining('"mode":"fixture"') }),
       ),
     );
   });
