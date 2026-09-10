@@ -4579,6 +4579,20 @@ export class FleetStore {
     ).map(eventFromRow);
   }
 
+  hasEventAfter(
+    sessionId: string,
+    sequence: number,
+    type: SessionEvent["type"],
+  ): boolean {
+    return Boolean(
+      this.statement(
+        `SELECT 1 FROM events
+         WHERE session_id=? AND sequence>? AND type=?
+         LIMIT 1`,
+      ).get(sessionId, sequence, type),
+    );
+  }
+
   private assertNoLiveSessions(
     column: "workspace_id" | "placement_id" | "node_id",
     id: string,

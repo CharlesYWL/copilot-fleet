@@ -209,6 +209,57 @@ describe("OrchestratorEngine", () => {
     expect(store.getRun(run.id)?.settleSeq).toBe(1);
   });
 
+  it("settles an idle autonomous continuation after the stale grace", () => {
+    const { store, engine, planned } = setup();
+    const run = planned([{ stepKey: "audit", title: "Audit", prompt: "audit it" }]);
+    engine.tickRun(run.id);
+    const step = store.listRunSteps(run.id)[0]!;
+    const session = store.getSession(step.sessionId)!;
+
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "running");
+    engine.tickRun(run.id);
+    store.appendEvent({
+      eventId: "autonomous-output",
+      sessionId: session.id,
+      sequence: 1,
+      type: "agent_text",
+      payload: { text: "background review finished" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(session.id, "idle");
+    store.touchSessionActivity(session.id, store.getSession(session.id)!.updatedAt);
+    const idle = store.getSession(session.id)!;
+
+    engine.tickRun(run.id, Date.parse(idle.updatedAt) + run.policy.staleAfterMs - 1);
+    expect(store.getRunStep(step.id)?.state).toBe("running");
+
+    engine.tickRun(run.id, Date.parse(idle.updatedAt) + run.policy.staleAfterMs);
+    expect(store.getRunStep(step.id)).toMatchObject({
+      state: "succeeded",
+      output: expect.stringContaining("background review finished"),
+    });
+  });
+
+  it("does not settle a stale idle retry that produced no output", () => {
+    const { store, engine, planned } = setup();
+    const run = planned([{ stepKey: "audit", title: "Audit", prompt: "audit it" }]);
+    engine.tickRun(run.id);
+    const step = store.listRunSteps(run.id)[0]!;
+    const session = store.getSession(step.sessionId)!;
+
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "running");
+    engine.tickRun(run.id);
+    store.transitionSession(session.id, "idle");
+    store.touchSessionActivity(session.id, store.getSession(session.id)!.updatedAt);
+    const idle = store.getSession(session.id)!;
+
+    engine.tickRun(run.id, Date.parse(idle.updatedAt) + run.policy.staleAfterMs);
+
+    expect(store.getRunStep(step.id)?.state).toBe("running");
+  });
+
   it("runs a dependent step only after its dependency succeeds, then finishes", () => {
     const { store, engine, planned, finishTurn, commands } = setup();
     const run = planned([
