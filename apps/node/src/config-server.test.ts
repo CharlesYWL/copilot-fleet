@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createServer, request, Server } from "node:http";
+import { once } from "node:events";
 import {
   MUTUAL_AUTH_PROTOCOL,
   NODE_ID_HEADER,
@@ -12,6 +14,7 @@ import { createIdentityKeyPair, verifyNodeHttpProof } from "@fleet/protocol/node
 import {
   createConfigRouter,
   refuseRequest,
+  startConfigServer,
   type ConfigServerOptions,
   type FleetApi,
 } from "./config-server.js";
@@ -94,6 +97,112 @@ function router(overrides: Partial<ConfigServerOptions> = {}) {
 function relayingRouter(overrides: Partial<ConfigServerOptions> = {}) {
   return createConfigRouter({ ...baseOptions(), ...overrides });
 }
+
+describe("config listener ports", () => {
+  const servers: Server[] = [];
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await Promise.all(
+      servers.splice(0).map(
+        (server) =>
+          new Promise<void>((done) => {
+            server.closeAllConnections();
+            server.close(() => done());
+          }),
+      ),
+    );
+  });
+  const portOfServer = (server: Server): number => {
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("No TCP listener");
+    return address.port;
+  };
+  const status = (port: number, headers: Record<string, string> = {}) =>
+    new Promise<number>((done, reject) => {
+      const call = request(
+        { host: "127.0.0.1", port, path: "/api/config", headers },
+        (response) => {
+          response.resume();
+          response.once("end", () => done(response.statusCode ?? 0));
+        },
+      );
+      call.once("error", reject);
+      call.end();
+    });
+
+  it("moves past an occupied port and uses the actual port for Host/Origin protection", async () => {
+    const occupied = createServer();
+    servers.push(occupied);
+    let preferred: number;
+    do {
+      occupied.listen(0, "127.0.0.1");
+      await once(occupied, "listening");
+      preferred = portOfServer(occupied);
+      if (preferred === 65535)
+        await new Promise<void>((done) => occupied.close(() => done()));
+    } while (preferred === 65535);
+    const log = vi.fn();
+    const server = startConfigServer({ ...baseOptions(), port: preferred, log });
+    servers.push(server);
+    await new Promise<void>((done) => server.once("listening", done));
+    const actual = portOfServer(server);
+    expect(actual).toBeGreaterThan(preferred);
+    expect(server.address()).toMatchObject({ address: "127.0.0.1" });
+    expect(log).toHaveBeenCalledWith(
+      `Config UI port ${preferred} is occupied; trying ${preferred + 1}.`,
+    );
+    expect(log).toHaveBeenCalledWith(`  config UI   http://127.0.0.1:${actual}`);
+    expect(
+      log.mock.calls
+        .filter(([line]) => line.startsWith("Config UI port "))
+        .map(([line]) => Number(/port (\d+)/.exec(line)?.[1])),
+    ).toEqual(
+      Array.from({ length: actual - preferred }, (_, index) => preferred + index),
+    );
+    expect(await status(actual, { Origin: `http://127.0.0.1:${actual}` })).toBe(200);
+    expect(await status(actual, { Origin: `http://127.0.0.1:${preferred}` })).toBe(403);
+    expect(await status(actual, { Host: `127.0.0.1:${preferred}` })).toBe(403);
+  });
+
+  it("reports the bound ephemeral port, not port zero", async () => {
+    const log = vi.fn();
+    const server = startConfigServer({ ...baseOptions(), port: 0, log });
+    servers.push(server);
+    await once(server, "listening");
+    const actual = portOfServer(server);
+    expect(log).toHaveBeenCalledWith(`  config UI   http://127.0.0.1:${actual}`);
+    expect(await status(actual)).toBe(200);
+  });
+
+  it.each([
+    { port: 8788, code: "EACCES" },
+    { port: 65535, code: "EADDRINUSE" },
+  ])("does not retry $code at port $port", ({ port, code }) => {
+    const listen = vi.spyOn(Server.prototype, "listen").mockImplementation(function (
+      this: Server,
+    ) {
+      return this;
+    });
+    const log = vi.fn();
+    const server = startConfigServer({ ...baseOptions(), port, log });
+    server.emit("error", Object.assign(new Error("cannot bind"), { code }));
+    expect(listen).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith("Config UI unavailable: cannot bind");
+  });
+
+  it("does not reopen after being closed during a pending retry", async () => {
+    const listen = vi.spyOn(Server.prototype, "listen").mockImplementation(function (
+      this: Server,
+    ) {
+      return this;
+    });
+    const server = startConfigServer({ ...baseOptions(), port: 8788 });
+    server.emit("error", Object.assign(new Error("occupied"), { code: "EADDRINUSE" }));
+    server.emit("close");
+    await new Promise<void>((done) => setImmediate(done));
+    expect(listen).toHaveBeenCalledTimes(1);
+  });
+});
 
 /**
  * The page this server serves can repoint the node at a different Host, which

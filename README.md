@@ -321,7 +321,7 @@ of them on one Windows machine, or split Host and Node across machines.
 - **Something needs attention:** use the notification bell, the amber
   Orchestrator/task state, the permission banner in the session, and
   **Settings → Diagnostics** for Host warnings/errors. The Node's own
-  `http://127.0.0.1:8788` config page shows Node-side logs when you can reach
+  config page (port 8788 by default; its actual URL is printed at startup) shows Node-side logs when you can reach
   that machine.
 
 ## Agency mode
@@ -1084,7 +1084,8 @@ can still reach the Host. A named hostname / `FLEET_PUBLIC_URL` / Tailscale Funn
 address is copied into the archive; a rotating quick-tunnel URL (`*.trycloudflare.com`,
 free ngrok, bore) is not — those nodes would have to be retargeted by hand.
 
-**Node** — the local config page (`http://127.0.0.1:8788`) → **Export identity**.
+**Node** — the local config page (use the URL printed at startup; default
+`http://127.0.0.1:8788`) → **Export identity**.
 That file is `node.json` plus `settings.json` for this machine. Import on the new
 box replaces this process's identity and reconnects. Placement paths stay whatever
 the Host already stored for that node id; update them if the checkout lives
@@ -1179,8 +1180,14 @@ responsible for deleting its own data through its supported API.
 
 ### Node config page
 
-Each node serves a small settings page at `http://127.0.0.1:8788` (override the
-port with `FLEET_NODE_CONFIG_PORT`). Use it to retarget the node when a tunnel
+Each node serves a small settings page starting at `http://127.0.0.1:8788`.
+If that port is occupied, it tries the next port and prints the actual URL.
+Set the preferred starting port with `--config-port` or `FLEET_NODE_CONFIG_PORT`.
+Service enrollment/start also prints the collision notices and final config URL;
+these are kept in the Node's runtime log. This is separate from the Host API's
+port 8787, which is not automatically moved.
+
+Use the config page to retarget the node when a tunnel
 hands out a new URL — the node reconnects in place, so no restart is needed and
 running sessions survive.
 

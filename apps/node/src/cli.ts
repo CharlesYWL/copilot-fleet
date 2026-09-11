@@ -128,7 +128,7 @@ const FLAGS: { names: string[]; spec: FlagSpec }[] = [
     spec: {
       env: "FLEET_NODE_CONFIG_PORT",
       placeholder: "<port>",
-      help: "Local config page port (FLEET_NODE_CONFIG_PORT)",
+      help: "Preferred local config page port; tries higher ports when busy (FLEET_NODE_CONFIG_PORT)",
     },
   },
   {

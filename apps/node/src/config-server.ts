@@ -355,7 +355,8 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
 
 export function startConfigServer(options: ConfigServerOptions): Server {
   const route = createConfigRouter(options);
-  const port = options.port ?? configServerPort();
+  let port = options.port ?? configServerPort();
+  let closed = false;
 
   const server = createServer((request, response) => {
     const url = request.url ?? "/";
@@ -409,11 +410,34 @@ export function startConfigServer(options: ConfigServerOptions): Server {
     });
   });
 
-  server.listen(port, HOST, () => {
+  server.on("listening", () => {
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("Config UI has no TCP address.");
+    port = address.port;
     options.log(`  config UI   http://${HOST}:${port}`);
   });
-  server.on("error", (error) => {
-    options.log(`Config UI unavailable: ${error.message}`);
+  server.once("close", () => {
+    closed = true;
   });
+  server.on("error", (error) => {
+    if (
+      "code" in error &&
+      error.code === "EADDRINUSE" &&
+      !server.listening &&
+      port > 0 &&
+      port < 65535 &&
+      !closed
+    ) {
+      options.log(`Config UI port ${port} is occupied; trying ${port + 1}.`);
+      port++;
+      setImmediate(() => {
+        if (!closed) server.listen(port, HOST);
+      });
+    } else {
+      options.log(`Config UI unavailable: ${error.message}`);
+    }
+  });
+  server.listen(port, HOST);
   return server;
 }

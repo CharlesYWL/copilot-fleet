@@ -22,6 +22,11 @@ Add-Content -LiteralPath (Join-Path $config.repositoryPath 'operations.log') -Va
 if($Action -eq 'probe'){
   @{ok=$true;accountSid=$config.accountSid}|ConvertTo-Json -Compress
 }else{
+  if($Action -eq 'start' -and $config.kind -eq 'node'){
+    [IO.File]::AppendAllText($config.logPath, "now [login-start] Starting node as fixture-user" + [Environment]::NewLine +
+      "now [node] Config UI port 8788 is occupied; trying 8789." + [Environment]::NewLine +
+      "now [node]   config UI   http://127.0.0.1:8789" + [Environment]::NewLine)
+  }
   @{installed=$true;active=($Action -eq 'start');state='ready'}|ConvertTo-Json -Compress
 }
 `;
@@ -120,6 +125,8 @@ describe.skipIf(process.platform !== "win32")(
         expect(installedFiles(directory).join("")).not.toContain(secret);
         expect(output).not.toContain(secret);
         expect(output).toContain("Prepared Node fixture-node");
+        expect(output).toContain("Config UI port 8788 is occupied; trying 8789.");
+        expect(output).toContain("Node config UI: http://127.0.0.1:8789");
         expect(
           readFileSync(join(root, "operations.log"), "utf8").trim().split(/\r?\n/),
         ).toEqual(["node:probe", "node:register", "node:start"]);

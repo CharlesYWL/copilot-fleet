@@ -6,8 +6,12 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
+import { open } from "node:fs/promises";
+import { Buffer } from "node:buffer";
+import { setTimeout as delay } from "node:timers/promises";
 import { dirname, join, resolve, win32 } from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -38,6 +42,79 @@ Stop manual Host/Node instances first. No passwords, token files, or elevation r
 Stop disables future logon/recovery runs until start; uninstall preserves all files.
 Host+Node operates sequentially on two independent tasks, not an atomic transaction.
 Only Windows is supported by these commands. Manual commands are unchanged.`;
+
+export function logPosition(path) {
+  try {
+    return statSync(path);
+  } catch (error) {
+    if (error.code === "ENOENT") return { size: 0, ino: 0 };
+    throw error;
+  }
+}
+
+/** Read only this startup's log bytes, including a log rotated by the runner. */
+export async function printNodeConfigUrl(
+  path,
+  cursor,
+  { timeoutMs = 60_000, log = console.log } = {},
+) {
+  const deadline = Date.now() + timeoutMs;
+  let offset = cursor.size,
+    inode = cursor.ino,
+    pending = "",
+    started = false;
+  while (Date.now() < deadline) {
+    let file;
+    try {
+      file = await open(path, "r");
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    if (file) {
+      try {
+        const current = await file.stat();
+        if (current.ino !== inode || current.size < offset) {
+          offset = 0;
+          pending = "";
+          started = false;
+        }
+        inode = current.ino;
+        const { bytesRead, buffer } = await file.read({
+          buffer: Buffer.alloc(64 * 1024),
+          position: offset,
+        });
+        offset += bytesRead;
+        const lines = (pending + buffer.subarray(0, bytesRead).toString("utf8")).split(
+          /\r?\n/,
+        );
+        pending = lines.pop().slice(-4096);
+        for (const line of lines) {
+          if (/^\S+ \[login-start\] Starting node as /.test(line)) {
+            started = true;
+            continue;
+          }
+          if (!started) continue;
+          const message = /^\S+ \[node\] (.*)$/.exec(line)?.[1] ?? "";
+          if (/^Config UI port \d+ is occupied; trying \d+\.$/.test(message))
+            log(message);
+          const ready = /^ {2}config UI {3}(http:\/\/127\.0\.0\.1:\d{1,5})$/.exec(message);
+          if (ready) {
+            log(`Node config UI: ${ready[1]}`);
+            return ready[1];
+          }
+          if (message.startsWith("Config UI unavailable:"))
+            throw new Error(`${message} Log: ${path}`);
+        }
+      } finally {
+        await file.close();
+      }
+    }
+    await delay(100);
+  }
+  throw new Error(
+    `The Node task started, but its config UI URL was not reported within ${timeoutMs / 1000}s. Inspect ${path}; the task remains installed.`,
+  );
+}
 
 export async function main(argv = process.argv.slice(2)) {
   const options = parseOptions(argv);
@@ -105,7 +182,13 @@ async function manage(options, sid) {
       }
       return;
     }
+    const startingNode =
+      options.kind === "node" &&
+      (options.action === "restart" ||
+        (options.action === "start" && !invoke("status").active));
+    const cursor = startingNode ? logPosition(old.logPath) : undefined;
     console.log(JSON.stringify(invoke(options.action)));
+    if (cursor) await printNodeConfigUrl(old.logPath, cursor);
     return;
   }
   if (old) {
@@ -212,8 +295,11 @@ async function manage(options, sid) {
     await verifyContext();
   }
   console.log(JSON.stringify(invoke("register")));
+  const cursor =
+    options.start && options.kind === "node" ? logPosition(manifest.logPath) : undefined;
   if (options.start) console.log(JSON.stringify(invoke("start")));
   console.log(`Starts after Windows sign-in. Log: ${manifest.logPath}`);
+  if (cursor) await printNodeConfigUrl(manifest.logPath, cursor);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

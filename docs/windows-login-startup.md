@@ -37,13 +37,28 @@ remains supported; generated commands use a one-time grant and Host fingerprint.
 | `--no-start` | Enable future login startup without starting immediately. |
 | `--start-mode login` | Explicitly select the only supported startup mode. |
 | `--devtunnel <id>` | Node's private-tunnel connection. |
-| `--config-port <port>` | Node configuration port, from 1 to 65535. |
+| `--config-port <port>` | Preferred Node configuration port (default 8788); tries higher ports if occupied. |
 
 Installation builds, probes authentication in a temporary same-user task,
 prepares/enrolls the Node, registers startup, and starts it. Initial enrollment
 requires a reachable Host. Host+Node uses two independent tasks: if Node setup
 fails, an installed Host is preserved, not rolled back. `host:service` and
 `node:service` are aliases; `service -- host` manages only the Host.
+
+The **Node config page starts at port 8788**, separate from the Host API's port
+8787. On a collision it tries 8789, 8790, and so on, bound only to `127.0.0.1`.
+Enrollment and new task starts/restarts print the actual address after the
+listener is ready, for example:
+
+```text
+Config UI port 8788 is occupied; trying 8789.
+Node config UI: http://127.0.0.1:8789
+```
+
+The URL is also in `runtime.log`. Startup waits up to 60 seconds for that
+announcement; a missing URL or listener error is reported explicitly and does
+not uninstall the task. Permission errors are not treated as port collisions,
+and the search never exceeds port 65535. Host API and tunnel ports are unchanged.
 
 ## Manage
 
