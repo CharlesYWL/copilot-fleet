@@ -58,6 +58,8 @@ export async function printNodeConfigUrl(
   cursor,
   { timeoutMs = 60_000, log = console.log } = {},
 ) {
+  // The first install builds this package; help/build must work before dist exists.
+  const { CONFIG_UI_EVENT_MARKER, ConfigUiEventSchema } = await import("@fleet/protocol");
   const deadline = Date.now() + timeoutMs;
   let offset = cursor.size,
     inode = cursor.ino,
@@ -89,21 +91,24 @@ export async function printNodeConfigUrl(
         );
         pending = lines.pop().slice(-4096);
         for (const line of lines) {
-          if (/^\S+ \[login-start\] Starting node as /.test(line)) {
+          const marker = line.indexOf(CONFIG_UI_EVENT_MARKER);
+          if (marker === -1) continue;
+          const event = ConfigUiEventSchema.parse(
+            JSON.parse(line.slice(marker + CONFIG_UI_EVENT_MARKER.length)),
+          );
+          if (event.type === "starting") {
             started = true;
             continue;
           }
           if (!started) continue;
-          const message = /^\S+ \[node\] (.*)$/.exec(line)?.[1] ?? "";
-          if (/^Config UI port \d+ is occupied; trying \d+\.$/.test(message))
-            log(message);
-          const ready = /^ {2}config UI {3}(http:\/\/127\.0\.0\.1:\d{1,5})$/.exec(message);
-          if (ready) {
-            log(`Node config UI: ${ready[1]}`);
-            return ready[1];
+          if (event.type === "retry")
+            log(`Config UI port ${event.port} is occupied; trying ${event.nextPort}.`);
+          if (event.type === "ready") {
+            log(`Node config UI: ${event.url}`);
+            return event.url;
           }
-          if (message.startsWith("Config UI unavailable:"))
-            throw new Error(`${message} Log: ${path}`);
+          if (event.type === "error")
+            throw new Error(`Config UI unavailable: ${event.message} Log: ${path}`);
         }
       } finally {
         await file.close();

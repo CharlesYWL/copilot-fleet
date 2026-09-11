@@ -58,7 +58,13 @@ Node config UI: http://127.0.0.1:8789
 The URL is also in `runtime.log`. Startup waits up to 60 seconds for that
 announcement; a missing URL or listener error is reported explicitly and does
 not uninstall the task. Permission errors are not treated as port collisions,
-and the search never exceeds port 65535. Host API and tunnel ports are unchanged.
+and at most 20 consecutive ports are tried, without exceeding port 65535. If
+that range is occupied, the error names it (for example, `ports 8788-8807 are
+all in use`). Host API and tunnel ports are unchanged.
+
+Startup detection uses shared `FLEET_CONFIG_UI` JSON events for starting,
+retrying, readiness, and failure, not the wording or spacing of the human
+banner. The normal readable messages remain in the log and installer output.
 
 ## Manage
 

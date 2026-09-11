@@ -1181,7 +1181,8 @@ responsible for deleting its own data through its supported API.
 ### Node config page
 
 Each node serves a small settings page starting at `http://127.0.0.1:8788`.
-If that port is occupied, it tries the next port and prints the actual URL.
+If that port is occupied, it tries up to 20 consecutive ports and prints the
+actual URL. An exhausted range is reported explicitly; it never scans past 65535.
 Set the preferred starting port with `--config-port` or `FLEET_NODE_CONFIG_PORT`.
 Service enrollment/start also prints the collision notices and final config URL;
 these are kept in the Node's runtime log. This is separate from the Host API's

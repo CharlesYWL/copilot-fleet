@@ -11,6 +11,7 @@ import {
 import { join, resolve } from "node:path";
 import process from "node:process";
 import { afterEach, describe, expect, it } from "vitest";
+import { CONFIG_UI_EVENT_MARKER } from "@fleet/protocol";
 
 const roots = [];
 const secret = "grant-fixture.should-never-reach-task-files";
@@ -23,9 +24,9 @@ if($Action -eq 'probe'){
   @{ok=$true;accountSid=$config.accountSid}|ConvertTo-Json -Compress
 }else{
   if($Action -eq 'start' -and $config.kind -eq 'node'){
-    [IO.File]::AppendAllText($config.logPath, "now [login-start] Starting node as fixture-user" + [Environment]::NewLine +
-      "now [node] Config UI port 8788 is occupied; trying 8789." + [Environment]::NewLine +
-      "now [node]   config UI   http://127.0.0.1:8789" + [Environment]::NewLine)
+    [IO.File]::AppendAllText($config.logPath, 'now ${CONFIG_UI_EVENT_MARKER}{"type":"starting"}' + [Environment]::NewLine +
+      'now ${CONFIG_UI_EVENT_MARKER}{"type":"retry","port":8788,"nextPort":8789}' + [Environment]::NewLine +
+      'now ${CONFIG_UI_EVENT_MARKER}{"type":"ready","url":"http://127.0.0.1:8789"}' + [Environment]::NewLine)
   }
   @{installed=$true;active=($Action -eq 'start');state='ready'}|ConvertTo-Json -Compress
 }
