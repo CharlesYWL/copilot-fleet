@@ -997,6 +997,9 @@ export function App() {
     workspaceId: string;
     name: string;
     objective: string;
+    workspaceMode: "auto" | "legacy" | "managed";
+    operationId: string;
+    sourcePlacementId?: string;
   }) => {
     if (!orchestrator || terminalSessionStates.has(orchestrator.state)) return false;
     const created = await request<{ run: { id: string } }>(

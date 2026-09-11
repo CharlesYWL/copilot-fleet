@@ -286,6 +286,15 @@ export function registerNodeGateway(
           return;
         }
         try {
+          if (message.type === "managed_worktree_result") {
+            if (!service.worktrees.handleResult(nodeId, message.result)) {
+              app.log.warn(
+                { nodeId, operationId: message.result.operationId },
+                "Rejected managed worktree receipt",
+              );
+            }
+            return;
+          }
           if (message.type === "session_cleanup_result") {
             service.sessionRetention.handleResult(nodeId, message);
             return;
@@ -467,6 +476,26 @@ export function registerNodeGateway(
                 message.sessionId,
                 message.error ?? "Node refused the command",
               );
+            }
+          }
+          if (
+            message.type === "command_result" &&
+            message.ok &&
+            message.executionBinding
+          ) {
+            const session = service.store.getSession(message.sessionId);
+            const attempt = service.store.getSessionDispatchAttempt(message.sessionId);
+            if (session?.nodeId === nodeId && attempt?.commandId === message.commandId) {
+              service.store.setSessionExecutionBinding(
+                session.id,
+                message.executionBinding,
+              );
+              const step = service.store.getRunStepBySession(session.id);
+              if (step)
+                service.store.updateRunStep(step.id, {
+                  executionBinding: message.executionBinding,
+                });
+              service.publishSession(service.store.getSession(session.id)!);
             }
           }
         } catch (error) {

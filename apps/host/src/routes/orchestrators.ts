@@ -6,6 +6,8 @@ import {
   StopSessionsSchema,
   terminalRunStates,
   terminalSessionStates,
+  WorkspaceModeSchema,
+  isChatsWorkspace,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
@@ -38,6 +40,9 @@ const ReviewSchema = z.object({
 });
 
 const CreateRunSchema = z.object({
+  operationId: z.string().uuid().optional(),
+  workspaceMode: WorkspaceModeSchema.default("auto"),
+  sourcePlacementId: z.string().optional(),
   workspaceId: z.string().min(1),
   name: z.string().min(1).max(80),
   objective: z.string().min(1).max(4_000),
@@ -315,6 +320,33 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     }
     const workspace = store.getWorkspace(input.workspaceId);
     if (!workspace) return reply.code(404).send({ error: "Workspace not found" });
+    if (input.operationId) {
+      const replay = store.managedApiReplay(
+        `create-task:${id}`,
+        input.operationId,
+        input,
+      ) as { runId: string } | undefined;
+      if (replay) return reply.code(201).send({ run: store.getRun(replay.runId) });
+    }
+    if (
+      input.sourcePlacementId &&
+      store.getPlacement(input.sourcePlacementId)?.workspaceId !== input.workspaceId
+    )
+      return reply.code(409).send({
+        code: "source_mismatch",
+        error: "Select a source placement in this workspace.",
+      });
+    if (
+      !isChatsWorkspace(input.workspaceId) &&
+      (input.workspaceMode === "managed" ||
+        (input.workspaceMode === "auto" && store.getManagedWorktreesEnabled())) &&
+      !input.operationId
+    ) {
+      return reply.code(409).send({
+        code: "idempotency_required",
+        error: "Managed task creation requires an operationId.",
+      });
+    }
     const reachable = store
       .listPlacements()
       .some(
@@ -329,16 +361,26 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     }
 
     const template = store.listRuns().find((entry) => entry.leadSessionId === lead.id);
-    const created = store.createRun({
-      workspaceId: workspace.id,
-      name: input.name,
-      objective: input.objective,
-      policy: {
-        ...(template ? template.policy : {}),
-        ...(input.policy ?? {}),
-        wakePolicy: "on_any_settle",
-        onStepFailure: "wake",
-      },
+    const created = store.writeAtomically(() => {
+      const created = store.createRun({
+        workspaceMode: input.workspaceMode,
+        sourcePlacementId: input.sourcePlacementId,
+        accessIntent: isChatsWorkspace(workspace.id) ? "no-checkout" : "checkout",
+        workspaceId: workspace.id,
+        name: input.name,
+        objective: input.objective,
+        policy: {
+          ...(template ? template.policy : {}),
+          ...(input.policy ?? {}),
+          wakePolicy: "on_any_settle",
+          onStepFailure: "wake",
+        },
+      });
+      if (input.operationId)
+        store.recordManagedApiRequest(`create-task:${id}`, input.operationId, input, {
+          runId: created.id,
+        });
+      return created;
     });
     const run = store.updateRun(created.id, {
       leadSessionId: lead.id,
@@ -353,7 +395,8 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       pendingPrompt: taskBrief(created.name, created.objective, workspace.name),
     })!;
 
-    service.publishRun(run);
+    await service.worktrees.prepare(run.id);
+    service.publishRun(store.getRun(run.id)!);
     engine.tick();
     return reply.code(201).send({ run: store.getRun(run.id) ?? run });
   });

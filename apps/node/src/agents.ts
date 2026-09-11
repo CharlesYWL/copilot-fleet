@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
+import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
   McpHttpServer,
@@ -178,6 +179,9 @@ export function resolveConfigValue(
 export type EventSink = (event: SessionEvent) => void;
 
 export type StartAgentOptions = {
+  processStarting?: (() => void) | undefined;
+  processStarted?: ((pid: number) => void) | undefined;
+  processesQuiesced?: (() => void) | undefined;
   /** Copilot session id to re-attach to via ACP `session/load`. */
   resumeAgentSessionId?: string;
   /** Workspace roots that were attached to the original Copilot session. */
@@ -466,6 +470,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly additionalDirectories: readonly string[] = [],
     /** Internal reconnect recovery must not look like an operator restart. */
     private readonly announceLifecycle = true,
+    private readonly processOwnership?: Pick<
+      StartAgentOptions,
+      "processStarting" | "processStarted" | "processesQuiesced"
+    >,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -499,13 +507,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (this.launch.notice) this.emit("system", { message: this.launch.notice });
     const args = [...this.launch.args, ...copilotLaunchArgs(this.yolo, this.contextTier)];
     const { command, shell } = copilotSpawnTarget(this.launch.command);
-    const child = spawn(command, args, {
+    this.processOwnership?.processStarting?.();
+    const child = (this.processOwnership ? spawnManagedProcess : spawn)(command, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       shell,
     });
     this.child = child;
+    if (child.pid) this.processOwnership?.processStarted?.(child.pid);
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       const text = chunk.trim();
@@ -802,18 +812,27 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.captureConfigOptions(response.configOptions);
   }
 
-  async stop(announce = true): Promise<void> {
-    if (this.stopping) return;
+  private stopPromise: Promise<void> | undefined;
+
+  stop(announce = true): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
-    this.unprompted.clear();
-    this.denyPendingPermissions();
-    this.connection?.close();
-    if (this.child && this.child.exitCode === null) {
-      this.child.kill();
-    }
-    if (announce && !this.hasTerminated) {
-      this.emit("state", { state: "stopped", activity: "Process stopped" });
-    }
+    this.stopPromise = (async () => {
+      this.unprompted.clear();
+      this.denyPendingPermissions();
+      this.connection?.close();
+      if (this.child) {
+        await stopProcessTree(this.child, Boolean(this.processOwnership));
+      }
+      this.processOwnership?.processesQuiesced?.();
+      if (announce && !this.hasTerminated) {
+        this.emit("state", { state: "stopped", activity: "Process stopped" });
+      }
+    })().catch((error: unknown) => {
+      this.stopPromise = undefined;
+      throw error;
+    });
+    return this.stopPromise;
   }
 
   /** Ends an incomplete startup as a failure before its process is torn down. */
@@ -1007,6 +1026,9 @@ export class AcpAgentFactory implements AgentFactory {
       options.config ?? [],
       options.additionalDirectories ?? [],
       options.announceLifecycle ?? true,
+      options.processStarting || options.processStarted || options.processesQuiesced
+        ? options
+        : undefined,
     );
     try {
       await withCopilotStartupTimeout(
@@ -1016,7 +1038,13 @@ export class AcpAgentFactory implements AgentFactory {
       return agent;
     } catch (error) {
       const failure = agent.failStartup(error);
-      await agent.stop();
+      try {
+        await agent.stop();
+      } catch (cleanupError) {
+        throw new AggregateError([failure, cleanupError], failure.message, {
+          cause: cleanupError,
+        });
+      }
       throw failure;
     }
   }

@@ -180,7 +180,7 @@ describe("GeneralPanel", () => {
     expect(notify).not.toHaveBeenCalled();
     view.rerender(panel());
     expect(notify).not.toHaveBeenCalled();
-    const toggle = screen.getAllByRole("switch")[0]!;
+    const toggle = screen.getByRole("switch", { name: "YOLO mode" });
     fireEvent.click(toggle);
     await waitFor(() => expect(screen.queryByText(warning)).toBeNull());
     fireEvent.click(toggle);

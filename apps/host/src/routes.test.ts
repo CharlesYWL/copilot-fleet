@@ -234,7 +234,19 @@ describe("host routes", () => {
     // session a permission-free agent is the operator's decision to make.
     const read = async () =>
       (await inject({ method: "GET", url: "/api/defaults" })).json();
+    const managedDefaults = {
+      managedWorktreesRevision: 0,
+      managedWorktreesEnabled: false,
+      managedWorktreePolicy: {
+        retentionDays: 7,
+        maxPerRepository: 8,
+        maxPerNode: 32,
+        freeSpaceFloorBytes: 1_073_741_824,
+        byteBudget: 10_737_418_240,
+      },
+    };
     expect(await read()).toEqual({
+      ...managedDefaults,
       yolo: false,
       agencyMode: false,
       agencyModeAvailable: false,
@@ -248,6 +260,7 @@ describe("host routes", () => {
     // A client that knows about one setting must not reset the other simply by
     // not mentioning it.
     expect(await read()).toEqual({
+      ...managedDefaults,
       yolo: true,
       agencyMode: false,
       agencyModeAvailable: false,
@@ -263,6 +276,7 @@ describe("host routes", () => {
       payload: { autoResume: false },
     });
     expect(await read()).toEqual({
+      ...managedDefaults,
       yolo: true,
       agencyMode: false,
       agencyModeAvailable: false,
@@ -288,6 +302,7 @@ describe("host routes", () => {
       payload: { model: "claude-opus-5", reasoningEffort: "xhigh" },
     });
     expect(await read()).toEqual({
+      ...managedDefaults,
       yolo: true,
       agencyMode: false,
       agencyModeAvailable: false,

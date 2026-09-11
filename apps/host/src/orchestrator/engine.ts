@@ -20,6 +20,7 @@ import {
 import { statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
 import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS } from "./deadlines.js";
 import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./schedule.js";
+import { stopSessions } from "./lifecycle.js";
 
 /**
  * Turns the scheduler's decisions into writes and commands.
@@ -163,6 +164,7 @@ export class OrchestratorEngine {
 
   /** Advances every run that is not already finished. */
   tick(nowMs = Date.now()): void {
+    this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
     for (const run of this.store.listRuns()) {
       if (terminalRunStates.has(run.state)) continue;
@@ -208,6 +210,14 @@ export class OrchestratorEngine {
       turnCompleteSessionIds: completedTurns,
       stepOutputs: this.collectOutputs(steps, run.policy.maxOutputChars),
       nowMs,
+      workspaceReady: steps.length ? this.service.worktrees.ensureReady(run) : true,
+      parkableSessionIds: new Set(
+        this.store
+          .listRuns()
+          .flatMap((entry) => this.store.listRunSteps(entry.id))
+          .filter((step) => terminalRunStepStates.has(step.state))
+          .map((step) => step.sessionId),
+      ),
     });
     if (actions.length === 0) return;
 
@@ -269,6 +279,9 @@ export class OrchestratorEngine {
       state: "starting",
       placementId: placement.id,
       dispatchedAt: new Date().toISOString(),
+      ...(this.service.worktrees.bindingFor(run)
+        ? { executionBinding: this.service.worktrees.bindingFor(run)! }
+        : {}),
     });
     if (!starting) return false;
 
@@ -294,6 +307,9 @@ export class OrchestratorEngine {
 
     this.store.updateRunStep(step.id, {
       sessionId: result.session.id,
+      ...(result.session.executionBinding
+        ? { executionBinding: result.session.executionBinding }
+        : {}),
       // Output collected from here on belongs to this step; a session that is
       // prompted again must not replay the previous turn.
       eventSeqFrom: this.store.maxEventSequence(result.session.id),
@@ -426,7 +442,7 @@ export class OrchestratorEngine {
     }
     // Stop, not cancel: cancel ends the turn and leaves the process holding a
     // slot on its node.
-    this.service.dispatch(session.nodeId, { type: "stop", sessionId });
+    stopSessions(this.service, [session]);
   }
 
   /**

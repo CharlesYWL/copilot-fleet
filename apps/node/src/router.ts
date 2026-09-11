@@ -8,11 +8,15 @@ import {
   type NodeCommand,
   type SessionEvent,
   type StartupConfig,
+  type ExecutionBinding,
+  WorktreeConflict,
 } from "@fleet/protocol";
 import type { AgentFactory, SessionAgent } from "./agents.js";
 import { installRequestedAgent, type CatalogEntry } from "./agent-catalog.js";
 type SessionKind = "writing" | "read-only";
 import { resolveMcpServers } from "./mcp-endpoint.js";
+import type { ManagedWorktrees } from "./managed-worktrees.js";
+import type { CheckoutLease } from "./checkout-locks.js";
 
 export type CommandResult = {
   commandId: string;
@@ -20,6 +24,7 @@ export type CommandResult = {
   error?: string;
   /** False when the command was refused but the session is still healthy. */
   fatal?: boolean;
+  executionBinding?: ExecutionBinding;
 };
 
 /**
@@ -31,6 +36,7 @@ export type CommandResult = {
 export class CommandRefused extends Error {}
 
 export type CommandRouterOptions = {
+  worktrees?: ManagedWorktrees;
   deleteInactiveSession?: (
     agentSessionId: string,
     inactiveBefore: number,
@@ -45,6 +51,12 @@ type SessionActivity = {
 };
 
 type SessionSlot = {
+  leases?: CheckoutLease[];
+  binding?: ExecutionBinding;
+  terminalEvent?: SessionEvent;
+  terminalEmitted?: boolean;
+  quiescing?: Promise<void>;
+  retiredAttempts?: Set<string>;
   agent: SessionAgent | undefined;
   ready: Promise<void>;
   initializing: boolean;
@@ -81,6 +93,9 @@ export class CommandRouter {
   private readonly sessionActivity = new Map<string, SessionActivity>();
   private readonly deleting = new Map<string, string>();
   private readonly deleted = new Map<string, string>();
+  private readonly bindings = new Map<string, ExecutionBinding>();
+  private readonly reconciliation = new Map<string, SessionSlot>();
+  private draining = false;
 
   constructor(
     private readonly factory: AgentFactory,
@@ -137,14 +152,24 @@ export class CommandRouter {
   private async run(command: NodeCommand): Promise<CommandResult> {
     try {
       await this.execute(command);
-      return { commandId: command.commandId, ok: true };
+      const binding = this.bindings.get(command.sessionId);
+      return {
+        commandId: command.commandId,
+        ok: true,
+        ...(binding ? { executionBinding: binding } : {}),
+      };
     } catch (error) {
       return {
         commandId: command.commandId,
         ok: false,
         error: error instanceof Error ? error.message : "Command failed",
         // A refusal leaves the session healthy, so the Host must not bury it.
-        fatal: command.type !== "delete_session" && !(error instanceof CommandRefused),
+        fatal:
+          command.type !== "delete_session" &&
+          !(error instanceof CommandRefused) &&
+          !(
+            error instanceof WorktreeConflict && this.slots.get(command.sessionId)?.agent
+          ),
       };
     }
   }
@@ -192,17 +217,54 @@ export class CommandRouter {
   }
 
   async stopAll(): Promise<void> {
-    const slots = [...this.slots.entries()];
-    for (const [sessionId] of slots) this.slots.delete(sessionId);
-    await Promise.all(
-      slots.map(async ([, slot]) => {
+    this.draining = true;
+    const slots = [...new Map([...this.reconciliation, ...this.slots])];
+    const results = await Promise.allSettled(
+      slots.map(async ([sessionId, slot]) => {
         await slot.ready.catch(() => undefined);
-        await slot.agent?.stop();
+        await this.quiesce(sessionId, slot, true);
       }),
+    ).finally(() => {
+      this.draining = false;
+    });
+    const errors = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason as unknown] : [],
     );
+    if (errors.length)
+      throw new AggregateError(errors, "Some sessions could not stop safely.");
+  }
+
+  async quiesceWorktree(worktreeId: string, targetPath?: string): Promise<void> {
+    const target = targetPath
+      ? await this.options.worktrees!.checkoutIdentity(targetPath)
+      : undefined;
+    const results = await Promise.allSettled(
+      [...new Map([...this.reconciliation, ...this.slots])].map(
+        async ([sessionId, slot]) => {
+          const checkoutKey =
+            slot.binding?.checkoutKey ??
+            (target && slot.cwd
+              ? (await this.options.worktrees!.checkoutIdentity(slot.cwd)).key
+              : undefined);
+          if (
+            slot.binding?.worktreeId !== worktreeId &&
+            (!target || checkoutKey !== target.key)
+          )
+            return;
+          await slot.ready.catch(() => undefined);
+          await this.quiesce(sessionId, slot, true);
+        },
+      ),
+    );
+    const errors = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason as unknown] : [],
+    );
+    if (errors.length)
+      throw new AggregateError(errors, "Worktree process quiescence is unknown.");
   }
 
   private async execute(command: NodeCommand): Promise<void> {
+    if (this.draining) throw new CommandRefused("Node sessions are being stopped.");
     if (command.type === "delete_session") return this.deleteSession(command);
     this.assertNotDeleting(
       command.sessionId,
@@ -222,29 +284,32 @@ export class CommandRouter {
       throw new Error("Session is not active on this node");
     }
     if (command.type === "prompt") {
-      // Refused rather than dropped. This used to be `.catch(() => undefined)`
-      // over a promise that rejects immediately when a turn is already in
-      // flight, so a follow-up sent while the agent was still working vanished:
-      // the Host had already been told the command succeeded, no event was
-      // raised, and the operator watched an agent that never answered. The
-      // resync corrects whatever state the Host guessed while disconnected,
-      // which is how the composer came to be open over a busy agent at all.
-      if (agent.busy) {
-        agent.resync();
-        throw new CommandRefused(
-          "Copilot is still working on the previous turn; wait for it to finish or cancel it",
-        );
-      }
-      void this.withActivity(slot, () =>
-        agent.prompt(command.prompt, command.attachments),
-      ).catch(() => undefined);
+      // Admission itself is in flight: cleanup must not stop the process while
+      // physical checkout/lease validation is waiting on the filesystem.
+      await this.withActivity(slot, async () => {
+        await this.revalidate(slot, command.executionBinding);
+        this.assertNotDeleting(command.sessionId, slot.agentSessionId);
+        if (this.slots.get(command.sessionId) !== slot || slot.agent !== agent) {
+          throw new CommandRefused("Session changed during prompt admission");
+        }
+        // Refused rather than dropped: acknowledge only after admission, but
+        // keep the turn tracked without making the Host wait for its completion.
+        if (agent.busy) {
+          agent.resync();
+          throw new CommandRefused(
+            "Copilot is still working on the previous turn; wait for it to finish or cancel it",
+          );
+        }
+        void this.withActivity(slot, () =>
+          agent.prompt(command.prompt, command.attachments),
+        ).catch(() => undefined);
+      });
     } else {
       await this.withActivity(slot, async () => {
         if (command.type === "cancel") {
           await agent.cancel();
         } else if (command.type === "stop") {
-          await agent.stop();
-          this.release(command.sessionId, slot);
+          await this.quiesce(command.sessionId, slot, true);
         } else if (command.type === "set_config_option") {
           // A rejected picker change must not tear down an otherwise healthy session.
           try {
@@ -394,12 +459,13 @@ export class CommandRouter {
         // ACP listing may have waited while the retained process produced output.
         this.assertInactive(command, slot, cutoff);
         if (slot) {
-          await slot.agent!.stop(false);
-          stopped = true;
           try {
+            await slot.agent!.stop(false);
+            stopped = true;
             this.assertInactive(command, slot, cutoff);
           } finally {
-            this.release(command.sessionId, slot);
+            if (stopped || slot.binding?.worktreeId)
+              this.release(command.sessionId, slot);
           }
         }
         prepared = true;
@@ -448,6 +514,13 @@ export class CommandRouter {
   }
 
   private startSession(command: LaunchCommand): Promise<void> {
+    if (this.reconciliation.has(command.sessionId))
+      return Promise.reject(
+        new WorktreeConflict(
+          "process_unknown",
+          "The previous process requires reconciliation.",
+        ),
+      );
     let lastActivityAt = Date.now();
     if (command.type === "resume_session" && command.lastActivityAt !== undefined) {
       const restoredActivity = Date.parse(command.lastActivityAt);
@@ -461,7 +534,26 @@ export class CommandRouter {
     const existing = this.slots.get(command.sessionId);
     if (existing) {
       this.noteActivity(existing, lastActivityAt);
-      return existing.ready;
+      return existing.ready.then(async () => {
+        if (this.slots.get(command.sessionId) !== existing || existing.quiescing)
+          throw new CommandRefused("Session is being stopped.");
+        if (command.type === "resume_session" && existing.binding?.worktreeId) {
+          return this.withActivity(existing, () => this.reattach(command, existing));
+        }
+        if (
+          existing.binding &&
+          command.executionBinding &&
+          (existing.binding.cwd !== command.executionBinding.cwd ||
+            existing.binding.worktreeId !== command.executionBinding.worktreeId ||
+            existing.binding.generation !== command.executionBinding.generation)
+        ) {
+          throw new WorktreeConflict(
+            "binding_mismatch",
+            "A live conversation cannot move checkout.",
+          );
+        }
+        await this.revalidate(existing, command.executionBinding);
+      });
     }
     const kind: SessionKind = command.readOnly ? "read-only" : "writing";
     const held = [...this.slots.values()].filter((slot) => slot.kind === kind).length;
@@ -501,7 +593,47 @@ export class CommandRouter {
       command.type === "resume_session" && command.lastActivityAt !== undefined;
     let replaying = automaticResume;
     try {
-      const cwd = await this.validatePath(command.localPath);
+      const worktrees = this.options.worktrees;
+      if (command.executionBinding?.worktreeId && !worktrees)
+        throw new WorktreeConflict(
+          "unsupported_node",
+          "Managed workspace admission is not configured on this Node.",
+        );
+      const requestedPath =
+        command.type === "start_session" && command.coordinator && worktrees
+          ? await worktrees.coordinatorPath(command.sessionId)
+          : command.localPath;
+      const cwd = await this.validatePath(requestedPath);
+      if (worktrees) {
+        const checkout = await worktrees.checkoutIdentity(cwd);
+        const binding = command.executionBinding?.worktreeId
+          ? command.executionBinding
+          : undefined;
+        if (
+          binding &&
+          (binding.checkoutKey !== checkout.key ||
+            binding.cwd !== cwd ||
+            command.localPath !== binding.cwd)
+        ) {
+          throw new WorktreeConflict(
+            "binding_mismatch",
+            "The launch path does not match the resolved physical checkout.",
+          );
+        }
+        worktrees.assertManagedPathBound(checkout, binding);
+        if (binding) {
+          await worktrees.validateExecution(binding);
+          slot.binding = binding;
+          slot.leases = [
+            worktrees.locks.acquire(checkout, {
+              owner: `session:${command.sessionId}`,
+              attempt: binding.leaseAttempt,
+              kind: "worker",
+            }),
+          ];
+          this.bindings.set(command.sessionId, binding);
+        }
+      }
       let additionalDirectories: string[] = [];
       if (command.type === "resume_session") {
         const restored = await Promise.allSettled(
@@ -517,6 +649,25 @@ export class CommandRouter {
           );
         }
       }
+      if (worktrees && additionalDirectories.length) {
+        const identities = await Promise.all(
+          additionalDirectories.map((path) => worktrees.checkoutIdentity(path)),
+        );
+        if (
+          slot.binding?.worktreeId &&
+          identities.some((identity) => identity.key !== slot.binding!.checkoutKey)
+        ) {
+          throw new WorktreeConflict(
+            "additional_checkout",
+            "A managed task cannot load additional source checkouts.",
+          );
+        }
+        for (const identity of identities.sort((a, b) => a.key.localeCompare(b.key))) {
+          if (slot.leases?.some((lease) => lease.key === identity.key)) continue;
+          worktrees.assertManagedPathBound(identity);
+        }
+      }
+      await this.revalidate(slot, command.executionBinding);
       const generation = slot.generation;
       const sink = (event: SessionEvent) =>
         this.handleSessionEvent(
@@ -559,6 +710,7 @@ export class CommandRouter {
                 mcpServers,
                 agent: requested.selected,
                 config: command.config,
+                ...this.processOwnership(slot),
               }
             : {
                 yolo: command.yolo,
@@ -566,6 +718,7 @@ export class CommandRouter {
                 mcpServers,
                 agent: requested.selected,
                 config: command.config,
+                ...this.processOwnership(slot),
               },
         )
         .finally(() => {
@@ -577,22 +730,220 @@ export class CommandRouter {
         throw new Error("Session terminated during startup");
       }
       // A resumed session waits for the operator's next prompt.
-      if (command.type === "start_session") {
-        void this.withActivity(slot, () => agent.prompt(command.prompt)).catch(() =>
-          this.release(command.sessionId, slot),
-        );
+      if (command.type === "start_session" && !slot.terminalEvent) {
+        void this.withActivity(slot, () => agent.prompt(command.prompt))
+          .catch(() => this.quiesce(command.sessionId, slot))
+          .catch((error: unknown) => this.warn(String(error)));
       }
     } catch (error) {
-      this.release(command.sessionId, slot);
+      try {
+        await this.quiesce(command.sessionId, slot);
+      } catch (cleanupError) {
+        throw new AggregateError([error, cleanupError], String(error), {
+          cause: cleanupError,
+        });
+      }
       throw error;
     } finally {
       if (!automaticResume) this.noteActivity(slot);
       slot.initializing = false;
+      if (slot.terminalEvent && this.slots.get(command.sessionId) === slot) {
+        void this.quiesce(command.sessionId, slot).catch((error: unknown) =>
+          this.warn(
+            error instanceof Error ? error.message : "Process quiescence is unknown.",
+          ),
+        );
+      }
     }
   }
 
   private release(sessionId: string, slot: SessionSlot): void {
+    const errors: unknown[] = [];
+    for (const lease of slot.leases ?? []) {
+      try {
+        lease.release();
+      } catch (error) {
+        errors.push(error);
+        try {
+          lease.requireReconciliation(String(error));
+        } catch (persistError) {
+          errors.push(persistError);
+        }
+      }
+    }
     if (this.slots.get(sessionId) === slot) this.slots.delete(sessionId);
+    if (errors.length) {
+      this.reconciliation.set(sessionId, slot);
+      if (slot.binding) {
+        try {
+          this.options.worktrees!.requireReconciliation(
+            slot.binding,
+            errors.map(String).join("; "),
+          );
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+      throw new AggregateError(errors, "Checkout remains locked for reconciliation.");
+    }
+    if (this.reconciliation.get(sessionId) === slot)
+      this.reconciliation.delete(sessionId);
+  }
+
+  private processOwnership(slot: SessionSlot) {
+    if (!slot.leases?.length) return {};
+    return {
+      processStarting: () => {
+        for (const lease of slot.leases!) lease.processPending();
+      },
+      processStarted: (pid: number) => {
+        for (const lease of slot.leases!) lease.processStarted(pid);
+      },
+      processesQuiesced: () => {
+        for (const lease of slot.leases!) lease.processesQuiesced();
+      },
+    };
+  }
+
+  private async revalidate(
+    slot: SessionSlot,
+    expected?: ExecutionBinding,
+  ): Promise<void> {
+    if (!slot.binding) {
+      if (expected?.worktreeId)
+        throw new WorktreeConflict(
+          "binding_mismatch",
+          "A legacy session cannot adopt a managed checkout.",
+        );
+      return;
+    }
+    const binding = slot.binding;
+    if (
+      slot.binding.worktreeId &&
+      (!expected ||
+        expected.worktreeId !== slot.binding.worktreeId ||
+        expected.generation !== slot.binding.generation ||
+        expected.checkoutKey !== slot.binding.checkoutKey ||
+        expected.cwd !== slot.binding.cwd ||
+        expected.sourcePlacementId !== slot.binding.sourcePlacementId ||
+        expected.accessClass !== slot.binding.accessClass ||
+        expected.quarantined !== slot.binding.quarantined ||
+        expected.leaseAttempt !== slot.binding.leaseAttempt)
+    ) {
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "Prompt/load binding does not match the task's checkout lease.",
+      );
+    }
+    await this.options.worktrees!.validateExecution(slot.binding);
+    for (const lease of slot.leases ?? []) await lease.revalidate();
+    if (slot.binding !== binding || slot.quiescing)
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "Checkout lease changed during command admission.",
+      );
+  }
+
+  private async reattach(
+    command: Extract<LaunchCommand, { type: "resume_session" }>,
+    slot: SessionSlot,
+  ): Promise<void> {
+    const previous = slot.binding!;
+    const next = command.executionBinding;
+    if (
+      !next ||
+      slot.agentSessionId !== command.agentSessionId ||
+      command.localPath !== previous.cwd ||
+      slot.retiredAttempts?.has(next.leaseAttempt) ||
+      next.sourcePlacementId !== previous.sourcePlacementId ||
+      next.accessClass !== previous.accessClass ||
+      next.quarantined !== previous.quarantined
+    )
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "Resume does not own this conversation's checkout.",
+      );
+    await this.revalidate(slot, { ...next, leaseAttempt: previous.leaseAttempt });
+    if (this.slots.get(command.sessionId) !== slot || slot.binding !== previous)
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "Session changed during reattachment.",
+      );
+    if (next.leaseAttempt === previous.leaseAttempt) {
+      slot.agent?.resync();
+      return;
+    }
+    // Managed sessions hold exactly one physical checkout. The synchronous CAS
+    // and binding replacement cannot interleave with another command.
+    if (slot.leases?.length !== 1)
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "Managed checkout lease is missing.",
+      );
+    slot.leases[0]!.reattach(
+      `session:${command.sessionId}`,
+      previous.leaseAttempt,
+      next.leaseAttempt,
+    );
+    (slot.retiredAttempts ??= new Set()).add(previous.leaseAttempt);
+    slot.binding = next;
+    if (slot.launch) slot.launch = { ...slot.launch, executionBinding: next };
+    this.bindings.set(command.sessionId, next);
+    slot.agent?.resync();
+  }
+
+  private quiesce(sessionId: string, slot: SessionSlot, announce = false): Promise<void> {
+    if (slot.quiescing) return slot.quiescing;
+    slot.quiescing = Promise.resolve()
+      .then(async () => {
+        const errors: unknown[] = [];
+        let stopped = false;
+        try {
+          await slot.agent?.stop(announce);
+          stopped = true;
+        } catch (error) {
+          errors.push(error);
+        }
+        try {
+          // Without a managed lease, a failed stop must not manufacture a
+          // terminal receipt and free the Host's legacy placement reservation.
+          if (stopped || slot.binding?.worktreeId) this.release(sessionId, slot);
+        } catch (error) {
+          errors.push(error);
+        } finally {
+          if (
+            errors.length &&
+            slot.binding?.worktreeId &&
+            slot.agent &&
+            !slot.terminalEvent &&
+            !slot.terminalEmitted
+          ) {
+            slot.terminalEvent = {
+              eventId: `quiescence-failed-${sessionId}-${++slot.sequenceOffset}`,
+              sessionId,
+              sequence: slot.sequenceOffset,
+              type: "state",
+              payload: {
+                state: "failed",
+                activity: "Process cleanup failed; ownership requires reconciliation",
+              },
+              createdAt: new Date().toISOString(),
+            };
+          }
+          const terminal = slot.terminalEvent;
+          delete slot.terminalEvent;
+          if (terminal && !slot.terminalEmitted) {
+            slot.terminalEmitted = true;
+            this.emit(terminal);
+          }
+        }
+        if (errors.length)
+          throw new AggregateError(errors, errors.map(String).join("; "));
+      })
+      .finally(() => {
+        delete slot.quiescing;
+      });
+    return slot.quiescing;
   }
 
   private handleSessionEvent(
@@ -634,11 +985,21 @@ export class CommandRouter {
         slot.toolTitles.delete(toolCallId);
       }
     }
-    this.emit(event);
     const state = eventPayload(event, "state")?.state;
-    if (state && terminalSessionStates.has(state)) {
-      this.release(sessionId, slot);
-    } else if (
+    if (state && terminalSessionStates.has(state) && slot.leases?.length) {
+      slot.terminalEvent ??= event;
+      if (!slot.initializing)
+        void this.quiesce(sessionId, slot).catch((error: unknown) =>
+          this.warn(
+            error instanceof Error ? error.message : "Process quiescence is unknown.",
+          ),
+        );
+      return;
+    }
+    if (state && terminalSessionStates.has(state)) slot.terminalEmitted = true;
+    this.emit(event);
+    if (state && terminalSessionStates.has(state)) this.release(sessionId, slot);
+    else if (
       state === "idle" &&
       slot.refreshMcpPending &&
       !this.deleting.has(sessionId)
@@ -673,8 +1034,10 @@ export class CommandRouter {
         return;
       }
       const generation = ++slot.generation;
+      await this.revalidate(slot, slot.binding);
       await current.stop(false);
       slot.agent = undefined;
+      await this.revalidate(slot, slot.binding);
       // Only load-time replay is historical; the retained sink goes live once startup settles.
       let replaying = true;
       const next = await this.factory
@@ -700,6 +1063,7 @@ export class CommandRouter {
             agent: slot.selectedAgent ?? "",
             config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
             announceLifecycle: false,
+            ...this.processOwnership(slot),
           },
         )
         .finally(() => {

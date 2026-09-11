@@ -1,4 +1,16 @@
 import { z } from "zod";
+import {
+  ExecutionBindingSchema,
+  ManagedWorktreePolicySchema,
+  ManagedWorktreeSchema,
+  RunWorkspaceBindingSchema,
+  WorktreeIntegrationSchema,
+  WorktreeOperationRequestSchema,
+  WorktreeOperationResultSchema,
+  WorktreeOperationSchema,
+  WorktreeTombstoneSchema,
+} from "./managed-worktrees.js";
+export * from "./managed-worktrees.js";
 
 /**
  * Standard base64, bounded.
@@ -309,6 +321,7 @@ export const RunRoleSchema = z.enum(["", "lead", "worker", "reviewer"]);
 export type RunRole = z.infer<typeof RunRoleSchema>;
 
 export const SessionSchema = z.object({
+  executionBinding: ExecutionBindingSchema.optional(),
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   workspaceName: z.string().min(1),
@@ -609,6 +622,9 @@ export type StartupConfig = z.infer<typeof StartupConfigSchema>;
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start_session"),
+    executionBinding: ExecutionBindingSchema.optional(),
+    sourcePlacementId: z.string().optional(),
+    coordinator: z.boolean().optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
@@ -648,6 +664,8 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("resume_session"),
+    executionBinding: ExecutionBindingSchema.optional(),
+    sourcePlacementId: z.string().optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
@@ -687,6 +705,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("prompt"),
+    executionBinding: ExecutionBindingSchema.optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     prompt: z.string().min(1),
@@ -851,6 +870,10 @@ export const NodeReadySchema = z.object({
 export type NodeReady = z.infer<typeof NodeReadySchema>;
 
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("managed_worktree_result"),
+    result: WorktreeOperationResultSchema,
+  }),
   NodeHelloSchema,
   NodeReadySchema,
   z.object({
@@ -880,6 +903,7 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("command_result"),
+    executionBinding: ExecutionBindingSchema.optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     ok: z.boolean(),
@@ -924,6 +948,10 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("managed_worktree"),
+    request: WorktreeOperationRequestSchema,
+  }),
   z.object({
     type: z.literal("welcome"),
     nodeId: z.string().min(1),
@@ -1264,6 +1292,9 @@ export const CriterionOutcomeSchema = z.enum(["met", "unmet", "blocked"]);
 export type CriterionOutcome = z.infer<typeof CriterionOutcomeSchema>;
 
 export const RunSchema = z.object({
+  workspaceBinding: RunWorkspaceBindingSchema.default(() =>
+    RunWorkspaceBindingSchema.parse({}),
+  ).optional(),
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   name: z.string().min(1),
@@ -1343,6 +1374,7 @@ export const RunSchema = z.object({
 export type Run = z.infer<typeof RunSchema>;
 
 export const RunStepSchema = z.object({
+  executionBinding: ExecutionBindingSchema.optional(),
   id: z.string().min(1),
   runId: z.string().min(1),
   /**
@@ -1403,6 +1435,7 @@ export const NotificationCategorySchema = z.enum([
 export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
 
 export const NotificationKindSchema = z.enum([
+  "managed_worktree_attention",
   "agent_completion",
   "agent_failure",
   "orchestration_needs_review",
@@ -2098,6 +2131,10 @@ export const SetSessionFavoriteSchema = z.object({
 });
 
 export const UpdateDefaultsSchema = z.object({
+  operationId: z.string().uuid().optional(),
+  expectedRevision: z.number().int().nonnegative().optional(),
+  managedWorktreesEnabled: z.boolean().optional(),
+  managedWorktreePolicy: ManagedWorktreePolicySchema.optional(),
   yolo: z.boolean().optional(),
   /** Fleet-wide launcher preference, applied to every new or resumed session. */
   agencyMode: z.boolean().optional(),
@@ -2375,6 +2412,10 @@ const hostBackupDataShape = {
   publicUrl: z.string().url().optional(),
   tunnel: HostBackupTunnelSchema,
   defaults: z.object({
+    managedWorktreesEnabled: z.boolean().default(false).optional(),
+    managedWorktreePolicy: ManagedWorktreePolicySchema.default(() =>
+      ManagedWorktreePolicySchema.parse({}),
+    ).optional(),
     yolo: z.boolean(),
     agencyMode: z.boolean().default(false),
     autoResume: z.boolean(),
@@ -2390,6 +2431,10 @@ const hostBackupDataShape = {
    * importing — the one failure mode a backup format may not have.
    */
   runs: z.array(RunSchema).default([]),
+  managedWorktrees: z.array(ManagedWorktreeSchema).default([]).optional(),
+  worktreeOperations: z.array(WorktreeOperationSchema).default([]).optional(),
+  worktreeIntegrations: z.array(WorktreeIntegrationSchema).default([]).optional(),
+  worktreeTombstones: z.array(WorktreeTombstoneSchema).default([]).optional(),
   runSteps: z.array(RunStepSchema).default([]),
   /**
    * A task's notes are the orchestrator's own record of it — what a phase

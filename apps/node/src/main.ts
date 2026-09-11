@@ -5,6 +5,7 @@ import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
 import {
   HOST_URL_SYNC_CAPABILITY,
+  MANAGED_WORKTREES_CAPABILITY,
   HostHandshakeFrameSchema,
   HostToNodeMessageSchema,
   MUTUAL_AUTH_PROTOCOL,
@@ -66,6 +67,7 @@ import {
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
+import { ManagedWorktrees } from "./managed-worktrees.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { EventOutbox } from "./outbox.js";
 import {
@@ -99,6 +101,7 @@ import {
 const VERSION = packageVersion();
 const REVISION = gitRevision();
 const NODE_CAPABILITIES = [
+  MANAGED_WORKTREES_CAPABILITY,
   "copilot-acp",
   "host-yolo",
   HOST_URL_SYNC_CAPABILITY,
@@ -345,7 +348,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         getCopilotCommand: () => settings.copilotCommand,
         getContextTier: () => settings.contextTier,
       });
-  const router = new CommandRouter(
+  const worktrees: ManagedWorktrees = new ManagedWorktrees({
+    directory: configDirectory(),
+    nodeId: () => credentials.nodeId,
+    quiesce: (id, target): Promise<void> => router.quiesceWorktree(id, target),
+    ...(process.env.FLEET_WORKTREE_ROOT ? { root: process.env.FLEET_WORKTREE_ROOT } : {}),
+  });
+  const router: CommandRouter = new CommandRouter(
     factory,
     settings.maxSessions,
     (event) => {
@@ -361,6 +370,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     agentCatalog,
     warn,
     {
+      worktrees,
       deleteInactiveSession: async (agentSessionId, inactiveBefore, beforeDelete) => {
         if (mockAgent) {
           await beforeDelete();
@@ -454,7 +464,23 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * both identity files, and dial the Host as that node.
    */
   async function applyBackup(archive: NodeBackup): Promise<void> {
-    await router.stopAll();
+    const errors: unknown[] = [];
+    try {
+      await router.stopAll();
+    } catch (error) {
+      errors.push(error);
+    } finally {
+      try {
+        await worktrees.quarantine();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(
+        errors,
+        "Backup import aborted: sessions could not be safely stopped and quarantined.",
+      );
     credentials = archive.credentials;
     settings = SettingsSchema.parse(archive.settings);
     await saveCredentials(credentials);
@@ -903,6 +929,15 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         await runSelfUpdate(frame.value.updateId);
         return;
       }
+      if (frame.value.type === "managed_worktree") {
+        try {
+          const result = await worktrees.execute(frame.value.request);
+          send({ type: "managed_worktree_result", result });
+        } catch (error) {
+          warn(`Managed operation refused: ${errorMessage(error)}`);
+        }
+        return;
+      }
       if (frame.value.type !== "command") return;
       const { command } = frame.value;
       log(`< ${command.type} session=${command.sessionId.slice(0, 8)}`);
@@ -927,6 +962,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           sessionId: command.sessionId,
           ok: result.ok,
           fatal: result.fatal ?? true,
+          ...(result.executionBinding
+            ? { executionBinding: result.executionBinding }
+            : {}),
           ...(result.error ? { error: result.error } : {}),
         });
       }
@@ -934,7 +972,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     active.on("close", async (code) => {
       // A settings change swaps the socket out; the stale one must not tear down
       // agents or schedule a retry against the URL we just left.
-      if (socket !== active) return;
+      if (socket !== active || shuttingDown) return;
       if (code === AUTH_FAILED_CLOSE_CODE) {
         /*
          * The credential this node holds will never be accepted again, so
@@ -958,7 +996,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         // Only tear agents down when this process is done; a Host bounce must
         // not wipe live sessions that we are about to re-announce on hello.
         router.denyPendingPermissions();
-        await router.stopAll();
+        try {
+          await shutdown();
+        } catch (error) {
+          errorLog(`Node shutdown failed: ${errorMessage(error)}`);
+        }
         if (code === SUPERSEDED_CLOSE_CODE) {
           console.error(
             "Connection superseded by another node instance; not reconnecting",
@@ -1137,10 +1179,29 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // An unref'd timer does not hold the loop open, but it does keep firing while
     // the process winds down, which resurrects a socket we are trying to close.
     clearInterval(heartbeatTimer);
-    releaseLiveness();
-    configServer.close();
-    socket?.close();
-    await router.stopAll();
+    const errors: unknown[] = [];
+    try {
+      for (const close of [
+        () => releaseLiveness(),
+        () => configServer.close(),
+        () => socket?.close(),
+        () => router.stopAll(),
+      ]) {
+        try {
+          await close();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    } finally {
+      try {
+        await worktrees.shutdown();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(errors, "Node shutdown encountered cleanup failures.");
   }
 
   return { shutdown };
@@ -1161,6 +1222,15 @@ if (process.env.NODE_ENV !== "test") {
     process.exit(2);
   }
   const runtime = await main(argv);
-  process.once("SIGINT", () => void runtime.shutdown().finally(() => process.exit(0)));
-  process.once("SIGTERM", () => void runtime.shutdown().finally(() => process.exit(0)));
+  const terminate = () => {
+    void runtime.shutdown().then(
+      () => process.exit(0),
+      (error: unknown) => {
+        console.error(error);
+        process.exit(1);
+      },
+    );
+  };
+  process.once("SIGINT", terminate);
+  process.once("SIGTERM", terminate);
 }

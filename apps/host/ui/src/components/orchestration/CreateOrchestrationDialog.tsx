@@ -15,7 +15,8 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import type { Placement, Workspace } from "@fleet/protocol";
+import type { Placement, Workspace, WorkspaceMode } from "@fleet/protocol";
+import { api } from "../../hooks/useFleet";
 
 const useStyles = makeStyles({
   /** What pressing the button does, said once, where the decision is made. */
@@ -37,6 +38,9 @@ export type CreateOrchestrationDialogProps = {
     workspaceId: string;
     name: string;
     objective: string;
+    workspaceMode: WorkspaceMode;
+    operationId: string;
+    sourcePlacementId?: string;
   }) => Promise<boolean>;
 };
 
@@ -67,11 +71,22 @@ export const CreateOrchestrationDialog = ({
   const [name, setName] = useState("");
   const [objective, setObjective] = useState("");
   const [busy, setBusy] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("auto");
+  const [operationId, setOperationId] = useState(() => crypto.randomUUID());
+  const [sourcePlacementId, setSourcePlacementId] = useState("");
+  const [capability, setCapability] = useState<{
+    managedWorktreesEnabled: boolean;
+    placements: { placementId: string; supported: boolean; online: boolean }[];
+  }>();
+  const [capabilityError, setCapabilityError] = useState("");
 
   useEffect(() => {
     if (!open) return;
     setName("");
     setObjective("");
+    setWorkspaceMode("auto");
+    setOperationId(crypto.randomUUID());
+    setSourcePlacementId("");
     setWorkspaceId((current) =>
       reachable.some((workspace) => workspace.id === current)
         ? current
@@ -81,8 +96,39 @@ export const CreateOrchestrationDialog = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  useEffect(() => {
+    if (!open || !workspaceId) return;
+    let current = true;
+    setCapability(undefined);
+    setCapabilityError("");
+    void api<NonNullable<typeof capability>>(
+      `/api/worktrees/capabilities?workspaceId=${encodeURIComponent(workspaceId)}`,
+    )
+      .then((result) => {
+        if (!current) return;
+        setCapability(result);
+        setSourcePlacementId(
+          result.placements.find((entry) => entry.supported && entry.online)
+            ?.placementId ?? "",
+        );
+      })
+      .catch((error: unknown) => {
+        if (current)
+          setCapabilityError(
+            error instanceof Error ? error.message : "Capability check unavailable.",
+          );
+      });
+    return () => {
+      current = false;
+    };
+  }, [open, workspaceId]);
+
   const chosen = reachable.find((workspace) => workspace.id === workspaceId);
   const canCreate = Boolean(workspaceId) && objective.trim().length > 0 && !busy;
+  const managed =
+    chosen?.kind !== "chats" &&
+    (workspaceMode === "managed" ||
+      (workspaceMode === "auto" && capability?.managedWorktreesEnabled));
 
   const submit = async () => {
     if (!canCreate) return;
@@ -91,6 +137,9 @@ export const CreateOrchestrationDialog = ({
       workspaceId,
       name: name.trim() || objective.trim().slice(0, 60),
       objective: objective.trim(),
+      workspaceMode,
+      operationId,
+      ...(managed && sourcePlacementId ? { sourcePlacementId } : {}),
     });
     setBusy(false);
     if (created) onOpenChange(false);
@@ -137,6 +186,68 @@ export const CreateOrchestrationDialog = ({
                 <Field label="Name" hint="Optional. Taken from the objective if empty.">
                   <Input value={name} onChange={(_, data) => setName(data.value)} />
                 </Field>
+                <Field label="Workspace isolation">
+                  <Dropdown
+                    aria-label="Workspace isolation"
+                    value={
+                      workspaceMode === "auto"
+                        ? "Auto (app default)"
+                        : workspaceMode === "managed"
+                          ? "Managed task worktree"
+                          : "Legacy source checkout"
+                    }
+                    selectedOptions={[workspaceMode]}
+                    onOptionSelect={(_, data) =>
+                      setWorkspaceMode(data.optionValue as WorkspaceMode)
+                    }
+                  >
+                    <Option value="auto">Auto (app default)</Option>
+                    <Option value="legacy">Legacy source checkout</Option>
+                    <Option value="managed">Managed task worktree</Option>
+                  </Dropdown>
+                </Field>
+                {managed && (
+                  <Field label="Source placement">
+                    <Dropdown
+                      aria-label="Source placement"
+                      value={
+                        placements.find((entry) => entry.id === sourcePlacementId)
+                          ?.nodeName ?? "Host selects an online source"
+                      }
+                      selectedOptions={sourcePlacementId ? [sourcePlacementId] : []}
+                      onOptionSelect={(_, data) =>
+                        setSourcePlacementId(data.optionValue ?? "")
+                      }
+                    >
+                      {placements
+                        .filter((entry) => entry.workspaceId === workspaceId)
+                        .map((entry) => (
+                          <Option
+                            key={entry.id}
+                            value={entry.id}
+                            text={entry.nodeName ?? entry.nodeId}
+                          >
+                            {entry.nodeName ?? entry.nodeId}
+                            {capability?.placements.find(
+                              (item) => item.placementId === entry.id,
+                            )?.supported
+                              ? " — managed capable"
+                              : " — Node upgrade required"}
+                          </Option>
+                        ))}
+                    </Dropdown>
+                  </Field>
+                )}
+                <p role="status" className={styles.footnote}>
+                  {chosen?.kind === "chats"
+                    ? "Chats requires no repository worktree."
+                    : capability
+                      ? `Effective mode: ${managed ? "Managed" : "Legacy"}. Auto uses the app default at creation; the resolved mode and source never change on resume.`
+                      : capabilityError || "Checking Node managed-worktree capability…"}
+                  {managed
+                    ? " Repository-root and committed-base eligibility are checked on the Node. Unsupported Nodes block the task; there is no Legacy fallback. All task roles share one checkout and serialize shell-capable sessions."
+                    : ""}
+                </p>
                 <p className={styles.footnote}>
                   This records the task, then asks the orchestrator — in its conversation
                   — to plan it. You can ask for the same thing by talking to it directly;

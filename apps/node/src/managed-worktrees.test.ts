@@ -1,0 +1,1316 @@
+import { createHash, randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import {
+  mkdir,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  NodeCommandSchema,
+  WorktreeOperationRequestSchema,
+  type ExecutionBinding,
+  type ManagedWorktree,
+  type SessionEvent,
+  type WorktreeOperationRequest,
+} from "@fleet/protocol";
+import { AcpAgentFactory, type AgentFactory, type SessionAgent } from "./agents.js";
+import * as copilotLaunch from "./copilot-launch.js";
+import * as processQuiescence from "./process-quiescence.js";
+import * as windowsJob from "./windows-process-job.js";
+import { canonicalPath } from "./canonical-path.js";
+import { CheckoutLocks } from "./checkout-locks.js";
+import { GitRunner, parseWorktreeRegistry } from "./git-runner.js";
+import { ManagedWorktrees, WorktreeCrash } from "./managed-worktrees.js";
+import { CommandRouter } from "./router.js";
+
+vi.mock("node:fs", async (importOriginal) => ({
+  ...(await importOriginal<typeof fs>()),
+}));
+
+const roots: string[] = [];
+const managers: ManagedWorktrees[] = [];
+const routers: CommandRouter[] = [];
+const releases: (() => void)[] = [];
+const git = new GitRunner();
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const release of releases.splice(0)) release();
+  for (const router of routers.splice(0)) await router.stopAll();
+  for (const manager of managers.splice(0)) manager.close();
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+});
+
+async function fixture(
+  checkpoint?: ConstructorParameters<typeof ManagedWorktrees>[0]["checkpoint"],
+) {
+  const root = resolve(".mwi-test-work", randomUUID());
+  roots.push(root);
+  const source = join(root, "source");
+  await mkdir(source, { recursive: true });
+  await git.run(source, ["init", "-b", "target"]);
+  await git.run(source, ["config", "user.name", "Fleet Test"]);
+  await git.run(source, ["config", "user.email", "fleet-test@example.invalid"]);
+  await git.run(source, ["config", "commit.gpgSign", "false"]);
+  await git.run(source, ["config", "core.autocrlf", "false"]);
+  await writeFile(join(source, "same.txt"), "base\n");
+  await writeFile(join(source, ".gitignore"), "ignored.txt\n");
+  await git.run(source, ["add", "."]);
+  await git.run(source, ["commit", "-m", "base"]);
+  const manager = new ManagedWorktrees({
+    directory: join(root, "state"),
+    nodeId: () => "node-1",
+    locks: new CheckoutLocks(join(root, "locks")),
+    ...(checkpoint ? { checkpoint } : {}),
+  });
+  managers.push(manager);
+  return { root, source, manager };
+}
+
+function reserveRequest(
+  source: string,
+  runId: string = randomUUID(),
+): WorktreeOperationRequest {
+  return WorktreeOperationRequestSchema.parse({
+    operationId: randomUUID(),
+    kind: "reserve",
+    runId,
+    worktreeId: `worktree-${runId}`,
+    sourcePath: source,
+    sourcePlacementId: "placement-1",
+    workspaceId: "workspace-1",
+    nodeId: "node-1",
+    hostInstallationId: "host-1",
+    generation: 1,
+    expectedVersion: 0,
+    actor: "test",
+    policy: { freeSpaceFloorBytes: 0 },
+  });
+}
+
+async function operation(
+  manager: ManagedWorktrees,
+  tree: ManagedWorktree,
+  kind: WorktreeOperationRequest["kind"],
+  extra: Partial<WorktreeOperationRequest> = {},
+) {
+  return manager.execute(
+    WorktreeOperationRequestSchema.parse({
+      ...reserveRequest(tree.repository.path, tree.runId),
+      kind,
+      worktreeId: tree.id,
+      generation: tree.generation,
+      expectedVersion: manager.get(tree.id)!.version,
+      expectedPath: tree.path,
+      expectedBranchRef: tree.branchRef,
+      expectedBaseSha: tree.baseSha,
+      ...extra,
+    }),
+  );
+}
+
+async function allocate(
+  manager: ManagedWorktrees,
+  source: string,
+): Promise<ManagedWorktree> {
+  const reserved = await manager.execute(reserveRequest(source));
+  expect(reserved.error).toBe("");
+  expect(reserved.ok).toBe(true);
+  const created = await operation(manager, reserved.worktree!, "create");
+  expect(created.error).toBe("");
+  expect(created.ok).toBe(true);
+  return created.worktree!;
+}
+
+function binding(tree: ManagedWorktree, leaseAttempt: string): ExecutionBinding {
+  return {
+    worktreeId: tree.id,
+    generation: tree.generation,
+    sourcePlacementId: tree.sourcePlacementId,
+    cwd: tree.path,
+    checkoutKey: tree.checkout!.key,
+    accessClass: "shell",
+    leaseAttempt,
+    quarantined: false,
+  };
+}
+
+function launch(id: string, tree: ManagedWorktree) {
+  return NodeCommandSchema.parse({
+    type: "start_session",
+    sessionId: id,
+    commandId: randomUUID(),
+    localPath: tree.path,
+    executionBinding: binding(tree, `lease-${id}`),
+    prompt: id,
+  });
+}
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  releases.push(resolve);
+  return { promise, resolve };
+}
+
+function factory(work: (cwd: string, text: string) => Promise<void>): AgentFactory {
+  return {
+    async start(_id, cwd): Promise<SessionAgent> {
+      let busy = false;
+      let pending = Promise.resolve();
+      return {
+        get busy() {
+          return busy;
+        },
+        prompt(text) {
+          busy = true;
+          pending = work(cwd, text).finally(() => {
+            busy = false;
+          });
+          return pending;
+        },
+        async stop() {
+          await pending;
+        },
+        async cancel() {},
+        async setConfigOption() {},
+        resync() {},
+        resolvePermission() {},
+        denyPendingPermissions() {},
+      };
+    },
+  };
+}
+
+async function liveAcpFixture(managed = true) {
+  const { root, source, manager } = await fixture();
+  const tree = await allocate(manager, source);
+  vi.spyOn(copilotLaunch, "resolveCopilotLaunch").mockResolvedValue({
+    command: process.execPath,
+    args: [resolve("apps", "node", "src", "fixtures", "managed-acp.mjs")],
+    provider: "copilot",
+  });
+  const events: SessionEvent[] = [];
+  const workers = new AcpAgentFactory(60_000, process.execPath);
+  const start = vi.spyOn(workers, "start");
+  const acquire = vi.spyOn(manager.locks, "acquire");
+  const router = new CommandRouter(
+    workers,
+    1,
+    (event) => events.push(event),
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    { worktrees: manager },
+  );
+  routers.push(router);
+  const initial = binding(tree, "lease-live");
+  expect(
+    await router.route(
+      NodeCommandSchema.parse({
+        ...launch("live", tree),
+        executionBinding: managed ? initial : undefined,
+        localPath: managed ? tree.path : source,
+      }),
+    ),
+  ).toMatchObject({ ok: true });
+  await expect.poll(() => router.busySessionIds).toEqual([]);
+  const agent = await start.mock.results[0]!.value;
+  const stop = vi.spyOn(agent, "stop");
+  const resync = vi.spyOn(agent, "resync");
+  const prompt = (executionBinding: ExecutionBinding, text = "follow-up") =>
+    router.route(
+      NodeCommandSchema.parse({
+        type: "prompt",
+        sessionId: "live",
+        commandId: randomUUID(),
+        executionBinding: managed ? executionBinding : undefined,
+        prompt: text,
+      }),
+    );
+  const resume = (executionBinding: ExecutionBinding, extra = {}) =>
+    router.route(
+      NodeCommandSchema.parse({
+        type: "resume_session",
+        sessionId: "live",
+        commandId: randomUUID(),
+        agentSessionId: events.find((event) => event.type === "agent_session")!.payload
+          .agentSessionId,
+        localPath: initial.cwd,
+        executionBinding,
+        ...extra,
+      }),
+    );
+  return {
+    root,
+    source,
+    manager,
+    tree,
+    events,
+    router,
+    agent,
+    initial,
+    start,
+    stop,
+    resync,
+    acquire,
+    prompt,
+    resume,
+    inventory: new CheckoutLocks(join(root, "locks")),
+  };
+}
+
+describe("real Git managed task worktrees", { timeout: 30_000 }, () => {
+  it.skipIf(process.platform !== "win32")(
+    "reattaches the existing real ACP slot and durable lease, fences retired attempts, and never duplicates its process",
+    async () => {
+      const live = await liveAcpFixture();
+      const { initial, inventory, acquire, resume, prompt, router } = live;
+      const lease = acquire.mock.results[0]!.value;
+      const reattach = vi.spyOn(lease, "reattach");
+      const original = inventory.holder(initial.checkoutKey)!;
+      const next = { ...initial, leaseAttempt: "reattached-attempt" };
+      expect(await resume(next)).toMatchObject({ ok: true, executionBinding: next });
+      expect(reattach).toHaveBeenCalledExactlyOnceWith(
+        "session:live",
+        initial.leaseAttempt,
+        next.leaseAttempt,
+      );
+      expect(inventory.holder(initial.checkoutKey)).toEqual({
+        ...original,
+        attempt: next.leaseAttempt,
+      });
+      expect(await prompt(next)).toMatchObject({ ok: true, executionBinding: next });
+      await expect.poll(() => router.busySessionIds).toEqual([]);
+      expect(await prompt(initial)).toMatchObject({ ok: false, fatal: false });
+      expect(await resume(initial)).toMatchObject({ ok: false, fatal: false });
+      for (const invalid of [
+        { ...next, worktreeId: "wrong-worktree" },
+        { ...next, generation: initial.generation + 1 },
+        { ...next, cwd: live.source },
+        { ...next, sourcePlacementId: "wrong-source-placement" },
+        { ...next, checkoutKey: "wrong-checkout" },
+      ]) {
+        expect(await resume(invalid)).toMatchObject({ ok: false, fatal: false });
+      }
+      expect(await resume(next, { localPath: live.source })).toMatchObject({
+        ok: false,
+        fatal: false,
+      });
+      expect(
+        await resume(next, { agentSessionId: "another-conversation" }),
+      ).toMatchObject({ ok: false, fatal: false });
+      expect(await resume(next)).toMatchObject({ ok: true, executionBinding: next });
+      expect(reattach).toHaveBeenCalledOnce();
+      expect(live.resync).toHaveBeenCalledTimes(2);
+      expect(live.stop).not.toHaveBeenCalled();
+      expect(live.start).toHaveBeenCalledOnce();
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(router.activeSessionIds).toEqual(["live"]);
+      expect(inventory.holder(initial.checkoutKey)).toEqual({
+        ...original,
+        attempt: next.leaseAttempt,
+      });
+      expect(live.manager.get(live.tree.id)).toMatchObject({
+        id: initial.worktreeId,
+        generation: initial.generation,
+      });
+      expect(await readdir(join(live.root, "locks"))).toHaveLength(1);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32").each(["save", "CAS"] as const)(
+    "keeps the live slot and durable attempt unchanged after reattachment %s failure",
+    async (failure) => {
+      const live = await liveAcpFixture();
+      const { initial, inventory, acquire, resume, prompt, router } = live;
+      const lease = acquire.mock.results[0]!.value;
+      const reattach = vi.spyOn(lease, "reattach");
+      const original = inventory.holder(initial.checkoutKey)!;
+      const next = { ...initial, leaseAttempt: "retryable-attempt" };
+      if (failure === "save") {
+        vi.spyOn(fs, "renameSync").mockImplementationOnce(() => {
+          throw Object.assign(new Error("Injected atomic lease save failure"), {
+            code: "EACCES",
+          });
+        });
+      } else {
+        const revalidate = lease.revalidate;
+        vi.spyOn(lease, "revalidate").mockImplementationOnce(async () => {
+          await revalidate();
+          // Simulate a changed owner attempt at the final CAS read, after
+          // asynchronous admission, without replacing the real CAS implementation.
+          vi.spyOn(live.manager.locks, "holder")
+            .mockReturnValueOnce(original)
+            .mockReturnValueOnce({ ...original, attempt: "concurrent-attempt" });
+        });
+      }
+      expect(await resume(next)).toMatchObject({
+        ok: false,
+        error:
+          failure === "save"
+            ? "Injected atomic lease save failure"
+            : "Checkout lease owner changed.",
+      });
+      expect(reattach).toHaveBeenCalledOnce();
+      expect(inventory.holder(initial.checkoutKey)).toEqual(original);
+      await expect(lease.revalidate()).resolves.toBeUndefined();
+      expect(await prompt(next)).toMatchObject({ ok: false, fatal: false });
+      expect(await prompt(initial)).toMatchObject({
+        ok: true,
+        executionBinding: initial,
+      });
+      await expect.poll(() => router.busySessionIds).toEqual([]);
+      expect(await resume(initial)).toMatchObject({
+        ok: true,
+        executionBinding: initial,
+      });
+      expect(await resume(next)).toMatchObject({ ok: true, executionBinding: next });
+      expect(inventory.holder(initial.checkoutKey)).toEqual({
+        ...original,
+        attempt: next.leaseAttempt,
+      });
+      expect(await prompt(initial)).toMatchObject({ ok: false, fatal: false });
+      expect(await prompt(next)).toMatchObject({ ok: true, executionBinding: next });
+      expect(reattach).toHaveBeenCalledTimes(2);
+      expect(live.stop).not.toHaveBeenCalled();
+      expect(live.start).toHaveBeenCalledOnce();
+      expect(acquire).toHaveBeenCalledOnce();
+      expect(router.activeSessionIds).toEqual(["live"]);
+      expect(await readdir(join(live.root, "locks"))).toHaveLength(1);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32").each([true, false])(
+    "keeps supervisor proof out of real ACP system events and stderrTail without hiding diagnostics (managed=%s)",
+    async (managed) => {
+      const spawned = vi.spyOn(windowsJob, "spawnWindowsJob");
+      const live = await liveAcpFixture(managed);
+      expect(await live.prompt(live.initial, "stderr:exit:0")).toMatchObject({
+        ok: true,
+      });
+      await expect
+        .poll(() => live.router.activeSessionIds, { timeout: 15_000 })
+        .toEqual([]);
+      const diagnostics = live.events
+        .filter((event) => event.type === "system")
+        .map((event) => event.payload.text)
+        .join("\n");
+      const tail: unknown = Reflect.get(live.agent, "stderrTail");
+      for (const text of [diagnostics, tail]) {
+        expect(text).toContain("legitimate stderr before exit");
+        expect(text).toContain("fleet-process-tree-quiesced:unrelated-diagnostic");
+        expect(text).toContain("legitimate unterminated stderr");
+        if (managed) expect(text).not.toContain(spawned.mock.results[0]!.value.proof);
+      }
+      expect(spawned).toHaveBeenCalledTimes(managed ? 1 : 0);
+      if (managed) {
+        await expect(live.agent.stop(false)).resolves.toBeUndefined();
+        expect(live.inventory.holder(live.initial.checkoutKey)).toBeUndefined();
+      }
+      expect(
+        live.events.filter((event) => event.payload.state === "completed"),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("leaves unbound legacy sessions on pre-feature admission without managed locks across installations and aliases", async () => {
+    const { root, source } = await fixture();
+    const first = new ManagedWorktrees({
+      directory: join(root, "legacy-node-a"),
+      nodeId: () => "node-a",
+    });
+    const second = new ManagedWorktrees({
+      directory: join(root, "legacy-node-b"),
+      nodeId: () => "node-b",
+    });
+    managers.push(first, second);
+    const entered = gate(),
+      release = gate(),
+      finished = gate();
+    let active = 0,
+      maximum = 0;
+    const workers = factory(async (cwd, text) => {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      entered.resolve();
+      await release.promise;
+      await writeFile(join(cwd, "same.txt"), text);
+      active -= 1;
+      finished.resolve();
+    });
+    const a = new CommandRouter(
+      workers,
+      4,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { worktrees: first },
+    );
+    const b = new CommandRouter(
+      workers,
+      4,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { worktrees: second },
+    );
+    routers.push(a, b);
+    const command = (id: string, path: string, readOnly = false) =>
+      NodeCommandSchema.parse({
+        type: "start_session",
+        commandId: randomUUID(),
+        sessionId: id,
+        localPath: path,
+        sourcePlacementId: id,
+        prompt: id,
+        readOnly,
+      });
+    expect((await a.route(command("legacy-a", source))).ok).toBe(true);
+    await entered.promise;
+    const alias = join(root, "legacy-alias");
+    await symlink(source, alias, "junction");
+    expect((await b.route(command("legacy-b", alias, true))).ok).toBe(true);
+    expect(await readdir(join(root, "locks"))).toEqual([]);
+    release.resolve();
+    await finished.promise;
+    expect((await b.route(command("still-held", alias))).ok).toBe(true);
+    await a.route(
+      NodeCommandSchema.parse({
+        type: "stop",
+        sessionId: "legacy-a",
+        commandId: randomUUID(),
+      }),
+    );
+    expect((await b.route(command("legacy-next", alias))).ok).toBe(true);
+    await b.stopAll();
+    expect(maximum).toBe(2);
+    expect(
+      parseWorktreeRegistry(
+        (await git.run(source, ["worktree", "list", "--porcelain", "-z"])).stdout,
+      ),
+    ).toHaveLength(1);
+    await unlink(alias);
+  });
+
+  it.skipIf(process.platform !== "win32").each([
+    [true, 0, "completed"],
+    [true, 9, "failed"],
+    [false, 0, "completed"],
+    [false, 9, "failed"],
+  ] as const)(
+    "delivers an unsolicited real ACP exit exactly once (managed=%s, code=%i)",
+    async (managed, code, state) => {
+      const { manager, source } = await fixture();
+      const tree = await allocate(manager, source);
+      const events: SessionEvent[] = [];
+      vi.spyOn(copilotLaunch, "resolveCopilotLaunch").mockResolvedValue({
+        command: process.execPath,
+        args: [resolve("apps", "node", "src", "fixtures", "managed-acp.mjs")],
+        provider: "copilot",
+      });
+      const acquire = vi.spyOn(manager.locks, "acquire");
+      const workers = new AcpAgentFactory(60_000, process.execPath);
+      const router = new CommandRouter(
+        workers,
+        1,
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { worktrees: manager },
+      );
+      routers.push(router);
+      const command = NodeCommandSchema.parse({
+        ...launch("exiting", tree),
+        localPath: managed ? tree.path : source,
+        executionBinding: managed ? binding(tree, "lease-exiting") : undefined,
+        prompt: `exit:${code}`,
+      });
+      expect(await router.route(command)).toMatchObject({ ok: true });
+      await expect
+        .poll(() => events.filter((event) => event.payload.state === state), {
+          timeout: 15_000,
+        })
+        .toHaveLength(1);
+      expect(
+        events.filter((event) =>
+          ["completed", "failed", "stopped"].includes(String(event.payload.state)),
+        ),
+      ).toHaveLength(1);
+      expect(router.activeSessionIds).toEqual([]);
+      expect(manager.locks.holder(tree.checkout!.key)).toBeUndefined();
+      expect(acquire).toHaveBeenCalledTimes(managed ? 1 : 0);
+      expect(
+        await router.route(
+          NodeCommandSchema.parse({
+            ...command,
+            commandId: randomUUID(),
+            sessionId: "next",
+            executionBinding: managed ? binding(tree, "lease-next") : undefined,
+            prompt: "stay",
+          }),
+        ),
+      ).toMatchObject({ ok: true });
+      await router.stopAll();
+      expect(
+        events.filter(
+          (event) =>
+            event.sessionId === "exiting" &&
+            ["completed", "failed", "stopped"].includes(String(event.payload.state)),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "settles every real ACP slot, persists uncertain ownership, and retries quiescence without memoizing failure",
+    async () => {
+      const { manager, source } = await fixture();
+      const unsafe = await allocate(manager, source);
+      const safe = await allocate(manager, source);
+      vi.spyOn(copilotLaunch, "resolveCopilotLaunch").mockResolvedValue({
+        command: process.execPath,
+        args: [resolve("apps", "node", "src", "fixtures", "managed-acp.mjs")],
+        provider: "copilot",
+      });
+      const events: SessionEvent[] = [];
+      const router = new CommandRouter(
+        new AcpAgentFactory(60_000, process.execPath),
+        3,
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { worktrees: manager },
+      );
+      routers.push(router);
+      expect((await router.route(launch("unsafe", unsafe))).ok).toBe(true);
+      expect((await router.route(launch("safe", safe))).ok).toBe(true);
+      const unsafePid = manager.locks.holder(unsafe.checkout!.key)!.processes[0]!;
+      const stop = processQuiescence.stopProcessTree;
+      const verify = vi
+        .spyOn(processQuiescence, "stopProcessTree")
+        .mockImplementation(async (child, ownership) => {
+          if (child.pid === unsafePid)
+            throw new Error("Cannot verify descendant ownership");
+          await stop(child, ownership);
+        });
+      await expect(router.stopAll()).rejects.toThrow(
+        "Some sessions could not stop safely",
+      );
+      expect(router.activeSessionIds).toEqual([]);
+      expect(manager.locks.holder(safe.checkout!.key)).toBeUndefined();
+      expect(manager.locks.holder(unsafe.checkout!.key)).toMatchObject({
+        owner: "session:unsafe",
+        processes: [unsafePid],
+        reconciliationRequired: expect.any(String),
+      });
+      expect(manager.get(unsafe.id)!.state).toBe("needs_reconciliation");
+      expect((await operation(manager, unsafe, "reconcile")).code).toBe(
+        "process_unknown",
+      );
+      expect((await router.route(launch("blocked", unsafe))).ok).toBe(false);
+      expect(
+        events.filter(
+          (event) => event.sessionId === "unsafe" && event.payload.state === "failed",
+        ),
+      ).toHaveLength(1);
+      verify.mockRestore();
+      await router.quiesceWorktree(unsafe.id);
+      expect(manager.locks.holder(unsafe.checkout!.key)).toBeUndefined();
+      expect((await operation(manager, unsafe, "reconcile")).ok).toBe(true);
+      expect((await router.route(launch("eligible", unsafe))).ok).toBe(true);
+      expect(
+        events.filter(
+          (event) =>
+            event.sessionId === "unsafe" &&
+            ["failed", "stopped"].includes(String(event.payload.state)),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "propagates a natural terminal event despite uncertain descendant verification and releases only after a verified retry",
+    async () => {
+      const { manager, source } = await fixture();
+      const tree = await allocate(manager, source);
+      vi.spyOn(copilotLaunch, "resolveCopilotLaunch").mockResolvedValue({
+        command: process.execPath,
+        args: [resolve("apps", "node", "src", "fixtures", "managed-acp.mjs")],
+        provider: "copilot",
+      });
+      const stop = vi
+        .spyOn(processQuiescence, "stopProcessTree")
+        .mockRejectedValue(new Error("Supervisor proof unavailable"));
+      const events: SessionEvent[] = [];
+      const router = new CommandRouter(
+        new AcpAgentFactory(60_000, process.execPath),
+        1,
+        (event) => events.push(event),
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { worktrees: manager },
+      );
+      routers.push(router);
+      expect(
+        (
+          await router.route(
+            NodeCommandSchema.parse({ ...launch("exit", tree), prompt: "exit:0" }),
+          )
+        ).ok,
+      ).toBe(true);
+      await expect
+        .poll(() => events.filter((event) => event.payload.state === "completed"), {
+          timeout: 15_000,
+        })
+        .toHaveLength(1);
+      expect(router.activeSessionIds).toEqual([]);
+      expect(
+        manager.locks.holder(tree.checkout!.key)?.reconciliationRequired,
+      ).toBeTruthy();
+      expect(manager.get(tree.id)!.state).toBe("needs_reconciliation");
+      stop.mockRestore();
+      await router.quiesceWorktree(tree.id);
+      expect(manager.locks.holder(tree.checkout!.key)).toBeUndefined();
+      expect(
+        events.filter((event) =>
+          ["completed", "failed", "stopped"].includes(String(event.payload.state)),
+        ),
+      ).toHaveLength(1);
+    },
+  );
+
+  it("closes the real worktree database even if an in-flight operation rejects", async () => {
+    const { manager } = await fixture();
+    const failure = new Error("Git worker failed during shutdown");
+    const inFlight = Reflect.get(manager, "inFlight") as Map<string, Promise<unknown>>;
+    inFlight.set("failing-operation", Promise.reject(failure));
+    await expect(manager.shutdown()).rejects.toMatchObject({ errors: [failure] });
+    expect(() => manager.get("any-tree")).toThrow(/not open|closed/i);
+  });
+
+  it("does not quiesce an unrelated legacy session when a managed worktree is drained", async () => {
+    const { manager, source } = await fixture();
+    const router = new CommandRouter(
+      factory(async () => {}),
+      2,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { worktrees: manager },
+    );
+    routers.push(router);
+    expect(
+      (
+        await router.route(
+          NodeCommandSchema.parse({
+            type: "start_session",
+            commandId: randomUUID(),
+            sessionId: "legacy",
+            localPath: source,
+            prompt: "legacy",
+          }),
+        )
+      ).ok,
+    ).toBe(true);
+    await router.quiesceWorktree("unrelated-managed-worktree");
+    expect(router.activeSessionIds).toEqual(["legacy"]);
+    expect(
+      manager.locks.holder((await manager.checkoutIdentity(source)).key),
+    ).toBeUndefined();
+  });
+
+  it("drains operations before quarantine and preserves quarantine despite operation failure", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    const failure = new Error("Operation rejected during restore");
+    const inFlight = Reflect.get(manager, "inFlight") as Map<string, Promise<unknown>>;
+    const pending = gate();
+    inFlight.set(
+      "pending-operation",
+      pending.promise.then(() => {
+        throw failure;
+      }),
+    );
+    const quarantining = manager.quarantine();
+    const failed = expect(quarantining).rejects.toMatchObject({ errors: [failure] });
+    await expect(
+      manager.validateExecution(binding(tree, "new-session")),
+    ).rejects.toMatchObject({ code: "node_draining" });
+    await expect(manager.execute(reserveRequest(source))).rejects.toMatchObject({
+      code: "node_draining",
+    });
+    pending.resolve();
+    await failed;
+    expect(manager.get(tree.id)!.state).toBe("quarantined");
+    await expect(
+      manager.validateExecution(binding(tree, "new-session")),
+    ).rejects.toMatchObject({ code: "binding_unavailable" });
+  });
+
+  it("enters two barrier-controlled writer sections simultaneously, editing the same filename independently", async () => {
+    const { manager, source } = await fixture();
+    const a = await allocate(manager, source);
+    const b = await allocate(manager, source);
+    const both = gate(),
+      release = gate(),
+      finished = gate();
+    let active = 0,
+      maximum = 0,
+      done = 0;
+    const router = new CommandRouter(
+      factory(async (cwd, text) => {
+        active += 1;
+        maximum = Math.max(active, maximum);
+        if (active === 2) both.resolve();
+        await release.promise;
+        await writeFile(join(cwd, "same.txt"), text);
+        active -= 1;
+        if (++done === 2) finished.resolve();
+      }),
+      4,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { worktrees: manager },
+    );
+    routers.push(router);
+    expect(
+      (
+        await Promise.all([router.route(launch("A", a)), router.route(launch("B", b))])
+      ).every((result) => result.ok),
+    ).toBe(true);
+    await both.promise;
+    expect(maximum).toBe(2);
+    release.resolve();
+    await finished.promise;
+    expect(a.checkout!.key).not.toBe(b.checkout!.key);
+    expect(await readFile(join(a.path, "same.txt"), "utf8")).toBe("A");
+    expect(await readFile(join(b.path, "same.txt"), "utf8")).toBe("B");
+    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("base\n");
+  });
+
+  it("serializes a task's writers and rejects readOnly/manual alias bypasses until process quiescence", async () => {
+    const { manager, source, root } = await fixture();
+    const tree = await allocate(manager, source);
+    const started = gate(),
+      release = gate();
+    let active = 0,
+      maximum = 0;
+    const router = new CommandRouter(
+      factory(async () => {
+        active += 1;
+        maximum = Math.max(active, maximum);
+        started.resolve();
+        await release.promise;
+        active -= 1;
+      }),
+      8,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { worktrees: manager },
+    );
+    routers.push(router);
+    expect((await router.route(launch("implementer", tree))).ok).toBe(true);
+    await started.promise;
+    expect(
+      (
+        await router.route(
+          NodeCommandSchema.parse({ ...launch("reviewer", tree), readOnly: true }),
+        )
+      ).ok,
+    ).toBe(false);
+    const alias = join(root, "alias");
+    await symlink(tree.path, alias, "junction");
+    expect(
+      (
+        await router.route(
+          NodeCommandSchema.parse({
+            type: "start_session",
+            commandId: randomUUID(),
+            sessionId: "manual",
+            localPath: alias,
+            prompt: "manual",
+            readOnly: true,
+          }),
+        )
+      ).ok,
+    ).toBe(false);
+    expect((await operation(manager, tree, "cleanup")).code).toBe("checkout_busy");
+    const stopped = router.route(
+      NodeCommandSchema.parse({
+        type: "stop",
+        commandId: randomUUID(),
+        sessionId: "implementer",
+      }),
+    );
+    expect((await router.route(launch("fixer-too-soon", tree))).ok).toBe(false);
+    release.resolve();
+    await stopped;
+    expect((await router.route(launch("fixer", tree))).ok).toBe(true);
+    expect(maximum).toBe(1);
+    await unlink(alias);
+  });
+
+  it("retains committed and uncommitted implementation state for reviewers, fixers and resumed conversations", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    await writeFile(join(tree.path, "same.txt"), "implementation\n");
+    await git.run(tree.path, ["commit", "-am", "implementation"]);
+    await writeFile(join(tree.path, "uncommitted.txt"), "context still here\n");
+    const resumed = await operation(manager, tree, "create");
+    expect(resumed.worktree!.checkout!.key).toBe(tree.checkout!.key);
+    const seen: string[] = [];
+    const router = new CommandRouter(
+      factory(async (cwd, text) => {
+        seen.push(
+          `${text}:${await readFile(join(cwd, "same.txt"), "utf8")}:${await readFile(join(cwd, "uncommitted.txt"), "utf8")}`,
+        );
+      }),
+      4,
+      () => {},
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { worktrees: manager },
+    );
+    routers.push(router);
+    const reviewer = launch("reviewer", tree);
+    expect((await router.route(reviewer)).ok).toBe(true);
+    await router.route(
+      NodeCommandSchema.parse({
+        type: "stop",
+        sessionId: "reviewer",
+        commandId: randomUUID(),
+      }),
+    );
+    expect((await router.route(launch("fixer", tree))).ok).toBe(true);
+    await router.route(
+      NodeCommandSchema.parse({
+        type: "stop",
+        sessionId: "fixer",
+        commandId: randomUUID(),
+      }),
+    );
+    expect(
+      (
+        await router.route(
+          NodeCommandSchema.parse({
+            type: "resume_session",
+            commandId: randomUUID(),
+            sessionId: "reviewer",
+            localPath: tree.path,
+            agentSessionId: "same-copilot-conversation",
+            executionBinding: binding(tree, "resume-reviewer"),
+          }),
+        )
+      ).ok,
+    ).toBe(true);
+    expect(
+      (
+        await router.route(
+          NodeCommandSchema.parse({
+            type: "prompt",
+            commandId: randomUUID(),
+            sessionId: "reviewer",
+            prompt: "follow-up",
+            executionBinding: binding(tree, "resume-reviewer"),
+          }),
+        )
+      ).ok,
+    ).toBe(true);
+    await router.stopAll();
+    expect(seen).toHaveLength(3);
+    expect(
+      seen.every((text) => text.includes("implementation\n:context still here\n")),
+    ).toBe(true);
+    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("base\n");
+  });
+
+  it.each(["cleanup", "stop"] as const)(
+    "guards a prompt waiting for checkout validation against concurrent %s",
+    async (action) => {
+      const { manager, source } = await fixture();
+      const tree = await allocate(manager, source);
+      const validating = gate(),
+        resume = gate();
+      const prompts: string[] = [];
+      const workers = factory(async (_cwd, text) => {
+        prompts.push(text);
+      });
+      const remove = vi.fn();
+      const router = new CommandRouter(
+        {
+          async start(id, cwd, sink, options) {
+            sink({
+              eventId: randomUUID(),
+              sessionId: id,
+              sequence: 1,
+              type: "agent_session",
+              payload: { agentSessionId: "conversation" },
+              createdAt: new Date().toISOString(),
+            });
+            return workers.start(id, cwd, sink, options);
+          },
+        },
+        2,
+        () => {},
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { worktrees: manager, deleteInactiveSession: remove },
+      );
+      routers.push(router);
+      expect((await router.route(launch("worker", tree))).ok).toBe(true);
+      const at = Date.now();
+      const clock = vi.spyOn(Date, "now").mockReturnValue(at);
+      vi.spyOn(manager, "validateExecution").mockImplementationOnce(async () => {
+        validating.resolve();
+        await resume.promise;
+      });
+      const prompt = router.route(
+        NodeCommandSchema.parse({
+          type: "prompt",
+          commandId: randomUUID(),
+          sessionId: "worker",
+          prompt: "follow-up",
+          executionBinding: binding(tree, "lease-worker"),
+        }),
+      );
+      await validating.promise;
+      clock.mockReturnValue(at + 60 * 86_400_000);
+      if (action === "cleanup") {
+        const cleanup = await router.route(
+          NodeCommandSchema.parse({
+            type: "delete_session",
+            commandId: randomUUID(),
+            sessionId: "worker",
+            agentSessionId: "conversation",
+            retentionDays: 30,
+            inactiveBefore: new Date(at + 30 * 86_400_000).toISOString(),
+          }),
+        );
+        expect(cleanup).toMatchObject({ ok: false, fatal: false });
+        expect(remove).not.toHaveBeenCalled();
+      } else {
+        expect(
+          (
+            await router.route(
+              NodeCommandSchema.parse({
+                type: "stop",
+                commandId: randomUUID(),
+                sessionId: "worker",
+              }),
+            )
+          ).ok,
+        ).toBe(true);
+      }
+      resume.resolve();
+      expect((await prompt).ok).toBe(action === "cleanup");
+      expect(prompts).toEqual(
+        action === "cleanup" ? ["worker", "follow-up"] : ["worker"],
+      );
+    },
+  );
+
+  it("pins the exact committed base before the source HEAD moves", async () => {
+    const { source, manager } = await fixture();
+    const reserved = await manager.execute(reserveRequest(source));
+    expect(reserved.ok).toBe(true);
+    const base = reserved.worktree!.baseSha;
+    await writeFile(join(source, "same.txt"), "source moved\n");
+    await git.run(source, ["commit", "-am", "source advances"]);
+    const created = await operation(manager, reserved.worktree!, "create");
+    expect(created.ok).toBe(true);
+    expect(
+      (await git.run(created.worktree!.path, ["rev-parse", "HEAD"])).stdout.trim(),
+    ).toBe(base);
+    expect(await readFile(join(created.worktree!.path, "same.txt"), "utf8")).toBe(
+      "base\n",
+    );
+  });
+
+  it("rejects deterministic ref collisions and counts reservations against quota without eviction", async () => {
+    const { source, manager } = await fixture();
+    const colliding = reserveRequest(source);
+    const key = createHash("sha256")
+      .update(
+        `${colliding.hostInstallationId}:${colliding.runId}:${colliding.generation}`,
+      )
+      .digest("hex")
+      .slice(0, 32);
+    const ref = `refs/heads/fleet/${key}`;
+    const base = (await git.run(source, ["rev-parse", "HEAD"])).stdout.trim();
+    await git.run(source, ["update-ref", ref, base]);
+    expect((await manager.execute(colliding)).code).toBe("path_ref_collision");
+    expect((await git.run(source, ["rev-parse", ref])).stdout.trim()).toBe(base);
+    const request = reserveRequest(source);
+    request.policy.maxPerRepository = 1;
+    const reserved = await manager.execute(request);
+    expect(reserved.ok).toBe(true);
+    expect(await manager.execute(request)).toEqual(reserved);
+    const extra = reserveRequest(source);
+    extra.policy.maxPerRepository = 1;
+    expect((await manager.execute(extra)).code).toBe("worktree_quota");
+    expect(manager.get(reserved.worktree!.id)!.state).toBe("reserved");
+    expect((await operation(manager, reserved.worktree!, "create")).ok).toBe(true);
+  });
+
+  it.each(["intent", "git", "receipt"] as const)(
+    "recovers a create crash at %s without a duplicate branch or overwrite",
+    async (stage) => {
+      let injected = false;
+      const { root, manager, source } = await fixture((where, request) => {
+        if (request.kind === "create" && where === stage && !injected) {
+          injected = true;
+          throw new WorktreeCrash("injected crash");
+        }
+      });
+      const reserved = (await manager.execute(reserveRequest(source))).worktree!;
+      const request = WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source, reserved.runId),
+        worktreeId: reserved.id,
+        kind: "create",
+        expectedVersion: reserved.version,
+        expectedPath: reserved.path,
+        expectedBranchRef: reserved.branchRef,
+        expectedBaseSha: reserved.baseSha,
+      });
+      await expect(manager.execute(request)).rejects.toThrow("injected");
+      manager.close();
+      managers.splice(managers.indexOf(manager), 1);
+      const restarted = new ManagedWorktrees({
+        directory: join(root, "state"),
+        nodeId: () => "node-1",
+        locks: new CheckoutLocks(join(root, "locks")),
+      });
+      managers.push(restarted);
+      const result = await restarted.execute(request);
+      expect(result.error).toBe("");
+      expect(result.ok).toBe(true);
+      expect(await restarted.execute(request)).toEqual(result);
+      const registry = parseWorktreeRegistry(
+        (await git.run(source, ["worktree", "list", "--porcelain", "-z"])).stdout,
+      );
+      expect(
+        registry.filter((entry) => entry.branch === reserved.branchRef),
+      ).toHaveLength(1);
+      expect(
+        (await operation(restarted, result.worktree!, "create")).worktree!.path,
+      ).toBe(reserved.path);
+    },
+  );
+
+  it("refuses dirty, untracked and ignored cleanup; abandonment names ownership and keeps files", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    for (const name of ["untracked.txt", "ignored.txt", "same.txt"]) {
+      await writeFile(join(tree.path, name), "valuable data\n");
+      expect((await operation(manager, tree, "cleanup")).code).toBe("dirty_or_unknown");
+      if (name === "same.txt") await writeFile(join(tree.path, name), "base\n");
+      else await unlink(join(tree.path, name));
+    }
+    await writeFile(join(tree.path, "same.txt"), "staged\n");
+    await git.run(tree.path, ["add", "same.txt"]);
+    expect((await operation(manager, tree, "cleanup")).code).toBe("dirty_or_unknown");
+    expect((await operation(manager, tree, "abandon", { confirm: "yes" })).code).toBe(
+      "confirmation_required",
+    );
+    const abandoned = await operation(manager, tree, "abandon", {
+      confirm: `ABANDON ${tree.branchRef} AT ${tree.path}; KEEP FILES`,
+    });
+    expect(abandoned.ok).toBe(true);
+    expect(abandoned.worktree!.abandonedAt).not.toBe("");
+    expect(await readFile(join(tree.path, "same.txt"), "utf8")).toBe("staged\n");
+    expect((await operation(manager, tree, "cleanup")).code).toBe("abandoned");
+  });
+
+  it("persists a real merge conflict, reserves the target, and aborts only the matching operation without touching the task", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    await writeFile(join(tree.path, "same.txt"), "task change\n");
+    await git.run(tree.path, ["commit", "-am", "task"]);
+    await writeFile(join(source, "same.txt"), "target change\n");
+    await git.run(source, ["commit", "-am", "target"]);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    expect(preview.taskDirty).toBe(false);
+    const started = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+    });
+    expect(started.error).toBe("");
+    expect(started.integration!.state).toBe("conflicted");
+    expect(started.integration!.conflicts).toEqual(["same.txt"]);
+    const target = await canonicalPath(source);
+    expect(() =>
+      manager.locks.acquire(target, { owner: "manual", kind: "worker", attempt: "1" }),
+    ).toThrow("reserved");
+    expect((await operation(manager, tree, "cleanup")).code).toBe(
+      "integration_unresolved",
+    );
+    expect(
+      (
+        await operation(manager, tree, "abort", {
+          integrationId: "wrong",
+          confirm: "ABORT MERGE wrong",
+        })
+      ).code,
+    ).toBe("wrong_integration");
+    const aborted = await operation(manager, tree, "abort", {
+      integrationId: started.integration!.id,
+      confirm: `ABORT MERGE ${started.integration!.id}`,
+    });
+    expect(aborted.error).toBe("");
+    expect(aborted.integration!.state).toBe("aborted");
+    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("target change\n");
+    expect(await readFile(join(tree.path, "same.txt"), "utf8")).toBe("task change\n");
+    expect(manager.locks.holder(target.key)).toBeUndefined();
+    expect((await operation(manager, tree, "cleanup")).worktree!.state).toBe("removed");
+    expect(
+      (await git.run(source, ["rev-parse", "--verify", tree.branchRef])).stdout.trim(),
+    ).toBe(preview.taskSha);
+  });
+
+  it("rejects stale reviewed SHA and target preview; merges only after explicit confirmation", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    await writeFile(join(tree.path, "task.txt"), "task");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    const input = {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+      commit: true,
+    };
+    expect(
+      (
+        await operation(manager, tree, "integrate", {
+          ...input,
+          reviewedTaskSha: tree.baseSha,
+        })
+      ).code,
+    ).toBe("review_required");
+    await writeFile(join(source, "source.txt"), "source");
+    await git.run(source, ["add", "source.txt"]);
+    await git.run(source, ["commit", "-m", "target moves"]);
+    expect((await operation(manager, tree, "integrate", input)).code).toBe(
+      "stale_preview",
+    );
+    const fresh = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    const integrated = await operation(manager, tree, "integrate", {
+      ...input,
+      previewId: fresh.id,
+    });
+    expect(integrated.error).toBe("");
+    expect(integrated.integration!.state).toBe("integrated");
+    expect(await readFile(join(source, "task.txt"), "utf8")).toBe("task");
+    expect((await operation(manager, tree, "cleanup")).ok).toBe(true);
+  });
+
+  it("continues a manually resolved conflict only after explicit confirmation and retains the task", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    await writeFile(join(tree.path, "same.txt"), "task\n");
+    await git.run(tree.path, ["commit", "-am", "task"]);
+    await writeFile(join(source, "same.txt"), "target\n");
+    await git.run(source, ["commit", "-am", "target"]);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target",
+      })
+    ).preview!;
+    const started = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+    });
+    expect(started.integration!.state).toBe("conflicted");
+    await writeFile(join(source, "same.txt"), "resolved\n");
+    await git.run(source, ["add", "same.txt"]);
+    const input = { integrationId: started.integration!.id, commit: true };
+    expect((await operation(manager, tree, "continue", input)).code).toBe(
+      "confirmation_required",
+    );
+    const continued = await operation(manager, tree, "continue", {
+      ...input,
+      confirm: `COMMIT MERGE ${input.integrationId}`,
+    });
+    expect(continued.error).toBe("");
+    expect(continued.integration!.state).toBe("integrated");
+    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("resolved\n");
+    expect(await readFile(join(tree.path, "same.txt"), "utf8")).toBe("task\n");
+    expect((await git.run(source, ["branch", "--show-current"])).stdout.trim()).toBe(
+      "target",
+    );
+    expect((await git.run(source, ["remote"])).stdout.trim()).toBe("");
+  });
+
+  it("fails closed on wrong ownership/generation/path and never recreates a manually missing checkout", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    expect((await operation(manager, tree, "cleanup", { generation: 2 })).code).toBe(
+      "binding_mismatch",
+    );
+    expect(
+      (await operation(manager, tree, "cleanup", { expectedPath: source })).code,
+    ).toBe("binding_mismatch");
+    expect(
+      (await operation(manager, tree, "cleanup", { hostInstallationId: "other" })).code,
+    ).toBe("binding_mismatch");
+    await rm(tree.path, { recursive: true });
+    expect((await operation(manager, tree, "create")).code).toBe("missing");
+    expect((await operation(manager, tree, "reconcile")).worktree!.state).not.toBe(
+      "ready",
+    );
+  });
+});

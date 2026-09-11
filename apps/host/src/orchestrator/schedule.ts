@@ -1,5 +1,7 @@
 import {
   HOST_YOLO_CAPABILITY,
+  MANAGED_WORKTREES_CAPABILITY,
+  checkoutLockKey,
   isChatsWorkspace,
   isWritingCategory,
   terminalRunStates,
@@ -44,6 +46,8 @@ export type ScheduleAction =
   | { type: "finish_run"; state: RunState; reason: string };
 
 export type ScheduleInput = {
+  workspaceReady?: boolean;
+  parkableSessionIds?: ReadonlySet<string>;
   run: Run;
   steps: readonly RunStep[];
   sessions: readonly FleetSession[];
@@ -276,34 +280,79 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     return reservedByNode.get(cacheKey)!;
   };
 
-  const writingInFlight = new Set(
-    input.sessions
-      .filter(
-        (session) =>
-          session.runRole !== "lead" &&
-          !session.readOnly &&
-          session.state !== "idle" &&
-          !terminalSessionStates.has(session.state) &&
-          session.placementId,
-      )
-      .map((session) => session.placementId),
-  );
+  const strictSession = (session: FleetSession) =>
+    Boolean(session.executionBinding?.worktreeId) ||
+    Boolean(
+      nodeById.get(session.nodeId)?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY),
+    );
+  const heldBy = (session: FleetSession) =>
+    session.runRole !== "lead" &&
+    !terminalSessionStates.has(session.state) &&
+    (strictSession(session) || (!session.readOnly && session.state !== "idle"));
+  const writingInFlight = new Set(input.sessions.filter(heldBy).map(checkoutLockKey));
   for (const step of [...inFlight, ...activeRetries]) {
-    if (isWritingCategory(step.category) && step.placementId) {
-      writingInFlight.add(step.placementId);
+    if (
+      requiresCheckoutLease(
+        run,
+        step.category,
+        nodeById.get(placementById.get(step.placementId)?.nodeId ?? ""),
+      ) &&
+      step.placementId
+    ) {
+      writingInFlight.add(executionKey(run, step.placementId));
     }
   }
   // Any writing step, settled or not: its changes are still in that tree.
   const hasWritingStep = steps.some((step) => isWritingCategory(step.category));
   let started = 0;
-  const parallelBudget = heldByHuman
-    ? 0
-    : run.policy.maxParallel - inFlight.length - activeRetries.length;
+  const workspaceReady =
+    input.workspaceReady ??
+    (run.workspaceBinding?.effectiveMode !== "managed" ||
+      run.workspaceBinding.initialization === "ready");
+  const parallelBudget =
+    heldByHuman || !workspaceReady
+      ? 0
+      : run.policy.maxParallel - inFlight.length - activeRetries.length;
 
   for (const step of steps) {
     if (effectiveState(step) !== "pending") continue;
     const unmet = step.dependsOn.some((key) => stateByKey.get(key) !== "succeeded");
     if (unmet) continue;
+    const desiredKey = executionKey(run, step.placementId || run.placementId);
+    if (!heldByHuman && workspaceReady) {
+      for (const occupant of input.sessions) {
+        if (
+          occupant.id === step.sessionId ||
+          !strictSession(occupant) ||
+          occupant.runRole === "lead" ||
+          occupant.state !== "idle" ||
+          occupant.stopRequested ||
+          checkoutLockKey(occupant) !== desiredKey
+        )
+          continue;
+        const settledWorker =
+          input.parkableSessionIds?.has(occupant.id) ||
+          steps.some(
+            (previous) =>
+              previous.sessionId === occupant.id &&
+              terminalRunStepStates.has(effectiveState(previous)),
+          );
+        if (
+          settledWorker &&
+          !actions.some(
+            (action) =>
+              action.type === "stop_session" && action.sessionId === occupant.id,
+          )
+        ) {
+          actions.push({
+            type: "stop_session",
+            sessionId: occupant.id,
+            reason:
+              "Park the settled conversation and verify process quiescence before checkout handoff.",
+          });
+        }
+      }
+    }
 
     /*
      * A pending step with a session id is a retry of that same Copilot
@@ -329,25 +378,28 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         continue;
       }
       if (session.stopRequested || session.dismissed || !node.online) continue;
+      const needsLease = requiresCheckoutLease(run, step.category, node);
+      const retryKey = executionKey(run, placementId);
       const anotherWriter =
-        isWritingCategory(step.category) &&
+        needsLease &&
         input.sessions.some(
           (candidate) =>
             candidate.id !== session.id &&
-            candidate.placementId === placementId &&
-            candidate.runRole !== "lead" &&
-            !candidate.readOnly &&
-            candidate.state !== "idle" &&
-            !terminalSessionStates.has(candidate.state),
+            checkoutLockKey(candidate) === retryKey &&
+            heldBy(candidate),
         );
       if (anotherWriter) continue;
 
       if (session.state === "idle") {
         if (started >= parallelBudget) continue;
-        if (isWritingCategory(step.category) && writingInFlight.has(placementId)) {
+        if (
+          needsLease &&
+          writingInFlight.has(retryKey) &&
+          !(strictSession(session) && started === 0)
+        ) {
           continue;
         }
-        if (isWritingCategory(step.category)) writingInFlight.add(placementId);
+        if (needsLease) writingInFlight.add(retryKey);
         started += 1;
         actions.push({
           type: "prompt_step",
@@ -371,7 +423,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         continue;
       }
       if (started >= parallelBudget) continue;
-      if (isWritingCategory(step.category) && writingInFlight.has(placementId)) {
+      if (needsLease && writingInFlight.has(retryKey)) {
         continue;
       }
 
@@ -379,7 +431,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       if (remainingCapacity(node, reservedFor(node.id, kind), kind) <= 0) continue;
 
       reservedByNode.set(key(node.id, kind), reservedFor(node.id, kind) + 1);
-      if (isWritingCategory(step.category)) writingInFlight.add(placementId);
+      if (needsLease) writingInFlight.add(retryKey);
       started += 1;
       actions.push({
         type: "resume_step",
@@ -408,7 +460,9 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       key(placement.nodeId, startedKind),
       reservedFor(placement.nodeId, startedKind) + 1,
     );
-    if (isWritingCategory(step.category)) writingInFlight.add(placementId);
+    if (requiresCheckoutLease(run, step.category, nodeById.get(placement.nodeId))) {
+      writingInFlight.add(executionKey(run, placementId));
+    }
     settled.set(step.id, "starting");
     started += 1;
     actions.push({
@@ -467,7 +521,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   return actions;
 }
 
-/** Read-only work: it cannot disturb a checkout, so it takes no write lock. */
+/** Capacity label only. Shell-capable reviewers still require a checkout lease. */
 export function isReadOnlyCategory(category: string): boolean {
   return !isWritingCategory(category);
 }
@@ -570,6 +624,32 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
   const { run, placements, nodeById, reservedFor, writingInFlight } = request;
   const writes = isWritingCategory(request.category);
   const kind: SessionKind = writes ? "writing" : "read-only";
+  if (run.workspaceBinding?.effectiveMode === "managed") {
+    const source = placements.find(
+      (placement) => placement.id === run.workspaceBinding!.sourcePlacementId,
+    );
+    if (!source)
+      return "The managed task's pinned source placement is unavailable. Reconcile it; no fallback is permitted.";
+    if (
+      (request.workspace &&
+        request.workspace.trim().toLowerCase() !== source.workspaceName?.toLowerCase()) ||
+      (request.node &&
+        ![source.nodeId, source.nodeName?.toLowerCase()].includes(
+          request.node.trim().toLowerCase(),
+        ))
+    ) {
+      return "All implementation, review, testing and fix-up for this managed task use its one pinned worktree. Open a different task for unrelated work.";
+    }
+    const node = nodeById.get(source.nodeId);
+    if (!node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY))
+      return "Upgrade the pinned Node to managed-worktrees-v1; managed tasks never fall back to Legacy.";
+    if (!usable(node, run)) return "The managed task's owning Node is unavailable.";
+    if (writingInFlight.has(executionKey(run, source.id)))
+      return "This task's checkout is held by another shell-capable session. Wait for process quiescence before the next writer/reviewer.";
+    if (remainingCapacity(node, reservedFor(node.id, kind), kind) < 1)
+      return "The task's owning Node has no free capacity.";
+    return source;
+  }
   const pinned =
     run.placementId && request.hasWritingStep
       ? placements.find((placement) => placement.id === run.placementId)
@@ -595,8 +675,11 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
     if (onlyNode && onlyNode.id !== pinned!.nodeId) {
       return `${pinned!.nodeName} ${why}, so this cannot run on ${onlyNode.name}. Send it to ${pinned!.nodeName}, or name a workspace if this is unrelated work.`;
     }
-    if (writes && writingInFlight.has(pinned!.id)) {
-      return `Another step is already writing to ${pinned!.nodeName}, which ${why}. Only one writer at a time; a review can go now.`;
+    if (
+      requiresCheckoutLease(run, request.category, nodeById.get(pinned!.nodeId)) &&
+      writingInFlight.has(pinned!.id)
+    ) {
+      return `Another session holds the checkout on ${pinned!.nodeName}, which ${why}. Wait for process quiescence; read-only labels do not grant filesystem isolation.`;
     }
     const node = nodeById.get(pinned!.nodeId);
     if (!usable(node, run)) {
@@ -660,7 +743,10 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
     .sort((a, b) => b.free - a.free);
 
   for (const { placement, free } of ranked) {
-    if (writes && writingInFlight.has(placement.id)) {
+    if (
+      requiresCheckoutLease(run, request.category, nodeById.get(placement.nodeId)) &&
+      writingInFlight.has(placement.id)
+    ) {
       blockedByWriter = true;
       continue;
     }
@@ -712,9 +798,17 @@ function choosePlacement(
     if (!chosen) return undefined;
     const node = context.nodeById.get(chosen.nodeId);
     if (!usable(node, context.run)) return undefined;
-    if (isWritingCategory(step.category) && context.writingInFlight.has(chosen.id)) {
+    if (
+      requiresCheckoutLease(context.run, step.category, node) &&
+      context.writingInFlight.has(executionKey(context.run, chosen.id))
+    ) {
       return undefined;
     }
+    if (
+      context.run.workspaceBinding?.effectiveMode === "managed" &&
+      chosen.id !== context.run.workspaceBinding.sourcePlacementId
+    )
+      return undefined;
     const kind: SessionKind = isReadOnlyCategory(step.category) ? "read-only" : "writing";
     if (remainingCapacity(node!, context.reservedFor(node!.id, kind), kind) < 1) {
       return undefined;
@@ -728,8 +822,32 @@ function choosePlacement(
 
 function usable(node: FleetNode | undefined, run: Run): boolean {
   if (!node?.online) return false;
+  if (
+    run.workspaceBinding?.effectiveMode === "managed" &&
+    !node.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)
+  )
+    return false;
   // Refused rather than downgraded: an older agent ignores the flag and runs
   // with prompts on, which is not the unattended execution the run authorised.
   if (run.policy.yolo && !node.capabilities.includes(HOST_YOLO_CAPABILITY)) return false;
   return true;
+}
+
+export function executionKey(run: Run, placementId: string): string {
+  const binding = run.workspaceBinding;
+  return binding?.effectiveMode === "managed"
+    ? binding.checkoutKey || `managed:${binding.managedWorktreeId}:${binding.generation}`
+    : placementId;
+}
+
+function requiresCheckoutLease(
+  run: Run,
+  category: string,
+  node: FleetNode | undefined,
+): boolean {
+  return (
+    run.workspaceBinding?.effectiveMode === "managed" ||
+    Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)) ||
+    isWritingCategory(category)
+  );
 }

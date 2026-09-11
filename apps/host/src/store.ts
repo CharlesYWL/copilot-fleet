@@ -68,6 +68,23 @@ import {
   terminalSessionStates,
   tryParseJson,
   tunnelProviders,
+  ExecutionBindingSchema,
+  ManagedWorktreePolicySchema,
+  ManagedWorktreeSchema,
+  RunWorkspaceBindingSchema,
+  WorktreeConflict,
+  WorktreeIntegrationSchema,
+  WorktreeOperationSchema,
+  WorktreeTombstoneSchema,
+  resolveWorkspaceMode,
+  type ExecutionBinding,
+  type ManagedWorktree,
+  type ManagedWorktreePolicy,
+  type RunWorkspaceBinding,
+  type WorkspaceMode,
+  type WorktreeIntegration,
+  type WorktreeOperation,
+  type WorktreeTombstone,
 } from "@fleet/protocol";
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import {
@@ -346,6 +363,7 @@ export const MAX_AUDIT_DETAIL_LENGTH = 500;
  * this Host by, and a data restore is not a change of identity.
  */
 export const PRESERVED_SETTING_KEYS = [
+  "worktrees.hostInstallationId",
   "auth.mode",
   "auth.passwordEnabled",
   "auth.passwordExplicitlyEnabled",
@@ -497,6 +515,25 @@ export class FleetStore {
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS managed_worktrees (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, node_id TEXT NOT NULL,
+        generation INTEGER NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS managed_api_requests (
+        scope TEXT NOT NULL, id TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL,
+        PRIMARY KEY(scope,id)
+      );
+      CREATE TABLE IF NOT EXISTS worktree_operations (
+        id TEXT PRIMARY KEY, worktree_id TEXT NOT NULL, data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_worktree_operations_tree
+        ON worktree_operations(worktree_id);
+      CREATE TABLE IF NOT EXISTS worktree_integrations (
+        id TEXT PRIMARY KEY, worktree_id TEXT NOT NULL, data TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS worktree_tombstones (
+        id TEXT PRIMARY KEY, worktree_id TEXT NOT NULL, data TEXT NOT NULL
       );
       -- Every ownership question (which sessions does this node own, may this
       -- workspace be deleted) filtered these columns with a full scan.
@@ -667,6 +704,9 @@ export class FleetStore {
         WHERE read_at IS NULL AND status <> 'dismissed';
     `);
     this.addColumnIfMissing("nodes", "home_dir", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("runs", "workspace_binding", "TEXT NOT NULL DEFAULT '{}'");
+    this.addColumnIfMissing("sessions", "execution_binding", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("run_steps", "execution_binding", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "revision", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "public_key", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing(
@@ -1111,6 +1151,281 @@ export class FleetStore {
     return this.getSetting("defaults.yolo") === "1";
   }
 
+  getManagedWorktreesEnabled(): boolean {
+    return this.getSetting("defaults.managedWorktreesEnabled") === "1";
+  }
+
+  setManagedWorktreesEnabled(enabled: boolean): void {
+    this.setSetting("defaults.managedWorktreesEnabled", enabled ? "1" : "0");
+  }
+
+  getManagedWorktreePolicy(): ManagedWorktreePolicy {
+    return ManagedWorktreePolicySchema.parse(
+      JSON.parse(this.getSetting("defaults.managedWorktreePolicy") ?? "{}"),
+    );
+  }
+
+  setManagedWorktreePolicy(policy: ManagedWorktreePolicy): void {
+    this.setSetting(
+      "defaults.managedWorktreePolicy",
+      JSON.stringify(ManagedWorktreePolicySchema.parse(policy)),
+    );
+  }
+
+  worktreeHostInstallationId(): string {
+    const existing = this.getSetting("worktrees.hostInstallationId");
+    if (existing) return existing;
+    const id = randomUUID();
+    this.setSetting("worktrees.hostInstallationId", id);
+    return id;
+  }
+
+  managedApiReplay(scope: string, id: string, request: unknown): unknown | undefined {
+    const row = this.statement(
+      "SELECT request,result FROM managed_api_requests WHERE scope=? AND id=?",
+    ).get(scope, id);
+    if (!row) return undefined;
+    if (
+      !isDeepStrictEqual(
+        JSON.parse(String(row.request)),
+        JSON.parse(JSON.stringify(request)),
+      )
+    ) {
+      throw new WorktreeConflict(
+        "idempotency_mismatch",
+        "That request ID was already used with a different payload.",
+      );
+    }
+    return JSON.parse(String(row.result)) as unknown;
+  }
+
+  recordManagedApiRequest(
+    scope: string,
+    id: string,
+    request: unknown,
+    result: unknown,
+  ): void {
+    if (this.managedApiReplay(scope, id, request) !== undefined) return;
+    this.statement(
+      "INSERT INTO managed_api_requests (scope,id,request,result) VALUES (?,?,?,?)",
+    ).run(scope, id, JSON.stringify(request), JSON.stringify(result));
+  }
+
+  listManagedWorktrees(): ManagedWorktree[] {
+    return this.statement("SELECT data FROM managed_worktrees")
+      .all()
+      .map((row) => ManagedWorktreeSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  getManagedWorktree(id: string): ManagedWorktree | undefined {
+    const row = this.statement("SELECT data FROM managed_worktrees WHERE id=?").get(id);
+    return row ? ManagedWorktreeSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  worktreeForRun(runId: string): ManagedWorktree | undefined {
+    const row = this.statement("SELECT data FROM managed_worktrees WHERE run_id=?").get(
+      runId,
+    );
+    return row ? ManagedWorktreeSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  putManagedWorktree(value: ManagedWorktree): void {
+    const parsed = ManagedWorktreeSchema.parse(value);
+    const current = this.getManagedWorktree(parsed.id);
+    if (
+      current &&
+      (parsed.generation !== current.generation ||
+        parsed.path !== current.path ||
+        parsed.branchRef !== current.branchRef ||
+        parsed.baseSha !== current.baseSha ||
+        parsed.sourcePlacementId !== current.sourcePlacementId ||
+        parsed.nodeInstallationId !== current.nodeInstallationId ||
+        parsed.hostInstallationId !== current.hostInstallationId ||
+        parsed.nodeId !== current.nodeId ||
+        parsed.machineId !== current.machineId ||
+        parsed.workspaceId !== current.workspaceId ||
+        parsed.taskKey !== current.taskKey ||
+        parsed.repository.key !== current.repository.key ||
+        parsed.managedRoot.key !== current.managedRoot.key ||
+        (current.checkout && parsed.checkout?.key !== current.checkout.key) ||
+        parsed.commonDirectory.key !== current.commonDirectory.key ||
+        parsed.version < current.version)
+    ) {
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "A managed checkout identity cannot be changed.",
+      );
+    }
+    this.statement(
+      `INSERT INTO managed_worktrees (id,run_id,node_id,generation,version,data)
+       VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,data=excluded.data`,
+    ).run(
+      parsed.id,
+      parsed.runId,
+      parsed.nodeId,
+      parsed.generation,
+      parsed.version,
+      JSON.stringify(parsed),
+    );
+  }
+
+  listWorktreeOperations(worktreeId?: string): WorktreeOperation[] {
+    const rows = worktreeId
+      ? this.statement("SELECT data FROM worktree_operations WHERE worktree_id=?").all(
+          worktreeId,
+        )
+      : this.statement("SELECT data FROM worktree_operations").all();
+    return rows.map((row) => WorktreeOperationSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  getWorktreeOperation(id: string): WorktreeOperation | undefined {
+    const row = this.statement("SELECT data FROM worktree_operations WHERE id=?").get(id);
+    return row ? WorktreeOperationSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  putWorktreeOperation(value: WorktreeOperation): void {
+    const parsed = WorktreeOperationSchema.parse(value);
+    const current = this.getWorktreeOperation(parsed.request.operationId);
+    if (current && !isDeepStrictEqual(current.request, parsed.request)) {
+      throw new WorktreeConflict(
+        "idempotency_mismatch",
+        "That operation ID names a different request.",
+      );
+    }
+    if (current?.state === "acknowledged" && !isDeepStrictEqual(current, parsed)) {
+      throw new WorktreeConflict(
+        "receipt_mismatch",
+        "A completed operation receipt cannot be replaced.",
+      );
+    }
+    this.statement(
+      `INSERT INTO worktree_operations (id,worktree_id,data) VALUES (?,?,?)
+       ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+    ).run(parsed.request.operationId, parsed.request.worktreeId, JSON.stringify(parsed));
+  }
+
+  listWorktreeIntegrations(worktreeId?: string): WorktreeIntegration[] {
+    const rows = worktreeId
+      ? this.statement("SELECT data FROM worktree_integrations WHERE worktree_id=?").all(
+          worktreeId,
+        )
+      : this.statement("SELECT data FROM worktree_integrations").all();
+    return rows.map((row) =>
+      WorktreeIntegrationSchema.parse(JSON.parse(String(row.data))),
+    );
+  }
+
+  putWorktreeIntegration(value: WorktreeIntegration): void {
+    const parsed = WorktreeIntegrationSchema.parse(value);
+    this.statement(
+      `INSERT INTO worktree_integrations (id,worktree_id,data) VALUES (?,?,?)
+       ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+    ).run(parsed.id, parsed.worktreeId, JSON.stringify(parsed));
+  }
+
+  listWorktreeTombstones(): WorktreeTombstone[] {
+    return this.statement("SELECT data FROM worktree_tombstones")
+      .all()
+      .map((row) => WorktreeTombstoneSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  putWorktreeTombstone(value: WorktreeTombstone): void {
+    const parsed = WorktreeTombstoneSchema.parse(value);
+    const id = createHash("sha256")
+      .update(`${parsed.worktreeId}:${parsed.generation}:${parsed.path}`)
+      .digest("hex");
+    this.statement(
+      `INSERT INTO worktree_tombstones (id,worktree_id,data) VALUES (?,?,?)
+       ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+    ).run(id, parsed.worktreeId, JSON.stringify(parsed));
+  }
+
+  assertWorktreePurgeAllowed(runId: string): void {
+    const worktree = this.worktreeForRun(runId);
+    const binding = this.getRun(runId)?.workspaceBinding;
+    if (!worktree) {
+      if (
+        binding?.effectiveMode === "managed" &&
+        binding.initialization !== "not_required"
+      ) {
+        const operations = this.listWorktreeOperations(binding.managedWorktreeId);
+        if (
+          operations.length === 0 ||
+          operations.every(
+            (entry) =>
+              entry.state === "acknowledged" &&
+              entry.request.kind === "reserve" &&
+              entry.result?.ok === false &&
+              !entry.result.worktree &&
+              !["binding_mismatch", "wrong_owner", "stale_revision"].includes(
+                entry.result.code,
+              ),
+          )
+        )
+          return;
+        throw new WorktreeConflict(
+          "worktree_unreconciled",
+          "Reconcile the managed workspace before purging this task.",
+        );
+      }
+      return;
+    }
+    const safe = worktree.state === "removed" || Boolean(worktree.abandonedAt);
+    this.putWorktreeTombstone({
+      worktreeId: worktree.id,
+      runId,
+      generation: worktree.generation,
+      path: worktree.path,
+      branchRef: worktree.branchRef,
+      nodeId: worktree.nodeId,
+      state: safe ? (worktree.abandonedAt ? "abandoned" : "reconciled") : "pending",
+      createdAt: new Date().toISOString(),
+      reconciledAt: safe ? new Date().toISOString() : "",
+    });
+    if (!safe)
+      throw new WorktreeConflict(
+        "worktree_retained",
+        "Clean up or explicitly abandon the owned worktree before purging this task. Its cleanup tombstone has been retained.",
+      );
+  }
+
+  setRunWorkspaceBinding(runId: string, value: RunWorkspaceBinding): void {
+    const parsed = RunWorkspaceBindingSchema.parse(value);
+    const current = this.getRun(runId)?.workspaceBinding;
+    if (
+      current &&
+      (current.requestedMode !== parsed.requestedMode ||
+        current.effectiveMode !== parsed.effectiveMode ||
+        current.resolutionSource !== parsed.resolutionSource ||
+        (current.sourcePlacementId &&
+          current.sourcePlacementId !== parsed.sourcePlacementId) ||
+        (current.baseSha && current.baseSha !== parsed.baseSha) ||
+        (current.checkoutKey && current.checkoutKey !== parsed.checkoutKey) ||
+        (current.resolvedPath && current.resolvedPath !== parsed.resolvedPath) ||
+        (current.managedWorktreeId &&
+          current.managedWorktreeId !== parsed.managedWorktreeId) ||
+        (current.generation && current.generation !== parsed.generation))
+    )
+      throw new WorktreeConflict(
+        "binding_immutable",
+        "The task's resolved workspace cannot be changed.",
+      );
+    this.statement("UPDATE runs SET workspace_binding=?,updated_at=? WHERE id=?").run(
+      JSON.stringify(parsed),
+      new Date().toISOString(),
+      runId,
+    );
+  }
+
+  setSessionExecutionBinding(sessionId: string, value: ExecutionBinding): void {
+    const parsed = ExecutionBindingSchema.parse(value);
+    assertExecutionBinding(this.getSession(sessionId)?.executionBinding, parsed);
+    this.statement("UPDATE sessions SET execution_binding=? WHERE id=?").run(
+      JSON.stringify(parsed),
+      sessionId,
+    );
+  }
+
   setDefaultYolo(yolo: boolean): void {
     this.setSetting("defaults.yolo", yolo ? "1" : "0");
   }
@@ -1208,6 +1523,8 @@ export class FleetStore {
       ...(input.publicUrl ? { publicUrl: input.publicUrl } : {}),
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
       defaults: {
+        managedWorktreesEnabled: this.getManagedWorktreesEnabled(),
+        managedWorktreePolicy: this.getManagedWorktreePolicy(),
         yolo: this.getDefaultYolo(),
         agencyMode: this.getAgencyMode(),
         autoResume: this.getAutoResume(),
@@ -1252,6 +1569,10 @@ export class FleetStore {
           "SELECT * FROM run_steps ORDER BY run_id,position,created_at",
         ).all() as Row[]
       ).map(runStepFromRow),
+      managedWorktrees: this.listManagedWorktrees(),
+      worktreeOperations: this.listWorktreeOperations(),
+      worktreeIntegrations: this.listWorktreeIntegrations(),
+      worktreeTombstones: this.listWorktreeTombstones(),
       runNotes: (
         this.statement(
           "SELECT * FROM run_notes ORDER BY run_id,created_at",
@@ -1350,7 +1671,7 @@ export class FleetStore {
       );
     }
     this.db.exec(
-      "DELETE FROM session_dispatch_attempts; DELETE FROM session_turn_completions; DELETE FROM session_transition_intents; DELETE FROM notification_preferences; DELETE FROM notifications; DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
+      "DELETE FROM managed_api_requests; DELETE FROM session_dispatch_attempts; DELETE FROM session_turn_completions; DELETE FROM session_transition_intents; DELETE FROM notification_preferences; DELETE FROM notifications; DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
     );
     /*
      * Settings are replaced wholesale except the ones that decide who may
@@ -1376,6 +1697,10 @@ export class FleetStore {
       this.setSetting("tunnel.devtunnel.id", tunnelIds.devtunnel);
     }
     this.setDefaultYolo(parsed.defaults.yolo);
+    this.setManagedWorktreesEnabled(parsed.defaults.managedWorktreesEnabled ?? false);
+    this.setManagedWorktreePolicy(
+      parsed.defaults.managedWorktreePolicy ?? ManagedWorktreePolicySchema.parse({}),
+    );
     this.setAgencyMode(parsed.defaults.agencyMode);
     this.setAutoResume(parsed.defaults.autoResume);
     this.setDefaultNotificationLifecycleEnabled(
@@ -1466,6 +1791,11 @@ export class FleetStore {
         session.favorite ? 1 : 0,
         session.lastActivityAt ?? session.updatedAt,
       );
+      if (session.executionBinding?.worktreeId)
+        this.statement("UPDATE sessions SET execution_binding=? WHERE id=?").run(
+          JSON.stringify({ ...session.executionBinding, quarantined: true }),
+          session.id,
+        );
     }
     for (const event of parsed.events) {
       this.statement(
@@ -1511,6 +1841,20 @@ export class FleetStore {
         run.createdAt,
         run.updatedAt,
       );
+      const binding = run.workspaceBinding ?? resolveWorkspaceMode(undefined, false);
+      this.statement("UPDATE runs SET workspace_binding=? WHERE id=?").run(
+        JSON.stringify(
+          binding.effectiveMode === "managed"
+            ? {
+                ...binding,
+                initialization: "quarantined",
+                error:
+                  "Restored metadata requires explicit Node reconciliation; no worktree files were backed up.",
+              }
+            : binding,
+        ),
+        run.id,
+      );
     }
     for (const step of parsed.runSteps) {
       this.statement(
@@ -1540,12 +1884,47 @@ export class FleetStore {
         step.createdAt,
         step.updatedAt,
       );
+      if (step.executionBinding?.worktreeId)
+        this.statement("UPDATE run_steps SET execution_binding=? WHERE id=?").run(
+          JSON.stringify({ ...step.executionBinding, quarantined: true }),
+          step.id,
+        );
     }
     // After the runs they reference, or the foreign key rejects them.
     for (const note of parsed.runNotes) {
       this.statement(
         "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
       ).run(note.id, note.runId, note.phaseIndex, note.body, note.createdAt);
+    }
+    // Filesystem ownership records deliberately have no cascading Run foreign key.
+    for (const tree of [
+      ...this.listManagedWorktrees(),
+      ...(parsed.managedWorktrees ?? []),
+    ]) {
+      this.putManagedWorktree({
+        ...tree,
+        version: Math.max(tree.version, this.getManagedWorktree(tree.id)?.version ?? 0),
+        state: "quarantined",
+        error: "Explicit reconciliation required after restore.",
+      });
+    }
+    for (const operation of parsed.worktreeOperations ?? []) {
+      this.statement(
+        "INSERT OR IGNORE INTO worktree_operations (id,worktree_id,data) VALUES (?,?,?)",
+      ).run(
+        operation.request.operationId,
+        operation.request.worktreeId,
+        JSON.stringify({ ...operation, state: "quarantined" }),
+      );
+    }
+    for (const integration of parsed.worktreeIntegrations ?? []) {
+      this.putWorktreeIntegration({ ...integration, state: "needs_reconciliation" });
+    }
+    for (const tombstone of [
+      ...this.listWorktreeTombstones(),
+      ...(parsed.worktreeTombstones ?? []),
+    ]) {
+      this.putWorktreeTombstone({ ...tombstone, state: "quarantined" });
     }
     for (const notification of parsed.notifications) {
       this.insertNotificationRow(notification);
@@ -2707,6 +3086,7 @@ export class FleetStore {
    * any non-terminal session is still attached so we never yank a live agent.
    */
   deleteWorkspace(id: string): void {
+    this.assertManagedCatalogMutable("workspaceId", id);
     assertNotReserved(id, "deleted");
     this.assertNoLiveSessions("workspace_id", id, "workspace");
     this.transaction(() => {
@@ -2845,6 +3225,7 @@ export class FleetStore {
     localPath?: string,
     workspaceId?: string,
   ): Placement | undefined {
+    this.assertManagedCatalogMutable("sourcePlacementId", id);
     const existing = this.getPlacement(id);
     // Both directions: a chat checkout is the node's own home directory and is
     // not an operator's to repath or refile, and a project checkout moved into
@@ -2901,6 +3282,7 @@ export class FleetStore {
   }
 
   deletePlacement(id: string): void {
+    this.assertManagedCatalogMutable("sourcePlacementId", id);
     const existing = this.getPlacement(id);
     if (existing) {
       assertNotReserved(existing.workspaceId, "stripped of its checkouts by hand");
@@ -2917,6 +3299,7 @@ export class FleetStore {
    * disconnect the WebSocket first if the node is currently online.
    */
   deleteNode(id: string): void {
+    this.assertManagedCatalogMutable("nodeId", id);
     this.assertNoLiveSessions("node_id", id, "node");
     this.transaction(() => {
       this.deleteSessionsWhere("node_id", id);
@@ -2932,6 +3315,37 @@ export class FleetStore {
        WHERE p.id=?`,
     ).get(id) as Row | undefined;
     return row ? placementFromRow(row) : undefined;
+  }
+
+  private assertManagedCatalogMutable(
+    field: "nodeId" | "workspaceId" | "sourcePlacementId",
+    id: string,
+  ): void {
+    if (
+      this.listManagedWorktrees().some(
+        (tree) => tree[field] === id && tree.state !== "removed" && !tree.abandonedAt,
+      ) ||
+      this.listRuns().some((run) => {
+        const binding = run.workspaceBinding;
+        if (
+          binding?.effectiveMode !== "managed" ||
+          !binding.sourcePlacementId ||
+          this.worktreeForRun(run.id)
+        )
+          return false;
+        const source = this.getPlacement(binding.sourcePlacementId);
+        return field === "sourcePlacementId"
+          ? binding.sourcePlacementId === id
+          : field === "workspaceId"
+            ? run.workspaceId === id
+            : source?.nodeId === id;
+      })
+    ) {
+      throw new WorktreeConflict(
+        "managed_catalog_in_use",
+        "Retained worktree ownership depends on this catalog identity. Clean up or explicitly abandon it before moving or deleting the source.",
+      );
+    }
   }
 
   listPlacements(): Placement[] {
@@ -3004,6 +3418,16 @@ export class FleetStore {
       ).get(agentSessionId) as Row | undefined;
       if (existingRow) {
         let session = sessionFromRow(existingRow);
+        if (
+          session.executionBinding &&
+          (session.placementId !== placement.id ||
+            session.nodeId !== placement.nodeId ||
+            session.workspaceId !== placement.workspaceId)
+        )
+          throw new WorktreeConflict(
+            "binding_immutable",
+            "An adopted conversation with an execution binding cannot move to another placement.",
+          );
         this.assertSessionMutable(session.id);
         const alreadyLive = liveSessionStates.has(session.state);
         if (!alreadyLive) {
@@ -3773,6 +4197,10 @@ export class FleetStore {
    * spends that authorisation instead of asking again.
    */
   createRun(input: {
+    id?: string;
+    workspaceMode?: WorkspaceMode | undefined;
+    accessIntent?: "checkout" | "no-checkout" | undefined;
+    sourcePlacementId?: string | undefined;
     workspaceId: string;
     name: string;
     objective: string;
@@ -3785,7 +4213,7 @@ export class FleetStore {
     stopWhen?: string | undefined;
   }): Run {
     const now = new Date().toISOString();
-    const id = randomUUID();
+    const id = input.id ?? randomUUID();
     const policy = RunPolicySchema.parse(input.policy ?? {});
     this.statement(
       `INSERT INTO runs
@@ -3803,6 +4231,20 @@ export class FleetStore {
       input.stopWhen ?? "",
       now,
       now,
+    );
+    const binding = resolveWorkspaceMode(
+      input.workspaceMode,
+      this.getManagedWorktreesEnabled(),
+      input.accessIntent,
+    );
+    binding.sourcePlacementId = input.sourcePlacementId ?? "";
+    if (binding.effectiveMode === "managed") {
+      binding.managedWorktreeId = `worktree-${id}`;
+      binding.generation = 1;
+    }
+    this.statement("UPDATE runs SET workspace_binding=? WHERE id=?").run(
+      JSON.stringify(binding),
+      id,
     );
     return this.getRun(id)!;
   }
@@ -4158,6 +4600,7 @@ export class FleetStore {
         | "eventSeqFrom"
         | "stoppedByOrchestrator"
         | "dispatchedAt"
+        | "executionBinding"
       >
     >,
   ): RunStep | undefined {
@@ -4165,6 +4608,8 @@ export class FleetStore {
     if (!current) return undefined;
     this.assertRunMutable(current.runId);
     if (patch.sessionId) this.assertSessionMutable(patch.sessionId);
+    if (patch.executionBinding)
+      assertExecutionBinding(current.executionBinding, patch.executionBinding);
     const columns: Record<string, unknown> = {
       state: patch.state,
       session_id: patch.sessionId,
@@ -4178,6 +4623,10 @@ export class FleetStore {
             ? 1
             : 0,
       dispatched_at: patch.dispatchedAt,
+      execution_binding:
+        patch.executionBinding === undefined
+          ? undefined
+          : JSON.stringify(patch.executionBinding),
     };
     const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
     if (entries.length === 0) return this.getRunStep(id);
@@ -4204,6 +4653,7 @@ export class FleetStore {
 
   /** Deletes a run, its steps, and its notes. Callers stop live sessions first. */
   deleteRun(id: string): boolean {
+    this.assertWorktreePurgeAllowed(id);
     return this.transaction(() => {
       if (!this.getRun(id)) return false;
       this.assertRunMutable(id);
@@ -4734,6 +5184,9 @@ function placementFromRow(row: Row): Placement {
 
 function sessionFromRow(row: Row): FleetSession {
   return SessionSchema.parse({
+    executionBinding: row.execution_binding
+      ? JSON.parse(String(row.execution_binding))
+      : undefined,
     id: String(row.id),
     workspaceId: String(row.workspace_id),
     workspaceName: String(row.workspace_name),
@@ -4770,6 +5223,7 @@ function runFromRow(row: Row): Run {
   // run finished instead of waking it.
   const stored = tryParseJson(String(row.policy ?? ""));
   return RunSchema.parse({
+    workspaceBinding: JSON.parse(String(row.workspace_binding || "{}")),
     id: String(row.id),
     workspaceId: String(row.workspace_id),
     name: String(row.name),
@@ -4797,6 +5251,9 @@ function runFromRow(row: Row): Run {
 
 function runStepFromRow(row: Row): RunStep {
   return RunStepSchema.parse({
+    executionBinding: row.execution_binding
+      ? JSON.parse(String(row.execution_binding))
+      : undefined,
     id: String(row.id),
     runId: String(row.run_id),
     stepKey: String(row.step_key),
@@ -4817,6 +5274,25 @@ function runStepFromRow(row: Row): RunStep {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
   });
+}
+
+function assertExecutionBinding(
+  current: ExecutionBinding | undefined,
+  next: ExecutionBinding,
+): void {
+  if (
+    current &&
+    (current.worktreeId !== next.worktreeId ||
+      current.generation !== next.generation ||
+      current.cwd !== next.cwd ||
+      current.checkoutKey !== next.checkoutKey ||
+      current.sourcePlacementId !== next.sourcePlacementId ||
+      current.accessClass !== next.accessClass)
+  )
+    throw new WorktreeConflict(
+      "binding_immutable",
+      "A session or step cannot move to another checkout.",
+    );
 }
 
 function runNoteFromRow(row: Row): RunNote {

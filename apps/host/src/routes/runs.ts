@@ -5,6 +5,8 @@ import {
   canTransitionRun,
   terminalRunStates,
   terminalSessionStates,
+  WorkspaceModeSchema,
+  isChatsWorkspace,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
@@ -12,6 +14,9 @@ import { archiveRun, purgeRun } from "../orchestrator/lifecycle.js";
 import { reopenPrompt } from "../orchestrator/review.js";
 
 const CreateRunSchema = z.object({
+  operationId: z.string().uuid().optional(),
+  workspaceMode: WorkspaceModeSchema.default("auto"),
+  sourcePlacementId: z.string().optional(),
   workspaceId: z.string().min(1),
   name: z.string().min(1).max(120),
   objective: z.string().min(1).max(4_000),
@@ -75,14 +80,49 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     if (!store.getWorkspace(input.workspaceId)) {
       return reply.code(404).send({ error: "Workspace not found" });
     }
-    const run = store.createRun({
-      workspaceId: input.workspaceId,
-      name: input.name,
-      objective: input.objective,
-      ...(input.policy ? { policy: input.policy } : {}),
+    if (input.operationId) {
+      const replay = store.managedApiReplay("create-run", input.operationId, input) as
+        { runId: string } | undefined;
+      if (replay) return reply.code(201).send(store.getRun(replay.runId));
+    }
+    if (
+      input.sourcePlacementId &&
+      store.getPlacement(input.sourcePlacementId)?.workspaceId !== input.workspaceId
+    )
+      return reply.code(409).send({
+        code: "source_mismatch",
+        error: "The source placement must belong to the requested workspace.",
+      });
+    if (
+      !isChatsWorkspace(input.workspaceId) &&
+      (input.workspaceMode === "managed" ||
+        (input.workspaceMode === "auto" && store.getManagedWorktreesEnabled())) &&
+      !input.operationId
+    ) {
+      return reply.code(409).send({
+        code: "idempotency_required",
+        error: "Managed task creation requires an operationId.",
+      });
+    }
+    const run = store.writeAtomically(() => {
+      const created = store.createRun({
+        workspaceMode: input.workspaceMode,
+        sourcePlacementId: input.sourcePlacementId,
+        accessIntent: isChatsWorkspace(input.workspaceId) ? "no-checkout" : "checkout",
+        workspaceId: input.workspaceId,
+        name: input.name,
+        objective: input.objective,
+        ...(input.policy ? { policy: input.policy } : {}),
+      });
+      if (input.operationId)
+        store.recordManagedApiRequest("create-run", input.operationId, input, {
+          runId: created.id,
+        });
+      return created;
     });
+    await service.worktrees.prepare(run.id);
     service.publishRun(run);
-    return reply.code(201).send(run);
+    return reply.code(201).send(store.getRun(run.id)!);
   });
 
   app.get("/api/runs/:id", async (request, reply) => {

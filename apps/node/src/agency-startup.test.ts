@@ -5,6 +5,7 @@ import type { SessionEvent } from "@fleet/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AcpAgentFactory, type SessionAgent } from "./agents.js";
 import type * as copilotLaunch from "./copilot-launch.js";
+import { stopProcessTree } from "./process-quiescence.js";
 
 const installation = vi.hoisted(() => ({
   path: "C:\\Program Files\\Agency\\agency.exe" as string | undefined,
@@ -21,6 +22,11 @@ vi.mock("./copilot-launch.js", async (importOriginal) => {
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof childProcess>()),
   spawn: vi.fn(),
+}));
+vi.mock("./process-quiescence.js", () => ({
+  stopProcessTree: vi.fn(async (child: ChildProcess) => {
+    child.kill();
+  }),
 }));
 
 type RpcRequest = {
@@ -312,6 +318,7 @@ describe("Agency ACP startup", () => {
       }),
     ).rejects.toThrow(/agency copilot.*\/login/);
     expect(processes.every(({ command }) => command === installation.path)).toBe(true);
+    expect(stopProcessTree).toHaveBeenCalledWith(launches()[0]?.child, false);
     expect(launches()[0]?.child.kill).toHaveBeenCalled();
     expect(events.some((event) => event.payload.state === "failed")).toBe(true);
   });

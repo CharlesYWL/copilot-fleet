@@ -434,6 +434,30 @@ export class NotificationService {
     });
   }
 
+  createWorktreeAttention(
+    runId: string,
+    identity: string,
+    reason: "creation" | "conflict" | "reconciliation",
+  ): InsertNotificationResult {
+    return this.insert({
+      sourceKey: `managed_worktree_attention:${runId}:${identity}:${reason}`,
+      category: "orchestration",
+      kind: "managed_worktree_attention",
+      severity: "warning",
+      title: "Managed task needs attention",
+      body:
+        reason === "creation"
+          ? "Worktree creation was blocked. Open the task to check Node compatibility and retry safely."
+          : reason === "conflict"
+            ? "Merge conflicts require an explicit resolution or abort. Open the task for recovery controls."
+            : "Workspace ownership needs reconciliation. Open the task; no automatic overwrite or deletion was attempted.",
+      subject: { type: "run", id: runId, label: "Managed task" },
+      navigation: { type: "run", runId },
+      data: { runId, reason },
+      createdAt: new Date().toISOString(),
+    });
+  }
+
   markRead(id: string): NotificationMutation | undefined {
     const before = this.store.getNotification(id);
     if (!before) return undefined;
