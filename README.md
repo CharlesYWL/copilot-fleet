@@ -43,6 +43,7 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [tunnels and who can reach the sign-in page](#tunnels-and-who-can-reach-the-sign-in-page)
   and [following a moved Host URL](#following-the-host-to-a-new-url).
 - **Connect or maintain machines:** [Windows Node](#windows-node-powershell),
+  [Windows login startup](#windows-login-startup),
   [Node command-line flags](#node-command-line-flags),
   [Node config page](#node-config-page), and
   [keeping nodes up to date](#keeping-nodes-up-to-date).
@@ -320,7 +321,7 @@ of them on one Windows machine, or split Host and Node across machines.
 - **Something needs attention:** use the notification bell, the amber
   Orchestrator/task state, the permission banner in the session, and
   **Settings → Diagnostics** for Host warnings/errors. The Node's own
-  `http://127.0.0.1:8788` config page shows Node-side logs when you can reach
+  config page (port 8788 by default; its actual URL is printed at startup) shows Node-side logs when you can reach
   that machine.
 
 ## Agency mode
@@ -718,6 +719,39 @@ to `Chats (2)` so the reserved name is free.
 An orchestrator can use it too — see
 [Chats as a destination](#chats-as-a-destination).
 
+## Windows login startup
+
+Start automatically **after signing into Windows**, using your current account
+and existing GitHub/Copilot/Dev Tunnels credentials. In **Nodes > Connect a
+machine**, copy the **npm run service -- node** command block to use a
+command that builds, enrolls, and starts the Node without a foreground
+connect/Ctrl+C step. The **npm run start:node** block keeps the existing direct
+launch. Both blocks are shown together, each with its own Copy button.
+
+```powershell
+npm run service -- node --devtunnel="<tunnel-id>" --host-id="<host-id>" --host-fingerprint="<sha256>" --enrollment-grant="<id.secret>"
+```
+
+Use `--url="<host-url>"` instead of `--devtunnel` for a direct endpoint. The
+service command accepts the same connection and settings flags as `start:node`;
+enrollment grants/tokens are used only during setup and are never saved in the
+scheduled task. The normal Node identity and settings are saved for later starts.
+For an already enrolled Node, stop manual instances first and choose one:
+
+```powershell
+npm run service -- node install --existing-node
+npm run service -- host+node install --existing-node
+```
+
+Installation builds, registers same-user scheduled tasks, and starts them now.
+Use `status`, `logs`, `stop`, `start`, `restart`, or `uninstall` instead of
+`install`. Stop disables automatic starts until `start`; uninstall preserves
+your data. No Windows password or separate service credential file is required.
+This does not run before Windows sign-in.
+
+See [Windows login startup](docs/windows-login-startup.md) for options, lifecycle
+details, credential caveats, and all historical design references.
+
 ## Windows Node (PowerShell)
 
 Install Node.js, then run `copilot update` and `copilot login` as the same OS
@@ -1050,7 +1084,8 @@ can still reach the Host. A named hostname / `FLEET_PUBLIC_URL` / Tailscale Funn
 address is copied into the archive; a rotating quick-tunnel URL (`*.trycloudflare.com`,
 free ngrok, bore) is not — those nodes would have to be retargeted by hand.
 
-**Node** — the local config page (`http://127.0.0.1:8788`) → **Export identity**.
+**Node** — the local config page (use the URL printed at startup; default
+`http://127.0.0.1:8788`) → **Export identity**.
 That file is `node.json` plus `settings.json` for this machine. Import on the new
 box replaces this process's identity and reconnects. Placement paths stay whatever
 the Host already stored for that node id; update them if the checkout lives
@@ -1145,8 +1180,15 @@ responsible for deleting its own data through its supported API.
 
 ### Node config page
 
-Each node serves a small settings page at `http://127.0.0.1:8788` (override the
-port with `FLEET_NODE_CONFIG_PORT`). Use it to retarget the node when a tunnel
+Each node serves a small settings page starting at `http://127.0.0.1:8788`.
+If that port is occupied, it tries up to 20 consecutive ports and prints the
+actual URL. An exhausted range is reported explicitly; it never scans past 65535.
+Set the preferred starting port with `--config-port` or `FLEET_NODE_CONFIG_PORT`.
+Service enrollment/start also prints the collision notices and final config URL;
+these are kept in the Node's runtime log. This is separate from the Host API's
+port 8787, which is not automatically moved.
+
+Use the config page to retarget the node when a tunnel
 hands out a new URL — the node reconnects in place, so no restart is needed and
 running sessions survive.
 

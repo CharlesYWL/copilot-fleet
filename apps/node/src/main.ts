@@ -4,18 +4,10 @@ import { join } from "node:path";
 import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
 import {
-  HOST_URL_SYNC_CAPABILITY,
-  MANAGED_WORKTREES_CAPABILITY,
   HostHandshakeFrameSchema,
   HostToNodeMessageSchema,
   MUTUAL_AUTH_PROTOCOL,
-  NODE_NAME_SYNC_CAPABILITY,
   NodeToHostMessageSchema,
-  OUTBOX_ACK_CAPABILITY,
-  SELF_UPDATE_CAPABILITY,
-  SESSION_ACTIVITY_CAPABILITY,
-  SESSION_CONFIG_CAPABILITY,
-  SESSION_RETENTION_CAPABILITY,
   decodeFrame,
   errorMessage,
   sameHostUrl,
@@ -70,6 +62,7 @@ import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { ManagedWorktrees } from "./managed-worktrees.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { EventOutbox } from "./outbox.js";
+import { NODE_CAPABILITIES } from "./node-capabilities.js";
 import {
   closeQuietly,
   flushReconnectOutbox,
@@ -100,18 +93,6 @@ import {
 
 const VERSION = packageVersion();
 const REVISION = gitRevision();
-const NODE_CAPABILITIES = [
-  MANAGED_WORKTREES_CAPABILITY,
-  "copilot-acp",
-  "host-yolo",
-  HOST_URL_SYNC_CAPABILITY,
-  SELF_UPDATE_CAPABILITY,
-  NODE_NAME_SYNC_CAPABILITY,
-  SESSION_ACTIVITY_CAPABILITY,
-  SESSION_CONFIG_CAPABILITY,
-  SESSION_RETENTION_CAPABILITY,
-  OUTBOX_ACK_CAPABILITY,
-];
 const RECONNECT_DELAY_MS = 2_000;
 /**
  * Dials that never reached the Host before the tunnel is assumed dead.

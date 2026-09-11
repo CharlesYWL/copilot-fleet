@@ -12,6 +12,17 @@ import {
 } from "./managed-worktrees.js";
 export * from "./managed-worktrees.js";
 
+/** Local startup events consumed by the service CLI, independent of log formatting. */
+export const CONFIG_UI_EVENT_MARKER = "FLEET_CONFIG_UI ";
+const configPort = z.number().int().min(1).max(65535);
+export const ConfigUiEventSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("starting") }),
+  z.object({ type: z.literal("retry"), port: configPort, nextPort: configPort }),
+  z.object({ type: z.literal("ready"), url: z.string().url() }),
+  z.object({ type: z.literal("error"), message: z.string().min(1).max(2000) }),
+]);
+export type ConfigUiEvent = z.infer<typeof ConfigUiEventSchema>;
+
 /**
  * Standard base64, bounded.
  *

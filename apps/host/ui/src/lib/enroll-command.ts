@@ -82,13 +82,21 @@ export type ConnectCommandFields = {
  * grant is single-use, expires, and authorises exactly the key the node is
  * about to generate.
  */
-export function keyEnrollCommand(fields: ConnectCommandFields): string {
+export type NodeLaunchMode = "direct" | "service";
+
+export function keyEnrollCommand(
+  fields: ConnectCommandFields,
+  mode: NodeLaunchMode = "direct",
+): string {
   const flags = [
     dialFlag(fields.hostUrl, fields.tunnelId),
     `--host-id="${fields.hostId}"`,
     `--host-fingerprint="${fields.hostFingerprint}"`,
     `--enrollment-grant="${fields.enrollmentGrant}"`,
   ].join(" ");
+  if (mode === "service") {
+    return ["npm install", `npm run service -- node ${flags}`].join("\n");
+  }
   return ["npm install", "npm run build:node", `npm run start:node -- ${flags}`].join(
     "\n",
   );

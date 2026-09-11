@@ -60,6 +60,39 @@ describe("keyEnrollCommand", () => {
     expect(tunnelled).not.toContain(DEVTUNNEL_URL);
     expect(tunnelled).toContain(`--host-fingerprint="${FINGERPRINT}"`);
   });
+
+  it("offers a single service setup command without a foreground connect/stop step", () => {
+    const service = keyEnrollCommand(
+      {
+        hostUrl: URL,
+        hostId: "host-1",
+        hostFingerprint: FINGERPRINT,
+        enrollmentGrant: GRANT,
+      },
+      "service",
+    );
+    expect(service).toContain(`npm run service -- node --url="${URL}"`);
+    expect(service).toContain(`--enrollment-grant="${GRANT}"`);
+    expect(service).not.toContain("start:node");
+    expect(service).not.toContain("--existing-node");
+    expect(service).not.toContain("build:node");
+  });
+
+  it("keeps the same pin and private tunnel in the service variant", () => {
+    const service = keyEnrollCommand(
+      {
+        hostUrl: DEVTUNNEL_URL,
+        hostId: "host-1",
+        hostFingerprint: FINGERPRINT,
+        enrollmentGrant: GRANT,
+        tunnelId: TUNNEL_ID,
+      },
+      "service",
+    );
+    expect(service).toContain(`npm run service -- node --devtunnel="${TUNNEL_ID}"`);
+    expect(service).toContain(`--host-fingerprint="${FINGERPRINT}"`);
+    expect(service).not.toContain(DEVTUNNEL_URL);
+  });
 });
 
 describe("enrollCommand", () => {
