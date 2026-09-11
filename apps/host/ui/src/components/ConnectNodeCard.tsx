@@ -19,6 +19,7 @@ import {
   isDevTunnelUrl,
   isLocalOnlyHostUrl,
   keyEnrollCommand,
+  type NodeLaunchMode,
 } from "../lib/enroll-command";
 import { terminal } from "../theme";
 import { CopyButton } from "./CopyButton";
@@ -40,13 +41,29 @@ const useStyles = makeStyles({
   urlField: {
     maxWidth: "520px",
   },
-  commandRow: {
+  commandBlock: {
     display: "flex",
-    alignItems: "flex-start",
+    flexDirection: "column",
+    gap: "10px",
+    minWidth: 0,
+    padding: "14px",
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: tokens.borderRadiusMedium,
+    background: tokens.colorNeutralBackground2,
+  },
+  commandHeader: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    flexWrap: "wrap",
     gap: "12px",
   },
+  commandTitle: {
+    margin: 0,
+    fontFamily: terminal.font,
+  },
   command: {
-    flexGrow: 1,
+    minWidth: 0,
     margin: 0,
     padding: "14px 16px",
     borderRadius: tokens.borderRadiusMedium,
@@ -72,6 +89,28 @@ const useStyles = makeStyles({
     wordBreak: "break-all",
   },
 });
+
+const launchMethods: readonly {
+  mode: NodeLaunchMode;
+  label: string;
+  invocation: string;
+  description: string;
+}[] = [
+  {
+    mode: "direct",
+    label: "npm start",
+    invocation: "npm run start:node",
+    description:
+      "Run in this terminal. Works in PowerShell and bash; keep the terminal open. Ctrl+C stops the Node.",
+  },
+  {
+    mode: "service",
+    label: "npm service",
+    invocation: "npm run service -- node",
+    description:
+      "Windows service mode: builds, enrolls, and starts now, then starts automatically at Windows sign-in. No terminal needs to stay open.",
+  },
+];
 
 type IssuedGrant = {
   id: string;
@@ -117,7 +156,6 @@ export const ConnectNodeCard = () => {
   if (!enrollment) return null;
 
   const devTunnel = isDevTunnelUrl(hostUrl);
-  const command = grant ? keyEnrollCommand({ ...grant.command, hostUrl }) : "";
 
   const issue = async () => {
     setBusy(true);
@@ -141,9 +179,8 @@ export const ConnectNodeCard = () => {
         <br />
         <Text className={styles.caption}>
           Run this from a Copilot Fleet checkout that has Node.js and a signed-in Copilot
-          CLI — the same lines work in bash and PowerShell. The node registers itself
-          under the machine&apos;s own hostname, generates its own key, and pins this
-          Host&apos;s fingerprint.
+          CLI. The node registers itself under the machine&apos;s own hostname, generates
+          its own key, and pins this Host&apos;s fingerprint.
         </Text>
       </div>
 
@@ -192,21 +229,49 @@ export const ConnectNodeCard = () => {
           <Button appearance="primary" disabled={busy} onClick={() => void issue()}>
             {busy ? "Creating…" : "Generate a connect command"}
           </Button>
-          <Text className={styles.caption}>One machine, one use, fifteen minutes.</Text>
+          <Text className={styles.caption}>
+            Includes npm start and npm service commands. One machine, one use, fifteen
+            minutes.
+          </Text>
         </div>
       ) : (
         <>
-          <div className={styles.commandRow}>
-            <pre className={styles.command} aria-label="Connect command">
-              {command}
-            </pre>
-            <CopyButton
-              text={command}
-              label="Copy the connect command"
-              appearance="primary"
-              showText
-            />
-          </div>
+          <Text weight="semibold">Choose and copy one command</Text>
+          <Text className={styles.caption}>
+            Both options use the same one-use grant for one machine. Copy the launch
+            method you want; you do not need to run both.
+          </Text>
+          {launchMethods.map((method) => {
+            const command = keyEnrollCommand({ ...grant.command, hostUrl }, method.mode);
+            return (
+              <section
+                className={styles.commandBlock}
+                aria-label={method.label}
+                key={method.mode}
+              >
+                <div className={styles.commandHeader}>
+                  <Text
+                    as="h3"
+                    size={400}
+                    weight="semibold"
+                    className={styles.commandTitle}
+                  >
+                    {method.invocation}
+                  </Text>
+                  <CopyButton
+                    text={command}
+                    label={`Copy ${method.label} command`}
+                    appearance={method.mode === "service" ? "primary" : "secondary"}
+                    showText
+                  />
+                </div>
+                <Text className={styles.caption}>{method.description}</Text>
+                <pre className={styles.command} aria-label={`${method.label} command`}>
+                  {command}
+                </pre>
+              </section>
+            );
+          })}
           <div className={styles.actions}>
             <Text className={styles.caption}>
               Expires at {expiryLabel(grant.expiresAt)}, or as soon as one machine uses

@@ -43,6 +43,7 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [tunnels and who can reach the sign-in page](#tunnels-and-who-can-reach-the-sign-in-page)
   and [following a moved Host URL](#following-the-host-to-a-new-url).
 - **Connect or maintain machines:** [Windows Node](#windows-node-powershell),
+  [Windows login startup](#windows-login-startup),
   [Node command-line flags](#node-command-line-flags),
   [Node config page](#node-config-page), and
   [keeping nodes up to date](#keeping-nodes-up-to-date).
@@ -717,6 +718,39 @@ to `Chats (2)` so the reserved name is free.
 
 An orchestrator can use it too — see
 [Chats as a destination](#chats-as-a-destination).
+
+## Windows login startup
+
+Start automatically **after signing into Windows**, using your current account
+and existing GitHub/Copilot/Dev Tunnels credentials. In **Nodes > Connect a
+machine**, copy the **npm run service -- node** command block to use a
+command that builds, enrolls, and starts the Node without a foreground
+connect/Ctrl+C step. The **npm run start:node** block keeps the existing direct
+launch. Both blocks are shown together, each with its own Copy button.
+
+```powershell
+npm run service -- node --devtunnel="<tunnel-id>" --host-id="<host-id>" --host-fingerprint="<sha256>" --enrollment-grant="<id.secret>"
+```
+
+Use `--url="<host-url>"` instead of `--devtunnel` for a direct endpoint. The
+service command accepts the same connection and settings flags as `start:node`;
+enrollment grants/tokens are used only during setup and are never saved in the
+scheduled task. The normal Node identity and settings are saved for later starts.
+For an already enrolled Node, stop manual instances first and choose one:
+
+```powershell
+npm run service -- node install --existing-node
+npm run service -- host+node install --existing-node
+```
+
+Installation builds, registers same-user scheduled tasks, and starts them now.
+Use `status`, `logs`, `stop`, `start`, `restart`, or `uninstall` instead of
+`install`. Stop disables automatic starts until `start`; uninstall preserves
+your data. No Windows password or separate service credential file is required.
+This does not run before Windows sign-in.
+
+See [Windows login startup](docs/windows-login-startup.md) for options, lifecycle
+details, credential caveats, and all historical design references.
 
 ## Windows Node (PowerShell)
 
