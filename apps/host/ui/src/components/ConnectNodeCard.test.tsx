@@ -126,14 +126,15 @@ describe("ConnectNodeCard", () => {
       await screen.findByRole("button", { name: /generate a connect command/i }),
     );
 
-    const command = await screen.findByLabelText("Connect command");
-    expect(command.textContent).toContain('--host-id="host-1"');
-    expect(command.textContent).toContain(`--host-fingerprint="${"b".repeat(64)}"`);
-    expect(command.textContent).toContain('--enrollment-grant="grant-1.grant-secret"');
-    // The legacy credential is a fleet-wide reusable secret; a new machine has
-    // no use for one, and pasting it here is how it reaches a stranger's relay.
-    expect(command.textContent).not.toContain("legacy-fleet-token");
-    expect(command.textContent).not.toContain("--token=");
+    for (const label of ["npm start command", "npm service command"]) {
+      const command = await screen.findByLabelText(label);
+      expect(command.textContent).toContain('--host-id="host-1"');
+      expect(command.textContent).toContain(`--host-fingerprint="${"b".repeat(64)}"`);
+      expect(command.textContent).toContain('--enrollment-grant="grant-1.grant-secret"');
+      // Neither launch method should expose the old reusable fleet-wide token.
+      expect(command.textContent).not.toContain("legacy-fleet-token");
+      expect(command.textContent).not.toContain("--token=");
+    }
   });
 
   it("says when the grant stops working, and offers another", async () => {
@@ -143,7 +144,7 @@ describe("ConnectNodeCard", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: /generate a connect command/i }),
     );
-    await screen.findByLabelText("Connect command");
+    await screen.findByLabelText("npm start command");
 
     expect(screen.getByText(/expires/i)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /new command/i }));
@@ -159,22 +160,23 @@ describe("ConnectNodeCard", () => {
     );
   });
 
-  it("copies the command as one paste", async () => {
-    host();
-    show();
+  it.each(["npm start", "npm service"])(
+    "copies the %s command as one paste",
+    async (label) => {
+      host();
+      show();
 
-    fireEvent.click(
-      await screen.findByRole("button", { name: /generate a connect command/i }),
-    );
-    await screen.findByLabelText("Connect command");
-    fireEvent.click(screen.getByRole("button", { name: /copy the connect command/i }));
+      fireEvent.click(
+        await screen.findByRole("button", { name: /generate a connect command/i }),
+      );
+      const command = await screen.findByLabelText(`${label} command`);
+      fireEvent.click(screen.getByRole("button", { name: `Copy ${label} command` }));
 
-    await waitFor(() =>
-      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
-        expect.stringContaining("--enrollment-grant="),
-      ),
-    );
-  });
+      await waitFor(() =>
+        expect(navigator.clipboard.writeText).toHaveBeenCalledWith(command.textContent),
+      );
+    },
+  );
 
   it("copies exactly the displayed command after the Host URL is edited", async () => {
     host();
@@ -182,18 +184,77 @@ describe("ConnectNodeCard", () => {
     fireEvent.click(
       await screen.findByRole("button", { name: /generate a connect command/i }),
     );
-    const command = await screen.findByLabelText("Connect command");
+    const command = await screen.findByLabelText("npm start command");
     fireEvent.change(screen.getByLabelText("Host URL the node should dial"), {
       target: { value: "https://fleet.example.com" },
     });
     expect(command.textContent).toContain('--url="https://fleet.example.com"');
     expect(command.textContent).not.toContain("--devtunnel=");
-    fireEvent.click(screen.getByRole("button", { name: /copy the connect command/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Copy npm start command" }));
     await waitFor(() =>
       expect(navigator.clipboard.writeText).toHaveBeenCalledWith(command.textContent),
     );
   });
 
+  it("shows both launch methods with enabled copy buttons without another selection or grant", async () => {
+    const fetchMock = host();
+    show();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /generate a connect command/i }),
+    );
+    const direct = await screen.findByLabelText("npm start command");
+    const service = screen.getByLabelText("npm service command");
+    expect(direct.textContent).toContain("npm run start:node");
+    expect(service.textContent).toContain("npm run service -- node");
+    expect(service.textContent).toContain('--devtunnel="fleet-abc.usw2"');
+    expect(service.textContent).toContain('--enrollment-grant="grant-1.grant-secret"');
+    expect(service.textContent).not.toContain("npm run start:node");
+    expect(screen.getByRole("heading", { name: "npm run start:node" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "npm run service -- node" })).toBeTruthy();
+    expect(screen.queryByRole("radio")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Copy npm service command" }),
+    ).toHaveProperty("disabled", false);
+    expect(screen.getByText(/you do not need to run both/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Copy npm service command" }));
+    await waitFor(() =>
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(service.textContent),
+    );
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url, init]) =>
+          String(url).includes("/api/enrollment-grants") &&
+          (init as RequestInit | undefined)?.method === "POST",
+      ),
+    ).toHaveLength(1);
+    expect(direct.textContent).toContain("npm run start:node");
+  });
+
+  it("updates both visible commands after editing a direct Host URL", async () => {
+    host();
+    show();
+    fireEvent.click(
+      await screen.findByRole("button", { name: /generate a connect command/i }),
+    );
+    await screen.findByLabelText("npm service command");
+    fireEvent.change(screen.getByLabelText("Host URL the node should dial"), {
+      target: { value: "https://fleet.example.com" },
+    });
+    const direct = screen.getByLabelText("npm start command");
+    const service = screen.getByLabelText("npm service command");
+    expect(direct.textContent).toContain(
+      'npm run start:node -- --url="https://fleet.example.com"',
+    );
+    expect(service.textContent).toContain(
+      'npm run service -- node --url="https://fleet.example.com"',
+    );
+    expect(direct.textContent).not.toContain("--devtunnel=");
+    expect(service.textContent).not.toContain("--devtunnel=");
+    fireEvent.click(screen.getByRole("button", { name: "Copy npm service command" }));
+    await waitFor(() =>
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith(service.textContent),
+    );
+  });
   it("says why a private tunnel needs the machine signed in first", async () => {
     host();
     show();
@@ -215,7 +276,8 @@ describe("ConnectNodeCard", () => {
     expect(
       await screen.findByText(/sign in with microsoft again before adding a machine/i),
     ).toBeTruthy();
-    expect(screen.queryByLabelText("Connect command")).toBeNull();
+    expect(screen.queryByLabelText("npm start command")).toBeNull();
+    expect(screen.queryByLabelText("npm service command")).toBeNull();
     expect(notify).toHaveBeenCalledExactlyOnceWith(
       "Sign in with Microsoft again before adding a machine.",
       "error",

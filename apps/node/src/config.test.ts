@@ -16,6 +16,7 @@ let directory = "";
 
 beforeEach(async () => {
   directory = await mkdtemp(join(tmpdir(), "fleet-node-config-"));
+  delete process.env.FLEET_NODE_CONFIG_DIR;
   process.env.APPDATA = directory;
   process.env.XDG_CONFIG_HOME = directory;
 });
@@ -57,6 +58,18 @@ const keyed = (): Credentials => {
  * that machine no longer owns alone.
  */
 describe("node credentials", () => {
+  it("uses an explicit existing configuration directory without moving identity", async () => {
+    process.env.FLEET_NODE_CONFIG_DIR = join(directory, "shared-identity");
+    expect(configDirectory()).toBe(process.env.FLEET_NODE_CONFIG_DIR);
+    await saveCredentials(legacy);
+    expect(await loadCredentials()).toEqual(legacy);
+  });
+
+  it.each(["", "relative"])("rejects nonabsolute overrides (%s)", (value) => {
+    process.env.FLEET_NODE_CONFIG_DIR = value;
+    expect(() => configDirectory()).toThrow("absolute directory");
+  });
+
   it("round-trips a key-based identity with the Host it pinned", async () => {
     const credentials = keyed();
     await saveCredentials(credentials);

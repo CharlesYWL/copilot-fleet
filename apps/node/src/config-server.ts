@@ -2,12 +2,14 @@ import { createServer, type Server } from "node:http";
 import { z } from "zod";
 import {
   BACKUP_VERSION,
+  CONFIG_UI_EVENT_MARKER,
   HOST_BACKUP_KIND,
   MUTUAL_AUTH_PROTOCOL,
   NODE_BACKUP_KIND,
   NodeBackupSchema,
   backupKind,
   errorMessage,
+  type ConfigUiEvent,
 } from "@fleet/protocol";
 import { EditableSettingsSchema } from "./settings.js";
 import { configAsset } from "./config-assets.js";
@@ -55,6 +57,7 @@ type Handler = (body: string) => Promise<ConfigReply>;
  * explicit SSH tunnel), which is the same bar as editing the config file.
  */
 const HOST = "127.0.0.1";
+const MAX_CONFIG_PORT_ATTEMPTS = 20;
 
 /** Loopback names a browser on this machine can legitimately have used. */
 const LOOPBACK_NAMES = new Set(["127.0.0.1", "localhost", "::1"]);
@@ -355,7 +358,16 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
 
 export function startConfigServer(options: ConfigServerOptions): Server {
   const route = createConfigRouter(options);
-  const port = options.port ?? configServerPort();
+  let port = options.port ?? configServerPort();
+  const firstPort = port;
+  const lastPort = Math.min(firstPort + MAX_CONFIG_PORT_ATTEMPTS - 1, 65535);
+  let closed = false;
+  const report = (event: ConfigUiEvent) =>
+    options.log(`${CONFIG_UI_EVENT_MARKER}${JSON.stringify(event)}`);
+  const unavailable = (message: string) => {
+    options.log(`Config UI unavailable: ${message}`);
+    report({ type: "error", message });
+  };
 
   const server = createServer((request, response) => {
     const url = request.url ?? "/";
@@ -409,11 +421,42 @@ export function startConfigServer(options: ConfigServerOptions): Server {
     });
   });
 
-  server.listen(port, HOST, () => {
+  server.on("listening", () => {
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      unavailable("listener has no TCP address.");
+      return;
+    }
+    port = address.port;
     options.log(`  config UI   http://${HOST}:${port}`);
+    report({ type: "ready", url: `http://${HOST}:${port}` });
+  });
+  server.once("close", () => {
+    closed = true;
   });
   server.on("error", (error) => {
-    options.log(`Config UI unavailable: ${error.message}`);
+    if (
+      "code" in error &&
+      error.code === "EADDRINUSE" &&
+      !server.listening &&
+      port > 0 &&
+      !closed
+    ) {
+      if (port >= lastPort) {
+        unavailable(`ports ${firstPort}-${port} are all in use`);
+        return;
+      }
+      options.log(`Config UI port ${port} is occupied; trying ${port + 1}.`);
+      report({ type: "retry", port, nextPort: port + 1 });
+      port++;
+      setImmediate(() => {
+        if (!closed) server.listen(port, HOST);
+      });
+    } else {
+      unavailable(error.message);
+    }
   });
+  report({ type: "starting" });
+  server.listen(port, HOST);
   return server;
 }
