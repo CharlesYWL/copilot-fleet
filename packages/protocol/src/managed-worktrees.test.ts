@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   HostBackupSchema,
   HostToNodeMessageSchema,
+  IntegrationPreviewSchema,
   ManagedWorktreePolicySchema,
   RunSchema,
   RunWorkspaceBindingSchema,
+  WorktreeIntegrationSchema,
   WorkspaceModeSchema,
   resolveWorkspaceMode,
 } from "./index.js";
@@ -108,5 +110,56 @@ describe("managed workspace protocol compatibility", () => {
         request: { kind: "force_delete" },
       }).success,
     ).toBe(false);
+  });
+
+  it("keeps historical integration records compatible while distinguishing validation and no-change outcomes", () => {
+    const now = new Date().toISOString();
+    const checkout = {
+      key: "checkout",
+      path: "C:\\repo",
+      machineId: "machine",
+      volume: "volume",
+      fileId: "file",
+    };
+    const preview = IntegrationPreviewSchema.parse({
+      id: "preview",
+      worktreeId: "tree",
+      generation: 1,
+      taskSha: "a".repeat(40),
+      diffIdentity: "diff",
+      diff: "",
+      targetPlacementId: "placement",
+      target: checkout,
+      targetRef: "refs/heads/main",
+      targetSha: "a".repeat(40),
+      taskDirty: false,
+      targetDirty: false,
+      alreadyIntegrated: false,
+      observedAt: now,
+    });
+    expect(preview).toMatchObject({
+      hasCommittedChanges: true,
+      baseContainedByTarget: false,
+      targetAdvancedFromBase: false,
+    });
+    expect(
+      WorktreeIntegrationSchema.parse({
+        id: "integration",
+        worktreeId: "tree",
+        generation: 1,
+        preview,
+        approvedTaskSha: preview.taskSha,
+        approvedDiffIdentity: preview.diffIdentity,
+        state: "no_changes",
+        preState: "clean",
+        createdAt: now,
+        updatedAt: now,
+      }),
+    ).toMatchObject({
+      state: "no_changes",
+      validationState: "not_run",
+      validationSummary: "",
+      validatedAt: "",
+    });
   });
 });

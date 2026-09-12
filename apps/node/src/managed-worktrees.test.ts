@@ -1286,14 +1286,63 @@ describe("real Git managed task worktrees", { timeout: 30_000 }, () => {
         targetPlacementId: "target-placement",
       })
     ).preview!;
+    expect(fresh).toMatchObject({
+      hasCommittedChanges: true,
+      baseContainedByTarget: true,
+      targetAdvancedFromBase: true,
+      alreadyIntegrated: false,
+    });
     const integrated = await operation(manager, tree, "integrate", {
       ...input,
       previewId: fresh.id,
     });
     expect(integrated.error).toBe("");
     expect(integrated.integration!.state).toBe("integrated");
+    expect(integrated.integration).toMatchObject({
+      validationState: "passed",
+      validationSummary: "Merge result is clean and contains the reviewed task commit.",
+      validatedAt: expect.any(String),
+    });
     expect(await readFile(join(source, "task.txt"), "utf8")).toBe("task");
     expect((await operation(manager, tree, "cleanup")).ok).toBe(true);
+  });
+
+  it("records a reviewed no-changes result without claiming the base was already integrated", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    expect(preview).toMatchObject({
+      taskSha: tree.baseSha,
+      hasCommittedChanges: false,
+      baseContainedByTarget: true,
+      targetAdvancedFromBase: false,
+      alreadyIntegrated: false,
+    });
+
+    const reviewed = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `REVIEW NO CHANGES FOR ${preview.taskSha}`,
+      commit: true,
+    });
+    expect(reviewed.integration).toMatchObject({
+      state: "no_changes",
+      resultSha: preview.targetSha,
+      validationState: "passed",
+      validationSummary: "No committed task changes require integration.",
+    });
+    const retained = await operation(manager, reviewed.worktree!, "retain");
+    expect(retained.worktree).toMatchObject({
+      integrationState: "no_changes",
+      state: "retained",
+      expiresAt: expect.any(String),
+    });
   });
 
   it("continues a manually resolved conflict only after explicit confirmation and retains the task", async () => {

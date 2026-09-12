@@ -155,8 +155,10 @@ physical checkout creation succeeds. Stop and cancellation remain available;
 there is no source-checkout fallback.
 
 Integration has independent `not_requested`, `not_ready`, `ready`, `integrating`,
-`integrated`, `conflicted`, `resolving`, `aborting`, `aborted`, `uncertain` and
-`needs_reconciliation` states. Approval never implies integration.
+`validating`, `integrated`, `no_changes`, `conflicted`, `resolving`, `aborting`,
+`aborted`, `uncertain` and `needs_reconciliation` states. Approval never implies
+integration. `no_changes` is a reviewed terminal outcome, not an alias for
+“already integrated.”
 
 Recovery checks `git worktree list --porcelain -z`, physical roots/marker, refs,
 HEAD, status and lease/process inventory. Missing/moved directories, replacement
@@ -178,8 +180,12 @@ Orphaned worker ownership that cannot be proved quiescent remains blocked.
 An authenticated operator chooses a catalog target on the same Node. The Node
 checks that its canonical Git common directory matches. Preview shows target
 path/ref/SHA, exact task SHA, complete bounded committed diff and its digest,
-dirty state and ancestry. The operator separately approves that SHA/diff and
-target; Fleet never selects or switches `main`, infers approval or pushes.
+dirty state and ancestry. It also states whether the task has any committed diff,
+whether the target contains or has advanced from the pinned base, and whether a
+changed task commit is already reachable. An unchanged task is recorded explicitly
+as `no_changes`; the base commit alone is never presented as completed integration.
+The operator separately approves that SHA/diff and target; Fleet never selects or
+switches `main`, infers approval or pushes.
 
 Start reacquires/revalidates administration and task/target checkout leases.
 Task and target must be clean (including untracked and ignored data), with no
@@ -204,6 +210,11 @@ staged: Fleet does not bypass signing. Conflict paths and the exact operation ar
 persisted. Resolve/stage in the target yourself, then explicitly Continue. Abort
 uses `git merge --abort` only when the operation, physical target, ref, HEAD and
 MERGE_HEAD still match. No reset/clean fallback exists; the task worktree is kept.
+After commit, integration enters `validating`: Fleet requires a clean target,
+verifies the exact merge tree and integration trailer, and proves the reviewed
+task commit is reachable from the result. Validation outcome and timestamp are
+persisted. A failed proof becomes `needs_reconciliation`; it is never reported as
+integrated or automatically cleaned up.
 
 ## Retention, cleanup and quotas
 

@@ -51,6 +51,7 @@ export type ManagedWorktreeOptions = {
 const now = () => new Date().toISOString();
 const unresolved = new Set([
   "integrating",
+  "validating",
   "ready",
   "conflicted",
   "resolving",
@@ -494,7 +495,8 @@ export class ManagedWorktrees {
           tree.state = "retained";
           tree.retainedAt = now();
           tree.expiresAt =
-            tree.integrationState === "integrated" && tree.observation.dirty === false
+            ["integrated", "no_changes"].includes(tree.integrationState) &&
+            tree.observation.dirty === false
               ? new Date(
                   Date.now() + request.policy.retentionDays * 86_400_000,
                 ).toISOString()
@@ -1273,6 +1275,10 @@ export class ManagedWorktrees {
         pending.state = "integrated";
         pending.resultSha = head;
         pending.conflicts = [];
+        pending.validationState = "passed";
+        pending.validationSummary =
+          "Recovered merge result is clean and contains the reviewed task commit.";
+        pending.validatedAt = now();
         pending.error = "";
       } else {
         pending.state = "needs_reconciliation";
@@ -1355,7 +1361,7 @@ export class ManagedWorktrees {
       tree.error = "";
       if (request.deleteBranch) {
         const integration = this.integrations(tree.id).find(
-          (entry) => entry.state === "integrated",
+          (entry) => entry.state === "integrated" || entry.state === "no_changes",
         );
         if (
           !integration ||
@@ -1460,6 +1466,12 @@ export class ManagedWorktrees {
         { maxBytes: 1_000_000 },
       )
     ).stdout;
+    const hasCommittedChanges = diff.length > 0;
+    const baseContainedByTarget = await this.ancestor(
+      target.path,
+      tree.baseSha,
+      targetSha,
+    );
     return IntegrationPreviewSchema.parse({
       id: request.operationId,
       worktreeId: tree.id,
@@ -1473,7 +1485,11 @@ export class ManagedWorktrees {
       targetRef,
       taskDirty: (await this.status(tree.path)).dirty,
       targetDirty: (await this.status(target.path)).dirty,
-      alreadyIntegrated: await this.ancestor(target.path, taskSha, targetSha),
+      hasCommittedChanges,
+      baseContainedByTarget,
+      targetAdvancedFromBase: baseContainedByTarget && targetSha !== tree.baseSha,
+      alreadyIntegrated:
+        hasCommittedChanges && (await this.ancestor(target.path, taskSha, targetSha)),
       observedAt: now(),
     });
   }
@@ -1515,7 +1531,10 @@ export class ManagedWorktrees {
         preview.generation !== tree.generation ||
         request.reviewedTaskSha !== preview.taskSha ||
         request.reviewedDiffIdentity !== preview.diffIdentity ||
-        request.confirm !== `MERGE ${preview.taskSha} INTO ${preview.targetRef}`
+        request.confirm !==
+          (preview.hasCommittedChanges
+            ? `MERGE ${preview.taskSha} INTO ${preview.targetRef}`
+            : `REVIEW NO CHANGES FOR ${preview.taskSha}`)
       )
         throw new WorktreeConflict(
           "review_required",
@@ -1572,16 +1591,30 @@ export class ManagedWorktrees {
           preview,
           approvedTaskSha: preview.taskSha,
           approvedDiffIdentity: preview.diffIdentity,
-          state: fresh.alreadyIntegrated ? "integrated" : "integrating",
+          state: !fresh.hasCommittedChanges
+            ? "no_changes"
+            : fresh.alreadyIntegrated
+              ? "integrated"
+              : "integrating",
           preState: "clean",
-          resultSha: fresh.alreadyIntegrated ? fresh.targetSha : "",
+          resultSha:
+            !fresh.hasCommittedChanges || fresh.alreadyIntegrated ? fresh.targetSha : "",
+          validationState:
+            !fresh.hasCommittedChanges || fresh.alreadyIntegrated ? "passed" : "not_run",
+          validationSummary: !fresh.hasCommittedChanges
+            ? "No committed task changes require integration."
+            : fresh.alreadyIntegrated
+              ? "The reviewed task commit is already reachable from the target."
+              : "",
+          validatedAt: !fresh.hasCommittedChanges || fresh.alreadyIntegrated ? now() : "",
           createdAt: now(),
           updatedAt: now(),
         });
         this.saveIntegration(integration);
         tree.integrationState = integration.state;
         this.save(tree);
-        if (fresh.alreadyIntegrated) return { worktree: tree, integration };
+        if (!fresh.hasCommittedChanges || fresh.alreadyIntegrated)
+          return { worktree: tree, integration };
         const targetLease = leases.find((lease) => lease.key === preview.target.key)!;
         this.integrationLeases.set(integration.id, targetLease);
         retainTarget = true;
@@ -1761,13 +1794,49 @@ export class ManagedWorktrees {
     );
     this.options.checkpoint?.("git", request);
     integration.resultSha = await this.ref(integration.preview.target.path, "HEAD");
-    this.requireClean(await this.status(integration.preview.target.path));
-    if (!(await this.matchesMergeCommit(integration, integration.resultSha)))
-      throw new WorktreeConflict(
-        "commit_uncertain",
-        "The merge result did not include the approved task.",
-      );
+    integration.state = "validating";
+    integration.validationState = "running";
+    integration.validationSummary = "Verifying the merge result and clean target.";
+    integration.updatedAt = now();
+    this.saveIntegration(integration);
+    tree.integrationState = "validating";
+    this.save(tree);
+    try {
+      this.requireClean(await this.status(integration.preview.target.path));
+      if (!(await this.matchesMergeCommit(integration, integration.resultSha)))
+        throw new WorktreeConflict(
+          "commit_uncertain",
+          "The merge result did not include the approved task.",
+        );
+      if (
+        !(await this.ancestor(
+          integration.preview.target.path,
+          integration.approvedTaskSha,
+          integration.resultSha,
+        ))
+      )
+        throw new WorktreeConflict(
+          "validation_failed",
+          "The reviewed task commit is not reachable from the integration result.",
+        );
+    } catch (error) {
+      integration.state = "needs_reconciliation";
+      integration.validationState = "failed";
+      integration.validationSummary =
+        "Post-integration validation failed; reconcile the target before cleanup.";
+      integration.error =
+        error instanceof Error ? error.message : "Integration validation failed.";
+      integration.updatedAt = now();
+      this.saveIntegration(integration);
+      tree.integrationState = "needs_reconciliation";
+      this.save(tree);
+      throw error;
+    }
     integration.state = "integrated";
+    integration.validationState = "passed";
+    integration.validationSummary =
+      "Merge result is clean and contains the reviewed task commit.";
+    integration.validatedAt = now();
     integration.error = "";
     integration.updatedAt = now();
     this.saveIntegration(integration);
@@ -1825,7 +1894,7 @@ export class ManagedWorktrees {
 }
 
 function isIntegrated(integration: WorktreeIntegration): boolean {
-  return integration.state === "integrated";
+  return integration.state === "integrated" || integration.state === "no_changes";
 }
 
 async function exists(path: string): Promise<boolean> {

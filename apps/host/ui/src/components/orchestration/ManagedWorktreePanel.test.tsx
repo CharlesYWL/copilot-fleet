@@ -82,6 +82,9 @@ const preview = {
   targetSha: tree.baseSha,
   taskDirty: false,
   targetDirty: false,
+  hasCommittedChanges: true,
+  baseContainedByTarget: true,
+  targetAdvancedFromBase: false,
   alreadyIntegrated: false,
   observedAt: at,
 };
@@ -301,6 +304,8 @@ describe("accessible managed workspace controls", () => {
               state: "conflicted",
               preview,
               conflicts: ["same.txt"],
+              validationState: "not_run",
+              validationSummary: "",
               error: "",
             },
           ],
@@ -309,7 +314,15 @@ describe("accessible managed workspace controls", () => {
         view = {
           ...view,
           integrations: [
-            { id: "integration", state: "aborted", preview, conflicts: [], error: "" },
+            {
+              id: "integration",
+              state: "aborted",
+              preview,
+              conflicts: [],
+              validationState: "not_run",
+              validationSummary: "",
+              error: "",
+            },
           ],
         };
       }
@@ -361,6 +374,38 @@ describe("accessible managed workspace controls", () => {
       confirm: "ABORT MERGE integration",
       expectedVersion: 4,
     });
+  });
+
+  it("labels a base-only task as no committed changes instead of already integrated", async () => {
+    const noChanges = {
+      ...preview,
+      taskSha: tree.baseSha,
+      diff: "",
+      hasCommittedChanges: false,
+      alreadyIntegrated: false,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((path: string, init?: RequestInit) => {
+        if (path === "/api/auth/csrf") return response({ csrfToken: "csrf" });
+        if (init?.method === "POST" && path.endsWith("integration-preview"))
+          return response({ operation: { result: { preview: noChanges } } });
+        return response(initialView());
+      }),
+    );
+    show();
+    await screen.findByText("C:\\trees\\task");
+    fireEvent.change(screen.getByLabelText("Target checkout on the owning Node"), {
+      target: { value: "source" },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Preview integration" }));
+    });
+    expect(
+      await screen.findByRole("button", { name: "Record no committed changes" }),
+    ).toBeTruthy();
+    expect(screen.getByText(/Committed task changes: No/)).toBeTruthy();
+    expect(screen.queryByText(/Already integrated/)).toBeNull();
   });
 
   it("requires the exact abandonment phrase and restores focus when cleanup is cancelled", async () => {

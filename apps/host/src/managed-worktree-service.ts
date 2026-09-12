@@ -200,6 +200,7 @@ export class ManagedWorktreeService {
         !tree.abandonedAt &&
         ![
           "integrating",
+          "validating",
           "ready",
           "conflicted",
           "resolving",
@@ -564,6 +565,7 @@ export class ManagedWorktreeService {
       );
     } else if (
       tree?.state === "needs_reconciliation" ||
+      tree?.integrationState === "needs_reconciliation" ||
       result.integration?.state === "needs_reconciliation"
     ) {
       this.publish(expected.runId);
@@ -634,7 +636,7 @@ export class ManagedWorktreeService {
         tree.state === "ready"
           ? "retain"
           : tree.state === "retained" &&
-              tree.integrationState === "integrated" &&
+              ["integrated", "no_changes"].includes(tree.integrationState) &&
               tree.observation?.dirty === false &&
               tree.expiresAt &&
               Date.parse(tree.expiresAt) <= nowMs
@@ -731,6 +733,7 @@ export class ManagedWorktreeService {
         ?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY) ||
       [
         "integrating",
+        "validating",
         "ready",
         "conflicted",
         "resolving",

@@ -216,6 +216,7 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     integration &&
     [
       "ready",
+      "validating",
       "conflicted",
       "resolving",
       "uncertain",
@@ -458,8 +459,19 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             </p>
             <p>
               Task dirty: {status(preview.taskDirty)} · Target dirty:{" "}
-              {status(preview.targetDirty)} · Already integrated:{" "}
-              {status(preview.alreadyIntegrated)}
+              {status(preview.targetDirty)}
+            </p>
+            <p>
+              Committed task changes: {status(preview.hasCommittedChanges)} · Target
+              baseline:{" "}
+              {preview.targetAdvancedFromBase
+                ? "advanced from the pinned base"
+                : preview.baseContainedByTarget
+                  ? "contains the pinned base"
+                  : "does not contain the pinned base"}
+              {preview.alreadyIntegrated
+                ? " · Reviewed task commit already reachable from target"
+                : ""}
             </p>
             <pre className={styles.diff} aria-label="Reviewed task diff">
               {preview.diff || "No committed diff from the pinned base."}
@@ -474,21 +486,35 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
               onClick={(event) =>
                 confirm(event, {
                   action: "integration-start",
-                  title: "Merge the reviewed task commit?",
-                  reviewed: true,
-                  detail: `Merge ${preview.taskSha} into ${preview.targetRef} at ${preview.target.path}. The preview and target HEAD are verified again under repository and checkout locks. Conflicts reserve the target; the task worktree is kept.`,
+                  title: preview.hasCommittedChanges
+                    ? "Merge the reviewed task commit?"
+                    : "Record that this task has no committed changes?",
+                  reviewed: preview.hasCommittedChanges,
+                  detail: preview.hasCommittedChanges
+                    ? `Merge ${preview.taskSha} into ${preview.targetRef} at ${preview.target.path}. The preview and target HEAD are verified again under repository and checkout locks. Conflicts reserve the target; the task worktree is kept.`
+                    : `The task has no committed diff from its pinned base. Revalidate ${preview.targetRef} and record a no-changes integration result without running git merge.`,
                   payload: {
                     previewId: preview.id,
                     reviewedTaskSha: preview.taskSha,
                     reviewedDiffIdentity: preview.diffIdentity,
-                    confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+                    confirm: preview.hasCommittedChanges
+                      ? `MERGE ${preview.taskSha} INTO ${preview.targetRef}`
+                      : `REVIEW NO CHANGES FOR ${preview.taskSha}`,
                   },
                 })
               }
             >
-              Merge reviewed commit
+              {preview.hasCommittedChanges
+                ? "Merge reviewed commit"
+                : "Record no committed changes"}
             </Button>
           </div>
+        )}
+        {integration && (
+          <p>
+            Validation: {integration.validationState}
+            {integration.validationSummary ? ` — ${integration.validationSummary}` : ""}
+          </p>
         )}
         {ongoingMerge && integration && (
           <div aria-label="Integration recovery">
