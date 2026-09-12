@@ -560,7 +560,11 @@ export class ManagedWorktrees {
     );
   }
 
-  private async supportedRepository(path: string, base: string): Promise<void> {
+  private async supportedRepository(
+    path: string,
+    base: string,
+    allowGitHooks = false,
+  ): Promise<void> {
     const config = await this.git.run(
       path,
       [
@@ -594,12 +598,13 @@ export class ManagedWorktrees {
         "unsupported_repository",
         "V1 does not manage Git LFS repositories.",
       );
-    await this.noninteractivePolicy(path, false);
+    await this.noninteractivePolicy(path, false, allowGitHooks);
   }
 
   private async noninteractivePolicy(
     path: string,
     committing: boolean,
+    allowGitHooks = false,
   ): Promise<boolean> {
     const hooksPath = (
       await this.git.run(path, [
@@ -613,7 +618,7 @@ export class ManagedWorktrees {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
     });
-    if (hookNames.some((name) => !name.endsWith(".sample"))) {
+    if (!allowGitHooks && hookNames.some((name) => !name.endsWith(".sample"))) {
       throw new WorktreeConflict(
         "unsupported_hooks",
         `V1 refuses active Git hooks in ${hooksPath}; remove or disable them before retrying Managed mode, or use Legacy mode. No hooks are bypassed silently.`,
@@ -659,7 +664,7 @@ export class ManagedWorktrees {
         await this.git.run(repository.path, ["rev-parse", "--verify", "HEAD^{commit}"])
       ).stdout.trim(),
     );
-    await this.supportedRepository(repository.path, base);
+    await this.supportedRepository(repository.path, base, request.allowGitHooks);
     await this.registry({ repository });
     const trees = this.db
       .prepare("SELECT data FROM trees")
@@ -777,6 +782,7 @@ export class ManagedWorktrees {
       branchRef,
       pinRef,
       baseSha: base,
+      allowGitHooks: request.allowGitHooks,
       state: "reserved",
       createdAt: now(),
       updatedAt: now(),
@@ -908,7 +914,11 @@ export class ManagedWorktrees {
       "--verify",
       `${tree.baseSha}^{commit}`,
     ]);
-    await this.supportedRepository(tree.repository.path, tree.baseSha);
+    await this.supportedRepository(
+      tree.repository.path,
+      tree.baseSha,
+      tree.allowGitHooks,
+    );
     const disk = await statfs(tree.managedRoot.path);
     if (
       disk.bavail * disk.bsize - (tree.observation?.approximateBytes ?? 0) <
@@ -1416,7 +1426,7 @@ export class ManagedWorktrees {
     this.locks.bindScope(target, tree.commonDirectory);
     await this.noGitOperation(tree.path);
     await this.noGitOperation(target.path);
-    await this.noninteractivePolicy(target.path, false);
+    await this.noninteractivePolicy(target.path, false, tree.allowGitHooks);
     const taskSha = GitShaSchema.parse(await this.ref(tree.path, "HEAD"));
     const targetSha = GitShaSchema.parse(await this.ref(target.path, "HEAD"));
     const targetRef = (
@@ -1714,7 +1724,13 @@ export class ManagedWorktrees {
         "resolution_unstaged",
         "Stage resolved files and remove no data automatically; untracked, ignored or unstaged changes block commit.",
       );
-    if (!(await this.noninteractivePolicy(integration.preview.target.path, true))) {
+    if (
+      !(await this.noninteractivePolicy(
+        integration.preview.target.path,
+        true,
+        tree.allowGitHooks,
+      ))
+    ) {
       integration.state = "ready";
       integration.error =
         "Merge is staged and target reserved. Configure noninteractive identity/signing policy, then explicitly continue. Fleet does not bypass signing.";

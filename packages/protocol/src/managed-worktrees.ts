@@ -23,6 +23,7 @@ export const RunWorkspaceBindingSchema = z.object({
   initialization: z
     .enum(["not_required", "pending", "reserved", "ready", "blocked", "quarantined"])
     .default("not_required"),
+  allowGitHooks: z.boolean().default(false),
   error: z.string().default(""),
 });
 export type RunWorkspaceBinding = z.infer<typeof RunWorkspaceBindingSchema>;
@@ -161,6 +162,7 @@ export const ManagedWorktreeSchema = z.object({
   state: WorktreeLifecycleSchema,
   integrationState: IntegrationStateSchema.default("not_requested"),
   integrationStrategy: z.literal("merge").default("merge"),
+  allowGitHooks: z.boolean().default(false),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
   retainedAt: z.string().default(""),
@@ -239,6 +241,7 @@ export const WorktreeOperationRequestSchema = z.object({
   expectedBranchRef: z.string().default(""),
   expectedBaseSha: z.string().default(""),
   actor: identity,
+  allowGitHooks: z.boolean().default(false),
   attempt: z.number().int().positive().default(1),
   policy: ManagedWorktreePolicySchema.default(() =>
     ManagedWorktreePolicySchema.parse({}),

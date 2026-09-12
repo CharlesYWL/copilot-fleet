@@ -21,12 +21,14 @@ const ActionSchema = z.object({
   confirm: z.string().max(16_384).optional(),
   commit: z.boolean().optional(),
   deleteBranch: z.boolean().optional(),
+  allowGitHooks: z.boolean().optional(),
 });
 
 const actions: Readonly<Record<string, WorktreeOperationRequest["kind"]>> = {
   observe: "observe",
   reconcile: "reconcile",
   "retry-create": "create",
+  "retry-with-hooks": "create",
   retain: "retain",
   quiesce: "quiesce",
   "integration-preview": "integration_preview",
@@ -118,11 +120,25 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
         "Explicitly confirm stopping task and selected target sessions.",
       );
     }
+    if (action === "retry-with-hooks" && input.confirm !== "ALLOW REPOSITORY GIT HOOKS") {
+      throw new WorktreeConflict(
+        "confirmation_required",
+        "Explicitly confirm allowing repository Git hooks for this managed task.",
+      );
+    }
+    if (action === "retry-with-hooks") {
+      const run = store.getRun(id)!;
+      store.setRunWorkspaceBinding(id, {
+        ...run.workspaceBinding!,
+        allowGitHooks: true,
+      });
+    }
     const operation = await service.worktrees.request(id, {
       ...Object.fromEntries(
         Object.entries(input).filter(([, value]) => value !== undefined),
       ),
       kind: kind === "create" && !store.worktreeForRun(id) ? "reserve" : kind,
+      ...(action === "retry-with-hooks" ? { allowGitHooks: true } : {}),
       actor: request.fleetSession?.administratorId || "operator",
     });
     if (!operation.result)

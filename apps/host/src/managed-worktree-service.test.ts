@@ -94,6 +94,7 @@ function acknowledgement(request: WorktreeOperationRequest): WorktreeOperationRe
     branchRef: `refs/heads/fleet/${safeKey}`,
     pinRef: `refs/fleet/pins/${safeKey}`,
     baseSha: "a".repeat(40),
+    allowGitHooks: request.allowGitHooks,
     state: request.kind === "reserve" ? "reserved" : "ready",
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -164,6 +165,34 @@ describe("Host managed workspace orchestration", () => {
     expect(store.listWorktreeOperations()).toEqual([]);
     expect(store.listNotificationHydration()).toHaveLength(1);
     expect(JSON.stringify(store.listNotificationHydration())).not.toContain("C:\\\\repo");
+  });
+
+  it("persists explicit Git hook consent across reservation and creation", async () => {
+    const { create, frames, node, service, store } = fixture();
+    const run = create();
+    store.setRunWorkspaceBinding(run.id, {
+      ...run.workspaceBinding!,
+      allowGitHooks: true,
+    });
+    const preparing = service.worktrees.prepare(run.id);
+    const reserve = lastRequest(frames);
+    expect(reserve.allowGitHooks).toBe(true);
+    expect(service.worktrees.handleResult(node.id, acknowledgement(reserve))).toBe(true);
+    await preparing;
+
+    const creating = service.worktrees.request(run.id, {
+      kind: "create",
+      actor: "test",
+    });
+    const createRequest = lastRequest(frames);
+    expect(createRequest.allowGitHooks).toBe(true);
+    expect(service.worktrees.handleResult(node.id, acknowledgement(createRequest))).toBe(
+      true,
+    );
+    await creating;
+
+    expect(store.getRun(run.id)!.workspaceBinding!.allowGitHooks).toBe(true);
+    expect(store.worktreeForRun(run.id)!.allowGitHooks).toBe(true);
   });
 
   it("enforces the same binding for initial dispatch, manual prompt, resume and reviewer transfer", async () => {

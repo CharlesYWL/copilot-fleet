@@ -229,6 +229,59 @@ describe("accessible managed workspace controls", () => {
     expect(screen.getByText(/including uncommitted changes/)).toBeTruthy();
   });
 
+  it("requires explicit consent before retrying a blocked task with Git hooks", async () => {
+    const blocked = RunSchema.parse({
+      ...run,
+      state: "running",
+      workspaceBinding: {
+        ...run.workspaceBinding,
+        initialization: "blocked",
+        resolvedPath: "",
+        checkoutKey: "",
+        error:
+          "V1 refuses active Git hooks in C:\\repo\\.husky\\_; remove or disable them.",
+      },
+    });
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/auth/csrf") return response({ csrfToken: "csrf" });
+      if (init?.method === "POST")
+        return response({ operation: { result: { ok: true } } });
+      return response({
+        binding: blocked.workspaceBinding,
+        version: 0,
+        operations: [],
+        integrations: [],
+        targets: [],
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    show(blocked);
+    const retry = await screen.findByRole("button", {
+      name: "Allow Git hooks and retry",
+    });
+    fireEvent.click(retry);
+    const confirmButton = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Confirm retry with hooks",
+    });
+    expect(confirmButton.disabled).toBe(true);
+    fireEvent.change(
+      screen.getByRole("textbox", { name: "Type the exact Git hooks confirmation" }),
+      { target: { value: "ALLOW REPOSITORY GIT HOOKS" } },
+    );
+    expect(confirmButton.disabled).toBe(false);
+    fireEvent.click(confirmButton);
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([path, init]) =>
+            path.endsWith("/retry-with-hooks") &&
+            JSON.parse(String(init?.body)).allowGitHooks === true &&
+            JSON.parse(String(init?.body)).confirm === "ALLOW REPOSITORY GIT HOOKS",
+        ),
+      ).toBe(true),
+    );
+  });
+
   it("previews an explicitly selected target, requires reviewed-SHA approval, and offers matching conflict abort", async () => {
     let view = initialView();
     const fetchMock = vi.fn((path: string, init?: RequestInit) => {

@@ -799,6 +799,15 @@ describe("real Git managed task worktrees", { timeout: 30_000 }, () => {
         /active-hooks.*remove or disable them.*use Legacy mode/i,
       ),
     });
+    expect(
+      await active.manager.execute({
+        ...reserveRequest(active.source),
+        allowGitHooks: true,
+      }),
+    ).toMatchObject({
+      ok: true,
+      worktree: { allowGitHooks: true },
+    });
   });
 
   it("enters two barrier-controlled writer sections simultaneously, editing the same filename independently", async () => {

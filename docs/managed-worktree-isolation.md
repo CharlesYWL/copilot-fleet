@@ -165,10 +165,14 @@ target; Fleet never selects or switches `main`, infers approval or pushes.
 Start reacquires/revalidates administration and task/target checkout leases.
 Task and target must be clean (including untracked and ignored data), with no
 other Git operation, no active checkout session, and unchanged preview/review
-identities. Active entries in the effective hooks directory are rejected rather
-than silently bypassed; an empty or sample-only custom `hooksPath` is supported.
-Git runs as argument arrays with deadlines, bounded output and noninteractive
-environment:
+identities. Active entries in the effective hooks directory are rejected by
+default rather than silently bypassed; an empty or sample-only custom
+`hooksPath` is supported. A task blocked by active hooks can proceed only after
+an administrator explicitly confirms **Allow Git hooks and retry** on that task.
+The consent is persisted on the managed binding and worktree, does not change
+repository configuration, and applies to later integration operations for that
+task. Git runs as argument arrays with deadlines, bounded output and
+noninteractive environment:
 
 ```text
 git merge --no-ff --no-commit <approved-task-sha>

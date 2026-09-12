@@ -39,6 +39,7 @@ type Confirmation = {
   payload: Record<string, unknown>;
   operationId: string;
   phrase?: string;
+  phraseLabel?: string;
   reviewed?: boolean;
 };
 const useStyles = makeStyles({
@@ -324,6 +325,24 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             Retry creation
           </Button>
         )}
+        {!tree && binding?.error.includes("active Git hooks") && (
+          <Button
+            disabled={busy || quarantined}
+            onClick={(event) =>
+              confirm(event, {
+                action: "retry-with-hooks",
+                title: "Allow repository Git hooks?",
+                detail:
+                  "Fleet and task agents may execute this repository’s configured Git hooks. Hooks can run arbitrary repository-defined code and may change files or delay Git commands. This consent applies only to this managed task and does not change repository configuration.",
+                payload: { allowGitHooks: true },
+                phrase: "ALLOW REPOSITORY GIT HOOKS",
+                phraseLabel: "Type the exact Git hooks confirmation",
+              })
+            }
+          >
+            Allow Git hooks and retry
+          </Button>
+        )}
         <Button disabled={blocked} onClick={() => void execute("observe")}>
           Refresh Git observation
         </Button>
@@ -534,7 +553,9 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
               <p>{confirmation?.detail}</p>
               {confirmation?.phrase && (
                 <Field
-                  label="Type the exact abandonment confirmation"
+                  label={
+                    confirmation.phraseLabel ?? "Type the exact abandonment confirmation"
+                  }
                   hint={confirmation.phrase}
                 >
                   <Input value={phrase} onChange={(_, data) => setPhrase(data.value)} />

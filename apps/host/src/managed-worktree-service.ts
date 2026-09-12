@@ -203,6 +203,7 @@ export class ManagedWorktreeService {
       expectedPath: tree?.path ?? "",
       expectedBranchRef: tree?.branchRef ?? "",
       expectedBaseSha: binding.baseSha,
+      allowGitHooks: input.allowGitHooks ?? binding.allowGitHooks,
       policy: this.store.getManagedWorktreePolicy(),
     });
     if (existing) {
@@ -376,6 +377,7 @@ export class ManagedWorktreeService {
                 baseSha: tree.baseSha,
                 checkoutKey: tree.checkout?.key ?? binding.checkoutKey,
                 resolvedPath: tree.path,
+                allowGitHooks: tree.allowGitHooks,
               }
             : {}),
           initialization: result.ok
