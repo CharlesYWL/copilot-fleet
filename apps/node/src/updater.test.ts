@@ -70,7 +70,7 @@ describe("updateCheckout", () => {
       "git rev-parse --abbrev-ref --symbolic-full-name @{u}",
       "git reset --hard origin/main",
       "git rev-parse HEAD",
-      "npm install",
+      "npm install --include=dev",
       "npm run build:node",
     ]);
     expect(stages).toEqual(["checking", "pulling", "pulling", "installing", "building"]);
@@ -87,7 +87,7 @@ describe("updateCheckout", () => {
     expect(outcome).toEqual({ action: "none", reason: "Already up to date" });
     // Restarting anyway would drop the connection for no gain — and on "Update
     // all" it would do that to every machine that was already up to date.
-    expect(calls).not.toContain("npm install");
+    expect(calls).not.toContain("npm install --include=dev");
   });
 
   it("resets onto whichever branch the checkout tracks", async () => {

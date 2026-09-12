@@ -154,10 +154,16 @@ export function updateCheckout({
       return { action: "none", reason: "Already up to date" };
     }
 
-    report("installing", "npm install");
-    const install = await run("npm", ["install"], repoRoot);
+    // TypeScript and the build toolchain are development dependencies. Node
+    // machines commonly set NODE_ENV=production or npm_config_omit=dev, so an
+    // unqualified install can succeed while leaving `tsc` unavailable.
+    report("installing", "npm install --include=dev");
+    const install = await run("npm", ["install", "--include=dev"], repoRoot);
     if (!install.ok) {
-      return { action: "failed", reason: `npm install: ${install.output}` };
+      return {
+        action: "failed",
+        reason: `npm install --include=dev: ${install.output}`,
+      };
     }
 
     report("building", "npm run build:node");
