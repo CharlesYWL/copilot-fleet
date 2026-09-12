@@ -165,9 +165,10 @@ target; Fleet never selects or switches `main`, infers approval or pushes.
 Start reacquires/revalidates administration and task/target checkout leases.
 Task and target must be clean (including untracked and ignored data), with no
 other Git operation, no active checkout session, and unchanged preview/review
-identities. Active hooks/custom `hooksPath` are rejected rather than silently
-bypassed. Git runs as argument arrays with deadlines, bounded output and
-noninteractive environment:
+identities. Active entries in the effective hooks directory are rejected rather
+than silently bypassed; an empty or sample-only custom `hooksPath` is supported.
+Git runs as argument arrays with deadlines, bounded output and noninteractive
+environment:
 
 ```text
 git merge --no-ff --no-commit <approved-task-sha>

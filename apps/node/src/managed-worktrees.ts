@@ -601,25 +601,22 @@ export class ManagedWorktrees {
     path: string,
     committing: boolean,
   ): Promise<boolean> {
-    const hooks = await this.git.run(path, ["config", "--get", "core.hooksPath"], {
-      allowedExitCodes: [0, 1],
+    const hooksPath = (
+      await this.git.run(path, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "hooks",
+      ])
+    ).stdout.trim();
+    const hookNames = await readdir(hooksPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
     });
-    if (hooks.stdout.trim())
-      throw new WorktreeConflict(
-        "unsupported_hooks",
-        "V1 requires no custom hooksPath or active Git hooks.",
-      );
-    const common = await this.commonDirectory(path);
-    const hookNames = await readdir(join(common.path, "hooks")).catch(
-      (error: unknown) => {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-        throw error;
-      },
-    );
     if (hookNames.some((name) => !name.endsWith(".sample"))) {
       throw new WorktreeConflict(
         "unsupported_hooks",
-        "V1 refuses active Git hooks; no hooks are bypassed silently.",
+        `V1 refuses active Git hooks in ${hooksPath}; remove or disable them before retrying Managed mode, or use Legacy mode. No hooks are bypassed silently.`,
       );
     }
     if (!committing) return true;

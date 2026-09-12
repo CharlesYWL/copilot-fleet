@@ -769,6 +769,38 @@ describe("real Git managed task worktrees", { timeout: 30_000 }, () => {
     ).rejects.toMatchObject({ code: "binding_unavailable" });
   });
 
+  it("allows an inactive custom hooksPath but rejects active hooks with remediation", async () => {
+    const missing = await fixture();
+    await git.run(missing.source, ["config", "core.hooksPath", "missing-hooks"]);
+    expect(await missing.manager.execute(reserveRequest(missing.source))).toMatchObject({
+      ok: true,
+    });
+
+    const inactive = await fixture();
+    const inactiveHooks = join(inactive.source, "inactive-hooks");
+    await mkdir(inactiveHooks);
+    await writeFile(join(inactiveHooks, "pre-commit.sample"), "sample\n");
+    await git.run(inactive.source, ["config", "core.hooksPath", "inactive-hooks"]);
+    expect(await inactive.manager.execute(reserveRequest(inactive.source))).toMatchObject(
+      {
+        ok: true,
+      },
+    );
+
+    const active = await fixture();
+    const activeHooks = join(active.root, "active-hooks");
+    await mkdir(activeHooks);
+    await writeFile(join(activeHooks, "pre-commit"), "active\n");
+    await git.run(active.source, ["config", "core.hooksPath", activeHooks]);
+    expect(await active.manager.execute(reserveRequest(active.source))).toMatchObject({
+      ok: false,
+      code: "unsupported_hooks",
+      error: expect.stringMatching(
+        /active-hooks.*remove or disable them.*use Legacy mode/i,
+      ),
+    });
+  });
+
   it("enters two barrier-controlled writer sections simultaneously, editing the same filename independently", async () => {
     const { manager, source } = await fixture();
     const a = await allocate(manager, source);
