@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import { DatabaseSync } from "node:sqlite";
 import {
   mkdir,
   readFile,
@@ -1582,6 +1583,84 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect((await manager.execute(extra)).code).toBe("worktree_quota");
     expect(manager.get(reserved.worktree!.id)!.state).toBe("reserved");
     expect((await operation(manager, reserved.worktree!, "create")).ok).toBe(true);
+  });
+
+  it("acknowledges a replay mismatch instead of stranding the Host", async () => {
+    const { manager, source } = await fixture();
+    const request = reserveRequest(source);
+    const reserved = await manager.execute(request);
+    expect(reserved.ok).toBe(true);
+
+    const mismatch = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...request,
+        actor: "different-replay-actor",
+      }),
+    );
+
+    expect(mismatch).toMatchObject({
+      operationId: request.operationId,
+      ok: false,
+      code: "idempotency_mismatch",
+    });
+    expect(mismatch).not.toHaveProperty("worktree");
+    expect(manager.get(reserved.worktree!.id)?.error).toBe("");
+  });
+
+  it("normalizes an interrupted operation persisted by an older protocol", async () => {
+    let injected = false;
+    const { root, manager, source } = await fixture((stage) => {
+      if (stage === "intent" && !injected) {
+        injected = true;
+        throw new WorktreeCrash("injected crash");
+      }
+    });
+    const request = reserveRequest(source);
+    await expect(manager.execute(request)).rejects.toThrow("injected");
+    manager.close();
+    managers.splice(managers.indexOf(manager), 1);
+
+    const database = new DatabaseSync(join(root, "state", "managed-worktrees.db"));
+    const persisted = JSON.parse(
+      String(
+        database
+          .prepare("SELECT request FROM operations WHERE id=?")
+          .get(request.operationId)!.request,
+      ),
+    ) as Record<string, unknown>;
+    for (const field of [
+      "allowGitHooks",
+      "attempt",
+      "commit",
+      "deleteBranch",
+      "expectedBaseRef",
+      "expectedBaseSha",
+      "expectedBranchRef",
+      "expectedPath",
+      "originatingPlacementId",
+      "ownerStepId",
+      "repositoryIdentity",
+      "workspaceKind",
+      "workspaceResults",
+    ])
+      delete persisted[field];
+    database
+      .prepare("UPDATE operations SET request=? WHERE id=?")
+      .run(JSON.stringify(persisted), request.operationId);
+    database.close();
+
+    const restarted = new ManagedWorktrees({
+      directory: join(root, "state"),
+      nodeId: () => "node-1",
+      locks: new CheckoutLocks(join(root, "locks")),
+    });
+    managers.push(restarted);
+    const result = await restarted.execute(request);
+    expect(result).toMatchObject({
+      operationId: request.operationId,
+      ok: true,
+      code: "",
+    });
   });
 
   it.each(["intent", "git", "receipt"] as const)(

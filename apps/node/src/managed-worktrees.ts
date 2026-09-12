@@ -277,29 +277,32 @@ export class ManagedWorktrees {
   private async runOperation(
     request: WorktreeOperationRequest,
   ): Promise<WorktreeOperationResult> {
-    if (request.nodeId !== this.options.nodeId()) {
-      throw new WorktreeConflict("wrong_owner", "This Node does not own that request.");
-    }
-    const previous = this.db
-      .prepare("SELECT * FROM operations WHERE id=?")
-      .get(request.operationId);
-    if (previous) {
-      if (!isDeepStrictEqual(JSON.parse(String(previous.request)), request)) {
-        throw new WorktreeConflict(
-          "idempotency_mismatch",
-          "Operation ID was reused with different arguments.",
-        );
-      }
-      if (previous.result)
-        return WorktreeOperationResultSchema.parse(JSON.parse(String(previous.result)));
-    } else {
-      this.db
-        .prepare("INSERT INTO operations (id,request) VALUES (?,?)")
-        .run(request.operationId, JSON.stringify(request));
-    }
-    this.options.checkpoint?.("intent", request);
     let result: WorktreeOperationResult;
     try {
+      if (request.nodeId !== this.options.nodeId()) {
+        throw new WorktreeConflict("wrong_owner", "This Node does not own that request.");
+      }
+      const previous = this.db
+        .prepare("SELECT * FROM operations WHERE id=?")
+        .get(request.operationId);
+      if (previous) {
+        const previousRequest = WorktreeOperationRequestSchema.parse(
+          JSON.parse(String(previous.request)),
+        );
+        if (!isDeepStrictEqual(previousRequest, request)) {
+          throw new WorktreeConflict(
+            "idempotency_mismatch",
+            "Operation ID was reused with different arguments.",
+          );
+        }
+        if (previous.result)
+          return WorktreeOperationResultSchema.parse(JSON.parse(String(previous.result)));
+      } else {
+        this.db
+          .prepare("INSERT INTO operations (id,request) VALUES (?,?)")
+          .run(request.operationId, JSON.stringify(request));
+      }
+      this.options.checkpoint?.("intent", request);
       const payload = await this.perform(request);
       result = WorktreeOperationResultSchema.parse({
         operationId: request.operationId,
@@ -315,7 +318,12 @@ export class ManagedWorktrees {
       if (error instanceof WorktreeCrash) throw error;
       const candidate = this.get(request.worktreeId);
       const code = error instanceof WorktreeConflict ? error.code : "git_failed";
-      const tree = ["binding_mismatch", "wrong_owner", "stale_revision"].includes(code)
+      const tree = [
+        "binding_mismatch",
+        "idempotency_mismatch",
+        "wrong_owner",
+        "stale_revision",
+      ].includes(code)
         ? undefined
         : candidate;
       const message =
