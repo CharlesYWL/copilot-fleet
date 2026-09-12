@@ -157,6 +157,7 @@ function operationResult(
   options: {
     targetRef?: string;
     noChanges?: boolean;
+    verifiedClean?: boolean;
     integrationState?: "integrated" | "no_changes" | "conflicted";
   } = {},
 ): WorktreeOperationResult {
@@ -177,6 +178,16 @@ function operationResult(
       request.kind === "integrate" ? integrationState : current.integrationState,
     retainedAt: request.kind === "retain" ? new Date().toISOString() : current.retainedAt,
     removedAt: request.kind === "cleanup" ? new Date().toISOString() : current.removedAt,
+    ...(options.verifiedClean
+      ? {
+          observation: WorktreeObservationSchema.parse({
+            generation: current.generation,
+            observedAt: new Date().toISOString(),
+            head: current.baseSha,
+            dirty: false,
+          }),
+        }
+      : {}),
     updatedAt: new Date().toISOString(),
   });
   const targetRef = options.targetRef ?? "refs/heads/main";
@@ -466,6 +477,70 @@ describe("Host managed workspace orchestration", () => {
       );
   });
 
+  it("accepts a derived step binding before the new session is attached to the step", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit, false);
+    const primary = kit.store.worktreeForRun(run.id)!;
+    const step = kit.store.upsertRunStep(run.id, {
+      stepKey: "implement",
+      title: "implement",
+      prompt: "change",
+      category: "implement",
+      position: 0,
+    });
+    const derived = ManagedWorktreeSchema.parse({
+      ...primary,
+      id: "worktree-derived",
+      taskKey: "derived-task",
+      path: "C:\\trees\\derived",
+      branchRef: "refs/heads/fleet/derived",
+      pinRef: "refs/fleet/pins/derived",
+      checkout: {
+        ...primary.checkout!,
+        key: "derived-checkout",
+        path: "C:\\trees\\derived",
+        fileId: "derived-checkout",
+      },
+      workspaceKind: "step",
+      ownerStepId: step.id,
+    });
+    kit.store.putDerivedWorkspace(derived);
+    const binding = {
+      worktreeId: derived.id,
+      generation: derived.generation,
+      sourcePlacementId: derived.sourcePlacementId,
+      cwd: derived.path,
+      checkoutKey: derived.checkout!.key,
+      accessClass: "shell" as const,
+      leaseAttempt: "derived-attempt",
+      quarantined: false,
+    };
+    kit.store.updateRunStep(step.id, {
+      state: "starting",
+      managedWorktreeId: derived.id,
+      workspaceState: "ready",
+      executionBinding: binding,
+    });
+
+    const started = kit.service.createAndStartSession({
+      placement: kit.placement,
+      prompt: "change",
+      yolo: false,
+      runId: run.id,
+      runRole: "worker",
+      executionBinding: binding,
+    });
+
+    expect(started.ok).toBe(true);
+    if (started.ok)
+      expect(started.session.executionBinding).toMatchObject({
+        worktreeId: binding.worktreeId,
+        generation: binding.generation,
+        checkoutKey: binding.checkoutKey,
+        cwd: binding.cwd,
+      });
+  });
+
   it("quarantines restores and never automatically replays or launches their managed metadata", async () => {
     const { create, frames, node, service, store } = fixture();
     const run = create();
@@ -607,6 +682,13 @@ describe("Host managed workspace orchestration", () => {
 
     kit.service.worktrees.advanceAggregation(run.id);
     await expect.poll(() => kit.frames.length).toBeGreaterThan(start);
+    const quiesceRequest = lastRequest(kit.frames);
+    expect(quiesceRequest.kind).toBe("quiesce");
+    kit.service.worktrees.handleResult(
+      kit.node.id,
+      operationResult(kit.store, quiesceRequest),
+    );
+    await expect.poll(() => lastRequest(kit.frames).kind).toBe("integration_preview");
     const previewRequest = lastRequest(kit.frames);
     expect(previewRequest).toMatchObject({
       kind: "integration_preview",
@@ -629,6 +711,13 @@ describe("Host managed workspace orchestration", () => {
     const beforeRetry = kit.frames.length;
     kit.service.worktrees.retryAggregation(run.id);
     await expect.poll(() => kit.frames.length).toBeGreaterThan(beforeRetry);
+    const retriedQuiesce = lastRequest(kit.frames);
+    expect(retriedQuiesce.kind).toBe("quiesce");
+    kit.service.worktrees.handleResult(
+      kit.node.id,
+      operationResult(kit.store, retriedQuiesce),
+    );
+    await expect.poll(() => lastRequest(kit.frames).kind).toBe("integration_preview");
     const retriedPreview = lastRequest(kit.frames);
     expect(retriedPreview.operationId).not.toBe(previewRequest.operationId);
     kit.service.worktrees.handleResult(
@@ -669,7 +758,7 @@ describe("Host managed workspace orchestration", () => {
     expect(aggregating.state).toBe("aggregating");
     expect(aggregating.workspaceBinding).toMatchObject({
       aggregationState: "in_progress",
-      aggregationPhase: "preview",
+      aggregationPhase: "quiesce",
     });
   });
 
@@ -724,6 +813,13 @@ describe("Host managed workspace orchestration", () => {
 
     kit.service.worktrees.advanceAggregation(run.id);
     await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+    const quiesceRequest = lastRequest(kit.frames);
+    expect(quiesceRequest.kind).toBe("quiesce");
+    kit.service.worktrees.handleResult(
+      kit.node.id,
+      operationResult(kit.store, quiesceRequest),
+    );
+    await expect.poll(() => lastRequest(kit.frames).kind).toBe("integration_preview");
     const previewRequest = lastRequest(kit.frames);
     kit.service.worktrees.handleResult(
       kit.node.id,
@@ -738,6 +834,11 @@ describe("Host managed workspace orchestration", () => {
     let seen = kit.frames.length;
     kit.service.worktrees.advanceAggregation(run.id);
 
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+    const quiesce = lastRequest(kit.frames);
+    expect(quiesce.kind).toBe("quiesce");
+    seen = kit.frames.length;
+    kit.service.worktrees.handleResult(kit.node.id, operationResult(kit.store, quiesce));
     await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
     const preview = lastRequest(kit.frames);
     seen = kit.frames.length;
@@ -776,9 +877,9 @@ describe("Host managed workspace orchestration", () => {
     kit.service.worktrees.advanceAggregation(run.id);
 
     for (const kind of [
+      "quiesce",
       "integration_preview",
       "integrate",
-      "quiesce",
       "retain",
       "cleanup",
     ] as const) {
@@ -805,7 +906,77 @@ describe("Host managed workspace orchestration", () => {
         .listWorktreeOperations()
         .filter((entry) => entry.request.actor === "host-integration-controller")
         .map((entry) => entry.request.kind),
-    ).toEqual(["integration_preview", "integrate", "quiesce", "retain", "cleanup"]);
+    ).toEqual(["quiesce", "integration_preview", "integrate", "retain", "cleanup"]);
+  });
+
+  it("cleans a verified unchanged run without reserving the integration target", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit, false);
+    const step = kit.store.upsertRunStep(run.id, {
+      stepKey: "investigate",
+      title: "investigate",
+      prompt: "inspect only",
+      category: "explore",
+      position: 0,
+    });
+    const started = kit.service.createAndStartSession({
+      placement: kit.placement,
+      prompt: "inspect only",
+      yolo: false,
+      runId: run.id,
+      runRole: "worker",
+      readOnly: true,
+    });
+    expect(started.ok).toBe(true);
+    if (!started.ok) return;
+    kit.store.updateRunStep(step.id, {
+      state: "starting",
+      sessionId: started.session.id,
+    });
+    kit.store.updateRunStep(step.id, { state: "running" });
+    kit.store.updateRunStep(step.id, { state: "succeeded", resultSha: "" });
+    kit.store.transitionSession(started.session.id, "starting");
+    kit.store.transitionSession(started.session.id, "stopped");
+    const current = kit.store.getRun(run.id)!;
+    kit.store.setRunWorkspaceBinding(run.id, {
+      ...current.workspaceBinding!,
+      baseRef: "",
+      aggregationState: "in_progress",
+      aggregationPhase: "preview",
+      aggregationAttempt: 1,
+    });
+    kit.store.setRunState(run.id, "aggregating");
+    kit.frames.splice(0);
+    let seen = 0;
+
+    kit.service.worktrees.advanceAggregation(run.id);
+    for (const kind of ["quiesce", "retain", "cleanup"] as const) {
+      await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+      const request = lastRequest(kit.frames);
+      expect(request.kind).toBe(kind);
+      seen = kit.frames.length;
+      kit.service.worktrees.handleResult(
+        kit.node.id,
+        operationResult(kit.store, request, {
+          verifiedClean: request.kind === "quiesce",
+        }),
+      );
+    }
+
+    await expect.poll(() => kit.store.getRun(run.id)?.state).toBe("completed");
+    expect(kit.store.getRun(run.id)?.workspaceBinding).toMatchObject({
+      aggregationState: "completed",
+      aggregationPhase: "done",
+      aggregationTargetRef: "",
+      aggregationSummary:
+        "No committed changes; verified task workspaces and cleaned them without merge integration.",
+    });
+    expect(
+      kit.store
+        .listWorktreeOperations()
+        .filter((entry) => entry.request.actor === "host-integration-controller")
+        .map((entry) => entry.request.kind),
+    ).toEqual(["quiesce", "retain", "cleanup"]);
   });
 
   it("prepares a composed workspace for a read-only dependent", async () => {

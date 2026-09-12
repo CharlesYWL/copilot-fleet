@@ -261,14 +261,18 @@ internally. A target that advanced before preview is still given a normal clean
 merge attempt. Fleet never pushes, creates a PR, switches branches, resets, cleans,
 or bypasses dirty-target, active-process, hook, identity or signing safety.
 
-No committed diff records `no_changes` and proceeds through cleanup. After a
-validated `integrated`/`no_changes` result, only sessions bound to task-owned
-managed workspace IDs are stopped and quiesced. Cleanup retries safely while
-process quiescence is pending; dirty/unknown state, conflicts and reconciliation
-uncertainty move the Run to resumable `blocked` attention. One generation-keyed
-notification identifies the target branch and phase without exposing paths or
-commands. **Retry integration** starts a new durable attempt and resolves that
-notification after success.
+Fleet stops and quiesces task-owned sessions before integration so a completed
+worker cannot keep the result checkout lease while the controller validates and
+merges it. If fresh observations prove every task workspace is clean at its pinned
+base, with no result SHA or published workspace result, target reservation and
+merge preview are unnecessary and Fleet proceeds directly through retention and
+cleanup. Unverified or changed workspaces fail closed into the normal preview and
+integration path, where no committed target diff records `no_changes`. Cleanup
+retries safely while process quiescence is pending; dirty/unknown state, conflicts
+and reconciliation uncertainty move the Run to resumable `blocked` attention. One
+generation-keyed notification identifies the target branch and phase without
+exposing paths or commands. **Retry integration** starts a new durable attempt and
+resolves that notification after success.
 
 ## Advanced recovery: explicit merge only
 
