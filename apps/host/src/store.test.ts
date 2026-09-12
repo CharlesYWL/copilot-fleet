@@ -1263,9 +1263,57 @@ describe("FleetStore", () => {
 
   it("changes only the path when no workspace is named", () => {
     const { store, placement } = setup();
+    store.putPlacementRepositoryCapability({
+      placementId: placement.id,
+      nodeId: placement.nodeId,
+      localPath: placement.localPath,
+      repositoryIdentity: {
+        id: "a".repeat(64),
+        objectFormat: "sha1",
+        evidence: "roots",
+        remoteHash: "",
+        rootHash: "b".repeat(64),
+      },
+      baseSha: "c".repeat(40),
+      baseAvailable: true,
+      verifiedAt: new Date().toISOString(),
+      error: "",
+    });
     const updated = store.updatePlacement(placement.id, "D:\\elsewhere");
     expect(updated?.localPath).toBe("D:\\elsewhere");
     expect(updated?.workspaceId).toBe(placement.workspaceId);
+    expect(store.getPlacementRepositoryCapability(placement.id)).toBeUndefined();
+  });
+
+  it("keeps repository capability proofs for concurrent pinned bases", () => {
+    const { store, placement } = setup();
+    const identity = {
+      id: "a".repeat(64),
+      objectFormat: "sha1" as const,
+      evidence: "roots" as const,
+      remoteHash: "",
+      rootHash: "b".repeat(64),
+    };
+    for (const baseSha of ["c".repeat(40), "d".repeat(40)])
+      store.putPlacementRepositoryCapability({
+        placementId: placement.id,
+        nodeId: placement.nodeId,
+        localPath: placement.localPath,
+        repositoryIdentity: identity,
+        baseSha,
+        baseAvailable: true,
+        verifiedAt: new Date().toISOString(),
+        error: "",
+      });
+
+    expect(
+      store.getPlacementRepositoryCapability(placement.id, identity.id, "c".repeat(40))
+        ?.baseSha,
+    ).toBe("c".repeat(40));
+    expect(
+      store.getPlacementRepositoryCapability(placement.id, identity.id, "d".repeat(40))
+        ?.baseSha,
+    ).toBe("d".repeat(40));
   });
 
   it("keeps the order an operator arranged, and puts new placements last", () => {

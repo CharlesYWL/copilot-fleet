@@ -28,6 +28,15 @@ type WorktreeView = {
   binding?: RunWorkspaceBinding;
   worktree?: ManagedWorktree;
   source?: Placement;
+  originatingPlacement?: Placement;
+  logicalRepository: string;
+  executionNodeCount: number;
+  portableResults: {
+    total: number;
+    available: number;
+    sealing: number;
+    corrupt: number;
+  };
   version: number;
   operations: WorktreeOperation[];
   integrations: WorktreeIntegration[];
@@ -364,6 +373,27 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
           Requested: {binding?.requestedMode} · Effective: {binding?.effectiveMode} ·
           Resolution: {binding?.resolutionSource}
         </p>
+        <dl className={styles.metadata}>
+          <dt>Logical repository</dt>
+          <dd>{view?.logicalRepository || sourceLabel}</dd>
+          <dt>Originating placement</dt>
+          <dd>
+            {view?.originatingPlacement?.nodeName || "Unknown"} ·{" "}
+            {view?.originatingPlacement?.workspaceName || sourceLabel}
+          </dd>
+          <dt>Execution Nodes</dt>
+          <dd>{view?.executionNodeCount ?? (tree ? 1 : 0)}</dd>
+          <dt>Sealed results</dt>
+          <dd>
+            {view?.portableResults?.available ?? 0} portable
+            {view?.portableResults?.sealing
+              ? ` · ${view.portableResults.sealing} sealing`
+              : ""}
+            {view?.portableResults?.corrupt
+              ? ` · ${view.portableResults.corrupt} corrupt`
+              : ""}
+          </dd>
+        </dl>
         <p>
           Independent writers use separate isolated workspaces. Dependent reviewers,
           testers and fixers receive a deterministic composed workspace containing their

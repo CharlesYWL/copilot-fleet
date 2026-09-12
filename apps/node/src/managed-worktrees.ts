@@ -1,6 +1,15 @@
-import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
-import { lstat, mkdir, readdir, readFile, statfs, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream, existsSync, mkdirSync } from "node:fs";
+import {
+  lstat,
+  mkdir,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  statfs,
+  writeFile,
+} from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isDeepStrictEqual } from "node:util";
@@ -9,6 +18,7 @@ import {
   IntegrationPreviewSchema,
   ManagedWorktreeSchema,
   RepositoryFeaturesSchema,
+  RepositoryIdentitySchema,
   WorktreeConflict,
   WorktreeIntegrationSchema,
   WorktreeObservationSchema,
@@ -19,6 +29,10 @@ import {
   type IntegrationPreview,
   type ManagedWorktree,
   type RepositoryFeatures,
+  type RepositoryIdentity,
+  type RepositoryProbeRequest,
+  type RepositoryProbeResult,
+  type WorkspaceResult,
   type WorktreeIntegration,
   type WorktreeObservation,
   type WorktreeOperationRequest,
@@ -49,6 +63,12 @@ export type ManagedWorktreeOptions = {
     stage: "intent" | "git" | "receipt",
     request: WorktreeOperationRequest,
   ) => void;
+  uploadArtifact?: (result: WorkspaceResult, path: string) => Promise<WorkspaceResult>;
+  downloadArtifact?: (
+    result: WorkspaceResult,
+    path: string,
+    operationId: string,
+  ) => Promise<void>;
 };
 const now = () => new Date().toISOString();
 const unresolved = new Set([
@@ -347,6 +367,9 @@ export class ManagedWorktrees {
       tree.runId === request.runId &&
       tree.generation === request.generation &&
       tree.sourcePlacementId === request.sourcePlacementId &&
+      tree.originatingPlacementId === request.originatingPlacementId &&
+      (!request.repositoryIdentity ||
+        tree.repositoryIdentity === request.repositoryIdentity) &&
       tree.workspaceId === request.workspaceId
     );
   }
@@ -355,6 +378,7 @@ export class ManagedWorktrees {
     worktree: ManagedWorktree;
     preview?: IntegrationPreview;
     integration?: WorktreeIntegration;
+    workspaceResult?: WorkspaceResult;
   }> {
     let tree = this.get(request.worktreeId);
     if (tree) {
@@ -447,8 +471,15 @@ export class ManagedWorktrees {
         return { worktree: await this.create(tree, request, admin) };
       if (request.kind === "compose")
         return { worktree: await this.compose(tree, request, admin) };
-      if (request.kind === "finalize")
-        return { worktree: await this.finalize(tree, request) };
+      if (request.kind === "materialize")
+        return { worktree: await this.materialize(tree, request, admin) };
+      if (request.kind === "finalize") {
+        const finalized = await this.finalize(tree, request);
+        return {
+          worktree: finalized.worktree,
+          ...(finalized.result ? { workspaceResult: finalized.result } : {}),
+        };
+      }
       if (request.kind === "cleanup" && tree.state === "removing")
         return await this.reconcile(tree, request, admin);
       if (request.kind === "reconcile") return await this.reconcile(tree, request, admin);
@@ -742,16 +773,40 @@ export class ManagedWorktrees {
     const base = request.expectedBaseSha
       ? GitShaSchema.parse(request.expectedBaseSha)
       : sourceHead;
-    if (sourceHead !== base)
+    if (
+      request.sourcePlacementId === request.originatingPlacementId &&
+      sourceHead !== base
+    )
       throw new WorktreeConflict(
         "source_advanced",
         "The source checkout advanced after the Run base was pinned. Fleet will not silently change the composition base.",
       );
-    const baseRef = (
+    const localBaseRef = (
       await this.git.run(repository.path, ["symbolic-ref", "-q", "HEAD"], {
         allowedExitCodes: [0, 1],
       })
     ).stdout.trim();
+    const baseRef =
+      request.sourcePlacementId === request.originatingPlacementId
+        ? localBaseRef
+        : request.expectedBaseRef;
+    const repositoryIdentity = await this.repositoryIdentity(repository.path, base);
+    if (
+      request.repositoryIdentity &&
+      request.repositoryIdentity !== repositoryIdentity.id
+    )
+      throw new WorktreeConflict(
+        "repository_identity_mismatch",
+        "This placement is not the task's logical repository.",
+      );
+    if (
+      request.repositoryObjectFormat &&
+      request.repositoryObjectFormat !== repositoryIdentity.objectFormat
+    )
+      throw new WorktreeConflict(
+        "repository_object_format",
+        "This placement uses a different Git object format.",
+      );
     const compatibility = await this.supportedRepository(
       repository.path,
       base,
@@ -854,6 +909,10 @@ export class ManagedWorktrees {
       runId: request.runId,
       taskKey: safeKey,
       sourcePlacementId: request.sourcePlacementId,
+      originatingPlacementId: request.originatingPlacementId || request.sourcePlacementId,
+      executionPlacementId: request.sourcePlacementId,
+      repositoryIdentity: repositoryIdentity.id,
+      repositoryObjectFormat: repositoryIdentity.objectFormat,
       workspaceId: request.workspaceId,
       nodeId: request.nodeId,
       hostInstallationId: request.hostInstallationId,
@@ -1114,6 +1173,14 @@ export class ManagedWorktrees {
   }
 
   private async assertPinnedSource(tree: ManagedWorktree): Promise<void> {
+    if (tree.sourcePlacementId !== tree.originatingPlacementId) {
+      await this.git.run(tree.repository.path, [
+        "rev-parse",
+        "--verify",
+        `${tree.baseSha}^{commit}`,
+      ]);
+      return;
+    }
     const sourceHead = GitShaSchema.parse(
       (
         await this.git.run(tree.repository.path, [
@@ -1180,6 +1247,7 @@ export class ManagedWorktrees {
     }
     tree.observation = await this.observe(tree);
     this.requireClean(tree.observation);
+    await this.importWorkspaceResults(tree, request, admin);
     if (
       tree.composition.state === "ready" &&
       tree.composition.resultSha === tree.observation.head
@@ -1219,24 +1287,25 @@ export class ManagedWorktrees {
     this.save(tree);
     for (const predecessor of tree.composition.predecessors) {
       const sourceTree = this.get(predecessor.worktreeId);
-      if (
-        !sourceTree ||
-        sourceTree.runId !== tree.runId ||
-        sourceTree.ownerStepId !== predecessor.stepId ||
-        sourceTree.resultSha !== predecessor.resultSha
-      )
-        throw new WorktreeConflict(
-          "predecessor_changed",
-          `Predecessor ${predecessor.stepKey} no longer matches its recorded workspace result.`,
-        );
-      await this.verifyTree(sourceTree);
-      const observed = await this.observe(sourceTree);
-      this.requireClean(observed);
-      if (observed.head !== predecessor.resultSha)
-        throw new WorktreeConflict(
-          "predecessor_changed",
-          `Predecessor ${predecessor.stepKey} changed after completion.`,
-        );
+      if (sourceTree && sourceTree.nodeId === tree.nodeId) {
+        if (
+          sourceTree.runId !== tree.runId ||
+          sourceTree.ownerStepId !== predecessor.stepId ||
+          sourceTree.resultSha !== predecessor.resultSha
+        )
+          throw new WorktreeConflict(
+            "predecessor_changed",
+            `Predecessor ${predecessor.stepKey} no longer matches its recorded workspace result.`,
+          );
+        await this.verifyTree(sourceTree);
+        const observed = await this.observe(sourceTree);
+        this.requireClean(observed);
+        if (observed.head !== predecessor.resultSha)
+          throw new WorktreeConflict(
+            "predecessor_changed",
+            `Predecessor ${predecessor.stepKey} changed after completion.`,
+          );
+      }
       if (await this.ancestor(tree.path, predecessor.resultSha, tree.observation.head))
         continue;
       const merge = await this.git.run(
@@ -1271,8 +1340,7 @@ export class ManagedWorktrees {
   private async finalize(
     tree: ManagedWorktree,
     request: WorktreeOperationRequest,
-  ): Promise<ManagedWorktree> {
-    void request;
+  ): Promise<{ worktree: ManagedWorktree; result?: WorkspaceResult }> {
     await this.verifyTree(tree);
     await this.assertPinnedSource(tree);
     await this.noGitOperation(tree.path);
@@ -1281,7 +1349,322 @@ export class ManagedWorktrees {
     tree.resultSha = GitShaSchema.parse(tree.observation.head);
     tree.resultRecordedAt = now();
     tree.error = "";
+    if (!tree.repositoryIdentity || !tree.repositoryObjectFormat)
+      throw new WorktreeConflict(
+        "repository_identity_missing",
+        "The workspace predates portable repository identity and must be reconciled.",
+      );
+    if (!this.options.uploadArtifact) return { worktree: tree };
+    const started = Date.now();
+    const directory = join(this.options.directory, "workspace-result-artifacts");
+    await mkdir(directory, { recursive: true });
+    const privateRef = `refs/fleet/results/${tree.taskKey}`;
+    const bundlePath = join(directory, `${request.operationId}.bundle`);
+    await rm(bundlePath, { force: true });
+    const existingResultRef = await this.ref(tree.repository.path, privateRef);
+    if (existingResultRef && existingResultRef !== tree.resultSha)
+      throw new WorktreeConflict(
+        "result_ref_collision",
+        "The Fleet result ref already names different content.",
+      );
+    if (!existingResultRef)
+      await this.git.run(tree.repository.path, [
+        "update-ref",
+        privateRef,
+        tree.resultSha,
+        "0".repeat(tree.resultSha.length),
+      ]);
+    this.options.checkpoint?.("git", request);
+    try {
+      const args = ["bundle", "create", bundlePath, privateRef];
+      if (tree.resultSha !== tree.baseSha) args.push(`^${tree.baseSha}`);
+      await this.git.run(tree.repository.path, args, { timeoutMs: 120_000 });
+      await this.git.run(tree.repository.path, ["bundle", "verify", bundlePath], {
+        timeoutMs: 120_000,
+      });
+      const artifactSize = (await stat(bundlePath)).size;
+      const artifactSha256 = await sha256File(bundlePath);
+      const result = {
+        id: request.operationId,
+        runId: tree.runId,
+        ownerStepId: tree.ownerStepId,
+        repositoryIdentity: tree.repositoryIdentity,
+        baseSha: tree.baseSha,
+        baseRef: tree.baseRef,
+        headSha: tree.resultSha,
+        sourceWorktreeId: tree.id,
+        sourceNodeId: tree.nodeId,
+        sourcePlacementId: tree.sourcePlacementId,
+        sourceGeneration: tree.generation,
+        state: "sealing" as const,
+        artifactId: artifactSha256,
+        artifactRef: privateRef,
+        artifactSha256,
+        artifactSize,
+        objectFormat: tree.repositoryObjectFormat,
+        createdAt: now(),
+        verifiedAt: "",
+        expiresAt: "",
+        error: "",
+        sealDurationMs: Date.now() - started,
+        uploadDurationMs: 0,
+        downloadDurationMs: 0,
+        materializeDurationMs: 0,
+      };
+      const available = await this.options.uploadArtifact(result, bundlePath);
+      return { worktree: tree, result: available };
+    } finally {
+      await this.git.run(tree.repository.path, [
+        "update-ref",
+        "-d",
+        privateRef,
+        tree.resultSha,
+      ]);
+      await rm(bundlePath, { force: true });
+    }
+  }
+
+  private async materialize(
+    tree: ManagedWorktree,
+    request: WorktreeOperationRequest,
+    admin: CheckoutLease,
+  ): Promise<ManagedWorktree> {
+    if (request.workspaceResults.length !== 1)
+      throw new WorktreeConflict(
+        "workspace_result_required",
+        "Final materialization requires exactly one sealed result.",
+      );
+    await this.verifyTree(tree);
+    await this.noGitOperation(tree.path);
+    tree.observation = await this.observe(tree);
+    this.requireClean(tree.observation);
+    const result = request.workspaceResults[0]!;
+    await this.importResult(tree, result, request.operationId, admin);
+    if (!(await this.ancestor(tree.path, result.headSha, tree.observation.head))) {
+      const merge = await this.git.run(
+        tree.path,
+        ["merge", "--no-ff", "--no-edit", result.headSha],
+        { allowedExitCodes: [0, 1], timeoutMs: 120_000, lease: admin },
+      );
+      if (merge.exitCode !== 0)
+        throw new WorktreeConflict(
+          "materialize_conflict",
+          "The final sealed result conflicted with the pinned integration workspace.",
+        );
+    }
+    tree.observation = await this.observe(tree);
+    this.requireClean(tree.observation);
+    tree.resultSha = GitShaSchema.parse(tree.observation.head);
+    tree.resultRecordedAt = now();
     return tree;
+  }
+
+  async probeRepository(request: RepositoryProbeRequest): Promise<RepositoryProbeResult> {
+    try {
+      const repository = await this.repository(request.localPath);
+      const identity = await this.repositoryIdentity(repository.path, request.baseSha);
+      const baseAvailable =
+        (
+          await this.git.run(
+            repository.path,
+            ["cat-file", "-e", `${request.baseSha}^{commit}`],
+            { allowedExitCodes: [0, 1, 128] },
+          )
+        ).exitCode === 0;
+      if (
+        request.expectedRepositoryIdentity &&
+        request.expectedRepositoryIdentity !== identity.id
+      )
+        throw new WorktreeConflict(
+          "repository_identity_mismatch",
+          "This placement is not the task's logical repository.",
+        );
+      return {
+        operationId: request.operationId,
+        runId: request.runId,
+        placementId: request.placementId,
+        nodeId: this.options.nodeId(),
+        ok: true,
+        capability: {
+          placementId: request.placementId,
+          nodeId: this.options.nodeId(),
+          localPath: request.localPath,
+          repositoryIdentity: identity,
+          baseSha: request.baseSha,
+          baseAvailable,
+          verifiedAt: now(),
+          error: baseAvailable ? "" : "Pinned base commit is unavailable.",
+        },
+        code: baseAvailable ? "" : "base_unavailable",
+        error: baseAvailable ? "" : "Pinned base commit is unavailable.",
+      };
+    } catch (error) {
+      return {
+        operationId: request.operationId,
+        runId: request.runId,
+        placementId: request.placementId,
+        nodeId: this.options.nodeId(),
+        ok: false,
+        code: error instanceof WorktreeConflict ? error.code : "repository_probe_failed",
+        error: error instanceof Error ? error.message : "Repository probe failed.",
+      };
+    }
+  }
+
+  private async repositoryIdentity(
+    path: string,
+    baseSha: string,
+  ): Promise<RepositoryIdentity> {
+    const objectFormat = (
+      await this.git.run(path, ["rev-parse", "--show-object-format"])
+    ).stdout.trim();
+    const roots = (
+      await this.git.run(path, ["rev-list", "--max-parents=0", baseSha])
+    ).stdout
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .sort();
+    const remoteLines = (
+      await this.git.run(path, ["remote", "get-url", "--all", "origin"], {
+        allowedExitCodes: [0, 2, 128],
+      })
+    ).stdout
+      .trim()
+      .split(/\r?\n/)
+      .map(normalizeRemoteIdentity)
+      .filter((value): value is string => Boolean(value))
+      .sort();
+    const rootHash = createHash("sha256").update(roots.join("\n")).digest("hex");
+    const remoteHash = remoteLines.length
+      ? createHash("sha256").update(remoteLines.join("\n")).digest("hex")
+      : "";
+    return RepositoryIdentitySchema.parse({
+      id: createHash("sha256")
+        .update(`${objectFormat}\0${remoteHash || rootHash}`)
+        .digest("hex"),
+      objectFormat,
+      evidence: remoteHash ? "remote" : "roots",
+      remoteHash,
+      rootHash,
+    });
+  }
+
+  private async importWorkspaceResults(
+    tree: ManagedWorktree,
+    request: WorktreeOperationRequest,
+    admin: CheckoutLease,
+  ): Promise<void> {
+    if (!tree.composition?.predecessors.length) return;
+    const results = new Map(
+      request.workspaceResults.map((result) => [result.id, result]),
+    );
+    const directory = join(this.options.directory, "workspace-result-artifacts");
+    const hooks = join(directory, "empty-hooks");
+    await mkdir(hooks, { recursive: true });
+    for (const predecessor of tree.composition.predecessors) {
+      if (await this.hasCommit(tree.repository.path, predecessor.resultSha)) continue;
+      const local = this.get(predecessor.worktreeId);
+      if (
+        !predecessor.workspaceResultId &&
+        local?.runId === tree.runId &&
+        local.ownerStepId === predecessor.stepId &&
+        local.resultSha === predecessor.resultSha
+      )
+        continue;
+      const result = predecessor.workspaceResultId
+        ? results.get(predecessor.workspaceResultId)
+        : undefined;
+      if (
+        !result ||
+        result.state !== "available" ||
+        result.runId !== tree.runId ||
+        result.ownerStepId !== predecessor.stepId ||
+        result.repositoryIdentity !== tree.repositoryIdentity ||
+        result.baseSha !== tree.baseSha ||
+        result.headSha !== predecessor.resultSha ||
+        result.objectFormat !== tree.repositoryObjectFormat
+      )
+        throw new WorktreeConflict(
+          "workspace_result_mismatch",
+          `Predecessor ${predecessor.stepKey} has no matching portable result.`,
+        );
+      await this.importResult(tree, result, request.operationId, admin, hooks);
+    }
+  }
+
+  private async importResult(
+    tree: ManagedWorktree,
+    result: WorkspaceResult,
+    operationId: string,
+    admin: CheckoutLease,
+    hooksPath?: string,
+  ): Promise<void> {
+    if (
+      result.state !== "available" ||
+      result.runId !== tree.runId ||
+      result.repositoryIdentity !== tree.repositoryIdentity ||
+      result.baseSha !== tree.baseSha ||
+      result.objectFormat !== tree.repositoryObjectFormat
+    )
+      throw new WorktreeConflict(
+        "workspace_result_mismatch",
+        "The portable result does not belong to this logical repository and base.",
+      );
+    if (!this.options.downloadArtifact)
+      throw new WorktreeConflict(
+        "artifact_transport_unavailable",
+        "This Node cannot materialize portable workspace results.",
+      );
+    const directory = join(this.options.directory, "workspace-result-artifacts");
+    const hooks = hooksPath ?? join(directory, "empty-hooks");
+    await mkdir(hooks, { recursive: true });
+    const bundlePath = join(directory, `${result.artifactId}.bundle`);
+    const importedRef = `refs/fleet/imports/${identityHash(
+      `${result.id}:${result.headSha}`,
+    ).slice(0, 32)}`;
+    try {
+      await this.options.downloadArtifact(result, bundlePath, operationId);
+      if ((await stat(bundlePath)).size !== result.artifactSize)
+        throw new WorktreeConflict("artifact_size", "Downloaded artifact size changed.");
+      if ((await sha256File(bundlePath)) !== result.artifactSha256)
+        throw new WorktreeConflict(
+          "artifact_corrupt",
+          "Downloaded artifact hash changed.",
+        );
+      await this.git.run(tree.repository.path, ["bundle", "verify", bundlePath], {
+        timeoutMs: 120_000,
+      });
+      const existing = await this.ref(tree.repository.path, importedRef);
+      if (existing && existing !== result.headSha)
+        throw new WorktreeConflict(
+          "import_ref_collision",
+          "A Fleet-private import ref names different content.",
+        );
+      if (!existing)
+        await this.git.run(
+          tree.repository.path,
+          [
+            "-c",
+            `core.hooksPath=${hooks}`,
+            "fetch",
+            "--no-write-fetch-head",
+            bundlePath,
+            `${result.artifactRef ?? result.headSha}:${importedRef}`,
+          ],
+          { timeoutMs: 120_000, lease: admin },
+        );
+      if ((await this.ref(tree.repository.path, importedRef)) !== result.headSha)
+        throw new WorktreeConflict("artifact_import", "Imported result HEAD changed.");
+      if (!tree.importedWorkspaceResults.some((entry) => entry.id === result.id))
+        tree.importedWorkspaceResults.push({
+          id: result.id,
+          headSha: result.headSha,
+          artifactId: result.artifactId,
+        });
+    } finally {
+      await rm(bundlePath, { force: true });
+    }
   }
   private async ref(path: string, ref: string): Promise<string> {
     return (
@@ -1289,6 +1672,16 @@ export class ManagedWorktrees {
         allowedExitCodes: [0, 128],
       })
     ).stdout.trim();
+  }
+
+  private async hasCommit(path: string, sha: string): Promise<boolean> {
+    return (
+      (
+        await this.git.run(path, ["cat-file", "-e", `${sha}^{commit}`], {
+          allowedExitCodes: [0, 1, 128],
+        })
+      ).exitCode === 0
+    );
   }
 
   private async status(
@@ -1595,6 +1988,11 @@ export class ManagedWorktrees {
       );
     await this.noGitOperation(tree.path);
     tree.observation = await this.observe(tree);
+    if (!tree.repositoryIdentity || !tree.repositoryObjectFormat) {
+      const identity = await this.repositoryIdentity(tree.repository.path, tree.baseSha);
+      tree.repositoryIdentity = identity.id;
+      tree.repositoryObjectFormat = identity.objectFormat;
+    }
     tree.state = "retained";
     tree.error = "";
     void request;
@@ -1645,6 +2043,17 @@ export class ManagedWorktrees {
       tree.state = "removed";
       tree.removedAt = now();
       tree.error = "";
+      for (const result of tree.importedWorkspaceResults) {
+        const importedRef = `refs/fleet/imports/${identityHash(
+          `${result.id}:${result.headSha}`,
+        ).slice(0, 32)}`;
+        if ((await this.ref(tree.repository.path, importedRef)) === result.headSha)
+          await this.git.run(
+            tree.repository.path,
+            ["update-ref", "-d", importedRef, result.headSha],
+            { lease: admin },
+          );
+      }
       if (request.deleteBranch) {
         const integration = this.integrations(tree.id).find(
           (entry) => entry.state === "integrated" || entry.state === "no_changes",
@@ -2200,6 +2609,37 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? resolve(left).toUpperCase() === resolve(right).toUpperCase()
     : resolve(left) === resolve(right);
+}
+
+function normalizeRemoteIdentity(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed || /^(?:file:|[A-Za-z]:[\\/]|\\\\|\/)/i.test(trimmed)) return undefined;
+  const scp = /^(?:[^@/\s]+@)?([^:/\s]+):(.+)$/.exec(trimmed);
+  if (scp && !trimmed.includes("://"))
+    return `ssh://${scp[1]!.toLowerCase()}/${scp[2]!
+      .replace(/\\/g, "/")
+      .replace(/\.git\/?$/i, "")
+      .replace(/^\/+|\/+$/g, "")}`;
+  try {
+    const url = new URL(trimmed);
+    if (!["http:", "https:", "ssh:", "git:"].includes(url.protocol)) return undefined;
+    return `${url.protocol}//${url.hostname.toLowerCase()}${url.port ? `:${url.port}` : ""}/${url.pathname
+      .replace(/\.git\/?$/i, "")
+      .replace(/^\/+|\/+$/g, "")}`;
+  } catch {
+    return undefined;
+  }
+}
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolvePromise, reject) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", resolvePromise);
+  });
+  return hash.digest("hex");
 }
 
 async function approximateBytes(root: string): Promise<number | null> {

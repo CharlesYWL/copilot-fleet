@@ -1,6 +1,6 @@
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
 import { EntraConfigSchema } from "./auth/entra.js";
@@ -76,6 +76,8 @@ import {
   WorktreeIntegrationSchema,
   WorktreeOperationSchema,
   WorktreeTombstoneSchema,
+  PlacementRepositoryCapabilitySchema,
+  WorkspaceResultSchema,
   resolveWorkspaceMode,
   type ExecutionBinding,
   type ManagedWorktree,
@@ -85,6 +87,8 @@ import {
   type WorktreeIntegration,
   type WorktreeOperation,
   type WorktreeTombstone,
+  type PlacementRepositoryCapability,
+  type WorkspaceResult,
 } from "@fleet/protocol";
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import {
@@ -431,6 +435,7 @@ export type SecureFiles = (databasePath: string) => void;
 
 export class FleetStore {
   private readonly db: DatabaseSync;
+  readonly artifactDirectory: string;
   private transactionDepth = 0;
   /**
    * Compiling the same SQL on every call showed up on the hot path: a node
@@ -444,6 +449,10 @@ export class FleetStore {
     path: string,
     options: { secureFiles?: SecureFiles; exclusive?: boolean } = {},
   ) {
+    this.artifactDirectory =
+      path === ":memory:"
+        ? join(process.cwd(), ".mwi-test-work", "host-artifacts", randomUUID())
+        : join(dirname(path), "workspace-result-artifacts");
     /*
      * The default writes to stderr rather than to a logger, because the store
      * is constructed before anything that has one — and a Host that could not
@@ -540,6 +549,18 @@ export class FleetStore {
       CREATE TABLE IF NOT EXISTS worktree_tombstones (
         id TEXT PRIMARY KEY, worktree_id TEXT NOT NULL, data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS placement_repository_capabilities_v2 (
+        placement_id TEXT NOT NULL, node_id TEXT NOT NULL,
+        repository_identity TEXT NOT NULL, base_sha TEXT NOT NULL,
+        verified_at TEXT NOT NULL, data TEXT NOT NULL,
+        PRIMARY KEY(placement_id,repository_identity,base_sha)
+      );
+      CREATE TABLE IF NOT EXISTS workspace_results (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, owner_step_id TEXT NOT NULL,
+        state TEXT NOT NULL, artifact_id TEXT NOT NULL, data TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_workspace_results_run
+        ON workspace_results(run_id,owner_step_id);
       -- Every ownership question (which sessions does this node own, may this
       -- workspace be deleted) filtered these columns with a full scan.
       CREATE INDEX IF NOT EXISTS idx_sessions_node ON sessions(node_id);
@@ -1296,6 +1317,8 @@ export class FleetStore {
         parsed.branchRef !== current.branchRef ||
         parsed.baseSha !== current.baseSha ||
         parsed.sourcePlacementId !== current.sourcePlacementId ||
+        parsed.originatingPlacementId !== current.originatingPlacementId ||
+        parsed.repositoryIdentity !== current.repositoryIdentity ||
         parsed.nodeInstallationId !== current.nodeInstallationId ||
         parsed.hostInstallationId !== current.hostInstallationId ||
         parsed.version < current.version)
@@ -1330,6 +1353,8 @@ export class FleetStore {
         parsed.branchRef !== current.branchRef ||
         parsed.baseSha !== current.baseSha ||
         parsed.sourcePlacementId !== current.sourcePlacementId ||
+        parsed.originatingPlacementId !== current.originatingPlacementId ||
+        parsed.repositoryIdentity !== current.repositoryIdentity ||
         parsed.nodeInstallationId !== current.nodeInstallationId ||
         parsed.hostInstallationId !== current.hostInstallationId ||
         parsed.nodeId !== current.nodeId ||
@@ -1431,6 +1456,114 @@ export class FleetStore {
     ).run(id, parsed.worktreeId, JSON.stringify(parsed));
   }
 
+  listPlacementRepositoryCapabilities(): PlacementRepositoryCapability[] {
+    return this.statement("SELECT data FROM placement_repository_capabilities_v2")
+      .all()
+      .map((row) =>
+        PlacementRepositoryCapabilitySchema.parse(JSON.parse(String(row.data))),
+      );
+  }
+
+  getPlacementRepositoryCapability(
+    placementId: string,
+    repositoryIdentity?: string,
+    baseSha?: string,
+  ): PlacementRepositoryCapability | undefined {
+    const row =
+      repositoryIdentity && baseSha
+        ? this.statement(
+            `SELECT data FROM placement_repository_capabilities_v2
+             WHERE placement_id=? AND repository_identity=? AND base_sha=?`,
+          ).get(placementId, repositoryIdentity, baseSha)
+        : this.statement(
+            `SELECT data FROM placement_repository_capabilities_v2
+             WHERE placement_id=? ORDER BY verified_at DESC LIMIT 1`,
+          ).get(placementId);
+    return row
+      ? PlacementRepositoryCapabilitySchema.parse(JSON.parse(String(row.data)))
+      : undefined;
+  }
+
+  putPlacementRepositoryCapability(value: PlacementRepositoryCapability): void {
+    const parsed = PlacementRepositoryCapabilitySchema.parse(value);
+    this.statement(
+      `INSERT INTO placement_repository_capabilities_v2
+       (placement_id,node_id,repository_identity,base_sha,verified_at,data)
+       VALUES (?,?,?,?,?,?) ON CONFLICT(placement_id,repository_identity,base_sha)
+       DO UPDATE SET node_id=excluded.node_id,verified_at=excluded.verified_at,
+       data=excluded.data`,
+    ).run(
+      parsed.placementId,
+      parsed.nodeId,
+      parsed.repositoryIdentity.id,
+      parsed.baseSha,
+      parsed.verifiedAt,
+      JSON.stringify(parsed),
+    );
+  }
+
+  deletePlacementRepositoryCapability(placementId: string): void {
+    this.statement(
+      "DELETE FROM placement_repository_capabilities_v2 WHERE placement_id=?",
+    ).run(placementId);
+  }
+
+  listWorkspaceResults(runId?: string): WorkspaceResult[] {
+    const rows = runId
+      ? this.statement(
+          "SELECT data FROM workspace_results WHERE run_id=? ORDER BY owner_step_id,id",
+        ).all(runId)
+      : this.statement("SELECT data FROM workspace_results ORDER BY run_id,id").all();
+    return rows.map((row) => WorkspaceResultSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  getWorkspaceResult(id: string): WorkspaceResult | undefined {
+    const row = this.statement("SELECT data FROM workspace_results WHERE id=?").get(id);
+    return row ? WorkspaceResultSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  workspaceResultForStep(
+    runId: string,
+    ownerStepId: string,
+  ): WorkspaceResult | undefined {
+    const row = this.statement(
+      "SELECT data FROM workspace_results WHERE run_id=? AND owner_step_id=? ORDER BY id DESC LIMIT 1",
+    ).get(runId, ownerStepId);
+    return row ? WorkspaceResultSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  putWorkspaceResult(value: WorkspaceResult): void {
+    const parsed = WorkspaceResultSchema.parse(value);
+    const current = this.getWorkspaceResult(parsed.id);
+    if (
+      current &&
+      (current.runId !== parsed.runId ||
+        current.ownerStepId !== parsed.ownerStepId ||
+        current.repositoryIdentity !== parsed.repositoryIdentity ||
+        current.baseSha !== parsed.baseSha ||
+        current.headSha !== parsed.headSha ||
+        current.artifactId !== parsed.artifactId ||
+        current.artifactSha256 !== parsed.artifactSha256 ||
+        current.artifactSize !== parsed.artifactSize)
+    )
+      throw new WorktreeConflict(
+        "workspace_result_mismatch",
+        "A sealed workspace result identity cannot be changed.",
+      );
+    this.statement(
+      `INSERT INTO workspace_results
+       (id,run_id,owner_step_id,state,artifact_id,data) VALUES (?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET state=excluded.state,data=excluded.data`,
+    ).run(
+      parsed.id,
+      parsed.runId,
+      parsed.ownerStepId,
+      parsed.state,
+      parsed.artifactId,
+      JSON.stringify(parsed),
+    );
+  }
+
   assertWorktreePurgeAllowed(runId: string): void {
     const worktree = this.worktreeForRun(runId);
     const worktrees = [
@@ -1498,6 +1631,12 @@ export class FleetStore {
         current.resolutionSource !== parsed.resolutionSource ||
         (current.sourcePlacementId &&
           current.sourcePlacementId !== parsed.sourcePlacementId) ||
+        (current.originatingPlacementId &&
+          current.originatingPlacementId !== parsed.originatingPlacementId) ||
+        (current.repositoryIdentity &&
+          current.repositoryIdentity !== parsed.repositoryIdentity) ||
+        (current.repositoryObjectFormat &&
+          current.repositoryObjectFormat !== parsed.repositoryObjectFormat) ||
         (current.baseSha && current.baseSha !== parsed.baseSha) ||
         (current.checkoutKey && current.checkoutKey !== parsed.checkoutKey) ||
         (current.resolvedPath && current.resolvedPath !== parsed.resolvedPath) ||
@@ -1673,6 +1812,7 @@ export class FleetStore {
       worktreeOperations: this.listWorktreeOperations(),
       worktreeIntegrations: this.listWorktreeIntegrations(),
       worktreeTombstones: this.listWorktreeTombstones(),
+      workspaceResults: this.listWorkspaceResults(),
       runNotes: (
         this.statement(
           "SELECT * FROM run_notes ORDER BY run_id,created_at",
@@ -2023,6 +2163,14 @@ export class FleetStore {
         operation.request.worktreeId,
         JSON.stringify({ ...operation, state: "quarantined" }),
       );
+    }
+    for (const result of parsed.workspaceResults ?? []) {
+      this.putWorkspaceResult({
+        ...result,
+        state: "expired",
+        verifiedAt: "",
+        error: "Backup metadata contains no artifact bytes; reseal the result.",
+      });
     }
     for (const integration of parsed.worktreeIntegrations ?? []) {
       this.putWorktreeIntegration({ ...integration, state: "needs_reconciliation" });
@@ -3342,12 +3490,18 @@ export class FleetStore {
       assertNotReserved(existing.workspaceId, "repointed at another directory by hand");
     }
     if (workspaceId !== undefined) assertNotReserved(workspaceId, NO_MANUAL_CHECKOUTS);
-    if (localPath !== undefined) {
-      this.statement("UPDATE placements SET local_path=? WHERE id=?").run(localPath, id);
-    }
     if (workspaceId !== undefined) {
       this.movePlacement(id, workspaceId);
     }
+    if (localPath !== undefined) {
+      this.statement("UPDATE placements SET local_path=? WHERE id=?").run(localPath, id);
+    }
+    if (
+      existing &&
+      ((localPath !== undefined && localPath !== existing.localPath) ||
+        (workspaceId !== undefined && workspaceId !== existing.workspaceId))
+    )
+      this.deletePlacementRepositoryCapability(id);
     return this.getPlacement(id);
   }
 
@@ -3397,6 +3551,7 @@ export class FleetStore {
     this.assertNoLiveSessions("placement_id", id, "placement");
     this.transaction(() => {
       this.deleteSessionsWhere("placement_id", id);
+      this.deletePlacementRepositoryCapability(id);
       this.statement("DELETE FROM placements WHERE id=?").run(id);
     });
   }
@@ -4345,6 +4500,7 @@ export class FleetStore {
       input.accessIntent,
     );
     binding.sourcePlacementId = input.sourcePlacementId ?? "";
+    binding.originatingPlacementId = input.sourcePlacementId ?? "";
     if (binding.effectiveMode === "managed") {
       binding.managedWorktreeId = `worktree-${id}`;
       binding.generation = 1;

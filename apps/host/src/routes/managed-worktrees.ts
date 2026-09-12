@@ -71,6 +71,7 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
     );
     const steps = runs.flatMap((run) => store.listRunSteps(run.id));
     const worktrees = store.listManagedWorktrees();
+    const results = store.listWorkspaceResults();
     const integrations = store.listWorktreeIntegrations();
     return {
       generatedAt: new Date().toISOString(),
@@ -87,6 +88,28 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
             .filter((run) => run.workspaceBinding?.effectiveMode !== "managed")
             .map((run) => duration(run.createdAt, run.updatedAt)),
         ),
+        crossNodeSteps: steps.filter((step) => {
+          const run = store.getRun(step.runId);
+          const placement = step.placementId
+            ? store.getPlacement(step.placementId)
+            : undefined;
+          return Boolean(
+            run?.workspaceBinding?.originatingPlacementId &&
+            placement &&
+            placement.id !== run.workspaceBinding.originatingPlacementId,
+          );
+        }).length,
+      },
+      portableResults: {
+        sealDuration: summarize(results.map((entry) => entry.sealDurationMs)),
+        uploadDuration: summarize(results.map((entry) => entry.uploadDurationMs)),
+        downloadDuration: summarize(results.map((entry) => entry.downloadDurationMs)),
+        materializeDuration: summarize(
+          results.map((entry) => entry.materializeDurationMs),
+        ),
+        bytes: results.reduce((sum, entry) => sum + entry.artifactSize, 0),
+        available: results.filter((entry) => entry.state === "available").length,
+        corrupt: results.filter((entry) => entry.state === "corrupt").length,
       },
       preparation: {
         duration: summarize(
@@ -186,10 +209,28 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
     const source = run.workspaceBinding?.sourcePlacementId
       ? store.getPlacement(run.workspaceBinding.sourcePlacementId)
       : undefined;
+    const results = store.listWorkspaceResults(id);
+    const executionNodeIds = new Set(
+      [...store.listManagedWorktrees(), ...store.listDerivedWorkspaces(id)]
+        .filter((entry) => entry.runId === id)
+        .map((entry) => entry.nodeId),
+    );
     return {
       binding: run.workspaceBinding,
       worktree,
       source,
+      logicalRepository: source?.workspaceName ?? "",
+      originatingPlacement: run.workspaceBinding?.originatingPlacementId
+        ? store.getPlacement(run.workspaceBinding.originatingPlacementId)
+        : source,
+      executionNodeCount: executionNodeIds.size,
+      portableResults: {
+        total: results.length,
+        available: results.filter((entry) => entry.state === "available").length,
+        sealing: results.filter((entry) => ["sealing", "uploading"].includes(entry.state))
+          .length,
+        corrupt: results.filter((entry) => entry.state === "corrupt").length,
+      },
       version: worktree?.version ?? 0,
       operations: store
         .listWorktreeOperations(run.workspaceBinding?.managedWorktreeId)

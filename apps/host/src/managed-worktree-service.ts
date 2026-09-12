@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   MANAGED_WORKTREES_CAPABILITY,
+  PORTABLE_WORKTREE_RESULTS_CAPABILITY,
   WorktreeConflict,
   WorktreeOperationRequestSchema,
   canTransitionRun,
@@ -16,11 +17,19 @@ import {
   type WorktreeOperation,
   type WorktreeOperationRequest,
   type WorktreeOperationResult,
+  type ArtifactDownloadRequest,
+  type ArtifactUploadBegin,
+  type ArtifactUploadChunk,
+  type ArtifactUploadComplete,
+  type RepositoryProbeResult,
 } from "@fleet/protocol";
 import type { FleetService } from "./fleet-service.js";
 import { stopSessions } from "./orchestrator/lifecycle.js";
+import { WorkspaceArtifactStore } from "./workspace-artifact-store.js";
 
 export class ManagedWorktreeService {
+  private static readonly ARTIFACT_RETENTION_MS = 24 * 60 * 60 * 1000;
+  private static readonly REPOSITORY_CAPABILITY_MAX_AGE_MS = 5 * 60_000;
   private readonly waiters = new Map<
     string,
     { resolve: (operation: WorktreeOperation) => void; timer: NodeJS.Timeout }
@@ -28,13 +37,16 @@ export class ManagedWorktreeService {
   private readonly initializing = new Map<string, Promise<void>>();
   private readonly aggregating = new Set<string>();
   private lastSweep = 0;
+  private readonly artifacts: WorkspaceArtifactStore;
 
   private deterministicUuid(value: string): string {
     const hex = createHash("sha256").update(value).digest("hex").slice(0, 32);
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20)}`;
   }
 
-  constructor(private readonly service: FleetService) {}
+  constructor(private readonly service: FleetService) {
+    this.artifacts = new WorkspaceArtifactStore(service.store);
+  }
   private get store() {
     return this.service.store;
   }
@@ -180,6 +192,7 @@ export class ManagedWorktreeService {
       this.store.setRunWorkspaceBinding(runId, {
         ...binding,
         sourcePlacementId: source.id,
+        originatingPlacementId: binding.originatingPlacementId || source.id,
       });
       this.store.updateRun(runId, { placementId: source.id });
       const operation = await this.request(runId, {
@@ -283,6 +296,12 @@ export class ManagedWorktreeService {
       (a, b) => a.position - b.position || a.id.localeCompare(b.id),
     );
     if (predecessors.length === 0) return undefined;
+    const results = new Map(
+      predecessors.map((entry) => [
+        entry.id,
+        this.store.workspaceResultForStep(run.id, entry.id),
+      ]),
+    );
     if (
       predecessors.some(
         (entry) =>
@@ -299,6 +318,10 @@ export class ManagedWorktreeService {
         position: entry.position,
         worktreeId: entry.managedWorktreeId!,
         resultSha: entry.resultSha!,
+        workspaceResultId:
+          results.get(entry.id)?.state === "available"
+            ? results.get(entry.id)!.id
+            : undefined,
       })),
       state: "pending",
       resultSha: "",
@@ -335,9 +358,12 @@ export class ManagedWorktreeService {
       return this.bindingFor(run);
     if (dependsOnWritableHistory && !composition) return undefined;
     const worktreeId = step.managedWorktreeId || this.workspaceId(run.id, step.id);
+    const executionPlacement = this.executionPlacement(run, step);
+    if (!executionPlacement) return undefined;
     if (!step.managedWorktreeId) {
       this.store.updateRunStep(step.id, {
         managedWorktreeId: worktreeId,
+        placementId: executionPlacement.id,
         workspaceState: "pending",
         workspaceError: "",
       });
@@ -359,6 +385,7 @@ export class ManagedWorktreeService {
         workspaceKind: composition ? "derived" : "step",
         ownerStepId: step.id,
         ...(composition ? { composition } : {}),
+        sourcePlacementId: executionPlacement.id,
         expectedVersion: expected?.version ?? 0,
       })
         .then(() => this.service.tickRun(run.id))
@@ -375,6 +402,7 @@ export class ManagedWorktreeService {
       request("reserve");
       return undefined;
     }
+
     if (tree.state === "reserved" || tree.state === "creation_failed") {
       this.store.updateRunStep(step.id, { workspaceState: "creating" });
       request("create", tree);
@@ -409,6 +437,79 @@ export class ManagedWorktreeService {
       executionBinding: binding,
     });
     return binding;
+  }
+
+  private executionPlacement(run: Run, step: RunStep) {
+    const binding = run.workspaceBinding!;
+    const primary = this.store.worktreeForRun(run.id);
+    let candidates = this.store
+      .listPlacements()
+      .filter((placement) => {
+        const node = this.store.getNode(placement.nodeId);
+        if (
+          placement.workspaceId !== run.workspaceId ||
+          !node?.online ||
+          !node.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)
+        )
+          return false;
+        if (
+          placement.id === (binding.originatingPlacementId || binding.sourcePlacementId)
+        )
+          return primary?.repositoryIdentity === binding.repositoryIdentity;
+        const capability = this.store.getPlacementRepositoryCapability(
+          placement.id,
+          binding.repositoryIdentity,
+          binding.baseSha,
+        );
+        return Boolean(
+          node.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY) &&
+          capability?.baseAvailable &&
+          capability.nodeId === placement.nodeId &&
+          capability.localPath === placement.localPath &&
+          Date.now() - Date.parse(capability.verifiedAt) <=
+            ManagedWorktreeService.REPOSITORY_CAPABILITY_MAX_AGE_MS &&
+          capability.baseSha === binding.baseSha &&
+          capability.repositoryIdentity.id === binding.repositoryIdentity &&
+          capability.repositoryIdentity.objectFormat === binding.repositoryObjectFormat,
+        );
+      })
+      .sort((a, b) => {
+        const count = (nodeId: string) =>
+          this.store
+            .listSessions()
+            .filter(
+              (session) =>
+                session.nodeId === nodeId && !terminalSessionStates.has(session.state),
+            ).length +
+          this.store
+            .listRunSteps(run.id)
+            .filter(
+              (candidate) =>
+                candidate.id !== step.id &&
+                candidate.placementId &&
+                this.store.getPlacement(candidate.placementId)?.nodeId === nodeId &&
+                !["succeeded", "failed", "cancelled", "skipped"].includes(
+                  candidate.state,
+                ),
+            ).length;
+        return count(a.nodeId) - count(b.nodeId) || a.id.localeCompare(b.id);
+      });
+    const composition = this.compositionFor(run, step);
+    if (composition?.predecessors.some((entry) => !entry.workspaceResultId)) {
+      const owners = new Set(
+        composition.predecessors.map(
+          (entry) => this.store.getAnyManagedWorkspace(entry.worktreeId)?.nodeId,
+        ),
+      );
+      if (owners.size !== 1 || owners.has(undefined)) return undefined;
+      candidates = candidates.filter((entry) => owners.has(entry.nodeId));
+    }
+    if (step.placementId) {
+      const pinned = candidates.find((entry) => entry.id === step.placementId);
+      if (pinned) return pinned;
+      if (step.sessionId) return undefined;
+    }
+    return candidates[0];
   }
 
   finalizeStep(run: Run, step: RunStep): boolean {
@@ -763,7 +864,26 @@ export class ManagedWorktreeService {
           "Automatic integration requires the pinned symbolic base branch.",
         );
 
-      const resultTree = this.resultWorkspaceForRun(runId) ?? primary;
+      let resultTree = this.resultWorkspaceForRun(runId) ?? primary;
+      if (resultTree.nodeId !== source.nodeId) {
+        const finalResult = this.store.workspaceResultForStep(
+          runId,
+          resultTree.ownerStepId,
+        );
+        if (!finalResult || finalResult.state !== "available")
+          throw new WorktreeConflict(
+            "workspace_result_unavailable",
+            "The final sealed result is unavailable for originating-placement integration.",
+          );
+        this.setAggregation(runId, { aggregationPhase: "integrate" });
+        const materialized = await this.automaticOperation(run, primary, "materialize", {
+          kind: "materialize",
+          actor: "host-integration-controller",
+          workspaceResults: [finalResult],
+        });
+        if (!materialized?.result?.worktree) return;
+        resultTree = materialized.result.worktree;
+      }
       let integration = this.store
         .listWorktreeIntegrations(resultTree.id)
         .filter(
@@ -880,6 +1000,11 @@ export class ManagedWorktreeService {
         });
         if (!operation) return;
       }
+      const artifactExpiry = new Date(
+        Date.now() + ManagedWorktreeService.ARTIFACT_RETENTION_MS,
+      ).toISOString();
+      for (const result of this.store.listWorkspaceResults(runId))
+        this.store.putWorkspaceResult({ ...result, expiresAt: artifactExpiry });
       if (
         ownedSessions.some((session) => {
           const fresh = this.store.getSession(session.id);
@@ -977,7 +1102,12 @@ export class ManagedWorktreeService {
         "quarantined",
         "Restored metadata requires explicit reconciliation first.",
       );
-    const placement = this.store.getPlacement(binding.sourcePlacementId);
+    const requestedPlacementId =
+      input.sourcePlacementId ||
+      this.store.getAnyManagedWorkspace(worktreeId)?.sourcePlacementId ||
+      binding.originatingPlacementId ||
+      binding.sourcePlacementId;
+    const placement = this.store.getPlacement(requestedPlacementId);
     if (!placement)
       throw new WorktreeConflict(
         "source_unavailable",
@@ -1003,6 +1133,9 @@ export class ManagedWorktreeService {
       worktreeId,
       runId,
       sourcePlacementId: placement.id,
+      originatingPlacementId: binding.originatingPlacementId || binding.sourcePlacementId,
+      repositoryIdentity: binding.repositoryIdentity,
+      repositoryObjectFormat: binding.repositoryObjectFormat,
       workspaceId: run.workspaceId,
       sourcePath: placement.localPath,
       nodeId: node.id,
@@ -1012,8 +1145,23 @@ export class ManagedWorktreeService {
       expectedPath: tree?.path ?? "",
       expectedBranchRef: tree?.branchRef ?? "",
       expectedBaseSha: binding.baseSha,
+      expectedBaseRef: binding.baseRef,
       allowGitHooks: input.allowGitHooks ?? binding.allowGitHooks,
       policy: this.store.getManagedWorktreePolicy(),
+      workspaceResults:
+        input.workspaceResults ??
+        (input.composition
+          ? input.composition.predecessors.flatMap((predecessor) => {
+              if (!predecessor.workspaceResultId) return [];
+              const result = this.store.getWorkspaceResult(predecessor.workspaceResultId);
+              if (!result || result.state !== "available")
+                throw new WorktreeConflict(
+                  "workspace_result_unavailable",
+                  `A sealed predecessor result is unavailable for ${predecessor.stepKey}.`,
+                );
+              return [result];
+            })
+          : []),
     });
     if (existing) {
       // A replay uses the original immutable envelope, not today's policy or path.
@@ -1127,6 +1275,8 @@ export class ManagedWorktreeService {
         tree.nodeId !== nodeId ||
         tree.hostInstallationId !== expected.hostInstallationId ||
         tree.sourcePlacementId !== expected.sourcePlacementId ||
+        tree.executionPlacementId !== expected.sourcePlacementId ||
+        tree.originatingPlacementId !== expected.originatingPlacementId ||
         tree.workspaceId !== expected.workspaceId ||
         tree.generation !== expected.generation ||
         tree.workspaceKind !== expected.workspaceKind ||
@@ -1145,6 +1295,22 @@ export class ManagedWorktreeService {
         (expected.kind === "reconcile"
           ? tree.version <= expected.expectedVersion
           : tree.version !== expected.expectedVersion + 1))
+    )
+      return false;
+    if (
+      result.workspaceResult &&
+      (!tree ||
+        result.workspaceResult.id !== expected.operationId ||
+        result.workspaceResult.runId !== expected.runId ||
+        result.workspaceResult.ownerStepId !== expected.ownerStepId ||
+        result.workspaceResult.sourceWorktreeId !== expected.worktreeId ||
+        result.workspaceResult.sourceNodeId !== nodeId ||
+        result.workspaceResult.sourcePlacementId !== expected.sourcePlacementId ||
+        result.workspaceResult.sourceGeneration !== expected.generation ||
+        result.workspaceResult.repositoryIdentity !== tree.repositoryIdentity ||
+        result.workspaceResult.baseSha !== tree.baseSha ||
+        result.workspaceResult.headSha !== tree.resultSha ||
+        result.workspaceResult.state !== "available")
     )
       return false;
     if (
@@ -1191,6 +1357,7 @@ export class ManagedWorktreeService {
           );
         this.store.putWorktreeIntegration(result.integration);
       }
+      if (result.workspaceResult) this.store.putWorkspaceResult(result.workspaceResult);
       this.store.putWorktreeOperation({ ...operation, state: "acknowledged", result });
       const run = this.store.getRun(expected.runId);
       const binding = run?.workspaceBinding;
@@ -1206,6 +1373,10 @@ export class ManagedWorktreeService {
                 checkoutKey: tree.checkout?.key ?? binding.checkoutKey,
                 resolvedPath: tree.path,
                 allowGitHooks: tree.allowGitHooks,
+                originatingPlacementId:
+                  binding.originatingPlacementId || tree.originatingPlacementId,
+                repositoryIdentity: tree.repositoryIdentity,
+                repositoryObjectFormat: tree.repositoryObjectFormat,
               }
             : {}),
           initialization: result.ok
@@ -1350,8 +1521,220 @@ export class ManagedWorktreeService {
     } else {
       this.publish(expected.runId);
     }
+    if (
+      expected.workspaceKind === "primary" &&
+      expected.kind === "reserve" &&
+      result.ok &&
+      tree?.repositoryIdentity
+    ) {
+      this.store.putPlacementRepositoryCapability({
+        placementId: expected.sourcePlacementId,
+        nodeId,
+        localPath: tree.repository.path,
+        repositoryIdentity: {
+          id: tree.repositoryIdentity,
+          objectFormat: tree.repositoryObjectFormat!,
+          evidence: "roots",
+          remoteHash: "",
+          rootHash: createHash("sha256").update(tree.baseSha).digest("hex"),
+        },
+        baseSha: tree.baseSha,
+        baseAvailable: true,
+        verifiedAt: result.acknowledgedAt,
+        error: "",
+      });
+      this.probeRunPlacements(expected.runId);
+    }
     this.service.tickRun(expected.runId);
     return true;
+  }
+
+  probeRunPlacements(runId: string): void {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding?.repositoryIdentity || !binding.baseSha) return;
+    for (const placement of this.store
+      .listPlacements()
+      .filter(
+        (entry) =>
+          entry.workspaceId === run.workspaceId &&
+          entry.id !== binding.originatingPlacementId,
+      )) {
+      const node = this.store.getNode(placement.nodeId);
+      if (
+        !node?.online ||
+        !node.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY)
+      )
+        continue;
+      const socket = this.service.nodeSocket(node.id);
+      if (!socket) continue;
+      const operationId = this.deterministicUuid(
+        `${run.id}:repository-probe:${placement.id}:${binding.baseSha}`,
+      );
+      this.service.send(socket, {
+        type: "repository_probe",
+        request: {
+          operationId,
+          runId,
+          placementId: placement.id,
+          localPath: placement.localPath,
+          baseSha: binding.baseSha,
+          expectedRepositoryIdentity: binding.repositoryIdentity,
+        },
+      });
+    }
+  }
+
+  handleRepositoryProbe(nodeId: string, result: RepositoryProbeResult): boolean {
+    const run = this.store.getRun(result.runId);
+    const placement = this.store.getPlacement(result.placementId);
+    if (!run || !placement || placement.nodeId !== nodeId || result.nodeId !== nodeId)
+      return false;
+    if (result.ok && result.capability) {
+      const binding = run.workspaceBinding;
+      if (
+        !binding ||
+        result.capability.placementId !== placement.id ||
+        result.capability.nodeId !== placement.nodeId ||
+        result.capability.localPath !== placement.localPath ||
+        result.capability.repositoryIdentity.id !== binding.repositoryIdentity ||
+        result.capability.repositoryIdentity.objectFormat !==
+          binding.repositoryObjectFormat ||
+        result.capability.baseSha !== binding.baseSha
+      )
+        return false;
+      this.store.putPlacementRepositoryCapability(result.capability);
+      this.service.tickRun(run.id);
+    }
+    return true;
+  }
+
+  async handleArtifactUploadBegin(nodeId: string, value: ArtifactUploadBegin) {
+    if (
+      value.resultId !== value.result.id ||
+      value.artifactId !== value.result.artifactId
+    )
+      throw new WorktreeConflict(
+        "artifact_upload_forbidden",
+        "Artifact upload identifiers do not match the sealed result.",
+      );
+    this.authorizeArtifactUpload(nodeId, value.operationId, value.result);
+    const offset = await this.artifacts.begin(value);
+    return {
+      operationId: value.operationId,
+      resultId: value.resultId,
+      artifactId: value.artifactId,
+      ok: true,
+      offset,
+      complete: offset === value.result.artifactSize,
+      code: "",
+      error: "",
+    };
+  }
+
+  async handleArtifactUploadChunk(nodeId: string, value: ArtifactUploadChunk) {
+    const result = this.store.getWorkspaceResult(value.resultId);
+    if (
+      !result ||
+      value.operationId !== result.id ||
+      value.artifactId !== result.artifactId
+    )
+      throw new WorktreeConflict("artifact_owner", "Artifact upload identity changed.");
+    this.authorizeArtifactUpload(nodeId, value.operationId, result);
+    const offset = await this.artifacts.append(value);
+    return {
+      operationId: value.operationId,
+      resultId: value.resultId,
+      artifactId: value.artifactId,
+      ok: true,
+      offset,
+      complete: offset === result.artifactSize,
+      code: "",
+      error: "",
+    };
+  }
+
+  async handleArtifactUploadComplete(nodeId: string, value: ArtifactUploadComplete) {
+    const result = this.store.getWorkspaceResult(value.resultId);
+    if (
+      !result ||
+      value.operationId !== result.id ||
+      value.artifactId !== result.artifactId ||
+      value.size !== result.artifactSize ||
+      value.sha256 !== result.artifactSha256
+    )
+      throw new WorktreeConflict("artifact_owner", "Artifact upload identity changed.");
+    this.authorizeArtifactUpload(nodeId, value.operationId, result);
+    const available = await this.artifacts.complete(value);
+    return {
+      operationId: value.operationId,
+      resultId: value.resultId,
+      artifactId: value.artifactId,
+      ok: true,
+      offset: available.artifactSize,
+      complete: true,
+      code: "",
+      error: "",
+    };
+  }
+
+  async handleArtifactDownload(nodeId: string, value: ArtifactDownloadRequest) {
+    const operation = this.store.getWorktreeOperation(value.operationId);
+    const result = this.store.getWorkspaceResult(value.resultId);
+    if (
+      !operation ||
+      operation.request.nodeId !== nodeId ||
+      !["intent", "uncertain"].includes(operation.state) ||
+      !operation.request.workspaceResults.some((entry) => entry.id === value.resultId) ||
+      !result ||
+      result.state !== "available"
+    )
+      throw new WorktreeConflict(
+        "artifact_download_forbidden",
+        "Artifact download is not authorized for this operation.",
+      );
+    const chunk = await this.artifacts.read(
+      value.resultId,
+      value.artifactId,
+      value.offset,
+    );
+    return { ...chunk, operationId: value.operationId };
+  }
+
+  private authorizeArtifactUpload(
+    nodeId: string,
+    operationId: string,
+    result: NonNullable<WorktreeOperationResult["workspaceResult"]>,
+  ): void {
+    const operation = this.store.getWorktreeOperation(operationId);
+    const tree = this.store.getAnyManagedWorkspace(result.sourceWorktreeId);
+    if (
+      !operation ||
+      result.id !== operationId ||
+      !["intent", "uncertain"].includes(operation.state) ||
+      operation.request.kind !== "finalize" ||
+      operation.request.nodeId !== nodeId ||
+      operation.request.runId !== result.runId ||
+      operation.request.ownerStepId !== result.ownerStepId ||
+      operation.request.worktreeId !== result.sourceWorktreeId ||
+      operation.request.sourcePlacementId !== result.sourcePlacementId ||
+      operation.request.generation !== result.sourceGeneration ||
+      !tree ||
+      tree.nodeId !== nodeId ||
+      tree.runId !== result.runId ||
+      tree.ownerStepId !== result.ownerStepId ||
+      tree.sourcePlacementId !== result.sourcePlacementId ||
+      tree.generation !== result.sourceGeneration ||
+      tree.repositoryIdentity !== result.repositoryIdentity ||
+      tree.baseSha !== result.baseSha ||
+      tree.baseRef !== result.baseRef ||
+      tree.repositoryObjectFormat !== result.objectFormat ||
+      result.artifactRef !== `refs/fleet/results/${tree.taskKey}`
+    )
+      throw new WorktreeConflict(
+        "artifact_upload_forbidden",
+        "Artifact upload is not authorized for this result.",
+      );
   }
 
   onNodeReconciled(nodeId: string): void {
@@ -1396,6 +1779,14 @@ export class ManagedWorktreeService {
       ).catch(() => undefined);
     }
     this.lastSweep = 0;
+    for (const run of this.store
+      .listRuns()
+      .filter(
+        (entry) =>
+          entry.workspaceBinding?.effectiveMode === "managed" &&
+          !terminalRunStates.has(entry.state),
+      ))
+      this.probeRunPlacements(run.id);
     this.sweep();
   }
 
@@ -1449,6 +1840,18 @@ export class ManagedWorktreeService {
               ...(tree.composition ? { composition: tree.composition } : {}),
             })
       ).catch(() => undefined);
+    }
+    for (const result of this.store
+      .listWorkspaceResults()
+      .filter(
+        (entry) =>
+          entry.state === "available" &&
+          Boolean(entry.expiresAt) &&
+          Date.parse(entry.expiresAt) <= nowMs &&
+          terminalRunStates.has(this.store.getRun(entry.runId)?.state ?? "running"),
+      )
+      .slice(0, Math.max(0, 2 - count))) {
+      void this.artifacts.expire(result.id).catch(() => undefined);
     }
   }
 

@@ -1,6 +1,9 @@
 import { config as loadEnv } from "dotenv";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { arch, homedir, platform } from "node:os";
 import { join } from "node:path";
+import { mkdir, open, rm, stat } from "node:fs/promises";
 import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
 import {
@@ -16,6 +19,10 @@ import {
   type NodeToHostMessage,
   type NodeUpdateStage,
   type SessionEvent,
+  type ArtifactDownloadChunk,
+  type ArtifactTransferAck,
+  type WorkspaceResult,
+  WORKSPACE_ARTIFACT_CHUNK_BYTES,
 } from "@fleet/protocol";
 import { type AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
@@ -33,6 +40,17 @@ import {
   ensureNodeCredentials,
   openNodeChannel,
 } from "./enrollment.js";
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", resolve);
+  });
+  return hash.digest("hex");
+}
 import {
   legacyKeyUpgradeRefusal,
   unsolicitedKeyAcknowledgement,
@@ -329,10 +347,170 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         getCopilotCommand: () => settings.copilotCommand,
         getContextTier: () => settings.contextTier,
       });
+  const transferAcks = new Map<
+    string,
+    { resolve: (value: ArtifactTransferAck) => void; reject: (error: Error) => void }
+  >();
+  const downloadChunks = new Map<
+    string,
+    { resolve: (value: ArtifactDownloadChunk) => void; reject: (error: Error) => void }
+  >();
+  const transferKey = (operationId: string, artifactId: string) =>
+    `${operationId}:${artifactId}`;
+  const waitFor = <T>(
+    map: Map<string, { resolve: (value: T) => void; reject: (error: Error) => void }>,
+    key: string,
+  ): Promise<T> =>
+    new Promise((resolvePromise, reject) => {
+      const timer = setTimeout(() => {
+        map.delete(key);
+        reject(new Error("Artifact transfer acknowledgement timed out."));
+      }, 30_000);
+      timer.unref();
+      map.set(key, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          map.delete(key);
+          resolvePromise(value);
+        },
+        reject,
+      });
+    });
+  const uploadArtifact = async (
+    result: WorkspaceResult,
+    path: string,
+  ): Promise<WorkspaceResult> => {
+    const started = Date.now();
+    const key = transferKey(result.id, result.artifactId);
+    let pending = waitFor(transferAcks, key);
+    if (
+      !send({
+        type: "artifact_upload_begin",
+        transfer: {
+          operationId: result.id,
+          resultId: result.id,
+          artifactId: result.artifactId,
+          result,
+        },
+      })
+    )
+      throw new Error("Host is unavailable for artifact upload.");
+    let ack = await pending;
+    if (!ack.ok) throw new Error(ack.error || ack.code);
+    const file = await open(path, "r");
+    try {
+      while (ack.offset < result.artifactSize) {
+        const length = Math.min(
+          WORKSPACE_ARTIFACT_CHUNK_BYTES,
+          result.artifactSize - ack.offset,
+        );
+        const buffer = Buffer.alloc(length);
+        const { bytesRead } = await file.read(buffer, 0, length, ack.offset);
+        pending = waitFor(transferAcks, key);
+        send({
+          type: "artifact_upload_chunk",
+          transfer: {
+            operationId: result.id,
+            resultId: result.id,
+            artifactId: result.artifactId,
+            offset: ack.offset,
+            data: buffer.subarray(0, bytesRead).toString("base64"),
+          },
+        });
+        ack = await pending;
+        if (!ack.ok) throw new Error(ack.error || ack.code);
+      }
+    } finally {
+      await file.close();
+    }
+    pending = waitFor(transferAcks, key);
+    send({
+      type: "artifact_upload_complete",
+      transfer: {
+        operationId: result.id,
+        resultId: result.id,
+        artifactId: result.artifactId,
+        size: result.artifactSize,
+        sha256: result.artifactSha256,
+      },
+    });
+    ack = await pending;
+    if (!ack.ok || !ack.complete) throw new Error(ack.error || ack.code);
+    return {
+      ...result,
+      state: "available",
+      verifiedAt: new Date().toISOString(),
+      uploadDurationMs: Date.now() - started,
+    };
+  };
+  const downloadArtifact = async (
+    result: WorkspaceResult,
+    path: string,
+    operationId: string,
+  ): Promise<void> => {
+    await mkdir(join(configDirectory(), "workspace-result-artifacts"), {
+      recursive: true,
+    });
+    const present = await stat(path).catch(() => undefined);
+    let offset = present && present.size <= result.artifactSize ? present.size : 0;
+    if (present && offset === result.artifactSize) {
+      const digest = await sha256File(path);
+      if (digest === result.artifactSha256) return;
+      await rm(path, { force: true });
+      offset = 0;
+    } else if (present && offset === 0) {
+      await rm(path, { force: true });
+    }
+    const file = await open(path, offset ? "a+" : "w", 0o600);
+    try {
+      while (offset < result.artifactSize) {
+        const key = transferKey(operationId, result.artifactId);
+        const pending = waitFor(downloadChunks, key);
+        if (
+          !send({
+            type: "artifact_download_request",
+            transfer: {
+              operationId,
+              resultId: result.id,
+              artifactId: result.artifactId,
+              offset,
+            },
+          })
+        )
+          throw new Error("Host is unavailable for artifact download.");
+        const chunk = await pending;
+        if (chunk.offset !== offset || chunk.size !== result.artifactSize)
+          throw new Error("Artifact download offset or size changed.");
+        if (chunk.sha256 !== result.artifactSha256)
+          throw new Error("Artifact download identity changed.");
+        const bytes = Buffer.from(chunk.data, "base64");
+        if (bytes.length === 0 && !chunk.complete)
+          throw new Error("Artifact download made no progress.");
+        await file.write(bytes, 0, bytes.length, offset);
+        await file.sync();
+        offset += bytes.length;
+        if (chunk.complete && offset !== result.artifactSize)
+          throw new Error("Artifact download completed at the wrong size.");
+      }
+    } finally {
+      await file.close();
+    }
+    const downloaded = await stat(path).catch(() => undefined);
+    if (
+      !downloaded ||
+      downloaded.size !== result.artifactSize ||
+      (await sha256File(path)) !== result.artifactSha256
+    ) {
+      await rm(path, { force: true });
+      throw new Error("Artifact download failed integrity verification.");
+    }
+  };
   const worktrees: ManagedWorktrees = new ManagedWorktrees({
     directory: configDirectory(),
     nodeId: () => credentials.nodeId,
     quiesce: (id, target): Promise<void> => router.quiesceWorktree(id, target),
+    uploadArtifact,
+    downloadArtifact,
     ...(process.env.FLEET_WORKTREE_ROOT ? { root: process.env.FLEET_WORKTREE_ROOT } : {}),
   });
   const router: CommandRouter = new CommandRouter(
@@ -917,6 +1095,33 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         } catch (error) {
           warn(`Managed operation refused: ${errorMessage(error)}`);
         }
+        return;
+      }
+      if (frame.value.type === "repository_probe") {
+        const result = await worktrees.probeRepository(frame.value.request);
+        send({ type: "repository_probe_result", result });
+        return;
+      }
+      if (frame.value.type === "artifact_transfer_ack") {
+        transferAcks
+          .get(
+            transferKey(
+              frame.value.transfer.operationId,
+              frame.value.transfer.artifactId,
+            ),
+          )
+          ?.resolve(frame.value.transfer);
+        return;
+      }
+      if (frame.value.type === "artifact_download_chunk") {
+        downloadChunks
+          .get(
+            transferKey(
+              frame.value.transfer.operationId,
+              frame.value.transfer.artifactId,
+            ),
+          )
+          ?.resolve(frame.value.transfer);
         return;
       }
       if (frame.value.type !== "command") return;

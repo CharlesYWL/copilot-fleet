@@ -1392,6 +1392,7 @@ export class FleetTools {
       nodeById,
       reservedFor: (nodeId, kind) => reservedSessionCount(sessions, nodeId, kind),
       writingInFlight,
+      repositoryCapabilities: this.store.listPlacementRepositoryCapabilities(),
     });
   }
 

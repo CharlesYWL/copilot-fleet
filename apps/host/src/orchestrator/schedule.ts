@@ -1,6 +1,7 @@
 import {
   HOST_YOLO_CAPABILITY,
   MANAGED_WORKTREES_CAPABILITY,
+  PORTABLE_WORKTREE_RESULTS_CAPABILITY,
   checkoutLockKey,
   isChatsWorkspace,
   isWritingCategory,
@@ -10,6 +11,7 @@ import {
   type FleetNode,
   type FleetSession,
   type Placement,
+  type PlacementRepositoryCapability,
   type Run,
   type RunState,
   type RunStep,
@@ -20,6 +22,8 @@ import {
   reservedSessionCount,
   type SessionKind,
 } from "../session-policy.js";
+
+const REPOSITORY_CAPABILITY_MAX_AGE_MS = 5 * 60_000;
 
 /**
  * What the engine should do next, decided without touching the database or the
@@ -573,6 +577,7 @@ export type PlacementRequest = {
   nodeById: ReadonlyMap<string, FleetNode>;
   reservedFor: (nodeId: string, kind: SessionKind) => number;
   writingInFlight: ReadonlySet<string>;
+  repositoryCapabilities?: readonly PlacementRepositoryCapability[];
 };
 
 /**
@@ -639,30 +644,65 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
   const writes = isWritingCategory(request.category);
   const kind: SessionKind = writes ? "writing" : "read-only";
   if (run.workspaceBinding?.effectiveMode === "managed") {
-    const source = placements.find(
-      (placement) => placement.id === run.workspaceBinding!.sourcePlacementId,
+    const binding = run.workspaceBinding;
+    const capabilities = new Map(
+      (request.repositoryCapabilities ?? []).map((entry) => [
+        `${entry.placementId}:${entry.repositoryIdentity.id}:${entry.baseSha}`,
+        entry,
+      ]),
     );
-    if (!source)
+    const matching = placements.filter((placement) => {
+      if (placement.workspaceId !== run.workspaceId) return false;
+      const capability = capabilities.get(
+        `${placement.id}:${binding.repositoryIdentity}:${binding.baseSha}`,
+      );
+      return (
+        placement.id === binding.originatingPlacementId ||
+        Boolean(
+          capability?.baseAvailable &&
+          capability.nodeId === placement.nodeId &&
+          capability.localPath === placement.localPath &&
+          Date.now() - Date.parse(capability.verifiedAt) <=
+            REPOSITORY_CAPABILITY_MAX_AGE_MS &&
+          capability.baseSha === binding.baseSha &&
+          capability.repositoryIdentity.id === binding.repositoryIdentity &&
+          capability.repositoryIdentity.objectFormat === binding.repositoryObjectFormat,
+        )
+      );
+    });
+    if (!matching.length)
       return "The managed task's pinned source placement is unavailable. Reconcile it; no fallback is permitted.";
-    if (
-      (request.workspace &&
-        request.workspace.trim().toLowerCase() !== source.workspaceName?.toLowerCase()) ||
-      (request.node &&
-        ![source.nodeId, source.nodeName?.toLowerCase()].includes(
-          request.node.trim().toLowerCase(),
-        ))
-    ) {
-      return "Managed DAG work stays on the pinned source Node; writable steps receive deterministic per-step or composed worktrees there. Open a different task for unrelated work.";
+    let candidates = matching;
+    if (request.node?.trim()) {
+      const resolved = resolveNode(request.node, [...nodeById.values()]);
+      if (typeof resolved === "string") return resolved;
+      candidates = candidates.filter((placement) => placement.nodeId === resolved.id);
+      if (!candidates.length)
+        return `${resolved.name} has no verified matching copy of this logical repository and pinned base.`;
     }
-    const node = nodeById.get(source.nodeId);
-    if (!node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY))
-      return "Upgrade the pinned Node to managed-worktrees-v1; managed tasks never fall back to Legacy.";
-    if (!usable(node, run)) return "The managed task's owning Node is unavailable.";
-    if (writingInFlight.has(executionKey(run, source.id)))
-      return "This task's checkout is held by another shell-capable session. Wait for process quiescence before the next writer/reviewer.";
-    if (remainingCapacity(node, reservedFor(node.id, kind), kind) < 1)
-      return "The task's owning Node has no free capacity.";
-    return source;
+    const ranked = candidates
+      .flatMap((placement) => {
+        const node = nodeById.get(placement.nodeId);
+        if (!usable(node, run)) return [];
+        if (
+          placement.id !== binding.originatingPlacementId &&
+          !node!.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY)
+        )
+          return [];
+        return [
+          {
+            placement,
+            free: remainingCapacity(node!, reservedFor(node!.id, kind), kind),
+          },
+        ];
+      })
+      .sort((a, b) => b.free - a.free || a.placement.id.localeCompare(b.placement.id));
+    for (const candidate of ranked) {
+      if (candidate.free < 1) continue;
+      if (writingInFlight.has(executionKey(run, candidate.placement.id))) continue;
+      return candidate.placement;
+    }
+    return "No online Node has a verified matching logical repository and pinned base with free capacity.";
   }
   const pinned =
     run.placementId && request.hasWritingStep
@@ -805,7 +845,7 @@ function choosePlacement(
     step.executionBinding
   ) {
     const source = context.placements.find(
-      (placement) => placement.id === context.run.workspaceBinding!.sourcePlacementId,
+      (placement) => placement.id === step.executionBinding!.sourcePlacementId,
     );
     const node = source ? context.nodeById.get(source.nodeId) : undefined;
     if (!source || !usable(node, context.run)) return undefined;
@@ -837,11 +877,6 @@ function choosePlacement(
     ) {
       return undefined;
     }
-    if (
-      context.run.workspaceBinding?.effectiveMode === "managed" &&
-      chosen.id !== context.run.workspaceBinding.sourcePlacementId
-    )
-      return undefined;
     const kind: SessionKind = isReadOnlyCategory(step.category) ? "read-only" : "writing";
     if (remainingCapacity(node!, context.reservedFor(node!.id, kind), kind) < 1) {
       return undefined;

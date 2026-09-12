@@ -1,6 +1,6 @@
 # ADR: Managed worktree isolation for parallel orchestration
 
-Status: implemented, conservative v1.
+Status: implemented, distributed portable-result v2.
 
 **Problem / motivation:** independently writable orchestration tasks need to run
 concurrently against one repository without sharing writable checkout state, while
@@ -131,6 +131,64 @@ Node-installation/repository namespace and an ownership marker. The Node may use
 edit the source `.gitignore`. Root containment, registration, branch, base and
 physical identity are revalidated; unknown directories/ref collisions are never
 overwritten or adopted.
+
+## Logical repositories and distributed execution
+
+A task owns a logical repository identity; Nodes own physical source checkouts,
+managed worktrees and Fleet-private refs. The Run persists
+`originatingPlacementId` separately from step execution placements. Historical
+`sourcePlacementId` bindings parse as the originating placement, preserving
+single-Node behavior.
+
+Each Node derives identity from Git's object format, roots reachable from the pinned
+base, and, when available, a normalized credential-free network origin. Local/file
+remotes are excluded. The Host marks another placement eligible only after that Node
+proves the same identity and possession of the exact base commit. A matching ref or
+SHA alone never identifies a repository.
+
+Independent writable steps may use different eligible Nodes under the existing
+capacity policy. Retries of one conversation and dirty/unsealed state remain
+node-affine. A dependent or fan-in step may move only when every required writable
+predecessor has an available sealed result; results are imported and composed in
+dependency/position order. If no exact match is online, dispatch waits. Automatic
+integration still targets the pinned originating placement/base ref; a remote final
+result is first materialized into the originating primary worktree.
+
+## Portable results and transport
+
+Writable-step finalization proves a clean worktree and exact committed HEAD, creates
+and verifies a `git bundle`, computes SHA-256/size, uploads it to Host-owned storage,
+and only then marks its durable `WorkspaceResult` available. Agents never push or
+fetch Fleet task refs through user remotes.
+
+Artifact bytes live outside SQLite; SQLite stores ownership, lifecycle and integrity
+metadata. Transfers use authenticated Host↔Node frames with 256 KiB chunks, a
+512 MiB artifact limit, 64 results/2 GiB per task, and 20 GiB per Host. Uploads
+are authorized against the exact pending finalize operation and immutable
+worktree ownership; contiguous offsets and replayed bytes must match. Partial files are fsynced,
+checksummed and atomically renamed. Reconnect repeats begin and resumes from the
+Host's durable offset. Downloads are authorized against the pending composition or
+materialization operation. Remote machines never supply Host storage paths.
+
+Receivers verify SHA-256 and `git bundle verify`, import into collision-checked
+`refs/fleet/imports/*` with hooks disabled, and verify the imported commit before
+composition. Downloaded bundles are removed after import, and cleanup removes only
+private refs recorded as owned by that workspace. Available Host artifacts get
+a 24-hour post-completion debugging window before bounded expiry. Partial/corrupt
+artifacts fail closed.
+
+Placement capability proofs are keyed by placement, logical repository and pinned
+base SHA, so concurrent Runs at different revisions do not invalidate one another.
+Proofs are bound to the current Node/path, expire after five minutes, and are
+invalidated when a placement is moved or repathed. Reconciliation backfills logical
+repository identity for compatible worktrees created before portable results existed.
+
+Rejected alternatives are shared filesystems/worktrees (incompatible identity,
+locking and failure domains) and ephemeral refs on user remotes (credential,
+visibility, lifecycle and third-party recovery risks). Remaining constraints are
+that every destination must already contain the pinned base, submodule/LFS behavior
+still follows repository compatibility checks, conflicting fan-in needs explicit
+recovery, and final automatic integration remains on the originating placement.
 
 ## Durable state and recovery
 

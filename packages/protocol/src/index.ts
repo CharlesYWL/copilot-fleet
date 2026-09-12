@@ -9,6 +9,15 @@ import {
   WorktreeOperationResultSchema,
   WorktreeOperationSchema,
   WorktreeTombstoneSchema,
+  WorkspaceResultSchema,
+  ArtifactDownloadChunkSchema,
+  ArtifactDownloadRequestSchema,
+  ArtifactTransferAckSchema,
+  ArtifactUploadBeginSchema,
+  ArtifactUploadChunkSchema,
+  ArtifactUploadCompleteSchema,
+  RepositoryProbeRequestSchema,
+  RepositoryProbeResultSchema,
 } from "./managed-worktrees.js";
 export * from "./managed-worktrees.js";
 
@@ -887,6 +896,26 @@ export type NodeReady = z.infer<typeof NodeReadySchema>;
 
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
   z.object({
+    type: z.literal("repository_probe_result"),
+    result: RepositoryProbeResultSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_upload_begin"),
+    transfer: ArtifactUploadBeginSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_upload_chunk"),
+    transfer: ArtifactUploadChunkSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_upload_complete"),
+    transfer: ArtifactUploadCompleteSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_download_request"),
+    transfer: ArtifactDownloadRequestSchema,
+  }),
+  z.object({
     type: z.literal("managed_worktree_result"),
     result: WorktreeOperationResultSchema,
   }),
@@ -964,6 +993,18 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("repository_probe"),
+    request: RepositoryProbeRequestSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_transfer_ack"),
+    transfer: ArtifactTransferAckSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_download_chunk"),
+    transfer: ArtifactDownloadChunkSchema,
+  }),
   z.object({
     type: z.literal("managed_worktree"),
     request: WorktreeOperationRequestSchema,
@@ -2470,6 +2511,7 @@ const hostBackupDataShape = {
   worktreeOperations: z.array(WorktreeOperationSchema).default([]).optional(),
   worktreeIntegrations: z.array(WorktreeIntegrationSchema).default([]).optional(),
   worktreeTombstones: z.array(WorktreeTombstoneSchema).default([]).optional(),
+  workspaceResults: z.array(WorkspaceResultSchema).default([]).optional(),
   runSteps: z.array(RunStepSchema).default([]),
   /**
    * A task's notes are the orchestrator's own record of it — what a phase

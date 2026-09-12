@@ -208,6 +208,31 @@ describe("managed checkout scheduling", () => {
     ).not.toContain("start_step");
   });
 
+  it("dispatches managed step bindings on different verified Nodes", () => {
+    const second = ExecutionBindingSchema.parse({
+      ...binding("remote"),
+      sourcePlacementId: "p2",
+      cwd: "D:\\trees\\remote",
+      checkoutKey: "physical-remote",
+    });
+    const actions = planNextActions(
+      world({
+        run: managed(),
+        nodes: [capable(), node("n2", { capabilities: capable().capabilities })],
+        steps: [
+          step("write-a", { executionBinding: binding("local") }),
+          step("write-b", { executionBinding: second }),
+        ],
+      }),
+    ).filter((action) => action.type === "start_step");
+    expect(actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ stepId: "write-a", placementId: "p1" }),
+        expect.objectContaining({ stepId: "write-b", placementId: "p2" }),
+      ]),
+    );
+  });
+
   it("dispatches a dependent from its derived workspace without taking a predecessor checkout", () => {
     const input = world({
       run: managed(),

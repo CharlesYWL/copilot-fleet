@@ -5,6 +5,7 @@ import {
   IntegrationPreviewSchema,
   ManagedWorktreePolicySchema,
   ManagedWorktreeSchema,
+  NodeToHostMessageSchema,
   RunSchema,
   RunWorkspaceBindingSchema,
   WorktreeIntegrationSchema,
@@ -86,6 +87,7 @@ describe("managed workspace protocol compatibility", () => {
     expect(backup.worktreeOperations).toEqual([]);
     expect(backup.worktreeIntegrations).toEqual([]);
     expect(backup.worktreeTombstones).toEqual([]);
+    expect(backup.workspaceResults).toEqual([]);
     expect(ManagedWorktreePolicySchema.parse({})).toMatchObject({
       retentionDays: 7,
       maxPerRepository: 8,
@@ -126,6 +128,8 @@ describe("managed workspace protocol compatibility", () => {
       updatedAt: now,
     });
     expect(old.workspaceKind).toBe("primary");
+    expect(old.originatingPlacementId).toBe("placement");
+    expect(old.executionPlacementId).toBe("placement");
     expect(
       ManagedWorktreeSchema.parse({
         ...old,
@@ -150,6 +154,27 @@ describe("managed workspace protocol compatibility", () => {
       state: "pending",
       predecessors: [{ stepId: "left", position: 0 }],
     });
+  });
+
+  it("keeps sourcePlacementId compatible while carrying repository and chunk metadata", () => {
+    const binding = RunWorkspaceBindingSchema.parse({
+      sourcePlacementId: "origin",
+      repositoryIdentity: "f".repeat(64),
+      repositoryObjectFormat: "sha1",
+    });
+    expect(binding.originatingPlacementId).toBe("origin");
+    expect(
+      NodeToHostMessageSchema.parse({
+        type: "artifact_upload_chunk",
+        transfer: {
+          operationId: "00000000-0000-4000-8000-000000000000",
+          resultId: "result",
+          artifactId: "a".repeat(64),
+          offset: 0,
+          data: Buffer.from("chunk").toString("base64"),
+        },
+      }).type,
+    ).toBe("artifact_upload_chunk");
   });
 
   it("keeps legacy commands valid and rejects untyped or unversioned worktree operations", () => {

@@ -5,6 +5,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   symlink,
   unlink,
   writeFile,
@@ -49,6 +50,7 @@ afterEach(async () => {
 
 async function fixture(
   checkpoint?: ConstructorParameters<typeof ManagedWorktrees>[0]["checkpoint"],
+  overrides: Partial<ConstructorParameters<typeof ManagedWorktrees>[0]> = {},
 ) {
   const root = resolve(".mwi-test-work", randomUUID());
   roots.push(root);
@@ -68,6 +70,7 @@ async function fixture(
     nodeId: () => "node-1",
     locks: new CheckoutLocks(join(root, "locks")),
     ...(checkpoint ? { checkpoint } : {}),
+    ...overrides,
   });
   managers.push(manager);
   return { root, source, manager };
@@ -98,7 +101,7 @@ async function operation(
   manager: ManagedWorktrees,
   tree: ManagedWorktree,
   kind: WorktreeOperationRequest["kind"],
-  extra: Partial<WorktreeOperationRequest> = {},
+  extra: Record<string, unknown> = {},
 ) {
   return manager.execute(
     WorktreeOperationRequestSchema.parse({
@@ -270,6 +273,250 @@ async function liveAcpFixture(managed = true) {
 }
 
 describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
+  it("moves a sealed result between node-local repositories without changing remotes", async () => {
+    const root = resolve(".mwi-test-work", randomUUID());
+    roots.push(root);
+    const sourceA = join(root, "source-a");
+    const sourceB = join(root, "source-b");
+    await mkdir(sourceA, { recursive: true });
+    await git.run(sourceA, ["init", "-b", "target"]);
+    await git.run(sourceA, ["config", "user.name", "Fleet Test"]);
+    await git.run(sourceA, ["config", "user.email", "fleet-test@example.invalid"]);
+    await writeFile(join(sourceA, "base.txt"), "base\n");
+    await git.run(sourceA, ["add", "."]);
+    await git.run(sourceA, ["commit", "-m", "base"]);
+    await git.run(root, ["clone", "--no-hardlinks", sourceA, sourceB]);
+    await git.run(sourceB, ["config", "user.name", "Fleet Test"]);
+    await git.run(sourceB, ["config", "user.email", "fleet-test@example.invalid"]);
+    const baseSha = (await git.run(sourceA, ["rev-parse", "HEAD"])).stdout.trim();
+    let artifact = Buffer.alloc(0);
+    const publisher = new ManagedWorktrees({
+      directory: join(root, "state-a"),
+      nodeId: () => "node-a",
+      locks: new CheckoutLocks(join(root, "locks-a")),
+      uploadArtifact: async (result, path) => {
+        artifact = await readFile(path);
+        return {
+          ...result,
+          state: "available",
+          verifiedAt: new Date().toISOString(),
+        };
+      },
+    });
+    managers.push(publisher);
+    const reserveA = WorktreeOperationRequestSchema.parse({
+      ...reserveRequest(sourceA, "portable-run"),
+      worktreeId: "portable-writer",
+      sourcePlacementId: "placement-a",
+      originatingPlacementId: "placement-a",
+      nodeId: "node-a",
+      workspaceKind: "step",
+      ownerStepId: "writer",
+    });
+    const reservedA = await publisher.execute(reserveA);
+    const createdA = await operation(publisher, reservedA.worktree!, "create", {
+      sourcePlacementId: "placement-a",
+      originatingPlacementId: "placement-a",
+      nodeId: "node-a",
+      workspaceKind: "step",
+      ownerStepId: "writer",
+      repositoryIdentity: reservedA.worktree!.repositoryIdentity,
+      repositoryObjectFormat: reservedA.worktree!.repositoryObjectFormat,
+    });
+    await writeFile(join(createdA.worktree!.path, "portable.txt"), "from node a\n");
+    await git.run(createdA.worktree!.path, ["add", "portable.txt"]);
+    await git.run(createdA.worktree!.path, ["commit", "-m", "portable"]);
+    const finalized = await operation(publisher, createdA.worktree!, "finalize", {
+      sourcePlacementId: "placement-a",
+      originatingPlacementId: "placement-a",
+      nodeId: "node-a",
+      workspaceKind: "step",
+      ownerStepId: "writer",
+      repositoryIdentity: createdA.worktree!.repositoryIdentity,
+      repositoryObjectFormat: createdA.worktree!.repositoryObjectFormat,
+    });
+    expect(finalized.workspaceResult?.state).toBe("available");
+    expect(artifact.length).toBeGreaterThan(0);
+
+    const remotesBefore = (await git.run(sourceB, ["remote", "-v"])).stdout;
+    const receiver = new ManagedWorktrees({
+      directory: join(root, "state-b"),
+      nodeId: () => "node-b",
+      locks: new CheckoutLocks(join(root, "locks-b")),
+      downloadArtifact: async (_result, path) => writeFile(path, artifact),
+    });
+    managers.push(receiver);
+    const result = finalized.workspaceResult!;
+    const mismatch = await receiver.probeRepository({
+      operationId: randomUUID(),
+      runId: "portable-run",
+      placementId: "placement-b",
+      localPath: sourceB,
+      baseSha,
+      expectedRepositoryIdentity: "0".repeat(64),
+    });
+    expect(mismatch).toMatchObject({
+      ok: false,
+      code: "repository_identity_mismatch",
+    });
+    const composition = {
+      baseSha,
+      baseRef: "refs/heads/target",
+      predecessors: [
+        {
+          stepId: "writer",
+          stepKey: "writer",
+          position: 0,
+          worktreeId: "portable-writer",
+          resultSha: result.headSha,
+          workspaceResultId: result.id,
+        },
+      ],
+      state: "pending" as const,
+    };
+    const reserveB = WorktreeOperationRequestSchema.parse({
+      ...reserveRequest(sourceB, "portable-run"),
+      operationId: randomUUID(),
+      worktreeId: "portable-derived",
+      sourcePlacementId: "placement-b",
+      originatingPlacementId: "placement-a",
+      nodeId: "node-b",
+      expectedBaseSha: baseSha,
+      expectedBaseRef: "refs/heads/target",
+      repositoryIdentity: result.repositoryIdentity,
+      repositoryObjectFormat: result.objectFormat,
+      workspaceKind: "derived",
+      ownerStepId: "consumer",
+      composition,
+      workspaceResults: [result],
+    });
+    const reservedB = await receiver.execute(reserveB);
+    expect(reservedB.ok).toBe(true);
+    const shared = {
+      sourcePlacementId: "placement-b",
+      originatingPlacementId: "placement-a",
+      nodeId: "node-b",
+      expectedBaseRef: "refs/heads/target",
+      repositoryIdentity: result.repositoryIdentity,
+      repositoryObjectFormat: result.objectFormat,
+      workspaceKind: "derived" as const,
+      ownerStepId: "consumer",
+      composition,
+      workspaceResults: [result],
+    };
+    const createdB = await operation(receiver, reservedB.worktree!, "create", shared);
+    const composed = await operation(receiver, createdB.worktree!, "compose", shared);
+    expect(composed.error).toBe("");
+    expect(composed.ok).toBe(true);
+    expect(
+      (await readFile(join(composed.worktree!.path, "portable.txt"), "utf8")).trim(),
+    ).toBe("from node a");
+    expect((await git.run(sourceB, ["remote", "-v"])).stdout).toBe(remotesBefore);
+    const importedRef = `refs/fleet/imports/${createHash("sha256")
+      .update(`${result.id}:${result.headSha}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+    expect(
+      (await git.run(sourceB, ["rev-parse", "--verify", importedRef])).stdout.trim(),
+    ).toBe(result.headSha);
+    await expect(
+      stat(
+        join(
+          root,
+          "state-b",
+          "workspace-result-artifacts",
+          `${result.artifactId}.bundle`,
+        ),
+      ),
+    ).rejects.toThrow();
+    expect((await operation(receiver, composed.worktree!, "cleanup", shared)).ok).toBe(
+      true,
+    );
+    expect(
+      (
+        await git.run(sourceB, ["rev-parse", "--verify", importedRef], {
+          allowedExitCodes: [0, 128],
+        })
+      ).stdout.trim(),
+    ).toBe("");
+  });
+
+  it("replays finalization after a crash leaves the private result ref behind", async () => {
+    let interruptFinalize = false;
+    let uploads = 0;
+    const { source, manager } = await fixture(
+      (stage, request) => {
+        if (interruptFinalize && stage === "git" && request.kind === "finalize") {
+          interruptFinalize = false;
+          throw new WorktreeCrash("interrupted finalization");
+        }
+      },
+      {
+        uploadArtifact: async (result) => {
+          uploads += 1;
+          return {
+            ...result,
+            state: "available",
+            verifiedAt: new Date().toISOString(),
+          };
+        },
+      },
+    );
+    const reserved = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source),
+        workspaceKind: "step",
+        ownerStepId: "writer",
+      }),
+    );
+    const created = await operation(manager, reserved.worktree!, "create", {
+      workspaceKind: "step",
+      ownerStepId: "writer",
+    });
+    const tree = created.worktree!;
+    await writeFile(join(tree.path, "portable.txt"), "portable\n");
+    await git.run(tree.path, ["add", "portable.txt"]);
+    await git.run(tree.path, ["commit", "-m", "portable"]);
+    const request = WorktreeOperationRequestSchema.parse({
+      ...reserveRequest(source, tree.runId),
+      operationId: randomUUID(),
+      kind: "finalize",
+      worktreeId: tree.id,
+      generation: tree.generation,
+      expectedVersion: manager.get(tree.id)!.version,
+      expectedPath: tree.path,
+      expectedBranchRef: tree.branchRef,
+      expectedBaseSha: tree.baseSha,
+      workspaceKind: "step",
+      ownerStepId: "writer",
+    });
+
+    interruptFinalize = true;
+    await expect(manager.execute(request)).rejects.toThrow(WorktreeCrash);
+    expect(
+      (
+        await git.run(source, [
+          "rev-parse",
+          "--verify",
+          `refs/fleet/results/${tree.taskKey}`,
+        ])
+      ).stdout.trim(),
+    ).toMatch(/^[a-f0-9]{40}$/);
+
+    const replayed = await manager.execute(request);
+    expect(replayed.ok, `${replayed.code}: ${replayed.error}`).toBe(true);
+    expect(replayed.workspaceResult?.state).toBe("available");
+    expect(uploads).toBe(1);
+    expect(
+      (
+        await git.run(
+          source,
+          ["rev-parse", "--verify", `refs/fleet/results/${tree.taskKey}`],
+          { allowedExitCodes: [0, 128] },
+        )
+      ).stdout.trim(),
+    ).toBe("");
+  });
   it("composes committed independent step results deterministically into a derived workspace", async () => {
     let interruptComposition = false;
     const { source, manager } = await fixture((stage, request) => {

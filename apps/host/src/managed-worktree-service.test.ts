@@ -79,6 +79,10 @@ function acknowledgement(request: WorktreeOperationRequest): WorktreeOperationRe
     runId: request.runId,
     taskKey: safeKey,
     sourcePlacementId: request.sourcePlacementId,
+    originatingPlacementId: request.originatingPlacementId,
+    executionPlacementId: request.sourcePlacementId,
+    repositoryIdentity: request.repositoryIdentity || "f".repeat(64),
+    repositoryObjectFormat: request.repositoryObjectFormat || "sha1",
     workspaceId: request.workspaceId,
     nodeId: request.nodeId,
     machineId: "machine",
@@ -890,6 +894,69 @@ describe("Host managed workspace orchestration", () => {
           },
         ],
       },
+    });
+  });
+
+  it("allocates independent writable steps across verified matching Nodes", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit, false);
+    const second = kit.store.registerNode({
+      name: "Node 2",
+      os: "win32",
+      arch: "x64",
+      version: "test",
+      maxSessions: 8,
+      capabilities: ["host-yolo", "managed-worktrees-v1", "portable-worktree-results-v1"],
+    }).node;
+    kit.store.setNodeOnline(second.id, true);
+    const placement2 = kit.store.createPlacement(run.workspaceId, second.id, "D:\\repo");
+    kit.store.putPlacementRepositoryCapability({
+      placementId: placement2.id,
+      nodeId: second.id,
+      localPath: placement2.localPath,
+      repositoryIdentity: {
+        id: run.workspaceBinding!.repositoryIdentity,
+        objectFormat: "sha1",
+        evidence: "roots",
+        remoteHash: "",
+        rootHash: "e".repeat(64),
+      },
+      baseSha: run.workspaceBinding!.baseSha,
+      baseAvailable: true,
+      verifiedAt: new Date().toISOString(),
+      error: "",
+    });
+    const remoteFrames: HostToNodeMessage[] = [];
+    kit.service.attachNode(second.id, {
+      OPEN: 1,
+      readyState: 1,
+      send: (text) => remoteFrames.push(HostToNodeMessageSchema.parse(JSON.parse(text))),
+      close() {},
+    });
+    const first = kit.store.upsertRunStep(run.id, {
+      stepKey: "one",
+      title: "one",
+      prompt: "one",
+      category: "implement",
+      placementId: kit.placement.id,
+      position: 0,
+    });
+    const secondStep = kit.store.upsertRunStep(run.id, {
+      stepKey: "two",
+      title: "two",
+      prompt: "two",
+      category: "implement",
+      position: 1,
+    });
+    kit.frames.splice(0);
+    kit.service.worktrees.ensureStepReady(kit.store.getRun(run.id)!, first);
+    kit.service.worktrees.ensureStepReady(kit.store.getRun(run.id)!, secondStep);
+    await expect.poll(() => remoteFrames.length).toBeGreaterThan(0);
+    expect(lastRequest(remoteFrames)).toMatchObject({
+      kind: "reserve",
+      sourcePlacementId: placement2.id,
+      originatingPlacementId: kit.placement.id,
+      repositoryIdentity: run.workspaceBinding!.repositoryIdentity,
     });
   });
 });
