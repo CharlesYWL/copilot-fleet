@@ -2845,13 +2845,14 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
    * returns it to `running` with the reviewer's note, and the orchestrator
    * carries on from the phase it was in.
    */
-  awaiting_human: new Set(["running", "completed", "failed", "cancelled"]),
-  aggregating: new Set(["completed", "failed", "cancelled"]),
+  awaiting_human: new Set(["running", "aggregating", "completed", "failed", "cancelled"]),
+  aggregating: new Set(["blocked", "completed", "failed", "cancelled"]),
   blocked: new Set([
     "awaiting_approval",
     "planning",
     "running",
     "awaiting_lead",
+    "aggregating",
     "failed",
     "cancelled",
   ]),

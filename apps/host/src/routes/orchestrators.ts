@@ -277,7 +277,10 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     if (outcome.kind === "approve") {
       if (outcome.note) store.appendRunNote(run!.id, run!.phaseIndex, outcome.note);
       service.resolveRunReview(run!.id);
-      const done = store.setRunState(run!.id, "completed")!;
+      const done =
+        run!.workspaceBinding?.effectiveMode === "managed"
+          ? service.worktrees.beginAggregation(run!.id)
+          : store.setRunState(run!.id, "completed")!;
       service.publishRun(done);
       engine.tick();
       return { ok: true, run: done };

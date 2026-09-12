@@ -36,6 +36,17 @@ export const RunWorkspaceBindingSchema = z.object({
     .default("running"),
   baseRef: z.string().default(""),
   allowGitHooks: z.boolean().default(false),
+  aggregationState: z
+    .enum(["not_started", "in_progress", "attention", "completed"])
+    .default("not_started"),
+  aggregationPhase: z
+    .enum(["idle", "preview", "integrate", "quiesce", "retain", "cleanup", "done"])
+    .default("idle"),
+  aggregationAttempt: z.number().int().nonnegative().default(0),
+  aggregationCode: z.string().default(""),
+  aggregationSummary: z.string().default(""),
+  aggregationTargetRef: z.string().default(""),
+  aggregationUpdatedAt: z.string().default(""),
   error: z.string().default(""),
 });
 export type RunWorkspaceBinding = z.infer<typeof RunWorkspaceBindingSchema>;

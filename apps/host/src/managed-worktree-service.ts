@@ -18,6 +18,7 @@ import {
   type WorktreeOperationResult,
 } from "@fleet/protocol";
 import type { FleetService } from "./fleet-service.js";
+import { stopSessions } from "./orchestrator/lifecycle.js";
 
 export class ManagedWorktreeService {
   private readonly waiters = new Map<
@@ -25,6 +26,7 @@ export class ManagedWorktreeService {
     { resolve: (operation: WorktreeOperation) => void; timer: NodeJS.Timeout }
   >();
   private readonly initializing = new Map<string, Promise<void>>();
+  private readonly aggregating = new Set<string>();
   private lastSweep = 0;
 
   private deterministicUuid(value: string): string {
@@ -530,6 +532,431 @@ export class ManagedWorktreeService {
     return result;
   }
 
+  private aggregationOperationId(run: Run, phase: string, worktreeId: string): string {
+    const attempt = Math.max(1, run.workspaceBinding?.aggregationAttempt ?? 1);
+    return this.deterministicUuid(
+      `${run.id}:aggregation:${attempt}:${phase}:${worktreeId}`,
+    );
+  }
+
+  private aggregationWorkspaces(runId: string): ManagedWorktree[] {
+    return [...this.store.listManagedWorktrees(), ...this.store.listDerivedWorkspaces()]
+      .filter((tree) => tree.runId === runId)
+      .sort(
+        (a, b) =>
+          Number(a.workspaceKind !== "primary") - Number(b.workspaceKind !== "primary") ||
+          a.id.localeCompare(b.id),
+      );
+  }
+
+  private setAggregation(
+    runId: string,
+    patch: Partial<NonNullable<Run["workspaceBinding"]>>,
+  ): void {
+    const binding = this.store.getRun(runId)?.workspaceBinding;
+    if (!binding) return;
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      ...patch,
+      aggregationUpdatedAt: new Date().toISOString(),
+    });
+    this.publish(runId);
+  }
+
+  private aggregationSummary(code: string, phase: string): string {
+    if (code === "integration_conflict")
+      return "The automatic merge has conflicts. Resolve or abort it in Advanced recovery, then retry integration.";
+    if (code === "target_ref_mismatch" || code === "target_unpinned")
+      return "The selected source checkout is no longer on the task’s pinned branch.";
+    if (code === "source_unavailable" || code === "target_node")
+      return "The task’s pinned source checkout is no longer available on its owning Node.";
+    if (code === "dirty_or_unknown")
+      return "The task or integration target is dirty or its cleanliness cannot be proven.";
+    if (code.includes("reconciliation") || code.includes("uncertain"))
+      return "Workspace or integration ownership must be reconciled before automation can continue.";
+    if (phase === "cleanup")
+      return "Safe workspace cleanup could not complete. No files were force-removed.";
+    return "Automatic integration stopped safely because its pinned target or reviewed result could not be revalidated.";
+  }
+
+  private escalateAggregation(
+    runId: string,
+    code: string,
+    phase: string,
+    targetRef: string,
+  ): void {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding) return;
+    this.setAggregation(runId, {
+      aggregationState: "attention",
+      aggregationPhase: phase as NonNullable<Run["workspaceBinding"]>["aggregationPhase"],
+      aggregationCode: code,
+      aggregationSummary: this.aggregationSummary(code, phase),
+      aggregationTargetRef: targetRef,
+    });
+    if (run.state !== "blocked" && canTransitionRun(run.state, "blocked"))
+      this.store.setRunState(runId, "blocked", this.aggregationSummary(code, phase));
+    this.service.notifications.createWorktreeAttention(
+      runId,
+      `aggregation:${binding.generation}`,
+      "integration",
+      code,
+      { phase, targetRef },
+    );
+    this.publish(runId);
+  }
+
+  private async automaticOperation(
+    run: Run,
+    tree: ManagedWorktree,
+    phase: string,
+    input: Partial<WorktreeOperationRequest> &
+      Pick<WorktreeOperationRequest, "kind" | "actor">,
+  ): Promise<WorktreeOperation | undefined> {
+    const operationId = this.aggregationOperationId(run, phase, tree.id);
+    const existing = this.store.getWorktreeOperation(operationId);
+    const operation = existing
+      ? existing.result
+        ? existing
+        : await this.send(existing, 30_000)
+      : await this.requestWorkspace(run.id, tree.id, tree.generation, {
+          ...input,
+          operationId,
+          expectedVersion: tree.version,
+          workspaceKind: tree.workspaceKind,
+          ownerStepId: tree.ownerStepId,
+          ...(tree.composition ? { composition: tree.composition } : {}),
+        });
+    if (!operation.result) return undefined;
+    if (
+      !operation.result.ok &&
+      operation.result.retryable &&
+      ["quiesce", "cleanup"].includes(phase) &&
+      !/(dirty|unknown|reconcil|mismatch|conflict)/i.test(operation.result.code)
+    ) {
+      const binding = this.store.getRun(run.id)?.workspaceBinding;
+      if (binding)
+        this.setAggregation(run.id, {
+          aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+          aggregationSummary:
+            "Waiting for task workspace processes to quiesce before safe cleanup.",
+        });
+      return undefined;
+    }
+    if (!operation.result.ok)
+      throw new WorktreeConflict(
+        operation.result.code || `${phase}_failed`,
+        operation.result.error || `Automatic ${phase} failed.`,
+      );
+    return operation;
+  }
+
+  /**
+   * Drives the post-orchestration integration transaction from durable receipts.
+   * Every phase has a stable operation ID for the current retry attempt, so a
+   * Host restart or Node reconnect replays rather than duplicates filesystem work.
+   */
+  advanceAggregation(runId: string): void {
+    if (this.aggregating.has(runId)) return;
+    const run = this.store.getRun(runId);
+    if (
+      !run ||
+      run.state !== "aggregating" ||
+      run.workspaceBinding?.effectiveMode !== "managed"
+    )
+      return;
+    this.aggregating.add(runId);
+    void this.runAggregation(runId).finally(() => this.aggregating.delete(runId));
+  }
+
+  beginAggregation(runId: string): Run {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding || binding.effectiveMode !== "managed")
+      throw new WorktreeConflict(
+        "not_managed",
+        "Automatic integration is available only for managed tasks.",
+      );
+    if (run.state === "aggregating") {
+      this.advanceAggregation(runId);
+      return run;
+    }
+    if (!canTransitionRun(run.state, "aggregating"))
+      throw new WorktreeConflict(
+        "integration_not_ready",
+        "This task cannot begin automatic integration from its current state.",
+      );
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      aggregationState: "in_progress",
+      aggregationPhase: "preview",
+      aggregationAttempt: Math.max(1, binding.aggregationAttempt),
+      aggregationCode: "",
+      aggregationSummary: "",
+      aggregationTargetRef: binding.baseRef,
+      aggregationUpdatedAt: new Date().toISOString(),
+    });
+    this.store.setRunState(runId, "aggregating", "");
+    this.publish(runId);
+    this.advanceAggregation(runId);
+    return this.store.getRun(runId)!;
+  }
+
+  retryAggregation(runId: string): void {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (
+      !run ||
+      !binding ||
+      binding.effectiveMode !== "managed" ||
+      binding.aggregationState !== "attention"
+    )
+      throw new WorktreeConflict(
+        "retry_not_available",
+        "Retry integration is available only when automatic integration needs attention.",
+      );
+    if (!canTransitionRun(run.state, "aggregating"))
+      throw new WorktreeConflict(
+        "retry_not_available",
+        "This task cannot resume automatic integration from its current state.",
+      );
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      aggregationState: "in_progress",
+      aggregationPhase: "preview",
+      aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+      aggregationCode: "",
+      aggregationSummary: "",
+      aggregationUpdatedAt: new Date().toISOString(),
+    });
+    this.store.setRunState(runId, "aggregating", "");
+    this.publish(runId);
+    this.advanceAggregation(runId);
+  }
+
+  private async runAggregation(runId: string): Promise<void> {
+    let run = this.store.getRun(runId);
+    let binding = run?.workspaceBinding;
+    if (!run || !binding || run.state !== "aggregating") return;
+    const targetRef = binding.baseRef;
+    let phase =
+      binding.aggregationPhase === "idle" ? "preview" : binding.aggregationPhase;
+    try {
+      const source = binding.sourcePlacementId
+        ? this.store.getPlacement(binding.sourcePlacementId)
+        : undefined;
+      const primary = this.store.worktreeForRun(runId);
+      if (!source || !primary)
+        throw new WorktreeConflict(
+          "source_unavailable",
+          "The pinned source placement or primary workspace is unavailable.",
+        );
+      if (source.nodeId !== primary.nodeId)
+        throw new WorktreeConflict(
+          "target_node",
+          "The pinned source placement moved away from the owning Node.",
+        );
+      if (!targetRef || !targetRef.startsWith("refs/heads/"))
+        throw new WorktreeConflict(
+          "target_unpinned",
+          "Automatic integration requires the pinned symbolic base branch.",
+        );
+
+      const resultTree = this.resultWorkspaceForRun(runId) ?? primary;
+      let integration = this.store
+        .listWorktreeIntegrations(resultTree.id)
+        .filter(
+          (entry) =>
+            entry.preview.targetPlacementId === source.id &&
+            entry.preview.targetRef === targetRef,
+        )
+        .at(-1);
+
+      phase = "preview";
+      this.setAggregation(runId, {
+        aggregationState: "in_progress",
+        aggregationPhase: "preview",
+        aggregationTargetRef: targetRef,
+        aggregationCode: "",
+        aggregationSummary: "",
+      });
+      const previewOperation = await this.automaticOperation(run, resultTree, "preview", {
+        kind: "integration_preview",
+        actor: "host-integration-controller",
+        targetPlacementId: source.id,
+      });
+      if (!previewOperation) return;
+      const preview = previewOperation.result?.preview;
+      if (!preview)
+        throw new WorktreeConflict(
+          "preview_missing",
+          "The Node returned no integration preview.",
+        );
+      if (
+        preview.targetPlacementId !== binding.sourcePlacementId ||
+        preview.targetRef !== targetRef
+      )
+        throw new WorktreeConflict(
+          "target_ref_mismatch",
+          "The preview target does not match the pinned source branch.",
+        );
+      const reusableIntegration =
+        integration &&
+        ["integrated", "no_changes"].includes(integration.state) &&
+        integration.approvedTaskSha === preview.taskSha &&
+        integration.approvedDiffIdentity === preview.diffIdentity &&
+        (integration.state === "no_changes" || preview.alreadyIntegrated);
+      if (!reusableIntegration) {
+        integration = undefined;
+        phase = "integrate";
+        this.setAggregation(runId, { aggregationPhase: "integrate" });
+        run = this.store.getRun(runId)!;
+        const integrateOperation = await this.automaticOperation(
+          run,
+          this.store.getAnyManagedWorkspace(resultTree.id)!,
+          "integrate",
+          {
+            kind: "integrate",
+            actor: "host-integration-controller",
+            targetPlacementId: source.id,
+            previewId: preview.id,
+            reviewedTaskSha: preview.taskSha,
+            reviewedDiffIdentity: preview.diffIdentity,
+            confirm: preview.hasCommittedChanges
+              ? `MERGE ${preview.taskSha} INTO ${preview.targetRef}`
+              : `REVIEW NO CHANGES FOR ${preview.taskSha}`,
+            commit: true,
+          },
+        );
+        if (!integrateOperation) return;
+        integration = integrateOperation.result?.integration;
+      }
+
+      if (!integration)
+        throw new WorktreeConflict(
+          "integration_missing",
+          "The Node returned no integration result.",
+        );
+      if (integration.preview.targetRef !== targetRef)
+        throw new WorktreeConflict(
+          "target_ref_mismatch",
+          "The integration target no longer matches the pinned branch.",
+        );
+      if (integration.state === "conflicted")
+        throw new WorktreeConflict(
+          "integration_conflict",
+          "The automatic merge has conflicts.",
+        );
+      if (!["integrated", "no_changes"].includes(integration.state))
+        throw new WorktreeConflict(
+          integration.state === "needs_reconciliation"
+            ? "integration_needs_reconciliation"
+            : "integration_incomplete",
+          "The automatic merge did not reach a validated terminal state.",
+        );
+
+      const workspaces = this.aggregationWorkspaces(runId);
+      phase = "quiesce";
+      this.setAggregation(runId, { aggregationPhase: "quiesce" });
+      const ownedIds = new Set(workspaces.map((tree) => tree.id));
+      const ownedSessions = this.store
+        .listSessions()
+        .filter(
+          (session) =>
+            session.runId === runId &&
+            Boolean(
+              session.executionBinding?.worktreeId &&
+              ownedIds.has(session.executionBinding.worktreeId),
+            ),
+        );
+      stopSessions(this.service, ownedSessions);
+      for (const workspace of workspaces) {
+        const fresh = this.store.getAnyManagedWorkspace(workspace.id)!;
+        if (fresh.state === "removed") continue;
+        const operation = await this.automaticOperation(run, fresh, "quiesce", {
+          kind: "quiesce",
+          actor: "host-integration-controller",
+        });
+        if (!operation) return;
+      }
+      if (
+        ownedSessions.some((session) => {
+          const fresh = this.store.getSession(session.id);
+          return (
+            fresh && (!terminalSessionStates.has(fresh.state) || fresh.stopRequested)
+          );
+        })
+      )
+        return;
+
+      phase = "retain";
+      this.setAggregation(runId, { aggregationPhase: "retain" });
+      for (const workspace of workspaces) {
+        const fresh = this.store.getAnyManagedWorkspace(workspace.id)!;
+        if (fresh.state === "removed" || fresh.state === "retained") continue;
+        const operation = await this.automaticOperation(run, fresh, "retain", {
+          kind: "retain",
+          actor: "host-integration-controller",
+        });
+        if (!operation) return;
+      }
+
+      phase = "cleanup";
+      this.setAggregation(runId, { aggregationPhase: "cleanup" });
+      for (const workspace of workspaces) {
+        const fresh = this.store.getAnyManagedWorkspace(workspace.id)!;
+        if (fresh.state === "removed") continue;
+        const operation = await this.automaticOperation(run, fresh, "cleanup", {
+          kind: "cleanup",
+          actor: "host-integration-controller",
+          deleteBranch: false,
+        });
+        if (!operation) return;
+      }
+
+      binding = this.store.getRun(runId)!.workspaceBinding!;
+      this.store.setRunWorkspaceBinding(runId, {
+        ...binding,
+        aggregationState: "completed",
+        aggregationPhase: "done",
+        aggregationCode: "",
+        aggregationSummary:
+          integration.state === "no_changes"
+            ? `No committed changes; verified ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.`
+            : `Integrated into ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.`,
+        aggregationTargetRef: targetRef,
+        aggregationUpdatedAt: new Date().toISOString(),
+      });
+      this.service.notifications.resolveWorktreeAttention(
+        runId,
+        `aggregation:${binding.generation}`,
+        "integration",
+      );
+      for (const entry of this.store.listWorktreeIntegrations()) {
+        if (entry.worktreeId === integration.worktreeId) {
+          this.service.notifications.resolveWorktreeAttention(
+            runId,
+            entry.id,
+            "conflict",
+          );
+          this.service.notifications.resolveWorktreeAttention(
+            runId,
+            entry.id,
+            "reconciliation",
+          );
+        }
+      }
+      const completed = this.store.getRun(runId)!;
+      if (canTransitionRun(completed.state, "completed"))
+        this.store.setRunState(runId, "completed", "");
+      this.publish(runId);
+    } catch (error) {
+      const code = error instanceof WorktreeConflict ? error.code : "integration_failed";
+      this.escalateAggregation(runId, code, phase, targetRef);
+    }
+  }
+
   private async requestWorkspace(
     runId: string,
     worktreeId: string,
@@ -898,7 +1325,10 @@ export class ManagedWorktreeService {
     } else if (setupOperation && setupReady) {
       this.markSetupReady(expected.runId);
       this.publish(expected.runId);
-    } else if (result.integration?.state === "conflicted") {
+    } else if (
+      result.integration?.state === "conflicted" &&
+      expected.actor !== "host-integration-controller"
+    ) {
       this.publish(expected.runId);
       this.service.notifications.createWorktreeAttention(
         expected.runId,
@@ -906,9 +1336,10 @@ export class ManagedWorktreeService {
         "conflict",
       );
     } else if (
-      tree?.state === "needs_reconciliation" ||
-      tree?.integrationState === "needs_reconciliation" ||
-      result.integration?.state === "needs_reconciliation"
+      expected.actor !== "host-integration-controller" &&
+      (tree?.state === "needs_reconciliation" ||
+        tree?.integrationState === "needs_reconciliation" ||
+        result.integration?.state === "needs_reconciliation")
     ) {
       this.publish(expected.runId);
       this.service.notifications.createWorktreeAttention(

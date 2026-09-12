@@ -59,6 +59,13 @@ const run = RunSchema.parse({
     checkoutKey: "checkout",
     resolvedPath: tree.path,
     initialization: "ready",
+    baseRef: "refs/heads/main",
+    aggregationState: "completed",
+    aggregationPhase: "done",
+    aggregationAttempt: 1,
+    aggregationSummary:
+      "Integrated into refs/heads/main and cleaned isolated workspaces.",
+    aggregationTargetRef: "refs/heads/main",
   },
 });
 const target = {
@@ -118,6 +125,65 @@ const initialView = () => ({
 });
 
 describe("accessible managed workspace controls", () => {
+  it("shows the automatic lifecycle normally and progressively discloses recovery controls", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response(initialView())),
+    );
+    show();
+
+    await screen.findByText(/Integrated into main/);
+    expect(screen.getByText("Workspace details").closest("details")?.open).toBe(false);
+    expect(screen.getByText(/Merge and validation:/).textContent).toContain("Complete");
+    expect(
+      screen
+        .getByRole("combobox", {
+          name: "Target checkout on the owning Node",
+        })
+        .closest("details")?.open,
+    ).toBe(false);
+
+    fireEvent.click(screen.getByText("Workspace details"));
+    expect(
+      screen.getByRole("combobox", {
+        name: "Target checkout on the owning Node",
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("Advanced recovery: manual integration")).toBeTruthy();
+  });
+
+  it("offers one-click retry only when automatic integration needs attention", async () => {
+    const blocked = RunSchema.parse({
+      ...run,
+      state: "blocked",
+      workspaceBinding: {
+        ...run.workspaceBinding,
+        aggregationState: "attention",
+        aggregationPhase: "integrate",
+        aggregationCode: "dirty_or_unknown",
+        aggregationSummary: "The integration target is dirty.",
+      },
+    });
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/auth/csrf") return response({ csrfToken: "csrf" });
+      if (init?.method === "POST") return response({ run: blocked });
+      return response({ ...initialView(), binding: blocked.workspaceBinding });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    show(blocked);
+
+    const retry = await screen.findByRole("button", { name: "Retry integration" });
+    fireEvent.click(retry);
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([path, init]) =>
+            path.endsWith("/retry-integration") && init?.method === "POST",
+        ),
+      ).toBe(true),
+    );
+  });
+
   it("persists the disabled General default with revision and idempotency metadata", async () => {
     let enabled = false;
     const fetchMock = vi.fn((path: string, init?: RequestInit) => {
@@ -232,7 +298,7 @@ describe("accessible managed workspace controls", () => {
         .disabled,
     ).toBe(false);
     expect(screen.getAllByText("Unknown").length).toBeGreaterThan(0);
-    expect(screen.getByText(/including uncommitted changes/)).toBeTruthy();
+    expect(screen.getByText(/deterministic composed workspace/)).toBeTruthy();
   });
 
   it("requires explicit consent before retrying a blocked task with Git hooks", async () => {

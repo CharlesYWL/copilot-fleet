@@ -16,9 +16,11 @@ the worktree ID, generation, canonical cwd/checkout key and lease attempt.
 
 1. **Managed checkout writer lease:** one shell-capable Fleet process at a time for a
    managed physical checkout. Managed tasks use different physical checkouts and can each
-   hold one writer. Every role in a task shares its checkout; `readOnly` is only a
-   capacity label, never a filesystem guarantee. Manual launch, prompt, resume,
-   automatic recovery and MCP process refresh use the same Node admission gate.
+   hold one writer. Independent writable DAG steps receive separate worktrees; dependent
+   roles receive a deterministic composed worktree containing committed predecessor
+   results. `readOnly` remains a capacity label, never a filesystem guarantee. Manual
+   launch, prompt, resume, automatic recovery and MCP process refresh use the same Node
+   admission gate.
 2. **Repository administration lease:** keyed by the physical Git common-directory
    identity, independently of worker capacity. Reserve/pin, create, remove and merge
    operations serialize there. Order is repository administration, then affected
@@ -167,7 +169,11 @@ Integration has independent `not_requested`, `not_ready`, `ready`, `integrating`
 `validating`, `integrated`, `no_changes`, `conflicted`, `resolving`, `aborting`,
 `aborted`, `uncertain` and `needs_reconciliation` states. Approval never implies
 integration. `no_changes` is a reviewed terminal outcome, not an alias for
-“already integrated.”
+“already integrated.” For managed Runs, successful orchestration now enters the
+nonterminal `aggregating` Run state. A Host-owned Integration Controller resumes
+from durable Node operation receipts after restart/reconnect, and the Run becomes
+`completed` only after integration validation, task-workspace quiescence, retention
+and safe cleanup of the primary and every step/derived workspace.
 
 Recovery checks `git worktree list --porcelain -z`, physical roots/marker, refs,
 HEAD, status and lease/process inventory. Missing/moved directories, replacement
@@ -184,17 +190,41 @@ may act on them. Explicit reconciliation requires the original owning Node,
 machine and installation; a different installation is not silently adopted.
 Orphaned worker ownership that cannot be proved quiescent remains blocked.
 
-## Explicit integration: merge only
+## Automatic integration with escalation
 
-An authenticated operator chooses a catalog target on the same Node. The Node
+The normal managed workflow requires no integration click. The Host infers exactly
+one target: the Run's pinned source placement on its owning Node, at the Run's
+pinned symbolic `baseRef`. It never searches for another online checkout. Missing,
+detached, moved or ref-mismatched targets fail closed. The Node's existing preview,
+merge and validation operations remain authoritative; stable per-Run/attempt/phase
+operation IDs make replay idempotent. The Host revalidates the exact preview task
+SHA, diff identity and target ref and generates the existing confirmation phrase
+internally. A target that advanced before preview is still given a normal clean
+merge attempt. Fleet never pushes, creates a PR, switches branches, resets, cleans,
+or bypasses dirty-target, active-process, hook, identity or signing safety.
+
+No committed diff records `no_changes` and proceeds through cleanup. After a
+validated `integrated`/`no_changes` result, only sessions bound to task-owned
+managed workspace IDs are stopped and quiesced. Cleanup retries safely while
+process quiescence is pending; dirty/unknown state, conflicts and reconciliation
+uncertainty move the Run to resumable `blocked` attention. One generation-keyed
+notification identifies the target branch and phase without exposing paths or
+commands. **Retry integration** starts a new durable attempt and resolves that
+notification after success.
+
+## Advanced recovery: explicit merge only
+
+For backward compatibility and conflict recovery, an authenticated operator may
+still choose a catalog target on the same Node. The Node
 checks that its canonical Git common directory matches. Preview shows target
 path/ref/SHA, exact task SHA, complete bounded committed diff and its digest,
 dirty state and ancestry. It also states whether the task has any committed diff,
 whether the target contains or has advanced from the pinned base, and whether a
 changed task commit is already reachable. An unchanged task is recorded explicitly
 as `no_changes`; the base commit alone is never presented as completed integration.
-The operator separately approves that SHA/diff and target; Fleet never selects or
-switches `main`, infers approval or pushes.
+The operator separately approves that SHA/diff and target. These low-level actions
+are hidden under Workspace details/Advanced recovery and are not part of normal
+completion.
 
 Start reacquires/revalidates administration and task/target checkout leases.
 Task and target must be clean (including untracked and ignored data), with no
@@ -227,7 +257,8 @@ integrated or automatically cleaned up.
 
 ## Retention, cleanup and quotas
 
-Stop, archive, approval, dismissal and retry do not delete worktrees. Purge first
+Stop, archive, dismissal and retry do not delete worktrees. Managed approval starts
+automatic integration and safe cleanup; failures retain all work for recovery. Purge first
 persists a cleanup tombstone and refuses while filesystem ownership remains.
 Tombstones and ownership records survive Run/session deletion and backup restore.
 
@@ -248,6 +279,12 @@ untracked/ignored status. It uses `git worktree remove <verified-path>` without
 force; there is no recursive-delete fallback and no repository-wide prune.
 Branches are kept by default. Explicit deletion requires a reachable integration
 result and `git branch -d`; a refusal keeps the branch.
+
+V1 intentionally automates the existing checkout-based merge against the pinned
+source placement. A future graph-level ref integration capability would require
+explicit coordination with every checkout whose symbolic HEAD points at the
+target ref; directly updating that ref today could leave such a checkout's index
+and worktree inconsistent, so the Host never performs direct ref updates.
 
 **Abandon ownership** is deliberately nondestructive v1: an exact branch/path
 confirmation relinquishes Fleet management while keeping files and branch.
@@ -275,7 +312,7 @@ GET  /api/runs/:id/worktree
 POST /api/runs/:id/worktree/:action
 ```
 
-Actions: `observe`, `reconcile`, `retry-create`, `retain`, `quiesce`,
+Actions: `observe`, `reconcile`, `retry-create`, `retry-integration`, `retain`, `quiesce`,
 `integration-preview`, `integration-start`, `integration-continue`,
 `integration-abort`, `cleanup`, `abandon`. Reconcile first drains an outstanding
 correlated acknowledgement before another filesystem transition is permitted.
@@ -284,9 +321,13 @@ General settings explain scope/quotas. Normal task creation names the selected
 repository, current committed baseline and `Isolated worktree` mode. It does not
 ask users to choose a filesystem destination. Generated branches, long paths,
 internal identities and cleanup mechanics are hidden behind `Workspace details`.
-Task detail keeps repository, base and `Preparing isolated workspace` state
-visible; bindings, generation, base/HEAD, branch/path/Node, lifecycle, lock/dirty
-observations, integration and cleanup controls remain progressively disclosed.
+Task detail keeps repository, base, preparation and the automatic
+integration/validation/quiescence/cleanup checklist visible. Completed Runs show
+the integrated branch and final cleanup summary; attention states show the concise
+reason and **Retry integration**. Bindings, generated refs, generation, base/HEAD,
+branch/path/Node, observations, manual integration, conflict continue/abort,
+reconcile, retain, quiesce, abandon and cleanup controls are progressively
+disclosed under Workspace details/Advanced recovery.
 Dialogs use accessible labels, non-color status/error text, explicit confirmation
 and focus restoration. A setup failure creates one error notification independent
 of ordinary agent-notification preferences, increments unread count, names the
@@ -355,7 +396,7 @@ and drive aliases. Protocol, store, scheduler, Host receipt and accessible UI te
 cover defaults, restoration, revisions, ownership and safe controls.
 
 `scripts/managed-worktrees.integration.test.js` is the local authenticated
-HTTP/WebSocket/Git smoke: two normal Runs execute concurrently, reviewers receive
-their original trees and uncommitted changes, the source remains unchanged,
+HTTP/WebSocket/Git smoke: two normal Runs execute concurrently, dependent roles receive
+the correct task-owned workspace state, the source remains unchanged before integration,
 CSRF/revision gates reject invalid mutations, and conflict/abort/cleanup use real
 Git. It also proves unsupported Nodes receive no worktree frames.

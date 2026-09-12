@@ -157,7 +157,7 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     setError("");
     setProgress(`Running ${action.replaceAll("-", " ")}…`);
     try {
-      const result = await api<{ operation: WorktreeOperation }>(
+      const result = await api<{ operation?: WorktreeOperation }>(
         `/api/runs/${run.id}/worktree/${action}`,
         {
           method: "POST",
@@ -168,11 +168,13 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
           }),
         },
       );
-      if (result.operation.result?.preview) setPreview(result.operation.result.preview);
+      if (result.operation?.result?.preview) setPreview(result.operation.result.preview);
       setProgress(
-        result.operation.result
-          ? `${action.replaceAll("-", " ")} completed.`
-          : "Awaiting Node acknowledgement. Ownership is not released by timeout.",
+        !result.operation
+          ? `${action.replaceAll("-", " ")} started.`
+          : result.operation.result
+            ? `${action.replaceAll("-", " ")} completed.`
+            : "Awaiting Node acknowledgement. Ownership is not released by timeout.",
       );
       close();
     } catch (reason) {
@@ -238,10 +240,20 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     view?.targets.find((entry) => entry.id === binding?.sourcePlacementId)
       ?.workspaceName ??
     "the selected repository";
-  const baseLabel =
+  const baseLabel = (
     binding?.baseRef ||
     tree?.baseRef ||
-    (binding?.baseSha ? binding.baseSha.slice(0, 12) : "current committed HEAD");
+    (binding?.baseSha ? binding.baseSha.slice(0, 12) : "current committed HEAD")
+  ).replace(/^refs\/heads\//, "");
+  const aggregationState = binding?.aggregationState ?? "not_started";
+  const aggregationPhase = binding?.aggregationPhase ?? "idle";
+  const needsAttention =
+    aggregationState === "attention" ||
+    (run.state === "blocked" && aggregationPhase !== "idle");
+  const integrated =
+    aggregationState === "completed" ||
+    integration?.state === "integrated" ||
+    integration?.state === "no_changes";
 
   return (
     <section className={styles.panel} aria-label="Managed task worktree">
@@ -257,6 +269,61 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             ? "Failed"
             : "In progress"}
       </p>
+      <h3>Integration</h3>
+      <ol>
+        <li>Workspace prepared: {setupState === "succeeded" ? "Complete" : "Pending"}</li>
+        <li>
+          Implementation, review and test orchestration:{" "}
+          {["aggregating", "completed", "blocked"].includes(run.state)
+            ? "Complete"
+            : "In progress"}
+        </li>
+        <li>
+          Merge and validation:{" "}
+          {integrated
+            ? "Complete"
+            : needsAttention
+              ? "Needs attention"
+              : run.state === "aggregating"
+                ? "In progress"
+                : "Pending"}
+        </li>
+        <li>
+          Workspace cleanup:{" "}
+          {aggregationState === "completed"
+            ? "Complete"
+            : aggregationPhase === "cleanup"
+              ? "In progress"
+              : "Pending"}
+        </li>
+      </ol>
+      {run.state === "aggregating" && !needsAttention && (
+        <p role="status">
+          Fleet is automatically integrating into <code>{baseLabel}</code>, validating the
+          merge, stopping task workspace sessions and cleaning isolated workspaces.
+        </p>
+      )}
+      {needsAttention && (
+        <>
+          <p role="alert">
+            {binding?.aggregationSummary ||
+              "Automatic integration stopped safely and needs attention."}
+          </p>
+          <div className={styles.actions}>
+            <Button disabled={busy} onClick={() => void execute("retry-integration")}>
+              Retry integration
+            </Button>
+          </div>
+        </>
+      )}
+      {aggregationState === "completed" && (
+        <p role="status">
+          {(
+            binding?.aggregationSummary ||
+            `Integrated into ${baseLabel} and cleaned isolated workspaces.`
+          ).replace(/refs\/heads\//g, "")}
+        </p>
+      )}
       {setupState === "failed" && (
         <>
           <p role="alert">
@@ -298,9 +365,10 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
           Resolution: {binding?.resolutionSource}
         </p>
         <p>
-          Implementer, reviewer, tester and fixer share this binding, including
-          uncommitted changes. Only one shell-capable session may hold it. Stop verifies
-          process quiescence; idle is not sufficient.
+          Independent writers use separate isolated workspaces. Dependent reviewers,
+          testers and fixers receive a deterministic composed workspace containing their
+          predecessors’ committed results. Stop verifies process quiescence; idle is not
+          sufficient.
         </p>
         <p role="status" aria-live="polite">
           {progress ||
@@ -424,10 +492,11 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             Stop checkout sessions
           </Button>
         </div>
-        <h3>Explicit merge integration</h3>
+        <h3>Advanced recovery: manual integration</h3>
         <p>
-          Task approval and integration are separate. Choose the target yourself; Fleet
-          never selects or switches main, pushes, or creates a PR.
+          Normal tasks integrate automatically into their pinned source branch. Use these
+          low-level controls only to inspect or recover a blocked operation. Fleet never
+          switches branches, resets or cleans a checkout, pushes, or creates a PR.
         </p>
         <label htmlFor={targetId}>Target checkout on the owning Node</label>{" "}
         <select

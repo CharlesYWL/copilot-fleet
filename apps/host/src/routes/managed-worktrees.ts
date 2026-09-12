@@ -224,6 +224,12 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
 
   app.post("/api/runs/:id/worktree/:action", async (request, reply) => {
     const { id, action } = request.params as { id: string; action: string };
+    if (action === "retry-integration") {
+      if (!store.getRun(id)) return reply.code(404).send({ error: "Task not found" });
+      ActionSchema.parse(request.body);
+      service.worktrees.retryAggregation(id);
+      return { run: store.getRun(id) };
+    }
     const kind = actions[action];
     if (!kind) return reply.code(404).send({ error: "Unknown worktree action" });
     if (!store.getRun(id)) return reply.code(404).send({ error: "Task not found" });

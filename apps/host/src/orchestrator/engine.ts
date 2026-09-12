@@ -176,6 +176,10 @@ export class OrchestratorEngine {
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
     if (!run || terminalRunStates.has(run.state)) return;
+    if (run.state === "aggregating") {
+      this.service.worktrees.advanceAggregation(run.id);
+      return;
+    }
 
     let steps = this.store.listRunSteps(runId);
     const sessions = this.store.listSessions();
@@ -659,6 +663,10 @@ export class OrchestratorEngine {
   }
 
   private finishRun(run: Run, state: Run["state"], reason: string): boolean {
+    if (state === "completed" && run.workspaceBinding?.effectiveMode === "managed") {
+      this.service.worktrees.beginAggregation(run.id);
+      return true;
+    }
     if (!canTransitionRun(run.state, state)) return false;
     this.store.setRunState(run.id, state, reason);
     return true;

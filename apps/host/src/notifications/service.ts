@@ -437,19 +437,23 @@ export class NotificationService {
   createWorktreeAttention(
     runId: string,
     identity: string,
-    reason: "creation" | "conflict" | "reconciliation",
+    reason: "creation" | "conflict" | "reconciliation" | "integration",
     code = "",
+    context: { phase?: string; targetRef?: string } = {},
   ): InsertNotificationResult {
     const run = this.store.getRun(runId);
-    return this.insert({
-      sourceKey: `managed_worktree_attention:${runId}:${identity}:${reason}`,
+    const sourceKey = `managed_worktree_attention:${runId}:${identity}:${reason}`;
+    const input: CreateNotification = {
+      sourceKey,
       category: "orchestration",
       kind: "managed_worktree_attention",
       severity: reason === "creation" ? "error" : "warning",
       title:
         reason === "creation"
           ? titledLabel("Workspace setup failed: ", run?.name ?? "Task")
-          : "Managed task needs attention",
+          : reason === "integration"
+            ? titledLabel("Integration needs attention: ", run?.name ?? "Task")
+            : "Managed task needs attention",
       body:
         reason === "creation"
           ? code === "node_unavailable"
@@ -459,18 +463,34 @@ export class NotificationService {
               : "Preparing the isolated workspace failed. Open the task for a safe retry and actionable details."
           : reason === "conflict"
             ? "Merge conflicts require an explicit resolution or abort. Open the task for recovery controls."
-            : "Workspace ownership needs reconciliation. Open the task; no automatic overwrite or deletion was attempted.",
+            : reason === "integration"
+              ? `Automatic integration${context.targetRef ? ` into ${context.targetRef}` : ""} stopped safely${context.phase ? ` during ${context.phase}` : ""}. Open the task to review the reason and retry.`
+              : "Workspace ownership needs reconciliation. Open the task; no automatic overwrite or deletion was attempted.",
       subject: { type: "run", id: runId, label: run?.name ?? "Managed task" },
       navigation: { type: "run", runId },
-      data: { runId, reason, ...(code ? { code } : {}) },
+      data: { runId, reason, ...context, ...(code ? { code } : {}) },
       createdAt: new Date().toISOString(),
-    });
+    };
+    const existing = this.store.getNotificationBySourceKey(sourceKey);
+    if (existing) {
+      const notification = this.store.updateNotification(existing.id, {
+        severity: input.severity,
+        title: input.title,
+        body: input.body,
+        subject: input.subject,
+        navigation: input.navigation,
+        data: input.data,
+      });
+      if (notification) this.publishOrDefer(notification, false);
+      return { notification: notification ?? existing, created: false };
+    }
+    return this.insert(input);
   }
 
   resolveWorktreeAttention(
     runId: string,
     identity: string,
-    reason: "creation" | "conflict" | "reconciliation",
+    reason: "creation" | "conflict" | "reconciliation" | "integration",
   ): NotificationMutation | undefined {
     const notification = this.store.getNotificationBySourceKey(
       `managed_worktree_attention:${runId}:${identity}:${reason}`,
