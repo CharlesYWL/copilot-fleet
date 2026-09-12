@@ -3,6 +3,7 @@ import {
   MANAGED_WORKTREES_CAPABILITY,
   WorktreeConflict,
   WorktreeOperationRequestSchema,
+  canTransitionRun,
   terminalSessionStates,
   terminalRunStates,
   type ExecutionBinding,
@@ -27,6 +28,97 @@ export class ManagedWorktreeService {
     return this.service.store;
   }
 
+  private setupSummary(code: string): string {
+    if (["source_required", "source_mismatch", "source_unavailable"].includes(code))
+      return "The selected repository is unavailable. Choose an available repository and retry.";
+    if (
+      [
+        "bare_repository",
+        "unborn_repository",
+        "invalid_base",
+        "invalid_baseline",
+      ].includes(code)
+    )
+      return "Fleet could not resolve a committed baseline from the selected repository.";
+    if (
+      [
+        "path_ref_collision",
+        "ref_collision",
+        "pin_collision",
+        "worktree_conflict",
+      ].includes(code)
+    )
+      return "An existing branch or worktree conflicts with this isolated workspace.";
+    if (code === "node_unavailable")
+      return "The repository’s Node disconnected during workspace preparation.";
+    if (code === "unsupported_hooks")
+      return "The selected repository has active Git hooks. Review the workspace details to continue explicitly.";
+    if (code.startsWith("unsupported") || code === "bare_repository")
+      return "The selected repository configuration is not supported by isolated workspaces.";
+    if (code === "git_incomplete" || code.startsWith("git_"))
+      return "Git could not finish preparing the isolated workspace.";
+    return "Fleet could not prepare the isolated workspace. Review the details and retry.";
+  }
+
+  private markSetupFailed(runId: string, code: string, detail: string): void {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding) return;
+    const resumeState =
+      run.state === "blocked"
+        ? binding.setupResumeState
+        : ["awaiting_approval", "planning", "running", "awaiting_lead"].includes(
+              run.state,
+            )
+          ? (run.state as typeof binding.setupResumeState)
+          : binding.setupResumeState;
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      initialization: "blocked",
+      setupState: "failed",
+      setupCode: code,
+      setupSummary: this.setupSummary(code),
+      setupCompletedAt: new Date().toISOString(),
+      setupResumeState: resumeState,
+      error: detail,
+    });
+    if (run.state !== "blocked" && canTransitionRun(run.state, "blocked")) {
+      this.store.setRunState(runId, "blocked");
+    }
+    this.service.notifications.createWorktreeAttention(
+      runId,
+      `generation:${binding.generation}`,
+      "creation",
+      code,
+    );
+    this.publish(runId);
+  }
+
+  private markSetupReady(runId: string): void {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding) return;
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      setupState: "succeeded",
+      setupCode: "",
+      setupSummary: "",
+      setupCompletedAt: new Date().toISOString(),
+      error: "",
+    });
+    if (
+      run.state === "blocked" &&
+      canTransitionRun("blocked", binding.setupResumeState)
+    ) {
+      this.store.setRunState(runId, binding.setupResumeState);
+    }
+    this.service.notifications.resolveWorktreeAttention(
+      runId,
+      `generation:${binding.generation}`,
+      "creation",
+    );
+  }
+
   prepare(runId: string): Promise<void> {
     const previous = this.initializing.get(runId);
     if (previous) return previous;
@@ -44,6 +136,15 @@ export class ManagedWorktreeService {
       binding.initialization !== "pending"
     )
       return;
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      setupState: "running",
+      setupStartedAt: binding.setupStartedAt || new Date().toISOString(),
+      setupCompletedAt: "",
+      setupCode: "",
+      setupSummary: "",
+      error: "",
+    });
     try {
       const source = binding.sourcePlacementId
         ? this.store.getPlacement(binding.sourcePlacementId)
@@ -76,22 +177,13 @@ export class ManagedWorktreeService {
       });
       if (operation.result?.ok) this.service.tickRun(runId);
     } catch (error) {
-      const current = this.store.getRun(runId)?.workspaceBinding;
-      if (current)
-        this.store.setRunWorkspaceBinding(runId, {
-          ...current,
-          initialization: "blocked",
-          error:
-            error instanceof Error
-              ? error.message
-              : "Managed workspace initialization failed.",
-        });
-      this.service.notifications.createWorktreeAttention(
+      this.markSetupFailed(
         runId,
-        `generation:${binding.generation}`,
-        "creation",
+        error instanceof WorktreeConflict ? error.code : "workspace_setup_failed",
+        error instanceof Error
+          ? error.message
+          : "Managed workspace initialization failed.",
       );
-      this.publish(runId);
     }
   }
 
@@ -122,17 +214,13 @@ export class ManagedWorktreeService {
       void this.request(run.id, { kind: "create", actor: "scheduler" })
         .then(() => this.service.tickRun(run.id))
         .catch((error: unknown) => {
-          const binding = this.store.getRun(run.id)?.workspaceBinding;
-          if (binding)
-            this.store.setRunWorkspaceBinding(run.id, {
-              ...binding,
-              initialization: "blocked",
-              error:
-                error instanceof Error
-                  ? error.message
-                  : "Managed workspace dispatch blocked.",
-            });
-          this.publish(run.id);
+          this.markSetupFailed(
+            run.id,
+            error instanceof WorktreeConflict ? error.code : "workspace_setup_failed",
+            error instanceof Error
+              ? error.message
+              : "Managed workspace dispatch blocked.",
+          );
         });
     }
     return false;
@@ -351,6 +439,13 @@ export class ManagedWorktreeService {
     )
       return false;
     if (result.ok && !tree) return false;
+    const setupOperation = ["reserve", "create"].includes(expected.kind);
+    const setupReady = Boolean(
+      result.ok &&
+      tree &&
+      ["ready", "retained"].includes(tree.state) &&
+      !tree.abandonedAt,
+    );
     this.store.writeAtomically(() => {
       if (tree) this.store.putManagedWorktree(tree);
       if (result.integration) {
@@ -375,6 +470,7 @@ export class ManagedWorktreeService {
           ...(tree
             ? {
                 baseSha: tree.baseSha,
+                baseRef: tree.baseRef,
                 checkoutKey: tree.checkout?.key ?? binding.checkoutKey,
                 resolvedPath: tree.path,
                 allowGitHooks: tree.allowGitHooks,
@@ -391,6 +487,15 @@ export class ManagedWorktreeService {
                 expected.kind === "reconcile"
               ? "blocked"
               : binding.initialization,
+          ...(setupOperation && result.ok && expected.kind === "reserve"
+            ? {
+                setupState: "running" as const,
+                setupCode: "",
+                setupSummary: "",
+                setupStartedAt: binding.setupStartedAt || new Date().toISOString(),
+                setupCompletedAt: "",
+              }
+            : {}),
           error: result.error || tree?.error || "",
         });
         if (result.ok && expected.kind === "reconcile" && available) {
@@ -430,14 +535,28 @@ export class ManagedWorktreeService {
       this.waiters.delete(result.operationId);
       waiter.resolve(this.store.getWorktreeOperation(result.operationId)!);
     }
-    this.publish(expected.runId);
-    if (!result.ok && ["reserve", "create"].includes(expected.kind)) {
-      this.service.notifications.createWorktreeAttention(
+    if (setupOperation && !result.ok) {
+      this.markSetupFailed(
         expected.runId,
-        `generation:${expected.generation}`,
-        "creation",
+        result.code || "workspace_setup_failed",
+        result.error || "Managed workspace preparation failed.",
       );
+    } else if (setupOperation && expected.kind === "reserve" && result.ok) {
+      const reservedRun = this.store.getRun(expected.runId);
+      const reservedBinding = reservedRun?.workspaceBinding;
+      if (
+        reservedRun?.state === "blocked" &&
+        reservedBinding &&
+        canTransitionRun("blocked", reservedBinding.setupResumeState)
+      ) {
+        this.store.setRunState(expected.runId, reservedBinding.setupResumeState);
+      }
+      this.publish(expected.runId);
+    } else if (setupOperation && setupReady) {
+      this.markSetupReady(expected.runId);
+      this.publish(expected.runId);
     } else if (result.integration?.state === "conflicted") {
+      this.publish(expected.runId);
       this.service.notifications.createWorktreeAttention(
         expected.runId,
         result.integration.id,
@@ -447,11 +566,14 @@ export class ManagedWorktreeService {
       tree?.state === "needs_reconciliation" ||
       result.integration?.state === "needs_reconciliation"
     ) {
+      this.publish(expected.runId);
       this.service.notifications.createWorktreeAttention(
         expected.runId,
         result.integration?.id ?? `generation:${expected.generation}`,
         "reconciliation",
       );
+    } else {
+      this.publish(expected.runId);
     }
     this.service.tickRun(expected.runId);
     return true;

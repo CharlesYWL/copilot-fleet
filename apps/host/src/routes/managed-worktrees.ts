@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   MANAGED_WORKTREES_CAPABILITY,
   WorktreeConflict,
+  type WorktreeOperation,
   type WorktreeOperationRequest,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
@@ -70,9 +71,13 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
     const run = store.getRun(id);
     if (!run) return reply.code(404).send({ error: "Task not found" });
     const worktree = store.worktreeForRun(id);
+    const source = run.workspaceBinding?.sourcePlacementId
+      ? store.getPlacement(run.workspaceBinding.sourcePlacementId)
+      : undefined;
     return {
       binding: run.workspaceBinding,
       worktree,
+      source,
       version: worktree?.version ?? 0,
       operations: store
         .listWorktreeOperations(run.workspaceBinding?.managedWorktreeId)
@@ -133,14 +138,44 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
         allowGitHooks: true,
       });
     }
-    const operation = await service.worktrees.request(id, {
-      ...Object.fromEntries(
-        Object.entries(input).filter(([, value]) => value !== undefined),
-      ),
-      kind: kind === "create" && !store.worktreeForRun(id) ? "reserve" : kind,
-      ...(action === "retry-with-hooks" ? { allowGitHooks: true } : {}),
-      actor: request.fleetSession?.administratorId || "operator",
-    });
+    const retryBinding =
+      action === "retry-create" || action === "retry-with-hooks"
+        ? store.getRun(id)!.workspaceBinding
+        : undefined;
+    if (retryBinding) {
+      const run = store.getRun(id)!;
+      const binding = run.workspaceBinding!;
+      store.setRunWorkspaceBinding(id, {
+        ...binding,
+        setupState: "running",
+        setupAttempt: binding.setupAttempt + 1,
+        setupCode: "",
+        setupSummary: "",
+        setupStartedAt: new Date().toISOString(),
+        setupCompletedAt: "",
+        error: "",
+      });
+    }
+    let operation: WorktreeOperation;
+    try {
+      operation = await service.worktrees.request(id, {
+        ...Object.fromEntries(
+          Object.entries(input).filter(([, value]) => value !== undefined),
+        ),
+        kind: kind === "create" && !store.worktreeForRun(id) ? "reserve" : kind,
+        ...(action === "retry-with-hooks" ? { allowGitHooks: true } : {}),
+        actor: request.fleetSession?.administratorId || "operator",
+      });
+    } catch (error) {
+      if (retryBinding) {
+        store.setRunWorkspaceBinding(id, {
+          ...retryBinding,
+          setupAttempt: retryBinding.setupAttempt + 1,
+          ...(action === "retry-with-hooks" ? { allowGitHooks: true } : {}),
+        });
+      }
+      throw error;
+    }
     if (!operation.result)
       return reply.code(202).send({
         operation,

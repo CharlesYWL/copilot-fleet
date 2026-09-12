@@ -94,6 +94,7 @@ function acknowledgement(request: WorktreeOperationRequest): WorktreeOperationRe
     branchRef: `refs/heads/fleet/${safeKey}`,
     pinRef: `refs/fleet/pins/${safeKey}`,
     baseSha: "a".repeat(40),
+    baseRef: "refs/heads/main",
     allowGitHooks: request.allowGitHooks,
     state: request.kind === "reserve" ? "reserved" : "ready",
     createdAt: new Date().toISOString(),
@@ -118,6 +119,90 @@ function lastRequest(frames: HostToNodeMessage[]): WorktreeOperationRequest {
 }
 
 describe("Host managed workspace orchestration", () => {
+  it("blocks a task on setup failure, deduplicates attention, and resumes only after creation succeeds", async () => {
+    const { create, frames, node, service, store } = fixture();
+    const created = create();
+    store.setRunState(created.id, "running");
+    const preparing = service.worktrees.prepare(created.id);
+    const reserve = lastRequest(frames);
+    const failure = WorktreeOperationResultSchema.parse({
+      operationId: reserve.operationId,
+      worktreeId: reserve.worktreeId,
+      generation: reserve.generation,
+      nodeId: reserve.nodeId,
+      hostInstallationId: reserve.hostInstallationId,
+      ok: false,
+      code: "invalid_baseline",
+      error: "private raw Git output and C:\\repo",
+      retryable: true,
+      acknowledgedAt: new Date().toISOString(),
+    });
+
+    expect(service.worktrees.handleResult(node.id, failure)).toBe(true);
+    await preparing;
+    expect(store.getRun(created.id)).toMatchObject({
+      state: "blocked",
+      workspaceBinding: {
+        initialization: "blocked",
+        setupState: "failed",
+        setupCode: "invalid_baseline",
+        setupSummary:
+          "Fleet could not resolve a committed baseline from the selected repository.",
+        setupResumeState: "running",
+      },
+    });
+    const notification = store.listNotifications().notifications[0]!;
+    expect(notification).toMatchObject({
+      severity: "error",
+      title: expect.stringContaining("Workspace setup failed"),
+      navigation: { type: "run", runId: created.id },
+      status: "active",
+    });
+    expect(JSON.stringify(notification)).not.toContain("C:\\repo");
+
+    const retrying = service.worktrees.request(created.id, {
+      kind: "reserve",
+      actor: "test",
+    });
+    const retriedReserve = lastRequest(frames);
+    expect(service.worktrees.handleResult(node.id, acknowledgement(retriedReserve))).toBe(
+      true,
+    );
+    await retrying;
+    expect(store.getRun(created.id)).toMatchObject({
+      state: "running",
+      workspaceBinding: {
+        initialization: "reserved",
+        setupState: "running",
+        baseRef: "refs/heads/main",
+      },
+    });
+    expect(store.listNotifications().notifications).toHaveLength(1);
+
+    const creating = service.worktrees.request(created.id, {
+      kind: "create",
+      actor: "test",
+    });
+    const createRequest = lastRequest(frames);
+    expect(service.worktrees.handleResult(node.id, acknowledgement(createRequest))).toBe(
+      true,
+    );
+    await creating;
+    expect(store.getRun(created.id)).toMatchObject({
+      state: "running",
+      workspaceBinding: {
+        initialization: "ready",
+        setupState: "succeeded",
+        baseRef: "refs/heads/main",
+      },
+    });
+    expect(store.getNotification(notification.id)).toMatchObject({
+      status: "resolved",
+      readAt: expect.any(String),
+    });
+    expect(store.notificationUnreadCount()).toBe(0);
+  });
+
   it("records intent before dispatch and rejects out-of-order, wrong-owner, generation and path acknowledgements", async () => {
     const { create, frames, node, service, store } = fixture();
     const run = create();

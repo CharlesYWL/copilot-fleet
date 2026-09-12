@@ -1209,6 +1209,7 @@ export const RunStateSchema = z.enum([
   "awaiting_approval",
   "planning",
   "running",
+  "blocked",
   "awaiting_lead",
   /**
    * Every phase is done and the orchestrator has handed the result to a person.
@@ -2796,9 +2797,10 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
    * fixture, which has no Lead and therefore nothing to plan — its plan
    * arrived over REST.
    */
-  awaiting_approval: new Set(["planning", "running", "failed", "cancelled"]),
-  planning: new Set(["running", "failed", "cancelled"]),
+  awaiting_approval: new Set(["planning", "running", "blocked", "failed", "cancelled"]),
+  planning: new Set(["running", "blocked", "failed", "cancelled"]),
   running: new Set([
+    "blocked",
     "awaiting_lead",
     "awaiting_human",
     "aggregating",
@@ -2807,6 +2809,7 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
     "cancelled",
   ]),
   awaiting_lead: new Set([
+    "blocked",
     "running",
     "awaiting_human",
     "aggregating",
@@ -2821,6 +2824,14 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
    */
   awaiting_human: new Set(["running", "completed", "failed", "cancelled"]),
   aggregating: new Set(["completed", "failed", "cancelled"]),
+  blocked: new Set([
+    "awaiting_approval",
+    "planning",
+    "running",
+    "awaiting_lead",
+    "failed",
+    "cancelled",
+  ]),
   /*
    * Finished, but not sealed.
    *

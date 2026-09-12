@@ -539,7 +539,8 @@ export class OrchestratorEngine {
       if (
         terminalRunStates.has(run.state) ||
         run.state === "awaiting_approval" ||
-        run.state === "awaiting_human"
+        run.state === "awaiting_human" ||
+        run.state === "blocked"
       ) {
         continue;
       }

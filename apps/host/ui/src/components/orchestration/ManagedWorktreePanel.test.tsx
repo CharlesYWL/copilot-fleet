@@ -186,9 +186,12 @@ describe("accessible managed workspace controls", () => {
         />
       </FluentProvider>,
     );
-    await screen.findByText(/Effective mode: Managed/);
+    await screen.findByText(
+      /An isolated workspace will be created from project on Node at its current committed HEAD/,
+    );
+    expect(screen.getByText("Workspace details").closest("details")?.open).toBe(false);
     fireEvent.click(screen.getByRole("combobox", { name: "Workspace isolation" }));
-    expect(screen.getByRole("option", { name: "Managed task worktree" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Isolated worktree" })).toBeTruthy();
     fireEvent.click(screen.getByRole("option", { name: "Legacy source checkout" }));
     fireEvent.change(screen.getByRole("textbox", { name: /What should be done/ }), {
       target: { value: "Implement the task" },

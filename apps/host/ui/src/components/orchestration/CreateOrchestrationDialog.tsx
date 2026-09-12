@@ -26,6 +26,11 @@ const useStyles = makeStyles({
     fontSize: tokens.fontSizeBase200,
     lineHeight: tokens.lineHeightBase200,
   },
+  summary: {
+    padding: "10px 12px",
+    borderRadius: tokens.borderRadiusMedium,
+    background: tokens.colorNeutralBackground2,
+  },
 });
 
 export type CreateOrchestrationDialogProps = {
@@ -101,6 +106,7 @@ export const CreateOrchestrationDialog = ({
     let current = true;
     setCapability(undefined);
     setCapabilityError("");
+    setSourcePlacementId("");
     void api<NonNullable<typeof capability>>(
       `/api/worktrees/capabilities?workspaceId=${encodeURIComponent(workspaceId)}`,
     )
@@ -124,11 +130,16 @@ export const CreateOrchestrationDialog = ({
   }, [open, workspaceId]);
 
   const chosen = reachable.find((workspace) => workspace.id === workspaceId);
-  const canCreate = Boolean(workspaceId) && objective.trim().length > 0 && !busy;
   const managed =
     chosen?.kind !== "chats" &&
     (workspaceMode === "managed" ||
       (workspaceMode === "auto" && capability?.managedWorktreesEnabled));
+  const canCreate =
+    Boolean(workspaceId) &&
+    objective.trim().length > 0 &&
+    (!managed || Boolean(sourcePlacementId)) &&
+    !busy;
+  const source = placements.find((entry) => entry.id === sourcePlacementId);
 
   const submit = async () => {
     if (!canCreate) return;
@@ -166,7 +177,7 @@ export const CreateOrchestrationDialog = ({
                     onChange={(_, data) => setObjective(data.value)}
                   />
                 </Field>
-                <Field label="Workspace">
+                <Field label="Repository">
                   <Dropdown
                     value={chosen?.name ?? ""}
                     selectedOptions={workspaceId ? [workspaceId] : []}
@@ -193,7 +204,7 @@ export const CreateOrchestrationDialog = ({
                       workspaceMode === "auto"
                         ? "Auto (app default)"
                         : workspaceMode === "managed"
-                          ? "Managed task worktree"
+                          ? "Isolated worktree"
                           : "Legacy source checkout"
                     }
                     selectedOptions={[workspaceMode]}
@@ -203,16 +214,17 @@ export const CreateOrchestrationDialog = ({
                   >
                     <Option value="auto">Auto (app default)</Option>
                     <Option value="legacy">Legacy source checkout</Option>
-                    <Option value="managed">Managed task worktree</Option>
+                    <Option value="managed">Isolated worktree</Option>
                   </Dropdown>
                 </Field>
                 {managed && (
-                  <Field label="Source placement">
+                  <Field label="Selected repository">
                     <Dropdown
-                      aria-label="Source placement"
+                      aria-label="Selected repository"
                       value={
-                        placements.find((entry) => entry.id === sourcePlacementId)
-                          ?.nodeName ?? "Host selects an online source"
+                        source
+                          ? `${chosen?.name ?? "Repository"} — ${source.nodeName ?? source.nodeId}`
+                          : "Select a repository"
                       }
                       selectedOptions={sourcePlacementId ? [sourcePlacementId] : []}
                       onOptionSelect={(_, data) =>
@@ -227,7 +239,7 @@ export const CreateOrchestrationDialog = ({
                             value={entry.id}
                             text={entry.nodeName ?? entry.nodeId}
                           >
-                            {entry.nodeName ?? entry.nodeId}
+                            {chosen?.name} — {entry.nodeName ?? entry.nodeId}
                             {capability?.placements.find(
                               (item) => item.placementId === entry.id,
                             )?.supported
@@ -242,12 +254,29 @@ export const CreateOrchestrationDialog = ({
                   {chosen?.kind === "chats"
                     ? "Chats requires no repository worktree."
                     : capability
-                      ? `Effective mode: ${managed ? "Managed" : "Legacy"}. Auto uses the app default at creation; the resolved mode and source never change on resume.`
+                      ? managed && source
+                        ? `An isolated workspace will be created from ${chosen?.name} on ${source.nodeName ?? source.nodeId} at its current committed HEAD.`
+                        : "This task will use the selected repository checkout directly."
                       : capabilityError || "Checking Node managed-worktree capability…"}
-                  {managed
-                    ? " Repository-root and committed-base eligibility are checked on the Node. Unsupported Nodes block the task; there is no Legacy fallback. All task roles share one checkout and serialize shell-capable sessions."
-                    : ""}
                 </p>
+                {managed && (
+                  <>
+                    <p className={styles.summary}>
+                      <strong>Base revision:</strong> Current committed HEAD, resolved and
+                      pinned during workspace setup.
+                    </p>
+                    <details>
+                      <summary>Workspace details</summary>
+                      <p className={styles.footnote}>
+                        Fleet verifies the selected path is a repository root and creates
+                        the worktree in a managed sibling location outside the source
+                        checkout. The generated path and branch are chosen safely for
+                        concurrent tasks. Setup failure never falls back to modifying the
+                        selected checkout.
+                      </p>
+                    </details>
+                  </>
+                )}
                 <p className={styles.footnote}>
                   This records the task, then asks the orchestrator — in its conversation
                   — to plan it. You can ask for the same thing by talking to it directly;

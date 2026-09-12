@@ -664,6 +664,11 @@ export class ManagedWorktrees {
         await this.git.run(repository.path, ["rev-parse", "--verify", "HEAD^{commit}"])
       ).stdout.trim(),
     );
+    const baseRef = (
+      await this.git.run(repository.path, ["symbolic-ref", "-q", "HEAD"], {
+        allowedExitCodes: [0, 1],
+      })
+    ).stdout.trim();
     await this.supportedRepository(repository.path, base, request.allowGitHooks);
     await this.registry({ repository });
     const trees = this.db
@@ -782,6 +787,7 @@ export class ManagedWorktrees {
       branchRef,
       pinRef,
       baseSha: base,
+      baseRef,
       allowGitHooks: request.allowGitHooks,
       state: "reserved",
       createdAt: now(),

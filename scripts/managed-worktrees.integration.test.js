@@ -579,10 +579,35 @@ describe(
       expect(first.body.workspaceBinding).toMatchObject({
         effectiveMode: "managed",
         initialization: "blocked",
+        setupState: "failed",
       });
+      expect(first.body.state).toBe("blocked");
       expect(first.body.workspaceBinding.error).toContain("managed-worktrees-v1");
+      const notificationPage = await fleet.request("/api/notifications");
+      expect(notificationPage.body.unreadCount).toBe(1);
+      expect(notificationPage.body.notifications).toHaveLength(1);
+      expect(notificationPage.body.notifications[0]).toMatchObject({
+        severity: "error",
+        navigation: { type: "run", runId: first.body.id },
+        status: "active",
+      });
+      expect(JSON.stringify(notificationPage.body.notifications[0])).not.toContain(
+        fleet.source,
+      );
       const duplicate = await fleet.request("/api/runs", "POST", body);
       expect(duplicate.body.id).toBe(first.body.id);
+      expect((await fleet.request("/api/notifications")).body.notifications).toHaveLength(
+        1,
+      );
+      expect(
+        (
+          await fleet.request("/api/runs", "POST", {
+            ...body,
+            operationId: randomUUID(),
+            sourcePlacementId: undefined,
+          })
+        ).body.code,
+      ).toBe("source_required");
       expect(
         (await fleet.request("/api/runs", "POST", { ...body, objective: "different" }))
           .body.code,

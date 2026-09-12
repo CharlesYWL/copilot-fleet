@@ -340,6 +340,17 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       !isChatsWorkspace(input.workspaceId) &&
       (input.workspaceMode === "managed" ||
         (input.workspaceMode === "auto" && store.getManagedWorktreesEnabled())) &&
+      !input.sourcePlacementId
+    ) {
+      return reply.code(409).send({
+        code: "source_required",
+        error: "Select the repository copy that should define this task’s baseline.",
+      });
+    }
+    if (
+      !isChatsWorkspace(input.workspaceId) &&
+      (input.workspaceMode === "managed" ||
+        (input.workspaceMode === "auto" && store.getManagedWorktreesEnabled())) &&
       !input.operationId
     ) {
       return reply.code(409).send({

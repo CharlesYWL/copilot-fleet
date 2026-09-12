@@ -107,6 +107,9 @@ export function runVisual(model: RunViewModel): Visual {
       icon: WarningRegular,
     };
   }
+  if (model.attention === "workspace-setup") {
+    return { label: "Setup failed", tone: "danger", icon: ErrorCircleRegular };
+  }
   if (model.attention === "failed-step") {
     return { label: "A step failed", tone: "danger", icon: ErrorCircleRegular };
   }

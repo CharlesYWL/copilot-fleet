@@ -96,6 +96,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   const { run, steps } = input;
   if (terminalRunStates.has(run.state)) return [];
   if (run.state === "awaiting_approval") return [];
+  if (run.state === "blocked") return [];
   /*
    * A task waiting on a person is not waiting on the fleet: nothing new is
    * dispatched and the orchestrator is not woken, because that would be the

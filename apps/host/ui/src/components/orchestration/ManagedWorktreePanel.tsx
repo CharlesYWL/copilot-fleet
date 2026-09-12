@@ -27,6 +27,7 @@ import { api } from "../../hooks/useFleet";
 type WorktreeView = {
   binding?: RunWorkspaceBinding;
   worktree?: ManagedWorktree;
+  source?: Placement;
   version: number;
   operations: WorktreeOperation[];
   integrations: WorktreeIntegration[];
@@ -221,323 +222,368 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
       "needs_reconciliation",
       "integrating",
     ].includes(integration.state);
+  const setupState =
+    binding?.setupState && binding.setupState !== "not_required"
+      ? binding.setupState
+      : binding?.initialization === "ready"
+        ? "succeeded"
+        : binding?.initialization === "blocked"
+          ? "failed"
+          : binding?.initialization === "reserved"
+            ? "running"
+            : "pending";
+  const sourceLabel =
+    view?.source?.workspaceName ??
+    view?.targets.find((entry) => entry.id === binding?.sourcePlacementId)
+      ?.workspaceName ??
+    "the selected repository";
+  const baseLabel =
+    binding?.baseRef ||
+    tree?.baseRef ||
+    (binding?.baseSha ? binding.baseSha.slice(0, 12) : "current committed HEAD");
 
   return (
     <section className={styles.panel} aria-label="Managed task worktree">
-      <h2>Managed task worktree</h2>
+      <h2>Isolated workspace</h2>
       <p>
-        Requested: {binding?.requestedMode} · Effective: {binding?.effectiveMode} ·
-        Resolution: {binding?.resolutionSource}
-      </p>
-      <p>
-        Implementer, reviewer, tester and fixer share this binding, including uncommitted
-        changes. Only one shell-capable session may hold it. Stop verifies process
-        quiescence; idle is not sufficient.
+        An isolated workspace is created from {sourceLabel} at <code>{baseLabel}</code>.
       </p>
       <p role="status" aria-live="polite">
-        {progress || `Lifecycle: ${tree?.state ?? binding?.initialization ?? "Unknown"}`}
+        <strong>Preparing isolated workspace:</strong>{" "}
+        {setupState === "succeeded"
+          ? "Ready"
+          : setupState === "failed"
+            ? "Failed"
+            : "In progress"}
       </p>
-      {!confirmation && error && <p role="alert">{error}</p>}
-      {(binding?.error || tree?.error) && (
-        <p role="alert">{binding?.error || tree?.error}</p>
+      {setupState === "failed" && (
+        <>
+          <p role="alert">
+            {binding?.setupSummary ||
+              "Fleet could not prepare the isolated workspace. Review details and retry."}
+          </p>
+          <div className={styles.actions}>
+            <Button
+              disabled={busy || quarantined}
+              onClick={() => void execute("retry-create")}
+            >
+              Retry workspace setup
+            </Button>
+            {!tree && binding?.error.includes("active Git hooks") && (
+              <Button
+                disabled={busy || quarantined}
+                onClick={(event) =>
+                  confirm(event, {
+                    action: "retry-with-hooks",
+                    title: "Allow repository Git hooks?",
+                    detail:
+                      "Fleet and task agents may execute this repository’s configured Git hooks. Hooks can run arbitrary repository-defined code and may change files or delay Git commands. This consent applies only to this managed task and does not change repository configuration.",
+                    payload: { allowGitHooks: true },
+                    phrase: "ALLOW REPOSITORY GIT HOOKS",
+                    phraseLabel: "Type the exact Git hooks confirmation",
+                  })
+                }
+              >
+                Allow Git hooks and retry
+              </Button>
+            )}
+          </div>
+        </>
       )}
-      {quarantined && (
+      <details>
+        <summary>Workspace details</summary>
         <p>
-          Restored metadata is quarantined. Backup contains no worktree files, locks or
-          process ownership. Explicit reconciliation is required before resume,
-          integration or cleanup.
+          Requested: {binding?.requestedMode} · Effective: {binding?.effectiveMode} ·
+          Resolution: {binding?.resolutionSource}
         </p>
-      )}
-      {tree?.abandonedAt && (
         <p>
-          Ownership abandoned. Files and branch were kept; Fleet will not adopt or clean
-          them.
+          Implementer, reviewer, tester and fixer share this binding, including
+          uncommitted changes. Only one shell-capable session may hold it. Stop verifies
+          process quiescence; idle is not sufficient.
         </p>
-      )}
-      {tree && (
-        <dl className={styles.metadata}>
-          <dt>Node</dt>
-          <dd>
-            {view?.targets.find((entry) => entry.id === tree.sourcePlacementId)
-              ?.nodeName ?? tree.nodeId}
-          </dd>
-          <dt>Branch</dt>
-          <dd>
-            <code>{tree.branchRef}</code>
-          </dd>
-          <dt>Path</dt>
-          <dd>
-            <code>{tree.path}</code>
-          </dd>
-          <dt>Base SHA</dt>
-          <dd>
-            <code>{tree.baseSha}</code>
-          </dd>
-          <dt>HEAD</dt>
-          <dd>
-            <code>{observation?.head || "Unknown"}</code>
-          </dd>
-          <dt>Generation</dt>
-          <dd>
-            {tree.generation} · revision {view?.version}
-          </dd>
-          <dt>Lock holder</dt>
-          <dd>
-            {observation?.lockHolder ||
-              (observation?.locked == null ? "Unknown" : "None at observation")}
-          </dd>
-          <dt>Dirty</dt>
-          <dd>{status(observation?.dirty)}</dd>
-          <dt>Changes</dt>
-          <dd>
-            Staged: {status(observation?.staged)}; unstaged:{" "}
-            {status(observation?.unstaged)}; untracked: {status(observation?.untracked)};
-            ignored: {status(observation?.ignored)}
-          </dd>
-          <dt>Ahead / behind</dt>
-          <dd>
-            {observation?.ahead ?? "Unknown"} / {observation?.behind ?? "Unknown"}{" "}
-            relative to pinned base
-          </dd>
-          <dt>Observed</dt>
-          <dd>
-            {observation?.observedAt ?? "Never"} (not a current cleanliness guarantee)
-          </dd>
-          <dt>Retention</dt>
-          <dd>
-            {tree.expiresAt
-              ? `Eligible after ${tree.expiresAt}, only if still clean, integrated and inactive.`
-              : "Retained until explicit safe cleanup; no dirty eviction."}
-          </dd>
-          <dt>Integration</dt>
-          <dd>{integration?.state ?? tree.integrationState}</dd>
-        </dl>
-      )}
-      <div className={styles.actions}>
-        <Button disabled={busy} onClick={() => void execute("reconcile")}>
-          Reconcile worktree
-        </Button>
-        {(!tree || ["reserved", "creating", "creation_failed"].includes(tree.state)) && (
-          <Button
-            disabled={busy || quarantined}
-            onClick={() => void execute("retry-create")}
-          >
-            Retry creation
-          </Button>
+        <p role="status" aria-live="polite">
+          {progress ||
+            `Lifecycle: ${tree?.state ?? binding?.initialization ?? "Unknown"}`}
+        </p>
+        {!confirmation && error && <p role="alert">{error}</p>}
+        {(binding?.error || tree?.error) && (
+          <p role="alert">{binding?.error || tree?.error}</p>
         )}
-        {!tree && binding?.error.includes("active Git hooks") && (
+        {quarantined && (
+          <p>
+            Restored metadata is quarantined. Backup contains no worktree files, locks or
+            process ownership. Explicit reconciliation is required before resume,
+            integration or cleanup.
+          </p>
+        )}
+        {tree?.abandonedAt && (
+          <p>
+            Ownership abandoned. Files and branch were kept; Fleet will not adopt or clean
+            them.
+          </p>
+        )}
+        {tree && (
+          <dl className={styles.metadata}>
+            <dt>Node</dt>
+            <dd>
+              {view?.targets.find((entry) => entry.id === tree.sourcePlacementId)
+                ?.nodeName ?? tree.nodeId}
+            </dd>
+            <dt>Branch</dt>
+            <dd>
+              <code>{tree.branchRef}</code>
+            </dd>
+            <dt>Path</dt>
+            <dd>
+              <code>{tree.path}</code>
+            </dd>
+            <dt>Base SHA</dt>
+            <dd>
+              <code>{tree.baseSha}</code>
+            </dd>
+            <dt>HEAD</dt>
+            <dd>
+              <code>{observation?.head || "Unknown"}</code>
+            </dd>
+            <dt>Generation</dt>
+            <dd>
+              {tree.generation} · revision {view?.version}
+            </dd>
+            <dt>Lock holder</dt>
+            <dd>
+              {observation?.lockHolder ||
+                (observation?.locked == null ? "Unknown" : "None at observation")}
+            </dd>
+            <dt>Dirty</dt>
+            <dd>{status(observation?.dirty)}</dd>
+            <dt>Changes</dt>
+            <dd>
+              Staged: {status(observation?.staged)}; unstaged:{" "}
+              {status(observation?.unstaged)}; untracked: {status(observation?.untracked)}
+              ; ignored: {status(observation?.ignored)}
+            </dd>
+            <dt>Ahead / behind</dt>
+            <dd>
+              {observation?.ahead ?? "Unknown"} / {observation?.behind ?? "Unknown"}{" "}
+              relative to pinned base
+            </dd>
+            <dt>Observed</dt>
+            <dd>
+              {observation?.observedAt ?? "Never"} (not a current cleanliness guarantee)
+            </dd>
+            <dt>Retention</dt>
+            <dd>
+              {tree.expiresAt
+                ? `Eligible after ${tree.expiresAt}, only if still clean, integrated and inactive.`
+                : "Retained until explicit safe cleanup; no dirty eviction."}
+            </dd>
+            <dt>Integration</dt>
+            <dd>{integration?.state ?? tree.integrationState}</dd>
+          </dl>
+        )}
+        <div className={styles.actions}>
+          <Button disabled={busy} onClick={() => void execute("reconcile")}>
+            Reconcile worktree
+          </Button>
+          <Button disabled={blocked} onClick={() => void execute("observe")}>
+            Refresh Git observation
+          </Button>
+          <Button disabled={blocked} onClick={() => void execute("retain")}>
+            Retain worktree
+          </Button>
           <Button
-            disabled={busy || quarantined}
+            disabled={blocked}
             onClick={(event) =>
               confirm(event, {
-                action: "retry-with-hooks",
-                title: "Allow repository Git hooks?",
+                action: "quiesce",
+                title: "Stop checkout sessions?",
                 detail:
-                  "Fleet and task agents may execute this repository’s configured Git hooks. Hooks can run arbitrary repository-defined code and may change files or delay Git commands. This consent applies only to this managed task and does not change repository configuration.",
-                payload: { allowGitHooks: true },
-                phrase: "ALLOW REPOSITORY GIT HOOKS",
-                phraseLabel: "Type the exact Git hooks confirmation",
-              })
-            }
-          >
-            Allow Git hooks and retry
-          </Button>
-        )}
-        <Button disabled={blocked} onClick={() => void execute("observe")}>
-          Refresh Git observation
-        </Button>
-        <Button disabled={blocked} onClick={() => void execute("retain")}>
-          Retain worktree
-        </Button>
-        <Button
-          disabled={blocked}
-          onClick={(event) =>
-            confirm(event, {
-              action: "quiesce",
-              title: "Stop checkout sessions?",
-              detail:
-                "Stop this task’s processes and any sessions on the selected target. Conversations and all working files remain intact.",
-              payload: {
-                confirm: "STOP TASK AND SELECTED TARGET SESSIONS",
-                ...(target ? { targetPlacementId: target } : {}),
-              },
-            })
-          }
-        >
-          Stop checkout sessions
-        </Button>
-      </div>
-      <h3>Explicit merge integration</h3>
-      <p>
-        Task approval and integration are separate. Choose the target yourself; Fleet
-        never selects or switches main, pushes, or creates a PR.
-      </p>
-      <label htmlFor={targetId}>Target checkout on the owning Node</label>{" "}
-      <select
-        id={targetId}
-        value={target}
-        disabled={blocked || Boolean(ongoingMerge)}
-        onChange={(event) => {
-          setTarget(event.target.value);
-          setPreview(undefined);
-        }}
-      >
-        <option value="">Choose a target checkout</option>
-        {view?.targets.map((entry) => (
-          <option key={entry.id} value={entry.id}>
-            {entry.workspaceName} · {entry.localPath}
-          </option>
-        ))}
-      </select>
-      <div className={styles.actions}>
-        <Button
-          disabled={blocked || !target || Boolean(ongoingMerge)}
-          onClick={() =>
-            void execute("integration-preview", { targetPlacementId: target })
-          }
-        >
-          Preview integration
-        </Button>
-      </div>
-      {preview && (
-        <div aria-label="Integration preview">
-          <p>
-            Target path: <code>{preview.target.path}</code>
-          </p>
-          <p>
-            Target branch: <code>{preview.targetRef}</code> · Target SHA:{" "}
-            <code>{preview.targetSha}</code>
-          </p>
-          <p>
-            Reviewed task SHA: <code>{preview.taskSha}</code>
-          </p>
-          <p>
-            Diff identity: <code>{preview.diffIdentity}</code>
-          </p>
-          <p>
-            Task dirty: {status(preview.taskDirty)} · Target dirty:{" "}
-            {status(preview.targetDirty)} · Already integrated:{" "}
-            {status(preview.alreadyIntegrated)}
-          </p>
-          <pre className={styles.diff} aria-label="Reviewed task diff">
-            {preview.diff || "No committed diff from the pinned base."}
-          </pre>
-          <Button
-            disabled={
-              blocked || preview.taskDirty || preview.targetDirty || Boolean(ongoingMerge)
-            }
-            onClick={(event) =>
-              confirm(event, {
-                action: "integration-start",
-                title: "Merge the reviewed task commit?",
-                reviewed: true,
-                detail: `Merge ${preview.taskSha} into ${preview.targetRef} at ${preview.target.path}. The preview and target HEAD are verified again under repository and checkout locks. Conflicts reserve the target; the task worktree is kept.`,
+                  "Stop this task’s processes and any sessions on the selected target. Conversations and all working files remain intact.",
                 payload: {
-                  previewId: preview.id,
-                  reviewedTaskSha: preview.taskSha,
-                  reviewedDiffIdentity: preview.diffIdentity,
-                  confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+                  confirm: "STOP TASK AND SELECTED TARGET SESSIONS",
+                  ...(target ? { targetPlacementId: target } : {}),
                 },
               })
             }
           >
-            Merge reviewed commit
+            Stop checkout sessions
           </Button>
         </div>
-      )}
-      {ongoingMerge && integration && (
-        <div aria-label="Integration recovery">
-          <p>
-            Integration {integration.id}: {integration.state}. Target:{" "}
-            <code>{integration.preview.target.path}</code>.
-          </p>
-          <p>
-            The target remains reserved. Resolve conflicts in that target using your
-            editor and stage the resolved files; Fleet does not resolve conflicts or reset
-            files automatically.
-          </p>
-          {integration.error && <p role="alert">{integration.error}</p>}
-          {integration.conflicts.length > 0 && (
-            <ul aria-label="Conflicting paths">
-              {integration.conflicts.map((path) => (
-                <li key={path}>{path}</li>
-              ))}
-            </ul>
-          )}
-          <div className={styles.actions}>
+        <h3>Explicit merge integration</h3>
+        <p>
+          Task approval and integration are separate. Choose the target yourself; Fleet
+          never selects or switches main, pushes, or creates a PR.
+        </p>
+        <label htmlFor={targetId}>Target checkout on the owning Node</label>{" "}
+        <select
+          id={targetId}
+          value={target}
+          disabled={blocked || Boolean(ongoingMerge)}
+          onChange={(event) => {
+            setTarget(event.target.value);
+            setPreview(undefined);
+          }}
+        >
+          <option value="">Choose a target checkout</option>
+          {view?.targets.map((entry) => (
+            <option key={entry.id} value={entry.id}>
+              {entry.workspaceName} · {entry.localPath}
+            </option>
+          ))}
+        </select>
+        <div className={styles.actions}>
+          <Button
+            disabled={blocked || !target || Boolean(ongoingMerge)}
+            onClick={() =>
+              void execute("integration-preview", { targetPlacementId: target })
+            }
+          >
+            Preview integration
+          </Button>
+        </div>
+        {preview && (
+          <div aria-label="Integration preview">
+            <p>
+              Target path: <code>{preview.target.path}</code>
+            </p>
+            <p>
+              Target branch: <code>{preview.targetRef}</code> · Target SHA:{" "}
+              <code>{preview.targetSha}</code>
+            </p>
+            <p>
+              Reviewed task SHA: <code>{preview.taskSha}</code>
+            </p>
+            <p>
+              Diff identity: <code>{preview.diffIdentity}</code>
+            </p>
+            <p>
+              Task dirty: {status(preview.taskDirty)} · Target dirty:{" "}
+              {status(preview.targetDirty)} · Already integrated:{" "}
+              {status(preview.alreadyIntegrated)}
+            </p>
+            <pre className={styles.diff} aria-label="Reviewed task diff">
+              {preview.diff || "No committed diff from the pinned base."}
+            </pre>
             <Button
-              disabled={blocked}
+              disabled={
+                blocked ||
+                preview.taskDirty ||
+                preview.targetDirty ||
+                Boolean(ongoingMerge)
+              }
               onClick={(event) =>
                 confirm(event, {
-                  action: "integration-continue",
-                  title: "Commit the resolved merge?",
-                  detail:
-                    "Only staged, verified conflict resolution will be committed. Noninteractive identity and signing policy must be supported. No push is performed.",
+                  action: "integration-start",
+                  title: "Merge the reviewed task commit?",
+                  reviewed: true,
+                  detail: `Merge ${preview.taskSha} into ${preview.targetRef} at ${preview.target.path}. The preview and target HEAD are verified again under repository and checkout locks. Conflicts reserve the target; the task worktree is kept.`,
                   payload: {
-                    integrationId: integration.id,
-                    confirm: `COMMIT MERGE ${integration.id}`,
-                    commit: true,
+                    previewId: preview.id,
+                    reviewedTaskSha: preview.taskSha,
+                    reviewedDiffIdentity: preview.diffIdentity,
+                    confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
                   },
                 })
               }
             >
-              Continue resolved merge
-            </Button>
-            <Button
-              disabled={blocked}
-              onClick={(event) =>
-                confirm(event, {
-                  action: "integration-abort",
-                  title: "Abort this merge?",
-                  detail: `Abort only operation ${integration.id} in ${integration.preview.target.path}. Resolution edits in that target merge are at risk. The task worktree and its branch remain intact.`,
-                  payload: {
-                    integrationId: integration.id,
-                    confirm: `ABORT MERGE ${integration.id}`,
-                  },
-                })
-              }
-            >
-              Abort merge
+              Merge reviewed commit
             </Button>
           </div>
+        )}
+        {ongoingMerge && integration && (
+          <div aria-label="Integration recovery">
+            <p>
+              Integration {integration.id}: {integration.state}. Target:{" "}
+              <code>{integration.preview.target.path}</code>.
+            </p>
+            <p>
+              The target remains reserved. Resolve conflicts in that target using your
+              editor and stage the resolved files; Fleet does not resolve conflicts or
+              reset files automatically.
+            </p>
+            {integration.error && <p role="alert">{integration.error}</p>}
+            {integration.conflicts.length > 0 && (
+              <ul aria-label="Conflicting paths">
+                {integration.conflicts.map((path) => (
+                  <li key={path}>{path}</li>
+                ))}
+              </ul>
+            )}
+            <div className={styles.actions}>
+              <Button
+                disabled={blocked}
+                onClick={(event) =>
+                  confirm(event, {
+                    action: "integration-continue",
+                    title: "Commit the resolved merge?",
+                    detail:
+                      "Only staged, verified conflict resolution will be committed. Noninteractive identity and signing policy must be supported. No push is performed.",
+                    payload: {
+                      integrationId: integration.id,
+                      confirm: `COMMIT MERGE ${integration.id}`,
+                      commit: true,
+                    },
+                  })
+                }
+              >
+                Continue resolved merge
+              </Button>
+              <Button
+                disabled={blocked}
+                onClick={(event) =>
+                  confirm(event, {
+                    action: "integration-abort",
+                    title: "Abort this merge?",
+                    detail: `Abort only operation ${integration.id} in ${integration.preview.target.path}. Resolution edits in that target merge are at risk. The task worktree and its branch remain intact.`,
+                    payload: {
+                      integrationId: integration.id,
+                      confirm: `ABORT MERGE ${integration.id}`,
+                    },
+                  })
+                }
+              >
+                Abort merge
+              </Button>
+            </div>
+          </div>
+        )}
+        <h3>Cleanup</h3>
+        <p>
+          Stop, approval and archive retain the checkout. Removal requires fresh verified
+          ownership, no active process or integration, and no staged, unstaged, untracked
+          or ignored data. Cleanup never force-removes, recursively deletes or prunes the
+          repository.
+        </p>
+        <div className={styles.actions}>
+          <Button
+            disabled={blocked || Boolean(ongoingMerge)}
+            onClick={(event) =>
+              confirm(event, {
+                action: "cleanup",
+                title: "Remove this clean worktree?",
+                detail: `${tree!.branchRef} at ${tree!.path}. Git will refuse any dirty or active checkout. The task branch is kept by default.`,
+                payload: {},
+              })
+            }
+          >
+            Remove clean worktree
+          </Button>
+          <Button
+            disabled={busy || !canAbandon || Boolean(ongoingMerge)}
+            onClick={(event) =>
+              confirm(event, {
+                action: "abandon",
+                title: "Abandon Fleet ownership?",
+                detail: `Keep all data and branch ${tree!.branchRef} at ${tree!.path}, but relinquish Fleet lifecycle management. Purging the task afterwards loses its conversation/history references. No files are deleted.`,
+                phrase: `ABANDON ${tree!.branchRef} AT ${tree!.path}; KEEP FILES`,
+                payload: {},
+              })
+            }
+          >
+            Abandon ownership
+          </Button>
         </div>
-      )}
-      <h3>Cleanup</h3>
-      <p>
-        Stop, approval and archive retain the checkout. Removal requires fresh verified
-        ownership, no active process or integration, and no staged, unstaged, untracked or
-        ignored data. Cleanup never force-removes, recursively deletes or prunes the
-        repository.
-      </p>
-      <div className={styles.actions}>
-        <Button
-          disabled={blocked || Boolean(ongoingMerge)}
-          onClick={(event) =>
-            confirm(event, {
-              action: "cleanup",
-              title: "Remove this clean worktree?",
-              detail: `${tree!.branchRef} at ${tree!.path}. Git will refuse any dirty or active checkout. The task branch is kept by default.`,
-              payload: {},
-            })
-          }
-        >
-          Remove clean worktree
-        </Button>
-        <Button
-          disabled={busy || !canAbandon || Boolean(ongoingMerge)}
-          onClick={(event) =>
-            confirm(event, {
-              action: "abandon",
-              title: "Abandon Fleet ownership?",
-              detail: `Keep all data and branch ${tree!.branchRef} at ${tree!.path}, but relinquish Fleet lifecycle management. Purging the task afterwards loses its conversation/history references. No files are deleted.`,
-              phrase: `ABANDON ${tree!.branchRef} AT ${tree!.path}; KEEP FILES`,
-              payload: {},
-            })
-          }
-        >
-          Abandon ownership
-        </Button>
-      </div>
+      </details>
       {/* Do not reuse a closing portal's modal/aria-hidden ownership for a new operation. */}
       <Dialog
         key={confirmation?.operationId ?? "closed"}

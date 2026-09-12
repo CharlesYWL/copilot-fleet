@@ -23,6 +23,18 @@ export const RunWorkspaceBindingSchema = z.object({
   initialization: z
     .enum(["not_required", "pending", "reserved", "ready", "blocked", "quarantined"])
     .default("not_required"),
+  setupState: z
+    .enum(["not_required", "pending", "running", "succeeded", "failed"])
+    .default("not_required"),
+  setupAttempt: z.number().int().nonnegative().default(0),
+  setupCode: z.string().default(""),
+  setupSummary: z.string().default(""),
+  setupStartedAt: z.string().default(""),
+  setupCompletedAt: z.string().default(""),
+  setupResumeState: z
+    .enum(["awaiting_approval", "planning", "running", "awaiting_lead"])
+    .default("running"),
+  baseRef: z.string().default(""),
   allowGitHooks: z.boolean().default(false),
   error: z.string().default(""),
 });
@@ -55,6 +67,16 @@ export function resolveWorkspaceMode(
       (requested === "managed" || (requested === "auto" && enabled))
         ? "pending"
         : "not_required",
+    setupState:
+      accessIntent === "checkout" &&
+      (requested === "managed" || (requested === "auto" && enabled))
+        ? "pending"
+        : "not_required",
+    setupAttempt:
+      accessIntent === "checkout" &&
+      (requested === "managed" || (requested === "auto" && enabled))
+        ? 1
+        : 0,
   });
 }
 
@@ -159,6 +181,7 @@ export const ManagedWorktreeSchema = z.object({
   branchRef: z.string().regex(/^refs\/heads\/fleet\/[a-z0-9-]+$/),
   pinRef: z.string().regex(/^refs\/fleet\/pins\/[a-z0-9-]+$/),
   baseSha: GitShaSchema,
+  baseRef: z.string().default(""),
   state: WorktreeLifecycleSchema,
   integrationState: IntegrationStateSchema.default("not_requested"),
   integrationStrategy: z.literal("merge").default("merge"),

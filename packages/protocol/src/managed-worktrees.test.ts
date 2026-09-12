@@ -15,6 +15,8 @@ describe("managed workspace protocol compatibility", () => {
       requestedMode: "managed",
       effectiveMode: "managed",
       resolutionSource: "explicit",
+      setupState: "pending",
+      setupAttempt: 1,
     });
     expect(resolveWorkspaceMode("legacy", true)).toMatchObject({
       effectiveMode: "legacy",
@@ -51,6 +53,17 @@ describe("managed workspace protocol compatibility", () => {
       updatedAt: now,
     });
     expect(run.workspaceBinding).toEqual(RunWorkspaceBindingSchema.parse({}));
+    expect(
+      RunWorkspaceBindingSchema.parse({
+        effectiveMode: "managed",
+        initialization: "ready",
+        baseSha: "a".repeat(40),
+      }),
+    ).toMatchObject({
+      setupState: "not_required",
+      setupAttempt: 0,
+      baseRef: "",
+    });
     const backup = HostBackupSchema.parse({
       kind: "copilot-fleet-host",
       version: 1,

@@ -91,9 +91,13 @@ than returning successful shutdown.
 - New task creation accepts `workspaceMode: auto | legacy | managed`.
 - Explicit Legacy/Managed wins. Auto resolves the app default once at creation.
   Historical/missing fields resolve to Legacy, including old backups.
+- New managed tasks require an explicit source placement from the repository the
+  user selected. Host does not substitute the first online copy. Historical tasks
+  that predate source metadata retain a compatibility-only lookup during initial
+  preparation; once resolved, the placement is pinned.
 - Requested/effective mode, resolution source, source placement, access intent,
-  exact base SHA and initialization state are stored. Resume, retries and later
-  setting edits never recompute them. Existing sessions are not migrated.
+  symbolic base ref, exact base SHA and setup state are stored. Resume, retries
+  and later setting edits never recompute them. Existing sessions are not migrated.
 - Chats/nonrepository tasks allocate no worktree. Merely describing a shell-capable
   repository reviewer as read-only does not prove no-checkout capability.
 - New capable-Node leads use nonrepository coordinator directories, not per-agent
@@ -134,6 +138,21 @@ reserved -> creating -> ready <-> retained -> removing -> removed
                        |
 creation_failed / missing / unavailable / needs_reconciliation / quarantined
 ```
+
+Workspace preparation is also a first-class blocking task step:
+
+```text
+pending -> running -> succeeded
+                    \-> failed
+```
+
+The scheduler dispatches no task agent until the worktree reaches `ready`. A
+reserve or create failure records a browser-safe failure class, moves the Run to
+the nonterminal `blocked` state and keeps raw diagnostics only in workspace
+details. Retry reuses the durable operation/worktree identity, returns to the
+saved Run state while preparation continues, and resolves the block only after
+physical checkout creation succeeds. Stop and cancellation remain available;
+there is no source-checkout fallback.
 
 Integration has independent `not_requested`, `not_ready`, `ready`, `integrating`,
 `integrated`, `conflicted`, `resolving`, `aborting`, `aborted`, `uncertain` and
@@ -236,13 +255,19 @@ Actions: `observe`, `reconcile`, `retry-create`, `retain`, `quiesce`,
 `integration-abort`, `cleanup`, `abandon`. Reconcile first drains an outstanding
 correlated acknowledgement before another filesystem transition is permitted.
 
-General settings explain scope/quotas. Task creation offers Auto/Legacy/Managed,
-source selection and capability feedback. Task detail shows bindings, generation,
-base/HEAD, branch/path/Node, lifecycle, lock/dirty observations and freshness,
-separate approval/integration controls, conflict recovery and cleanup warnings.
+General settings explain scope/quotas. Normal task creation names the selected
+repository, current committed baseline and `Isolated worktree` mode. It does not
+ask users to choose a filesystem destination. Generated branches, long paths,
+internal identities and cleanup mechanics are hidden behind `Workspace details`.
+Task detail keeps repository, base and `Preparing isolated workspace` state
+visible; bindings, generation, base/HEAD, branch/path/Node, lifecycle, lock/dirty
+observations, integration and cleanup controls remain progressively disclosed.
 Dialogs use accessible labels, non-color status/error text, explicit confirmation
-and focus restoration. Creation failure and merge conflict/reconciliation
-notifications use stable deduplication keys and generic browser-safe text;
+and focus restoration. A setup failure creates one error notification independent
+of ordinary agent-notification preferences, increments unread count, names the
+task, navigates to it and uses a stable generation key across replay/reconnect.
+A successful retry resolves that notification. Creation failure and merge
+conflict/reconciliation notifications use generic browser-safe text;
 ordinary dependency completion remains quiet.
 
 ## Limitations / deferred
