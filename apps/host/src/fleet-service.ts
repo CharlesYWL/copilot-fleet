@@ -766,6 +766,7 @@ export class FleetService {
         sessionId,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
+        contextOverflowRecoveryPrompt: contextOverflowRecoveryPrompt(session),
         additionalDirectories: session.additionalDirectories ?? [],
         sequenceOffset: this.store.maxEventSequence(sessionId),
         yolo: session.yolo,
@@ -1353,6 +1354,7 @@ export class FleetService {
         lastActivityAt: session.lastActivityAt ?? session.updatedAt,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
+        contextOverflowRecoveryPrompt: contextOverflowRecoveryPrompt(session),
         additionalDirectories: session.additionalDirectories ?? [],
         sequenceOffset: this.store.maxEventSequence(session.id),
         yolo: session.yolo,
@@ -1951,6 +1953,18 @@ function eventMayAffectNotifications(event: SessionEvent): boolean {
     event.type === "permission" ||
     event.type === "permission_result"
   );
+}
+
+export function contextOverflowRecoveryPrompt(session: FleetSession): string {
+  const assignment = session.initialPrompt.trim().slice(0, 12_000);
+  const latest = session.lastText.trim().slice(-3_000);
+  return [
+    assignment ? `Original assignment:\n${assignment}` : "",
+    latest ? `Most recent agent output:\n${latest}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 16_000);
 }
 
 function isSqliteConstraintError(error: unknown): boolean {

@@ -6,11 +6,13 @@ import {
   MockAgentFactory,
   UnpromptedTurn,
   configRecoveryRequest,
+  contextRolloverPrompt,
   copilotAcpAuthVersionError,
   copilotFailureMessage,
   copilotLaunchArgs,
   copilotSupportsContextTier,
   copilotVersionFromOutput,
+  isCapiRequestTooLarge,
   supportedAdditionalDirectories,
   toolDetail,
   toolErrorMessage,
@@ -21,6 +23,32 @@ import {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("CAPI context rollover", () => {
+  it("recognizes only the request-size failure that a fresh conversation can recover", () => {
+    expect(
+      isCapiRequestTooLarge(
+        new Error(
+          "Execution failed: The request is too large to send through CAPI Responses. Try shortening the conversation or prompt. (36.0 MB request; 32.0 MB limit)",
+        ),
+      ),
+    ).toBe(true);
+    expect(isCapiRequestTooLarge(new Error("network unavailable"))).toBe(false);
+  });
+
+  it("builds a bounded handoff from the assignment, latest request, and attachment metadata", () => {
+    const prompt = contextRolloverPrompt(
+      `assignment-${"a".repeat(20_000)}`,
+      `latest-${"z".repeat(10_000)}`,
+      [{ name: "trace.txt", mimeType: "text/plain", data: "aGVsbG8=" }],
+    );
+    expect(prompt.length).toBeLessThanOrEqual(16_000);
+    expect(prompt).toContain("Original assignment:");
+    expect(prompt).toContain("Latest request:");
+    expect(prompt).toContain("trace.txt (5 bytes)");
+    expect(prompt).not.toContain("aGVsbG8=");
+  });
 });
 
 describe("copilotLaunchArgs", () => {

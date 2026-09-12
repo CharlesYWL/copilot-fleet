@@ -681,6 +681,11 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
     agentSessionId: z.string().min(1),
+    /**
+     * Bounded task context used only if Copilot cannot load or prompt the
+     * persisted conversation because its CAPI request exceeds the size limit.
+     */
+    contextOverflowRecoveryPrompt: z.string().max(16_384).optional(),
     /** Workspace roots originally attached to the Copilot conversation. */
     additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
     /** Continues the host's event sequence so replayed rows stay ordered. */

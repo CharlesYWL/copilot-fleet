@@ -703,6 +703,12 @@ export class CommandRouter {
           command.type === "resume_session"
             ? {
                 resumeAgentSessionId: command.agentSessionId,
+                ...(command.contextOverflowRecoveryPrompt
+                  ? {
+                      contextOverflowRecoveryPrompt:
+                        command.contextOverflowRecoveryPrompt,
+                    }
+                  : {}),
                 additionalDirectories,
                 sequenceOffset: command.sequenceOffset,
                 yolo: command.yolo,
@@ -713,6 +719,7 @@ export class CommandRouter {
                 ...this.processOwnership(slot),
               }
             : {
+                contextOverflowRecoveryPrompt: command.prompt,
                 yolo: command.yolo,
                 agencyMode: command.agencyMode ?? false,
                 mcpServers,
