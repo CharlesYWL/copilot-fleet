@@ -157,6 +157,144 @@ describe("durable managed workspace store", () => {
     expect(store.getManagedWorktree(tree.id)).toBeDefined();
   });
 
+  it("refuses purge until every derived workspace is removed or abandoned", () => {
+    const store = open();
+    const { run, tree } = seed(store);
+    const step = store.upsertRunStep(run.id, {
+      stepKey: "writer",
+      title: "writer",
+      prompt: "write",
+      category: "implement",
+    });
+    const derived = ManagedWorktreeSchema.parse({
+      ...tree,
+      id: "worktree-writer",
+      taskKey: "writer-safe",
+      path: "C:\\.fleet-worktrees\\writer-safe",
+      branchRef: "refs/heads/fleet/writer-safe",
+      pinRef: "refs/fleet/pins/writer-safe",
+      checkout: {
+        ...tree.checkout!,
+        key: "writer-checkout",
+        path: "C:\\.fleet-worktrees\\writer-safe",
+        fileId: "writer-checkout",
+      },
+      workspaceKind: "step",
+      ownerStepId: step.id,
+    });
+    store.putDerivedWorkspace(derived);
+    store.putManagedWorktree({
+      ...tree,
+      state: "removed",
+      version: tree.version + 1,
+      removedAt: new Date().toISOString(),
+    });
+
+    expect(() => store.deleteRun(run.id)).toThrow("every owned worktree");
+    expect(
+      store.listWorktreeTombstones().find((entry) => entry.worktreeId === derived.id)
+        ?.state,
+    ).toBe("pending");
+
+    store.putDerivedWorkspace({
+      ...derived,
+      state: "removed",
+      version: derived.version + 1,
+      removedAt: new Date().toISOString(),
+    });
+    expect(store.deleteRun(run.id)).toBe(true);
+  });
+
+  it("persists distinct per-step and derived workspace identities across restart", async () => {
+    const path = resolve(".mwi-test-work", randomUUID());
+    paths.push(path);
+    await mkdir(path, { recursive: true });
+    let store = open(join(path, "host.db"));
+    const { run, tree } = seed(store);
+    const left = store.upsertRunStep(run.id, {
+      stepKey: "left",
+      title: "left",
+      prompt: "write left",
+      category: "implement",
+      position: 0,
+    });
+    const joinStep = store.upsertRunStep(run.id, {
+      stepKey: "join",
+      title: "join",
+      prompt: "combine",
+      category: "implement",
+      dependsOn: ["left"],
+      position: 1,
+    });
+    const stepTree = ManagedWorktreeSchema.parse({
+      ...tree,
+      id: "worktree-left",
+      taskKey: "left-safe",
+      path: "C:\\.fleet-worktrees\\left-safe",
+      branchRef: "refs/heads/fleet/left-safe",
+      pinRef: "refs/fleet/pins/left-safe",
+      checkout: {
+        ...tree.checkout!,
+        key: "left-checkout",
+        path: "C:\\.fleet-worktrees\\left-safe",
+        fileId: "left-checkout",
+      },
+      workspaceKind: "step",
+      ownerStepId: left.id,
+      resultSha: "b".repeat(40),
+    });
+    const derived = ManagedWorktreeSchema.parse({
+      ...stepTree,
+      id: "worktree-join",
+      taskKey: "join-safe",
+      path: "C:\\.fleet-worktrees\\join-safe",
+      branchRef: "refs/heads/fleet/join-safe",
+      pinRef: "refs/fleet/pins/join-safe",
+      checkout: {
+        ...tree.checkout!,
+        key: "join-checkout",
+        path: "C:\\.fleet-worktrees\\join-safe",
+        fileId: "join-checkout",
+      },
+      workspaceKind: "derived",
+      ownerStepId: joinStep.id,
+      resultSha: "",
+      composition: {
+        baseSha: tree.baseSha,
+        predecessors: [
+          {
+            stepId: left.id,
+            stepKey: left.stepKey,
+            position: left.position,
+            worktreeId: stepTree.id,
+            resultSha: stepTree.resultSha,
+          },
+        ],
+        state: "pending",
+      },
+    });
+    store.putDerivedWorkspace(stepTree);
+    store.putDerivedWorkspace(derived);
+    store.updateRunStep(left.id, {
+      managedWorktreeId: stepTree.id,
+      workspaceState: "completed",
+      resultSha: stepTree.resultSha,
+    });
+    store.close();
+    stores.splice(stores.indexOf(store), 1);
+    store = open(join(path, "host.db"));
+    expect(new Set(store.listDerivedWorkspaces(run.id).map((entry) => entry.id))).toEqual(
+      new Set([stepTree.id, derived.id]),
+    );
+    expect(store.derivedWorkspaceForStep(run.id, joinStep.id)?.composition).toMatchObject(
+      { predecessors: [{ worktreeId: stepTree.id }] },
+    );
+    expect(store.getRunStep(left.id)).toMatchObject({
+      managedWorktreeId: stepTree.id,
+      resultSha: stepTree.resultSha,
+    });
+  });
+
   it("quarantines restored managed binding/step/session/operation metadata without restoring execution ownership", () => {
     const source = open();
     const { run, tree, placement } = seed(source);

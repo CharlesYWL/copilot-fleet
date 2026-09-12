@@ -44,6 +44,118 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
   service: FleetService;
 }> = async (app, { service }) => {
   const { store } = service;
+  app.get("/api/worktrees/metrics", async () => {
+    const duration = (start: string, end: string) => {
+      const value = Date.parse(end) - Date.parse(start);
+      return Number.isFinite(value) && value >= 0 ? value : undefined;
+    };
+    const summarize = (values: Array<number | undefined>) => {
+      const measured = values.filter((value): value is number => value !== undefined);
+      return {
+        count: measured.length,
+        averageMs: measured.length
+          ? Math.round(measured.reduce((sum, value) => sum + value, 0) / measured.length)
+          : 0,
+        maximumMs: measured.reduce((maximum, value) => Math.max(maximum, value), 0),
+      };
+    };
+    const runs = store.listRuns();
+    const completed = runs.filter((run) =>
+      ["completed", "failed", "cancelled"].includes(run.state),
+    );
+    const managed = runs.filter(
+      (run) => run.workspaceBinding?.effectiveMode === "managed",
+    );
+    const legacy = runs.filter(
+      (run) => run.workspaceBinding?.effectiveMode !== "managed",
+    );
+    const steps = runs.flatMap((run) => store.listRunSteps(run.id));
+    const worktrees = store.listManagedWorktrees();
+    const integrations = store.listWorktreeIntegrations();
+    return {
+      generatedAt: new Date().toISOString(),
+      tasks: {
+        managed: managed.length,
+        legacy: legacy.length,
+        managedDuration: summarize(
+          completed
+            .filter((run) => run.workspaceBinding?.effectiveMode === "managed")
+            .map((run) => duration(run.createdAt, run.updatedAt)),
+        ),
+        legacyDuration: summarize(
+          completed
+            .filter((run) => run.workspaceBinding?.effectiveMode !== "managed")
+            .map((run) => duration(run.createdAt, run.updatedAt)),
+        ),
+      },
+      preparation: {
+        duration: summarize(
+          managed.map((run) => {
+            const binding = run.workspaceBinding;
+            return binding?.setupStartedAt && binding.setupCompletedAt
+              ? duration(binding.setupStartedAt, binding.setupCompletedAt)
+              : undefined;
+          }),
+        ),
+        failures: managed.filter((run) => run.workspaceBinding?.setupState === "failed")
+          .length,
+        retries: managed.reduce(
+          (sum, run) => sum + Math.max(0, (run.workspaceBinding?.setupAttempt ?? 0) - 1),
+          0,
+        ),
+      },
+      execution: {
+        queueDuration: summarize(
+          steps.map((step) =>
+            step.dispatchedAt ? duration(step.createdAt, step.dispatchedAt) : undefined,
+          ),
+        ),
+        implementationDuration: summarize(
+          steps.map((step) =>
+            step.dispatchedAt && ["succeeded", "failed", "cancelled"].includes(step.state)
+              ? duration(step.dispatchedAt, step.updatedAt)
+              : undefined,
+          ),
+        ),
+      },
+      integration: {
+        duration: summarize(
+          integrations.map((entry) => duration(entry.createdAt, entry.updatedAt)),
+        ),
+        validationDuration: summarize(
+          integrations.map((entry) =>
+            entry.validationStartedAt && entry.validatedAt
+              ? duration(entry.validationStartedAt, entry.validatedAt)
+              : undefined,
+          ),
+        ),
+        conflicts: integrations.filter((entry) => entry.conflicts.length > 0).length,
+        reconciliationFailures: integrations.filter(
+          (entry) => entry.state === "needs_reconciliation",
+        ).length,
+      },
+      cleanup: {
+        duration: summarize(
+          worktrees.map((tree) =>
+            tree.retainedAt && tree.removedAt
+              ? duration(tree.retainedAt, tree.removedAt)
+              : undefined,
+          ),
+        ),
+        retained: worktrees.filter((tree) => tree.state === "retained").length,
+        removed: worktrees.filter((tree) => tree.state === "removed").length,
+      },
+      compatibility: {
+        sparseCheckout: worktrees.filter((tree) => tree.repositoryFeatures.sparseCheckout)
+          .length,
+        submodules: worktrees.filter((tree) => tree.repositoryFeatures.submodules).length,
+        gitLfs: worktrees.filter((tree) => tree.repositoryFeatures.gitLfs).length,
+        partialClone: worktrees.filter((tree) => tree.repositoryFeatures.partialClone)
+          .length,
+      },
+    };
+  });
+
   app.get("/api/worktrees/capabilities", async (request) => {
     const { workspaceId } = z.object({ workspaceId: z.string() }).parse(request.query);
     return {

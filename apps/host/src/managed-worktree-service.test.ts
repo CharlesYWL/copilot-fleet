@@ -454,4 +454,117 @@ describe("Host managed workspace orchestration", () => {
         .sort(),
     ).toEqual(eligible.sort());
   });
+
+  it("starts a bounded orphan-retention sweep immediately after Node reconciliation", async () => {
+    const { create, frames, node, service, store } = fixture();
+    const run = create();
+    const preparing = service.worktrees.prepare(run.id);
+    service.worktrees.handleResult(node.id, acknowledgement(lastRequest(frames)));
+    await preparing;
+    const creating = service.worktrees.request(run.id, {
+      kind: "create",
+      actor: "test",
+    });
+    service.worktrees.handleResult(node.id, acknowledgement(lastRequest(frames)));
+    await creating;
+    store.updateRun(run.id, { state: "completed" });
+    frames.splice(0);
+
+    service.worktrees.onNodeReconciled(node.id);
+
+    expect(lastRequest(frames)).toMatchObject({
+      runId: run.id,
+      kind: "retain",
+      actor: "bounded-retention",
+    });
+  });
+
+  it("prepares a composed workspace for a read-only dependent", async () => {
+    const { create, frames, node, service, store } = fixture();
+    const run = create();
+    const preparing = service.worktrees.prepare(run.id);
+    service.worktrees.handleResult(node.id, acknowledgement(lastRequest(frames)));
+    await preparing;
+    const creating = service.worktrees.request(run.id, {
+      kind: "create",
+      actor: "test",
+    });
+    service.worktrees.handleResult(node.id, acknowledgement(lastRequest(frames)));
+    await creating;
+    const primary = store.worktreeForRun(run.id)!;
+    const writer = store.upsertRunStep(run.id, {
+      stepKey: "writer",
+      title: "writer",
+      prompt: "write",
+      category: "implement",
+      position: 0,
+    });
+    const writerTree = ManagedWorktreeSchema.parse({
+      ...primary,
+      id: "worktree-writer",
+      taskKey: "writer-safe",
+      path: "C:\\trees\\writer-safe",
+      branchRef: "refs/heads/fleet/writer-safe",
+      pinRef: "refs/fleet/pins/writer-safe",
+      checkout: {
+        ...primary.checkout!,
+        key: "writer-checkout",
+        path: "C:\\trees\\writer-safe",
+        fileId: "writer-checkout",
+      },
+      workspaceKind: "step",
+      ownerStepId: writer.id,
+      resultSha: "b".repeat(40),
+    });
+    store.putDerivedWorkspace(writerTree);
+    store.updateRunStep(writer.id, {
+      state: "starting",
+      managedWorktreeId: writerTree.id,
+      workspaceState: "ready",
+      executionBinding: {
+        worktreeId: writerTree.id,
+        generation: writerTree.generation,
+        sourcePlacementId: writerTree.sourcePlacementId,
+        cwd: writerTree.path,
+        checkoutKey: writerTree.checkout!.key,
+        accessClass: "shell",
+        leaseAttempt: "writer",
+        quarantined: false,
+      },
+    });
+    store.updateRunStep(writer.id, { state: "running" });
+    store.updateRunStep(writer.id, {
+      state: "succeeded",
+      workspaceState: "completed",
+      resultSha: writerTree.resultSha,
+    });
+    const review = store.upsertRunStep(run.id, {
+      stepKey: "review",
+      title: "review",
+      prompt: "review",
+      category: "review-deep",
+      dependsOn: ["writer"],
+      position: 1,
+    });
+    frames.splice(0);
+
+    expect(service.worktrees.ensureStepReady(store.getRun(run.id)!, review)).toBe(
+      undefined,
+    );
+    await expect.poll(() => frames.length).toBeGreaterThan(0);
+    expect(lastRequest(frames)).toMatchObject({
+      kind: "reserve",
+      workspaceKind: "derived",
+      ownerStepId: review.id,
+      composition: {
+        predecessors: [
+          {
+            stepId: writer.id,
+            worktreeId: writerTree.id,
+            resultSha: writerTree.resultSha,
+          },
+        ],
+      },
+    });
+  });
 });

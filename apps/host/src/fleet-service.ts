@@ -576,7 +576,7 @@ export class FleetService {
     try {
       if (input.runId && input.runRole !== "lead") {
         const run = this.store.getRun(input.runId);
-        if (run) binding = this.worktrees.bindingFor(run) ?? binding;
+        if (run && !binding) binding = this.worktrees.bindingFor(run) ?? binding;
       }
     } catch (error) {
       return {
@@ -936,7 +936,7 @@ export class FleetService {
           ...(binding?.worktreeId &&
           (request.type === "start_session" || request.type === "prompt")
             ? {
-                prompt: `${request.prompt}\n\n<fleet-workspace>\nUse only this task checkout for repository work: ${binding.cwd}\nWorktree ${binding.worktreeId}, generation ${binding.generation}. The catalog placement is the source, not your writable cwd. Implementation, review, tests and fix-up share this checkout. Do not create/remove worktrees or integrate/push automatically; those are explicit operator actions. This binding is not a filesystem sandbox.\n</fleet-workspace>`,
+                prompt: `${request.prompt}\n\n<fleet-workspace>\nUse only this bound checkout for repository work: ${binding.cwd}\nWorktree ${binding.worktreeId}, generation ${binding.generation}. The catalog placement is the source, not your writable cwd. This may be a per-step or composed DAG workspace; never substitute another predecessor or the source checkout. Do not create/remove worktrees or integrate/push automatically; those are managed operations. This binding is not a filesystem sandbox.\n</fleet-workspace>`,
               }
             : {}),
           ...(binding ? { executionBinding: binding } : {}),

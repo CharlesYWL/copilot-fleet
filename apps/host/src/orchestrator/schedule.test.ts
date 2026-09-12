@@ -173,7 +173,7 @@ describe("managed checkout scheduling", () => {
       world({
         run: managed(),
         nodes: [capable()],
-        steps: [step("implement")],
+        steps: [step("implement", { executionBinding: binding() })],
         sessions: [
           session("other-task", { runId: "task-b", executionBinding: binding("b") }),
         ],
@@ -182,24 +182,24 @@ describe("managed checkout scheduling", () => {
     expect(actions.filter((action) => action.type === "start_step")).toHaveLength(1);
   });
 
-  it("never schedules two reviewers or writers in one task worktree", () => {
+  it("schedules independent managed writers only when they have distinct step worktrees", () => {
     const actions = planNextActions(
       world({
         run: managed(),
         nodes: [capable()],
         steps: [
-          step("review-a", { category: "review-deep" }),
-          step("review-b", { category: "review-quick" }),
+          step("write-a", { executionBinding: binding("a") }),
+          step("write-b", { executionBinding: binding("b") }),
         ],
       }),
     );
-    expect(actions.filter((action) => action.type === "start_step")).toHaveLength(1);
+    expect(actions.filter((action) => action.type === "start_step")).toHaveLength(2);
     expect(
       types(
         world({
           run: managed(),
           nodes: [capable()],
-          steps: [step("fixer")],
+          steps: [step("fixer", { executionBinding: binding() })],
           sessions: [
             session("reviewer", { readOnly: true, executionBinding: binding() }),
           ],
@@ -208,7 +208,7 @@ describe("managed checkout scheduling", () => {
     ).not.toContain("start_step");
   });
 
-  it("parks a settled implementer and waits for a terminal process receipt before reviewer handoff", () => {
+  it("dispatches a dependent from its derived workspace without taking a predecessor checkout", () => {
     const input = world({
       run: managed(),
       nodes: [capable()],
@@ -219,20 +219,16 @@ describe("managed checkout scheduling", () => {
           placementId: "p1",
           executionBinding: binding(),
         }),
-        step("review", { category: "review-deep", dependsOn: ["implement"] }),
+        step("review", {
+          category: "review-deep",
+          dependsOn: ["implement"],
+          executionBinding: binding("derived"),
+        }),
       ],
       sessions: [session("implementer", { state: "idle", executionBinding: binding() })],
     });
-    expect(types(input)).toContain("stop_session");
-    expect(types(input)).not.toContain("start_step");
-    expect(
-      types({
-        ...input,
-        sessions: [
-          session("implementer", { state: "stopped", executionBinding: binding() }),
-        ],
-      }),
-    ).toContain("start_step");
+    expect(types(input)).not.toContain("stop_session");
+    expect(types(input)).toContain("start_step");
   });
 
   it("retains its own session/binding for follow-up and refuses unavailable or old-Node workspaces", () => {
@@ -252,7 +248,13 @@ describe("managed checkout scheduling", () => {
     expect(types(input)).toContain("prompt_step");
     expect(types({ ...input, workspaceReady: false })).not.toContain("prompt_step");
     expect(
-      types(world({ run: managed(), steps: [step("pending")], nodes: [node("n1")] })),
+      types(
+        world({
+          run: managed(),
+          steps: [step("pending", { executionBinding: binding() })],
+          nodes: [node("n1")],
+        }),
+      ),
     ).not.toContain("start_step");
   });
 });

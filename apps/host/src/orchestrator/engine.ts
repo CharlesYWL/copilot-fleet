@@ -177,7 +177,7 @@ export class OrchestratorEngine {
     const run = this.store.getRun(runId);
     if (!run || terminalRunStates.has(run.state)) return;
 
-    const steps = this.store.listRunSteps(runId);
+    let steps = this.store.listRunSteps(runId);
     const sessions = this.store.listSessions();
     const completedTurns = new Set<string>();
     for (const session of sessions) {
@@ -222,6 +222,12 @@ export class OrchestratorEngine {
         completedTurns.add(session.id);
       }
     }
+    const workspaceReady = steps.length ? this.service.worktrees.ensureReady(run) : true;
+    if (workspaceReady && run.workspaceBinding?.effectiveMode === "managed") {
+      for (const step of steps)
+        if (step.state === "pending") this.service.worktrees.ensureStepReady(run, step);
+      steps = this.store.listRunSteps(runId);
+    }
     const actions = planNextActions({
       run,
       steps,
@@ -231,7 +237,7 @@ export class OrchestratorEngine {
       turnCompleteSessionIds: completedTurns,
       stepOutputs: this.collectOutputs(steps, run.policy.maxOutputChars),
       nowMs,
-      workspaceReady: steps.length ? this.service.worktrees.ensureReady(run) : true,
+      workspaceReady,
       parkableSessionIds: new Set(
         this.store
           .listRuns()
@@ -300,9 +306,7 @@ export class OrchestratorEngine {
       state: "starting",
       placementId: placement.id,
       dispatchedAt: new Date().toISOString(),
-      ...(this.service.worktrees.bindingFor(run)
-        ? { executionBinding: this.service.worktrees.bindingFor(run)! }
-        : {}),
+      ...(step.executionBinding ? { executionBinding: step.executionBinding } : {}),
     });
     if (!starting) return false;
 
@@ -317,6 +321,9 @@ export class OrchestratorEngine {
       // not; capacity is read from sessions long after this point.
       readOnly: isReadOnlyCategory(step.category),
       dispatchAttempt: notificationAttemptKeyForStep(run, starting),
+      ...(starting.executionBinding
+        ? { executionBinding: starting.executionBinding }
+        : {}),
     });
 
     if (!result.ok) {
@@ -422,6 +429,8 @@ export class OrchestratorEngine {
     if (action.state === "failed") {
       return this.failStep(run, step, action.output);
     }
+    if (action.state === "succeeded" && !this.service.worktrees.finalizeStep(run, step))
+      return true;
     const settled = this.service.settleOrchestrationStep({
       runId: run.id,
       stepId: step.id,

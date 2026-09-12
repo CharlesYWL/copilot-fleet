@@ -520,6 +520,11 @@ export class FleetStore {
         id TEXT PRIMARY KEY, run_id TEXT NOT NULL UNIQUE, node_id TEXT NOT NULL,
         generation INTEGER NOT NULL, version INTEGER NOT NULL, data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS derived_workspaces (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, owner_step_id TEXT NOT NULL,
+        node_id TEXT NOT NULL, generation INTEGER NOT NULL, version INTEGER NOT NULL,
+        data TEXT NOT NULL, UNIQUE(run_id,owner_step_id,generation)
+      );
       CREATE TABLE IF NOT EXISTS managed_api_requests (
         scope TEXT NOT NULL, id TEXT NOT NULL, request TEXT NOT NULL, result TEXT NOT NULL,
         PRIMARY KEY(scope,id)
@@ -707,6 +712,18 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "workspace_binding", "TEXT NOT NULL DEFAULT '{}'");
     this.addColumnIfMissing("sessions", "execution_binding", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("run_steps", "execution_binding", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing(
+      "run_steps",
+      "managed_worktree_id",
+      "TEXT NOT NULL DEFAULT ''",
+    );
+    this.addColumnIfMissing(
+      "run_steps",
+      "workspace_state",
+      "TEXT NOT NULL DEFAULT 'not_required'",
+    );
+    this.addColumnIfMissing("run_steps", "workspace_error", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("run_steps", "result_sha", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "revision", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("nodes", "public_key", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing(
@@ -1229,6 +1246,80 @@ export class FleetStore {
     return row ? ManagedWorktreeSchema.parse(JSON.parse(String(row.data))) : undefined;
   }
 
+  listDerivedWorkspaces(runId?: string): ManagedWorktree[] {
+    const rows = runId
+      ? this.statement(
+          "SELECT data FROM derived_workspaces WHERE run_id=? ORDER BY owner_step_id,id",
+        ).all(runId)
+      : this.statement(
+          "SELECT data FROM derived_workspaces ORDER BY run_id,owner_step_id,id",
+        ).all();
+    return rows.map((row) => ManagedWorktreeSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  derivedWorkspaceForStep(runId: string, stepId: string): ManagedWorktree | undefined {
+    const row = this.statement(
+      "SELECT data FROM derived_workspaces WHERE run_id=? AND owner_step_id=? ORDER BY generation DESC LIMIT 1",
+    ).get(runId, stepId);
+    return row ? ManagedWorktreeSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  getAnyManagedWorkspace(id: string): ManagedWorktree | undefined {
+    return (
+      this.getManagedWorktree(id) ??
+      (() => {
+        const row = this.statement("SELECT data FROM derived_workspaces WHERE id=?").get(
+          id,
+        );
+        return row
+          ? ManagedWorktreeSchema.parse(JSON.parse(String(row.data)))
+          : undefined;
+      })()
+    );
+  }
+
+  putDerivedWorkspace(value: ManagedWorktree): void {
+    const parsed = ManagedWorktreeSchema.parse(value);
+    if (parsed.workspaceKind === "primary" || !parsed.ownerStepId)
+      throw new WorktreeConflict(
+        "workspace_kind",
+        "A derived workspace must identify its owning step.",
+      );
+    const current = this.getAnyManagedWorkspace(parsed.id);
+    if (
+      current &&
+      (parsed.runId !== current.runId ||
+        parsed.ownerStepId !== current.ownerStepId ||
+        parsed.workspaceKind !== current.workspaceKind ||
+        parsed.generation !== current.generation ||
+        parsed.path !== current.path ||
+        parsed.branchRef !== current.branchRef ||
+        parsed.baseSha !== current.baseSha ||
+        parsed.sourcePlacementId !== current.sourcePlacementId ||
+        parsed.nodeInstallationId !== current.nodeInstallationId ||
+        parsed.hostInstallationId !== current.hostInstallationId ||
+        parsed.version < current.version)
+    )
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "A derived workspace identity cannot be changed.",
+      );
+    this.statement(
+      `INSERT INTO derived_workspaces
+       (id,run_id,owner_step_id,node_id,generation,version,data)
+       VALUES (?,?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET version=excluded.version,data=excluded.data`,
+    ).run(
+      parsed.id,
+      parsed.runId,
+      parsed.ownerStepId,
+      parsed.nodeId,
+      parsed.generation,
+      parsed.version,
+      JSON.stringify(parsed),
+    );
+  }
+
   putManagedWorktree(value: ManagedWorktree): void {
     const parsed = ManagedWorktreeSchema.parse(value);
     const current = this.getManagedWorktree(parsed.id);
@@ -1342,8 +1433,12 @@ export class FleetStore {
 
   assertWorktreePurgeAllowed(runId: string): void {
     const worktree = this.worktreeForRun(runId);
+    const worktrees = [
+      ...(worktree ? [worktree] : []),
+      ...this.listDerivedWorkspaces(runId),
+    ];
     const binding = this.getRun(runId)?.workspaceBinding;
-    if (!worktree) {
+    if (worktrees.length === 0) {
       if (
         binding?.effectiveMode === "managed" &&
         binding.initialization !== "not_required"
@@ -1370,22 +1465,26 @@ export class FleetStore {
       }
       return;
     }
-    const safe = worktree.state === "removed" || Boolean(worktree.abandonedAt);
-    this.putWorktreeTombstone({
-      worktreeId: worktree.id,
-      runId,
-      generation: worktree.generation,
-      path: worktree.path,
-      branchRef: worktree.branchRef,
-      nodeId: worktree.nodeId,
-      state: safe ? (worktree.abandonedAt ? "abandoned" : "reconciled") : "pending",
-      createdAt: new Date().toISOString(),
-      reconciledAt: safe ? new Date().toISOString() : "",
-    });
-    if (!safe)
+    let unsafe = false;
+    for (const owned of worktrees) {
+      const safe = owned.state === "removed" || Boolean(owned.abandonedAt);
+      unsafe ||= !safe;
+      this.putWorktreeTombstone({
+        worktreeId: owned.id,
+        runId,
+        generation: owned.generation,
+        path: owned.path,
+        branchRef: owned.branchRef,
+        nodeId: owned.nodeId,
+        state: safe ? (owned.abandonedAt ? "abandoned" : "reconciled") : "pending",
+        createdAt: new Date().toISOString(),
+        reconciledAt: safe ? new Date().toISOString() : "",
+      });
+    }
+    if (unsafe)
       throw new WorktreeConflict(
         "worktree_retained",
-        "Clean up or explicitly abandon the owned worktree before purging this task. Its cleanup tombstone has been retained.",
+        "Clean up or explicitly abandon every owned worktree before purging this task. Cleanup tombstones have been retained.",
       );
   }
 
@@ -1570,6 +1669,7 @@ export class FleetStore {
         ).all() as Row[]
       ).map(runStepFromRow),
       managedWorktrees: this.listManagedWorktrees(),
+      derivedWorkspaces: this.listDerivedWorkspaces(),
       worktreeOperations: this.listWorktreeOperations(),
       worktreeIntegrations: this.listWorktreeIntegrations(),
       worktreeTombstones: this.listWorktreeTombstones(),
@@ -1904,6 +2004,13 @@ export class FleetStore {
       this.putManagedWorktree({
         ...tree,
         version: Math.max(tree.version, this.getManagedWorktree(tree.id)?.version ?? 0),
+        state: "quarantined",
+        error: "Explicit reconciliation required after restore.",
+      });
+    }
+    for (const tree of parsed.derivedWorkspaces ?? []) {
+      this.putDerivedWorkspace({
+        ...tree,
         state: "quarantined",
         error: "Explicit reconciliation required after restore.",
       });
@@ -3322,7 +3429,7 @@ export class FleetStore {
     id: string,
   ): void {
     if (
-      this.listManagedWorktrees().some(
+      [...this.listManagedWorktrees(), ...this.listDerivedWorkspaces()].some(
         (tree) => tree[field] === id && tree.state !== "removed" && !tree.abandonedAt,
       ) ||
       this.listRuns().some((run) => {
@@ -4476,7 +4583,10 @@ export class FleetStore {
         `UPDATE run_steps
          SET title=?,prompt=?,category=?,depends_on=?,state='pending',
              attempts=attempts+1,session_id='',placement_id=?,output='',
-             dispatched_at='',stopped_by_orchestrator=0,phase_index=?,updated_at=?
+             dispatched_at='',stopped_by_orchestrator=0,phase_index=?,
+             result_sha='',workspace_error='',
+             workspace_state=CASE WHEN managed_worktree_id<>'' THEN 'ready' ELSE workspace_state END,
+             updated_at=?
          WHERE id=?`,
       ).run(
         input.title,
@@ -4601,6 +4711,10 @@ export class FleetStore {
         | "stoppedByOrchestrator"
         | "dispatchedAt"
         | "executionBinding"
+        | "managedWorktreeId"
+        | "workspaceState"
+        | "workspaceError"
+        | "resultSha"
       >
     >,
   ): RunStep | undefined {
@@ -4627,6 +4741,10 @@ export class FleetStore {
         patch.executionBinding === undefined
           ? undefined
           : JSON.stringify(patch.executionBinding),
+      managed_worktree_id: patch.managedWorktreeId,
+      workspace_state: patch.workspaceState,
+      workspace_error: patch.workspaceError,
+      result_sha: patch.resultSha,
     };
     const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
     if (entries.length === 0) return this.getRunStep(id);
@@ -5268,6 +5386,10 @@ function runStepFromRow(row: Row): RunStep {
     executionBinding: row.execution_binding
       ? JSON.parse(String(row.execution_binding))
       : undefined,
+    managedWorktreeId: String(row.managed_worktree_id ?? ""),
+    workspaceState: String(row.workspace_state ?? "not_required"),
+    workspaceError: String(row.workspace_error ?? ""),
+    resultSha: String(row.result_sha ?? ""),
     id: String(row.id),
     runId: String(row.run_id),
     stepKey: String(row.step_key),

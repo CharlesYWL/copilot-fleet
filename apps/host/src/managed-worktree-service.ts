@@ -4,11 +4,15 @@ import {
   WorktreeConflict,
   WorktreeOperationRequestSchema,
   canTransitionRun,
+  isWritingCategory,
   terminalSessionStates,
   terminalRunStates,
   type ExecutionBinding,
   type FleetSession,
   type Run,
+  type RunStep,
+  type ManagedWorktree,
+  type WorktreeComposition,
   type WorktreeOperation,
   type WorktreeOperationRequest,
   type WorktreeOperationResult,
@@ -22,6 +26,11 @@ export class ManagedWorktreeService {
   >();
   private readonly initializing = new Map<string, Promise<void>>();
   private lastSweep = 0;
+
+  private deterministicUuid(value: string): string {
+    const hex = createHash("sha256").update(value).digest("hex").slice(0, 32);
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20)}`;
+  }
 
   constructor(private readonly service: FleetService) {}
   private get store() {
@@ -239,8 +248,292 @@ export class ManagedWorktreeService {
       );
   }
 
+  private pendingWorkspace(worktreeId: string): WorktreeOperation | undefined {
+    return this.store
+      .listWorktreeOperations(worktreeId)
+      .find((operation) => ["intent", "uncertain"].includes(operation.state));
+  }
+
+  private workspaceId(runId: string, stepId: string): string {
+    return `worktree-${createHash("sha256")
+      .update(`${runId}:step:${stepId}`)
+      .digest("hex")
+      .slice(0, 32)}`;
+  }
+
+  private compositionFor(run: Run, step: RunStep): WorktreeComposition | undefined {
+    const all = this.store.listRunSteps(run.id);
+    const byKey = new Map(all.map((entry) => [entry.stepKey, entry]));
+    const collected = new Map<string, RunStep>();
+    const visit = (key: string, seen = new Set<string>()) => {
+      if (seen.has(key)) return;
+      seen.add(key);
+      const predecessor = byKey.get(key);
+      if (!predecessor) return;
+      if (isWritingCategory(predecessor.category)) {
+        collected.set(predecessor.id, predecessor);
+        return;
+      }
+      for (const dependency of predecessor.dependsOn) visit(dependency, seen);
+    };
+    for (const key of step.dependsOn) visit(key);
+    const predecessors = [...collected.values()].sort(
+      (a, b) => a.position - b.position || a.id.localeCompare(b.id),
+    );
+    if (predecessors.length === 0) return undefined;
+    if (
+      predecessors.some(
+        (entry) =>
+          entry.state !== "succeeded" || !entry.resultSha || !entry.managedWorktreeId,
+      )
+    )
+      return undefined;
+    return {
+      baseSha: run.workspaceBinding!.baseSha,
+      baseRef: run.workspaceBinding!.baseRef,
+      predecessors: predecessors.map((entry) => ({
+        stepId: entry.id,
+        stepKey: entry.stepKey,
+        position: entry.position,
+        worktreeId: entry.managedWorktreeId!,
+        resultSha: entry.resultSha!,
+      })),
+      state: "pending",
+      resultSha: "",
+      conflicts: [],
+      error: "",
+      startedAt: "",
+      completedAt: "",
+    };
+  }
+
+  ensureStepReady(run: Run, step: RunStep): ExecutionBinding | undefined {
+    if (run.workspaceBinding?.effectiveMode !== "managed") return this.bindingFor(run);
+    const primary = this.store.worktreeForRun(run.id);
+    if (!primary || run.workspaceBinding.initialization !== "ready") return undefined;
+    const composition = this.compositionFor(run, step);
+    const all = this.store.listRunSteps(run.id);
+    const byKey = new Map(all.map((entry) => [entry.stepKey, entry]));
+    const hasWritableHistory = (key: string, seen = new Set<string>()): boolean => {
+      if (seen.has(key)) return false;
+      seen.add(key);
+      const predecessor = byKey.get(key);
+      return Boolean(
+        predecessor &&
+        (isWritingCategory(predecessor.category) ||
+          predecessor.dependsOn.some((dependency) =>
+            hasWritableHistory(dependency, seen),
+          )),
+      );
+    };
+    const dependsOnWritableHistory = step.dependsOn.some((key) =>
+      hasWritableHistory(key),
+    );
+    if (!isWritingCategory(step.category) && !dependsOnWritableHistory)
+      return this.bindingFor(run);
+    if (dependsOnWritableHistory && !composition) return undefined;
+    const worktreeId = step.managedWorktreeId || this.workspaceId(run.id, step.id);
+    if (!step.managedWorktreeId) {
+      this.store.updateRunStep(step.id, {
+        managedWorktreeId: worktreeId,
+        workspaceState: "pending",
+        workspaceError: "",
+      });
+    }
+    const tree = this.store.derivedWorkspaceForStep(run.id, step.id);
+    const pending = this.pendingWorkspace(worktreeId);
+    const request = (
+      kind: WorktreeOperationRequest["kind"],
+      expected?: ManagedWorktree,
+    ) => {
+      if (pending) return;
+      const operationId = this.deterministicUuid(
+        `${worktreeId}:${kind}:${expected?.version ?? 0}`,
+      );
+      void this.requestWorkspace(run.id, worktreeId, 1, {
+        kind,
+        actor: "dag-scheduler",
+        operationId,
+        workspaceKind: composition ? "derived" : "step",
+        ownerStepId: step.id,
+        ...(composition ? { composition } : {}),
+        expectedVersion: expected?.version ?? 0,
+      })
+        .then(() => this.service.tickRun(run.id))
+        .catch((error: unknown) => {
+          this.store.updateRunStep(step.id, {
+            workspaceState: "blocked",
+            workspaceError:
+              error instanceof Error ? error.message : "Workspace preparation failed.",
+          });
+          this.publish(run.id);
+        });
+    };
+    if (!tree) {
+      request("reserve");
+      return undefined;
+    }
+    if (tree.state === "reserved" || tree.state === "creation_failed") {
+      this.store.updateRunStep(step.id, { workspaceState: "creating" });
+      request("create", tree);
+      return undefined;
+    }
+    if (!["ready", "retained"].includes(tree.state) || tree.abandonedAt) {
+      this.store.updateRunStep(step.id, {
+        workspaceState: "blocked",
+        workspaceError: tree.error || "The step workspace is unavailable.",
+      });
+      return undefined;
+    }
+    if (composition) {
+      if (!tree.composition || tree.composition.state === "pending") {
+        this.store.updateRunStep(step.id, { workspaceState: "composing" });
+        request("compose", tree);
+        return undefined;
+      }
+      if (tree.composition.state !== "ready") {
+        this.store.updateRunStep(step.id, {
+          workspaceState: "blocked",
+          workspaceError:
+            tree.composition.error || "Predecessor composition is not ready.",
+        });
+        return undefined;
+      }
+    }
+    const binding = this.bindingForTree(tree);
+    this.store.updateRunStep(step.id, {
+      workspaceState: "ready",
+      workspaceError: "",
+      executionBinding: binding,
+    });
+    return binding;
+  }
+
+  finalizeStep(run: Run, step: RunStep): boolean {
+    if (
+      run.workspaceBinding?.effectiveMode !== "managed" ||
+      !isWritingCategory(step.category)
+    )
+      return true;
+    if (step.resultSha) return true;
+    const tree = this.store.derivedWorkspaceForStep(run.id, step.id);
+    if (!tree || this.pendingWorkspace(tree.id)) return false;
+    this.store.updateRunStep(step.id, { workspaceState: "finalizing" });
+    void this.requestWorkspace(run.id, tree.id, tree.generation, {
+      kind: "finalize",
+      actor: "dag-scheduler",
+      operationId: this.deterministicUuid(`${tree.id}:finalize:${tree.version}`),
+      workspaceKind: tree.workspaceKind,
+      ownerStepId: step.id,
+      expectedVersion: tree.version,
+      ...(tree.composition ? { composition: tree.composition } : {}),
+    })
+      .then(() => this.service.tickRun(run.id))
+      .catch((error: unknown) => {
+        this.store.updateRunStep(step.id, {
+          workspaceState: "blocked",
+          workspaceError:
+            error instanceof Error ? error.message : "Could not record a clean commit.",
+        });
+        this.publish(run.id);
+      });
+    return false;
+  }
+
   async request(
     runId: string,
+    input: Partial<WorktreeOperationRequest> &
+      Pick<WorktreeOperationRequest, "kind" | "actor">,
+    waitMs = 30_000,
+  ): Promise<WorktreeOperation> {
+    const binding = this.store.getRun(runId)?.workspaceBinding;
+    if (!binding)
+      throw new WorktreeConflict("not_managed", "This task has no workspace binding.");
+    const resultKinds = new Set<WorktreeOperationRequest["kind"]>([
+      "integration_preview",
+      "integrate",
+      "continue",
+      "abort",
+    ]);
+    const resultTree = resultKinds.has(input.kind)
+      ? this.resultWorkspaceForRun(runId)
+      : undefined;
+    return this.requestWorkspace(
+      runId,
+      resultTree?.id ?? binding.managedWorktreeId,
+      resultTree?.generation ?? binding.generation,
+      {
+        ...input,
+        ...(resultTree
+          ? {
+              workspaceKind: resultTree.workspaceKind,
+              ownerStepId: resultTree.ownerStepId,
+              expectedVersion: input.expectedVersion ?? resultTree.version,
+              ...(resultTree.composition ? { composition: resultTree.composition } : {}),
+            }
+          : {}),
+      },
+      waitMs,
+    );
+  }
+
+  private resultWorkspaceForRun(runId: string): ManagedWorktree | undefined {
+    const steps = this.store.listRunSteps(runId);
+    const writing = steps.filter((step) => isWritingCategory(step.category));
+    if (
+      writing.length === 0 ||
+      writing.every((step) => !step.managedWorktreeId && !step.resultSha)
+    )
+      return undefined;
+    const byKey = new Map(steps.map((step) => [step.stepKey, step]));
+    const dependsOn = (
+      step: RunStep,
+      targetKey: string,
+      seen = new Set<string>(),
+    ): boolean =>
+      step.dependsOn.some((key) => {
+        if (key === targetKey) return true;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        const dependency = byKey.get(key);
+        return dependency ? dependsOn(dependency, targetKey, seen) : false;
+      });
+    const hasWritableDescendant = new Set(
+      writing
+        .filter((candidate) =>
+          writing.some(
+            (descendant) =>
+              descendant.id !== candidate.id && dependsOn(descendant, candidate.stepKey),
+          ),
+        )
+        .map((step) => step.id),
+    );
+    const sinks = writing
+      .filter(
+        (step) =>
+          !hasWritableDescendant.has(step.id) &&
+          step.state === "succeeded" &&
+          Boolean(step.resultSha),
+      )
+      .sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
+    if (sinks.length !== 1)
+      throw new WorktreeConflict(
+        "result_workspace_ambiguous",
+        "Managed integration requires one committed writable DAG sink. Add an explicit fan-in step before integration.",
+      );
+    const result = this.store.derivedWorkspaceForStep(runId, sinks[0]!.id);
+    if (!result || result.resultSha !== sinks[0]!.resultSha)
+      throw new WorktreeConflict(
+        "result_workspace_changed",
+        "The final step workspace no longer matches its committed result SHA.",
+      );
+    return result;
+  }
+
+  private async requestWorkspace(
+    runId: string,
+    worktreeId: string,
+    generation: number,
     input: Partial<WorktreeOperationRequest> &
       Pick<WorktreeOperationRequest, "kind" | "actor">,
     waitMs = 30_000,
@@ -274,13 +567,13 @@ export class ManagedWorktreeService {
         "node_unavailable",
         "The owning Node is offline; checkout state and process ownership are unknown.",
       );
-    const tree = this.store.worktreeForRun(runId);
+    const tree = this.store.getAnyManagedWorkspace(worktreeId);
     const suppliedId = input.operationId ?? randomUUID();
     const existing = this.store.getWorktreeOperation(suppliedId);
     const request = WorktreeOperationRequestSchema.parse({
       ...input,
       operationId: suppliedId,
-      worktreeId: binding.managedWorktreeId,
+      worktreeId,
       runId,
       sourcePlacementId: placement.id,
       workspaceId: run.workspaceId,
@@ -288,7 +581,7 @@ export class ManagedWorktreeService {
       nodeId: node.id,
       hostInstallationId: this.store.worktreeHostInstallationId(),
       expectedVersion: input.expectedVersion ?? tree?.version ?? 0,
-      generation: binding.generation,
+      generation,
       expectedPath: tree?.path ?? "",
       expectedBranchRef: tree?.branchRef ?? "",
       expectedBaseSha: binding.baseSha,
@@ -321,7 +614,7 @@ export class ManagedWorktreeService {
         "stale_revision",
         "Worktree state changed. Refresh the preview and revision.",
       );
-    const pending = this.pending(runId);
+    const pending = this.pendingWorkspace(worktreeId);
     if (pending) {
       if (input.kind === "reconcile") return this.send(pending, waitMs);
       throw new WorktreeConflict(
@@ -393,7 +686,11 @@ export class ManagedWorktreeService {
       return JSON.stringify(operation.result) === JSON.stringify(result);
     const tree = result.worktree;
     const safeKey = createHash("sha256")
-      .update(`${expected.hostInstallationId}:${expected.runId}:${expected.generation}`)
+      .update(
+        expected.workspaceKind === "primary"
+          ? `${expected.hostInstallationId}:${expected.runId}:${expected.generation}`
+          : `${expected.hostInstallationId}:${expected.runId}:${expected.workspaceKind}:${expected.ownerStepId}:${expected.generation}`,
+      )
       .digest("hex")
       .slice(0, 32);
     if (
@@ -405,6 +702,8 @@ export class ManagedWorktreeService {
         tree.sourcePlacementId !== expected.sourcePlacementId ||
         tree.workspaceId !== expected.workspaceId ||
         tree.generation !== expected.generation ||
+        tree.workspaceKind !== expected.workspaceKind ||
+        tree.ownerStepId !== expected.ownerStepId ||
         tree.taskKey !== safeKey ||
         tree.branchRef !== `refs/heads/fleet/${safeKey}` ||
         tree.pinRef !== `refs/fleet/pins/${safeKey}` ||
@@ -440,7 +739,9 @@ export class ManagedWorktreeService {
     )
       return false;
     if (result.ok && !tree) return false;
-    const setupOperation = ["reserve", "create"].includes(expected.kind);
+    const setupOperation =
+      expected.workspaceKind === "primary" &&
+      ["reserve", "create"].includes(expected.kind);
     const setupReady = Boolean(
       result.ok &&
       tree &&
@@ -448,7 +749,10 @@ export class ManagedWorktreeService {
       !tree.abandonedAt,
     );
     this.store.writeAtomically(() => {
-      if (tree) this.store.putManagedWorktree(tree);
+      if (tree) {
+        if (tree.workspaceKind === "primary") this.store.putManagedWorktree(tree);
+        else this.store.putDerivedWorkspace(tree);
+      }
       if (result.integration) {
         if (
           result.integration.worktreeId !== expected.worktreeId ||
@@ -463,7 +767,7 @@ export class ManagedWorktreeService {
       this.store.putWorktreeOperation({ ...operation, state: "acknowledged", result });
       const run = this.store.getRun(expected.runId);
       const binding = run?.workspaceBinding;
-      if (binding) {
+      if (binding && expected.workspaceKind === "primary") {
         const available =
           tree && ["ready", "retained"].includes(tree.state) && !tree.abandonedAt;
         this.store.setRunWorkspaceBinding(expected.runId, {
@@ -516,6 +820,44 @@ export class ManagedWorktreeService {
                 executionBinding: { ...step.executionBinding, quarantined: false },
               });
             }
+        }
+      }
+      if (expected.ownerStepId) {
+        const step = this.store.getRunStep(expected.ownerStepId);
+        if (step?.runId === expected.runId) {
+          const blocked =
+            !result.ok ||
+            tree?.composition?.state === "conflicted" ||
+            tree?.composition?.state === "blocked";
+          this.store.updateRunStep(step.id, {
+            ...(tree?.checkout
+              ? {
+                  executionBinding: this.bindingForTree(
+                    tree,
+                    step.executionBinding?.leaseAttempt,
+                  ),
+                }
+              : {}),
+            workspaceState: blocked
+              ? "blocked"
+              : expected.kind === "reserve"
+                ? "reserved"
+                : expected.kind === "create"
+                  ? tree?.composition
+                    ? "composing"
+                    : "ready"
+                  : expected.kind === "compose"
+                    ? tree?.composition?.state === "ready"
+                      ? "ready"
+                      : "blocked"
+                    : expected.kind === "finalize" && tree?.resultSha
+                      ? "completed"
+                      : step.workspaceState,
+            workspaceError: result.error || tree?.composition?.error || tree?.error || "",
+            ...(expected.kind === "finalize" && tree?.resultSha
+              ? { resultSha: tree.resultSha }
+              : {}),
+          });
         }
       }
       if (tree?.state === "removed" || tree?.abandonedAt) {
@@ -593,8 +935,10 @@ export class ManagedWorktreeService {
       )
       .slice(0, 2))
       void this.send(operation, 30_000);
-    for (const tree of this.store
-      .listManagedWorktrees()
+    for (const tree of [
+      ...this.store.listManagedWorktrees(),
+      ...this.store.listDerivedWorkspaces(),
+    ]
       .filter(
         (entry) =>
           entry.nodeId === nodeId &&
@@ -604,17 +948,34 @@ export class ManagedWorktreeService {
           !this.pending(entry.runId),
       )
       .slice(0, 2)) {
-      void this.request(tree.runId, { kind: "reconcile", actor: "node-reconnect" }).catch(
-        () => undefined,
-      );
+      void (
+        tree.workspaceKind === "primary"
+          ? this.request(tree.runId, {
+              kind: "reconcile",
+              actor: "node-reconnect",
+            })
+          : this.requestWorkspace(tree.runId, tree.id, tree.generation, {
+              kind: "reconcile",
+              actor: "node-reconnect",
+              workspaceKind: tree.workspaceKind,
+              ownerStepId: tree.ownerStepId,
+              expectedVersion: tree.version,
+              ...(tree.composition ? { composition: tree.composition } : {}),
+            })
+      ).catch(() => undefined);
     }
+    this.lastSweep = 0;
+    this.sweep();
   }
 
   sweep(nowMs = Date.now()): void {
     if (nowMs - this.lastSweep < 60_000) return;
     this.lastSweep = nowMs;
     let count = 0;
-    for (const tree of this.store.listManagedWorktrees()) {
+    for (const tree of [
+      ...this.store.listManagedWorktrees(),
+      ...this.store.listDerivedWorkspaces(),
+    ]) {
       if (count >= 2) break;
       const run = this.store.getRun(tree.runId);
       if (
@@ -622,7 +983,7 @@ export class ManagedWorktreeService {
         !terminalRunStates.has(run.state) ||
         tree.abandonedAt ||
         !this.store.getNode(tree.nodeId)?.online ||
-        this.pending(run.id) ||
+        this.pendingWorkspace(tree.id) ||
         this.store
           .listSessions()
           .some(
@@ -636,7 +997,8 @@ export class ManagedWorktreeService {
         tree.state === "ready"
           ? "retain"
           : tree.state === "retained" &&
-              ["integrated", "no_changes"].includes(tree.integrationState) &&
+              (tree.workspaceKind !== "primary" ||
+                ["integrated", "no_changes"].includes(tree.integrationState)) &&
               tree.observation?.dirty === false &&
               tree.expiresAt &&
               Date.parse(tree.expiresAt) <= nowMs
@@ -644,27 +1006,39 @@ export class ManagedWorktreeService {
             : undefined;
       if (!kind) continue;
       count += 1;
-      void this.request(run.id, { kind, actor: "bounded-retention" }).catch(
-        () => undefined,
-      );
+      void (
+        tree.workspaceKind === "primary"
+          ? this.request(run.id, { kind, actor: "bounded-retention" })
+          : this.requestWorkspace(run.id, tree.id, tree.generation, {
+              kind,
+              actor: "bounded-retention",
+              workspaceKind: tree.workspaceKind,
+              ownerStepId: tree.ownerStepId,
+              expectedVersion: tree.version,
+              ...(tree.composition ? { composition: tree.composition } : {}),
+            })
+      ).catch(() => undefined);
     }
   }
 
   nodeLost(nodeId: string): void {
-    for (const tree of this.store
-      .listManagedWorktrees()
-      .filter(
-        (entry) =>
-          entry.nodeId === nodeId && !["removed", "quarantined"].includes(entry.state),
-      )) {
-      this.store.putManagedWorktree({
+    for (const tree of [
+      ...this.store.listManagedWorktrees(),
+      ...this.store.listDerivedWorkspaces(),
+    ].filter(
+      (entry) =>
+        entry.nodeId === nodeId && !["removed", "quarantined"].includes(entry.state),
+    )) {
+      const unavailable = {
         ...tree,
         state: "unavailable",
         error: "Node unavailable: process and filesystem state are unknown.",
         ...(tree.observation
           ? { observation: { ...tree.observation, dirty: null, locked: null } }
           : {}),
-      });
+      } as ManagedWorktree;
+      if (tree.workspaceKind === "primary") this.store.putManagedWorktree(unavailable);
+      else this.store.putDerivedWorkspace(unavailable);
     }
   }
 
@@ -682,6 +1056,18 @@ export class ManagedWorktreeService {
         "workspace_not_ready",
         binding.error ||
           "Managed task workspace is not ready; source fallback is prohibited.",
+      );
+    return this.bindingForTree(tree, attempt);
+  }
+
+  private bindingForTree(
+    tree: ManagedWorktree,
+    attempt: string = randomUUID(),
+  ): ExecutionBinding {
+    if (!tree.checkout)
+      throw new WorktreeConflict(
+        "workspace_not_ready",
+        "The managed workspace has no verified checkout identity.",
       );
     return {
       worktreeId: tree.id,
@@ -713,19 +1099,29 @@ export class ManagedWorktreeService {
         "quarantined",
         "This managed session requires explicit reconciliation.",
       );
-    if (this.pending(run.id))
+    if (this.pendingWorkspace(binding.worktreeId))
       throw new WorktreeConflict(
         "workspace_admin_pending",
         "A durable worktree operation is in progress. Wait for its Node acknowledgement.",
       );
-    const expected = this.bindingFor(run, binding.leaseAttempt)!;
+    const tree = this.store.getAnyManagedWorkspace(binding.worktreeId);
+    const step = this.store.getRunStepBySession(session.id);
+    if (
+      !tree ||
+      tree.runId !== run.id ||
+      (tree.workspaceKind !== "primary" && tree.ownerStepId !== step?.id)
+    )
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "The session is not bound to its step's durable managed workspace.",
+      );
+    const expected = this.bindingForTree(tree, binding.leaseAttempt);
     if (JSON.stringify({ ...binding, quarantined: false }) !== JSON.stringify(expected)) {
       throw new WorktreeConflict(
         "binding_mismatch",
         "The session's immutable checkout binding does not match its task.",
       );
     }
-    const tree = this.store.worktreeForRun(run.id)!;
     if (
       tree.nodeId !== session.nodeId ||
       !this.store

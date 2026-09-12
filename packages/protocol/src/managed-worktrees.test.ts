@@ -4,6 +4,7 @@ import {
   HostToNodeMessageSchema,
   IntegrationPreviewSchema,
   ManagedWorktreePolicySchema,
+  ManagedWorktreeSchema,
   RunSchema,
   RunWorkspaceBindingSchema,
   WorktreeIntegrationSchema,
@@ -81,6 +82,7 @@ describe("managed workspace protocol compatibility", () => {
     });
     expect(backup.defaults.managedWorktreesEnabled).toBe(false);
     expect(backup.managedWorktrees).toEqual([]);
+    expect(backup.derivedWorkspaces).toEqual([]);
     expect(backup.worktreeOperations).toEqual([]);
     expect(backup.worktreeIntegrations).toEqual([]);
     expect(backup.worktreeTombstones).toEqual([]);
@@ -88,6 +90,65 @@ describe("managed workspace protocol compatibility", () => {
       retentionDays: 7,
       maxPerRepository: 8,
       maxPerNode: 32,
+    });
+  });
+
+  it("defaults old worktrees to primary while preserving derived composition provenance", () => {
+    const now = new Date().toISOString();
+    const physical = {
+      key: "checkout",
+      path: "C:\\repo",
+      machineId: "machine",
+      volume: "volume",
+      fileId: "file",
+    };
+    const old = ManagedWorktreeSchema.parse({
+      id: "tree",
+      runId: "run",
+      taskKey: "safe",
+      sourcePlacementId: "placement",
+      workspaceId: "workspace",
+      nodeId: "node",
+      machineId: "machine",
+      hostInstallationId: "host",
+      nodeInstallationId: "node-install",
+      repository: physical,
+      commonDirectory: physical,
+      managedRoot: physical,
+      generation: 1,
+      version: 0,
+      path: "C:\\tree",
+      branchRef: "refs/heads/fleet/safe",
+      pinRef: "refs/fleet/pins/safe",
+      baseSha: "a".repeat(40),
+      state: "ready",
+      createdAt: now,
+      updatedAt: now,
+    });
+    expect(old.workspaceKind).toBe("primary");
+    expect(
+      ManagedWorktreeSchema.parse({
+        ...old,
+        id: "derived",
+        workspaceKind: "derived",
+        ownerStepId: "join",
+        composition: {
+          baseSha: old.baseSha,
+          predecessors: [
+            {
+              stepId: "left",
+              stepKey: "left",
+              position: 0,
+              worktreeId: "left-tree",
+              resultSha: "b".repeat(40),
+            },
+          ],
+          state: "pending",
+        },
+      }).composition,
+    ).toMatchObject({
+      state: "pending",
+      predecessors: [{ stepId: "left", position: 0 }],
     });
   });
 

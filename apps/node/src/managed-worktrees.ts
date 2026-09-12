@@ -8,6 +8,7 @@ import {
   GitShaSchema,
   IntegrationPreviewSchema,
   ManagedWorktreeSchema,
+  RepositoryFeaturesSchema,
   WorktreeConflict,
   WorktreeIntegrationSchema,
   WorktreeObservationSchema,
@@ -17,6 +18,7 @@ import {
   type ExecutionBinding,
   type IntegrationPreview,
   type ManagedWorktree,
+  type RepositoryFeatures,
   type WorktreeIntegration,
   type WorktreeObservation,
   type WorktreeOperationRequest,
@@ -69,6 +71,10 @@ export class ManagedWorktrees {
   private readonly queuedRequests = new Map<string, WorktreeOperationRequest>();
   private readonly worktreeTails = new Map<string, Promise<void>>();
   private readonly integrationLeases = new Map<string, CheckoutLease>();
+  private readonly repositoryScans = new Map<
+    string,
+    Promise<{ submodules: boolean; gitLfs: boolean; estimatedBytes: number }>
+  >();
   private readonly adminQueues = new Map<string, Promise<void>>();
   private paused = false;
   private closed = false;
@@ -80,8 +86,14 @@ export class ManagedWorktrees {
       PRAGMA journal_mode=WAL;
       CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS trees (id TEXT PRIMARY KEY, data TEXT NOT NULL);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_trees_run_generation
-        ON trees(json_extract(data,'$.runId'),json_extract(data,'$.generation'));
+      DROP INDEX IF EXISTS idx_trees_run_generation;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_trees_owner_generation
+        ON trees(
+          json_extract(data,'$.runId'),
+          COALESCE(json_extract(data,'$.ownerStepId'),''),
+          COALESCE(json_extract(data,'$.workspaceKind'),'primary'),
+          json_extract(data,'$.generation')
+        );
       CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, request TEXT NOT NULL, result TEXT);
       CREATE TABLE IF NOT EXISTS previews (id TEXT PRIMARY KEY, data TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS integrations (id TEXT PRIMARY KEY, data TEXT NOT NULL);
@@ -433,6 +445,10 @@ export class ManagedWorktrees {
       if (request.kind === "reserve") return { worktree: tree };
       if (request.kind === "create")
         return { worktree: await this.create(tree, request, admin) };
+      if (request.kind === "compose")
+        return { worktree: await this.compose(tree, request, admin) };
+      if (request.kind === "finalize")
+        return { worktree: await this.finalize(tree, request) };
       if (request.kind === "cleanup" && tree.state === "removing")
         return await this.reconcile(tree, request, admin);
       if (request.kind === "reconcile") return await this.reconcile(tree, request, admin);
@@ -494,8 +510,13 @@ export class ManagedWorktrees {
         if (request.kind === "retain") {
           tree.state = "retained";
           tree.retainedAt = now();
+          if (request.actor === "bounded-retention") {
+            tree.orphanedAt ||= tree.retainedAt;
+            tree.orphanReason ||= "The owning task is terminal and no session holds it.";
+          }
           tree.expiresAt =
-            ["integrated", "no_changes"].includes(tree.integrationState) &&
+            (tree.workspaceKind !== "primary" ||
+              ["integrated", "no_changes"].includes(tree.integrationState)) &&
             tree.observation.dirty === false
               ? new Date(
                   Date.now() + request.policy.retentionDays * 86_400_000,
@@ -566,7 +587,7 @@ export class ManagedWorktrees {
     path: string,
     base: string,
     allowGitHooks = false,
-  ): Promise<void> {
+  ): Promise<{ features: RepositoryFeatures; estimatedBytes: number }> {
     const config = await this.git.run(
       path,
       [
@@ -576,31 +597,83 @@ export class ManagedWorktrees {
       ],
       { allowedExitCodes: [0, 1] },
     );
-    if (config.stdout.trim())
-      throw new WorktreeConflict(
-        "unsupported_repository",
-        "V1 rejects sparse, partial/promisor, LFS and worktree-specific configurations.",
-      );
-    const modules = await this.git.run(path, ["ls-tree", "-r", base], {
-      maxBytes: 2_000_000,
-    });
-    if (/^160000 /m.test(modules.stdout) || /\t\.gitmodules$/m.test(modules.stdout)) {
-      throw new WorktreeConflict(
-        "unsupported_repository",
-        "V1 does not initialize or manage submodules.",
-      );
+    const sparseCheckout =
+      (
+        await this.git.run(path, ["config", "--bool", "core.sparseCheckout"], {
+          allowedExitCodes: [0, 1],
+        })
+      ).stdout.trim() === "true";
+    const sparseCone =
+      sparseCheckout &&
+      (
+        await this.git.run(path, ["config", "--bool", "core.sparseCheckoutCone"], {
+          allowedExitCodes: [0, 1],
+        })
+      ).stdout.trim() !== "false";
+    const sparsePaths = sparseCheckout
+      ? (
+          await this.git.run(path, ["sparse-checkout", "list"], {
+            maxBytes: 1_000_000,
+          })
+        ).stdout
+          .split(/\r?\n/)
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+      : [];
+    const scanKey = `${path}\0${base}`;
+    let scan = this.repositoryScans.get(scanKey);
+    if (!scan) {
+      scan = (async () => {
+        const files = await this.git.run(path, ["ls-tree", "-r", "-l", base], {
+          maxBytes: 2_000_000,
+        });
+        const attributes = await this.git.run(
+          path,
+          ["grep", "-I", "-l", "-e", "filter=lfs", base, "--", "*.gitattributes"],
+          { allowedExitCodes: [0, 1] },
+        );
+        return {
+          submodules:
+            /^160000 /m.test(files.stdout) || /\t\.gitmodules$/m.test(files.stdout),
+          gitLfs: Boolean(attributes.stdout.trim()),
+          estimatedBytes: files.stdout
+            .split("\n")
+            .reduce(
+              (sum, line) =>
+                sum + (Number(/^\d+ \w+ [a-f0-9]+ +(\d+)\t/.exec(line)?.[1]) || 0),
+              0,
+            ),
+        };
+      })().catch((error: unknown) => {
+        this.repositoryScans.delete(scanKey);
+        throw error;
+      });
+      this.repositoryScans.set(scanKey, scan);
     }
-    const attributes = await this.git.run(
-      path,
-      ["grep", "-I", "-l", "-e", "filter=lfs", base, "--", "*.gitattributes"],
-      { allowedExitCodes: [0, 1] },
-    );
-    if (attributes.stdout)
-      throw new WorktreeConflict(
-        "unsupported_repository",
-        "V1 does not manage Git LFS repositories.",
-      );
+    const scanned = await scan;
+    if (scanned.gitLfs) {
+      const lfs = await this.git.run(path, ["lfs", "version"], {
+        allowedExitCodes: [0, 1],
+      });
+      if (lfs.exitCode !== 0)
+        throw new WorktreeConflict(
+          "git_lfs_required",
+          "This repository uses Git LFS. Install git-lfs for the Node service account before retrying.",
+        );
+    }
     await this.noninteractivePolicy(path, false, allowGitHooks);
+    return {
+      features: RepositoryFeaturesSchema.parse({
+        sparseCheckout,
+        sparseCone,
+        sparsePaths,
+        submodules: scanned.submodules,
+        gitLfs: scanned.gitLfs,
+        partialClone: /(?:promisor|partialclone)/i.test(config.stdout),
+        estimatedBytesReliable: !scanned.submodules && !scanned.gitLfs,
+      }),
+      estimatedBytes: scanned.estimatedBytes,
+    };
   }
 
   private async noninteractivePolicy(
@@ -661,17 +734,29 @@ export class ManagedWorktrees {
     commonDirectory: CheckoutIdentity,
     admin: CheckoutLease,
   ): Promise<ManagedWorktree> {
-    const base = GitShaSchema.parse(
+    const sourceHead = GitShaSchema.parse(
       (
         await this.git.run(repository.path, ["rev-parse", "--verify", "HEAD^{commit}"])
       ).stdout.trim(),
     );
+    const base = request.expectedBaseSha
+      ? GitShaSchema.parse(request.expectedBaseSha)
+      : sourceHead;
+    if (sourceHead !== base)
+      throw new WorktreeConflict(
+        "source_advanced",
+        "The source checkout advanced after the Run base was pinned. Fleet will not silently change the composition base.",
+      );
     const baseRef = (
       await this.git.run(repository.path, ["symbolic-ref", "-q", "HEAD"], {
         allowedExitCodes: [0, 1],
       })
     ).stdout.trim();
-    await this.supportedRepository(repository.path, base, request.allowGitHooks);
+    const compatibility = await this.supportedRepository(
+      repository.path,
+      base,
+      request.allowGitHooks,
+    );
     await this.registry({ repository });
     const trees = this.db
       .prepare("SELECT data FROM trees")
@@ -732,7 +817,9 @@ export class ManagedWorktrees {
       throw new WorktreeConflict("root_alias", "The managed root may not be a junction.");
     const managedRoot = await canonicalPath(rootPath);
     const safeKey = identityHash(
-      `${request.hostInstallationId}:${request.runId}:${request.generation}`,
+      request.workspaceKind === "primary"
+        ? `${request.hostInstallationId}:${request.runId}:${request.generation}`
+        : `${request.hostInstallationId}:${request.runId}:${request.workspaceKind}:${request.ownerStepId}:${request.generation}`,
     ).slice(0, 32);
     const path = join(managedRoot.path, safeKey);
     const branchRef = `refs/heads/fleet/${safeKey}`;
@@ -747,15 +834,7 @@ export class ManagedWorktrees {
         "The deterministic task path or ref already exists without this operation's ownership receipt.",
       );
     }
-    const files = await this.git.run(repository.path, ["ls-tree", "-r", "-l", base], {
-      maxBytes: 2_000_000,
-    });
-    const estimate = files.stdout
-      .split("\n")
-      .reduce(
-        (sum, line) => sum + (Number(/^\d+ \w+ [a-f0-9]+ +(\d+)\t/.exec(line)?.[1]) || 0),
-        0,
-      );
+    const estimate = compatibility.estimatedBytes;
     const free = await statfs(managedRoot.path);
     const freeBytes = free.bavail * free.bsize;
     if (
@@ -790,6 +869,10 @@ export class ManagedWorktrees {
       pinRef,
       baseSha: base,
       baseRef,
+      workspaceKind: request.workspaceKind,
+      ownerStepId: request.ownerStepId,
+      composition: request.composition,
+      repositoryFeatures: compatibility.features,
       allowGitHooks: request.allowGitHooks,
       state: "reserved",
       createdAt: now(),
@@ -908,10 +991,12 @@ export class ManagedWorktrees {
     request: WorktreeOperationRequest,
     admin: CheckoutLease,
   ): Promise<ManagedWorktree> {
+    if (tree.workspaceKind !== "primary") await this.assertPinnedSource(tree);
     if (tree.state === "ready" || tree.state === "retained") {
       await this.verifyTree(tree);
       return tree;
     }
+
     if (!["reserved", "creating", "creation_failed"].includes(tree.state))
       throw new WorktreeConflict(
         "not_creatable",
@@ -922,11 +1007,16 @@ export class ManagedWorktrees {
       "--verify",
       `${tree.baseSha}^{commit}`,
     ]);
-    await this.supportedRepository(
+    const compatibility = await this.supportedRepository(
       tree.repository.path,
       tree.baseSha,
       tree.allowGitHooks,
     );
+    if (!isDeepStrictEqual(tree.repositoryFeatures, compatibility.features))
+      throw new WorktreeConflict(
+        "repository_features_changed",
+        "The repository checkout configuration changed after reservation. Retry setup from a fresh reservation.",
+      );
     const disk = await statfs(tree.managedRoot.path);
     if (
       disk.bavail * disk.bsize - (tree.observation?.approximateBytes ?? 0) <
@@ -969,18 +1059,43 @@ export class ManagedWorktrees {
         );
       tree.state = "creating";
       this.save(tree);
-      await this.git.run(
-        tree.repository.path,
-        [
-          "worktree",
-          "add",
-          "-b",
-          tree.branchRef.slice("refs/heads/".length),
+      const addArguments = [
+        "worktree",
+        "add",
+        ...(tree.repositoryFeatures.sparseCheckout ? ["--no-checkout"] : []),
+        "-b",
+        tree.branchRef.slice("refs/heads/".length),
+        tree.path,
+        tree.baseSha,
+      ];
+      await this.git.run(tree.repository.path, addArguments, {
+        timeoutMs: 120_000,
+        lease: admin,
+      });
+      if (tree.repositoryFeatures.sparseCheckout) {
+        await this.git.run(
           tree.path,
-          tree.baseSha,
-        ],
-        { timeoutMs: 120_000, lease: admin },
-      );
+          [
+            "sparse-checkout",
+            "set",
+            tree.repositoryFeatures.sparseCone ? "--cone" : "--no-cone",
+            "--stdin",
+          ],
+          {
+            timeoutMs: 120_000,
+            stdin: `${tree.repositoryFeatures.sparsePaths.join("\n")}\n`,
+          },
+        );
+        await this.git.run(tree.path, ["read-tree", "-mu", "HEAD"], {
+          timeoutMs: 120_000,
+        });
+      }
+      if (tree.repositoryFeatures.submodules)
+        await this.git.run(
+          tree.path,
+          ["submodule", "update", "--init", "--recursive", "--checkout"],
+          { timeoutMs: 600_000 },
+        );
       this.options.checkpoint?.("git", request);
       await this.verifyTree(tree);
     }
@@ -998,6 +1113,176 @@ export class ManagedWorktrees {
     return tree;
   }
 
+  private async assertPinnedSource(tree: ManagedWorktree): Promise<void> {
+    const sourceHead = GitShaSchema.parse(
+      (
+        await this.git.run(tree.repository.path, [
+          "rev-parse",
+          "--verify",
+          "HEAD^{commit}",
+        ])
+      ).stdout.trim(),
+    );
+    if (sourceHead !== tree.baseSha)
+      throw new WorktreeConflict(
+        "source_advanced",
+        "The source checkout advanced after this Run was pinned. Composition is blocked.",
+      );
+    if (tree.baseRef) {
+      const sourceRef = (
+        await this.git.run(tree.repository.path, ["symbolic-ref", "-q", "HEAD"], {
+          allowedExitCodes: [0, 1],
+        })
+      ).stdout.trim();
+      if (sourceRef !== tree.baseRef)
+        throw new WorktreeConflict(
+          "source_ref_changed",
+          "The source checkout changed branches after this Run was pinned.",
+        );
+    }
+  }
+
+  private async compose(
+    tree: ManagedWorktree,
+    request: WorktreeOperationRequest,
+    admin: CheckoutLease,
+  ): Promise<ManagedWorktree> {
+    if (tree.workspaceKind !== "derived" || !tree.composition || !request.composition)
+      throw new WorktreeConflict(
+        "composition_required",
+        "Only a derived workspace with durable composition provenance can be composed.",
+      );
+    const provenance = (composition: NonNullable<ManagedWorktree["composition"]>) => ({
+      baseSha: composition.baseSha,
+      baseRef: composition.baseRef,
+      predecessors: composition.predecessors,
+    });
+    if (!isDeepStrictEqual(provenance(tree.composition), provenance(request.composition)))
+      throw new WorktreeConflict(
+        "composition_changed",
+        "The predecessor set or pinned result SHAs changed after reservation.",
+      );
+    await this.verifyTree(tree);
+    await this.assertPinnedSource(tree);
+    if (tree.composition.state === "conflicted") return tree;
+    await this.noGitOperation(tree.path, true);
+    const gitDirectory = (
+      await this.git.run(tree.path, ["rev-parse", "--absolute-git-dir"])
+    ).stdout.trim();
+    if (await exists(join(gitDirectory, "MERGE_HEAD"))) {
+      tree.composition.state = "conflicted";
+      tree.composition.conflicts = await this.conflicts(tree.path);
+      tree.composition.error =
+        "An interrupted predecessor merge requires explicit resolution or abandonment; Fleet did not reset or clean the workspace.";
+      tree.error = tree.composition.error;
+      tree.observation = await this.observe(tree);
+      return tree;
+    }
+    tree.observation = await this.observe(tree);
+    this.requireClean(tree.observation);
+    if (
+      tree.composition.state === "ready" &&
+      tree.composition.resultSha === tree.observation.head
+    )
+      return tree;
+    if (tree.observation.head !== tree.baseSha) {
+      const expected = new Set(
+        tree.composition.predecessors.map((predecessor) => predecessor.resultSha),
+      );
+      const history = (
+        await this.git.run(tree.path, [
+          "rev-list",
+          "--first-parent",
+          "--parents",
+          `${tree.baseSha}..${tree.observation.head}`,
+        ])
+      ).stdout
+        .trim()
+        .split(/\r?\n/)
+        .filter(Boolean);
+      if (
+        history.some((line) => {
+          const [, , ...otherParents] = line.split(" ");
+          return (
+            otherParents.length === 0 || !otherParents.some((sha) => expected.has(sha))
+          );
+        })
+      )
+        throw new WorktreeConflict(
+          "composition_head_changed",
+          "The derived workspace contains commits outside its recorded predecessor composition.",
+        );
+    }
+    tree.composition.state = "composing";
+    tree.composition.startedAt ||= now();
+    tree.composition.error = "";
+    this.save(tree);
+    for (const predecessor of tree.composition.predecessors) {
+      const sourceTree = this.get(predecessor.worktreeId);
+      if (
+        !sourceTree ||
+        sourceTree.runId !== tree.runId ||
+        sourceTree.ownerStepId !== predecessor.stepId ||
+        sourceTree.resultSha !== predecessor.resultSha
+      )
+        throw new WorktreeConflict(
+          "predecessor_changed",
+          `Predecessor ${predecessor.stepKey} no longer matches its recorded workspace result.`,
+        );
+      await this.verifyTree(sourceTree);
+      const observed = await this.observe(sourceTree);
+      this.requireClean(observed);
+      if (observed.head !== predecessor.resultSha)
+        throw new WorktreeConflict(
+          "predecessor_changed",
+          `Predecessor ${predecessor.stepKey} changed after completion.`,
+        );
+      if (await this.ancestor(tree.path, predecessor.resultSha, tree.observation.head))
+        continue;
+      const merge = await this.git.run(
+        tree.path,
+        ["merge", "--no-ff", "--no-edit", predecessor.resultSha],
+        { allowedExitCodes: [0, 1], timeoutMs: 120_000, lease: admin },
+      );
+      this.options.checkpoint?.("git", request);
+      if (merge.exitCode !== 0) {
+        tree.composition.conflicts = await this.conflicts(tree.path);
+        tree.composition.state = "conflicted";
+        tree.composition.error = `Merging predecessor ${predecessor.stepKey} conflicted. Resolve or abandon explicitly; Fleet did not reset or clean the workspace.`;
+        tree.error = tree.composition.error;
+        tree.observation = await this.observe(tree);
+        return tree;
+      }
+      tree.observation = await this.observe(tree);
+      this.save(tree);
+    }
+    await this.noGitOperation(tree.path);
+    tree.observation = await this.observe(tree);
+    this.requireClean(tree.observation);
+    tree.composition.state = "ready";
+    tree.composition.resultSha = tree.observation.head;
+    tree.composition.conflicts = [];
+    tree.composition.error = "";
+    tree.composition.completedAt = now();
+    tree.error = "";
+    return tree;
+  }
+
+  private async finalize(
+    tree: ManagedWorktree,
+    request: WorktreeOperationRequest,
+  ): Promise<ManagedWorktree> {
+    void request;
+    await this.verifyTree(tree);
+    await this.assertPinnedSource(tree);
+    await this.noGitOperation(tree.path);
+    tree.observation = await this.observe(tree);
+    this.requireClean(tree.observation);
+    tree.resultSha = GitShaSchema.parse(tree.observation.head);
+    tree.resultRecordedAt = now();
+    tree.error = "";
+    return tree;
+  }
   private async ref(path: string, ref: string): Promise<string> {
     return (
       await this.git.run(path, ["rev-parse", "--verify", ref], {
@@ -1278,6 +1563,7 @@ export class ManagedWorktrees {
         pending.validationState = "passed";
         pending.validationSummary =
           "Recovered merge result is clean and contains the reviewed task commit.";
+        pending.validationStartedAt ||= pending.createdAt;
         pending.validatedAt = now();
         pending.error = "";
       } else {
@@ -1606,6 +1892,8 @@ export class ManagedWorktrees {
             : fresh.alreadyIntegrated
               ? "The reviewed task commit is already reachable from the target."
               : "",
+          validationStartedAt:
+            !fresh.hasCommittedChanges || fresh.alreadyIntegrated ? now() : "",
           validatedAt: !fresh.hasCommittedChanges || fresh.alreadyIntegrated ? now() : "",
           createdAt: now(),
           updatedAt: now(),
@@ -1797,6 +2085,7 @@ export class ManagedWorktrees {
     integration.state = "validating";
     integration.validationState = "running";
     integration.validationSummary = "Verifying the merge result and clean target.";
+    integration.validationStartedAt = now();
     integration.updatedAt = now();
     this.saveIntegration(integration);
     tree.integrationState = "validating";

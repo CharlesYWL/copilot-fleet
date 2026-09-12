@@ -269,7 +269,219 @@ async function liveAcpFixture(managed = true) {
   };
 }
 
-describe("real Git managed task worktrees", { timeout: 30_000 }, () => {
+describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
+  it("composes committed independent step results deterministically into a derived workspace", async () => {
+    let interruptComposition = false;
+    const { source, manager } = await fixture((stage, request) => {
+      if (interruptComposition && stage === "git" && request.kind === "compose") {
+        interruptComposition = false;
+        throw new WorktreeCrash("interrupted composition");
+      }
+    });
+    const baseSha = (
+      await git.run(source, ["rev-parse", "--verify", "HEAD"])
+    ).stdout.trim();
+    const makeStep = async (stepId: string, position: number, file: string) => {
+      const runId = "dag-run";
+      const request = WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source, runId),
+        operationId: randomUUID(),
+        worktreeId: `worktree-${stepId}`,
+        expectedBaseSha: baseSha,
+        workspaceKind: "step",
+        ownerStepId: stepId,
+      });
+      const reserved = await manager.execute(request);
+      const created = await operation(manager, reserved.worktree!, "create", {
+        workspaceKind: "step",
+        ownerStepId: stepId,
+      });
+      await writeFile(join(created.worktree!.path, file), `${stepId}\n`);
+      await git.run(created.worktree!.path, ["add", file]);
+      await git.run(created.worktree!.path, ["commit", "-m", stepId]);
+      const finalized = await operation(manager, created.worktree!, "finalize", {
+        workspaceKind: "step",
+        ownerStepId: stepId,
+      });
+      expect(finalized.ok).toBe(true);
+      expect(finalized.worktree!.resultSha).toMatch(/^[a-f0-9]{40}$/);
+      return {
+        stepId,
+        stepKey: stepId,
+        position,
+        worktreeId: finalized.worktree!.id,
+        resultSha: finalized.worktree!.resultSha,
+      };
+    };
+    const left = await makeStep("left", 0, "left.txt");
+    const right = await makeStep("right", 1, "right.txt");
+    const composition = {
+      baseSha,
+      baseRef: "refs/heads/target",
+      predecessors: [left, right],
+      state: "pending" as const,
+      resultSha: "",
+      conflicts: [],
+      error: "",
+      startedAt: "",
+      completedAt: "",
+    };
+    const reserve = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source, "dag-run"),
+        operationId: randomUUID(),
+        worktreeId: "worktree-join",
+        expectedBaseSha: baseSha,
+        workspaceKind: "derived",
+        ownerStepId: "join",
+        composition,
+      }),
+    );
+    const created = await operation(manager, reserve.worktree!, "create", {
+      workspaceKind: "derived",
+      ownerStepId: "join",
+      composition,
+    });
+    const composeRequest = WorktreeOperationRequestSchema.parse({
+      ...reserveRequest(source, "dag-run"),
+      operationId: randomUUID(),
+      kind: "compose",
+      worktreeId: created.worktree!.id,
+      generation: created.worktree!.generation,
+      expectedVersion: manager.get(created.worktree!.id)!.version,
+      expectedPath: created.worktree!.path,
+      expectedBranchRef: created.worktree!.branchRef,
+      expectedBaseSha: created.worktree!.baseSha,
+      workspaceKind: "derived",
+      ownerStepId: "join",
+      composition,
+    });
+    interruptComposition = true;
+    await expect(manager.execute(composeRequest)).rejects.toThrow(WorktreeCrash);
+    const composed = await manager.execute(composeRequest);
+    const replayed = await manager.execute(composeRequest);
+    expect(composed.ok).toBe(true);
+    expect(replayed).toEqual(composed);
+    expect(composed.worktree!.composition).toMatchObject({
+      state: "ready",
+      predecessors: [left, right],
+    });
+    await expect(
+      readFile(join(composed.worktree!.path, "left.txt"), "utf8"),
+    ).resolves.toBe("left\n");
+    await expect(
+      readFile(join(composed.worktree!.path, "right.txt"), "utf8"),
+    ).resolves.toBe("right\n");
+    expect(
+      (
+        await git.run(composed.worktree!.path, [
+          "rev-list",
+          "--parents",
+          "-n",
+          "1",
+          "HEAD",
+        ])
+      ).stdout
+        .trim()
+        .split(/\s+/)[2],
+    ).toBe(right.resultSha);
+
+    const conflictLeft = await makeStep("conflict-left", 2, "same.txt");
+    const conflictRight = await makeStep("conflict-right", 3, "same.txt");
+    const conflicting = {
+      ...composition,
+      predecessors: [conflictLeft, conflictRight],
+    };
+    const conflictReserve = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source, "dag-run"),
+        operationId: randomUUID(),
+        worktreeId: "worktree-conflict-join",
+        expectedBaseSha: baseSha,
+        workspaceKind: "derived",
+        ownerStepId: "conflict-join",
+        composition: conflicting,
+      }),
+    );
+    const conflictCreated = await operation(
+      manager,
+      conflictReserve.worktree!,
+      "create",
+      {
+        workspaceKind: "derived",
+        ownerStepId: "conflict-join",
+        composition: conflicting,
+      },
+    );
+    const conflictResult = await operation(
+      manager,
+      conflictCreated.worktree!,
+      "compose",
+      {
+        workspaceKind: "derived",
+        ownerStepId: "conflict-join",
+        composition: conflicting,
+      },
+    );
+    expect(conflictResult.ok).toBe(true);
+    expect(conflictResult.worktree!.composition).toMatchObject({
+      state: "conflicted",
+      conflicts: ["same.txt"],
+      error: expect.stringContaining("did not reset or clean"),
+    });
+  });
+
+  it("inherits cone-mode sparse checkout without materializing excluded paths", async () => {
+    const { source, manager } = await fixture();
+    await mkdir(join(source, "included"));
+    await mkdir(join(source, "excluded"));
+    await writeFile(join(source, "included", "visible.txt"), "visible\n");
+    await writeFile(join(source, "excluded", "hidden.txt"), "hidden\n");
+    await git.run(source, ["add", "."]);
+    await git.run(source, ["commit", "-m", "add sparse paths"]);
+    await git.run(source, ["sparse-checkout", "init", "--cone"]);
+    await git.run(source, ["sparse-checkout", "set", "included"]);
+
+    const tree = await allocate(manager, source);
+
+    expect(tree.repositoryFeatures).toMatchObject({
+      sparseCheckout: true,
+      sparseCone: true,
+      sparsePaths: ["included"],
+    });
+    expect(await readFile(join(tree.path, "included", "visible.txt"), "utf8")).toBe(
+      "visible\n",
+    );
+    expect(fs.existsSync(join(tree.path, "excluded", "hidden.txt"))).toBe(false);
+  });
+
+  it("records submodule compatibility instead of rejecting the repository", async () => {
+    const { root, source, manager } = await fixture();
+    const child = join(root, "child");
+    await mkdir(child);
+    await git.run(child, ["init", "-b", "main"]);
+    await git.run(child, ["config", "user.name", "Fleet Test"]);
+    await git.run(child, ["config", "user.email", "fleet-test@example.invalid"]);
+    await writeFile(join(child, "child.txt"), "child\n");
+    await git.run(child, ["add", "."]);
+    await git.run(child, ["commit", "-m", "child"]);
+    await git.run(source, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "add",
+      child,
+      "modules/child",
+    ]);
+    await git.run(source, ["commit", "-am", "add submodule"]);
+
+    const reserved = await manager.execute(reserveRequest(source));
+
+    expect(reserved.ok).toBe(true);
+    expect(reserved.worktree?.repositoryFeatures.submodules).toBe(true);
+    expect(reserved.worktree?.repositoryFeatures.estimatedBytesReliable).toBe(false);
+  });
+
   it.skipIf(process.platform !== "win32")(
     "reattaches the existing real ACP slot and durable lease, fences retired attempts, and never duplicates its process",
     async () => {
@@ -1337,11 +1549,15 @@ describe("real Git managed task worktrees", { timeout: 30_000 }, () => {
       validationState: "passed",
       validationSummary: "No committed task changes require integration.",
     });
-    const retained = await operation(manager, reviewed.worktree!, "retain");
+    const retained = await operation(manager, reviewed.worktree!, "retain", {
+      actor: "bounded-retention",
+    });
     expect(retained.worktree).toMatchObject({
       integrationState: "no_changes",
       state: "retained",
       expiresAt: expect.any(String),
+      orphanedAt: expect.any(String),
+      orphanReason: "The owning task is terminal and no session holds it.",
     });
   });
 

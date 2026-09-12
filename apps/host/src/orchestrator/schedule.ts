@@ -300,7 +300,9 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       ) &&
       step.placementId
     ) {
-      writingInFlight.add(executionKey(run, step.placementId));
+      writingInFlight.add(
+        step.executionBinding?.checkoutKey ?? executionKey(run, step.placementId),
+      );
     }
   }
   // Any writing step, settled or not: its changes are still in that tree.
@@ -319,7 +321,15 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     if (effectiveState(step) !== "pending") continue;
     const unmet = step.dependsOn.some((key) => stateByKey.get(key) !== "succeeded");
     if (unmet) continue;
-    const desiredKey = executionKey(run, step.placementId || run.placementId);
+    if (
+      run.workspaceBinding?.effectiveMode === "managed" &&
+      isWritingCategory(step.category) &&
+      !step.executionBinding
+    )
+      continue;
+    const desiredKey =
+      step.executionBinding?.checkoutKey ??
+      executionKey(run, step.placementId || run.placementId);
     if (!heldByHuman && workspaceReady) {
       for (const occupant of input.sessions) {
         if (
@@ -380,7 +390,8 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       }
       if (session.stopRequested || session.dismissed || !node.online) continue;
       const needsLease = requiresCheckoutLease(run, step.category, node);
-      const retryKey = executionKey(run, placementId);
+      const retryKey =
+        step.executionBinding?.checkoutKey ?? executionKey(run, placementId);
       const anotherWriter =
         needsLease &&
         input.sessions.some(
@@ -462,7 +473,9 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       reservedFor(placement.nodeId, startedKind) + 1,
     );
     if (requiresCheckoutLease(run, step.category, nodeById.get(placement.nodeId))) {
-      writingInFlight.add(executionKey(run, placementId));
+      writingInFlight.add(
+        step.executionBinding?.checkoutKey ?? executionKey(run, placementId),
+      );
     }
     settled.set(step.id, "starting");
     started += 1;
@@ -639,7 +652,7 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
           request.node.trim().toLowerCase(),
         ))
     ) {
-      return "All implementation, review, testing and fix-up for this managed task use its one pinned worktree. Open a different task for unrelated work.";
+      return "Managed DAG work stays on the pinned source Node; writable steps receive deterministic per-step or composed worktrees there. Open a different task for unrelated work.";
     }
     const node = nodeById.get(source.nodeId);
     if (!node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY))
@@ -787,6 +800,25 @@ function choosePlacement(
   step: RunStep,
   context: Omit<PlacementRequest, "category" | "workspace">,
 ): string | undefined {
+  if (
+    context.run.workspaceBinding?.effectiveMode === "managed" &&
+    step.executionBinding
+  ) {
+    const source = context.placements.find(
+      (placement) => placement.id === context.run.workspaceBinding!.sourcePlacementId,
+    );
+    const node = source ? context.nodeById.get(source.nodeId) : undefined;
+    if (!source || !usable(node, context.run)) return undefined;
+    const kind: SessionKind = isReadOnlyCategory(step.category) ? "read-only" : "writing";
+    if (remainingCapacity(node!, context.reservedFor(node!.id, kind), kind) < 1)
+      return undefined;
+    if (
+      requiresCheckoutLease(context.run, step.category, node) &&
+      context.writingInFlight.has(step.executionBinding.checkoutKey)
+    )
+      return undefined;
+    return source.id;
+  }
   /*
    * A step that already names a checkout keeps it. The orchestrator tools
    * resolve one up front so they can answer the model with a real path, and

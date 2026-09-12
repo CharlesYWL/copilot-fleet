@@ -113,6 +113,15 @@ the first checkout step. Source HEAD may move, and the source may be dirty:
 `git worktree add -b fleet/<safe-key> <owned-path> <stored-base-sha>` still uses the
 original committed base. The target must start clean.
 
+The original Run worktree remains the primary durable identity used for operator
+integration and compatibility. Writable DAG steps additionally receive durable
+step worktrees. A writable fan-in step receives a distinct derived workspace,
+pinned to the same Run base, whose provenance records predecessor step/worktree
+identities and committed result SHAs in dependency/position order. Dispatch waits
+until those fixed commits merge cleanly. Dirty predecessor output, changed SHAs,
+source advancement, active Git state, or conflicts block the step without reset,
+clean, branch switching, cherry-pick, rebase, or source-checkout fallback.
+
 The safe key is a SHA-256-derived Host-installation/Run/generation key, not a task
 title. Default paths are in a verified sibling `.fleet-worktrees` root with a
 Node-installation/repository namespace and an ownership marker. The Node may use
@@ -228,6 +237,10 @@ managed-byte budget. General settings and the defaults API configure these limit
 Retention sweeps perform at most two operations/minute. Quotas include reservations;
 tracked-byte estimates and bounded filesystem observations are approximate, not
 an OS disk quota. Dirty/unknown work is never evicted to make room.
+Node reconciliation triggers an immediate bounded sweep. A terminal task's valid,
+inactive checkout is first marked as a retained orphan candidate, with durable
+reason and timestamp, rather than deleted. The normal retention window remains
+available for review and crash debugging before safe cleanup is considered.
 
 Normal cleanup requires fresh ownership, registry and containment validation, no
 active readers/writers or unresolved integration, and clean staged/unstaged/
@@ -257,6 +270,7 @@ POST /api/defaults
 POST /api/runs                         # workspaceMode, operationId
 POST /api/orchestrators/:id/runs        # normal task creation
 GET  /api/worktrees/capabilities?workspaceId=...
+GET  /api/worktrees/metrics
 GET  /api/runs/:id/worktree
 POST /api/runs/:id/worktree/:action
 ```
@@ -281,14 +295,45 @@ A successful retry resolves that notification. Creation failure and merge
 conflict/reconciliation notifications use generic browser-safe text;
 ordinary dependency completion remains quiet.
 
+`/api/worktrees/metrics` exposes path-free aggregate task, preparation, queue,
+implementation, integration, validation, cleanup, retry, conflict, reconciliation
+and compatibility measurements. It separates managed and Legacy task duration so
+setup and parallelism changes can be evaluated against wall-clock outcomes rather
+than inferred from worktree counts.
+
+## Repository compatibility and setup performance
+
+Only the selected committed revision is inherited; staged, unstaged and untracked
+source-checkout state is never copied. Cone and non-cone sparse definitions are
+captured at reservation and applied before checkout materialization, preventing a
+sparse source from silently expanding into a full managed checkout. A changed
+repository feature configuration invalidates the reservation and requires a fresh
+retry.
+
+Submodules are initialized recursively with noninteractive Git and setup remains
+blocked if their committed URLs or objects cannot be resolved. Repositories using
+Git LFS require `git-lfs` for the Node service account; missing tooling is reported
+before dispatch. Partial/promisor clones are admitted only after the pinned commit
+is locally verifiable; any later bounded object fetch failure remains an explicit
+setup failure. Feature flags and estimate reliability are durable and visible only
+under `Workspace details`.
+
+Immutable revision scans used for submodule/LFS detection and tracked-byte
+estimation are cached by source path and base SHA for the Node process lifetime.
+Package download caches already supplied through the Node service environment may
+be shared, but Fleet does not share repository-local `node_modules`, build output,
+generated files or bootstrap-mutated directories between worktrees.
+
 ## Limitations / deferred
 
 This is not a sandbox or a guarantee against arbitrary external programs or users
-modifying a checkout. There are no per-agent worktrees and no intra-task
-multi-writer execution. Node loss never proves cleanliness or process exit.
-V1 rejects bare/unborn repositories, submodules, active sparse/worktree-specific
-configuration and partial/promisor clones. Repositories with LFS attributes are
-rejected; a globally installed but unused LFS filter is harmless.
+modifying a checkout. Writable DAG steps receive durable per-step worktrees, and
+multi-predecessor dependents receive a deterministic derived workspace that merges
+the recorded predecessor commits in dependency/position order. Read-only steps keep
+their existing behavior. Node loss never proves cleanliness or process exit.
+Bare/unborn repositories remain unsupported. Submodule and partial-clone setup can
+still require network access configured outside Fleet, and LFS object size is not
+included in the approximate preflight byte estimate.
 
 Deferred: automatic push/PR, rebase, cherry-pick, automatic conflict resolution,
 cross-Node migration, clone lifecycle, user-worktree adoption, signing automation,

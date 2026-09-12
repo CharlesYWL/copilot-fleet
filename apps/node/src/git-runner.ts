@@ -22,6 +22,7 @@ export type GitRunOptions = {
   timeoutMs?: number;
   maxBytes?: number;
   lease?: CheckoutLease;
+  stdin?: string;
 };
 
 export class GitRunner {
@@ -48,8 +49,9 @@ export class GitRunner {
       env,
       shell: false,
       windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe"],
     });
+    child.stdin.end(options.stdin ?? "");
     if (child.pid) options.lease?.processStarted(child.pid);
     return new Promise<GitResult>((resolve, reject) => {
       const stdout: Buffer[] = [];

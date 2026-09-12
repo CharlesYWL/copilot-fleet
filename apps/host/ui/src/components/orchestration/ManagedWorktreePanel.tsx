@@ -368,12 +368,26 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
               {observation?.ahead ?? "Unknown"} / {observation?.behind ?? "Unknown"}{" "}
               relative to pinned base
             </dd>
+            <dt>Repository features</dt>
+            <dd>
+              {[
+                tree.repositoryFeatures.sparseCheckout && "sparse checkout inherited",
+                tree.repositoryFeatures.submodules && "submodules initialized",
+                tree.repositoryFeatures.gitLfs && "Git LFS enabled",
+                tree.repositoryFeatures.partialClone && "partial clone",
+              ]
+                .filter(Boolean)
+                .join("; ") || "Standard checkout"}
+            </dd>
             <dt>Observed</dt>
             <dd>
               {observation?.observedAt ?? "Never"} (not a current cleanliness guarantee)
             </dd>
             <dt>Retention</dt>
             <dd>
+              {tree.orphanedAt
+                ? `Retained orphan candidate since ${tree.orphanedAt}. ${tree.orphanReason} `
+                : ""}
               {tree.expiresAt
                 ? `Eligible after ${tree.expiresAt}, only if still clean, integrated and inactive.`
                 : "Retained until explicit safe cleanup; no dirty eviction."}

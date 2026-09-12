@@ -1392,6 +1392,23 @@ export type Run = z.infer<typeof RunSchema>;
 
 export const RunStepSchema = z.object({
   executionBinding: ExecutionBindingSchema.optional(),
+  managedWorktreeId: z.string().optional(),
+  workspaceState: z
+    .enum([
+      "not_required",
+      "pending",
+      "reserved",
+      "creating",
+      "composing",
+      "ready",
+      "finalizing",
+      "completed",
+      "blocked",
+      "quarantined",
+    ])
+    .optional(),
+  workspaceError: z.string().optional(),
+  resultSha: z.string().optional(),
   id: z.string().min(1),
   runId: z.string().min(1),
   /**
@@ -2449,6 +2466,7 @@ const hostBackupDataShape = {
    */
   runs: z.array(RunSchema).default([]),
   managedWorktrees: z.array(ManagedWorktreeSchema).default([]).optional(),
+  derivedWorkspaces: z.array(ManagedWorktreeSchema).default([]).optional(),
   worktreeOperations: z.array(WorktreeOperationSchema).default([]).optional(),
   worktreeIntegrations: z.array(WorktreeIntegrationSchema).default([]).optional(),
   worktreeTombstones: z.array(WorktreeTombstoneSchema).default([]).optional(),

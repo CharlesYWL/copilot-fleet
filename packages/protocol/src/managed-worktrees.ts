@@ -112,6 +112,44 @@ export const ManagedWorktreePolicySchema = z.object({
 });
 export type ManagedWorktreePolicy = z.infer<typeof ManagedWorktreePolicySchema>;
 
+export const RepositoryFeaturesSchema = z.object({
+  sparseCheckout: z.boolean().default(false),
+  sparseCone: z.boolean().default(false),
+  sparsePaths: z.array(z.string()).max(10_000).default([]),
+  submodules: z.boolean().default(false),
+  gitLfs: z.boolean().default(false),
+  partialClone: z.boolean().default(false),
+  estimatedBytesReliable: z.boolean().default(true),
+});
+export type RepositoryFeatures = z.infer<typeof RepositoryFeaturesSchema>;
+
+export const ManagedWorkspaceKindSchema = z.enum(["primary", "step", "derived"]);
+export type ManagedWorkspaceKind = z.infer<typeof ManagedWorkspaceKindSchema>;
+
+export const CompositionPredecessorSchema = z.object({
+  stepId: identity,
+  stepKey: identity,
+  position: z.number().int().nonnegative(),
+  worktreeId: identity,
+  resultSha: GitShaSchema,
+});
+export type CompositionPredecessor = z.infer<typeof CompositionPredecessorSchema>;
+
+export const WorktreeCompositionSchema = z.object({
+  baseSha: GitShaSchema,
+  baseRef: z.string().default(""),
+  predecessors: z.array(CompositionPredecessorSchema).default([]),
+  state: z
+    .enum(["not_required", "pending", "composing", "ready", "conflicted", "blocked"])
+    .default("not_required"),
+  resultSha: z.union([GitShaSchema, z.literal("")]).default(""),
+  conflicts: z.array(z.string()).default([]),
+  error: z.string().default(""),
+  startedAt: z.string().default(""),
+  completedAt: z.string().default(""),
+});
+export type WorktreeComposition = z.infer<typeof WorktreeCompositionSchema>;
+
 export const WorktreeLifecycleSchema = z.enum([
   "reserved",
   "creating",
@@ -184,6 +222,14 @@ export const ManagedWorktreeSchema = z.object({
   pinRef: z.string().regex(/^refs\/fleet\/pins\/[a-z0-9-]+$/),
   baseSha: GitShaSchema,
   baseRef: z.string().default(""),
+  workspaceKind: ManagedWorkspaceKindSchema.default("primary"),
+  ownerStepId: z.string().default(""),
+  resultSha: z.union([GitShaSchema, z.literal("")]).default(""),
+  resultRecordedAt: z.string().default(""),
+  composition: WorktreeCompositionSchema.optional(),
+  repositoryFeatures: RepositoryFeaturesSchema.default(() =>
+    RepositoryFeaturesSchema.parse({}),
+  ),
   state: WorktreeLifecycleSchema,
   integrationState: IntegrationStateSchema.default("not_requested"),
   integrationStrategy: z.literal("merge").default("merge"),
@@ -192,6 +238,8 @@ export const ManagedWorktreeSchema = z.object({
   updatedAt: z.string().datetime(),
   retainedAt: z.string().default(""),
   expiresAt: z.string().default(""),
+  orphanedAt: z.string().default(""),
+  orphanReason: z.string().default(""),
   removedAt: z.string().default(""),
   abandonedAt: z.string().default(""),
   error: z.string().default(""),
@@ -235,6 +283,7 @@ export const WorktreeIntegrationSchema = z.object({
   conflicts: z.array(z.string()).default([]),
   validationState: z.enum(["not_run", "running", "passed", "failed"]).default("not_run"),
   validationSummary: z.string().default(""),
+  validationStartedAt: z.string().default(""),
   validatedAt: z.string().default(""),
   error: z.string().default(""),
   createdAt: z.string().datetime(),
@@ -249,6 +298,8 @@ export const WorktreeOperationKindSchema = z.enum([
   "reconcile",
   "retain",
   "quiesce",
+  "compose",
+  "finalize",
   "integration_preview",
   "integrate",
   "continue",
@@ -283,6 +334,9 @@ export const WorktreeOperationRequestSchema = z.object({
   integrationId: z.string().optional(),
   reviewedTaskSha: GitShaSchema.optional(),
   reviewedDiffIdentity: z.string().optional(),
+  workspaceKind: ManagedWorkspaceKindSchema.default("primary"),
+  ownerStepId: z.string().default(""),
+  composition: WorktreeCompositionSchema.optional(),
   confirm: z.string().optional(),
   commit: z.boolean().default(false),
   deleteBranch: z.boolean().default(false),
