@@ -4580,7 +4580,7 @@ export class FleetStore {
   }
 
   setRunState(id: string, state: RunState, failureReason = ""): Run | undefined {
-    return this.updateRun(id, { state, ...(failureReason ? { failureReason } : {}) });
+    return this.updateRun(id, { state, failureReason });
   }
 
   /**

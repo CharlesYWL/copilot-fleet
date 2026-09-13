@@ -1837,6 +1837,19 @@ describe("FleetStore runs", () => {
     expect(second?.reviewSeq).toBe(2);
   });
 
+  it("clears a stale failure reason when a run resumes successfully", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    store.setRunState(run.id, "blocked", "Temporary integration failure");
+
+    store.setRunState(run.id, "running");
+
+    expect(store.getRun(run.id)).toMatchObject({
+      state: "running",
+      failureReason: "",
+    });
+  });
+
   it("rolls back review state and notes when its notification cannot be written", () => {
     const { store, workspace } = setup();
     const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
