@@ -1935,6 +1935,50 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect((await operation(manager, tree, "cleanup")).ok).toBe(true);
   });
 
+  it("allows unrelated ignored target output but blocks ignored paths the merge would overwrite", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    await writeFile(join(source, "ignored.txt"), "local generated output\n");
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    expect(preview.targetDirty).toBe(false);
+    const integrated = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+      commit: true,
+    });
+    expect(integrated.integration?.state).toBe("integrated");
+    await expect(readFile(join(source, "ignored.txt"), "utf8")).resolves.toBe(
+      "local generated output\n",
+    );
+
+    const collisionFixture = await fixture();
+    const collision = await allocate(collisionFixture.manager, collisionFixture.source);
+    await writeFile(
+      join(collisionFixture.source, "ignored.txt"),
+      "local generated output\n",
+    );
+    await writeFile(join(collision.path, "ignored.txt"), "tracked task output\n");
+    await git.run(collision.path, ["add", "-f", "ignored.txt"]);
+    await git.run(collision.path, ["commit", "-m", "track ignored path"]);
+    const blocked = (
+      await operation(collisionFixture.manager, collision, "integration_preview", {
+        targetPath: collisionFixture.source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    expect(blocked.targetDirty).toBe(true);
+  });
+
   it("records a reviewed no-changes result without claiming the base was already integrated", async () => {
     const { manager, source } = await fixture();
     const tree = await allocate(manager, source);

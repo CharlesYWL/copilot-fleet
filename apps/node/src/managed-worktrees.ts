@@ -1699,7 +1699,10 @@ export class ManagedWorktrees {
   private async status(
     path: string,
   ): Promise<
-    Pick<WorktreeObservation, "staged" | "unstaged" | "untracked" | "ignored" | "dirty">
+    Pick<
+      WorktreeObservation,
+      "staged" | "unstaged" | "untracked" | "ignored" | "dirty"
+    > & { ignoredPaths: string[] }
   > {
     const text = (
       await this.git.run(path, [
@@ -1714,14 +1717,17 @@ export class ManagedWorktrees {
       unstaged = false,
       untracked = false,
       ignored = false;
+    const ignoredPaths: string[] = [];
     const fields = text.split("\0");
     for (let index = 0; index < fields.length; index += 1) {
       const field = fields[index]!;
       if (!field) continue;
       const xy = field.slice(0, 2);
       if (xy === "??") untracked = true;
-      else if (xy === "!!") ignored = true;
-      else {
+      else if (xy === "!!") {
+        ignored = true;
+        ignoredPaths.push(field.slice(3));
+      } else {
         staged ||= xy[0] !== " ";
         unstaged ||= xy[1] !== " ";
         if (/[RC]/.test(xy)) index += 1;
@@ -1733,7 +1739,43 @@ export class ManagedWorktrees {
       untracked,
       ignored,
       dirty: staged || unstaged || untracked || ignored,
+      ignoredPaths,
     };
+  }
+
+  private async integrationTargetDirty(
+    tree: ManagedWorktree,
+    targetPath: string,
+    taskSha: string,
+  ): Promise<boolean> {
+    const status = await this.status(targetPath);
+    if (status.staged || status.unstaged || status.untracked) return true;
+    if (!status.ignored) return false;
+    const changedPaths = (
+      await this.git.run(tree.path, [
+        "diff",
+        "--name-only",
+        "-z",
+        tree.baseSha,
+        taskSha,
+        "--",
+      ])
+    ).stdout
+      .split("\0")
+      .filter(Boolean);
+    const comparable = (path: string) =>
+      (process.platform === "win32" ? path.toLowerCase() : path).replace(/\/+$/, "");
+    return status.ignoredPaths.some((ignoredPath) => {
+      const ignored = comparable(ignoredPath);
+      return changedPaths.some((changedPath) => {
+        const changed = comparable(changedPath);
+        return (
+          changed === ignored ||
+          changed.startsWith(`${ignored}/`) ||
+          ignored.startsWith(`${changed}/`)
+        );
+      });
+    });
   }
 
   private async observe(tree: ManagedWorktree): Promise<WorktreeObservation> {
@@ -1773,6 +1815,16 @@ export class ManagedWorktrees {
       throw new WorktreeConflict(
         "dirty_or_unknown",
         "Staged, unstaged, untracked, ignored or unknown data prevents this operation. No files were deleted.",
+      );
+  }
+
+  private requireCleanTarget(
+    status: Pick<WorktreeObservation, "staged" | "unstaged" | "untracked">,
+  ): void {
+    if (status.staged || status.unstaged || status.untracked)
+      throw new WorktreeConflict(
+        "dirty_or_unknown",
+        "Staged, unstaged, untracked or unknown target data prevents this operation. No files were deleted.",
       );
   }
 
@@ -1951,7 +2003,7 @@ export class ManagedWorktrees {
         ["integrating", "aborting", "aborted"].includes(pending.state)
       ) {
         await this.noGitOperation(pending.preview.target.path);
-        this.requireClean(await this.status(pending.preview.target.path));
+        this.requireCleanTarget(await this.status(pending.preview.target.path));
         pending.state = "aborted";
         pending.conflicts = [];
         pending.error = "";
@@ -1961,7 +2013,7 @@ export class ManagedWorktrees {
         (await this.matchesMergeCommit(pending, head))
       ) {
         await this.noGitOperation(pending.preview.target.path);
-        this.requireClean(await this.status(pending.preview.target.path));
+        this.requireCleanTarget(await this.status(pending.preview.target.path));
         pending.state = "integrated";
         pending.resultSha = head;
         pending.conflicts = [];
@@ -2191,7 +2243,7 @@ export class ManagedWorktrees {
       targetSha,
       targetRef,
       taskDirty: (await this.status(tree.path)).dirty,
-      targetDirty: (await this.status(target.path)).dirty,
+      targetDirty: await this.integrationTargetDirty(tree, target.path, taskSha),
       hasCommittedChanges,
       baseContainedByTarget,
       targetAdvancedFromBase: baseContainedByTarget && targetSha !== tree.baseSha,
@@ -2289,7 +2341,7 @@ export class ManagedWorktrees {
         if (fresh.taskDirty || fresh.targetDirty)
           throw new WorktreeConflict(
             "dirty_or_unknown",
-            "Both task and target must be clean, including untracked and ignored data.",
+            "The task must be clean, and the target must have no staged, unstaged, untracked, or incoming-path-conflicting ignored data.",
           );
         const integration = WorktreeIntegrationSchema.parse({
           id: request.operationId,
@@ -2390,7 +2442,7 @@ export class ManagedWorktrees {
           "abort_uncertain",
           "Abort did not restore the recorded target; reconciliation is required.",
         );
-      this.requireClean(await this.status(target.path));
+      this.requireCleanTarget(await this.status(target.path));
       integration.state = "aborted";
       integration.conflicts = [];
       integration.updatedAt = now();
@@ -2467,10 +2519,10 @@ export class ManagedWorktrees {
       throw new WorktreeConflict("stale_review", "The approved task HEAD changed.");
     this.requireClean(await this.status(tree.path));
     const status = await this.status(integration.preview.target.path);
-    if (status.untracked || status.ignored || status.unstaged)
+    if (status.untracked || status.unstaged)
       throw new WorktreeConflict(
         "resolution_unstaged",
-        "Stage resolved files and remove no data automatically; untracked, ignored or unstaged changes block commit.",
+        "Stage resolved files and remove no data automatically; untracked or unstaged changes block commit.",
       );
     if (
       !(await this.noninteractivePolicy(
@@ -2512,7 +2564,7 @@ export class ManagedWorktrees {
     tree.integrationState = "validating";
     this.save(tree);
     try {
-      this.requireClean(await this.status(integration.preview.target.path));
+      this.requireCleanTarget(await this.status(integration.preview.target.path));
       if (!(await this.matchesMergeCommit(integration, integration.resultSha)))
         throw new WorktreeConflict(
           "commit_uncertain",
