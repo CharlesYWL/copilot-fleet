@@ -573,7 +573,9 @@ export class ManagedWorktreeService {
       return true;
     if (step.resultSha) return true;
     const tree = this.store.derivedWorkspaceForStep(run.id, step.id);
-    if (!tree || this.pendingWorkspace(tree.id)) return false;
+    if (!tree) return false;
+    const pending = this.pendingWorkspace(tree.id);
+    if (pending && pending.request.kind !== "finalize") return false;
     this.store.updateRunStep(step.id, { workspaceState: "finalizing" });
     const fail = (error: unknown) => {
       const message =
@@ -594,16 +596,22 @@ export class ManagedWorktreeService {
       });
       this.publish(run.id);
     };
-    void this.requestWorkspace(run.id, tree.id, tree.generation, {
-      kind: "finalize",
-      actor: "dag-scheduler",
-      operationId: this.deterministicUuid(`${tree.id}:finalize:${tree.version}`),
-      workspaceKind: tree.workspaceKind,
-      ownerStepId: step.id,
-      expectedVersion: tree.version,
-      ...(tree.composition ? { composition: tree.composition } : {}),
-    })
+    void this.requestWorkspace(
+      run.id,
+      tree.id,
+      tree.generation,
+      pending?.request ?? {
+        kind: "finalize",
+        actor: "dag-scheduler",
+        operationId: this.deterministicUuid(`${tree.id}:finalize:${tree.version}`),
+        workspaceKind: tree.workspaceKind,
+        ownerStepId: step.id,
+        expectedVersion: tree.version,
+        ...(tree.composition ? { composition: tree.composition } : {}),
+      },
+    )
       .then((operation) => {
+        if (!operation.result) return;
         if (operation.result && !operation.result.ok) {
           fail(operation.result.error || "Could not record a clean commit.");
           return;
