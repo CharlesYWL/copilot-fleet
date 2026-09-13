@@ -41,7 +41,12 @@ export const STAGE_LABELS: Record<OrchestrationStage, string> = {
  * happened, an offline node may yet come back on its own.
  */
 export type RunAttention =
-  "permission" | "workspace-setup" | "failed-step" | "offline-node" | undefined;
+  | "permission"
+  | "workspace-setup"
+  | "integration"
+  | "failed-step"
+  | "offline-node"
+  | undefined;
 
 export type RunViewModel = {
   run: Run;
@@ -151,13 +156,16 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
         ? undefined
         : run.state === "blocked" && run.workspaceBinding?.setupState === "failed"
           ? "workspace-setup"
-          : blocked || run.state === "awaiting_human"
-            ? "permission"
-            : failed
-              ? "failed-step"
-              : offline
-                ? "offline-node"
-                : undefined;
+          : run.state === "blocked" &&
+              run.workspaceBinding?.aggregationState === "attention"
+            ? "integration"
+            : blocked || run.state === "awaiting_human"
+              ? "permission"
+              : failed
+                ? "failed-step"
+                : offline
+                  ? "offline-node"
+                  : undefined;
 
       return {
         run,
@@ -194,7 +202,10 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
  */
 export function stageOf(run: Run, steps: readonly RunStep[]): OrchestrationStage {
   if (terminalRunStates.has(run.state)) return "delivery";
-  if (run.state === "blocked") return "planning";
+  if (run.state === "blocked")
+    return run.workspaceBinding?.aggregationState === "attention"
+      ? "validation"
+      : "planning";
   if (run.state === "awaiting_human") return "validation";
   if (steps.some(isLive)) return "implementation";
   if (run.state === "awaiting_approval" || run.state === "planning") return "planning";
@@ -218,6 +229,7 @@ export function isOrchestratorStoppedRun(run: Run): boolean {
 function priorityOf(attention: RunAttention, live: number, run: Run): number {
   if (attention === "permission") return 100;
   if (attention === "workspace-setup") return 90;
+  if (attention === "integration") return 85;
   if (attention === "failed-step") return 80;
   if (attention === "offline-node") return 70;
   if (live > 0) return 50;
@@ -282,7 +294,10 @@ export function runStateLabel(run: Run): string {
     case "awaiting_human":
       return "Needs you";
     case "blocked":
-      return "Setup failed";
+      if (run.workspaceBinding?.setupState === "failed") return "Setup failed";
+      if (run.workspaceBinding?.aggregationState === "attention")
+        return "Integration needs attention";
+      return "Blocked";
     case "awaiting_lead":
       return "Deciding";
     case "awaiting_approval":
