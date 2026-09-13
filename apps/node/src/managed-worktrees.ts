@@ -2226,6 +2226,7 @@ export class ManagedWorktrees {
       tree.baseSha,
       targetSha,
     );
+    const taskStatus = await this.status(tree.path);
     return IntegrationPreviewSchema.parse({
       id: request.operationId,
       worktreeId: tree.id,
@@ -2237,7 +2238,7 @@ export class ManagedWorktrees {
       target,
       targetSha,
       targetRef,
-      taskDirty: (await this.status(tree.path)).dirty,
+      taskDirty: taskStatus.staged || taskStatus.unstaged || taskStatus.untracked,
       targetDirty: await this.integrationTargetDirty(tree, target.path, taskSha),
       hasCommittedChanges,
       baseContainedByTarget,
@@ -2512,7 +2513,7 @@ export class ManagedWorktrees {
     await this.verifyMerge(integration);
     if ((await this.ref(tree.path, "HEAD")) !== integration.approvedTaskSha)
       throw new WorktreeConflict("stale_review", "The approved task HEAD changed.");
-    this.requireClean(await this.status(tree.path));
+    this.requireTrackedClean(await this.status(tree.path));
     const status = await this.status(integration.preview.target.path);
     if (status.untracked || status.unstaged)
       throw new WorktreeConflict(

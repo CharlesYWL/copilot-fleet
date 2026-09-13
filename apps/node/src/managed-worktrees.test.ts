@@ -1961,6 +1961,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     const tree = await allocate(manager, source);
     await writeFile(join(source, "ignored.txt"), "local generated output\n");
     await writeFile(join(tree.path, "task.txt"), "task\n");
+    await writeFile(join(tree.path, "ignored.txt"), "task generated output\n");
     await git.run(tree.path, ["add", "task.txt"]);
     await git.run(tree.path, ["commit", "-m", "task"]);
     const preview = (
@@ -1969,6 +1970,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         targetPlacementId: "target-placement",
       })
     ).preview!;
+    expect(preview.taskDirty).toBe(false);
     expect(preview.targetDirty).toBe(false);
     const integrated = await operation(manager, tree, "integrate", {
       previewId: preview.id,
@@ -1977,9 +1979,13 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
       commit: true,
     });
+    expect(integrated.error).toBe("");
     expect(integrated.integration?.state).toBe("integrated");
     await expect(readFile(join(source, "ignored.txt"), "utf8")).resolves.toBe(
       "local generated output\n",
+    );
+    await expect(readFile(join(tree.path, "ignored.txt"), "utf8")).resolves.toBe(
+      "task generated output\n",
     );
 
     const collisionFixture = await fixture();
