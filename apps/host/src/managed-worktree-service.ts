@@ -429,7 +429,7 @@ export class ManagedWorktreeService {
     ) => {
       if (pending) return;
       const operationId = this.deterministicUuid(
-        `${worktreeId}:${kind}:${expected?.version ?? 0}`,
+        `${worktreeId}:${kind}:${expected?.version ?? 0}:${step.attempts}`,
       );
       void this.requestWorkspace(run.id, worktreeId, 1, {
         kind,
@@ -603,7 +603,9 @@ export class ManagedWorktreeService {
       pending?.request ?? {
         kind: "finalize",
         actor: "dag-scheduler",
-        operationId: this.deterministicUuid(`${tree.id}:finalize:${tree.version}`),
+        operationId: this.deterministicUuid(
+          `${tree.id}:finalize:${tree.version}:${step.attempts}`,
+        ),
         workspaceKind: tree.workspaceKind,
         ownerStepId: step.id,
         expectedVersion: tree.version,
