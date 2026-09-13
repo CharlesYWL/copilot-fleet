@@ -1296,10 +1296,13 @@ export class ManagedWorktrees {
     for (const predecessor of tree.composition.predecessors) {
       const sourceTree = this.get(predecessor.worktreeId);
       if (sourceTree && sourceTree.nodeId === tree.nodeId) {
+        const primarySource =
+          sourceTree.workspaceKind === "primary" && !sourceTree.ownerStepId;
         if (
           sourceTree.runId !== tree.runId ||
-          sourceTree.ownerStepId !== predecessor.stepId ||
-          sourceTree.resultSha !== predecessor.resultSha
+          (!primarySource &&
+            (sourceTree.ownerStepId !== predecessor.stepId ||
+              sourceTree.resultSha !== predecessor.resultSha))
         )
           throw new WorktreeConflict(
             "predecessor_changed",

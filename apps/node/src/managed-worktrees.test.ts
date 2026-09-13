@@ -705,6 +705,70 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     });
   });
 
+  it("composes a clean primary checkout advanced by a read-only predecessor", async () => {
+    const { source, manager } = await fixture();
+    const runId = "read-only-predecessor-run";
+    const primaryReserve = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source, runId),
+        operationId: randomUUID(),
+        worktreeId: "worktree-primary",
+      }),
+    );
+    const primary = await operation(manager, primaryReserve.worktree!, "create");
+    await writeFile(join(primary.worktree!.path, "latest.txt"), "latest\n");
+    await git.run(primary.worktree!.path, ["add", "latest.txt"]);
+    await git.run(primary.worktree!.path, ["commit", "-m", "advance primary"]);
+    const advancedHead = (
+      await git.run(primary.worktree!.path, ["rev-parse", "--verify", "HEAD"])
+    ).stdout.trim();
+    const composition = {
+      baseSha: primary.worktree!.baseSha,
+      baseRef: primary.worktree!.baseRef,
+      predecessors: [
+        {
+          stepId: "investigate",
+          stepKey: "investigate",
+          position: 0,
+          worktreeId: primary.worktree!.id,
+          resultSha: advancedHead,
+        },
+      ],
+      state: "pending" as const,
+      resultSha: "",
+      conflicts: [],
+      error: "",
+      startedAt: "",
+      completedAt: "",
+    };
+    const derivedReserve = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source, runId),
+        operationId: randomUUID(),
+        worktreeId: "worktree-derived-from-primary",
+        expectedBaseSha: primary.worktree!.baseSha,
+        workspaceKind: "derived",
+        ownerStepId: "implement",
+        composition,
+      }),
+    );
+    const derived = await operation(manager, derivedReserve.worktree!, "create", {
+      workspaceKind: "derived",
+      ownerStepId: "implement",
+      composition,
+    });
+    const composed = await operation(manager, derived.worktree!, "compose", {
+      workspaceKind: "derived",
+      ownerStepId: "implement",
+      composition,
+    });
+
+    expect(composed.ok).toBe(true);
+    await expect(
+      readFile(join(composed.worktree!.path, "latest.txt"), "utf8"),
+    ).resolves.toBe("latest\n");
+  });
+
   it("inherits cone-mode sparse checkout without materializing excluded paths", async () => {
     const { source, manager } = await fixture();
     await mkdir(join(source, "included"));

@@ -1068,6 +1068,73 @@ describe("Host managed workspace orchestration", () => {
     });
   });
 
+  it("composes a writer from a read-only predecessor that advanced the primary checkout", async () => {
+    const { create, frames, node, service, store } = fixture();
+    const run = create();
+    const preparing = service.worktrees.prepare(run.id);
+    service.worktrees.handleResult(node.id, acknowledgement(lastRequest(frames)));
+    await preparing;
+    const creating = service.worktrees.request(run.id, {
+      kind: "create",
+      actor: "test",
+    });
+    service.worktrees.handleResult(node.id, acknowledgement(lastRequest(frames)));
+    await creating;
+    const primary = store.worktreeForRun(run.id)!;
+    const advancedHead = "b".repeat(40);
+    store.putManagedWorktree(
+      ManagedWorktreeSchema.parse({
+        ...primary,
+        observation: {
+          ...primary.observation,
+          generation: primary.generation,
+          observedAt: new Date().toISOString(),
+          head: advancedHead,
+          dirty: false,
+        },
+      }),
+    );
+    const investigate = store.upsertRunStep(run.id, {
+      stepKey: "investigate",
+      title: "investigate",
+      prompt: "inspect network-latest main",
+      category: "explore",
+      position: 0,
+    });
+    store.updateRunStep(investigate.id, { state: "starting" });
+    store.updateRunStep(investigate.id, { state: "running" });
+    store.updateRunStep(investigate.id, { state: "succeeded" });
+    const implement = store.upsertRunStep(run.id, {
+      stepKey: "implement",
+      title: "implement",
+      prompt: "implement from the inspected revision",
+      category: "implement",
+      dependsOn: ["investigate"],
+      position: 1,
+    });
+    frames.splice(0);
+
+    expect(
+      service.worktrees.ensureStepReady(store.getRun(run.id)!, implement),
+    ).toBeUndefined();
+    await expect.poll(() => frames.length).toBeGreaterThan(0);
+    expect(lastRequest(frames)).toMatchObject({
+      kind: "reserve",
+      workspaceKind: "derived",
+      ownerStepId: implement.id,
+      composition: {
+        baseSha: primary.baseSha,
+        predecessors: [
+          {
+            stepId: investigate.id,
+            worktreeId: primary.id,
+            resultSha: advancedHead,
+          },
+        ],
+      },
+    });
+  });
+
   it("allocates independent writable steps across verified matching Nodes", async () => {
     const kit = fixture();
     const run = await readyManaged(kit, false);

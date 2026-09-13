@@ -295,7 +295,48 @@ export class ManagedWorktreeService {
     const predecessors = [...collected.values()].sort(
       (a, b) => a.position - b.position || a.id.localeCompare(b.id),
     );
-    if (predecessors.length === 0) return undefined;
+    if (predecessors.length === 0) {
+      const directReadOnlyPredecessors = step.dependsOn
+        .map((key) => byKey.get(key))
+        .filter((entry): entry is RunStep =>
+          Boolean(
+            entry && entry.state === "succeeded" && !isWritingCategory(entry.category),
+          ),
+        )
+        .sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
+      const primary = this.store.worktreeForRun(run.id);
+      const observedHead = primary?.observation?.head;
+      if (
+        directReadOnlyPredecessors.length > 0 &&
+        directReadOnlyPredecessors.length === step.dependsOn.length &&
+        primary &&
+        observedHead &&
+        observedHead !== run.workspaceBinding!.baseSha &&
+        primary.observation?.dirty === false
+      ) {
+        const predecessor = directReadOnlyPredecessors.at(-1)!;
+        return {
+          baseSha: run.workspaceBinding!.baseSha,
+          baseRef: run.workspaceBinding!.baseRef,
+          predecessors: [
+            {
+              stepId: predecessor.id,
+              stepKey: predecessor.stepKey,
+              position: predecessor.position,
+              worktreeId: primary.id,
+              resultSha: observedHead,
+            },
+          ],
+          state: "pending",
+          resultSha: "",
+          conflicts: [],
+          error: "",
+          startedAt: "",
+          completedAt: "",
+        };
+      }
+      return undefined;
+    }
     const results = new Map(
       predecessors.map((entry) => [
         entry.id,
