@@ -256,7 +256,7 @@ describe("managed checkout scheduling", () => {
     expect(types(input)).toContain("start_step");
   });
 
-  it("retains its own session/binding for follow-up and refuses unavailable or old-Node workspaces", () => {
+  it("retains a ready derived workspace for follow-up when the primary workspace is blocked", () => {
     const input = world({
       run: managed(),
       nodes: [capable()],
@@ -265,13 +265,24 @@ describe("managed checkout scheduling", () => {
           sessionId: "same-session",
           placementId: "p1",
           attempts: 2,
+          workspaceState: "ready",
           executionBinding: binding(),
         }),
       ],
       sessions: [session("same-session", { state: "idle", executionBinding: binding() })],
     });
     expect(types(input)).toContain("prompt_step");
-    expect(types({ ...input, workspaceReady: false })).not.toContain("prompt_step");
+    expect(types({ ...input, workspaceReady: false })).toContain("prompt_step");
+    expect(
+      types({
+        ...input,
+        workspaceReady: false,
+        steps: input.steps.map((candidate) => ({
+          ...candidate,
+          workspaceState: "blocked",
+        })),
+      }),
+    ).not.toContain("prompt_step");
     expect(
       types(
         world({

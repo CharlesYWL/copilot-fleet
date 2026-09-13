@@ -316,13 +316,17 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     input.workspaceReady ??
     (run.workspaceBinding?.effectiveMode !== "managed" ||
       run.workspaceBinding.initialization === "ready");
-  const parallelBudget =
-    heldByHuman || !workspaceReady
-      ? 0
-      : run.policy.maxParallel - inFlight.length - activeRetries.length;
+  const parallelBudget = heldByHuman
+    ? 0
+    : run.policy.maxParallel - inFlight.length - activeRetries.length;
 
   for (const step of steps) {
     if (effectiveState(step) !== "pending") continue;
+    const retryWorkspaceReady =
+      Boolean(step.sessionId) &&
+      step.workspaceState === "ready" &&
+      Boolean(step.executionBinding);
+    if (!workspaceReady && !retryWorkspaceReady) continue;
     const unmet = step.dependsOn.some((key) => stateByKey.get(key) !== "succeeded");
     if (unmet) continue;
     if (
