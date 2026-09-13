@@ -6,6 +6,7 @@ import {
   WorktreeOperationRequestSchema,
   canTransitionRun,
   isWritingCategory,
+  terminalRunStepStates,
   terminalSessionStates,
   terminalRunStates,
   type ExecutionBinding,
@@ -722,8 +723,21 @@ export class ManagedWorktreeService {
   }
 
   private aggregationWorkspaces(runId: string): ManagedWorktree[] {
+    const steps = new Map(this.store.listRunSteps(runId).map((step) => [step.id, step]));
+    const sessions = this.store.listSessions();
     return [...this.store.listManagedWorktrees(), ...this.store.listDerivedWorkspaces()]
       .filter((tree) => tree.runId === runId)
+      .filter((tree) => {
+        if (tree.workspaceKind === "primary" || !tree.ownerStepId) return true;
+        const step = steps.get(tree.ownerStepId);
+        if (!step || !terminalRunStepStates.has(step.state) || step.state === "succeeded")
+          return true;
+        return sessions.some(
+          (session) =>
+            session.executionBinding?.worktreeId === tree.id &&
+            (!terminalSessionStates.has(session.state) || session.stopRequested),
+        );
+      })
       .sort(
         (a, b) =>
           Number(a.workspaceKind !== "primary") - Number(b.workspaceKind !== "primary") ||
