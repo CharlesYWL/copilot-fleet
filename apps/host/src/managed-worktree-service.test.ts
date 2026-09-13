@@ -909,6 +909,75 @@ describe("Host managed workspace orchestration", () => {
     ).toEqual(["quiesce", "integration_preview", "integrate", "retain", "cleanup"]);
   });
 
+  it("completes integration while retaining ignored-only generated output", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit);
+    let seen = kit.frames.length;
+    kit.service.worktrees.advanceAggregation(run.id);
+
+    for (const kind of [
+      "quiesce",
+      "integration_preview",
+      "integrate",
+      "retain",
+      "cleanup",
+    ] as const) {
+      await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+      const request = lastRequest(kit.frames);
+      expect(request.kind).toBe(kind);
+      seen = kit.frames.length;
+      if (kind !== "cleanup") {
+        kit.service.worktrees.handleResult(
+          kit.node.id,
+          operationResult(kit.store, request),
+        );
+        continue;
+      }
+      const current = kit.store.getAnyManagedWorkspace(request.worktreeId)!;
+      kit.service.worktrees.handleResult(
+        kit.node.id,
+        WorktreeOperationResultSchema.parse({
+          operationId: request.operationId,
+          worktreeId: request.worktreeId,
+          generation: request.generation,
+          nodeId: request.nodeId,
+          hostInstallationId: request.hostInstallationId,
+          ok: false,
+          retryable: false,
+          code: "dirty_or_unknown",
+          error:
+            "Staged, unstaged, untracked, ignored or unknown data prevents this operation. No files were deleted.",
+          worktree: {
+            ...current,
+            version: request.expectedVersion + 1,
+            state: "retained",
+            observation: WorktreeObservationSchema.parse({
+              generation: current.generation,
+              observedAt: new Date().toISOString(),
+              head: current.resultSha || current.baseSha,
+              staged: false,
+              unstaged: false,
+              untracked: false,
+              ignored: true,
+              dirty: true,
+            }),
+          },
+          acknowledgedAt: new Date().toISOString(),
+        }),
+      );
+    }
+
+    await expect.poll(() => kit.store.getRun(run.id)?.state).toBe("completed");
+    expect(kit.store.getRun(run.id)?.workspaceBinding).toMatchObject({
+      aggregationState: "completed",
+      aggregationPhase: "done",
+      aggregationSummary: expect.stringContaining(
+        "1 workspace retained because ignored generated output was present.",
+      ),
+    });
+    expect(kit.store.worktreeForRun(run.id)?.state).toBe("retained");
+  });
+
   it("cleans a verified unchanged run without reserving the integration target", async () => {
     const kit = fixture();
     const run = await readyManaged(kit, false);

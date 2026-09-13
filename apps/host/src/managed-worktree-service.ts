@@ -1158,28 +1158,51 @@ export class ManagedWorktreeService {
 
       phase = "cleanup";
       this.setAggregation(runId, { aggregationPhase: "cleanup" });
+      let retainedWorkspaceCount = 0;
       for (const workspace of workspaces) {
         const fresh = this.store.getAnyManagedWorkspace(workspace.id)!;
         if (fresh.state === "removed") continue;
-        const operation = await this.automaticOperation(run, fresh, "cleanup", {
-          kind: "cleanup",
-          actor: "host-integration-controller",
-          deleteBranch: false,
-        });
-        if (!operation) return;
+        try {
+          const operation = await this.automaticOperation(run, fresh, "cleanup", {
+            kind: "cleanup",
+            actor: "host-integration-controller",
+            deleteBranch: false,
+          });
+          if (!operation) return;
+        } catch (error) {
+          const observation = this.store.getAnyManagedWorkspace(
+            workspace.id,
+          )?.observation;
+          if (
+            error instanceof WorktreeConflict &&
+            error.code === "dirty_or_unknown" &&
+            fresh.state === "retained" &&
+            observation?.ignored === true &&
+            observation.staged === false &&
+            observation.unstaged === false &&
+            observation.untracked === false
+          ) {
+            retainedWorkspaceCount += 1;
+            continue;
+          }
+          throw error;
+        }
       }
 
       binding = this.store.getRun(runId)!.workspaceBinding!;
+      const cleanupSuffix = retainedWorkspaceCount
+        ? ` ${retainedWorkspaceCount} workspace${retainedWorkspaceCount === 1 ? "" : "s"} retained because ignored generated output was present.`
+        : "";
       this.store.setRunWorkspaceBinding(runId, {
         ...binding,
         aggregationState: "completed",
         aggregationPhase: "done",
         aggregationCode: "",
         aggregationSummary: verifiedNoChanges
-          ? "No committed changes; verified task workspaces and cleaned them without merge integration."
+          ? `No committed changes; verified task workspaces and cleaned them without merge integration.${cleanupSuffix}`
           : integration?.state === "no_changes"
-            ? `No committed changes; verified ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.`
-            : `Integrated into ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.`,
+            ? `No committed changes; verified ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`
+            : `Integrated into ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`,
         aggregationTargetRef: targetRef,
         aggregationUpdatedAt: new Date().toISOString(),
       });
