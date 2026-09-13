@@ -1238,6 +1238,7 @@ export class ManagedWorktrees {
         "The predecessor set or pinned result SHAs changed after reservation.",
       );
     await this.verifyTree(tree);
+    if (tree.composition.state === "ready") return tree;
     await this.assertPinnedSource(tree);
     if (tree.composition.state === "conflicted") return tree;
     await this.noGitOperation(tree.path, true);
@@ -1256,11 +1257,6 @@ export class ManagedWorktrees {
     tree.observation = await this.observe(tree);
     this.requireClean(tree.observation);
     await this.importWorkspaceResults(tree, request, admin);
-    if (
-      tree.composition.state === "ready" &&
-      tree.composition.resultSha === tree.observation.head
-    )
-      return tree;
     if (tree.observation.head !== tree.baseSha) {
       const expected = new Set(
         tree.composition.predecessors.map((predecessor) => predecessor.resultSha),

@@ -707,6 +707,20 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       conflicts: ["same.txt"],
       error: expect.stringContaining("did not reset or clean"),
     });
+
+    await writeFile(join(source, "later.txt"), "later\n");
+    await git.run(source, ["add", "later.txt"]);
+    await git.run(source, ["commit", "-m", "advance source"]);
+    const readyReplay = await operation(manager, composed.worktree!, "compose", {
+      workspaceKind: "derived",
+      ownerStepId: "join",
+      composition,
+    });
+    expect(readyReplay.ok).toBe(true);
+    expect(readyReplay.worktree!.composition).toMatchObject({
+      state: "ready",
+      resultSha: composed.worktree!.composition!.resultSha,
+    });
   });
 
   it("composes a clean primary checkout advanced by a read-only predecessor", async () => {
