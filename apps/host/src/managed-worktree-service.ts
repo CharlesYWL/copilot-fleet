@@ -575,6 +575,25 @@ export class ManagedWorktreeService {
     const tree = this.store.derivedWorkspaceForStep(run.id, step.id);
     if (!tree || this.pendingWorkspace(tree.id)) return false;
     this.store.updateRunStep(step.id, { workspaceState: "finalizing" });
+    const fail = (error: unknown) => {
+      const message =
+        error instanceof Error
+          ? error.message
+          : typeof error === "string" && error
+            ? error
+            : "Could not record a clean commit.";
+      this.store.updateRunStep(step.id, {
+        workspaceState: "blocked",
+        workspaceError: message,
+      });
+      this.service.settleOrchestrationStep({
+        runId: run.id,
+        stepId: step.id,
+        state: "failed",
+        output: `Managed workspace finalization failed: ${message}`,
+      });
+      this.publish(run.id);
+    };
     void this.requestWorkspace(run.id, tree.id, tree.generation, {
       kind: "finalize",
       actor: "dag-scheduler",
@@ -584,15 +603,14 @@ export class ManagedWorktreeService {
       expectedVersion: tree.version,
       ...(tree.composition ? { composition: tree.composition } : {}),
     })
-      .then(() => this.service.tickRun(run.id))
-      .catch((error: unknown) => {
-        this.store.updateRunStep(step.id, {
-          workspaceState: "blocked",
-          workspaceError:
-            error instanceof Error ? error.message : "Could not record a clean commit.",
-        });
-        this.publish(run.id);
-      });
+      .then((operation) => {
+        if (operation.result && !operation.result.ok) {
+          fail(operation.result.error || "Could not record a clean commit.");
+          return;
+        }
+        this.service.tickRun(run.id);
+      })
+      .catch(fail);
     return false;
   }
 

@@ -1137,6 +1137,71 @@ describe("Host managed workspace orchestration", () => {
     });
   });
 
+  it("settles a step when managed finalization fails instead of retrying forever", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit, false);
+    kit.store.setRunState(run.id, "running");
+    const primary = kit.store.worktreeForRun(run.id)!;
+    const step = kit.store.upsertRunStep(run.id, {
+      stepKey: "implement",
+      title: "implement",
+      prompt: "change files",
+      category: "implement",
+      position: 0,
+    });
+    const tree = ManagedWorktreeSchema.parse({
+      ...primary,
+      id: "worktree-finalize-failure",
+      taskKey: "finalize-failure",
+      path: "C:\\trees\\finalize-failure",
+      branchRef: "refs/heads/fleet/finalize-failure",
+      pinRef: "refs/fleet/pins/finalize-failure",
+      checkout: {
+        ...primary.checkout!,
+        key: "finalize-failure-checkout",
+        path: "C:\\trees\\finalize-failure",
+        fileId: "finalize-failure-checkout",
+      },
+      workspaceKind: "step",
+      ownerStepId: step.id,
+    });
+    kit.store.putDerivedWorkspace(tree);
+    kit.store.updateRunStep(step.id, {
+      state: "starting",
+      managedWorktreeId: tree.id,
+      workspaceState: "ready",
+    });
+    kit.store.updateRunStep(step.id, { state: "running" });
+    kit.frames.splice(0);
+
+    expect(kit.service.worktrees.finalizeStep(kit.store.getRun(run.id)!, step)).toBe(
+      false,
+    );
+    const request = lastRequest(kit.frames);
+    kit.service.worktrees.handleResult(
+      kit.node.id,
+      WorktreeOperationResultSchema.parse({
+        operationId: request.operationId,
+        worktreeId: request.worktreeId,
+        generation: request.generation,
+        nodeId: request.nodeId,
+        hostInstallationId: request.hostInstallationId,
+        ok: false,
+        retryable: false,
+        code: "dirty_or_unknown",
+        error: "The managed checkout is dirty.",
+        acknowledgedAt: new Date().toISOString(),
+      }),
+    );
+
+    await expect.poll(() => kit.store.getRunStep(step.id)?.state).toBe("failed");
+    expect(kit.store.getRunStep(step.id)).toMatchObject({
+      workspaceState: "blocked",
+      workspaceError: "The managed checkout is dirty.",
+      output: "Managed workspace finalization failed: The managed checkout is dirty.",
+    });
+  });
+
   it("allocates independent writable steps across verified matching Nodes", async () => {
     const kit = fixture();
     const run = await readyManaged(kit, false);
