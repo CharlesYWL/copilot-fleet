@@ -2005,7 +2005,12 @@ export class ManagedWorktrees {
       } else if (
         sameTarget &&
         !mergeHead &&
-        (await this.matchesMergeCommit(pending, head))
+        ((await this.matchesMergeCommit(pending, head)) ||
+          (await this.ancestor(
+            pending.preview.target.path,
+            pending.approvedTaskSha,
+            head,
+          )))
       ) {
         await this.noGitOperation(pending.preview.target.path);
         this.requireTrackedClean(await this.status(pending.preview.target.path));

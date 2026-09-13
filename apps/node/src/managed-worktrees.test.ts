@@ -2050,6 +2050,53 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     );
   });
 
+  it("reconciles a clean target when an allowed post-commit hook advances it", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source, { allowGitHooks: true });
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+    const hook = join(source, ".git", "hooks", "post-commit");
+    await writeFile(
+      hook,
+      [
+        "#!/bin/sh",
+        'if ! git log -1 --pretty=%s | grep -q "^Post-hook audit$"; then',
+        "  git -c core.hooksPath=/dev/null commit --allow-empty -m 'Post-hook audit'",
+        "fi",
+        "",
+      ].join("\n"),
+    );
+    await chmod(hook, 0o755);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    const attempted = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+      commit: true,
+    });
+    expect(attempted.code).toBe("commit_uncertain");
+
+    const reconciled = await operation(manager, tree, "reconcile");
+
+    expect(reconciled.error).toBe("");
+    expect(reconciled.worktree).toMatchObject({
+      state: "retained",
+      integrationState: "integrated",
+    });
+    expect(
+      await git.run(source, ["merge-base", "--is-ancestor", preview.taskSha, "HEAD"], {
+        allowedExitCodes: [0, 1],
+      }),
+    ).toMatchObject({ exitCode: 0 });
+  });
+
   it("records a reviewed no-changes result without claiming the base was already integrated", async () => {
     const { manager, source } = await fixture();
     const tree = await allocate(manager, source);
