@@ -1362,6 +1362,7 @@ export class ManagedWorktrees {
         "repository_identity_missing",
         "The workspace predates portable repository identity and must be reconciled.",
       );
+    if (tree.resultSha === tree.baseSha) return { worktree: tree };
     if (!this.options.uploadArtifact) return { worktree: tree };
     const started = Date.now();
     const directory = join(this.options.directory, "workspace-result-artifacts");

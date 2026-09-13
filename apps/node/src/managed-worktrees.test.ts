@@ -274,6 +274,32 @@ async function liveAcpFixture(managed = true) {
 }
 
 describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
+  it("finalizes an unchanged workspace without uploading the repository history", async () => {
+    const uploadArtifact = vi.fn();
+    const { source, manager } = await fixture(undefined, { uploadArtifact });
+    const reserved = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source),
+        workspaceKind: "step",
+        ownerStepId: "reader",
+      }),
+    );
+    const created = await operation(manager, reserved.worktree!, "create", {
+      workspaceKind: "step",
+      ownerStepId: "reader",
+    });
+
+    const finalized = await operation(manager, created.worktree!, "finalize", {
+      workspaceKind: "step",
+      ownerStepId: "reader",
+    });
+
+    expect(finalized.ok).toBe(true);
+    expect(finalized.worktree?.resultSha).toBe(finalized.worktree?.baseSha);
+    expect(finalized.workspaceResult).toBeUndefined();
+    expect(uploadArtifact).not.toHaveBeenCalled();
+  });
+
   it("moves a sealed result between node-local repositories without changing remotes", async () => {
     const root = resolve(".mwi-test-work", randomUUID());
     roots.push(root);
