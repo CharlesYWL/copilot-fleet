@@ -998,6 +998,7 @@ describe("Host managed workspace orchestration", () => {
       prompt: "write",
       category: "implement",
       position: 0,
+      phaseIndex: 0,
     });
     const writerTree = ManagedWorktreeSchema.parse({
       ...primary,
@@ -1043,8 +1044,8 @@ describe("Host managed workspace orchestration", () => {
       title: "review",
       prompt: "review",
       category: "review-deep",
-      dependsOn: ["writer"],
       position: 1,
+      phaseIndex: 1,
     });
     frames.splice(0);
 
@@ -1100,6 +1101,7 @@ describe("Host managed workspace orchestration", () => {
       prompt: "inspect network-latest main",
       category: "explore",
       position: 0,
+      phaseIndex: 0,
     });
     store.updateRunStep(investigate.id, { state: "starting" });
     store.updateRunStep(investigate.id, { state: "running" });
@@ -1109,8 +1111,8 @@ describe("Host managed workspace orchestration", () => {
       title: "implement",
       prompt: "implement from the inspected revision",
       category: "implement",
-      dependsOn: ["investigate"],
       position: 1,
+      phaseIndex: 1,
     });
     frames.splice(0);
 

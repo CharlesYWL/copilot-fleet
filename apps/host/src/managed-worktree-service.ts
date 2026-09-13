@@ -276,9 +276,20 @@ export class ManagedWorktreeService {
       .slice(0, 32)}`;
   }
 
+  private dependencyKeysFor(step: RunStep, all: RunStep[]): string[] {
+    if (step.dependsOn.length > 0) return step.dependsOn;
+    return all
+      .filter(
+        (entry) => entry.phaseIndex < step.phaseIndex && entry.state === "succeeded",
+      )
+      .sort((a, b) => a.position - b.position || a.id.localeCompare(b.id))
+      .map((entry) => entry.stepKey);
+  }
+
   private compositionFor(run: Run, step: RunStep): WorktreeComposition | undefined {
     const all = this.store.listRunSteps(run.id);
     const byKey = new Map(all.map((entry) => [entry.stepKey, entry]));
+    const dependencyKeys = this.dependencyKeysFor(step, all);
     const collected = new Map<string, RunStep>();
     const visit = (key: string, seen = new Set<string>()) => {
       if (seen.has(key)) return;
@@ -291,12 +302,12 @@ export class ManagedWorktreeService {
       }
       for (const dependency of predecessor.dependsOn) visit(dependency, seen);
     };
-    for (const key of step.dependsOn) visit(key);
+    for (const key of dependencyKeys) visit(key);
     const predecessors = [...collected.values()].sort(
       (a, b) => a.position - b.position || a.id.localeCompare(b.id),
     );
     if (predecessors.length === 0) {
-      const directReadOnlyPredecessors = step.dependsOn
+      const directReadOnlyPredecessors = dependencyKeys
         .map((key) => byKey.get(key))
         .filter((entry): entry is RunStep =>
           Boolean(
@@ -308,7 +319,7 @@ export class ManagedWorktreeService {
       const observedHead = primary?.observation?.head;
       if (
         directReadOnlyPredecessors.length > 0 &&
-        directReadOnlyPredecessors.length === step.dependsOn.length &&
+        directReadOnlyPredecessors.length === dependencyKeys.length &&
         primary &&
         observedHead &&
         observedHead !== run.workspaceBinding!.baseSha &&
@@ -380,6 +391,7 @@ export class ManagedWorktreeService {
     const composition = this.compositionFor(run, step);
     const all = this.store.listRunSteps(run.id);
     const byKey = new Map(all.map((entry) => [entry.stepKey, entry]));
+    const dependencyKeys = this.dependencyKeysFor(step, all);
     const hasWritableHistory = (key: string, seen = new Set<string>()): boolean => {
       if (seen.has(key)) return false;
       seen.add(key);
@@ -392,7 +404,7 @@ export class ManagedWorktreeService {
           )),
       );
     };
-    const dependsOnWritableHistory = step.dependsOn.some((key) =>
+    const dependsOnWritableHistory = dependencyKeys.some((key) =>
       hasWritableHistory(key),
     );
     if (!isWritingCategory(step.category) && !dependsOnWritableHistory)
