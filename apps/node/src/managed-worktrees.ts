@@ -1356,7 +1356,7 @@ export class ManagedWorktrees {
     await this.assertPinnedSource(tree);
     await this.noGitOperation(tree.path);
     tree.observation = await this.observe(tree);
-    this.requireClean(tree.observation);
+    this.requireTrackedClean(tree.observation);
     tree.resultSha = GitShaSchema.parse(tree.observation.head);
     tree.resultRecordedAt = now();
     tree.error = "";
@@ -1818,7 +1818,7 @@ export class ManagedWorktrees {
       );
   }
 
-  private requireCleanTarget(
+  private requireTrackedClean(
     status: Pick<WorktreeObservation, "staged" | "unstaged" | "untracked">,
   ): void {
     if (status.staged || status.unstaged || status.untracked)
@@ -2003,7 +2003,7 @@ export class ManagedWorktrees {
         ["integrating", "aborting", "aborted"].includes(pending.state)
       ) {
         await this.noGitOperation(pending.preview.target.path);
-        this.requireCleanTarget(await this.status(pending.preview.target.path));
+        this.requireTrackedClean(await this.status(pending.preview.target.path));
         pending.state = "aborted";
         pending.conflicts = [];
         pending.error = "";
@@ -2013,7 +2013,7 @@ export class ManagedWorktrees {
         (await this.matchesMergeCommit(pending, head))
       ) {
         await this.noGitOperation(pending.preview.target.path);
-        this.requireCleanTarget(await this.status(pending.preview.target.path));
+        this.requireTrackedClean(await this.status(pending.preview.target.path));
         pending.state = "integrated";
         pending.resultSha = head;
         pending.conflicts = [];
@@ -2442,7 +2442,7 @@ export class ManagedWorktrees {
           "abort_uncertain",
           "Abort did not restore the recorded target; reconciliation is required.",
         );
-      this.requireCleanTarget(await this.status(target.path));
+      this.requireTrackedClean(await this.status(target.path));
       integration.state = "aborted";
       integration.conflicts = [];
       integration.updatedAt = now();
@@ -2564,7 +2564,7 @@ export class ManagedWorktrees {
     tree.integrationState = "validating";
     this.save(tree);
     try {
-      this.requireCleanTarget(await this.status(integration.preview.target.path));
+      this.requireTrackedClean(await this.status(integration.preview.target.path));
       if (!(await this.matchesMergeCommit(integration, integration.resultSha)))
         throw new WorktreeConflict(
           "commit_uncertain",

@@ -274,7 +274,7 @@ async function liveAcpFixture(managed = true) {
 }
 
 describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
-  it("finalizes an unchanged workspace without uploading the repository history", async () => {
+  it("finalizes an unchanged workspace with ignored output without uploading repository history", async () => {
     const uploadArtifact = vi.fn();
     const { source, manager } = await fixture(undefined, { uploadArtifact });
     const reserved = await manager.execute(
@@ -288,6 +288,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       workspaceKind: "step",
       ownerStepId: "reader",
     });
+    await writeFile(join(created.worktree!.path, "ignored.txt"), "generated\n");
 
     const finalized = await operation(manager, created.worktree!, "finalize", {
       workspaceKind: "step",
@@ -298,6 +299,9 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(finalized.worktree?.resultSha).toBe(finalized.worktree?.baseSha);
     expect(finalized.workspaceResult).toBeUndefined();
     expect(uploadArtifact).not.toHaveBeenCalled();
+    await expect(
+      readFile(join(created.worktree!.path, "ignored.txt"), "utf8"),
+    ).resolves.toBe("generated\n");
   });
 
   it("moves a sealed result between node-local repositories without changing remotes", async () => {
