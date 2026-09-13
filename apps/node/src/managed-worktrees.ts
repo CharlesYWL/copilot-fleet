@@ -2643,9 +2643,10 @@ export class ManagedWorktrees {
       { maxBytes: 32_000 },
     );
     const [parents, tree, ...message] = result.stdout.split("\n");
+    const hooksMayModifyTree = this.get(integration.worktreeId)?.allowGitHooks === true;
     return (
       parents === `${integration.preview.targetSha} ${integration.approvedTaskSha}` &&
-      tree === integration.mergeTree &&
+      (tree === integration.mergeTree || hooksMayModifyTree) &&
       message.includes(`Fleet-Integration: ${integration.id}`)
     );
   }

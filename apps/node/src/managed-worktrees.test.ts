@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import {
+  chmod,
   mkdir,
   readFile,
   readdir,
@@ -122,8 +123,14 @@ async function operation(
 async function allocate(
   manager: ManagedWorktrees,
   source: string,
+  extra: Partial<WorktreeOperationRequest> = {},
 ): Promise<ManagedWorktree> {
-  const reserved = await manager.execute(reserveRequest(source));
+  const reserved = await manager.execute(
+    WorktreeOperationRequestSchema.parse({
+      ...reserveRequest(source),
+      ...extra,
+    }),
+  );
   expect(reserved.error).toBe("");
   expect(reserved.ok).toBe(true);
   const created = await operation(manager, reserved.worktree!, "create");
@@ -2004,6 +2011,43 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       })
     ).preview!;
     expect(blocked.targetDirty).toBe(true);
+  });
+
+  it("accepts reviewed merge changes made by explicitly allowed commit hooks", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source, { allowGitHooks: true });
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+    const hook = join(source, ".git", "hooks", "pre-commit");
+    await writeFile(
+      hook,
+      "#!/bin/sh\nprintf 'hook output\\n' > hook-output.txt\ngit add hook-output.txt\n",
+    );
+    await chmod(hook, 0o755);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+
+    const integrated = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+      commit: true,
+    });
+
+    expect(integrated.error).toBe("");
+    expect(integrated.integration).toMatchObject({
+      state: "integrated",
+      validationState: "passed",
+    });
+    await expect(readFile(join(source, "hook-output.txt"), "utf8")).resolves.toBe(
+      "hook output\n",
+    );
   });
 
   it("records a reviewed no-changes result without claiming the base was already integrated", async () => {
