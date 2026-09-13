@@ -45,6 +45,9 @@ export const RunWorkspaceBindingSchema = z
       .enum(["awaiting_approval", "planning", "running", "awaiting_lead"])
       .default("running"),
     baseRef: z.string().default(""),
+    integrationBaseRef: z.string().default(""),
+    integrationTargetRef: z.string().default(""),
+    integrationRemote: z.string().default(""),
     allowGitHooks: z.boolean().default(false),
     aggregationState: z
       .enum(["not_started", "in_progress", "attention", "completed"])
@@ -303,6 +306,8 @@ export const IntegrationPreviewSchema = z.object({
   targetPlacementId: identity,
   target: CheckoutIdentitySchema,
   targetRef: identity,
+  targetBaseRef: z.string().default(""),
+  targetRemote: z.string().default(""),
   targetSha: GitShaSchema,
   taskDirty: z.boolean(),
   targetDirty: z.boolean(),
@@ -374,6 +379,9 @@ export const WorktreeOperationRequestSchema = z
     expectedBranchRef: z.string().default(""),
     expectedBaseSha: z.string().default(""),
     expectedBaseRef: z.string().default(""),
+    integrationBaseRef: z.string().default(""),
+    integrationTargetRef: z.string().default(""),
+    integrationRemote: z.string().default(""),
     actor: identity,
     allowGitHooks: z.boolean().default(false),
     attempt: z.number().int().positive().default(1),

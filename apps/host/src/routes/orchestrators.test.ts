@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
@@ -96,6 +97,7 @@ describe("orchestrator lifecycle routes", () => {
       method: "POST",
       url: `/api/orchestrators/${leadId}/stop`,
     });
+
     const second = await app.inject({
       method: "POST",
       url: `/api/orchestrators/${leadId}/stop`,
@@ -151,6 +153,34 @@ describe("orchestrator lifecycle routes", () => {
     expect(
       dispatch.mock.calls.filter(([, command]) => command.type === "prompt"),
     ).toHaveLength(0);
+  });
+
+  it("creates managed tasks with a remote-main development branch target", async () => {
+    const { app, store, service, leadId } = await setup();
+    store.setManagedWorktreesEnabled(true);
+    vi.spyOn(service.worktrees, "prepare").mockResolvedValue();
+    const lead = store.getSession(leadId)!;
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/runs`,
+      payload: {
+        operationId: randomUUID(),
+        workspaceMode: "managed",
+        sourcePlacementId: lead.placementId,
+        workspaceId: lead.workspaceId,
+        name: "Read-only Dependencies Failing in Object Overview",
+        objective: "Create and validate the fix.",
+      },
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(response.json().run.workspaceBinding).toMatchObject({
+      integrationBaseRef: "refs/remotes/origin/main",
+      integrationTargetRef:
+        "refs/heads/dev/operator/read-only-dependencies-failing-in-object-overvie",
+      integrationRemote: "origin",
+    });
   });
 
   it("blocks early resume, then continues only stopped unfinished work once", async () => {

@@ -778,12 +778,25 @@ export class ManagedWorktrees {
         await this.git.run(repository.path, ["rev-parse", "--verify", "HEAD^{commit}"])
       ).stdout.trim(),
     );
-    const base = request.expectedBaseSha
+    let base = request.expectedBaseSha
       ? GitShaSchema.parse(request.expectedBaseSha)
       : sourceHead;
+    if (!request.expectedBaseSha && request.integrationBaseRef) {
+      await this.refreshIntegrationBase(repository.path, request, admin);
+      base = GitShaSchema.parse(
+        (
+          await this.git.run(repository.path, [
+            "rev-parse",
+            "--verify",
+            `${request.integrationBaseRef}^{commit}`,
+          ])
+        ).stdout.trim(),
+      );
+    }
     if (
       request.sourcePlacementId === request.originatingPlacementId &&
-      sourceHead !== base
+      sourceHead !== base &&
+      !request.integrationBaseRef
     )
       throw new WorktreeConflict(
         "source_advanced",
@@ -794,10 +807,19 @@ export class ManagedWorktrees {
         allowedExitCodes: [0, 1],
       })
     ).stdout.trim();
-    const baseRef =
-      request.sourcePlacementId === request.originatingPlacementId
+    const baseRef = request.integrationBaseRef
+      ? request.integrationBaseRef
+      : request.sourcePlacementId === request.originatingPlacementId
         ? localBaseRef
         : request.expectedBaseRef;
+    if (
+      request.integrationTargetRef &&
+      (await this.ref(repository.path, request.integrationTargetRef))
+    )
+      throw new WorktreeConflict(
+        "integration_branch_collision",
+        `The integration branch ${request.integrationTargetRef.replace(/^refs\/heads\//, "")} already exists.`,
+      );
     const repositoryIdentity = await this.repositoryIdentity(repository.path, base);
     if (
       request.repositoryIdentity &&
@@ -2168,6 +2190,104 @@ export class ManagedWorktrees {
     );
   }
 
+  private integrationRemoteBranch(request: WorktreeOperationRequest): {
+    remote: string;
+    branch: string;
+  } {
+    const remote = request.integrationRemote || "origin";
+    const prefix = `refs/remotes/${remote}/`;
+    if (!request.integrationBaseRef.startsWith(prefix))
+      throw new WorktreeConflict(
+        "integration_base_invalid",
+        `Integration base must be a remote-tracking branch under ${prefix}.`,
+      );
+    const branch = request.integrationBaseRef.slice(prefix.length);
+    if (!branch || branch.startsWith("-"))
+      throw new WorktreeConflict(
+        "integration_base_invalid",
+        "Integration base branch is invalid.",
+      );
+    return { remote, branch };
+  }
+
+  private async refreshIntegrationBase(
+    path: string,
+    request: WorktreeOperationRequest,
+    admin: CheckoutLease,
+  ): Promise<void> {
+    const { remote, branch } = this.integrationRemoteBranch(request);
+    const fetched = await this.git.run(
+      path,
+      [
+        "fetch",
+        "--no-tags",
+        remote,
+        `+refs/heads/${branch}:refs/remotes/${remote}/${branch}`,
+      ],
+      { allowedExitCodes: [0, 1, 128], lease: admin },
+    );
+    if (fetched.exitCode !== 0)
+      throw new WorktreeConflict(
+        "integration_base_fetch_failed",
+        `Could not update ${remote}/${branch}; authenticate Git for this Node and retry.`,
+      );
+  }
+
+  private async prepareIntegrationTarget(
+    path: string,
+    request: WorktreeOperationRequest,
+    admin: CheckoutLease,
+  ): Promise<void> {
+    if (!request.integrationTargetRef) return;
+    if (!request.integrationTargetRef.startsWith("refs/heads/dev/"))
+      throw new WorktreeConflict(
+        "integration_branch_invalid",
+        "Automatic task branches must be under refs/heads/dev/.",
+      );
+    const branch = request.integrationTargetRef.replace(/^refs\/heads\//, "");
+    const valid = await this.git.run(path, ["check-ref-format", "--branch", branch], {
+      allowedExitCodes: [0, 1],
+    });
+    if (valid.exitCode !== 0)
+      throw new WorktreeConflict(
+        "integration_branch_invalid",
+        "The generated integration branch name is not valid for Git.",
+      );
+    await this.refreshIntegrationBase(path, request, admin);
+    const currentRef = (
+      await this.git.run(path, ["symbolic-ref", "-q", "HEAD"], {
+        allowedExitCodes: [0, 1],
+      })
+    ).stdout.trim();
+    if (currentRef === request.integrationTargetRef) return;
+    this.requireTrackedClean(await this.status(path));
+    if (await this.ref(path, request.integrationTargetRef))
+      throw new WorktreeConflict(
+        "integration_branch_collision",
+        `The integration branch ${branch} already exists outside this task's active target checkout.`,
+      );
+    await this.git.run(path, ["switch", "-c", branch, request.integrationBaseRef], {
+      lease: admin,
+    });
+  }
+
+  private async publishIntegration(
+    integration: WorktreeIntegration,
+    admin: CheckoutLease,
+  ): Promise<void> {
+    if (!integration.preview.targetRemote) return;
+    await this.git.run(
+      integration.preview.target.path,
+      [
+        "push",
+        "--set-upstream",
+        integration.preview.targetRemote,
+        `${integration.preview.targetRef}:${integration.preview.targetRef}`,
+      ],
+      { lease: admin },
+    );
+  }
+
   private async conflicts(path: string): Promise<string[]> {
     return (
       await this.git.run(path, ["diff", "--name-only", "--diff-filter=U", "-z"])
@@ -2179,6 +2299,7 @@ export class ManagedWorktrees {
   private async preview(
     tree: ManagedWorktree,
     request: WorktreeOperationRequest,
+    admin: CheckoutLease,
   ): Promise<IntegrationPreview> {
     if (!request.targetPath || !request.targetPlacementId)
       throw new WorktreeConflict(
@@ -2197,6 +2318,7 @@ export class ManagedWorktrees {
     this.locks.bindScope(target, tree.commonDirectory);
     await this.noGitOperation(tree.path);
     await this.noGitOperation(target.path);
+    await this.prepareIntegrationTarget(target.path, request, admin);
     await this.noninteractivePolicy(target.path, false, tree.allowGitHooks);
     const taskSha = GitShaSchema.parse(await this.ref(tree.path, "HEAD"));
     const targetSha = GitShaSchema.parse(await this.ref(target.path, "HEAD"));
@@ -2243,6 +2365,8 @@ export class ManagedWorktrees {
       target,
       targetSha,
       targetRef,
+      targetBaseRef: request.integrationBaseRef,
+      targetRemote: request.integrationRemote,
       taskDirty: taskStatus.staged || taskStatus.unstaged || taskStatus.untracked,
       targetDirty: await this.integrationTargetDirty(tree, target.path, taskSha),
       hasCommittedChanges,
@@ -2264,7 +2388,7 @@ export class ManagedWorktrees {
     integration?: WorktreeIntegration;
   }> {
     if (request.kind === "integration_preview") {
-      const preview = await this.preview(tree, request);
+      const preview = await this.preview(tree, request, admin);
       this.db
         .prepare("INSERT INTO previews (id,data) VALUES (?,?)")
         .run(preview.id, JSON.stringify(preview));
@@ -2323,11 +2447,15 @@ export class ManagedWorktrees {
           leases.push(lease);
           await lease.revalidate();
         }
-        const fresh = await this.preview(tree, {
-          ...request,
-          targetPath: preview.target.path,
-          targetPlacementId: preview.targetPlacementId,
-        });
+        const fresh = await this.preview(
+          tree,
+          {
+            ...request,
+            targetPath: preview.target.path,
+            targetPlacementId: preview.targetPlacementId,
+          },
+          admin,
+        );
         if (
           fresh.taskSha !== preview.taskSha ||
           fresh.diffIdentity !== preview.diffIdentity ||
@@ -2375,8 +2503,10 @@ export class ManagedWorktrees {
         this.saveIntegration(integration);
         tree.integrationState = integration.state;
         this.save(tree);
-        if (!fresh.hasCommittedChanges || fresh.alreadyIntegrated)
+        if (!fresh.hasCommittedChanges || fresh.alreadyIntegrated) {
+          await this.publishIntegration(integration, admin);
           return { worktree: tree, integration };
+        }
         const targetLease = leases.find((lease) => lease.key === preview.target.key)!;
         this.integrationLeases.set(integration.id, targetLease);
         retainTarget = true;
@@ -2604,6 +2734,7 @@ export class ManagedWorktrees {
     integration.updatedAt = now();
     this.saveIntegration(integration);
     tree.integrationState = "integrated";
+    await this.publishIntegration(integration, admin);
   }
 
   private recoverTaskMaintenance(tree: ManagedWorktree): void {

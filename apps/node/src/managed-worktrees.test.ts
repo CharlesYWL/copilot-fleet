@@ -2050,6 +2050,72 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     );
   });
 
+  it("creates and publishes a task branch from the latest remote main", async () => {
+    const { root, manager, source } = await fixture();
+    const remote = join(root, "origin.git");
+    const upstream = join(root, "upstream");
+    await git.run(root, ["init", "--bare", remote]);
+    await git.run(source, ["branch", "-M", "main"]);
+    await git.run(source, ["remote", "add", "origin", remote]);
+    await git.run(source, ["push", "-u", "origin", "main"]);
+    await git.run(remote, ["symbolic-ref", "HEAD", "refs/heads/main"]);
+    await git.run(root, ["clone", remote, upstream]);
+    await git.run(upstream, ["config", "user.name", "Fleet Test"]);
+    await git.run(upstream, ["config", "user.email", "fleet-test@example.invalid"]);
+    await writeFile(join(upstream, "upstream.txt"), "latest main\n");
+    await git.run(upstream, ["add", "upstream.txt"]);
+    await git.run(upstream, ["commit", "-m", "advance origin main"]);
+    await git.run(upstream, ["push", "origin", "main"]);
+    const integration = {
+      integrationBaseRef: "refs/remotes/origin/main",
+      integrationTargetRef: "refs/heads/dev/fleet-test/example-task",
+      integrationRemote: "origin",
+    };
+    const tree = await allocate(manager, source, integration);
+    await expect(readFile(join(tree.path, "upstream.txt"), "utf8")).resolves.toBe(
+      "latest main\n",
+    );
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+        ...integration,
+      })
+    ).preview!;
+    expect(preview).toMatchObject({
+      targetBaseRef: integration.integrationBaseRef,
+      targetRef: integration.integrationTargetRef,
+      targetRemote: "origin",
+    });
+    const integrated = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+      commit: true,
+      ...integration,
+    });
+
+    expect(integrated.error).toBe("");
+    expect(integrated.integration?.state).toBe("integrated");
+    expect((await git.run(source, ["symbolic-ref", "-q", "HEAD"])).stdout.trim()).toBe(
+      integration.integrationTargetRef,
+    );
+    expect(
+      (
+        await git.run(source, [
+          "ls-remote",
+          "--heads",
+          "origin",
+          integration.integrationTargetRef,
+        ])
+      ).stdout.trim(),
+    ).toContain(integrated.integration!.resultSha);
+  });
+
   it("reconciles a clean target when an allowed post-commit hook advances it", async () => {
     const { manager, source } = await fixture();
     const tree = await allocate(manager, source, { allowGitHooks: true });

@@ -747,6 +747,7 @@ export class FleetTools {
     const template = this.runs()[0];
     const run = this.store.createRun({
       workspaceMode: done.workspaceMode ?? "auto",
+      integrationUsername: "operator",
       accessIntent: isChatsWorkspace(done.workspaceId ?? lead.workspaceId)
         ? "no-checkout"
         : "checkout",

@@ -250,16 +250,18 @@ Orphaned worker ownership that cannot be proved quiescent remains blocked.
 
 ## Automatic integration with escalation
 
-The normal managed workflow requires no integration click. The Host infers exactly
-one target: the Run's pinned source placement on its owning Node, at the Run's
-pinned symbolic `baseRef`. It never searches for another online checkout. Missing,
-detached, moved or ref-mismatched targets fail closed. The Node's existing preview,
-merge and validation operations remain authoritative; stable per-Run/attempt/phase
-operation IDs make replay idempotent. The Host revalidates the exact preview task
-SHA, diff identity and target ref and generates the existing confirmation phrase
-internally. A target that advanced before preview is still given a normal clean
-merge attempt. Fleet never pushes, creates a PR, switches branches, resets, cleans,
-or bypasses dirty-target, active-process, hook, identity or signing safety.
+The normal managed workflow requires no integration click. For new tasks, the Host
+records a remote base and a task branch when the task is created. Unless the caller
+specifies another base, Fleet fetches `origin/main`, pins that fetched commit, and
+creates `dev/<short-user>/<short-task>` in the originating checkout. The reviewed
+task commit is merged into that branch and the branch is pushed to the same remote.
+Existing Runs without this metadata retain their original pinned-branch behavior.
+Fleet never searches for another online checkout. Missing, moved, dirty or
+ref-mismatched targets fail closed. The Node's preview, merge, validation and push
+operations remain authoritative; stable per-Run/attempt/phase operation IDs make
+replay idempotent. The Host revalidates the exact preview task SHA, diff identity
+and target ref and generates the confirmation phrase internally. Fleet does not
+reset, clean, force-push, bypass hooks, or overwrite an existing task branch.
 
 Fleet stops and quiesces task-owned sessions before integration so a completed
 worker cannot keep the result checkout lease while the controller validates and

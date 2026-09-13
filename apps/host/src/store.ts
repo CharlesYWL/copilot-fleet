@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
 import { EntraConfigSchema } from "./auth/entra.js";
+import { integrationBranchSettings } from "./integration-branch.js";
 import { isDeepStrictEqual } from "node:util";
 import {
   type FleetNode,
@@ -4463,6 +4464,9 @@ export class FleetStore {
     workspaceMode?: WorkspaceMode | undefined;
     accessIntent?: "checkout" | "no-checkout" | undefined;
     sourcePlacementId?: string | undefined;
+    integrationBaseRef?: string | undefined;
+    integrationBranchRef?: string | undefined;
+    integrationUsername?: string | undefined;
     workspaceId: string;
     name: string;
     objective: string;
@@ -4502,6 +4506,21 @@ export class FleetStore {
     binding.sourcePlacementId = input.sourcePlacementId ?? "";
     binding.originatingPlacementId = input.sourcePlacementId ?? "";
     if (binding.effectiveMode === "managed") {
+      if (
+        input.integrationUsername !== undefined ||
+        input.integrationBaseRef !== undefined ||
+        input.integrationBranchRef !== undefined
+      ) {
+        const integration = integrationBranchSettings({
+          username: input.integrationUsername,
+          taskName: input.name,
+          baseRef: input.integrationBaseRef,
+          branchRef: input.integrationBranchRef,
+        });
+        binding.integrationBaseRef = integration.baseRef;
+        binding.integrationTargetRef = integration.branchRef;
+        binding.integrationRemote = integration.remote;
+      }
       binding.managedWorktreeId = `worktree-${id}`;
       binding.generation = 1;
     }

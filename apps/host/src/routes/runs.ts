@@ -17,6 +17,8 @@ const CreateRunSchema = z.object({
   operationId: z.string().uuid().optional(),
   workspaceMode: WorkspaceModeSchema.default("auto"),
   sourcePlacementId: z.string().optional(),
+  integrationBaseRef: z.string().max(512).optional(),
+  integrationBranchRef: z.string().max(512).optional(),
   workspaceId: z.string().min(1),
   name: z.string().min(1).max(120),
   objective: z.string().min(1).max(4_000),
@@ -116,9 +118,15 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
       });
     }
     const run = store.writeAtomically(() => {
+      const administrator = request.fleetSession?.administratorId
+        ? store.getAdministrator(request.fleetSession.administratorId)
+        : undefined;
       const created = store.createRun({
         workspaceMode: input.workspaceMode,
         sourcePlacementId: input.sourcePlacementId,
+        integrationBaseRef: input.integrationBaseRef,
+        integrationBranchRef: input.integrationBranchRef,
+        integrationUsername: administrator?.username || "operator",
         accessIntent: isChatsWorkspace(input.workspaceId) ? "no-checkout" : "checkout",
         workspaceId: input.workspaceId,
         name: input.name,

@@ -890,7 +890,7 @@ export class ManagedWorktreeService {
       aggregationAttempt: Math.max(1, binding.aggregationAttempt),
       aggregationCode: "",
       aggregationSummary: "",
-      aggregationTargetRef: binding.baseRef,
+      aggregationTargetRef: binding.integrationTargetRef || binding.baseRef,
       aggregationUpdatedAt: new Date().toISOString(),
     });
     this.store.setRunState(runId, "aggregating", "");
@@ -948,7 +948,7 @@ export class ManagedWorktreeService {
     let run = this.store.getRun(runId);
     let binding = run?.workspaceBinding;
     if (!run || !binding || run.state !== "aggregating") return;
-    const targetRef = binding.baseRef;
+    const targetRef = binding.integrationTargetRef || binding.baseRef;
     let phase =
       binding.aggregationPhase === "idle" ? "preview" : binding.aggregationPhase;
     try {
@@ -1065,6 +1065,9 @@ export class ManagedWorktreeService {
             kind: "integration_preview",
             actor: "host-integration-controller",
             targetPlacementId: source.id,
+            integrationBaseRef: binding.integrationBaseRef,
+            integrationTargetRef: binding.integrationTargetRef,
+            integrationRemote: binding.integrationRemote,
           },
         );
         if (!previewOperation) return;
@@ -1101,6 +1104,9 @@ export class ManagedWorktreeService {
               kind: "integrate",
               actor: "host-integration-controller",
               targetPlacementId: source.id,
+              integrationBaseRef: binding.integrationBaseRef,
+              integrationTargetRef: binding.integrationTargetRef,
+              integrationRemote: binding.integrationRemote,
               previewId: preview.id,
               reviewedTaskSha: preview.taskSha,
               reviewedDiffIdentity: preview.diffIdentity,
@@ -1299,6 +1305,9 @@ export class ManagedWorktreeService {
       expectedBranchRef: tree?.branchRef ?? "",
       expectedBaseSha: binding.baseSha,
       expectedBaseRef: binding.baseRef,
+      integrationBaseRef: binding.integrationBaseRef,
+      integrationTargetRef: binding.integrationTargetRef,
+      integrationRemote: binding.integrationRemote,
       allowGitHooks: input.allowGitHooks ?? binding.allowGitHooks,
       policy: this.store.getManagedWorktreePolicy(),
       workspaceResults:

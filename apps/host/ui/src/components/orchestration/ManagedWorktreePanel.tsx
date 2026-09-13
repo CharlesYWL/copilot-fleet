@@ -250,6 +250,8 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
       ?.workspaceName ??
     "the selected repository";
   const baseLabel = (
+    binding?.integrationTargetRef ||
+    binding?.aggregationTargetRef ||
     binding?.baseRef ||
     tree?.baseRef ||
     (binding?.baseSha ? binding.baseSha.slice(0, 12) : "current committed HEAD")

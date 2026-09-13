@@ -19,6 +19,7 @@ import {
   reopenOrchestratorStoppedRun,
   stopSessions,
 } from "../orchestrator/lifecycle.js";
+import { integrationBranchSettings } from "../integration-branch.js";
 
 const CreateOrchestratorSchema = z.object({
   /** Where its workers run. The orchestrator itself only talks. */
@@ -43,6 +44,8 @@ const CreateRunSchema = z.object({
   operationId: z.string().uuid().optional(),
   workspaceMode: WorkspaceModeSchema.default("auto"),
   sourcePlacementId: z.string().optional(),
+  integrationBaseRef: z.string().max(512).optional(),
+  integrationBranchRef: z.string().max(512).optional(),
   workspaceId: z.string().min(1),
   name: z.string().min(1).max(80),
   objective: z.string().min(1).max(4_000),
@@ -375,10 +378,22 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     }
 
     const template = store.listRuns().find((entry) => entry.leadSessionId === lead.id);
+    const administrator = request.fleetSession?.administratorId
+      ? store.getAdministrator(request.fleetSession.administratorId)
+      : undefined;
+    const integration = integrationBranchSettings({
+      username: administrator?.username,
+      taskName: input.name,
+      baseRef: input.integrationBaseRef,
+      branchRef: input.integrationBranchRef,
+    });
     const created = store.writeAtomically(() => {
       const created = store.createRun({
         workspaceMode: input.workspaceMode,
         sourcePlacementId: input.sourcePlacementId,
+        integrationBaseRef: integration.baseRef,
+        integrationBranchRef: integration.branchRef,
+        integrationUsername: administrator?.username,
         accessIntent: isChatsWorkspace(workspace.id) ? "no-checkout" : "checkout",
         workspaceId: workspace.id,
         name: input.name,
