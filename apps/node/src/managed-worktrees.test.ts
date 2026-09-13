@@ -289,6 +289,9 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       ownerStepId: "reader",
     });
     await writeFile(join(created.worktree!.path, "ignored.txt"), "generated\n");
+    await writeFile(join(source, "source-advanced.txt"), "later\n");
+    await git.run(source, ["add", "source-advanced.txt"]);
+    await git.run(source, ["commit", "-m", "advance source"]);
 
     const finalized = await operation(manager, created.worktree!, "finalize", {
       workspaceKind: "step",

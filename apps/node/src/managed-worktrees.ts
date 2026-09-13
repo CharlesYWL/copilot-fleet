@@ -1349,7 +1349,6 @@ export class ManagedWorktrees {
     request: WorktreeOperationRequest,
   ): Promise<{ worktree: ManagedWorktree; result?: WorkspaceResult }> {
     await this.verifyTree(tree);
-    await this.assertPinnedSource(tree);
     await this.noGitOperation(tree.path);
     tree.observation = await this.observe(tree);
     this.requireTrackedClean(tree.observation);
