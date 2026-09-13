@@ -9,6 +9,7 @@ import {
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
   SUPERSEDED_CLOSE_CODE,
+  WorktreeConflict,
   decodeFrame,
   resolveNodeName,
   type OutboxEventPosition,
@@ -287,9 +288,21 @@ export function registerNodeGateway(
         }
         try {
           if (message.type === "managed_worktree_result") {
-            if (!service.worktrees.handleResult(nodeId, message.result)) {
+            try {
+              if (!service.worktrees.handleResult(nodeId, message.result)) {
+                app.log.warn(
+                  { nodeId, operationId: message.result.operationId },
+                  "Rejected managed worktree receipt",
+                );
+              }
+            } catch (error) {
+              if (!(error instanceof WorktreeConflict)) throw error;
               app.log.warn(
-                { nodeId, operationId: message.result.operationId },
+                {
+                  nodeId,
+                  operationId: message.result.operationId,
+                  code: error.code,
+                },
                 "Rejected managed worktree receipt",
               );
             }
