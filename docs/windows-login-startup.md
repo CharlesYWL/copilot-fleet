@@ -89,6 +89,13 @@ Files live under `%LOCALAPPDATA%\CopilotFleet\login\host` and `...\node`.
 and `logs` shows their last 80 lines. Large runtime logs rotate on startup to
 `runtime.log.previous`. Treat logs as private: they can include claim information.
 
+For a quick live view, use the Host's **Settings → Diagnostics** or the Node's
+config page. Both show the latest 80 runtime entries, including normal activity,
+with a **Problems only** filter and five-second refresh. This is a bounded
+in-memory view cleared on application restart, not a download of the service log.
+Use the `logs` command above for launcher/supervisor output or startup failures
+that prevent the config page from opening.
+
 ## Credentials and lifecycle
 
 The tasks use the current user's SID, InteractiveToken, and normal privileges.
@@ -112,6 +119,15 @@ task; retrying after enrollment reuses the saved key for that Host.
 
 Host/Node logon delays are 15/25 seconds, with no execution time limit and ten
 one-minute crash retries. The Node supervisor handles planned exit-75 updates.
+Host-triggered Node updates include build-time development dependencies despite
+`NODE_ENV=production`, rebuild when the running revision is behind an already
+updated checkout, and restart through that supervisor. They do not need
+`node install --existing-node` or alter the registered task, identity, or settings.
+The Host confirms success only after the restart reports the expected revision.
+If an older updater is stuck, stop the Node service, run
+`npm install --include=dev` and `npm run build:node` in the updated checkout, then
+`npm run service -- node start` to load this fix once.
+
 A kill-on-close Windows job contains the task's descendants; application output
 goes directly to its log file. The existing Host tunnel lifecycle is unchanged.
 

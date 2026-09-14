@@ -25,6 +25,7 @@ import {
   type HostPortableBackupData,
   type McpHttpServer,
   type NodeCommand,
+  type NodeHealth,
   type NodeUpdateStage,
   type Notification,
   type Placement,
@@ -166,6 +167,8 @@ export class FleetService {
    */
   private readonly nodeSockets = new Map<string, NodeLink>();
   private readonly browserSockets = new Set<WebSocket>();
+  /** Latest observations only: no history, database writes, or backup telemetry. */
+  private readonly nodeHealth = new Map<string, NodeHealth>();
   /**
    * Nodes told to update that have not yet reported how it went.
    *
@@ -173,7 +176,15 @@ export class FleetService {
    * before it exits: there is nobody left to send anything after that. The Host
    * has to notice the return itself, so it remembers which Nodes owe it one.
    */
-  private readonly updatesInFlight = new Set<string>();
+  private readonly updatesInFlight = new Map<
+    string,
+    {
+      updateId: string;
+      previousRevision: string;
+      restarting: boolean;
+      expectedRevision?: string;
+    }
+  >();
   /** Suppresses disconnect bookkeeping while the Host itself is shutting down. */
   private closing = false;
   /**
@@ -244,7 +255,7 @@ export class FleetService {
 
   snapshot(): Snapshot {
     return {
-      nodes: this.store.listNodes(),
+      nodes: this.listNodes(),
       workspaces: this.store.listWorkspaces(),
       placements: this.store.listPlacements(),
       sessions: this.store.listSessions(),
@@ -253,6 +264,15 @@ export class FleetService {
       notificationUnreadCount: this.store.notificationUnreadCount(),
       hostRevision: this.hostRevision,
     };
+  }
+
+  listNodes(): FleetNode[] {
+    return this.store.listNodes().map((node) => this.withNodeHealth(node));
+  }
+
+  private withNodeHealth(node: FleetNode): FleetNode {
+    const health = this.nodeHealth.get(node.id);
+    return health ? { ...node, health } : node;
   }
 
   get hostRevision(): string {
@@ -275,11 +295,13 @@ export class FleetService {
 
   attachNode(nodeId: string, socket: NodeLink): void {
     this.sessionRetention.nodeDisconnected(nodeId);
+    this.nodeHealth.delete(nodeId);
     this.nodeSockets.set(nodeId, socket);
   }
 
   /** Hangs up on a Node the operator deleted; no session bookkeeping follows. */
   evictNode(nodeId: string, code: number, reason: string): void {
+    this.nodeHealth.delete(nodeId);
     const socket = this.nodeSockets.get(nodeId);
     if (!socket) return;
     this.nodeSockets.delete(nodeId);
@@ -294,6 +316,7 @@ export class FleetService {
    * from the map first means the close handler will not call disconnectNode.
    */
   evictAllNodes(code: number, reason: string): void {
+    this.nodeHealth.clear();
     for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
       this.sessionRetention.nodeDisconnected(nodeId);
       this.nodeSockets.delete(nodeId);
@@ -347,7 +370,7 @@ export class FleetService {
   }
 
   publishNode(node: FleetNode): void {
-    this.broadcast({ type: "node", node });
+    this.broadcast({ type: "node", node: this.withNodeHealth(node) });
   }
 
   publishSession(session: FleetSession): void {
@@ -1150,7 +1173,11 @@ export class FleetService {
     const updateId = randomUUID();
     this.send(socket, HostToNodeMessageSchema.parse({ type: "update_node", updateId }));
     this.log.info({ nodeId, updateId }, "Asked node to update itself");
-    this.updatesInFlight.add(nodeId);
+    this.updatesInFlight.set(nodeId, {
+      updateId,
+      previousRevision: node.revision,
+      restarting: false,
+    });
     this.publishNodeUpdate(nodeId, "checking", "Update requested");
     return { started: true };
   }
@@ -1163,7 +1190,21 @@ export class FleetService {
       .map((node) => node.id);
   }
 
-  publishNodeUpdate(nodeId: string, stage: NodeUpdateStage, detail: string): void {
+  publishNodeUpdate(
+    nodeId: string,
+    stage: NodeUpdateStage,
+    detail: string,
+    status?: { updateId: string; revision?: string | undefined },
+  ): void {
+    const update = this.updatesInFlight.get(nodeId);
+    if (status && update?.updateId !== status.updateId) {
+      this.log.warn({ nodeId, updateId: status.updateId }, "Ignored stale node update");
+      return;
+    }
+    if (update && stage === "restarting") {
+      update.restarting = true;
+      if (status?.revision) update.expectedRevision = status.revision;
+    }
     // Only these two end an update. Every other stage is progress, and leaving
     // the Node on the books through them is what lets the return be recognised.
     if (stage === "up_to_date" || stage === "failed") {
@@ -1185,14 +1226,30 @@ export class FleetService {
    * — a dropped tunnel, a machine waking up — stays silent.
    */
   settleUpdateOnReconnect(nodeId: string, revision: string | undefined): void {
-    if (!this.updatesInFlight.has(nodeId)) return;
+    const update = this.updatesInFlight.get(nodeId);
+    // A tunnel reconnect during install/build is not a completed restart.
+    if (!update?.restarting) return;
     const landed = revision?.trim();
+    const expected = update.expectedRevision;
+    const matches = (left: string, right: string) =>
+      left.slice(0, 12) === right.slice(0, 12);
+    if (
+      !landed ||
+      (expected
+        ? !matches(landed, expected)
+        : !update.previousRevision || matches(landed, update.previousRevision))
+    ) {
+      const detail = !landed
+        ? "Node reconnected without a revision; the update could not be verified"
+        : expected
+          ? `Node reconnected on ${landed.slice(0, 12)}, expected ${expected.slice(0, 12)}; the new build is not running`
+          : `Node reconnected on ${landed.slice(0, 12)}; no revision change could be verified`;
+      this.log.warn({ nodeId, revision: landed }, detail);
+      this.publishNodeUpdate(nodeId, "failed", detail);
+      return;
+    }
     this.log.info({ nodeId, revision: landed }, "Node returned from its update");
-    this.publishNodeUpdate(
-      nodeId,
-      "up_to_date",
-      landed ? `Updated to ${landed.slice(0, 12)}` : "Update finished",
-    );
+    this.publishNodeUpdate(nodeId, "up_to_date", `Updated to ${landed.slice(0, 12)}`);
   }
 
   /** Records a heartbeat, publishing only when a browser would render it. */
@@ -1201,13 +1258,20 @@ export class FleetService {
     activeSessionIds: readonly string[],
     busySessionIds: readonly string[] = [],
     reconcileSessions = true,
+    health?: NodeHealth,
   ): void {
     const { node, changed } = this.store.recordPresence(
       nodeId,
       true,
       activeSessionIds.length,
     );
-    if (node && changed) this.publishNode(node);
+    if (node) {
+      const healthChanged =
+        JSON.stringify(this.nodeHealth.get(nodeId)) !== JSON.stringify(health);
+      if (health) this.nodeHealth.set(nodeId, health);
+      else this.nodeHealth.delete(nodeId);
+      if (changed || healthChanged) this.publishNode(node);
+    }
     if (!reconcileSessions) return;
     this.reconcile(nodeId, activeSessionIds, busySessionIds);
   }

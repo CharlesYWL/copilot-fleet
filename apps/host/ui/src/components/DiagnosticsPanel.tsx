@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Button,
+  Checkbox,
   Text,
   Title3,
   makeStyles,
@@ -8,22 +9,24 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { ArrowClockwise20Regular } from "@fluentui/react-icons";
+import { problemsOnly, type LogEntry } from "@fleet/protocol/log-buffer";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive, useSettingsPolling } from "../hooks/useSettingsActivity";
 
 /**
- * What the Host has complained about lately.
+ * Recent runtime output, even when the Host runs without a visible terminal.
  *
  * The Host logs to the terminal it was started from. On a fleet that runs
  * unattended that is a terminal nobody is watching, and by the time something
  * has gone wrong it is often a terminal that has been closed — so the record of
  * what happened existed only where it could not be read. The operator is here.
  *
- * Only warnings and errors are kept, because the Host logs every request it
- * serves and a buffer holding those would evict the one line worth reading long
- * before anyone came looking for it.
+ * Routine HTTP request traffic is omitted by the recorder so the panel's own
+ * polls cannot crowd out the activity being diagnosed.
  */
+
+const MAX_VISIBLE_LOG_ENTRIES = 80;
 
 const useStyles = makeStyles({
   panel: {
@@ -86,8 +89,6 @@ const useStyles = makeStyles({
   },
 });
 
-type LogEntry = { at: string; level: "info" | "warn" | "error"; message: string };
-
 const clockTime = (at: string): string => {
   const parsed = Date.parse(at);
   return Number.isNaN(parsed)
@@ -99,6 +100,7 @@ export const DiagnosticsPanel = () => {
   const styles = useStyles();
   const active = useSettingsActive();
   const [entries, setEntries] = useState<LogEntry[]>();
+  const [onlyProblems, setOnlyProblems] = useState(false);
   const [error, setError] = useState<string>();
   useMessageNotification(error);
   const viewRef = useRef<HTMLDivElement>(null);
@@ -122,7 +124,7 @@ export const DiagnosticsPanel = () => {
     const element = viewRef.current;
     if (!active || !element || !pinnedRef.current) return;
     element.scrollTop = element.scrollHeight;
-  }, [active, entries]);
+  }, [active, entries, onlyProblems]);
 
   const handleScroll = () => {
     const element = viewRef.current;
@@ -131,14 +133,18 @@ export const DiagnosticsPanel = () => {
       element.scrollHeight - element.scrollTop - element.clientHeight < 32;
   };
 
+  const visibleEntries = (
+    onlyProblems && entries ? problemsOnly(entries) : entries
+  )?.slice(-MAX_VISIBLE_LOG_ENTRIES);
+
   return (
     <section className={styles.panel} aria-label="Diagnostics">
       <div className={styles.head}>
         <div>
-          <Title3>Host problems</Title3>
+          <Title3>Host runtime logs</Title3>
           <Text as="p" className={styles.caption}>
-            Warnings and errors this Host has logged since it started. Restarting it
-            clears them, which is also what clears most of what they describe.
+            Latest {MAX_VISIBLE_LOG_ENTRIES} matching runtime messages. Routine HTTP
+            traffic is omitted; restarting the Host clears the log.
           </Text>
         </div>
         <Button
@@ -150,19 +156,32 @@ export const DiagnosticsPanel = () => {
         </Button>
       </div>
 
+      <Checkbox
+        label="Problems only"
+        checked={onlyProblems}
+        onChange={(_event, data) => setOnlyProblems(data.checked === true)}
+      />
+
       {error ? (
         <Text className={styles.error}>{error}</Text>
-      ) : entries === undefined ? (
+      ) : visibleEntries === undefined ? (
         <Text className={styles.empty}>Loading…</Text>
-      ) : entries.length === 0 ? (
+      ) : visibleEntries.length === 0 ? (
         <Text className={styles.empty}>
-          Nothing logged. The Host has not warned about anything since it started.
+          {onlyProblems ? "No warnings or errors recorded." : "Nothing logged yet."}
         </Text>
       ) : (
-        <div className={styles.log} ref={viewRef} onScroll={handleScroll} role="log">
-          {entries.map((entry, index) => (
+        <div
+          className={styles.log}
+          ref={viewRef}
+          onScroll={handleScroll}
+          role="log"
+          aria-label="Host runtime logs"
+        >
+          {visibleEntries.map((entry, index) => (
             <div className={styles.line} key={`${entry.at}-${index}`}>
               <span className={styles.at}>{clockTime(entry.at)}</span>
+              <span className={styles.at}>[{entry.level.toUpperCase()}]</span>
               <span
                 className={mergeClasses(
                   entry.level === "error" ? styles.error : undefined,

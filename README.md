@@ -26,6 +26,40 @@ pickers along the bottom.
 > any machine without a Copilot login. A real node streams real Copilot output in
 > exactly the same surfaces.
 
+### Node health and session navigation
+
+**Settings → Nodes** keeps each machine on one row, with compact blue CPU,
+green RAM, and purple disk meters in the **Health** column. Hover or focus a
+metric for capacity, scope, and sampling details; clock icons and striped bars
+mark readings that are not current. Disk capacity covers the volume containing
+the Node user's home directory. Disk is not an
+average of every drive or a measure of disk activity; a project on another
+volume can have different free space. Updated Nodes sample approximately every
+30 seconds and report through their existing connection. Each reading keeps
+its own measurement time. Missing readings, stale readings, clock skew, and
+offline Nodes are labelled rather than shown as fresh zeroes. Older Nodes keep
+working without health telemetry, and health does not change scheduling.
+
+The session header's **Session information** icon opens the same details dialog
+in both the full chat and the focused overview chat. It shows the Node, platform,
+workspace, current placement path, model, status, timestamps, and both the Fleet
+and native Copilot session IDs. Copy buttons provide the path, IDs, and a
+shell-quoted local recovery command. Only the native Copilot ID can be passed
+to `copilot --resume`; demo sessions and sessions without that ID have no recovery
+command.
+
+Run local recovery on the original Node as the same OS user, after stopping or
+verifying the old process has exited. The command uses standard Copilot CLI and
+the current placement: if either your launcher/configuration or the placement
+has changed, use the corresponding original setup. Local recovery does not
+reattach the CLI to Fleet or restore orchestration tools; use Fleet's **Resume**
+to continue managed work.
+
+Scroll back or select an earlier prompt to reveal **Jump to latest**, even on
+an idle or ended chat with no new output. It takes you to the bottom, clears
+the unread count, and resumes following streamed output. Reading older messages
+never pulls you back down automatically.
+
 ## Feature map and contents
 
 Start with the walkthrough, then use this map when you need a specific surface.
@@ -320,9 +354,13 @@ of them on one Windows machine, or split Host and Node across machines.
   does not mean Copilot is signed out.
 - **Something needs attention:** use the notification bell, the amber
   Orchestrator/task state, the permission banner in the session, and
-  **Settings → Diagnostics** for Host warnings/errors. The Node's own
-  config page (port 8788 by default; its actual URL is printed at startup) shows Node-side logs when you can reach
-  that machine.
+  **Settings → Diagnostics** for Host runtime logs. The Node's own config page
+  (port 8788 by default; its actual URL is printed at startup) shows Node-side
+  logs when you can reach that machine. Both show the latest 80 entries,
+  including normal activity, and refresh every five seconds. Use **Problems
+  only** to focus on warnings/errors. Logs are bounded in memory and clear on
+  restart; routine Host HTTP access messages are excluded so polling does not
+  drown out useful activity.
 
 ## Agency mode
 
@@ -1267,9 +1305,20 @@ was already running.
 The Nodes tab compares each machine's commit with the Host's and marks it **Up
 to date**, **Update available**, or **Manual update**. **Update** on a row — or
 **Update all** above the table — tells those machines to `git fetch --prune`,
-`git reset --hard` onto the branch they track, `npm install`,
+`git reset --hard` onto the branch they track, `npm install --include=dev`,
 `npm run build:node`, and restart into the new build. Progress appears in the row
 as it happens.
+
+Build dependencies are included even when the Node runs as a production login
+service. An unchanged checkout only skips the build when the running process
+also reports that commit; retrying after a failed install/build rebuilds and
+restarts instead of falsely reporting "Already up to date".
+
+The Host waits for the restart and verifies the returning revision against the
+Node's announced build. Reconnecting during install/build is not success, and a
+missing or incorrect revision after restart is reported as a failure. Older
+Nodes without an announced build must at least return on a different known
+revision.
 
 The commit is compared, not the package version: `0.1.0` never moves between
 deploys, so comparing it would report every machine as current no matter how far
@@ -1312,6 +1361,12 @@ the node (`apps/node/supervisor.mjs`). The node never replaces itself: it exits
 with status 75 to ask for a restart, and the supervisor — which had nothing to
 do with the update and is therefore still alive — starts the new build in the
 same terminal. Nothing is detached and no window appears.
+
+`npm run service -- node start` uses this same production supervisor. Updating
+does not reinstall the scheduled task or replace the Node identity/settings.
+If an older service is already stuck after moving its checkout, stop it, run
+`npm install --include=dev` and `npm run build:node` in the updated checkout, then
+run `npm run service -- node start` once to load the fixed updater.
 
 This exists because a process cannot reliably replace itself on Windows. The
 version that tried spawned a detached successor, which arrives with a console

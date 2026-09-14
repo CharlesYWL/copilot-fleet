@@ -82,6 +82,8 @@ export const runCommand: RunCommand = (command, args, cwd) =>
 
 export type UpdateOptions = {
   repoRoot: string;
+  /** Captured when the process started, not the HEAD an earlier attempt moved. */
+  runningRevision?: string;
   report: UpdateReport;
   run?: RunCommand;
 };
@@ -114,6 +116,7 @@ const UPSTREAM_REF = ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}
  */
 export function updateCheckout({
   repoRoot,
+  runningRevision,
   report,
   run = runCommand,
 }: UpdateOptions): Promise<UpdateOutcome> {
@@ -148,9 +151,13 @@ export function updateCheckout({
 
     const after = await run("git", ["rev-parse", "HEAD"], repoRoot);
     if (!after.ok) return { action: "failed", reason: `git rev-parse: ${after.output}` };
-    if (after.output.trim() === before.output.trim()) {
-      // Restarting anyway would drop the connection for no gain, and on "Update
-      // all" it would do that to every machine that was already current.
+    const targetRevision = after.output.trim();
+    const currentRevision = runningRevision?.trim() ?? before.output.trim();
+    if (
+      targetRevision === before.output.trim() &&
+      currentRevision &&
+      targetRevision.startsWith(currentRevision)
+    ) {
       return { action: "none", reason: "Already up to date" };
     }
 
@@ -172,7 +179,7 @@ export function updateCheckout({
       return { action: "failed", reason: `npm run build:node: ${build.output}` };
     }
 
-    return { action: "restart", revision: after.output.trim().slice(0, 12) };
+    return { action: "restart", revision: targetRevision.slice(0, 12) };
   })();
 }
 

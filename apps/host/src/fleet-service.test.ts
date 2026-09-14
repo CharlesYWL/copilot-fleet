@@ -21,6 +21,7 @@ type SentFrame = {
   nodeId?: string;
   stage?: string;
   detail?: string;
+  updateId?: string;
   notification?: Notification;
   unreadCount?: number;
   command?: { type: string; sessionId: string; localPath?: string };
@@ -1216,6 +1217,7 @@ describe("settleUpdateOnReconnect", () => {
 
   it("settles an update once, however often the node reconnects", () => {
     const { service, node, browser } = updating();
+    service.publishNodeUpdate(node.nodeId, "restarting", "Restarting");
     service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
     browser.sent.length = 0;
 
@@ -1236,13 +1238,66 @@ describe("settleUpdateOnReconnect", () => {
     expect(browser.sent).toEqual([]);
   });
 
-  it("still concludes when the node cannot name a revision", () => {
+  it("fails verification when the restarted node cannot name a revision", () => {
     const { service, node, browser, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "restarting", "Restarting");
 
     service.settleUpdateOnReconnect(node.nodeId, undefined);
 
-    expect(stages()).toEqual(["checking", "up_to_date"]);
-    expect(browser.sent.at(-1)?.detail).toBe("Update finished");
+    expect(stages()).toEqual(["checking", "restarting", "failed"]);
+    expect(browser.sent.at(-1)?.detail).toContain("could not be verified");
+  });
+
+  it("does not mistake a reconnect during build for a successful update", () => {
+    const { service, node, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "building", "Building");
+    service.settleUpdateOnReconnect(node.nodeId, "node1111");
+    expect(stages()).toEqual(["checking", "building"]);
+
+    service.publishNodeUpdate(node.nodeId, "restarting", "Restarting");
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+    expect(stages()).toEqual(["checking", "building", "restarting", "up_to_date"]);
+  });
+
+  it("reports an unchanged revision as a failed restart rather than success", () => {
+    const { service, node, browser, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "restarting", "Restarting");
+    service.settleUpdateOnReconnect(node.nodeId, "node1111");
+    expect(stages()).toEqual(["checking", "restarting", "failed"]);
+    expect(browser.sent.at(-1)?.detail).toContain("no revision change");
+  });
+
+  it("requires the expected built revision, not just any different commit", () => {
+    const { service, node, browser, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "restarting", "Restarting", {
+      updateId: node.sent[0]!.updateId!,
+      revision: "abcdef123456",
+    });
+    service.settleUpdateOnReconnect(node.nodeId, "000000000000");
+    expect(stages()).toEqual(["checking", "restarting", "failed"]);
+    expect(browser.sent.at(-1)?.detail).toContain("expected abcdef123456");
+  });
+
+  it("verifies the announced build after reconnect", () => {
+    const { service, node, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "restarting", "Restarting", {
+      updateId: node.sent[0]!.updateId!,
+      revision: "abcdef123456",
+    });
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+    expect(stages()).toEqual(["checking", "restarting", "up_to_date"]);
+  });
+
+  it("ignores progress from a different update request", () => {
+    const { service, node, stages } = updating();
+    service.publishNodeUpdate(node.nodeId, "up_to_date", "Old success", {
+      updateId: "old-update",
+    });
+    service.publishNodeUpdate(node.nodeId, "restarting", "Old restart", {
+      updateId: "old-update",
+    });
+    service.settleUpdateOnReconnect(node.nodeId, "abcdef1234567890");
+    expect(stages()).toEqual(["checking"]);
   });
 });
 

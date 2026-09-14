@@ -576,6 +576,9 @@ describe("node gateway mutual authentication", () => {
     const { socket, channel } = await handshake({ nodeId: receipt.nodeId, keys });
     channel.open((await nextFrame(socket)) as unknown as AuthenticatedEnvelope);
 
+    const health = {
+      cpu: { sampledAt: "2026-09-14T12:00:00.000Z", usagePercent: 25 },
+    };
     socket.send(
       JSON.stringify(
         channel.seal(
@@ -584,12 +587,12 @@ describe("node gateway mutual authentication", () => {
             activeSessionIds: [],
             busySessionIds: [],
             sentAt: new Date().toISOString(),
+            health,
           }),
         ),
       ),
     );
-    // The Host stays connected and the Node shows online, which is the whole
-    // observable effect of a heartbeat.
+    // The authenticated heartbeat carries source measurement time unchanged.
     await new Promise((resolve) => setTimeout(resolve, 100));
     const nodes = (
       await app.inject({
@@ -597,8 +600,9 @@ describe("node gateway mutual authentication", () => {
         url: "/api/nodes",
         headers: { cookie: owner.cookie() },
       })
-    ).json() as { id: string; online: boolean }[];
+    ).json() as { id: string; online: boolean; health?: typeof health }[];
     expect(nodes.find((node) => node.id === receipt.nodeId)?.online).toBe(true);
+    expect(nodes.find((node) => node.id === receipt.nodeId)?.health).toEqual(health);
     socket.close();
   });
 

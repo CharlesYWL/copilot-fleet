@@ -31,10 +31,13 @@ afterEach(() => {
 /** Answers each command in order, so a test can fail whichever step it means to. */
 function scriptedRun(answers: Record<string, CommandResult[]>) {
   const calls: string[] = [];
+  const queuedAnswers = new Map(
+    Object.entries(answers).map(([key, values]) => [key, [...values]]),
+  );
   const run = (command: string, args: readonly string[]): Promise<CommandResult> => {
     const key = `${command} ${args.join(" ")}`;
     calls.push(key);
-    const queued = answers[key]?.shift();
+    const queued = queuedAnswers.get(key)?.shift();
     return Promise.resolve(queued ?? { ok: true, output: "" });
   };
   return { run, calls };
@@ -88,6 +91,80 @@ describe("updateCheckout", () => {
     // Restarting anyway would drop the connection for no gain — and on "Update
     // all" it would do that to every machine that was already up to date.
     expect(calls).not.toContain("npm install --include=dev");
+    expect(calls.some((call) => call.startsWith("npm "))).toBe(false);
+  });
+
+  it("rebuilds an unchanged checkout when the running service is still on an older commit", async () => {
+    const { run, calls } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("new222222222222"), ok("new222222222222")],
+    });
+    const outcome = await updateCheckout({
+      repoRoot: gitCheckout(),
+      runningRevision: "old111111111",
+      report,
+      run,
+    });
+
+    expect(outcome).toEqual({ action: "restart", revision: "new222222222" });
+    expect(calls.slice(-2)).toEqual(["npm install --include=dev", "npm run build:node"]);
+  });
+
+  it("accepts the abbreviated running revision when both the process and checkout are current", async () => {
+    const { run, calls } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("same11111111111"), ok("same11111111111")],
+    });
+    expect(
+      await updateCheckout({
+        repoRoot: gitCheckout(),
+        runningRevision: "same11111111",
+        report,
+        run,
+      }),
+    ).toEqual({ action: "none", reason: "Already up to date" });
+    expect(calls.some((call) => call.startsWith("npm "))).toBe(false);
+  });
+
+  it("retries a failed build even though the previous attempt already moved HEAD", async () => {
+    const root = gitCheckout();
+    const { run, calls } = scriptedRun({
+      "git rev-parse --abbrev-ref --symbolic-full-name @{u}": [
+        ok("origin/main"),
+        ok("origin/main"),
+      ],
+      "git rev-parse HEAD": [
+        ok("old111111111111"),
+        ok("new222222222222"),
+        ok("new222222222222"),
+        ok("new222222222222"),
+      ],
+      "npm run build:node": [{ ok: false, output: "tsc not found" }, ok()],
+    });
+    const options = { repoRoot: root, runningRevision: "old111111111", report, run };
+    expect((await updateCheckout(options)).action).toBe("failed");
+    expect(await updateCheckout(options)).toEqual({
+      action: "restart",
+      revision: "new222222222",
+    });
+    expect(calls.filter((call) => call === "npm run build:node")).toHaveLength(2);
+  });
+
+  it("rebuilds rather than claiming success when the running revision is unknown", async () => {
+    const { run } = scriptedRun({
+      ...upstream,
+      "git rev-parse HEAD": [ok("same11111111111"), ok("same11111111111")],
+    });
+    expect(
+      (
+        await updateCheckout({
+          repoRoot: gitCheckout(),
+          runningRevision: "",
+          report,
+          run,
+        })
+      ).action,
+    ).toBe("restart");
   });
 
   it("resets onto whichever branch the checkout tracks", async () => {

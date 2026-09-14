@@ -34,6 +34,7 @@ export const HELP = `Windows login startup (not signed-out boot)
   npm run node:service -- install --existing-node [--devtunnel <id>] [--config-port <port>]
   npm run host:service -- install
 
+Run install once before start; start does not install tasks.
 Install builds and starts by default. Options: --no-build, --no-start, --start-mode login.
 Use your normal Windows account and existing gh/Copilot/Dev Tunnels login.
 Pass the Host's Connect-card flags to enroll and start in one command.
@@ -153,11 +154,12 @@ export async function main(argv = process.argv.slice(2)) {
         build: options.build && !(combined && kind === "node"),
       },
       sid,
+      options.kind,
     );
   }
 }
 
-async function manage(options, sid) {
+async function manage(options, sid, requestedKind) {
   const directory = loginDirectory(options.kind);
   const manifestPath = join(directory, "manifest.json");
   const source = dirname(fileURLToPath(import.meta.url));
@@ -177,7 +179,32 @@ async function manage(options, sid) {
         );
         return;
       }
-      throw new Error("Login startup is not installed.");
+      const installKind =
+        requestedKind === "host+node" &&
+        ["host", "node"].every(
+          (kind) => !existsSync(join(loginDirectory(kind), "manifest.json")),
+        )
+          ? requestedKind
+          : options.kind;
+      const includesNode = installKind !== "host";
+      throw new Error(
+        [
+          `${options.kind === "host" ? "Host" : "Node"} login startup is not installed for this Windows account.`,
+          "start only starts installed tasks; it does not install them.",
+          "",
+          "Stop any manually running Host/Node instances before installing.",
+          includesNode ? "If your Node is already enrolled, run:" : "Run:",
+          `  npm run service -- ${installKind} install${includesNode ? " --existing-node" : ""}`,
+          "",
+          "Install builds, registers, and starts the selected tasks, and enables startup after Windows sign-in.",
+          ...(includesNode
+            ? [
+                "For a new Node, install/start the Host first if needed, then use the service enrollment command from Nodes > Connect a machine.",
+              ]
+            : []),
+          "If you installed previously, use the same Windows account.",
+        ].join("\n"),
+      );
     }
     if (options.action === "logs") {
       for (const path of [old.logPath, `${old.logPath}.startup.log`]) {

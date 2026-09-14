@@ -40,7 +40,7 @@ export type SystemRouteOptions = {
   /** The URL to hand a Node when no tunnel is up. */
   fallbackPublicUrl: () => string;
   enrollmentHostUrl: () => string;
-  /** Recent warnings and errors, newest last, for the Diagnostics panel. */
+  /** Bounded runtime output, newest last, for the Diagnostics panel. */
   recentLogs?: () => LogEntry[];
 };
 
@@ -64,13 +64,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
 
   app.get("/api/health", async () => ({ ok: true, version }));
 
-  /**
-   * What the Host has complained about lately.
-   *
-   * Only warnings and errors are kept: the Host logs every request it serves,
-   * and a buffer holding those would evict the one line worth reading by the
-   * time anyone came looking for it.
-   */
+  /** The recorder keeps runtime output but omits routine HTTP request traffic. */
   app.get("/api/logs", async () => ({ entries: recentLogs ? recentLogs() : [] }));
 
   /**

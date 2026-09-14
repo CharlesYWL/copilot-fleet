@@ -29,6 +29,7 @@ import type * as SettingsModule from "./settings.js";
 import type * as AgentCatalogModule from "./agent-catalog.js";
 import type * as InstanceLockModule from "./instance-lock.js";
 import type * as ConfigServerModule from "./config-server.js";
+import type * as UpdaterModule from "./updater.js";
 import type { CopilotSessionDiscoveryOptions } from "./copilot-sessions.js";
 import type { CommandResult, CommandRouterOptions } from "./router.js";
 
@@ -67,6 +68,14 @@ let routerOptions: CommandRouterOptions;
 let discoveryOptions: CopilotSessionDiscoveryOptions;
 let configOptions: Parameters<typeof ConfigServerModule.startConfigServer>[0];
 const createDiscovery = vi.fn();
+const stopHealthSampler = vi.fn();
+const sampledHealth = {
+  memory: {
+    sampledAt: "2026-09-14T12:00:00.000Z",
+    totalBytes: 16_000,
+    availableBytes: 4_000,
+  },
+};
 const deleteInactiveSession = vi.fn<
   NonNullable<CommandRouterOptions["deleteInactiveSession"]>
 >(async (_id, _cutoff, beforeDelete) => {
@@ -90,6 +99,9 @@ const credentials = {
 
 vi.mock("ws", () => ({ default: TestSocket }));
 vi.mock("dotenv", () => ({ config: vi.fn() }));
+vi.mock("./health.js", () => ({
+  startHealthSampler: () => ({ latest: () => sampledHealth, stop: stopHealthSampler }),
+}));
 vi.mock("./config.js", () => ({
   configDirectory: () => process.cwd(),
   loadCredentials: vi.fn(async () => credentials),
@@ -114,6 +126,11 @@ vi.mock("./config-server.js", () => ({
     configOptions = options;
     return { close: vi.fn() };
   },
+}));
+vi.mock("./updater.js", async (original) => ({
+  ...(await original<typeof UpdaterModule>()),
+  updateCheckout: vi.fn(),
+  respawn: vi.fn(),
 }));
 vi.mock("./copilot-sessions.js", () => ({
   CopilotSessionDiscovery: class {
@@ -159,6 +176,99 @@ beforeEach(() => {
   sockets.length = 0;
   vi.clearAllMocks();
 });
+
+it.each([false, true])(
+  "reports failures and verifies service restart handoff (shutdown failure: %s)",
+  async (failShutdown) => {
+    vi.useFakeTimers();
+    vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+    vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+    vi.stubEnv("FLEET_MOCK_AGENT", "1");
+    vi.stubEnv("FLEET_RESTART_MODE", "exit");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const exit = vi.spyOn(process, "exit").mockReturnValue(undefined as never);
+    const { loadCredentials } = await import("./config.js");
+    vi.mocked(loadCredentials).mockResolvedValueOnce({
+      hostUrl: credentials.hostUrl,
+      nodeId: credentials.nodeId,
+      name: credentials.name,
+      authProtocol: "legacy-secret",
+      secret: "test-secret",
+    });
+    const { updateCheckout, respawn } = await import("./updater.js");
+    const exits = process.listeners("exit");
+    const { main } = await import("./main.js");
+    const runtime = await main([]);
+    try {
+      const socket = sockets[0]!;
+      socket.readyState = TestSocket.OPEN;
+      socket.emit("open");
+      const hello = JSON.parse(socket.send.mock.calls[0]![0]) as Extract<
+        NodeToHostMessage,
+        { type: "hello" }
+      >;
+      vi.mocked(updateCheckout).mockResolvedValueOnce({
+        action: "failed",
+        reason: "Build failed",
+      });
+      await socket.receive({ type: "update_node", updateId: "failed-build" });
+      expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+        type: "update_status",
+        updateId: "failed-build",
+        stage: "failed",
+        detail: "Build failed",
+      });
+      expect(exit).not.toHaveBeenCalled();
+      expect(configOptions.recentLogs?.()).toContainEqual(
+        expect.objectContaining({
+          level: "error",
+          message: "Self-update failed: Build failed",
+        }),
+      );
+
+      vi.mocked(updateCheckout).mockRejectedValueOnce(new Error("Cannot start build"));
+      await socket.receive({ type: "update_node", updateId: "failed-command" });
+      expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+        stage: "failed",
+        detail: "Cannot start build",
+      });
+      expect(exit).not.toHaveBeenCalled();
+
+      vi.mocked(updateCheckout).mockResolvedValueOnce({
+        action: "restart",
+        revision: "abcdef123456",
+      });
+      if (failShutdown) {
+        stopAll.mockRejectedValueOnce(new Error("Shutdown failed"));
+        await expect(
+          socket.receive({ type: "update_node", updateId: "restart-service" }),
+        ).rejects.toThrow("Shutdown failed");
+      } else {
+        await socket.receive({ type: "update_node", updateId: "restart-service" });
+      }
+      expect(updateCheckout).toHaveBeenLastCalledWith({
+        repoRoot: expect.any(String),
+        runningRevision: hello.revision,
+        report: expect.any(Function),
+      });
+      expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+        type: "update_status",
+        updateId: "restart-service",
+        stage: "restarting",
+        revision: "abcdef123456",
+      });
+      if (failShutdown) expect(exit).not.toHaveBeenCalled();
+      else expect(exit).toHaveBeenCalledExactlyOnceWith(75);
+      expect(respawn).not.toHaveBeenCalled();
+    } finally {
+      await runtime.shutdown();
+      for (const listener of process.listeners("exit")) {
+        if (!exits.includes(listener)) process.removeListener("exit", listener);
+      }
+    }
+  },
+);
 
 afterEach(() => {
   vi.useRealTimers();
@@ -277,6 +387,18 @@ it("replays events produced during mutual authentication before refreshing MCP s
     await receive({ type: "outbox_flush_ack", flushId: nextBatch.outboxFlush.flushId });
     expect(refreshMcpSessions).toHaveBeenCalledOnce();
 
+    const heartbeatIndex = socket.send.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(open(heartbeatIndex)).toMatchObject({
+      type: "heartbeat",
+      health: sampledHealth,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(open(heartbeatIndex + 1)).toMatchObject({
+      type: "heartbeat",
+      health: sampledHealth,
+    });
+
     const beforeDelete = vi.fn(async () => {});
     await routerOptions.deleteInactiveSession!("mock-session", Date.now(), beforeDelete);
     expect(beforeDelete).toHaveBeenCalledOnce();
@@ -337,6 +459,7 @@ it("replays events produced during mutual authentication before refreshing MCP s
     });
   } finally {
     await runtime.shutdown();
+    expect(stopHealthSampler).toHaveBeenCalledOnce();
     for (const listener of process.listeners("exit")) {
       if (!exits.includes(listener)) process.removeListener("exit", listener);
     }

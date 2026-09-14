@@ -31,7 +31,7 @@ export const nodeRoutes: FastifyPluginAsync<NodeRouteOptions> = async (
 ) => {
   const { store } = service;
 
-  app.get("/api/nodes", async () => store.listNodes());
+  app.get("/api/nodes", async () => service.listNodes());
 
   /**
    * Updates one Node, or every Node that is behind this Host.
