@@ -308,6 +308,7 @@ export function registerNodeGateway(
               message.activeSessionIds,
               message.busySessionIds,
               !awaitingOutboxFlush,
+              message.health,
             );
             return;
           }

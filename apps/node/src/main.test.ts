@@ -61,6 +61,14 @@ let routerOptions: CommandRouterOptions;
 let discoveryOptions: CopilotSessionDiscoveryOptions;
 let configOptions: Parameters<typeof ConfigServerModule.startConfigServer>[0];
 const createDiscovery = vi.fn();
+const stopHealthSampler = vi.fn();
+const sampledHealth = {
+  memory: {
+    sampledAt: "2026-09-14T12:00:00.000Z",
+    totalBytes: 16_000,
+    availableBytes: 4_000,
+  },
+};
 const deleteInactiveSession = vi.fn<
   NonNullable<CommandRouterOptions["deleteInactiveSession"]>
 >(async (_id, _cutoff, beforeDelete) => {
@@ -84,6 +92,9 @@ const credentials = {
 
 vi.mock("ws", () => ({ default: TestSocket }));
 vi.mock("dotenv", () => ({ config: vi.fn() }));
+vi.mock("./health.js", () => ({
+  startHealthSampler: () => ({ latest: () => sampledHealth, stop: stopHealthSampler }),
+}));
 vi.mock("./config.js", () => ({
   configDirectory: () => process.cwd(),
   loadCredentials: vi.fn(async () => credentials),
@@ -265,6 +276,18 @@ it("replays events produced during mutual authentication before refreshing MCP s
     await receive({ type: "outbox_flush_ack", flushId: nextBatch.outboxFlush.flushId });
     expect(refreshMcpSessions).toHaveBeenCalledOnce();
 
+    const heartbeatIndex = socket.send.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(open(heartbeatIndex)).toMatchObject({
+      type: "heartbeat",
+      health: sampledHealth,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(open(heartbeatIndex + 1)).toMatchObject({
+      type: "heartbeat",
+      health: sampledHealth,
+    });
+
     const beforeDelete = vi.fn(async () => {});
     await routerOptions.deleteInactiveSession!("mock-session", Date.now(), beforeDelete);
     expect(beforeDelete).toHaveBeenCalledOnce();
@@ -325,6 +348,7 @@ it("replays events produced during mutual authentication before refreshing MCP s
     });
   } finally {
     await runtime.shutdown();
+    expect(stopHealthSampler).toHaveBeenCalledOnce();
     for (const listener of process.listeners("exit")) {
       if (!exits.includes(listener)) process.removeListener("exit", listener);
     }

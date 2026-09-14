@@ -1290,6 +1290,12 @@ export function App() {
                       )}
                       <TerminalView
                         session={activeSession}
+                        node={snapshot.nodes.find(
+                          (node) => node.id === activeSession.nodeId,
+                        )}
+                        placement={snapshot.placements.find(
+                          (placement) => placement.id === activeSession.placementId,
+                        )}
                         events={events[activeSession.id] ?? noEvents}
                         onPrompt={(prompt, attachments) =>
                           void command(`/api/sessions/${activeSession.id}/prompt`, {
@@ -1380,6 +1386,10 @@ export function App() {
         {view === "overview" && activeSession && (
           <SessionFocusDialog
             session={activeSession}
+            node={snapshot.nodes.find((node) => node.id === activeSession.nodeId)}
+            placement={snapshot.placements.find(
+              (placement) => placement.id === activeSession.placementId,
+            )}
             events={events[activeSession.id] ?? noEvents}
             open={focusOpen}
             onOpenChange={setFocusOpen}

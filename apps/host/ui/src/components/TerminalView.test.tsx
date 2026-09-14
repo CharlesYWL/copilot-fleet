@@ -187,6 +187,71 @@ describe("TerminalView composer", () => {
 });
 
 describe("TerminalView transcript", () => {
+  it("offers Jump to latest on an idle transcript without waiting for new output", () => {
+    show({}, EMPTY_DRAFT, [streamEvent("agent_text", { text: "An existing answer" })]);
+    const transcript = screen.getByRole("region", { name: "Chat transcript" });
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, value: 1200 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+    transcript.scrollTop = 100;
+    fireEvent.scroll(transcript);
+    fireEvent.click(screen.getByRole("button", { name: "Jump to latest" }));
+    expect(transcript.scrollTop).toBe(1200);
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+  });
+
+  it("unpins when navigating to a prompt and shows a way back immediately", () => {
+    show({}, EMPTY_DRAFT, [
+      streamEvent("system", { text: "User: first ask" }),
+      streamEvent("agent_text", { text: "The answer" }),
+    ]);
+    fireEvent.click(screen.getByRole("button", { name: "Jump to prompt: first ask" }));
+    expect(screen.getByRole("button", { name: "Jump to latest" })).toBeTruthy();
+  });
+
+  it("keeps the reading position during streaming, then follows output after jumping", () => {
+    const events = [streamEvent("agent_text", { text: "First answer" })];
+    const view = show({ state: "running" }, EMPTY_DRAFT, events);
+    const transcript = screen.getByRole("region", { name: "Chat transcript" });
+    let height = 1200;
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, get: () => height },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    const update = (nextEvents: SessionEvent[]) =>
+      view.rerender(
+        <FluentProvider theme={fleetDarkTheme}>
+          <NotificationContext.Provider value={vi.fn()}>
+            <TerminalView
+              session={session({ state: "running" })}
+              events={nextEvents}
+              onPrompt={vi.fn()}
+              onCancel={vi.fn()}
+              onStop={vi.fn()}
+              onPermission={vi.fn()}
+              draft={EMPTY_DRAFT}
+              onDraftChange={vi.fn()}
+            />
+          </NotificationContext.Provider>
+        </FluentProvider>,
+      );
+    transcript.scrollTop = 100;
+    fireEvent.scroll(transcript);
+    const more = [...events, streamEvent("agent_text", { text: "More output" })];
+    update(more);
+    expect(transcript.scrollTop).toBe(100);
+    expect(screen.getByRole("button", { name: "Jump to latest" }).textContent).toContain(
+      "1 new",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Jump to latest" }));
+    height = 1400;
+    update([...more, streamEvent("agent_text", { text: "Latest output" })]);
+    expect(transcript.scrollTop).toBe(1400);
+    expect(screen.queryByRole("button", { name: "Jump to latest" })).toBeNull();
+  });
+
   it("draws a tool call as one line: what it did and what it ran on", () => {
     // The steps between an operator's prompt and the agent's answer outnumber
     // the answer several times over. Each used to be a bordered card with a
