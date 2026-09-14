@@ -1,6 +1,7 @@
 # ADR: Managed worktree isolation for parallel orchestration
 
-Status: implemented, distributed portable-result v2.
+Status: implemented in stages; distributed execution is enabled with explicit
+fail-closed limits described below.
 
 **Problem / motivation:** independently writable orchestration tasks need to run
 concurrently against one repository without sharing writable checkout state, while
@@ -9,10 +10,12 @@ and uncommitted changes.
 
 ## Decision and two-layer lock model
 
-A placement remains the source catalog identity (workspace, Node and local path).
-Fleet does **not** add worktrees as duplicate placements. A Run owns one immutable
-resolved workspace binding; its steps, sessions and launch/prompt commands carry
-the worktree ID, generation, canonical cwd/checkout key and lease attempt.
+A placement remains repository provenance and a materialization candidate
+(workspace, Node and local path). Fleet does **not** add worktrees as duplicate
+placements. A Run owns an immutable `RunWorkspaceSpec`; each physical checkout is
+a generation-scoped `WorkspaceInstance`, and every integration retry creates or
+updates a separately identified `IntegrationAttempt`. The legacy workspace binding
+remains a compatibility projection for existing Runs and UI status.
 
 1. **Managed checkout writer lease:** one shell-capable Fleet process at a time for a
    managed physical checkout. Managed tasks use different physical checkouts and can each
@@ -22,8 +25,8 @@ the worktree ID, generation, canonical cwd/checkout key and lease attempt.
    launch, prompt, resume, automatic recovery and MCP process refresh use the same Node
    admission gate.
 2. **Repository administration lease:** keyed by the physical Git common-directory
-   identity, independently of worker capacity. Reserve/pin, create, remove and merge
-   operations serialize there. Order is repository administration, then affected
+   identity, independently of worker capacity. Registry and private-ref mutations
+   serialize there. Order is repository administration, then affected
    checkout keys in sorted order. An operation never waits for administration while
    holding a worker lease. Node-local administration queues avoid expected races;
    exclusive on-disk leases close cross-installation and manual-route races.
@@ -97,9 +100,10 @@ than returning successful shutdown.
   user selected. Host does not substitute the first online copy. Historical tasks
   that predate source metadata retain a compatibility-only lookup during initial
   preparation; once resolved, the placement is pinned.
-- Requested/effective mode, resolution source, source placement, access intent,
-  symbolic base ref, exact base SHA and setup state are stored. Resume, retries
-  and later setting edits never recompute them. Existing sessions are not migrated.
+- Requested/effective mode, repository identity, source provenance, execution base,
+  integration/publication policies and repository execution policy are stored in
+  the immutable workspace spec. Resume, retries and later setting edits never
+  rewrite resolved identity. Existing persisted bindings are migrated additively.
 - Chats/nonrepository tasks allocate no worktree. Merely describing a shell-capable
   repository reviewer as read-only does not prove no-checkout capability.
 - New capable-Node leads use nonrepository coordinator directories, not per-agent
@@ -109,15 +113,18 @@ than returning successful shutdown.
   only the Node's quiescence/terminal receipt permits the handoff.
 
 At creation, Host persists a reserve intent and asks the selected Node to verify
-the repository and pin HEAD's exact committed SHA. A private `refs/fleet/pins/*`
-ref preserves that object until the task branch exists. Allocation occurs before
-the first checkout step. Source HEAD may move, and the source may be dirty:
+the repository and pin the exact resolved commit. Remote resolution fetches the
+source ref by URL with `--no-write-fetch-head` into `refs/fleet/fetch/*`, verifies
+the expected SHA, then pins it in `refs/fleet/pins/*`; user-visible remote-tracking
+refs and `FETCH_HEAD` are not changed. Allocation occurs before the first checkout
+step. Source HEAD may move, and the source may be dirty:
 `git worktree add -b fleet/<safe-key> <owned-path> <stored-base-sha>` still uses the
 original committed base. The target must start clean.
 
-The original Run worktree remains the primary durable identity used for operator
-integration and compatibility. Writable DAG steps additionally receive durable
-step worktrees. A writable fan-in step receives a distinct derived workspace,
+The original Run worktree remains a compatibility/control identity and is not an
+agent execution surface. Every shell-capable step, including a nominally read-only
+step, receives an isolated step workspace. A writable fan-in step receives a distinct
+derived workspace,
 pinned to the same Run base, whose provenance records predecessor step/worktree
 identities and committed result SHAs in dependency/position order. Dispatch waits
 until those fixed commits merge cleanly. Dirty predecessor output, changed SHAs,
@@ -146,20 +153,28 @@ remotes are excluded. The Host marks another placement eligible only after that 
 proves the same identity and possession of the exact base commit. A matching ref or
 SHA alone never identifies a repository.
 
-Independent writable steps may use different eligible Nodes under the existing
-capacity policy. Retries of one conversation and dirty/unsealed state remain
-node-affine. A dependent or fan-in step may move only when every required writable
-predecessor has an available sealed result; results are imported and composed in
-dependency/position order. If no exact match is online, dispatch waits. Automatic
-integration still targets the pinned originating placement/base ref; a remote final
-result is first materialized into the originating primary worktree.
+Independent writable steps may use different eligible Nodes. Eligibility requires
+the exact base to be present or securely materializable, repository/toolchain
+compatibility, and result portability when transfer is needed. Retries of one
+conversation and dirty/unsealed state remain Node-affine. Explicit DAG edges are
+authoritative; a conservative phase barrier is retained only for legacy plans and
+is recorded as fallback telemetry. Composition removes predecessor results already
+covered by a descendant result. Multiple writable sinks create a durable synthetic
+fan-in workspace instead of being treated as inherently ambiguous.
+
+`originatingPlacement` is provenance and a locality hint only. Integration runs on
+an eligible integration-capable Node in a Fleet-owned detached worktree. It never
+selects, switches, cleans, resets, merges in, or otherwise depends on the user's
+originating checkout.
 
 ## Portable results and transport
 
-Writable-step finalization proves a clean worktree and exact committed HEAD, creates
-and verifies a `git bundle`, computes SHA-256/size, uploads it to Host-owned storage,
-and only then marks its durable `WorkspaceResult` available. Agents never push or
-fetch Fleet task refs through user remotes.
+Writable-step finalization is infrastructure-owned. Fleet quiesces supervised
+processes, inspects the checkout, blocks unknown untracked/unsafe data, and may
+create an idempotent hook-disabled checkpoint for tracked modifications or
+deletions. It records the included paths, final tree OID and checkpoint provenance,
+then creates and verifies a Git bundle before marking the durable result available.
+Agent execution success and sealing/transport success are distinct.
 
 Artifact bytes live outside SQLite; SQLite stores ownership, lifecycle and integrity
 metadata. Transfers use authenticated Host↔Node frames with 256 KiB chunks, a
@@ -183,12 +198,17 @@ Proofs are bound to the current Node/path, expire after five minutes, and are
 invalidated when a placement is moved or repathed. Reconciliation backfills logical
 repository identity for compatible worktrees created before portable results existed.
 
+Git bundles do not make LFS objects or submodule repositories portable by
+themselves. Until complete manifests and authenticated object transfer are
+implemented, affected repositories are explicitly marked non-portable and may not
+move sealed results across Nodes. They remain usable on one Node. A destination
+may securely materialize a published exact base from the configured remote;
+portable base artifacts for committed but unpushed bases are not yet supported.
+
 Rejected alternatives are shared filesystems/worktrees (incompatible identity,
 locking and failure domains) and ephemeral refs on user remotes (credential,
-visibility, lifecycle and third-party recovery risks). Remaining constraints are
-that every destination must already contain the pinned base, submodule/LFS behavior
-still follows repository compatibility checks, conflicting fan-in needs explicit
-recovery, and final automatic integration remains on the originating placement.
+visibility, lifecycle and third-party recovery risks). Git conflicts remain
+explicit and fail closed; Fleet does not blindly auto-resolve them.
 
 ## Durable state and recovery
 
@@ -230,8 +250,9 @@ integration. `no_changes` is a reviewed terminal outcome, not an alias for
 “already integrated.” For managed Runs, successful orchestration now enters the
 nonterminal `aggregating` Run state. A Host-owned Integration Controller resumes
 from durable Node operation receipts after restart/reconnect, and the Run becomes
-`completed` only after integration validation, task-workspace quiescence, retention
-and safe cleanup of the primary and every step/derived workspace.
+`completed` only after exact-tree validation, publication, task-workspace
+quiescence, retention and safe cleanup of primary, step, derived, synthetic fan-in
+and integration workspaces.
 
 Recovery checks `git worktree list --porcelain -z`, physical roots/marker, refs,
 HEAD, status and lease/process inventory. Missing/moved directories, replacement
@@ -250,18 +271,28 @@ Orphaned worker ownership that cannot be proved quiescent remains blocked.
 
 ## Automatic integration with escalation
 
-The normal managed workflow requires no integration click. For new tasks, the Host
-records a remote base and a task branch when the task is created. Unless the caller
-specifies another base, Fleet fetches `origin/main`, pins that fetched commit, and
-creates `dev/<short-user>/<short-task>` in the originating checkout. The reviewed
-task commit is merged into that branch and the branch is pushed to the same remote.
-Existing Runs without this metadata retain their original pinned-branch behavior.
-Fleet never searches for another online checkout. Missing, moved, dirty or
-ref-mismatched targets fail closed. The Node's preview, merge, validation and push
-operations remain authoritative; stable per-Run/attempt/phase operation IDs make
-replay idempotent. The Host revalidates the exact preview task SHA, diff identity
-and target ref and generates the confirmation phrase internally. Fleet does not
-reset, clean, force-push, bypass hooks, or overwrite an existing task branch.
+The normal managed workflow requires no integration click. The Host records the
+resolved remote/base and generates a privacy-safe branch such as
+`dev/<short-user>/fleet-<stable-run-id>`. Fleet selects an eligible Node, creates a
+detached integration worktree at the exact integration base, imports the immutable
+reviewed result, composes it and validates the exact final tree. It then stops in
+`await_publish_approval`; no shared remote state has changed.
+
+The UI presents the publication base, proposed final commit, final `base..result`
+diff, changed-file/commit counts, validation status and review status. **Publish
+branch** records an immutable approval envelope binding the Run, integration,
+remote, target ref, expected remote SHA, final result SHA and final tree SHA. The
+Publication Controller revalidates that envelope and the local integration
+workspace before pushing. A newly appeared or changed target ref invalidates the
+approval and nothing is published. Publication uses expected-old-value semantics
+and never overwrites an unapproved remote ref.
+
+Integration, validation, approval and publication are separate durable phases.
+Publication failure preserves the validated result for publish-only retry, but a
+new approval is required when any approved identity changes. If the integration
+base advanced beyond the execution base, Fleet currently stops with
+`post_integration_validation_required`; repository-specific validation commands
+are not yet configured, so Fleet does not claim the refreshed final tree is safe.
 
 Fleet stops and quiesces task-owned sessions before integration so a completed
 worker cannot keep the result checkout lease while the controller validates and
@@ -276,30 +307,23 @@ generation-keyed notification identifies the target branch and phase without
 exposing paths or commands. **Retry integration** starts a new durable attempt and
 resolves that notification after success.
 
-## Advanced recovery: explicit merge only
+## Advanced recovery
 
-For backward compatibility and conflict recovery, an authenticated operator may
-still choose a catalog target on the same Node. The Node
-checks that its canonical Git common directory matches. Preview shows target
-path/ref/SHA, exact task SHA, complete bounded committed diff and its digest,
-dirty state and ancestry. It also states whether the task has any committed diff,
-whether the target contains or has advanced from the pinned base, and whether a
-changed task commit is already reachable. An unchanged task is recorded explicitly
-as `no_changes`; the base commit alone is never presented as completed integration.
-The operator separately approves that SHA/diff and target. These low-level actions
-are hidden under Workspace details/Advanced recovery and are not part of normal
-completion.
+An authenticated operator may inspect or retry a blocked Fleet integration attempt.
+Preview shows the Fleet-owned integration path/ref/SHA, exact task SHA, a safely
+bounded presentation diff, dirty state and ancestry. The bounded diff is never an
+authoritative identity. Base/task/target/expected/final tree OIDs and the exact
+expected parent graph define the reviewed result. An unchanged task is recorded
+explicitly as `no_changes`; the base commit alone is never presented as completed
+integration. These controls are hidden under Workspace details and never ask the
+operator to select a user checkout.
 
-Start reacquires/revalidates administration and task/target checkout leases.
-Task and target must be clean (including untracked and ignored data), with no
-other Git operation, no active checkout session, and unchanged preview/review
-identities. Active entries in the effective hooks directory are rejected by
-default rather than silently bypassed; an empty or sample-only custom
-`hooksPath` is supported. A task blocked by active hooks can proceed only after
-an administrator explicitly confirms **Allow Git hooks and retry** on that task.
-The consent is persisted on the managed binding and worktree, does not change
-repository configuration, and applies to later integration operations for that
-task. Git runs as argument arrays with deadlines, bounded output and
+The operation revalidates task and integration workspace physical identity,
+cleanliness, exact SHAs and repository execution policy. That policy fingerprints
+active hooks and content, filters/LFS configuration, executable submodule helpers,
+fsmonitor and credential-helper configuration. Unsupported executable surfaces fail
+closed. Hook approval is bound to exact content and is invalidated when content
+changes. Git runs as argument arrays with deadlines, bounded output and a
 noninteractive environment:
 
 ```text
@@ -313,11 +337,11 @@ staged: Fleet does not bypass signing. Conflict paths and the exact operation ar
 persisted. Resolve/stage in the target yourself, then explicitly Continue. Abort
 uses `git merge --abort` only when the operation, physical target, ref, HEAD and
 MERGE_HEAD still match. No reset/clean fallback exists; the task worktree is kept.
-After commit, integration enters `validating`: Fleet requires a clean target,
-verifies the exact merge tree and integration trailer, and proves the reviewed
-task commit is reachable from the result. Validation outcome and timestamp are
-persisted. A failed proof becomes `needs_reconciliation`; it is never reported as
-integrated or automatically cleaned up.
+After commit, integration enters `validating`: Fleet requires the exact expected
+parents, merge tree, integration trailer and final tree. Reachability alone is
+insufficient. Hook-modified trees and post-commit extra commits stop publication
+and become reconciliation/validation failures; they are not accepted because the
+reviewed SHA remains an ancestor. Validation outcome and timestamp are persisted.
 
 ## Retention, cleanup and quotas
 
@@ -341,14 +365,9 @@ Normal cleanup requires fresh ownership, registry and containment validation, no
 active readers/writers or unresolved integration, and clean staged/unstaged/
 untracked/ignored status. It uses `git worktree remove <verified-path>` without
 force; there is no recursive-delete fallback and no repository-wide prune.
-Branches are kept by default. Explicit deletion requires a reachable integration
-result and `git branch -d`; a refusal keeps the branch.
-
-V1 intentionally automates the existing checkout-based merge against the pinned
-source placement. A future graph-level ref integration capability would require
-explicit coordination with every checkout whose symbolic HEAD points at the
-target ref; directly updating that ref today could leave such a checkout's index
-and worktree inconsistent, so the Host never performs direct ref updates.
+Temporary Fleet worktrees and owned private refs are removed only after sealed
+results and receipts make recovery safe. Cleanup never deletes adopted or
+user-created refs.
 
 **Abandon ownership** is deliberately nondestructive v1: an exact branch/path
 confirmation relinquishes Fleet management while keeping files and branch.
@@ -378,18 +397,19 @@ POST /api/runs/:id/worktree/:action
 
 Actions: `observe`, `reconcile`, `retry-create`, `retry-integration`, `retain`, `quiesce`,
 `integration-preview`, `integration-start`, `integration-continue`,
-`integration-abort`, `cleanup`, `abandon`. Reconcile first drains an outstanding
+`integration-abort`, `publish`, `cleanup`, `abandon`. Reconcile first drains an outstanding
 correlated acknowledgement before another filesystem transition is permitted.
 
 General settings explain scope/quotas. Normal task creation names the selected
 repository, current committed baseline and `Isolated worktree` mode. It does not
 ask users to choose a filesystem destination. Generated branches, long paths,
 internal identities and cleanup mechanics are hidden behind `Workspace details`.
-Task detail keeps repository, base, preparation and the automatic
-integration/validation/quiescence/cleanup checklist visible. Completed Runs show
+Task detail keeps repository, base, preparation and the automatic integration and
+validation checklist visible. Publication displays **Waiting for you** until the
+exact final result is approved. Completed Runs show
 the integrated branch and final cleanup summary; attention states show the concise
 reason and **Retry integration**. Bindings, generated refs, generation, base/HEAD,
-branch/path/Node, observations, manual integration, conflict continue/abort,
+branch/path/Node, observations, Fleet integration attempts, conflict continue/abort,
 reconcile, retain, quiesce, abandon and cleanup controls are progressively
 disclosed under Workspace details/Advanced recovery.
 Dialogs use accessible labels, non-color status/error text, explicit confirmation
@@ -440,7 +460,8 @@ Bare/unborn repositories remain unsupported. Submodule and partial-clone setup c
 still require network access configured outside Fleet, and LFS object size is not
 included in the approximate preflight byte estimate.
 
-Deferred: automatic push/PR, rebase, cherry-pick, automatic conflict resolution,
+Deferred: automatic publication policy, PR creation, rebase, cherry-pick,
+automatic conflict resolution,
 cross-Node migration, clone lifecycle, user-worktree adoption, signing automation,
 network-volume identity and advanced repository configurations. Large Git output
 or an unprovable physical/process identity fails closed rather than weakening

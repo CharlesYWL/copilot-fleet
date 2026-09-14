@@ -329,11 +329,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     if (!workspaceReady && !retryWorkspaceReady) continue;
     const unmet = step.dependsOn.some((key) => stateByKey.get(key) !== "succeeded");
     if (unmet) continue;
-    if (
-      run.workspaceBinding?.effectiveMode === "managed" &&
-      isWritingCategory(step.category) &&
-      !step.executionBinding
-    )
+    if (run.workspaceBinding?.effectiveMode === "managed" && !step.executionBinding)
       continue;
     const desiredKey =
       step.executionBinding?.checkoutKey ??
@@ -663,7 +659,7 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
       return (
         placement.id === binding.originatingPlacementId ||
         Boolean(
-          capability?.baseAvailable &&
+          (capability?.baseAvailable || capability?.baseMaterializable) &&
           capability.nodeId === placement.nodeId &&
           capability.localPath === placement.localPath &&
           Date.now() - Date.parse(capability.verifiedAt) <=
@@ -688,9 +684,13 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
       .flatMap((placement) => {
         const node = nodeById.get(placement.nodeId);
         if (!usable(node, run)) return [];
+        const capability = capabilities.get(
+          `${placement.id}:${binding.repositoryIdentity}:${binding.baseSha}`,
+        );
         if (
           placement.id !== binding.originatingPlacementId &&
-          !node!.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY)
+          (!node!.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY) ||
+            capability?.portableResultsSupported === false)
         )
           return [];
         return [

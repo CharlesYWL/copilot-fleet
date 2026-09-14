@@ -148,7 +148,11 @@ export async function stopProcessTree(
       if (child.exitCode === null && child.signalCode === null) throw error;
     });
   } else {
-    child.kill("SIGKILL");
+    try {
+      process.kill(-pid, "SIGKILL");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
   }
   await closed;
 }

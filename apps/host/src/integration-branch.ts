@@ -23,6 +23,7 @@ function remoteBranchRef(value: string): string {
 }
 
 export function integrationBranchSettings(input: {
+  runId?: string | undefined;
   username?: string | undefined;
   taskName: string;
   baseRef?: string | undefined;
@@ -32,12 +33,12 @@ export function integrationBranchSettings(input: {
   branchRef: string;
   remote: string;
 } {
-  const baseRef = remoteBranchRef(input.baseRef || "origin/main");
+  const baseRef = input.baseRef ? remoteBranchRef(input.baseRef) : "";
   return {
     baseRef,
     branchRef: localBranchRef(
       input.branchRef ||
-        `dev/${branchSegment(input.username ?? "", "operator", 32)}/${branchSegment(input.taskName, "task")}`,
+        `dev/${branchSegment(input.username ?? "", "operator", 32)}/fleet-${branchSegment(input.runId ?? "", "run", 20)}`,
     ),
     remote: baseRef.split("/")[2] || "origin",
   };

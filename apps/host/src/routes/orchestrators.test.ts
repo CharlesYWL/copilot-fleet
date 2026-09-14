@@ -175,10 +175,10 @@ describe("orchestrator lifecycle routes", () => {
     });
 
     expect(response.statusCode).toBe(201);
-    expect(response.json().run.workspaceBinding).toMatchObject({
-      integrationBaseRef: "refs/remotes/origin/main",
-      integrationTargetRef:
-        "refs/heads/dev/operator/read-only-dependencies-failing-in-object-overvie",
+    const created = response.json().run;
+    expect(created.workspaceBinding).toMatchObject({
+      integrationBaseRef: "",
+      integrationTargetRef: `refs/heads/dev/operator/fleet-${created.id.slice(0, 20)}`,
       integrationRemote: "origin",
     });
   });

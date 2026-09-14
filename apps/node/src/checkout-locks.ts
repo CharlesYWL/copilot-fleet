@@ -177,7 +177,7 @@ export class CheckoutLocks {
             "Process quiescence has not been verified; its checkout lease is retained.",
           );
         }
-        unlinkSync(this.file(key));
+        unlinkIfPresent(this.file(key));
         this.held.delete(key);
         released = true;
       },
@@ -267,7 +267,7 @@ export class CheckoutLocks {
     }
     if (this.holder(identity.key)?.token !== record.token)
       throw new WorktreeConflict("lease_changed", "Target reservation changed.");
-    unlinkSync(this.file(identity.key));
+    unlinkIfPresent(this.file(identity.key));
   }
 
   recoverMaintenance(identity: CheckoutIdentity, owner: string): void {
@@ -291,7 +291,15 @@ export class CheckoutLocks {
         "Maintenance ownership changed during reconciliation.",
       );
     }
-    unlinkSync(this.file(identity.key));
+    unlinkIfPresent(this.file(identity.key));
+  }
+}
+
+function unlinkIfPresent(path: string): void {
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 }
 

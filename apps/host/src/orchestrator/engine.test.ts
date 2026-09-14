@@ -333,7 +333,7 @@ describe("OrchestratorEngine", () => {
         aggregationState: "in_progress",
         aggregationPhase: "preview",
         aggregationAttempt: 1,
-        aggregationTargetRef: "refs/heads/main",
+        aggregationTargetRef: run.workspaceBinding!.integrationTargetRef,
       },
     });
     expect(advance).toHaveBeenCalledWith(run.id);

@@ -47,6 +47,7 @@ export class GitRunner {
     const child = spawn("git", ["--no-pager", ...args], {
       cwd,
       env,
+      detached: process.platform !== "win32",
       shell: false,
       windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],

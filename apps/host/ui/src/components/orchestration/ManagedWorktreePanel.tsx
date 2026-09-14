@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Button,
   Checkbox,
@@ -17,6 +17,7 @@ import type {
   IntegrationPreview,
   ManagedWorktree,
   Placement,
+  PublicationApproval,
   Run,
   RunWorkspaceBinding,
   WorktreeIntegration,
@@ -40,6 +41,7 @@ type WorktreeView = {
   version: number;
   operations: WorktreeOperation[];
   integrations: WorktreeIntegration[];
+  publicationApproval?: PublicationApproval;
   targets: Placement[];
 };
 type Confirmation = {
@@ -84,8 +86,8 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
   const [error, setError] = useState("");
   const [progress, setProgress] = useState("");
   const [busy, setBusy] = useState(false);
-  const [target, setTarget] = useState("");
   const [preview, setPreview] = useState<IntegrationPreview>();
+  const [showPublicationReview, setShowPublicationReview] = useState(false);
   const [confirmation, setConfirmation] = useState<Confirmation>();
   const [phrase, setPhrase] = useState("");
   const [reviewed, setReviewed] = useState(false);
@@ -100,7 +102,6 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     },
     [],
   );
-  const targetId = useId();
   const managed = run.workspaceBinding?.effectiveMode === "managed";
   const refresh = useCallback(async () => {
     const next = await api<WorktreeView>(`/api/runs/${run.id}/worktree`);
@@ -265,10 +266,27 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     aggregationState === "completed" ||
     integration?.state === "integrated" ||
     integration?.state === "no_changes";
+  const published =
+    aggregationState === "completed" || integration?.publishState === "published";
+  const awaitingPublicationApproval =
+    aggregationPhase === "await_publish_approval" &&
+    integration?.publishState === "awaiting_approval";
+  const phaseLabel =
+    aggregationPhase === "publish"
+      ? "Publishing"
+      : aggregationPhase === "await_publish_approval"
+        ? "Ready to publish"
+        : aggregationPhase === "validate"
+          ? "Validating"
+          : aggregationPhase === "integrate" || aggregationPhase === "preview"
+            ? "Integrating"
+            : aggregationPhase === "retain" || aggregationPhase === "cleanup"
+              ? "Cleaning up"
+              : "Preparing";
 
   return (
     <section className={styles.panel} aria-label="Managed task worktree">
-      <h2>Isolated workspace</h2>
+      <h2>Fleet workspace</h2>
       <p>
         An isolated workspace is created from {sourceLabel} at <code>{baseLabel}</code>.
       </p>
@@ -290,7 +308,7 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             : "In progress"}
         </li>
         <li>
-          Merge and validation:{" "}
+          Integration and validation:{" "}
           {integrated
             ? "Complete"
             : needsAttention
@@ -298,6 +316,18 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
               : run.state === "aggregating"
                 ? "In progress"
                 : "Pending"}
+        </li>
+        <li>
+          Publication:{" "}
+          {published
+            ? "Complete"
+            : awaitingPublicationApproval
+              ? "Waiting for you"
+              : aggregationPhase === "publish" && needsAttention
+                ? "Needs attention"
+                : aggregationPhase === "publish"
+                  ? "In progress"
+                  : "Pending"}
         </li>
         <li>
           Workspace cleanup:{" "}
@@ -310,9 +340,58 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
       </ol>
       {run.state === "aggregating" && !needsAttention && (
         <p role="status">
-          Fleet is automatically integrating into <code>{baseLabel}</code>, validating the
-          merge, stopping task workspace sessions and cleaning isolated workspaces.
+          {phaseLabel} <code>{baseLabel}</code>.
         </p>
+      )}
+      {awaitingPublicationApproval && integration && (
+        <div aria-label="Ready to publish">
+          <h3>Ready to publish</h3>
+          <dl className={styles.metadata}>
+            <dt>Target</dt>
+            <dd>
+              <code>
+                {integration.preview.targetRemote}/
+                {integration.preview.targetRef.replace(/^refs\/heads\//, "")}
+              </code>
+            </dd>
+            <dt>Changes</dt>
+            <dd>{integration.publicationFileCount} files changed</dd>
+            <dt>Commits</dt>
+            <dd>{integration.publicationCommitCount}</dd>
+            <dt>Validation</dt>
+            <dd>Tests passed</dd>
+            <dt>Review</dt>
+            <dd>Passed</dd>
+          </dl>
+          <div className={styles.actions}>
+            <Button
+              disabled={busy}
+              onClick={() => setShowPublicationReview((current) => !current)}
+            >
+              Review changes
+            </Button>
+            <Button
+              appearance="primary"
+              disabled={busy}
+              onClick={() => void execute("publish-branch")}
+            >
+              Publish branch
+            </Button>
+          </div>
+          {showPublicationReview && (
+            <div aria-label="Final publication review">
+              <p>
+                Publication base: <code>{integration.publicationBaseSha}</code>
+              </p>
+              <p>
+                Proposed result: <code>{integration.resultSha}</code>
+              </p>
+              <pre className={styles.diff}>
+                {integration.publicationDiff || "No changes"}
+              </pre>
+            </div>
+          )}
+        </div>
       )}
       {needsAttention && (
         <>
@@ -513,11 +592,8 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
                 action: "quiesce",
                 title: "Stop checkout sessions?",
                 detail:
-                  "Stop this task’s processes and any sessions on the selected target. Conversations and all working files remain intact.",
-                payload: {
-                  confirm: "STOP TASK AND SELECTED TARGET SESSIONS",
-                  ...(target ? { targetPlacementId: target } : {}),
-                },
+                  "Stop this task’s supervised processes. Conversations and all working files remain intact.",
+                payload: { confirm: "STOP TASK SESSIONS" },
               })
             }
           >
@@ -526,33 +602,14 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
         </div>
         <h3>Advanced recovery: manual integration</h3>
         <p>
-          Normal tasks integrate automatically into their pinned source branch. Use these
-          low-level controls only to inspect or recover a blocked operation. Fleet never
-          switches branches, resets or cleans a checkout, pushes, or creates a PR.
+          Fleet creates a dedicated detached integration workspace. Use these low-level
+          controls only to inspect or recover a blocked operation; the originating
+          checkout is never selected or modified.
         </p>
-        <label htmlFor={targetId}>Target checkout on the owning Node</label>{" "}
-        <select
-          id={targetId}
-          value={target}
-          disabled={blocked || Boolean(ongoingMerge)}
-          onChange={(event) => {
-            setTarget(event.target.value);
-            setPreview(undefined);
-          }}
-        >
-          <option value="">Choose a target checkout</option>
-          {view?.targets.map((entry) => (
-            <option key={entry.id} value={entry.id}>
-              {entry.workspaceName} · {entry.localPath}
-            </option>
-          ))}
-        </select>
         <div className={styles.actions}>
           <Button
-            disabled={blocked || !target || Boolean(ongoingMerge)}
-            onClick={() =>
-              void execute("integration-preview", { targetPlacementId: target })
-            }
+            disabled={blocked || Boolean(ongoingMerge)}
+            onClick={() => void execute("integration-preview")}
           >
             Preview integration
           </Button>

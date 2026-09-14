@@ -31,6 +31,7 @@ import { WorkspaceArtifactStore } from "./workspace-artifact-store.js";
 export class ManagedWorktreeService {
   private static readonly ARTIFACT_RETENTION_MS = 24 * 60 * 60 * 1000;
   private static readonly REPOSITORY_CAPABILITY_MAX_AGE_MS = 5 * 60_000;
+  private static readonly MAX_AUTOMATIC_QUIESCE_ATTEMPTS = 3;
   private readonly waiters = new Map<
     string,
     { resolve: (operation: WorktreeOperation) => void; timer: NodeJS.Timeout }
@@ -307,6 +308,27 @@ export class ManagedWorktreeService {
     const predecessors = [...collected.values()].sort(
       (a, b) => a.position - b.position || a.id.localeCompare(b.id),
     );
+    const dependsOn = (
+      candidate: RunStep,
+      targetKey: string,
+      seen = new Set<string>(),
+    ): boolean =>
+      candidate.dependsOn.some((key) => {
+        if (key === targetKey) return true;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        const dependency = byKey.get(key);
+        return dependency ? dependsOn(dependency, targetKey, seen) : false;
+      });
+    const frontier = predecessors.filter(
+      (candidate) =>
+        !predecessors.some(
+          (other) => other.id !== candidate.id && dependsOn(other, candidate.stepKey),
+        ),
+    );
+    const coveredPredecessorStepIds = predecessors
+      .filter((candidate) => !frontier.some((entry) => entry.id === candidate.id))
+      .map((entry) => entry.id);
     if (predecessors.length === 0) {
       const directReadOnlyPredecessors = dependencyKeys
         .map((key) => byKey.get(key))
@@ -330,6 +352,8 @@ export class ManagedWorktreeService {
         return {
           baseSha: run.workspaceBinding!.baseSha,
           baseRef: run.workspaceBinding!.baseRef,
+          dependencyResolution: step.dependsOn.length > 0 ? "explicit" : "phase_fallback",
+          implicitDependencyFallback: step.dependsOn.length === 0,
           predecessors: [
             {
               stepId: predecessor.id,
@@ -339,6 +363,7 @@ export class ManagedWorktreeService {
               resultSha: observedHead,
             },
           ],
+          coveredPredecessorStepIds: [],
           state: "pending",
           resultSha: "",
           conflicts: [],
@@ -356,7 +381,7 @@ export class ManagedWorktreeService {
       ]),
     );
     if (
-      predecessors.some(
+      frontier.some(
         (entry) =>
           entry.state !== "succeeded" || !entry.resultSha || !entry.managedWorktreeId,
       )
@@ -365,7 +390,9 @@ export class ManagedWorktreeService {
     return {
       baseSha: run.workspaceBinding!.baseSha,
       baseRef: run.workspaceBinding!.baseRef,
-      predecessors: predecessors.map((entry) => ({
+      dependencyResolution: step.dependsOn.length > 0 ? "explicit" : "phase_fallback",
+      implicitDependencyFallback: step.dependsOn.length === 0,
+      predecessors: frontier.map((entry) => ({
         stepId: entry.id,
         stepKey: entry.stepKey,
         position: entry.position,
@@ -376,6 +403,7 @@ export class ManagedWorktreeService {
             ? results.get(entry.id)!.id
             : undefined,
       })),
+      coveredPredecessorStepIds,
       state: "pending",
       resultSha: "",
       conflicts: [],
@@ -408,8 +436,6 @@ export class ManagedWorktreeService {
     const dependsOnWritableHistory = dependencyKeys.some((key) =>
       hasWritableHistory(key),
     );
-    if (!isWritingCategory(step.category) && !dependsOnWritableHistory)
-      return this.bindingFor(run);
     if (dependsOnWritableHistory && !composition) return undefined;
     const worktreeId = step.managedWorktreeId || this.workspaceId(run.id, step.id);
     const executionPlacement = this.executionPlacement(run, step);
@@ -517,7 +543,8 @@ export class ManagedWorktreeService {
         );
         return Boolean(
           node.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY) &&
-          capability?.baseAvailable &&
+          (capability?.baseAvailable || capability?.baseMaterializable) &&
+          capability.portableResultsSupported &&
           capability.nodeId === placement.nodeId &&
           capability.localPath === placement.localPath &&
           Date.now() - Date.parse(capability.verifiedAt) <=
@@ -616,6 +643,25 @@ export class ManagedWorktreeService {
       .then((operation) => {
         if (!operation.result) return;
         if (operation.result && !operation.result.ok) {
+          if (
+            operation.result.retryable &&
+            operation.result.code === "artifact_transport_failed" &&
+            this.store
+              .listWorktreeOperations(tree.id)
+              .filter(
+                (entry) =>
+                  entry.request.kind === "finalize" &&
+                  entry.result?.code === "artifact_transport_failed",
+              ).length < 3
+          ) {
+            this.store.updateRunStep(step.id, {
+              workspaceState: "finalizing",
+              workspaceError:
+                "The result is sealed; retrying artifact transport without rerunning the agent.",
+            });
+            this.service.tickRun(run.id);
+            return;
+          }
           fail(operation.result.error || "Could not record a clean commit.");
           return;
         }
@@ -639,6 +685,7 @@ export class ManagedWorktreeService {
       "integrate",
       "continue",
       "abort",
+      "publish",
     ]);
     const resultTree = resultKinds.has(input.kind)
       ? this.resultWorkspaceForRun(runId)
@@ -670,6 +717,35 @@ export class ManagedWorktreeService {
       writing.every((step) => !step.managedWorktreeId && !step.resultSha)
     )
       return undefined;
+    const synthetic = this.store
+      .listDerivedWorkspaces(runId)
+      .filter(
+        (tree) =>
+          tree.workspaceKind === "derived" &&
+          tree.ownerStepId === `synthetic-fan-in:${runId}` &&
+          Boolean(tree.resultSha),
+      )
+      .sort((a, b) => b.generation - a.generation)
+      .at(0);
+    if (synthetic) return synthetic;
+    const sinks = this.writableSinkSteps(runId);
+    if (sinks.length !== 1)
+      throw new WorktreeConflict(
+        "result_workspace_ambiguous",
+        "The final writable results have not yet been aggregated.",
+      );
+    const result = this.store.derivedWorkspaceForStep(runId, sinks[0]!.id);
+    if (!result || result.resultSha !== sinks[0]!.resultSha)
+      throw new WorktreeConflict(
+        "result_workspace_changed",
+        "The final step workspace no longer matches its committed result SHA.",
+      );
+    return result;
+  }
+
+  private writableSinkSteps(runId: string): RunStep[] {
+    const steps = this.store.listRunSteps(runId);
+    const writing = steps.filter((step) => isWritingCategory(step.category));
     const byKey = new Map(steps.map((step) => [step.stepKey, step]));
     const dependsOn = (
       step: RunStep,
@@ -693,7 +769,7 @@ export class ManagedWorktreeService {
         )
         .map((step) => step.id),
     );
-    const sinks = writing
+    return writing
       .filter(
         (step) =>
           !hasWritableDescendant.has(step.id) &&
@@ -701,18 +777,119 @@ export class ManagedWorktreeService {
           Boolean(step.resultSha),
       )
       .sort((a, b) => a.position - b.position || a.id.localeCompare(b.id));
-    if (sinks.length !== 1)
-      throw new WorktreeConflict(
-        "result_workspace_ambiguous",
-        "Managed integration requires one committed writable DAG sink. Add an explicit fan-in step before integration.",
-      );
-    const result = this.store.derivedWorkspaceForStep(runId, sinks[0]!.id);
-    if (!result || result.resultSha !== sinks[0]!.resultSha)
-      throw new WorktreeConflict(
-        "result_workspace_changed",
-        "The final step workspace no longer matches its committed result SHA.",
-      );
-    return result;
+  }
+
+  private async ensureSyntheticFanIn(run: Run): Promise<ManagedWorktree | undefined> {
+    const sinks = this.writableSinkSteps(run.id);
+    if (sinks.length <= 1) return this.resultWorkspaceForRun(run.id);
+    const ownerStepId = `synthetic-fan-in:${run.id}`;
+    const existing = this.store
+      .listDerivedWorkspaces(run.id)
+      .filter((tree) => tree.ownerStepId === ownerStepId)
+      .sort((a, b) => b.generation - a.generation)
+      .at(0);
+    const predecessors = sinks.map((step) => {
+      const worktree = this.store.derivedWorkspaceForStep(run.id, step.id);
+      if (!worktree || worktree.resultSha !== step.resultSha)
+        throw new WorktreeConflict(
+          "fan_in_result_changed",
+          `The sealed result for ${step.stepKey} no longer matches its workspace.`,
+        );
+      const result = this.store.workspaceResultForStep(run.id, step.id);
+      return {
+        stepId: step.id,
+        stepKey: step.stepKey,
+        position: step.position,
+        worktreeId: worktree.id,
+        resultSha: step.resultSha!,
+        ...(result?.state === "available" ? { workspaceResultId: result.id } : {}),
+      };
+    });
+    const composition = {
+      baseSha: run.workspaceBinding!.baseSha,
+      baseRef: run.workspaceBinding!.baseRef,
+      dependencyResolution: "explicit" as const,
+      implicitDependencyFallback: false,
+      predecessors,
+      coveredPredecessorStepIds: [],
+      state: "pending" as const,
+      resultSha: "",
+      conflicts: [],
+      error: "",
+      startedAt: "",
+      completedAt: "",
+    };
+    const first =
+      predecessors
+        .map((entry) => this.store.getAnyManagedWorkspace(entry.worktreeId))
+        .find(
+          (tree) =>
+            tree &&
+            this.store.getNode(tree.nodeId)?.online &&
+            this.service.nodeSocket(tree.nodeId),
+        ) ?? this.store.getAnyManagedWorkspace(predecessors[0]!.worktreeId)!;
+    const worktreeId =
+      existing?.id ??
+      `worktree-${createHash("sha256")
+        .update(`${run.id}:synthetic-fan-in:1`)
+        .digest("hex")
+        .slice(0, 32)}`;
+    let tree = existing;
+    if (!tree) {
+      const reserved = await this.requestWorkspace(run.id, worktreeId, 1, {
+        kind: "reserve",
+        actor: "host-aggregation-controller",
+        operationId: this.deterministicUuid(`${worktreeId}:reserve:1`),
+        workspaceKind: "derived",
+        ownerStepId,
+        sourcePlacementId: first.sourcePlacementId,
+        composition,
+      });
+      tree = reserved.result?.worktree;
+      if (!tree) return undefined;
+    }
+    if (tree.state === "reserved" || tree.state === "creation_failed") {
+      const created = await this.requestWorkspace(run.id, tree.id, tree.generation, {
+        kind: "create",
+        actor: "host-aggregation-controller",
+        operationId: this.deterministicUuid(`${tree.id}:create:${tree.version}`),
+        workspaceKind: "derived",
+        ownerStepId,
+        sourcePlacementId: tree.sourcePlacementId,
+        expectedVersion: tree.version,
+        composition,
+      });
+      tree = created.result?.worktree;
+      if (!tree) return undefined;
+    }
+    if (tree.composition?.state !== "ready") {
+      const composed = await this.requestWorkspace(run.id, tree.id, tree.generation, {
+        kind: "compose",
+        actor: "host-aggregation-controller",
+        operationId: this.deterministicUuid(`${tree.id}:compose:${tree.version}`),
+        workspaceKind: "derived",
+        ownerStepId,
+        sourcePlacementId: tree.sourcePlacementId,
+        expectedVersion: tree.version,
+        composition,
+      });
+      tree = composed.result?.worktree;
+      if (!tree || tree.composition?.state !== "ready") return tree;
+    }
+    if (!tree.resultSha) {
+      const finalized = await this.requestWorkspace(run.id, tree.id, tree.generation, {
+        kind: "finalize",
+        actor: "host-aggregation-controller",
+        operationId: this.deterministicUuid(`${tree.id}:finalize:${tree.version}`),
+        workspaceKind: "derived",
+        ownerStepId,
+        sourcePlacementId: tree.sourcePlacementId,
+        expectedVersion: tree.version,
+        composition: tree.composition,
+      });
+      tree = finalized.result?.worktree;
+    }
+    return tree;
   }
 
   private aggregationOperationId(run: Run, phase: string, worktreeId: string): string {
@@ -756,6 +933,51 @@ export class ManagedWorktreeService {
       ...patch,
       aggregationUpdatedAt: new Date().toISOString(),
     });
+    const attempt = this.store
+      .listIntegrationAttempts(runId)
+      .find(
+        (entry) =>
+          entry.attemptNumber ===
+          Math.max(1, patch.aggregationAttempt ?? binding.aggregationAttempt),
+      );
+    if (attempt) {
+      const phase = patch.aggregationPhase ?? binding.aggregationPhase;
+      const mappedPhase =
+        phase === "quiesce"
+          ? "quiesce"
+          : phase === "preview" || phase === "integrate"
+            ? "integrate"
+            : phase === "retain"
+              ? "retain"
+              : phase === "publish"
+                ? "publish"
+                : phase === "await_publish_approval"
+                  ? "validate"
+                  : phase === "cleanup"
+                    ? "cleanup"
+                    : phase === "done"
+                      ? "done"
+                      : attempt.phase;
+      this.store.putIntegrationAttempt({
+        ...attempt,
+        phase: mappedPhase,
+        status:
+          patch.aggregationState === "attention"
+            ? "attention"
+            : patch.aggregationState === "completed"
+              ? "completed"
+              : attempt.status,
+        publishState:
+          phase === "await_publish_approval"
+            ? "awaiting_approval"
+            : phase === "publish"
+              ? "publishing"
+              : patch.aggregationState === "completed"
+                ? "published"
+                : attempt.publishState,
+        updatedAt: new Date().toISOString(),
+      });
+    }
     this.publish(runId);
   }
 
@@ -768,6 +990,8 @@ export class ManagedWorktreeService {
       return "The task’s pinned source checkout is no longer available on its owning Node.";
     if (code === "dirty_or_unknown")
       return "The task or integration target is dirty or its cleanliness cannot be proven.";
+    if (code === "publication_failed")
+      return "Changes are validated and ready, but Fleet could not publish the branch.";
     if (code.includes("reconciliation") || code.includes("uncertain"))
       return "Workspace or integration ownership must be reconciled before automation can continue.";
     if (phase === "cleanup")
@@ -812,18 +1036,25 @@ export class ManagedWorktreeService {
   ): Promise<WorktreeOperation | undefined> {
     const operationId = this.aggregationOperationId(run, phase, tree.id);
     const existing = this.store.getWorktreeOperation(operationId);
-    const operation = existing
-      ? existing.result
-        ? existing
-        : await this.send(existing, 30_000)
-      : await this.requestWorkspace(run.id, tree.id, tree.generation, {
-          ...input,
-          operationId,
-          expectedVersion: tree.version,
-          workspaceKind: tree.workspaceKind,
-          ownerStepId: tree.ownerStepId,
-          ...(tree.composition ? { composition: tree.composition } : {}),
-        });
+    let operation: WorktreeOperation;
+    try {
+      operation = existing
+        ? existing.result
+          ? existing
+          : await this.send(existing, 30_000)
+        : await this.requestWorkspace(run.id, tree.id, tree.generation, {
+            ...input,
+            operationId,
+            expectedVersion: tree.version,
+            workspaceKind: tree.workspaceKind,
+            ownerStepId: tree.ownerStepId,
+            ...(tree.composition ? { composition: tree.composition } : {}),
+          });
+    } catch (error) {
+      if (error instanceof WorktreeConflict && error.code === "operation_pending")
+        return undefined;
+      throw error;
+    }
     if (!operation.result) return undefined;
     if (
       !operation.result.ok &&
@@ -832,12 +1063,22 @@ export class ManagedWorktreeService {
       !/(dirty|unknown|reconcil|mismatch|conflict)/i.test(operation.result.code)
     ) {
       const binding = this.store.getRun(run.id)?.workspaceBinding;
-      if (binding)
+      if (
+        binding &&
+        binding.aggregationAutomaticRetries <
+          ManagedWorktreeService.MAX_AUTOMATIC_QUIESCE_ATTEMPTS - 1
+      )
         this.setAggregation(run.id, {
           aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+          aggregationAutomaticRetries: binding.aggregationAutomaticRetries + 1,
           aggregationSummary:
             "Waiting for task workspace processes to quiesce before safe cleanup.",
         });
+      else
+        throw new WorktreeConflict(
+          "automatic_retry_exhausted",
+          "Automatic workspace quiescence did not complete after three attempts.",
+        );
       return undefined;
     }
     if (!operation.result.ok)
@@ -888,6 +1129,7 @@ export class ManagedWorktreeService {
       aggregationState: "in_progress",
       aggregationPhase: "preview",
       aggregationAttempt: Math.max(1, binding.aggregationAttempt),
+      aggregationAutomaticRetries: 0,
       aggregationCode: "",
       aggregationSummary: "",
       aggregationTargetRef: binding.integrationTargetRef || binding.baseRef,
@@ -922,6 +1164,7 @@ export class ManagedWorktreeService {
       aggregationState: "in_progress",
       aggregationPhase: "preview",
       aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+      aggregationAutomaticRetries: 0,
       aggregationCode: "",
       aggregationSummary: "",
       aggregationUpdatedAt: new Date().toISOString(),
@@ -929,6 +1172,59 @@ export class ManagedWorktreeService {
     this.store.setRunState(runId, "aggregating", "");
     this.publish(runId);
     this.advanceAggregation(runId);
+  }
+
+  approvePublication(runId: string, approvalId: string, approvedBy: string) {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding || run.state !== "aggregating")
+      throw new WorktreeConflict(
+        "publication_not_ready",
+        "This task does not have a validated result awaiting publication.",
+      );
+    const attempt = this.store.listIntegrationAttempts(runId).at(-1);
+    const tree = attempt
+      ? this.store.getAnyManagedWorkspace(attempt.resultWorkspaceId)
+      : undefined;
+    const integration = tree
+      ? (this.store
+          .listWorktreeIntegrations(tree.id)
+          .find((entry) => entry.id === attempt?.attemptId) ??
+        this.store.listWorktreeIntegrations(tree.id).at(-1))
+      : undefined;
+    if (
+      !attempt ||
+      !tree ||
+      !integration ||
+      integration.validationState !== "passed" ||
+      !["integrated", "no_changes"].includes(integration.state) ||
+      !integration.resultSha ||
+      !integration.finalTree
+    )
+      throw new WorktreeConflict(
+        "publication_not_ready",
+        "Only the exact validated integrated result can be approved for publication.",
+      );
+    const approval = this.store.putPublicationApproval({
+      approvalId,
+      runId,
+      integrationId: integration.id,
+      targetRemote: integration.preview.targetRemote,
+      targetRef: integration.preview.targetRef,
+      expectedRemoteSha: "",
+      finalResultSha: integration.resultSha,
+      finalTreeSha: integration.finalTree,
+      approvedBy,
+      approvedAt: new Date().toISOString(),
+    });
+    this.setAggregation(runId, {
+      aggregationState: "in_progress",
+      aggregationPhase: "publish",
+      aggregationCode: "",
+      aggregationSummary: "",
+    });
+    this.advanceAggregation(runId);
+    return approval;
   }
 
   private isVerifiedNoChangeRun(runId: string, workspaces: ManagedWorktree[]): boolean {
@@ -952,22 +1248,32 @@ export class ManagedWorktreeService {
     let phase =
       binding.aggregationPhase === "idle" ? "preview" : binding.aggregationPhase;
     try {
-      const source = binding.sourcePlacementId
-        ? this.store.getPlacement(binding.sourcePlacementId)
-        : undefined;
       const primary = this.store.worktreeForRun(runId);
-      if (!source || !primary)
+      if (!primary)
         throw new WorktreeConflict(
           "source_unavailable",
-          "The pinned source placement or primary workspace is unavailable.",
-        );
-      if (source.nodeId !== primary.nodeId)
-        throw new WorktreeConflict(
-          "target_node",
-          "The pinned source placement moved away from the owning Node.",
+          "The primary managed workspace is unavailable.",
         );
 
-      const workspaces = this.aggregationWorkspaces(runId);
+      let workspaces = this.aggregationWorkspaces(runId);
+      const sinks = this.writableSinkSteps(runId);
+      let selectedResultTree =
+        sinks.length === 1
+          ? this.store.derivedWorkspaceForStep(runId, sinks[0]!.id)
+          : (sinks
+              .map((step) => this.store.derivedWorkspaceForStep(runId, step.id))
+              .find(
+                (tree) =>
+                  tree &&
+                  this.store.getNode(tree.nodeId)?.online &&
+                  this.service.nodeSocket(tree.nodeId),
+              ) ?? this.store.worktreeForRun(runId));
+      const preQuiesceNoChanges = this.isVerifiedNoChangeRun(
+        runId,
+        workspaces
+          .map((workspace) => this.store.getAnyManagedWorkspace(workspace.id))
+          .filter((workspace): workspace is ManagedWorktree => Boolean(workspace)),
+      );
       phase = "quiesce";
       this.setAggregation(runId, { aggregationPhase: "quiesce" });
       const ownedIds = new Set(workspaces.map((tree) => tree.id));
@@ -985,6 +1291,26 @@ export class ManagedWorktreeService {
       for (const workspace of workspaces) {
         const fresh = this.store.getAnyManagedWorkspace(workspace.id)!;
         if (fresh.state === "removed") continue;
+        const ownerOnline = Boolean(
+          this.store.getNode(fresh.nodeId)?.online &&
+          this.service.nodeSocket(fresh.nodeId),
+        );
+        const liveSession = ownedSessions.some(
+          (session) =>
+            session.executionBinding?.worktreeId === fresh.id &&
+            (!terminalSessionStates.has(session.state) || session.stopRequested),
+        );
+        if (!ownerOnline) {
+          if (
+            liveSession ||
+            (!preQuiesceNoChanges && fresh.id === selectedResultTree?.id)
+          )
+            throw new WorktreeConflict(
+              "node_unavailable",
+              `Node ${fresh.nodeId} must be online to quiesce the active integration workspace.`,
+            );
+          continue;
+        }
         const operation = await this.automaticOperation(run, fresh, "quiesce", {
           kind: "quiesce",
           actor: "host-integration-controller",
@@ -1000,6 +1326,43 @@ export class ManagedWorktreeService {
         })
       )
         return;
+      if (sinks.length > 1) {
+        selectedResultTree = await this.ensureSyntheticFanIn(run);
+        if (!selectedResultTree) return;
+        workspaces = this.aggregationWorkspaces(runId);
+      } else {
+        selectedResultTree = selectedResultTree
+          ? this.store.getAnyManagedWorkspace(selectedResultTree.id)
+          : undefined;
+      }
+      if (selectedResultTree) {
+        const attemptNumber = Math.max(1, binding.aggregationAttempt);
+        const attemptId = this.deterministicUuid(
+          `${runId}:integration-attempt:${attemptNumber}`,
+        );
+        const currentAttempt = this.store
+          .listIntegrationAttempts(runId)
+          .find((entry) => entry.attemptId === attemptId);
+        if (!currentAttempt)
+          this.store.putIntegrationAttempt({
+            attemptId,
+            runId,
+            attemptNumber,
+            resultWorkspaceId: selectedResultTree.id,
+            resultGeneration: selectedResultTree.generation,
+            integrationBaseSha: "",
+            targetRef,
+            assignedNodeId: selectedResultTree.nodeId,
+            phase: "aggregate",
+            expectedTree: "",
+            finalSha: "",
+            status: "in_progress",
+            publishState: "not_started",
+            receiptIds: [],
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          });
+      }
       const verifiedNoChanges = this.isVerifiedNoChangeRun(
         runId,
         workspaces
@@ -1014,84 +1377,51 @@ export class ManagedWorktreeService {
 
       let integration;
       if (!verifiedNoChanges) {
-        let resultTree =
-          this.resultWorkspaceForRun(runId) ?? this.store.worktreeForRun(runId)!;
-        if (resultTree.nodeId !== source.nodeId) {
-          const finalResult = this.store.workspaceResultForStep(
-            runId,
-            resultTree.ownerStepId,
-          );
-          if (!finalResult || finalResult.state !== "available")
-            throw new WorktreeConflict(
-              "workspace_result_unavailable",
-              "The final sealed result is unavailable for originating-placement integration.",
-            );
-          this.setAggregation(runId, { aggregationPhase: "integrate" });
-          const materialized = await this.automaticOperation(
-            run,
-            this.store.worktreeForRun(runId)!,
-            "materialize",
-            {
-              kind: "materialize",
-              actor: "host-integration-controller",
-              workspaceResults: [finalResult],
-            },
-          );
-          if (!materialized?.result?.worktree) return;
-          resultTree = materialized.result.worktree;
-        }
+        const resultTree = selectedResultTree!;
         integration = this.store
           .listWorktreeIntegrations(resultTree.id)
-          .filter(
-            (entry) =>
-              entry.preview.targetPlacementId === source.id &&
-              entry.preview.targetRef === targetRef,
-          )
+          .filter((entry) => entry.preview.targetRef === targetRef)
           .at(-1);
 
-        phase = "preview";
-        this.setAggregation(runId, {
-          aggregationState: "in_progress",
-          aggregationPhase: "preview",
-          aggregationTargetRef: targetRef,
-          aggregationCode: "",
-          aggregationSummary: "",
-        });
-        const previewOperation = await this.automaticOperation(
-          run,
-          resultTree,
-          "preview",
-          {
-            kind: "integration_preview",
-            actor: "host-integration-controller",
-            targetPlacementId: source.id,
-            integrationBaseRef: binding.integrationBaseRef,
-            integrationTargetRef: binding.integrationTargetRef,
-            integrationRemote: binding.integrationRemote,
-          },
-        );
-        if (!previewOperation) return;
-        const preview = previewOperation.result?.preview;
-        if (!preview)
-          throw new WorktreeConflict(
-            "preview_missing",
-            "The Node returned no integration preview.",
-          );
-        if (
-          preview.targetPlacementId !== binding.sourcePlacementId ||
-          preview.targetRef !== targetRef
-        )
-          throw new WorktreeConflict(
-            "target_ref_mismatch",
-            "The preview target does not match the pinned source branch.",
-          );
-        const reusableIntegration =
+        const reusableValidatedIntegration =
           integration &&
           ["integrated", "no_changes"].includes(integration.state) &&
-          integration.approvedTaskSha === preview.taskSha &&
-          integration.approvedDiffIdentity === preview.diffIdentity &&
-          (integration.state === "no_changes" || preview.alreadyIntegrated);
-        if (!reusableIntegration) {
+          integration.validationState === "passed" &&
+          integration.approvedTaskSha ===
+            (resultTree.resultSha || resultTree.observation?.head);
+        if (!reusableValidatedIntegration) {
+          phase = "preview";
+          this.setAggregation(runId, {
+            aggregationState: "in_progress",
+            aggregationPhase: "preview",
+            aggregationTargetRef: verifiedNoChanges ? "" : targetRef,
+            aggregationCode: "",
+            aggregationSummary: "",
+          });
+          const previewOperation = await this.automaticOperation(
+            run,
+            resultTree,
+            "preview",
+            {
+              kind: "integration_preview",
+              actor: "host-integration-controller",
+              integrationBaseRef: binding.integrationBaseRef,
+              integrationTargetRef: binding.integrationTargetRef,
+              integrationRemote: binding.integrationRemote,
+            },
+          );
+          if (!previewOperation) return;
+          const preview = previewOperation.result?.preview;
+          if (!preview)
+            throw new WorktreeConflict(
+              "preview_missing",
+              "The Node returned no integration preview.",
+            );
+          if (preview.targetRef !== targetRef)
+            throw new WorktreeConflict(
+              "target_ref_mismatch",
+              "The preview target does not match the pinned source branch.",
+            );
           integration = undefined;
           phase = "integrate";
           this.setAggregation(runId, { aggregationPhase: "integrate" });
@@ -1103,7 +1433,6 @@ export class ManagedWorktreeService {
             {
               kind: "integrate",
               actor: "host-integration-controller",
-              targetPlacementId: source.id,
               integrationBaseRef: binding.integrationBaseRef,
               integrationTargetRef: binding.integrationTargetRef,
               integrationRemote: binding.integrationRemote,
@@ -1142,6 +1471,45 @@ export class ManagedWorktreeService {
               : "integration_incomplete",
             "The automatic merge did not reach a validated terminal state.",
           );
+        const approval = this.store.getPublicationApproval(runId);
+        const approvalMatches =
+          approval?.integrationId === integration.id &&
+          approval.targetRemote === integration.preview.targetRemote &&
+          approval.targetRef === integration.preview.targetRef &&
+          approval.finalResultSha === integration.resultSha &&
+          approval.finalTreeSha === integration.finalTree;
+        if (integration.publishState !== "published" && !approvalMatches) {
+          this.setAggregation(runId, {
+            aggregationState: "in_progress",
+            aggregationPhase: "await_publish_approval",
+            aggregationCode: "",
+            aggregationSummary:
+              "The exact validated integrated result is ready for your review and publication approval.",
+          });
+          return;
+        }
+        phase = "publish";
+        this.setAggregation(runId, { aggregationPhase: "publish" });
+        if (integration.publishState !== "published") {
+          const publishOperation = await this.automaticOperation(
+            run,
+            this.store.getAnyManagedWorkspace(resultTree.id)!,
+            "publish",
+            {
+              kind: "publish",
+              actor: "host-integration-controller",
+              integrationId: integration.id,
+              publicationApproval: approval,
+            },
+          );
+          if (!publishOperation) return;
+          integration = publishOperation.result?.integration;
+        }
+        if (!integration || integration.publishState !== "published")
+          throw new WorktreeConflict(
+            "publication_failed",
+            "The integration is validated, but Fleet could not publish the branch.",
+          );
       }
 
       const artifactExpiry = new Date(
@@ -1155,6 +1523,11 @@ export class ManagedWorktreeService {
       for (const workspace of workspaces) {
         const fresh = this.store.getAnyManagedWorkspace(workspace.id)!;
         if (fresh.state === "removed" || fresh.state === "retained") continue;
+        if (
+          !this.store.getNode(fresh.nodeId)?.online ||
+          !this.service.nodeSocket(fresh.nodeId)
+        )
+          continue;
         const operation = await this.automaticOperation(run, fresh, "retain", {
           kind: "retain",
           actor: "host-integration-controller",
@@ -1168,6 +1541,13 @@ export class ManagedWorktreeService {
       for (const workspace of workspaces) {
         const fresh = this.store.getAnyManagedWorkspace(workspace.id)!;
         if (fresh.state === "removed") continue;
+        if (
+          !this.store.getNode(fresh.nodeId)?.online ||
+          !this.service.nodeSocket(fresh.nodeId)
+        ) {
+          retainedWorkspaceCount += 1;
+          continue;
+        }
         try {
           const operation = await this.automaticOperation(run, fresh, "cleanup", {
             kind: "cleanup",
@@ -1209,7 +1589,7 @@ export class ManagedWorktreeService {
           : integration?.state === "no_changes"
             ? `No committed changes; verified ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`
             : `Integrated into ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`,
-        aggregationTargetRef: targetRef,
+        aggregationTargetRef: verifiedNoChanges ? "" : targetRef,
         aggregationUpdatedAt: new Date().toISOString(),
       });
       this.service.notifications.resolveWorktreeAttention(
@@ -1359,18 +1739,10 @@ export class ManagedWorktreeService {
         `Operation ${pending.request.operationId} is awaiting reconciliation or its Node acknowledgement.`,
       );
     }
-    if (request.targetPlacementId) {
-      const target = this.store.getPlacement(request.targetPlacementId);
-      if (!target || target.nodeId !== node.id)
-        throw new WorktreeConflict(
-          "target_node",
-          "Choose a target placement on the owning Node.",
-        );
-      request.targetPath = target.localPath;
-    } else if (request.targetPath) {
+    if (request.targetPath) {
       throw new WorktreeConflict(
-        "target_required",
-        "Targets must be explicitly selected from this Node's catalog.",
+        "target_not_fleet_owned",
+        "The Host does not accept a user checkout as a managed integration target.",
       );
     }
     const operation: WorktreeOperation = {
@@ -1480,7 +1852,8 @@ export class ManagedWorktreeService {
       (result.preview.worktreeId !== expected.worktreeId ||
         result.preview.generation !== expected.generation ||
         result.preview.id !== expected.operationId ||
-        result.preview.targetPlacementId !== expected.targetPlacementId)
+        result.preview.targetPlacementId !==
+          (expected.targetPlacementId || expected.sourcePlacementId))
     )
       return false;
     if (
@@ -1489,7 +1862,7 @@ export class ManagedWorktreeService {
         result.integration.generation !== expected.generation ||
         (expected.kind === "integrate" &&
           result.integration.id !== expected.operationId) ||
-        (["continue", "abort"].includes(expected.kind) &&
+        (["continue", "abort", "publish"].includes(expected.kind) &&
           result.integration.id !== expected.integrationId))
     )
       return false;
@@ -1689,6 +2062,13 @@ export class ManagedWorktreeService {
       result.ok &&
       tree?.repositoryIdentity
     ) {
+      this.store.resolveRunWorkspaceSpec(expected.runId, {
+        repositoryIdentity: tree.repositoryIdentity,
+        repositoryObjectFormat: tree.repositoryObjectFormat,
+        executionBaseRef: tree.baseRef,
+        executionBaseSha: tree.baseSha,
+        repositoryExecutionPolicy: tree.repositoryExecutionPolicy,
+      });
       this.store.putPlacementRepositoryCapability({
         placementId: expected.sourcePlacementId,
         nodeId,
@@ -1702,6 +2082,14 @@ export class ManagedWorktreeService {
         },
         baseSha: tree.baseSha,
         baseAvailable: true,
+        baseMaterializable: false,
+        portableResultsSupported:
+          !tree.repositoryFeatures.gitLfs && !tree.repositoryFeatures.submodules,
+        portabilityReason: tree.repositoryFeatures.gitLfs
+          ? "Git LFS result transport is not implemented; execution is Node-local."
+          : tree.repositoryFeatures.submodules
+            ? "Submodule result transport is not implemented; execution is Node-local."
+            : "",
         verifiedAt: result.acknowledgedAt,
         error: "",
       });
@@ -1741,6 +2129,8 @@ export class ManagedWorktreeService {
           placementId: placement.id,
           localPath: placement.localPath,
           baseSha: binding.baseSha,
+          baseRef: binding.baseRef,
+          remote: binding.integrationRemote,
           expectedRepositoryIdentity: binding.repositoryIdentity,
         },
       });

@@ -190,7 +190,10 @@ function operationResult(
       : {}),
     updatedAt: new Date().toISOString(),
   });
-  const targetRef = options.targetRef ?? "refs/heads/main";
+  const targetRef =
+    options.targetRef ??
+    store.getRun(request.runId)?.workspaceBinding?.integrationTargetRef ??
+    "refs/heads/main";
   const preview = IntegrationPreviewSchema.parse({
     id:
       request.kind === "integration_preview"
@@ -204,6 +207,11 @@ function operationResult(
     targetPlacementId: request.targetPlacementId ?? current.sourcePlacementId,
     target: current.repository,
     targetRef,
+    targetBaseRef: request.integrationBaseRef,
+    targetRemote:
+      request.integrationRemote ??
+      store.getRun(request.runId)?.workspaceBinding?.integrationRemote ??
+      "",
     targetSha: current.baseSha,
     taskDirty: false,
     targetDirty: false,
@@ -214,9 +222,9 @@ function operationResult(
     observedAt: new Date().toISOString(),
   });
   const integration =
-    request.kind === "integrate"
+    request.kind === "integrate" || request.kind === "publish"
       ? WorktreeIntegrationSchema.parse({
-          id: request.operationId,
+          id: request.kind === "publish" ? request.integrationId : request.operationId,
           worktreeId: request.worktreeId,
           generation: request.generation,
           preview,
@@ -225,6 +233,7 @@ function operationResult(
           state: integrationState,
           preState: "clean",
           resultSha: preview.targetSha,
+          finalTree: preview.targetSha,
           conflicts: integrationState === "conflicted" ? ["same.txt"] : [],
           validationState: integrationState === "conflicted" ? "not_run" : "passed",
           validationSummary: options.noChanges
@@ -232,6 +241,8 @@ function operationResult(
             : "Merge result is clean and contains the reviewed task commit.",
           validationStartedAt: new Date().toISOString(),
           validatedAt: new Date().toISOString(),
+          publishState: request.kind === "publish" ? "published" : "awaiting_approval",
+          publishedAt: request.kind === "publish" ? new Date().toISOString() : "",
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         })
@@ -675,7 +686,7 @@ describe("Host managed workspace orchestration", () => {
     });
   });
 
-  it("infers only the pinned source target and deduplicates mismatched-ref attention across retry", async () => {
+  it("uses a Fleet-owned integration target and deduplicates mismatched-ref attention across retry", async () => {
     const kit = fixture();
     const run = await readyManaged(kit);
     const start = kit.frames.length;
@@ -692,8 +703,8 @@ describe("Host managed workspace orchestration", () => {
     const previewRequest = lastRequest(kit.frames);
     expect(previewRequest).toMatchObject({
       kind: "integration_preview",
-      targetPlacementId: kit.placement.id,
     });
+    expect(previewRequest.targetPlacementId).toBeUndefined();
     kit.service.worktrees.handleResult(
       kit.node.id,
       operationResult(kit.store, previewRequest, {
@@ -704,7 +715,7 @@ describe("Host managed workspace orchestration", () => {
     expect(kit.store.getRun(run.id)?.workspaceBinding).toMatchObject({
       aggregationState: "attention",
       aggregationCode: "target_ref_mismatch",
-      aggregationTargetRef: "refs/heads/main",
+      aggregationTargetRef: run.workspaceBinding!.integrationTargetRef,
     });
     expect(kit.store.listNotifications().notifications).toHaveLength(1);
 
@@ -735,14 +746,14 @@ describe("Host managed workspace orchestration", () => {
       `aggregation:${run.workspaceBinding!.generation}`,
       "integration",
       "cleanup_failed",
-      { phase: "cleanup", targetRef: "refs/heads/main" },
+      { phase: "cleanup", targetRef: run.workspaceBinding!.integrationTargetRef },
     );
     expect(kit.store.listNotifications().notifications[0]).toMatchObject({
       data: {
         reason: "integration",
         code: "cleanup_failed",
         phase: "cleanup",
-        targetRef: "refs/heads/main",
+        targetRef: run.workspaceBinding!.integrationTargetRef,
       },
       body: expect.stringContaining("during cleanup"),
     });
@@ -762,6 +773,55 @@ describe("Host managed workspace orchestration", () => {
     });
   });
 
+  it("escalates repeated automatic quiescence failures instead of retrying forever", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit);
+    let seen = kit.frames.length;
+    kit.service.worktrees.advanceAggregation(run.id);
+
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+      const request = lastRequest(kit.frames);
+      expect(request.kind).toBe("quiesce");
+      seen = kit.frames.length;
+      kit.service.worktrees.handleResult(
+        kit.node.id,
+        WorktreeOperationResultSchema.parse({
+          operationId: request.operationId,
+          worktreeId: request.worktreeId,
+          generation: request.generation,
+          nodeId: request.nodeId,
+          hostInstallationId: request.hostInstallationId,
+          ok: false,
+          retryable: true,
+          code: "process_still_running",
+          error: "A supervised child is still running.",
+          acknowledgedAt: new Date().toISOString(),
+        }),
+      );
+      await expect
+        .poll(() => kit.store.getWorktreeOperation(request.operationId)?.result?.code)
+        .toBe("process_still_running");
+      if (attempt < 3) {
+        await expect
+          .poll(
+            () => kit.store.getRun(run.id)?.workspaceBinding?.aggregationAutomaticRetries,
+          )
+          .toBe(attempt);
+        kit.service.worktrees.advanceAggregation(run.id);
+      }
+    }
+
+    await expect.poll(() => kit.store.getRun(run.id)?.state).toBe("blocked");
+    expect(kit.store.getRun(run.id)?.workspaceBinding).toMatchObject({
+      aggregationState: "attention",
+      aggregationCode: "automatic_retry_exhausted",
+      aggregationAttempt: 3,
+      aggregationAutomaticRetries: 2,
+    });
+    expect(kit.store.listNotifications().notifications).toHaveLength(1);
+  });
+
   it("does not reuse a terminal integration for a newer workspace result", async () => {
     const kit = fixture();
     const run = await readyManaged(kit);
@@ -775,7 +835,7 @@ describe("Host managed workspace orchestration", () => {
       diff: "+old\n",
       targetPlacementId: kit.placement.id,
       target: tree.repository,
-      targetRef: "refs/heads/main",
+      targetRef: run.workspaceBinding!.integrationTargetRef,
       targetSha: tree.baseSha,
       taskDirty: false,
       targetDirty: false,
@@ -865,7 +925,7 @@ describe("Host managed workspace orchestration", () => {
       data: {
         reason: "integration",
         phase: "integrate",
-        targetRef: "refs/heads/main",
+        targetRef: run.workspaceBinding!.integrationTargetRef,
       },
     });
   });
@@ -880,6 +940,7 @@ describe("Host managed workspace orchestration", () => {
       "quiesce",
       "integration_preview",
       "integrate",
+      "publish",
       "retain",
       "cleanup",
     ] as const) {
@@ -891,13 +952,20 @@ describe("Host managed workspace orchestration", () => {
         kit.node.id,
         operationResult(kit.store, request, { noChanges: true }),
       );
+      if (kind === "integrate") {
+        await expect
+          .poll(() => kit.store.getRun(run.id)?.workspaceBinding?.aggregationPhase)
+          .toBe("await_publish_approval");
+        expect(kit.frames).toHaveLength(seen);
+        kit.service.worktrees.approvePublication(run.id, randomUUID(), "operator");
+      }
     }
 
     await expect.poll(() => kit.store.getRun(run.id)?.state).toBe("completed");
     expect(kit.store.getRun(run.id)?.workspaceBinding).toMatchObject({
       aggregationState: "completed",
       aggregationPhase: "done",
-      aggregationTargetRef: "refs/heads/main",
+      aggregationTargetRef: run.workspaceBinding!.integrationTargetRef,
       aggregationSummary: expect.stringContaining("No committed changes"),
     });
     expect(kit.store.worktreeForRun(run.id)?.state).toBe("removed");
@@ -906,7 +974,14 @@ describe("Host managed workspace orchestration", () => {
         .listWorktreeOperations()
         .filter((entry) => entry.request.actor === "host-integration-controller")
         .map((entry) => entry.request.kind),
-    ).toEqual(["quiesce", "integration_preview", "integrate", "retain", "cleanup"]);
+    ).toEqual([
+      "quiesce",
+      "integration_preview",
+      "integrate",
+      "publish",
+      "retain",
+      "cleanup",
+    ]);
   });
 
   it("completes integration while retaining ignored-only generated output", async () => {
@@ -919,6 +994,7 @@ describe("Host managed workspace orchestration", () => {
       "quiesce",
       "integration_preview",
       "integrate",
+      "publish",
       "retain",
       "cleanup",
     ] as const) {
@@ -931,6 +1007,8 @@ describe("Host managed workspace orchestration", () => {
           kit.node.id,
           operationResult(kit.store, request),
         );
+        if (kind === "integrate")
+          kit.service.worktrees.approvePublication(run.id, randomUUID(), "operator");
         continue;
       }
       const current = kit.store.getAnyManagedWorkspace(request.worktreeId)!;
@@ -1297,6 +1375,9 @@ describe("Host managed workspace orchestration", () => {
       },
       baseSha: run.workspaceBinding!.baseSha,
       baseAvailable: true,
+      baseMaterializable: false,
+      portableResultsSupported: true,
+      portabilityReason: "",
       verifiedAt: new Date().toISOString(),
       error: "",
     });

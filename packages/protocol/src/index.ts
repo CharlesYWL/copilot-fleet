@@ -3,6 +3,7 @@ import {
   ExecutionBindingSchema,
   ManagedWorktreePolicySchema,
   ManagedWorktreeSchema,
+  RunWorkspaceSpecSchema,
   RunWorkspaceBindingSchema,
   WorktreeIntegrationSchema,
   WorktreeOperationRequestSchema,
@@ -1387,6 +1388,7 @@ export const RunSchema = z.object({
   workspaceBinding: RunWorkspaceBindingSchema.default(() =>
     RunWorkspaceBindingSchema.parse({}),
   ).optional(),
+  workspaceSpec: RunWorkspaceSpecSchema.optional(),
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   name: z.string().min(1),

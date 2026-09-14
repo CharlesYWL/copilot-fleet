@@ -208,6 +208,18 @@ describe("managed checkout scheduling", () => {
     ).not.toContain("start_step");
   });
 
+  it("does not dispatch a shell-capable reviewer before its isolated workspace is ready", () => {
+    expect(
+      types(
+        world({
+          run: managed(),
+          nodes: [capable()],
+          steps: [step("review", { category: "review-deep" })],
+        }),
+      ),
+    ).not.toContain("start_step");
+  });
+
   it("dispatches managed step bindings on different verified Nodes", () => {
     const second = ExecutionBindingSchema.parse({
       ...binding("remote"),

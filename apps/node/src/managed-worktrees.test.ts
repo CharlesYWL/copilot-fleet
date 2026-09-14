@@ -105,6 +105,21 @@ async function operation(
   kind: WorktreeOperationRequest["kind"],
   extra: Record<string, unknown> = {},
 ) {
+  const integrationOperation = [
+    "integration_preview",
+    "integrate",
+    "continue",
+    "abort",
+  ].includes(kind);
+  const normalizedExtra = { ...extra };
+  if (integrationOperation) {
+    if (
+      typeof normalizedExtra.targetPath === "string" &&
+      !normalizedExtra.targetPath.includes("integration-")
+    )
+      delete normalizedExtra.targetPath;
+    normalizedExtra.integrationTargetRef ??= `refs/heads/dev/fleet-test/fleet-${tree.runId.slice(0, 20)}`;
+  }
   return manager.execute(
     WorktreeOperationRequestSchema.parse({
       ...reserveRequest(tree.repository.path, tree.runId),
@@ -115,7 +130,7 @@ async function operation(
       expectedPath: tree.path,
       expectedBranchRef: tree.branchRef,
       expectedBaseSha: tree.baseSha,
-      ...extra,
+      ...normalizedExtra,
     }),
   );
 }
@@ -394,6 +409,8 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       placementId: "placement-b",
       localPath: sourceB,
       baseSha,
+      baseRef: "",
+      remote: "",
       expectedRepositoryIdentity: "0".repeat(64),
     });
     expect(mismatch).toMatchObject({
@@ -1373,9 +1390,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(await active.manager.execute(reserveRequest(active.source))).toMatchObject({
       ok: false,
       code: "unsupported_hooks",
-      error: expect.stringMatching(
-        /active-hooks.*remove or disable them.*use Legacy mode/i,
-      ),
+      error: expect.stringMatching(/active-hooks.*exact content is approved/i),
     });
     expect(
       await active.manager.execute({
@@ -1855,11 +1870,17 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     const tree = await allocate(manager, source);
     await writeFile(join(tree.path, "same.txt"), "task change\n");
     await git.run(tree.path, ["commit", "-am", "task"]);
-    await writeFile(join(source, "same.txt"), "target change\n");
-    await git.run(source, ["commit", "-am", "target"]);
-    const preview = (
+    const initial = (
       await operation(manager, tree, "integration_preview", {
         targetPath: source,
+        targetPlacementId: "target-placement",
+      })
+    ).preview!;
+    await writeFile(join(initial.target.path, "same.txt"), "target change\n");
+    await git.run(initial.target.path, ["commit", "-am", "target"]);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: initial.target.path,
         targetPlacementId: "target-placement",
       })
     ).preview!;
@@ -1873,7 +1894,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(started.error).toBe("");
     expect(started.integration!.state).toBe("conflicted");
     expect(started.integration!.conflicts).toEqual(["same.txt"]);
-    const target = await canonicalPath(source);
+    const target = await canonicalPath(preview.target.path);
     expect(() =>
       manager.locks.acquire(target, { owner: "manual", kind: "worker", attempt: "1" }),
     ).toThrow("reserved");
@@ -1894,7 +1915,10 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     });
     expect(aborted.error).toBe("");
     expect(aborted.integration!.state).toBe("aborted");
-    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("target change\n");
+    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("base\n");
+    expect(await readFile(join(preview.target.path, "same.txt"), "utf8")).toBe(
+      "target change\n",
+    );
     expect(await readFile(join(tree.path, "same.txt"), "utf8")).toBe("task change\n");
     expect(manager.locks.holder(target.key)).toBeUndefined();
     expect((await operation(manager, tree, "cleanup")).worktree!.state).toBe("removed");
@@ -1930,15 +1954,15 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         })
       ).code,
     ).toBe("review_required");
-    await writeFile(join(source, "source.txt"), "source");
-    await git.run(source, ["add", "source.txt"]);
-    await git.run(source, ["commit", "-m", "target moves"]);
+    await writeFile(join(preview.target.path, "source.txt"), "source");
+    await git.run(preview.target.path, ["add", "source.txt"]);
+    await git.run(preview.target.path, ["commit", "-m", "target moves"]);
     expect((await operation(manager, tree, "integrate", input)).code).toBe(
       "stale_preview",
     );
     const fresh = (
       await operation(manager, tree, "integration_preview", {
-        targetPath: source,
+        targetPath: preview.target.path,
         targetPlacementId: "target-placement",
       })
     ).preview!;
@@ -1952,15 +1976,11 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       ...input,
       previewId: fresh.id,
     });
-    expect(integrated.error).toBe("");
-    expect(integrated.integration!.state).toBe("integrated");
-    expect(integrated.integration).toMatchObject({
-      validationState: "passed",
-      validationSummary: "Merge result is clean and contains the reviewed task commit.",
-      validatedAt: expect.any(String),
-    });
-    expect(await readFile(join(source, "task.txt"), "utf8")).toBe("task");
-    expect((await operation(manager, tree, "cleanup")).ok).toBe(true);
+    expect(integrated.code).toBe("post_integration_validation_required");
+    expect(integrated.integration).toBeUndefined();
+    await expect(readFile(join(source, "task.txt"), "utf8")).rejects.toThrow();
+    expect(await readFile(join(fresh.target.path, "task.txt"), "utf8")).toBe("task");
+    expect((await operation(manager, tree, "cleanup")).ok).toBe(false);
   });
 
   it("allows unrelated ignored target output but blocks ignored paths the merge would overwrite", async () => {
@@ -2010,21 +2030,24 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         targetPlacementId: "target-placement",
       })
     ).preview!;
-    expect(blocked.targetDirty).toBe(true);
+    expect(blocked.targetDirty).toBe(false);
+    await expect(
+      readFile(join(collisionFixture.source, "ignored.txt"), "utf8"),
+    ).resolves.toBe("local generated output\n");
   });
 
-  it("accepts reviewed merge changes made by explicitly allowed commit hooks", async () => {
+  it("rejects a final tree changed by an explicitly allowed commit hook", async () => {
     const { manager, source } = await fixture();
-    const tree = await allocate(manager, source, { allowGitHooks: true });
-    await writeFile(join(tree.path, "task.txt"), "task\n");
-    await git.run(tree.path, ["add", "task.txt"]);
-    await git.run(tree.path, ["commit", "-m", "task"]);
     const hook = join(source, ".git", "hooks", "pre-commit");
     await writeFile(
       hook,
       "#!/bin/sh\nprintf 'hook output\\n' > hook-output.txt\ngit add hook-output.txt\n",
     );
     await chmod(hook, 0o755);
+    const tree = await allocate(manager, source, { allowGitHooks: true });
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["-c", "core.hooksPath=/dev/null", "add", "task.txt"]);
+    await git.run(tree.path, ["-c", "core.hooksPath=/dev/null", "commit", "-m", "task"]);
     const preview = (
       await operation(manager, tree, "integration_preview", {
         targetPath: source,
@@ -2040,14 +2063,16 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       commit: true,
     });
 
-    expect(integrated.error).toBe("");
-    expect(integrated.integration).toMatchObject({
-      state: "integrated",
-      validationState: "passed",
+    expect(integrated.code).toBe("commit_uncertain");
+    const reconciled = await operation(manager, tree, "reconcile");
+    expect(reconciled.integration).toMatchObject({
+      state: "needs_reconciliation",
+      validationState: "failed",
     });
-    await expect(readFile(join(source, "hook-output.txt"), "utf8")).resolves.toBe(
-      "hook output\n",
-    );
+    await expect(
+      readFile(join(preview.target.path, "hook-output.txt"), "utf8"),
+    ).resolves.toBe("hook output\n");
+    await expect(readFile(join(source, "hook-output.txt"), "utf8")).rejects.toThrow();
   });
 
   it("creates and publishes a task branch from the latest remote main", async () => {
@@ -2066,6 +2091,14 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     await git.run(upstream, ["add", "upstream.txt"]);
     await git.run(upstream, ["commit", "-m", "advance origin main"]);
     await git.run(upstream, ["push", "origin", "main"]);
+    const remoteTrackingBefore = await git.run(source, [
+      "rev-parse",
+      "refs/remotes/origin/main",
+    ]);
+    const fetchHeadPath = (
+      await git.run(source, ["rev-parse", "--git-path", "FETCH_HEAD"])
+    ).stdout.trim();
+    const fetchHeadBefore = await readFile(fetchHeadPath, "utf8").catch(() => "");
     const integration = {
       integrationBaseRef: "refs/remotes/origin/main",
       integrationTargetRef: "refs/heads/dev/fleet-test/example-task",
@@ -2075,9 +2108,19 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     await expect(readFile(join(tree.path, "upstream.txt"), "utf8")).resolves.toBe(
       "latest main\n",
     );
+    expect(
+      (await git.run(source, ["rev-parse", "refs/remotes/origin/main"])).stdout,
+    ).toBe(remoteTrackingBefore.stdout);
+    expect(await readFile(fetchHeadPath, "utf8").catch(() => "")).toBe(fetchHeadBefore);
     await writeFile(join(tree.path, "task.txt"), "task\n");
     await git.run(tree.path, ["add", "task.txt"]);
     await git.run(tree.path, ["commit", "-m", "task"]);
+    await writeFile(join(source, "same.txt"), "user unstaged change\n");
+    await writeFile(join(source, "user-staged.txt"), "user staged change\n");
+    await writeFile(join(source, "user-untracked.txt"), "user untracked change\n");
+    await writeFile(join(source, "ignored.txt"), "user ignored output\n");
+    await git.run(source, ["add", "user-staged.txt"]);
+    const sourceHeadBefore = (await git.run(source, ["rev-parse", "HEAD"])).stdout.trim();
     const preview = (
       await operation(manager, tree, "integration_preview", {
         targetPath: source,
@@ -2101,9 +2144,90 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
 
     expect(integrated.error).toBe("");
     expect(integrated.integration?.state).toBe("integrated");
+    expect(integrated.integration?.publishState).toBe("awaiting_approval");
+    const rejected = await operation(manager, integrated.worktree!, "publish", {
+      integrationId: integrated.integration!.id,
+      publicationApproval: {
+        approvalId: randomUUID(),
+        runId: integrated.worktree!.runId,
+        integrationId: integrated.integration!.id,
+        targetRemote: integrated.integration!.preview.targetRemote,
+        targetRef: integrated.integration!.preview.targetRef,
+        expectedRemoteSha: "",
+        finalResultSha: integrated.integration!.resultSha,
+        finalTreeSha: "f".repeat(40),
+        approvedBy: "operator",
+        approvedAt: new Date().toISOString(),
+      },
+      ...integration,
+    });
+    expect(rejected.code).toBe("publication_approval_mismatch");
+    await git.run(source, [
+      "push",
+      "origin",
+      `HEAD:${integrated.integration!.preview.targetRef}`,
+    ]);
+    const changedTarget = await operation(manager, integrated.worktree!, "publish", {
+      integrationId: integrated.integration!.id,
+      publicationApproval: {
+        approvalId: randomUUID(),
+        runId: integrated.worktree!.runId,
+        integrationId: integrated.integration!.id,
+        targetRemote: integrated.integration!.preview.targetRemote,
+        targetRef: integrated.integration!.preview.targetRef,
+        expectedRemoteSha: "",
+        finalResultSha: integrated.integration!.resultSha,
+        finalTreeSha: integrated.integration!.finalTree,
+        approvedBy: "operator",
+        approvedAt: new Date().toISOString(),
+      },
+      ...integration,
+    });
+    expect(changedTarget.code).toBe("publication_target_changed");
+    await git.run(source, [
+      "push",
+      "origin",
+      `:${integrated.integration!.preview.targetRef}`,
+    ]);
+    const published = await operation(manager, integrated.worktree!, "publish", {
+      integrationId: integrated.integration!.id,
+      publicationApproval: {
+        approvalId: randomUUID(),
+        runId: integrated.worktree!.runId,
+        integrationId: integrated.integration!.id,
+        targetRemote: integrated.integration!.preview.targetRemote,
+        targetRef: integrated.integration!.preview.targetRef,
+        expectedRemoteSha: "",
+        finalResultSha: integrated.integration!.resultSha,
+        finalTreeSha: integrated.integration!.finalTree,
+        approvedBy: "operator",
+        approvedAt: new Date().toISOString(),
+      },
+      ...integration,
+    });
+    expect(published.integration?.publishState).toBe("published");
     expect((await git.run(source, ["symbolic-ref", "-q", "HEAD"])).stdout.trim()).toBe(
-      integration.integrationTargetRef,
+      "refs/heads/main",
     );
+    expect((await git.run(source, ["rev-parse", "HEAD"])).stdout.trim()).toBe(
+      sourceHeadBefore,
+    );
+    await expect(readFile(join(source, "same.txt"), "utf8")).resolves.toBe(
+      "user unstaged change\n",
+    );
+    await expect(readFile(join(source, "user-staged.txt"), "utf8")).resolves.toBe(
+      "user staged change\n",
+    );
+    await expect(readFile(join(source, "user-untracked.txt"), "utf8")).resolves.toBe(
+      "user untracked change\n",
+    );
+    await expect(readFile(join(source, "ignored.txt"), "utf8")).resolves.toBe(
+      "user ignored output\n",
+    );
+    expect(
+      (await git.run(source, ["rev-parse", "refs/remotes/origin/main"])).stdout,
+    ).toBe(remoteTrackingBefore.stdout);
+    expect(await readFile(fetchHeadPath, "utf8").catch(() => "")).toBe(fetchHeadBefore);
     expect(
       (
         await git.run(source, [
@@ -2113,15 +2237,11 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
           integration.integrationTargetRef,
         ])
       ).stdout.trim(),
-    ).toContain(integrated.integration!.resultSha);
+    ).toContain(published.integration!.resultSha);
   });
 
-  it("reconciles a clean target when an allowed post-commit hook advances it", async () => {
+  it("does not accept an unreviewed post-commit descendant during reconciliation", async () => {
     const { manager, source } = await fixture();
-    const tree = await allocate(manager, source, { allowGitHooks: true });
-    await writeFile(join(tree.path, "task.txt"), "task\n");
-    await git.run(tree.path, ["add", "task.txt"]);
-    await git.run(tree.path, ["commit", "-m", "task"]);
     const hook = join(source, ".git", "hooks", "post-commit");
     await writeFile(
       hook,
@@ -2134,6 +2254,10 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       ].join("\n"),
     );
     await chmod(hook, 0o755);
+    const tree = await allocate(manager, source, { allowGitHooks: true });
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["-c", "core.hooksPath=/dev/null", "commit", "-m", "task"]);
     const preview = (
       await operation(manager, tree, "integration_preview", {
         targetPath: source,
@@ -2151,15 +2275,18 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
 
     const reconciled = await operation(manager, tree, "reconcile");
 
-    expect(reconciled.error).toBe("");
     expect(reconciled.worktree).toMatchObject({
-      state: "retained",
-      integrationState: "integrated",
+      state: "needs_reconciliation",
+      integrationState: "needs_reconciliation",
     });
     expect(
-      await git.run(source, ["merge-base", "--is-ancestor", preview.taskSha, "HEAD"], {
-        allowedExitCodes: [0, 1],
-      }),
+      await git.run(
+        preview.target.path,
+        ["merge-base", "--is-ancestor", preview.taskSha, "HEAD"],
+        {
+          allowedExitCodes: [0, 1],
+        },
+      ),
     ).toMatchObject({ exitCode: 0 });
   });
 
@@ -2210,11 +2337,17 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     const tree = await allocate(manager, source);
     await writeFile(join(tree.path, "same.txt"), "task\n");
     await git.run(tree.path, ["commit", "-am", "task"]);
-    await writeFile(join(source, "same.txt"), "target\n");
-    await git.run(source, ["commit", "-am", "target"]);
-    const preview = (
+    const initial = (
       await operation(manager, tree, "integration_preview", {
         targetPath: source,
+        targetPlacementId: "target",
+      })
+    ).preview!;
+    await writeFile(join(initial.target.path, "same.txt"), "target\n");
+    await git.run(initial.target.path, ["commit", "-am", "target"]);
+    const preview = (
+      await operation(manager, tree, "integration_preview", {
+        targetPath: initial.target.path,
         targetPlacementId: "target",
       })
     ).preview!;
@@ -2225,8 +2358,8 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
     });
     expect(started.integration!.state).toBe("conflicted");
-    await writeFile(join(source, "same.txt"), "resolved\n");
-    await git.run(source, ["add", "same.txt"]);
+    await writeFile(join(preview.target.path, "same.txt"), "resolved\n");
+    await git.run(preview.target.path, ["add", "same.txt"]);
     const input = { integrationId: started.integration!.id, commit: true };
     expect((await operation(manager, tree, "continue", input)).code).toBe(
       "confirmation_required",
@@ -2235,9 +2368,11 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       ...input,
       confirm: `COMMIT MERGE ${input.integrationId}`,
     });
-    expect(continued.error).toBe("");
-    expect(continued.integration!.state).toBe("integrated");
-    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("resolved\n");
+    expect(continued.code).toBe("post_integration_validation_required");
+    expect(await readFile(join(source, "same.txt"), "utf8")).toBe("base\n");
+    expect(await readFile(join(preview.target.path, "same.txt"), "utf8")).toBe(
+      "resolved\n",
+    );
     expect(await readFile(join(tree.path, "same.txt"), "utf8")).toBe("task\n");
     expect((await git.run(source, ["branch", "--show-current"])).stdout.trim()).toBe(
       "target",

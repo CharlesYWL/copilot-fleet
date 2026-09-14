@@ -72,6 +72,9 @@ import {
   ExecutionBindingSchema,
   ManagedWorktreePolicySchema,
   ManagedWorktreeSchema,
+  RunWorkspaceSpecSchema,
+  IntegrationAttemptSchema,
+  PublicationApprovalSchema,
   RunWorkspaceBindingSchema,
   WorktreeConflict,
   WorktreeIntegrationSchema,
@@ -84,6 +87,10 @@ import {
   type ManagedWorktree,
   type ManagedWorktreePolicy,
   type RunWorkspaceBinding,
+  type RunWorkspaceSpec,
+  type IntegrationAttempt,
+  type PublicationApproval,
+  type WorkspaceInstance,
   type WorkspaceMode,
   type WorktreeIntegration,
   type WorktreeOperation,
@@ -562,6 +569,17 @@ export class FleetStore {
       );
       CREATE INDEX IF NOT EXISTS idx_workspace_results_run
         ON workspace_results(run_id,owner_step_id);
+      CREATE TABLE IF NOT EXISTS run_workspace_specs (
+        run_id TEXT PRIMARY KEY, schema_version INTEGER NOT NULL, data TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS integration_attempts (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, attempt_number INTEGER NOT NULL,
+        data TEXT NOT NULL, UNIQUE(run_id,attempt_number)
+      );
+      CREATE TABLE IF NOT EXISTS publication_approvals (
+        id TEXT PRIMARY KEY, run_id TEXT NOT NULL, integration_id TEXT NOT NULL,
+        data TEXT NOT NULL
+      );
       -- Every ownership question (which sessions does this node own, may this
       -- workspace be deleted) filtered these columns with a full scan.
       CREATE INDEX IF NOT EXISTS idx_sessions_node ON sessions(node_id);
@@ -734,6 +752,7 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "workspace_binding", "TEXT NOT NULL DEFAULT '{}'");
     this.addColumnIfMissing("sessions", "execution_binding", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("run_steps", "execution_binding", "TEXT NOT NULL DEFAULT ''");
+    this.migrateRunWorkspaceSpecs();
     this.addColumnIfMissing(
       "run_steps",
       "managed_worktree_id",
@@ -1248,6 +1267,186 @@ export class FleetStore {
     this.statement(
       "INSERT INTO managed_api_requests (scope,id,request,result) VALUES (?,?,?,?)",
     ).run(scope, id, JSON.stringify(request), JSON.stringify(result));
+  }
+
+  private migrateRunWorkspaceSpecs(): void {
+    const rows = this.statement(
+      `SELECT id,workspace_id,workspace_binding,created_at
+       FROM runs WHERE id NOT IN (SELECT run_id FROM run_workspace_specs)`,
+    ).all() as Row[];
+    for (const row of rows) {
+      const binding = RunWorkspaceBindingSchema.parse(
+        JSON.parse(String(row.workspace_binding || "{}")),
+      );
+      const spec = RunWorkspaceSpecSchema.parse({
+        requestedMode: binding.requestedMode,
+        effectiveMode: binding.effectiveMode,
+        repositoryIdentity: binding.repositoryIdentity,
+        repositoryObjectFormat: binding.repositoryObjectFormat,
+        executionBaseRef: binding.baseRef,
+        executionBaseSha: binding.baseSha,
+        sourceProvenance: {
+          placementId: binding.originatingPlacementId,
+          workspaceId: String(row.workspace_id),
+        },
+        integrationBasePolicy: binding.integrationBaseRef ? "latest-target" : "pinned",
+        integrationBaseRef: binding.integrationBaseRef,
+        integrationStrategy: "merge",
+        publicationPolicy: {
+          mode: binding.integrationTargetRef ? "branch" : "none",
+          remote: binding.integrationRemote,
+          targetRef: binding.integrationTargetRef,
+          createOnly: true,
+        },
+        hookPolicy: binding.allowGitHooks ? "approved_exact" : "disabled",
+        createdAt: String(row.created_at),
+      });
+      this.putRunWorkspaceSpec(String(row.id), spec);
+    }
+  }
+
+  getRunWorkspaceSpec(runId: string): RunWorkspaceSpec | undefined {
+    const row = this.statement("SELECT data FROM run_workspace_specs WHERE run_id=?").get(
+      runId,
+    );
+    return row ? RunWorkspaceSpecSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  putRunWorkspaceSpec(runId: string, value: RunWorkspaceSpec): void {
+    const parsed = RunWorkspaceSpecSchema.parse(value);
+    const current = this.getRunWorkspaceSpec(runId);
+    if (current && !isDeepStrictEqual(current, parsed))
+      throw new WorktreeConflict(
+        "workspace_spec_immutable",
+        "The resolved managed-workspace specification cannot be rewritten.",
+      );
+    this.statement(
+      `INSERT OR IGNORE INTO run_workspace_specs (run_id,schema_version,data)
+       VALUES (?,?,?)`,
+    ).run(runId, parsed.schemaVersion, JSON.stringify(parsed));
+  }
+
+  resolveRunWorkspaceSpec(
+    runId: string,
+    input: Pick<
+      RunWorkspaceSpec,
+      | "repositoryIdentity"
+      | "repositoryObjectFormat"
+      | "executionBaseRef"
+      | "executionBaseSha"
+      | "repositoryExecutionPolicy"
+    >,
+  ): RunWorkspaceSpec {
+    const current = this.getRunWorkspaceSpec(runId);
+    if (!current)
+      throw new WorktreeConflict(
+        "workspace_spec_missing",
+        "The managed-workspace specification is missing.",
+      );
+    if (current.executionBaseSha) {
+      const expected = {
+        repositoryIdentity: current.repositoryIdentity,
+        repositoryObjectFormat: current.repositoryObjectFormat,
+        executionBaseRef: current.executionBaseRef,
+        executionBaseSha: current.executionBaseSha,
+        repositoryExecutionPolicy: current.repositoryExecutionPolicy,
+      };
+      if (!isDeepStrictEqual(expected, input))
+        throw new WorktreeConflict(
+          "workspace_spec_immutable",
+          "The resolved repository, base, or execution policy changed.",
+        );
+      return current;
+    }
+    const resolved = RunWorkspaceSpecSchema.parse({ ...current, ...input });
+    this.statement(
+      "UPDATE run_workspace_specs SET schema_version=?,data=? WHERE run_id=?",
+    ).run(resolved.schemaVersion, JSON.stringify(resolved), runId);
+    return resolved;
+  }
+
+  listWorkspaceInstances(runId: string): WorkspaceInstance[] {
+    return [...this.listManagedWorktrees(), ...this.listDerivedWorkspaces()]
+      .filter((tree) => tree.runId === runId)
+      .map((tree) => ({
+        workspaceId: tree.id,
+        runId: tree.runId,
+        generation: tree.generation,
+        kind: tree.workspaceKind,
+        ownerStepId: tree.ownerStepId,
+        assignedNodeId: tree.nodeId,
+        placementId: tree.executionPlacementId,
+        physicalIdentity: tree.checkout,
+        localPath: tree.path,
+        lifecycleState: tree.state,
+        currentHead: tree.observation?.head || "",
+        resultId: tree.resultSha,
+      }));
+  }
+
+  listIntegrationAttempts(runId: string): IntegrationAttempt[] {
+    return this.statement(
+      "SELECT data FROM integration_attempts WHERE run_id=? ORDER BY attempt_number",
+    )
+      .all(runId)
+      .map((row) => IntegrationAttemptSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  putIntegrationAttempt(value: IntegrationAttempt): void {
+    const parsed = IntegrationAttemptSchema.parse(value);
+    const row = this.statement("SELECT data FROM integration_attempts WHERE id=?").get(
+      parsed.attemptId,
+    );
+    const current = row
+      ? IntegrationAttemptSchema.parse(JSON.parse(String(row.data)))
+      : undefined;
+    if (
+      current &&
+      (current.runId !== parsed.runId ||
+        current.attemptNumber !== parsed.attemptNumber ||
+        current.resultWorkspaceId !== parsed.resultWorkspaceId ||
+        current.resultGeneration !== parsed.resultGeneration ||
+        current.assignedNodeId !== parsed.assignedNodeId ||
+        current.targetRef !== parsed.targetRef)
+    )
+      throw new WorktreeConflict(
+        "integration_attempt_immutable",
+        "An integration attempt's identity and assignment cannot be rewritten.",
+      );
+    this.statement(
+      `INSERT INTO integration_attempts (id,run_id,attempt_number,data)
+       VALUES (?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET data=excluded.data`,
+    ).run(parsed.attemptId, parsed.runId, parsed.attemptNumber, JSON.stringify(parsed));
+  }
+
+  getPublicationApproval(runId: string): PublicationApproval | undefined {
+    const row = this.statement(
+      "SELECT data FROM publication_approvals WHERE run_id=? ORDER BY rowid DESC LIMIT 1",
+    ).get(runId);
+    return row
+      ? PublicationApprovalSchema.parse(JSON.parse(String(row.data)))
+      : undefined;
+  }
+
+  putPublicationApproval(value: PublicationApproval): PublicationApproval {
+    const parsed = PublicationApprovalSchema.parse(value);
+    const row = this.statement("SELECT data FROM publication_approvals WHERE id=?").get(
+      parsed.approvalId,
+    );
+    if (row) {
+      const current = PublicationApprovalSchema.parse(JSON.parse(String(row.data)));
+      if (!isDeepStrictEqual(current, parsed))
+        throw new WorktreeConflict(
+          "publication_approval_immutable",
+          "A publication approval cannot be changed after it is recorded.",
+        );
+      return current;
+    }
+    this.statement(
+      "INSERT INTO publication_approvals (id,run_id,integration_id,data) VALUES (?,?,?,?)",
+    ).run(parsed.approvalId, parsed.runId, parsed.integrationId, JSON.stringify(parsed));
+    return parsed;
   }
 
   listManagedWorktrees(): ManagedWorktree[] {
@@ -4506,21 +4705,16 @@ export class FleetStore {
     binding.sourcePlacementId = input.sourcePlacementId ?? "";
     binding.originatingPlacementId = input.sourcePlacementId ?? "";
     if (binding.effectiveMode === "managed") {
-      if (
-        input.integrationUsername !== undefined ||
-        input.integrationBaseRef !== undefined ||
-        input.integrationBranchRef !== undefined
-      ) {
-        const integration = integrationBranchSettings({
-          username: input.integrationUsername,
-          taskName: input.name,
-          baseRef: input.integrationBaseRef,
-          branchRef: input.integrationBranchRef,
-        });
-        binding.integrationBaseRef = integration.baseRef;
-        binding.integrationTargetRef = integration.branchRef;
-        binding.integrationRemote = integration.remote;
-      }
+      const integration = integrationBranchSettings({
+        runId: id,
+        username: input.integrationUsername,
+        taskName: input.name,
+        baseRef: input.integrationBaseRef,
+        branchRef: input.integrationBranchRef,
+      });
+      binding.integrationBaseRef = integration.baseRef;
+      binding.integrationTargetRef = integration.branchRef;
+      binding.integrationRemote = integration.remote;
       binding.managedWorktreeId = `worktree-${id}`;
       binding.generation = 1;
     }
@@ -4528,19 +4722,53 @@ export class FleetStore {
       JSON.stringify(binding),
       id,
     );
+    const spec = RunWorkspaceSpecSchema.parse({
+      requestedMode: binding.requestedMode,
+      effectiveMode: binding.effectiveMode,
+      repositoryIdentity: binding.repositoryIdentity,
+      repositoryObjectFormat: binding.repositoryObjectFormat,
+      executionBaseRef: binding.baseRef,
+      executionBaseSha: binding.baseSha,
+      sourceProvenance: {
+        placementId: binding.originatingPlacementId,
+        workspaceId: input.workspaceId,
+      },
+      integrationBasePolicy: binding.integrationBaseRef ? "latest-target" : "pinned",
+      integrationBaseRef: binding.integrationBaseRef,
+      integrationStrategy: "merge",
+      publicationPolicy: {
+        mode: binding.integrationTargetRef ? "branch" : "none",
+        remote: binding.integrationRemote,
+        targetRef: binding.integrationTargetRef,
+        createOnly: true,
+      },
+      hookPolicy: binding.allowGitHooks ? "approved_exact" : "disabled",
+      createdAt: now,
+    });
+    this.putRunWorkspaceSpec(id, spec);
     return this.getRun(id)!;
   }
 
   getRun(id: string): Run | undefined {
     const row = this.statement("SELECT * FROM runs WHERE id=?").get(id) as
       Row | undefined;
-    return row ? runFromRow(row) : undefined;
+    if (!row) return undefined;
+    return RunSchema.parse({
+      ...runFromRow(row),
+      workspaceSpec: this.getRunWorkspaceSpec(id),
+    });
   }
 
   listRuns(): Run[] {
     return (
       this.statement("SELECT * FROM runs ORDER BY created_at DESC").all() as Row[]
-    ).map(runFromRow);
+    ).map((row) => {
+      const run = runFromRow(row);
+      return RunSchema.parse({
+        ...run,
+        workspaceSpec: this.getRunWorkspaceSpec(run.id),
+      });
+    });
   }
 
   /** Patches a run. Callers check {@link canTransitionRun} before moving state. */

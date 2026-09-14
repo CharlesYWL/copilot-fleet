@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
 import process from "node:process";
@@ -41,6 +41,10 @@ async function localFleet(capable = true) {
   await writeFile(join(source, "same.txt"), "base\n");
   await git.run(source, ["add", "."]);
   await git.run(source, ["commit", "-m", "base"]);
+  const remote = join(root, "remote.git");
+  await git.run(root, ["init", "--bare", remote]);
+  await git.run(source, ["remote", "add", "origin", remote]);
+  await git.run(source, ["push", "origin", "target"]);
   const app = await buildServer({
     databasePath: join(root, "host.db"),
     enrollmentToken: "smoke-token",
@@ -146,14 +150,10 @@ async function localFleet(capable = true) {
               await release.promise;
               await writeFile(join(cwd, "same.txt"), `${text}\n`);
               await git.run(cwd, ["commit", "-am", text]);
-              await writeFile(join(cwd, "uncommitted.txt"), `uncommitted-${text}`);
               active -= 1;
             } else {
               expect(await readFile(join(cwd, "same.txt"), "utf8")).toContain(
                 "implement-",
-              );
-              expect(await readFile(join(cwd, "uncommitted.txt"), "utf8")).toContain(
-                "uncommitted-implement-",
               );
               reviewed.add(cwd);
             }
@@ -314,7 +314,7 @@ describe(
   "managed orchestration local HTTP/WebSocket/Git smoke",
   { timeout: 120_000 },
   () => {
-    it("reattaches a live managed Node slot after Host rotates its resume attempt without duplicating the lease or process", async () => {
+    it("quiesces the managed Node slot after automatic integration completes", async () => {
       const fleet = await localFleet();
       const run = (await fleet.create("reattach", "managed")).body;
       expect(
@@ -337,91 +337,26 @@ describe(
       await expect.poll(() => fleet.entered.size, { timeout: 30_000 }).toBe(1);
       fleet.release();
       await expect
+        .poll(
+          async () =>
+            (await fleet.request(`/api/runs/${run.id}`)).body.run.workspaceBinding
+              .aggregationPhase,
+          { timeout: 60_000 },
+        )
+        .toBe("await_publish_approval");
+      expect((await fleet.action(run.id, "publish-branch")).status).toBe(200);
+      await expect
         .poll(async () => (await fleet.request(`/api/runs/${run.id}`)).body.run.state, {
-          timeout: 30_000,
+          timeout: 120_000,
         })
         .toBe("completed");
       const store = new FleetStore(join(fleet.root, "host.db"));
       try {
         const session = store.listSessions().find((entry) => entry.runId === run.id);
-        expect(fleet.router.activeSessionIds).toContain(session.id);
-        const previous = session.executionBinding;
-        const originalLease = fleet.manager.locks.holder(previous.checkoutKey);
-        // Simulate a Host recovery state while the owning Node process survives.
-        store.transitionSession(session.id, "failed");
-        expect(
-          (await fleet.request(`/api/sessions/${session.id}/resume`, "POST", {})).status,
-        ).toBe(202);
-        await expect
-          .poll(() => store.getSession(session.id).state, { timeout: 10_000 })
-          .toBe("idle");
-        const current = store.getSession(session.id).executionBinding;
-        expect(current.leaseAttempt).not.toBe(previous.leaseAttempt);
-        expect(fleet.manager.locks.holder(current.checkoutKey)).toMatchObject({
-          token: originalLease.token,
-          owner: `session:${session.id}`,
-          attempt: current.leaseAttempt,
-        });
-        const resume = {
-          type: "resume_session",
-          sessionId: session.id,
-          agentSessionId: session.agentSessionId,
-          localPath: current.cwd,
-          executionBinding: current,
-          config: [],
-          mcpServers: [],
-          additionalDirectories: [],
-          sequenceOffset: 0,
-        };
-        expect(
-          await fleet.router.route({ ...resume, commandId: randomUUID() }),
-        ).toMatchObject({ ok: true });
-        for (const invalid of [
-          { ...previous },
-          { ...current, worktreeId: "wrong-worktree" },
-          { ...current, generation: current.generation + 1 },
-          { ...current, checkoutKey: "wrong-checkout" },
-          { ...current, sourcePlacementId: "wrong-source" },
-        ]) {
-          expect(
-            await fleet.router.route({
-              ...resume,
-              executionBinding: invalid,
-              commandId: randomUUID(),
-            }),
-          ).toMatchObject({ ok: false, fatal: false });
-        }
-        expect(
-          await fleet.router.route({
-            ...resume,
-            commandId: randomUUID(),
-            agentSessionId: "another-conversation",
-          }),
-        ).toMatchObject({ ok: false, fatal: false });
-        expect(
-          await fleet.router.route({
-            type: "prompt",
-            sessionId: session.id,
-            commandId: randomUUID(),
-            prompt: "stale",
-            attachments: [],
-            executionBinding: previous,
-          }),
-        ).toMatchObject({ ok: false, fatal: false });
-        expect(
-          (
-            await fleet.request(`/api/sessions/${session.id}/prompt`, "POST", {
-              prompt: "review-follow-up",
-            })
-          ).status,
-        ).toBe(202);
-        await expect.poll(() => fleet.reviewed.size, { timeout: 10_000 }).toBe(1);
+        expect(fleet.router.activeSessionIds).not.toContain(session.id);
         expect(fleet.starts.get(session.id)).toBe(1);
-        expect(
-          fleet.router.activeSessionIds.filter((id) => id === session.id),
-        ).toHaveLength(1);
-        expect(fleet.manager.locks.holder(current.checkoutKey).token).toBe(
-          originalLease.token,
+        expect(fleet.manager.locks.holder(session.executionBinding.checkoutKey)).toBe(
+          undefined,
         );
         expect(fleet.failures).toEqual([]);
       } finally {
@@ -481,20 +416,35 @@ describe(
       await expect.poll(() => fleet.entered.size, { timeout: 30_000 }).toBe(2);
       expect(fleet.maximum()).toBe(2);
       fleet.release();
-      await expect.poll(() => fleet.reviewed.size, { timeout: 30_000 }).toBe(2);
+      await expect.poll(() => fleet.reviewed.size, { timeout: 90_000 }).toBe(2);
+      for (const run of [a, b]) {
+        await expect
+          .poll(
+            async () =>
+              (await fleet.request(`/api/runs/${run.id}`)).body.run.workspaceBinding
+                .aggregationPhase,
+            { timeout: 60_000 },
+          )
+          .toBe("await_publish_approval");
+        expect((await fleet.action(run.id, "publish-branch")).status).toBe(200);
+      }
       await expect
         .poll(async () => (await fleet.request(`/api/runs/${a.id}`)).body.run.state, {
-          timeout: 15_000,
+          timeout: 60_000,
         })
         .toBe("completed");
       const aState = await fleet.state(a.id),
         bState = await fleet.state(b.id);
       expect(aState.worktree.path).not.toBe(bState.worktree.path);
       expect(
-        aState.sessions.every((session) => session.binding.cwd === aState.worktree.path),
+        aState.sessions.every(
+          (session) => session.binding.worktreeId && session.binding.cwd !== fleet.source,
+        ),
       ).toBe(true);
       expect(
-        bState.sessions.every((session) => session.binding.cwd === bState.worktree.path),
+        bState.sessions.every(
+          (session) => session.binding.worktreeId && session.binding.cwd !== fleet.source,
+        ),
       ).toBe(true);
       expect(await readFile(join(fleet.source, "same.txt"), "utf8")).toBe("base\n");
       const unauthorized = await fetch(`${fleet.url}/api/runs/${a.id}/worktree/cleanup`, {
@@ -512,55 +462,11 @@ describe(
       expect(
         (await fleet.action(a.id, "cleanup", { expectedVersion: 0 })).body.code,
       ).toBe("stale_revision");
-      for (const run of [a, b]) {
-        expect(
-          (
-            await fleet.action(run.id, "quiesce", {
-              confirm: "STOP TASK AND SELECTED TARGET SESSIONS",
-            })
-          ).status,
-        ).toBe(200);
-        expect((await fleet.action(run.id, "cleanup")).body.code).toBe(
-          "dirty_or_unknown",
-        );
-      }
-      await unlink(join(aState.worktree.path, "uncommitted.txt"));
-      await unlink(join(bState.worktree.path, "uncommitted.txt"));
-      await writeFile(join(fleet.source, "same.txt"), "target conflict\n");
-      await git.run(fleet.source, ["commit", "-am", "target conflict"]);
-      const previewResponse = await fleet.action(a.id, "integration-preview", {
-        targetPlacementId: fleet.placement.id,
-      });
-      expect(previewResponse.status).toBe(200);
-      const preview = previewResponse.body.operation.result.preview;
-      const started = await fleet.action(a.id, "integration-start", {
-        previewId: preview.id,
-        reviewedTaskSha: preview.taskSha,
-        reviewedDiffIdentity: preview.diffIdentity,
-        confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
-      });
-      expect(started.status).toBe(200);
-      const integration = started.body.operation.result.integration;
-      expect(integration.state).toBe("conflicted");
-      expect((await fleet.state(a.id)).integrations[0].conflicts).toEqual(["same.txt"]);
+      expect(aState.worktree.state).toBe("removed");
+      expect(bState.worktree.state).toBe("removed");
       expect(
-        (
-          await fleet.action(a.id, "integration-abort", {
-            integrationId: integration.id,
-            confirm: `ABORT MERGE ${integration.id}`,
-          })
-        ).status,
-      ).toBe(200);
-      expect(await readFile(join(fleet.source, "same.txt"), "utf8")).toBe(
-        "target conflict\n",
-      );
-      expect(await readFile(join(aState.worktree.path, "same.txt"), "utf8")).toBe(
-        "implement-A\n",
-      );
-      for (const run of [a, b]) {
-        expect((await fleet.action(run.id, "cleanup")).status).toBe(200);
-        expect((await fleet.state(run.id)).worktree.state).toBe("removed");
-      }
+        (await git.run(fleet.source, ["ls-remote", "--heads", "origin"])).stdout,
+      ).toContain(a.id.slice(0, 20));
       expect(fleet.failures).toEqual([]);
     });
 

@@ -1276,6 +1276,9 @@ describe("FleetStore", () => {
       },
       baseSha: "c".repeat(40),
       baseAvailable: true,
+      baseMaterializable: false,
+      portableResultsSupported: true,
+      portabilityReason: "",
       verifiedAt: new Date().toISOString(),
       error: "",
     });
@@ -1302,6 +1305,9 @@ describe("FleetStore", () => {
         repositoryIdentity: identity,
         baseSha,
         baseAvailable: true,
+        baseMaterializable: false,
+        portableResultsSupported: true,
+        portabilityReason: "",
         verifiedAt: new Date().toISOString(),
         error: "",
       });
@@ -2173,5 +2179,129 @@ describe("FleetStore runs", () => {
     expect(store.deleteRun(run.id)).toBe(true);
     expect(store.getRun(run.id)).toBeUndefined();
     expect(store.listRunNotes(run.id)).toEqual([]);
+  });
+
+  it("freezes the resolved workspace specification", () => {
+    const { store, workspace, placement } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      sourcePlacementId: placement.id,
+      workspaceMode: "managed",
+      name: "isolated",
+      objective: "test immutable intent",
+    });
+    const resolved = store.resolveRunWorkspaceSpec(run.id, {
+      repositoryIdentity: "repository-v1",
+      repositoryObjectFormat: "sha1",
+      executionBaseRef: "refs/heads/main",
+      executionBaseSha: "a".repeat(40),
+      repositoryExecutionPolicy: undefined,
+    });
+
+    expect(
+      store.resolveRunWorkspaceSpec(run.id, {
+        repositoryIdentity: "repository-v1",
+        repositoryObjectFormat: "sha1",
+        executionBaseRef: "refs/heads/main",
+        executionBaseSha: "a".repeat(40),
+        repositoryExecutionPolicy: undefined,
+      }),
+    ).toEqual(resolved);
+    expect(() =>
+      store.resolveRunWorkspaceSpec(run.id, {
+        repositoryIdentity: "repository-v1",
+        repositoryObjectFormat: "sha1",
+        executionBaseRef: "refs/heads/main",
+        executionBaseSha: "b".repeat(40),
+        repositoryExecutionPolicy: undefined,
+      }),
+    ).toThrow(/changed/i);
+  });
+
+  it("preserves append-only integration-attempt identity across status updates", () => {
+    const { store, workspace, placement, node } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      sourcePlacementId: placement.id,
+      workspaceMode: "managed",
+      name: "attempts",
+      objective: "retain integration history",
+    });
+    const now = new Date().toISOString();
+    const attempt = {
+      attemptId: "attempt-1",
+      runId: run.id,
+      attemptNumber: 1,
+      resultWorkspaceId: "result-workspace",
+      resultGeneration: 1,
+      integrationBaseSha: "a".repeat(40),
+      targetRef: "refs/heads/dev/operator/fleet-run",
+      assignedNodeId: node.id,
+      phase: "integrate" as const,
+      expectedTree: "",
+      finalSha: "",
+      status: "in_progress" as const,
+      publishState: "not_started" as const,
+      receiptIds: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.putIntegrationAttempt(attempt);
+    store.putIntegrationAttempt({
+      ...attempt,
+      phase: "publish",
+      status: "completed",
+      publishState: "published",
+      receiptIds: ["receipt-1"],
+      updatedAt: new Date(Date.now() + 1_000).toISOString(),
+    });
+
+    expect(store.listIntegrationAttempts(run.id)).toMatchObject([
+      {
+        attemptId: "attempt-1",
+        phase: "publish",
+        status: "completed",
+        publishState: "published",
+        receiptIds: ["receipt-1"],
+      },
+    ]);
+    expect(() =>
+      store.putIntegrationAttempt({
+        ...attempt,
+        assignedNodeId: "different-node",
+      }),
+    ).toThrow(/cannot be rewritten/i);
+  });
+
+  it("records an immutable exact-result publication approval", () => {
+    const { store, workspace, placement } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      sourcePlacementId: placement.id,
+      workspaceMode: "managed",
+      name: "publish",
+      objective: "approve one exact result",
+    });
+    const approval = {
+      approvalId: "approval-1",
+      runId: run.id,
+      integrationId: "integration-1",
+      targetRemote: "origin",
+      targetRef: "refs/heads/dev/operator/fleet-run",
+      expectedRemoteSha: "",
+      finalResultSha: "a".repeat(40),
+      finalTreeSha: "b".repeat(40),
+      approvedBy: "operator",
+      approvedAt: new Date().toISOString(),
+    };
+
+    expect(store.putPublicationApproval(approval)).toEqual(approval);
+    expect(store.getPublicationApproval(run.id)).toEqual(approval);
+    expect(() =>
+      store.putPublicationApproval({
+        ...approval,
+        finalResultSha: "c".repeat(40),
+      }),
+    ).toThrow(/cannot be changed/i);
   });
 });

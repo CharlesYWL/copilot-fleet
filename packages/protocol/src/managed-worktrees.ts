@@ -53,9 +53,21 @@ export const RunWorkspaceBindingSchema = z
       .enum(["not_started", "in_progress", "attention", "completed"])
       .default("not_started"),
     aggregationPhase: z
-      .enum(["idle", "preview", "integrate", "quiesce", "retain", "cleanup", "done"])
+      .enum([
+        "idle",
+        "preview",
+        "integrate",
+        "validate",
+        "await_publish_approval",
+        "publish",
+        "quiesce",
+        "retain",
+        "cleanup",
+        "done",
+      ])
       .default("idle"),
     aggregationAttempt: z.number().int().nonnegative().default(0),
+    aggregationAutomaticRetries: z.number().int().nonnegative().default(0),
     aggregationCode: z.string().default(""),
     aggregationSummary: z.string().default(""),
     aggregationTargetRef: z.string().default(""),
@@ -151,7 +163,77 @@ export const RepositoryFeaturesSchema = z.object({
 });
 export type RepositoryFeatures = z.infer<typeof RepositoryFeaturesSchema>;
 
-export const ManagedWorkspaceKindSchema = z.enum(["primary", "step", "derived"]);
+export const RepositoryExecutionPolicySchema = z.object({
+  version: z.literal(1).default(1),
+  hooks: z.enum(["disabled", "approved_exact"]).default("disabled"),
+  hooksDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .default("0".repeat(64)),
+  filters: z.enum(["disabled", "git_lfs"]).default("disabled"),
+  filtersDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .default("0".repeat(64)),
+  submodules: z.enum(["disabled", "node_local"]).default("disabled"),
+  fsmonitor: z.literal("disabled").default("disabled"),
+  credentialHelpers: z.literal("publication_only").default("publication_only"),
+  configurationDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .default("0".repeat(64)),
+});
+export type RepositoryExecutionPolicy = z.infer<typeof RepositoryExecutionPolicySchema>;
+
+export const IntegrationBasePolicySchema = z.enum([
+  "pinned",
+  "latest-target",
+  "repository-policy",
+]);
+export const IntegrationStrategySchema = z.enum([
+  "merge",
+  "squash",
+  "linear",
+  "repository-policy",
+]);
+export const PublicationPolicySchema = z.object({
+  mode: z.enum(["none", "branch"]).default("branch"),
+  approval: z.literal("ask").default("ask"),
+  remote: z.string().default(""),
+  targetRef: z.string().default(""),
+  createOnly: z.boolean().default(true),
+});
+export const RunWorkspaceSpecSchema = z.object({
+  schemaVersion: z.literal(1).default(1),
+  requestedMode: WorkspaceModeSchema,
+  effectiveMode: z.enum(["legacy", "managed"]),
+  repositoryIdentity: z.string().default(""),
+  repositoryObjectFormat: z.enum(["sha1", "sha256"]).optional(),
+  executionBaseRef: z.string().default(""),
+  executionBaseSha: z.union([GitShaSchema, z.literal("")]).default(""),
+  sourceProvenance: z.object({
+    placementId: z.string().default(""),
+    workspaceId: z.string().default(""),
+  }),
+  workspacePolicy: ManagedWorktreePolicySchema.optional(),
+  integrationBasePolicy: IntegrationBasePolicySchema.default("latest-target"),
+  integrationBaseRef: z.string().default(""),
+  integrationStrategy: IntegrationStrategySchema.default("merge"),
+  publicationPolicy: PublicationPolicySchema.default(() =>
+    PublicationPolicySchema.parse({}),
+  ),
+  repositoryExecutionPolicy: RepositoryExecutionPolicySchema.optional(),
+  hookPolicy: z.enum(["disabled", "approved_exact"]).default("disabled"),
+  createdAt: z.string().datetime(),
+});
+export type RunWorkspaceSpec = z.infer<typeof RunWorkspaceSpecSchema>;
+
+export const ManagedWorkspaceKindSchema = z.enum([
+  "primary",
+  "step",
+  "derived",
+  "integration",
+]);
 export type ManagedWorkspaceKind = z.infer<typeof ManagedWorkspaceKindSchema>;
 
 export const CompositionPredecessorSchema = z.object({
@@ -167,7 +249,10 @@ export type CompositionPredecessor = z.infer<typeof CompositionPredecessorSchema
 export const WorktreeCompositionSchema = z.object({
   baseSha: GitShaSchema,
   baseRef: z.string().default(""),
+  dependencyResolution: z.enum(["explicit", "phase_fallback"]).default("explicit"),
+  implicitDependencyFallback: z.boolean().default(false),
   predecessors: z.array(CompositionPredecessorSchema).default([]),
+  coveredPredecessorStepIds: z.array(identity).default([]),
   state: z
     .enum(["not_required", "pending", "composing", "ready", "conflicted", "blocked"])
     .default("not_required"),
@@ -260,6 +345,8 @@ export const ManagedWorktreeSchema = z
     ownerStepId: z.string().default(""),
     resultSha: z.union([GitShaSchema, z.literal("")]).default(""),
     resultRecordedAt: z.string().default(""),
+    fleetCheckpointSha: z.union([GitShaSchema, z.literal("")]).default(""),
+    sealedFiles: z.array(z.string()).default([]),
     importedWorkspaceResults: z
       .array(
         z.object({
@@ -273,6 +360,9 @@ export const ManagedWorktreeSchema = z
     composition: WorktreeCompositionSchema.optional(),
     repositoryFeatures: RepositoryFeaturesSchema.default(() =>
       RepositoryFeaturesSchema.parse({}),
+    ),
+    repositoryExecutionPolicy: RepositoryExecutionPolicySchema.default(() =>
+      RepositoryExecutionPolicySchema.parse({}),
     ),
     state: WorktreeLifecycleSchema,
     integrationState: IntegrationStateSchema.default("not_requested"),
@@ -296,11 +386,31 @@ export const ManagedWorktreeSchema = z
   }));
 export type ManagedWorktree = z.infer<typeof ManagedWorktreeSchema>;
 
+export const WorkspaceInstanceSchema = z.object({
+  workspaceId: identity,
+  runId: identity,
+  generation: z.number().int().positive(),
+  kind: ManagedWorkspaceKindSchema,
+  ownerStepId: z.string().default(""),
+  assignedNodeId: identity,
+  placementId: z.string().default(""),
+  physicalIdentity: CheckoutIdentitySchema.optional(),
+  localPath: z.string().default(""),
+  lifecycleState: WorktreeLifecycleSchema,
+  currentHead: z.union([GitShaSchema, z.literal("")]).default(""),
+  resultId: z.string().default(""),
+});
+export type WorkspaceInstance = z.infer<typeof WorkspaceInstanceSchema>;
+
 export const IntegrationPreviewSchema = z.object({
   id: identity,
   worktreeId: identity,
+  integrationWorkspaceId: z.string().default(""),
   generation: z.number().int().positive(),
   taskSha: GitShaSchema,
+  baseTree: z.union([GitShaSchema, z.literal("")]).default(""),
+  taskTree: z.union([GitShaSchema, z.literal("")]).default(""),
+  targetTree: z.union([GitShaSchema, z.literal("")]).default(""),
   diffIdentity: identity,
   diff: z.string().max(1_000_000),
   targetPlacementId: identity,
@@ -331,16 +441,71 @@ export const WorktreeIntegrationSchema = z.object({
   preState: z.string(),
   resultSha: z.string().default(""),
   mergeTree: z.string().default(""),
+  finalTree: z.string().default(""),
   conflicts: z.array(z.string()).default([]),
   validationState: z.enum(["not_run", "running", "passed", "failed"]).default("not_run"),
   validationSummary: z.string().default(""),
   validationStartedAt: z.string().default(""),
   validatedAt: z.string().default(""),
+  publishState: z
+    .enum(["not_started", "awaiting_approval", "publishing", "published", "failed"])
+    .default("not_started"),
+  publicationBaseSha: z.union([GitShaSchema, z.literal("")]).default(""),
+  publicationDiff: z.string().max(1_000_000).default(""),
+  publicationFileCount: z.number().int().nonnegative().default(0),
+  publicationCommitCount: z.number().int().nonnegative().default(0),
+  publishedAt: z.string().default(""),
   error: z.string().default(""),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
 });
 export type WorktreeIntegration = z.infer<typeof WorktreeIntegrationSchema>;
+
+export const IntegrationAttemptSchema = z.object({
+  attemptId: identity,
+  runId: identity,
+  attemptNumber: z.number().int().positive(),
+  resultWorkspaceId: identity,
+  resultGeneration: z.number().int().positive(),
+  integrationBaseSha: z.union([GitShaSchema, z.literal("")]).default(""),
+  targetRef: z.string().default(""),
+  assignedNodeId: identity,
+  phase: z.enum([
+    "quiesce",
+    "aggregate",
+    "integrate",
+    "validate",
+    "publish",
+    "retain",
+    "cleanup",
+    "done",
+  ]),
+  preview: IntegrationPreviewSchema.optional(),
+  expectedTree: z.union([GitShaSchema, z.literal("")]).default(""),
+  finalSha: z.union([GitShaSchema, z.literal("")]).default(""),
+  status: z.enum(["in_progress", "attention", "completed"]).default("in_progress"),
+  publishState: z
+    .enum(["not_started", "awaiting_approval", "publishing", "published", "failed"])
+    .default("not_started"),
+  receiptIds: z.array(identity).default([]),
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+});
+export type IntegrationAttempt = z.infer<typeof IntegrationAttemptSchema>;
+
+export const PublicationApprovalSchema = z.object({
+  approvalId: identity,
+  runId: identity,
+  integrationId: identity,
+  targetRemote: identity,
+  targetRef: identity,
+  expectedRemoteSha: z.union([GitShaSchema, z.literal("")]).default(""),
+  finalResultSha: GitShaSchema,
+  finalTreeSha: GitShaSchema,
+  approvedBy: identity,
+  approvedAt: z.string().datetime(),
+});
+export type PublicationApproval = z.infer<typeof PublicationApprovalSchema>;
 
 export const WorktreeOperationKindSchema = z.enum([
   "reserve",
@@ -354,6 +519,7 @@ export const WorktreeOperationKindSchema = z.enum([
   "finalize",
   "integration_preview",
   "integrate",
+  "publish",
   "continue",
   "abort",
   "cleanup",
@@ -394,6 +560,7 @@ export const WorktreeOperationRequestSchema = z
     integrationId: z.string().optional(),
     reviewedTaskSha: GitShaSchema.optional(),
     reviewedDiffIdentity: z.string().optional(),
+    publicationApproval: PublicationApprovalSchema.optional(),
     workspaceKind: ManagedWorkspaceKindSchema.default("primary"),
     ownerStepId: z.string().default(""),
     composition: WorktreeCompositionSchema.optional(),
@@ -445,6 +612,9 @@ export const PlacementRepositoryCapabilitySchema = z.object({
   repositoryIdentity: RepositoryIdentitySchema,
   baseSha: GitShaSchema,
   baseAvailable: z.boolean(),
+  baseMaterializable: z.boolean().default(false),
+  portableResultsSupported: z.boolean().default(true),
+  portabilityReason: z.string().default(""),
   verifiedAt: z.string().datetime(),
   error: z.string().default(""),
 });
@@ -467,6 +637,9 @@ export const WorkspaceResultSchema = z.object({
   baseSha: GitShaSchema,
   baseRef: z.string().default(""),
   headSha: GitShaSchema,
+  finalTreeOid: GitShaSchema.optional(),
+  includedFiles: z.array(z.string()).default([]),
+  checkpointCreated: z.boolean().default(false),
   sourceWorktreeId: identity,
   sourceNodeId: identity,
   sourcePlacementId: identity,
@@ -480,6 +653,8 @@ export const WorkspaceResultSchema = z.object({
   artifactSha256: z.string().regex(/^[a-f0-9]{64}$/),
   artifactSize: z.number().int().nonnegative().max(WORKSPACE_ARTIFACT_MAX_BYTES),
   objectFormat: z.enum(["sha1", "sha256"]),
+  portability: z.enum(["portable", "node_local"]).default("portable"),
+  portabilityReason: z.string().default(""),
   createdAt: z.string().datetime(),
   verifiedAt: z.string().default(""),
   expiresAt: z.string().default(""),
@@ -497,6 +672,8 @@ export const RepositoryProbeRequestSchema = z.object({
   placementId: identity,
   localPath: identity,
   baseSha: GitShaSchema,
+  baseRef: z.string().default(""),
+  remote: z.string().default(""),
   expectedRepositoryIdentity: z.string().default(""),
 });
 export type RepositoryProbeRequest = z.infer<typeof RepositoryProbeRequestSchema>;

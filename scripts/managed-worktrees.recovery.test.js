@@ -34,6 +34,10 @@ async function fixture() {
   await writeFile(join(source, "same.txt"), "base\n");
   await git.run(source, ["add", "."]);
   await git.run(source, ["commit", "-m", "base"]);
+  const remote = join(root, "remote.git");
+  await git.run(root, ["init", "--bare", remote]);
+  await git.run(source, ["remote", "add", "origin", remote]);
+  await git.run(source, ["push", "origin", "target"]);
   const directory = join(root, "node");
   let manager = new ManagedWorktrees({ directory, nodeId: () => "node" });
   cleanup.push(() => manager.shutdown());
@@ -75,6 +79,9 @@ async function fixture() {
       expectedPath: tree.path,
       expectedBranchRef: tree.branchRef,
       expectedBaseSha: tree.baseSha,
+      integrationBaseRef: "refs/remotes/origin/target",
+      integrationTargetRef: `refs/heads/dev/test/fleet-${runId.slice(0, 20)}`,
+      integrationRemote: "origin",
       actor: "test",
       policy: { freeSpaceFloorBytes: 0 },
       ...extra,
@@ -161,12 +168,8 @@ describe("real Node process-death recovery", { timeout: 90_000 }, () => {
     await git.run(fleet.tree().path, ["commit", "-am", "task"]);
     await writeFile(join(fleet.source, "same.txt"), "target\n");
     await git.run(fleet.source, ["commit", "-am", "target"]);
-    const preview = (
-      await fleet.act("integration_preview", {
-        targetPath: fleet.source,
-        targetPlacementId: "target",
-      })
-    ).preview;
+    await git.run(fleet.source, ["push", "origin", "target"]);
+    const preview = (await fleet.act("integration_preview")).preview;
     const integration = fleet.request("integrate", {
       previewId: preview.id,
       reviewedTaskSha: preview.taskSha,
@@ -176,23 +179,19 @@ describe("real Node process-death recovery", { timeout: 90_000 }, () => {
     await fleet.crash(integration);
     expect(
       (
-        await git.run(fleet.source, ["diff", "--name-only", "--diff-filter=U"])
+        await git.run(preview.target.path, ["diff", "--name-only", "--diff-filter=U"])
       ).stdout.trim(),
     ).toBe("same.txt");
-    await fleet.crash(
-      fleet.request("abort", {
-        integrationId: integration.operationId,
-        confirm: `ABORT MERGE ${integration.operationId}`,
-      }),
-      1,
-      true,
-    );
     const restored = await fleet.act("reconcile");
-    expect(restored.error).toBe("");
-    expect(restored.integration.state).toBe("aborted");
-    expect(await readFile(join(fleet.source, "same.txt"), "utf8")).toBe("target\n");
+    expect(restored.integration.state).toBe("needs_reconciliation");
+    expect(restored.worktree.state).toBe("needs_reconciliation");
+    expect(
+      (
+        await git.run(preview.target.path, ["diff", "--name-only", "--diff-filter=U"])
+      ).stdout.trim(),
+    ).toBe("same.txt");
     expect(await readFile(join(fleet.tree().path, "same.txt"), "utf8")).toBe("task\n");
-    expect((await fleet.act("cleanup")).ok).toBe(true);
+    expect((await fleet.act("cleanup")).ok).toBe(false);
   });
 
   it("recognizes the exact owned merge commit after death before its receipt, without committing again", async () => {
@@ -201,12 +200,7 @@ describe("real Node process-death recovery", { timeout: 90_000 }, () => {
     await writeFile(join(fleet.tree().path, "task.txt"), "task\n");
     await git.run(fleet.tree().path, ["add", "."]);
     await git.run(fleet.tree().path, ["commit", "-m", "task"]);
-    const preview = (
-      await fleet.act("integration_preview", {
-        targetPath: fleet.source,
-        targetPlacementId: "target",
-      })
-    ).preview;
+    const preview = (await fleet.act("integration_preview")).preview;
     const request = fleet.request("integrate", {
       previewId: preview.id,
       reviewedTaskSha: preview.taskSha,
@@ -215,12 +209,16 @@ describe("real Node process-death recovery", { timeout: 90_000 }, () => {
       commit: true,
     });
     await fleet.crash(request, 2);
-    const head = (await git.run(fleet.source, ["rev-parse", "HEAD"])).stdout.trim();
+    const head = (
+      await git.run(preview.target.path, ["rev-parse", "HEAD"])
+    ).stdout.trim();
     const restored = await fleet.act("reconcile");
     expect(restored.error).toBe("");
-    expect(restored.integration.state).toBe("integrated");
-    expect(restored.integration.resultSha).toBe(head);
-    expect((await git.run(fleet.source, ["rev-parse", "HEAD"])).stdout.trim()).toBe(head);
-    expect((await fleet.act("cleanup")).ok).toBe(true);
+    expect(restored.integration.state).toBe("needs_reconciliation");
+    expect(restored.worktree.state).toBe("needs_reconciliation");
+    expect(
+      (await git.run(preview.target.path, ["rev-parse", "HEAD"])).stdout.trim(),
+    ).toBe(head);
+    expect((await fleet.act("cleanup")).ok).toBe(false);
   });
 });

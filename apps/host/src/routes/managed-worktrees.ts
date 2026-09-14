@@ -236,7 +236,14 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
         .listWorktreeOperations(run.workspaceBinding?.managedWorktreeId)
         .filter((entry) => entry.request.runId === id)
         .slice(-10),
-      integrations: worktree ? store.listWorktreeIntegrations(worktree.id) : [],
+      integrations: store
+        .listWorktreeIntegrations()
+        .filter((entry) =>
+          store
+            .listWorkspaceInstances(id)
+            .some((workspace) => workspace.workspaceId === entry.worktreeId),
+        ),
+      publicationApproval: store.getPublicationApproval(id),
       tombstones: worktree
         ? store
             .listWorktreeTombstones()
@@ -271,17 +278,25 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
       service.worktrees.retryAggregation(id);
       return { run: store.getRun(id) };
     }
+    if (action === "publish-branch") {
+      const run = store.getRun(id);
+      if (!run) return reply.code(404).send({ error: "Task not found" });
+      const input = ActionSchema.parse(request.body);
+      const approval = service.worktrees.approvePublication(
+        id,
+        input.operationId,
+        request.fleetSession?.administratorId || "operator",
+      );
+      return { approval, run: store.getRun(id) };
+    }
     const kind = actions[action];
     if (!kind) return reply.code(404).send({ error: "Unknown worktree action" });
     if (!store.getRun(id)) return reply.code(404).send({ error: "Task not found" });
     const input = ActionSchema.parse(request.body);
-    if (
-      kind === "quiesce" &&
-      input.confirm !== "STOP TASK AND SELECTED TARGET SESSIONS"
-    ) {
+    if (kind === "quiesce" && input.confirm !== "STOP TASK SESSIONS") {
       throw new WorktreeConflict(
         "confirmation_required",
-        "Explicitly confirm stopping task and selected target sessions.",
+        "Explicitly confirm stopping this task's supervised sessions.",
       );
     }
     if (action === "retry-with-hooks" && input.confirm !== "ALLOW REPOSITORY GIT HOOKS") {

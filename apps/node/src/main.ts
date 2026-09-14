@@ -1409,7 +1409,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         errors.push(error);
       }
     }
-    if (errors.length)
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1)
       throw new AggregateError(errors, "Node shutdown encountered cleanup failures.");
   }
 

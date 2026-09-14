@@ -134,21 +134,16 @@ describe("accessible managed workspace controls", () => {
 
     await screen.findByText(/Integrated into main/);
     expect(screen.getByText("Workspace details").closest("details")?.open).toBe(false);
-    expect(screen.getByText(/Merge and validation:/).textContent).toContain("Complete");
+    expect(screen.getByText(/Integration and validation:/).textContent).toContain(
+      "Complete",
+    );
     expect(
-      screen
-        .getByRole("combobox", {
-          name: "Target checkout on the owning Node",
-        })
-        .closest("details")?.open,
+      screen.getByRole("button", { name: "Preview integration" }).closest("details")
+        ?.open,
     ).toBe(false);
 
     fireEvent.click(screen.getByText("Workspace details"));
-    expect(
-      screen.getByRole("combobox", {
-        name: "Target checkout on the owning Node",
-      }),
-    ).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Preview integration" })).toBeTruthy();
     expect(screen.getByText("Advanced recovery: manual integration")).toBeTruthy();
   });
 
@@ -397,9 +392,6 @@ describe("accessible managed workspace controls", () => {
     vi.stubGlobal("fetch", fetchMock);
     show();
     await screen.findByText("C:\\trees\\task");
-    fireEvent.change(screen.getByLabelText("Target checkout on the owning Node"), {
-      target: { value: "source" },
-    });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Preview integration" }));
     });
@@ -461,9 +453,6 @@ describe("accessible managed workspace controls", () => {
     );
     show();
     await screen.findByText("C:\\trees\\task");
-    fireEvent.change(screen.getByLabelText("Target checkout on the owning Node"), {
-      target: { value: "source" },
-    });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Preview integration" }));
     });
@@ -472,6 +461,79 @@ describe("accessible managed workspace controls", () => {
     ).toBeTruthy();
     expect(screen.getByText(/Committed task changes: No/)).toBeTruthy();
     expect(screen.queryByText(/Already integrated/)).toBeNull();
+  });
+
+  it("reviews and explicitly approves the exact final integrated result", async () => {
+    const awaiting = {
+      ...run,
+      state: "aggregating",
+      workspaceBinding: {
+        ...run.workspaceBinding!,
+        aggregationState: "in_progress",
+        aggregationPhase: "await_publish_approval",
+        aggregationSummary:
+          "The exact validated integrated result is ready for your review and publication approval.",
+      },
+    } as typeof run;
+    const finalIntegration = {
+      id: "integration",
+      worktreeId: "tree",
+      generation: 1,
+      preview: {
+        ...preview,
+        targetRemote: "origin",
+        targetRef: "refs/heads/dev/vicky/worktree-8f42c1",
+      },
+      approvedTaskSha: preview.taskSha,
+      approvedDiffIdentity: preview.diffIdentity,
+      strategy: "merge",
+      state: "integrated",
+      preState: "clean",
+      resultSha: "c".repeat(40),
+      mergeTree: "d".repeat(40),
+      finalTree: "d".repeat(40),
+      conflicts: [],
+      validationState: "passed",
+      validationSummary: "Tests and review passed.",
+      validationStartedAt: at,
+      validatedAt: at,
+      publishState: "awaiting_approval",
+      publicationBaseSha: "a".repeat(40),
+      publicationDiff: "+ final integrated content\n",
+      publicationFileCount: 14,
+      publicationCommitCount: 3,
+      publishedAt: "",
+      error: "",
+      createdAt: at,
+      updatedAt: at,
+    };
+    const fetchMock = vi.fn((path: string, init?: RequestInit) => {
+      if (path === "/api/auth/csrf") return response({ csrfToken: "csrf" });
+      if (init?.method === "POST" && path.endsWith("publish-branch"))
+        return response({ approval: { approvalId: "approval" } });
+      return response({
+        ...initialView(),
+        binding: awaiting.workspaceBinding,
+        integrations: [finalIntegration],
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    show(awaiting);
+
+    expect(await screen.findByText("Ready to publish")).toBeTruthy();
+    expect(screen.getByText("14 files changed")).toBeTruthy();
+    expect(screen.getByText("3")).toBeTruthy();
+    expect(screen.getByText("Tests passed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Review changes" }));
+    expect(await screen.findByText("+ final integrated content")).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Publish branch" }));
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([path, init]) => path.endsWith("publish-branch") && init?.method === "POST",
+      ),
+    ).toBe(true);
   });
 
   it("requires the exact abandonment phrase and restores focus when cleanup is cancelled", async () => {
