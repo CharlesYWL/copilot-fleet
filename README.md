@@ -787,6 +787,12 @@ Use `status`, `logs`, `stop`, `start`, `restart`, or `uninstall` instead of
 your data. No Windows password or separate service credential file is required.
 This does not run before Windows sign-in.
 
+Interactive Node installation, start, and restart check GitHub CLI authentication
+before proceeding. Missing or expired credentials open `gh auth login` in the
+same terminal; after sign-in is verified, the original command continues.
+Automatic logon starts never prompt. Copilot and Dev Tunnels retain their
+separate sign-ins.
+
 See [Windows login startup](docs/windows-login-startup.md) for options, lifecycle
 details, credential caveats, and all historical design references.
 
@@ -808,6 +814,15 @@ npm run start:node -- --url="https://fleet.example.com" `
   --host-fingerprint="<sha256>" `
   --enrollment-grant="<id>.<secret>"
 ```
+
+GitHub CLI (`gh`) must also be on PATH. `npm run start:node` and `npm run node`
+check its active account before connecting or enrolling. In an interactive
+terminal, missing/expired GitHub credentials trigger browser/device sign-in
+in that same command, followed by verification and continued startup.
+Cancellation stops startup without retrying login. Noninteractive launches
+report the required login instead of waiting for input; network and executable
+errors do not trigger re-authentication. If an environment token such as
+`GH_TOKEN` is invalid, replace or unset it first: it overrides saved login.
 
 The same lines work in bash — flags avoid the `$env:` / `VAR=value` split
 between shells. Generate them from **Settings → Nodes → Generate a connect
