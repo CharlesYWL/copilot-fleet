@@ -99,6 +99,8 @@ describe("login-start CLI", () => {
     );
     expect(output).toContain("not signed-out boot");
     expect(output).toContain("host+node install");
+    expect(output).toContain("Run install once before start");
+    expect(output).toContain("start does not install tasks");
   });
 });
 

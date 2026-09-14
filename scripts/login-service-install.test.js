@@ -1,6 +1,7 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -12,6 +13,7 @@ import { join, resolve } from "node:path";
 import process from "node:process";
 import { afterEach, describe, expect, it } from "vitest";
 import { CONFIG_UI_EVENT_MARKER } from "@fleet/protocol";
+import { taskName, windowsSid } from "./login-service.mjs";
 
 const roots = [];
 const secret = "grant-fixture.should-never-reach-task-files";
@@ -32,7 +34,7 @@ if($Action -eq 'probe'){
 }
 `;
 
-function fixture() {
+function fixture(installedKind) {
   const root = mkdtempSync(join(resolve("scripts"), ".login-install-"));
   roots.push(root);
   for (const path of [
@@ -73,6 +75,27 @@ function fixture() {
     }
   `,
   );
+  if (installedKind) {
+    const directory = join(root, "profile", "CopilotFleet", "login", installedKind);
+    const sid = windowsSid();
+    mkdirSync(directory, { recursive: true });
+    writeFileSync(
+      join(directory, "manifest.json"),
+      JSON.stringify({
+        schemaVersion: 1,
+        kind: installedKind,
+        taskName: taskName(installedKind, sid),
+        accountSid: sid,
+        repositoryPath: root,
+        nodePath: process.execPath,
+        runnerPath: join(root, "scripts", "login-service-runner.mjs"),
+        controllerPath: join(root, "scripts", "windows-login-task.ps1"),
+        logPath: join(directory, "runtime.log"),
+        environment: {},
+        runtimeArgs: [],
+      }),
+    );
+  }
   return root;
 }
 
@@ -97,6 +120,20 @@ function launch(root, kind, extra = []) {
   );
 }
 
+function runAction(root, kind, action) {
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts", "login-service-cli.mjs"), kind, action],
+    {
+      env: { ...process.env, LOCALAPPDATA: join(root, "profile") },
+      encoding: "utf8",
+      timeout: 30_000,
+    },
+  );
+  if (result.error) throw result.error;
+  return result;
+}
+
 function installedFiles(directory) {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
     const path = join(directory, entry.name);
@@ -109,6 +146,74 @@ describe.skipIf(process.platform !== "win32")(
   () => {
     afterEach(() => {
       for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+    });
+
+    it.each([
+      ["host", "start", "Host"],
+      ["node", "start", "Node"],
+      ["host+node", "start", "Host"],
+      ["host+node", "restart", "Node"],
+      ["host+node", "stop", "Node"],
+      ["node", "logs", "Node"],
+    ])("explains how to install before %s %s", (kind, action, missing) => {
+      const root = fixture();
+      const result = runAction(root, kind, action);
+      const command = `npm run service -- ${kind} install`;
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        `${missing} login startup is not installed for this Windows account.`,
+      );
+      expect(result.stderr).toContain(
+        "start only starts installed tasks; it does not install them.",
+      );
+      expect(result.stderr).toContain("Stop any manually running Host/Node instances");
+      expect(result.stderr).toContain(
+        "Install builds, registers, and starts the selected tasks",
+      );
+      expect(result.stderr).toContain("use the same Windows account");
+      if (kind === "host") {
+        expect(result.stderr).toContain(`  ${command}\n`);
+        expect(result.stderr).not.toContain("--existing-node");
+        expect(result.stderr).not.toContain("enrollment command");
+      } else {
+        expect(result.stderr).toContain("If your Node is already enrolled");
+        expect(result.stderr).toContain(`  ${command} --existing-node\n`);
+        expect(result.stderr).toContain("For a new Node");
+        expect(result.stderr).toContain("Nodes > Connect a machine");
+        expect(result.stderr).toContain("service enrollment command");
+      }
+      expect(existsSync(join(root, "profile", "CopilotFleet"))).toBe(false);
+      expect(existsSync(join(root, "operations.log"))).toBe(false);
+    });
+
+    it.each(["host", "node"])(
+      "suggests installing only the missing %s task in a partial Host+Node installation",
+      { timeout: 30_000 },
+      (missing) => {
+        const root = fixture(missing === "host" ? "node" : "host");
+        const result = runAction(root, "host+node", "start");
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain(`npm run service -- ${missing} install`);
+        expect(result.stderr).not.toContain("npm run service -- host+node install");
+      },
+    );
+
+    it.each([
+      ["host", "status"],
+      ["node", "status"],
+      ["host+node", "status"],
+      ["host", "uninstall"],
+      ["node", "uninstall"],
+      ["host+node", "uninstall"],
+    ])("keeps %s %s idempotent when nothing is installed", (kind, action) => {
+      const root = fixture();
+      const result = runAction(root, kind, action);
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+      const statuses = result.stdout.trim().split(/\r?\n/).map(JSON.parse);
+      expect(statuses).toHaveLength(kind === "host+node" ? 2 : 1);
+      for (const status of statuses) expect(status.installed).toBe(false);
+      expect(existsSync(join(root, "profile", "CopilotFleet"))).toBe(false);
     });
 
     it(
