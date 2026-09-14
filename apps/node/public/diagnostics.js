@@ -1,9 +1,14 @@
 import { $, el, note, post } from "./ui.js";
 
+const MAX_VISIBLE_LOG_ENTRIES = 80;
+
 const logLine = (entry) => {
   const time = entry.at.length > 19 ? entry.at.slice(11, 19) : entry.at;
   return el("div", { className: "lvl-" + entry.level }, [
-    el("span", { className: "at", textContent: time + "  " }),
+    el("span", {
+      className: "at",
+      textContent: time + "  [" + entry.level.toUpperCase() + "] ",
+    }),
     document.createTextNode(entry.message),
   ]);
 };
@@ -25,9 +30,10 @@ export const initDiagnostics = ({ loadConfig, renderConfig }) => {
       const response = await fetch("/api/logs");
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || "Could not read logs");
-      const entries = $("logProblemsOnly").checked
+      const matching = $("logProblemsOnly").checked
         ? data.entries.filter((entry) => entry.level !== "info")
         : data.entries;
+      const entries = matching.slice(-MAX_VISIBLE_LOG_ENTRIES);
       if (!entries.length) {
         view.replaceChildren(
           el("div", {
@@ -70,7 +76,9 @@ export const initDiagnostics = ({ loadConfig, renderConfig }) => {
   $("logRefresh").addEventListener("click", () => void loadLogs());
   $("logProblemsOnly").addEventListener("change", () => void loadLogs());
   void loadLogs();
-  setInterval(loadLogs, 5000);
+  setInterval(() => {
+    if (!document.hidden) void loadLogs();
+  }, 5000);
 
   $("exportNode").addEventListener("click", async () => {
     try {

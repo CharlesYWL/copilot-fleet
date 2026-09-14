@@ -64,6 +64,31 @@ it("handles planned exit-75 updates inside the Node supervisor", async () => {
   expect(readFileSync(join(manifest.repositoryPath, "count"), "utf8")).toBe("2");
   expect(readFileSync(manifest.logPath, "utf8")).toContain("node exited for an update");
 });
+it("runs the replacement build with the same service arguments without reinstalling", async () => {
+  const replacement = `
+    import {writeFileSync} from "node:fs";
+    writeFileSync("replacement.json", JSON.stringify({
+      revision: "new222222222", mode: process.env.NODE_ENV,
+      restart: process.env.FLEET_RESTART_MODE, args: process.argv.slice(2)
+    }));`;
+  const manifest = fixture(
+    "node",
+    `
+    import {writeFileSync} from "node:fs";
+    writeFileSync(import.meta.filename, ${JSON.stringify(replacement)});
+    process.exitCode = 75;`,
+  );
+  manifest.runtimeArgs = ["--config-port=8799"];
+  await expect(run(manifest)).resolves.toBe(0);
+  expect(
+    JSON.parse(readFileSync(join(manifest.repositoryPath, "replacement.json"), "utf8")),
+  ).toEqual({
+    revision: "new222222222",
+    mode: "production",
+    restart: "exit",
+    args: ["--config-port=8799"],
+  });
+});
 it("does not replace a missing Node identity", async () => {
   const manifest = fixture("node", 'throw new Error("must not run");');
   writeFileSync(

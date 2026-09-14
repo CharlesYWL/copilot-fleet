@@ -1,8 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { runCommand, updateCheckout, type CommandResult } from "./updater.js";
 
 /**
@@ -102,7 +109,7 @@ describe("updateCheckout against a real repository", () => {
       expect(updated).toEqual({ action: "restart", revision: head(clone, true) });
       // The build has to run before a restart is proposed, or a node could exit
       // into a tree that does not compile.
-      expect(npmCalls).toEqual(["npm install", "npm run build:node"]);
+      expect(npmCalls).toEqual(["npm install --include=dev", "npm run build:node"]);
     },
     timeout,
   );
@@ -143,7 +150,7 @@ describe("updateCheckout against a real repository", () => {
       expect(readFileSync(join(clone, "first.txt"), "utf8")).toBe("one");
       expect(existsSync(join(clone, "local.txt"))).toBe(false);
       expect(existsSync(join(clone, ".env"))).toBe(true);
-      expect(npmCalls).toEqual(["npm install", "npm run build:node"]);
+      expect(npmCalls).toEqual(["npm install --include=dev", "npm run build:node"]);
     },
     timeout,
   );
@@ -169,9 +176,65 @@ describe("updateCheckout against a real repository", () => {
         report: () => {},
         run: gitOnly(npmCalls),
       });
+
       expect(outcome.action).toBe("failed");
       expect(npmCalls).toEqual([]);
     },
     timeout,
   );
 });
+
+it("installs build tools under the login service's production environment", async () => {
+  const root = makeTemp("fleet-production-update-");
+  mkdirSync(join(root, ".git"));
+  mkdirSync(join(root, "build-tool"));
+  writeFileSync(
+    join(root, "build-tool", "package.json"),
+    JSON.stringify({ name: "fleet-build-tool", version: "1.0.0", main: "index.js" }),
+  );
+  writeFileSync(join(root, "build-tool", "index.js"), 'module.exports = "built";');
+  writeFileSync(
+    join(root, "package.json"),
+    JSON.stringify({
+      name: "fleet-update-fixture",
+      version: "1.0.0",
+      private: true,
+      scripts: { "build:node": "node build.cjs" },
+      devDependencies: { "fleet-build-tool": "file:./build-tool" },
+    }),
+  );
+  writeFileSync(
+    join(root, "build.cjs"),
+    'require("node:fs").writeFileSync("build-result", require("fleet-build-tool"));',
+  );
+  const offline = ["--offline", "--ignore-scripts", "--no-audit", "--no-fund"];
+  vi.stubEnv("NODE_ENV", "production");
+  try {
+    // The previous updater pruned the very tools its next step needed.
+    expect((await runCommand("npm", ["install", ...offline], root)).ok).toBe(true);
+    expect((await runCommand("npm", ["run", "build:node"], root)).ok).toBe(false);
+    const outcome = await updateCheckout({
+      repoRoot: root,
+      runningRevision: "old111111111",
+      report: () => {},
+      run: (command, args, cwd) => {
+        if (command === "git") {
+          return Promise.resolve({
+            ok: true,
+            output: args.includes("HEAD") ? "new222222222222" : "origin/main",
+          });
+        }
+        return runCommand(
+          command,
+          args[0] === "install" ? [...args, ...offline] : args,
+          cwd,
+        );
+      },
+    });
+    expect(outcome).toEqual({ action: "restart", revision: "new222222222" });
+    expect(readFileSync(join(root, "build-result"), "utf8")).toBe("built");
+    expect(process.env.NODE_ENV).toBe("production");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+}, 60_000);

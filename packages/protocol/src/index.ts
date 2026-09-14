@@ -954,6 +954,8 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     updateId: z.string().min(1),
     stage: NodeUpdateStageSchema,
     detail: z.string().default(""),
+    /** Built revision expected on reconnect; absent on older Nodes. */
+    revision: z.string().min(1).optional(),
   }),
   /**
    * Retained for older peers. The Host ignores this key: a legacy connection

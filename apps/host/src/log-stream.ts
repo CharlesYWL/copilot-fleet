@@ -6,7 +6,7 @@ import type { LogBuffer, LogLevel } from "@fleet/protocol/log-buffer";
  * The Host logs to the terminal it was started from, which on a fleet that runs
  * unattended is a terminal nobody is looking at — and by the time somebody is,
  * it is usually a terminal that has been closed. The operator is in the browser,
- * so the browser has to be able to answer "what went wrong".
+ * so the browser has to be able to answer "what is it doing".
  *
  * A pino stream rather than a wrapped logger: fastify hands `request.log` and
  * `app.log` to every route and gateway, and each one that wrapped the logger
@@ -14,14 +14,16 @@ import type { LogBuffer, LogLevel } from "@fleet/protocol/log-buffer";
  * logs goes through here whether or not the code doing the logging knows it.
  */
 
-/** pino's numeric levels; anything at or above `warn` is worth keeping. */
+/** Keep normal runtime output; trace and debug stay in the terminal. */
+const INFO = 30;
 const WARN = 40;
 const ERROR = 50;
 
 export function levelFromPino(level: unknown): LogLevel | undefined {
   const value = typeof level === "number" ? level : Number(level);
-  if (!Number.isFinite(value) || value < WARN) return undefined;
-  return value >= ERROR ? "error" : "warn";
+  if (!Number.isFinite(value) || value < INFO) return undefined;
+  if (value >= ERROR) return "error";
+  return value >= WARN ? "warn" : "info";
 }
 
 /**
@@ -35,10 +37,23 @@ export function messageFromPino(entry: Record<string, unknown>): string {
   const parts: string[] = [];
   const msg = typeof entry.msg === "string" ? entry.msg : "";
   if (msg) parts.push(msg);
+  // Only this known event's progress text is browser-safe; never serialize the
+  // rest of a pino record, which may include credentials or request headers.
+  if (msg === "Node self-update progress") {
+    for (const value of [entry.stage, entry.detail]) {
+      if (typeof value === "string" && value && !parts.includes(value)) {
+        parts.push(value);
+      }
+    }
+  }
   const err = entry.err;
   if (err && typeof err === "object") {
     const detail = (err as { message?: unknown }).message;
-    if (typeof detail === "string" && detail && !msg.includes(detail)) {
+    if (
+      typeof detail === "string" &&
+      detail &&
+      !parts.some((part) => part.includes(detail))
+    ) {
       parts.push(detail);
     }
   }
@@ -70,6 +85,14 @@ export function recordingLogStream(
         }
         const level = levelFromPino(entry.level);
         if (!level) continue;
+        // Fastify logs every request, including this view's polls. Keep those
+        // out of the tail without losing runtime activity or request failures.
+        if (
+          level === "info" &&
+          (entry.msg === "incoming request" || entry.msg === "request completed")
+        ) {
+          continue;
+        }
         logs.record(level, messageFromPino(entry));
       }
     },

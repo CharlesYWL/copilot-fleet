@@ -172,7 +172,15 @@ export class FleetService {
    * before it exits: there is nobody left to send anything after that. The Host
    * has to notice the return itself, so it remembers which Nodes owe it one.
    */
-  private readonly updatesInFlight = new Set<string>();
+  private readonly updatesInFlight = new Map<
+    string,
+    {
+      updateId: string;
+      previousRevision: string;
+      restarting: boolean;
+      expectedRevision?: string;
+    }
+  >();
   /** Suppresses disconnect bookkeeping while the Host itself is shutting down. */
   private closing = false;
   /**
@@ -1083,7 +1091,11 @@ export class FleetService {
     const updateId = randomUUID();
     this.send(socket, HostToNodeMessageSchema.parse({ type: "update_node", updateId }));
     this.log.info({ nodeId, updateId }, "Asked node to update itself");
-    this.updatesInFlight.add(nodeId);
+    this.updatesInFlight.set(nodeId, {
+      updateId,
+      previousRevision: node.revision,
+      restarting: false,
+    });
     this.publishNodeUpdate(nodeId, "checking", "Update requested");
     return { started: true };
   }
@@ -1096,7 +1108,21 @@ export class FleetService {
       .map((node) => node.id);
   }
 
-  publishNodeUpdate(nodeId: string, stage: NodeUpdateStage, detail: string): void {
+  publishNodeUpdate(
+    nodeId: string,
+    stage: NodeUpdateStage,
+    detail: string,
+    status?: { updateId: string; revision?: string | undefined },
+  ): void {
+    const update = this.updatesInFlight.get(nodeId);
+    if (status && update?.updateId !== status.updateId) {
+      this.log.warn({ nodeId, updateId: status.updateId }, "Ignored stale node update");
+      return;
+    }
+    if (update && stage === "restarting") {
+      update.restarting = true;
+      if (status?.revision) update.expectedRevision = status.revision;
+    }
     // Only these two end an update. Every other stage is progress, and leaving
     // the Node on the books through them is what lets the return be recognised.
     if (stage === "up_to_date" || stage === "failed") {
@@ -1118,14 +1144,30 @@ export class FleetService {
    * — a dropped tunnel, a machine waking up — stays silent.
    */
   settleUpdateOnReconnect(nodeId: string, revision: string | undefined): void {
-    if (!this.updatesInFlight.has(nodeId)) return;
+    const update = this.updatesInFlight.get(nodeId);
+    // A tunnel reconnect during install/build is not a completed restart.
+    if (!update?.restarting) return;
     const landed = revision?.trim();
+    const expected = update.expectedRevision;
+    const matches = (left: string, right: string) =>
+      left.slice(0, 12) === right.slice(0, 12);
+    if (
+      !landed ||
+      (expected
+        ? !matches(landed, expected)
+        : !update.previousRevision || matches(landed, update.previousRevision))
+    ) {
+      const detail = !landed
+        ? "Node reconnected without a revision; the update could not be verified"
+        : expected
+          ? `Node reconnected on ${landed.slice(0, 12)}, expected ${expected.slice(0, 12)}; the new build is not running`
+          : `Node reconnected on ${landed.slice(0, 12)}; no revision change could be verified`;
+      this.log.warn({ nodeId, revision: landed }, detail);
+      this.publishNodeUpdate(nodeId, "failed", detail);
+      return;
+    }
     this.log.info({ nodeId, revision: landed }, "Node returned from its update");
-    this.publishNodeUpdate(
-      nodeId,
-      "up_to_date",
-      landed ? `Updated to ${landed.slice(0, 12)}` : "Update finished",
-    );
+    this.publishNodeUpdate(nodeId, "up_to_date", `Updated to ${landed.slice(0, 12)}`);
   }
 
   /** Records a heartbeat, publishing only when a browser would render it. */
