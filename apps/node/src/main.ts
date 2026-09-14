@@ -62,6 +62,7 @@ import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { EventOutbox } from "./outbox.js";
 import { NODE_CAPABILITIES } from "./node-capabilities.js";
+import { startHealthSampler } from "./health.js";
 import {
   closeQuietly,
   flushReconnectOutbox,
@@ -1104,12 +1105,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   connect();
 
+  const health = startHealthSampler(errorLog);
   const heartbeatTimer = setInterval(() => {
     send({
       type: "heartbeat",
       activeSessionIds: router.activeSessionIds,
       busySessionIds: router.busySessionIds,
       sentAt: new Date().toISOString(),
+      health: health.latest(),
     });
   }, 5_000);
   heartbeatTimer.unref();
@@ -1120,6 +1123,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // An unref'd timer does not hold the loop open, but it does keep firing while
     // the process winds down, which resurrects a socket we are trying to close.
     clearInterval(heartbeatTimer);
+    health.stop();
     releaseLiveness();
     configServer.close();
     socket?.close();

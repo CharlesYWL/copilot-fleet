@@ -1,6 +1,12 @@
 import { Dialog, DialogSurface, makeStyles, tokens } from "@fluentui/react-components";
 import type { ReactNode } from "react";
-import type { FleetSession, PromptAttachment, SessionEvent } from "@fleet/protocol";
+import type {
+  FleetNode,
+  FleetSession,
+  Placement,
+  PromptAttachment,
+  SessionEvent,
+} from "@fleet/protocol";
 import type { SessionDraft } from "../lib/session-drafts";
 import { TerminalView } from "./TerminalView";
 
@@ -21,6 +27,8 @@ const useStyles = makeStyles({
 
 type SessionFocusDialogProps = {
   session: FleetSession;
+  node?: FleetNode | undefined;
+  placement?: Placement | undefined;
   events: SessionEvent[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -43,6 +51,8 @@ type SessionFocusDialogProps = {
 
 export const SessionFocusDialog = ({
   session,
+  node,
+  placement,
   events,
   open,
   onOpenChange,
@@ -70,6 +80,8 @@ export const SessionFocusDialog = ({
       <DialogSurface className={styles.surface}>
         <TerminalView
           session={session}
+          node={node}
+          placement={placement}
           events={events}
           onPrompt={onPrompt}
           onCancel={onCancel}

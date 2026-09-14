@@ -79,6 +79,12 @@ export const semanticColors = {
   dim: "#4d576d",
 } as const;
 
+export const nodeHealthColors = {
+  cpu: semanticColors.interaction,
+  memory: semanticColors.running,
+  disk: "#c39cff",
+} as const;
+
 export type StatusTone = "success" | "info" | "attention" | "danger" | "neutral";
 
 /** The colour and surface each tone draws itself with. */

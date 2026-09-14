@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Badge,
   Button,
@@ -19,7 +19,6 @@ import {
   Text,
   Title3,
   makeStyles,
-  mergeClasses,
   tokens,
 } from "@fluentui/react-components";
 import {
@@ -41,6 +40,7 @@ import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { sessionLabel } from "../lib/session-label";
 import { ConnectNodeCard } from "./ConnectNodeCard";
+import { NodeHealth } from "./NodeHealth";
 import { StatusDot } from "./StatusDot";
 
 const useStyles = makeStyles({
@@ -60,6 +60,9 @@ const useStyles = makeStyles({
     flexGrow: 1,
     overflowY: "auto",
     padding: "28px 32px",
+    "@media (max-width: 760px)": {
+      padding: "16px 12px",
+    },
   },
   head: {
     marginBottom: "20px",
@@ -76,7 +79,7 @@ const useStyles = makeStyles({
   table: {
     tableLayout: "fixed",
     width: "100%",
-    minWidth: "720px",
+    minWidth: "960px",
   },
   statusCell: {
     display: "flex",
@@ -86,6 +89,10 @@ const useStyles = makeStyles({
   mono: {
     fontFamily: '"JetBrains Mono", ui-monospace, monospace',
     fontSize: "12px",
+    maxWidth: "100%",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
   },
   nameText: {
     display: "block",
@@ -110,13 +117,13 @@ const useStyles = makeStyles({
     gap: "2px",
     flexShrink: 0,
   },
-  colStatus: { width: "110px" },
-  colName: { width: "20%" },
-  colPlatform: { width: "14%" },
-  colCapacity: { width: "90px" },
-  colVersion: { width: "170px" },
-  colSeen: { width: "16%" },
-  colActions: { width: "128px" },
+  colStatus: { width: "96px" },
+  colName: { width: "auto" },
+  colPlatform: { width: "110px" },
+  colCapacity: { width: "76px" },
+  colHealth: { width: "296px" },
+  colVersion: { width: "150px" },
+  colActions: { width: "104px" },
   versionCell: {
     display: "flex",
     flexDirection: "column",
@@ -178,6 +185,13 @@ const busyStages = new Set<NodeUpdateStage>([
 export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps) => {
   const styles = useStyles();
   const active = useSettingsActive();
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 10_000);
+    return () => clearInterval(timer);
+  }, [active]);
   const { renameNode, deleteNode, updateNode, updateAllNodes } = useCatalog();
   /** The node whose update is waiting on a decision about its live sessions. */
   const [blocked, setBlocked] = useState<{
@@ -230,7 +244,12 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
           </Button>
         </div>
       )}
-      <div className={styles.surface}>
+      <div
+        className={styles.surface}
+        role="region"
+        aria-label="Node inventory, scroll horizontally for more columns"
+        tabIndex={0}
+      >
         <Table className={styles.table} aria-label="Registered nodes">
           <TableHeader>
             <TableRow>
@@ -238,8 +257,8 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
               <TableHeaderCell className={styles.colName}>Name</TableHeaderCell>
               <TableHeaderCell className={styles.colPlatform}>Platform</TableHeaderCell>
               <TableHeaderCell className={styles.colCapacity}>Capacity</TableHeaderCell>
+              <TableHeaderCell className={styles.colHealth}>Health</TableHeaderCell>
               <TableHeaderCell className={styles.colVersion}>Version</TableHeaderCell>
-              <TableHeaderCell className={styles.colSeen}>Last seen</TableHeaderCell>
               <TableHeaderCell className={styles.colActions}>Actions</TableHeaderCell>
             </TableRow>
           </TableHeader>
@@ -248,6 +267,7 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
               <NodeRow
                 key={node.id}
                 node={node}
+                now={now}
                 hostRevision={hostRevision}
                 progress={nodeUpdates[node.id]}
                 onRename={renameNode}
@@ -315,6 +335,7 @@ export const NodesPanel = ({ nodes, hostRevision, nodeUpdates }: NodesPanelProps
 
 type NodeRowProps = {
   node: FleetNode;
+  now: number;
   hostRevision: string;
   progress?: { stage: NodeUpdateStage; detail: string } | undefined;
   onRename: (nodeId: string, name: string) => Promise<boolean>;
@@ -324,6 +345,7 @@ type NodeRowProps = {
 
 const NodeRow = ({
   node,
+  now,
   hostRevision,
   progress,
   onRename,
@@ -395,6 +417,9 @@ const NodeRow = ({
       <TableCell className={styles.colCapacity}>
         {node.activeSessions} / {node.maxSessions}
       </TableCell>
+      <TableCell className={styles.colHealth}>
+        <NodeHealth node={node} now={now} />
+      </TableCell>
       <TableCell className={styles.colVersion}>
         <span className={styles.versionCell} title={progress?.detail || label.hint}>
           <Badge
@@ -410,11 +435,10 @@ const NodeRow = ({
           >
             {progress && busy ? stageLabels[progress.stage] : label.text}
           </Badge>
-          <Text className={styles.mono}>{node.revision || node.version}</Text>
+          <Text className={styles.mono} title={node.revision || node.version}>
+            {node.revision || node.version}
+          </Text>
         </span>
-      </TableCell>
-      <TableCell className={mergeClasses(styles.colSeen, styles.mono)}>
-        {new Date(node.lastHeartbeat).toLocaleString()}
       </TableCell>
       <TableCell className={styles.colActions}>
         <span className={styles.actions}>

@@ -101,6 +101,35 @@ export const NodeAgentSchema = z.object({
 });
 export type NodeAgent = z.infer<typeof NodeAgentSchema>;
 
+const resourceBytes = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const capacitySampleShape = {
+  sampledAt: z.string().datetime(),
+  totalBytes: resourceBytes.positive(),
+  availableBytes: resourceBytes,
+};
+const availableWithinTotal = (sample: { totalBytes: number; availableBytes: number }) =>
+  sample.availableBytes <= sample.totalBytes;
+
+/**
+ * Machine-wide readings, not this process's usage. Missing metrics are unavailable.
+ * Each timestamp belongs to the measurement, never to the enclosing heartbeat.
+ * Disk covers only the volume containing the Node's home directory.
+ */
+export const NodeHealthSchema = z.object({
+  cpu: z
+    .object({
+      sampledAt: z.string().datetime(),
+      usagePercent: z.number().min(0).max(100),
+    })
+    .optional(),
+  memory: z.object(capacitySampleShape).refine(availableWithinTotal).optional(),
+  disk: z
+    .object({ ...capacitySampleShape, scope: z.literal("home") })
+    .refine(availableWithinTotal)
+    .optional(),
+});
+export type NodeHealth = z.infer<typeof NodeHealthSchema>;
+
 export const NodeSchema = z.object({
   id: z.string().min(1),
   name: z.string().min(1),
@@ -127,6 +156,8 @@ export const NodeSchema = z.object({
   online: z.boolean(),
   /** The node's home directory, used to seed placement paths in the UI. */
   homeDir: z.string().default(""),
+  /** Ephemeral telemetry; older Nodes and restored archives need not carry it. */
+  health: NodeHealthSchema.optional(),
   /**
    * How this machine proves it is itself.
    *
@@ -870,6 +901,7 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     /** As on `hello`: which of those are mid-turn. */
     busySessionIds: z.array(z.string()).default([]),
     sentAt: z.string().datetime(),
+    health: NodeHealthSchema.optional(),
   }),
   z.object({
     /**

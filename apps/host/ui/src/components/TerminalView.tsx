@@ -53,7 +53,9 @@ import {
   SESSION_NAME_MAX_LENGTH,
   isResumableSession,
   terminalSessionStates,
+  type FleetNode,
   type FleetSession,
+  type Placement,
   type SessionState,
   type SessionEvent,
   type PromptAttachment,
@@ -92,6 +94,7 @@ import { PermissionBanner } from "./PermissionBanner";
 import { PromptRail } from "./PromptRail";
 import { SessionConfigBar } from "./SessionConfigBar";
 import { SessionAgentBadge } from "./SessionAgentBadge";
+import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SlashMenu } from "./SlashMenu";
 import { StatusDot } from "./StatusDot";
 
@@ -230,6 +233,10 @@ const useStyles = makeStyles({
     color: semanticColors.interaction,
     font: "inherit",
     ":hover": { background: tokens.colorNeutralBackground1Hover },
+    ":focus-visible": {
+      outline: `2px solid ${tokens.colorBrandStroke1}`,
+      outlineOffset: "3px",
+    },
   },
   noticeStalled: {
     ...shorthands.borderColor(statusVisuals.attention.border),
@@ -531,6 +538,8 @@ const THOUGHT_PREVIEW_LENGTH = 150;
 
 type TerminalViewProps = {
   session: FleetSession;
+  node?: FleetNode | undefined;
+  placement?: Placement | undefined;
   events: SessionEvent[];
   onPrompt: (prompt: string, attachments?: PromptAttachment[]) => void;
   onCancel: () => void;
@@ -552,6 +561,8 @@ type TerminalViewProps = {
 
 export const TerminalView = ({
   session,
+  node,
+  placement,
   events,
   onPrompt,
   onCancel,
@@ -635,13 +646,19 @@ export const TerminalView = ({
       // Left pinned, the next streamed chunk would yank the reader straight
       // back to the bottom of the very transcript they just left.
       pinnedRef.current = false;
+      setPinned(false);
       const offset =
         node.getBoundingClientRect().top - element.getBoundingClientRect().top;
       const top = element.scrollTop + offset - 14;
       // `scrollTo` is what animates; the assignment is the fallback for hosts
       // that do not have it, which is also what keeps this testable.
       if (typeof element.scrollTo === "function") {
-        element.scrollTo({ top, behavior: "smooth" });
+        element.scrollTo({
+          top,
+          behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+            ? "instant"
+            : "smooth",
+        });
       } else {
         element.scrollTop = top;
       }
@@ -656,6 +673,14 @@ export const TerminalView = ({
     element.scrollTop = element.scrollHeight;
   }, []);
 
+  const jumpToLatest = useCallback(() => {
+    pinnedRef.current = true;
+    setPinned(true);
+    setUnseen(0);
+    scrollToEnd();
+    updateActivePrompt();
+  }, [scrollToEnd, updateActivePrompt]);
+
   useEffect(() => {
     updateActivePrompt();
   }, [blocks, updateActivePrompt]);
@@ -666,11 +691,8 @@ export const TerminalView = ({
   }, [blocks, scrollToEnd]);
 
   useEffect(() => {
-    pinnedRef.current = true;
-    setPinned(true);
-    setUnseen(0);
-    scrollToEnd();
-  }, [session.id, scrollToEnd]);
+    jumpToLatest();
+  }, [session.id, jumpToLatest]);
 
   /*
    * How far behind the reader is, and how long the agent has been silent.
@@ -771,8 +793,7 @@ export const TerminalView = ({
     // Sending is a request to watch what happens next, so it re-pins the
     // transcript. Scrolling back to read something older otherwise left the
     // operator staring at old output while the answer arrived below the fold.
-    pinnedRef.current = true;
-    scrollToEnd();
+    jumpToLatest();
   };
 
   const addFiles = async (files: readonly File[]) => {
@@ -833,8 +854,7 @@ export const TerminalView = ({
       // read back off `prompt`.
       onPrompt(choice.text);
       onDraftChange(() => EMPTY_DRAFT);
-      pinnedRef.current = true;
-      scrollToEnd();
+      jumpToLatest();
       return;
     }
     inputRef.current?.focus();
@@ -966,6 +986,13 @@ export const TerminalView = ({
             {session.currentActivity}
           </Text>
         </div>
+        <SessionInfoDialog
+          key={session.id}
+          session={session}
+          node={node}
+          placement={placement}
+          className={styles.headerAction}
+        />
         {notificationPreferenceControl}
         <Button
           className={styles.headerAction}
@@ -1061,7 +1088,14 @@ export const TerminalView = ({
       )}
 
       <div className={styles.streamArea}>
-        <div className={styles.stream} ref={streamRef} onScroll={handleScroll}>
+        <div
+          className={styles.stream}
+          ref={streamRef}
+          onScroll={handleScroll}
+          role="region"
+          aria-label="Chat transcript"
+          tabIndex={0}
+        >
           {blocks.length === 0 ? (
             <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
           ) : (
@@ -1075,23 +1109,22 @@ export const TerminalView = ({
           Floated over the stream rather than inserted into it, so appearing
           never shifts the text someone is reading.
         */}
-        {notice && (
+        {(!pinned || notice) && (
           <div className={styles.noticeSlot} aria-live="polite">
-            {notice.kind === "new-output" ? (
+            {!pinned ? (
               <button
                 type="button"
                 className={mergeClasses(styles.notice, styles.noticeAction)}
-                onClick={() => {
-                  pinnedRef.current = true;
-                  setPinned(true);
-                  setUnseen(0);
-                  scrollToEnd();
-                }}
+                onClick={jumpToLatest}
+                aria-label="Jump to latest"
               >
                 <ArrowDown16Regular aria-hidden="true" />
-                {notice.label}
+                Jump to latest
+                {notice?.kind === "new-output" && (
+                  <span className={styles.noticeDetail}>({notice.count} new)</span>
+                )}
               </button>
-            ) : (
+            ) : notice && notice.kind !== "new-output" ? (
               <span
                 className={mergeClasses(
                   styles.notice,
@@ -1102,7 +1135,7 @@ export const TerminalView = ({
                 <strong>{notice.label}</strong>
                 <span className={styles.noticeDetail}>· {notice.detail}</span>
               </span>
-            )}
+            ) : null}
           </div>
         )}
         {promptMarks.length > 0 && (

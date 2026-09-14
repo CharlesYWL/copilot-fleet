@@ -26,6 +26,40 @@ pickers along the bottom.
 > any machine without a Copilot login. A real node streams real Copilot output in
 > exactly the same surfaces.
 
+### Node health and session navigation
+
+**Settings → Nodes** keeps each machine on one row, with compact blue CPU,
+green RAM, and purple disk meters in the **Health** column. Hover or focus a
+metric for capacity, scope, and sampling details; clock icons and striped bars
+mark readings that are not current. Disk capacity covers the volume containing
+the Node user's home directory. Disk is not an
+average of every drive or a measure of disk activity; a project on another
+volume can have different free space. Updated Nodes sample approximately every
+30 seconds and report through their existing connection. Each reading keeps
+its own measurement time. Missing readings, stale readings, clock skew, and
+offline Nodes are labelled rather than shown as fresh zeroes. Older Nodes keep
+working without health telemetry, and health does not change scheduling.
+
+The session header's **Session information** icon opens the same details dialog
+in both the full chat and the focused overview chat. It shows the Node, platform,
+workspace, current placement path, model, status, timestamps, and both the Fleet
+and native Copilot session IDs. Copy buttons provide the path, IDs, and a
+shell-quoted local recovery command. Only the native Copilot ID can be passed
+to `copilot --resume`; demo sessions and sessions without that ID have no recovery
+command.
+
+Run local recovery on the original Node as the same OS user, after stopping or
+verifying the old process has exited. The command uses standard Copilot CLI and
+the current placement: if either your launcher/configuration or the placement
+has changed, use the corresponding original setup. Local recovery does not
+reattach the CLI to Fleet or restore orchestration tools; use Fleet's **Resume**
+to continue managed work.
+
+Scroll back or select an earlier prompt to reveal **Jump to latest**, even on
+an idle or ended chat with no new output. It takes you to the bottom, clears
+the unread count, and resumes following streamed output. Reading older messages
+never pulls you back down automatically.
+
 ## Feature map and contents
 
 Start with the walkthrough, then use this map when you need a specific surface.
