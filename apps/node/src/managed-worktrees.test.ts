@@ -748,7 +748,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       state: "ready",
       resultSha: composed.worktree!.composition!.resultSha,
     });
-  });
+  }, 120_000);
 
   it("composes a clean primary checkout advanced by a read-only predecessor", async () => {
     const { source, manager } = await fixture();

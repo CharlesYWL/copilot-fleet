@@ -1,6 +1,10 @@
 import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
-import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
+import {
+  killPosixProcessGroup,
+  spawnManagedProcess,
+  stopProcessTree,
+} from "./process-quiescence.js";
 
 describe("Windows process quiescence", () => {
   it.skipIf(process.platform !== "win32")(
@@ -42,33 +46,6 @@ describe("Windows process quiescence", () => {
         child.once("exit", () => reject(new Error("Supervisor exited before readiness")));
       });
 
-      describe("POSIX process quiescence", () => {
-        it.skipIf(process.platform === "win32")(
-          "terminates the detached process group rather than only the direct child",
-          async () => {
-            const child = spawn(
-              process.execPath,
-              [
-                "-e",
-                'const {spawn}=require("node:child_process");const c=spawn(process.execPath,["-e","setTimeout(()=>{},30000)"],{stdio:"ignore"});console.log(c.pid);setTimeout(()=>{},30000)',
-              ],
-              { detached: true, stdio: ["ignore", "pipe", "ignore"] },
-            );
-            const descendant = await new Promise<number>((resolve, reject) => {
-              child.stdout.once("data", (chunk: Buffer) =>
-                resolve(Number(chunk.toString().trim())),
-              );
-              child.once("error", reject);
-            });
-
-            await stopProcessTree(child);
-            expect(() => process.kill(descendant, 0)).toThrow(
-              expect.objectContaining({ code: "ESRCH" }),
-            );
-          },
-          30_000,
-        );
-      });
       const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
       child.kill();
       await closed;
@@ -212,6 +189,51 @@ describe("Windows process quiescence", () => {
       } finally {
         await stopProcessTree(child);
       }
+    },
+    30_000,
+  );
+});
+
+describe("POSIX process quiescence", () => {
+  it("signals the detached process group by negative PID", () => {
+    const calls: Array<[number, NodeJS.Signals]> = [];
+    killPosixProcessGroup(42, (pid, signal) => {
+      calls.push([pid, signal]);
+      return true;
+    });
+    expect(calls).toEqual([[-42, "SIGKILL"]]);
+  });
+
+  it("ignores a process group that exited concurrently", () => {
+    expect(() =>
+      killPosixProcessGroup(42, () => {
+        throw Object.assign(new Error("gone"), { code: "ESRCH" });
+      }),
+    ).not.toThrow();
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "terminates the detached process group rather than only the direct child",
+    async () => {
+      const child = spawn(
+        process.execPath,
+        [
+          "-e",
+          'const {spawn}=require("node:child_process");const c=spawn(process.execPath,["-e","setTimeout(()=>{},30000)"],{stdio:"ignore"});console.log(c.pid);setTimeout(()=>{},30000)',
+        ],
+        { detached: true, stdio: ["ignore", "pipe", "ignore"] },
+      );
+      const descendant = await new Promise<number>((resolve, reject) => {
+        child.stdout.once("data", (chunk: Buffer) =>
+          resolve(Number(chunk.toString().trim())),
+        );
+        child.once("error", reject);
+      });
+
+      await stopProcessTree(child);
+      expect(() => process.kill(descendant, 0)).toThrow(
+        expect.objectContaining({ code: "ESRCH" }),
+      );
     },
     30_000,
   );

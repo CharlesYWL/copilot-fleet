@@ -13,6 +13,17 @@ const jobs = new WeakMap<
   { name: string; closed: Promise<void>; verified: () => boolean }
 >();
 
+export function killPosixProcessGroup(
+  pid: number,
+  kill: (pid: number, signal: NodeJS.Signals) => boolean = process.kill,
+): void {
+  try {
+    kill(-pid, "SIGKILL");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+  }
+}
+
 function quiescenceStderr(proof: string, verified: () => void): Transform {
   const expected = Buffer.from(proof);
   const expectedCR = Buffer.from(`${proof}\r`);
@@ -148,11 +159,7 @@ export async function stopProcessTree(
       if (child.exitCode === null && child.signalCode === null) throw error;
     });
   } else {
-    try {
-      process.kill(-pid, "SIGKILL");
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    }
+    killPosixProcessGroup(pid);
   }
   await closed;
 }

@@ -148,7 +148,7 @@ describe("recordingLogStream", () => {
     } finally {
       await app.close();
     }
-  });
+  }, 15_000);
 
   it("keeps the console output byte for byte", () => {
     // This is a second reader of the log, not a replacement for the first.

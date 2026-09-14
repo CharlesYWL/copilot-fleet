@@ -334,7 +334,15 @@ describe(
       expect(
         (await fleet.request(`/api/runs/${run.id}/approve`, "POST", {})).status,
       ).toBe(200);
-      await expect.poll(() => fleet.entered.size, { timeout: 30_000 }).toBe(1);
+      await expect
+        .poll(
+          () => {
+            if (fleet.failures.length) throw fleet.failures[0];
+            return fleet.entered.size;
+          },
+          { timeout: 30_000 },
+        )
+        .toBe(1);
       fleet.release();
       await expect
         .poll(
@@ -413,7 +421,15 @@ describe(
           (await fleet.request(`/api/runs/${run.id}/approve`, "POST", {})).status,
         ).toBe(200);
       }
-      await expect.poll(() => fleet.entered.size, { timeout: 30_000 }).toBe(2);
+      await expect
+        .poll(
+          () => {
+            if (fleet.failures.length) throw fleet.failures[0];
+            return fleet.entered.size;
+          },
+          { timeout: 30_000 },
+        )
+        .toBe(2);
       expect(fleet.maximum()).toBe(2);
       fleet.release();
       await expect.poll(() => fleet.reviewed.size, { timeout: 90_000 }).toBe(2);
