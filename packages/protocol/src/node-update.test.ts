@@ -1,5 +1,23 @@
 import { describe, expect, it } from "vitest";
-import { SELF_UPDATE_CAPABILITY, nodeUpdateState } from "./index.js";
+import {
+  NodeToHostMessageSchema,
+  SELF_UPDATE_CAPABILITY,
+  nodeUpdateState,
+} from "./index.js";
+
+it("carries the expected restart revision while accepting older update reports", () => {
+  const report = {
+    type: "update_status",
+    updateId: "update-1",
+    stage: "restarting",
+    detail: "Restarting",
+  };
+  expect(NodeToHostMessageSchema.parse(report)).toEqual(report);
+  expect(NodeToHostMessageSchema.parse({ ...report, revision: "abcdef123456" })).toEqual({
+    ...report,
+    revision: "abcdef123456",
+  });
+});
 
 const node = (revision: string, capabilities: string[] = [SELF_UPDATE_CAPABILITY]) => ({
   revision,

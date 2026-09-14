@@ -442,7 +442,7 @@ export function registerNodeGateway(
               },
               "Node self-update progress",
             );
-            service.publishNodeUpdate(nodeId, message.stage, message.detail);
+            service.publishNodeUpdate(nodeId, message.stage, message.detail, message);
             return;
           }
           if (message.type === "command_result" && !message.ok) {

@@ -259,8 +259,11 @@ npm start
   如果仍然失败，请检查 Node 上的 Copilot 和 MCP 日志，确认是否有服务缓慢、不可用或配置
   错误。仅凭这个超时不能判断 Copilot 已退出登录。
 - **有事项需要处理：** 看通知铃铛、Orchestrator/task 的琥珀色状态、session 内的权限横幅，
-  以及 **Settings → Diagnostics** 里的 Host warning/error。能访问 Node 机器时，它自己的
-  `http://127.0.0.1:8788` 配置页会显示 Node 侧日志。
+  以及 **Settings → Diagnostics** 里的 Host 运行日志。能访问 Node 机器时，它自己的
+  配置页（默认从 `http://127.0.0.1:8788` 开始，实际地址在启动时输出）会显示 Node 侧日志。
+  两个页面默认显示最近 80 条日志，包括正常活动，每五秒刷新；勾选 **Problems only**
+  可以只看警告和错误。日志只在内存中保留有限条数，重启后清空；Host 会排除例行 HTTP
+  访问日志，避免轮询淹没有用的信息。
 
 ## Agency 模式
 
@@ -944,8 +947,14 @@ UI。`npm run dev` 时你点开的页面是 Vite 的 `http://127.0.0.1:5173`，�
 Nodes 标签页会把每台机器的提交与 Host 的提交做比较，标记为 **Up to date**、
 **Update available** 或 **Manual update**。某一行上的 **Update** —— 或者表格上方的
 **Update all** —— 会让那些机器执行 `git fetch --prune`、对所跟踪分支做
-`git reset --hard`、`npm install`、`npm run build:node`，然后重启进入新构建。过程会实时
+`git reset --hard`、`npm install --include=dev`、`npm run build:node`，然后重启进入新构建。过程会实时
 显示在该行里。
+
+生产环境的登录服务也会安装构建所需的开发依赖。只有检出和正在运行的进程都已是目标提交，
+才会跳过构建；安装或构建失败后重试，即使 HEAD 已经移动，也会重新构建并重启。
+Host 只会在重启后核对 Node 上报的提交与预期构建一致时报告成功；构建期间的普通重连不算
+更新成功。重启后提交缺失或不符会报告失败。未上报预期构建的旧 Node 至少必须返回不同的
+已知提交。
 
 比较的是提交而不是包版本：`0.1.0` 在两次部署之间不会变，用它比较会把每台机器都报成
 最新的，无论它落后多远。
@@ -977,6 +986,11 @@ Nodes 标签页会把每台机器的提交与 Host 的提交做比较，标记�
 （`apps/node/supervisor.mjs`）。节点从不替换自己：它以状态码 75 退出来请求重启，而
 supervisor —— 它没有参与更新，因此仍然活着 —— 会在同一个终端里启动新构建。没有任何东西
 被 detach，也不会弹出窗口。
+
+`npm run service -- node start` 使用同一个生产 supervisor，更新无需重新安装计划任务，
+也不会替换 Node 身份或设置。如果旧服务已在更新途中卡住，请先停止服务，在更新后的检出中
+执行 `npm install --include=dev` 和 `npm run build:node`，再执行
+`npm run service -- node start` 一次来加载修复后的更新器。
 
 之所以这样做，是因为在 Windows 上一个进程无法可靠地替换自己。曾经尝试这么做的版本会
 spawn 一个 detached 的后继进程，它会自带一个控制台窗口，并且必须赢得实例锁的竞争。在

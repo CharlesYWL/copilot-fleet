@@ -320,9 +320,13 @@ of them on one Windows machine, or split Host and Node across machines.
   does not mean Copilot is signed out.
 - **Something needs attention:** use the notification bell, the amber
   Orchestrator/task state, the permission banner in the session, and
-  **Settings → Diagnostics** for Host warnings/errors. The Node's own
-  config page (port 8788 by default; its actual URL is printed at startup) shows Node-side logs when you can reach
-  that machine.
+  **Settings → Diagnostics** for Host runtime logs. The Node's own config page
+  (port 8788 by default; its actual URL is printed at startup) shows Node-side
+  logs when you can reach that machine. Both show the latest 80 entries,
+  including normal activity, and refresh every five seconds. Use **Problems
+  only** to focus on warnings/errors. Logs are bounded in memory and clear on
+  restart; routine Host HTTP access messages are excluded so polling does not
+  drown out useful activity.
 
 ## Agency mode
 
@@ -1259,9 +1263,20 @@ was already running.
 The Nodes tab compares each machine's commit with the Host's and marks it **Up
 to date**, **Update available**, or **Manual update**. **Update** on a row — or
 **Update all** above the table — tells those machines to `git fetch --prune`,
-`git reset --hard` onto the branch they track, `npm install`,
+`git reset --hard` onto the branch they track, `npm install --include=dev`,
 `npm run build:node`, and restart into the new build. Progress appears in the row
 as it happens.
+
+Build dependencies are included even when the Node runs as a production login
+service. An unchanged checkout only skips the build when the running process
+also reports that commit; retrying after a failed install/build rebuilds and
+restarts instead of falsely reporting "Already up to date".
+
+The Host waits for the restart and verifies the returning revision against the
+Node's announced build. Reconnecting during install/build is not success, and a
+missing or incorrect revision after restart is reported as a failure. Older
+Nodes without an announced build must at least return on a different known
+revision.
 
 The commit is compared, not the package version: `0.1.0` never moves between
 deploys, so comparing it would report every machine as current no matter how far
@@ -1304,6 +1319,12 @@ the node (`apps/node/supervisor.mjs`). The node never replaces itself: it exits
 with status 75 to ask for a restart, and the supervisor — which had nothing to
 do with the update and is therefore still alive — starts the new build in the
 same terminal. Nothing is detached and no window appears.
+
+`npm run service -- node start` uses this same production supervisor. Updating
+does not reinstall the scheduled task or replace the Node identity/settings.
+If an older service is already stuck after moving its checkout, stop it, run
+`npm install --include=dev` and `npm run build:node` in the updated checkout, then
+run `npm run service -- node start` once to load the fixed updater.
 
 This exists because a process cannot reliably replace itself on Windows. The
 version that tried spawned a detached successor, which arrives with a console

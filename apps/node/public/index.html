@@ -291,11 +291,21 @@
             <button type="button" class="secondary" id="logRefresh">Refresh</button>
           </div>
           <div class="card">
+            <p class="sub spaced">
+              Latest 80 matching runtime messages. Restarting the node clears the log.
+            </p>
             <label class="inline">
-              <input type="checkbox" id="logProblemsOnly" checked />
+              <input type="checkbox" id="logProblemsOnly" />
               <span>Problems only</span>
             </label>
-            <pre class="logs" id="logs" aria-live="polite">Loading…</pre>
+            <pre
+              class="logs"
+              id="logs"
+              role="log"
+              aria-label="Node runtime logs"
+              aria-live="polite"
+            >
+Loading…</pre>
           </div>
         </section>
 

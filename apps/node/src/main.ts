@@ -548,9 +548,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     const root = repoRoot();
     log(`Self-update requested; using checkout ${root}`);
     try {
-      const outcome = await updateCheckout({ repoRoot: root, report });
+      const outcome = await updateCheckout({
+        repoRoot: root,
+        runningRevision: REVISION,
+        report,
+      });
       if (outcome.action === "failed") {
-        log(`Self-update failed: ${outcome.reason}`);
         report("failed", outcome.reason);
         return;
       }
@@ -586,14 +589,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         );
         return;
       }
-      // Sent before the process goes, because nothing can be reported from the
-      // other side of an exit.
-      report("restarting", `Updated to ${outcome.revision}; restarting`);
       // The successor reads settings.json rather than inheriting the flags this
       // process was started with, so what is in memory now has to be on disk
       // before it looks. Without this a node whose address was corrected from
       // the config page comes back on the address it was launched with.
       await saveSettings(settings);
+      // The Host verifies this revision when the supervisor's child reconnects.
+      report(
+        "restarting",
+        `Updated to ${outcome.revision}; restarting`,
+        outcome.revision,
+      );
       if (supervised) {
         log(`Exiting for the supervisor to restart (${RESTART_MODE_ENV}=exit)`);
       } else {
@@ -615,12 +621,25 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // Ctrl-C would bring the Node straight back. The successor of an
       // unsupervised restart is already running, so this one just leaves.
       process.exit(supervised ? RESTART_EXIT_CODE : 0);
+    } catch (error) {
+      report("failed", errorMessage(error));
+      // Once shutdown has closed the listeners, staying alive cannot recover.
+      if (shuttingDown) throw error;
     } finally {
       updating = false;
     }
 
-    function report(stage: NodeUpdateStage, detail: string): void {
-      send({ type: "update_status", updateId, stage, detail });
+    function report(stage: NodeUpdateStage, detail: string, revision?: string): void {
+      const message = `Self-update ${stage}: ${detail}`;
+      if (stage === "failed") errorLog(message);
+      else log(message);
+      send({
+        type: "update_status",
+        updateId,
+        stage,
+        detail,
+        ...(revision ? { revision } : {}),
+      });
     }
   }
 
