@@ -859,6 +859,7 @@ export class ManagedWorktrees {
   private workspacePolicyMatches(
     expected: RepositoryExecutionPolicy,
     observed: RepositoryExecutionPolicy,
+    options: { ignoreHooks?: boolean } = {},
   ): boolean {
     const {
       credentialHelpersDigest: _expectedCredentialHelpersDigest,
@@ -869,18 +870,19 @@ export class ManagedWorktrees {
       ...observedWorkspacePolicy
     } = observed;
     if (isDeepStrictEqual(expectedWorkspacePolicy, observedWorkspacePolicy)) return true;
-    return this.workspacePolicyMismatches(expected, observed).length === 0;
+    return this.workspacePolicyMismatches(expected, observed, options).length === 0;
   }
 
   private workspacePolicyMismatches(
     expected: RepositoryExecutionPolicy,
     observed: RepositoryExecutionPolicy,
+    options: { ignoreHooks?: boolean } = {},
   ): string[] {
     const mismatches: string[] = [];
     if (expected.version !== observed.version) mismatches.push("policy version");
     if (
-      expected.hooks !== observed.hooks ||
-      expected.hooksDigest !== observed.hooksDigest
+      !options.ignoreHooks &&
+      (expected.hooks !== observed.hooks || expected.hooksDigest !== observed.hooksDigest)
     )
       mismatches.push("Git hooks");
     if (
@@ -906,6 +908,7 @@ export class ManagedWorktrees {
     options: {
       adoptCredentialHelpers?: boolean;
       strictCredentialHelpers?: boolean;
+      ignoreHooks?: boolean;
     } = {},
   ): Promise<void> {
     const observed = await this.repositoryExecutionPolicy(
@@ -913,13 +916,14 @@ export class ManagedWorktrees {
       tree.repositoryFeatures,
       tree.allowGitHooks,
     );
-    if (!this.workspacePolicyMatches(tree.repositoryExecutionPolicy, observed)) {
+    if (!this.workspacePolicyMatches(tree.repositoryExecutionPolicy, observed, options)) {
       const scope = samePath(path, tree.repository.path)
         ? "source repository"
         : "integration workspace";
       const mismatches = this.workspacePolicyMismatches(
         tree.repositoryExecutionPolicy,
         observed,
+        options,
       );
       throw new WorktreeConflict(
         "repository_execution_policy_changed",
@@ -981,6 +985,12 @@ export class ManagedWorktrees {
       if (identity.exitCode !== 0) return false;
     }
     return true;
+  }
+
+  private async disabledHooksPath(): Promise<string> {
+    const hooks = join(this.options.directory, "empty-hooks");
+    await mkdir(hooks, { recursive: true });
+    return hooks;
   }
 
   private async registry(
@@ -2027,7 +2037,7 @@ export class ManagedWorktrees {
         "This Node cannot materialize portable workspace results.",
       );
     const directory = join(this.options.directory, "workspace-result-artifacts");
-    const hooks = hooksPath ?? join(directory, "empty-hooks");
+    const hooks = hooksPath ?? (await this.disabledHooksPath());
     await mkdir(hooks, { recursive: true });
     const bundlePath = join(directory, `${result.artifactId}.bundle`);
     const importedRef = `refs/fleet/imports/${identityHash(
@@ -2724,7 +2734,15 @@ export class ManagedWorktrees {
         );
       await this.git.run(
         tree.repository.path,
-        ["worktree", "add", "--detach", path, baseSha],
+        [
+          "-c",
+          `core.hooksPath=${await this.disabledHooksPath()}`,
+          "worktree",
+          "add",
+          "--detach",
+          path,
+          baseSha,
+        ],
         {
           timeoutMs: 120_000,
           lease: admin,
@@ -2940,6 +2958,7 @@ export class ManagedWorktrees {
     await this.validateIntegrationTarget(tree, target);
     await this.verifyRepositoryExecutionPolicy(tree, target.path, {
       adoptCredentialHelpers: true,
+      ignoreHooks: true,
     });
     await this.noninteractivePolicy(target.path, false, tree.allowGitHooks);
     const taskSha = GitShaSchema.parse(await this.ref(tree.path, "HEAD"));
@@ -3040,6 +3059,7 @@ export class ManagedWorktrees {
       await this.validateIntegrationTarget(tree, integration.preview.target);
       await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path, {
         strictCredentialHelpers: true,
+        ignoreHooks: true,
       });
       if (
         (await this.ref(integration.preview.target.path, "HEAD")) !==
@@ -3208,7 +3228,14 @@ export class ManagedWorktrees {
           retainTarget = true;
           const result = await this.git.run(
             preview.target.path,
-            ["merge", "--no-ff", "--no-commit", preview.taskSha],
+            [
+              "-c",
+              `core.hooksPath=${await this.disabledHooksPath()}`,
+              "merge",
+              "--no-ff",
+              "--no-commit",
+              preview.taskSha,
+            ],
             { allowedExitCodes: [0, 1], lease: admin },
           );
           this.options.checkpoint?.("git", request);
@@ -3365,7 +3392,9 @@ export class ManagedWorktrees {
     request: WorktreeOperationRequest,
   ): Promise<void> {
     await this.verifyMerge(integration);
-    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path);
+    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path, {
+      ignoreHooks: true,
+    });
     if ((await this.ref(tree.path, "HEAD")) !== integration.approvedTaskSha)
       throw new WorktreeConflict("stale_review", "The approved task HEAD changed.");
     this.requireTrackedClean(await this.status(tree.path));
@@ -3398,6 +3427,8 @@ export class ManagedWorktrees {
     await this.git.run(
       integration.preview.target.path,
       [
+        "-c",
+        `core.hooksPath=${await this.disabledHooksPath()}`,
         "commit",
         "-m",
         `Merge Fleet task ${tree.taskKey}\n\nFleet-Integration: ${integration.id}`,
@@ -3405,7 +3436,9 @@ export class ManagedWorktrees {
       { lease: admin },
     );
     this.options.checkpoint?.("git", request);
-    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path);
+    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path, {
+      ignoreHooks: true,
+    });
     integration.resultSha = await this.ref(integration.preview.target.path, "HEAD");
     integration.finalTree = await this.treeOid(
       integration.preview.target.path,
