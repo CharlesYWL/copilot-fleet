@@ -25,7 +25,7 @@ Add-Content -LiteralPath (Join-Path $config.repositoryPath 'operations.log') -Va
 if($Action -eq 'probe'){
   @{ok=$true;accountSid=$config.accountSid}|ConvertTo-Json -Compress
 }else{
-  if($Action -eq 'start' -and $config.kind -eq 'node'){
+  if($Action -in @('start','restart') -and $config.kind -eq 'node'){
     [IO.File]::AppendAllText($config.logPath, 'now ${CONFIG_UI_EVENT_MARKER}{"type":"starting"}' + [Environment]::NewLine +
       'now ${CONFIG_UI_EVENT_MARKER}{"type":"retry","port":8788,"nextPort":8789}' + [Environment]::NewLine +
       'now ${CONFIG_UI_EVENT_MARKER}{"type":"ready","url":"http://127.0.0.1:8789"}' + [Environment]::NewLine)
@@ -60,6 +60,16 @@ function fixture(installedKind) {
     "# No real job or scheduler in this fixture.",
   );
   writeFileSync(join(root, "apps", "node", "dist", "main.js"), "");
+  writeFileSync(
+    join(root, "apps", "node", "dist", "github-auth.js"),
+    `
+    import {appendFileSync} from "node:fs";
+    export async function ensureGithubAuth({env, interactive}) {
+      appendFileSync(${JSON.stringify(join(root, "operations.log"))}, "node:github-auth\\n");
+      if (interactive) throw new Error("Piped CLI must not prompt");
+      if (env.FLEET_TEST_GH_AUTH_FAIL === "1") throw new Error("GitHub authentication cancelled");
+    }`,
+  );
   writeFileSync(join(root, "apps", "host", "dist", "server", "server.js"), "");
   writeFileSync(join(root, "apps", "host", "dist", "ui", "index.html"), "fixture");
   writeFileSync(
@@ -75,16 +85,16 @@ function fixture(installedKind) {
     }
   `,
   );
-  if (installedKind) {
-    const directory = join(root, "profile", "CopilotFleet", "login", installedKind);
+  for (const kind of installedKind ? [installedKind].flat() : []) {
+    const directory = join(root, "profile", "CopilotFleet", "login", kind);
     const sid = windowsSid();
     mkdirSync(directory, { recursive: true });
     writeFileSync(
       join(directory, "manifest.json"),
       JSON.stringify({
         schemaVersion: 1,
-        kind: installedKind,
-        taskName: taskName(installedKind, sid),
+        kind,
+        taskName: taskName(kind, sid),
         accountSid: sid,
         repositoryPath: root,
         nodePath: process.execPath,
@@ -235,7 +245,7 @@ describe.skipIf(process.platform !== "win32")(
         expect(output).toContain("Node config UI: http://127.0.0.1:8789");
         expect(
           readFileSync(join(root, "operations.log"), "utf8").trim().split(/\r?\n/),
-        ).toEqual(["node:probe", "node:register", "node:start"]);
+        ).toEqual(["node:github-auth", "node:probe", "node:register", "node:start"]);
       },
     );
 
@@ -257,6 +267,7 @@ describe.skipIf(process.platform !== "win32")(
           "host:probe",
           "host:register",
           "host:start",
+          "node:github-auth",
           "node:probe",
           "node:register",
           "node:start",
@@ -271,10 +282,57 @@ describe.skipIf(process.platform !== "win32")(
         const root = fixture();
         expect(() => launch(root, "node", ["--name=fail"])).toThrow();
         expect(readFileSync(join(root, "operations.log"), "utf8").trim()).toBe(
-          "node:probe",
+          "node:github-auth\nnode:probe",
         );
         expect(installedFiles(join(root, "profile")).join("")).not.toContain(secret);
       },
     );
+
+    it("does not enroll, probe, register, or start after failed authentication", () => {
+      const root = fixture();
+      writeFileSync(join(root, ".env"), "FLEET_TEST_GH_AUTH_FAIL=1\n");
+      expect(() => launch(root, "node")).toThrow("GitHub authentication cancelled");
+      expect(readFileSync(join(root, "operations.log"), "utf8").trim()).toBe(
+        "node:github-auth",
+      );
+      expect(installedFiles(join(root, "profile")).join("")).not.toContain(secret);
+    });
+
+    it.each(["start", "restart"])(
+      "checks authentication before %s of an installed Node",
+      (action) => {
+        const root = fixture("node");
+        const result = runAction(root, "node", action);
+        expect(result.status).toBe(0);
+        const operations = readFileSync(join(root, "operations.log"), "utf8")
+          .trim()
+          .split(/\r?\n/);
+        expect(operations.indexOf("node:github-auth")).toBeLessThan(
+          operations.indexOf(`node:${action}`),
+        );
+      },
+    );
+
+    it("does not stop an installed Node when restart authentication fails", () => {
+      const root = fixture("node");
+      writeFileSync(join(root, ".env"), "FLEET_TEST_GH_AUTH_FAIL=1\n");
+      const result = runAction(root, "node", "restart");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("GitHub authentication cancelled");
+      expect(readFileSync(join(root, "operations.log"), "utf8").trim()).toBe(
+        "node:github-auth",
+      );
+    });
+
+    it("checks authentication before stopping either task for a combined restart", () => {
+      const root = fixture(["host", "node"]);
+      writeFileSync(join(root, ".env"), "FLEET_TEST_GH_AUTH_FAIL=1\n");
+      const result = runAction(root, "host+node", "restart");
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("GitHub authentication cancelled");
+      expect(readFileSync(join(root, "operations.log"), "utf8").trim()).toBe(
+        "node:github-auth",
+      );
+    });
   },
 );

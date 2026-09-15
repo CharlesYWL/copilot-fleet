@@ -6,7 +6,8 @@ existing interactive account and credentials. This is not signed-out boot startu
 ## Install
 
 Use normal PowerShell in an updated Fleet checkout with Node.js, GitHub CLI, and
-Copilot installed and signed in. Private-tunnel Nodes also need
+Copilot installed. Sign in to Copilot first; missing or expired GitHub CLI
+credentials can be renewed inline. Private-tunnel Nodes also need
 `devtunnel user login`. Stop existing manual instances before switching launch
 modes; the installer never terminates them for you.
 
@@ -39,7 +40,8 @@ remains supported; generated commands use a one-time grant and Host fingerprint.
 | `--devtunnel <id>` | Node's private-tunnel connection. |
 | `--config-port <port>` | Preferred Node configuration port (default 8788); tries higher ports if occupied. |
 
-Installation builds, probes authentication in a temporary same-user task,
+Installation builds, checks GitHub authentication in the current terminal,
+probes authentication in a temporary same-user task,
 prepares/enrolls the Node, registers startup, and starts it. Initial enrollment
 requires a reachable Host. Host+Node uses two independent tasks: if Node setup
 fails, an installed Host is preserved, not rolled back. `host:service` and
@@ -100,8 +102,8 @@ that prevent the config page from opening.
 
 The tasks use the current user's SID, InteractiveToken, and normal privileges.
 There is no Windows password, LocalService, S4U, auto-logon, elevation requirement,
-credential export, or service token file. Manual commands and Unix behavior remain
-unchanged.
+credential export, or service token file. Interactive manual Node startup on
+Windows and Unix uses the same GitHub authentication recovery.
 
 Existing profiles, tool paths, Node identity/settings/lock, and Host data/tunnel
 settings are retained. `FLEET_NODE_CONFIG_DIR` may select an existing absolute
@@ -109,7 +111,29 @@ identity directory. Only allowlisted nonsecret environment overrides are saved;
 reinstall when captured paths change. PowerShell profiles are not executed.
 The checkout's `.env` still loads as with manual startup.
 
-Preflight uses `gh auth status --active` and Copilot `auth.getStatus` in the
+Before Node installation, start, or restart, the CLI checks
+`gh auth status --active --hostname <host>` using the saved task profile and
+checkout environment. `<host>` is `GH_HOST` or `github.com`. For missing/expired
+credentials, an interactive terminal runs
+`gh auth login --hostname <host> --web --skip-ssh-key`, then verifies the result
+and continues the original operation. Restart checks occur before stopping the
+running Node. Cancellation, failed login, or failed verification stop the command;
+there is no repeated login loop.
+
+The status command alone cannot distinguish invalid credentials from network
+errors. On failure, an authentication-required result or an HTTP 401 from
+`gh api user` permits recovery; other failures report an actionable error without
+opening login. Status/diagnostic output is not printed or persisted. The login
+itself owns the terminal so the operator can see its device code and prompts.
+
+No login is attempted without terminal input/output, or when
+`GH_PROMPT_DISABLED` is set. An invalid `GH_TOKEN`, `GITHUB_TOKEN`, or matching
+enterprise token override must be replaced or unset; browser login cannot
+override environment credentials. Shell-only tokens are not saved in task
+metadata and cannot substitute for the scheduled task's own successful probe.
+Copilot and Dev Tunnels still have independent authentication.
+
+Preflight repeats the GitHub check and uses Copilot `auth.getStatus` in the
 actual task without printing raw output or sending a model prompt. Then
 enrollment runs in the installer's same Windows user context, with any temporary
 Dev Tunnel closed afterward. Grants/tokens remain in memory, not task arguments,

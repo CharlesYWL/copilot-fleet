@@ -99,6 +99,7 @@ const credentials = {
 
 vi.mock("ws", () => ({ default: TestSocket }));
 vi.mock("dotenv", () => ({ config: vi.fn() }));
+vi.mock("./github-auth.js", () => ({ ensureGithubAuth: vi.fn(async () => {}) }));
 vi.mock("./health.js", () => ({
   startHealthSampler: () => ({ latest: () => sampledHealth, stop: stopHealthSampler }),
 }));
@@ -201,6 +202,8 @@ it.each([false, true])(
     const { main } = await import("./main.js");
     const runtime = await main([]);
     try {
+      const { ensureGithubAuth } = await import("./github-auth.js");
+      expect(ensureGithubAuth).not.toHaveBeenCalled();
       const socket = sockets[0]!;
       socket.readyState = TestSocket.OPEN;
       socket.emit("open");
@@ -476,6 +479,10 @@ it("uses current Copilot launch settings for persisted cleanup without starting 
   const { main } = await import("./main.js");
   const runtime = await main([]);
   try {
+    const { ensureGithubAuth } = await import("./github-auth.js");
+    expect(ensureGithubAuth).toHaveBeenCalledExactlyOnceWith({
+      env: expect.objectContaining({ FLEET_MOCK_AGENT: "0" }),
+    });
     expect(createDiscovery).toHaveBeenCalledOnce();
     const settings = configOptions.getSettings();
     expect(discoveryOptions.getCopilotCommand()).toBe(settings.copilotCommand);
@@ -563,4 +570,16 @@ it("always shuts down worktree resources and surfaces every shutdown failure", a
       if (!exits.includes(listener)) process.removeListener("exit", listener);
     }
   }
+});
+
+it("stops before connecting or loading settings when GitHub authentication fails", async () => {
+  vi.stubEnv("FLEET_MOCK_AGENT", "0");
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "must-not-connect");
+  const { ensureGithubAuth } = await import("./github-auth.js");
+  const { loadSettings } = await import("./settings.js");
+  vi.mocked(ensureGithubAuth).mockRejectedValueOnce(new Error("GitHub login cancelled"));
+  const { main } = await import("./main.js");
+  await expect(main([])).rejects.toThrow("GitHub login cancelled");
+  expect(loadSettings).not.toHaveBeenCalled();
+  expect(sockets).toHaveLength(0);
 });

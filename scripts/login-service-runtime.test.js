@@ -10,7 +10,7 @@ import {
 import { join, resolve } from "node:path";
 import process from "node:process";
 import { afterEach, expect, it } from "vitest";
-import { run } from "./login-service-runner.mjs";
+import { ensureNodeGithubAuth, run } from "./login-service-runner.mjs";
 
 const temporary = [];
 afterEach(() => {
@@ -97,4 +97,29 @@ it("does not replace a missing Node identity", async () => {
   );
   await expect(run(manifest)).rejects.toThrow("refusing replacement enrollment");
   expect(existsSync(manifest.logPath)).toBe(false);
+});
+
+it("checks the saved task profile and checkout environment without changing the parent environment", async () => {
+  const manifest = fixture("node", "");
+  writeFileSync(
+    join(manifest.repositoryPath, "apps", "node", "dist", "github-auth.js"),
+    `import {writeFileSync} from "node:fs";
+     export async function ensureGithubAuth({env, interactive}) {
+       writeFileSync(${JSON.stringify(join(manifest.repositoryPath, "auth.json"))},
+         JSON.stringify({host:env.GH_HOST,profile:env.GH_CONFIG_DIR,interactive}));
+     }`,
+  );
+  writeFileSync(
+    join(manifest.repositoryPath, ".env"),
+    "GH_HOST=checkout.example.com\nGH_CONFIG_DIR=checkout-profile\n",
+  );
+  manifest.environment = { GH_HOST: "saved.example.com", GH_CONFIG_DIR: "saved-profile" };
+  const before = { host: process.env.GH_HOST, profile: process.env.GH_CONFIG_DIR };
+  await ensureNodeGithubAuth(manifest);
+  expect(
+    JSON.parse(readFileSync(join(manifest.repositoryPath, "auth.json"), "utf8")),
+  ).toEqual({ host: "saved.example.com", profile: "saved-profile", interactive: false });
+  expect({ host: process.env.GH_HOST, profile: process.env.GH_CONFIG_DIR }).toEqual(
+    before,
+  );
 });

@@ -611,6 +611,14 @@ npm run start:node -- --url="https://fleet.example.com" `
   --enrollment-grant="<id>.<secret>"
 ```
 
+还需要将 GitHub CLI（`gh`）加入 PATH。`npm run start:node` 和 `npm run node`
+会在连接或注册前检查当前 GitHub 账号；凭据缺失或过期时，在同一个终端中启动
+浏览器/设备码登录，验证成功后自动继续原命令，无需重新执行。取消登录会停止启动，
+不会循环重试。非交互启动只报告需要登录，不会等待输入；网络故障或缺少可执行文件
+不会触发重新登录。若 `GH_TOKEN` 等环境变量中的令牌无效，需要先替换或取消该变量，
+因为它会覆盖已保存的登录凭据。Windows 服务的交互安装、启动和重启使用同样的流程，
+自动登录任务不会弹出登录提示；Copilot 和 Dev Tunnels 仍需各自登录。
+
 同样这些行在 bash 里也能用 —— 用命令行参数就绕开了 `$env:` 与 `VAR=value` 在两种 shell
 之间的差异。这些值从 **Settings → Nodes → Generate a connect command** 生成：授权是按需
 签发的，只对一台机器有效，15 分钟过期，Host 也不会以能再发一次的形式保存它。
