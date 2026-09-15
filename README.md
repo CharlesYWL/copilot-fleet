@@ -1054,6 +1054,8 @@ billing checkpoint (`totalNanoAiu / 1,000,000,000`), polled on its node; premium
 requests are never relabeled as credits. Metrics not yet reported are shown as
 unavailable, not zero. The latest readings persist across browser/Host reloads,
 resume, and backup/restore. No account-wide quota or budget is shown.
+If request-size recovery replaces the underlying Copilot conversation, the
+usage readout resets to that new conversation rather than retaining old metrics.
 
 **Compact** in the popover sends the agent's `/compact` command when it is offered and the session
 is idle. It summarizes the live context without clearing the saved transcript or
@@ -1220,6 +1222,14 @@ resume that fails is left for a person instead of retried every heartbeat.
 Re-attaching sends no prompt: the agent lands on idle waiting for input, so
 nothing runs until you ask it to. Turn it off under **Settings → General** if
 you would rather press Resume yourself.
+
+If Copilot reports that a saved conversation is too large for the CAPI Responses
+request limit, Fleet replaces only the Copilot conversation while retaining the
+same Fleet session, task, checkout and files. It continues in a fresh conversation
+with a bounded handoff containing the original assignment, recent agent output
+and latest request. Attachments are named but not copied into that recovery
+prompt. The new Copilot session ID is persisted, so later resumes do not reload
+the oversized history.
 
 Three things have to hold for that to work: the Host's `DATABASE_PATH` file is
 intact, the node starts with the same `node.json` identity, and Copilot on that

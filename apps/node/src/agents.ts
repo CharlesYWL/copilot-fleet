@@ -1,6 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { Readable, Writable } from "node:stream";
 import { randomUUID } from "node:crypto";
+import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
   McpHttpServer,
@@ -91,6 +92,36 @@ export const UNPROMPTED_QUIET_MS = 45_000;
  * benefit of the doubt is bounded rather than open.
  */
 export const UNPROMPTED_TOOL_GRACE_MS = 10 * 60_000;
+const CONTEXT_ROLLOVER_PROMPT_CHARS = 16_000;
+
+export function isCapiRequestTooLarge(error: unknown): boolean {
+  return /request is too large to send through CAPI Responses/i.test(errorMessage(error));
+}
+
+export function contextRolloverPrompt(
+  originalAssignment: string,
+  latestRequest: string,
+  attachments: readonly PromptAttachment[] = [],
+): string {
+  const assignment = originalAssignment.trim().slice(0, 10_000);
+  const latest = latestRequest.trim().slice(-5_000);
+  const attachmentText = attachments
+    .map((attachment) => attachmentSummary(attachment))
+    .map((attachment) => `${attachment.name} (${attachment.bytes} bytes)`)
+    .join(", ")
+    .slice(0, 500);
+  return [
+    "Continue the same Fleet task in this fresh conversation. The previous Copilot conversation exceeded the CAPI request-size limit. Treat the current workspace files and Git state as authoritative; do not restart completed work.",
+    assignment ? `Original assignment:\n${assignment}` : "",
+    latest ? `Latest request:\n${latest}` : "",
+    attachmentText
+      ? `The latest request included attachments that were omitted from rollover to keep the request bounded: ${attachmentText}. Inspect the workspace copies if needed.`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, CONTEXT_ROLLOVER_PROMPT_CHARS);
+}
 
 /**
  * What to set, if anything, to get a session's pickers back.
@@ -183,8 +214,13 @@ export function resolveConfigValue(
 export type EventSink = (event: SessionEvent) => void;
 
 export type StartAgentOptions = {
+  processStarting?: (() => void) | undefined;
+  processStarted?: ((pid: number) => void) | undefined;
+  processesQuiesced?: (() => void) | undefined;
   /** Copilot session id to re-attach to via ACP `session/load`. */
   resumeAgentSessionId?: string;
+  /** Bounded handoff for replacing a conversation that exceeds CAPI's request limit. */
+  contextOverflowRecoveryPrompt?: string;
   /** Workspace roots that were attached to the original Copilot session. */
   additionalDirectories?: readonly string[];
   /** First event sequence number to use, so resumed runs keep ordering. */
@@ -417,6 +453,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private agentSessionId: string | undefined;
   private connection: acp.ClientConnection | undefined;
   private child: ChildProcessWithoutNullStreams | undefined;
+  private cwd = "";
   private stderrTail = "";
   private prompting = false;
   private stopping = false;
@@ -479,8 +516,13 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly startupConfig: readonly StartupConfig[] = [],
     /** Workspace roots to restore when loading an existing Copilot session. */
     private readonly additionalDirectories: readonly string[] = [],
+    private readonly contextOverflowRecoveryPrompt = "",
     /** Internal reconnect recovery must not look like an operator restart. */
     private readonly announceLifecycle = true,
+    private readonly processOwnership?: Pick<
+      StartAgentOptions,
+      "processStarting" | "processStarted" | "processesQuiesced"
+    >,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
@@ -505,6 +547,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   }
 
   async start(cwd: string, resumeAgentSessionId?: string): Promise<void> {
+    this.cwd = cwd;
     if (this.announceLifecycle) {
       this.emit("state", {
         state: "starting",
@@ -520,13 +563,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
     const args = [...this.launch.args, ...copilotLaunchArgs(this.yolo, this.contextTier)];
     const { command, shell } = copilotSpawnTarget(this.launch.command);
-    const child = spawn(command, args, {
+    this.processOwnership?.processStarting?.();
+    const child = (this.processOwnership ? spawnManagedProcess : spawn)(command, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       shell,
     });
     this.child = child;
+    if (child.pid) this.processOwnership?.processStarted?.(child.pid);
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
       const text = chunk.trim();
@@ -612,19 +657,28 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (resumeAgentSessionId) {
       this.replaying = true;
       try {
-        const loaded = await this.connection.agent.request(
-          acp.methods.agent.session.load,
-          {
-            sessionId: resumeAgentSessionId,
-            cwd,
-            ...supportedAdditionalDirectories(
-              initialized.agentCapabilities,
-              this.additionalDirectories,
-            ),
-            mcpServers: this.mcpServers(),
-          },
-        );
-        this.captureConfigOptions(loaded.configOptions);
+        try {
+          const loaded = await this.connection.agent.request(
+            acp.methods.agent.session.load,
+            {
+              sessionId: resumeAgentSessionId,
+              cwd,
+              ...supportedAdditionalDirectories(
+                initialized.agentCapabilities,
+                this.additionalDirectories,
+              ),
+              mcpServers: this.mcpServers(),
+            },
+          );
+          this.captureConfigOptions(loaded.configOptions);
+        } catch (error) {
+          if (!isCapiRequestTooLarge(error)) throw error;
+          this.replaying = false;
+          await this.rollOverConversation(
+            contextRolloverPrompt(this.contextOverflowRecoveryPrompt, ""),
+          );
+          return;
+        }
       } finally {
         this.replaying = false;
       }
@@ -646,10 +700,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     await this.applyStartupConfig();
     this.captureConfigOptions(this.configOptions);
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
-    this.creditReader = new SessionCreditReader(this.agentSessionId);
-    await this.refreshCredits();
-    this.creditTimer = setInterval(() => void this.refreshCredits(), 2_000);
-    this.creditTimer.unref();
+    await this.trackUsage(this.agentSessionId);
     if (resumeAgentSessionId) {
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
     }
@@ -781,6 +832,25 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.emit("usage", update);
   }
 
+  private async trackUsage(agentSessionId: string, reset = false): Promise<void> {
+    clearInterval(this.creditTimer);
+    await this.creditRead;
+    this.creditReader = new SessionCreditReader(agentSessionId);
+    if (reset) {
+      this.reportUsage({
+        aiCredits: null,
+        contextTokens: null,
+        contextWindow: null,
+        context: null,
+      });
+    }
+    await this.refreshCredits();
+    if (!this.stopping && !this.hasTerminated) {
+      this.creditTimer = setInterval(() => void this.refreshCredits(), 2_000);
+      this.creditTimer.unref();
+    }
+  }
+
   private refreshCredits(): Promise<void> {
     if (this.creditRead) return this.creditRead;
     if (!this.creditReader) return Promise.resolve();
@@ -907,16 +977,68 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.prompting = false;
       this.emit("state", { state: "idle", activity: "Ready for follow-up" });
     } catch (error) {
+      let failure = error;
+      if (isCapiRequestTooLarge(error)) {
+        try {
+          await this.rollOverConversation(
+            contextRolloverPrompt(this.contextOverflowRecoveryPrompt, text, attachments),
+          );
+          return;
+        } catch (recoveryError) {
+          failure = new AggregateError(
+            [error, recoveryError],
+            "Copilot context rollover failed",
+            { cause: recoveryError },
+          );
+        }
+      }
       this.emit("error", {
-        message: error instanceof Error ? error.message : "ACP prompt failed",
+        message: failure instanceof Error ? failure.message : "ACP prompt failed",
       });
       this.emit("state", { state: "failed", activity: "ACP prompt failed" });
       await this.stop();
-      throw error;
+      throw failure;
     } finally {
       this.contextCapture = undefined;
       this.prompting = false;
     }
+  }
+
+  private async rollOverConversation(prompt: string): Promise<void> {
+    if (!this.connection) throw new Error("ACP session is not initialized");
+    this.denyPendingPermissions();
+    this.contextCapture = undefined;
+    this.contextCommandAvailable = false;
+    this.reportUsage({ context: null });
+    this.configOptions = [];
+    this.emit("system", {
+      message:
+        "Copilot’s saved conversation exceeded the request-size limit. Fleet started a fresh conversation in the same workspace and continued with a bounded task handoff.",
+    });
+    const created = await this.connection.agent.request(acp.methods.agent.session.new, {
+      cwd: this.cwd,
+      mcpServers: this.mcpServers(),
+    });
+    this.agentSessionId = created.sessionId;
+    this.captureConfigOptions(created.configOptions);
+    await this.recoverConfigOptions();
+    await this.selectCustomAgent();
+    await this.applyStartupConfig();
+    this.emit("agent_session", { agentSessionId: created.sessionId });
+    await this.trackUsage(created.sessionId, true);
+    this.emit("state", { state: "running", activity: "Continuing in fresh context" });
+    const response = await this.connection.agent.request(
+      acp.methods.agent.session.prompt,
+      {
+        sessionId: created.sessionId,
+        prompt: toPromptBlocks(prompt, []),
+      },
+    );
+    await this.refreshContext();
+    await this.refreshCredits();
+    this.emit("turn_complete", { stopReason: response.stopReason });
+    this.prompting = false;
+    this.emit("state", { state: "idle", activity: "Ready for follow-up" });
   }
 
   get busy(): boolean {
@@ -975,36 +1097,29 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.captureConfigOptions(response.configOptions);
   }
 
-  async stop(announce = true): Promise<void> {
-    if (this.stopping) return;
+  private stopPromise: Promise<void> | undefined;
+
+  stop(announce = true): Promise<void> {
+    if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
     clearInterval(this.creditTimer);
-    this.unprompted.clear();
-    this.denyPendingPermissions();
-    this.connection?.close();
-    if (this.child && this.child.exitCode === null) {
-      const child = this.child;
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(() => {
-          child.off("exit", exited);
-          reject(
-            new Error(
-              "Copilot did not exit; refusing to reopen its conversation concurrently",
-            ),
-          );
-        }, 5_000);
-        const exited = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-        child.once("exit", exited);
-        child.kill();
-      });
-    }
-    await this.refreshCredits();
-    if (announce && !this.hasTerminated) {
-      this.emit("state", { state: "stopped", activity: "Process stopped" });
-    }
+    this.stopPromise = (async () => {
+      this.unprompted.clear();
+      this.denyPendingPermissions();
+      this.connection?.close();
+      if (this.child) {
+        await stopProcessTree(this.child, Boolean(this.processOwnership));
+      }
+      this.processOwnership?.processesQuiesced?.();
+      await this.refreshCredits();
+      if (announce && !this.hasTerminated) {
+        this.emit("state", { state: "stopped", activity: "Process stopped" });
+      }
+    })().catch((error: unknown) => {
+      this.stopPromise = undefined;
+      throw error;
+    });
+    return this.stopPromise;
   }
 
   /** Ends an incomplete startup as a failure before its process is torn down. */
@@ -1209,7 +1324,11 @@ export class AcpAgentFactory implements AgentFactory {
       options.agent ?? "",
       options.config ?? [],
       options.additionalDirectories ?? [],
+      options.contextOverflowRecoveryPrompt ?? "",
       options.announceLifecycle ?? true,
+      options.processStarting || options.processStarted || options.processesQuiesced
+        ? options
+        : undefined,
     );
     try {
       await withCopilotStartupTimeout(
@@ -1219,7 +1338,13 @@ export class AcpAgentFactory implements AgentFactory {
       return agent;
     } catch (error) {
       const failure = agent.failStartup(error);
-      await agent.stop();
+      try {
+        await agent.stop();
+      } catch (cleanupError) {
+        throw new AggregateError([failure, cleanupError], failure.message, {
+          cause: cleanupError,
+        });
+      }
       throw failure;
     }
   }

@@ -20,6 +20,7 @@ import {
 import { statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
 import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS } from "./deadlines.js";
 import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./schedule.js";
+import { stopSessions } from "./lifecycle.js";
 
 /**
  * Turns the scheduler's decisions into writes and commands.
@@ -163,6 +164,7 @@ export class OrchestratorEngine {
 
   /** Advances every run that is not already finished. */
   tick(nowMs = Date.now()): void {
+    this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
     for (const run of this.store.listRuns()) {
       if (terminalRunStates.has(run.state)) continue;
@@ -174,8 +176,12 @@ export class OrchestratorEngine {
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
     if (!run || terminalRunStates.has(run.state)) return;
+    if (run.state === "aggregating") {
+      this.service.worktrees.advanceAggregation(run.id);
+      return;
+    }
 
-    const steps = this.store.listRunSteps(runId);
+    let steps = this.store.listRunSteps(runId);
     const sessions = this.store.listSessions();
     const completedTurns = new Set<string>();
     for (const session of sessions) {
@@ -220,15 +226,30 @@ export class OrchestratorEngine {
         completedTurns.add(session.id);
       }
     }
+    const workspaceReady = steps.length ? this.service.worktrees.ensureReady(run) : true;
+    if (workspaceReady && run.workspaceBinding?.effectiveMode === "managed") {
+      for (const step of steps)
+        if (step.state === "pending") this.service.worktrees.ensureStepReady(run, step);
+      steps = this.store.listRunSteps(runId);
+    }
     const actions = planNextActions({
       run,
       steps,
       sessions,
       nodes: this.store.listNodes(),
       placements: this.store.listPlacements(),
+      repositoryCapabilities: this.store.listPlacementRepositoryCapabilities(),
       turnCompleteSessionIds: completedTurns,
       stepOutputs: this.collectOutputs(steps, run.policy.maxOutputChars),
       nowMs,
+      workspaceReady,
+      parkableSessionIds: new Set(
+        this.store
+          .listRuns()
+          .flatMap((entry) => this.store.listRunSteps(entry.id))
+          .filter((step) => terminalRunStepStates.has(step.state))
+          .map((step) => step.sessionId),
+      ),
     });
     if (actions.length === 0) return;
 
@@ -290,6 +311,7 @@ export class OrchestratorEngine {
       state: "starting",
       placementId: placement.id,
       dispatchedAt: new Date().toISOString(),
+      ...(step.executionBinding ? { executionBinding: step.executionBinding } : {}),
     });
     if (!starting) return false;
 
@@ -304,6 +326,9 @@ export class OrchestratorEngine {
       // not; capacity is read from sessions long after this point.
       readOnly: isReadOnlyCategory(step.category),
       dispatchAttempt: notificationAttemptKeyForStep(run, starting),
+      ...(starting.executionBinding
+        ? { executionBinding: starting.executionBinding }
+        : {}),
     });
 
     if (!result.ok) {
@@ -315,6 +340,9 @@ export class OrchestratorEngine {
 
     this.store.updateRunStep(step.id, {
       sessionId: result.session.id,
+      ...(result.session.executionBinding
+        ? { executionBinding: result.session.executionBinding }
+        : {}),
       // Output collected from here on belongs to this step; a session that is
       // prompted again must not replay the previous turn.
       eventSeqFrom: this.store.maxEventSequence(result.session.id),
@@ -406,6 +434,8 @@ export class OrchestratorEngine {
     if (action.state === "failed") {
       return this.failStep(run, step, action.output);
     }
+    if (action.state === "succeeded" && !this.service.worktrees.finalizeStep(run, step))
+      return true;
     const settled = this.service.settleOrchestrationStep({
       runId: run.id,
       stepId: step.id,
@@ -447,7 +477,7 @@ export class OrchestratorEngine {
     }
     // Stop, not cancel: cancel ends the turn and leaves the process holding a
     // slot on its node.
-    this.service.dispatch(session.nodeId, { type: "stop", sessionId });
+    stopSessions(this.service, [session]);
   }
 
   /**
@@ -523,7 +553,8 @@ export class OrchestratorEngine {
       if (
         terminalRunStates.has(run.state) ||
         run.state === "awaiting_approval" ||
-        run.state === "awaiting_human"
+        run.state === "awaiting_human" ||
+        run.state === "blocked"
       ) {
         continue;
       }
@@ -633,6 +664,10 @@ export class OrchestratorEngine {
   }
 
   private finishRun(run: Run, state: Run["state"], reason: string): boolean {
+    if (state === "completed" && run.workspaceBinding?.effectiveMode === "managed") {
+      this.service.worktrees.beginAggregation(run.id);
+      return true;
+    }
     if (!canTransitionRun(run.state, state)) return false;
     this.store.setRunState(run.id, state, reason);
     return true;

@@ -90,6 +90,7 @@ describe("updateCheckout", () => {
     expect(outcome).toEqual({ action: "none", reason: "Already up to date" });
     // Restarting anyway would drop the connection for no gain — and on "Update
     // all" it would do that to every machine that was already up to date.
+    expect(calls).not.toContain("npm install --include=dev");
     expect(calls.some((call) => call.startsWith("npm "))).toBe(false);
   });
 

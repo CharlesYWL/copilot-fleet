@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { FleetNode, FleetSession, Placement, Run, RunStep } from "@fleet/protocol";
-import { RunPolicySchema } from "@fleet/protocol";
+import {
+  ExecutionBindingSchema,
+  RunPolicySchema,
+  RunWorkspaceBindingSchema,
+} from "@fleet/protocol";
 import {
   decidePlacement,
   planNextActions,
@@ -134,6 +138,174 @@ function world(overrides: Partial<ScheduleInput> = {}): ScheduleInput {
 }
 
 const types = (input: ScheduleInput) => planNextActions(input).map((a) => a.type);
+
+describe("managed checkout scheduling", () => {
+  const managed = () =>
+    run({
+      placementId: "p1",
+      workspaceBinding: RunWorkspaceBindingSchema.parse({
+        requestedMode: "managed",
+        effectiveMode: "managed",
+        resolutionSource: "explicit",
+        sourcePlacementId: "p1",
+        managedWorktreeId: "tree-a",
+        generation: 1,
+        baseSha: "a".repeat(40),
+        checkoutKey: "physical-a",
+        resolvedPath: "C:\\trees\\a",
+        initialization: "ready",
+      }),
+    });
+  const capable = () =>
+    node("n1", { capabilities: ["copilot-acp", "host-yolo", "managed-worktrees-v1"] });
+  const binding = (key = "a") =>
+    ExecutionBindingSchema.parse({
+      worktreeId: `tree-${key}`,
+      generation: 1,
+      sourcePlacementId: "p1",
+      cwd: `C:\\trees\\${key}`,
+      checkoutKey: `physical-${key}`,
+      leaseAttempt: "attempt",
+    });
+
+  it("allows another task's writer in the same repository without sharing its checkout", () => {
+    const actions = planNextActions(
+      world({
+        run: managed(),
+        nodes: [capable()],
+        steps: [step("implement", { executionBinding: binding() })],
+        sessions: [
+          session("other-task", { runId: "task-b", executionBinding: binding("b") }),
+        ],
+      }),
+    );
+    expect(actions.filter((action) => action.type === "start_step")).toHaveLength(1);
+  });
+
+  it("schedules independent managed writers only when they have distinct step worktrees", () => {
+    const actions = planNextActions(
+      world({
+        run: managed(),
+        nodes: [capable()],
+        steps: [
+          step("write-a", { executionBinding: binding("a") }),
+          step("write-b", { executionBinding: binding("b") }),
+        ],
+      }),
+    );
+    expect(actions.filter((action) => action.type === "start_step")).toHaveLength(2);
+    expect(
+      types(
+        world({
+          run: managed(),
+          nodes: [capable()],
+          steps: [step("fixer", { executionBinding: binding() })],
+          sessions: [
+            session("reviewer", { readOnly: true, executionBinding: binding() }),
+          ],
+        }),
+      ),
+    ).not.toContain("start_step");
+  });
+
+  it("does not dispatch a shell-capable reviewer before its isolated workspace is ready", () => {
+    expect(
+      types(
+        world({
+          run: managed(),
+          nodes: [capable()],
+          steps: [step("review", { category: "review-deep" })],
+        }),
+      ),
+    ).not.toContain("start_step");
+  });
+
+  it("dispatches managed step bindings on different verified Nodes", () => {
+    const second = ExecutionBindingSchema.parse({
+      ...binding("remote"),
+      sourcePlacementId: "p2",
+      cwd: "D:\\trees\\remote",
+      checkoutKey: "physical-remote",
+    });
+    const actions = planNextActions(
+      world({
+        run: managed(),
+        nodes: [capable(), node("n2", { capabilities: capable().capabilities })],
+        steps: [
+          step("write-a", { executionBinding: binding("local") }),
+          step("write-b", { executionBinding: second }),
+        ],
+      }),
+    ).filter((action) => action.type === "start_step");
+    expect(actions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ stepId: "write-a", placementId: "p1" }),
+        expect.objectContaining({ stepId: "write-b", placementId: "p2" }),
+      ]),
+    );
+  });
+
+  it("dispatches a dependent from its derived workspace without taking a predecessor checkout", () => {
+    const input = world({
+      run: managed(),
+      nodes: [capable()],
+      steps: [
+        step("implement", {
+          state: "succeeded",
+          sessionId: "implementer",
+          placementId: "p1",
+          executionBinding: binding(),
+        }),
+        step("review", {
+          category: "review-deep",
+          dependsOn: ["implement"],
+          executionBinding: binding("derived"),
+        }),
+      ],
+      sessions: [session("implementer", { state: "idle", executionBinding: binding() })],
+    });
+    expect(types(input)).not.toContain("stop_session");
+    expect(types(input)).toContain("start_step");
+  });
+
+  it("retains a ready derived workspace for follow-up when the primary workspace is blocked", () => {
+    const input = world({
+      run: managed(),
+      nodes: [capable()],
+      steps: [
+        step("implement", {
+          sessionId: "same-session",
+          placementId: "p1",
+          attempts: 2,
+          workspaceState: "ready",
+          executionBinding: binding(),
+        }),
+      ],
+      sessions: [session("same-session", { state: "idle", executionBinding: binding() })],
+    });
+    expect(types(input)).toContain("prompt_step");
+    expect(types({ ...input, workspaceReady: false })).toContain("prompt_step");
+    expect(
+      types({
+        ...input,
+        workspaceReady: false,
+        steps: input.steps.map((candidate) => ({
+          ...candidate,
+          workspaceState: "blocked",
+        })),
+      }),
+    ).not.toContain("prompt_step");
+    expect(
+      types(
+        world({
+          run: managed(),
+          steps: [step("pending", { executionBinding: binding() })],
+          nodes: [node("n1")],
+        }),
+      ),
+    ).not.toContain("start_step");
+  });
+});
 
 describe("planNextActions", () => {
   it("does nothing while every node is offline, because offline means unknown", () => {

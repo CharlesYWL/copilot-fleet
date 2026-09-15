@@ -7,6 +7,8 @@ import {
   ContextTierSchema,
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
+  MANAGED_WORKTREES_CAPABILITY,
+  WorktreeConflict,
   NODE_NAME_SYNC_CAPABILITY,
   ORCHESTRATOR_STOP_REASON,
   SELF_UPDATE_CAPABILITY,
@@ -38,6 +40,7 @@ import {
   type SessionEvent,
   type SessionState,
   type Snapshot,
+  type ExecutionBinding,
 } from "@fleet/protocol";
 import type {
   FleetStore,
@@ -47,6 +50,7 @@ import type {
 } from "./store.js";
 import { isBroadcastableHostUrl } from "./host-url.js";
 import { SessionRetention } from "./session-retention.js";
+import { ManagedWorktreeService } from "./managed-worktree-service.js";
 import {
   NotificationService,
   notificationAttemptKey,
@@ -207,6 +211,7 @@ export class FleetService {
   private runTicker: ((runId: string) => void) | undefined;
   readonly notifications: NotificationService;
   readonly sessionRetention: SessionRetention;
+  readonly worktrees: ManagedWorktreeService;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -224,6 +229,10 @@ export class FleetService {
   /** Advances one run now, used by the tools so a dispatch is not left waiting. */
   tickRun(runId: string): void {
     this.runTicker?.(runId);
+  }
+
+  logManagedPlacementScheduling(details: Record<string, unknown>, message: string): void {
+    this.log.info(details, message);
   }
 
   constructor(
@@ -247,6 +256,7 @@ export class FleetService {
       runUpsert: (run) => this.publishRun(run),
     });
     this.sessionRetention = new SessionRetention(this, log, sessionRetentionDays);
+    this.worktrees = new ManagedWorktreeService(this);
   }
 
   snapshot(): Snapshot {
@@ -571,6 +581,7 @@ export class FleetService {
     readOnly?: boolean;
     /** Authoritative orchestration attempt when the step is not attached yet. */
     dispatchAttempt?: string;
+    executionBinding?: ExecutionBinding;
   }):
     | { ok: true; session: FleetSession }
     | { ok: false; status: number; error: string; session?: FleetSession } {
@@ -590,7 +601,20 @@ export class FleetService {
     const unsupported = yoloUnsupportedReason(node, input.yolo);
     if (unsupported) return { ok: false, status: 409, error: unsupported };
 
-    const session = this.store.createSession(
+    let binding = input.executionBinding;
+    try {
+      if (input.runId && input.runRole !== "lead") {
+        const run = this.store.getRun(input.runId);
+        if (run && !binding) binding = this.worktrees.bindingFor(run) ?? binding;
+      }
+    } catch (error) {
+      return {
+        ok: false,
+        status: 409,
+        error: error instanceof Error ? error.message : "Workspace unavailable",
+      };
+    }
+    let session = this.store.createSession(
       input.placement,
       input.prompt,
       input.yolo,
@@ -601,6 +625,24 @@ export class FleetService {
         readOnly: input.readOnly ?? false,
       },
     );
+    if (binding) {
+      this.store.setSessionExecutionBinding(session.id, binding);
+      session = this.store.getSession(session.id)!;
+    }
+    try {
+      this.worktrees.validateSession(session);
+    } catch (error) {
+      this.store.transitionSession(
+        session.id,
+        "failed",
+        error instanceof Error ? error.message : "Workspace unavailable",
+      );
+      return {
+        ok: false,
+        status: 409,
+        error: error instanceof Error ? error.message : "Workspace unavailable",
+      };
+    }
     this.publishSession(session);
     const dispatched = this.dispatch(
       node.id,
@@ -608,6 +650,11 @@ export class FleetService {
         type: "start_session",
         sessionId: session.id,
         localPath: input.placement.localPath,
+        sourcePlacementId: input.placement.id,
+        ...(input.runRole === "lead" &&
+        node.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)
+          ? { coordinator: true }
+          : {}),
         prompt: input.prompt,
         yolo: input.yolo,
         mcpServers: this.mcpServersFor(session),
@@ -626,7 +673,7 @@ export class FleetService {
         ...(dispatched.session ? { session: dispatched.session } : {}),
       };
     }
-    return { ok: true, session };
+    return { ok: true, session: this.store.getSession(session.id)! };
   }
 
   /**
@@ -726,6 +773,15 @@ export class FleetService {
     }
     const unsupported = yoloUnsupportedReason(node, session.yolo);
     if (unsupported) return { ok: false, status: 409, error: unsupported };
+    try {
+      this.worktrees.validateSession(session);
+    } catch (error) {
+      return {
+        ok: false,
+        status: 409,
+        error: error instanceof Error ? error.message : "Workspace unavailable",
+      };
+    }
 
     const resumed = this.transitionSession(sessionId, "starting", activity, {
       type: "host",
@@ -739,6 +795,7 @@ export class FleetService {
         sessionId,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
+        contextOverflowRecoveryPrompt: contextOverflowRecoveryPrompt(session),
         additionalDirectories: session.additionalDirectories ?? [],
         sequenceOffset: this.store.maxEventSequence(sessionId),
         yolo: session.yolo,
@@ -849,6 +906,14 @@ export class FleetService {
     if (request.type !== "delete_session") {
       this.store.assertSessionMutable(request.sessionId);
     }
+    if (
+      request.type === "start_session" ||
+      request.type === "resume_session" ||
+      request.type === "prompt"
+    ) {
+      const session = this.store.getSession(request.sessionId);
+      if (session) this.worktrees.validateSession(session);
+    }
     const lifecycleIntent =
       request.type === "cancel" || request.type === "stop" ? request.type : undefined;
     const socket = this.nodeSockets.get(nodeId);
@@ -866,6 +931,10 @@ export class FleetService {
         const session = this.store.getSession(request.sessionId);
         if (!session) return { sent: false };
         const commandId = randomUUID();
+        let binding = session.executionBinding;
+        if (binding && request.type !== "prompt") {
+          binding = { ...binding, leaseAttempt: commandId };
+        }
         const attempt = attemptOverride ?? this.dispatchAttemptKey(session);
         const eventSeqFrom =
           request.type === "resume_session"
@@ -874,6 +943,10 @@ export class FleetService {
         // A new attempt must not inherit a stop/cancel or completion receipt
         // from the old one, and its sequence boundary must be durable before send.
         this.store.writeAtomically(() => {
+          // Resume is an authoritative reattachment, not a new checkout owner.
+          // Persist its fencing attempt and dispatch receipt as one transition.
+          if (binding && request.type !== "prompt")
+            this.store.setSessionExecutionBinding(session.id, binding);
           this.store.clearSessionTransitionIntent(request.sessionId);
           this.store.clearSessionTurnCompletion(request.sessionId);
           this.store.setSessionDispatchAttempt(request.sessionId, {
@@ -889,6 +962,19 @@ export class FleetService {
         // automatic recovery, and orchestration, not just the new-session UI.
         const command = {
           ...request,
+          ...(binding?.worktreeId &&
+          (request.type === "start_session" || request.type === "prompt")
+            ? {
+                prompt: `${request.prompt}\n\n<fleet-workspace>\nUse only this bound checkout for repository work: ${binding.cwd}\nWorktree ${binding.worktreeId}, generation ${binding.generation}. The catalog placement is the source, not your writable cwd. This may be a per-step or composed DAG workspace; never substitute another predecessor or the source checkout. Do not create/remove worktrees or integrate/push automatically; those are managed operations. This binding is not a filesystem sandbox.\n</fleet-workspace>`,
+              }
+            : {}),
+          ...(binding ? { executionBinding: binding } : {}),
+          ...(request.type === "start_session" || request.type === "resume_session"
+            ? {
+                localPath: binding?.cwd ?? request.localPath,
+                sourcePlacementId: session.placementId,
+              }
+            : {}),
           ...(request.type === "start_session" || request.type === "resume_session"
             ? {
                 agencyMode: this.store.getAgencyMode(),
@@ -1276,6 +1362,7 @@ export class FleetService {
       this.dispatch(nodeId, { type: "stop", sessionId: session.id });
     }
     this.sessionRetention.nodeReconciled(nodeId);
+    this.worktrees.onNodeReconciled(nodeId);
     this.autoResume(nodeId, settled);
     return settled;
   }
@@ -1333,12 +1420,19 @@ export class FleetService {
       const placement = this.store.getPlacement(session.placementId);
       if (!placement) continue;
       if (yoloUnsupportedReason(node, session.yolo)) continue;
+      try {
+        this.worktrees.validateSession(session);
+      } catch (error) {
+        if (error instanceof WorktreeConflict) continue;
+        throw error;
+      }
       const dispatched = this.dispatch(nodeId, {
         type: "resume_session",
         sessionId: session.id,
         lastActivityAt: session.lastActivityAt ?? session.updatedAt,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
+        contextOverflowRecoveryPrompt: contextOverflowRecoveryPrompt(session),
         additionalDirectories: session.additionalDirectories ?? [],
         sequenceOffset: this.store.maxEventSequence(session.id),
         yolo: session.yolo,
@@ -1374,6 +1468,7 @@ export class FleetService {
   }
 
   disconnectNode(nodeId: string, activity: string): void {
+    this.worktrees.nodeLost(nodeId);
     this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeSockets.delete(nodeId);
     const node = this.store.setNodeOnline(nodeId, false, 0);
@@ -1920,6 +2015,7 @@ export class FleetService {
    * deploy bounce) can resurrect agents the Node kept alive.
    */
   shutdown(): void {
+    this.worktrees.shutdown();
     this.closing = true;
     for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
       this.disconnectNode(nodeId, "Host stopped; waiting for Node reconnect");
@@ -1935,6 +2031,18 @@ function eventMayAffectNotifications(event: SessionEvent): boolean {
     event.type === "permission" ||
     event.type === "permission_result"
   );
+}
+
+export function contextOverflowRecoveryPrompt(session: FleetSession): string {
+  const assignment = session.initialPrompt.trim().slice(0, 12_000);
+  const latest = session.lastText.trim().slice(-3_000);
+  return [
+    assignment ? `Original assignment:\n${assignment}` : "",
+    latest ? `Most recent agent output:\n${latest}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+    .slice(0, 16_000);
 }
 
 function isSqliteConstraintError(error: unknown): boolean {

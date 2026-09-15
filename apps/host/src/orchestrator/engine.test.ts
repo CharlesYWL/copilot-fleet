@@ -299,6 +299,46 @@ describe("OrchestratorEngine", () => {
     expect(commands("stop")).toHaveLength(0);
   });
 
+  it("moves a managed run to aggregating before automatic integration can complete it", () => {
+    const { store, service, engine, workspace, placement } = setup();
+    const created = store.createRun({
+      workspaceId: workspace.id,
+      name: "managed",
+      objective: "done",
+      workspaceMode: "managed",
+      sourcePlacementId: placement.id,
+    });
+    store.replaceRunSteps(created.id, [
+      { stepKey: "done", title: "Done", prompt: "done", category: "explore" },
+    ]);
+    store.setRunState(created.id, "running");
+    const run = store.getRun(created.id)!;
+    const step = store.listRunSteps(run.id)[0]!;
+    store.updateRunStep(step.id, { state: "skipped" });
+    store.setRunWorkspaceBinding(run.id, {
+      ...run.workspaceBinding!,
+      baseRef: "refs/heads/main",
+      initialization: "ready",
+    });
+    vi.spyOn(service.worktrees, "ensureReady").mockReturnValue(true);
+    const advance = vi
+      .spyOn(service.worktrees, "advanceAggregation")
+      .mockImplementation(() => undefined);
+
+    engine.tickRun(run.id);
+
+    expect(store.getRun(run.id)).toMatchObject({
+      state: "aggregating",
+      workspaceBinding: {
+        aggregationState: "in_progress",
+        aggregationPhase: "preview",
+        aggregationAttempt: 1,
+        aggregationTargetRef: run.workspaceBinding!.integrationTargetRef,
+      },
+    });
+    expect(advance).toHaveBeenCalledWith(run.id);
+  });
+
   it("does not settle anything while the fleet is offline", () => {
     const { store, service, engine, node, planned, finishTurn } = setup();
     const run = planned([{ stepKey: "audit", title: "Audit", prompt: "audit it" }]);

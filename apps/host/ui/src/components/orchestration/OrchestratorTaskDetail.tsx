@@ -28,6 +28,7 @@ import { semanticColors, statusVisuals, terminal } from "../../theme";
 import { MarkdownBody } from "../MarkdownBody";
 import { RunStatusIndicator } from "./RunStatusIndicator";
 import { WorkerStepTimeline } from "./WorkerStepTimeline";
+import { ManagedWorktreePanel } from "./ManagedWorktreePanel";
 
 const useStyles = makeStyles({
   page: {
@@ -361,6 +362,7 @@ export const OrchestratorTaskDetail = ({
       </header>
 
       <div className={styles.body}>
+        <ManagedWorktreePanel run={run} />
         {run.state === "awaiting_human" && (
           <section className={mergeClasses(styles.section, styles.review)}>
             <Text weight="semibold">Ready for you</Text>

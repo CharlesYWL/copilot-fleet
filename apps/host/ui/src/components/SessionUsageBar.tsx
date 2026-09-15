@@ -114,15 +114,15 @@ export function SessionUsageBar({
   const context = usage?.context;
   const used = usage?.contextTokens;
   const size = usage?.contextWindow;
-  const hasUsed = used !== undefined && Number.isFinite(used) && used >= 0;
-  const hasSize = size !== undefined && Number.isFinite(size) && size > 0;
+  const hasUsed = used != null && Number.isFinite(used) && used >= 0;
+  const hasSize = size != null && Number.isFinite(size) && size > 0;
   const percentage =
     context && Number.isFinite(context.percentage) && context.percentage >= 0
       ? context.percentage
       : undefined;
   const estimate = context?.estimated ? "~" : "";
   const creditLabel =
-    credits === undefined
+    credits == null
       ? "\u2014"
       : credits > 0 && credits < 0.01
         ? "<0.01"
@@ -266,7 +266,7 @@ export function SessionUsageBar({
           <span>AI credits</span>
           <strong
             title={
-              credits === undefined
+              credits == null
                 ? "Billed AI credits have not been reported for this session."
                 : `${exactCredits.format(credits)} AI credits used in this session.`
             }

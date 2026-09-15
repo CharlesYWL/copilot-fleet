@@ -59,7 +59,9 @@ follow-up implementation plan, not the currently shipped execution architecture.
   those to express something only the UI cares about. It cannot be renamed,
   deleted, or have Placements added, moved, or removed by hand, and the seed
   moves an operator's own workspace aside if one already holds the name.
-- **Placement**: `(workspaceId, nodeId, localPath)`. It is the only source of a Session working directory.
+- **Placement**: `(workspaceId, nodeId, localPath)`. The source catalog identity;
+  legacy sessions use its path, while managed tasks keep an immutable resolved
+  execution binding to a task-owned worktree on the same Node.
 - **Session**: one long-lived Copilot process bound to one Placement. Carries an
   optional operator-chosen name; empty means the UI labels it by its initial prompt.
 - **Turn**: one initial or follow-up prompt. MVP permits one active Turn per Session.
@@ -118,9 +120,19 @@ Three rules follow from problems that only appear in production:
   and those are separate checkouts. Re-picking between steps is exactly what
   would hand a reviewer a tree without the implementation in it.
 
-The parallel limit is therefore scoped to a Placement, not a Workspace: two
-writing steps may not share a checkout, but a read-only reviewer may — and must,
-or it cannot see the diff.
+Managed writer admission is scoped to a physical checkout, not a Workspace. Managed
+tasks get distinct checkouts and can each hold one writer; all roles within a
+task share its checkout and serialize shell-capable sessions. `readOnly` remains
+a capacity label, not a filesystem guarantee. A separate canonical Git
+common-directory administration lock protects worktree and integration operations.
+Unbound legacy sessions retain Host placement-based admission and direct terminal
+events; they never create managed checkout leases. Managed ACP uses Windows Job
+Object supervision, releasing a lease only after verified process-tree termination.
+Uncertain ownership is durably reconciliation-required without suppressing the
+terminal event. Resume can rotate a Host fencing attempt on the same live
+conversation through an atomic lease reattachment, never a second writer.
+See [Managed worktree isolation](docs/managed-worktree-isolation.md) for the
+two-layer lock model, persisted mode resolution and recovery rules.
 
 Timeouts are the absence of events, so the Host runs a low-frequency deadline
 sweep alongside the heartbeat sweep. Every deadline is recomputed from stored
@@ -180,23 +192,22 @@ tick walks every run and re-reads sessions, but a lead just prompted still reads
 `idle` until the Node says otherwise, so two tasks sharing an orchestrator would
 otherwise both send and the second would be lost.
 
-A settled worker is stopped at once. `idle` means "waiting for another turn",
-not "finished", and an idle agent still reserves a slot on its node; nothing
-reclaimed one until its whole Run ended, which for a long-lived orchestrator is
-never. Three read-only errands were enough to fill a node with agents that had
-nothing left to do, and the fleet reported itself full. That is asked of the
-state rather than of the transition — a step is terminal only once, and
-anything that missed the moment would otherwise hold its slot forever. A
-follow-up after that point is refused rather than accepted, because no step is
-tracking that turn: the prompt would land, and the wake it promised could never
-come.
+A settled worker conversation is retained for tracked follow-up. `idle` means
+"waiting for another turn", not process quiescence: an attached worker still
+holds capacity and, on an upgraded Node, its physical checkout lease. Before
+another task worker or reviewer takes that checkout, the engine parks the
+settled process and waits for the Node's verified terminal receipt. Follow-up
+resumes the same Copilot conversation and immutable task binding, preserving
+committed and uncommitted changes rather than constructing another worktree.
 
 Where a step runs is decided once, in `decidePlacement`, and recorded on the
 step. A Run pins to a checkout when it first writes to one, so later work that
 must see those changes — a reviewer above all — is sent there. That pin says
 where the changes are, not where the orchestrator lives: naming a workspace is
-how it works on something else, read-only work never takes the write lock, and
-a pin belonging to a Run that has written nothing is ignored outright.
+how legacy work targets something else, and a legacy pin belonging to a Run
+that has written nothing is ignored. Managed Runs select and pin their source
+and exact committed base at creation; their implementation/review/fix-up steps
+cannot switch repositories or physical worktree generations.
 
 Naming **Chats** is how it asks for the one destination that is not a checkout,
 and the only place the decision loses a candidate rather than gaining one: a
@@ -594,7 +605,8 @@ Five separate facts, deliberately not collapsed into one: a tunnel decides who c
 - Hardware-backed Host or Node keys
 - End-to-end encryption of Node payloads against a malicious tunnel relay
 - Session migration or automatic resume after Node disconnect
-- Git clone/worktree lifecycle
+- Git clone lifecycle and adoption of user-owned worktrees (task-owned managed
+  worktree lifecycle is supported; no automatic push, PR or cross-Node migration)
 - Multi-user RBAC and billing
 - Agent adapters other than Copilot CLI
 - Kubernetes/Nomad scheduling

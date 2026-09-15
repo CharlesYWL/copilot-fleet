@@ -78,6 +78,7 @@ describe("SessionUsageBar", () => {
   it.each([
     undefined,
     {},
+    { aiCredits: null, contextTokens: null, contextWindow: null, context: null },
     { contextTokens: 0 },
     { contextWindow: 200000 },
     { contextTokens: 1000, contextWindow: 0 },

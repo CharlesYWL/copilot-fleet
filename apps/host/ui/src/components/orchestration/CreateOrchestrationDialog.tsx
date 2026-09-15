@@ -15,7 +15,8 @@ import {
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
-import type { Placement, Workspace } from "@fleet/protocol";
+import type { Placement, Workspace, WorkspaceMode } from "@fleet/protocol";
+import { api } from "../../hooks/useFleet";
 
 const useStyles = makeStyles({
   /** What pressing the button does, said once, where the decision is made. */
@@ -24,6 +25,11 @@ const useStyles = makeStyles({
     color: tokens.colorNeutralForeground3,
     fontSize: tokens.fontSizeBase200,
     lineHeight: tokens.lineHeightBase200,
+  },
+  summary: {
+    padding: "10px 12px",
+    borderRadius: tokens.borderRadiusMedium,
+    background: tokens.colorNeutralBackground2,
   },
 });
 
@@ -37,6 +43,9 @@ export type CreateOrchestrationDialogProps = {
     workspaceId: string;
     name: string;
     objective: string;
+    workspaceMode: WorkspaceMode;
+    operationId: string;
+    sourcePlacementId?: string;
   }) => Promise<boolean>;
 };
 
@@ -67,11 +76,22 @@ export const CreateOrchestrationDialog = ({
   const [name, setName] = useState("");
   const [objective, setObjective] = useState("");
   const [busy, setBusy] = useState(false);
+  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("auto");
+  const [operationId, setOperationId] = useState(() => crypto.randomUUID());
+  const [sourcePlacementId, setSourcePlacementId] = useState("");
+  const [capability, setCapability] = useState<{
+    managedWorktreesEnabled: boolean;
+    placements: { placementId: string; supported: boolean; online: boolean }[];
+  }>();
+  const [capabilityError, setCapabilityError] = useState("");
 
   useEffect(() => {
     if (!open) return;
     setName("");
     setObjective("");
+    setWorkspaceMode("auto");
+    setOperationId(crypto.randomUUID());
+    setSourcePlacementId("");
     setWorkspaceId((current) =>
       reachable.some((workspace) => workspace.id === current)
         ? current
@@ -81,8 +101,45 @@ export const CreateOrchestrationDialog = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  useEffect(() => {
+    if (!open || !workspaceId) return;
+    let current = true;
+    setCapability(undefined);
+    setCapabilityError("");
+    setSourcePlacementId("");
+    void api<NonNullable<typeof capability>>(
+      `/api/worktrees/capabilities?workspaceId=${encodeURIComponent(workspaceId)}`,
+    )
+      .then((result) => {
+        if (!current) return;
+        setCapability(result);
+        setSourcePlacementId(
+          result.placements.find((entry) => entry.supported && entry.online)
+            ?.placementId ?? "",
+        );
+      })
+      .catch((error: unknown) => {
+        if (current)
+          setCapabilityError(
+            error instanceof Error ? error.message : "Capability check unavailable.",
+          );
+      });
+    return () => {
+      current = false;
+    };
+  }, [open, workspaceId]);
+
   const chosen = reachable.find((workspace) => workspace.id === workspaceId);
-  const canCreate = Boolean(workspaceId) && objective.trim().length > 0 && !busy;
+  const managed =
+    chosen?.kind !== "chats" &&
+    (workspaceMode === "managed" ||
+      (workspaceMode === "auto" && capability?.managedWorktreesEnabled));
+  const canCreate =
+    Boolean(workspaceId) &&
+    objective.trim().length > 0 &&
+    (!managed || Boolean(sourcePlacementId)) &&
+    !busy;
+  const source = placements.find((entry) => entry.id === sourcePlacementId);
 
   const submit = async () => {
     if (!canCreate) return;
@@ -91,6 +148,9 @@ export const CreateOrchestrationDialog = ({
       workspaceId,
       name: name.trim() || objective.trim().slice(0, 60),
       objective: objective.trim(),
+      workspaceMode,
+      operationId,
+      ...(managed && sourcePlacementId ? { sourcePlacementId } : {}),
     });
     setBusy(false);
     if (created) onOpenChange(false);
@@ -117,7 +177,7 @@ export const CreateOrchestrationDialog = ({
                     onChange={(_, data) => setObjective(data.value)}
                   />
                 </Field>
-                <Field label="Workspace">
+                <Field label="Repository">
                   <Dropdown
                     value={chosen?.name ?? ""}
                     selectedOptions={workspaceId ? [workspaceId] : []}
@@ -137,6 +197,86 @@ export const CreateOrchestrationDialog = ({
                 <Field label="Name" hint="Optional. Taken from the objective if empty.">
                   <Input value={name} onChange={(_, data) => setName(data.value)} />
                 </Field>
+                <Field label="Workspace isolation">
+                  <Dropdown
+                    aria-label="Workspace isolation"
+                    value={
+                      workspaceMode === "auto"
+                        ? "Auto (app default)"
+                        : workspaceMode === "managed"
+                          ? "Isolated worktree"
+                          : "Legacy source checkout"
+                    }
+                    selectedOptions={[workspaceMode]}
+                    onOptionSelect={(_, data) =>
+                      setWorkspaceMode(data.optionValue as WorkspaceMode)
+                    }
+                  >
+                    <Option value="auto">Auto (app default)</Option>
+                    <Option value="legacy">Legacy source checkout</Option>
+                    <Option value="managed">Isolated worktree</Option>
+                  </Dropdown>
+                </Field>
+                {managed && (
+                  <Field label="Selected repository">
+                    <Dropdown
+                      aria-label="Selected repository"
+                      value={
+                        source
+                          ? `${chosen?.name ?? "Repository"} — ${source.nodeName ?? source.nodeId}`
+                          : "Select a repository"
+                      }
+                      selectedOptions={sourcePlacementId ? [sourcePlacementId] : []}
+                      onOptionSelect={(_, data) =>
+                        setSourcePlacementId(data.optionValue ?? "")
+                      }
+                    >
+                      {placements
+                        .filter((entry) => entry.workspaceId === workspaceId)
+                        .map((entry) => (
+                          <Option
+                            key={entry.id}
+                            value={entry.id}
+                            text={entry.nodeName ?? entry.nodeId}
+                          >
+                            {chosen?.name} — {entry.nodeName ?? entry.nodeId}
+                            {capability?.placements.find(
+                              (item) => item.placementId === entry.id,
+                            )?.supported
+                              ? " — managed capable"
+                              : " — Node upgrade required"}
+                          </Option>
+                        ))}
+                    </Dropdown>
+                  </Field>
+                )}
+                <p role="status" className={styles.footnote}>
+                  {chosen?.kind === "chats"
+                    ? "Chats requires no repository worktree."
+                    : capability
+                      ? managed && source
+                        ? `An isolated workspace will be created from ${chosen?.name} on ${source.nodeName ?? source.nodeId} at its current committed HEAD.`
+                        : "This task will use the selected repository checkout directly."
+                      : capabilityError || "Checking Node managed-worktree capability…"}
+                </p>
+                {managed && (
+                  <>
+                    <p className={styles.summary}>
+                      <strong>Base revision:</strong> Current committed HEAD, resolved and
+                      pinned during workspace setup.
+                    </p>
+                    <details>
+                      <summary>Workspace details</summary>
+                      <p className={styles.footnote}>
+                        Fleet verifies the selected path is a repository root and creates
+                        the worktree in a managed sibling location outside the source
+                        checkout. The generated path and branch are chosen safely for
+                        concurrent tasks. Setup failure never falls back to modifying the
+                        selected checkout.
+                      </p>
+                    </details>
+                  </>
+                )}
                 <p className={styles.footnote}>
                   This records the task, then asks the orchestrator — in its conversation
                   — to plan it. You can ask for the same thing by talking to it directly;

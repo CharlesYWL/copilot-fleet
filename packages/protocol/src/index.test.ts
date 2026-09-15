@@ -682,6 +682,7 @@ describe("run orchestration protocol", () => {
     // The handwritten-DAG fixture has no Lead, so there is nothing to plan.
     expect(canTransitionRun("awaiting_approval", "running")).toBe(true);
     expect(canTransitionRun("running", "awaiting_lead")).toBe(true);
+    expect(canTransitionRun("awaiting_human", "aggregating")).toBe(true);
     expect(canTransitionRun("planning", "awaiting_lead")).toBe(false);
     /*
      * Finished, but not sealed. A person can reopen a task they had called done

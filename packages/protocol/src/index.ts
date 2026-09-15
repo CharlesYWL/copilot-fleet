@@ -1,4 +1,26 @@
 import { z } from "zod";
+import {
+  ExecutionBindingSchema,
+  ManagedWorktreePolicySchema,
+  ManagedWorktreeSchema,
+  RunWorkspaceSpecSchema,
+  RunWorkspaceBindingSchema,
+  WorktreeIntegrationSchema,
+  WorktreeOperationRequestSchema,
+  WorktreeOperationResultSchema,
+  WorktreeOperationSchema,
+  WorktreeTombstoneSchema,
+  WorkspaceResultSchema,
+  ArtifactDownloadChunkSchema,
+  ArtifactDownloadRequestSchema,
+  ArtifactTransferAckSchema,
+  ArtifactUploadBeginSchema,
+  ArtifactUploadChunkSchema,
+  ArtifactUploadCompleteSchema,
+  RepositoryProbeRequestSchema,
+  RepositoryProbeResultSchema,
+} from "./managed-worktrees.js";
+export * from "./managed-worktrees.js";
 
 /** Local startup events consumed by the service CLI, independent of log formatting. */
 export const CONFIG_UI_EVENT_MARKER = "FLEET_CONFIG_UI ";
@@ -304,10 +326,10 @@ export type ContextUsage = z.infer<typeof ContextUsageSchema>;
 
 /** Latest session-local readings; unavailable metrics stay absent, not zero. */
 export const SessionUsageSchema = z.object({
-  aiCredits: z.number().nonnegative().optional(),
+  aiCredits: z.number().nonnegative().nullable().optional(),
   /** ACP's pre-response input usage and prompt budget, not the full model window. */
-  contextTokens: z.number().int().nonnegative().optional(),
-  contextWindow: z.number().int().positive().optional(),
+  contextTokens: z.number().int().nonnegative().nullable().optional(),
+  contextWindow: z.number().int().positive().nullable().optional(),
   /** A fresh /context snapshot. Null invalidates an earlier model/tier's snapshot. */
   context: ContextUsageSchema.nullable().optional(),
 });
@@ -376,6 +398,7 @@ export const RunRoleSchema = z.enum(["", "lead", "worker", "reviewer"]);
 export type RunRole = z.infer<typeof RunRoleSchema>;
 
 export const SessionSchema = z.object({
+  executionBinding: ExecutionBindingSchema.optional(),
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   workspaceName: z.string().min(1),
@@ -679,6 +702,9 @@ export type StartupConfig = z.infer<typeof StartupConfigSchema>;
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start_session"),
+    executionBinding: ExecutionBindingSchema.optional(),
+    sourcePlacementId: z.string().optional(),
+    coordinator: z.boolean().optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
@@ -719,10 +745,17 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("resume_session"),
+    executionBinding: ExecutionBindingSchema.optional(),
+    sourcePlacementId: z.string().optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     localPath: z.string().min(1),
     agentSessionId: z.string().min(1),
+    /**
+     * Bounded task context used only if Copilot cannot load or prompt the
+     * persisted conversation because its CAPI request exceeds the size limit.
+     */
+    contextOverflowRecoveryPrompt: z.string().max(16_384).optional(),
     /** Workspace roots originally attached to the Copilot conversation. */
     additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
     /** Continues the host's event sequence so replayed rows stay ordered. */
@@ -759,6 +792,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("prompt"),
+    executionBinding: ExecutionBindingSchema.optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     prompt: z.string().min(1),
@@ -923,6 +957,30 @@ export const NodeReadySchema = z.object({
 export type NodeReady = z.infer<typeof NodeReadySchema>;
 
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("repository_probe_result"),
+    result: RepositoryProbeResultSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_upload_begin"),
+    transfer: ArtifactUploadBeginSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_upload_chunk"),
+    transfer: ArtifactUploadChunkSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_upload_complete"),
+    transfer: ArtifactUploadCompleteSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_download_request"),
+    transfer: ArtifactDownloadRequestSchema,
+  }),
+  z.object({
+    type: z.literal("managed_worktree_result"),
+    result: WorktreeOperationResultSchema,
+  }),
   NodeHelloSchema,
   NodeReadySchema,
   z.object({
@@ -953,6 +1011,7 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("command_result"),
+    executionBinding: ExecutionBindingSchema.optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     ok: z.boolean(),
@@ -999,6 +1058,22 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("repository_probe"),
+    request: RepositoryProbeRequestSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_transfer_ack"),
+    transfer: ArtifactTransferAckSchema,
+  }),
+  z.object({
+    type: z.literal("artifact_download_chunk"),
+    transfer: ArtifactDownloadChunkSchema,
+  }),
+  z.object({
+    type: z.literal("managed_worktree"),
+    request: WorktreeOperationRequestSchema,
+  }),
   z.object({
     type: z.literal("welcome"),
     nodeId: z.string().min(1),
@@ -1245,6 +1320,7 @@ export const RunStateSchema = z.enum([
   "awaiting_approval",
   "planning",
   "running",
+  "blocked",
   "awaiting_lead",
   /**
    * Every phase is done and the orchestrator has handed the result to a person.
@@ -1339,6 +1415,10 @@ export const CriterionOutcomeSchema = z.enum(["met", "unmet", "blocked"]);
 export type CriterionOutcome = z.infer<typeof CriterionOutcomeSchema>;
 
 export const RunSchema = z.object({
+  workspaceBinding: RunWorkspaceBindingSchema.default(() =>
+    RunWorkspaceBindingSchema.parse({}),
+  ).optional(),
+  workspaceSpec: RunWorkspaceSpecSchema.optional(),
   id: z.string().min(1),
   workspaceId: z.string().min(1),
   name: z.string().min(1),
@@ -1418,6 +1498,24 @@ export const RunSchema = z.object({
 export type Run = z.infer<typeof RunSchema>;
 
 export const RunStepSchema = z.object({
+  executionBinding: ExecutionBindingSchema.optional(),
+  managedWorktreeId: z.string().optional(),
+  workspaceState: z
+    .enum([
+      "not_required",
+      "pending",
+      "reserved",
+      "creating",
+      "composing",
+      "ready",
+      "finalizing",
+      "completed",
+      "blocked",
+      "quarantined",
+    ])
+    .optional(),
+  workspaceError: z.string().optional(),
+  resultSha: z.string().optional(),
   id: z.string().min(1),
   runId: z.string().min(1),
   /**
@@ -1478,6 +1576,7 @@ export const NotificationCategorySchema = z.enum([
 export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
 
 export const NotificationKindSchema = z.enum([
+  "managed_worktree_attention",
   "agent_completion",
   "agent_failure",
   "orchestration_needs_review",
@@ -2173,6 +2272,10 @@ export const SetSessionFavoriteSchema = z.object({
 });
 
 export const UpdateDefaultsSchema = z.object({
+  operationId: z.string().uuid().optional(),
+  expectedRevision: z.number().int().nonnegative().optional(),
+  managedWorktreesEnabled: z.boolean().optional(),
+  managedWorktreePolicy: ManagedWorktreePolicySchema.optional(),
   yolo: z.boolean().optional(),
   contextTier: ContextTierSchema.optional(),
   /** Fleet-wide launcher preference, applied to every new or resumed session. */
@@ -2451,6 +2554,10 @@ const hostBackupDataShape = {
   publicUrl: z.string().url().optional(),
   tunnel: HostBackupTunnelSchema,
   defaults: z.object({
+    managedWorktreesEnabled: z.boolean().default(false).optional(),
+    managedWorktreePolicy: ManagedWorktreePolicySchema.default(() =>
+      ManagedWorktreePolicySchema.parse({}),
+    ).optional(),
     yolo: z.boolean(),
     contextTier: ContextTierSchema.optional(),
     agencyMode: z.boolean().default(false),
@@ -2467,6 +2574,12 @@ const hostBackupDataShape = {
    * importing — the one failure mode a backup format may not have.
    */
   runs: z.array(RunSchema).default([]),
+  managedWorktrees: z.array(ManagedWorktreeSchema).default([]).optional(),
+  derivedWorkspaces: z.array(ManagedWorktreeSchema).default([]).optional(),
+  worktreeOperations: z.array(WorktreeOperationSchema).default([]).optional(),
+  worktreeIntegrations: z.array(WorktreeIntegrationSchema).default([]).optional(),
+  worktreeTombstones: z.array(WorktreeTombstoneSchema).default([]).optional(),
+  workspaceResults: z.array(WorkspaceResultSchema).default([]).optional(),
   runSteps: z.array(RunStepSchema).default([]),
   /**
    * A task's notes are the orchestrator's own record of it — what a phase
@@ -2817,9 +2930,10 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
    * fixture, which has no Lead and therefore nothing to plan — its plan
    * arrived over REST.
    */
-  awaiting_approval: new Set(["planning", "running", "failed", "cancelled"]),
-  planning: new Set(["running", "failed", "cancelled"]),
+  awaiting_approval: new Set(["planning", "running", "blocked", "failed", "cancelled"]),
+  planning: new Set(["running", "blocked", "failed", "cancelled"]),
   running: new Set([
+    "blocked",
     "awaiting_lead",
     "awaiting_human",
     "aggregating",
@@ -2828,6 +2942,7 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
     "cancelled",
   ]),
   awaiting_lead: new Set([
+    "blocked",
     "running",
     "awaiting_human",
     "aggregating",
@@ -2840,8 +2955,17 @@ const runTransitions: Record<RunState, ReadonlySet<RunState>> = {
    * returns it to `running` with the reviewer's note, and the orchestrator
    * carries on from the phase it was in.
    */
-  awaiting_human: new Set(["running", "completed", "failed", "cancelled"]),
-  aggregating: new Set(["completed", "failed", "cancelled"]),
+  awaiting_human: new Set(["running", "aggregating", "completed", "failed", "cancelled"]),
+  aggregating: new Set(["blocked", "completed", "failed", "cancelled"]),
+  blocked: new Set([
+    "awaiting_approval",
+    "planning",
+    "running",
+    "awaiting_lead",
+    "aggregating",
+    "failed",
+    "cancelled",
+  ]),
   /*
    * Finished, but not sealed.
    *

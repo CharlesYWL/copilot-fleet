@@ -22,6 +22,7 @@ import {
 } from "@fluentui/react-components";
 import type {
   ContextTier,
+  ManagedWorktreePolicy,
   SessionConfigChoice,
   SessionConfigOption,
 } from "@fleet/protocol";
@@ -95,6 +96,9 @@ const useStyles = makeStyles({
 });
 
 type Defaults = {
+  managedWorktreesEnabled: boolean;
+  managedWorktreesRevision: number;
+  managedWorktreePolicy: ManagedWorktreePolicy;
   yolo: boolean;
   contextTier: ContextTier;
   agencyMode: boolean;
@@ -160,7 +164,16 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
       setDefaults(
         await api<Defaults>("/api/defaults", {
           method: "POST",
-          body: JSON.stringify(patch),
+          body: JSON.stringify({
+            ...patch,
+            ...(patch.managedWorktreesEnabled !== undefined ||
+            patch.managedWorktreePolicy !== undefined
+              ? {
+                  operationId: crypto.randomUUID(),
+                  expectedRevision: defaults?.managedWorktreesRevision ?? 0,
+                }
+              : {}),
+          }),
         }),
       );
     } catch (reason) {
@@ -230,6 +243,7 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
   }
 
   const {
+    managedWorktreesEnabled = false,
     yolo,
     contextTier = "long_context",
     agencyMode = false,
@@ -258,6 +272,44 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
           <MessageBarBody>{error}</MessageBarBody>
         </MessageBar>
       )}
+
+      <section className={styles.card} aria-label="Managed worktree isolation">
+        <div className={styles.row}>
+          <div>
+            <Text weight="semibold">Managed worktree isolation</Text>
+            <br />
+            <Text className={styles.caption}>
+              Auto creates one isolated Git worktree per new repository task when enabled.
+              Implementation, review, testing and fix-up share that task’s checkout and
+              still allow only one shell-capable writer at a time. Different tasks can
+              write concurrently; this is not a sandbox or a worktree per agent.
+            </Text>
+          </div>
+          <Switch
+            aria-label="Managed worktree isolation"
+            checked={managedWorktreesEnabled}
+            disabled={busy}
+            label={managedWorktreesEnabled ? "On" : "Off"}
+            onChange={(_, data) => void update({ managedWorktreesEnabled: data.checked })}
+          />
+        </div>
+        <Text className={styles.caption}>
+          Only new Auto tasks use this default. Explicit Legacy/Managed choices override
+          it; existing tasks and live sessions never migrate. Managed tasks require an
+          upgraded Node and an eligible committed Git repository. Approval does not merge,
+          push or delete a checkout.
+        </Text>
+        {defaults.managedWorktreePolicy && (
+          <details>
+            <summary>Managed retention and quotas</summary>
+            <ManagedQuotaEditor
+              policy={defaults.managedWorktreePolicy}
+              busy={busy}
+              onSave={(policy) => void update({ managedWorktreePolicy: policy })}
+            />
+          </details>
+        )}
+      </section>
 
       {onStartTour && (
         <section className={styles.card} aria-label="Getting started">
@@ -322,8 +374,8 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
             </Text>
           </div>
           <Switch
-            checked={yolo}
             aria-label="YOLO mode"
+            checked={yolo}
             disabled={busy}
             label={yolo ? "On" : "Off"}
             onChange={(_event, data) => void update({ yolo: data.checked })}
@@ -577,3 +629,48 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
     </div>
   );
 };
+
+function ManagedQuotaEditor({
+  policy,
+  busy,
+  onSave,
+}: {
+  policy: ManagedWorktreePolicy;
+  busy: boolean;
+  onSave: (policy: ManagedWorktreePolicy) => void;
+}) {
+  const [draft, setDraft] = useState(policy);
+  const fields = [
+    ["retentionDays", "Clean integrated retention (days)", 1],
+    ["maxPerRepository", "Maximum worktrees per repository", 1],
+    ["maxPerNode", "Maximum worktrees per Node", 1],
+    ["freeSpaceFloorBytes", "Free-space floor (bytes)", 0],
+    ["byteBudget", "Approximate Node worktree budget (bytes)", 1],
+  ] as const;
+  return (
+    <div>
+      <p>
+        Only clean, integrated, inactive checkouts may expire. Dirty or unknown work is
+        never evicted.
+      </p>
+      {fields.map(([key, label, min]) => (
+        <label key={key} style={{ display: "block", marginBottom: 8 }}>
+          {label}{" "}
+          <input
+            type="number"
+            min={min}
+            aria-label={label}
+            value={draft[key]}
+            disabled={busy}
+            onChange={(event) =>
+              setDraft({ ...draft, [key]: Number(event.target.value) })
+            }
+          />
+        </label>
+      ))}
+      <Button disabled={busy} onClick={() => onSave(draft)}>
+        Save managed quotas
+      </Button>
+    </div>
+  );
+}

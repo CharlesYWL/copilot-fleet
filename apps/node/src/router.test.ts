@@ -103,6 +103,7 @@ describe("CommandRouter", () => {
         yolo: true,
         agencyMode: true,
         contextTier: "long_context",
+        contextOverflowRecoveryPrompt: "Original assignment",
         mcpServers,
         config: [
           { id: "model", value: "selected-model" },
@@ -120,6 +121,7 @@ describe("CommandRouter", () => {
       expect(start).toHaveBeenCalledTimes(2);
       expect(start.mock.calls[1]?.[3]).toMatchObject({
         contextTier: "default",
+        contextOverflowRecoveryPrompt: "Original assignment",
         resumeAgentSessionId: "saved-id",
         additionalDirectories: ["C:\\shared"],
         sequenceOffset: 44,
@@ -140,6 +142,9 @@ describe("CommandRouter", () => {
       if (orchestrator) {
         await router.refreshMcpSessions();
         expect(start.mock.calls[2]?.[3]?.contextTier).toBe("default");
+        expect(start.mock.calls[2]?.[3]?.contextOverflowRecoveryPrompt).toBe(
+          "Original assignment",
+        );
       }
       await router.stopAll();
     },
@@ -153,6 +158,7 @@ describe("CommandRouter", () => {
       (event) => events.push(event),
       async (path) => path,
     );
+    const start = vi.spyOn(MockAgentFactory.prototype, "start");
     await router.route({
       ...START_DEFAULTS,
       type: "start_session",
@@ -180,6 +186,7 @@ describe("CommandRouter", () => {
         value: "default",
       }),
     ).toMatchObject({ ok: true });
+    expect(start.mock.calls.at(-1)?.[3]?.contextOverflowRecoveryPrompt).toBe("work");
     expect(
       events.filter((event) => event.type === "config").at(-1)?.payload.options,
     ).toEqual(
@@ -188,7 +195,61 @@ describe("CommandRouter", () => {
       ]),
     );
     await router.stopAll();
+    start.mockRestore();
   });
+
+  it.each([false, true])(
+    "settles every legacy stop without inventing a terminal event (terminal before rejection: %s)",
+    async (terminalBeforeRejection) => {
+      const events: SessionEvent[] = [];
+      const safeStop = vi.fn(async () => {});
+      const unsafeStop = vi.fn(async () => {});
+      const factory: AgentFactory = {
+        async start(id, _cwd, sink) {
+          if (id === "unsafe")
+            unsafeStop.mockImplementationOnce(async () => {
+              if (terminalBeforeRejection) sink(stateEvent(id, "failed"));
+              throw new Error("Legacy process stop could not be verified");
+            });
+          return {
+            ...inertAgent(id, sink),
+            stop: id === "unsafe" ? unsafeStop : safeStop,
+          };
+        },
+      };
+      const router = new CommandRouter(
+        factory,
+        2,
+        (event) => events.push(event),
+        async (path) => path,
+      );
+      for (const id of ["unsafe", "safe"]) {
+        expect(
+          (
+            await router.route({
+              ...START_DEFAULTS,
+              type: "start_session",
+              commandId: id,
+              sessionId: id,
+              localPath: `C:\\${id}`,
+              prompt: "work",
+            })
+          ).ok,
+        ).toBe(true);
+      }
+      await expect(router.stopAll()).rejects.toThrow(
+        "Some sessions could not stop safely",
+      );
+      expect(safeStop).toHaveBeenCalledOnce();
+      expect(unsafeStop).toHaveBeenCalledOnce();
+      expect(events).toHaveLength(terminalBeforeRejection ? 1 : 0);
+      expect(router.activeSessionIds).toEqual(terminalBeforeRejection ? [] : ["unsafe"]);
+      await router.stopAll();
+      expect(router.activeSessionIds).toEqual([]);
+      expect(unsafeStop).toHaveBeenCalledTimes(terminalBeforeRejection ? 1 : 2);
+      expect(events).toHaveLength(terminalBeforeRejection ? 1 : 0);
+    },
+  );
 
   it.each(["start_session", "resume_session"] as const)(
     "passes the Host's Agency preference through %s",

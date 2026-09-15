@@ -9,6 +9,7 @@ import {
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
   SUPERSEDED_CLOSE_CODE,
+  WorktreeConflict,
   decodeFrame,
   resolveNodeName,
   type OutboxEventPosition,
@@ -286,6 +287,121 @@ export function registerNodeGateway(
           return;
         }
         try {
+          if (message.type === "managed_worktree_result") {
+            try {
+              if (!service.worktrees.handleResult(nodeId, message.result)) {
+                app.log.warn(
+                  { nodeId, operationId: message.result.operationId },
+                  "Rejected managed worktree receipt",
+                );
+              }
+            } catch (error) {
+              if (!(error instanceof WorktreeConflict)) throw error;
+              app.log.warn(
+                {
+                  nodeId,
+                  operationId: message.result.operationId,
+                  code: error.code,
+                },
+                "Rejected managed worktree receipt",
+              );
+            }
+            return;
+          }
+          if (message.type === "repository_probe_result") {
+            if (!service.worktrees.handleRepositoryProbe(nodeId, message.result))
+              app.log.warn(
+                { nodeId, operationId: message.result.operationId },
+                "Rejected repository capability receipt",
+              );
+            return;
+          }
+          if (message.type === "artifact_upload_begin") {
+            void service.worktrees
+              .handleArtifactUploadBegin(nodeId, message.transfer)
+              .then((transfer) =>
+                service.send(input.link, { type: "artifact_transfer_ack", transfer }),
+              )
+              .catch((error: unknown) =>
+                service.send(input.link, {
+                  type: "artifact_transfer_ack",
+                  transfer: {
+                    operationId: message.transfer.operationId,
+                    resultId: message.transfer.resultId,
+                    artifactId: message.transfer.artifactId,
+                    ok: false,
+                    offset: 0,
+                    complete: false,
+                    code:
+                      error instanceof Error && "code" in error
+                        ? String(error.code)
+                        : "artifact_upload_failed",
+                    error:
+                      error instanceof Error ? error.message : "Artifact upload failed.",
+                  },
+                }),
+              );
+            return;
+          }
+          if (message.type === "artifact_upload_chunk") {
+            void service.worktrees
+              .handleArtifactUploadChunk(nodeId, message.transfer)
+              .then((transfer) =>
+                service.send(input.link, { type: "artifact_transfer_ack", transfer }),
+              )
+              .catch((error: unknown) =>
+                service.send(input.link, {
+                  type: "artifact_transfer_ack",
+                  transfer: {
+                    operationId: message.transfer.operationId,
+                    resultId: message.transfer.resultId,
+                    artifactId: message.transfer.artifactId,
+                    ok: false,
+                    offset: message.transfer.offset,
+                    complete: false,
+                    code: "artifact_chunk_failed",
+                    error:
+                      error instanceof Error ? error.message : "Artifact chunk failed.",
+                  },
+                }),
+              );
+            return;
+          }
+          if (message.type === "artifact_upload_complete") {
+            void service.worktrees
+              .handleArtifactUploadComplete(nodeId, message.transfer)
+              .then((transfer) =>
+                service.send(input.link, { type: "artifact_transfer_ack", transfer }),
+              )
+              .catch((error: unknown) =>
+                service.send(input.link, {
+                  type: "artifact_transfer_ack",
+                  transfer: {
+                    operationId: message.transfer.operationId,
+                    resultId: message.transfer.resultId,
+                    artifactId: message.transfer.artifactId,
+                    ok: false,
+                    offset: 0,
+                    complete: false,
+                    code: "artifact_complete_failed",
+                    error:
+                      error instanceof Error
+                        ? error.message
+                        : "Artifact verification failed.",
+                  },
+                }),
+              );
+            return;
+          }
+          if (message.type === "artifact_download_request") {
+            void service.worktrees
+              .handleArtifactDownload(nodeId, message.transfer)
+              .then((transfer) =>
+                service.send(input.link, { type: "artifact_download_chunk", transfer }),
+              )
+              .catch(() => socket.close(1008, "Artifact download refused"));
+            return;
+          }
           if (message.type === "session_cleanup_result") {
             service.sessionRetention.handleResult(nodeId, message);
             return;
@@ -468,6 +584,26 @@ export function registerNodeGateway(
                 message.sessionId,
                 message.error ?? "Node refused the command",
               );
+            }
+          }
+          if (
+            message.type === "command_result" &&
+            message.ok &&
+            message.executionBinding
+          ) {
+            const session = service.store.getSession(message.sessionId);
+            const attempt = service.store.getSessionDispatchAttempt(message.sessionId);
+            if (session?.nodeId === nodeId && attempt?.commandId === message.commandId) {
+              service.store.setSessionExecutionBinding(
+                session.id,
+                message.executionBinding,
+              );
+              const step = service.store.getRunStepBySession(session.id);
+              if (step)
+                service.store.updateRunStep(step.id, {
+                  executionBinding: message.executionBinding,
+                });
+              service.publishSession(service.store.getSession(session.id)!);
             }
           }
         } catch (error) {

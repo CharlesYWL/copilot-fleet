@@ -1,6 +1,9 @@
 import { config as loadEnv } from "dotenv";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import { arch, homedir, platform } from "node:os";
 import { join } from "node:path";
+import { mkdir, open, rm, stat } from "node:fs/promises";
 import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
 import { ensureGithubAuth } from "./github-auth.js";
@@ -17,6 +20,10 @@ import {
   type NodeToHostMessage,
   type NodeUpdateStage,
   type SessionEvent,
+  type ArtifactDownloadChunk,
+  type ArtifactTransferAck,
+  type WorkspaceResult,
+  WORKSPACE_ARTIFACT_CHUNK_BYTES,
 } from "@fleet/protocol";
 import { type AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
@@ -34,6 +41,17 @@ import {
   ensureNodeCredentials,
   openNodeChannel,
 } from "./enrollment.js";
+
+async function sha256File(path: string): Promise<string> {
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(path);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.once("error", reject);
+    stream.once("end", resolve);
+  });
+  return hash.digest("hex");
+}
 import {
   legacyKeyUpgradeRefusal,
   unsolicitedKeyAcknowledgement,
@@ -60,6 +78,7 @@ import {
   shouldReconnectAfterClose,
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
+import { ManagedWorktrees } from "./managed-worktrees.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { EventOutbox } from "./outbox.js";
 import { NODE_CAPABILITIES } from "./node-capabilities.js";
@@ -331,7 +350,173 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         getCopilotCommand: () => settings.copilotCommand,
         getContextTier: () => settings.contextTier,
       });
-  const router = new CommandRouter(
+  const transferAcks = new Map<
+    string,
+    { resolve: (value: ArtifactTransferAck) => void; reject: (error: Error) => void }
+  >();
+  const downloadChunks = new Map<
+    string,
+    { resolve: (value: ArtifactDownloadChunk) => void; reject: (error: Error) => void }
+  >();
+  const transferKey = (operationId: string, artifactId: string) =>
+    `${operationId}:${artifactId}`;
+  const waitFor = <T>(
+    map: Map<string, { resolve: (value: T) => void; reject: (error: Error) => void }>,
+    key: string,
+  ): Promise<T> =>
+    new Promise((resolvePromise, reject) => {
+      const timer = setTimeout(() => {
+        map.delete(key);
+        reject(new Error("Artifact transfer acknowledgement timed out."));
+      }, 30_000);
+      timer.unref();
+      map.set(key, {
+        resolve: (value) => {
+          clearTimeout(timer);
+          map.delete(key);
+          resolvePromise(value);
+        },
+        reject,
+      });
+    });
+  const uploadArtifact = async (
+    result: WorkspaceResult,
+    path: string,
+  ): Promise<WorkspaceResult> => {
+    const started = Date.now();
+    const key = transferKey(result.id, result.artifactId);
+    let pending = waitFor(transferAcks, key);
+    if (
+      !send({
+        type: "artifact_upload_begin",
+        transfer: {
+          operationId: result.id,
+          resultId: result.id,
+          artifactId: result.artifactId,
+          result,
+        },
+      })
+    )
+      throw new Error("Host is unavailable for artifact upload.");
+    let ack = await pending;
+    if (!ack.ok) throw new Error(ack.error || ack.code);
+    const file = await open(path, "r");
+    try {
+      while (ack.offset < result.artifactSize) {
+        const length = Math.min(
+          WORKSPACE_ARTIFACT_CHUNK_BYTES,
+          result.artifactSize - ack.offset,
+        );
+        const buffer = Buffer.alloc(length);
+        const { bytesRead } = await file.read(buffer, 0, length, ack.offset);
+        pending = waitFor(transferAcks, key);
+        send({
+          type: "artifact_upload_chunk",
+          transfer: {
+            operationId: result.id,
+            resultId: result.id,
+            artifactId: result.artifactId,
+            offset: ack.offset,
+            data: buffer.subarray(0, bytesRead).toString("base64"),
+          },
+        });
+        ack = await pending;
+        if (!ack.ok) throw new Error(ack.error || ack.code);
+      }
+    } finally {
+      await file.close();
+    }
+    pending = waitFor(transferAcks, key);
+    send({
+      type: "artifact_upload_complete",
+      transfer: {
+        operationId: result.id,
+        resultId: result.id,
+        artifactId: result.artifactId,
+        size: result.artifactSize,
+        sha256: result.artifactSha256,
+      },
+    });
+    ack = await pending;
+    if (!ack.ok || !ack.complete) throw new Error(ack.error || ack.code);
+    return {
+      ...result,
+      state: "available",
+      verifiedAt: new Date().toISOString(),
+      uploadDurationMs: Date.now() - started,
+    };
+  };
+  const downloadArtifact = async (
+    result: WorkspaceResult,
+    path: string,
+    operationId: string,
+  ): Promise<void> => {
+    await mkdir(join(configDirectory(), "workspace-result-artifacts"), {
+      recursive: true,
+    });
+    const present = await stat(path).catch(() => undefined);
+    let offset = present && present.size <= result.artifactSize ? present.size : 0;
+    if (present && offset === result.artifactSize) {
+      const digest = await sha256File(path);
+      if (digest === result.artifactSha256) return;
+      await rm(path, { force: true });
+      offset = 0;
+    } else if (present && offset === 0) {
+      await rm(path, { force: true });
+    }
+    const file = await open(path, offset ? "a+" : "w", 0o600);
+    try {
+      while (offset < result.artifactSize) {
+        const key = transferKey(operationId, result.artifactId);
+        const pending = waitFor(downloadChunks, key);
+        if (
+          !send({
+            type: "artifact_download_request",
+            transfer: {
+              operationId,
+              resultId: result.id,
+              artifactId: result.artifactId,
+              offset,
+            },
+          })
+        )
+          throw new Error("Host is unavailable for artifact download.");
+        const chunk = await pending;
+        if (chunk.offset !== offset || chunk.size !== result.artifactSize)
+          throw new Error("Artifact download offset or size changed.");
+        if (chunk.sha256 !== result.artifactSha256)
+          throw new Error("Artifact download identity changed.");
+        const bytes = Buffer.from(chunk.data, "base64");
+        if (bytes.length === 0 && !chunk.complete)
+          throw new Error("Artifact download made no progress.");
+        await file.write(bytes, 0, bytes.length, offset);
+        await file.sync();
+        offset += bytes.length;
+        if (chunk.complete && offset !== result.artifactSize)
+          throw new Error("Artifact download completed at the wrong size.");
+      }
+    } finally {
+      await file.close();
+    }
+    const downloaded = await stat(path).catch(() => undefined);
+    if (
+      !downloaded ||
+      downloaded.size !== result.artifactSize ||
+      (await sha256File(path)) !== result.artifactSha256
+    ) {
+      await rm(path, { force: true });
+      throw new Error("Artifact download failed integrity verification.");
+    }
+  };
+  const worktrees: ManagedWorktrees = new ManagedWorktrees({
+    directory: configDirectory(),
+    nodeId: () => credentials.nodeId,
+    quiesce: (id, target): Promise<void> => router.quiesceWorktree(id, target),
+    uploadArtifact,
+    downloadArtifact,
+    ...(process.env.FLEET_WORKTREE_ROOT ? { root: process.env.FLEET_WORKTREE_ROOT } : {}),
+  });
+  const router: CommandRouter = new CommandRouter(
     factory,
     settings.maxSessions,
     (event) => {
@@ -347,6 +532,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     agentCatalog,
     warn,
     {
+      worktrees,
       deleteInactiveSession: async (agentSessionId, inactiveBefore, beforeDelete) => {
         if (mockAgent) {
           await beforeDelete();
@@ -440,7 +626,23 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * both identity files, and dial the Host as that node.
    */
   async function applyBackup(archive: NodeBackup): Promise<void> {
-    await router.stopAll();
+    const errors: unknown[] = [];
+    try {
+      await router.stopAll();
+    } catch (error) {
+      errors.push(error);
+    } finally {
+      try {
+        await worktrees.quarantine();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(
+        errors,
+        "Backup import aborted: sessions could not be safely stopped and quarantined.",
+      );
     credentials = archive.credentials;
     settings = SettingsSchema.parse(archive.settings);
     await saveCredentials(credentials);
@@ -908,6 +1110,42 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         await runSelfUpdate(frame.value.updateId);
         return;
       }
+      if (frame.value.type === "managed_worktree") {
+        try {
+          const result = await worktrees.execute(frame.value.request);
+          send({ type: "managed_worktree_result", result });
+        } catch (error) {
+          warn(`Managed operation refused: ${errorMessage(error)}`);
+        }
+        return;
+      }
+      if (frame.value.type === "repository_probe") {
+        const result = await worktrees.probeRepository(frame.value.request);
+        send({ type: "repository_probe_result", result });
+        return;
+      }
+      if (frame.value.type === "artifact_transfer_ack") {
+        transferAcks
+          .get(
+            transferKey(
+              frame.value.transfer.operationId,
+              frame.value.transfer.artifactId,
+            ),
+          )
+          ?.resolve(frame.value.transfer);
+        return;
+      }
+      if (frame.value.type === "artifact_download_chunk") {
+        downloadChunks
+          .get(
+            transferKey(
+              frame.value.transfer.operationId,
+              frame.value.transfer.artifactId,
+            ),
+          )
+          ?.resolve(frame.value.transfer);
+        return;
+      }
       if (frame.value.type !== "command") return;
       const { command } = frame.value;
       log(`< ${command.type} session=${command.sessionId.slice(0, 8)}`);
@@ -932,6 +1170,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           sessionId: command.sessionId,
           ok: result.ok,
           fatal: result.fatal ?? true,
+          ...(result.executionBinding
+            ? { executionBinding: result.executionBinding }
+            : {}),
           ...(result.error ? { error: result.error } : {}),
         });
       }
@@ -939,7 +1180,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     active.on("close", async (code) => {
       // A settings change swaps the socket out; the stale one must not tear down
       // agents or schedule a retry against the URL we just left.
-      if (socket !== active) return;
+      if (socket !== active || shuttingDown) return;
       if (code === AUTH_FAILED_CLOSE_CODE) {
         /*
          * The credential this node holds will never be accepted again, so
@@ -963,7 +1204,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         // Only tear agents down when this process is done; a Host bounce must
         // not wipe live sessions that we are about to re-announce on hello.
         router.denyPendingPermissions();
-        await router.stopAll();
+        try {
+          await shutdown();
+        } catch (error) {
+          errorLog(`Node shutdown failed: ${errorMessage(error)}`);
+        }
         if (code === SUPERSEDED_CLOSE_CODE) {
           console.error(
             "Connection superseded by another node instance; not reconnecting",
@@ -1144,11 +1389,31 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // An unref'd timer does not hold the loop open, but it does keep firing while
     // the process winds down, which resurrects a socket we are trying to close.
     clearInterval(heartbeatTimer);
-    health.stop();
-    releaseLiveness();
-    configServer.close();
-    socket?.close();
-    await router.stopAll();
+    const errors: unknown[] = [];
+    try {
+      for (const close of [
+        () => health.stop(),
+        () => releaseLiveness(),
+        () => configServer.close(),
+        () => socket?.close(),
+        () => router.stopAll(),
+      ]) {
+        try {
+          await close();
+        } catch (error) {
+          errors.push(error);
+        }
+      }
+    } finally {
+      try {
+        await worktrees.shutdown();
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1)
+      throw new AggregateError(errors, "Node shutdown encountered cleanup failures.");
   }
 
   return { shutdown };
@@ -1169,6 +1434,15 @@ if (process.env.NODE_ENV !== "test") {
     process.exit(2);
   }
   const runtime = await main(argv);
-  process.once("SIGINT", () => void runtime.shutdown().finally(() => process.exit(0)));
-  process.once("SIGTERM", () => void runtime.shutdown().finally(() => process.exit(0)));
+  const terminate = () => {
+    void runtime.shutdown().then(
+      () => process.exit(0),
+      (error: unknown) => {
+        console.error(error);
+        process.exit(1);
+      },
+    );
+  };
+  process.once("SIGINT", terminate);
+  process.once("SIGTERM", terminate);
 }

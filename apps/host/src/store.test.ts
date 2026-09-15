@@ -117,6 +117,13 @@ describe("FleetStore", () => {
     emit(6, { context: null });
     expect(store.getSession(session.id)?.usage?.context).toBeNull();
     expect(store.getSession(session.id)?.usage?.aiCredits).toBe(29);
+    emit(7, { aiCredits: null, contextTokens: null, contextWindow: null, context: null });
+    expect(store.getSession(session.id)?.usage).toEqual({
+      aiCredits: null,
+      contextTokens: null,
+      contextWindow: null,
+      context: null,
+    });
   });
 
   it("learns new capabilities when an upgraded node reconnects", () => {
@@ -1314,9 +1321,63 @@ describe("FleetStore", () => {
 
   it("changes only the path when no workspace is named", () => {
     const { store, placement } = setup();
+    store.putPlacementRepositoryCapability({
+      placementId: placement.id,
+      nodeId: placement.nodeId,
+      localPath: placement.localPath,
+      repositoryIdentity: {
+        id: "a".repeat(64),
+        objectFormat: "sha1",
+        evidence: "roots",
+        remoteHash: "",
+        rootHash: "b".repeat(64),
+      },
+      baseSha: "c".repeat(40),
+      baseAvailable: true,
+      baseMaterializable: false,
+      portableResultsSupported: true,
+      portabilityReason: "",
+      verifiedAt: new Date().toISOString(),
+      error: "",
+    });
     const updated = store.updatePlacement(placement.id, "D:\\elsewhere");
     expect(updated?.localPath).toBe("D:\\elsewhere");
     expect(updated?.workspaceId).toBe(placement.workspaceId);
+    expect(store.getPlacementRepositoryCapability(placement.id)).toBeUndefined();
+  });
+
+  it("keeps repository capability proofs for concurrent pinned bases", () => {
+    const { store, placement } = setup();
+    const identity = {
+      id: "a".repeat(64),
+      objectFormat: "sha1" as const,
+      evidence: "roots" as const,
+      remoteHash: "",
+      rootHash: "b".repeat(64),
+    };
+    for (const baseSha of ["c".repeat(40), "d".repeat(40)])
+      store.putPlacementRepositoryCapability({
+        placementId: placement.id,
+        nodeId: placement.nodeId,
+        localPath: placement.localPath,
+        repositoryIdentity: identity,
+        baseSha,
+        baseAvailable: true,
+        baseMaterializable: false,
+        portableResultsSupported: true,
+        portabilityReason: "",
+        verifiedAt: new Date().toISOString(),
+        error: "",
+      });
+
+    expect(
+      store.getPlacementRepositoryCapability(placement.id, identity.id, "c".repeat(40))
+        ?.baseSha,
+    ).toBe("c".repeat(40));
+    expect(
+      store.getPlacementRepositoryCapability(placement.id, identity.id, "d".repeat(40))
+        ?.baseSha,
+    ).toBe("d".repeat(40));
   });
 
   it("keeps the order an operator arranged, and puts new placements last", () => {
@@ -1840,6 +1901,19 @@ describe("FleetStore runs", () => {
     expect(second?.reviewSeq).toBe(2);
   });
 
+  it("clears a stale failure reason when a run resumes successfully", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    store.setRunState(run.id, "blocked", "Temporary integration failure");
+
+    store.setRunState(run.id, "running");
+
+    expect(store.getRun(run.id)).toMatchObject({
+      state: "running",
+      failureReason: "",
+    });
+  });
+
   it("rolls back review state and notes when its notification cannot be written", () => {
     const { store, workspace } = setup();
     const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
@@ -2163,5 +2237,129 @@ describe("FleetStore runs", () => {
     expect(store.deleteRun(run.id)).toBe(true);
     expect(store.getRun(run.id)).toBeUndefined();
     expect(store.listRunNotes(run.id)).toEqual([]);
+  });
+
+  it("freezes the resolved workspace specification", () => {
+    const { store, workspace, placement } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      sourcePlacementId: placement.id,
+      workspaceMode: "managed",
+      name: "isolated",
+      objective: "test immutable intent",
+    });
+    const resolved = store.resolveRunWorkspaceSpec(run.id, {
+      repositoryIdentity: "repository-v1",
+      repositoryObjectFormat: "sha1",
+      executionBaseRef: "refs/heads/main",
+      executionBaseSha: "a".repeat(40),
+      repositoryExecutionPolicy: undefined,
+    });
+
+    expect(
+      store.resolveRunWorkspaceSpec(run.id, {
+        repositoryIdentity: "repository-v1",
+        repositoryObjectFormat: "sha1",
+        executionBaseRef: "refs/heads/main",
+        executionBaseSha: "a".repeat(40),
+        repositoryExecutionPolicy: undefined,
+      }),
+    ).toEqual(resolved);
+    expect(() =>
+      store.resolveRunWorkspaceSpec(run.id, {
+        repositoryIdentity: "repository-v1",
+        repositoryObjectFormat: "sha1",
+        executionBaseRef: "refs/heads/main",
+        executionBaseSha: "b".repeat(40),
+        repositoryExecutionPolicy: undefined,
+      }),
+    ).toThrow(/changed/i);
+  });
+
+  it("preserves append-only integration-attempt identity across status updates", () => {
+    const { store, workspace, placement, node } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      sourcePlacementId: placement.id,
+      workspaceMode: "managed",
+      name: "attempts",
+      objective: "retain integration history",
+    });
+    const now = new Date().toISOString();
+    const attempt = {
+      attemptId: "attempt-1",
+      runId: run.id,
+      attemptNumber: 1,
+      resultWorkspaceId: "result-workspace",
+      resultGeneration: 1,
+      integrationBaseSha: "a".repeat(40),
+      targetRef: "refs/heads/dev/operator/fleet-run",
+      assignedNodeId: node.id,
+      phase: "integrate" as const,
+      expectedTree: "",
+      finalSha: "",
+      status: "in_progress" as const,
+      publishState: "not_started" as const,
+      receiptIds: [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    store.putIntegrationAttempt(attempt);
+    store.putIntegrationAttempt({
+      ...attempt,
+      phase: "publish",
+      status: "completed",
+      publishState: "published",
+      receiptIds: ["receipt-1"],
+      updatedAt: new Date(Date.now() + 1_000).toISOString(),
+    });
+
+    expect(store.listIntegrationAttempts(run.id)).toMatchObject([
+      {
+        attemptId: "attempt-1",
+        phase: "publish",
+        status: "completed",
+        publishState: "published",
+        receiptIds: ["receipt-1"],
+      },
+    ]);
+    expect(() =>
+      store.putIntegrationAttempt({
+        ...attempt,
+        assignedNodeId: "different-node",
+      }),
+    ).toThrow(/cannot be rewritten/i);
+  });
+
+  it("records an immutable exact-result publication approval", () => {
+    const { store, workspace, placement } = setup();
+    const run = store.createRun({
+      workspaceId: workspace.id,
+      sourcePlacementId: placement.id,
+      workspaceMode: "managed",
+      name: "publish",
+      objective: "approve one exact result",
+    });
+    const approval = {
+      approvalId: "approval-1",
+      runId: run.id,
+      integrationId: "integration-1",
+      targetRemote: "origin",
+      targetRef: "refs/heads/dev/operator/fleet-run",
+      expectedRemoteSha: "",
+      finalResultSha: "a".repeat(40),
+      finalTreeSha: "b".repeat(40),
+      approvedBy: "operator",
+      approvedAt: new Date().toISOString(),
+    };
+
+    expect(store.putPublicationApproval(approval)).toEqual(approval);
+    expect(store.getPublicationApproval(run.id)).toEqual(approval);
+    expect(() =>
+      store.putPublicationApproval({
+        ...approval,
+        finalResultSha: "c".repeat(40),
+      }),
+    ).toThrow(/cannot be changed/i);
   });
 });
