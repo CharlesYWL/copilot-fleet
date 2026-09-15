@@ -269,6 +269,10 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
   const needsAttention =
     aggregationState === "attention" ||
     (run.state === "blocked" && aggregationPhase !== "idle");
+  const automaticallyRecovering =
+    aggregationState === "in_progress" &&
+    (binding?.aggregationAutomaticRetries ?? 0) > 0 &&
+    Boolean(binding?.aggregationCode);
   const integrated =
     aggregationState === "completed" ||
     integration?.state === "integrated" ||
@@ -430,6 +434,9 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             </Button>
           </div>
         </>
+      )}
+      {automaticallyRecovering && binding?.aggregationSummary && (
+        <p role="status">{binding.aggregationSummary}</p>
       )}
       {aggregationState === "completed" && (
         <p role="status">

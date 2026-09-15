@@ -33,6 +33,7 @@ export class ManagedWorktreeService {
   private static readonly REPOSITORY_OBSERVATION_MAX_AGE_MS = 5 * 60_000;
   private static readonly REPOSITORY_PROBE_WINDOW_MS = 3_000;
   private static readonly MAX_AUTOMATIC_QUIESCE_ATTEMPTS = 3;
+  private static readonly AUTOMATIC_RECOVERY_DELAYS_MS = [1_000, 3_000, 10_000];
   private readonly waiters = new Map<
     string,
     { resolve: (operation: WorktreeOperation) => void; timer: NodeJS.Timeout }
@@ -42,6 +43,7 @@ export class ManagedWorktreeService {
   private readonly placementProbeStartedAt = new Map<string, number>();
   private readonly placementProbeCooldownUntil = new Map<string, number>();
   private readonly placementProbeTimers = new Map<string, NodeJS.Timeout>();
+  private readonly aggregationRecoveryTimers = new Map<string, NodeJS.Timeout>();
   private readonly placementProbeFailures = new Map<string, string>();
   private readonly workspacePlacementStartedAt = new Map<string, number>();
   private lastSweep = 0;
@@ -1186,7 +1188,49 @@ export class ManagedWorktreeService {
       return "Workspace or integration ownership must be reconciled before automation can continue.";
     if (phase === "cleanup")
       return "Safe workspace cleanup could not complete. No files were force-removed.";
-    return "Automatic integration stopped safely because its pinned target or reviewed result could not be revalidated.";
+    return `Automatic integration stopped safely during ${phase} (${code}). Nothing was published; the retained workspace and reviewed result were not modified.`;
+  }
+
+  private canAutomaticallyRecover(run: Run, code: string): boolean {
+    if (!run.policy.automaticManagedIntegrationRecovery) return false;
+    return !/(ambiguous|changed|mismatch|dirty|conflict|unpin|uncertain|reconcil|quarantin|idempotency|forbidden|unsupported|owner|validation|required|not_fleet_owned|retry_exhausted)/i.test(
+      code,
+    );
+  }
+
+  private scheduleAutomaticRecovery(runId: string, code: string, phase: string): boolean {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding || !this.canAutomaticallyRecover(run, code)) return false;
+    const retryIndex = binding.aggregationAutomaticRetries;
+    const delay = ManagedWorktreeService.AUTOMATIC_RECOVERY_DELAYS_MS[retryIndex];
+    if (delay === undefined) return false;
+
+    const existingTimer = this.aggregationRecoveryTimers.get(runId);
+    if (existingTimer) clearTimeout(existingTimer);
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      aggregationState: "in_progress",
+      aggregationPhase: phase as NonNullable<Run["workspaceBinding"]>["aggregationPhase"],
+      aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+      aggregationAutomaticRetries: retryIndex + 1,
+      aggregationCode: code,
+      aggregationSummary: `Plan-approved automatic recovery ${retryIndex + 1}/${ManagedWorktreeService.AUTOMATIC_RECOVERY_DELAYS_MS.length}: revalidating the retained workspace after ${code}. Nothing has been published.`,
+      aggregationUpdatedAt: new Date().toISOString(),
+    });
+    this.publish(runId);
+    const timer = setTimeout(() => {
+      this.aggregationRecoveryTimers.delete(runId);
+      const current = this.store.getRun(runId);
+      if (
+        current?.state === "aggregating" &&
+        current.workspaceBinding?.aggregationState === "in_progress"
+      )
+        this.advanceAggregation(runId);
+    }, delay);
+    timer.unref();
+    this.aggregationRecoveryTimers.set(runId, timer);
+    return true;
   }
 
   private escalateAggregation(
@@ -1815,6 +1859,7 @@ export class ManagedWorktreeService {
       this.publish(runId);
     } catch (error) {
       const code = error instanceof WorktreeConflict ? error.code : "integration_failed";
+      if (this.scheduleAutomaticRecovery(runId, code, phase)) return;
       this.escalateAggregation(runId, code, phase, targetRef);
     }
   }
@@ -2769,6 +2814,8 @@ export class ManagedWorktreeService {
     this.placementProbeStartedAt.clear();
     this.placementProbeCooldownUntil.clear();
     this.placementProbeFailures.clear();
+    for (const timer of this.aggregationRecoveryTimers.values()) clearTimeout(timer);
+    this.aggregationRecoveryTimers.clear();
     this.workspacePlacementStartedAt.clear();
   }
 

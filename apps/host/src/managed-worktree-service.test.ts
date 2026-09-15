@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { FastifyBaseLogger } from "fastify";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   HostToNodeMessageSchema,
   IntegrationPreviewSchema,
@@ -833,6 +833,71 @@ describe("Host managed workspace orchestration", () => {
       aggregationAutomaticRetries: 2,
     });
     expect(kit.store.listNotifications().notifications).toHaveLength(1);
+  });
+
+  it("uses plan-approved recovery for transient Node loss without blocking the task", async () => {
+    vi.useFakeTimers();
+    const kit = fixture();
+    try {
+      const run = await readyManaged(kit);
+      kit.store.setNodeOnline(kit.node.id, false);
+      const beforeRetry = kit.frames.length;
+
+      kit.service.worktrees.advanceAggregation(run.id);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(kit.store.getRun(run.id)).toMatchObject({
+        state: "aggregating",
+        workspaceBinding: {
+          aggregationState: "in_progress",
+          aggregationCode: "node_unavailable",
+          aggregationAttempt: 2,
+          aggregationAutomaticRetries: 1,
+        },
+      });
+      expect(kit.store.listNotifications().notifications).toHaveLength(0);
+
+      kit.store.setNodeOnline(kit.node.id, true);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(kit.frames.length).toBeGreaterThan(beforeRetry);
+      expect(lastRequest(kit.frames).kind).toBe("quiesce");
+    } finally {
+      kit.service.worktrees.shutdown();
+      vi.useRealTimers();
+    }
+  });
+
+  it("exhausts the approved recovery budget before asking for attention", async () => {
+    vi.useFakeTimers();
+    const kit = fixture();
+    try {
+      const run = await readyManaged(kit);
+      kit.store.setNodeOnline(kit.node.id, false);
+
+      kit.service.worktrees.advanceAggregation(run.id);
+      await Promise.resolve();
+      await Promise.resolve();
+      for (const delay of [1_000, 3_000, 10_000]) {
+        await vi.advanceTimersByTimeAsync(delay);
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+
+      expect(kit.store.getRun(run.id)).toMatchObject({
+        state: "blocked",
+        workspaceBinding: {
+          aggregationState: "attention",
+          aggregationCode: "node_unavailable",
+          aggregationAttempt: 4,
+          aggregationAutomaticRetries: 3,
+        },
+      });
+      expect(kit.store.listNotifications().notifications).toHaveLength(1);
+    } finally {
+      kit.service.worktrees.shutdown();
+      vi.useRealTimers();
+    }
   });
 
   it("does not reuse a terminal integration for a newer workspace result", async () => {

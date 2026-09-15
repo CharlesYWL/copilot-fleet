@@ -320,6 +320,16 @@ the final result equals the publication base (`0 files / 0 commits`), publicatio
 marked complete without creating a remote branch or requesting approval, and Fleet
 continues directly to retention and cleanup.
 
+Approving the task plan also authorizes bounded automatic recovery for idempotent
+managed integration operations. Fleet may refresh observations, wait briefly for
+an owning Node, replay a durable operation receipt and rebuild a disposable
+integration workspace from the same immutable reviewed result. Every attempt
+revalidates ownership, generation, pinned refs, reviewed SHA/tree and cleanliness.
+Fleet stops for user attention instead of retrying when evidence changed, ownership
+is uncertain, files are dirty, a merge conflicts or the retry budget is exhausted.
+Publication of a changed result still requires a separate approval bound to the
+exact validated commit and remote state.
+
 The UI presents the publication base, proposed final commit, final `base..result`
 diff, changed-file/commit counts, validation status and review status. **Publish
 branch** records an immutable approval envelope binding the Run, integration,

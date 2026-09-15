@@ -216,6 +216,32 @@ describe("accessible managed workspace controls", () => {
     );
   });
 
+  it("shows plan-approved automatic recovery without asking for another click", async () => {
+    const recovering = RunSchema.parse({
+      ...run,
+      state: "aggregating",
+      workspaceBinding: {
+        ...run.workspaceBinding,
+        aggregationState: "in_progress",
+        aggregationPhase: "quiesce",
+        aggregationCode: "node_unavailable",
+        aggregationAttempt: 2,
+        aggregationAutomaticRetries: 1,
+        aggregationSummary:
+          "Plan-approved automatic recovery 1/3: revalidating the retained workspace after node_unavailable. Nothing has been published.",
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response({ ...initialView(), binding: recovering.workspaceBinding })),
+    );
+
+    show(recovering);
+
+    expect(await screen.findByText(/Plan-approved automatic recovery 1\/3/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry integration" })).toBeNull();
+  });
+
   it("persists the disabled General default with revision and idempotency metadata", async () => {
     let enabled = false;
     const fetchMock = vi.fn((path: string, init?: RequestInit) => {
