@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { SessionEvent } from "@fleet/protocol";
+import { statusCheckEnvelope, wakeEnvelope } from "../../../src/orchestrator/briefing";
+import { reopenPrompt } from "../../../src/orchestrator/review";
 import {
   pendingPermission,
   pendingPermissionRequests,
@@ -172,6 +174,185 @@ describe("toTerminalBlocks", () => {
     // The envelope is kept whole, because the row is a fold and not a summary
     // the reader has to trust without being able to check it.
     expect(blocks[0]?.body).toContain("repeated at length");
+  });
+
+  it("recognises current wake envelopes with stable task and worker IDs", () => {
+    const prompt = wakeEnvelope({
+      runId: "task-1",
+      task: 'Fix the "banner"',
+      phase: "Verify",
+      phaseNumber: 1,
+      phaseCount: 1,
+      isLastPhase: true,
+      wakes: 2,
+      maxWakes: 12,
+      settled: [
+        {
+          title: "Verify the fix",
+          category: "test",
+          state: "succeeded",
+          output: "The regression passed.",
+          sessionId: "worker-1",
+        },
+      ],
+      running: [],
+    });
+    const source = event("system", { text: `User: ${prompt}` });
+
+    expect(toTerminalBlocks([source])).toEqual([
+      {
+        key: source.eventId,
+        kind: "wake",
+        text: "1 worker finished",
+        detail: 'Fix the "banner" · Verify (1/1) · Verify the fix: succeeded · wake 2/12',
+        body: prompt,
+        createdAt: source.createdAt,
+      },
+    ]);
+  });
+
+  it.each([
+    {
+      // sendBackPrompt in apps/host/src/orchestrator/review.ts.
+      prompt: [
+        '<fleet-review task="Fix query acceleration teaching banner 5476738" verdict="changes requested">',
+        "https://github.com/example/repo/pull/42",
+        "The teaching banner still covers the query.",
+        "</fleet-review>",
+        "",
+        "Act on this: dispatch the work it calls for, then end your turn.",
+        "Call fleet_submit_task again once it is addressed.",
+      ].join("\n"),
+      title: "Changes requested",
+      detail: "Fix query acceleration teaching banner 5476738",
+    },
+    {
+      prompt: reopenPrompt('Fix the "banner" in C:\\repo', "The regression is back."),
+      title: "Task reopened",
+      detail: 'Fix the "banner" in C:\\repo',
+    },
+    {
+      // taskBrief in apps/host/src/routes/orchestrators.ts.
+      prompt: [
+        '<fleet-task name="Fix the banner" workspace="C:\\\\repo">',
+        "Keep the query visible.",
+        "</fleet-task>",
+        "",
+        'Plan this with fleet_plan_task using the task name "Fix the banner", then dispatch the',
+        "work for its first phase and end your turn.",
+      ].join("\n"),
+      title: "Task received",
+      detail: "Fix the banner · C:\\repo",
+    },
+    {
+      prompt: statusCheckEnvelope([
+        {
+          name: "Fix the banner",
+          state: "running",
+          phase: "phase 1/1: Verify",
+          openSteps: 1,
+          dispatchedSteps: 1,
+        },
+      ]),
+      title: "Status check",
+      detail: "30m interval",
+    },
+  ])(
+    "folds $title with the full payload, timestamp and key intact",
+    ({ prompt, title, detail }) => {
+      const source = event("system", { text: `User: ${prompt}` });
+
+      expect(toTerminalBlocks([source])).toEqual([
+        {
+          key: source.eventId,
+          kind: "wake",
+          text: title,
+          detail,
+          body: prompt,
+          createdAt: source.createdAt,
+        },
+      ]);
+    },
+  );
+
+  it.each([
+    'Explain <fleet-review task="Fix" verdict="reopened"> and <fleet-wake>.',
+    'Inspect this:\n<fleet-review task="Fix" verdict="reopened">\nnote\n</fleet-review>',
+    '```xml\n<fleet-review task="Fix" verdict="reopened">\nnote\n</fleet-review>\n```',
+    "<fleet-review>\nWhat does this tag do?\n</fleet-review>",
+    '<fleet-review task="Fix" verdict="reopened">\nWhat does this header mean?',
+    '<fleet-review task="Fix" verdict="reopened">\nnote\n</fleet-task>',
+    '<fleet-task name="Fix">\nAn example, not a task brief.\n</fleet-task>',
+    "<fleet-status-check>\nWhat is this?\n</fleet-status-check>",
+    "Fix the banner.\n\n<fleet-workspace>\nUse the bound checkout.\n</fleet-workspace>",
+  ])(
+    "keeps literal tag mentions and incomplete frames as human prompts: %s",
+    (prompt) => {
+      const source = event("system", {
+        text: `User: ${prompt}`,
+        attachments: [{ name: "banner.png", mimeType: "image/png", bytes: 128 }],
+      });
+
+      expect(toTerminalBlocks([source])).toEqual([
+        {
+          key: source.eventId,
+          kind: "user",
+          text: prompt,
+          createdAt: source.createdAt,
+          attachments: source.payload.attachments,
+        },
+      ]);
+    },
+  );
+
+  it("only folds the prompt channel, preserving streaming merges and tool responses", () => {
+    const prompt = reopenPrompt("Fix the banner", "The regression is back.");
+    const first = event("agent_text", { text: "Before " });
+    const thought = event("agent_thought", { text: "Considering " });
+    const tool = event("tool", {
+      toolCallId: "t1",
+      title: "Read review",
+      response: prompt,
+      status: "pending",
+    });
+    const blocks = toTerminalBlocks([
+      first,
+      event("agent_text", { text: "the review." }),
+      event("system", { text: `User: ${prompt}` }),
+      thought,
+      event("agent_thought", { text: "the fix." }),
+      tool,
+      event("tool", { toolCallId: "t1", status: "completed" }),
+      event("agent_text", { text: prompt }),
+      event("system", { text: prompt }),
+    ]);
+
+    expect(blocks.map((block) => block.kind)).toEqual([
+      "agent",
+      "wake",
+      "thought",
+      "tool",
+      "agent",
+      "system",
+    ]);
+    expect(blocks[0]).toMatchObject({
+      key: first.eventId,
+      text: "Before the review.",
+      createdAt: first.createdAt,
+    });
+    expect(blocks[2]).toMatchObject({
+      key: thought.eventId,
+      text: "Considering the fix.",
+      createdAt: thought.createdAt,
+    });
+    expect(blocks[3]).toMatchObject({
+      key: tool.eventId,
+      body: prompt,
+      status: "completed",
+      createdAt: tool.createdAt,
+    });
+    expect(blocks[4]?.text).toBe(prompt);
+    expect(blocks[5]?.text).toBe(prompt);
   });
 
   it("skips a payload that lost its shape instead of printing a blank line", () => {

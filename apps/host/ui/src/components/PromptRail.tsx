@@ -14,6 +14,11 @@ const useStyles = makeStyles({
     // replaces used to appear on approach.
     zIndex: 1,
   },
+  marks: {
+    position: "absolute",
+    inset: 0,
+    overflowY: "clip",
+  },
   mark: {
     position: "absolute",
     right: "10px",
@@ -65,6 +70,7 @@ const useStyles = makeStyles({
 const MARK_HEIGHT = 3;
 const MIN_GAP = 5;
 const MAX_GAP = 18;
+const MAX_MARKS = 40;
 const RESTING_WIDTH = 13;
 const PEAK_WIDTH = 30;
 /** How near the pointer has to be, vertically, before a mark grows at all. */
@@ -82,9 +88,9 @@ type PromptRailProps = {
  * A scrollbar answers "how far down am I", which is the least interesting
  * question about a session that has run for an hour. Each mark here is one
  * thing the operator asked for: the pointer nearing the edge lengthens them,
- * resting on one names it, and clicking jumps back to that turn. The mark for
- * the turn currently on screen stays lit, so the rail doubles as the position
- * indicator the scrollbar used to be.
+ * resting on one names it, and clicking jumps back to that turn. Long sessions
+ * sample prompts evenly, keeping both endpoints. The last sampled prompt at
+ * or before the current turn stays lit as the position indicator.
  */
 export const PromptRail = ({ marks, activeKey, onSelect }: PromptRailProps) => {
   const styles = useStyles();
@@ -105,8 +111,15 @@ export const PromptRail = ({ marks, activeKey, onSelect }: PromptRailProps) => {
     return () => observer.disconnect();
   }, []);
 
-  const { step, top } = railLayout(marks.length, height);
-  const hovered = marks.findIndex((mark) => mark.key === hoveredKey);
+  const indices = railIndices(marks.length, height);
+  const { step, top } = railLayout(indices.length, height);
+  const active = marks.findIndex((mark) => mark.key === activeKey);
+  const activeSlot = indices.reduce(
+    (slot, promptIndex, index) => (promptIndex <= active ? index : slot),
+    -1,
+  );
+  const hovered = indices.findIndex((index) => marks[index]?.key === hoveredKey);
+  const hoveredMark = marks[indices[hovered] ?? -1];
 
   return (
     <div
@@ -120,34 +133,39 @@ export const PromptRail = ({ marks, activeKey, onSelect }: PromptRailProps) => {
         setHoveredKey(undefined);
       }}
     >
-      {marks.map((mark, index) => {
-        const center = top + index * step + MARK_HEIGHT / 2;
-        return (
-          <button
-            key={mark.key}
-            type="button"
-            className={mergeClasses(styles.mark, mark.key === activeKey && styles.active)}
-            style={{
-              top: `${center - MARK_HEIGHT / 2}px`,
-              width: `${markWidth(center, pointerY)}px`,
-            }}
-            aria-label={`Jump to prompt: ${mark.label}`}
-            onPointerEnter={() => setHoveredKey(mark.key)}
-            onFocus={() => setHoveredKey(mark.key)}
-            onBlur={() => setHoveredKey(undefined)}
-            onClick={() => onSelect(mark.key)}
-          />
-        );
-      })}
-      {hovered >= 0 && marks[hovered] ? (
+      <div className={styles.marks}>
+        {indices.map((promptIndex, index) => {
+          const mark = marks[promptIndex];
+          if (!mark) return null;
+          const center = top + index * step + MARK_HEIGHT / 2;
+          return (
+            <button
+              key={mark.key}
+              type="button"
+              className={mergeClasses(styles.mark, index === activeSlot && styles.active)}
+              style={{
+                top: `${center - MARK_HEIGHT / 2}px`,
+                width: `${markWidth(center, pointerY)}px`,
+              }}
+              aria-label={`Jump to prompt: ${mark.label}`}
+              aria-current={index === activeSlot ? "location" : undefined}
+              onPointerEnter={() => setHoveredKey(mark.key)}
+              onFocus={() => setHoveredKey(mark.key)}
+              onBlur={() => setHoveredKey(undefined)}
+              onClick={() => onSelect(mark.key)}
+            />
+          );
+        })}
+      </div>
+      {hoveredMark ? (
         <div
           className={styles.tooltip}
           style={{ top: `${tooltipTop(top + hovered * step, height)}px` }}
           role="tooltip"
         >
-          <span className={styles.tooltipLabel}>{marks[hovered].label}</span>
+          <span className={styles.tooltipLabel}>{hoveredMark.label}</span>
           <span className={styles.tooltipTime}>
-            {promptTimeLabel(marks[hovered].createdAt)}
+            {promptTimeLabel(hoveredMark.createdAt)}
           </span>
         </div>
       ) : null}
@@ -155,20 +173,30 @@ export const PromptRail = ({ marks, activeKey, onSelect }: PromptRailProps) => {
   );
 };
 
-/**
- * Where the marks sit: evenly spaced and centred as a group.
- *
- * The spacing closes up rather than the group running off the edge, because a
- * session with sixty prompts still has to show all sixty — a rail that only
- * draws the first twenty is worse than the scrollbar it replaced.
- */
+/** Sample across the whole history, never just its first or most recent turns. */
+function railIndices(count: number, height: number): number[] {
+  // Relax the inset in very short panes before giving up either endpoint.
+  const inset = Math.min(12, Math.max(0, (height - 2 * MARK_HEIGHT - MIN_GAP) / 2));
+  const capacity =
+    height > 0
+      ? Math.floor((height - 2 * inset + MIN_GAP) / (MARK_HEIGHT + MIN_GAP))
+      : MAX_MARKS;
+  const visible = Math.min(count, MAX_MARKS, capacity);
+  if (visible === 0) return [];
+  if (visible === 1) return [count - 1];
+  return Array.from({ length: visible }, (_, index) =>
+    Math.round((index * (count - 1)) / (visible - 1)),
+  );
+}
+
+/** Keep the sampled marks evenly spaced and centred within the available height. */
 function railLayout(count: number, height: number): { step: number; top: number } {
   const usable = height > 0 ? height - 24 : count * (MARK_HEIGHT + MAX_GAP);
   const spread = count > 1 ? (usable - count * MARK_HEIGHT) / (count - 1) : MAX_GAP;
   const gap = Math.max(MIN_GAP, Math.min(MAX_GAP, spread));
   const step = MARK_HEIGHT + gap;
   const groupHeight = count * MARK_HEIGHT + Math.max(0, count - 1) * gap;
-  return { step, top: Math.max(12, (height - groupHeight) / 2) };
+  return { step, top: height > 0 ? Math.max(0, (height - groupHeight) / 2) : 12 };
 }
 
 /** Dock-style magnification: nearest to the pointer is longest. */
