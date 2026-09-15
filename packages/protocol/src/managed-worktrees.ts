@@ -48,6 +48,7 @@ export const RunWorkspaceBindingSchema = z
     integrationBaseRef: z.string().default(""),
     integrationTargetRef: z.string().default(""),
     integrationRemote: z.string().default(""),
+    integrationUsername: z.string().max(320).default(""),
     allowGitHooks: z.boolean().default(false),
     aggregationState: z
       .enum(["not_started", "in_progress", "attention", "completed"])

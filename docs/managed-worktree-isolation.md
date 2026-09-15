@@ -312,7 +312,9 @@ bounded and Git-safe. A short stable Run suffix is used only when the task name 
 no safe slug or another local Run already owns the generated target. Remote
 publication remains create-only, so an independently existing remote branch is
 reported as a conflict rather than overwritten. An explicit target branch still
-overrides the generated name. Fleet selects an eligible Node, creates a detached
+overrides the generated name. The initiating administrator username is persisted
+on the orchestrator lead and inherited by tasks it opens, so autonomous task
+creation does not fall back to `operator`. Fleet selects an eligible Node, creates a detached
 integration worktree at the exact integration base, imports the immutable reviewed
 result, composes it and validates the exact final tree. It then stops in
 `await_publish_approval`; no shared remote state has changed. If validation proves

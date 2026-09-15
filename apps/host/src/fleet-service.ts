@@ -577,6 +577,7 @@ export class FleetService {
     name?: string;
     runId?: string;
     runRole?: RunRole;
+    operatorUsername?: string;
     /** Work that only reads, which is counted against its own allowance. */
     readOnly?: boolean;
     /** Authoritative orchestration attempt when the step is not attached yet. */
@@ -623,6 +624,7 @@ export class FleetService {
         runId: input.runId ?? "",
         runRole: input.runRole ?? "",
         readOnly: input.readOnly ?? false,
+        operatorUsername: input.operatorUsername ?? "",
       },
     );
     if (binding) {

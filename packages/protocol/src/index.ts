@@ -450,6 +450,8 @@ export const SessionSchema = z.object({
    */
   runId: z.string().default(""),
   runRole: RunRoleSchema.default(""),
+  /** Login identity that owns publication naming for an orchestrator lead. */
+  operatorUsername: z.string().max(320).optional(),
   /**
    * Persisted control intent, separate from the worker's last observed state.
    *
