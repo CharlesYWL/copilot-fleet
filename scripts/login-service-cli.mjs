@@ -24,6 +24,7 @@ import {
   taskName,
   windowsSid,
 } from "./login-service.mjs";
+import { ensureNodeGithubAuth } from "./login-service-runner.mjs";
 
 export const HELP = `Windows login startup (not signed-out boot)
 
@@ -36,13 +37,14 @@ export const HELP = `Windows login startup (not signed-out boot)
 
 Run install once before start; start does not install tasks.
 Install builds and starts by default. Options: --no-build, --no-start, --start-mode login.
-Use your normal Windows account and existing gh/Copilot/Dev Tunnels login.
+Use your normal Windows account. Expired gh login is renewed in this terminal.
+Copilot and Dev Tunnels still require their own login.
 Pass the Host's Connect-card flags to enroll and start in one command.
 Enrollment secrets are used in memory during setup, never saved in the scheduled task.
 Stop manual Host/Node instances first. No passwords, token files, or elevation required.
 Stop disables future logon/recovery runs until start; uninstall preserves all files.
 Host+Node operates sequentially on two independent tasks, not an atomic transaction.
-Only Windows is supported by these commands. Manual commands are unchanged.`;
+Only Windows is supported by these task-management commands.`;
 
 export function logPosition(path) {
   try {
@@ -145,6 +147,16 @@ export async function main(argv = process.argv.slice(2)) {
         ]
       : kinds.map((kind) => [kind, options.action]);
   const sid = windowsSid();
+  if (
+    combined &&
+    options.action === "restart" &&
+    kinds.every((kind) => existsSync(join(loginDirectory(kind), "manifest.json")))
+  ) {
+    await ensureNodeGithubAuth(
+      readManifest(join(loginDirectory("node"), "manifest.json"), sid),
+      { interactive: process.stdin.isTTY === true && process.stdout.isTTY === true },
+    );
+  }
   for (const [kind, action] of steps) {
     await manage(
       {
@@ -218,6 +230,11 @@ async function manage(options, sid, requestedKind) {
       options.kind === "node" &&
       (options.action === "restart" ||
         (options.action === "start" && !invoke("status").active));
+    if (startingNode) {
+      await ensureNodeGithubAuth(old, {
+        interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
+      });
+    }
     const cursor = startingNode ? logPosition(old.logPath) : undefined;
     console.log(JSON.stringify(invoke(options.action)));
     if (cursor) await printNodeConfigUrl(old.logPath, cursor);
@@ -309,6 +326,11 @@ async function manage(options, sid, requestedKind) {
   const verifyContext = async (settings) => {
     if (settings) manifest.environment.FLEET_COPILOT_COMMAND = settings.copilotCommand;
     saveManifest();
+    if (manifest.kind === "node") {
+      await ensureNodeGithubAuth(manifest, {
+        interactive: process.stdin.isTTY === true && process.stdout.isTTY === true,
+      });
+    }
     const proof = invoke("probe", ["-ProbeResult", join(directory, "probe.json")]);
     if (!proof.ok) throw new Error(proof.error || "The logged-in task preflight failed.");
     console.log("Same-user authentication preflight succeeded.");

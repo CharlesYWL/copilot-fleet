@@ -162,6 +162,18 @@ async function loadCheckoutEnvironment(manifest) {
   require("dotenv").config({ path: join(manifest.repositoryPath, ".env"), quiet: true });
 }
 
+export async function ensureNodeGithubAuth(manifest, { interactive = false } = {}) {
+  const env = { ...process.env, ...manifest.environment };
+  const require = createRequire(join(manifest.repositoryPath, "package.json"));
+  require("dotenv").config({
+    path: join(manifest.repositoryPath, ".env"),
+    processEnv: env,
+    quiet: true,
+  });
+  const { ensureGithubAuth } = await importNodeModule(manifest, "github-auth.js");
+  await ensureGithubAuth({ env, interactive });
+}
+
 async function hostPortAvailable() {
   const port = Number(process.env.PORT || 8787);
   if (!Number.isInteger(port) || port < 1 || port > 65535)
@@ -199,13 +211,7 @@ export async function preflight(manifest) {
   assertIdleNode(config.configDirectory());
   const { loadSettings } = await importNodeModule(manifest, "settings.js");
   const settings = await loadSettings();
-  await commandCheck("gh", [
-    "auth",
-    "status",
-    "--active",
-    "--hostname",
-    process.env.GH_HOST || "github.com",
-  ]);
+  await ensureNodeGithubAuth(manifest);
   const { copilotSpawnTarget } = await importNodeModule(manifest, "copilot-launch.js");
   const target = copilotSpawnTarget(
     (manifest.environment?.FLEET_COPILOT_COMMAND ?? settings.copilotCommand) ||

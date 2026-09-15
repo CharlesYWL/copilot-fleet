@@ -3,6 +3,7 @@ import { arch, homedir, platform } from "node:os";
 import { join } from "node:path";
 import WebSocket from "ws";
 import { connectDevTunnel, type DevTunnelConnection } from "./devtunnel.js";
+import { ensureGithubAuth } from "./github-auth.js";
 import {
   HostHandshakeFrameSchema,
   HostToNodeMessageSchema,
@@ -118,6 +119,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   loadEnv({ path: envFilePath(), quiet: true });
   // One lookup path for both sources; the flags are already the last word.
   const env: NodeJS.ProcessEnv = { ...process.env, ...flags.env };
+  if (env.FLEET_MOCK_AGENT !== "1") await ensureGithubAuth({ env });
 
   /**
    * What this process has been saying, kept so the config page can show it.
