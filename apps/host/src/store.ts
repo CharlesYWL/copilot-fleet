@@ -580,6 +580,10 @@ export class FleetStore {
         id TEXT PRIMARY KEY, run_id TEXT NOT NULL, integration_id TEXT NOT NULL,
         data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS publication_approval_revocations (
+        approval_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, revoked_by TEXT NOT NULL,
+        reason TEXT NOT NULL, revoked_at TEXT NOT NULL
+      );
       -- Every ownership question (which sessions does this node own, may this
       -- workspace be deleted) filtered these columns with a full scan.
       CREATE INDEX IF NOT EXISTS idx_sessions_node ON sessions(node_id);
@@ -1424,7 +1428,12 @@ export class FleetStore {
 
   getPublicationApproval(runId: string): PublicationApproval | undefined {
     const row = this.statement(
-      "SELECT data FROM publication_approvals WHERE run_id=? ORDER BY rowid DESC LIMIT 1",
+      `SELECT data FROM publication_approvals
+       WHERE run_id=? AND NOT EXISTS (
+         SELECT 1 FROM publication_approval_revocations revoked
+         WHERE revoked.approval_id=publication_approvals.id
+       )
+       ORDER BY rowid DESC LIMIT 1`,
     ).get(runId);
     return row
       ? PublicationApprovalSchema.parse(JSON.parse(String(row.data)))
@@ -1449,6 +1458,34 @@ export class FleetStore {
       "INSERT INTO publication_approvals (id,run_id,integration_id,data) VALUES (?,?,?,?)",
     ).run(parsed.approvalId, parsed.runId, parsed.integrationId, JSON.stringify(parsed));
     return parsed;
+  }
+
+  revokePublicationApprovals(
+    runId: string,
+    revokedBy: string,
+    reason: string,
+    revokedAt = new Date().toISOString(),
+  ): number {
+    const rows = this.statement(
+      `SELECT id FROM publication_approvals
+       WHERE run_id=? AND NOT EXISTS (
+         SELECT 1 FROM publication_approval_revocations revoked
+         WHERE revoked.approval_id=publication_approvals.id
+       )`,
+    ).all(runId) as Array<{ id: string }>;
+    for (const row of rows) {
+      this.statement(
+        `INSERT OR IGNORE INTO publication_approval_revocations
+         (approval_id,run_id,revoked_by,reason,revoked_at) VALUES (?,?,?,?,?)`,
+      ).run(
+        row.id,
+        runId,
+        revokedBy,
+        reason,
+        revokedAt,
+      );
+    }
+    return rows.length;
   }
 
   listManagedWorktrees(): ManagedWorktree[] {

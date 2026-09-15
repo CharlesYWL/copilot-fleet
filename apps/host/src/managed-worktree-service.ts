@@ -26,6 +26,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "./fleet-service.js";
 import { stopSessions } from "./orchestrator/lifecycle.js";
+import { sendBackPrompt } from "./orchestrator/review.js";
 import { WorkspaceArtifactStore } from "./workspace-artifact-store.js";
 
 export class ManagedWorktreeService {
@@ -1421,10 +1422,9 @@ export class ManagedWorktreeService {
       ? this.store.getAnyManagedWorkspace(attempt.resultWorkspaceId)
       : undefined;
     const integration = tree
-      ? (this.store
+      ? this.store
           .listWorktreeIntegrations(tree.id)
-          .find((entry) => entry.id === attempt?.attemptId) ??
-        this.store.listWorktreeIntegrations(tree.id).at(-1))
+          .find((entry) => entry.id === attempt?.attemptId)
       : undefined;
     if (
       !attempt ||
@@ -1459,6 +1459,93 @@ export class ManagedWorktreeService {
     });
     this.advanceAggregation(runId);
     return approval;
+  }
+
+  requestPublicationChanges(runId: string, feedback: string, requestedBy: string): Run {
+    const note = feedback.trim();
+    if (!note)
+      throw new WorktreeConflict(
+        "publication_feedback_required",
+        "Say what needs changing, so the orchestrator can act on it.",
+      );
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    const attempt = this.store.listIntegrationAttempts(runId).at(-1);
+    const tree = attempt
+      ? this.store.getAnyManagedWorkspace(attempt.resultWorkspaceId)
+      : undefined;
+    const integration = tree
+      ? (this.store
+          .listWorktreeIntegrations(tree.id)
+          .find((entry) => entry.id === attempt?.attemptId) ??
+        this.store.listWorktreeIntegrations(tree.id).at(-1))
+      : undefined;
+    const lead = run?.leadSessionId
+      ? this.store.getSession(run.leadSessionId)
+      : undefined;
+    if (
+      !run ||
+      !binding ||
+      run.state !== "aggregating" ||
+      binding.aggregationPhase !== "await_publish_approval" ||
+      !attempt ||
+      !tree ||
+      !integration ||
+      integration.publishState !== "awaiting_approval" ||
+      integration.validationState !== "passed" ||
+      !["integrated", "no_changes"].includes(integration.state)
+    )
+      throw new WorktreeConflict(
+        "publication_not_ready",
+        "Changes can be requested only for the exact validated result awaiting publication.",
+      );
+    if (!lead || terminalSessionStates.has(lead.state))
+      throw new WorktreeConflict(
+        "orchestrator_unavailable",
+        "The orchestrator conversation has ended, so it cannot act on requested changes.",
+      );
+
+    const now = new Date().toISOString();
+    const reopened = this.store.writeAtomically(() => {
+      this.store.revokePublicationApprovals(runId, requestedBy, note, now);
+      this.store.putWorktreeIntegration({
+        ...integration,
+        validationState: "failed",
+        validationSummary: "Changes requested during final publication review.",
+        publishState: "failed",
+        error: "Publication was rejected pending requested changes.",
+        updatedAt: now,
+      });
+      this.store.putIntegrationAttempt({
+        ...attempt,
+        status: "attention",
+        publishState: "failed",
+        updatedAt: now,
+      });
+      this.store.appendRunNote(
+        runId,
+        run.phaseIndex,
+        `Changes requested during final publication review.\n\n${note}`,
+      );
+      this.store.setRunWorkspaceBinding(runId, {
+        ...binding,
+        aggregationState: "not_started",
+        aggregationPhase: "idle",
+        aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+        aggregationAutomaticRetries: 0,
+        aggregationCode: "",
+        aggregationSummary: "Changes requested; orchestration resumed.",
+        aggregationUpdatedAt: now,
+      });
+      return this.store.updateRun(runId, {
+        state: "running",
+        failureReason: "",
+        pendingPrompt: sendBackPrompt(run.name, note),
+      })!;
+    });
+    this.publish(runId);
+    this.service.tickRun(runId);
+    return reopened;
   }
 
   private isVerifiedNoChangeRun(runId: string, workspaces: ManagedWorktree[]): boolean {

@@ -574,6 +574,8 @@ describe("accessible managed workspace controls", () => {
       if (path === "/api/auth/csrf") return response({ csrfToken: "csrf" });
       if (init?.method === "POST" && path.endsWith("publish-branch"))
         return response({ approval: { approvalId: "approval" } });
+      if (init?.method === "POST" && path.endsWith("request-changes"))
+        return response({ run: { ...awaiting, state: "running" } });
       return response({
         ...initialView(),
         binding: awaiting.workspaceBinding,
@@ -589,6 +591,21 @@ describe("accessible managed workspace controls", () => {
     expect(screen.getByText("Tests passed")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Review changes" }));
     expect(await screen.findByText("+ final integrated content")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "What needs changing?" }), {
+      target: { value: "Add the missing regression test." },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send back for changes" }));
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([path, init]) =>
+          path.endsWith("request-changes") &&
+          init?.method === "POST" &&
+          JSON.parse(String(init.body)).feedback === "Add the missing regression test.",
+      ),
+    ).toBe(true);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Publish branch" }));
     });

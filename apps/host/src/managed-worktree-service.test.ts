@@ -163,6 +163,7 @@ function operationResult(
     noChanges?: boolean;
     verifiedClean?: boolean;
     legacyNoChangesAwaitingPublication?: boolean;
+    publicationRequired?: boolean;
     integrationState?: "integrated" | "no_changes" | "conflicted";
   } = {},
 ): WorktreeOperationResult {
@@ -237,8 +238,8 @@ function operationResult(
           approvedDiffIdentity: preview.diffIdentity,
           state: integrationState,
           preState: "clean",
-          resultSha: preview.targetSha,
-          finalTree: preview.targetSha,
+          resultSha: options.publicationRequired ? "c".repeat(40) : preview.targetSha,
+          finalTree: options.publicationRequired ? "d".repeat(40) : preview.targetSha,
           conflicts: integrationState === "conflicted" ? ["same.txt"] : [],
           validationState: integrationState === "conflicted" ? "not_run" : "passed",
           validationSummary: options.noChanges
@@ -251,6 +252,8 @@ function operationResult(
             (options.noChanges && !options.legacyNoChangesAwaitingPublication)
               ? "published"
               : "awaiting_approval",
+          publicationFileCount: options.publicationRequired ? 1 : 0,
+          publicationCommitCount: options.publicationRequired ? 1 : 0,
           publishedAt:
             request.kind === "publish" ||
             (options.noChanges && !options.legacyNoChangesAwaitingPublication)
@@ -988,6 +991,82 @@ describe("Host managed workspace orchestration", () => {
       operationResult(kit.store, previewRequest),
     );
     await expect.poll(() => lastRequest(kit.frames).kind).toBe("integrate");
+  });
+
+  it("sends a rejected publication review back through the retained orchestrator", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit);
+    const lead = kit.store.createSession(kit.placement, "orchestrate", false, "", {
+      runRole: "lead",
+    });
+    kit.store.transitionSession(lead.id, "starting");
+    kit.store.transitionSession(lead.id, "idle");
+    kit.store.updateRun(run.id, { leadSessionId: lead.id });
+    let seen = kit.frames.length;
+    kit.service.worktrees.advanceAggregation(run.id);
+
+    for (const kind of ["quiesce", "integration_preview", "integrate"] as const) {
+      await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+      const request = lastRequest(kit.frames);
+      expect(request.kind).toBe(kind);
+      seen = kit.frames.length;
+      kit.service.worktrees.handleResult(
+        kit.node.id,
+        operationResult(kit.store, request, {
+          publicationRequired: kind === "integrate",
+        }),
+      );
+    }
+    await expect
+      .poll(() => kit.store.getRun(run.id)?.workspaceBinding?.aggregationPhase)
+      .toBe("await_publish_approval");
+    const integration = kit.store
+      .listWorktreeIntegrations(kit.store.worktreeForRun(run.id)!.id)
+      .at(-1)!;
+    kit.store.putPublicationApproval({
+      approvalId: randomUUID(),
+      runId: run.id,
+      integrationId: integration.id,
+      targetRemote: integration.preview.targetRemote,
+      targetRef: integration.preview.targetRef,
+      expectedRemoteSha: "",
+      finalResultSha: integration.resultSha,
+      finalTreeSha: integration.finalTree,
+      approvedBy: "operator",
+      approvedAt: new Date().toISOString(),
+    });
+
+    const reopened = kit.service.worktrees.requestPublicationChanges(
+      run.id,
+      "Add the missing regression test.",
+      "administrator",
+    );
+
+    expect(reopened).toMatchObject({
+      state: "running",
+      failureReason: "",
+      pendingPrompt: expect.stringContaining("Add the missing regression test."),
+      workspaceBinding: {
+        aggregationState: "not_started",
+        aggregationPhase: "idle",
+        aggregationAttempt: 2,
+      },
+    });
+    expect(kit.store.getPublicationApproval(run.id)).toBeUndefined();
+    expect(
+      kit.store.listWorktreeIntegrations(integration.worktreeId).at(-1),
+    ).toMatchObject({
+      validationState: "failed",
+      publishState: "failed",
+      error: "Publication was rejected pending requested changes.",
+    });
+    expect(kit.store.listIntegrationAttempts(run.id).at(-1)).toMatchObject({
+      status: "attention",
+      publishState: "failed",
+    });
+    expect(kit.store.listRunNotes(run.id).at(-1)?.body).toContain(
+      "Add the missing regression test.",
+    );
   });
 
   it("escalates an automatic merge conflict with one controller notification", async () => {

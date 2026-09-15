@@ -23,6 +23,7 @@ const ActionSchema = z.object({
   commit: z.boolean().optional(),
   deleteBranch: z.boolean().optional(),
   allowGitHooks: z.boolean().optional(),
+  feedback: z.string().max(4_000).optional(),
 });
 
 const actions: Readonly<Record<string, WorktreeOperationRequest["kind"]>> = {
@@ -288,6 +289,16 @@ export const managedWorktreeRoutes: FastifyPluginAsync<{
         request.fleetSession?.administratorId || "operator",
       );
       return { approval, run: store.getRun(id) };
+    }
+    if (action === "request-changes") {
+      if (!store.getRun(id)) return reply.code(404).send({ error: "Task not found" });
+      const input = ActionSchema.parse(request.body);
+      const run = service.worktrees.requestPublicationChanges(
+        id,
+        input.feedback ?? "",
+        request.fleetSession?.administratorId || "operator",
+      );
+      return { run };
     }
     const kind = actions[action];
     if (!kind) return reply.code(404).send({ error: "Unknown worktree action" });

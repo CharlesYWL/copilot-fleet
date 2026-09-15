@@ -10,6 +10,7 @@ import {
   DialogTitle,
   Field,
   Input,
+  Textarea,
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
@@ -88,6 +89,8 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<IntegrationPreview>();
   const [showPublicationReview, setShowPublicationReview] = useState(false);
+  const [requestChangesOpen, setRequestChangesOpen] = useState(false);
+  const [feedback, setFeedback] = useState("");
   const [confirmation, setConfirmation] = useState<Confirmation>();
   const [phrase, setPhrase] = useState("");
   const [reviewed, setReviewed] = useState(false);
@@ -186,6 +189,8 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             ? `${action.replaceAll("-", " ")} completed.`
             : "Awaiting Node acknowledgement. Ownership is not released by timeout.",
       );
+      setRequestChangesOpen(false);
+      setFeedback("");
       close();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Worktree operation failed.");
@@ -405,6 +410,9 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
               onClick={() => void execute("publish-branch")}
             >
               Publish branch
+            </Button>
+            <Button disabled={busy} onClick={() => setRequestChangesOpen(true)}>
+              Request changes
             </Button>
           </div>
           {showPublicationReview && (
@@ -814,6 +822,47 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
           </Button>
         </div>
       </details>
+      <Dialog
+        open={requestChangesOpen}
+        onOpenChange={(_, data) => {
+          if (!busy) setRequestChangesOpen(data.open);
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Request changes</DialogTitle>
+            <DialogContent>
+              <p>
+                The reviewed integration result will be rejected and the orchestrator will
+                resume work in the retained managed workspace. A new integration preview
+                and publication approval will be required.
+              </p>
+              <Field label="What needs changing?">
+                <Textarea
+                  rows={5}
+                  value={feedback}
+                  onChange={(_, data) => setFeedback(data.value)}
+                />
+              </Field>
+              {error && <p role="alert">{error}</p>}
+            </DialogContent>
+            <DialogActions>
+              <Button disabled={busy} onClick={() => setRequestChangesOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={busy || feedback.trim().length === 0}
+                onClick={() =>
+                  void execute("request-changes", { feedback: feedback.trim() })
+                }
+              >
+                Send back for changes
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
       {/* Do not reuse a closing portal's modal/aria-hidden ownership for a new operation. */}
       <Dialog
         key={confirmation?.operationId ?? "closed"}

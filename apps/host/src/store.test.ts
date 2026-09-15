@@ -2361,5 +2361,31 @@ describe("FleetStore runs", () => {
         finalResultSha: "c".repeat(40),
       }),
     ).toThrow(/cannot be changed/i);
+
+    expect(
+      store.revokePublicationApprovals(
+        run.id,
+        "administrator",
+        "Add the missing regression test.",
+      ),
+    ).toBe(1);
+    expect(store.getPublicationApproval(run.id)).toBeUndefined();
+    expect(
+      store.revokePublicationApprovals(
+        run.id,
+        "administrator",
+        "Add the missing regression test.",
+      ),
+    ).toBe(0);
+
+    const replacement = {
+      ...approval,
+      approvalId: "approval-2",
+      integrationId: "integration-2",
+      finalResultSha: "c".repeat(40),
+      finalTreeSha: "d".repeat(40),
+    };
+    expect(store.putPublicationApproval(replacement)).toEqual(replacement);
+    expect(store.getPublicationApproval(run.id)).toEqual(replacement);
   });
 });
