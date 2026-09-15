@@ -2541,14 +2541,27 @@ export class ManagedWorktreeService {
   onNodeReconciled(nodeId: string): void {
     if (!this.store.getNode(nodeId)?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY))
       return;
-    for (const operation of this.store
+    const pendingOperations = this.store
       .listWorktreeOperations()
       .filter(
         (entry) =>
           entry.request.nodeId === nodeId &&
           ["intent", "uncertain"].includes(entry.state),
       )
-      .slice(0, 2))
+      .sort((left, right) => {
+        const leftActive = !terminalRunStates.has(
+          this.store.getRun(left.request.runId)?.state ?? "failed",
+        );
+        const rightActive = !terminalRunStates.has(
+          this.store.getRun(right.request.runId)?.state ?? "failed",
+        );
+        return (
+          Number(rightActive) - Number(leftActive) ||
+          right.createdAt.localeCompare(left.createdAt) ||
+          right.request.operationId.localeCompare(left.request.operationId)
+        );
+      });
+    for (const operation of pendingOperations.slice(0, 2))
       void this.send(operation, 30_000);
     for (const tree of [
       ...this.store.listManagedWorktrees(),

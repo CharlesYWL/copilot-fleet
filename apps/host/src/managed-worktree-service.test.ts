@@ -620,6 +620,30 @@ describe("Host managed workspace orchestration", () => {
     }
   });
 
+  it("prioritizes current tasks when replaying bounded reconnect operations", async () => {
+    const { create, frames, node, service, store } = fixture();
+    const runs = [create(), create(), create()];
+    const pending = runs.map((run) => service.worktrees.prepare(run.id));
+    service.worktrees.shutdown();
+    await Promise.all(pending);
+    store.updateRun(runs[0]!.id, { state: "completed" });
+    frames.splice(0);
+
+    const restarted = new ManagedWorktreeService(service);
+    try {
+      restarted.onNodeReconciled(node.id);
+
+      expect(
+        frames
+          .filter((frame) => frame.type === "managed_worktree")
+          .map((frame) => frame.request.runId)
+          .sort(),
+      ).toEqual([runs[1]!.id, runs[2]!.id].sort());
+    } finally {
+      restarted.shutdown();
+    }
+  });
+
   it("bounds retention to two operations per minute and skips dirty, unknown, unintegrated and unexpired trees", async () => {
     const { create, frames, node, service, store } = fixture();
     const at = Date.now();
