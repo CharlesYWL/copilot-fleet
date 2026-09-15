@@ -36,7 +36,7 @@ describe("StatusIndicator", () => {
     },
   );
 
-  it("animates the icon wrapper, never the label, and supplies a reduced-motion rule", () => {
+  it("animates the icon wrapper, never the label or idle state", () => {
     render(
       <FluentProvider theme={fleetDarkTheme}>
         <StatusIndicator descriptor={statusDescriptor("running")} />
@@ -53,11 +53,48 @@ describe("StatusIndicator", () => {
       getComputedStyle(screen.getByRole("img", { name: /Idle/ }).firstElementChild!)
         .animationName,
     ).toBe("none");
-    const css = [...document.styleSheets]
-      .flatMap((sheet) => [...sheet.cssRules])
-      .map((rule) => rule.cssText)
-      .join("\n");
-    expect(css).toContain("prefers-reduced-motion: reduce");
-    expect(css).toContain("animation-name: none");
+  });
+
+  it.each(["running", "stopping"] as const)(
+    "keeps %s visibly rotating more slowly under reduced motion",
+    (state) => {
+      const descriptor = statusDescriptor(state);
+      render(
+        <FluentProvider theme={fleetDarkTheme}>
+          <StatusIndicator descriptor={descriptor} />
+        </FluentProvider>,
+      );
+      const icon = screen.getByRole("img", { name: descriptor.label }).firstElementChild!;
+      const rules = reducedMotionRules(icon);
+      expect(rules.some((rule) => rule.style.animationName === "none")).toBe(false);
+      expect(rules.some((rule) => rule.style.animationDuration === "3s")).toBe(true);
+    },
+  );
+
+  it("still disables decorative attention pulses under reduced motion", () => {
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <StatusIndicator descriptor={statusDescriptor("waiting-for-permission")} />
+      </FluentProvider>,
+    );
+    const icon = screen.getByRole("img", { name: "Waiting for you" }).firstElementChild!;
+    expect(
+      reducedMotionRules(icon).some((rule) => rule.style.animationName === "none"),
+    ).toBe(true);
   });
 });
+
+function reducedMotionRules(element: Element): CSSStyleRule[] {
+  return [...document.styleSheets]
+    .flatMap((sheet) => [...sheet.cssRules])
+    .filter(
+      (rule): rule is CSSMediaRule =>
+        rule instanceof CSSMediaRule &&
+        rule.conditionText.includes("prefers-reduced-motion: reduce"),
+    )
+    .flatMap((rule) => [...rule.cssRules])
+    .filter(
+      (rule): rule is CSSStyleRule =>
+        rule instanceof CSSStyleRule && element.matches(rule.selectorText),
+    );
+}

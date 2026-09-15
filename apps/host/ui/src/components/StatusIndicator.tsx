@@ -32,7 +32,8 @@ const useStyles = makeStyles({
     animationDuration: "1s",
     animationTimingFunction: "linear",
     animationIterationCount: "infinite",
-    "@media (prefers-reduced-motion: reduce)": { animationName: "none" },
+    // Keep in-flight work visibly active when Windows disables UI animations.
+    "@media (prefers-reduced-motion: reduce)": { animationDuration: "3s" },
   },
   pulse: {
     animationName: {

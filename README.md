@@ -33,9 +33,10 @@ work: a blue spinning ring means running, a green circled check means done/succe
 a gray pause-circle means idle and ready for follow-up, and a red disconnected plug
 means offline. A red error-circle means failed; amber marks permission or recovery
 attention. Queued work uses a clock, stopped/cancelled work a stop square, and skipped
-work a forward arrow. Hover labels and accessible names identify every icon, and
-animations respect reduced-motion preferences. A completed step keeps its result
-even if its worker later becomes idle or offline.
+work a forward arrow. Hover labels and accessible names identify every icon.
+With reduced motion enabled, running/stopping rings rotate more slowly rather than
+appearing inactive; decorative attention pulses are disabled. A completed step keeps
+its result even if its worker later becomes idle or offline.
 
 **Settings → Nodes** keeps each machine on one row, with compact blue CPU,
 green RAM, and purple disk meters in the **Health** column. Hover or focus a
