@@ -21,6 +21,53 @@ afterEach(() => {
 });
 
 describe("GeneralPanel", () => {
+  it("defaults to long context and saves both context tiers without changing other defaults", async () => {
+    let defaults = {
+      yolo: false,
+      contextTier: "long_context",
+      autoResume: true,
+      notificationLifecycleEnabled: true,
+      model: "",
+      reasoningEffort: "",
+    };
+    const fetchMock = vi.fn(async (path: string | URL | Request, init?: RequestInit) => {
+      if (String(path) === "/api/auth/csrf") return response({ csrfToken: "proof" });
+      if (init?.method === "POST") {
+        defaults = { ...defaults, ...JSON.parse(String(init.body)) };
+      }
+      return response(defaults);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel sessions={[]} />
+      </FluentProvider>,
+    );
+    const toggle = await screen.findByRole<HTMLInputElement>("switch", {
+      name: "Long context by default",
+    });
+    expect(toggle.checked).toBe(true);
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.checked).toBe(false));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ contextTier: "default" }),
+      }),
+    );
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle.checked).toBe(true));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ contextTier: "long_context" }),
+      }),
+    );
+    expect(defaults.yolo).toBe(false);
+  });
+
   it("shows the fleet-wide Agency toggle and saves changes in both directions", async () => {
     let defaults = {
       yolo: false,

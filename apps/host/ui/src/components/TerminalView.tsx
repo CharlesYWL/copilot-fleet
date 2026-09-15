@@ -93,6 +93,7 @@ import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
 import { PromptRail } from "./PromptRail";
 import { SessionConfigBar } from "./SessionConfigBar";
+import { SessionUsageBar } from "./SessionUsageBar";
 import { SessionAgentBadge } from "./SessionAgentBadge";
 import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SlashMenu } from "./SlashMenu";
@@ -700,15 +701,23 @@ export const TerminalView = ({
    * Counted from events rather than blocks because a block can absorb many
    * events into one line, and "3 new lines" should mean three things arrived.
    */
+  let latestActivityEventId: string | undefined;
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event && event.type !== "usage") {
+      latestActivityEventId = event.eventId;
+      break;
+    }
+  }
   useEffect(() => {
-    if (events.length === 0) return;
+    if (!latestActivityEventId) return;
     setLastEventAt(Date.now());
     if (pinnedRef.current) {
       setUnseen(0);
       return;
     }
     setUnseen((count) => count + 1);
-  }, [events.length]);
+  }, [latestActivityEventId]);
 
   // A clock, only while it could change the answer: a silent running session.
   useEffect(() => {
@@ -1219,6 +1228,17 @@ export const TerminalView = ({
             onChange={(configId, value) => onConfigChange?.(configId, value)}
           />
           <span className={styles.toolbarSpacer} />
+          <SessionUsageBar
+            usage={session.usage}
+            canCompact={canPrompt}
+            compactAvailable={session.commands.some(
+              (command) => command.name === "compact",
+            )}
+            onCompact={() => {
+              onPrompt("/compact");
+              jumpToLatest();
+            }}
+          />
           <Button
             className={styles.send}
             appearance="primary"

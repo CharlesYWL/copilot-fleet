@@ -2,6 +2,8 @@ import type { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import {
   CreateSessionSchema,
+  CONTEXT_TIER_CONFIG_ID,
+  ContextTierSchema,
   MAX_ATTACHMENTS_PER_PROMPT,
   MAX_ATTACHMENT_BYTES,
   PermissionResponseSchema,
@@ -212,7 +214,11 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
        * Never overwrites a name: their own beats ours, and the second message
        * of a conversation is not what it is about.
        */
-      if (session.runRole === "lead" && isUnnamed(session.name)) {
+      if (
+        session.runRole === "lead" &&
+        isUnnamed(session.name) &&
+        !input.prompt.trimStart().startsWith("/")
+      ) {
         const title = conversationTitle(input.prompt);
         if (title) {
           const named = store.renameSession(id, title);
@@ -244,6 +250,19 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     if (!session) return reply.code(404).send({ error: "Session not found" });
     if (terminalSessionStates.has(session.state)) {
       return reply.code(409).send({ error: "Session has ended" });
+    }
+    if (input.configId === CONTEXT_TIER_CONFIG_ID) {
+      ContextTierSchema.parse(input.value);
+      if (session.state !== "idle" || session.stopRequested) {
+        return reply.code(409).send({
+          error: "Wait for the session to be idle before changing its context window",
+        });
+      }
+      if (!session.configOptions.some((option) => option.id === CONTEXT_TIER_CONFIG_ID)) {
+        return reply.code(409).send({
+          error: "This node does not support changing the session context window",
+        });
+      }
     }
     const node = store.getNode(session.nodeId);
     const unsupported = node && configUnsupportedReason(node);

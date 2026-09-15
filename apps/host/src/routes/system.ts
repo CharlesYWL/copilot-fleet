@@ -252,6 +252,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     managedWorktreesEnabled: store.getManagedWorktreesEnabled(),
     managedWorktreePolicy: store.getManagedWorktreePolicy(),
     yolo: store.getDefaultYolo(),
+    contextTier: store.getDefaultContextTier(),
     agencyMode: store.getAgencyMode(),
     agencyModeAvailable: auth.agencyAvailableFor(request.fleetSession),
     autoResume: store.getAutoResume(),
@@ -293,6 +294,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     // Each field is optional so a client that knows about one setting cannot
     // reset the others merely by not mentioning them.
     if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
+    if (input.contextTier !== undefined) store.setDefaultContextTier(input.contextTier);
     if (input.managedWorktreesEnabled !== undefined)
       store.setManagedWorktreesEnabled(input.managedWorktreesEnabled);
     if (input.managedWorktreePolicy !== undefined)
@@ -313,6 +315,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       managedWorktreesEnabled: store.getManagedWorktreesEnabled(),
       managedWorktreePolicy: store.getManagedWorktreePolicy(),
       yolo: store.getDefaultYolo(),
+      contextTier: store.getDefaultContextTier(),
       agencyMode: store.getAgencyMode(),
       agencyModeAvailable,
       autoResume: store.getAutoResume(),

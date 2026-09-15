@@ -1,9 +1,30 @@
 import type * as acp from "@agentclientprotocol/sdk";
 import type {
+  ContextTier,
   SessionCommand,
   SessionConfigChoice,
   SessionConfigOption,
 } from "@fleet/protocol";
+import { CONTEXT_TIER_CONFIG_ID } from "@fleet/protocol";
+
+export function contextConfigOption(tier: ContextTier): SessionConfigOption {
+  return {
+    id: CONTEXT_TIER_CONFIG_ID,
+    name: "Context window",
+    description:
+      "Requests a context tier and restarts the session, keeping conversation history. Some Copilot ACP versions ignore this request; check the reported window in session usage.",
+    category: "context",
+    currentValue: tier,
+    choices: [
+      { value: "default", name: "Default", description: "Standard context window" },
+      {
+        value: "long_context",
+        name: "Long",
+        description: "Extended context window; higher cost",
+      },
+    ],
+  };
+}
 
 /**
  * ACP's view of commands and pickers, flattened into the fleet's own shape.

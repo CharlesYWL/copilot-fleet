@@ -310,6 +310,31 @@ export const SessionConfigOptionSchema = z.object({
 });
 export type SessionConfigOption = z.infer<typeof SessionConfigOptionSchema>;
 
+export const ContextTierSchema = z.enum(["default", "long_context"]);
+export type ContextTier = z.infer<typeof ContextTierSchema>;
+export const CONTEXT_TIER_CONFIG_ID = "fleet_context_tier";
+
+export const ContextUsageSchema = z.object({
+  model: z.string().min(1),
+  usedTokens: z.number().nonnegative(),
+  tokenLimit: z.number().positive(),
+  percentage: z.number().nonnegative(),
+  updatedAt: z.string().datetime(),
+  estimated: z.boolean(),
+});
+export type ContextUsage = z.infer<typeof ContextUsageSchema>;
+
+/** Latest session-local readings; unavailable metrics stay absent, not zero. */
+export const SessionUsageSchema = z.object({
+  aiCredits: z.number().nonnegative().nullable().optional(),
+  /** ACP's pre-response input usage and prompt budget, not the full model window. */
+  contextTokens: z.number().int().nonnegative().nullable().optional(),
+  contextWindow: z.number().int().positive().nullable().optional(),
+  /** A fresh /context snapshot. Null invalidates an earlier model/tier's snapshot. */
+  context: ContextUsageSchema.nullable().optional(),
+});
+export type SessionUsage = z.infer<typeof SessionUsageSchema>;
+
 /**
  * A file riding along with a prompt.
  *
@@ -412,6 +437,7 @@ export const SessionSchema = z.object({
    */
   commands: z.array(SessionCommandSchema).default([]),
   configOptions: z.array(SessionConfigOptionSchema).default([]),
+  usage: SessionUsageSchema.optional(),
   /**
    * The run that owns this session, and the seat it occupies in it.
    *
@@ -478,6 +504,7 @@ export const SessionEventSchema = z.object({
     "agent_session",
     "commands",
     "config",
+    "usage",
   ]),
   payload: z.record(z.string(), z.unknown()),
   createdAt: z.string().datetime(),
@@ -596,6 +623,7 @@ export const sessionEventPayloadSchemas = {
   config: z.object({
     options: listOfOptional(SessionConfigOptionSchema),
   }),
+  usage: SessionUsageSchema,
 } as const;
 
 export type SessionEventPayload<T extends SessionEventType> = z.infer<
@@ -685,6 +713,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     yolo: z.boolean().default(false),
     /** Prefer Agency on this Node; absent on older Hosts means standard Copilot. */
     agencyMode: z.boolean().optional(),
+    contextTier: ContextTierSchema.optional(),
     /**
      * Tools this session may call back into the Host with.
      *
@@ -735,6 +764,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
     lastActivityAt: z.string().datetime().optional(),
     yolo: z.boolean().default(false),
     agencyMode: z.boolean().optional(),
+    contextTier: ContextTierSchema.optional(),
     /**
      * Re-supplied on resume, because `session/load` takes its own `mcpServers`
      * and a session reloaded without them comes back with no tools — an
@@ -2247,6 +2277,7 @@ export const UpdateDefaultsSchema = z.object({
   managedWorktreesEnabled: z.boolean().optional(),
   managedWorktreePolicy: ManagedWorktreePolicySchema.optional(),
   yolo: z.boolean().optional(),
+  contextTier: ContextTierSchema.optional(),
   /** Fleet-wide launcher preference, applied to every new or resumed session. */
   agencyMode: z.boolean().optional(),
   /** Re-attach a session its Node lost, without waiting to be asked. */
@@ -2528,6 +2559,7 @@ const hostBackupDataShape = {
       ManagedWorktreePolicySchema.parse({}),
     ).optional(),
     yolo: z.boolean(),
+    contextTier: ContextTierSchema.optional(),
     agencyMode: z.boolean().default(false),
     autoResume: z.boolean(),
     notificationLifecycleEnabled: z.boolean().default(true),

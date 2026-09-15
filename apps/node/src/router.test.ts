@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import type { NodeCommand, SessionEvent } from "@fleet/protocol";
+import {
+  CONTEXT_TIER_CONFIG_ID,
+  type NodeCommand,
+  type SessionEvent,
+} from "@fleet/protocol";
+import { contextConfigOption } from "./acp-config.js";
 import { CommandRouter } from "./router.js";
 import {
   MockAgentFactory,
@@ -40,6 +45,159 @@ const START_DEFAULTS: Pick<
 > = { yolo: false, mcpServers: [], agent: "", readOnly: false, config: [] };
 
 describe("CommandRouter", () => {
+  it.each([false, true])(
+    "restarts context in place with saved history and pickers (orchestrator: %s)",
+    async (orchestrator) => {
+      const events: SessionEvent[] = [];
+      const agents: SessionAgent[] = [];
+      const start = vi.fn<AgentFactory["start"]>(
+        async (sessionId, _cwd, sink, options = {}) => {
+          let sequence = options.sequenceOffset ?? 0;
+          for (const [type, payload] of [
+            [
+              "agent_session",
+              { agentSessionId: options.resumeAgentSessionId ?? "saved-id" },
+            ],
+            [
+              "config",
+              { options: [contextConfigOption(options.contextTier ?? "long_context")] },
+            ],
+          ] as const) {
+            sink({
+              eventId: `start-${agents.length}-${type}`,
+              sessionId,
+              sequence: ++sequence,
+              type,
+              payload,
+              createdAt: new Date().toISOString(),
+            });
+          }
+          const agent = {
+            ...inertAgent(sessionId, sink),
+            prompt: vi.fn(async () => {}),
+            stop: vi.fn(async () => {}),
+          };
+          agents.push(agent);
+          return agent;
+        },
+      );
+      const router = new CommandRouter(
+        { start },
+        1,
+        (event) => events.push(event),
+        async (path) => path,
+        () => "http://localhost",
+      );
+      const mcpServers = orchestrator
+        ? [{ name: "fleet", url: "http://localhost/mcp", headers: [] }]
+        : [];
+      await router.route({
+        ...START_DEFAULTS,
+        type: "resume_session",
+        commandId: "start",
+        sessionId: "s1",
+        localPath: "C:\\repo",
+        agentSessionId: "saved-id",
+        additionalDirectories: ["C:\\shared"],
+        sequenceOffset: 42,
+        yolo: true,
+        agencyMode: true,
+        contextTier: "long_context",
+        contextOverflowRecoveryPrompt: "Original assignment",
+        mcpServers,
+        config: [
+          { id: "model", value: "selected-model" },
+          { id: "reasoning_effort", value: "high" },
+        ],
+      });
+      const result = await router.route({
+        type: "set_config_option",
+        commandId: "context",
+        sessionId: "s1",
+        configId: CONTEXT_TIER_CONFIG_ID,
+        value: "default",
+      });
+      expect(result.ok).toBe(true);
+      expect(start).toHaveBeenCalledTimes(2);
+      expect(start.mock.calls[1]?.[3]).toMatchObject({
+        contextTier: "default",
+        contextOverflowRecoveryPrompt: "Original assignment",
+        resumeAgentSessionId: "saved-id",
+        additionalDirectories: ["C:\\shared"],
+        sequenceOffset: 44,
+        yolo: true,
+        agencyMode: true,
+        mcpServers,
+        config: expect.arrayContaining([
+          { id: "model", value: "selected-model" },
+          { id: "reasoning_effort", value: "high" },
+        ]),
+      });
+      expect(agents[0]?.stop).toHaveBeenCalledWith(false);
+      expect(
+        agents.every((agent) => vi.mocked(agent.prompt).mock.calls.length === 0),
+      ).toBe(true);
+      expect(router.activeSessionIds).toEqual(["s1"]);
+      expect(events.map((event) => event.sequence)).toEqual([43, 44, 45, 46]);
+      if (orchestrator) {
+        await router.refreshMcpSessions();
+        expect(start.mock.calls[2]?.[3]?.contextTier).toBe("default");
+        expect(start.mock.calls[2]?.[3]?.contextOverflowRecoveryPrompt).toBe(
+          "Original assignment",
+        );
+      }
+      await router.stopAll();
+    },
+  );
+
+  it("refuses a context change mid-turn without interrupting or poisoning the session", async () => {
+    const events: SessionEvent[] = [];
+    const router = new CommandRouter(
+      new MockAgentFactory(),
+      1,
+      (event) => events.push(event),
+      async (path) => path,
+    );
+    const start = vi.spyOn(MockAgentFactory.prototype, "start");
+    await router.route({
+      ...START_DEFAULTS,
+      type: "start_session",
+      commandId: "start",
+      sessionId: "s1",
+      localPath: "C:\\repo",
+      prompt: "work",
+    });
+    expect(
+      await router.route({
+        type: "set_config_option",
+        commandId: "busy",
+        sessionId: "s1",
+        configId: CONTEXT_TIER_CONFIG_ID,
+        value: "default",
+      }),
+    ).toMatchObject({ ok: false, fatal: false });
+    await waitFor(() => hasSettled(events, "s1"));
+    expect(
+      await router.route({
+        type: "set_config_option",
+        commandId: "idle",
+        sessionId: "s1",
+        configId: CONTEXT_TIER_CONFIG_ID,
+        value: "default",
+      }),
+    ).toMatchObject({ ok: true });
+    expect(start.mock.calls.at(-1)?.[3]?.contextOverflowRecoveryPrompt).toBe("work");
+    expect(
+      events.filter((event) => event.type === "config").at(-1)?.payload.options,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: CONTEXT_TIER_CONFIG_ID, currentValue: "default" }),
+      ]),
+    );
+    await router.stopAll();
+    start.mockRestore();
+  });
+
   it.each([false, true])(
     "settles every legacy stop without inventing a terminal event (terminal before rejection: %s)",
     async (terminalBeforeRejection) => {

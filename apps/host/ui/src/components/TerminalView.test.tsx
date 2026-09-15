@@ -50,6 +50,7 @@ const show = (
   events: SessionEvent[] = [],
   notify = vi.fn(),
   onDraftChange: ComponentProps<typeof TerminalView>["onDraftChange"] = vi.fn(),
+  onPrompt: ComponentProps<typeof TerminalView>["onPrompt"] = vi.fn(),
 ) =>
   render(
     <FluentProvider theme={fleetDarkTheme}>
@@ -57,7 +58,7 @@ const show = (
         <TerminalView
           session={session(overrides)}
           events={events}
-          onPrompt={vi.fn()}
+          onPrompt={onPrompt}
           onCancel={vi.fn()}
           onStop={vi.fn()}
           onResume={vi.fn()}
@@ -85,6 +86,83 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
+  it("compacts via /compact without sending or clearing a pending draft", () => {
+    const onPrompt = vi.fn();
+    const onDraftChange = vi.fn();
+    show(
+      {
+        runRole: "lead",
+        commands: [{ name: "compact", description: "Summarize history" }],
+        usage: {
+          aiCredits: 27.4014,
+          contextTokens: 250000,
+          contextWindow: 272000,
+          context: {
+            model: "GPT-6 Astra",
+            usedTokens: 125200,
+            tokenLimit: 400000,
+            percentage: 31,
+            updatedAt: "2026-09-15T07:00:00.000Z",
+            estimated: true,
+          },
+        },
+      },
+      {
+        prompt: "unfinished message",
+        attachments: [
+          {
+            id: "draft-file",
+            name: "draft.txt",
+            mimeType: "text/plain",
+            data: "ZmlsZQ==",
+          },
+        ],
+      },
+      [],
+      vi.fn(),
+      onDraftChange,
+      onPrompt,
+    );
+    expect(screen.queryByText("AI credits")).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Session context usage: approximately 31% used",
+      }),
+    );
+    expect(screen.getByText("27.4")).toBeTruthy();
+    expect(screen.getByText("~125,200 / ~400,000 tokens")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Compact context" }));
+    expect(onPrompt).toHaveBeenCalledExactlyOnceWith("/compact");
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect(screen.getByLabelText<HTMLTextAreaElement>("Follow-up prompt").value).toBe(
+      "unfinished message",
+    );
+    expect(screen.getByText("draft.txt")).toBeTruthy();
+  });
+
+  it.each([
+    { state: "running" as const, commands: [{ name: "compact", description: "" }] },
+    { state: "offline" as const, commands: [{ name: "compact", description: "" }] },
+    { state: "idle" as const, commands: [] },
+    {
+      state: "idle" as const,
+      stopRequested: true,
+      commands: [{ name: "compact", description: "" }],
+    },
+  ])("does not compact busy, stopping, or unsupported sessions: %j", (values) => {
+    const onPrompt = vi.fn();
+    show(values, EMPTY_DRAFT, [], vi.fn(), vi.fn(), onPrompt);
+    fireEvent.click(screen.getByRole("button", { name: "Session usage unavailable" }));
+    const button = screen.getByRole<HTMLButtonElement>("button", {
+      name: "Compact context",
+    });
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(onPrompt).not.toHaveBeenCalled();
+    expect(screen.getByText("\u2014")).toBeTruthy();
+    expect(screen.getByText("Usage unavailable")).toBeTruthy();
+  });
+
   it("adds attachment read errors to notifications and keeps the inline error", async () => {
     const notify = vi.fn();
     const { container } = show({}, EMPTY_DRAFT, [], notify, (update) => {
@@ -107,7 +185,7 @@ describe("TerminalView composer", () => {
     // composer is one object, so a picker outside the form is the regression.
     const { container } = show();
     const form = container.querySelector("form");
-    const trigger = screen.getByRole("button", { name: "Model" });
+    const trigger = screen.getByRole("button", { name: "Model settings" });
     expect(form?.contains(trigger)).toBe(true);
     expect(form?.contains(screen.getByLabelText("Follow-up prompt"))).toBe(true);
   });
@@ -158,9 +236,9 @@ describe("TerminalView composer", () => {
     // Switching model is a setting, not a turn, so an agent mid-run is exactly
     // when an operator reaches for it.
     show({ state: "running" });
-    expect(screen.getByRole("button", { name: "Model" }).hasAttribute("disabled")).toBe(
-      false,
-    );
+    expect(
+      screen.getByRole("button", { name: "Model settings" }).hasAttribute("disabled"),
+    ).toBe(false);
   });
 
   it("shows the draft it was handed rather than an empty box", () => {
@@ -183,6 +261,23 @@ describe("TerminalView composer", () => {
     const height = Number.parseInt(box.style.height, 10);
     expect(Number.isNaN(height)).toBe(false);
     expect(height).toBeLessThanOrEqual(220);
+  });
+
+  it("puts only the usage ring after the spacer and directly left of Send in the toolbar", () => {
+    const { container } = show();
+    const send = screen.getByRole("button", { name: "Send" });
+    const ring = screen.getByRole("button", { name: "Session usage unavailable" });
+    const attach = screen.getByRole("button", { name: "Attach files" });
+    expect(ring.nextElementSibling).toBe(send);
+    expect(ring.parentElement).toBe(attach.parentElement);
+    expect(getComputedStyle(ring.previousElementSibling!).flexGrow).toBe("1");
+    expect(container.querySelector("form")?.lastElementChild).toBe(send.parentElement);
+    expect(screen.queryByText("AI credits")).toBeNull();
+    expect(screen.queryByText(/tokens/)).toBeNull();
+    expect(getComputedStyle(send.parentElement!).flexWrap).not.toBe("wrap");
+    expect(getComputedStyle(ring).flexShrink).toBe("0");
+    expect(getComputedStyle(ring).width).toBe("28px");
+    expect(ring.textContent).not.toContain("credits");
   });
 });
 
@@ -245,6 +340,11 @@ describe("TerminalView transcript", () => {
     expect(screen.getByRole("button", { name: "Jump to latest" }).textContent).toContain(
       "1 new",
     );
+    update([...more, streamEvent("usage", { aiCredits: 1 })]);
+    expect(screen.getByRole("button", { name: "Jump to latest" }).textContent).toContain(
+      "1 new",
+    );
+    expect(transcript.scrollTop).toBe(100);
     fireEvent.click(screen.getByRole("button", { name: "Jump to latest" }));
     height = 1400;
     update([...more, streamEvent("agent_text", { text: "Latest output" })]);

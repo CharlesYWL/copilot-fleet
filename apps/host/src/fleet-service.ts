@@ -3,6 +3,8 @@ import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import {
   BrowserMessageSchema,
+  CONTEXT_TIER_CONFIG_ID,
+  ContextTierSchema,
   HOST_URL_SYNC_CAPABILITY,
   HostToNodeMessageSchema,
   MANAGED_WORKTREES_CAPABILITY,
@@ -974,7 +976,15 @@ export class FleetService {
               }
             : {}),
           ...(request.type === "start_session" || request.type === "resume_session"
-            ? { agencyMode: this.store.getAgencyMode() }
+            ? {
+                agencyMode: this.store.getAgencyMode(),
+                contextTier:
+                  ContextTierSchema.safeParse(
+                    session.configOptions.find(
+                      (option) => option.id === CONTEXT_TIER_CONFIG_ID,
+                    )?.currentValue,
+                  ).data ?? this.store.getDefaultContextTier(),
+              }
             : {}),
           commandId,
         } as NodeCommand;

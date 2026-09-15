@@ -7,6 +7,7 @@ import {
   canTransition,
   CHATS_WORKSPACE_ID,
   CHATS_WORKSPACE_NAME,
+  type SessionEvent,
   type CreateNotification,
 } from "@fleet/protocol";
 import {
@@ -68,6 +69,63 @@ function notificationInput(
 }
 
 describe("FleetStore", () => {
+  it("persists cumulative session usage and context defaults through backup without adding replayed credits", () => {
+    const { store, placement } = setup();
+    const session = store.createSession(placement, "usage");
+    const emit = (sequence: number, payload: SessionEvent["payload"]) =>
+      store.appendEvent({
+        eventId: `usage-${sequence}`,
+        sessionId: session.id,
+        sequence,
+        type: "usage",
+        payload,
+        createdAt: new Date().toISOString(),
+      });
+    const lastActivityAt = store.getSession(session.id)?.lastActivityAt;
+    const context = {
+      model: "gpt-5.5",
+      usedTokens: 10000,
+      tokenLimit: 400000,
+      percentage: 3,
+      updatedAt: new Date().toISOString(),
+      estimated: true,
+    };
+    emit(1, { aiCredits: 27.4014, contextTokens: 100000, contextWindow: 200000 });
+    emit(3, { aiCredits: 29 });
+    emit(2, { aiCredits: 28, contextTokens: 110000 });
+    emit(4, { contextTokens: 10000, contextWindow: 200000, context });
+    emit(5, { aiCredits: -1 });
+    expect(store.getSession(session.id)?.usage).toEqual({
+      aiCredits: 29,
+      contextTokens: 10000,
+      contextWindow: 200000,
+      context,
+    });
+    expect(store.getSession(session.id)?.lastActivityAt).toBe(lastActivityAt);
+    store.setDefaultContextTier("default");
+    const backup = store.exportHostBackup({ enrollmentToken: "" });
+    const restored = new FleetStore(":memory:");
+    stores.push(restored);
+    restored.replaceHostBackup(backup);
+    expect(restored.getDefaultContextTier()).toBe("default");
+    expect(restored.getSession(session.id)?.usage).toEqual(
+      store.getSession(session.id)?.usage,
+    );
+    expect(emit(4, { contextTokens: 10000, contextWindow: 200000, context }).stored).toBe(
+      false,
+    );
+    emit(6, { context: null });
+    expect(store.getSession(session.id)?.usage?.context).toBeNull();
+    expect(store.getSession(session.id)?.usage?.aiCredits).toBe(29);
+    emit(7, { aiCredits: null, contextTokens: null, contextWindow: null, context: null });
+    expect(store.getSession(session.id)?.usage).toEqual({
+      aiCredits: null,
+      contextTokens: null,
+      contextWindow: null,
+      context: null,
+    });
+  });
+
   it("learns new capabilities when an upgraded node reconnects", () => {
     // Registration happens once, but agents are upgraded in place; without this
     // the Host keeps rejecting a feature the machine has already gained.

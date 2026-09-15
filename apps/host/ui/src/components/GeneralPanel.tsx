@@ -21,6 +21,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import type {
+  ContextTier,
   ManagedWorktreePolicy,
   SessionConfigChoice,
   SessionConfigOption,
@@ -99,6 +100,7 @@ type Defaults = {
   managedWorktreesRevision: number;
   managedWorktreePolicy: ManagedWorktreePolicy;
   yolo: boolean;
+  contextTier: ContextTier;
   agencyMode: boolean;
   agencyModeAvailable: boolean;
   autoResume: boolean;
@@ -243,6 +245,7 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
   const {
     managedWorktreesEnabled = false,
     yolo,
+    contextTier = "long_context",
     agencyMode = false,
     agencyModeAvailable = false,
     autoResume,
@@ -329,6 +332,34 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
           </div>
         </section>
       )}
+
+      <section className={styles.card} aria-label="Default context window">
+        <div className={styles.row}>
+          <div>
+            <Text weight="semibold">Long context by default</Text>
+            <br />
+            <Text className={styles.caption}>
+              Request --context long_context for new sessions, including Chats,
+              orchestrators, and workers. Extended context can cost more; the window size
+              depends on the model. Each chat can override this setting.
+            </Text>
+          </div>
+          <Switch
+            aria-label="Long context by default"
+            checked={contextTier === "long_context"}
+            disabled={busy}
+            label={contextTier === "long_context" ? "On" : "Off"}
+            onChange={(_event, data) =>
+              void update({ contextTier: data.checked ? "long_context" : "default" })
+            }
+          />
+        </div>
+        <Text className={styles.caption}>
+          Existing sessions keep their requested context tier when resumed. Changing this
+          default does not restart running sessions. Some Copilot ACP versions ignore tier
+          requests; check the reported window in the session usage popover.
+        </Text>
+      </section>
 
       <section className={styles.card}>
         <div className={styles.row}>

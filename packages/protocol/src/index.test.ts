@@ -19,6 +19,7 @@ import {
   RenameSessionSchema,
   SessionEventSchema,
   SessionSchema,
+  SessionUsageSchema,
   SetSessionConfigSchema,
   SnapshotSchema,
   StopSessionsSchema,
@@ -38,6 +39,45 @@ import {
 } from "./index.js";
 
 describe("protocol validation", () => {
+  it.each(["start_session", "resume_session"] as const)(
+    "validates context tiers for %s",
+    (type) => {
+      const command = {
+        type,
+        commandId: "c",
+        sessionId: "s",
+        localPath: "C:\\repo",
+        prompt: "work",
+        agentSessionId: "acp",
+      };
+      expect(NodeCommandSchema.parse(command)).not.toHaveProperty("contextTier");
+      expect(
+        NodeCommandSchema.parse({ ...command, contextTier: "long_context" }),
+      ).toMatchObject({
+        contextTier: "long_context",
+      });
+      expect(
+        NodeCommandSchema.safeParse({ ...command, contextTier: "invalid" }).success,
+      ).toBe(false);
+    },
+  );
+
+  it("distinguishes absent and zero usage while rejecting invalid readings", () => {
+    expect(SessionUsageSchema.parse({})).toEqual({});
+    expect(SessionUsageSchema.parse({ aiCredits: 0, contextTokens: 0 })).toEqual({
+      aiCredits: 0,
+      contextTokens: 0,
+    });
+    for (const usage of [
+      { aiCredits: -1 },
+      { aiCredits: Infinity },
+      { contextWindow: 0 },
+      { contextTokens: -1 },
+    ]) {
+      expect(SessionUsageSchema.safeParse(usage).success).toBe(false);
+    }
+  });
+
   it.each(["start_session", "resume_session"] as const)(
     "carries Agency mode on %s and accepts launches from older Hosts",
     (type) => {

@@ -77,6 +77,35 @@ describe("host routes", () => {
     await app.close();
   });
 
+  it("persists the long-context default and rejects unsupported tiers", async () => {
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      contextTier: "long_context",
+    });
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: { contextTier: "default" },
+        })
+      ).json(),
+    ).toMatchObject({ contextTier: "default" });
+    await inject({ method: "POST", url: "/api/defaults", payload: { model: "deep" } });
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      contextTier: "default",
+      model: "deep",
+    });
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: { contextTier: "huge" },
+        })
+      ).statusCode,
+    ).toBe(400);
+  });
+
   it("reports health and an empty snapshot", async () => {
     const health = await inject({ method: "GET", url: "/api/health" });
     expect(health.statusCode).toBe(200);
@@ -248,6 +277,7 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       ...managedDefaults,
       yolo: false,
+      contextTier: "long_context",
       agencyMode: false,
       agencyModeAvailable: false,
       autoResume: true,
@@ -262,6 +292,7 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       ...managedDefaults,
       yolo: true,
+      contextTier: "long_context",
       agencyMode: false,
       agencyModeAvailable: false,
       autoResume: true,
@@ -278,6 +309,7 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       ...managedDefaults,
       yolo: true,
+      contextTier: "long_context",
       agencyMode: false,
       agencyModeAvailable: false,
       autoResume: false,
@@ -304,6 +336,7 @@ describe("host routes", () => {
     expect(await read()).toEqual({
       ...managedDefaults,
       yolo: true,
+      contextTier: "long_context",
       agencyMode: false,
       agencyModeAvailable: false,
       autoResume: false,
