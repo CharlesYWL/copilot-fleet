@@ -1446,6 +1446,40 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     );
   });
 
+  it("ignores opaque configuration differences when explicit policy matches and submodules are disabled", async () => {
+    const { manager, root, source } = await fixture();
+    const tree = await allocate(manager, source);
+    const database = new DatabaseSync(join(root, "state", "managed-worktrees.db"));
+    try {
+      const row = database.prepare("SELECT data FROM trees WHERE id=?").get(tree.id) as {
+        data: string;
+      };
+      const stored = JSON.parse(row.data) as ManagedWorktree;
+      expect(stored.repositoryExecutionPolicy.credentialHelpersDigest).toMatch(
+        /^[a-f0-9]{64}$/,
+      );
+      stored.repositoryExecutionPolicy.configurationDigest = createHash("sha256")
+        .update(`${stored.repositoryExecutionPolicy.configurationDigest}:worktree-local`)
+        .digest("hex");
+      database
+        .prepare("UPDATE trees SET data=? WHERE id=?")
+        .run(JSON.stringify(stored), tree.id);
+    } finally {
+      database.close();
+    }
+
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+
+    expect(
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      }),
+    ).toMatchObject({ ok: true });
+  });
+
   it("enters two barrier-controlled writer sections simultaneously, editing the same filename independently", async () => {
     const { manager, source } = await fixture();
     const a = await allocate(manager, source);

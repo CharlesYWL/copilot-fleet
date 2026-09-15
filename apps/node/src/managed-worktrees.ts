@@ -869,8 +869,7 @@ export class ManagedWorktrees {
       ...observedWorkspacePolicy
     } = observed;
     if (isDeepStrictEqual(expectedWorkspacePolicy, observedWorkspacePolicy)) return true;
-    if (expected.credentialHelpersDigest || expected.submodules !== "disabled")
-      return false;
+    if (expected.submodules !== "disabled") return false;
     return (
       expected.version === observed.version &&
       expected.hooks === observed.hooks &&
