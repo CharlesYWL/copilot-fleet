@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { TerminalBlock } from "./terminal-blocks";
+import { toTerminalBlocks, type TerminalBlock } from "./terminal-blocks";
 import { promptTimeLabel, toPromptMarks } from "./prompt-marks";
 
 const block = (values: Partial<TerminalBlock>): TerminalBlock => ({
@@ -22,6 +22,37 @@ describe("toPromptMarks", () => {
     expect(marks.map((mark) => [mark.key, mark.label])).toEqual([
       ["u1", "fix the retry helper"],
       ["u2", "now ship it"],
+    ]);
+  });
+
+  it("excludes generated Fleet envelopes but keeps prompts that discuss them", () => {
+    const human = "Explain <fleet-review>, <fleet-task>, and <fleet-wake>.";
+    const prompts = [
+      human,
+      '<fleet-review task="Fix" verdict="changes requested">\nReview details.\n</fleet-review>\n\nAct on this.',
+      '<fleet-review task="Fix" verdict="reopened">\nNot finished.\n</fleet-review>',
+      '<fleet-task name="Fix" workspace="repo">\nDo the work.\n</fleet-task>',
+      '<fleet-status-check interval="30m">\nReview active tasks.\n</fleet-status-check>',
+      '<fleet-wake task="Fix" taskId="task-1" wakes=1/12>\nJust finished:\n- Fix (implement, session worker-1): succeeded\n</fleet-wake>',
+      "Now show me the fix.",
+    ];
+    const createdAt = "2026-08-18T20:39:00.000Z";
+    const marks = toPromptMarks(
+      toTerminalBlocks(
+        prompts.map((text, sequence) => ({
+          eventId: `e${sequence}`,
+          sessionId: "s1",
+          sequence,
+          type: "system",
+          payload: { text: `User: ${text}` },
+          createdAt,
+        })),
+      ),
+    );
+
+    expect(marks).toEqual([
+      { key: "e0", label: human, createdAt },
+      { key: "e6", label: "Now show me the fix.", createdAt },
     ]);
   });
 

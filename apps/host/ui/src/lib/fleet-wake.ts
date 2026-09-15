@@ -1,5 +1,5 @@
 /**
- * Reading the machine turn an orchestrator is woken by.
+ * Reading the machine turns delivered to an orchestrator.
  *
  * A wake is a prompt only in the mechanical sense: the Host sends it because
  * that is the one way to give a running agent something to read. Nobody typed
@@ -27,7 +27,48 @@ export type WakeSummary = {
 
 /** Matches the header `wakeEnvelope` writes; see `apps/host/src/orchestrator/briefing.ts`. */
 const HEADER =
-  /^<fleet-wake\s+task="((?:[^"\\]|\\.)*)"(?:\s+phase="((?:[^"\\]|\\.)*)"\s*(\(\d+\/\d+\))?)?(?:\s+wakes=(\S+?))?>\s*$/;
+  /^<fleet-wake\s+task="((?:[^"\\]|\\.)*)"(?:\s+taskId="(?:[^"\\]|\\.)*")?(?:\s+phase="((?:[^"\\]|\\.)*)"\s*(\(\d+\/\d+\))?)?(?:\s+wakes=(\S+?))?>\s*$/;
+
+/** Headers emitted by review.ts, routes/orchestrators.ts and briefing.ts. */
+const REVIEW_HEADER =
+  /^<fleet-review\s+task="((?:[^"\\]|\\.)*)"\s+verdict="(changes requested|reopened)">$/;
+const TASK_HEADER =
+  /^<fleet-task\s+name="((?:[^"\\]|\\.)*)"\s+workspace="((?:[^"\\]|\\.)*)">$/;
+const STATUS_HEADER = /^<fleet-status-check\s+interval="((?:[^"\\]|\\.)*)">$/;
+
+/**
+ * Only standalone producer-shaped envelopes qualify, not prose mentioning a
+ * Fleet tag or the fleet-workspace suffix attached to ordinary human prompts.
+ * Wakes retain their existing tolerance for an incomplete body.
+ */
+export function parseFleetControl(
+  text: string,
+): { title: string; detail: string } | undefined {
+  const wake = parseWake(text);
+  if (wake) return { title: wakeTitle(wake), detail: wakeDetail(wake) };
+
+  const lines = text.split("\n");
+  const header = lines[0]?.trim() ?? "";
+  const review = REVIEW_HEADER.exec(header);
+  if (review && lines.some((line) => line.trim() === "</fleet-review>")) {
+    return {
+      title: review[2] === "reopened" ? "Task reopened" : "Changes requested",
+      detail: unquote(review[1] ?? ""),
+    };
+  }
+  const task = TASK_HEADER.exec(header);
+  if (task && lines.some((line) => line.trim() === "</fleet-task>")) {
+    return {
+      title: "Task received",
+      detail: [unquote(task[1] ?? ""), unquote(task[2] ?? "")].join(" · "),
+    };
+  }
+  const status = STATUS_HEADER.exec(header);
+  if (status && lines.some((line) => line.trim() === "</fleet-status-check>")) {
+    return { title: "Status check", detail: `${unquote(status[1] ?? "")} interval` };
+  }
+  return undefined;
+}
 
 /** `- Open PR for the fix (implement): succeeded` */
 const SETTLED = /^-\s+(.*?)\s*(?:\(([^()]*)\))?\s*:\s*(\S+)\s*$/;

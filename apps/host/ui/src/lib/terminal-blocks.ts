@@ -1,5 +1,5 @@
 import { eventPayload, type AttachmentSummary, type SessionEvent } from "@fleet/protocol";
-import { parseWake, wakeDetail, wakeTitle } from "./fleet-wake";
+import { parseFleetControl } from "./fleet-wake";
 
 export type TerminalBlockKind =
   | "user"
@@ -12,6 +12,7 @@ export type TerminalBlockKind =
   | "state"
   | "error"
   | "system"
+  /** Fleet control envelopes: worker wakes, reviews, task briefs and status checks. */
   | "wake";
 
 export type TerminalBlock = {
@@ -121,17 +122,17 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       const prompt = isUser ? text.slice(USER_PREFIX.length) : text;
 
       /*
-       * A wake is delivered down the prompt channel because that is the only
-       * way to hand a running agent something to read, but nobody typed it —
-       * so it gets a folded step line rather than the operator's own column.
+       * Fleet control envelopes use the prompt channel to reach the agent,
+       * but are not chat prompts. Reuse the wake's folded step instead of the
+       * operator's column (and its prompt-rail marks).
        */
-      const wake = isUser ? parseWake(prompt) : undefined;
-      if (wake) {
+      const control = isUser ? parseFleetControl(prompt) : undefined;
+      if (control) {
         blocks.push({
           key: event.eventId,
           kind: "wake",
-          text: wakeTitle(wake),
-          detail: wakeDetail(wake),
+          text: control.title,
+          detail: control.detail,
           body: prompt,
           createdAt: event.createdAt,
         });

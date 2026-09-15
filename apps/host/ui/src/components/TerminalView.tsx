@@ -1334,7 +1334,7 @@ const TerminalLine = memo(function TerminalLine({
 
   if (block.kind === "thought") return <ThoughtLine block={block} time={time} />;
 
-  if (block.kind === "wake") return <WakeLine block={block} time={time} />;
+  if (block.kind === "wake") return <FleetControlLine block={block} time={time} />;
 
   // Raw agent stderr and errors are the two things a truncated line would
   // actively cost the reader, so they keep their full text under the row.
@@ -1421,15 +1421,14 @@ const ThoughtLine = ({ block, time }: { block: TerminalBlock; time: string }) =>
 };
 
 /**
- * A wake, folded to one line the way a tool call is.
+ * A Fleet control message, folded to one line the way a tool call is.
  *
  * The Host delivers these down the prompt channel, so the transcript records
- * them as something the operator said — and a wake is a whole transcript of
- * everything that settled, which as a chat bubble pushed the orchestrator's own
- * reply off the screen. The row says what came back; the envelope is one click
- * away for the reader who wants to check the orchestrator's judgement of it.
+ * them as something the operator said. The row summarises the event; the full
+ * envelope and trailing guidance stay one click away, without a chat bubble
+ * pushing the orchestrator's own reply off the screen.
  */
-const WakeLine = ({ block, time }: { block: TerminalBlock; time: string }) => {
+const FleetControlLine = ({ block, time }: { block: TerminalBlock; time: string }) => {
   const styles = useStyles();
   const [expanded, setExpanded] = useState(false);
 

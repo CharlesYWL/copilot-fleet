@@ -464,6 +464,8 @@ describe("TerminalView transcript", () => {
     // something the operator said. It is a whole transcript of everything that
     // settled, and as a bubble it buried the orchestrator's reply under it.
     const output = `${"the worker explained itself at length. ".repeat(30)}done`;
+    const guidance =
+      "Nothing else is running. Dispatch the next step, or report and stop.";
     const { container } = show({ runRole: "lead" }, EMPTY_DRAFT, [
       streamEvent("system", {
         text: [
@@ -472,6 +474,8 @@ describe("TerminalView transcript", () => {
           "- Open PR for the fix (implement): succeeded",
           `  ${output}`,
           "</fleet-wake>",
+          "",
+          guidance,
         ].join("\n"),
       }),
     ]);
@@ -484,6 +488,111 @@ describe("TerminalView transcript", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
     toggle.click();
     expect(await screen.findByText(output, { exact: false })).toBeTruthy();
+    expect(screen.getByText(guidance)).toBeTruthy();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(output, { exact: false })).toBeNull();
+    expect(screen.queryByText(guidance)).toBeNull();
+  });
+
+  it.each([
+    {
+      header:
+        '<fleet-review task="Fix query acceleration teaching banner 5476738" verdict="changes requested">',
+      body: "https://github.com/example/repo/pull/42\nThe teaching banner still covers the query.",
+      closing: "</fleet-review>",
+      guidance:
+        "Act on this: dispatch the work it calls for, then end your turn.\nCall fleet_submit_task again once it is addressed.",
+      title: "Changes requested",
+      detail: "Fix query acceleration teaching banner 5476738",
+    },
+    {
+      header: '<fleet-review task="Fix the banner" verdict="reopened">',
+      body: "The regression is back.",
+      closing: "</fleet-review>",
+      guidance:
+        "This task was finished and has been reopened, so its notes and criteria\ndescribe work you already did. Read them before deciding anything.",
+      title: "Task reopened",
+      detail: "Fix the banner",
+    },
+    {
+      header: '<fleet-task name="Fix the banner" workspace="repo">',
+      body: "Keep the query visible.",
+      closing: "</fleet-task>",
+      guidance:
+        'Plan this with fleet_plan_task using the task name "Fix the banner", then dispatch the\nwork for its first phase and end your turn.',
+      title: "Task received",
+      detail: "Fix the banner · repo",
+    },
+    {
+      header: '<fleet-status-check interval="30m">',
+      body: "Review only these active tasks assigned to this conversation:\n- Fix the banner — running; phase 1/1: Verify; 1 open step(s), 1 dispatched",
+      closing: "</fleet-status-check>",
+      guidance:
+        "Use fleet_list_work to inspect their current status. This is a read-only check:\ndo not prompt, follow up with, stop, or otherwise disturb a worker whose step is\nalready starting or running.",
+      title: "Status check",
+      detail: "30m interval",
+    },
+    {
+      header: '<fleet-wake task="Fix the banner" taskId="task-1" wakes=1/12>',
+      body: "Just finished:\n- Fix the banner (implement, session worker-1): succeeded\n  The regression passed.",
+      closing: "</fleet-wake>",
+      guidance:
+        "Nothing else is running. Use fleet_follow_up for the same deliverable, dispatch distinct work, or report and stop.",
+      title: "1 worker finished",
+      detail: "Fix the banner · Fix the banner: succeeded · wake 1/12",
+    },
+  ])(
+    "renders $title as a compact disclosure, not a human prompt",
+    ({ header, body, closing, guidance, title, detail }) => {
+      const prompt = [header, body, closing, "", guidance].join("\n");
+      const source = streamEvent("system", { text: `User: ${prompt}` });
+      const { container } = show({ runRole: "lead" }, EMPTY_DRAFT, [source]);
+      const toggle = screen.getByRole("button", { name: new RegExp(`^${title}`) });
+
+      expect(screen.getByText(detail)).toBeTruthy();
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      expect(toggle.getAttribute("type")).toBe("button");
+      expect(toggle.getAttribute("title")).toBe(
+        new Date(source.createdAt).toLocaleTimeString(undefined, { hour12: false }),
+      );
+      expect(container.textContent).not.toContain(body);
+      expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(0);
+      expect(screen.queryByRole("button", { name: /^Jump to prompt:/ })).toBeNull();
+
+      toggle.focus();
+      expect(document.activeElement).toBe(toggle);
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      for (const text of [
+        header,
+        ...body.split("\n").map((line) => line.trim().replace(/^-\s+/, "")),
+        closing,
+        guidance,
+      ]) {
+        expect(toggle.parentElement?.textContent).toContain(text);
+      }
+      expect(screen.getByRole("button", { name: "Copy message" })).toBeTruthy();
+
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      expect(container.textContent).not.toContain(body);
+      expect(container.textContent).not.toContain(guidance);
+      expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(0);
+    },
+  );
+
+  it("keeps human tag discussions in bubbles with prompt marks", () => {
+    const prompt =
+      'Explain `<fleet-review task="Fix" verdict="reopened">`, not a new review.';
+    const source = streamEvent("system", { text: `User: ${prompt}` });
+    const { container } = show({ runRole: "lead" }, EMPTY_DRAFT, [source]);
+
+    expect(
+      container.querySelector("[data-prompt-key]")?.getAttribute("data-prompt-key"),
+    ).toBe(source.eventId);
+    expect(screen.getByRole("button", { name: /^Jump to prompt: Explain/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Task reopened/ })).toBeNull();
   });
 
   it("gives every prompt a mark on the rail, and a way back to it", () => {

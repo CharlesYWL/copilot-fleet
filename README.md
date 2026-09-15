@@ -981,6 +981,21 @@ Permissions are also announced outside the page, with a tab-title count and a
 desktop notification that survives until it is clicked, because a request blocks
 its agent until the node's timeout expires.
 
+### Navigating long conversations
+
+The right-hand prompt rail shows up to 40 marks, or fewer when the transcript
+pane is short. Small sessions keep a mark for every prompt; longer sessions
+sample evenly across the whole history, keeping the first and last prompt
+whenever at least two marks fit. Hover or focus a mark to preview the actual
+prompt, and click it to jump there. The lit mark tracks the current turn, using
+the preceding sampled prompt when that turn has no mark. Unsampled prompts stay
+in the transcript and remain reachable by scrolling.
+
+Fleet-generated control messages, including worker wake summaries and task
+reviews, appear as compact expandable steps rather than user chat bubbles.
+Expand a step to read its full original message. These messages do not add
+marks to the user-prompt rail.
+
 ### Attaching files and images
 
 The composer takes files: paste a screenshot straight into the box, or use the
