@@ -104,6 +104,13 @@ describe("GitHub startup authentication", () => {
     expect(spawn.mock.calls.filter((call) => call[1][1] === "login")).toHaveLength(1);
   });
 
+  it("accepts an authenticated API probe when an older gh rejects --active", async () => {
+    outcomes.push({ code: 1, stderr: "unknown flag: --active" }, {});
+    await ensure();
+    expect(spawn).toHaveBeenCalledTimes(2);
+    expect(log).not.toHaveBeenCalled();
+  });
+
   it.each([
     "error connecting: dial tcp: no such host",
     "gh: API rate limit exceeded (HTTP 403)",

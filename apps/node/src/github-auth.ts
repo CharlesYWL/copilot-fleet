@@ -69,8 +69,12 @@ async function checkGithubAuth(env: NodeJS.ProcessEnv, host: string): Promise<vo
   if (status.code === 4) throw new GithubAuthRequiredError(host);
 
   // `auth status` uses exit 1 for both invalid credentials and network errors.
-  // The API's 401 (or gh's auth-required exit 4) distinguishes recoverable auth.
+  // Older gh versions do not support `--active`; a successful API probe is the
+  // equivalent authentication proof only for that explicitly detected case.
+  const activeFlagUnsupported =
+    status.code === 1 && /unknown flag:\s*--active\b/i.test(status.stderr);
   const probe = await runGh(["api", "user", "--hostname", host, "--silent"], env);
+  if (activeFlagUnsupported && probe.code === 0) return;
   if (probe.code === 4 || (probe.code !== 0 && /\bHTTP 401\b/i.test(probe.stderr))) {
     throw new GithubAuthRequiredError(host);
   }
