@@ -52,11 +52,7 @@ import {
 import { useCatalog } from "../hooks/useCatalog";
 import { sessionLabel } from "../lib/session-label";
 import { customAgentName } from "../lib/session-config";
-import {
-  sessionAccent,
-  sessionStatusDescriptor,
-  sessionStatusLabel,
-} from "../lib/session-status";
+import { sessionStatusDescriptor, sessionStatusLabel } from "../lib/session-status";
 import {
   nextClosedItems,
   nodeKey,
@@ -64,7 +60,6 @@ import {
   workspaceKey,
   type TreeReading,
 } from "../lib/tree-collapse";
-import { StatusDot } from "./StatusDot";
 import { StatusIndicator } from "./StatusIndicator";
 import { statusVisuals } from "../theme";
 import type { AppView } from "../App";
@@ -545,11 +540,16 @@ export const Sidebar = ({
                         : onSelectSession(favorite.id)
                     }
                   >
-                    {lead ? (
-                      <Chat20Regular aria-hidden="true" />
-                    ) : (
-                      <StatusDot state={favorite.state} color={sessionAccent(favorite)} />
-                    )}
+                    {lead && <Chat20Regular aria-hidden="true" />}
+                    <StatusIndicator
+                      descriptor={sessionStatusDescriptor(
+                        favorite,
+                        waitingPermissions.some(
+                          (event) => event.sessionId === favorite.id,
+                        ),
+                      )}
+                      variant="icon"
+                    />
                     <span className={styles.sessionName}>{sessionLabel(favorite)}</span>
                   </button>
                 </div>
@@ -647,7 +647,7 @@ export const Sidebar = ({
                     lead,
                     waitingPermissions.some((event) => event.sessionId === lead.id),
                   )}
-                  variant="dot"
+                  variant="icon"
                 />
               </button>
             );
@@ -966,9 +966,14 @@ export const Sidebar = ({
                                     }}
                                   >
                                     <span className={styles.sessionLabel}>
-                                      <StatusDot
-                                        state={session.state}
-                                        color={sessionAccent(session)}
+                                      <StatusIndicator
+                                        descriptor={sessionStatusDescriptor(
+                                          session,
+                                          waitingPermissions.some(
+                                            (event) => event.sessionId === session.id,
+                                          ),
+                                        )}
+                                        variant="icon"
                                       />
                                       {session.runRole !== "" && (
                                         <span

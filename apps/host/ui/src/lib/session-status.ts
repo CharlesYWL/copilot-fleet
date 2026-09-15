@@ -3,15 +3,12 @@ import {
   terminalSessionStates,
   type FleetSession,
 } from "@fleet/protocol";
+import { semanticColors } from "../theme";
 import {
-  ArrowClockwiseRegular,
-  CheckmarkCircleRegular,
-  CircleRegular,
-  ErrorCircleRegular,
-  WarningRegular,
-} from "@fluentui/react-icons";
-import type { ComponentType } from "react";
-import { semanticColors, stateAccent, statusVisuals, terminal } from "../theme";
+  statusDescriptor,
+  type StatusDescriptor,
+  type StatusState,
+} from "./status-visuals";
 
 /**
  * Amber for a session that ended but can be picked back up.
@@ -24,83 +21,6 @@ import { semanticColors, stateAccent, statusVisuals, terminal } from "../theme";
 export const RESUMABLE_ACCENT = semanticColors.permission;
 
 /**
- * What a session looks like to a person, as opposed to what state it is in.
- *
- * The protocol has nine session states; a screen needs five distinctions, and
- * the one that matters most — "this is waiting on you" — is not a session state
- * at all but a pending permission event. Deriving it in one place is what keeps
- * the sidebar, the tiles, the terminal header and the run views from each
- * inventing their own answer, which is how "running" ended up three colours.
- */
-export type SessionVisualState =
-  "running" | "stopping" | "idle" | "waiting-for-permission" | "failed" | "done";
-
-export type SessionStatusDescriptor = {
-  state: SessionVisualState;
-  /** The full word, for a header or a tooltip. */
-  label: string;
-  /** The compact word, for a tile or a tree row. */
-  shortLabel: string;
-  icon: ComponentType<{ className?: string }>;
-  tone: keyof typeof statusVisuals;
-  /** Higher sorts first. Attention outranks work, work outranks rest. */
-  priority: number;
-  /** The accent this state draws with; also available via `tone`. */
-  color: string;
-};
-
-const DESCRIPTORS: Record<SessionVisualState, Omit<SessionStatusDescriptor, "state">> = {
-  "waiting-for-permission": {
-    label: "Waiting for you",
-    shortLabel: "needs you",
-    icon: WarningRegular,
-    tone: "attention",
-    priority: 40,
-    color: statusVisuals.attention.foreground,
-  },
-  running: {
-    label: "Running",
-    shortLabel: "running",
-    icon: ArrowClockwiseRegular,
-    tone: "success",
-    priority: 30,
-    color: statusVisuals.success.foreground,
-  },
-  stopping: {
-    label: "Stopping",
-    shortLabel: "stopping",
-    icon: ArrowClockwiseRegular,
-    tone: "attention",
-    priority: 35,
-    color: statusVisuals.attention.foreground,
-  },
-  failed: {
-    label: "Failed",
-    shortLabel: "failed",
-    icon: ErrorCircleRegular,
-    tone: "danger",
-    priority: 20,
-    color: statusVisuals.danger.foreground,
-  },
-  idle: {
-    label: "Ready for follow-up",
-    shortLabel: "idle",
-    icon: CircleRegular,
-    tone: "info",
-    priority: 10,
-    color: statusVisuals.info.foreground,
-  },
-  done: {
-    label: "Finished",
-    shortLabel: "done",
-    icon: CheckmarkCircleRegular,
-    tone: "neutral",
-    priority: 0,
-    color: statusVisuals.neutral.foreground,
-  },
-};
-
-/**
  * How one session should be shown.
  *
  * `awaitingPermission` is passed in rather than read from the session because
@@ -110,43 +30,35 @@ const DESCRIPTORS: Record<SessionVisualState, Omit<SessionStatusDescriptor, "sta
 export function sessionStatusDescriptor(
   session: FleetSession,
   awaitingPermission = false,
-): SessionStatusDescriptor {
-  const state = visualState(session, awaitingPermission);
-  const base = DESCRIPTORS[state];
-  // A dormant session is `failed` underneath but recoverable, so it keeps the
-  // attention colour it has always had rather than reading as a casualty.
-  if (state === "failed" && isDormantSession(session)) {
+): StatusDescriptor {
+  const descriptor = statusDescriptor(visualState(session, awaitingPermission));
+  if (session.stopRequested && session.state === "offline") {
     return {
-      ...base,
-      state,
-      label: "Resumable",
-      shortLabel: "resumable",
-      tone: "attention",
-      color: RESUMABLE_ACCENT,
+      ...descriptor,
+      label: "Stopping - node offline",
+      icon: statusDescriptor("offline").icon,
+      motion: undefined,
     };
   }
-  return { ...base, state };
+  return descriptor;
 }
 
-function visualState(
-  session: FleetSession,
-  awaitingPermission: boolean,
-): SessionVisualState {
+function visualState(session: FleetSession, awaitingPermission: boolean): StatusState {
   if (session.stopRequested) return "stopping";
+  if (session.state === "offline") return "offline";
+  if (isDormantSession(session)) return "resumable";
+  if (session.state === "failed") return "failed";
+  if (session.state === "completed") return "done";
+  if (session.state === "stopped") return "stopped";
   if (awaitingPermission) return "waiting-for-permission";
-  if (session.state === "failed" || session.state === "offline") return "failed";
-  if (session.state === "completed" || session.state === "stopped") {
-    return isDormantSession(session) ? "failed" : "done";
-  }
   if (session.state === "running" || session.state === "starting") return "running";
-  if (session.state === "queued" || session.state === "cancelling") return "running";
+  if (session.state === "queued") return "queued";
+  if (session.state === "cancelling") return "stopping";
   return "idle";
 }
 
 /** Orders a list so whatever needs a person is at the top of it. */
-export function byAttention(
-  descriptorOf: (session: FleetSession) => SessionStatusDescriptor,
-) {
+export function byAttention(descriptorOf: (session: FleetSession) => StatusDescriptor) {
   return (a: FleetSession, b: FleetSession) =>
     descriptorOf(b).priority - descriptorOf(a).priority;
 }
@@ -170,8 +82,7 @@ export function sessionStatusLabel(session: FleetSession): string {
 }
 
 export function sessionAccent(session: FleetSession): string {
-  if (isDormantSession(session)) return RESUMABLE_ACCENT;
-  return stateAccent[session.state] ?? terminal.dim;
+  return sessionStatusDescriptor(session).color;
 }
 
 /**

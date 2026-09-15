@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { FleetSession, SessionState } from "@fleet/protocol";
 import {
+  CheckmarkCircleRegular,
+  PauseCircleRegular,
+  PlugDisconnectedRegular,
+  SpinnerIosRegular,
+} from "@fluentui/react-icons";
+import { semanticColors } from "../theme";
+import { stepStatusDescriptor } from "./run-step-status";
+import {
   RESUMABLE_ACCENT,
   filterOrchestratorConversations,
   filterVisibleSessions,
@@ -100,7 +108,12 @@ describe("session status", () => {
   it("shows persisted stop intent instead of the stale execution state", () => {
     const value = session({ state: "offline", stopRequested: true });
     expect(sessionStatusLabel(value)).toBe("stopping");
-    expect(sessionStatusDescriptor(value).label).toBe("Stopping");
+    expect(sessionStatusDescriptor(value)).toMatchObject({
+      label: "Stopping - node offline",
+      state: "stopping",
+      icon: PlugDisconnectedRegular,
+      motion: undefined,
+    });
   });
 
   it("reads an ended-but-recoverable session as resumable, not failed", () => {
@@ -166,6 +179,53 @@ describe("run-owned sessions in the session list", () => {
 });
 
 describe("sessionStatusDescriptor", () => {
+  it.each([
+    ["running", "running", SpinnerIosRegular, semanticColors.running, "spin"],
+    ["idle", "idle", PauseCircleRegular, semanticColors.idle, undefined],
+    ["completed", "done", CheckmarkCircleRegular, semanticColors.completed, undefined],
+    ["offline", "offline", PlugDisconnectedRegular, semanticColors.failed, undefined],
+  ] as const)(
+    "gives %s its own shape, color, and motion",
+    (state, visual, icon, color, motion) => {
+      expect(sessionStatusDescriptor(session({ state }))).toMatchObject({
+        state: visual,
+        icon,
+        color,
+        motion,
+      });
+    },
+  );
+
+  it("uses the same running and success visuals as dispatched work", () => {
+    expect(stepStatusDescriptor("running")).toEqual(
+      sessionStatusDescriptor(session({ state: "running" })),
+    );
+    expect(stepStatusDescriptor("succeeded")).toEqual(
+      sessionStatusDescriptor(session({ state: "completed" })),
+    );
+  });
+
+  it("does not animate queued, stopped, or recoverable work as running", () => {
+    for (const state of ["queued", "stopped"] as const) {
+      expect(sessionStatusDescriptor(session({ state }))).toMatchObject({
+        state,
+        motion: undefined,
+      });
+    }
+    expect(sessionStatusDescriptor(dormant("a"))).toMatchObject({
+      state: "resumable",
+      motion: undefined,
+    });
+  });
+
+  it("does not let an old permission hide offline or terminal state", () => {
+    for (const state of ["offline", "failed", "completed", "stopped"] as const) {
+      expect(sessionStatusDescriptor(session({ state }), true)).toEqual(
+        sessionStatusDescriptor(session({ state })),
+      );
+    }
+  });
+
   it("puts a blocked session above a running one", () => {
     // The session is still `running` as far as its own state machine knows;
     // the permission lives in the event log, so it is passed in.

@@ -1,19 +1,5 @@
-import {
-  Button,
-  Text,
-  makeStyles,
-  mergeClasses,
-  tokens,
-} from "@fluentui/react-components";
-import {
-  ArrowClockwiseRegular,
-  CheckmarkCircleRegular,
-  CircleRegular,
-  Dismiss12Regular,
-  ErrorCircleRegular,
-  PlugDisconnectedRegular,
-  WarningRegular,
-} from "@fluentui/react-icons";
+import { Button, makeStyles, mergeClasses } from "@fluentui/react-components";
+import { Dismiss12Regular } from "@fluentui/react-icons";
 import { useState } from "react";
 import type { RunViewModel } from "../../lib/orchestration-view";
 import {
@@ -21,7 +7,8 @@ import {
   isOrchestratorStoppedRun,
   runStateLabel,
 } from "../../lib/orchestration-view";
-import { statusVisuals, type StatusTone } from "../../theme";
+import { statusDescriptor, type StatusDescriptor } from "../../lib/status-visuals";
+import { StatusIndicator } from "../StatusIndicator";
 
 export const FAILED_STEP_DISMISS_PREFIX = "fleet.ui.run.failed-step.";
 
@@ -32,18 +19,6 @@ const useStyles = makeStyles({
     gap: "6px",
     minWidth: 0,
   },
-  icon: { flexShrink: 0, fontSize: "14px" },
-  label: {
-    fontSize: tokens.fontSizeBase200,
-    fontWeight: tokens.fontWeightSemibold,
-    whiteSpace: "nowrap",
-  },
-  pulse: {
-    animationName: { "0%,100%": { opacity: 1 }, "50%": { opacity: 0.4 } },
-    animationDuration: "1.8s",
-    animationIterationCount: "infinite",
-    "@media (prefers-reduced-motion: reduce)": { animationName: "none" },
-  },
   dismiss: {
     minWidth: "20px",
     width: "20px",
@@ -51,12 +26,6 @@ const useStyles = makeStyles({
     color: "inherit",
   },
 });
-
-type Visual = {
-  label: string;
-  tone: StatusTone;
-  icon: typeof WarningRegular;
-};
 
 type DismissedFailure = {
   runId: string;
@@ -92,54 +61,61 @@ const rememberDismissedFailures = (runId: string, tokens: readonly string[]) => 
  * node that went quiet — an operator triaging three amber cards needs to know
  * which one is blocking an agent right now.
  */
-export function runVisual(model: RunViewModel): Visual {
+export function runVisual(model: RunViewModel): StatusDescriptor {
   if ((model.stoppingSteps ?? 0) > 0) {
     return {
+      ...statusDescriptor("stopping"),
       label: model.stoppingUnavailable ? "Stopping · node offline" : "Stopping",
-      tone: "attention",
-      icon: model.stoppingUnavailable ? PlugDisconnectedRegular : ArrowClockwiseRegular,
+      icon: statusDescriptor(model.stoppingUnavailable ? "offline" : "stopping").icon,
+      motion: model.stoppingUnavailable ? undefined : "spin",
     };
   }
   if (model.attention === "permission") {
     return {
+      ...statusDescriptor("waiting-for-permission"),
       label: model.run.state === "awaiting_human" ? "Needs review" : "Needs you",
-      tone: "attention",
-      icon: WarningRegular,
     };
   }
   if (model.attention === "workspace-setup") {
-    return { label: "Setup failed", tone: "danger", icon: ErrorCircleRegular };
+    return { ...statusDescriptor("failed"), label: "Setup failed" };
   }
   if (model.attention === "integration") {
     return {
+      ...statusDescriptor("waiting-for-permission"),
       label: "Integration needs attention",
-      tone: "attention",
-      icon: WarningRegular,
     };
   }
   if (model.attention === "failed-step") {
-    return { label: "A step failed", tone: "danger", icon: ErrorCircleRegular };
+    return { ...statusDescriptor("failed"), label: "A step failed" };
   }
   if (model.attention === "offline-node") {
-    return { label: "Node offline", tone: "danger", icon: PlugDisconnectedRegular };
+    return { ...statusDescriptor("offline"), label: "Node offline" };
   }
   if (model.liveSteps > 0) {
-    return { label: "Running", tone: "success", icon: ArrowClockwiseRegular };
+    return statusDescriptor("running");
   }
   if (model.run.state === "completed") {
-    return { label: "Done", tone: "neutral", icon: CheckmarkCircleRegular };
+    return statusDescriptor("done");
   }
   if (model.run.state === "cancelled") {
     return {
+      ...statusDescriptor("stopped"),
       label: isOrchestratorStoppedRun(model.run) ? "Stopped" : "Abandoned",
-      tone: "neutral",
-      icon: CircleRegular,
     };
   }
   if (model.run.state === "failed") {
-    return { label: "Failed", tone: "danger", icon: ErrorCircleRegular };
+    return statusDescriptor("failed");
   }
-  return { label: runStateLabel(model.run), tone: "info", icon: CircleRegular };
+  return {
+    ...statusDescriptor(
+      model.run.state === "awaiting_approval"
+        ? "queued"
+        : model.run.state === "blocked"
+          ? "waiting-for-permission"
+          : "running",
+    ),
+    label: runStateLabel(model.run),
+  };
 }
 
 export const RunStatusIndicator = ({
@@ -171,7 +147,6 @@ export const RunStatusIndicator = ({
     failureTokens.length > 0 &&
     failureTokens.every((token) => acknowledgedFailures.has(token));
   const visual = runVisual(failureDismissed ? { ...model, attention: undefined } : model);
-  const Icon = visual.icon;
 
   const dismissFailure = () => {
     const next = {
@@ -185,15 +160,10 @@ export const RunStatusIndicator = ({
 
   return (
     <span
-      className={mergeClasses(
-        styles.root,
-        visual.tone === "attention" && styles.pulse,
-        className,
-      )}
-      style={{ color: statusVisuals[visual.tone].foreground }}
+      className={mergeClasses(styles.root, className)}
+      style={{ color: visual.color }}
     >
-      <Icon className={styles.icon} aria-hidden="true" />
-      <Text className={styles.label}>{visual.label}</Text>
+      <StatusIndicator descriptor={{ ...visual, shortLabel: visual.label }} />
       {dismissible && model.attention === "failed-step" && !failureDismissed ? (
         <Button
           appearance="subtle"

@@ -62,7 +62,7 @@ import {
 } from "@fleet/protocol";
 import { blockColor, semanticColors, statusVisuals, terminal } from "../theme";
 import { sessionLabel } from "../lib/session-label";
-import { sessionAccent, sessionStatusLabel } from "../lib/session-status";
+import { sessionStatusDescriptor } from "../lib/session-status";
 import { transcriptNotice } from "../lib/transcript-notice";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import {
@@ -97,7 +97,7 @@ import { SessionUsageBar } from "./SessionUsageBar";
 import { SessionAgentBadge } from "./SessionAgentBadge";
 import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SlashMenu } from "./SlashMenu";
-import { StatusDot } from "./StatusDot";
+import { StatusIndicator } from "./StatusIndicator";
 
 const useStyles = makeStyles({
   view: {
@@ -609,6 +609,7 @@ export const TerminalView = ({
 
   const blocks = useMemo(() => toTerminalBlocks(events), [events]);
   const permission = useMemo(() => pendingPermission(events), [events]);
+  const status = sessionStatusDescriptor(session, Boolean(permission));
   const promptMarks = useMemo(() => toPromptMarks(blocks), [blocks]);
   const [activePrompt, setActivePrompt] = useState<string>();
 
@@ -933,9 +934,9 @@ export const TerminalView = ({
       <div className={styles.header}>
         <div className={styles.headerText}>
           <span className={styles.title}>
-            <StatusDot state={session.state} color={sessionAccent(session)} />
-            <span className={styles.state} style={{ color: sessionAccent(session) }}>
-              {sessionStatusLabel(session)}
+            <StatusIndicator descriptor={status} variant="icon" />
+            <span className={styles.state} style={{ color: status.color }}>
+              {status.shortLabel}
             </span>
             {isEditingName ? (
               <form className={styles.nameForm} onSubmit={submitName}>

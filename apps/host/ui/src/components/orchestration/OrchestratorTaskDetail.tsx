@@ -475,6 +475,7 @@ export const OrchestratorTaskDetail = ({
         <section className={styles.section}>
           <Text className={styles.sectionLabel}>Dispatched work</Text>
           <WorkerStepTimeline
+            awaitingPermissionSessionId={model.attentionSessionId}
             steps={model.steps}
             phases={run.phases}
             sessions={sessions}

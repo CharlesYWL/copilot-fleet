@@ -189,7 +189,7 @@ export const SessionTile = ({
         onKeyDown={handleKeyDown}
       >
         <div className={styles.head}>
-          <StatusIndicator descriptor={descriptor} variant="dot" />
+          <StatusIndicator descriptor={descriptor} variant="icon" />
           <Text weight="semibold" className={styles.name}>
             {sessionLabel(session)}
           </Text>
