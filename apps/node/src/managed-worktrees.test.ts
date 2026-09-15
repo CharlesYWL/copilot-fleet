@@ -2291,12 +2291,20 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
   });
 
   it("records a reviewed no-changes result without claiming the base was already integrated", async () => {
-    const { manager, source } = await fixture();
-    const tree = await allocate(manager, source);
+    const { root, manager, source } = await fixture();
+    const remote = join(root, "origin.git");
+    await git.run(root, ["init", "--bare", remote]);
+    await git.run(source, ["remote", "add", "origin", remote]);
+    const integration = {
+      integrationTargetRef: "refs/heads/dev/fleet-test/no-changes",
+      integrationRemote: "origin",
+    };
+    const tree = await allocate(manager, source, integration);
     const preview = (
       await operation(manager, tree, "integration_preview", {
         targetPath: source,
         targetPlacementId: "target-placement",
+        ...integration,
       })
     ).preview!;
     expect(preview).toMatchObject({
@@ -2313,13 +2321,35 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       reviewedDiffIdentity: preview.diffIdentity,
       confirm: `REVIEW NO CHANGES FOR ${preview.taskSha}`,
       commit: true,
+      ...integration,
     });
     expect(reviewed.integration).toMatchObject({
       state: "no_changes",
       resultSha: preview.targetSha,
       validationState: "passed",
       validationSummary: "No committed task changes require integration.",
+      publishState: "published",
+      publicationFileCount: 0,
+      publicationCommitCount: 0,
+      publishedAt: expect.any(String),
     });
+    expect(preview.targetRemote).toBe("origin");
+    const published = await operation(manager, reviewed.worktree!, "publish", {
+      integrationId: reviewed.integration!.id,
+    });
+    expect(published.integration).toMatchObject({
+      publishState: "published",
+      resultSha: preview.targetSha,
+    });
+    expect(
+      (
+        await git.run(
+          source,
+          ["ls-remote", "--refs", preview.targetRemote!, preview.targetRef],
+          { allowedExitCodes: [0, 2, 128] },
+        )
+      ).stdout.trim(),
+    ).toBe("");
     const retained = await operation(manager, reviewed.worktree!, "retain", {
       actor: "bounded-retention",
     });

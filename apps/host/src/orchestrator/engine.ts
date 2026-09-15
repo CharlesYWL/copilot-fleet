@@ -238,6 +238,7 @@ export class OrchestratorEngine {
       sessions,
       nodes: this.store.listNodes(),
       placements: this.store.listPlacements(),
+      repositoryCapabilities: this.store.listPlacementRepositoryCapabilities(),
       turnCompleteSessionIds: completedTurns,
       stepOutputs: this.collectOutputs(steps, run.policy.maxOutputChars),
       nowMs,

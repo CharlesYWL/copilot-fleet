@@ -229,6 +229,10 @@ export class FleetService {
     this.runTicker?.(runId);
   }
 
+  logManagedPlacementScheduling(details: Record<string, unknown>, message: string): void {
+    this.log.info(details, message);
+  }
+
   constructor(
     readonly store: FleetStore,
     private readonly log: FastifyBaseLogger,

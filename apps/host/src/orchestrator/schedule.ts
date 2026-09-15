@@ -57,6 +57,7 @@ export type ScheduleInput = {
   sessions: readonly FleetSession[];
   nodes: readonly FleetNode[];
   placements: readonly Placement[];
+  repositoryCapabilities?: readonly PlacementRepositoryCapability[];
   /**
    * Sessions whose current turn has ended.
    *
@@ -465,6 +466,9 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       reservedFor,
       writingInFlight,
       hasWritingStep,
+      ...(input.repositoryCapabilities
+        ? { repositoryCapabilities: input.repositoryCapabilities }
+        : {}),
     });
     if (!placementId) continue;
 
@@ -700,7 +704,13 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
           },
         ];
       })
-      .sort((a, b) => b.free - a.free || a.placement.id.localeCompare(b.placement.id));
+      .sort(
+        (a, b) =>
+          b.free - a.free ||
+          Number(b.placement.id === binding.originatingPlacementId) -
+            Number(a.placement.id === binding.originatingPlacementId) ||
+          a.placement.id.localeCompare(b.placement.id),
+      );
     for (const candidate of ranked) {
       if (candidate.free < 1) continue;
       if (writingInFlight.has(executionKey(run, candidate.placement.id))) continue;

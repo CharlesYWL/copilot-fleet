@@ -99,7 +99,8 @@ than returning successful shutdown.
 - New managed tasks require an explicit source placement from the repository the
   user selected. Host does not substitute the first online copy. Historical tasks
   that predate source metadata retain a compatibility-only lookup during initial
-  preparation; once resolved, the placement is pinned.
+  preparation. The resolved placement remains immutable provenance for the Run,
+  not permanent scheduler affinity.
 - Requested/effective mode, repository identity, source provenance, execution base,
   integration/publication policies and repository execution policy are stored in
   the immutable workspace spec. Resume, retries and later setting edits never
@@ -153,19 +154,52 @@ remotes are excluded. The Host marks another placement eligible only after that 
 proves the same identity and possession of the exact base commit. A matching ref or
 SHA alone never identifies a repository.
 
-Independent writable steps may use different eligible Nodes. Eligibility requires
-the exact base to be present or securely materializable, repository/toolchain
-compatibility, and result portability when transfer is needed. Retries of one
-conversation and dirty/unsealed state remain Node-affine. Explicit DAG edges are
-authoritative; a conservative phase barrier is retained only for legacy plans and
-is recorded as fallback telemetry. Composition removes predecessor results already
-covered by a descendant result. Multiple writable sinks create a durable synthetic
-fan-in workspace instead of being treated as inherently ambiguous.
+All compatible placements for that logical repository form a repository execution
+pool. Before binding each new step, the Host refreshes stale or missing placement
+proofs and briefly waits for those asynchronous probes instead of immediately
+falling back to the originating Node. Existing placements that already contain the
+exact base are the fast path. A destination that can fetch the exact published base
+is the next choice; portable Git-object transfer remains a fallback for predecessor
+results rather than a reason to copy an entire repository.
+
+Independent steps may use different eligible Nodes. Selection minimizes incremental
+start cost rather than maximizing Node count: current queue/workspace load, exact-base
+availability versus remote materialization, and portable predecessor-result transfer
+are compared, with originating-placement locality and then stable placement identity
+as tie-breakers. Node diversity is not itself an objective. Fleet parallelizes when
+that shortens the critical path and colocates when result locality makes the same Node
+cheaper.
+
+The three-second repository probe window is a bounded scheduling decision
+deadline, not a repository correctness boundary. Fleet records how many candidates
+were known, pending, or failed when the decision was made, how long it waited, the
+selected placement, and the predicted active/base/transfer cost for every eligible
+candidate. It also records bind-to-workspace-ready latency so estimates can be
+compared with observed startup time.
+
+Repository identity and compatibility are stable capability facts; the five-minute
+window applies only to the scheduling observation for the pinned base (local
+availability or materializability). A stale observation makes that placement pending
+and eligible for re-probe, not incompatible. Future protocol versions may persist
+those lifetimes separately, but scheduling must preserve this distinction.
+
+Eligibility requires repository/toolchain compatibility and result portability when
+transfer is needed. Retries of one conversation and dirty/unsealed state remain
+Node-affine. Explicit DAG edges are authoritative; a conservative phase barrier is
+retained only for legacy plans and is recorded as fallback telemetry. Composition
+removes predecessor results already covered by a descendant result. Multiple writable
+sinks create a durable synthetic fan-in workspace instead of being treated as
+inherently ambiguous.
 
 `originatingPlacement` is provenance and a locality hint only. Integration runs on
 an eligible integration-capable Node in a Fleet-owned detached worktree. It never
 selects, switches, cleans, resets, merges in, or otherwise depends on the user's
 originating checkout.
+
+`readOnly` remains a scheduling/capacity declaration, not an OS-enforced execution
+class. Until Fleet can deny filesystem mutation at the sandbox boundary, shell-capable
+reviews still receive disposable managed worktrees rather than sharing a placement
+checkout directly.
 
 ## Portable results and transport
 
@@ -276,7 +310,10 @@ resolved remote/base and generates a privacy-safe branch such as
 `dev/<short-user>/fleet-<stable-run-id>`. Fleet selects an eligible Node, creates a
 detached integration worktree at the exact integration base, imports the immutable
 reviewed result, composes it and validates the exact final tree. It then stops in
-`await_publish_approval`; no shared remote state has changed.
+`await_publish_approval`; no shared remote state has changed. If validation proves
+the final result equals the publication base (`0 files / 0 commits`), publication is
+marked complete without creating a remote branch or requesting approval, and Fleet
+continues directly to retention and cleanup.
 
 The UI presents the publication base, proposed final commit, final `base..result`
 diff, changed-file/commit counts, validation status and review status. **Publish

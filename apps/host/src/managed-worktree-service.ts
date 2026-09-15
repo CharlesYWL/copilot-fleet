@@ -30,7 +30,8 @@ import { WorkspaceArtifactStore } from "./workspace-artifact-store.js";
 
 export class ManagedWorktreeService {
   private static readonly ARTIFACT_RETENTION_MS = 24 * 60 * 60 * 1000;
-  private static readonly REPOSITORY_CAPABILITY_MAX_AGE_MS = 5 * 60_000;
+  private static readonly REPOSITORY_OBSERVATION_MAX_AGE_MS = 5 * 60_000;
+  private static readonly REPOSITORY_PROBE_WINDOW_MS = 3_000;
   private static readonly MAX_AUTOMATIC_QUIESCE_ATTEMPTS = 3;
   private readonly waiters = new Map<
     string,
@@ -38,6 +39,11 @@ export class ManagedWorktreeService {
   >();
   private readonly initializing = new Map<string, Promise<void>>();
   private readonly aggregating = new Set<string>();
+  private readonly placementProbeStartedAt = new Map<string, number>();
+  private readonly placementProbeCooldownUntil = new Map<string, number>();
+  private readonly placementProbeTimers = new Map<string, NodeJS.Timeout>();
+  private readonly placementProbeFailures = new Map<string, string>();
+  private readonly workspacePlacementStartedAt = new Map<string, number>();
   private lastSweep = 0;
   private readonly artifacts: WorkspaceArtifactStore;
 
@@ -437,6 +443,7 @@ export class ManagedWorktreeService {
       hasWritableHistory(key),
     );
     if (dependsOnWritableHistory && !composition) return undefined;
+    if (this.waitingForPlacementProbes(run, step)) return undefined;
     const worktreeId = step.managedWorktreeId || this.workspaceId(run.id, step.id);
     const executionPlacement = this.executionPlacement(run, step);
     if (!executionPlacement) return undefined;
@@ -511,6 +518,22 @@ export class ManagedWorktreeService {
       }
     }
     const binding = this.bindingForTree(tree);
+    const placementStartedAt = this.workspacePlacementStartedAt.get(tree.id);
+    if (placementStartedAt !== undefined) {
+      this.service.logManagedPlacementScheduling(
+        {
+          event: "managed_workspace_ready",
+          run_id: run.id,
+          step_id: step.id,
+          worktree_id: tree.id,
+          selected_node_id: tree.nodeId,
+          selected_placement_id: tree.executionPlacementId,
+          actual_workspace_ready_ms: Date.now() - placementStartedAt,
+        },
+        "Managed workspace became ready",
+      );
+      this.workspacePlacementStartedAt.delete(tree.id);
+    }
     this.store.updateRunStep(step.id, {
       workspaceState: "ready",
       workspaceError: "",
@@ -519,9 +542,147 @@ export class ManagedWorktreeService {
     return binding;
   }
 
+  private placementCapability(run: Run, placementId: string) {
+    const binding = run.workspaceBinding!;
+    return this.store.getPlacementRepositoryCapability(
+      placementId,
+      binding.repositoryIdentity,
+      binding.baseSha,
+    );
+  }
+
+  private freshPlacementObservation(run: Run, placementId: string) {
+    const capability = this.placementCapability(run, placementId);
+    return capability &&
+      Date.now() - Date.parse(capability.verifiedAt) <=
+        ManagedWorktreeService.REPOSITORY_OBSERVATION_MAX_AGE_MS
+      ? capability
+      : undefined;
+  }
+
+  private placementProbeKey(run: Run, placementId: string): string {
+    return `${run.id}:${placementId}:${run.workspaceBinding!.baseSha}`;
+  }
+
+  private waitingForPlacementProbes(run: Run, step: RunStep): boolean {
+    if (step.sessionId || step.executionBinding) return false;
+    const binding = run.workspaceBinding!;
+    const alternatives = this.store.listPlacements().filter((placement) => {
+      const node = this.store.getNode(placement.nodeId);
+      return (
+        placement.workspaceId === run.workspaceId &&
+        placement.id !== binding.originatingPlacementId &&
+        node?.online &&
+        node.capabilities.includes(MANAGED_WORKTREES_CAPABILITY) &&
+        node.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY)
+      );
+    });
+    if (!alternatives.length) return false;
+    const key = `${run.id}:${step.id}:${step.attempts}`;
+    const now = Date.now();
+    const cooldownUntil = this.placementProbeCooldownUntil.get(key) ?? 0;
+    if (cooldownUntil > now) return false;
+    this.placementProbeCooldownUntil.delete(key);
+    const allProven = alternatives.every((placement) =>
+      Boolean(this.freshPlacementObservation(run, placement.id)),
+    );
+    if (allProven) {
+      this.placementProbeCooldownUntil.set(
+        key,
+        now + ManagedWorktreeService.REPOSITORY_OBSERVATION_MAX_AGE_MS,
+      );
+      const startedAt = this.placementProbeStartedAt.get(key);
+      this.service.logManagedPlacementScheduling(
+        {
+          event: "repository_probe_decision",
+          run_id: run.id,
+          step_id: step.id,
+          candidate_count_known: alternatives.length + 1,
+          candidate_count_pending: 0,
+          candidate_count_failed: alternatives.filter((placement) =>
+            this.placementProbeFailures.has(this.placementProbeKey(run, placement.id)),
+          ).length,
+          probe_wait_ms: startedAt === undefined ? 0 : now - startedAt,
+          schedule_reason: "all_eligible_probes_resolved",
+        },
+        "Repository placement probes resolved before scheduling",
+      );
+      this.placementProbeStartedAt.delete(key);
+      const timer = this.placementProbeTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.placementProbeTimers.delete(key);
+      return false;
+    }
+    if (!this.placementProbeStartedAt.has(key)) {
+      this.placementProbeStartedAt.set(key, now);
+      this.probeRunPlacements(run.id);
+      const timer = setTimeout(() => {
+        const finishedAt = Date.now();
+        const startedAt = this.placementProbeStartedAt.get(key) ?? finishedAt;
+        const known = alternatives.filter((placement) =>
+          Boolean(this.freshPlacementObservation(run, placement.id)),
+        ).length;
+        const failed = alternatives.filter((placement) =>
+          this.placementProbeFailures.has(this.placementProbeKey(run, placement.id)),
+        ).length;
+        this.service.logManagedPlacementScheduling(
+          {
+            event: "repository_probe_decision",
+            run_id: run.id,
+            step_id: step.id,
+            candidate_count_known: known + 1,
+            candidate_count_pending: alternatives.length - known - failed,
+            candidate_count_failed: failed,
+            probe_wait_ms: finishedAt - startedAt,
+            schedule_reason: "probe_decision_deadline",
+          },
+          "Repository placement probe deadline reached",
+        );
+        this.placementProbeStartedAt.delete(key);
+        this.placementProbeTimers.delete(key);
+        this.placementProbeCooldownUntil.set(
+          key,
+          finishedAt + ManagedWorktreeService.REPOSITORY_OBSERVATION_MAX_AGE_MS,
+        );
+        this.service.tickRun(run.id);
+      }, ManagedWorktreeService.REPOSITORY_PROBE_WINDOW_MS);
+      timer.unref();
+      this.placementProbeTimers.set(key, timer);
+    }
+    return true;
+  }
+
   private executionPlacement(run: Run, step: RunStep) {
     const binding = run.workspaceBinding!;
     const primary = this.store.worktreeForRun(run.id);
+    const composition = this.compositionFor(run, step);
+    const activeCost = (nodeId: string) =>
+      this.store
+        .listSessions()
+        .filter(
+          (session) =>
+            session.nodeId === nodeId && !terminalSessionStates.has(session.state),
+        ).length *
+        60_000 +
+      this.store
+        .listRunSteps(run.id)
+        .filter(
+          (candidate) =>
+            candidate.id !== step.id &&
+            candidate.placementId &&
+            this.store.getPlacement(candidate.placementId)?.nodeId === nodeId &&
+            !terminalRunStepStates.has(candidate.state),
+        ).length *
+        60_000;
+    const transferCost = (nodeId: string) =>
+      (composition?.predecessors ?? []).reduce((total, predecessor) => {
+        const owner = this.store.getAnyManagedWorkspace(predecessor.worktreeId)?.nodeId;
+        if (!owner || owner === nodeId) return total;
+        const result = predecessor.workspaceResultId
+          ? this.store.getWorkspaceResult(predecessor.workspaceResultId)
+          : undefined;
+        return total + 1_000 + Math.ceil((result?.artifactSize ?? 0) / 20_000);
+      }, 0);
     let candidates = this.store
       .listPlacements()
       .filter((placement) => {
@@ -536,46 +697,35 @@ export class ManagedWorktreeService {
           placement.id === (binding.originatingPlacementId || binding.sourcePlacementId)
         )
           return primary?.repositoryIdentity === binding.repositoryIdentity;
-        const capability = this.store.getPlacementRepositoryCapability(
-          placement.id,
-          binding.repositoryIdentity,
-          binding.baseSha,
-        );
+        const capability = this.freshPlacementObservation(run, placement.id);
         return Boolean(
           node.capabilities.includes(PORTABLE_WORKTREE_RESULTS_CAPABILITY) &&
           (capability?.baseAvailable || capability?.baseMaterializable) &&
           capability.portableResultsSupported &&
           capability.nodeId === placement.nodeId &&
           capability.localPath === placement.localPath &&
-          Date.now() - Date.parse(capability.verifiedAt) <=
-            ManagedWorktreeService.REPOSITORY_CAPABILITY_MAX_AGE_MS &&
           capability.baseSha === binding.baseSha &&
           capability.repositoryIdentity.id === binding.repositoryIdentity &&
           capability.repositoryIdentity.objectFormat === binding.repositoryObjectFormat,
         );
       })
-      .sort((a, b) => {
-        const count = (nodeId: string) =>
-          this.store
-            .listSessions()
-            .filter(
-              (session) =>
-                session.nodeId === nodeId && !terminalSessionStates.has(session.state),
-            ).length +
-          this.store
-            .listRunSteps(run.id)
-            .filter(
-              (candidate) =>
-                candidate.id !== step.id &&
-                candidate.placementId &&
-                this.store.getPlacement(candidate.placementId)?.nodeId === nodeId &&
-                !["succeeded", "failed", "cancelled", "skipped"].includes(
-                  candidate.state,
-                ),
-            ).length;
-        return count(a.nodeId) - count(b.nodeId) || a.id.localeCompare(b.id);
-      });
-    const composition = this.compositionFor(run, step);
+      .sort((a, b) => a.id.localeCompare(b.id));
+    const score = (placement: (typeof candidates)[number]) => {
+      const active = activeCost(placement.nodeId);
+      const base =
+        placement.id === binding.originatingPlacementId ||
+        this.freshPlacementObservation(run, placement.id)?.baseAvailable
+          ? 0
+          : 30_000;
+      const transfer = transferCost(placement.nodeId);
+      return {
+        placement,
+        active_cost_ms: active,
+        base_cost_ms: base,
+        transfer_cost_ms: transfer,
+        predicted_total_ms: active + base + transfer,
+      };
+    };
     if (composition?.predecessors.some((entry) => !entry.workspaceResultId)) {
       const owners = new Set(
         composition.predecessors.map(
@@ -585,12 +735,52 @@ export class ManagedWorktreeService {
       if (owners.size !== 1 || owners.has(undefined)) return undefined;
       candidates = candidates.filter((entry) => owners.has(entry.nodeId));
     }
-    if (step.placementId) {
-      const pinned = candidates.find((entry) => entry.id === step.placementId);
-      if (pinned) return pinned;
-      if (step.sessionId) return undefined;
+    const ranked = candidates
+      .map(score)
+      .sort(
+        (a, b) =>
+          a.predicted_total_ms - b.predicted_total_ms ||
+          Number(b.placement.id === binding.originatingPlacementId) -
+            Number(a.placement.id === binding.originatingPlacementId) ||
+          a.placement.id.localeCompare(b.placement.id),
+      );
+    const selected =
+      step.sessionId && step.placementId
+        ? ranked.find((entry) => entry.placement.id === step.placementId)
+        : ranked[0];
+    if (step.sessionId && step.placementId) {
+      if (selected) return selected.placement;
+      return undefined;
     }
-    return candidates[0];
+    const choice = selected ?? ranked[0];
+    if (choice && !step.managedWorktreeId) {
+      const worktreeId = this.workspaceId(run.id, step.id);
+      this.workspacePlacementStartedAt.set(worktreeId, Date.now());
+      this.service.logManagedPlacementScheduling(
+        {
+          event: "managed_placement_selected",
+          run_id: run.id,
+          step_id: step.id,
+          selected_node_id: choice.placement.nodeId,
+          selected_placement_id: choice.placement.id,
+          originating_placement_id: binding.originatingPlacementId,
+          schedule_reason:
+            choice.placement.id === binding.originatingPlacementId
+              ? "lowest_cost_with_locality_tiebreak"
+              : "lower_estimated_completion_cost",
+          candidates: ranked.map((entry) => ({
+            node_id: entry.placement.nodeId,
+            placement_id: entry.placement.id,
+            active_cost_ms: entry.active_cost_ms,
+            base_cost_ms: entry.base_cost_ms,
+            transfer_cost_ms: entry.transfer_cost_ms,
+            predicted_total_ms: entry.predicted_total_ms,
+          })),
+        },
+        "Selected managed repository placement",
+      );
+    }
+    return choice?.placement;
   }
 
   finalizeStep(run: Run, step: RunStep): boolean {
@@ -1478,7 +1668,15 @@ export class ManagedWorktreeService {
           approval.targetRef === integration.preview.targetRef &&
           approval.finalResultSha === integration.resultSha &&
           approval.finalTreeSha === integration.finalTree;
-        if (integration.publishState !== "published" && !approvalMatches) {
+        const publicationRequired =
+          integration.resultSha !== integration.preview.targetSha ||
+          integration.publicationFileCount > 0 ||
+          integration.publicationCommitCount > 0;
+        if (
+          integration.publishState !== "published" &&
+          publicationRequired &&
+          !approvalMatches
+        ) {
           this.setAggregation(runId, {
             aggregationState: "in_progress",
             aggregationPhase: "await_publish_approval",
@@ -1499,7 +1697,7 @@ export class ManagedWorktreeService {
               kind: "publish",
               actor: "host-integration-controller",
               integrationId: integration.id,
-              publicationApproval: approval,
+              ...(approval ? { publicationApproval: approval } : {}),
             },
           );
           if (!publishOperation) return;
@@ -2156,7 +2354,13 @@ export class ManagedWorktreeService {
       )
         return false;
       this.store.putPlacementRepositoryCapability(result.capability);
+      this.placementProbeFailures.delete(this.placementProbeKey(run, placement.id));
       this.service.tickRun(run.id);
+    } else {
+      this.placementProbeFailures.set(
+        this.placementProbeKey(run, placement.id),
+        result.error || result.code || "Repository probe failed.",
+      );
     }
     return true;
   }
@@ -2560,6 +2764,12 @@ export class ManagedWorktreeService {
       if (operation) waiter.resolve(operation);
     }
     this.waiters.clear();
+    for (const timer of this.placementProbeTimers.values()) clearTimeout(timer);
+    this.placementProbeTimers.clear();
+    this.placementProbeStartedAt.clear();
+    this.placementProbeCooldownUntil.clear();
+    this.placementProbeFailures.clear();
+    this.workspacePlacementStartedAt.clear();
   }
 
   private publish(runId: string): void {

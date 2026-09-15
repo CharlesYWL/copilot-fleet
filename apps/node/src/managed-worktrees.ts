@@ -2767,15 +2767,26 @@ export class ManagedWorktrees {
 
   private async publishIntegration(
     integration: WorktreeIntegration,
-    approval: NonNullable<WorktreeOperationRequest["publicationApproval"]>,
+    approval: WorktreeOperationRequest["publicationApproval"],
     admin: CheckoutLease,
   ): Promise<void> {
-    if (!integration.preview.targetRemote) {
+    const publicationRequired =
+      integration.resultSha !== integration.preview.targetSha ||
+      integration.publicationFileCount > 0 ||
+      integration.publicationCommitCount > 0;
+    if (!publicationRequired || !integration.preview.targetRemote) {
       integration.publishState = "published";
       integration.publishedAt = now();
+      integration.error = "";
+      integration.updatedAt = now();
       this.saveIntegration(integration);
       return;
     }
+    if (!approval)
+      throw new WorktreeConflict(
+        "publication_approval_mismatch",
+        "Publication approval is required before creating a remote branch.",
+      );
     integration.publishState = "publishing";
     integration.updatedAt = now();
     this.saveIntegration(integration);
@@ -2927,14 +2938,19 @@ export class ManagedWorktrees {
           "Only an exactly validated integration result may be published.",
         );
       const approval = request.publicationApproval;
+      const publicationRequired =
+        integration.resultSha !== integration.preview.targetSha ||
+        integration.publicationFileCount > 0 ||
+        integration.publicationCommitCount > 0;
       if (
-        !approval ||
-        approval.runId !== tree.runId ||
-        approval.integrationId !== integration.id ||
-        approval.targetRemote !== integration.preview.targetRemote ||
-        approval.targetRef !== integration.preview.targetRef ||
-        approval.finalResultSha !== integration.resultSha ||
-        approval.finalTreeSha !== integration.finalTree
+        publicationRequired &&
+        (!approval ||
+          approval.runId !== tree.runId ||
+          approval.integrationId !== integration.id ||
+          approval.targetRemote !== integration.preview.targetRemote ||
+          approval.targetRef !== integration.preview.targetRef ||
+          approval.finalResultSha !== integration.resultSha ||
+          approval.finalTreeSha !== integration.finalTree)
       )
         throw new WorktreeConflict(
           "publication_approval_mismatch",
@@ -3083,10 +3099,10 @@ export class ManagedWorktrees {
               !fresh.hasCommittedChanges || fresh.alreadyIntegrated ? now() : "",
             publishState:
               !fresh.hasCommittedChanges || fresh.alreadyIntegrated
-                ? fresh.targetRemote
-                  ? "awaiting_approval"
-                  : "published"
+                ? "published"
                 : "not_started",
+            publishedAt:
+              !fresh.hasCommittedChanges || fresh.alreadyIntegrated ? now() : "",
             publicationBaseSha:
               !fresh.hasCommittedChanges || fresh.alreadyIntegrated
                 ? fresh.targetSha

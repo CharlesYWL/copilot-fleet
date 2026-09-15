@@ -5,6 +5,7 @@ import {
   HostToNodeMessageSchema,
   IntegrationPreviewSchema,
   ManagedWorktreeSchema,
+  RepositoryProbeResultSchema,
   WorktreeIntegrationSchema,
   WorktreeObservationSchema,
   WorktreeOperationResultSchema,
@@ -25,8 +26,11 @@ afterEach(() => {
 });
 function fixture(capable = true) {
   const store = new FleetStore(":memory:");
+  const logs: Array<{ details: unknown; message: unknown }> = [];
   const log = {
-    info() {},
+    info(details: unknown, message: unknown) {
+      logs.push({ details, message });
+    },
     warn() {},
     error() {},
     debug() {},
@@ -59,7 +63,7 @@ function fixture(capable = true) {
       workspaceMode: mode,
       sourcePlacementId: placement.id,
     });
-  return { store, service, node, frames, placement, create };
+  return { store, service, node, frames, placement, create, logs };
 }
 function acknowledgement(request: WorktreeOperationRequest): WorktreeOperationResult {
   const safeKey = createHash("sha256")
@@ -158,6 +162,7 @@ function operationResult(
     targetRef?: string;
     noChanges?: boolean;
     verifiedClean?: boolean;
+    legacyNoChangesAwaitingPublication?: boolean;
     integrationState?: "integrated" | "no_changes" | "conflicted";
   } = {},
 ): WorktreeOperationResult {
@@ -241,8 +246,16 @@ function operationResult(
             : "Merge result is clean and contains the reviewed task commit.",
           validationStartedAt: new Date().toISOString(),
           validatedAt: new Date().toISOString(),
-          publishState: request.kind === "publish" ? "published" : "awaiting_approval",
-          publishedAt: request.kind === "publish" ? new Date().toISOString() : "",
+          publishState:
+            request.kind === "publish" ||
+            (options.noChanges && !options.legacyNoChangesAwaitingPublication)
+              ? "published"
+              : "awaiting_approval",
+          publishedAt:
+            request.kind === "publish" ||
+            (options.noChanges && !options.legacyNoChangesAwaitingPublication)
+              ? new Date().toISOString()
+              : "",
           createdAt: new Date().toISOString(),
           updatedAt: new Date().toISOString(),
         })
@@ -940,7 +953,6 @@ describe("Host managed workspace orchestration", () => {
       "quiesce",
       "integration_preview",
       "integrate",
-      "publish",
       "retain",
       "cleanup",
     ] as const) {
@@ -952,13 +964,6 @@ describe("Host managed workspace orchestration", () => {
         kit.node.id,
         operationResult(kit.store, request, { noChanges: true }),
       );
-      if (kind === "integrate") {
-        await expect
-          .poll(() => kit.store.getRun(run.id)?.workspaceBinding?.aggregationPhase)
-          .toBe("await_publish_approval");
-        expect(kit.frames).toHaveLength(seen);
-        kit.service.worktrees.approvePublication(run.id, randomUUID(), "operator");
-      }
     }
 
     await expect.poll(() => kit.store.getRun(run.id)?.state).toBe("completed");
@@ -974,14 +979,40 @@ describe("Host managed workspace orchestration", () => {
         .listWorktreeOperations()
         .filter((entry) => entry.request.actor === "host-integration-controller")
         .map((entry) => entry.request.kind),
-    ).toEqual([
+    ).toEqual(["quiesce", "integration_preview", "integrate", "retain", "cleanup"]);
+  });
+
+  it("reconciles a persisted no-change integration without approval or a remote push", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit);
+    let seen = kit.frames.length;
+    kit.service.worktrees.advanceAggregation(run.id);
+
+    for (const kind of [
       "quiesce",
       "integration_preview",
       "integrate",
       "publish",
       "retain",
       "cleanup",
-    ]);
+    ] as const) {
+      await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+      const request = lastRequest(kit.frames);
+      expect(request.kind).toBe(kind);
+      if (kind === "publish") expect(request.publicationApproval).toBeUndefined();
+      seen = kit.frames.length;
+      kit.service.worktrees.handleResult(
+        kit.node.id,
+        operationResult(kit.store, request, {
+          noChanges: true,
+          legacyNoChangesAwaitingPublication: kind === "integrate",
+        }),
+      );
+    }
+
+    await expect.poll(() => kit.store.getRun(run.id)?.state).toBe("completed");
+    expect(kit.store.getPublicationApproval(run.id)).toBeUndefined();
+    expect(kit.store.worktreeForRun(run.id)?.state).toBe("removed");
   });
 
   it("completes integration while retaining ignored-only generated output", async () => {
@@ -1412,6 +1443,206 @@ describe("Host managed workspace orchestration", () => {
       sourcePlacementId: placement2.id,
       originatingPlacementId: kit.placement.id,
       repositoryIdentity: run.workspaceBinding!.repositoryIdentity,
+    });
+  });
+
+  it("keeps a new step local when another verified Node has no lower estimated cost", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit, false);
+    const second = kit.store.registerNode({
+      name: "Node 2",
+      os: "win32",
+      arch: "x64",
+      version: "test",
+      maxSessions: 8,
+      capabilities: ["host-yolo", "managed-worktrees-v1", "portable-worktree-results-v1"],
+    }).node;
+    kit.store.setNodeOnline(second.id, true);
+    const placement2 = kit.store.createPlacement(run.workspaceId, second.id, "D:\\repo");
+    kit.store.putPlacementRepositoryCapability({
+      placementId: placement2.id,
+      nodeId: second.id,
+      localPath: placement2.localPath,
+      repositoryIdentity: {
+        id: run.workspaceBinding!.repositoryIdentity,
+        objectFormat: "sha1",
+        evidence: "roots",
+        remoteHash: "",
+        rootHash: "e".repeat(64),
+      },
+      baseSha: run.workspaceBinding!.baseSha,
+      baseAvailable: true,
+      baseMaterializable: false,
+      portableResultsSupported: true,
+      portabilityReason: "",
+      verifiedAt: new Date().toISOString(),
+      error: "",
+    });
+    const remoteFrames: HostToNodeMessage[] = [];
+    kit.service.attachNode(second.id, {
+      OPEN: 1,
+      readyState: 1,
+      send: (text) => remoteFrames.push(HostToNodeMessageSchema.parse(JSON.parse(text))),
+      close() {},
+    });
+    const step = kit.store.upsertRunStep(run.id, {
+      stepKey: "local",
+      title: "local",
+      prompt: "local",
+      category: "explore",
+      position: 0,
+    });
+    kit.frames.splice(0);
+
+    kit.service.worktrees.ensureStepReady(kit.store.getRun(run.id)!, step);
+
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(0);
+    expect(lastRequest(kit.frames)).toMatchObject({
+      kind: "reserve",
+      sourcePlacementId: kit.placement.id,
+      originatingPlacementId: kit.placement.id,
+    });
+    expect(remoteFrames).toHaveLength(0);
+    expect(kit.logs).toContainEqual({
+      details: expect.objectContaining({
+        event: "managed_placement_selected",
+        selected_node_id: kit.node.id,
+        selected_placement_id: kit.placement.id,
+        schedule_reason: "lowest_cost_with_locality_tiebreak",
+        candidates: expect.arrayContaining([
+          expect.objectContaining({
+            node_id: second.id,
+            placement_id: placement2.id,
+            predicted_total_ms: 0,
+          }),
+        ]),
+      }),
+      message: "Selected managed repository placement",
+    });
+  });
+
+  it("waits for repository pool proofs before binding a new step to the origin", async () => {
+    const kit = fixture();
+    const second = kit.store.registerNode({
+      name: "Node 2",
+      os: "win32",
+      arch: "x64",
+      version: "test",
+      maxSessions: 8,
+      capabilities: ["host-yolo", "managed-worktrees-v1", "portable-worktree-results-v1"],
+    }).node;
+    kit.store.setNodeOnline(second.id, true);
+    const placement2 = kit.store.createPlacement(
+      kit.placement.workspaceId,
+      second.id,
+      "D:\\repo",
+    );
+    const remoteFrames: HostToNodeMessage[] = [];
+    kit.service.attachNode(second.id, {
+      OPEN: 1,
+      readyState: 1,
+      send: (text) => remoteFrames.push(HostToNodeMessageSchema.parse(JSON.parse(text))),
+      close() {},
+    });
+
+    const run = await readyManaged(kit, false);
+    const probe = remoteFrames.find((frame) => frame.type === "repository_probe");
+    expect(probe).toMatchObject({
+      type: "repository_probe",
+      request: {
+        placementId: placement2.id,
+        baseSha: run.workspaceBinding!.baseSha,
+        expectedRepositoryIdentity: run.workspaceBinding!.repositoryIdentity,
+      },
+    });
+    const step = kit.store.upsertRunStep(run.id, {
+      stepKey: "pool",
+      title: "pool",
+      prompt: "pool",
+      category: "explore",
+      position: 0,
+    });
+    const busy = kit.store.upsertRunStep(run.id, {
+      stepKey: "busy-origin",
+      title: "busy-origin",
+      prompt: "busy-origin",
+      category: "explore",
+      placementId: kit.placement.id,
+      position: 1,
+    });
+    kit.store.updateRunStep(busy.id, { state: "running" });
+    kit.frames.splice(0);
+    remoteFrames.splice(0);
+
+    expect(
+      kit.service.worktrees.ensureStepReady(kit.store.getRun(run.id)!, step),
+    ).toBeUndefined();
+    expect(kit.frames.some((frame) => frame.type === "managed_worktree")).toBe(false);
+    const refreshed = remoteFrames.find((frame) => frame.type === "repository_probe");
+    if (!refreshed || refreshed.type !== "repository_probe")
+      throw new Error("Expected a repository capability probe");
+    expect(
+      kit.service.worktrees.handleRepositoryProbe(
+        second.id,
+        RepositoryProbeResultSchema.parse({
+          operationId: refreshed.request.operationId,
+          runId: run.id,
+          placementId: placement2.id,
+          nodeId: second.id,
+          ok: true,
+          capability: {
+            placementId: placement2.id,
+            nodeId: second.id,
+            localPath: placement2.localPath,
+            repositoryIdentity: {
+              id: run.workspaceBinding!.repositoryIdentity,
+              objectFormat: "sha1",
+              evidence: "roots",
+              remoteHash: "",
+              rootHash: "e".repeat(64),
+            },
+            baseSha: run.workspaceBinding!.baseSha,
+            baseAvailable: true,
+            baseMaterializable: false,
+            portableResultsSupported: true,
+            portabilityReason: "",
+            verifiedAt: new Date().toISOString(),
+            error: "",
+          },
+          code: "",
+          error: "",
+        }),
+      ),
+    ).toBe(true);
+
+    kit.service.worktrees.ensureStepReady(
+      kit.store.getRun(run.id)!,
+      kit.store.getRunStep(step.id)!,
+    );
+    await expect.poll(() => remoteFrames.length).toBeGreaterThan(1);
+    expect(lastRequest(remoteFrames)).toMatchObject({
+      kind: "reserve",
+      sourcePlacementId: placement2.id,
+      originatingPlacementId: kit.placement.id,
+    });
+    expect(kit.logs).toContainEqual({
+      details: expect.objectContaining({
+        event: "repository_probe_decision",
+        candidate_count_known: 2,
+        candidate_count_pending: 0,
+        probe_wait_ms: expect.any(Number),
+        schedule_reason: "all_eligible_probes_resolved",
+      }),
+      message: "Repository placement probes resolved before scheduling",
+    });
+    expect(kit.logs).toContainEqual({
+      details: expect.objectContaining({
+        event: "managed_placement_selected",
+        selected_node_id: second.id,
+        selected_placement_id: placement2.id,
+        schedule_reason: "lower_estimated_completion_cost",
+      }),
+      message: "Selected managed repository placement",
     });
   });
 });
