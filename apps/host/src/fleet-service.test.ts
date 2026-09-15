@@ -3,6 +3,7 @@ import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import {
   CHATS_WORKSPACE_NAME,
+  CONTEXT_TIER_CONFIG_ID,
   HOST_URL_SYNC_CAPABILITY,
   NODE_NAME_SYNC_CAPABILITY,
   SELF_UPDATE_CAPABILITY,
@@ -63,6 +64,79 @@ function setup(hostRevision: string | (() => string) = "") {
   };
   return { store, service, enroll };
 }
+
+describe("session context defaults", () => {
+  it.each(["", "lead", "worker", "reviewer"] as const)(
+    "starts %s sessions in long context",
+    (runRole) => {
+      const { store, service, enroll } = setup();
+      try {
+        const wire = enroll("box", ["copilot-acp"]);
+        store.setNodeOnline(wire.nodeId, true, 0);
+        const workspace = store.createWorkspace("repo", "");
+        const placement = store.createPlacement(workspace.id, wire.nodeId, "C:\\repo");
+        expect(
+          service.createAndStartSession({
+            placement,
+            prompt: "hello",
+            yolo: false,
+            runRole,
+          }).ok,
+        ).toBe(true);
+        expect(wire.sent.at(-1)).toMatchObject({
+          command: { contextTier: "long_context" },
+        });
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it("applies the default on adoption and retains a session's explicit choice on resume and recovery", () => {
+    const { store, service, enroll } = setup();
+    try {
+      const wire = enroll("box", ["copilot-acp"]);
+      store.setNodeOnline(wire.nodeId, true, 0);
+      const workspace = store.createWorkspace("repo", "");
+      const placement = store.createPlacement(workspace.id, wire.nodeId, "C:\\repo");
+      store.setDefaultContextTier("default");
+      const result = service.adoptAndResumeSession({
+        placement,
+        agentSessionId: "same-conversation",
+        yolo: false,
+      });
+      if (!result.ok) throw new Error(result.error);
+      expect(wire.sent.at(-1)).toMatchObject({ command: { contextTier: "default" } });
+      store.appendEvent({
+        eventId: "context",
+        sessionId: result.session.id,
+        sequence: 1,
+        type: "config",
+        payload: {
+          options: [
+            { id: CONTEXT_TIER_CONFIG_ID, name: "Context", currentValue: "long_context" },
+          ],
+        },
+        createdAt: new Date().toISOString(),
+      });
+      store.transitionSession(result.session.id, "stopped");
+      expect(service.resumeSession(result.session.id).ok).toBe(true);
+      expect(wire.sent.at(-1)).toMatchObject({
+        command: {
+          contextTier: "long_context",
+          agentSessionId: "same-conversation",
+        },
+      });
+      store.markNodeSessionsOffline(wire.nodeId, "Node restarted");
+      service.reconcile(wire.nodeId, []);
+      expect(wire.sent.at(-1)).toMatchObject({
+        command: { contextTier: "long_context" },
+      });
+    } finally {
+      store.close();
+    }
+  });
+});
 
 describe("adopting discovered Copilot sessions", () => {
   it("creates one Fleet session with the stable ACP id and dispatches resume", () => {

@@ -1,5 +1,6 @@
 import {
   Menu,
+  MenuItem,
   MenuItemRadio,
   MenuList,
   MenuPopover,
@@ -9,20 +10,24 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import { ChevronDown12Regular } from "@fluentui/react-icons";
-import type { SessionConfigOption } from "@fleet/protocol";
+import { CONTEXT_TIER_CONFIG_ID, type SessionConfigOption } from "@fleet/protocol";
 import { visibleConfigOptions } from "../lib/session-config";
 
 const useStyles = makeStyles({
   bar: {
     display: "flex",
     alignItems: "center",
+    flexWrap: "wrap",
+    flex: "1 1 0",
+    gap: "4px",
     minWidth: 0,
   },
   trigger: {
     display: "flex",
     alignItems: "center",
     gap: "3px",
-    maxWidth: "190px",
+    minWidth: 0,
+    maxWidth: "min(320px, 100%)",
     padding: "3px 6px",
     border: "none",
     borderRadius: tokens.borderRadiusMedium,
@@ -41,6 +46,10 @@ const useStyles = makeStyles({
       color: tokens.colorNeutralForegroundDisabled,
       background: "transparent",
     },
+    ":focus-visible": {
+      outline: `2px solid ${tokens.colorBrandStroke1}`,
+      outlineOffset: "2px",
+    },
   },
   value: {
     overflow: "hidden",
@@ -51,12 +60,28 @@ const useStyles = makeStyles({
     flexShrink: 0,
     opacity: 0.6,
   },
-  separator: {
-    flexShrink: 0,
-    width: "1px",
-    height: "14px",
-    margin: "0 4px",
-    background: tokens.colorNeutralStroke2,
+  popover: {
+    minWidth: 0,
+    maxWidth: "min(340px, calc(100vw - 24px))",
+  },
+  row: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "16px",
+    minWidth: 0,
+  },
+  selected: {
+    minWidth: 0,
+    maxWidth: "190px",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+    color: tokens.colorNeutralForeground3,
+  },
+  choice: {
+    whiteSpace: "normal",
+    overflowWrap: "anywhere",
   },
   // The popover carries the label, so the trigger does not have to spend width
   // repeating "Model" next to the model's own name.
@@ -65,6 +90,14 @@ const useStyles = makeStyles({
     padding: "6px 10px 2px",
     color: tokens.colorNeutralForeground4,
     fontSize: "11px",
+    maxWidth: "300px",
+    whiteSpace: "normal",
+  },
+  description: {
+    display: "block",
+    color: tokens.colorNeutralForeground3,
+    fontSize: "11px",
+    whiteSpace: "normal",
   },
   /**
    * Keeps a long picker inside the window.
@@ -88,25 +121,17 @@ const useStyles = makeStyles({
 export type SessionConfigBarProps = {
   options: SessionConfigOption[];
   /** Whose session this is: some pickers are the fleet's, not the operator's. */
-  session?: { runRole?: string };
+  session?: { runRole?: string; state?: string; stopRequested?: boolean | undefined };
   disabled?: boolean;
   onChange: (configId: string, value: string) => void;
 };
 
-/**
- * The session's pickers, as a strip of compact controls.
- *
- * Each one shows only its current value. The composer is the busiest part of
- * the screen, and a row of labelled dropdowns above it spent a whole band
- * saying words that never change; the name lives in the menu that opens
- * instead, where there is room for it next to each choice.
- *
- * Menus open upwards because the strip sits at the bottom of the window, where
- * a downward popover would have nowhere to go.
- *
- * What is left out is decided by {@link visibleConfigOptions}, which drops the
- * settings the fleet has already made for this session.
- */
+const modelSettingIds = ["model", "reasoning_effort", CONTEXT_TIER_CONFIG_ID];
+const currentLabel = (option: SessionConfigOption) =>
+  option.choices.find((choice) => choice.value === option.currentValue)?.name ??
+  (option.currentValue || option.name);
+
+/** Model settings share one chip; fleet-owned pickers stay out of the composer. */
 export const SessionConfigBar = ({
   options,
   session,
@@ -116,62 +141,111 @@ export const SessionConfigBar = ({
   const styles = useStyles();
   const usable = visibleConfigOptions(options, session ?? {});
   if (usable.length === 0) return null;
+  const modelSettings = modelSettingIds.flatMap((id) =>
+    usable.filter((option) => option.id === id),
+  );
+  const otherSettings = usable.filter((option) => !modelSettingIds.includes(option.id));
+  const summary =
+    ["model", "reasoning_effort"]
+      .flatMap((id) => options.filter((option) => option.id === id).map(currentLabel))
+      .join(" · ") || modelSettings.map(currentLabel).join(" · ");
+
+  const picker = (option: SessionConfigOption, nested = false) => {
+    const contextLocked =
+      option.id === CONTEXT_TIER_CONFIG_ID &&
+      (session?.state !== "idle" || session.stopRequested);
+    const locked = Boolean(disabled || contextLocked);
+    const description = contextLocked
+      ? `Wait for the session to be idle to change the context window. ${option.description}`
+      : option.description || option.name;
+    const label = option.id === "reasoning_effort" ? "Effort" : option.name;
+    const value = currentLabel(option);
+    return (
+      <Menu
+        key={option.id}
+        positioning={nested ? "after-top" : "above-start"}
+        checkedValues={{ [option.id]: [option.currentValue] }}
+        onCheckedValueChange={(_event, data) => {
+          const next = data.checkedItems[0];
+          // An empty string is a real choice, not an absent selection.
+          if (locked || next === undefined || next === option.currentValue) return;
+          onChange(option.id, next);
+        }}
+      >
+        <MenuTrigger disableButtonEnhancement>
+          {nested ? (
+            <MenuItem
+              disabled={locked}
+              content={{ className: styles.row }}
+              title={description}
+              aria-label={`${label}: ${value}`}
+            >
+              <span>{label}</span>
+              <span className={styles.selected}>{value}</span>
+            </MenuItem>
+          ) : (
+            <button
+              type="button"
+              className={styles.trigger}
+              disabled={locked}
+              aria-label={option.name}
+              title={description}
+            >
+              <span className={styles.value}>{value}</span>
+              <ChevronDown12Regular className={styles.chevron} />
+            </button>
+          )}
+        </MenuTrigger>
+        <MenuPopover className={styles.popover}>
+          <MenuList className={styles.list} aria-label={option.name}>
+            <Text className={styles.heading}>{option.name}</Text>
+            {option.description && (
+              <Text className={styles.heading}>{option.description}</Text>
+            )}
+            {option.choices.map((choice) => (
+              <MenuItemRadio
+                key={choice.value}
+                name={option.id}
+                value={choice.value}
+                disabled={locked}
+                content={{ className: styles.choice }}
+              >
+                {choice.name}
+                {choice.description && (
+                  <span className={styles.description}>{choice.description}</span>
+                )}
+              </MenuItemRadio>
+            ))}
+          </MenuList>
+        </MenuPopover>
+      </Menu>
+    );
+  };
 
   return (
     <div className={styles.bar}>
-      {usable.map((option, index) => {
-        const current = option.choices.find(
-          (choice) => choice.value === option.currentValue,
-        );
-        return (
-          <div className={styles.bar} key={option.id}>
-            {index > 0 ? <span className={styles.separator} aria-hidden /> : null}
-            <Menu
-              positioning="above-start"
-              checkedValues={{ [option.id]: [option.currentValue] }}
-              onCheckedValueChange={(_event, data) => {
-                const next = data.checkedItems[0];
-                // Compared against undefined rather than tested for truth: ""
-                // is a selectable value (Copilot's default `agent`), and a
-                // falsy check made that one choice impossible to pick.
-                if (next === undefined || next === option.currentValue) return;
-                onChange(option.id, next);
-              }}
+      {modelSettings.length > 0 && (
+        <Menu positioning="above-start">
+          <MenuTrigger disableButtonEnhancement>
+            <button
+              type="button"
+              className={styles.trigger}
+              disabled={disabled}
+              aria-label="Model settings"
+              title={summary}
             >
-              <MenuTrigger disableButtonEnhancement>
-                <button
-                  type="button"
-                  className={styles.trigger}
-                  disabled={disabled}
-                  aria-label={option.name}
-                  title={option.description || option.name}
-                >
-                  {/* An agent can report a value that predates the list it
-                      sent, so the raw id is shown rather than nothing. */}
-                  <span className={styles.value}>
-                    {current?.name ?? option.currentValue}
-                  </span>
-                  <ChevronDown12Regular className={styles.chevron} />
-                </button>
-              </MenuTrigger>
-              <MenuPopover>
-                <MenuList className={styles.list}>
-                  <Text className={styles.heading}>{option.name}</Text>
-                  {option.choices.map((choice) => (
-                    <MenuItemRadio
-                      key={choice.value}
-                      name={option.id}
-                      value={choice.value}
-                    >
-                      {choice.name}
-                    </MenuItemRadio>
-                  ))}
-                </MenuList>
-              </MenuPopover>
-            </Menu>
-          </div>
-        );
-      })}
+              <span className={styles.value}>{summary}</span>
+              <ChevronDown12Regular className={styles.chevron} />
+            </button>
+          </MenuTrigger>
+          <MenuPopover className={styles.popover}>
+            <MenuList className={styles.list} aria-label="Model settings">
+              {modelSettings.map((option) => picker(option, true))}
+            </MenuList>
+          </MenuPopover>
+        </Menu>
+      )}
+      {otherSettings.map((option) => picker(option))}
     </div>
   );
 };

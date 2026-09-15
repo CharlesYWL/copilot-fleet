@@ -1,13 +1,21 @@
 import { ChildProcess, spawn } from "node:child_process";
 import type * as childProcess from "node:child_process";
 import { PassThrough } from "node:stream";
-import type { SessionEvent } from "@fleet/protocol";
+import { CONTEXT_TIER_CONFIG_ID, type SessionEvent } from "@fleet/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AcpAgentFactory, type SessionAgent } from "./agents.js";
 import type * as copilotLaunch from "./copilot-launch.js";
 
 const installation = vi.hoisted(() => ({
   path: "C:\\Program Files\\Agency\\agency.exe" as string | undefined,
+}));
+const credits = vi.hoisted(() => ({ value: undefined as number | undefined }));
+vi.mock("./session-credits.js", () => ({
+  SessionCreditReader: class {
+    async read() {
+      return credits.value;
+    }
+  },
 }));
 vi.mock("./copilot-launch.js", async (importOriginal) => {
   const actual = await importOriginal<typeof copilotLaunch>();
@@ -35,6 +43,13 @@ let metadataFailure: string | undefined;
 let startupFailure: string | undefined;
 let metadataHangs = false;
 let agencyVersion = "1.0.84";
+let loadUsage: { used: number; size: number } | undefined;
+let advertiseContext = false;
+let contextResponse = "";
+let contextFailure = false;
+let currentModel = "model-a";
+let interleavedText = false;
+let splitContextResponse = false;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -45,6 +60,15 @@ beforeEach(() => {
   startupFailure = undefined;
   metadataHangs = false;
   agencyVersion = "1.0.84";
+  credits.value = undefined;
+  loadUsage = undefined;
+  advertiseContext = false;
+  contextResponse =
+    "Context Usage\n\n○ ● ·   model-a · 31k/400k tokens (8%)\n◎ ◎   Buffer 141.6k (35%)";
+  contextFailure = false;
+  currentModel = "model-a";
+  interleavedText = false;
+  splitContextResponse = false;
   vi.mocked(spawn).mockImplementation((command, args) => {
     const argv: string[] = Array.isArray(args) ? args : [];
     const child = Object.assign(new ChildProcess(), {
@@ -95,6 +119,12 @@ beforeEach(() => {
         const request = JSON.parse(line) as RpcRequest;
         requests.push(request);
         if (request.id === undefined) continue;
+        if (
+          request.method === "session/set_config_option" &&
+          request.params.configId === "model"
+        ) {
+          currentModel = String(request.params.value);
+        }
         const configOptions = [
           {
             id: "allow_all",
@@ -106,7 +136,25 @@ beforeEach(() => {
               { value: "off", name: "Off" },
             ],
           },
+          ...(advertiseContext
+            ? [
+                {
+                  id: "model",
+                  name: "Model",
+                  type: "select",
+                  currentValue: currentModel,
+                  options: [
+                    { value: "model-a", name: "A" },
+                    { value: "model-b", name: "B" },
+                  ],
+                },
+              ]
+            : []),
         ];
+        const isContext =
+          request.method === "session/prompt" &&
+          (request.params.prompt as { type: string; text?: string }[])[0]?.text ===
+            "/context";
         const result =
           request.method === "initialize"
             ? {
@@ -118,14 +166,82 @@ beforeEach(() => {
               }
             : request.method === "session/new"
               ? { sessionId: "acp-created", configOptions }
-              : { configOptions };
+              : request.method === "session/prompt"
+                ? { stopReason: "end_turn" }
+                : { configOptions };
         const reply =
-          startupFailure && request.method === "initialize"
-            ? { id: request.id, error: { code: -32000, message: startupFailure } }
+          (startupFailure && request.method === "initialize") ||
+          (isContext && contextFailure)
+            ? {
+                id: request.id,
+                error: { code: -32000, message: startupFailure ?? "Context read failed" },
+              }
             : { id: request.id, result };
-        queueMicrotask(() =>
-          child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...reply })}\n`),
-        );
+        queueMicrotask(() => {
+          const notify = (update: Record<string, unknown>) =>
+            child.stdout.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: { sessionId: request.params.sessionId ?? "acp-created", update },
+              })}\n`,
+            );
+          if (
+            advertiseContext &&
+            ["session/new", "session/load"].includes(request.method)
+          ) {
+            notify({
+              sessionUpdate: "available_commands_update",
+              availableCommands: [{ name: "context", description: "Show context usage" }],
+            });
+          }
+          if (
+            advertiseContext &&
+            request.method === "session/prompt" &&
+            !contextFailure
+          ) {
+            if (!isContext)
+              notify({ sessionUpdate: "usage_update", used: 28000, size: 272000 });
+            if (isContext && interleavedText)
+              notify({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Background update before" },
+              });
+            const chunks = isContext
+              ? splitContextResponse
+                ? [
+                    contextResponse.slice(0, 3),
+                    contextResponse.slice(3, 45),
+                    contextResponse.slice(45),
+                  ]
+                : [contextResponse]
+              : ["Model response"];
+            for (const text of chunks) {
+              notify({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text },
+              });
+            }
+            if (isContext && interleavedText)
+              notify({
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: "Background update after" },
+              });
+          }
+          if (request.method === "session/load" && loadUsage) {
+            child.stdout.write(
+              `${JSON.stringify({
+                jsonrpc: "2.0",
+                method: "session/update",
+                params: {
+                  sessionId: request.params.sessionId,
+                  update: { sessionUpdate: "usage_update", ...loadUsage },
+                },
+              })}\n`,
+            );
+          }
+          child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...reply })}\n`);
+        });
       }
     });
     return child;
@@ -141,6 +257,187 @@ const fleetMcp = [{ name: "fleet", url: "http://127.0.0.1:8787/mcp", headers: []
 const launches = () => processes.filter((entry) => entry.args.includes("--acp"));
 
 describe("Agency ACP startup", () => {
+  it("overrides the node tier for a session, reports cumulative credits and replayed context, and sends real /compact", async () => {
+    credits.value = 27.4014;
+    loadUsage = { used: 50000, size: 200000 };
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60000, "copilot", "long_context").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+      { agencyMode: true, contextTier: "default", resumeAgentSessionId: "saved-id" },
+    );
+    agents.push(agent);
+    expect(launches()[0]?.args.slice(-2)).toEqual(["--context", "default"]);
+    expect(
+      events.filter((event) => event.type === "config").at(-1)?.payload.options,
+    ).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: CONTEXT_TIER_CONFIG_ID, currentValue: "default" }),
+      ]),
+    );
+    expect(
+      events.filter((event) => event.type === "usage").map((event) => event.payload),
+    ).toEqual([
+      { context: null },
+      { contextTokens: 50000, contextWindow: 200000 },
+      { aiCredits: 27.4014 },
+    ]);
+    expect(agent.busy).toBe(false);
+    expect(events.some((event) => event.payload.state === "running")).toBe(false);
+    await agent.prompt("/compact");
+    expect(
+      requests.find((request) => request.method === "session/prompt")?.params,
+    ).toEqual({
+      sessionId: "saved-id",
+      prompt: [{ type: "text", text: "/compact" }],
+    });
+    expect(events.filter((event) => event.type === "usage")).toHaveLength(3);
+    expect(agent.busy).toBe(false);
+  });
+
+  it("refreshes full context after the response without adding a turn or transcript noise", async () => {
+    advertiseContext = true;
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+      { agencyMode: true },
+    );
+    agents.push(agent);
+    await agent.prompt("Work");
+    expect(
+      requests
+        .filter((request) => request.method === "session/prompt")
+        .map((request) => request.params.prompt),
+    ).toEqual([[{ type: "text", text: "Work" }], [{ type: "text", text: "/context" }]]);
+    const usage = events.filter((event) => event.type === "usage");
+    expect(usage.at(-1)?.payload.context).toMatchObject({
+      model: "model-a",
+      usedTokens: 31000,
+      tokenLimit: 400000,
+      percentage: 8,
+      estimated: true,
+    });
+    expect(usage).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          payload: { contextTokens: 28000, contextWindow: 272000 },
+        }),
+      ]),
+    );
+    expect(
+      events
+        .filter((event) => event.type === "agent_text")
+        .map((event) => event.payload.text),
+    ).toEqual(["Model response"]);
+    expect(events.filter((event) => event.type === "turn_complete")).toHaveLength(1);
+    expect(
+      events
+        .filter((event) => event.type === "system")
+        .map((event) => event.payload.text),
+    ).not.toContain("User: /context");
+    expect(agent.busy).toBe(false);
+    await agent.setConfigOption("model", "model-b");
+    expect(
+      events.filter((event) => event.type === "usage").at(-1)?.payload.context,
+    ).toBeNull();
+    await agent.prompt("Continue on the new model");
+    expect(
+      events.filter((event) => event.type === "usage").at(-1)?.payload.context,
+    ).toBeNull();
+  });
+
+  it("uses an explicit /context result without running the command twice", async () => {
+    advertiseContext = true;
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+    );
+    agents.push(agent);
+    await agent.prompt("/context");
+    expect(
+      requests.filter((request) => request.method === "session/prompt"),
+    ).toHaveLength(1);
+    expect(
+      events.filter((event) => event.type === "agent_text").at(-1)?.payload.text,
+    ).toBe(contextResponse);
+    expect(
+      events.filter((event) => event.type === "usage").at(-1)?.payload.context,
+    ).toMatchObject({ percentage: 8, tokenLimit: 400000 });
+  });
+
+  it("does not swallow background output surrounding the local context report", async () => {
+    advertiseContext = true;
+    interleavedText = true;
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+    );
+    agents.push(agent);
+    await agent.prompt("Work");
+    expect(
+      events
+        .filter((event) => event.type === "agent_text")
+        .map((event) => event.payload.text),
+    ).toEqual(["Model response", "Background update before", "Background update after"]);
+    expect(
+      events.filter((event) => event.type === "usage").at(-1)?.payload.context,
+    ).toMatchObject({ percentage: 8 });
+  });
+
+  it("collects a fragmented local context report without displaying its chunks", async () => {
+    advertiseContext = true;
+    splitContextResponse = true;
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      (event) => events.push(event),
+    );
+    agents.push(agent);
+    await agent.prompt("Work");
+    expect(
+      events
+        .filter((event) => event.type === "agent_text")
+        .map((event) => event.payload.text),
+    ).toEqual(["Model response"]);
+    expect(
+      events.filter((event) => event.type === "usage").at(-1)?.payload.context,
+    ).toMatchObject({ percentage: 8, tokenLimit: 400000 });
+  });
+
+  it.each(["invalid", "rpc-failure"])(
+    "reports metadata failure without failing a successful turn: %s",
+    async (failure) => {
+      advertiseContext = true;
+      contextResponse = "Unexpected context format";
+      contextFailure = failure === "rpc-failure";
+      const events: SessionEvent[] = [];
+      const agent = await new AcpAgentFactory(60000, "copilot").start(
+        "s1",
+        "C:\\repo",
+        (event) => events.push(event),
+      );
+      agents.push(agent);
+      await agent.prompt("Work");
+      expect(events.some((event) => event.payload.state === "failed")).toBe(false);
+      expect(events.at(-1)?.payload.state).toBe("idle");
+      expect(
+        events.some(
+          (event) =>
+            event.type === "system" &&
+            String(event.payload.text).includes("Context usage is unavailable"),
+        ),
+      ).toBe(true);
+    },
+  );
+
   it("probes Agency's Copilot and preserves ACP flags, permissions, cwd, and Fleet MCP", async () => {
     const events: SessionEvent[] = [];
     const factory = new AcpAgentFactory(60_000, "standard-copilot", "long_context");

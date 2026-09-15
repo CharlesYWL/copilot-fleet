@@ -249,6 +249,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
 
   app.get("/api/defaults", async (request) => ({
     yolo: store.getDefaultYolo(),
+    contextTier: store.getDefaultContextTier(),
     agencyMode: store.getAgencyMode(),
     agencyModeAvailable: auth.agencyAvailableFor(request.fleetSession),
     autoResume: store.getAutoResume(),
@@ -269,6 +270,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     // Each field is optional so a client that knows about one setting cannot
     // reset the others merely by not mentioning them.
     if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
+    if (input.contextTier !== undefined) store.setDefaultContextTier(input.contextTier);
     if (input.agencyMode !== undefined) store.setAgencyMode(input.agencyMode);
     if (input.autoResume !== undefined) store.setAutoResume(input.autoResume);
     if (input.notificationLifecycleEnabled !== undefined) {
@@ -280,6 +282,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     }
     return {
       yolo: store.getDefaultYolo(),
+      contextTier: store.getDefaultContextTier(),
       agencyMode: store.getAgencyMode(),
       agencyModeAvailable,
       autoResume: store.getAutoResume(),

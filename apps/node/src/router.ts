@@ -1,6 +1,8 @@
 import { isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import {
+  CONTEXT_TIER_CONFIG_ID,
+  ContextTierSchema,
   eventPayload,
   isSessionActivityEvent,
   sessionRetentionCutoff,
@@ -8,6 +10,7 @@ import {
   type NodeCommand,
   type SessionEvent,
   type StartupConfig,
+  type ContextTier,
 } from "@fleet/protocol";
 import type { AgentFactory, SessionAgent } from "./agents.js";
 import { installRequestedAgent, type CatalogEntry } from "./agent-catalog.js";
@@ -186,7 +189,7 @@ export class CommandRouter {
           slot.refreshMcpPending = true;
           return;
         }
-        await this.refreshMcpSession(sessionId, slot);
+        await this.restartSession(sessionId, slot);
       }),
     );
   }
@@ -248,8 +251,26 @@ export class CommandRouter {
         } else if (command.type === "set_config_option") {
           // A rejected picker change must not tear down an otherwise healthy session.
           try {
-            await agent.setConfigOption(command.configId, command.value);
-            slot.config.set(command.configId, command.value);
+            if (command.configId === CONTEXT_TIER_CONFIG_ID) {
+              const tier = ContextTierSchema.parse(command.value);
+              if (!slot.config.has(CONTEXT_TIER_CONFIG_ID)) {
+                throw new CommandRefused(
+                  "This Copilot does not support context switching",
+                );
+              }
+              if (agent.busy) {
+                agent.resync();
+                throw new CommandRefused(
+                  "Wait for the current turn before changing context",
+                );
+              }
+              if (slot.config.get(CONTEXT_TIER_CONFIG_ID) !== tier) {
+                await this.restartSession(command.sessionId, slot, tier);
+              }
+            } else {
+              await agent.setConfigOption(command.configId, command.value);
+              slot.config.set(command.configId, command.value);
+            }
           } catch (error) {
             throw new CommandRefused(
               error instanceof Error ? error.message : "Could not change that option",
@@ -556,6 +577,7 @@ export class CommandRouter {
                 sequenceOffset: command.sequenceOffset,
                 yolo: command.yolo,
                 agencyMode: command.agencyMode ?? false,
+                ...(command.contextTier ? { contextTier: command.contextTier } : {}),
                 mcpServers,
                 agent: requested.selected,
                 config: command.config,
@@ -563,6 +585,7 @@ export class CommandRouter {
             : {
                 yolo: command.yolo,
                 agencyMode: command.agencyMode ?? false,
+                ...(command.contextTier ? { contextTier: command.contextTier } : {}),
                 mcpServers,
                 agent: requested.selected,
                 config: command.config,
@@ -644,11 +667,15 @@ export class CommandRouter {
       !this.deleting.has(sessionId)
     ) {
       slot.refreshMcpPending = false;
-      void this.refreshMcpSession(sessionId, slot);
+      void this.restartSession(sessionId, slot);
     }
   }
 
-  private async refreshMcpSession(sessionId: string, slot: SessionSlot): Promise<void> {
+  private async restartSession(
+    sessionId: string,
+    slot: SessionSlot,
+    contextTier?: ContextTier,
+  ): Promise<void> {
     if (this.deleting.has(sessionId)) return;
     if (slot.refreshing) {
       await slot.refreshing;
@@ -664,15 +691,25 @@ export class CommandRouter {
         !launch ||
         !slot.cwd ||
         !slot.agentSessionId ||
-        launch.mcpServers.length === 0
+        (contextTier === undefined && launch.mcpServers.length === 0)
       ) {
+        if (contextTier !== undefined) {
+          throw new CommandRefused(
+            "Session cannot be restarted without its saved conversation",
+          );
+        }
         return;
       }
       if (current.busy) {
+        if (contextTier !== undefined) {
+          current.resync();
+          throw new CommandRefused("Wait for the current turn before changing context");
+        }
         slot.refreshMcpPending = true;
         return;
       }
       const generation = ++slot.generation;
+      const nextContextTier = contextTier ?? launch.contextTier;
       await current.stop(false);
       slot.agent = undefined;
       // Only load-time replay is historical; the retained sink goes live once startup settles.
@@ -696,6 +733,7 @@ export class CommandRouter {
             sequenceOffset: slot.sequenceOffset,
             yolo: launch.yolo,
             agencyMode: launch.agencyMode ?? false,
+            ...(nextContextTier ? { contextTier: nextContextTier } : {}),
             mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
             agent: slot.selectedAgent ?? "",
             config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
@@ -710,10 +748,14 @@ export class CommandRouter {
         return;
       }
       slot.agent = next;
+      if (contextTier !== undefined) slot.launch = { ...launch, contextTier };
     });
     const handled = refresh.catch((error) => {
+      if (error instanceof CommandRefused) throw error;
+      const purpose =
+        contextTier === undefined ? "restore MCP tools" : "change context window";
       this.warn(
-        `session ${sessionId.slice(0, 8)}: could not restore MCP tools: ${
+        `session ${sessionId.slice(0, 8)}: could not ${purpose}: ${
           error instanceof Error ? error.message : "unknown error"
         }`,
       );
@@ -726,11 +768,12 @@ export class CommandRouter {
           type: "state",
           payload: {
             state: "failed",
-            activity: "Copilot could not be restarted to restore MCP tools",
+            activity: `Copilot could not be restarted to ${purpose}`,
           },
           createdAt: new Date().toISOString(),
         });
       }
+      if (contextTier !== undefined) throw error;
     });
     slot.refreshing = handled;
     slot.ready = handled;
@@ -738,6 +781,7 @@ export class CommandRouter {
       await handled;
     } finally {
       if (slot.refreshing === handled) delete slot.refreshing;
+      if (slot.ready === handled) slot.ready = Promise.resolve();
     }
   }
 }

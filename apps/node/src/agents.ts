@@ -7,9 +7,11 @@ import type {
   PromptAttachment,
   SessionEvent,
   StartupConfig,
+  SessionUsage,
 } from "@fleet/protocol";
-import { attachmentSummary, errorMessage } from "@fleet/protocol";
+import { CONTEXT_TIER_CONFIG_ID, attachmentSummary, errorMessage } from "@fleet/protocol";
 import {
+  contextConfigOption,
   configValueFor,
   toSessionCommands,
   toSessionConfigOptions,
@@ -20,6 +22,8 @@ import {
   resolveCopilotLaunch,
   type CopilotLaunch,
 } from "./copilot-launch.js";
+import { SessionCreditReader } from "./session-credits.js";
+import { parseContextUsage } from "./context-usage.js";
 
 export type PermissionDecision = {
   outcome: "allow_once" | "deny";
@@ -43,7 +47,8 @@ export function supportedAdditionalDirectories(
  * Mirrors the choices `copilot --context` accepts; kept in step with the enum
  * in settings.ts, which is what the config page writes.
  */
-export type ContextTier = "default" | "long_context";
+export type { ContextTier } from "@fleet/protocol";
+import type { ContextTier } from "@fleet/protocol";
 
 /**
  * The first Copilot CLI release whose ACP handshake verifies login.
@@ -188,6 +193,7 @@ export type StartAgentOptions = {
   yolo?: boolean;
   /** Prefer this Node's Agency installation, falling back only when it is absent. */
   agencyMode?: boolean;
+  contextTier?: ContextTier;
   /**
    * MCP servers to hand this session, supplied on both `session/new` and
    * `session/load`. Empty for every ordinary session.
@@ -416,6 +422,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private stopping = false;
   /** `session/load` replays the whole history; the host already stored it. */
   private replaying = false;
+  private creditReader: SessionCreditReader | undefined;
+  private creditTimer: ReturnType<typeof setInterval> | undefined;
+  private creditRead: Promise<void> | undefined;
+  private creditError: string | undefined;
+  private usage: SessionUsage = {};
+  private contextCommandAvailable = false;
+  private contextCapture:
+    { text: string; hidden: boolean; truncated: boolean; complete: boolean } | undefined;
+  private contextError: string | undefined;
   /**
    * The agent's own option list, kept as ACP sent it.
    *
@@ -496,7 +511,13 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         activity: resumeAgentSessionId ? "Resuming Copilot ACP" : "Starting Copilot ACP",
       });
     }
+    this.reportUsage({ context: null });
     if (this.launch.notice) this.emit("system", { message: this.launch.notice });
+    if (!this.contextTier) {
+      this.emit("system", {
+        text: "This Copilot does not support --context; update it to select a context window.",
+      });
+    }
     const args = [...this.launch.args, ...copilotLaunchArgs(this.yolo, this.contextTier)];
     const { command, shell } = copilotSpawnTarget(this.launch.command);
     const child = spawn(command, args, {
@@ -519,6 +540,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.denyPendingPermissions();
     });
     child.on("exit", (code, signal) => {
+      clearInterval(this.creditTimer);
       this.denyPendingPermissions();
       this.unprompted.clear();
       if (!this.stopping && !this.hasTerminated) {
@@ -535,6 +557,32 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         this.requestPermission(params),
       )
       .onNotification(acp.methods.client.session.update, ({ params }) => {
+        if (
+          this.contextCapture &&
+          params.update.sessionUpdate === "agent_message_chunk" &&
+          params.update.content.type === "text"
+        ) {
+          const capture = this.contextCapture;
+          const text = params.update.content.text;
+          const belongsToReport =
+            !capture.hidden ||
+            (!capture.complete &&
+              (capture.text !== "" ||
+                text.startsWith("Context Usage") ||
+                "Context Usage".startsWith(text) ||
+                text.startsWith("Context information")));
+          if (belongsToReport) {
+            capture.text += text;
+            if (capture.text.length > 32_768) {
+              capture.text = capture.text.slice(0, 32_768);
+              capture.truncated = true;
+            }
+            capture.complete =
+              capture.text.startsWith("Context information is not yet available.") ||
+              /\bBuffer\s+[\d.,]+[kKmM]?\s+\([\d.]+%\)\s*$/.test(capture.text);
+            if (capture.hidden) return;
+          }
+        }
         // Commands and pickers describe what the session can do now, not what
         // it did, so they are the one thing a replay must not swallow: a
         // resumed session would otherwise come back with an empty slash menu
@@ -581,7 +629,6 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         this.replaying = false;
       }
       this.agentSessionId = resumeAgentSessionId;
-      this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
         cwd,
@@ -597,7 +644,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     await this.recoverConfigOptions();
     await this.selectCustomAgent();
     await this.applyStartupConfig();
+    this.captureConfigOptions(this.configOptions);
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
+    this.creditReader = new SessionCreditReader(this.agentSessionId);
+    await this.refreshCredits();
+    this.creditTimer = setInterval(() => void this.refreshCredits(), 2_000);
+    this.creditTimer.unref();
+    if (resumeAgentSessionId) {
+      this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
+    }
   }
 
   /**
@@ -613,6 +668,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
    */
   private async applyStartupConfig(): Promise<void> {
     for (const wanted of this.startupConfig) {
+      if (wanted.id === CONTEXT_TIER_CONFIG_ID) continue;
       const option = this.configOptions.find((entry) => entry.id === wanted.id);
       if (!option) {
         this.emit("system", {
@@ -698,8 +754,108 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     options: acp.SessionConfigOption[] | null | undefined,
   ): void {
     if (!options) return;
+    const previousModel = this.configOptions.find(
+      (option) => option.id === "model",
+    )?.currentValue;
+    const nextModel = options.find((option) => option.id === "model")?.currentValue;
+    if (previousModel !== undefined && previousModel !== nextModel) {
+      this.reportUsage({ context: null });
+    }
     this.configOptions = options;
-    this.emit("config", { options: toSessionConfigOptions(options) });
+    this.emit("config", {
+      options: [
+        ...toSessionConfigOptions(options),
+        ...(this.contextTier ? [contextConfigOption(this.contextTier)] : []),
+      ],
+    });
+  }
+
+  private reportUsage(update: SessionUsage): void {
+    if (
+      Object.entries(update).every(
+        ([key, value]) => this.usage[key as keyof SessionUsage] === value,
+      )
+    )
+      return;
+    this.usage = { ...this.usage, ...update };
+    this.emit("usage", update);
+  }
+
+  private refreshCredits(): Promise<void> {
+    if (this.creditRead) return this.creditRead;
+    if (!this.creditReader) return Promise.resolve();
+    const read = this.creditReader
+      .read()
+      .then((aiCredits) => {
+        this.creditError = undefined;
+        if (aiCredits !== undefined) this.reportUsage({ aiCredits });
+      })
+      .catch((error: unknown) => {
+        const message = `Session AI credit usage is unavailable: ${errorMessage(error)}`;
+        if (this.creditError !== message) this.emit("system", { text: message });
+        this.creditError = message;
+      })
+      .finally(() => {
+        this.creditRead = undefined;
+      });
+    this.creditRead = read;
+    return read;
+  }
+
+  private publishContextCapture(): void {
+    const capture = this.contextCapture;
+    if (!capture) return;
+    try {
+      if (capture.truncated) throw new Error("Copilot's /context report was too large");
+      const context = parseContextUsage(capture.text);
+      const selectedModel = this.configOptions.find(
+        (option) => option.id === "model",
+      )?.currentValue;
+      this.reportUsage({
+        context:
+          context &&
+          selectedModel &&
+          selectedModel !== "auto" &&
+          selectedModel !== context.model
+            ? null
+            : context,
+      });
+      this.contextError = undefined;
+    } catch (error) {
+      this.contextReadFailed(error);
+    }
+  }
+
+  private contextReadFailed(error: unknown): void {
+    this.reportUsage({ context: null });
+    const message = `Context usage is unavailable: ${errorMessage(error)}`;
+    if (message !== this.contextError && !this.stopping)
+      this.emit("system", { text: message });
+    this.contextError = message;
+  }
+
+  /** /context is an advertised local CLI command, not a model prompt. */
+  private async refreshContext(): Promise<void> {
+    if (
+      !this.contextCommandAvailable ||
+      !this.agentSessionId ||
+      !this.connection ||
+      this.stopping
+    )
+      return;
+    this.contextCapture = { text: "", hidden: true, truncated: false, complete: false };
+    try {
+      await this.connection.agent.request(
+        acp.methods.agent.session.prompt,
+        { sessionId: this.agentSessionId, prompt: [{ type: "text", text: "/context" }] },
+        { cancellationSignal: AbortSignal.timeout(5_000) },
+      );
+      this.publishContextCapture();
+    } catch (error) {
+      this.contextReadFailed(error);
+    } finally {
+      this.contextCapture = undefined;
+    }
   }
 
   async prompt(
@@ -711,6 +867,18 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
     if (this.prompting) throw new Error("A prompt is already active");
     this.prompting = true;
+    const isContextCommand =
+      this.contextCommandAvailable &&
+      text.trim() === "/context" &&
+      attachments.length === 0;
+    if (isContextCommand) {
+      this.contextCapture = {
+        text: "",
+        hidden: false,
+        truncated: false,
+        complete: false,
+      };
+    }
     // The prompt owns the session's state from here, so whatever was inferred
     // from a turn Copilot started for itself stands down without a word.
     this.unprompted.clear();
@@ -732,7 +900,11 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           prompt: toPromptBlocks(text, attachments),
         },
       );
+      if (isContextCommand) this.publishContextCapture();
+      else await this.refreshContext();
+      await this.refreshCredits();
       this.emit("turn_complete", { stopReason: response.stopReason });
+      this.prompting = false;
       this.emit("state", { state: "idle", activity: "Ready for follow-up" });
     } catch (error) {
       this.emit("error", {
@@ -742,6 +914,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       await this.stop();
       throw error;
     } finally {
+      this.contextCapture = undefined;
       this.prompting = false;
     }
   }
@@ -805,12 +978,30 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   async stop(announce = true): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
+    clearInterval(this.creditTimer);
     this.unprompted.clear();
     this.denyPendingPermissions();
     this.connection?.close();
     if (this.child && this.child.exitCode === null) {
-      this.child.kill();
+      const child = this.child;
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          child.off("exit", exited);
+          reject(
+            new Error(
+              "Copilot did not exit; refusing to reopen its conversation concurrently",
+            ),
+          );
+        }, 5_000);
+        const exited = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        child.once("exit", exited);
+        child.kill();
+      });
     }
+    await this.refreshCredits();
     if (announce && !this.hasTerminated) {
       this.emit("state", { state: "stopped", activity: "Process stopped" });
     }
@@ -883,7 +1074,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private isCurrentStateUpdate(update: acp.SessionUpdate): boolean {
     return (
       update.sessionUpdate === "available_commands_update" ||
-      update.sessionUpdate === "config_option_update"
+      update.sessionUpdate === "config_option_update" ||
+      update.sessionUpdate === "usage_update"
     );
   }
 
@@ -901,7 +1093,17 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   }
 
   private forwardUpdate(update: acp.SessionUpdate): void {
+    if (update.sessionUpdate === "usage_update") {
+      this.reportUsage({
+        contextTokens: update.used,
+        ...(update.size > 0 ? { contextWindow: update.size } : {}),
+      });
+      return;
+    }
     if (update.sessionUpdate === "available_commands_update") {
+      this.contextCommandAvailable = update.availableCommands.some(
+        (command) => command.name === "context",
+      );
       this.emit("commands", { commands: toSessionCommands(update.availableCommands) });
       return;
     }
@@ -994,6 +1196,7 @@ export class AcpAgentFactory implements AgentFactory {
       this.copilotCommand,
     );
     await this.validateCopilot(launch);
+    const supportsContext = await this.acceptsContextTier(launch);
     const agent = new AcpAgent(
       sessionId,
       sink,
@@ -1001,7 +1204,7 @@ export class AcpAgentFactory implements AgentFactory {
       options.sequenceOffset ?? 0,
       options.yolo ?? false,
       launch,
-      (await this.acceptsContextTier(launch)) ? this.contextTier : undefined,
+      supportsContext ? (options.contextTier ?? this.contextTier) : undefined,
       options.mcpServers ?? [],
       options.agent ?? "",
       options.config ?? [],
@@ -1071,7 +1274,12 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     ["mode", "agent"],
   ]);
 
-  constructor(fleetSessionId: string, sink: EventSink, sequenceOffset = 0) {
+  constructor(
+    fleetSessionId: string,
+    sink: EventSink,
+    sequenceOffset = 0,
+    private readonly contextTier: ContextTier = "long_context",
+  ) {
     super(fleetSessionId, sink, sequenceOffset);
   }
 
@@ -1087,6 +1295,7 @@ class MockAgent extends SequencedAgent implements SessionAgent {
     });
     this.emit("commands", {
       commands: [
+        { name: "compact", description: "Compact conversation context" },
         { name: "usage", description: "Display session usage metrics" },
         { name: "model", description: "Select AI model to use", hint: "model" },
         { name: "review", description: "Review changes", hint: "instructions" },
@@ -1174,6 +1383,7 @@ class MockAgent extends SequencedAgent implements SessionAgent {
   private publishConfig(): void {
     this.emit("config", {
       options: [
+        contextConfigOption(this.contextTier),
         {
           id: "model",
           name: "Model",
@@ -1208,7 +1418,12 @@ export class MockAgentFactory implements AgentFactory {
     sink: EventSink,
     options: StartAgentOptions = {},
   ): Promise<SessionAgent> {
-    const agent = new MockAgent(sessionId, sink, options.sequenceOffset ?? 0);
+    const agent = new MockAgent(
+      sessionId,
+      sink,
+      options.sequenceOffset ?? 0,
+      options.contextTier ?? "long_context",
+    );
     agent.start(options.resumeAgentSessionId, options.announceLifecycle);
     return agent;
   }

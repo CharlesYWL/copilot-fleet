@@ -1007,15 +1007,57 @@ straight away. The list is whatever the agent reports for that session, includin
 skills and plugins, so a machine with extra skills installed shows them without
 any change here.
 
-Along the bottom of the composer sit the session's pickers — **Model**, **Mode**,
-**Reasoning Effort** — as the agent reports them. Each shows only its current
-value and opens a menu upwards; the setting's name lives in that menu rather
-than on the strip, so the composer stays one compact object instead of a band of
-labelled dropdowns. These are the settings a terminal Copilot opens a chooser
-for, which is why `/model` on its own answers "no model is currently selected"
-over a wire protocol: there is no terminal to open a chooser in. Changing one
-takes effect on the live session without spending a turn, and works while the
-agent is mid-run.
+One compact button combines **Model**, **Reasoning Effort**, and **Context window**.
+Its upward-opening menu shows each setting's current value and a submenu of
+choices. **Mode** remains separate where the operator controls it; a custom agent
+remains beside the session title. Model and effort can change while work is running;
+context changes require an idle session.
+
+New sessions request
+`--context long_context` by default, including Chats, orchestrators, workers, and
+reviewers. Turn **Settings → General → Long context by default** off to use
+`--context default` instead. A session's own selection survives stop/resume and
+automatic recovery. The Host default takes precedence over the node-local context
+setting; changing it does not interrupt existing sessions.
+
+Changing the context picker requires an idle session and restarts only that
+Copilot process, loading the same conversation with its history, current pickers,
+workspace roots, permissions, and Fleet MCP tools intact. The menu explains the
+restart and higher cost of extended context. Window sizes vary by model; a CLI
+without `--context` support reports that limitation and does not offer the picker.
+An accepted flag is not confirmation of a 1M window: some CLI versions drop the
+tier in the ACP bridge at creation or model changes
+([github/copilot-cli#4275](https://github.com/github/copilot-cli/issues/4275)).
+Fleet preserves the request but never substitutes the catalog maximum for the
+window Copilot actually reports.
+
+The planned native-backend replacement is documented in the
+[Copilot RPC migration runbook](docs/copilot-rpc-migration-runbook.md). That work
+belongs to a follow-up PR; the controls described here still use ACP.
+
+A small **context ring beside Send** opens on hover, focus, or click. Its popover
+contains **AI credits**, **context details**, and **Compact**, without adding a
+second composer row. The ring uses a fresh local `/context` report after each
+requested turn completes (including compaction); an explicit `/context` also updates it.
+These local status commands do not ask the model to answer. Values rounded by the
+CLI are marked as estimates, its percentage is retained, and the popover shows the
+report's model and timestamp. Restarting or changing models invalidates old readings.
+
+ACP `usage_update.size` is an **input/prompt budget**, not the full model window:
+for example, 272k input plus a 128k output reserve gives the 400k `/context` window.
+Its used-token count is also an earlier snapshot, often before the response.
+Those readings are labeled separately rather than mixed into the ring's full-window
+percentage. A missing `/context` snapshot leaves a neutral ring, not a fake zero.
+
+AI credits come from the session's cumulative
+billing checkpoint (`totalNanoAiu / 1,000,000,000`), polled on its node; premium
+requests are never relabeled as credits. Metrics not yet reported are shown as
+unavailable, not zero. The latest readings persist across browser/Host reloads,
+resume, and backup/restore. No account-wide quota or budget is shown.
+
+**Compact** in the popover sends the agent's `/compact` command when it is offered and the session
+is idle. It summarizes the live context without clearing the saved transcript or
+your unsent draft and attachments.
 
 Copilot also reports an **Allow All** picker, and the strip leaves it out.
 Permission policy is decided once when the session is launched, with or without

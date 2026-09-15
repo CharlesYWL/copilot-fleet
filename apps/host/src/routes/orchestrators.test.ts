@@ -1,6 +1,6 @@
 import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
+import { CONTEXT_TIER_CONFIG_ID, ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { orchestratorRoutes } from "./orchestrators.js";
@@ -86,6 +86,75 @@ describe("orchestrator lifecycle routes", () => {
       worker,
     };
   };
+
+  it("sends /compact without renaming an orchestrator or discarding its history", async () => {
+    const { app, store, service, leadId } = await setup();
+    const dispatch = vi.spyOn(service, "dispatch");
+    const name = store.getSession(leadId)!.name;
+    const events = store.listEvents(leadId);
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/sessions/${leadId}/prompt`,
+          payload: { prompt: "/compact" },
+        })
+      ).statusCode,
+    ).toBe(202);
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        type: "prompt",
+        sessionId: leadId,
+        prompt: "/compact",
+        attachments: [],
+      }),
+      expect.anything(),
+    );
+    expect(store.getSession(leadId)!.name).toBe(name);
+    expect(store.listEvents(leadId)).toEqual(events);
+  });
+
+  it("gates context changes on an idle session with a context picker", async () => {
+    const { app, store, service, leadId } = await setup();
+    const change = () =>
+      app.inject({
+        method: "POST",
+        url: `/api/sessions/${leadId}/config`,
+        payload: { configId: CONTEXT_TIER_CONFIG_ID, value: "default" },
+      });
+    expect((await change()).statusCode).toBe(409);
+    const session = store.getSession(leadId)!;
+    store.setNodeIdentity(session.nodeId, {
+      version: "0.6.0",
+      capabilities: ["copilot-acp", "session-config"],
+    });
+    store.appendEvent({
+      eventId: "context",
+      sessionId: leadId,
+      sequence: 2,
+      type: "config",
+      payload: {
+        options: [
+          { id: CONTEXT_TIER_CONFIG_ID, name: "Context", currentValue: "long_context" },
+        ],
+      },
+      createdAt: new Date().toISOString(),
+    });
+    const dispatch = vi.spyOn(service, "dispatch");
+    expect((await change()).statusCode).toBe(202);
+    expect(dispatch).toHaveBeenCalledWith(session.nodeId, {
+      type: "set_config_option",
+      sessionId: leadId,
+      configId: CONTEXT_TIER_CONFIG_ID,
+      value: "default",
+    });
+    store.transitionSession(leadId, "running");
+    expect((await change()).statusCode).toBe(409);
+    store.transitionSession(leadId, "idle");
+    store.setSessionControls(leadId, { stopRequested: true });
+    expect((await change()).statusCode).toBe(409);
+  });
 
   it("stops atomically, preserves terminal outcomes, and is idempotent", async () => {
     const { app, store, service, leadId, run, done, active, descendant, worker } =

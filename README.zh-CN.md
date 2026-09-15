@@ -759,11 +759,39 @@ npm start -- --url=https://fleet.example.com
 光标停在后面；不需要参数的（`/usage`、`/context`）直接执行。列表就是该会话的代理所上报
 的内容，包括 skills 和 plugins，所以装了额外 skills 的机器无需这里改动就会显示出来。
 
-输入框底部是该会话的选择器 —— **Model**、**Mode**、**Reasoning Effort** —— 内容由代理
-上报。每个只显示当前值并向上打开菜单；设置项的名字放在菜单里而不是条上，这样输入框
-仍然是一个紧凑的整体，而不是一排带标签的下拉框。这些正是终端里的 Copilot 会弹出选择器
-的设置项，也正因如此，`/model` 单独使用时在线协议上会回答“当前没有选择模型”：没有终端
-可以弹出选择器。改动会立即作用于在线会话，不消耗一个回合，代理正在运行时也能改。
+输入框用一个紧凑按钮合并 **Model**、**Reasoning Effort** 和 **Context window**。向上打开的
+菜单显示各项当前值，并通过子菜单选择；可由用户控制的 **Mode** 仍单独显示，自定义代理仍在
+会话标题旁。模型和推理强度可在运行时更改，上下文切换必须等待空闲。
+
+新会话默认请求 `--context long_context`，包括
+Chats、Orchestrator、worker 和 reviewer；可在 **Settings → General → Long context by
+default** 关闭此默认行为，改用 `--context default`。Host 默认值优先于节点本地设置；
+单个会话的选择会在恢复和自动重连时保留，修改默认值不会中断已有会话。
+
+切换上下文窗口需要会话空闲，只重启该 Copilot 进程并加载同一会话，保留历史、当前选择器、
+工作目录、权限和 Fleet MCP 工具。菜单提示重启行为及长上下文可能增加的费用。实际窗口
+大小取决于模型；不支持 `--context` 的 CLI 会明确提示且不显示该选择器。部分 CLI 的 ACP
+桥接层会在创建或切换模型时丢弃上下文档位
+（[github/copilot-cli#4275](https://github.com/github/copilot-cli/issues/4275)），所以接受启动
+参数不等于实际启用了 1M；Fleet 不会用模型目录的最大值替代实际报告的窗口。
+
+后续原生后端迁移见 [Copilot RPC migration runbook](docs/copilot-rpc-migration-runbook.md)。
+本次只交付界面和实施计划，迁移将在另一份 PR 中实现；当前仍使用 ACP。
+
+**发送按钮旁的上下文圆环**支持悬停、键盘聚焦或点击打开弹窗，里面显示本会话的 **AI credits**、
+上下文详情和 **Compact**，不再额外占用输入框一行。每个回合结束（包括压缩）后读取本地
+`/context` 报告；手动执行 `/context` 也会同步更新。此状态命令不会让模型作答。CLI 四舍五入的
+数值会标为估计值，并保留其百分比、报告模型和时间戳；重启或切换模型会使旧报告失效。
+
+ACP 的 `usage_update.size` 是**输入预算**而非完整窗口，例如 272k 输入预算加上 128k 输出预留
+对应 `/context` 的 400k。ACP 的已用 token 数也通常来自回复之前的快照，因此单独标记，不混入
+圆环的完整窗口百分比。没有新报告时圆环保持未知状态，而不是显示虚假的零。
+
+AI credits 来自节点上该会话的累计计费检查点
+（`totalNanoAiu / 1,000,000,000`），不会把 premium requests 当成 credits，也不显示账号
+总额度。尚未上报的数据标为不可用而非零，已上报数据随刷新、恢复和备份保留。
+弹窗内的 **Compact** 在空闲且代理支持时发送 `/compact`，压缩在线上下文，但不清除已保存的对话记录
+或尚未发送的草稿和附件。
 
 Copilot 还会上报一个 **Allow All** 选择器，而这条选择器条把它排除在外。权限策略在会话
 启动时就已经决定（带或不带 `--allow-all`），并且已经显示为会话的 YOLO 标记。把它再作为

@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
+import { ContextTierSchema } from "@fleet/protocol";
 import { configDirectory } from "./config.js";
 
 /**
@@ -16,31 +17,14 @@ export const SettingsSchema = z.object({
   copilotCommand: z.string(),
   permissionTimeoutMs: z.number().int().min(1_000).max(3_600_000),
   /**
-   * Which context window agents on this machine are started with.
-   *
-   * The long window is a setting on a model rather than a model of its own:
-   * Copilot's catalog puts claude-opus-5, claude-sonnet-5 and the Gemini models
-   * at 1,000,000 tokens (936,000 of them usable for the prompt) and the GPT-5.6
-   * family at 1,050,000, all under the same ids the model picker already shows.
-   * Which tier a model actually runs on is persisted per model, in the app's
-   * own store rather than a file the fleet can read — `copilot-context-tier`
-   * holds something like {"claude-opus-5":"long_context"} — and only covers the
-   * models someone has switched over by hand. A node that does not ask for a
-   * tier therefore inherits that map, so the same session gets a different
-   * window depending on which machine it landed on and what was clicked there.
-   * Asking every time is what makes that consistent, the same way `--allow-all`
-   * is passed explicitly rather than left to the environment.
-   *
-   * Do not use `/context` to check whether this worked: in ACP mode it reports
-   * 264k for models the catalog puts at 1,000,000, and that figure is not the
-   * budget being enforced — a 435k-token prompt was accepted and answered from
-   * its first line. It appears to be a default-tier constant, and reading it as
-   * the real limit is how this setting first came to be documented as useless.
-   *
-   * Applies to agents started from now on; sessions already running keep the
-   * tier they were launched with, since it is fixed at spawn.
+   * Tier requested with --context, not proof of the effective model window.
+   * Copilot's ACP bridge can drop the tier at creation or on model changes
+   * (github/copilot-cli#4275). Neither a catalog maximum nor an accepted flag
+   * proves that the session is using it. The UI reports /context separately.
+   * The Host's per-session tier takes precedence; this local setting is the
+   * fallback for older Hosts and for local session discovery.
    */
-  contextTier: z.enum(["default", "long_context"]).default("long_context"),
+  contextTier: ContextTierSchema.default("long_context"),
   /**
    * Addresses this node has reached the Host on before, newest first.
    *

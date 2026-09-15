@@ -685,6 +685,7 @@ export class FleetStore {
     this.addColumnIfMissing("sessions", "name", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "commands", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "config_options", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "usage", "TEXT NOT NULL DEFAULT '{}'");
     this.addColumnIfMissing("placements", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("workspaces", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "position", "INTEGER NOT NULL DEFAULT 0");
@@ -1115,6 +1116,16 @@ export class FleetStore {
     this.setSetting("defaults.yolo", yolo ? "1" : "0");
   }
 
+  getDefaultContextTier(): "default" | "long_context" {
+    return this.getSetting("defaults.contextTier") === "default"
+      ? "default"
+      : "long_context";
+  }
+
+  setDefaultContextTier(tier: "default" | "long_context"): void {
+    this.setSetting("defaults.contextTier", tier);
+  }
+
   getAgencyMode(): boolean {
     return this.getSetting("defaults.agencyMode") === "1";
   }
@@ -1209,6 +1220,7 @@ export class FleetStore {
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
       defaults: {
         yolo: this.getDefaultYolo(),
+        contextTier: this.getDefaultContextTier(),
         agencyMode: this.getAgencyMode(),
         autoResume: this.getAutoResume(),
         notificationLifecycleEnabled: this.getDefaultNotificationLifecycleEnabled(),
@@ -1376,6 +1388,7 @@ export class FleetStore {
       this.setSetting("tunnel.devtunnel.id", tunnelIds.devtunnel);
     }
     this.setDefaultYolo(parsed.defaults.yolo);
+    this.setDefaultContextTier(parsed.defaults.contextTier ?? "long_context");
     this.setAgencyMode(parsed.defaults.agencyMode);
     this.setAutoResume(parsed.defaults.autoResume);
     this.setDefaultNotificationLifecycleEnabled(
@@ -1439,8 +1452,8 @@ export class FleetStore {
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
-            stop_requested,dismissed,favorite,last_activity_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            stop_requested,dismissed,favorite,last_activity_at,usage)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -1465,6 +1478,7 @@ export class FleetStore {
         session.dismissed ? 1 : 0,
         session.favorite ? 1 : 0,
         session.lastActivityAt ?? session.updatedAt,
+        JSON.stringify(session.usage ?? {}),
       );
     }
     for (const event of parsed.events) {
@@ -4531,6 +4545,15 @@ export class FleetStore {
             "UPDATE sessions SET config_options=?,updated_at=? WHERE id=?",
           ).run(JSON.stringify(options), event.createdAt, event.sessionId);
         }
+        const usage = eventPayload(event, "usage");
+        if (usage && Object.keys(usage).length > 0) {
+          const previousUsage = this.getSession(event.sessionId)?.usage;
+          this.statement("UPDATE sessions SET usage=?,updated_at=? WHERE id=?").run(
+            JSON.stringify({ ...previousUsage, ...usage }),
+            event.createdAt,
+            event.sessionId,
+          );
+        }
       }
       const agentSessionId = eventPayload(event, "agent_session")?.agentSessionId;
       if (agentSessionId) {
@@ -4768,6 +4791,7 @@ function sessionFromRow(row: Row): FleetSession {
     yolo: Number(row.yolo ?? 0) === 1,
     commands: parseJsonList(row.commands),
     configOptions: parseJsonList(row.config_options),
+    usage: JSON.parse(String(row.usage ?? "{}")),
     runId: String(row.run_id ?? ""),
     runRole: String(row.run_role ?? ""),
     stopRequested: Boolean(row.stop_requested),
