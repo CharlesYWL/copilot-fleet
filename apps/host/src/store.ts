@@ -4725,6 +4725,10 @@ export class FleetStore {
         taskName: input.name,
         baseRef: input.integrationBaseRef,
         branchRef: input.integrationBranchRef,
+        existingBranchRefs: this.listRuns()
+          .filter((run) => run.id !== id)
+          .map((run) => run.workspaceBinding?.integrationTargetRef ?? "")
+          .filter(Boolean),
       });
       binding.integrationBaseRef = integration.baseRef;
       binding.integrationTargetRef = integration.branchRef;

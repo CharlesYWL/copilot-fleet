@@ -2,7 +2,6 @@ function branchSegment(value: string, fallback: string, maxLength = 48): string 
   const normalized = value
     .trim()
     .toLowerCase()
-    .replace(/@.*$/, "")
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, maxLength)
@@ -28,18 +27,30 @@ export function integrationBranchSettings(input: {
   taskName: string;
   baseRef?: string | undefined;
   branchRef?: string | undefined;
+  existingBranchRefs?: readonly string[] | undefined;
 }): {
   baseRef: string;
   branchRef: string;
   remote: string;
 } {
   const baseRef = input.baseRef ? remoteBranchRef(input.baseRef) : "";
+  const taskFallback = `task-${branchSegment(input.runId ?? "", "run", 8)}`;
+  const usernameSegment = branchSegment(
+    (input.username ?? "").replace(/@.*$/, ""),
+    "operator",
+    32,
+  );
+  const taskSegment = branchSegment(input.taskName, taskFallback, 48);
+  const generatedBranchRef = localBranchRef(`dev/${usernameSegment}/${taskSegment}`);
+  const branchRef =
+    !input.branchRef && input.existingBranchRefs?.includes(generatedBranchRef)
+      ? localBranchRef(
+          `dev/${usernameSegment}/${branchSegment(input.taskName, "task", 39)}-${branchSegment(input.runId ?? "", "run", 8)}`,
+        )
+      : generatedBranchRef;
   return {
     baseRef,
-    branchRef: localBranchRef(
-      input.branchRef ||
-        `dev/${branchSegment(input.username ?? "", "operator", 32)}/fleet-${branchSegment(input.runId ?? "", "run", 20)}`,
-    ),
+    branchRef: input.branchRef ? localBranchRef(input.branchRef) : branchRef,
     remote: baseRef.split("/")[2] || "origin",
   };
 }

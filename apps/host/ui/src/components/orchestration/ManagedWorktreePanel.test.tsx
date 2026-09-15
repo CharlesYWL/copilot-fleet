@@ -147,6 +147,43 @@ describe("accessible managed workspace controls", () => {
     expect(screen.getByText("Advanced recovery: manual integration")).toBeTruthy();
   });
 
+  it("distinguishes the execution base from an uncreated no-change publication target", async () => {
+    const noChanges = RunSchema.parse({
+      ...run,
+      workspaceBinding: {
+        ...run.workspaceBinding!,
+        integrationRemote: "origin",
+        integrationTargetRef: "refs/heads/dev/sihanwang/sql-endpoints-object-overview",
+        aggregationSummary:
+          "No committed changes; verified task workspaces and cleaned them without merge integration.",
+        aggregationTargetRef: "",
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        response({
+          ...initialView(),
+          binding: noChanges.workspaceBinding,
+        }),
+      ),
+    );
+
+    show(noChanges);
+
+    const workspaceHeading = await screen.findByRole("heading", {
+      name: "Fleet workspace",
+    });
+    expect(workspaceHeading.nextElementSibling?.textContent).toContain(
+      "execution base main (aaaaaaaaaaaa)",
+    );
+    expect(screen.getByText(/Publication target:/).textContent).toContain(
+      "origin/dev/sihanwang/sql-endpoints-object-overview",
+    );
+    expect(screen.getByText(/Publication:/).textContent).toContain("Not required");
+    expect(screen.getByText(/a no-change task never creates it/)).toBeTruthy();
+  });
+
   it("offers one-click retry only when automatic integration needs attention", async () => {
     const blocked = RunSchema.parse({
       ...run,
