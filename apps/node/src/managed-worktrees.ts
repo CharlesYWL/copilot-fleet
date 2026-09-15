@@ -869,17 +869,35 @@ export class ManagedWorktrees {
       ...observedWorkspacePolicy
     } = observed;
     if (isDeepStrictEqual(expectedWorkspacePolicy, observedWorkspacePolicy)) return true;
-    if (expected.submodules !== "disabled") return false;
-    return (
-      expected.version === observed.version &&
-      expected.hooks === observed.hooks &&
-      expected.hooksDigest === observed.hooksDigest &&
-      expected.filters === observed.filters &&
-      expected.filtersDigest === observed.filtersDigest &&
-      expected.submodules === observed.submodules &&
-      expected.fsmonitor === observed.fsmonitor &&
-      expected.credentialHelpers === observed.credentialHelpers
-    );
+    return this.workspacePolicyMismatches(expected, observed).length === 0;
+  }
+
+  private workspacePolicyMismatches(
+    expected: RepositoryExecutionPolicy,
+    observed: RepositoryExecutionPolicy,
+  ): string[] {
+    const mismatches: string[] = [];
+    if (expected.version !== observed.version) mismatches.push("policy version");
+    if (
+      expected.hooks !== observed.hooks ||
+      expected.hooksDigest !== observed.hooksDigest
+    )
+      mismatches.push("Git hooks");
+    if (
+      expected.filters !== observed.filters ||
+      expected.filtersDigest !== observed.filtersDigest
+    )
+      mismatches.push("Git filters");
+    if (expected.fsmonitor !== observed.fsmonitor) mismatches.push("fsmonitor");
+    if (expected.submodules !== observed.submodules) mismatches.push("submodule mode");
+    if (expected.credentialHelpers !== observed.credentialHelpers)
+      mismatches.push("credential-helper policy");
+    if (
+      expected.submodules !== "disabled" &&
+      expected.configurationDigest !== observed.configurationDigest
+    )
+      mismatches.push("submodule helper configuration");
+    return mismatches;
   }
 
   private async verifyRepositoryExecutionPolicy(
@@ -895,11 +913,19 @@ export class ManagedWorktrees {
       tree.repositoryFeatures,
       tree.allowGitHooks,
     );
-    if (!this.workspacePolicyMatches(tree.repositoryExecutionPolicy, observed))
+    if (!this.workspacePolicyMatches(tree.repositoryExecutionPolicy, observed)) {
+      const scope = samePath(path, tree.repository.path)
+        ? "source repository"
+        : "integration workspace";
+      const mismatches = this.workspacePolicyMismatches(
+        tree.repositoryExecutionPolicy,
+        observed,
+      );
       throw new WorktreeConflict(
         "repository_execution_policy_changed",
-        "Hooks, filters, fsmonitor, or submodule helpers changed after reservation.",
+        `Repository execution policy changed in the ${scope}: ${mismatches.join(", ")}.`,
       );
+    }
     if (
       options.strictCredentialHelpers &&
       observed.credentialHelpersDigest !==

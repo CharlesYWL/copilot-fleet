@@ -1480,6 +1480,23 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     ).toMatchObject({ ok: true });
   });
 
+  it("names the changed policy field and checkout scope", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source, { allowGitHooks: true });
+    await writeFile(join(source, ".git", "hooks", "pre-commit"), "changed\n");
+
+    expect(
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      }),
+    ).toMatchObject({
+      ok: false,
+      code: "repository_execution_policy_changed",
+      error: expect.stringMatching(/source repository: Git hooks/i),
+    });
+  });
+
   it("enters two barrier-controlled writer sections simultaneously, editing the same filename independently", async () => {
     const { manager, source } = await fixture();
     const a = await allocate(manager, source);
