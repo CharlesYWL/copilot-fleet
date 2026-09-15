@@ -828,6 +828,13 @@ export class ManagedWorktrees {
     const filtersDigest = createHash("sha256")
       .update(filterConfig.join("\n"))
       .digest("hex");
+    const credentialHelpersDigest = createHash("sha256")
+      .update(
+        credentialHelpers
+          .map((value) => createHash("sha256").update(value).digest("hex"))
+          .join("\n"),
+      )
+      .digest("hex");
     const configurationDigest = createHash("sha256")
       .update(
         JSON.stringify({
@@ -835,9 +842,6 @@ export class ManagedWorktrees {
           filtersDigest,
           fsmonitor: fsmonitor || "false",
           submoduleUpdates,
-          credentialHelpers: credentialHelpers.map((value) =>
-            createHash("sha256").update(value).digest("hex"),
-          ),
         }),
       )
       .digest("hex");
@@ -847,24 +851,74 @@ export class ManagedWorktrees {
       filters: features.gitLfs ? "git_lfs" : "disabled",
       filtersDigest,
       submodules: features.submodules ? "node_local" : "disabled",
+      credentialHelpersDigest,
       configurationDigest,
     });
+  }
+
+  private workspacePolicyMatches(
+    expected: RepositoryExecutionPolicy,
+    observed: RepositoryExecutionPolicy,
+  ): boolean {
+    const {
+      credentialHelpersDigest: _expectedCredentialHelpersDigest,
+      ...expectedWorkspacePolicy
+    } = expected;
+    const {
+      credentialHelpersDigest: _observedCredentialHelpersDigest,
+      ...observedWorkspacePolicy
+    } = observed;
+    if (isDeepStrictEqual(expectedWorkspacePolicy, observedWorkspacePolicy)) return true;
+    if (expected.credentialHelpersDigest || expected.submodules !== "disabled")
+      return false;
+    return (
+      expected.version === observed.version &&
+      expected.hooks === observed.hooks &&
+      expected.hooksDigest === observed.hooksDigest &&
+      expected.filters === observed.filters &&
+      expected.filtersDigest === observed.filtersDigest &&
+      expected.submodules === observed.submodules &&
+      expected.fsmonitor === observed.fsmonitor &&
+      expected.credentialHelpers === observed.credentialHelpers
+    );
   }
 
   private async verifyRepositoryExecutionPolicy(
     tree: ManagedWorktree,
     path = tree.repository.path,
+    options: {
+      adoptCredentialHelpers?: boolean;
+      strictCredentialHelpers?: boolean;
+    } = {},
   ): Promise<void> {
     const observed = await this.repositoryExecutionPolicy(
       path,
       tree.repositoryFeatures,
       tree.allowGitHooks,
     );
-    if (!isDeepStrictEqual(observed, tree.repositoryExecutionPolicy))
+    if (!this.workspacePolicyMatches(tree.repositoryExecutionPolicy, observed))
       throw new WorktreeConflict(
         "repository_execution_policy_changed",
-        "Hooks, filters, fsmonitor, submodule helpers, or credential-helper configuration changed after reservation.",
+        "Hooks, filters, fsmonitor, or submodule helpers changed after reservation.",
       );
+    if (
+      options.strictCredentialHelpers &&
+      observed.credentialHelpersDigest !==
+        tree.repositoryExecutionPolicy.credentialHelpersDigest
+    )
+      throw new WorktreeConflict(
+        "publication_credential_policy_changed",
+        "Git credential-helper configuration changed after integration preview. Review the refreshed publication result before retrying.",
+      );
+    if (
+      !tree.repositoryExecutionPolicy.credentialHelpersDigest ||
+      (options.adoptCredentialHelpers &&
+        observed.credentialHelpersDigest !==
+          tree.repositoryExecutionPolicy.credentialHelpersDigest)
+    ) {
+      tree.repositoryExecutionPolicy = observed;
+      this.save(tree);
+    }
   }
 
   private async noninteractivePolicy(
@@ -2859,7 +2913,9 @@ export class ManagedWorktrees {
     await this.noGitOperation(tree.path);
     await this.noGitOperation(target.path);
     await this.validateIntegrationTarget(tree, target);
-    await this.verifyRepositoryExecutionPolicy(tree, target.path);
+    await this.verifyRepositoryExecutionPolicy(tree, target.path, {
+      adoptCredentialHelpers: true,
+    });
     await this.noninteractivePolicy(target.path, false, tree.allowGitHooks);
     const taskSha = GitShaSchema.parse(await this.ref(tree.path, "HEAD"));
     const targetSha = GitShaSchema.parse(await this.ref(target.path, "HEAD"));
@@ -2957,6 +3013,9 @@ export class ManagedWorktrees {
           "Publication approval does not match this exact validated result and target.",
         );
       await this.validateIntegrationTarget(tree, integration.preview.target);
+      await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path, {
+        strictCredentialHelpers: true,
+      });
       if (
         (await this.ref(integration.preview.target.path, "HEAD")) !==
         integration.resultSha

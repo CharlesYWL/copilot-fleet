@@ -1403,6 +1403,49 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     });
   });
 
+  it("refreshes publication-only credential helpers without invalidating integration", async () => {
+    const { manager, root, source } = await fixture();
+    await git.run(source, ["config", "credential.helper", "initial-helper"]);
+    const tree = await allocate(manager, source);
+    const legacy = manager.get(tree.id)!;
+    const legacyDigest = legacy.repositoryExecutionPolicy.configurationDigest;
+    const database = new DatabaseSync(join(root, "state", "managed-worktrees.db"));
+    let stored: ManagedWorktree;
+    try {
+      const row = database.prepare("SELECT data FROM trees WHERE id=?").get(tree.id) as {
+        data: string;
+      };
+      stored = JSON.parse(row.data) as ManagedWorktree;
+      stored.repositoryExecutionPolicy.credentialHelpersDigest = "";
+      stored.repositoryExecutionPolicy.configurationDigest = createHash("sha256")
+        .update(`${legacyDigest}:legacy-credential-helper`)
+        .digest("hex");
+      database
+        .prepare("UPDATE trees SET data=? WHERE id=?")
+        .run(JSON.stringify(stored), tree.id);
+    } finally {
+      database.close();
+    }
+
+    await git.run(source, ["config", "credential.helper", "refreshed-helper"]);
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+
+    const result = await operation(manager, tree, "integration_preview", {
+      targetPath: source,
+      targetPlacementId: "target-placement",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(
+      manager.get(tree.id)!.repositoryExecutionPolicy.credentialHelpersDigest,
+    ).toMatch(/^[a-f0-9]{64}$/);
+    expect(manager.get(tree.id)!.repositoryExecutionPolicy.configurationDigest).not.toBe(
+      stored.repositoryExecutionPolicy.configurationDigest,
+    );
+  });
+
   it("enters two barrier-controlled writer sections simultaneously, editing the same filename independently", async () => {
     const { manager, source } = await fixture();
     const a = await allocate(manager, source);
@@ -2189,6 +2232,32 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       "origin",
       `:${integrated.integration!.preview.targetRef}`,
     ]);
+    await git.run(source, ["config", "credential.helper", "changed-after-preview"]);
+    const changedCredentialPolicy = await operation(
+      manager,
+      integrated.worktree!,
+      "publish",
+      {
+        integrationId: integrated.integration!.id,
+        publicationApproval: {
+          approvalId: randomUUID(),
+          runId: integrated.worktree!.runId,
+          integrationId: integrated.integration!.id,
+          targetRemote: integrated.integration!.preview.targetRemote,
+          targetRef: integrated.integration!.preview.targetRef,
+          expectedRemoteSha: "",
+          finalResultSha: integrated.integration!.resultSha,
+          finalTreeSha: integrated.integration!.finalTree,
+          approvedBy: "operator",
+          approvedAt: new Date().toISOString(),
+        },
+        ...integration,
+      },
+    );
+    expect(changedCredentialPolicy.code).toBe("publication_credential_policy_changed");
+    await git.run(source, ["config", "--unset-all", "credential.helper"], {
+      allowedExitCodes: [0, 5],
+    });
     const published = await operation(manager, integrated.worktree!, "publish", {
       integrationId: integrated.integration!.id,
       publicationApproval: {
