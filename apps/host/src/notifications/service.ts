@@ -434,6 +434,70 @@ export class NotificationService {
     });
   }
 
+  createWorktreeAttention(
+    runId: string,
+    identity: string,
+    reason: "creation" | "conflict" | "reconciliation" | "integration",
+    code = "",
+    context: { phase?: string; targetRef?: string } = {},
+  ): InsertNotificationResult {
+    const run = this.store.getRun(runId);
+    const sourceKey = `managed_worktree_attention:${runId}:${identity}:${reason}`;
+    const input: CreateNotification = {
+      sourceKey,
+      category: "orchestration",
+      kind: "managed_worktree_attention",
+      severity: reason === "creation" ? "error" : "warning",
+      title:
+        reason === "creation"
+          ? titledLabel("Workspace setup failed: ", run?.name ?? "Task")
+          : reason === "integration"
+            ? titledLabel("Integration needs attention: ", run?.name ?? "Task")
+            : "Managed task needs attention",
+      body:
+        reason === "creation"
+          ? code === "node_unavailable"
+            ? "The repository’s Node disconnected. Open the task and retry workspace setup after it reconnects."
+            : code === "unsupported_hooks"
+              ? "The repository has active Git hooks. Open the task to review details and continue explicitly."
+              : "Preparing the isolated workspace failed. Open the task for a safe retry and actionable details."
+          : reason === "conflict"
+            ? "Merge conflicts require an explicit resolution or abort. Open the task for recovery controls."
+            : reason === "integration"
+              ? `Automatic integration${context.targetRef ? ` into ${context.targetRef}` : ""} stopped safely${context.phase ? ` during ${context.phase}` : ""}. Open the task to review the reason and retry.`
+              : "Workspace ownership needs reconciliation. Open the task; no automatic overwrite or deletion was attempted.",
+      subject: { type: "run", id: runId, label: run?.name ?? "Managed task" },
+      navigation: { type: "run", runId },
+      data: { runId, reason, ...context, ...(code ? { code } : {}) },
+      createdAt: new Date().toISOString(),
+    };
+    const existing = this.store.getNotificationBySourceKey(sourceKey);
+    if (existing) {
+      const notification = this.store.updateNotification(existing.id, {
+        severity: input.severity,
+        title: input.title,
+        body: input.body,
+        subject: input.subject,
+        navigation: input.navigation,
+        data: input.data,
+      });
+      if (notification) this.publishOrDefer(notification, false);
+      return { notification: notification ?? existing, created: false };
+    }
+    return this.insert(input);
+  }
+
+  resolveWorktreeAttention(
+    runId: string,
+    identity: string,
+    reason: "creation" | "conflict" | "reconciliation" | "integration",
+  ): NotificationMutation | undefined {
+    const notification = this.store.getNotificationBySourceKey(
+      `managed_worktree_attention:${runId}:${identity}:${reason}`,
+    );
+    return notification ? this.resolve(notification.id) : undefined;
+  }
+
   markRead(id: string): NotificationMutation | undefined {
     const before = this.store.getNotification(id);
     if (!before) return undefined;

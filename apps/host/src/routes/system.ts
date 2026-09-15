@@ -248,6 +248,9 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
   );
 
   app.get("/api/defaults", async (request) => ({
+    managedWorktreesRevision: Number(store.getSetting("defaults.managedRevision") ?? 0),
+    managedWorktreesEnabled: store.getManagedWorktreesEnabled(),
+    managedWorktreePolicy: store.getManagedWorktreePolicy(),
     yolo: store.getDefaultYolo(),
     agencyMode: store.getAgencyMode(),
     agencyModeAvailable: auth.agencyAvailableFor(request.fleetSession),
@@ -259,6 +262,27 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
 
   app.post("/api/defaults", async (request, reply) => {
     const input = UpdateDefaultsSchema.parse(request.body);
+    const managedChange =
+      input.managedWorktreesEnabled !== undefined ||
+      input.managedWorktreePolicy !== undefined;
+    if (managedChange) {
+      if (!input.operationId || input.expectedRevision === undefined)
+        return reply.code(409).send({
+          code: "revision_required",
+          error:
+            "Managed defaults require an operationId and the current expectedRevision.",
+        });
+      const replay = store.managedApiReplay("managed-defaults", input.operationId, input);
+      if (replay !== undefined) return replay;
+      if (
+        input.expectedRevision !==
+        Number(store.getSetting("defaults.managedRevision") ?? 0)
+      )
+        return reply.code(409).send({
+          code: "stale_revision",
+          error: "Defaults changed; refresh before applying this setting.",
+        });
+    }
     const agencyModeAvailable = auth.agencyAvailableFor(request.fleetSession);
     if (input.agencyMode !== undefined && !agencyModeAvailable) {
       return reply.code(403).send({
@@ -269,6 +293,10 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     // Each field is optional so a client that knows about one setting cannot
     // reset the others merely by not mentioning them.
     if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
+    if (input.managedWorktreesEnabled !== undefined)
+      store.setManagedWorktreesEnabled(input.managedWorktreesEnabled);
+    if (input.managedWorktreePolicy !== undefined)
+      store.setManagedWorktreePolicy(input.managedWorktreePolicy);
     if (input.agencyMode !== undefined) store.setAgencyMode(input.agencyMode);
     if (input.autoResume !== undefined) store.setAutoResume(input.autoResume);
     if (input.notificationLifecycleEnabled !== undefined) {
@@ -278,7 +306,12 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     if (input.reasoningEffort !== undefined) {
       store.setDefaultReasoningEffort(input.reasoningEffort);
     }
-    return {
+    if (managedChange)
+      store.setSetting("defaults.managedRevision", String(input.expectedRevision! + 1));
+    const result = {
+      managedWorktreesRevision: Number(store.getSetting("defaults.managedRevision") ?? 0),
+      managedWorktreesEnabled: store.getManagedWorktreesEnabled(),
+      managedWorktreePolicy: store.getManagedWorktreePolicy(),
       yolo: store.getDefaultYolo(),
       agencyMode: store.getAgencyMode(),
       agencyModeAvailable,
@@ -287,6 +320,14 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       model: store.getDefaultModel(),
       reasoningEffort: store.getDefaultReasoningEffort(),
     };
+    if (managedChange)
+      store.recordManagedApiRequest(
+        "managed-defaults",
+        input.operationId!,
+        input,
+        result,
+      );
+    return result;
   });
 
   app.get("/api/tunnel", async () => tunnel.info(fallbackPublicUrl()));

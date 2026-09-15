@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   RunPolicySchema,
+  RunWorkspaceBindingSchema,
   type FleetSession,
   type Run,
   type RunStep,
+  type RunWorkspaceBinding,
 } from "@fleet/protocol";
 import {
   awaitingPlan,
@@ -43,6 +45,21 @@ function run(overrides: Partial<Run> = {}): Run {
     ...overrides,
   };
 }
+
+const managedBinding = (overrides: Partial<RunWorkspaceBinding> = {}) =>
+  RunWorkspaceBindingSchema.parse({
+    requestedMode: "managed",
+    effectiveMode: "managed",
+    resolutionSource: "explicit",
+    sourcePlacementId: "p1",
+    managedWorktreeId: "tree-a",
+    generation: 1,
+    baseSha: "a".repeat(40),
+    checkoutKey: "physical-a",
+    resolvedPath: "C:\\trees\\a",
+    initialization: "ready",
+    ...overrides,
+  });
 
 function step(id: string, overrides: Partial<RunStep> = {}): RunStep {
   return {
@@ -199,6 +216,25 @@ describe("buildRunViewModels", () => {
     });
 
     expect(model?.attention).toBe("failed-step");
+  });
+
+  it("reports integration attention instead of a historical failed step", () => {
+    const [model] = build({
+      runs: [
+        run({
+          state: "blocked",
+          workspaceBinding: managedBinding({
+            setupState: "succeeded",
+            aggregationState: "attention",
+          }),
+        }),
+      ],
+      stepsByRun: { r1: [step("old", { state: "failed" })] },
+      sessions: [],
+    });
+
+    expect(model?.attention).toBe("integration");
+    expect(model?.stage).toBe("validation");
   });
 
   it("notices a step whose node went away", () => {
@@ -404,6 +440,28 @@ describe("labels", () => {
   it("calls a cancelled run abandoned, because its output is still there", () => {
     // `cancel` keeps the run and its steps; only the dispatching stops.
     expect(runStateLabel(run({ state: "cancelled" }))).toBe("Abandoned");
+  });
+
+  it("distinguishes setup failures from integration attention", () => {
+    expect(
+      runStateLabel(
+        run({
+          state: "blocked",
+          workspaceBinding: managedBinding({ setupState: "failed" }),
+        }),
+      ),
+    ).toBe("Setup failed");
+    expect(
+      runStateLabel(
+        run({
+          state: "blocked",
+          workspaceBinding: managedBinding({
+            setupState: "succeeded",
+            aggregationState: "attention",
+          }),
+        }),
+      ),
+    ).toBe("Integration needs attention");
   });
 
   it("names the phase the orchestrator chose, and nothing when it chose none", () => {

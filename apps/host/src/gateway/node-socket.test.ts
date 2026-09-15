@@ -13,6 +13,7 @@ import {
   OUTBOX_ACK_CAPABILITY,
   SESSION_RETENTION_CAPABILITY,
   SESSION_RETENTION_DAY_MS,
+  WorktreeConflict,
   OutboxFlushIdSchema,
   parseEnrollmentGrant,
   type AuthenticatedEnvelope,
@@ -1878,6 +1879,45 @@ describe("node reconnect socket ordering", () => {
 
     expect(await acknowledged).toMatchObject({ flushId: firstFlushId });
     expect(store.listEvents(sessionId)).toHaveLength(1);
+  });
+
+  it("keeps the node connected after rejecting a stale managed worktree receipt", async () => {
+    vi.spyOn(service.worktrees, "handleResult").mockImplementation(() => {
+      throw new WorktreeConflict(
+        "binding_mismatch",
+        "The receipt no longer matches the current workspace binding.",
+      );
+    });
+    const client = await connect({ capabilities: [] });
+    const closed = vi.fn();
+    client.on("close", closed);
+
+    send(client, {
+      type: "managed_worktree_result",
+      result: {
+        operationId: "11111111-1111-4111-8111-111111111111",
+        worktreeId: "worktree-stale",
+        generation: 1,
+        nodeId,
+        hostInstallationId: "22222222-2222-4222-8222-222222222222",
+        ok: false,
+        code: "binding_mismatch",
+        error: "Stale receipt",
+        retryable: false,
+        acknowledgedAt: new Date().toISOString(),
+      },
+    });
+    await delay(20);
+    send(client, {
+      type: "heartbeat",
+      activeSessionIds: [sessionId],
+      busySessionIds: [],
+      sentAt: new Date().toISOString(),
+    });
+    await delay(20);
+
+    expect(closed).not.toHaveBeenCalled();
+    expect(store.getNode(nodeId)?.online).toBe(true);
   });
 
   async function connect(

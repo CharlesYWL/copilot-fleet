@@ -5,6 +5,7 @@ import type { SessionEvent } from "@fleet/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AcpAgentFactory, type SessionAgent } from "./agents.js";
 import type * as copilotLaunch from "./copilot-launch.js";
+import { stopProcessTree } from "./process-quiescence.js";
 
 const installation = vi.hoisted(() => ({
   path: "C:\\Program Files\\Agency\\agency.exe" as string | undefined,
@@ -22,6 +23,11 @@ vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof childProcess>()),
   spawn: vi.fn(),
 }));
+vi.mock("./process-quiescence.js", () => ({
+  stopProcessTree: vi.fn(async (child: ChildProcess) => {
+    child.kill();
+  }),
+}));
 
 type RpcRequest = {
   id?: number;
@@ -35,6 +41,9 @@ let metadataFailure: string | undefined;
 let startupFailure: string | undefined;
 let metadataHangs = false;
 let agencyVersion = "1.0.84";
+let oversizedLoad = false;
+let oversizedPrompts = 0;
+let createdSessions = 0;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -45,6 +54,9 @@ beforeEach(() => {
   startupFailure = undefined;
   metadataHangs = false;
   agencyVersion = "1.0.84";
+  oversizedLoad = false;
+  oversizedPrompts = 0;
+  createdSessions = 0;
   vi.mocked(spawn).mockImplementation((command, args) => {
     const argv: string[] = Array.isArray(args) ? args : [];
     const child = Object.assign(new ChildProcess(), {
@@ -117,12 +129,30 @@ beforeEach(() => {
                 },
               }
             : request.method === "session/new"
-              ? { sessionId: "acp-created", configOptions }
+              ? {
+                  sessionId:
+                    ++createdSessions === 1
+                      ? "acp-created"
+                      : `acp-created-${createdSessions}`,
+                  configOptions,
+                }
               : { configOptions };
+        const oversized =
+          (request.method === "session/load" && oversizedLoad) ||
+          (request.method === "session/prompt" && oversizedPrompts-- > 0);
         const reply =
           startupFailure && request.method === "initialize"
             ? { id: request.id, error: { code: -32000, message: startupFailure } }
-            : { id: request.id, result };
+            : oversized
+              ? {
+                  id: request.id,
+                  error: {
+                    code: -32000,
+                    message:
+                      "Execution failed: The request is too large to send through CAPI Responses. Try shortening the conversation or prompt. (36.0 MB request; 32.0 MB limit)",
+                  },
+                }
+              : { id: request.id, result };
         queueMicrotask(() =>
           child.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", ...reply })}\n`),
         );
@@ -177,6 +207,70 @@ describe("Agency ACP startup", () => {
     expect(events.map((event) => event.sequence)).toEqual(
       events.map((_, index) => index + 1),
     );
+  });
+
+  it("replaces an oversized loaded conversation and continues from a bounded handoff", async () => {
+    oversizedLoad = true;
+    const events: SessionEvent[] = [];
+    const factory = new AcpAgentFactory(60_000, "standard-copilot");
+    agents.push(
+      await factory.start("s1", "C:\\repo", (event) => events.push(event), {
+        resumeAgentSessionId: "oversized-session",
+        contextOverflowRecoveryPrompt: "Original assignment: finish the feature",
+      }),
+    );
+
+    expect(requests.map((request) => request.method)).toEqual(
+      expect.arrayContaining(["session/load", "session/new", "session/prompt"]),
+    );
+    expect(
+      JSON.stringify(requests.find((request) => request.method === "session/prompt")),
+    ).toContain("finish the feature");
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "agent_session",
+          payload: { agentSessionId: "acp-created" },
+        }),
+        expect.objectContaining({
+          type: "state",
+          payload: { state: "idle", activity: "Ready for follow-up" },
+        }),
+      ]),
+    );
+    expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
+  it("rolls over once when an established conversation exceeds CAPI on prompt", async () => {
+    oversizedPrompts = 1;
+    const events: SessionEvent[] = [];
+    const factory = new AcpAgentFactory(60_000, "standard-copilot");
+    const agent = await factory.start("s1", "C:\\repo", (event) => events.push(event), {
+      contextOverflowRecoveryPrompt: "Original assignment: preserve current edits",
+    });
+    agents.push(agent);
+
+    await agent.prompt("finish and report");
+
+    expect(requests.filter((request) => request.method === "session/new")).toHaveLength(
+      2,
+    );
+    expect(
+      requests.filter((request) => request.method === "session/prompt"),
+    ).toHaveLength(2);
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "agent_session",
+          payload: { agentSessionId: "acp-created-2" },
+        }),
+        expect.objectContaining({
+          type: "state",
+          payload: { state: "idle", activity: "Ready for follow-up" },
+        }),
+      ]),
+    );
+    expect(events.some((event) => event.type === "error")).toBe(false);
   });
 
   it("uses only standard Copilot when Agency mode is off", async () => {
@@ -312,6 +406,7 @@ describe("Agency ACP startup", () => {
       }),
     ).rejects.toThrow(/agency copilot.*\/login/);
     expect(processes.every(({ command }) => command === installation.path)).toBe(true);
+    expect(stopProcessTree).toHaveBeenCalledWith(launches()[0]?.child, false);
     expect(launches()[0]?.child.kill).toHaveBeenCalled();
     expect(events.some((event) => event.payload.state === "failed")).toBe(true);
   });

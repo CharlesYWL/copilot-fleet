@@ -93,6 +93,7 @@ describe("adopting discovered Copilot sessions", () => {
         type: "resume_session",
         sessionId: store.listSessions()[0]!.id,
         localPath: "C:\\repo",
+        contextOverflowRecoveryPrompt: expect.stringContaining("Original assignment:"),
         additionalDirectories: ["C:\\shared"],
       },
     });

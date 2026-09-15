@@ -52,6 +52,7 @@ import { startNotificationRetentionMonitor } from "./notifications/retention.js"
 import { startSessionRetentionMonitor } from "./session-retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { runRoutes } from "./routes/runs.js";
+import { managedWorktreeRoutes } from "./routes/managed-worktrees.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
 import { systemRoutes } from "./routes/system.js";
 import { FleetStore } from "./store.js";
@@ -257,7 +258,15 @@ export async function buildServer(
   // would leave every route on Fastify's default 500.
   app.setErrorHandler((error, _request, reply) => {
     const status = hasIssues(error) ? 400 : getStatusCode(error);
-    reply.code(status).send({ error: errorMessage(error, "Internal server error") });
+    reply.code(status).send({
+      error: errorMessage(error, "Internal server error"),
+      ...(error &&
+      typeof error === "object" &&
+      "code" in error &&
+      typeof error.code === "string"
+        ? { code: error.code }
+        : {}),
+    });
   });
 
   await app.register(websocket);
@@ -370,6 +379,7 @@ export async function buildServer(
     audit: (entry) => auth.audit(entry),
   });
   await app.register(runRoutes, { service, engine });
+  await app.register(managedWorktreeRoutes, { service });
   await app.register(orchestratorRoutes, { service, engine });
 
   registerBrowserGateway(app, { service, auth, registry: browsers });

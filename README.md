@@ -1179,6 +1179,14 @@ Re-attaching sends no prompt: the agent lands on idle waiting for input, so
 nothing runs until you ask it to. Turn it off under **Settings → General** if
 you would rather press Resume yourself.
 
+If Copilot reports that a saved conversation is too large for the CAPI Responses
+request limit, Fleet replaces only the Copilot conversation while retaining the
+same Fleet session, task, checkout and files. It continues in a fresh conversation
+with a bounded handoff containing the original assignment, recent agent output
+and latest request. Attachments are named but not copied into that recovery
+prompt. The new Copilot session ID is persisted, so later resumes do not reload
+the oversized history.
+
 Three things have to hold for that to work: the Host's `DATABASE_PATH` file is
 intact, the node starts with the same `node.json` identity, and Copilot on that
 machine still has the agent session on disk. A session that died before its agent

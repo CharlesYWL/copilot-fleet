@@ -5,6 +5,9 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   OUTBOX_ACK_CAPABILITY,
   SESSION_RETENTION_CAPABILITY,
+  NodeBackupSchema,
+  NODE_BACKUP_KIND,
+  BACKUP_VERSION,
   type HostToNodeMessage,
   type NodeCommand,
   type NodeClientHello,
@@ -56,6 +59,8 @@ const sockets: TestSocket[] = [];
 let emitEvent: (event: SessionEvent) => void;
 const refreshMcpSessions = vi.fn(async () => {});
 const stopAll = vi.fn(async () => {});
+const quarantine = vi.fn();
+const worktreesShutdown = vi.fn(async () => {});
 const route = vi.fn<(command: NodeCommand) => Promise<CommandResult>>(
   async (command) => ({ commandId: command.commandId, ok: true }),
 );
@@ -159,6 +164,12 @@ vi.mock("./router.js", () => ({
       emitEvent = onEvent;
       routerOptions = options;
     }
+  },
+}));
+vi.mock("./managed-worktrees.js", () => ({
+  ManagedWorktrees: class {
+    quarantine = quarantine;
+    shutdown = worktreesShutdown;
   },
 }));
 
@@ -495,6 +506,66 @@ it("uses current Copilot launch settings for persisted cleanup without starting 
     expect(beforeDelete).toHaveBeenCalledOnce();
   } finally {
     await runtime.shutdown();
+    for (const listener of process.listeners("exit")) {
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  }
+});
+
+it("always quarantines a failed backup drain and never installs an unsafe replacement identity", async () => {
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const { saveCredentials } = await import("./config.js");
+  const runtime = await main([]);
+  try {
+    const stopError = new Error("ACP descendants cannot be verified");
+    stopAll.mockRejectedValueOnce(stopError);
+    const saves = vi.mocked(saveCredentials).mock.calls.length;
+    const archive = NodeBackupSchema.parse({
+      kind: NODE_BACKUP_KIND,
+      version: BACKUP_VERSION,
+      exportedAt: new Date().toISOString(),
+      credentials: { ...credentials, nodeId: "replacement" },
+      settings: configOptions.getSettings(),
+    });
+    await expect(configOptions.applyBackup(archive)).rejects.toMatchObject({
+      message: expect.stringContaining("Backup import aborted"),
+      errors: [stopError],
+    });
+    expect(quarantine).toHaveBeenCalledOnce();
+    expect(vi.mocked(saveCredentials).mock.calls).toHaveLength(saves);
+    expect(sockets).toHaveLength(1);
+  } finally {
+    await runtime.shutdown();
+    for (const listener of process.listeners("exit")) {
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  }
+});
+
+it("always shuts down worktree resources and surfaces every shutdown failure", async () => {
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  const stopError = new Error("ACP stop failed");
+  const shutdownError = new Error("Worktree operation failed after database close");
+  stopAll.mockRejectedValueOnce(stopError);
+  worktreesShutdown.mockRejectedValueOnce(shutdownError);
+  try {
+    await expect(runtime.shutdown()).rejects.toMatchObject({
+      errors: [stopError, shutdownError],
+    });
+    expect(worktreesShutdown).toHaveBeenCalledOnce();
+    expect(sockets[0]!.close).toHaveBeenCalled();
+  } finally {
     for (const listener of process.listeners("exit")) {
       if (!exits.includes(listener)) process.removeListener("exit", listener);
     }

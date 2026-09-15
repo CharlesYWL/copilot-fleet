@@ -2,6 +2,11 @@ import { z } from "zod";
 import {
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
+  MANAGED_WORKTREES_CAPABILITY,
+  WorkspaceModeSchema,
+  AccessIntentSchema,
+  checkoutLockKey,
+  type WorkspaceMode,
   isChatsWorkspace,
   RunCriterionSchema,
   canTransitionRun,
@@ -197,6 +202,12 @@ export function composeWorkerPrompt(input: {
 }
 
 export const PlanTaskSchema = z.object({
+  workspaceMode: WorkspaceModeSchema.optional().describe(
+    "Auto uses the current app default for NEW tasks only. Existing task bindings never change.",
+  ),
+  accessIntent: AccessIntentSchema.optional().describe(
+    "Use no-checkout only for nonrepository work in Chats. Shell-capable repository work always requires a checkout lease.",
+  ),
   task: z.string().min(1).max(80).describe("A short name for this piece of work."),
   objective: z
     .string()
@@ -727,12 +738,19 @@ export class FleetTools {
       stopWhen?: string;
       objective?: string;
       workspaceId?: string;
+      workspaceMode?: WorkspaceMode | undefined;
+      accessIntent?: "checkout" | "no-checkout" | undefined;
     } = {},
   ): Run | undefined {
     const lead = this.store.getSession(this.leadSessionId);
     if (!lead) return undefined;
     const template = this.runs()[0];
     const run = this.store.createRun({
+      workspaceMode: done.workspaceMode ?? "auto",
+      integrationUsername: "operator",
+      accessIntent: isChatsWorkspace(done.workspaceId ?? lead.workspaceId)
+        ? "no-checkout"
+        : "checkout",
       workspaceId: done.workspaceId ?? lead.workspaceId,
       name,
       objective: done.objective ?? name,
@@ -745,10 +763,12 @@ export class FleetTools {
         onStepFailure: "wake",
       },
     });
-    return this.store.updateRun(run.id, {
+    const opened = this.store.updateRun(run.id, {
       leadSessionId: this.leadSessionId,
       state: "running",
     });
+    void this.service.worktrees.prepare(run.id);
+    return opened;
   }
 
   /** The phase a task is on, as a line to show the model. */
@@ -796,7 +816,8 @@ export class FleetTools {
     if (
       existing &&
       existing.workspaceId !== workspaceId &&
-      this.store.listRunSteps(existing.id).length > 0
+      (this.store.listRunSteps(existing.id).length > 0 ||
+        existing.workspaceBinding?.effectiveMode === "managed")
     ) {
       return refuse(
         "That task already has workers in its original workspace. Do not move its context " +
@@ -847,6 +868,8 @@ export class FleetTools {
       );
     }
     const run = this.openTask(input.task, input.phases, {
+      workspaceMode: input.workspaceMode,
+      accessIntent: input.accessIntent,
       successCriteria: input.successCriteria,
       stopWhen: input.stopWhen,
       objective: input.objective,
@@ -1311,7 +1334,7 @@ export class FleetTools {
         // step has to be able to see that the pin took, and one that did not
         // still has to know where its changes now live.
         `  node: ${session?.nodeName ?? placement.nodeName ?? "?"}${input.node ? " (as asked)" : ""}`,
-        `  path: ${placement.localPath}`,
+        `  path: ${session?.executionBinding?.cwd ?? placement.localPath}`,
         "",
         "You will be woken when it finishes. Do not poll for it.",
       ].join("\n"),
@@ -1336,13 +1359,28 @@ export class FleetTools {
       sessions
         .filter(
           (session) =>
+            !(
+              session.state === "idle" &&
+              session.runRole !== "lead" &&
+              terminalRunStepStates.has(
+                this.store.getRunStepBySession(session.id)?.state ?? "pending",
+              )
+            ),
+        )
+        .filter(
+          (session) =>
             session.runRole !== "lead" &&
-            !session.readOnly &&
-            session.state !== "idle" &&
+            (Boolean(session.executionBinding?.worktreeId) ||
+              Boolean(
+                nodeById
+                  .get(session.nodeId)
+                  ?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY),
+              ) ||
+              (!session.readOnly && session.state !== "idle")) &&
             !terminalSessionStates.has(session.state) &&
             session.placementId,
         )
-        .map((session) => session.placementId),
+        .map(checkoutLockKey),
     );
 
     return decidePlacement({
@@ -1355,6 +1393,7 @@ export class FleetTools {
       nodeById,
       reservedFor: (nodeId, kind) => reservedSessionCount(sessions, nodeId, kind),
       writingInFlight,
+      repositoryCapabilities: this.store.listPlacementRepositoryCapabilities(),
     });
   }
 
