@@ -71,8 +71,8 @@ export const semanticColors = {
   interaction: "#6c8cff",
   /** A person is blocked. The only interrupt colour. */
   permission: "#f7bf61",
-  running: "#4ad6a7",
-  idle: "#6c8cff",
+  running: "#6c8cff",
+  idle: "#8994ab",
   failed: "#ff6b7a",
   completed: "#4ad6a7",
   neutral: "#8994ab",
@@ -81,7 +81,7 @@ export const semanticColors = {
 
 export const nodeHealthColors = {
   cpu: semanticColors.interaction,
-  memory: semanticColors.running,
+  memory: semanticColors.completed,
   disk: "#c39cff",
 } as const;
 
@@ -93,12 +93,12 @@ export const statusVisuals: Record<
   { foreground: string; surface: string; border: string }
 > = {
   success: {
-    foreground: semanticColors.running,
+    foreground: semanticColors.completed,
     surface: "rgba(74, 214, 167, 0.10)",
     border: "rgba(74, 214, 167, 0.45)",
   },
   info: {
-    foreground: semanticColors.idle,
+    foreground: semanticColors.running,
     surface: "rgba(108, 140, 255, 0.10)",
     border: "rgba(108, 140, 255, 0.45)",
   },
@@ -123,7 +123,7 @@ export const blockColor: Record<TerminalBlockKind, string> = {
   user: terminal.user,
   agent: terminal.agent,
   thought: terminal.thought,
-  tool: semanticColors.running,
+  tool: terminal.tool,
   permission: semanticColors.permission,
   permission_result: terminal.dim,
   turn: terminal.dim,
@@ -131,18 +131,6 @@ export const blockColor: Record<TerminalBlockKind, string> = {
   error: semanticColors.failed,
   system: terminal.dim,
   wake: semanticColors.running,
-};
-
-export const stateAccent: Record<string, string> = {
-  queued: semanticColors.neutral,
-  starting: semanticColors.permission,
-  running: semanticColors.running,
-  idle: semanticColors.idle,
-  cancelling: semanticColors.permission,
-  offline: semanticColors.failed,
-  stopped: semanticColors.failed,
-  completed: semanticColors.completed,
-  failed: semanticColors.failed,
 };
 
 /**

@@ -11,6 +11,8 @@ import { fleetDarkTheme } from "../../theme";
 import { buildRunViewModels, type RunViewModel } from "../../lib/orchestration-view";
 import { OrchestratorPage } from "./OrchestratorPage";
 import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
+import { runVisual } from "./RunStatusIndicator";
+import { statusDescriptor } from "../../lib/status-visuals";
 
 const ISO = "2026-01-01T12:00:00.000Z";
 
@@ -136,6 +138,22 @@ const page = (
 };
 
 describe("orchestrator views", () => {
+  it.each([
+    ["running", "running"],
+    ["completed", "done"],
+    ["cancelled", "stopped"],
+    ["failed", "failed"],
+    ["awaiting_approval", "queued"],
+    ["awaiting_lead", "running"],
+  ] as const)("uses the shared %s task icon and color", (state, visualState) => {
+    const model = models([run({ state })])[0]!;
+    const visual = runVisual(model);
+    const shared = statusDescriptor(visualState);
+    expect(visual.icon).toBe(shared.icon);
+    expect(visual.color).toBe(shared.color);
+    expect(visual.motion).toBe(shared.motion);
+  });
+
   it.each(["stage", "list", "dependency"] as const)(
     "opens the same task detail from the %s view",
     (mode) => {

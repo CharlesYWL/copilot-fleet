@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
 import { Sidebar } from "./Sidebar";
@@ -264,7 +264,7 @@ describe("Sidebar favorites", () => {
       onSelectSession,
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "fav" }));
+    fireEvent.click(screen.getByRole("button", { name: /Idle.*fav/ }));
 
     expect(onSelectSession).toHaveBeenCalledWith("fav");
   });
@@ -311,9 +311,61 @@ describe("Sidebar favorites", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Hide favorites" }));
 
-    expect(screen.queryByRole("button", { name: "fav" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Idle.*fav/ })).toBeNull();
     expect(screen.getByRole("button", { name: "Show favorites" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Manage favorites" })).toBeTruthy();
+  });
+
+  describe("Sidebar status icons", () => {
+    it("shows the same labelled icons in the tree, favorites, and conversations", () => {
+      const active = session("active", "w1", "n1", "running");
+      const idle = session("resting", "w1", "n1");
+      const offline = session("disconnected", "w1", "n1", "offline");
+      const lead = {
+        ...active,
+        id: "lead",
+        name: "Coordinator",
+        runRole: "lead" as const,
+      };
+      show([placement], [active, idle, offline], {
+        favoriteSessions: [active],
+        leadSessions: [lead],
+      });
+
+      const tree = screen.getByRole("tree", { name: "Sessions by workspace" });
+      const running = within(tree).getByRole("img", { name: "Running" });
+      expect(running.querySelector("svg")).not.toBeNull();
+      expect(
+        within(tree).getByRole("img", { name: /Idle.*ready for follow-up/ }),
+      ).toBeTruthy();
+      expect(within(tree).getByRole("img", { name: "Offline" })).toBeTruthy();
+      for (const indicator of screen.getAllByRole("img", { name: "Running" })) {
+        expect(indicator.querySelector("svg")?.innerHTML).toBe(
+          running.querySelector("svg")?.innerHTML,
+        );
+        expect(indicator.style.color).toBe(running.style.color);
+      }
+      expect(screen.getAllByRole("img", { name: "Running" })).toHaveLength(3);
+    });
+
+    it("marks pending permissions in ordinary tree rows and favorites too", () => {
+      const active = session("active", "w1", "n1", "running");
+      show([placement], [active], {
+        favoriteSessions: [active],
+        waitingPermissions: [
+          {
+            eventId: "permission",
+            sessionId: active.id,
+            sequence: 1,
+            type: "permission",
+            payload: {},
+            createdAt: active.updatedAt,
+          },
+        ],
+      });
+      expect(screen.getAllByRole("img", { name: "Waiting for you" })).toHaveLength(2);
+      expect(screen.queryByRole("img", { name: "Running" })).toBeNull();
+    });
   });
 });
 

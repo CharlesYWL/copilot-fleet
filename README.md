@@ -28,6 +28,15 @@ pickers along the bottom.
 
 ### Node health and session navigation
 
+Status icons use the same meanings in the sidebar, session headers, and dispatched
+work: a blue spinning ring means running, a green circled check means done/success,
+a gray pause-circle means idle and ready for follow-up, and a red disconnected plug
+means offline. A red error-circle means failed; amber marks permission or recovery
+attention. Queued work uses a clock, stopped/cancelled work a stop square, and skipped
+work a forward arrow. Hover labels and accessible names identify every icon, and
+animations respect reduced-motion preferences. A completed step keeps its result
+even if its worker later becomes idle or offline.
+
 **Settings → Nodes** keeps each machine on one row, with compact blue CPU,
 green RAM, and purple disk meters in the **Health** column. Hover or focus a
 metric for capacity, scope, and sampling details; clock icons and striped bars

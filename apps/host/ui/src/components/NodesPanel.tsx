@@ -41,7 +41,8 @@ import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { sessionLabel } from "../lib/session-label";
 import { ConnectNodeCard } from "./ConnectNodeCard";
 import { NodeHealth } from "./NodeHealth";
-import { StatusDot } from "./StatusDot";
+import { StatusIndicator } from "./StatusIndicator";
+import { statusDescriptor } from "../lib/status-visuals";
 
 const useStyles = makeStyles({
   dialogBody: {
@@ -371,7 +372,10 @@ const NodeRow = ({
     <TableRow>
       <TableCell className={styles.colStatus}>
         <span className={styles.statusCell}>
-          <StatusDot state={node.online ? "running" : "offline"} />
+          <StatusIndicator
+            descriptor={statusDescriptor(node.online ? "online" : "offline")}
+            variant="icon"
+          />
           {node.online ? "Online" : "Offline"}
         </span>
       </TableCell>

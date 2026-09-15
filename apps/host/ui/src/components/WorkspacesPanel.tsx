@@ -32,7 +32,8 @@ import {
   type DropVerdict,
 } from "../lib/drag-drop";
 import { useCatalog } from "../hooks/useCatalog";
-import { StatusDot } from "./StatusDot";
+import { StatusIndicator } from "./StatusIndicator";
+import { statusDescriptor } from "../lib/status-visuals";
 
 const useStyles = makeStyles({
   panel: {
@@ -377,7 +378,10 @@ export const WorkspacesPanel = ({
                 }}
                 title={`${node.name} — drag onto a workspace`}
               >
-                <StatusDot state={node.online ? "idle" : "offline"} />
+                <StatusIndicator
+                  descriptor={statusDescriptor(node.online ? "online" : "offline")}
+                  variant="icon"
+                />
                 {node.name}
               </span>
             ))}

@@ -26,7 +26,7 @@ const useStyles = makeStyles({
     boxShadow: "none",
   },
   done: {
-    background: semanticColors.running,
+    background: semanticColors.completed,
   },
   // A ring rather than a fill for the step in progress, so the three states
   // differ in shape as well as in colour.

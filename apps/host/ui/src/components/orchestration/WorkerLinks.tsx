@@ -5,19 +5,10 @@ import {
   shorthands,
   tokens,
 } from "@fluentui/react-components";
-import { Flow16Regular } from "@fluentui/react-icons";
 import type { RunStep } from "@fleet/protocol";
 import { semanticColors, terminal } from "../../theme";
-
-const stepColor: Record<string, string> = {
-  pending: terminal.dim,
-  starting: semanticColors.permission,
-  running: semanticColors.running,
-  succeeded: semanticColors.completed,
-  failed: semanticColors.failed,
-  skipped: terminal.dim,
-  cancelled: terminal.dim,
-};
+import { stepStatusDescriptor } from "../../lib/run-step-status";
+import { StatusIndicator } from "../StatusIndicator";
 
 const useStyles = makeStyles({
   row: {
@@ -58,7 +49,6 @@ const useStyles = makeStyles({
     fontSize: "10px",
     color: tokens.colorNeutralForeground3,
   },
-  dot: { flexShrink: 0, fontSize: "12px" },
   label: { overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
 });
 
@@ -116,10 +106,9 @@ export const WorkerLinks = ({
               onOpenWorker(step.sessionId);
             }}
           >
-            <Flow16Regular
-              className={styles.dot}
-              style={{ color: stepColor[step.state] ?? terminal.dim }}
-              aria-hidden="true"
+            <StatusIndicator
+              descriptor={stepStatusDescriptor(step.state)}
+              variant="icon"
             />
             <span className={styles.label}>{step.title}</span>
           </button>

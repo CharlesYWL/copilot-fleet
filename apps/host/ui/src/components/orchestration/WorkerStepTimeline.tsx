@@ -1,19 +1,14 @@
 import { useState } from "react";
-import {
-  shorthands,
-  Button,
-  Text,
-  makeStyles,
-  mergeClasses,
-  tokens,
-} from "@fluentui/react-components";
+import { shorthands, Button, Text, makeStyles, tokens } from "@fluentui/react-components";
 import {
   ChevronDown20Regular,
   ChevronRight20Regular,
   Open16Regular,
 } from "@fluentui/react-icons";
 import type { FleetSession, RunStep } from "@fleet/protocol";
-import { semanticColors, statusVisuals, terminal } from "../../theme";
+import { terminal } from "../../theme";
+import { stepStatusDescriptor } from "../../lib/run-step-status";
+import { StatusIndicator } from "../StatusIndicator";
 import { relativeTime } from "./OrchestratorRunList";
 
 const useStyles = makeStyles({
@@ -39,7 +34,6 @@ const useStyles = makeStyles({
     cursor: "pointer",
     ":hover": { background: tokens.colorNeutralBackground1Hover },
   },
-  dot: { width: "8px", height: "8px", borderRadius: "50%", flexShrink: 0 },
   title: {
     flexGrow: 1,
     minWidth: 0,
@@ -86,21 +80,11 @@ const useStyles = makeStyles({
   },
 });
 
-const stepColour = (step: RunStep): string => {
-  if (step.state === "succeeded") return statusVisuals.success.foreground;
-  if (step.state === "failed" || step.state === "cancelled") {
-    return statusVisuals.danger.foreground;
-  }
-  if (step.state === "running" || step.state === "starting") {
-    return semanticColors.interaction;
-  }
-  return statusVisuals.neutral.foreground;
-};
-
 export type WorkerStepTimelineProps = {
   steps: RunStep[];
   phases: readonly string[];
   sessions: readonly FleetSession[];
+  awaitingPermissionSessionId?: string;
   onOpenWorker: (sessionId: string) => void;
 };
 
@@ -116,6 +100,7 @@ export const WorkerStepTimeline = ({
   steps,
   phases,
   sessions,
+  awaitingPermissionSessionId,
   onOpenWorker,
 }: WorkerStepTimelineProps) => {
   const styles = useStyles();
@@ -141,6 +126,11 @@ export const WorkerStepTimeline = ({
       {steps.map((step) => {
         const expanded = open.has(step.id);
         const session = step.sessionId ? sessionById.get(step.sessionId) : undefined;
+        const status = stepStatusDescriptor(
+          step.state,
+          session,
+          Boolean(step.sessionId && step.sessionId === awaitingPermissionSessionId),
+        );
         const Chevron = expanded ? ChevronDown20Regular : ChevronRight20Regular;
         return (
           <li key={step.id} className={styles.item}>
@@ -151,17 +141,13 @@ export const WorkerStepTimeline = ({
               onClick={() => toggle(step.id)}
             >
               <Chevron aria-hidden="true" />
-              <span
-                className={styles.dot}
-                style={{ background: stepColour(step) }}
-                aria-hidden="true"
-              />
+              <StatusIndicator descriptor={status} variant="icon" />
               <span className={styles.title}>{step.title}</span>
               {phases[step.phaseIndex] && (
                 <span className={styles.phaseTag}>{phases[step.phaseIndex]}</span>
               )}
               <span className={styles.meta}>
-                {step.category || "step"} · {step.state}
+                {step.category || "step"} · {status.shortLabel}
               </span>
             </button>
             {expanded && (
@@ -215,6 +201,3 @@ export const WorkerStepTimeline = ({
     </ul>
   );
 };
-
-export { stepColour };
-export const timelineClasses = mergeClasses;
