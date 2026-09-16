@@ -135,6 +135,7 @@ export async function stopProcessTree(
   if (requireOwnership)
     throw new Error("Process-tree ownership is unknown; reconciliation is required.");
   if (child.exitCode !== null || child.signalCode !== null) return;
+  let disposeWait: (() => void) | undefined;
   const closed = new Promise<void>((resolve, reject) => {
     const timer = setTimeout(
       () =>
@@ -142,24 +143,38 @@ export async function stopProcessTree(
       15_000,
     );
     timer.unref();
-    child.once("close", () => {
+    const onClose = () => {
       clearTimeout(timer);
       resolve();
-    });
-    child.once("error", () => {
+    };
+    const onError = (error: Error) => {
       clearTimeout(timer);
-      resolve();
-    });
+      reject(error);
+    };
+    disposeWait = () => {
+      clearTimeout(timer);
+      child.removeListener("close", onClose);
+      child.removeListener("error", onError);
+    };
+    child.once("close", onClose);
+    child.once("error", onError);
   });
-  if (process.platform === "win32") {
-    await execute("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-      windowsHide: true,
-      timeout: 10_000,
-    }).catch((error: unknown) => {
-      if (child.exitCode === null && child.signalCode === null) throw error;
-    });
-  } else {
-    killPosixProcessGroup(pid);
+  const terminate = async () => {
+    if (process.platform === "win32") {
+      await execute("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        timeout: 10_000,
+      }).catch((error: unknown) => {
+        if (child.exitCode === null && child.signalCode === null) throw error;
+      });
+    } else {
+      killPosixProcessGroup(pid);
+    }
+  };
+  try {
+    // Observe both promises before waiting: taskkill must not orphan the exit deadline.
+    await Promise.all([closed, terminate()]);
+  } finally {
+    disposeWait?.();
   }
-  await closed;
 }
