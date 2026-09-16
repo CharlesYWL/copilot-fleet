@@ -1422,9 +1422,10 @@ export class ManagedWorktreeService {
       ? this.store.getAnyManagedWorkspace(attempt.resultWorkspaceId)
       : undefined;
     const integration = tree
-      ? this.store
+      ? (this.store
           .listWorktreeIntegrations(tree.id)
-          .find((entry) => entry.id === attempt?.attemptId)
+          .find((entry) => entry.id === attempt?.attemptId) ??
+        this.store.listWorktreeIntegrations(tree.id).at(-1))
       : undefined;
     if (
       !attempt ||

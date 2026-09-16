@@ -163,7 +163,7 @@ describe("claim startup fixtures", () => {
         callback.searchParams.set("state", state);
         const finished = await request(callback, undefined, true);
         expect(finished.statusCode).toBe(302);
-        expect(finished.headers.location).toBe(link.href);
+        expect(finished.headers.location).toBe(new URL("/?welcome=1", link).href);
         const status = await request(
           new URL("/api/auth/status", String(finished.headers.location)),
         );

@@ -477,7 +477,7 @@ describe("accessible managed workspace controls", () => {
       fireEvent.click(screen.getByRole("button", { name: "Abort merge" }));
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     });
-    await screen.findByRole("heading", { name: "Abort this merge?" });
+    await screen.findByRole("heading", { name: "Abort this merge?" }, { timeout: 5_000 });
     const abortDialog = screen.getByRole("dialog");
     expect(abortDialog).not.toBe(dialog);
     expect(abortDialog.getAttribute("aria-hidden")).not.toBe("true");

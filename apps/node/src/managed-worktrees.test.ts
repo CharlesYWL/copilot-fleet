@@ -2401,7 +2401,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     ).toContain(published.integration!.resultSha);
   });
 
-  it("does not accept an unreviewed post-commit descendant during reconciliation", async () => {
+  it("does not run post-commit hooks during controlled integration", async () => {
     const { manager, source } = await fixture();
     const hook = join(source, ".git", "hooks", "post-commit");
     await writeFile(
@@ -2425,30 +2425,22 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         targetPlacementId: "target-placement",
       })
     ).preview!;
-    const attempted = await operation(manager, tree, "integrate", {
+    const integrated = await operation(manager, tree, "integrate", {
       previewId: preview.id,
       reviewedTaskSha: preview.taskSha,
       reviewedDiffIdentity: preview.diffIdentity,
       confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
       commit: true,
     });
-    expect(attempted.code).toBe("commit_uncertain");
 
-    const reconciled = await operation(manager, tree, "reconcile");
-
-    expect(reconciled.worktree).toMatchObject({
-      state: "needs_reconciliation",
-      integrationState: "needs_reconciliation",
-    });
+    expect(integrated.error).toBe("");
+    expect(integrated.integration?.state).toBe("integrated");
     expect(
-      await git.run(
-        preview.target.path,
-        ["merge-base", "--is-ancestor", preview.taskSha, "HEAD"],
-        {
-          allowedExitCodes: [0, 1],
-        },
-      ),
-    ).toMatchObject({ exitCode: 0 });
+      (await git.run(preview.target.path, ["log", "-1", "--pretty=%s"])).stdout.trim(),
+    ).toBe(`Merge Fleet task ${tree.taskKey}`);
+    expect(
+      (await git.run(preview.target.path, ["rev-list", "--count", "HEAD"])).stdout.trim(),
+    ).toBe("3");
   });
 
   it("records a reviewed no-changes result without claiming the base was already integrated", async () => {
