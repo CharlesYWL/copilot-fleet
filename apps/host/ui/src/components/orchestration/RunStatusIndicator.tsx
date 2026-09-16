@@ -18,6 +18,7 @@ const useStyles = makeStyles({
     alignItems: "center",
     gap: "6px",
     minWidth: 0,
+    maxWidth: "100%",
   },
   dismiss: {
     minWidth: "20px",
@@ -163,7 +164,7 @@ export const RunStatusIndicator = ({
       className={mergeClasses(styles.root, className)}
       style={{ color: visual.color }}
     >
-      <StatusIndicator descriptor={{ ...visual, shortLabel: visual.label }} />
+      <StatusIndicator descriptor={{ ...visual, shortLabel: visual.label }} wrap />
       {dismissible && model.attention === "failed-step" && !failureDismissed ? (
         <Button
           appearance="subtle"

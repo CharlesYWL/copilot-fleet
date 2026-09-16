@@ -15,6 +15,7 @@ const useStyles = makeStyles({
   card: {
     position: "relative",
     width: "100%",
+    minWidth: 0,
     minHeight: "116px",
     flexShrink: 0,
     display: "flex",
@@ -25,6 +26,7 @@ const useStyles = makeStyles({
     borderRadius: tokens.borderRadiusMedium,
     background: tokens.colorNeutralBackground1,
     textAlign: "left",
+    overflowWrap: "anywhere",
     ":hover": {
       ...shorthands.borderColor(tokens.colorNeutralStroke1),
       background: tokens.colorNeutralBackground1Hover,
@@ -76,6 +78,7 @@ const useStyles = makeStyles({
   },
   kicker: {
     display: "flex",
+    flexWrap: "wrap",
     alignItems: "center",
     justifyContent: "space-between",
     gap: "8px",

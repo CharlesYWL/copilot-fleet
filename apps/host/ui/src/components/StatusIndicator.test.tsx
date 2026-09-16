@@ -55,6 +55,27 @@ describe("StatusIndicator", () => {
     ).toBe("none");
   });
 
+  it.each([false, true])("only wraps status labels when requested (wrap: %s)", (wrap) => {
+    const descriptor = {
+      ...statusDescriptor("waiting-for-permission"),
+      label: "Integration needs attention",
+      shortLabel: "Integration needs attention",
+    };
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <StatusIndicator descriptor={descriptor} wrap={wrap} />
+      </FluentProvider>,
+    );
+
+    const indicator = screen.getByRole("img", { name: descriptor.label });
+    expect(indicator.getAttribute("title")).toBe(descriptor.label);
+    expect(getComputedStyle(indicator).flexShrink).toBe(wrap ? "1" : "0");
+    expect(getComputedStyle(indicator.firstElementChild!).flexShrink).toBe("0");
+    expect(getComputedStyle(screen.getByText(descriptor.label)).whiteSpace).toBe(
+      wrap ? "normal" : "nowrap",
+    );
+  });
+
   it.each(["running", "stopping"] as const)(
     "keeps %s visibly rotating more slowly under reduced motion",
     (state) => {
