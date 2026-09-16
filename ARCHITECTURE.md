@@ -41,9 +41,13 @@ Agency installation falls back to the Node's standard Copilot command, with a
 session-log notice; Agency startup errors are not hidden by a fallback.
 Already-running sessions keep their launcher until stopped and resumed.
 
-The [native Copilot RPC migration runbook](docs/copilot-rpc-migration-runbook.md)
-describes a proposed replacement for the Node-side ACP adapter. It is a
-follow-up implementation plan, not the currently shipped execution architecture.
+The execution backend remains ACP. Validate the upstream context-flag fix before
+considering a separately approved migration of the Node-side adapter.
+
+The [remote command execution plan](docs/remote-command-execution-plan.md) proposes
+a permission-gated Node command runner exposed through Fleet MCP without starting
+a Copilot worker. It is a planned capability, not shipped behavior, and does not
+replace ACP for Copilot sessions.
 
 ## Domain model
 

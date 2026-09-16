@@ -794,8 +794,8 @@ default** 关闭此默认行为，改用 `--context default`。Host 默认值优
 （[github/copilot-cli#4275](https://github.com/github/copilot-cli/issues/4275)），所以接受启动
 参数不等于实际启用了 1M；Fleet 不会用模型目录的最大值替代实际报告的窗口。
 
-后续原生后端迁移见 [Copilot RPC migration runbook](docs/copilot-rpc-migration-runbook.md)。
-本次只交付界面和实施计划，迁移将在另一份 PR 中实现；当前仍使用 ACP。
+Fleet 继续使用 ACP。应先在实际运行的 CLI 上验证上游上下文参数修复，再考虑另行审批的
+后端迁移。如果修复后的 CLI 满足需求，就无需迁移；目前尚未确认包含修复的发布版本。
 
 **发送按钮旁的上下文圆环**支持悬停、键盘聚焦或点击打开弹窗，里面显示本会话的 **AI credits**、
 上下文详情和 **Compact**，不再额外占用输入框一行。每个回合结束（包括压缩）后读取本地

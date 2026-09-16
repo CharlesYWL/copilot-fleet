@@ -1056,9 +1056,10 @@ tier in the ACP bridge at creation or model changes
 Fleet preserves the request but never substitutes the catalog maximum for the
 window Copilot actually reports.
 
-The planned native-backend replacement is documented in the
-[Copilot RPC migration runbook](docs/copilot-rpc-migration-runbook.md). That work
-belongs to a follow-up PR; the controls described here still use ACP.
+Fleet continues to use ACP. Verify the upstream context-flag fix against the
+running CLI before considering a separately approved backend migration. If a
+fixed CLI meets the requirements, no migration is needed; a fixed release has
+not yet been confirmed here.
 
 A small **context ring beside Send** opens on hover, focus, or click. Its popover
 contains **AI credits**, **context details**, and **Compact**, without adding a
