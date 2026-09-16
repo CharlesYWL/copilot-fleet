@@ -141,8 +141,30 @@ input files, or installed metadata. Only identity/settings and restart-safe
 tunnel/port flags persist. A failed preparation registers no new long-running
 task; retrying after enrollment reuses the saved key for that Host.
 
-Host/Node logon delays are 15/25 seconds, with no execution time limit and ten
-one-minute crash retries. The Node supervisor handles planned exit-75 updates.
+Host/Node logon delays are 15/25 seconds, with no execution time limit. Both tasks
+retain Task Scheduler's ten one-minute failure retries, but those are an outer
+fallback, not the Node's in-process recovery mechanism.
+
+The Windows Node login runner retries an unexpectedly failed supervisor **at most
+four times per task invocation**, waiting **5, 15, 30, then 60 seconds**. The budget
+does not reset after a long-running attempt. Each attempt, exit code/signal,
+verified process-tree termination, backoff, and exhausted budget is recorded in
+`runtime.log` with a `[login-recovery]` prefix, independently of Task Scheduler's
+Operational history setting. Exit 0 is a clean stop, not a crash. SIGINT/SIGTERM
+stop requests cancel backoff and prevent another attempt. Missing identity/config,
+spawn failures, unsafe cleanup, or log failures halt recovery rather than looping;
+launcher failures are also reported in `runtime.log.startup.log`.
+
+Each Node supervisor attempt has its **own kill-on-close Windows Job Object**.
+Before any retry, the runner requires proof that the previous attempt's entire
+tree, including orphaned Copilot/MCP descendants, terminated. Missing proof is a
+fatal error, never permission to spawn another writer. The runner never removes
+checkout locks or identity files; stale Node-instance locks remain the Node
+runtime's responsibility. Node stdout/stderr and job diagnostics are streamed to
+the runtime log with backpressure; a log-write failure is fatal. Host behavior is
+unchanged.
+
+The Node supervisor still handles planned exit-75 updates inside one attempt.
 Host-triggered Node updates include build-time development dependencies despite
 `NODE_ENV=production`, rebuild when the running revision is behind an already
 updated checkout, and restart through that supervisor. They do not need
@@ -152,8 +174,23 @@ If an older updater is stuck, stop the Node service, run
 `npm install --include=dev` and `npm run build:node` in the updated checkout, then
 `npm run service -- node start` to load this fix once.
 
-A kill-on-close Windows job contains the task's descendants; application output
-goes directly to its log file. The existing Host tunnel lifecycle is unchanged.
+**Installing runner changes is different from updating Node application code.**
+The task runs a copied runner under `%LOCALAPPDATA%`, while the runner loads the
+Node's production build from the checkout. Existing installations must stop the
+task, update/build the checkout, and reinstall the runner to gain crash recovery:
+
+```powershell
+npm run service -- node stop
+npm run build:node
+npm run service -- node install --existing-node --no-build
+```
+
+Run these in the updated checkout, preserving any nondefault install flags such as
+`--config-port`. A plain task start/restart or a Host-triggered application update
+does not refresh the installed runner copy.
+
+An outer kill-on-close Windows job still contains the entire task action and all
+its descendants. The existing Host tunnel lifecycle is unchanged.
 
 Locking Windows keeps tasks running while awake. RDP disconnection normally does
 too, unless policy logs off the session. Do not expect execution during sleep or

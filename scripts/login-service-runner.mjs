@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { join, resolve, win32 } from "node:path";
 import process from "node:process";
+import { finished } from "node:stream/promises";
 import { setTimeout, clearTimeout } from "node:timers";
 import { pathToFileURL } from "node:url";
 import { Buffer } from "node:buffer";
@@ -242,14 +243,207 @@ async function rotateLog(path) {
   await rename(path, `${path}.previous`);
 }
 
-export async function run(manifest) {
-  await loadCheckoutEnvironment(manifest);
-  if (manifest.kind === "node") {
-    const config = await importNodeModule(manifest, "config.js");
-    if (!(await config.loadCredentials()))
-      throw new Error("Node identity is missing; refusing replacement enrollment.");
-    assertIdleNode(config.configDirectory());
+const NODE_CRASH_DELAYS_MS = [5_000, 15_000, 30_000, 60_000];
+
+async function existingIdleNode(manifest) {
+  const config = await importNodeModule(manifest, "config.js");
+  const credentials = await config.loadCredentials();
+  if (!credentials)
+    throw new Error("Node identity is missing; refusing replacement enrollment.");
+  assertIdleNode(config.configDirectory());
+  return credentials.nodeId;
+}
+
+async function runRecoveringNode(
+  manifest,
+  entry,
+  log,
+  nodeId,
+  { processManager, retryDelaysMs = NODE_CRASH_DELAYS_MS, signalSource = process },
+) {
+  const { spawnManagedProcess, stopProcessTree } =
+    processManager ?? (await importNodeModule(manifest, "process-quiescence.js"));
+  const output = log.createWriteStream({ autoClose: false });
+  let current;
+  let cancelBackoff;
+  let stopping;
+  let logError;
+  let fatalError;
+  let exitCode = 0;
+  output.on("error", (error) => {
+    logError = error;
+    current?.fail(error);
+    cancelBackoff?.();
+  });
+  const record = (message) =>
+    new Promise((done, reject) => {
+      if (logError) return reject(logError);
+      output.write(
+        `${new Date().toISOString()} [login-recovery] ${message}\n`,
+        (error) => (error ? reject(error) : done()),
+      );
+    });
+  const signals = new Map();
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const handler = () => {
+      stopping ??= signal;
+      cancelBackoff?.();
+      // stop() always resolves an outcome; the attempt below owns any failure.
+      current?.stop();
+    };
+    signals.set(signal, handler);
+    signalSource.on(signal, handler);
   }
+  try {
+    for (let attempt = 0; attempt <= retryDelaysMs.length && !stopping; attempt++) {
+      if (attempt > 0 && (await existingIdleNode(manifest)) !== nodeId)
+        throw new Error(
+          "Node identity changed; refusing recovery with another identity.",
+        );
+      await record(`Starting attempt ${attempt + 1}/${retryDelaysMs.length + 1}.`);
+      if (stopping) break;
+      const child = spawnManagedProcess(
+        manifest.nodePath,
+        [entry, ...manifest.runtimeArgs],
+        {
+          cwd: manifest.repositoryPath,
+          windowsHide: true,
+          env: { ...process.env, NODE_ENV: "production" },
+        },
+      );
+      let failure;
+      let resolveFailure;
+      const failed = new Promise((done) => {
+        resolveFailure = done;
+      });
+      const streams = [child.stdout, child.stderr];
+      const fail = (error) => {
+        failure ??= error;
+        resolveFailure({ error });
+        // Keep consuming the proof-bearing stderr even if the log is broken.
+        // Normal piping uses stream backpressure, never an in-memory log queue.
+        for (const stream of streams) {
+          stream.unpipe(output);
+          stream.resume();
+        }
+      };
+      const closed = new Promise((done) => {
+        child.once("error", fail);
+        child.once("close", (code, signal) => done({ code, signal }));
+      });
+      const drained = Promise.all(
+        streams.map((stream) => finished(stream, { cleanup: true }).catch(fail)),
+      );
+      let quiescence;
+      const stop = () =>
+        (quiescence ??= Promise.resolve()
+          .then(() => stopProcessTree(child, true))
+          .then(
+            () => undefined,
+            (error) => {
+              fail(error);
+              return error;
+            },
+          ));
+      current = { stop, fail };
+      child.stdin.once("error", fail);
+      child.stdin.end();
+      for (const stream of streams) stream.pipe(output, { end: false });
+      const result = await Promise.race([closed, failed]);
+      if (!result.error) await drained;
+      const cleanupError = await stop();
+      current = undefined;
+      if (cleanupError) {
+        // No successor is allowed without proof. Release the wrapper handles
+        // and let the outer task job contain this fatal action exit.
+        try {
+          child.kill();
+        } finally {
+          child.stdin.destroy();
+          for (const stream of streams) stream.destroy();
+          child.unref();
+        }
+        throw new Error(
+          `Process-tree termination was not verified; refusing recovery: ${cleanupError.message}`,
+          { cause: cleanupError },
+        );
+      }
+      await drained;
+      if (failure) throw failure;
+      await record(
+        `Attempt ${attempt + 1} exited (code=${result.code ?? "none"}, signal=${result.signal ?? "none"}); process tree verified terminated.`,
+      );
+      if (stopping) break;
+      if (result.code === 0 && !result.signal) {
+        await record("Clean exit; not restarting.");
+        break;
+      }
+      if (attempt === retryDelaysMs.length) {
+        await record(`Crash recovery exhausted after ${attempt} retries; stopping.`);
+        if (!stopping) exitCode = result.signal ? 1 : (result.code ?? 1);
+        break;
+      }
+      const delay = retryDelaysMs[attempt];
+      await record(
+        `Crash recovery retry ${attempt + 1}/${retryDelaysMs.length} in ${delay}ms.`,
+      );
+      if (stopping) break;
+      if (logError) throw logError;
+      await new Promise((done) => {
+        const timer = setTimeout(() => {
+          cancelBackoff = undefined;
+          done();
+        }, delay);
+        cancelBackoff = () => {
+          clearTimeout(timer);
+          cancelBackoff = undefined;
+          done();
+        };
+      });
+      if (logError) throw logError;
+    }
+    if (stopping) await record(`Stopped by ${stopping}; no further retries.`);
+  } catch (error) {
+    fatalError = error;
+    if (!logError) {
+      try {
+        await record(`Recovery halted; no retry: ${error.message}`);
+      } catch (error) {
+        logError = error;
+      }
+    }
+  } finally {
+    cancelBackoff?.();
+    for (const [signal, handler] of signals) signalSource.removeListener(signal, handler);
+    try {
+      if (!logError) {
+        await new Promise((done, reject) =>
+          output.end((error) => (error ? reject(error) : done())),
+        );
+      }
+    } catch (error) {
+      logError = error;
+    } finally {
+      if (!output.closed) {
+        await new Promise((done) => {
+          output.once("close", done);
+          output.destroy();
+        });
+      }
+    }
+  }
+  if (fatalError && logError && fatalError !== logError)
+    throw new AggregateError(
+      [fatalError, logError],
+      `${fatalError.message}; ${logError.message}`,
+    );
+  if (fatalError || logError) throw fatalError || logError;
+  return exitCode;
+}
+
+export async function run(manifest, options = {}) {
+  await loadCheckoutEnvironment(manifest);
+  const nodeId = manifest.kind === "node" ? await existingIdleNode(manifest) : undefined;
   const entry =
     manifest.kind === "node"
       ? join(manifest.repositoryPath, "apps", "node", "supervisor.mjs")
@@ -262,6 +456,12 @@ export async function run(manifest) {
     await log.write(
       `\n${new Date().toISOString()} [login-start] Starting ${manifest.kind} as ${manifest.accountSid}\n`,
     );
+    if (
+      manifest.kind === "node" &&
+      (process.platform === "win32" || options.processManager)
+    ) {
+      return await runRecoveringNode(manifest, entry, log, nodeId, options);
+    }
     const child = spawn(manifest.nodePath, [entry, ...manifest.runtimeArgs], {
       cwd: manifest.repositoryPath,
       windowsHide: true,
