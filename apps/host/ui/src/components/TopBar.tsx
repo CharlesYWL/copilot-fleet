@@ -244,11 +244,15 @@ export const TopBar = ({
     username: string;
     displayName: string;
   }>();
+  const [noAuth, setNoAuth] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     void fetchAuthStatus().then((status) => {
-      if (!cancelled) setOperator(status.identity);
+      if (!cancelled) {
+        setOperator(status.identity);
+        setNoAuth(status.state === "no-auth");
+      }
     });
     return () => {
       cancelled = true;
@@ -402,14 +406,18 @@ export const TopBar = ({
             {operator.displayName || operator.username}
           </Text>
         )}
-        <Button
-          appearance="subtle"
-          size="small"
-          icon={<SignOut20Regular />}
-          title="Sign out"
-          aria-label="Sign out"
-          onClick={onSignOut}
-        />
+        {noAuth ? (
+          <Text className={styles.operator}>Microsoft sign-in off</Text>
+        ) : (
+          <Button
+            appearance="subtle"
+            size="small"
+            icon={<SignOut20Regular />}
+            title="Sign out"
+            aria-label="Sign out"
+            onClick={onSignOut}
+          />
+        )}
       </div>
     </header>
   );

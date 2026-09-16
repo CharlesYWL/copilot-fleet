@@ -32,3 +32,19 @@ export function requireAdministrator(
   }
   return administrator;
 }
+
+/** Node management remains available when the operator deliberately skips sign-in. */
+export function requireNodeOperator(
+  auth: FleetAuth,
+  request: FastifyRequest,
+  reply: FastifyReply,
+  recent: boolean,
+): { actorKind: "operator" | "administrator"; actorId: string } | undefined {
+  if (auth.noAuthEnabled() && auth.noAuthEndpointAllowed(request.headers.host)) {
+    return { actorKind: "operator", actorId: "" };
+  }
+  const administrator = requireAdministrator(auth, request, reply, recent);
+  return administrator
+    ? { actorKind: "administrator", actorId: administrator.id }
+    : undefined;
+}

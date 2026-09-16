@@ -227,7 +227,7 @@ const ProviderCard = ({
             !spec.binaryPresent ||
             switching ||
             state.external ||
-            !spec.controlPlaneEligible
+            (!spec.controlPlaneEligible && !state.enabled)
           }
           label={state.enabled ? "On" : "Off"}
           onChange={(_event, data) => onToggle(data.checked)}
@@ -237,9 +237,15 @@ const ProviderCard = ({
       {!spec.controlPlaneEligible && (
         <MessageBar intent="error">
           <MessageBarBody>
-            {spec.label} publishes plain HTTP with no TLS, so the operator session cookie
-            and every transcript behind it would cross it readable. Fleet will not expose
-            the console through it.
+            {spec.externalScheme === "https" ? (
+              `${spec.label} is public. Enable Microsoft sign-in in Settings → Security first, or use private Dev Tunnels.`
+            ) : (
+              <>
+                {spec.label} publishes plain HTTP with no TLS, so the operator session
+                cookie and every transcript behind it would cross it readable. Fleet will
+                not expose the console through it.
+              </>
+            )}
           </MessageBarBody>
         </MessageBar>
       )}
@@ -368,10 +374,11 @@ export const TunnelPanel = () => {
         <Title3 as="h1">Remote access tunnels</Title3>
         <br />
         <Text className={styles.caption}>
-          Each provider runs on its own, so more than one can be up at a time — a fixed
-          public hostname for teammates, a private tunnel for just this account. The one
-          marked for enrollment is the address handed to new nodes. A tunnel decides who
-          can reach this Host; it never decides who may operate it.
+          The tunnel marked for enrollment is the address handed to new nodes. With
+          Microsoft sign-in enabled, Fleet separately checks who may operate it, and
+          multiple HTTPS providers can run together. Without Microsoft sign-in, anyone who
+          can reach the Host can operate it: keep the listener on loopback and use private
+          Dev Tunnels, never anonymous tunnel access.
         </Text>
       </div>
 

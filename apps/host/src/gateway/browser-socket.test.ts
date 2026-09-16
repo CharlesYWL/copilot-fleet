@@ -143,6 +143,50 @@ describe("browser socket revocation", () => {
     await expect(openSocket("")).rejects.toThrow(/401/);
   });
 
+  it("streams without a session after setup is skipped and disconnects when Microsoft ownership is enabled", async () => {
+    const owner = jarFor();
+    const bootstrap = async () =>
+      owner.remember(
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/bootstrap",
+          headers: { cookie: owner.cookie() },
+          payload: { code: claimCode },
+        }),
+      );
+    await bootstrap();
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/skip",
+          headers: { cookie: owner.cookie() },
+          payload: {},
+        })
+      ).statusCode,
+    ).toBe(200);
+    const socket = await openSocket("");
+    try {
+      await bootstrap();
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/auth/configure",
+            headers: { cookie: owner.cookie() },
+            payload: { tenantId: TENANT, clientId: CLIENT },
+          })
+        ).statusCode,
+      ).toBe(200);
+      const closed = closeCodeOf(socket);
+      expect((await signIn(owner)).statusCode).toBe(302);
+      expect(await closed).toBe(AUTHENTICATION_CLOSE_CODE);
+      await expect(openSocket("")).rejects.toThrow(/401/);
+    } finally {
+      socket.close();
+    }
+  });
+
   it("closes the stream the moment its administrator is removed", async () => {
     const owner = jarFor();
     owner.remember(

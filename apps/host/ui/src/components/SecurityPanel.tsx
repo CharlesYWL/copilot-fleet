@@ -42,6 +42,7 @@ import { DeviceCodePanel } from "./auth/DeviceCodePanel";
 import { MicrosoftSignInForm } from "./auth/MicrosoftSignInForm";
 import { CopyButton } from "./CopyButton";
 import { PortableBackupCard } from "./PortableBackupCard";
+import { MicrosoftSignInSetup } from "./AuthGate";
 import { terminal } from "../theme";
 
 const useStyles = makeStyles({
@@ -151,6 +152,8 @@ type Security = {
 };
 
 const AUTH_MODE_COPY: Record<AuthStatus["state"], string> = {
+  "no-auth":
+    "Microsoft sign-in is off. Access is controlled by the local listener or private Dev Tunnel.",
   "entra-unconfigured": "No Microsoft sign-in is configured on this Host.",
   unclaimed: "Configured, but nobody has claimed this Fleet yet.",
   "legacy-password":
@@ -181,13 +184,26 @@ export const SecurityPanel = () => {
 
   const load = useCallback(async () => {
     try {
-      const [status, admins, audit, enrollment] = await Promise.all([
+      const [status, enrollment] = await Promise.all([
         api<AuthStatus>("/api/auth/status"),
+        api<Enrollment>("/api/enrollment"),
+      ]);
+      if (status.state === "no-auth") {
+        setData({
+          status,
+          enrollment,
+          currentAdministratorId: "",
+          administrators: [],
+          pending: [],
+          audit: [],
+        });
+        return;
+      }
+      const [admins, audit] = await Promise.all([
         api<Pick<Security, "currentAdministratorId" | "administrators" | "pending">>(
           "/api/auth/administrators",
         ),
         api<{ events: AuditEvent[] }>("/api/security/audit?limit=100"),
-        api<Enrollment>("/api/enrollment"),
       ]);
       setData({
         status,
@@ -267,6 +283,30 @@ export const SecurityPanel = () => {
         ) : (
           <Spinner label="Loading security settings…" />
         )}
+      </div>
+    );
+  }
+
+  if (data.status.state === "no-auth") {
+    return (
+      <div className={styles.panel}>
+        <Title3 as="h1">Security</Title3>
+        <MessageBar intent="warning">
+          <MessageBarBody>
+            Microsoft sign-in is off. Anyone who can reach this Host can operate Fleet.
+            Keep the listener on loopback and Dev Tunnels private. Never enable anonymous
+            tunnel access. Microsoft sign-in can be set up below with your own approved
+            app registration and the current console claim code; it is not required.
+          </MessageBarBody>
+        </MessageBar>
+        <IdentityCard status={data.status} enrollment={data.enrollment} />
+        <NodeMigrationCard enrollment={data.enrollment} run={run} />
+        {error && (
+          <MessageBar intent="error">
+            <MessageBarBody>{error}</MessageBarBody>
+          </MessageBar>
+        )}
+        <MicrosoftSignInSetup status={data.status} onChanged={load} />
       </div>
     );
   }
@@ -369,7 +409,11 @@ function IdentityCard({
       <div className={styles.facts}>
         <Text className={styles.caption}>Signed in as</Text>
         <span className={styles.identity}>
-          <Text>{status.identity?.username ?? "a shared password session"}</Text>
+          <Text>
+            {status.state === "no-auth"
+              ? "No Fleet sign-in"
+              : (status.identity?.username ?? "a shared password session")}
+          </Text>
           {status.identity?.displayName && (
             <Text className={styles.caption}>{status.identity.displayName}</Text>
           )}

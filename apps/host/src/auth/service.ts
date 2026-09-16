@@ -46,6 +46,7 @@ import {
 import { deriveAuthState, resolvePasswordMode, type AuthState } from "./state.js";
 
 export const AUTH_MODE_SETTING = "auth.mode";
+export const NO_AUTH_PRINCIPAL = "no-auth";
 export const PASSWORD_ENABLED_SETTING = "auth.passwordEnabled";
 export const PASSWORD_RECOVERY_SETTING = "auth.passwordIsRecovery";
 export const PASSWORD_EXPLICIT_SETTING = "auth.passwordExplicitlyEnabled";
@@ -241,7 +242,70 @@ export class FleetAuth {
       passwordEnabled: this.passwordAuth !== undefined,
       entraConfigured: this.entraConfig() !== undefined,
       recoveryPassword: this.store.getSetting(PASSWORD_RECOVERY_SETTING) === "1",
+      noAuthEnabled: this.store.getSetting(AUTH_MODE_SETTING) === NO_AUTH_PRINCIPAL,
     });
+  }
+
+  noAuthEnabled(): boolean {
+    return (
+      this.store.getSetting(AUTH_MODE_SETTING) === NO_AUTH_PRINCIPAL &&
+      !this.claimed() &&
+      !this.passwordEnabled()
+    );
+  }
+
+  noAuthEndpointAllowed(host: string | undefined): boolean {
+    const endpoint = this.classify(host);
+    return (
+      endpoint.kind === "loopback" ||
+      (endpoint.kind === "external-https" && endpoint.provider === "devtunnel")
+    );
+  }
+
+  skipMicrosoftSetup(input: {
+    token: string | undefined;
+    binding: string;
+    host: string | undefined;
+  }): { ok: true } | AuthFailure {
+    if (this.claimed() || this.passwordEnabled()) {
+      return {
+        ok: false,
+        status: 409,
+        error: "Existing Microsoft or password protection cannot be skipped.",
+      };
+    }
+    if (!this.noAuthEndpointAllowed(input.host)) {
+      return {
+        ok: false,
+        status: 409,
+        error: "Open this Host locally or through a private Dev Tunnel to skip sign-in.",
+      };
+    }
+    if (
+      !this.claim.verifyBootstrap(input.token, input.binding) ||
+      !this.claim.consumeBootstrap(input.token)
+    ) {
+      return {
+        ok: false,
+        status: 401,
+        error: "Enter the claim code printed on the Host console first.",
+      };
+    }
+    this.store.setSetting(AUTH_MODE_SETTING, NO_AUTH_PRINCIPAL);
+    this.clearPendingAuthentication();
+    this.claim.clear();
+    this.claim.issue();
+    this.onAuthenticationReset();
+    this.warn(
+      "Microsoft sign-in was skipped. Anyone who can reach this Host can operate it. Keep the listener on loopback and Dev Tunnels private; do not grant anonymous tunnel access.",
+    );
+    this.audit({
+      eventType: "microsoft_setup_skipped",
+      actorKind: "bootstrap",
+      outcome: "allowed",
+      requestHost: endpointLabel(this.classify(input.host)),
+    });
+    return { ok: true };
   }
 
   passwordEnabled(): boolean {
@@ -1045,6 +1109,7 @@ export class FleetAuth {
   ): LoginSuccess | AuthFailure {
     const requestHost = endpointLabel(this.classify(context.host));
     if (!this.claimed()) {
+      const wasNoAuth = this.noAuthEnabled();
       if (!context.bootstrap || !this.claim.consumeBootstrap(context.grantToken)) {
         this.audit({
           eventType: "microsoft_login_denied_not_admin",
@@ -1081,6 +1146,7 @@ export class FleetAuth {
       this.claim.clear();
       if (this.passwordEnabled()) this.disablePassword(administrator.id);
       else this.store.setSetting(AUTH_MODE_SETTING, "microsoft-only");
+      if (wasNoAuth) this.onAuthenticationReset();
       this.audit({
         eventType: "fleet_claimed",
         actorKind: "administrator",
@@ -1727,6 +1793,7 @@ export class FleetAuth {
     if (this.claimed()) this.claim.clear();
     else this.claim.issue();
     this.onSessionsRevoked(revoked);
+    this.onAuthenticationReset();
     this.audit({
       eventType: "security_backup_imported",
       actorKind: "administrator",

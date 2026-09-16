@@ -120,8 +120,9 @@ Start with the walkthrough, then use this map when you need a specific surface.
   access permitted by your subscription and organization
 - An existing absolute local directory for every workspace placement on the Node
   that will run it
-- An approved publisher- or operator-owned Microsoft app registration for Host
-  sign-in; see [registration and account support](#microsoft-sign-in-registration-and-account-support)
+- Optional: an approved publisher- or operator-owned Microsoft app registration
+  if you enable Host sign-in; see [registration and account support](#microsoft-sign-in-registration-and-account-support).
+  Setup can instead use no Fleet login with local access or private Dev Tunnels.
 - Optional but recommended for multi-machine access: Microsoft Dev Tunnels
   (`devtunnel`) signed in on the Host and, for private tunnels, on each remote
   Node that will dial through it
@@ -163,7 +164,7 @@ build that workspace for you. By default, the API listens on
 Use the Vite URL while developing. If you change `PORT` in `.env`, use that
 API port in the configuration and examples below.
 
-Follow the [walkthrough](#first-run-walkthrough) to claim the Host and enroll
+Follow the [walkthrough](#first-run-walkthrough) to set up the Host and enroll
 your first Node. Once a local Node is enrolled and Copilot CLI is signed in,
 `npm run dev` starts Host, UI, and that Node together. Starting a Node process
 alone does not enroll it. The Node reads initial `FLEET_*` settings from `.env`,
@@ -184,7 +185,9 @@ It expires in 30 minutes and is printed only here.
 ```
 
 See [First run: claiming a Fleet](#first-run-claiming-a-fleet) for the two
-proofs a claim takes and how to register the Entra app it needs. A normal fresh
+proofs a Microsoft claim takes and how to register the Entra app it needs.
+After unlocking setup, **Continue without Microsoft sign-in** needs no client or
+tenant ID and opens the setup tour immediately. A normal fresh
 public sign-in needs a registered public client/config supplied by the operator
 or publisher; this repository does not bundle a working public default.
 
@@ -254,18 +257,25 @@ of them on one Windows machine, or split Host and Node across machines.
    Alternatively, run `npm run build` then `npm run start:host` for a built Host.
    Keep the Host console open; the claim code is printed only there and expires
    after 30 minutes.
-2. **Claim the Host.** Open `http://localhost:5173` in development or
+2. **Choose Host sign-in.** Open `http://localhost:5173` in development or
    `http://localhost:8787` in production. If Fleet shows
    **Configure Microsoft sign-in**, enter the code and select **Unlock setup**.
-   Paste an approved Microsoft Application (client) ID, choose **Work/school and
+   For no Fleet login, choose **Continue without Microsoft sign-in**. Keep the
+   listener on loopback; use private, authenticated Dev Tunnels for remote access.
+   Anyone who can reach this Host can operate it, so never allow anonymous tunnel
+   access. The choice survives restarts and public tunnel providers are disabled.
+   Alternatively, paste an approved Microsoft Application (client) ID, choose **Work/school and
    personal Microsoft accounts** or **One organization (fixed directory)**,
    then **Save and continue**. If sign-in was already configured, enter the
    code and select **Unlock claim** instead. Choose **Claim with Microsoft** and finish sign-in
    with the account that should administer this Host. **Claiming also signs you
    in**; on later visits, use **Sign in with Microsoft** with an authorized
-   account rather than claiming again.
+   account rather than claiming again. If you skipped sign-in, configure it later
+   in **Settings → Security** with the current console code and your own approved
+   registration. Saving a registration does not enable authentication until the
+   first Microsoft claim succeeds.
 3. **Follow the teaching tour, or continue with the steps below.** The tour opens
-   after the first successful claim, not on every login. Its 10 stops highlight
+   after setup is skipped or the first claim succeeds, not on every visit. Its 10 stops highlight
    the controls for tunnels, Nodes, workspaces, placements, sessions,
    permissions, Orchestrator, task review, and the rest of Settings.
    **Back** and **Next** move through the guide without changing settings or
@@ -409,9 +419,18 @@ apply. Agency mode is saved with the Host and included in Host backups.
 ## First run: claiming a Fleet
 
 A Fleet Host can start processes and read every transcript on every machine
-enrolled in it. Who may do that is decided by Microsoft Entra ID plus this
-Host's own list of administrators — and nothing else. A tunnel decides who can
-_reach_ the Host; it never decides who may operate it.
+enrolled in it. Microsoft sign-in is optional. After the console-code check,
+**Continue without Microsoft sign-in** persists a no-auth mode: anyone who can
+reach the Host can operate it. Keep `HOST=127.0.0.1` and use private Dev Tunnels
+for remote access, without anonymous tunnel access. Other public tunnel providers
+and direct public/LAN endpoints are refused in this mode. Host-name, browser-origin
+and CSRF checks remain active; Nodes still use one-time enrollment grants and keys.
+
+With Microsoft sign-in enabled, Entra ID plus this Host's administrator list
+decides who may operate it independently of tunnel access. Existing Microsoft
+and password protection cannot be skipped. Microsoft-specific administrator
+operations and portable security exports still require a Microsoft administrator;
+ordinary Fleet use, Node management and data backups work without sign-in.
 
 Two proofs are needed to claim a fresh Host, and one alone is worth nothing:
 
@@ -437,9 +456,9 @@ An organization's consent and Conditional Access policies can still refuse
 sign-in; Fleet does not bypass them. An enterprise configuration can instead
 restrict authentication to one directory.
 
-**A publisher or operator must supply an approved app registration first.**
+**To enable Microsoft sign-in, a publisher or operator must supply an approved app registration first.**
 There is currently no approved Fleet-owned client ID bundled in this repository.
-A fresh install without one shows setup-required; it never silently falls back
+A fresh install without one offers setup or an explicit skip; it never silently falls back
 to the borrowed Visual Studio client. Users of a distribution that supplies
 legitimate configuration need no tenant setup of their own — the publisher has
 already done the one-time registration work.
@@ -1732,7 +1751,12 @@ stops a run rather than a prompt each time.
 
 ## Security notes
 
-- The web UI and the whole `/api` surface require a Fleet session belonging to a
+- In explicit no-auth mode, local access or a private Dev Tunnel replaces Fleet
+  login. All reachable operators have control; keep the listener on loopback and
+  never enable anonymous tunnel access. Skipping requires a browser-bound console
+  grant, cannot downgrade an existing protected Host, and never borrows another
+  application's client/tenant ID.
+- With Microsoft sign-in enabled, the operator UI and API require a Fleet session belonging to a
   live administrator. A Fleet session is issued only after Microsoft Entra ID
   has authenticated the person **and** this Host's own administrator table has
   authorized them: a supported Microsoft account that nobody added is
@@ -1749,16 +1773,18 @@ stops a run rather than a prompt each time.
   apparent loopback, `x-forwarded-proto` and caller-supplied `Host` values are
   not security inputs — every supported tunnel relays into loopback, so all of
   them describe the relay.
-- Every state-changing browser request carries an `X-CSRF-Token` derived from
-  the session with an HMAC, so nothing per-session is stored to leak.
+- State-changing operator requests carry an `X-CSRF-Token` derived with an HMAC
+  from the session, or the no-auth principal in skipped mode. Host and origin
+  checks apply in both modes.
 - High-impact changes — removing an administrator, disabling the password,
   changing Microsoft sign-in configuration, exporting a portable backup —
   additionally require an **authorization-code** sign-in from the last ten minutes. A device
   sign-in does not satisfy it, because an attacker can start a device flow and
   have an administrator finish it.
-- Generating a connect command requires a live Microsoft administrator session
+- In Microsoft mode, generating a connect command requires a live Microsoft administrator session
   and CSRF protection, but no recent reauthentication. Authorization-code and
-  device sign-ins both work for this operation.
+  device sign-ins both work for this operation. In no-auth mode, a reachable
+  operator with CSRF proof can generate the same single-use grant.
 - Removing an administrator revokes their sessions and closes their live browser
   sockets in the same operation; a 60-second sweep re-checks every open socket
   against the live session and administrator rows.

@@ -24,7 +24,7 @@ import { providerSpecs } from "../tunnel-providers.js";
 import type { EnrollmentGrants } from "../auth/enrollment-grants.js";
 import type { HostIdentityService } from "../auth/host-identity.js";
 import type { FleetAuth } from "../auth/service.js";
-import { requireAdministrator } from "./require-administrator.js";
+import { requireNodeOperator } from "./require-administrator.js";
 
 /** Large enough for a personal fleet's event log; not a license to dump binaries. */
 export const HOST_BACKUP_BODY_LIMIT = 50 * 1024 * 1024;
@@ -107,14 +107,13 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
    * expires after fifteen minutes, and is audited under that administrator.
    */
   app.post("/api/enrollment-grants", async (request, reply) => {
-    const administrator = requireAdministrator(auth, request, reply, false);
-    if (!administrator) return reply;
+    const actor = requireNodeOperator(auth, request, reply, false);
+    if (!actor) return reply;
     const host = identity.identity();
-    const issued = grants.create(administrator.id);
+    const issued = grants.create(actor.actorId);
     auth.audit({
       eventType: "enrollment_grant_created",
-      actorKind: "administrator",
-      actorId: administrator.id,
+      ...actor,
       targetId: issued.id,
       outcome: "allowed",
     });
@@ -142,8 +141,8 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
    * are left, so "why can't I?" has an answer.
    */
   app.post("/api/nodes/mutual-authentication", async (request, reply) => {
-    const administrator = requireAdministrator(auth, request, reply, true);
-    if (!administrator) return reply;
+    const actor = requireNodeOperator(auth, request, reply, true);
+    if (!actor) return reply;
     const input = MutualNodeAuthenticationSchema.parse(request.body ?? {});
     const summary = store.nodeAuthenticationSummary();
     if (input.required && summary.legacy > 0) {
@@ -162,8 +161,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       eventType: input.required
         ? "mutual_node_authentication_enforced"
         : "mutual_node_authentication_relaxed",
-      actorKind: "administrator",
-      actorId: administrator.id,
+      ...actor,
       outcome: "allowed",
       ...(clearedSecrets ? { detail: `cleared ${clearedSecrets} legacy secret(s)` } : {}),
     });
@@ -345,9 +343,14 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
      * consequence — the Fleet session cookie and every transcript behind it
      * crossing a relay in clear text — does not depend on which client asked.
      */
-    if (input.enabled && !providerSpecs[provider].controlPlaneEligible) {
+    const privateOnly = auth.noAuthEnabled();
+    if (
+      input.enabled &&
+      (!providerSpecs[provider].controlPlaneEligible ||
+        (privateOnly && providerSpecs[provider].access !== "creator-private"))
+    ) {
       return reply.code(400).send({
-        error: ineligibleProviderMessage(provider),
+        error: ineligibleProviderMessage(provider, privateOnly),
         tunnel: await tunnel.info(fallbackPublicUrl()),
       });
     }

@@ -102,6 +102,33 @@ describe("TopBar counts", () => {
 });
 
 describe("TopBar layout", () => {
+  it("shows the no-auth mode instead of a sign-out action", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              state: "no-auth",
+              authenticated: false,
+              passwordEnabled: false,
+              entraConfigured: false,
+              deviceFlowEnabled: false,
+              claimCodeRequired: false,
+              canSignIn: true,
+            }),
+          ),
+      ),
+    );
+    try {
+      show();
+      expect(await screen.findByText("Microsoft sign-in off")).toBeTruthy();
+      expect(screen.queryByRole("button", { name: "Sign out" })).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("shows the Microsoft account beside sign out", async () => {
     vi.stubGlobal(
       "fetch",

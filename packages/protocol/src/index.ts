@@ -1896,6 +1896,7 @@ export type HostIdentity = z.infer<typeof HostIdentitySchema>;
  * from `unclaimed` shows a sign-in form that cannot possibly work.
  */
 export const authStates = [
+  "no-auth",
   "entra-unconfigured",
   "unclaimed",
   "legacy-password",

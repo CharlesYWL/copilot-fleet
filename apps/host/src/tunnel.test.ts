@@ -17,6 +17,75 @@ import {
 /** Never spawns anything, so tests do not depend on what the box has installed. */
 const fakeProbe = (present = true) => new BinaryProbe(async () => present);
 
+describe("private tunnels without Microsoft sign-in", () => {
+  it("refuses public providers on start and restore and reports them as ineligible", async () => {
+    const supervisor = new TunnelSupervisor({
+      localTarget: "http://127.0.0.1:8787",
+      privateOnly: () => true,
+      readExternal: () => undefined,
+      probe: fakeProbe(),
+    });
+    for (const provider of ["cloudflare", "ngrok", "tailscale"] as const) {
+      await expect(supervisor.setEnabled(provider, true)).rejects.toThrow(
+        /private Dev Tunnels/,
+      );
+    }
+    const info = await supervisor.info("http://127.0.0.1:8787");
+    expect(
+      info.providers
+        .filter((provider) => provider.controlPlaneEligible)
+        .map((provider) => provider.id),
+    ).toEqual(["devtunnel"]);
+    expect(supervisor.activeTunnelUrl()).toBeUndefined();
+  });
+
+  it("rejects external public tunnels but keeps authenticated Dev Tunnels available", async () => {
+    const publicTunnel = new TunnelManager({
+      localTarget: "http://127.0.0.1:8787",
+      provider: "cloudflare",
+      privateOnly: () => true,
+      readExternal: () => ({
+        provider: "cloudflare",
+        url: "https://public.example",
+        tunnelId: undefined,
+      }),
+      probe: fakeProbe(),
+    });
+    expect(publicTunnel.state()).toMatchObject({ status: "error", enabled: false });
+    expect(publicTunnel.activeTunnelUrl()).toBeUndefined();
+    await expect(publicTunnel.setEnabled(true)).rejects.toThrow(/private Dev Tunnels/);
+    const privateTunnel = new TunnelManager({
+      localTarget: "http://127.0.0.1:8787",
+      provider: "devtunnel",
+      privateOnly: () => true,
+      readExternal: () => ({
+        provider: "devtunnel",
+        url: "https://private.example",
+        tunnelId: "fleet.usw2",
+      }),
+      probe: fakeProbe(),
+    });
+    await privateTunnel.setEnabled(true);
+    expect(privateTunnel.activeTunnelUrl()).toBe("https://private.example");
+  });
+
+  it("rechecks access after a slow probe before spawning a public tunnel", async () => {
+    let privateOnly = false;
+    const manager = new TunnelManager({
+      localTarget: "http://127.0.0.1:8787",
+      provider: "cloudflare",
+      privateOnly: () => privateOnly,
+      readExternal: () => undefined,
+      probe: new BinaryProbe(async () => {
+        privateOnly = true;
+        return true;
+      }),
+    });
+    await expect(manager.setEnabled(true)).rejects.toThrow(/private Dev Tunnels/);
+    expect(manager.state()).toMatchObject({ status: "error", enabled: false });
+  });
+});
+
 describe("external tunnel handover", () => {
   const managerWithExternal = (url: string | undefined) =>
     new TunnelManager({

@@ -13,7 +13,7 @@ import {
 import type { FleetStore } from "./store.js";
 import { BINDING_COOKIE, BOOTSTRAP_COOKIE, OPERATOR_COOKIE, readCookie } from "./auth.js";
 import { isStateChanging, requiredPrincipal } from "./auth/guard-rules.js";
-import type { FleetAuth } from "./auth/service.js";
+import { NO_AUTH_PRINCIPAL, type FleetAuth } from "./auth/service.js";
 import type { ActiveSession } from "./auth/sessions.js";
 import type { SchemeDecision } from "./auth/external-scheme.js";
 
@@ -492,6 +492,22 @@ export function registerRequestGuard(
     // against stored state, so the guard only insists that nothing else rides
     // in on the same path.
     if (principal === "transaction") return;
+
+    if (auth.noAuthEnabled()) {
+      if (!auth.noAuthEndpointAllowed(request.headers.host)) {
+        return reply.code(403).send({
+          error: "Without Microsoft sign-in, use loopback or a private Dev Tunnel.",
+        });
+      }
+      if (isStateChanging(request.method)) {
+        if (
+          !auth.sessions.verifyCsrf(NO_AUTH_PRINCIPAL, header(request, "x-csrf-token"))
+        ) {
+          return reply.code(403).send({ error: "Missing or invalid CSRF token" });
+        }
+      }
+      return;
+    }
 
     const session = auth.verifySession(
       readCookie(request.headers.cookie, OPERATOR_COOKIE),

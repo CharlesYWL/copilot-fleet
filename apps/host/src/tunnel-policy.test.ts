@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import type { TunnelInfo } from "@fleet/protocol";
 import { buildServer } from "./server.js";
 import { FleetStore } from "./store.js";
 import { providerSpecs } from "./tunnel-providers.js";
+import { BinaryProbe, TunnelSupervisor } from "./tunnel.js";
 
 /**
  * Each of these builds a whole Host and signs an operator in with a password,
@@ -21,6 +22,70 @@ const SLOW_INTEGRATION_MS = 30_000;
  * an operator session, including a script that never renders the panel.
  */
 describe("tunnel provider policy", () => {
+  it("rejects public providers through the API after setup is skipped, but allows private Dev Tunnels", async () => {
+    let code = "";
+    const app = await buildServer({
+      databasePath: ":memory:",
+      operatorPassword: "",
+      announceClaimCode: (value) => {
+        code = value;
+      },
+    });
+    app.log.level = "silent";
+    vi.spyOn(BinaryProbe.prototype, "present").mockResolvedValue(true);
+    const start = vi
+      .spyOn(TunnelSupervisor.prototype, "setEnabled")
+      .mockResolvedValue(undefined);
+    try {
+      const bootstrap = await app.inject({
+        method: "POST",
+        url: "/api/auth/bootstrap",
+        payload: { code },
+      });
+      const cookie = bootstrap.cookies
+        .map(({ name, value }) => `${name}=${value}`)
+        .join("; ");
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/auth/skip",
+            headers: { cookie },
+            payload: {},
+          })
+        ).statusCode,
+      ).toBe(200);
+      const { csrfToken } = (await app.inject({ url: "/api/auth/csrf" })).json<{
+        csrfToken: string;
+      }>();
+      for (const provider of ["cloudflare", "ngrok", "tailscale"]) {
+        const response = await app.inject({
+          method: "POST",
+          url: "/api/tunnel",
+          headers: { "x-csrf-token": csrfToken },
+          payload: { provider, enabled: true },
+        });
+        expect(response.statusCode).toBe(400);
+        expect(response.json().error).toMatch(/private Dev Tunnels/);
+      }
+      expect(start).not.toHaveBeenCalled();
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/tunnel",
+            headers: { "x-csrf-token": csrfToken },
+            payload: { provider: "devtunnel", enabled: true },
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect(start).toHaveBeenCalledWith("devtunnel", true, true);
+    } finally {
+      await app.close();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("starts a fresh Host on the private provider, not an anonymous public one", () => {
     const store = new FleetStore(":memory:");
     // Nothing has chosen yet: the first tunnel a Host offers is the one whose

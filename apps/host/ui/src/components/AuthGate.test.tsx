@@ -95,6 +95,100 @@ describe("AuthGate", () => {
     expect(await screen.findByText("console")).toBeTruthy();
   });
 
+  it("opens a no-auth Host without Microsoft identity and retains the setup tour", async () => {
+    sessionStorage.setItem(TOUR_STORAGE_KEY, "placement");
+    host({}, { state: "no-auth", authenticated: false, entraConfigured: false });
+    show();
+    expect(await screen.findByText("console")).toBeTruthy();
+    expect(sessionStorage.getItem(TOUR_STORAGE_KEY)).toBe("placement");
+  });
+
+  it("does not open a no-auth Host over a refused endpoint", async () => {
+    host({}, { state: "no-auth", canSignIn: false });
+    show();
+    expect(
+      await screen.findByRole("heading", { name: "This address cannot sign you in" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("console")).toBeNull();
+  });
+
+  it("refreshes a no-auth gate when Microsoft ownership is enabled in another browser", async () => {
+    let claimed = false;
+    host({
+      "/api/auth/status": () =>
+        answer(
+          statusBody({
+            state: claimed ? "microsoft-only" : "no-auth",
+            authenticated: false,
+          }),
+        ),
+    });
+    show();
+    expect(await screen.findByText("console")).toBeTruthy();
+    claimed = true;
+    announceSignedOut();
+    expect(
+      await screen.findByRole("heading", { name: "Sign in with Microsoft" }),
+    ).toBeTruthy();
+    expect(screen.queryByText("console")).toBeNull();
+  });
+
+  it("skips Microsoft setup after console proof and starts the tour without submitting registration details", async () => {
+    let skipped = false;
+    const fetchMock = host({
+      "/api/auth/status": () =>
+        answer(
+          statusBody({
+            state: skipped ? "no-auth" : "entra-unconfigured",
+            entraConfigured: false,
+            claimCodeRequired: !skipped,
+          }),
+        ),
+      "/api/auth/bootstrap": () => answer({ ok: true }),
+      "/api/auth/skip": () => {
+        skipped = true;
+        return answer({ ok: true });
+      },
+    });
+    show();
+    fireEvent.change(await screen.findByLabelText("Claim code"), {
+      target: { value: "console-code" },
+    });
+    expect(
+      screen.queryByRole("button", { name: "Continue without Microsoft sign-in" }),
+    ).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Unlock setup" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Continue without Microsoft sign-in" }),
+    );
+    expect(await screen.findByText("console")).toBeTruthy();
+    expect(window.location.search).toContain("welcome=1");
+    expect(
+      fetchMock.mock.calls.some(([url]) => String(url) === "/api/auth/configure"),
+    ).toBe(false);
+  });
+
+  it("shows a refused skip without opening the console", async () => {
+    host(
+      {
+        "/api/auth/bootstrap": () => answer({ ok: true }),
+        "/api/auth/skip": () => answer({ error: "Setup authorization expired" }, 401),
+      },
+      { state: "entra-unconfigured", entraConfigured: false, claimCodeRequired: true },
+    );
+    show();
+    fireEvent.change(await screen.findByLabelText("Claim code"), {
+      target: { value: "code" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Unlock setup" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Continue without Microsoft sign-in" }),
+    );
+    expect(await screen.findByText("Setup authorization expired")).toBeTruthy();
+    expect(screen.queryByText("console")).toBeNull();
+    expect(screen.getByRole("button", { name: "Unlock setup again" })).toBeTruthy();
+  });
+
   it("discards an unfinished tour when the previous session is no longer signed in", async () => {
     sessionStorage.setItem(TOUR_STORAGE_KEY, "placement");
     host({});

@@ -23,7 +23,7 @@ export const tourSteps: readonly TourStep[] = [
     view: "session",
     targets: ['[data-tour="fleet-brand"]', '[data-tour="fleet-header"]'],
     paragraphs: [
-      "You have claimed this Host and are signed in. Next, give it a machine to work on, choose a project directory, and start a session.",
+      "Host setup is complete. Next, give it a machine to work on, choose a project directory, and start a session.",
       "Follow along now or look around first. This walkthrough changes no settings and starts no agents for you.",
     ],
   },
