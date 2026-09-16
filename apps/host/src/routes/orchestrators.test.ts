@@ -247,9 +247,29 @@ describe("orchestrator lifecycle routes", () => {
     const created = response.json().run;
     expect(created.workspaceBinding).toMatchObject({
       integrationBaseRef: "",
-      integrationTargetRef: `refs/heads/dev/operator/fleet-${created.id.slice(0, 20)}`,
+      integrationTargetRef:
+        "refs/heads/dev/operator/read-only-dependencies-failing-in-object-overvie",
       integrationRemote: "origin",
     });
+
+    const duplicate = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/runs`,
+      payload: {
+        operationId: randomUUID(),
+        workspaceMode: "managed",
+        sourcePlacementId: lead.placementId,
+        workspaceId: lead.workspaceId,
+        name: "Read-only Dependencies Failing in Object Overview",
+        objective: "Create and validate another fix.",
+      },
+    });
+
+    expect(duplicate.statusCode).toBe(201);
+    const duplicateRun = duplicate.json().run;
+    expect(duplicateRun.workspaceBinding.integrationTargetRef).toBe(
+      `refs/heads/dev/operator/read-only-dependencies-failing-in-objec-${duplicateRun.id.slice(0, 8)}`,
+    );
   });
 
   it("blocks early resume, then continues only stopped unfinished work once", async () => {

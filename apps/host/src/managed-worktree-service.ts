@@ -26,6 +26,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "./fleet-service.js";
 import { stopSessions } from "./orchestrator/lifecycle.js";
+import { sendBackPrompt } from "./orchestrator/review.js";
 import { WorkspaceArtifactStore } from "./workspace-artifact-store.js";
 
 export class ManagedWorktreeService {
@@ -33,6 +34,7 @@ export class ManagedWorktreeService {
   private static readonly REPOSITORY_OBSERVATION_MAX_AGE_MS = 5 * 60_000;
   private static readonly REPOSITORY_PROBE_WINDOW_MS = 3_000;
   private static readonly MAX_AUTOMATIC_QUIESCE_ATTEMPTS = 3;
+  private static readonly AUTOMATIC_RECOVERY_DELAYS_MS = [1_000, 3_000, 10_000];
   private readonly waiters = new Map<
     string,
     { resolve: (operation: WorktreeOperation) => void; timer: NodeJS.Timeout }
@@ -42,6 +44,7 @@ export class ManagedWorktreeService {
   private readonly placementProbeStartedAt = new Map<string, number>();
   private readonly placementProbeCooldownUntil = new Map<string, number>();
   private readonly placementProbeTimers = new Map<string, NodeJS.Timeout>();
+  private readonly aggregationRecoveryTimers = new Map<string, NodeJS.Timeout>();
   private readonly placementProbeFailures = new Map<string, string>();
   private readonly workspacePlacementStartedAt = new Map<string, number>();
   private lastSweep = 0;
@@ -1186,7 +1189,49 @@ export class ManagedWorktreeService {
       return "Workspace or integration ownership must be reconciled before automation can continue.";
     if (phase === "cleanup")
       return "Safe workspace cleanup could not complete. No files were force-removed.";
-    return "Automatic integration stopped safely because its pinned target or reviewed result could not be revalidated.";
+    return `Automatic integration stopped safely during ${phase} (${code}). Nothing was published; the retained workspace and reviewed result were not modified.`;
+  }
+
+  private canAutomaticallyRecover(run: Run, code: string): boolean {
+    if (!run.policy.automaticManagedIntegrationRecovery) return false;
+    return !/(ambiguous|changed|mismatch|dirty|conflict|unpin|uncertain|reconcil|quarantin|idempotency|forbidden|unsupported|owner|validation|required|not_fleet_owned|retry_exhausted)/i.test(
+      code,
+    );
+  }
+
+  private scheduleAutomaticRecovery(runId: string, code: string, phase: string): boolean {
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    if (!run || !binding || !this.canAutomaticallyRecover(run, code)) return false;
+    const retryIndex = binding.aggregationAutomaticRetries;
+    const delay = ManagedWorktreeService.AUTOMATIC_RECOVERY_DELAYS_MS[retryIndex];
+    if (delay === undefined) return false;
+
+    const existingTimer = this.aggregationRecoveryTimers.get(runId);
+    if (existingTimer) clearTimeout(existingTimer);
+    this.store.setRunWorkspaceBinding(runId, {
+      ...binding,
+      aggregationState: "in_progress",
+      aggregationPhase: phase as NonNullable<Run["workspaceBinding"]>["aggregationPhase"],
+      aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+      aggregationAutomaticRetries: retryIndex + 1,
+      aggregationCode: code,
+      aggregationSummary: `Plan-approved automatic recovery ${retryIndex + 1}/${ManagedWorktreeService.AUTOMATIC_RECOVERY_DELAYS_MS.length}: revalidating the retained workspace after ${code}. Nothing has been published.`,
+      aggregationUpdatedAt: new Date().toISOString(),
+    });
+    this.publish(runId);
+    const timer = setTimeout(() => {
+      this.aggregationRecoveryTimers.delete(runId);
+      const current = this.store.getRun(runId);
+      if (
+        current?.state === "aggregating" &&
+        current.workspaceBinding?.aggregationState === "in_progress"
+      )
+        this.advanceAggregation(runId);
+    }, delay);
+    timer.unref();
+    this.aggregationRecoveryTimers.set(runId, timer);
+    return true;
   }
 
   private escalateAggregation(
@@ -1415,6 +1460,93 @@ export class ManagedWorktreeService {
     });
     this.advanceAggregation(runId);
     return approval;
+  }
+
+  requestPublicationChanges(runId: string, feedback: string, requestedBy: string): Run {
+    const note = feedback.trim();
+    if (!note)
+      throw new WorktreeConflict(
+        "publication_feedback_required",
+        "Say what needs changing, so the orchestrator can act on it.",
+      );
+    const run = this.store.getRun(runId);
+    const binding = run?.workspaceBinding;
+    const attempt = this.store.listIntegrationAttempts(runId).at(-1);
+    const tree = attempt
+      ? this.store.getAnyManagedWorkspace(attempt.resultWorkspaceId)
+      : undefined;
+    const integration = tree
+      ? (this.store
+          .listWorktreeIntegrations(tree.id)
+          .find((entry) => entry.id === attempt?.attemptId) ??
+        this.store.listWorktreeIntegrations(tree.id).at(-1))
+      : undefined;
+    const lead = run?.leadSessionId
+      ? this.store.getSession(run.leadSessionId)
+      : undefined;
+    if (
+      !run ||
+      !binding ||
+      run.state !== "aggregating" ||
+      binding.aggregationPhase !== "await_publish_approval" ||
+      !attempt ||
+      !tree ||
+      !integration ||
+      integration.publishState !== "awaiting_approval" ||
+      integration.validationState !== "passed" ||
+      !["integrated", "no_changes"].includes(integration.state)
+    )
+      throw new WorktreeConflict(
+        "publication_not_ready",
+        "Changes can be requested only for the exact validated result awaiting publication.",
+      );
+    if (!lead || terminalSessionStates.has(lead.state))
+      throw new WorktreeConflict(
+        "orchestrator_unavailable",
+        "The orchestrator conversation has ended, so it cannot act on requested changes.",
+      );
+
+    const now = new Date().toISOString();
+    const reopened = this.store.writeAtomically(() => {
+      this.store.revokePublicationApprovals(runId, requestedBy, note, now);
+      this.store.putWorktreeIntegration({
+        ...integration,
+        validationState: "failed",
+        validationSummary: "Changes requested during final publication review.",
+        publishState: "failed",
+        error: "Publication was rejected pending requested changes.",
+        updatedAt: now,
+      });
+      this.store.putIntegrationAttempt({
+        ...attempt,
+        status: "attention",
+        publishState: "failed",
+        updatedAt: now,
+      });
+      this.store.appendRunNote(
+        runId,
+        run.phaseIndex,
+        `Changes requested during final publication review.\n\n${note}`,
+      );
+      this.store.setRunWorkspaceBinding(runId, {
+        ...binding,
+        aggregationState: "not_started",
+        aggregationPhase: "idle",
+        aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+        aggregationAutomaticRetries: 0,
+        aggregationCode: "",
+        aggregationSummary: "Changes requested; orchestration resumed.",
+        aggregationUpdatedAt: now,
+      });
+      return this.store.updateRun(runId, {
+        state: "running",
+        failureReason: "",
+        pendingPrompt: sendBackPrompt(run.name, note),
+      })!;
+    });
+    this.publish(runId);
+    this.service.tickRun(runId);
+    return reopened;
   }
 
   private isVerifiedNoChangeRun(runId: string, workspaces: ManagedWorktree[]): boolean {
@@ -1815,6 +1947,7 @@ export class ManagedWorktreeService {
       this.publish(runId);
     } catch (error) {
       const code = error instanceof WorktreeConflict ? error.code : "integration_failed";
+      if (this.scheduleAutomaticRecovery(runId, code, phase)) return;
       this.escalateAggregation(runId, code, phase, targetRef);
     }
   }
@@ -2496,14 +2629,27 @@ export class ManagedWorktreeService {
   onNodeReconciled(nodeId: string): void {
     if (!this.store.getNode(nodeId)?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY))
       return;
-    for (const operation of this.store
+    const pendingOperations = this.store
       .listWorktreeOperations()
       .filter(
         (entry) =>
           entry.request.nodeId === nodeId &&
           ["intent", "uncertain"].includes(entry.state),
       )
-      .slice(0, 2))
+      .sort((left, right) => {
+        const leftActive = !terminalRunStates.has(
+          this.store.getRun(left.request.runId)?.state ?? "failed",
+        );
+        const rightActive = !terminalRunStates.has(
+          this.store.getRun(right.request.runId)?.state ?? "failed",
+        );
+        return (
+          Number(rightActive) - Number(leftActive) ||
+          right.createdAt.localeCompare(left.createdAt) ||
+          right.request.operationId.localeCompare(left.request.operationId)
+        );
+      });
+    for (const operation of pendingOperations.slice(0, 2))
       void this.send(operation, 30_000);
     for (const tree of [
       ...this.store.listManagedWorktrees(),
@@ -2769,6 +2915,8 @@ export class ManagedWorktreeService {
     this.placementProbeStartedAt.clear();
     this.placementProbeCooldownUntil.clear();
     this.placementProbeFailures.clear();
+    for (const timer of this.aggregationRecoveryTimers.values()) clearTimeout(timer);
+    this.aggregationRecoveryTimers.clear();
     this.workspacePlacementStartedAt.clear();
   }
 

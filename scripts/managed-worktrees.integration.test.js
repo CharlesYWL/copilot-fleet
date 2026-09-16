@@ -346,13 +346,19 @@ describe(
       fleet.release();
       await expect
         .poll(
-          async () =>
-            (await fleet.request(`/api/runs/${run.id}`)).body.run.workspaceBinding
-              .aggregationPhase,
+          async () => {
+            const current = (await fleet.request(`/api/runs/${run.id}`)).body.run;
+            return (
+              current.workspaceBinding.aggregationPhase === "await_publish_approval" ||
+              current.state === "completed"
+            );
+          },
           { timeout: 60_000 },
         )
-        .toBe("await_publish_approval");
-      expect((await fleet.action(run.id, "publish-branch")).status).toBe(200);
+        .toBe(true);
+      const current = (await fleet.request(`/api/runs/${run.id}`)).body.run;
+      if (current.workspaceBinding.aggregationPhase === "await_publish_approval")
+        expect((await fleet.action(run.id, "publish-branch")).status).toBe(200);
       await expect
         .poll(async () => (await fleet.request(`/api/runs/${run.id}`)).body.run.state, {
           timeout: 120_000,
@@ -482,7 +488,7 @@ describe(
       expect(bState.worktree.state).toBe("removed");
       expect(
         (await git.run(fleet.source, ["ls-remote", "--heads", "origin"])).stdout,
-      ).toContain(a.id.slice(0, 20));
+      ).toContain(a.workspaceBinding.integrationTargetRef.replace("refs/heads/", ""));
       expect(fleet.failures).toEqual([]);
     });
 

@@ -48,6 +48,7 @@ export const RunWorkspaceBindingSchema = z
     integrationBaseRef: z.string().default(""),
     integrationTargetRef: z.string().default(""),
     integrationRemote: z.string().default(""),
+    integrationUsername: z.string().max(320).default(""),
     allowGitHooks: z.boolean().default(false),
     aggregationState: z
       .enum(["not_started", "in_progress", "attention", "completed"])
@@ -178,6 +179,10 @@ export const RepositoryExecutionPolicySchema = z.object({
   submodules: z.enum(["disabled", "node_local"]).default("disabled"),
   fsmonitor: z.literal("disabled").default("disabled"),
   credentialHelpers: z.literal("publication_only").default("publication_only"),
+  credentialHelpersDigest: z
+    .string()
+    .regex(/^(?:[a-f0-9]{64})?$/)
+    .default(""),
   configurationDigest: z
     .string()
     .regex(/^[a-f0-9]{64}$/)

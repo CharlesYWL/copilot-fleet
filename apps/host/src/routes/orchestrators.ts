@@ -202,6 +202,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         error: "No online node holds this workspace, so there is nowhere to run it",
       });
     }
+    const administrator = request.fleetSession?.administratorId
+      ? store.getAdministrator(request.fleetSession.administratorId)
+      : undefined;
 
     /*
      * The orchestrator runs on a machine that can reach this workspace, which
@@ -235,6 +238,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       yolo: true,
       name: input.name ?? "Orchestrator",
       runRole: "lead",
+      operatorUsername: administrator?.username ?? "",
       /*
        * Counted against reading rather than writing: an orchestrator's job is
        * to call tools, and it is told in as many words not to touch the

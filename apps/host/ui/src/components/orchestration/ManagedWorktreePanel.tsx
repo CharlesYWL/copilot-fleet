@@ -10,6 +10,7 @@ import {
   DialogTitle,
   Field,
   Input,
+  Textarea,
   makeStyles,
   tokens,
 } from "@fluentui/react-components";
@@ -88,6 +89,8 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<IntegrationPreview>();
   const [showPublicationReview, setShowPublicationReview] = useState(false);
+  const [requestChangesOpen, setRequestChangesOpen] = useState(false);
+  const [feedback, setFeedback] = useState("");
   const [confirmation, setConfirmation] = useState<Confirmation>();
   const [phrase, setPhrase] = useState("");
   const [reviewed, setReviewed] = useState(false);
@@ -186,6 +189,8 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             ? `${action.replaceAll("-", " ")} completed.`
             : "Awaiting Node acknowledgement. Ownership is not released by timeout.",
       );
+      setRequestChangesOpen(false);
+      setFeedback("");
       close();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Worktree operation failed.");
@@ -250,24 +255,42 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     view?.targets.find((entry) => entry.id === binding?.sourcePlacementId)
       ?.workspaceName ??
     "the selected repository";
-  const baseLabel = (
-    binding?.integrationTargetRef ||
-    binding?.aggregationTargetRef ||
+  const executionBaseLabel = (
     binding?.baseRef ||
     tree?.baseRef ||
     (binding?.baseSha ? binding.baseSha.slice(0, 12) : "current committed HEAD")
   ).replace(/^refs\/heads\//, "");
+  const executionBaseSha = binding?.baseSha || tree?.baseSha || "";
+  const publicationTargetRef = (
+    binding?.integrationTargetRef ||
+    binding?.aggregationTargetRef ||
+    ""
+  ).replace(/^refs\/heads\//, "");
+  const publicationTargetLabel = publicationTargetRef
+    ? `${binding?.integrationRemote || "origin"}/${publicationTargetRef}`
+    : "";
   const aggregationState = binding?.aggregationState ?? "not_started";
   const aggregationPhase = binding?.aggregationPhase ?? "idle";
   const needsAttention =
     aggregationState === "attention" ||
     (run.state === "blocked" && aggregationPhase !== "idle");
+  const automaticallyRecovering =
+    aggregationState === "in_progress" &&
+    (binding?.aggregationAutomaticRetries ?? 0) > 0 &&
+    Boolean(binding?.aggregationCode);
   const integrated =
     aggregationState === "completed" ||
     integration?.state === "integrated" ||
     integration?.state === "no_changes";
+  const publicationNotRequired =
+    aggregationState === "completed" &&
+    (binding?.aggregationSummary?.includes("No committed changes") ||
+      (integration?.state === "no_changes" &&
+        integration.publicationFileCount === 0 &&
+        integration.publicationCommitCount === 0));
   const published =
-    aggregationState === "completed" || integration?.publishState === "published";
+    !publicationNotRequired &&
+    (aggregationState === "completed" || integration?.publishState === "published");
   const awaitingPublicationApproval =
     aggregationPhase === "await_publish_approval" &&
     integration?.publishState === "awaiting_approval";
@@ -288,8 +311,17 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     <section className={styles.panel} aria-label="Managed task worktree">
       <h2>Fleet workspace</h2>
       <p>
-        An isolated workspace is created from {sourceLabel} at <code>{baseLabel}</code>.
+        An isolated workspace is created from {sourceLabel} at execution base{" "}
+        <code>{executionBaseLabel}</code>
+        {executionBaseSha ? ` (${executionBaseSha.slice(0, 12)})` : ""}.
       </p>
+      {publicationTargetLabel && (
+        <p>
+          Publication target: <code>{publicationTargetLabel}</code>. This branch is
+          created only after validated changes are approved for publication; a no-change
+          task never creates it.
+        </p>
+      )}
       <p role="status" aria-live="polite">
         <strong>Preparing isolated workspace:</strong>{" "}
         {setupState === "succeeded"
@@ -319,15 +351,17 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
         </li>
         <li>
           Publication:{" "}
-          {published
-            ? "Complete"
-            : awaitingPublicationApproval
-              ? "Waiting for you"
-              : aggregationPhase === "publish" && needsAttention
-                ? "Needs attention"
-                : aggregationPhase === "publish"
-                  ? "In progress"
-                  : "Pending"}
+          {publicationNotRequired
+            ? "Not required"
+            : published
+              ? "Complete"
+              : awaitingPublicationApproval
+                ? "Waiting for you"
+                : aggregationPhase === "publish" && needsAttention
+                  ? "Needs attention"
+                  : aggregationPhase === "publish"
+                    ? "In progress"
+                    : "Pending"}
         </li>
         <li>
           Workspace cleanup:{" "}
@@ -340,7 +374,7 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
       </ol>
       {run.state === "aggregating" && !needsAttention && (
         <p role="status">
-          {phaseLabel} <code>{baseLabel}</code>.
+          {phaseLabel} <code>{publicationTargetLabel || executionBaseLabel}</code>.
         </p>
       )}
       {awaitingPublicationApproval && integration && (
@@ -377,6 +411,9 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             >
               Publish branch
             </Button>
+            <Button disabled={busy} onClick={() => setRequestChangesOpen(true)}>
+              Request changes
+            </Button>
           </div>
           {showPublicationReview && (
             <div aria-label="Final publication review">
@@ -406,11 +443,14 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
           </div>
         </>
       )}
+      {automaticallyRecovering && binding?.aggregationSummary && (
+        <p role="status">{binding.aggregationSummary}</p>
+      )}
       {aggregationState === "completed" && (
         <p role="status">
           {(
             binding?.aggregationSummary ||
-            `Integrated into ${baseLabel} and cleaned isolated workspaces.`
+            `Integrated into ${publicationTargetLabel || executionBaseLabel} and cleaned isolated workspaces.`
           ).replace(/refs\/heads\//g, "")}
         </p>
       )}
@@ -782,6 +822,47 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
           </Button>
         </div>
       </details>
+      <Dialog
+        open={requestChangesOpen}
+        onOpenChange={(_, data) => {
+          if (!busy) setRequestChangesOpen(data.open);
+        }}
+      >
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Request changes</DialogTitle>
+            <DialogContent>
+              <p>
+                The reviewed integration result will be rejected and the orchestrator will
+                resume work in the retained managed workspace. A new integration preview
+                and publication approval will be required.
+              </p>
+              <Field label="What needs changing?">
+                <Textarea
+                  rows={5}
+                  value={feedback}
+                  onChange={(_, data) => setFeedback(data.value)}
+                />
+              </Field>
+              {error && <p role="alert">{error}</p>}
+            </DialogContent>
+            <DialogActions>
+              <Button disabled={busy} onClick={() => setRequestChangesOpen(false)}>
+                Cancel
+              </Button>
+              <Button
+                appearance="primary"
+                disabled={busy || feedback.trim().length === 0}
+                onClick={() =>
+                  void execute("request-changes", { feedback: feedback.trim() })
+                }
+              >
+                Send back for changes
+              </Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
       {/* Do not reuse a closing portal's modal/aria-hidden ownership for a new operation. */}
       <Dialog
         key={confirmation?.operationId ?? "closed"}

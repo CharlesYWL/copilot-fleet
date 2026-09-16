@@ -419,6 +419,28 @@ describe("task detail", () => {
     },
   );
 
+  it("marks phases after an early terminal phase as not reached", () => {
+    const model = models([
+      run({
+        id: "r1",
+        state: "completed",
+        phases: ["Extract baseline", "Implement and validate", "Independent review"],
+        phaseIndex: 0,
+      }),
+    ])[0]!;
+    detail({ model });
+
+    expect(screen.getByText("Extract baseline").parentElement?.textContent).toContain(
+      "Stopped here",
+    );
+    expect(
+      screen.getByText("Implement and validate").parentElement?.textContent,
+    ).toContain("Not reached");
+    expect(screen.getByText("Independent review").parentElement?.textContent).toContain(
+      "Not reached",
+    );
+  });
+
   it("will not reopen a task without saying what is still wanted", () => {
     // The orchestrator is woken to act on this, and "not done" is not something
     // anyone can act on — the same rule as sending a task back.
@@ -696,6 +718,27 @@ describe("task detail", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
+    expect(props.onReview).toHaveBeenCalledWith(true, "");
+  });
+
+  it("makes an escalated incomplete review explicit before it can be closed", async () => {
+    const model = models([run({ id: "r1", state: "awaiting_human" })])[0]!;
+    const props = detail({
+      model,
+      notes: [
+        {
+          id: "note",
+          runId: "r1",
+          phaseIndex: 0,
+          body: "**Escalated — this task is not finished.**\n\nFigma access is required.",
+          createdAt: ISO,
+        },
+      ],
+    });
+
+    expect(screen.getByText("Blocked — needs your decision")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Accept incomplete result" }));
     expect(props.onReview).toHaveBeenCalledWith(true, "");
   });
 });

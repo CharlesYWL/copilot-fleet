@@ -1403,6 +1403,145 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     });
   });
 
+  it("refreshes publication-only credential helpers without invalidating integration", async () => {
+    const { manager, root, source } = await fixture();
+    await git.run(source, ["config", "credential.helper", "initial-helper"]);
+    const tree = await allocate(manager, source);
+    const legacy = manager.get(tree.id)!;
+    const legacyDigest = legacy.repositoryExecutionPolicy.configurationDigest;
+    const database = new DatabaseSync(join(root, "state", "managed-worktrees.db"));
+    let stored: ManagedWorktree;
+    try {
+      const row = database.prepare("SELECT data FROM trees WHERE id=?").get(tree.id) as {
+        data: string;
+      };
+      stored = JSON.parse(row.data) as ManagedWorktree;
+      stored.repositoryExecutionPolicy.credentialHelpersDigest = "";
+      stored.repositoryExecutionPolicy.configurationDigest = createHash("sha256")
+        .update(`${legacyDigest}:legacy-credential-helper`)
+        .digest("hex");
+      database
+        .prepare("UPDATE trees SET data=? WHERE id=?")
+        .run(JSON.stringify(stored), tree.id);
+    } finally {
+      database.close();
+    }
+
+    await git.run(source, ["config", "credential.helper", "refreshed-helper"]);
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+
+    const result = await operation(manager, tree, "integration_preview", {
+      targetPath: source,
+      targetPlacementId: "target-placement",
+    });
+
+    expect(result.ok).toBe(true);
+    expect(
+      manager.get(tree.id)!.repositoryExecutionPolicy.credentialHelpersDigest,
+    ).toMatch(/^[a-f0-9]{64}$/);
+    expect(manager.get(tree.id)!.repositoryExecutionPolicy.configurationDigest).not.toBe(
+      stored.repositoryExecutionPolicy.configurationDigest,
+    );
+  });
+
+  it("ignores opaque configuration differences when explicit policy matches and submodules are disabled", async () => {
+    const { manager, root, source } = await fixture();
+    const tree = await allocate(manager, source);
+    const database = new DatabaseSync(join(root, "state", "managed-worktrees.db"));
+    try {
+      const row = database.prepare("SELECT data FROM trees WHERE id=?").get(tree.id) as {
+        data: string;
+      };
+      const stored = JSON.parse(row.data) as ManagedWorktree;
+      expect(stored.repositoryExecutionPolicy.credentialHelpersDigest).toMatch(
+        /^[a-f0-9]{64}$/,
+      );
+      stored.repositoryExecutionPolicy.configurationDigest = createHash("sha256")
+        .update(`${stored.repositoryExecutionPolicy.configurationDigest}:worktree-local`)
+        .digest("hex");
+      database
+        .prepare("UPDATE trees SET data=? WHERE id=?")
+        .run(JSON.stringify(stored), tree.id);
+    } finally {
+      database.close();
+    }
+
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+
+    expect(
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      }),
+    ).toMatchObject({ ok: true });
+  });
+
+  it("names the changed policy field and checkout scope", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source, { allowGitHooks: true });
+    await writeFile(join(source, ".git", "hooks", "pre-commit"), "changed\n");
+
+    expect(
+      await operation(manager, tree, "integration_preview", {
+        targetPath: source,
+        targetPlacementId: "target-placement",
+      }),
+    ).toMatchObject({
+      ok: false,
+      code: "repository_execution_policy_changed",
+      error: expect.stringMatching(/source repository: Git hooks/i),
+    });
+  });
+
+  it("disables checkout-relative hooks in Fleet-controlled integration workspaces", async () => {
+    const { manager, root, source } = await fixture();
+    const sourceHooks = join(root, "source-hooks");
+    await mkdir(sourceHooks);
+    await writeFile(join(sourceHooks, "pre-commit"), "#!/bin/sh\nexit 0\n");
+    await chmod(join(sourceHooks, "pre-commit"), 0o755);
+    await git.run(source, ["config", "core.hooksPath", sourceHooks]);
+    const tree = await allocate(manager, source, { allowGitHooks: true });
+    await writeFile(join(tree.path, "task.txt"), "task\n");
+    await git.run(tree.path, ["add", "task.txt"]);
+    await git.run(tree.path, ["commit", "-m", "task"]);
+
+    const targetPath = join(tree.managedRoot.path, "integration-hook-test");
+    await git.run(source, ["worktree", "add", "--detach", targetPath, tree.baseSha]);
+    await git.run(source, ["config", "extensions.worktreeConfig", "true"]);
+    const targetHooks = join(root, "target-hooks");
+    const marker = join(root, "target-hook-ran");
+    await mkdir(targetHooks);
+    await writeFile(
+      join(targetHooks, "pre-commit"),
+      `#!/bin/sh\nprintf hook > "${marker.replaceAll("\\", "/")}"\n`,
+    );
+    await chmod(join(targetHooks, "pre-commit"), 0o755);
+    await git.run(targetPath, ["config", "--worktree", "core.hooksPath", targetHooks]);
+
+    const previewResult = await operation(manager, tree, "integration_preview", {
+      targetPath,
+      targetPlacementId: "target-placement",
+      integrationTargetRef: "refs/heads/dev/fleet-test/hook-policy",
+    });
+    expect(previewResult.ok).toBe(true);
+    const preview = previewResult.preview!;
+    const integrated = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+      commit: true,
+      integrationTargetRef: preview.targetRef,
+    });
+
+    expect(integrated.integration?.state).toBe("integrated");
+    await expect(stat(marker)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
   it("enters two barrier-controlled writer sections simultaneously, editing the same filename independently", async () => {
     const { manager, source } = await fixture();
     const a = await allocate(manager, source);
@@ -2036,7 +2175,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     ).resolves.toBe("local generated output\n");
   });
 
-  it("rejects a final tree changed by an explicitly allowed commit hook", async () => {
+  it("disables explicitly allowed hooks during Fleet-controlled integration commits", async () => {
     const { manager, source } = await fixture();
     const hook = join(source, ".git", "hooks", "pre-commit");
     await writeFile(
@@ -2063,15 +2202,11 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       commit: true,
     });
 
-    expect(integrated.code).toBe("commit_uncertain");
-    const reconciled = await operation(manager, tree, "reconcile");
-    expect(reconciled.integration).toMatchObject({
-      state: "needs_reconciliation",
-      validationState: "failed",
-    });
+    expect(integrated.error).toBe("");
+    expect(integrated.integration?.state).toBe("integrated");
     await expect(
       readFile(join(preview.target.path, "hook-output.txt"), "utf8"),
-    ).resolves.toBe("hook output\n");
+    ).rejects.toThrow();
     await expect(readFile(join(source, "hook-output.txt"), "utf8")).rejects.toThrow();
   });
 
@@ -2189,6 +2324,32 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       "origin",
       `:${integrated.integration!.preview.targetRef}`,
     ]);
+    await git.run(source, ["config", "credential.helper", "changed-after-preview"]);
+    const changedCredentialPolicy = await operation(
+      manager,
+      integrated.worktree!,
+      "publish",
+      {
+        integrationId: integrated.integration!.id,
+        publicationApproval: {
+          approvalId: randomUUID(),
+          runId: integrated.worktree!.runId,
+          integrationId: integrated.integration!.id,
+          targetRemote: integrated.integration!.preview.targetRemote,
+          targetRef: integrated.integration!.preview.targetRef,
+          expectedRemoteSha: "",
+          finalResultSha: integrated.integration!.resultSha,
+          finalTreeSha: integrated.integration!.finalTree,
+          approvedBy: "operator",
+          approvedAt: new Date().toISOString(),
+        },
+        ...integration,
+      },
+    );
+    expect(changedCredentialPolicy.code).toBe("publication_credential_policy_changed");
+    await git.run(source, ["config", "--unset-all", "credential.helper"], {
+      allowedExitCodes: [0, 5],
+    });
     const published = await operation(manager, integrated.worktree!, "publish", {
       integrationId: integrated.integration!.id,
       publicationApproval: {
@@ -2240,7 +2401,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     ).toContain(published.integration!.resultSha);
   });
 
-  it("does not accept an unreviewed post-commit descendant during reconciliation", async () => {
+  it("does not run post-commit hooks during controlled integration", async () => {
     const { manager, source } = await fixture();
     const hook = join(source, ".git", "hooks", "post-commit");
     await writeFile(
@@ -2264,30 +2425,22 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         targetPlacementId: "target-placement",
       })
     ).preview!;
-    const attempted = await operation(manager, tree, "integrate", {
+    const integrated = await operation(manager, tree, "integrate", {
       previewId: preview.id,
       reviewedTaskSha: preview.taskSha,
       reviewedDiffIdentity: preview.diffIdentity,
       confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
       commit: true,
     });
-    expect(attempted.code).toBe("commit_uncertain");
 
-    const reconciled = await operation(manager, tree, "reconcile");
-
-    expect(reconciled.worktree).toMatchObject({
-      state: "needs_reconciliation",
-      integrationState: "needs_reconciliation",
-    });
+    expect(integrated.error).toBe("");
+    expect(integrated.integration?.state).toBe("integrated");
     expect(
-      await git.run(
-        preview.target.path,
-        ["merge-base", "--is-ancestor", preview.taskSha, "HEAD"],
-        {
-          allowedExitCodes: [0, 1],
-        },
-      ),
-    ).toMatchObject({ exitCode: 0 });
+      (await git.run(preview.target.path, ["log", "-1", "--pretty=%s"])).stdout.trim(),
+    ).toBe(`Merge Fleet task ${tree.taskKey}`);
+    expect(
+      (await git.run(preview.target.path, ["rev-list", "--count", "HEAD"])).stdout.trim(),
+    ).toBe("3");
   });
 
   it("records a reviewed no-changes result without claiming the base was already integrated", async () => {

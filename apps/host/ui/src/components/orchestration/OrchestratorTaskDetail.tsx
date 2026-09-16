@@ -97,6 +97,10 @@ const useStyles = makeStyles({
     background: tokens.colorNeutralBackground3,
     boxShadow: `inset 2px 0 ${semanticColors.interaction}`,
   },
+  phaseState: {
+    color: tokens.colorNeutralForeground4,
+    fontSize: tokens.fontSizeBase100,
+  },
   pip: { width: "8px", height: "8px", borderRadius: "50%", background: "currentColor" },
   /*
    * The contract the orchestrator is held to, shown to the person in the same
@@ -278,6 +282,19 @@ export const OrchestratorTaskDetail = ({
   const { run } = model;
   const finished =
     run.state === "completed" || run.state === "cancelled" || run.state === "failed";
+  const latestNote = notes[notes.length - 1]?.body ?? "";
+  const blockedReview =
+    run.state === "awaiting_human" &&
+    latestNote.startsWith("**Escalated — this task is not finished.**");
+  const phaseState = (index: number) => {
+    if (index < run.phaseIndex) return "Complete";
+    if (index > run.phaseIndex)
+      return finished || run.state === "awaiting_human" ? "Not reached" : "Planned";
+    if (run.state === "completed" && run.phaseIndex >= Math.max(0, run.phases.length - 1))
+      return "Complete";
+    if (finished) return "Stopped here";
+    return run.state === "awaiting_human" ? "Waiting here" : "Current";
+  };
 
   const answer = async (approved: boolean, text: string) => {
     setBusy(true);
@@ -365,7 +382,9 @@ export const OrchestratorTaskDetail = ({
         <ManagedWorktreePanel run={run} />
         {run.state === "awaiting_human" && (
           <section className={mergeClasses(styles.section, styles.review)}>
-            <Text weight="semibold">Ready for you</Text>
+            <Text weight="semibold">
+              {blockedReview ? "Blocked — needs your decision" : "Ready for you"}
+            </Text>
             {notes.length > 0 && (
               <div className={mergeClasses(styles.noteSurface, styles.reviewBody)}>
                 <MarkdownBody
@@ -376,16 +395,33 @@ export const OrchestratorTaskDetail = ({
               </div>
             )}
             <div className={styles.reviewButtons}>
-              <Button
-                appearance="primary"
-                disabled={busy}
-                onClick={() => void answer(true, "")}
-              >
-                Approve
-              </Button>
-              <Button disabled={busy} onClick={() => setSendBackOpen(true)}>
-                Send back
-              </Button>
+              {blockedReview ? (
+                <>
+                  <Button
+                    appearance="primary"
+                    disabled={busy}
+                    onClick={() => setSendBackOpen(true)}
+                  >
+                    Resume with guidance
+                  </Button>
+                  <Button disabled={busy} onClick={() => void answer(true, "")}>
+                    Accept incomplete result
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    appearance="primary"
+                    disabled={busy}
+                    onClick={() => void answer(true, "")}
+                  >
+                    Approve
+                  </Button>
+                  <Button disabled={busy} onClick={() => setSendBackOpen(true)}>
+                    Send back
+                  </Button>
+                </>
+              )}
             </div>
           </section>
         )}
@@ -420,7 +456,8 @@ export const OrchestratorTaskDetail = ({
                   )}
                 >
                   <span className={styles.pip} aria-hidden="true" />
-                  {phase}
+                  <span>{phase}</span>
+                  <span className={styles.phaseState}>{phaseState(index)}</span>
                 </span>
               ))}
             </div>

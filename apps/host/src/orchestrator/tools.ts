@@ -745,9 +745,16 @@ export class FleetTools {
     const lead = this.store.getSession(this.leadSessionId);
     if (!lead) return undefined;
     const template = this.runs()[0];
+    const activeAdministrators = this.store
+      .listAdministrators()
+      .filter((administrator) => !administrator.disabledAt);
     const run = this.store.createRun({
       workspaceMode: done.workspaceMode ?? "auto",
-      integrationUsername: "operator",
+      integrationUsername:
+        template?.workspaceBinding?.integrationUsername ||
+        lead.operatorUsername ||
+        (activeAdministrators.length === 1 ? activeAdministrators[0]!.username : "") ||
+        "operator",
       accessIntent: isChatsWorkspace(done.workspaceId ?? lead.workspaceId)
         ? "no-checkout"
         : "checkout",

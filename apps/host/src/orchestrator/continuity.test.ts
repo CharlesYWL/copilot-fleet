@@ -36,7 +36,7 @@ describe("orchestrator task discovery and continuity", () => {
       ...overrides,
     });
     expect(result.ok, result.text).toBe(true);
-    return world.store.listRuns().find((run) => run.name === name)!;
+    return world.store.listRuns().find((entry) => entry.name === name)!;
   };
 
   const start = (
@@ -56,6 +56,19 @@ describe("orchestrator task discovery and continuity", () => {
     const run = world.store.listRuns().find((entry) => entry.name === task)!;
     return world.store.listRunSteps(run.id).at(-1)!;
   };
+
+  it("uses the orchestrator login username for managed publication branches", () => {
+    world.store.setManagedWorktreesEnabled(true);
+
+    const run = plan("ICM 868148454 targeted fix", {
+      workspaceMode: "managed",
+    });
+
+    expect(run.workspaceBinding).toMatchObject({
+      integrationUsername: "test.operator@example.com",
+      integrationTargetRef: "refs/heads/dev/test-operator/icm-868148454-targeted-fix",
+    });
+  });
 
   const settle = (step: ReturnType<typeof start>, resumable = false) => {
     world.store.transitionSession(step.sessionId, "starting");

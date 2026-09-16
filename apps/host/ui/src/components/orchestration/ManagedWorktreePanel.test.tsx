@@ -147,6 +147,43 @@ describe("accessible managed workspace controls", () => {
     expect(screen.getByText("Advanced recovery: manual integration")).toBeTruthy();
   });
 
+  it("distinguishes the execution base from an uncreated no-change publication target", async () => {
+    const noChanges = RunSchema.parse({
+      ...run,
+      workspaceBinding: {
+        ...run.workspaceBinding!,
+        integrationRemote: "origin",
+        integrationTargetRef: "refs/heads/dev/sihanwang/sql-endpoints-object-overview",
+        aggregationSummary:
+          "No committed changes; verified task workspaces and cleaned them without merge integration.",
+        aggregationTargetRef: "",
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        response({
+          ...initialView(),
+          binding: noChanges.workspaceBinding,
+        }),
+      ),
+    );
+
+    show(noChanges);
+
+    const workspaceHeading = await screen.findByRole("heading", {
+      name: "Fleet workspace",
+    });
+    expect(workspaceHeading.nextElementSibling?.textContent).toContain(
+      "execution base main (aaaaaaaaaaaa)",
+    );
+    expect(screen.getByText(/Publication target:/).textContent).toContain(
+      "origin/dev/sihanwang/sql-endpoints-object-overview",
+    );
+    expect(screen.getByText(/Publication:/).textContent).toContain("Not required");
+    expect(screen.getByText(/a no-change task never creates it/)).toBeTruthy();
+  });
+
   it("offers one-click retry only when automatic integration needs attention", async () => {
     const blocked = RunSchema.parse({
       ...run,
@@ -177,6 +214,32 @@ describe("accessible managed workspace controls", () => {
         ),
       ).toBe(true),
     );
+  });
+
+  it("shows plan-approved automatic recovery without asking for another click", async () => {
+    const recovering = RunSchema.parse({
+      ...run,
+      state: "aggregating",
+      workspaceBinding: {
+        ...run.workspaceBinding,
+        aggregationState: "in_progress",
+        aggregationPhase: "quiesce",
+        aggregationCode: "node_unavailable",
+        aggregationAttempt: 2,
+        aggregationAutomaticRetries: 1,
+        aggregationSummary:
+          "Plan-approved automatic recovery 1/3: revalidating the retained workspace after node_unavailable. Nothing has been published.",
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => response({ ...initialView(), binding: recovering.workspaceBinding })),
+    );
+
+    show(recovering);
+
+    expect(await screen.findByText(/Plan-approved automatic recovery 1\/3/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Retry integration" })).toBeNull();
   });
 
   it("persists the disabled General default with revision and idempotency metadata", async () => {
@@ -414,7 +477,7 @@ describe("accessible managed workspace controls", () => {
       fireEvent.click(screen.getByRole("button", { name: "Abort merge" }));
       await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
     });
-    await screen.findByRole("heading", { name: "Abort this merge?" });
+    await screen.findByRole("heading", { name: "Abort this merge?" }, { timeout: 5_000 });
     const abortDialog = screen.getByRole("dialog");
     expect(abortDialog).not.toBe(dialog);
     expect(abortDialog.getAttribute("aria-hidden")).not.toBe("true");
@@ -511,6 +574,8 @@ describe("accessible managed workspace controls", () => {
       if (path === "/api/auth/csrf") return response({ csrfToken: "csrf" });
       if (init?.method === "POST" && path.endsWith("publish-branch"))
         return response({ approval: { approvalId: "approval" } });
+      if (init?.method === "POST" && path.endsWith("request-changes"))
+        return response({ run: { ...awaiting, state: "running" } });
       return response({
         ...initialView(),
         binding: awaiting.workspaceBinding,
@@ -526,6 +591,21 @@ describe("accessible managed workspace controls", () => {
     expect(screen.getByText("Tests passed")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Review changes" }));
     expect(await screen.findByText("+ final integrated content")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Request changes" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "What needs changing?" }), {
+      target: { value: "Add the missing regression test." },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Send back for changes" }));
+    });
+    expect(
+      fetchMock.mock.calls.some(
+        ([path, init]) =>
+          path.endsWith("request-changes") &&
+          init?.method === "POST" &&
+          JSON.parse(String(init.body)).feedback === "Add the missing regression test.",
+      ),
+    ).toBe(true);
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Publish branch" }));
     });

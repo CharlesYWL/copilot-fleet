@@ -450,6 +450,8 @@ export const SessionSchema = z.object({
    */
   runId: z.string().default(""),
   runRole: RunRoleSchema.default(""),
+  /** Login identity that owns publication naming for an orchestrator lead. */
+  operatorUsername: z.string().max(320).optional(),
   /**
    * Persisted control intent, separate from the worker's last observed state.
    *
@@ -1298,6 +1300,11 @@ export const RunPolicySchema = z.object({
   maxParallel: z.number().int().positive().default(3),
   /** Cumulative sessions this run may spawn, the Lead included. */
   maxSessions: z.number().int().positive().default(8),
+  /**
+   * Plan approval authorizes bounded retries of idempotent managed integration
+   * operations. Evidence changes and publication remain explicit boundaries.
+   */
+  automaticManagedIntegrationRecovery: z.boolean().default(true),
   maxWakes: z.number().int().positive().default(12),
   /** Cap on one step's output inside a wake envelope. */
   maxOutputChars: z.number().int().positive().default(8_000),

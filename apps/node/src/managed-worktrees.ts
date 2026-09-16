@@ -828,6 +828,13 @@ export class ManagedWorktrees {
     const filtersDigest = createHash("sha256")
       .update(filterConfig.join("\n"))
       .digest("hex");
+    const credentialHelpersDigest = createHash("sha256")
+      .update(
+        credentialHelpers
+          .map((value) => createHash("sha256").update(value).digest("hex"))
+          .join("\n"),
+      )
+      .digest("hex");
     const configurationDigest = createHash("sha256")
       .update(
         JSON.stringify({
@@ -835,9 +842,6 @@ export class ManagedWorktrees {
           filtersDigest,
           fsmonitor: fsmonitor || "false",
           submoduleUpdates,
-          credentialHelpers: credentialHelpers.map((value) =>
-            createHash("sha256").update(value).digest("hex"),
-          ),
         }),
       )
       .digest("hex");
@@ -847,24 +851,103 @@ export class ManagedWorktrees {
       filters: features.gitLfs ? "git_lfs" : "disabled",
       filtersDigest,
       submodules: features.submodules ? "node_local" : "disabled",
+      credentialHelpersDigest,
       configurationDigest,
     });
+  }
+
+  private workspacePolicyMatches(
+    expected: RepositoryExecutionPolicy,
+    observed: RepositoryExecutionPolicy,
+    options: { ignoreHooks?: boolean } = {},
+  ): boolean {
+    const {
+      credentialHelpersDigest: _expectedCredentialHelpersDigest,
+      ...expectedWorkspacePolicy
+    } = expected;
+    const {
+      credentialHelpersDigest: _observedCredentialHelpersDigest,
+      ...observedWorkspacePolicy
+    } = observed;
+    if (isDeepStrictEqual(expectedWorkspacePolicy, observedWorkspacePolicy)) return true;
+    return this.workspacePolicyMismatches(expected, observed, options).length === 0;
+  }
+
+  private workspacePolicyMismatches(
+    expected: RepositoryExecutionPolicy,
+    observed: RepositoryExecutionPolicy,
+    options: { ignoreHooks?: boolean } = {},
+  ): string[] {
+    const mismatches: string[] = [];
+    if (expected.version !== observed.version) mismatches.push("policy version");
+    if (
+      !options.ignoreHooks &&
+      (expected.hooks !== observed.hooks || expected.hooksDigest !== observed.hooksDigest)
+    )
+      mismatches.push("Git hooks");
+    if (
+      expected.filters !== observed.filters ||
+      expected.filtersDigest !== observed.filtersDigest
+    )
+      mismatches.push("Git filters");
+    if (expected.fsmonitor !== observed.fsmonitor) mismatches.push("fsmonitor");
+    if (expected.submodules !== observed.submodules) mismatches.push("submodule mode");
+    if (expected.credentialHelpers !== observed.credentialHelpers)
+      mismatches.push("credential-helper policy");
+    if (
+      expected.submodules !== "disabled" &&
+      expected.configurationDigest !== observed.configurationDigest
+    )
+      mismatches.push("submodule helper configuration");
+    return mismatches;
   }
 
   private async verifyRepositoryExecutionPolicy(
     tree: ManagedWorktree,
     path = tree.repository.path,
+    options: {
+      adoptCredentialHelpers?: boolean;
+      strictCredentialHelpers?: boolean;
+      ignoreHooks?: boolean;
+    } = {},
   ): Promise<void> {
     const observed = await this.repositoryExecutionPolicy(
       path,
       tree.repositoryFeatures,
       tree.allowGitHooks,
     );
-    if (!isDeepStrictEqual(observed, tree.repositoryExecutionPolicy))
+    if (!this.workspacePolicyMatches(tree.repositoryExecutionPolicy, observed, options)) {
+      const scope = samePath(path, tree.repository.path)
+        ? "source repository"
+        : "integration workspace";
+      const mismatches = this.workspacePolicyMismatches(
+        tree.repositoryExecutionPolicy,
+        observed,
+        options,
+      );
       throw new WorktreeConflict(
         "repository_execution_policy_changed",
-        "Hooks, filters, fsmonitor, submodule helpers, or credential-helper configuration changed after reservation.",
+        `Repository execution policy changed in the ${scope}: ${mismatches.join(", ")}.`,
       );
+    }
+    if (
+      options.strictCredentialHelpers &&
+      observed.credentialHelpersDigest !==
+        tree.repositoryExecutionPolicy.credentialHelpersDigest
+    )
+      throw new WorktreeConflict(
+        "publication_credential_policy_changed",
+        "Git credential-helper configuration changed after integration preview. Review the refreshed publication result before retrying.",
+      );
+    if (
+      !tree.repositoryExecutionPolicy.credentialHelpersDigest ||
+      (options.adoptCredentialHelpers &&
+        observed.credentialHelpersDigest !==
+          tree.repositoryExecutionPolicy.credentialHelpersDigest)
+    ) {
+      tree.repositoryExecutionPolicy = observed;
+      this.save(tree);
+    }
   }
 
   private async noninteractivePolicy(
@@ -902,6 +985,12 @@ export class ManagedWorktrees {
       if (identity.exitCode !== 0) return false;
     }
     return true;
+  }
+
+  private async disabledHooksPath(): Promise<string> {
+    const hooks = join(this.options.directory, "empty-hooks");
+    await mkdir(hooks, { recursive: true });
+    return hooks;
   }
 
   private async registry(
@@ -1948,7 +2037,7 @@ export class ManagedWorktrees {
         "This Node cannot materialize portable workspace results.",
       );
     const directory = join(this.options.directory, "workspace-result-artifacts");
-    const hooks = hooksPath ?? join(directory, "empty-hooks");
+    const hooks = hooksPath ?? (await this.disabledHooksPath());
     await mkdir(hooks, { recursive: true });
     const bundlePath = join(directory, `${result.artifactId}.bundle`);
     const importedRef = `refs/fleet/imports/${identityHash(
@@ -2645,7 +2734,15 @@ export class ManagedWorktrees {
         );
       await this.git.run(
         tree.repository.path,
-        ["worktree", "add", "--detach", path, baseSha],
+        [
+          "-c",
+          `core.hooksPath=${await this.disabledHooksPath()}`,
+          "worktree",
+          "add",
+          "--detach",
+          path,
+          baseSha,
+        ],
         {
           timeoutMs: 120_000,
           lease: admin,
@@ -2859,7 +2956,10 @@ export class ManagedWorktrees {
     await this.noGitOperation(tree.path);
     await this.noGitOperation(target.path);
     await this.validateIntegrationTarget(tree, target);
-    await this.verifyRepositoryExecutionPolicy(tree, target.path);
+    await this.verifyRepositoryExecutionPolicy(tree, target.path, {
+      adoptCredentialHelpers: true,
+      ignoreHooks: true,
+    });
     await this.noninteractivePolicy(target.path, false, tree.allowGitHooks);
     const taskSha = GitShaSchema.parse(await this.ref(tree.path, "HEAD"));
     const targetSha = GitShaSchema.parse(await this.ref(target.path, "HEAD"));
@@ -2957,6 +3057,10 @@ export class ManagedWorktrees {
           "Publication approval does not match this exact validated result and target.",
         );
       await this.validateIntegrationTarget(tree, integration.preview.target);
+      await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path, {
+        strictCredentialHelpers: true,
+        ignoreHooks: true,
+      });
       if (
         (await this.ref(integration.preview.target.path, "HEAD")) !==
         integration.resultSha
@@ -3124,7 +3228,14 @@ export class ManagedWorktrees {
           retainTarget = true;
           const result = await this.git.run(
             preview.target.path,
-            ["merge", "--no-ff", "--no-commit", preview.taskSha],
+            [
+              "-c",
+              `core.hooksPath=${await this.disabledHooksPath()}`,
+              "merge",
+              "--no-ff",
+              "--no-commit",
+              preview.taskSha,
+            ],
             { allowedExitCodes: [0, 1], lease: admin },
           );
           this.options.checkpoint?.("git", request);
@@ -3281,7 +3392,9 @@ export class ManagedWorktrees {
     request: WorktreeOperationRequest,
   ): Promise<void> {
     await this.verifyMerge(integration);
-    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path);
+    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path, {
+      ignoreHooks: true,
+    });
     if ((await this.ref(tree.path, "HEAD")) !== integration.approvedTaskSha)
       throw new WorktreeConflict("stale_review", "The approved task HEAD changed.");
     this.requireTrackedClean(await this.status(tree.path));
@@ -3314,6 +3427,8 @@ export class ManagedWorktrees {
     await this.git.run(
       integration.preview.target.path,
       [
+        "-c",
+        `core.hooksPath=${await this.disabledHooksPath()}`,
         "commit",
         "-m",
         `Merge Fleet task ${tree.taskKey}\n\nFleet-Integration: ${integration.id}`,
@@ -3321,7 +3436,9 @@ export class ManagedWorktrees {
       { lease: admin },
     );
     this.options.checkpoint?.("git", request);
-    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path);
+    await this.verifyRepositoryExecutionPolicy(tree, integration.preview.target.path, {
+      ignoreHooks: true,
+    });
     integration.resultSha = await this.ref(integration.preview.target.path, "HEAD");
     integration.finalTree = await this.treeOid(
       integration.preview.target.path,

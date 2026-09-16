@@ -307,13 +307,30 @@ Orphaned worker ownership that cannot be proved quiescent remains blocked.
 
 The normal managed workflow requires no integration click. The Host records the
 resolved remote/base and generates a privacy-safe branch such as
-`dev/<short-user>/fleet-<stable-run-id>`. Fleet selects an eligible Node, creates a
-detached integration worktree at the exact integration base, imports the immutable
-reviewed result, composes it and validates the exact final tree. It then stops in
+`dev/<short-user>/<meaningful-task-slug>`. Task and user segments are normalized,
+bounded and Git-safe. A short stable Run suffix is used only when the task name has
+no safe slug or another local Run already owns the generated target. Remote
+publication remains create-only, so an independently existing remote branch is
+reported as a conflict rather than overwritten. An explicit target branch still
+overrides the generated name. The initiating administrator username is persisted
+on the orchestrator lead and inherited by tasks it opens, so autonomous task
+creation does not fall back to `operator`. Fleet selects an eligible Node, creates a detached
+integration worktree at the exact integration base, imports the immutable reviewed
+result, composes it and validates the exact final tree. It then stops in
 `await_publish_approval`; no shared remote state has changed. If validation proves
 the final result equals the publication base (`0 files / 0 commits`), publication is
 marked complete without creating a remote branch or requesting approval, and Fleet
 continues directly to retention and cleanup.
+
+Approving the task plan also authorizes bounded automatic recovery for idempotent
+managed integration operations. Fleet may refresh observations, wait briefly for
+an owning Node, replay a durable operation receipt and rebuild a disposable
+integration workspace from the same immutable reviewed result. Every attempt
+revalidates ownership, generation, pinned refs, reviewed SHA/tree and cleanliness.
+Fleet stops for user attention instead of retrying when evidence changed, ownership
+is uncertain, files are dirty, a merge conflicts or the retry budget is exhausted.
+Publication of a changed result still requires a separate approval bound to the
+exact validated commit and remote state.
 
 The UI presents the publication base, proposed final commit, final `base..result`
 diff, changed-file/commit counts, validation status and review status. **Publish

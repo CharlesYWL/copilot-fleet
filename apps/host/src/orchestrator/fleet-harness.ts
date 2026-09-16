@@ -92,7 +92,7 @@ export function fleet(): {
     "orchestrate",
     true,
     "Orchestrator",
-    { runRole: "lead" },
+    { runRole: "lead", operatorUsername: "test.operator@example.com" },
   );
   /*
    * No task, which is how a real conversation starts.

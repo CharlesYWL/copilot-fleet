@@ -33,7 +33,7 @@ export function reviewOutcome(run: Run | undefined, input: ReviewInput): ReviewO
  * treating `<fleet-...>` blocks as facts to act on since its first turn, and a
  * bare sentence from a person reads as something to discuss instead.
  */
-function sendBackPrompt(task: string, note: string): string {
+export function sendBackPrompt(task: string, note: string): string {
   return [
     `<fleet-review task=${JSON.stringify(task)} verdict="changes requested">`,
     note,

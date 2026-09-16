@@ -580,6 +580,10 @@ export class FleetStore {
         id TEXT PRIMARY KEY, run_id TEXT NOT NULL, integration_id TEXT NOT NULL,
         data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS publication_approval_revocations (
+        approval_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, revoked_by TEXT NOT NULL,
+        reason TEXT NOT NULL, revoked_at TEXT NOT NULL
+      );
       -- Every ownership question (which sessions does this node own, may this
       -- workspace be deleted) filtered these columns with a full scan.
       CREATE INDEX IF NOT EXISTS idx_sessions_node ON sessions(node_id);
@@ -788,6 +792,7 @@ export class FleetStore {
     this.addColumnIfMissing("workspaces", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "position", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "run_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "operator_username", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "run_role", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("sessions", "read_only", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing("sessions", "stop_requested", "INTEGER NOT NULL DEFAULT 0");
@@ -1423,7 +1428,12 @@ export class FleetStore {
 
   getPublicationApproval(runId: string): PublicationApproval | undefined {
     const row = this.statement(
-      "SELECT data FROM publication_approvals WHERE run_id=? ORDER BY rowid DESC LIMIT 1",
+      `SELECT data FROM publication_approvals
+       WHERE run_id=? AND NOT EXISTS (
+         SELECT 1 FROM publication_approval_revocations revoked
+         WHERE revoked.approval_id=publication_approvals.id
+       )
+       ORDER BY rowid DESC LIMIT 1`,
     ).get(runId);
     return row
       ? PublicationApprovalSchema.parse(JSON.parse(String(row.data)))
@@ -1448,6 +1458,34 @@ export class FleetStore {
       "INSERT INTO publication_approvals (id,run_id,integration_id,data) VALUES (?,?,?,?)",
     ).run(parsed.approvalId, parsed.runId, parsed.integrationId, JSON.stringify(parsed));
     return parsed;
+  }
+
+  revokePublicationApprovals(
+    runId: string,
+    revokedBy: string,
+    reason: string,
+    revokedAt = new Date().toISOString(),
+  ): number {
+    const rows = this.statement(
+      `SELECT id FROM publication_approvals
+       WHERE run_id=? AND NOT EXISTS (
+         SELECT 1 FROM publication_approval_revocations revoked
+         WHERE revoked.approval_id=publication_approvals.id
+       )`,
+    ).all(runId) as Array<{ id: string }>;
+    for (const row of rows) {
+      this.statement(
+        `INSERT OR IGNORE INTO publication_approval_revocations
+         (approval_id,run_id,revoked_by,reason,revoked_at) VALUES (?,?,?,?,?)`,
+      ).run(
+        row.id,
+        runId,
+        revokedBy,
+        reason,
+        revokedAt,
+      );
+    }
+    return rows.length;
   }
 
   listManagedWorktrees(): ManagedWorktree[] {
@@ -2217,8 +2255,8 @@ export class FleetStore {
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
-            stop_requested,dismissed,favorite,last_activity_at,usage)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            stop_requested,dismissed,favorite,last_activity_at,usage,operator_username)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -2244,6 +2282,7 @@ export class FleetStore {
         session.favorite ? 1 : 0,
         session.lastActivityAt ?? session.updatedAt,
         JSON.stringify(session.usage ?? {}),
+        session.operatorUsername ?? "",
       );
       if (session.executionBinding?.worktreeId)
         this.statement("UPDATE sessions SET execution_binding=? WHERE id=?").run(
@@ -3842,15 +3881,20 @@ export class FleetStore {
     prompt: string,
     yolo = false,
     name = "",
-    run: { runId?: string; runRole?: RunRole; readOnly?: boolean } = {},
+    run: {
+      runId?: string;
+      runRole?: RunRole;
+      readOnly?: boolean;
+      operatorUsername?: string;
+    } = {},
   ): FleetSession {
     if (run.runId) this.assertRunMutable(run.runId);
     const now = new Date().toISOString();
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at,operator_username)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -3868,6 +3912,7 @@ export class FleetStore {
       run.runRole ?? "",
       run.readOnly ? 1 : 0,
       now,
+      run.operatorUsername ?? "",
     );
     return this.getSession(id)!;
   }
@@ -4718,6 +4763,7 @@ export class FleetStore {
     );
     binding.sourcePlacementId = input.sourcePlacementId ?? "";
     binding.originatingPlacementId = input.sourcePlacementId ?? "";
+    binding.integrationUsername = input.integrationUsername ?? "";
     if (binding.effectiveMode === "managed") {
       const integration = integrationBranchSettings({
         runId: id,
@@ -4725,6 +4771,10 @@ export class FleetStore {
         taskName: input.name,
         baseRef: input.integrationBaseRef,
         branchRef: input.integrationBranchRef,
+        existingBranchRefs: this.listRuns()
+          .filter((run) => run.id !== id)
+          .map((run) => run.workspaceBinding?.integrationTargetRef ?? "")
+          .filter(Boolean),
       });
       binding.integrationBaseRef = integration.baseRef;
       binding.integrationTargetRef = integration.branchRef;
@@ -5768,6 +5818,7 @@ function sessionFromRow(row: Row): FleetSession {
     usage: JSON.parse(String(row.usage ?? "{}")),
     runId: String(row.run_id ?? ""),
     runRole: String(row.run_role ?? ""),
+    operatorUsername: String(row.operator_username ?? ""),
     stopRequested: Boolean(row.stop_requested),
     dismissed: Boolean(row.dismissed),
     favorite: Boolean(row.favorite),
