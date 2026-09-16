@@ -1,8 +1,13 @@
 # Approved remote command execution
 
-Status: Draft implementation plan for review; no implementation changes made.
+Status: Review-amended implementation plan; feasibility gates remain open.
 Date: 2026-09-16
 Repository: copilot-fleet
+Review baseline: `80a01c02a6990fcfde4b93abf3109b430ac7ed3c`.
+
+This revision incorporates the source-checked Opus feedback R1-R6. It changes the
+plan only: no execution feature, supervision guarantee, or migration described
+below has been implemented or experimentally proven by this document.
 
 ## 1. Outcome
 
@@ -25,13 +30,15 @@ probe or a filesystem sandbox.
 | --- | --- |
 | Agent interface | Three tools: request execution, read execution, cancel execution. |
 | Commands | Noninteractive, finite shell commands/scripts, including Git and npm. |
-| Target | An exact registered placement or existing managed task checkout. |
+| Target | An exact registered placement or eligible mutable managed checkout. Sealed, reviewed, composed, or integrating managed targets are excluded. |
+| Shell | Windows PowerShell 5.1, explicitly named `windows-powershell-5.1`. PowerShell 7 and a direct cmd shell adapter are deferred, not silent fallbacks. |
 | Approval | Explicit allow-once or deny for every new execution, including Git reads. No inherited YOLO or blanket approval. |
 | Working directory | Resolved and pinned by Fleet for each execution; no persistent shell state. |
 | Output | Live browser output, bounded retained logs, and an Orchestrator completion notification. |
 | Task association | Optional; standalone inspections do not create a Run or Session. |
-| Platform rollout | Windows first, reusing existing verified Job Object supervision. Other Nodes report unsupported until an equivalent adapter is implemented and verified. |
+| Platform rollout | Windows execution first, after extending and proving Job Object supervision. The lead may be elsewhere, but its Node must independently support durable wake delivery. |
 | Node control | Local opt-in, default off. The Host cannot remotely turn this setting on. |
+| Admission | Every Fleet-admitted participant on an eligible repository must honor shared cross-installation exclusion, including legacy/source-placement sessions. |
 | Public API names | Proposed names in this plan; not currently implemented. |
 
 Out of scope: interactive terminals/PTYs, stdin conversations, permanent services
@@ -45,6 +52,10 @@ A command can contain `cd` or invoke other programs. Target selection only fixes
 its initial directory. Neither that directory nor a Fleet checkout lease contains
 arbitrary code within the selected workspace.
 
+Do not cut approval, local opt-in, supervision, durable evidence, or bounded
+output to accelerate delivery. Cut optional shell editions, target states, and UI
+breadth first.
+
 ## 3. Existing code to build on
 
 Paths below are relative to the repository root.
@@ -54,12 +65,14 @@ Paths below are relative to the repository root.
 | `packages\protocol\src\index.ts` | Separate Node-scoped messages already exist alongside session commands. Add capability-gated execution messages; do not add fake session IDs. |
 | `apps\host\src\orchestrator\mcp-routes.ts` | Authenticates live lead principals; uses per-request stateless JSON responses. Register the new tools behind the same principal checks. |
 | `apps\host\src\orchestrator\tools.ts` | Shared advertised/validated schemas and scoped task lookup. Add request/read/cancel methods and target discovery. |
-| `apps\host\src\orchestrator\engine.ts` | Schedules prompts only for idle leads and prevents multiple prompts per tick. Extend scheduling for command completions, including leads without a Run. |
+| `apps\host\src\orchestrator\engine.ts` and `fleet-service.ts` | Current per-tick prompt exclusion is not durable across ticks. Add a persisted per-lead in-flight reservation shared by all prompt producers, including leads without a Run. |
 | `apps\host\src\store.ts` | SQLite transactions, durable transitions, security audit, and Run wake bookkeeping. Add execution-specific records and invariants. |
 | `apps\host\src\gateway\node-socket.ts` | Authenticated message dispatch and Node receipt validation. Route execution events and reconciliation. |
 | `apps\node\src\main.ts` | Already handles `repository_probe` outside Copilot sessions. Wire the command runner, inventory, settings, shutdown, and update coordination here. |
-| `apps\node\src\process-quiescence.ts` and `windows-process-job.ts` | Existing strict process-tree ownership uses Windows Job Objects. Reuse the process supervision, not the Copilot session lifecycle. |
-| `apps\node\src\checkout-locks.ts` and `canonical-path.ts` | Physical checkout identity, lease acquisition, revalidation, and release only after verified quiescence. |
+| `apps\node\src\process-quiescence.ts` and `windows-process-job.ts` | Existing Job Object helper starts suspended and kills descendants on root exit, but lacks an independent runtime deadline and Node-parent-loss policy. Extend it before reuse. |
+| `apps\node\src\checkout-locks.ts`, `canonical-path.ts`, and `router.ts` | Physical identity and durable managed leases are useful; unbound sessions currently skip those leases, and checkout/admin keys are independent. Admission must change in both directions. |
+| `apps\node\src\updater.ts` and `main.ts` | Update mutates Git/dependencies before shutdown. A maintenance barrier must precede the first mutation, not just the restart. |
+| `apps\host\src\managed-worktree-service.ts` and `store.ts` | Finalization short-circuits on existing `resultSha`; sealed artifacts are immutable. Reject protected managed targets instead of clearing observations and promising resealing. |
 | `apps\node\src\settings.ts`, `node-capabilities.ts`, and config-server surfaces | Add local opt-in and advertise actual supported shells and availability. |
 | `apps\node\src\outbox.ts` | Existing buffered events are session-specific and in memory. Its acknowledgment pattern is useful, but it is not a durable command journal. |
 | `apps\host\ui\src\hooks\useFleet.ts` and existing notification components | Add execution metadata updates and bounded live output without putting all logs in the initial snapshot. |
@@ -72,7 +85,13 @@ Important distinctions:
 - `GitRunner` is specific to Git and buffers output. Do not turn it into a generic
   shell runner or route npm through it.
 - Existing wake counters and envelopes are Run/worker-specific. Reuse the
-  scheduling discipline, not synthetic worker completion events.
+  scheduling discipline, not synthetic worker completion events or the existing
+  mark-before-send delivery helper unchanged.
+- Modern lead startup uses `coordinator: true` and a private coordinator
+  directory. Preserve this behavior; do not assume every standalone lead holds
+  its source checkout or silently stop the requesting lead.
+- The existing supervision crash test kills the helper, not the Node parent.
+  That is not evidence that a silent command stays bounded after Node death.
 
 ## 4. Proposed MCP contract
 
@@ -82,8 +101,7 @@ Inputs:
 
 - `target`: exactly one of `{ placementId }` or `{ worktreeId, generation }`.
 - `command`: exact command/script text; bounded and NUL-free.
-- `shell`: a supported identifier advertised by the target Node, initially
-  `powershell` or `cmd` on supported Windows installations.
+- `shell`: the exact advertised edition, initially `windows-powershell-5.1`.
 - `reason`: a short explanation shown to the approver.
 - `timeoutMs`: bounded by Host and Node policy.
 - `requestKey`: caller-generated idempotency key.
@@ -105,13 +123,17 @@ that task to belong to the requesting lead, and reject a conflicting explicit
 task ID. A placement alias into a managed checkout must not bypass its binding,
 ownership, or lease requirements.
 
+Apply the managed-target eligibility rules in section 9 and check durable
+delivery support on the lead's Node before accepting work. Never substitute a
+source placement when the requested managed checkout is ineligible.
+
 Example tool input:
 
 ```json
 {
   "target": { "placementId": "placement-id-from-discovery" },
   "command": "npm run build",
-  "shell": "powershell",
+  "shell": "windows-powershell-5.1",
   "reason": "Check whether the current workspace builds",
   "timeoutMs": 300000,
   "requestKey": "build-check-001"
@@ -131,22 +153,28 @@ The normal response is immediate:
 The response identifies the Node and requested catalog cwd; the approval view
 shows the Node-verified physical cwd. `awaiting_approval` may be returned if
 preparation has already completed. Invalid targets,
-unsupported Nodes, forbidden ownership, and exhausted admission limits return
-explicit errors. No process starts as part of this MCP request.
+unsupported execution/delivery combinations, forbidden ownership, and exhausted
+admission limits return explicit errors. No submitted command starts as part of
+this MCP request.
 
 Idempotency is scoped to the authenticated Orchestrator and request key. Repeating
 the same key and payload returns the existing execution. Reusing it with changed
 execution-affecting input is a conflict. A deliberate rerun needs a new key and
-new approval.
+new approval. Retiring verbose history does not retire key identity; section 8
+defines the retry horizon and compact tombstones.
 
 ### `fleet_get_execution`
 
-Input: `executionId`, optional `afterSeq`, and a bounded output limit.
+Input: `executionId`, optional `afterSeq`, a bounded output limit, and optional
+`format: "text" | "raw"` (default text).
 
 Return status, target, timestamps, exit code or signal where known, failure reason,
-pending cancellation/reconciliation information, stdout/stderr events, and
-`nextSeq`, `hasMore`, and explicit dropped/truncated ranges. Exit code is nullable:
-denial, spawn failure, and unknown completion are not successful zero exits.
+process-ownership state, forced descendant cleanup, stdout/stderr events, and
+`nextSeq`, `hasMore`, `finalOutputSeq`, and explicit dropped/truncated ranges.
+Expose `outcomeKnown`, `outputComplete`, and text encoding/loss indicators
+separately. Raw pages preserve retained bytes using bounded Base64 payloads.
+Exit code is nullable: denial, spawn failure, and unknown completion are not
+successful zero exits.
 
 Authorize ownership on every call. This is for retrieving additional evidence,
 not a polling loop. Extend existing discovery/task details with recent execution
@@ -154,10 +182,11 @@ IDs so an Orchestrator can recover after losing a tool response.
 
 ### `fleet_cancel_execution`
 
-Pending approval or queued work cancels without spawning. Started work records a
-durable cancellation intent and returns `cancelling`; cancellation is complete
-only after the Node verifies process-tree termination. Repeated cancellation is
-idempotent. Operators can also cancel through the UI.
+Undispatched work cancels without spawning. Once a start has been dispatched,
+record durable cancellation intent and remain `cancelling` until the Node proves
+either no launch or verified termination. Host cancellation cannot retroactively
+retract a start already in flight. Repeated cancellation is idempotent; operators
+can also cancel through the UI.
 
 ## 5. Host execution lifecycle
 
@@ -175,6 +204,15 @@ Additional outcomes:
 - `cancelling`: termination requested, not yet established.
 - `reconciliation_required`: dispatch or process ownership is uncertain; not
   equivalent to a terminal state and never a reason to release a lease.
+- `interrupted`: terminal only with proven quiescence; outcome evidence was lost,
+  the Node parent died, or root exit required forced cleanup of descendants.
+  Preserve a known root exit code as evidence, otherwise use null. Never infer
+  success from an absent receipt or zero root exit with forced child cleanup.
+
+Track ownership independently as `not_started`, `active`, `quiescent`, or
+`unknown`. A lost outcome with proven quiescence releases the lease and settles
+as interrupted. A missing or reused PID is not quiescence proof. A known root exit
+with unproven descendant termination remains reconciliation-required.
 
 Connectivity is separate from outcome. An offline Node makes a running result
 unobservable, not successful, failed, or safely cancelled. A late validated Node
@@ -185,11 +223,15 @@ Persist in SQLite:
 
 - `command_executions`: owner, optional task, pinned target, command digest,
   command/shell, limits, approval identity/version/expiry, dispatch attempt,
-  cancellation intent, state, outcome, and timestamps.
+  cancellation intent, state, ownership, outcome, final output watermark, and
+  timestamps.
 - `command_execution_events`: execution ID, monotonic Node sequence, stream or
   event kind, timestamp, and bounded payload. Unique `(executionId, sequence)`.
-- Completion-delivery state on the execution or a small dedicated delivery table:
-  recipient, completion revision, delivery identity, attempt, and acknowledgment.
+- Compact request/launch/cancel tombstones separate from verbose execution history.
+- Durable per-lead prompt reservation and delivery receipts: recipient, logical
+  delivery ID, represented completion revisions, native session/attempt identity,
+  handoff state, and acknowledgment. Do not overload a single overwriteable
+  session dispatch-attempt field.
 
 Use transactional compare-and-set transitions for approve/deny/cancel/dispatch.
 Persist dispatch intent before sending. A socket send or acceptance receipt is
@@ -206,11 +248,18 @@ Proposed initial limits, centralized and tested:
 | Unsettled request admission | 10 per Orchestrator and 32 per Node |
 | Retained output | 10 MiB per execution, with explicit truncation markers |
 | MCP output page | At most 64 KiB |
+| Request-key retry horizon | 24 hours; older known keys return `request_expired`, never create another execution |
+| Reconnect receipt/output replay horizon | 7 days for settled, quiescent jobs; unresolved identities stay protected |
+| Transport/browser output queue | 1 MiB per connection, independently of log retention; pause live delivery and recover by cursor |
+| Aggregate verbose-log storage | 512 MiB on Host, 128 MiB per Node; reserve 16 MiB separately for lifecycle evidence on each |
 | Execution metadata/history | 30 days after settlement; unresolved ownership and delivery receipts are protected |
 
-Apply aggregate Host/Node storage quotas as well as per-execution caps. Lifecycle
-receipts must not be evicted to make room for noisy stdout. Pending, unapproved
-requests consume admission budget but do not reserve checkout leases or processes.
+Count command text in UTF-8 bytes, not JavaScript characters; wire/Base64 overhead
+has separate limits. Bound in-memory browser rendering independently of retained
+logs. Coalesce gap ranges instead of creating unbounded per-chunk gap records.
+Lifecycle receipts must not be evicted to make room for stdout. If the lifecycle
+reserve cannot be maintained, close admission and surface storage pressure.
+Pending requests consume admission budget, not checkout leases or processes.
 
 ## 6. Approval and authorization
 
@@ -232,6 +281,14 @@ Recheck immediately before dispatch and again on the Node:
 - Start authorization is unexpired, cancellation has not won, and the required
   checkout lease is available.
 
+The Host remains authoritative for approval expiry. Preparation must establish a
+bounded estimate of Host time over the authenticated channel; reject start if
+clock-offset uncertainty exceeds five seconds, clock discontinuity is detected,
+or the conservative expiry cannot be established. Subtract the uncertainty when
+converting expiry to a Node-local deadline; never restart the authorization
+lifetime on receipt/reconnect. A separate supervisor-local monotonic timer limits
+runtime after release of the suspended process.
+
 Only advertise/use the new protocol over the existing mutually authenticated,
 sealed channel. Do not add execution support to legacy secret-only connections.
 
@@ -246,49 +303,84 @@ Neither parameter checks nor cwd restriction creates a sandbox.
 
 ## 7. Node runner and wire protocol
 
-Add one small execution manager and shell adapter using existing Node APIs and
-process supervision. Avoid a generic job framework.
+Add a focused execution manager, durable journal, and shell adapter. Reuse the
+Job Object foundation but extend its supervision protocol; MCP registration and
+`spawn` alone are not the difficult part. Avoid a generic job framework.
 
 New capability: `remote-command-execution-v1`. Inventory reports local enablement,
-supported shells, concurrency, and active execution identities. Gate new
+exact shell edition, supervisor readiness, admission-protocol version,
+concurrency, and active execution identities. Gate new
 Host-to-Node messages on this capability and transport authentication; unsupported
 Nodes remain connected and receive no unknown frames.
 
-Add execution-scoped target preparation, start, cancel, inventory/reconciliation, output,
-acknowledgment, and final-result messages. Bind every message to the enrolled
-Node, execution ID, dispatch attempt, and immutable request digest. Validate all
-payloads with shared protocol schemas.
+Add target preparation, start, cancel, reconciliation, output, acknowledgment,
+and final-result messages. Bind each to Host/enrolled Node identity, execution ID,
+attempt, and immutable request digest; validate with shared schemas.
 
-Runner requirements:
+### 7.1. Crash-independent supervision (R1)
 
-- Resolve supported shell identifiers to trusted local executables; never accept
-  a caller-selected executable path as a shell. Pass cwd separately.
-- Use noninteractive/no-profile invocation and closed stdin. Make shell exit-code
-  behavior explicit, including propagation of a failing final npm/native command
-  through PowerShell. Multi-command scripts remain responsible for their own
-  chosen error handling.
-- Support Windows paths, quoting, Unicode, and npm's `.cmd` launcher correctly.
-  Do not concatenate cwd into shell text.
-- Preserve needed OS/toolchain environment while not injecting Fleet session MCP
-  credentials or control-plane tokens. No additional environment/secret input
-  surface in this release. The process still has the Node OS user's privileges.
-- Attach supervision before user code can run. Track descendants on natural
-  exit as well as cancellation; release leases only after verified quiescence.
-- Decode streamed output safely across UTF-8 chunk boundaries. Batch small
-  chunks, enforce frame limits, apply backpressure, and keep heartbeats responsive.
-- Continue draining pipes when retention is full; record a gap rather than
-  deadlocking the command or silently presenting its output as complete.
+Keep command-specific deadline, parent-loss, and outcome reporting behind an
+explicit helper mode. Do not silently change ACP session lifetime or completion
+semantics while extending the shared supervision foundation.
 
-Do not retain a shell between executions. Long-running jobs cannot outlive their
-deadline by keeping child processes or streams open.
+- The independent supervisor owns the job, its runtime deadline, and a handle to
+  the Node parent with creation identity, not just a PID. Parent loss terminates
+  the job; a silent command cannot outlive its limit because Node died.
+- Persist execution/attempt ID, journal namespace, random job identity, supervisor
+  identity, and parent identity. Create the root suspended, assign it to the job,
+  configure deadline/parent monitoring, and return a readiness receipt over a
+  control channel that is not submitted-command stdout/stderr.
+- Node durably records that receipt and arbitrates launch versus cancellation
+  before sending a one-time release. Supervisor rechecks parent liveness and
+  start expiry before resuming. An outer ChildProcess `spawn` event is not proof.
+- Supervisor writes a durable terminal/quiescence receipt even if Node is gone.
+  Missing receipts keep outcome or ownership explicitly uncertain; reuse no PID
+  to infer an old process's identity.
+- On natural root exit, terminate any remaining job descendants immediately,
+  then verify emptiness. Expose `descendantCleanupForced`, reason, and root exit
+  code. Forced cleanup settles as interrupted, not ordinary success.
+- Runtime/termination timers and parent monitoring do not depend on JavaScript
+  callbacks, stdout traffic, or the Host connection. If quiescence cannot be
+  proven, retain ownership and block reuse.
+
+### 7.2. Windows transport, readiness, and encoding (R6)
+
+- Initially support only trusted absolute Windows PowerShell 5.1 and a trusted
+  absolute supervisor launcher. Do not resolve bare `powershell.exe` from cwd,
+  substitute `pwsh`, or weaken execution/language policy.
+- Before advertising readiness, run a fixed non-user-controlled fixture that
+  proves the actual helper can establish and empty a Job Object. Installed shell
+  presence is insufficient: the current C# `Add-Type` path can be policy-blocked.
+- Store the exact approved script body in a per-attempt, access-controlled `.ps1`
+  file encoded as UTF-8 with BOM for 5.1. Pass a short quoted file path, separate
+  cwd, closed stdin, and noninteractive/no-profile arguments. Do not embed user
+  script text in the helper's Base64 command line. Use file/short-control-channel
+  transport for the helper too, and check every generated command-line length.
+- Preserve the approved script bytes/line endings in its digest. Clean up exact
+  script paths only after proven quiescence and durable receipt persistence;
+  uncertain attempts are quarantined for recovery.
+- Propagate explicit script exits and exact final native/npm failure codes.
+  Capture shell error/native exit state before wrapper housekeeping alters it.
+  Multi-command scripts remain responsible for their chosen error handling.
+- Invoking npm `.cmd` remains supported through the approved PowerShell script.
+  Nested cmd execution still has an 8,191-character expanded-line constraint;
+  script files do not remove it. Dynamic shell expansion cannot be fully
+  prevalidated: surface runtime errors, and never truncate accepted input.
+- Script encoding is not output encoding. Preserve raw stdout/stderr bytes,
+  request UTF-8 for controlled shell output, and label native decoding as an
+  assumption unless established. Report invalid/lossy decoding and offer retained
+  raw pages; a UTF-8 decoder cannot repair arbitrary legacy-codepage output.
+- Preserve necessary OS/toolchain environment without injecting Fleet control
+  tokens. Batch output, bound buffers, and keep draining pipes after retention
+  fills, recording gaps. No persistent shell state or secret-input surface.
 
 ## 8. Recovery and delivery guarantees
 
 Implement a small durable Node journal under its existing secured config/data
-directory. Persist accepted execution identity and launch intent before spawning,
-then process ownership and final receipt. Keep bounded output and unacknowledged
-lifecycle receipts across Node restarts. The existing in-memory session outbox is
-not sufficient.
+directory, shared with the independent supervisor through its defined receipt
+protocol. Persist launch/cancel identities before side effects, then supervision,
+release, and final evidence. Keep bounded output and lifecycle receipts across
+Node restarts. The existing in-memory session outbox is not sufficient.
 
 Do not claim exactly-once arbitrary process execution across every crash window.
 Prefer an unresolved operation over accidentally running it twice.
@@ -296,73 +388,174 @@ Prefer an unresolved operation over accidentally running it twice.
 | Failure | Required behavior |
 | --- | --- |
 | MCP reply is lost | Same request key returns the persisted execution. |
-| Approval races denial/cancellation | One versioned transition wins; no start after a winning cancellation. |
+| Approval races denial/cancellation | Host arbitration prevents undispatched work; after dispatch, Node launch arbitration and durable cancel tombstones decide no-start versus termination. |
 | Start acknowledgment is lost | Reconcile the same execution ID against the Node journal; do not create another process. |
 | Host restarts | Reload approvals, deadlines, cancellation intents, and completion deliveries; reconcile before uncertain dispatch. |
 | Connection drops while running | The Node continues the already-authorized bounded job, enforces its local deadline, and spools bounded output. No new offline starts. |
-| Node crashes between launch intent and process evidence | Mark reconciliation required; never automatically relaunch. |
-| Output/result is replayed | Sequence and identity checks deduplicate it; final receipts remain until acknowledged. |
+| Node crashes before readiness or during a silent job | Independent parent-loss/deadline enforcement bounds the job. Recover ownership separately from outcome; never relaunch. |
+| Root exit is known, but descendants remain | Supervisor terminates descendants and reports forced cleanup; zero root exit is not ordinary success. |
+| Outcome receipt is lost, but quiescence is proven | Release proven-quiescent leases; settle interrupted with a null exit code rather than blocking reuse forever or inventing success. |
+| Output/result is replayed | Sequence/identity checks deduplicate it; lifecycle acknowledgment follows durable Host persistence, not receipt in memory. |
 | Output exceeds a quota | Show a known gap/truncation and preserve lifecycle evidence. |
 | Cancellation cannot reach an offline Node | Show cancellation pending; do not free the checkout until reconciled. |
 | Target is removed or rebound | Refuse new dispatch; retain history and reconcile existing execution ownership. |
-| Backup is restored | Restore history, not executable authority: expire pending approvals and reconcile active attempts without starting them. |
+| Lead/task/catalog is deleted | Preserve immutable ownership snapshots and unresolved journal/tombstone identities; no cascading deletion of process evidence. Revoke dispatch and deliver no wake to a deleted lead. |
+| Backup is restored | Use existing quarantine patterns. Expire approvals, rotate command-request namespace, retain dedup identities, and reconcile active attempts without executing history. |
 
-Keep deduplication receipts at least through every possible dispatch/replay
-window. Journal loss is uncertainty, not permission to retry an arbitrary script.
-Transport reconnection alone must never replay side effects.
+Define a durable Node-local launch boundary: serialize release authorization and
+cancel tombstones for the same attempt. A cancelled execution whose start frame
+arrives later is rejected, even after reconnect. If release already won,
+cancellation remains pending until verified termination; do not claim it never
+started.
+
+Final receipts include `finalOutputSeq` and skipped ranges. Outcome may be known
+before output replay finishes. `outputComplete` means every sequence through the
+watermark is received or accounted for as an explicit gap. Acknowledge lifecycle
+receipts only after durable persistence. Reaching the seven-day output replay
+horizon records missing ranges instead of pretending logs are complete.
+
+Keep compact request-key tombstones for the lifetime of the owning principal and
+any outstanding dispatch authority, beyond the 30-day verbose history. Past the
+24-hour retry window return `request_expired`; require a new key and approval.
+After owner deletion, retire tombstones only when its authority is revoked and
+all attempts are quiescent/reconciled. Restore does not reuse the old request
+namespace. If tombstone capacity fills, refuse admission instead of forgetting
+keys. Journal loss is uncertainty, never permission to retry.
+
+Bound Node transport queues, Host persistence queues, and individual browser
+buffers separately. Pause a slow browser's live output and let it resume from a
+cursor, with visible gaps where retention expired. Reserve capacity for control
+and lifecycle messages. Disk-pressure failure must not prevent supervisor
+termination or produce an acknowledgment for an unpersisted receipt.
 
 ## 9. Orchestrator and checkout integration
 
-Use existing lead token validation and explicit ownership checks for all three
-tools. Extend discovery with eligible target IDs and shell capability. The tool
-description tells the Orchestrator to end its turn after a pending receipt.
+### 9.1. Shared admission and lock ordering (R2)
 
-Persist a completion delivery when an execution settles, including denial and
-expiry. Notify with ID, outcome, exit code, target, short bounded output, and a
-cursor for more. Raw output is labeled untrusted command data, not instructions.
+On command-eligible repositories, introduce a cross-installation participation
+barrier keyed by canonical Git common-directory identity (canonical directory
+identity for non-Git placements). All Fleet session start/resume/additional-root
+paths participate, including unbound, read-only-labelled, and aliased paths.
 
-Extend the existing prompt scheduler so:
+Agent processes hold shared participation for their lifetime plus any existing
+managed checkout lease. General commands and control-plane Git mutations acquire
+exclusive repository participation. Existing per-checkout writer rules remain.
+This deliberately serializes a command against Fleet work in sibling worktrees;
+it is a conservative opt-in tradeoff, not a claimed sandbox or a new global
+serialization rule for unrelated repositories.
 
-- Busy leads are not interrupted and only one prompt is admitted per lead/tick.
-- Standalone commands can notify a lead without inventing a Run.
-- Several completions may be combined into one bounded notification.
-- Delivery carries a stable identity and uses a recorded prompt acceptance path.
-  Add receiver-side deduplication/receipts for this path where required; existing
-  Run wake counters alone do not provide it. Reconcile uncertain delivery rather
-  than repeatedly sending prompts.
-- Pending delivery is recoverable after Host restart. Do not simply mark it
-  delivered before sending and assume it arrived.
-- Stopped/deleted leads are not resurrected. Their outcomes remain visible in
-  history; new dispatches and queued approvals are revoked.
+Acquire in one order: Node admission ticket, repository participation barriers
+sorted by canonical key, existing Git administration locks sorted by key, then
+checkout leases sorted by key. Release in reverse after proven quiescence. Never
+wait for an upper-level lock while holding a lower-level one or upgrade a shared
+participation in place. Preparation resolves identities without mutation; after
+locking, revalidate them. Maintenance drains outside the acquisition path.
 
-Distinguish durable result availability, Node acceptance of a wake prompt, and
-model consumption. Do not claim exactly-once model consumption across a crash.
-If handoff cannot be proven, show delivery uncertainty and keep the result
-discoverable rather than silently losing it or generating an unlimited retry loop.
+Register admission tickets under a short Node-local critical section; do not
+hold that mutex while waiting for repository locks or draining processes.
+Maintenance can close admission while existing tickets remain visible in its
+snapshot. Cancellation and quiescence reporting do not require a new start ticket.
 
-Command completion does not imply task completion, successful review, or approval
-to integrate/push. Exit code zero is evidence only.
+Every installation permitted to share an eligible checkout must support this
+protocol. Activation requires drain/reconciliation of pre-feature participants;
+known older, inaccessible, or untracked Fleet ownership makes the target
+ineligible. Absence from one Node's memory is not proof. A second upgraded
+installation must observe the same physical barrier, not a private config lock.
 
-General commands are shell-capable writers for admission purposes, even when
-their text looks like a read. Acquire the selected checkout lease and coordinate
-with existing Git administration locks; never allow an agent-supplied `readOnly`
-label to bypass them. Do not forcibly evict an active worker. Queue/refuse with
-the lease holder identified, and use existing explicit park/stop flows as needed.
+Noncooperating old installations and arbitrary non-Fleet OS processes cannot be
+excluded merely by a new lock file; keeping them off an eligible checkout is an
+explicit deployment prerequisite. Where that prerequisite cannot be established,
+refuse the feature for that target. Do not silently rewrite legacy admission
+semantics everywhere else.
 
-Task-linked executions must block task handover, result sealing/integration,
-worktree removal, or purge while their process ownership remains live/uncertain.
-Invalidate stale observations/review evidence after command writes; do not allow
-previously sealed results to silently stand for a modified checkout. This release
-does not make command jobs portable DAG result-producing steps.
+Preserve private coordinator directories. Never implicitly Stop the requesting
+lead to make a command fit: Stop revokes its requests. If explicit process parking
+is needed, it must preserve the live logical lead identity and be separate from
+operator Stop; otherwise return busy and keep completion delivery possible.
 
-Arbitrary shell code can touch other checkouts or shared Git metadata. Leases
-coordinate Fleet-admitted work on the declared target; they cannot police
-undeclared filesystem access without a sandbox.
+### 9.2. Conservative managed-target policy (R4)
 
-Wire cancellation into task/orchestrator stop and Node local opt-out. Block
-destructive lifecycle operations until ownership is reconciled. Node shutdown
-must stop and journal command outcomes; self-update must not mutate/restart under
-an active command without explicit stop/quiescence coordination.
+V1 permits an explicitly bound mutable managed generation only before its task
+has any sealed result/result SHA, dependent composition, review evidence,
+publication approval, or integration attempt. The task must be active, not in
+handover, aggregation, cleanup, or reconciliation. This conservative task-wide
+test intentionally excludes many post-implementation build/review commands.
+
+Check eligibility during preparation and atomically again before dispatch.
+Install a task/workspace command fence and advance its mutable-evidence revision
+before the command could write. While fenced, block worker admission,
+finalization/sealing, composition, review/publication, handover, and removal.
+Failed, cancelled, interrupted, and timed-out jobs can all leave changes; none
+restores the old evidence revision merely because it did not succeed.
+
+After proven quiescence, obtain a fresh observation before releasing the
+execution-only fence to ordinary phase scheduling. Keep handover/publication
+blocked until required verification records refer to the new evidence revision;
+do not block the verification work needed to establish that evidence. Failed
+observation leaves the task blocked. A proven no-start can clear the execution
+fence without claiming a write occurred. Existing historical observations never
+become current merely because the fence was removed.
+
+Protected targets return `managed_target_not_mutable`. Do not clear `resultSha`,
+overwrite immutable artifacts, or invalidate a few fields and call it resealing.
+Future support needs a separately designed revision/reopen operation that creates
+new result identities, dependent compositions, reviews, and publication approvals.
+The existing reopen operation is not assumed to supply that behavior.
+
+### 9.3. Durable completion delivery (R5)
+
+Use existing lead authentication and ownership checks. Independently negotiate
+`durable-lead-delivery-v1` on the Node hosting the lead, regardless of execution
+Node capability or OS. V1 rejects unsupported combinations before execution;
+there is no silent history-only fallback to a promised automatic wake.
+
+Persist a stable logical delivery ID, its bounded set of completion revisions,
+and a per-lead in-flight reservation across ticks and restarts. Every prompt
+producer, including Run wakes, queued task briefs, status checks, and human
+prompts, must respect the same reservation. Do not overwrite an existing
+delivery's session attempt with a newly generated command ID.
+
+The lead Node deduplicates deliveries and durably reports `accepted`,
+`rejected_busy`, or `uncertain`, bound to the native conversation/attempt.
+Acceptance is not model consumption. Keep the prompt slot reserved until the
+accepted turn settles, a definitive refusal permits release, or reconciliation
+establishes the state. Expiry alone cannot release an uncertain reservation.
+On busy refusal, preserve the owed result and retry only after an eligible idle
+transition; never let an unrelated wake disappear behind the refusal.
+
+Notify with execution ID, outcome, target, output-completeness/cleanup flags,
+short bounded output, and a cursor. No polling or log-line wake storm. Standalone
+commands use the same delivery path without fake Runs. Deleted/stopped leads are
+not resurrected. Uncertain ACP handoff remains visible with discoverable results;
+do not claim exactly-once model consumption or retry indefinitely.
+
+### 9.4. Maintenance barrier and lifecycle (R3)
+
+Use one Node-local admission/maintenance controller for command starts, existing
+session admission, update, opt-out, shutdown, and identity/backup restore. Close
+admission atomically before taking the active/launch-in-progress snapshot, so an
+asynchronous WebSocket handler cannot admit a concurrent start.
+
+Self-update refuses while relevant Fleet processes or uncertain ownership remain;
+it does not automatically stop them. This check and exclusive maintenance
+ownership precede `updateCheckout`, including its Git fetch/reset, npm install,
+and build. Hold the barrier through mutation/restart and obey the shared
+repository barrier across installations.
+
+Opt-out and shutdown first close admission, then cancel/drain and persist
+supervisor/final receipts locally before closing storage, even if the socket is
+already closed. Identity/backup restore refuses mutation until drain is proven,
+then quarantines restored authority. If maintenance fails before mutation and
+ownership is known, explicitly reopen prior admission; after uncertain drain or
+partial mutation, remain maintenance-blocked with a recovery action, not a silent
+permanent busy flag or unsafe automatic reopening.
+
+Task/orchestrator Stop revokes pending work and requests termination. Purge and
+target removal cannot destroy unresolved ownership records. Command completion
+does not complete a task or authorize integration/push.
+
+These barriers coordinate declared Fleet work, not arbitrary script access to
+unlisted checkouts or other OS resources.
 
 ## 10. Browser, retention, and observability
 
@@ -372,7 +565,9 @@ and the notification center. It must work without a task or worker session.
 Show status, exact target, approval identity, timestamps, cancel control, exit
 code/error, live output, and clear offline/truncation/reconciliation indicators.
 Pending requests must reappear after refresh. Fetch history/output by cursor;
-send only recent metadata in a reconnect snapshot.
+send only recent metadata in a reconnect snapshot. Show interrupted outcome
+separately from unknown ownership, forced descendant cleanup, incomplete output,
+decoding assumptions, and pending/uncertain lead delivery.
 
 Use existing Fluent UI/theme patterns. Keep keyboard focus predictable, label
 allow/deny/cancel controls, avoid announcing every stdout chunk to screen
@@ -391,17 +586,19 @@ existing diagnostics/audit facilities. No new telemetry service is required.
 
 ## 11. Implementation sequence
 
-Each phase depends on the previous phase. Keep the feature disabled until the
-end-to-end acceptance gates pass.
+Start with the Windows feasibility spike, then preserve the six-phase delivery
+shape. Admission and maintenance are prerequisites to dispatch, not rollout
+cleanup. Prove one disabled end-to-end slice before expanding UI/history. Do not
+enable the feature until all release-blocking gates pass.
 
 | Phase | Deliverable and likely files | Exit condition |
 | --- | --- | --- |
-| 1. Contracts and persistence | New `packages\protocol\src\command-execution.ts`, exports/message unions; `store.ts` migration and execution tests. | Schemas, state transitions, deduplication, approval versions, quotas, and restore behavior are defined and exercised. |
-| 2. Node runner and recovery | New `apps\node\src\command-executor.ts` plus a small journal/shell module as justified; existing supervision/locks/settings/config integration. | Finite Git/npm jobs run without Copilot; natural exit, failure, timeout, cancellation, restart uncertainty, and replay are handled honestly. |
-| 3. Host controller and transport | New `apps\host\src\command-execution-service.ts`, gateway/main message handling, inventory, capability checks, deadlines and acknowledgment. | Approved jobs run end to end; unauthorized, duplicate, expired, offline, and rebound-target cases cannot cause a new unintended process. |
-| 4. MCP and wake integration | `orchestrator\tools.ts`, `mcp-routes.ts`, `engine.ts`, shared lifecycle/task gates. | All three tools are scoped; pending returns promptly; completion reaches idle standalone/task leads without polling or synthetic Sessions. |
-| 5. Approval and live-output UI | New command routes and UI detail component; `useFleet`, snapshot/events, notifications, Node config page. | Human approval is usable and persistent; output/cancellation/recovery are visible and accessible. |
-| 6. Compatibility and rollout | Regression coverage, recovery exercises, docs, retention/backup integration, feature enablement. | Mixed fleets work unchanged; enabled Windows Nodes satisfy every release-blocking scenario below. |
+| 1. Feasibility and contracts | Disposable supervisor/shell fixtures; `windows-process-job.ts`; proposed `packages\protocol\src\command-execution.ts`. | R1/R6 parent-death, deadline, release-handshake, script-size, encoding, and restricted-policy cases pass before contracts are finalized. |
+| 2. Persistence and admission | `store.ts`, Node journal/runner, `router.ts`, shared physical barriers, `main.ts`/updater/settings lifecycle. | R2/R3 bidirectional admission and pre-mutation maintenance gates work before any public command can dispatch; cancellation/dedup/restore identities are durable. |
+| 3. Disabled vertical slice | Command controller, Node transport, minimal MCP request, browser allow/deny, result persistence, and durable lead reservation/receiver receipts. | One approved Git/npm job returns to the lead; delayed/busy/lost acknowledgments and different lead/execution Node capabilities exercise R5 immediately. |
+| 4. Complete command and task contracts | Read/cancel/discovery tools, bounded replay, retention/tombstones, standalone delivery, and conservative managed eligibility/fences. | R4 rejects protected targets and restores eligible mutable tasks through fresh evidence; output completeness and unknown ownership remain distinct. |
+| 5. Operational UI and history | Approval/detail UI, notification navigation, Node config, slow-consumer recovery, accessibility, and diagnostics. | Refresh, cancellation, gaps, decoding loss, maintenance, and uncertain delivery are understandable without fake Sessions. |
+| 6. Compatibility and rollout | Full failure matrix, backup/delete/retention exercises, targeted regressions, docs, and controlled enablement. | The pilot meets the gates below; unsupported combinations are refused explicitly and unrelated existing fleets remain unchanged. |
 
 The source filenames proposed above are candidates, not a requirement to create
 a framework or duplicate existing helpers. Keep runtime code in focused modules
@@ -416,21 +613,30 @@ limits, MCP usage, recovery, cancellation, and log retention.
 | Scenario | Expected evidence |
 | --- | --- |
 | Branch inspection on a workspace other than Fleet | Correct Node/checkout result, including detached/unborn behavior, with zero Copilot worker launches. |
-| `npm run build` | Actual stdout/stderr and exit code; failure stays failure, including through the Windows shell adapter. |
+| `npm run build` | Actual stdout/stderr and exact exit code; final native failures and explicit script exits survive wrapper bookkeeping. |
 | Target preparation / permission pending, denied, or expired | Only fixed preparation metadata checks may run; no submitted command process or checkout lease is created. |
 | Approval payload/target changes | Old approval cannot authorize the changed command, shell, limits, path, or generation. |
 | Ownership/authentication | A different lead, worker token, revoked task, browser-origin MCP call, or unsupported/legacy connection cannot execute/read/cancel outside its authority. |
-| Idempotent retries | Repeated MCP requests and start frames create no second process; changed payload with the same key conflicts. |
-| Paths and shell behavior | Spaces, quotes, multiline scripts, Unicode, npm `.cmd`, and nonzero native exits behave according to the advertised shell. |
-| Descendants | Timeout, cancel, shutdown, and natural parent exit leave no untracked descendants; unverifiable ownership preserves the lease and surfaces reconciliation. |
-| Concurrent checkout usage | No command starts over a live worker/admin lease; task work targets its actual worktree, not a same-named source placement or an alias that bypasses binding checks. |
-| Task lifecycle | Outstanding/uncertain commands block handover, sealing/integration, cleanup, and purge; stop revokes pending starts and requests termination. |
+| Idempotent retries and expiry | Repeated requests/start frames create no second process; conflicting payloads fail; retry after verbose history removal still cannot turn an old key into new work. |
+| Cancellation launch boundary | Race cancel before/after dispatch and supervisor release; delayed starts meet durable tombstones, or report termination pending rather than false no-start. |
+| Paths and near-limit scripts | UTF-8 byte limits, near-16-KiB multiline files, Unicode paths, quoting, and nested cmd limits behave explicitly without truncation or Base64 command-line overflow. |
+| Shell/readiness policy | Missing exact edition or policy-blocked supervisor fails before submitted code; no edition substitution or execution/language-policy bypass. |
+| Native output encoding | Split UTF-8, legacy codepages, and binary/invalid bytes retain recoverable raw data with honest display-decoding indicators. |
+| Node-parent death (R1) | Kill Node before start acknowledgment and during a silent command with grandchildren, not just the helper. Supervisor independently bounds lifetime, journals evidence, and never relaunches. |
+| Outcome versus ownership | Proven quiescence with lost outcome settles interrupted/null exit and releases the lease; unknown ownership blocks reuse. Forced cleanup is visible even with root exit zero. |
+| Bidirectional admission (R2) | Race command versus agent start/resume in both directions across unbound/read-only-labelled sessions, extra roots, junction aliases, and a second installation. Unknown old participation is refused. |
+| Coordinator continuity | Private coordinator placement stays intact; no implicit operator Stop of the requesting lead; its completion remains deliverable. |
+| Maintenance before mutation (R3) | Concurrent starts cannot slip into update/opt-out; failed quiescence prevents the first updater Git/npm mutation. Failed maintenance reopens only when safe; shutdown retains receipts after socket loss. |
+| Managed evidence policy (R4) | Reject sealed/reviewed/composed/integrating tasks. Fence eligible targets before possible writes; failures/cancellation/timeouts cannot restore stale evidence. No immutable result overwrite or source-target substitution. |
+| Task lifecycle | Outstanding/uncertain commands block handover, sealing/integration, cleanup, and purge; stop revokes pending starts without cascading away recovery evidence. |
 | Lost connection / Host restart / Node restart | Recoverable output and terminal receipts survive; uncertain launches do not rerun; restored backups do not launch historical work. |
-| Noisy output | Output/frame/global quotas hold, heartbeats remain responsive, UTF-8 is intact, and truncation is visible. |
-| Completion while lead is busy | One durable logical completion is queued and later delivered; no interrupt, log-line wake storm, or lost standalone completion. |
+| Noisy output / slow browser / full disk | Independent retained-log, transport, renderer, and aggregate quotas hold. Lifecycle reserve closes admission when unavailable; outcome watermarks and gaps remain honest. |
+| Outcome before output completion | Persist/ack terminal outcome with a final watermark, then replay delayed output; status does not falsely imply complete logs. |
+| Lead delivery races (R5) | Delay acknowledgment across multiple ticks with ordinary Run wakes and several completions; repeat after Host restart/lost ack. A persistent reservation prevents distinct deliveries from colliding; busy rejection loses nothing. |
+| Lead/execution version mismatch | An upgraded Windows execution Node with an old or non-Windows lead Node is supported only if the lead independently advertises durable delivery; otherwise reject before command execution. |
 | Browser refresh and output rendering | Approval reappears, output resumes from cursor, and malicious-looking text remains inert data. |
 | Older/disabled/non-Windows Node | Explicit unsupported/disabled status, no new protocol frame, and no connection disruption. |
-| Retention and quota pressure | Settled history expires as documented; unresolved ownership, idempotency, and unacknowledged lifecycle receipts remain protected. |
+| Retention, deletion, restore, and clocks | Tombstones/owner snapshots survive history removal; restored authority is quarantined; bounded start-time uncertainty and supervisor monotonic runtime prevent expiry extension. |
 
 Use the existing Vitest setup: protocol/controller/runner tests with deterministic
 process fixtures, UI tests for approval and replay, and real temporary-repository
@@ -448,11 +654,39 @@ No new test framework is needed.
    Expose command availability independently of Copilot session capacity.
 4. Roll back by disabling admission, cancelling/reconciling active jobs, and
    leaving history readable. Never delete journals to force a clean appearance.
-5. Follow-on work, only when needed: POSIX supervision, human command composer,
-   interactive PTYs/services, stronger OS isolation, or first-class command DAG
-   steps.
+5. Follow-on work, only when needed: PowerShell 7/direct cmd editions, POSIX
+   execution supervision, protected managed-result revision flows, human command
+   composer, interactive PTYs/services, stronger OS isolation, or command DAG steps.
 
 Review should confirm the deliberate first-release choices: Windows-first
-support, approval for every command, one active command per Node, bounded
-noninteractive execution, and no persistent shell state. These are proposed
-defaults for this plan, not settings that have already been changed.
+execution with explicit PowerShell 5.1, independent lead-delivery capability,
+approval for every command, repository-wide exclusion for opted-in targets,
+mutable-only managed tasks, one active command per Node, and no persistent shell
+state. These are proposed defaults, not settings already changed.
+
+## 14. Review disposition and evidence
+
+All six review amendments are accepted as design requirements, not claims of
+already reproduced runtime failures. Current code was checked against the review
+baseline and the subsequent UI-only commit `9c48cd3`.
+
+| Review | Disposition and source |
+| --- | --- |
+| R1 | Independent supervisor deadline, Node-parent-loss termination, suspended-release handshake, and outcome/ownership separation are release blockers. `windows-process-job.ts` (`FleetJob.Run`) currently waits indefinitely; `process-quiescence.test.ts` kills the helper rather than Node. |
+| R2 | Add shared cross-installation admission before dispatch. `CommandRouter.initializeSession` acquires managed leases only for bound sessions; `managed-worktrees.test.ts` explicitly preserves unbound concurrency. `CheckoutLocks.acquire` separates admin and checkout keys. |
+| R3 | Maintenance ownership precedes all update mutations. `main.ts` (`runSelfUpdate`) calls `updateCheckout` before shutdown; `updater.ts` mutates Git, dependencies, and build outputs first. |
+| R4 | Narrow v1 to mutable, unsealed/unreviewed tasks; reject protected targets rather than promise implicit resealing. `ManagedWorktreeService.finalizeStep` returns on `step.resultSha`; `FleetStore.putWorkspaceResult` rejects changing immutable result identity. |
+| R5 | Persist one per-lead in-flight reservation across all producers and negotiate delivery on the lead Node separately. `engine.ts` resets `promptedThisTick`; `FleetService.dispatch` generates prompt command IDs/attempts; ordinary success receipts are not durable consumption proof. |
+| R6 | One named shell edition, file transport, readiness probe, and separate script/output encoding contracts. `spawnWindowsJob` currently embeds its target command line in UTF-16LE Base64 helper text. |
+
+Official Windows contracts consulted:
+
+- [CreateProcessW command-line limit](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw):
+  32,767 characters including terminator. A 16,384-byte ASCII script expands to
+  43,692 Base64 characters after UTF-16LE encoding, before helper overhead.
+- [cmd command-line and batch expansion limits](https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/command-line-string-limitation):
+  8,191 characters; file transport does not remove per-expanded-command limits.
+- [Windows PowerShell 5.1 character encoding](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_character_encoding?view=powershell-5.1):
+  non-ASCII script files need the appropriate BOM; native output has a separate encoding contract.
+- [PowerShell language modes](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_language_modes?view=powershell-5.1):
+  application-control policy can constrain the helper; never weaken policy to advertise readiness.
