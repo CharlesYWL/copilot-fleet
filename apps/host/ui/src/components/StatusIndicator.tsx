@@ -24,6 +24,8 @@ const useStyles = makeStyles({
     fontWeight: tokens.fontWeightSemibold,
     whiteSpace: "nowrap",
   },
+  wrap: { flexShrink: 1 },
+  wrapLabel: { whiteSpace: "normal" },
   spin: {
     animationName: {
       from: { transform: "rotate(0deg)" },
@@ -50,6 +52,8 @@ export type StatusIndicatorProps = {
   descriptor: StatusDescriptor;
   /** `icon` for dense rows, `full` where there is room for the word. */
   variant?: "icon" | "full";
+  /** Allow the full label to reflow in constrained layouts. */
+  wrap?: boolean;
   className?: string;
 };
 
@@ -59,6 +63,7 @@ export type StatusIndicatorProps = {
 export const StatusIndicator = ({
   descriptor,
   variant = "full",
+  wrap = false,
   className,
 }: StatusIndicatorProps) => {
   const styles = useStyles();
@@ -69,7 +74,7 @@ export const StatusIndicator = ({
       role="img"
       aria-label={descriptor.label}
       title={descriptor.label}
-      className={mergeClasses(styles.root, className)}
+      className={mergeClasses(styles.root, wrap && styles.wrap, className)}
       style={{ color: descriptor.color }}
     >
       <span
@@ -83,7 +88,9 @@ export const StatusIndicator = ({
         <Icon />
       </span>
       {variant === "full" && (
-        <span className={styles.label}>{descriptor.shortLabel}</span>
+        <span className={mergeClasses(styles.label, wrap && styles.wrapLabel)}>
+          {descriptor.shortLabel}
+        </span>
       )}
     </span>
   );

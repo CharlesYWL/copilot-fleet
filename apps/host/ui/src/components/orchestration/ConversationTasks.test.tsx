@@ -122,6 +122,32 @@ describe("conversation tasks", () => {
     expect(getComputedStyle(card!).flexShrink).toBe("0");
   });
 
+  it.each([
+    "Extract PRs and verify each slice",
+    "ExtractPRsAndVerifyEachSlice".repeat(5),
+  ])("lets a narrow card reflow its phase and review status: %s", (phase) => {
+    show({
+      models: models([
+        run({
+          name: "Split Schema Designer POC into reviewable PRs",
+          state: "awaiting_human",
+          phases: [phase],
+        }),
+      ]),
+    });
+
+    const status = screen.getByRole("img", { name: "Needs review" });
+    const card = screen.getByRole("article");
+
+    expect(screen.getByText(phase)).toBeTruthy();
+    expect(getComputedStyle(card).minWidth).toBe("0px");
+    expect(getComputedStyle(card).overflowWrap).toBe("anywhere");
+    expect(getComputedStyle(card.firstElementChild!).flexWrap).toBe("wrap");
+    expect(getComputedStyle(status.parentElement!).maxWidth).toBe("100%");
+    expect(getComputedStyle(status).flexShrink).toBe("1");
+    expect(getComputedStyle(screen.getByText("Needs review")).whiteSpace).toBe("normal");
+  });
+
   it("filters tasks by text, status, and phase", () => {
     show({
       models: models([
