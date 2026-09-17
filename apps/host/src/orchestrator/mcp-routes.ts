@@ -16,14 +16,17 @@ import type { LeadTokenClaims, LeadTokens } from "./lead-tokens.js";
 import {
   AdvanceTaskSchema,
   CloseTaskSchema,
+  CheckpointPrMaintenanceSchema,
   DiscardTaskSchema,
   EscalateSchema,
   FleetTools,
   FollowUpSchema,
+  GetPrMaintenanceSchema,
   ListWorkSchema,
   PlanTaskSchema,
   ReopenTaskSchema,
   SessionRefSchema,
+  SetPrMaintenanceSchema,
   StartWorkSchema,
   SubmitTaskSchema,
   TaskRefSchema,
@@ -457,6 +460,45 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
   );
 
   server.registerTool(
+    "fleet_set_pr_maintenance",
+    {
+      title: "Set owned PR maintenance",
+      description:
+        "Pause an owned registration or reconcile already authorized enablement. Enablement, renewal, resume and release require the authenticated task action; this tool cannot mint operator approval or clear a design decision.",
+      inputSchema: SetPrMaintenanceSchema.shape,
+    },
+    guard("fleet_set_pr_maintenance", SetPrMaintenanceSchema, (input) =>
+      tools.setPrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
+    "fleet_get_pr_maintenance",
+    {
+      title: "Read PR maintenance and claim due work",
+      description:
+        "Read this lead's durable registrations on every wake. List bounded summaries with nextCursor, or read a complete record by recordId. takeDue claims the next persisted oldest-due visit and reserves a bounded helper request allowance for this Host-recorded turn; it does not start a worker. A lost claim stays charged. Reconcile paused or terminal work without repairs.",
+      inputSchema: GetPrMaintenanceSchema.shape,
+    },
+    guard("fleet_get_pr_maintenance", GetPrMaintenanceSchema, (input) =>
+      tools.getPrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
+    "fleet_checkpoint_pr_maintenance",
+    {
+      title: "Checkpoint PR maintenance facts",
+      description:
+        "Persist a complete or incomplete observation, exact prepared batch, per-finding/effect settlement, readiness, or reconciliation with an optimistic version. Checkpointing cannot authorize a design change, broaden scope, or transfer ownership. A worker completion is not batch settlement.",
+      inputSchema: CheckpointPrMaintenanceSchema.shape,
+    },
+    guard("fleet_checkpoint_pr_maintenance", CheckpointPrMaintenanceSchema, (input) =>
+      tools.checkpointPrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
     "fleet_follow_up",
     {
       title: "Send a worker another turn",
@@ -466,6 +508,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "Use the sessionId from fleet_list_work or fleet_get_task. A closed task must first be reopened with fleet_reopen_task.",
         "Accepted follow-ups are persisted and scheduled; queued means accepted, not failed. Repeating the same pending follow-up does not resend it; a different prompt cannot overwrite it.",
         "Busy, stopping or offline is not a reason to replace a worker. Use fleet_start_work only for genuinely different work or a confirmed non-resumable conversation.",
+        "For registered PR maintenance, supply its recordId/generation/batchId in maintenance and the byte-identical prepared prompt. Acceptance binds the same step/attempt atomically; omitted metadata cannot bypass a hold.",
       ].join(" "),
       inputSchema: FollowUpSchema.shape,
     },

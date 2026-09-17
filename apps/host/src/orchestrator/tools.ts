@@ -5,6 +5,8 @@ import {
   MANAGED_WORKTREES_CAPABILITY,
   WorkspaceModeSchema,
   AccessIntentSchema,
+  PrMaintenanceCheckpointSchema,
+  type PrMaintenanceAdmission,
   checkoutLockKey,
   type WorkspaceMode,
   isChatsWorkspace,
@@ -28,6 +30,7 @@ import { archiveRun, purgeRun } from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
+import { PrMaintenanceError } from "../pr-maintenance-store.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export const WORKER_CATEGORIES = [
@@ -381,11 +384,60 @@ export const EscalateSchema = TaskRefSchema.extend({
       "What is in the way, concretely enough for a person to act on: what you tried, what " +
         "happened, and what you would need in order to continue.",
     ),
+  maintenance: z
+    .object({
+      recordId: z.string().min(1),
+      expectedVersion: z.number().int().positive(),
+      decisionId: z.string().min(1).max(200),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Pause the whole registered PR for this stable decision. Retries preserve the existing human question.",
+    ),
 });
 
 export const FollowUpSchema = SessionRefSchema.extend({
   prompt: z.string().min(1).describe("What it should do next."),
+  maintenance: z
+    .object({
+      recordId: z.string().min(1),
+      generation: z.number().int().positive(),
+      batchId: z.string().min(1).max(200),
+    })
+    .strict()
+    .optional()
+    .describe(
+      "Link this turn to the exact prepared PR-maintenance batch. The prompt must match its persisted prompt byte for byte.",
+    ),
 });
+
+export const SetPrMaintenanceSchema = z
+  .object({
+    recordId: z.string().min(1),
+    expectedVersion: z.number().int().positive(),
+    action: z.enum(["enable", "pause", "resume", "release"]),
+    reason: z.string().min(1).max(8_192).optional(),
+  })
+  .strict();
+
+export const GetPrMaintenanceSchema = z
+  .object({
+    recordId: z.string().min(1).optional(),
+    limit: z.number().int().min(1).max(100).default(20),
+    cursor: z.string().min(1).optional(),
+    takeDue: z.boolean().default(false),
+    reserveRequests: z.number().int().min(1).max(40).optional(),
+  })
+  .strict();
+
+export const CheckpointPrMaintenanceSchema = z
+  .object({
+    recordId: z.string().min(1),
+    expectedVersion: z.number().int().positive(),
+    checkpoint: PrMaintenanceCheckpointSchema,
+  })
+  .strict();
 
 /**
  * Ending a task that is not going to be handed over.
@@ -458,6 +510,7 @@ type Continuation = {
     | "reopen_task"
     | "queued"
     | "in_flight"
+    | "wait_for_human"
     | "wait"
     | "restore_session"
     | "replace_worker"
@@ -666,6 +719,201 @@ export class FleetTools {
     return this.service.store;
   }
 
+  private maintenanceRefusal(input: PrMaintenanceAdmission): ToolResult | undefined {
+    const result = this.store.prMaintenance.admission({
+      ...input,
+      leadSessionId: this.leadSessionId,
+    });
+    if (result.allowed) return undefined;
+    return refuse(
+      `PR maintenance ${result.recordId}: ${result.reason}` +
+        (result.decisionId ? `; decision ${result.decisionId}` : "") +
+        ". Read fleet_get_pr_maintenance. Do not reopen, replace the worker, or bypass this gate.",
+    );
+  }
+
+  private maintenanceResult(action: () => unknown): ToolResult {
+    try {
+      return ok(JSON.stringify(action()));
+    } catch (error) {
+      if (error instanceof PrMaintenanceError) {
+        return refuse(`${error.code}: ${error.message}`);
+      }
+      throw error;
+    }
+  }
+
+  private requireMaintenanceVisit(recordId: string, admitOperation: boolean): string {
+    const registry = this.store.prMaintenance;
+    const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
+    if (!wakeId)
+      throw new PrMaintenanceError(
+        "wake_required",
+        "This operation needs an existing Host-recorded lead turn.",
+      );
+    const wake = registry.beginWake(this.leadSessionId, wakeId);
+    if (!wake.visitedIds.includes(recordId)) {
+      throw new PrMaintenanceError(
+        "visit_required",
+        "Claim the persisted oldest-due PR with takeDue before admitting maintenance work.",
+      );
+    }
+    const remaining = registry.remainingWake(this.leadSessionId, wakeId);
+    if (admitOperation && (!remaining.requests || !remaining.milliseconds)) {
+      throw new PrMaintenanceError(
+        "wake_exhausted",
+        "End this maintenance pass; only receipt reconciliation remains available.",
+      );
+    }
+    return wakeId;
+  }
+
+  setPrMaintenance(input: z.infer<typeof SetPrMaintenanceSchema>): ToolResult {
+    return this.maintenanceResult(() => {
+      const record = this.store.prMaintenance.set(this.leadSessionId, {
+        id: input.recordId,
+        expectedVersion: input.expectedVersion,
+        action: input.action,
+        ...(input.reason ? { reason: input.reason } : {}),
+      });
+      this.service.cancelPausedPrMaintenance();
+      return record;
+    });
+  }
+
+  getPrMaintenance(input: z.input<typeof GetPrMaintenanceSchema> = {}): ToolResult {
+    const parsed = GetPrMaintenanceSchema.parse(input);
+    return this.maintenanceResult(() => {
+      const registry = this.store.prMaintenance;
+      if (parsed.recordId) {
+        const record = registry.get(parsed.recordId, this.leadSessionId);
+        if (!record)
+          throw new PrMaintenanceError("not_found", "Maintenance record not found.");
+        if (parsed.takeDue || parsed.reserveRequests) {
+          throw new PrMaintenanceError(
+            "invalid_scan",
+            "Claim oldest-due work without a record ID.",
+          );
+        }
+        return record;
+      }
+      // The caller cannot invent a wake ID to reset the per-turn allowance.
+      const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
+      if (parsed.takeDue) {
+        if (!wakeId) {
+          throw new PrMaintenanceError(
+            "wake_required",
+            "A recorded lead turn is required to claim maintenance work.",
+          );
+        }
+        registry.beginWake(this.leadSessionId, wakeId);
+        return this.store.writeAtomically(() => {
+          const record = registry.takeDue(this.leadSessionId, wakeId);
+          const allowance = registry.remainingWake(this.leadSessionId, wakeId);
+          if (!record) return { record: null, allowance };
+          const requests = Math.min(parsed.reserveRequests ?? 8, allowance.requests);
+          registry.chargeWake(this.leadSessionId, wakeId, { requests, milliseconds: 0 });
+          return {
+            record,
+            observationAllowance: { requests, milliseconds: allowance.milliseconds },
+            allowance: registry.remainingWake(this.leadSessionId, wakeId),
+            instruction:
+              "Allowance is reserved, including lost responses. Run the bounded helper once, checkpoint its result, and do not reclaim this visit. Paused/terminal records permit reconciliation only.",
+          };
+        });
+      }
+      if (parsed.reserveRequests) {
+        throw new PrMaintenanceError("invalid_scan", "reserveRequests requires takeDue.");
+      }
+      const page = registry.list({
+        leadSessionId: this.leadSessionId,
+        limit: parsed.limit,
+        ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+      });
+      return {
+        ...page,
+        records: page.records.map((record) => ({
+          id: record.id,
+          version: record.version,
+          generation: record.generation,
+          taskId: record.taskId,
+          workerSessionId: record.workerSessionId,
+          identity: record.identity,
+          lifecycle: record.lifecycle,
+          pauseReason: record.pauseReason,
+          lastSuccessAt: record.lastSuccessAt,
+          nextCheckAt: record.nextCheckAt,
+          decision: record.decision,
+          ownershipReleasedAt: record.ownershipReleasedAt,
+          counters: record.counters,
+          pendingBatches: record.batches
+            .filter((batch) =>
+              ["prepared", "accepted", "reconciling", "uncertain"].includes(batch.state),
+            )
+            .map((batch) => ({ id: batch.id, state: batch.state })),
+        })),
+        instruction:
+          "Read a record by ID for its complete checkpoint; use takeDue for a persisted oldest-due visit and bounded helper allowance.",
+      };
+    });
+  }
+
+  checkpointPrMaintenance(
+    input: z.infer<typeof CheckpointPrMaintenanceSchema>,
+  ): ToolResult {
+    return this.maintenanceResult(() => {
+      const record = this.store.writeAtomically(() => {
+        const registry = this.store.prMaintenance;
+        if (input.checkpoint.kind === "prepare_batch") {
+          this.requireMaintenanceVisit(input.recordId, true);
+        }
+        if (
+          input.checkpoint.kind === "observation" ||
+          (input.checkpoint.kind === "action" &&
+            input.checkpoint.effect.state === "reserved")
+        ) {
+          const wakeId = this.requireMaintenanceVisit(
+            input.recordId,
+            input.checkpoint.kind === "action",
+          );
+          if (
+            input.checkpoint.kind === "action" &&
+            input.checkpoint.effect.kind !== "notification"
+          ) {
+            const effect = input.checkpoint.effect;
+            const previous = registry
+              .get(input.recordId, this.leadSessionId)
+              ?.actions.find((entry) => entry.key === effect.key);
+            const requests = effect.attempts - (previous?.attempts ?? 0);
+            if (requests > 0) {
+              if (
+                requests > registry.remainingWake(this.leadSessionId, wakeId).requests
+              ) {
+                throw new PrMaintenanceError(
+                  "wake_exhausted",
+                  "Not enough lead request allowance; end this maintenance pass.",
+                );
+              }
+              registry.chargeWake(this.leadSessionId, wakeId, {
+                requests,
+                milliseconds: 0,
+              });
+            }
+          }
+        }
+        return registry.checkpoint(
+          this.leadSessionId,
+          input.recordId,
+          input.expectedVersion,
+          input.checkpoint,
+        );
+      });
+      this.service.cancelPausedPrMaintenance();
+      this.service.publishSnapshot();
+      return record;
+    });
+  }
+
   /** Every task this orchestrator is running, newest last. */
   private runs(): Run[] {
     return this.store
@@ -796,6 +1044,10 @@ export class FleetTools {
   planTask(input: z.infer<typeof PlanTaskSchema>): ToolResult {
     const existing = this.run(input.task);
     if (existing && "ok" in existing) return existing;
+    if (existing) {
+      const held = this.maintenanceRefusal({ action: "advance", taskId: existing.id });
+      if (held) return held;
+    }
     if (existing?.state === "awaiting_human") {
       return refuse(
         `"${existing.name}" is with the person for review. Take it back with ` +
@@ -900,6 +1152,8 @@ export class FleetTools {
   advanceTask(input: z.infer<typeof AdvanceTaskSchema>): ToolResult {
     const run = this.requireTask(input.task);
     if ("ok" in run) return run;
+    const held = this.maintenanceRefusal({ action: "advance", taskId: run.id });
+    if (held) return held;
     if (terminalRunStates.has(run.state)) {
       return refuse(`"${run.name}" is already closed.`);
     }
@@ -951,6 +1205,8 @@ export class FleetTools {
   submitTask(input: z.infer<typeof SubmitTaskSchema>): ToolResult {
     const run = this.requireTask(input.task);
     if ("ok" in run) return run;
+    const held = this.maintenanceRefusal({ action: "submit", taskId: run.id });
+    if (held) return held;
     if (terminalRunStates.has(run.state)) {
       return refuse(`"${run.name}" is already closed.`);
     }
@@ -1010,6 +1266,64 @@ export class FleetTools {
   escalate(input: z.infer<typeof EscalateSchema>): ToolResult {
     const run = this.requireTask(input.task);
     if ("ok" in run) return run;
+    const registrations = this.store.prMaintenance.list({
+      taskId: run.id,
+      leadSessionId: this.leadSessionId,
+      retainedOnly: true,
+    }).records;
+    if (input.maintenance || registrations.length) {
+      return this.maintenanceResult(() => {
+        const record = input.maintenance
+          ? this.store.prMaintenance.get(input.maintenance.recordId, this.leadSessionId)
+          : registrations[0];
+        if (!record || record.taskId !== run.id) {
+          throw new PrMaintenanceError(
+            "ownership",
+            "The maintenance record must belong to this task.",
+          );
+        }
+        const headSha = record.observation?.headSha;
+        if (!headSha)
+          throw new PrMaintenanceError(
+            "head_required",
+            "Observe the PR before proposing a design decision.",
+          );
+        const held = this.store.prMaintenance.holdForDecision(
+          this.leadSessionId,
+          record.id,
+          input.maintenance?.expectedVersion ?? record.version,
+          {
+            id:
+              input.maintenance?.decisionId ??
+              record.decision?.id ??
+              `decision-${record.version}`,
+            version: 1,
+            proposal: input.reason,
+            headSha,
+            scope: record.authorization.scope.baseline,
+          },
+          () => {
+            if (terminalRunStates.has(run.state)) {
+              this.store.updateRun(run.id, { state: "running" });
+            }
+            if (
+              !this.service.requestRunReview({
+                runId: run.id,
+                note: `**PR maintenance needs a design decision.**\n\n${input.reason}\n\nUse Send back with instructions for bounded direction. Approve task does not authorize a design change.`,
+                reason: "blocked",
+              })
+            ) {
+              throw new PrMaintenanceError(
+                "review_conflict",
+                "The existing human review cannot be overwritten.",
+              );
+            }
+          },
+        );
+        this.service.cancelPausedPrMaintenance();
+        return held;
+      });
+    }
     if (terminalRunStates.has(run.state)) {
       return refuse(`"${run.name}" is already closed.`);
     }
@@ -1113,6 +1427,8 @@ export class FleetTools {
   reopenTask(input: z.infer<typeof ReopenTaskSchema>): ToolResult {
     const run = this.requireTask(input.task);
     if ("ok" in run) return run;
+    const maintenance = this.maintenanceRefusal({ action: "reopen", taskId: run.id });
+    if (maintenance) return maintenance;
     if (!terminalRunStates.has(run.state) && run.state !== "awaiting_human") {
       return refuse(
         `"${run.name}" is still open (${this.phaseLine(run)}), so there is nothing to ` +
@@ -1318,6 +1634,8 @@ export class FleetTools {
           : "This orchestrator has no task yet. Pass `task` to name one.",
       );
     }
+    const held = this.maintenanceRefusal({ action: "dispatch", taskId: run.id });
+    if (held) return held;
     if (terminalRunStates.has(run.state)) {
       return refuse(
         `The task "${run.name}" is closed. Use fleet_reopen_task (task: "${run.id}"), ` +
@@ -1350,6 +1668,12 @@ export class FleetTools {
 
     const placement = this.choosePlacement(run, input);
     if (typeof placement === "string") return refuse(placement);
+    const reserved = this.maintenanceRefusal({
+      action: "dispatch",
+      taskId: run.id,
+      placementId: placement.id,
+    });
+    if (reserved) return reserved;
 
     const stepKey = `step-${steps.length + 1}`;
     const step = this.store.upsertRunStep(run.id, {
@@ -1565,6 +1889,11 @@ export class FleetTools {
 
   private taskSummary(run: Run, steps: readonly RunStep[]): string {
     const placement = this.store.getPlacement(run.placementId);
+    const maintenance = this.store.prMaintenance.list({
+      taskId: run.id,
+      leadSessionId: this.leadSessionId,
+      retainedOnly: true,
+    });
     return [
       `task: ${JSON.stringify(run.name)} - ${run.state} - ${this.phaseLine(run)}`,
       `  task id: ${run.id}`,
@@ -1587,6 +1916,10 @@ export class FleetTools {
         ? [`  pinned checkout: ${placement.nodeName}, ${placement.localPath}`]
         : []),
       `  budget: ${steps.length}/${run.policy.maxSessions} sessions, ${run.wakeSeq}/${run.policy.maxWakes} wakes`,
+      ...maintenance.records.map(
+        (record) =>
+          `  PR maintenance: ${record.id} - ${record.lifecycle}${record.pauseReason ? ` (${record.pauseReason})` : ""}; read fleet_get_pr_maintenance before continuation.`,
+      ),
       ...(steps.length
         ? steps.map((step) => {
             const session = this.store.getSession(step.sessionId);
@@ -1612,6 +1945,21 @@ export class FleetTools {
 
   /** Shared by discovery and dispatch so their advice cannot contradict each other. */
   private continuation(run: Run, step: RunStep, session?: FleetSession): Continuation {
+    const maintenance = this.store.prMaintenance.admission({
+      action: "discover",
+      taskId: run.id,
+      ...(session ? { sessionId: session.id } : {}),
+      leadSessionId: this.leadSessionId,
+    });
+    if (!maintenance.allowed) {
+      return {
+        action:
+          maintenance.decisionId || maintenance.reason === "wait_for_human"
+            ? "wait_for_human"
+            : "wait",
+        reason: `PR maintenance ${maintenance.recordId}: ${maintenance.reason}${maintenance.decisionId ? `; decision ${maintenance.decisionId}` : ""}. Read fleet_get_pr_maintenance; do not reopen or replace the worker.`,
+      };
+    }
     if (terminalRunStates.has(run.state) || run.state === "awaiting_human") {
       return {
         action: "reopen_task",
@@ -1734,6 +2082,43 @@ export class FleetTools {
     }
     const run = this.store.getRun(step.runId);
     if (!run) return refuse("That worker's task record is no longer available.");
+    if (input.maintenance) {
+      const reference = input.maintenance;
+      const record = this.store.prMaintenance.get(reference.recordId, this.leadSessionId);
+      const batch = record?.batches.find((entry) => entry.id === reference.batchId);
+      if (
+        !record ||
+        record.taskId !== run.id ||
+        record.workerSessionId !== owned.id ||
+        record.generation !== reference.generation ||
+        !batch ||
+        batch.prompt !== input.prompt
+      ) {
+        return refuse(
+          "The maintenance generation, worker, task and exact prepared prompt must match.",
+        );
+      }
+      if (batch.state !== "prepared") {
+        return ok(
+          `Batch ${batch.id} is already ${batch.state}; no prompt was sent. Reconcile its recorded step/attempt through fleet_get_pr_maintenance.`,
+        );
+      }
+      try {
+        this.requireMaintenanceVisit(record.id, true);
+      } catch (error) {
+        if (error instanceof PrMaintenanceError)
+          return refuse(`${error.code}: ${error.message}`);
+        throw error;
+      }
+    }
+    const maintenance = this.maintenanceRefusal({
+      action: "dispatch",
+      taskId: run.id,
+      sessionId: owned.id,
+      placementId: owned.placementId,
+      ...(input.maintenance ?? {}),
+    });
+    if (maintenance) return maintenance;
     const next = this.continuation(run, step, owned);
     if (
       (next.action === "queued" || next.action === "in_flight") &&
@@ -1747,21 +2132,41 @@ export class FleetTools {
       return refuse(`${next.reason} This call did not send or overwrite a prompt.`);
     }
 
-    this.store.retryRunStepInSession(
-      run.id,
-      {
-        stepKey: step.stepKey,
-        title: step.title,
-        prompt: input.prompt,
-        category: step.category,
-        dependsOn: step.dependsOn,
-        placementId: step.placementId || owned.placementId,
-        phaseIndex: run.phaseIndex,
-        position: step.position,
-      },
-      owned.id,
-      this.store.maxEventSequence(owned.id),
-    );
+    try {
+      this.store.writeAtomically(() => {
+        this.store.retryRunStepInSession(
+          run.id,
+          {
+            stepKey: step.stepKey,
+            title: step.title,
+            prompt: input.prompt,
+            category: step.category,
+            dependsOn: step.dependsOn,
+            placementId: step.placementId || owned.placementId,
+            phaseIndex: run.phaseIndex,
+            position: step.position,
+          },
+          owned.id,
+          this.store.maxEventSequence(owned.id),
+        );
+        if (input.maintenance) {
+          const retried = this.store.getRunStep(step.id)!;
+          this.store.prMaintenance.acceptBatch(
+            this.leadSessionId,
+            input.maintenance.recordId,
+            input.maintenance.generation,
+            input.maintenance.batchId,
+            retried.id,
+            retried.attempts,
+            input.prompt,
+          );
+        }
+      });
+    } catch (error) {
+      if (error instanceof PrMaintenanceError)
+        return refuse(`${error.code}: ${error.message}`);
+      throw error;
+    }
     this.service.publishRunSteps(run.id, this.store.listRunSteps(run.id));
     this.service.tickRun(run.id);
     const retried = this.store.getRunStep(step.id);

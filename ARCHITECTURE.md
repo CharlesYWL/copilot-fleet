@@ -306,6 +306,36 @@ enrollment uses, which prefers a public tunnel, and an agent on the Host's own
 machine would have been sent out to the internet to reach a port it was already
 talking to.
 
+### Opt-in PR maintenance
+
+Maintenance is durable task continuity, not a second scheduler: the existing
+Orchestrator discovers scoped registrations through Fleet MCP, reads GitHub with
+the packaged bounded helper on an authorized Node, and dispatches the retained
+eligible worker through the existing follow-up path. Browser task actions supply
+human authorization; MCP cannot mint an operator principal or approve its own
+scope. Node credentials and provider tokens stay on their existing boundary.
+
+Registrations separately retain identity/binding, lifecycle, optimistic version,
+authorization, decisions, observations, batches, per-finding outcomes, remote
+effects and budgets. A terminal PR is not a settled batch. PR, remote head-ref and
+worker ownership remain reserved while work/effects are unsettled; active/paused
+owners are automatic-retention roots. Cleanup admission rechecks those roots.
+
+Shared maintenance admission applies to task completion/reopen, dispatch and
+queued execution, bound-session prompt/resume, and publication. Human holds are
+task/resource scoped, not lead-wide. Send back records the exact decision version
+and bounded operator direction in the same transaction as its task note/review
+transition. Generic approval/reopen never consumes a pending maintenance decision.
+Stop and archive pause first, preserving review/effect evidence; deletion cannot
+discard unsettled continuity.
+
+This is an eligible-worker pilot. Sealed/published/cleaned managed continuation,
+standalone handoff, automatic merge, paid reviewer sessions, and an independent
+provider observer remain unsupported. Helper observations and model reports are
+evidence, not transactional exactly-once remote effects or hostile-shell isolation.
+The proposed model-evaluation success thresholds remain unmeasured by deterministic
+tests.
+
 ## Browser UI
 
 Nothing renders until the Host says who is asking. `AuthGate` holds the whole

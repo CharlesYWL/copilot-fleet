@@ -36,6 +36,8 @@ export function stopSessions(
   service: FleetService,
   sessions: readonly FleetSession[],
 ): StopSessionsResult {
+  for (const session of sessions)
+    service.store.prMaintenance.pauseForSession(session.id, "Session Stop requested");
   for (const session of sessions) service.store.assertSessionMutable(session.id);
   const result: StopSessionsResult = {
     matched: sessions.length,
@@ -91,7 +93,11 @@ export function archiveRun(
   const run = store.getRun(runId);
   if (!run) return;
 
-  service.resolveRunReview(runId);
+  store.prMaintenance.pauseForTask(runId, reason);
+  const held =
+    store.prMaintenance.admission({ taskId: runId, action: "discover" }).reason ===
+    "wait_for_human";
+  if (!held) service.resolveRunReview(runId);
   if (!terminalRunStates.has(run.state)) {
     const cancelled = store.cancelRunWithUnfinishedSteps(
       runId,
@@ -129,6 +135,7 @@ export function reopenOrchestratorStoppedRun(
   ) {
     return false;
   }
+  store.prMaintenance.assertAdmission({ taskId: runId, action: "reopen" });
   const reopened = store.resumeOrchestratorStoppedRun(runId, ORCHESTRATOR_STOP_REASON);
   if (!reopened) return false;
   service.publishRun(reopened);
@@ -147,6 +154,8 @@ export function reopenOrchestratorStoppedRun(
 export function purgeRun(service: FleetService, runId: string): boolean {
   const { store } = service;
   if (!store.getRun(runId)) return false;
+  store.prMaintenance.pauseForTask(runId, "Task deletion requested");
+  store.prMaintenance.assertTaskCleanupAllowed(runId);
   store.assertWorktreePurgeAllowed(runId);
   service.resolveRunReview(runId);
   // Sessions are stopped before the rows go, because a deleted run cannot stop

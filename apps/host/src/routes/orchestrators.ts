@@ -1,4 +1,4 @@
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { z } from "zod";
 import {
   liveSessionStates,
@@ -8,12 +8,16 @@ import {
   terminalSessionStates,
   WorkspaceModeSchema,
   isChatsWorkspace,
+  PrMaintenanceEnableSchema,
+  PrMaintenanceOperatorActionSchema,
+  type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
 import { orchestratorBriefing } from "../orchestrator/briefing.js";
-import { reviewOutcome } from "../orchestrator/review.js";
+import { maintenanceDirectionPrompt, reviewOutcome } from "../orchestrator/review.js";
+import { PrMaintenanceError, prMaintenanceUnsettled } from "../pr-maintenance-store.js";
 import {
   archiveRun,
   reopenOrchestratorStoppedRun,
@@ -33,11 +37,43 @@ const CreateOrchestratorSchema = z.object({
    */
 });
 
-const ReviewSchema = z.object({
-  approved: z.boolean(),
-  /** Required when sending back: the orchestrator acts on it verbatim. */
-  note: z.string().max(4_000).optional(),
-});
+const ReviewSchema = z
+  .object({
+    approved: z.boolean(),
+    /** Required when sending back: the orchestrator acts on it verbatim. */
+    note: z.string().max(4_000).optional(),
+    maintenance: z
+      .object({
+        recordId: z.string().min(1),
+        expectedVersion: z.number().int().positive(),
+        decisionId: z.string().min(1),
+        decisionVersion: z.number().int().positive(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+
+const MaintenanceActionSchema = z.discriminatedUnion("action", [
+  z
+    .object({ action: z.literal("enable"), registration: PrMaintenanceEnableSchema })
+    .strict(),
+  z
+    .object({
+      action: z.literal("update"),
+      recordId: z.string().min(1),
+      expectedVersion: z.number().int().positive(),
+      operation: PrMaintenanceOperatorActionSchema,
+    })
+    .strict(),
+]);
+
+function maintenanceOperator(request: FastifyRequest): string | undefined {
+  const session = request.fleetSession;
+  if (request.fleetNodeId || !session || session.expiresAt <= Date.now())
+    return undefined;
+  return session.administratorId || `operator:${session.authMethod}`;
+}
 
 const CreateRunSchema = z.object({
   operationId: z.string().uuid().optional(),
@@ -93,6 +129,96 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
 ) => {
   const { store } = service;
 
+  const maintenanceForTask = (taskId: string) => {
+    const records: PrMaintenanceRegistration[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = store.prMaintenance.list({
+        taskId,
+        retainedOnly: true,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      records.push(...page.records);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return records;
+  };
+
+  app.get("/api/runs/:id/pr-maintenance", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const run = store.getRun(id);
+    if (!run) return reply.code(404).send({ error: "Task not found" });
+    const records = maintenanceForTask(id);
+    const workers = store
+      .listSessions()
+      .filter((session) => session.runId === id && session.runRole === "worker");
+    const unsupportedReason =
+      !run.leadSessionId || workers.length === 0
+        ? "Maintenance requires an existing Orchestrator-owned task worker; standalone handoff is unsupported."
+        : run.workspaceBinding?.effectiveMode === "managed" &&
+            (store.listRunSteps(id).some((step) => Boolean(step.resultSha)) ||
+              run.workspaceBinding.aggregationState !== "not_started")
+          ? "Sealed or published managed results require an explicit supported handoff; v1 cannot continue them."
+          : undefined;
+    return {
+      records,
+      canAuthorize: Boolean(maintenanceOperator(request)),
+      ...(unsupportedReason ? { unsupportedReason } : {}),
+    };
+  });
+
+  app.post("/api/runs/:id/pr-maintenance", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const run = store.getRun(id);
+    if (!run) return reply.code(404).send({ error: "Task not found" });
+    const actor = maintenanceOperator(request);
+    if (!actor)
+      return reply.code(403).send({
+        error:
+          "An authenticated browser operator must authorize maintenance; Node, MCP and no-login principals cannot.",
+      });
+    const input = MaintenanceActionSchema.parse(request.body);
+    let updated: PrMaintenanceRegistration;
+    if (input.action === "enable") {
+      if (input.registration.taskId !== id)
+        return reply
+          .code(409)
+          .send({ error: "The maintenance proposal names another task." });
+      updated = store.prMaintenance.enableFromOperator(input.registration, actor);
+    } else {
+      const record = store.prMaintenance.get(input.recordId);
+      if (!record || record.taskId !== id)
+        return reply
+          .code(404)
+          .send({ error: "Maintenance registration not found for this task." });
+      if (input.operation.action === "direction")
+        return reply.code(409).send({
+          error:
+            "Use Send back with instructions to record maintenance direction with its task review.",
+        });
+      updated = store.prMaintenance.operatorAction(
+        record.id,
+        input.expectedVersion,
+        input.operation,
+        actor,
+        () => {
+          if (input.operation.action !== "release") return;
+          store.appendRunNote(
+            id,
+            run.phaseIndex,
+            `Maintenance released by ${actor}: ${input.operation.reason}`,
+          );
+          if (record.decision?.state === "pending") service.resolveRunReview(id);
+        },
+      );
+    }
+    service.cancelPausedPrMaintenance();
+    service.publishRun(store.getRun(id)!);
+    engine.tick();
+    return updated;
+  });
+
   /**
    * Every orchestrator conversation not explicitly dismissed, newest first.
    *
@@ -122,6 +248,14 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
   const dismissalError = (sessionId: string): string | undefined => {
     const session = store.getSession(sessionId);
     if (!session || session.runRole !== "lead") return "Orchestrator not found";
+    const maintenance = store.prMaintenance.list({
+      leadSessionId: sessionId,
+      retainedOnly: true,
+      limit: 100,
+    });
+    if (maintenance.records.some(prMaintenanceUnsettled) || maintenance.nextCursor) {
+      return "Reconcile unsettled PR maintenance before dismissing its owning conversation";
+    }
     if (!terminalSessionStates.has(session.state)) {
       return "Stop the orchestrator before dismissing it";
     }
@@ -152,6 +286,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       if (candidate.id !== leadSessionId && !ownedRunIds.has(candidate.runId)) continue;
       if (!candidate.stopRequested || candidate.state !== "offline") continue;
       if (store.getNode(candidate.nodeId)?.online) continue;
+      if (store.prMaintenance.hasSessionRetentionBlockers(candidate.id)) continue;
       service.settleCommandedSession(
         candidate.id,
         "stopped",
@@ -266,10 +401,20 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     const { id } = request.params as { id: string };
     const input = ReviewSchema.parse(request.body);
     const run = store.getRun(id);
-    const outcome = reviewOutcome(run, input);
+    const held = maintenanceForTask(id).find(
+      (record) => record.decision?.state === "pending",
+    );
+    const outcome = reviewOutcome(run, input, Boolean(held));
 
     if (outcome.kind === "not_found") {
       return reply.code(404).send({ error: "Task not found" });
+    }
+    if (outcome.kind === "maintenance_direction_required") {
+      return reply.code(409).send({
+        code: "wait_for_human",
+        error:
+          "Approve task cannot authorize a maintenance design change. Use Send back with instructions for the exact decision.",
+      });
     }
     if (outcome.kind === "not_waiting") {
       return reply.code(409).send({ error: "That task is not waiting for a review" });
@@ -279,6 +424,65 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .code(400)
         .send({ error: "Say what needs changing, so the orchestrator can act on it" });
     }
+
+    if (held) {
+      const actor = maintenanceOperator(request);
+      if (!actor)
+        return reply.code(403).send({
+          error: "Maintenance direction requires an authenticated browser operator.",
+        });
+      const reference = input.maintenance;
+      if (!reference || reference.recordId !== held.id)
+        return reply.code(409).send({
+          error:
+            "Refresh the task and reference the current maintenance decision and record version.",
+        });
+      if (outcome.kind !== "send_back")
+        throw new PrMaintenanceError(
+          "wait_for_human",
+          "Maintenance needs bounded direction.",
+        );
+      const record = store.prMaintenance.operatorAction(
+        held.id,
+        reference.expectedVersion,
+        {
+          action: "direction",
+          decisionId: reference.decisionId,
+          decisionVersion: reference.decisionVersion,
+          direction: outcome.note,
+          resume: false,
+        },
+        actor,
+        () => {
+          store.appendRunNote(
+            id,
+            run!.phaseIndex,
+            `Maintenance direction (${reference.decisionId} v${reference.decisionVersion}) by ${actor}:\n\n${outcome.note}`,
+          );
+          service.resolveRunReview(id);
+          store.updateRun(id, {
+            ...(run!.state === "awaiting_human" ? { state: "running" as const } : {}),
+            pendingPrompt: maintenanceDirectionPrompt(
+              run!.name,
+              reference.decisionId,
+              outcome.note,
+            ),
+          });
+        },
+      );
+      const directed = store.getRun(id)!;
+      service.publishRun(directed);
+      engine.tick();
+      return { ok: true, run: directed, maintenance: record };
+    }
+    if (input.maintenance)
+      return reply.code(409).send({
+        error: "The displayed maintenance decision is stale; refresh before acting.",
+      });
+    store.prMaintenance.assertAdmission({
+      taskId: id,
+      action: outcome.kind === "approve" ? "approve" : "reopen",
+    });
 
     if (outcome.kind === "approve") {
       if (outcome.note) store.appendRunNote(run!.id, run!.phaseIndex, outcome.note);
@@ -467,6 +671,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
    */
   app.delete("/api/orchestrators/:id", async (request, reply) => {
     const { id } = request.params as { id: string };
+    store.prMaintenance.pauseForSession(id, "Orchestrator dismissed");
     const error = dismissalError(id);
     if (error) {
       return reply.code(error === "Orchestrator not found" ? 404 : 409).send({ error });
@@ -479,6 +684,8 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
 
   app.post("/api/orchestrators/cleanup", async (request, reply) => {
     const input = StopSessionsSchema.parse(request.body);
+    for (const id of new Set(input.sessionIds))
+      store.prMaintenance.pauseForSession(id, "Orchestrator cleanup requested");
     const error = input.sessionIds.map(dismissalError).find(Boolean);
     if (error) return reply.code(409).send({ error });
     for (const id of new Set(input.sessionIds)) {
@@ -547,6 +754,16 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         )
         .map((run) => run.id),
     );
+    const blockedRuns = [...resumableRunIds].flatMap((runId) => {
+      const admission = store.prMaintenance.admission({
+        taskId: runId,
+        action: "reopen",
+      });
+      return admission.allowed
+        ? []
+        : [{ runId, reason: admission.reason, decisionId: admission.decisionId }];
+    });
+    const heldRunIds = new Set(blockedRuns.map((entry) => entry.runId));
     const unsettledWorker = store.listSessions().find(
       (worker) =>
         ownedRunIds.has(worker.runId) &&
@@ -575,11 +792,14 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         return reply.code(resumed.status).send({ error: resumed.error });
       }
     }
-    for (const run of ownedRuns) reopenOrchestratorStoppedRun(service, run.id);
+    for (const run of ownedRuns) {
+      if (!heldRunIds.has(run.id)) reopenOrchestratorStoppedRun(service, run.id);
+    }
     engine.tick();
     return reply.code(202).send({
       ok: true,
       recovered: recoveringInterruptedResume,
+      ...(blockedRuns.length ? { blockedRuns } : {}),
     });
   });
 };

@@ -5,6 +5,7 @@ import type {
   FleetSession,
   MarkAllNotificationsReadResponse,
   Notification,
+  PrMaintenanceRegistration,
   Run,
   RunRole,
   RunStep,
@@ -507,6 +508,43 @@ export class NotificationService {
       `review:${run.id}:${run.reviewSeq}`,
     );
     return notification ? this.resolve(notification.id) : undefined;
+  }
+
+  createPrMaintenanceAttention(
+    record: PrMaintenanceRegistration,
+    reason: "paused" | "ready" | "long_pause",
+  ): InsertNotificationResult {
+    const identity =
+      reason === "ready"
+        ? record.readyFingerprint
+        : reason === "long_pause"
+          ? record.renewedAt
+          : record.pauseReason;
+    return this.insert({
+      sourceKey: `pr-maintenance:${record.id}:${record.authorization.id}:${reason}:${digest(identity ?? "")}`,
+      category: "orchestration",
+      kind: "pr_maintenance_attention",
+      severity: reason === "ready" ? "info" : "warning",
+      title:
+        reason === "ready"
+          ? "PR is ready for human merge"
+          : reason === "long_pause"
+            ? "Resume or release PR maintenance"
+            : "PR maintenance paused",
+      body:
+        reason === "ready"
+          ? "Current feedback, checks and reviews permit readiness. Fleet will not merge the PR."
+          : reason === "long_pause"
+            ? "Maintenance has been paused for 30 days. Continuity remains protected until an operator releases settled work."
+            : `Maintenance is waiting: ${record.pauseReason}. Open the task for its checkpoint and bounded recovery actions.`,
+      subject: {
+        type: "run",
+        id: record.taskId,
+        label: `PR #${record.identity.prNumber}`,
+      },
+      navigation: { type: "run", runId: record.taskId },
+      data: { recordId: record.id, reason },
+    });
   }
 
   createOrchestrationStepFailure(run: Run, step: RunStep): InsertNotificationResult {

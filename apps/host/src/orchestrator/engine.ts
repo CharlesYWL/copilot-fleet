@@ -60,6 +60,9 @@ export class OrchestratorEngine {
    * flag here rather than re-reading the log keeps the tick cheap.
    */
   handleSessionEvent(event: SessionEvent): void {
+    if (event.type === "turn_complete" || event.type === "state") {
+      this.service.reconcilePrMaintenanceExecution(event.sessionId);
+    }
     if (event.type === "turn_complete") {
       const completion = this.store.getSessionTurnCompletion(event.sessionId);
       if (completion) {
@@ -165,6 +168,7 @@ export class OrchestratorEngine {
   /** Advances every run that is not already finished. */
   tick(nowMs = Date.now()): void {
     this.service.commands.tick(nowMs);
+    this.service.cancelPausedPrMaintenance(new Date(nowMs).toISOString());
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
     for (const run of this.store.listRuns()) {
@@ -184,6 +188,11 @@ export class OrchestratorEngine {
     )
       return;
     if (run.state === "aggregating") {
+      if (
+        !this.store.prMaintenance.admission({ action: "aggregate", taskId: run.id })
+          .allowed
+      )
+        return;
       this.service.worktrees.advanceAggregation(run.id);
       return;
     }
@@ -233,7 +242,12 @@ export class OrchestratorEngine {
         completedTurns.add(session.id);
       }
     }
-    const workspaceReady = steps.length ? this.service.worktrees.ensureReady(run) : true;
+    const mayContinue = this.store.prMaintenance.admission({
+      action: "discover",
+      taskId: run.id,
+    }).allowed;
+    const workspaceReady =
+      mayContinue && (steps.length ? this.service.worktrees.ensureReady(run) : true);
     if (workspaceReady && run.workspaceBinding?.effectiveMode === "managed") {
       for (const step of steps)
         if (step.state === "pending") this.service.worktrees.ensureStepReady(run, step);
@@ -312,6 +326,17 @@ export class OrchestratorEngine {
     const placement = this.store.getPlacement(action.placementId);
     const step = this.store.getRunStep(action.stepId);
     if (!placement || !step) return false;
+    if (
+      !this.store.prMaintenance.admission({
+        action: "execute",
+        taskId: run.id,
+        placementId: placement.id,
+        ...(step.executionBinding
+          ? { checkoutKey: step.executionBinding.checkoutKey }
+          : {}),
+      }).allowed
+    )
+      return false;
     if (!canTransitionRunStep(step.state, "starting")) return false;
 
     const starting = this.store.updateRunStep(step.id, {
@@ -383,6 +408,16 @@ export class OrchestratorEngine {
     if (!step || step.state !== "pending" || !session || session.cleanupRequested) {
       return false;
     }
+    if (
+      !this.store.prMaintenance.admission({
+        action: "execute",
+        taskId: run.id,
+        sessionId: session.id,
+        placementId: session.placementId,
+        ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
+      }).allowed
+    )
+      return false;
     if (!terminalSessionStates.has(session.state)) return false;
     this.store.updateRunStep(step.id, { dispatchedAt: new Date().toISOString() });
     this.store.commands.recordStepEvidence(run.id, step.id);
@@ -409,6 +444,16 @@ export class OrchestratorEngine {
     const session = this.store.getSession(action.sessionId);
     if (!step || step.state !== "pending" || session?.state !== "idle") return false;
     if (session.stopRequested || session.dismissed || session.cleanupRequested)
+      return false;
+    if (
+      !this.store.prMaintenance.admission({
+        action: "execute",
+        taskId: run.id,
+        sessionId: session.id,
+        placementId: session.placementId,
+        ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
+      }).allowed
+    )
       return false;
 
     this.store.updateRunStep(step.id, {
@@ -444,7 +489,11 @@ export class OrchestratorEngine {
     if (action.state === "failed") {
       return this.failStep(run, step, action.output);
     }
-    if (action.state === "succeeded" && !this.service.worktrees.finalizeStep(run, step))
+    if (
+      action.state === "succeeded" &&
+      !this.store.prMaintenance.referenceForStep(step.id, step.attempts) &&
+      !this.service.worktrees.finalizeStep(run, step)
+    )
       return true;
     const settled = this.service.settleOrchestrationStep({
       runId: run.id,
@@ -610,6 +659,9 @@ export class OrchestratorEngine {
       owned.push(run);
       activeByLead.set(run.leadSessionId, owned);
     }
+    for (const leadId of this.store.prMaintenance.wakeEligibleLeadIds()) {
+      if (!activeByLead.has(leadId)) activeByLead.set(leadId, []);
+    }
 
     for (const [leadSessionId, runs] of activeByLead) {
       const lead = sessionById.get(leadSessionId);
@@ -668,10 +720,22 @@ export class OrchestratorEngine {
         continue;
       }
       this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+      const maintenance = this.store.prMaintenance.list({
+        leadSessionId: lead.id,
+        retainedOnly: true,
+        limit: 5,
+      });
       this.service.dispatch(lead.nodeId, {
         type: "prompt",
         sessionId: lead.id,
-        prompt: statusCheckEnvelope(tasks),
+        prompt: [
+          statusCheckEnvelope(tasks),
+          ...(maintenance.records.length
+            ? [
+                `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,
+              ]
+            : []),
+        ].join("\n\n"),
         attachments: [],
       });
     }
@@ -724,6 +788,11 @@ export class OrchestratorEngine {
   }
 
   private finishRun(run: Run, state: Run["state"], reason: string): boolean {
+    if (
+      state === "completed" &&
+      !this.store.prMaintenance.admission({ action: "aggregate", taskId: run.id }).allowed
+    )
+      return false;
     if (state === "completed" && run.workspaceBinding?.effectiveMode === "managed") {
       this.service.worktrees.beginAggregation(run.id);
       return true;
