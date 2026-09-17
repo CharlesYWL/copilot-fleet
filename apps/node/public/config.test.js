@@ -91,6 +91,21 @@ afterEach(() => {
 });
 
 describe("node settings form", () => {
+  it("defaults commands off and submits explicit local roots and deployment attestation as typed values", async () => {
+    await startPage();
+    expect($("remoteCommandsEnabled").checked).toBe(false);
+    expect($("commandIsolationConfirmed").checked).toBe(false);
+    $("remoteCommandsEnabled").checked = true;
+    $("commandIsolationConfirmed").checked = true;
+    type("commandExecutionRoots", "C:\\work\\one\nD:\\work\\two\n");
+    $("save").click();
+    await vi.waitFor(() => expect($("msg").textContent).toBe("Saved."));
+    expect(posted[0]).toMatchObject({
+      remoteCommandsEnabled: true,
+      commandIsolationConfirmed: true,
+      commandExecutionRoots: ["C:\\work\\one", "D:\\work\\two"],
+    });
+  });
   it("keeps what was typed instead of the value the node reports", async () => {
     await startPage();
     type("maxSessions", "24");

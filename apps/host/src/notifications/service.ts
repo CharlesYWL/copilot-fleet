@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import type {
   CreateNotification,
+  CommandExecution,
   FleetSession,
   MarkAllNotificationsReadResponse,
   Notification,
@@ -9,6 +10,7 @@ import type {
   RunStep,
   SessionState,
 } from "@fleet/protocol";
+import { terminalCommandExecutionStates } from "@fleet/protocol";
 import type {
   FleetStore,
   InsertNotificationResult,
@@ -183,6 +185,102 @@ export class NotificationService {
 
   list(input: NotificationListInput = {}): NotificationPage {
     return this.store.listNotifications(input);
+  }
+
+  /** A durable phase receipt prevents replay from resurrecting pruned notifications. */
+  syncCommandExecution(
+    execution: Pick<
+      CommandExecution,
+      | "id"
+      | "leadSessionId"
+      | "nodeId"
+      | "nodeName"
+      | "taskId"
+      | "state"
+      | "createdAt"
+      | "updatedAt"
+      | "settledAt"
+      | "ownership"
+      | "outcomeKnown"
+      | "exitCode"
+      | "descendantCleanupForced"
+    >,
+  ): void {
+    const phase = this.store.commands.notificationPhase(execution.id);
+    const awaiting = execution.state === "awaiting_approval";
+    const terminal = terminalCommandExecutionStates.has(execution.state);
+    if (phase === "completion") {
+      const approval = this.store.getNotificationBySourceKey(
+        `command_approval:${execution.id}`,
+      );
+      if (!awaiting && approval?.status === "active") this.resolve(approval.id);
+      return;
+    }
+    if (
+      (awaiting && phase === "approval") ||
+      (!awaiting && !terminal && phase !== "approval")
+    )
+      return;
+    this.commitAtomically(() => {
+      const approvalKey = `command_approval:${execution.id}`;
+      if (!awaiting) {
+        const approval = this.store.getNotificationBySourceKey(approvalKey);
+        if (approval) this.resolve(approval.id);
+      }
+      if (awaiting || terminal) {
+        const kind = awaiting ? "command_approval" : "command_completion";
+        this.insert({
+          sourceKey: `${kind}:${execution.id}`,
+          category: awaiting ? "permission" : "orchestration",
+          kind,
+          severity:
+            awaiting ||
+            execution.state === "interrupted" ||
+            execution.state === "timed_out"
+              ? "warning"
+              : execution.state === "failed"
+                ? "error"
+                : "info",
+          title: titledLabel(
+            awaiting ? "Command approval: " : `Command ${execution.state}: `,
+            execution.nodeName,
+          ),
+          body: awaiting
+            ? "Review the complete command and Node-verified target before allowing it once or denying it."
+            : "The command request has settled. Open the execution to inspect the outcome, retained output, and delivery status.",
+          subject: {
+            type: "command_execution",
+            id: execution.id,
+            label: titledLabel("Command on ", execution.nodeName),
+            parentId: execution.leadSessionId,
+            parentLabel: "Lead orchestrator",
+          },
+          navigation: { type: "command_execution", executionId: execution.id },
+          data: {
+            executionId: execution.id,
+            nodeId: execution.nodeId,
+            leadSessionId: execution.leadSessionId,
+            state: execution.state,
+            ...(execution.taskId ? { taskId: execution.taskId } : {}),
+            ...(terminal
+              ? {
+                  ownership: execution.ownership,
+                  outcomeKnown: execution.outcomeKnown,
+                  exitCode: execution.exitCode,
+                  descendantCleanupForced: execution.descendantCleanupForced,
+                }
+              : {}),
+          },
+          createdAt: awaiting
+            ? execution.updatedAt
+            : (execution.settledAt ?? execution.updatedAt),
+        });
+      }
+      this.store.commands.recordNotificationPhase(
+        execution.id,
+        awaiting ? "approval" : terminal ? "completion" : "closed",
+      );
+    });
   }
 
   effectivePreference(session: FleetSession): EffectiveSessionNotificationPreference {

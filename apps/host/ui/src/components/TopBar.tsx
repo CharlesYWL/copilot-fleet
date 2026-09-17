@@ -10,6 +10,7 @@ import {
   tokens,
 } from "@fluentui/react-components";
 import {
+  Code20Regular,
   Navigation20Regular,
   PanelLeftContract20Regular,
   PanelLeftExpand20Regular,
@@ -111,6 +112,8 @@ const useStyles = makeStyles({
     minWidth: "auto",
     ...shorthands.padding("4px", "8px"),
   },
+  commandButton: { minWidth: "auto" },
+  commandLabel: { "@media (max-width: 900px)": { display: "none" } },
   warn: { color: semanticColors.permission },
   /** The connection state is reassurance, not information; a dot is enough. */
   connection: {
@@ -196,6 +199,8 @@ type TopBarProps = {
   onDismissAllNotifications?: () => void;
   onDismissNotification?: (id: string) => void | Promise<unknown>;
   onSignOut: () => void;
+  onOpenCommandExecutions?: (() => void) | undefined;
+  commandApprovalCount?: number;
   /** Jumps to whatever needs a person, when anything does. */
   onShowAttention?: (() => void) | undefined;
   /** Only meaningful below the width where the tree becomes a drawer. */
@@ -232,6 +237,8 @@ export const TopBar = ({
   onDismissAllNotifications = () => undefined,
   onDismissNotification = () => undefined,
   onSignOut,
+  onOpenCommandExecutions,
+  commandApprovalCount = 0,
   onShowAttention,
   onToggleNav,
   navOpen = false,
@@ -339,6 +346,19 @@ export const TopBar = ({
             icon={<Warning20Regular />}
             warn={waitingPermissions > 0}
           />
+        )}
+        {onOpenCommandExecutions && (
+          <Button
+            appearance="subtle"
+            size="small"
+            className={styles.commandButton}
+            icon={<Code20Regular />}
+            onClick={onOpenCommandExecutions}
+            aria-label={`Command executions${commandApprovalCount ? `, ${commandApprovalCount} awaiting approval` : ""}`}
+          >
+            <span className={styles.commandLabel}>Commands</span>
+            {commandApprovalCount > 0 ? ` (${commandApprovalCount})` : ""}
+          </Button>
         )}
         <NotificationCenter
           notifications={[...notifications, ...(appNotifications?.notifications ?? [])]}

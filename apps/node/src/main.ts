@@ -24,6 +24,11 @@ import {
   type ArtifactTransferAck,
   type WorkspaceResult,
   WORKSPACE_ARTIFACT_CHUNK_BYTES,
+  COMMAND_EXECUTION_CAPABILITY,
+  DURABLE_LEAD_DELIVERY_CAPABILITY,
+  COMMAND_LIMITS,
+  CommandExecutionHostMessageSchema,
+  LeadPromptDeliverySchema,
 } from "@fleet/protocol";
 import { type AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
@@ -79,6 +84,14 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { ManagedWorktrees } from "./managed-worktrees.js";
+import { NodeAdmission } from "./node-admission.js";
+import { UpdateQuarantine } from "./update-quarantine.js";
+import { RepositoryParticipation } from "./repository-participation.js";
+import { CommandJournal } from "./command-journal.js";
+import { CommandExecutionManager } from "./command-execution-manager.js";
+import { nativeCommandSupervisor } from "./command-supervisor-adapter.js";
+import { LeadPromptJournal } from "./lead-prompt-delivery.js";
+import { CheckoutLocks } from "./checkout-locks.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { EventOutbox } from "./outbox.js";
 import { NODE_CAPABILITIES } from "./node-capabilities.js";
@@ -114,6 +127,8 @@ import {
 const VERSION = packageVersion();
 const REVISION = gitRevision();
 const RECONNECT_DELAY_MS = 2_000;
+const RECOVERED_COMMAND_OWNERSHIP =
+  "Recovered command ownership remains unknown; reconcile before admitting work.";
 /**
  * Dials that never reached the Host before the tunnel is assumed dead.
  *
@@ -326,6 +341,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * talking over the plain connection it authenticated with.
    */
   let sealedConnection = false;
+  let commandExecutionsNegotiated = false;
+  let leadDeliveryNegotiated = false;
   /**
    * Stops the liveness watchdog on whichever socket is current.
    *
@@ -342,6 +359,33 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
+  const admission = new NodeAdmission();
+  const updateQuarantine = new UpdateQuarantine(
+    admission,
+    configDirectory(),
+    repoRoot(),
+    REVISION,
+  );
+  const repositories = new RepositoryParticipation();
+  const journal = new CommandJournal(join(configDirectory(), "remote-commands"));
+  const leadDeliveries = new LeadPromptJournal(
+    join(configDirectory(), "lead-deliveries"),
+    (receipt, hostId) => {
+      if (
+        sealedConnection &&
+        channel &&
+        leadDeliveryNegotiated &&
+        credentials.authProtocol === MUTUAL_AUTH_PROTOCOL &&
+        credentials.host.hostId === hostId
+      )
+        return send({ type: "lead_prompt_receipt", receipt });
+      return false;
+    },
+  );
+  leadDeliveries.onFailure = (error) =>
+    admission.quarantine(
+      `Durable lead receipt journal cannot persist evidence: ${String(error)}`,
+    );
   let outboxReconciliationPending = false;
   let holdEventsForReconnectFlush = false;
   const sessionDiscovery = mockAgent
@@ -514,6 +558,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     quiesce: (id, target): Promise<void> => router.quiesceWorktree(id, target),
     uploadArtifact,
     downloadArtifact,
+    admission,
+    repositories,
     ...(process.env.FLEET_WORKTREE_ROOT ? { root: process.env.FLEET_WORKTREE_ROOT } : {}),
   });
   const router: CommandRouter = new CommandRouter(
@@ -533,6 +579,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     warn,
     {
       worktrees,
+      admission,
+      repositories,
+      leadDeliveries,
       deleteInactiveSession: async (agentSessionId, inactiveBefore, beforeDelete) => {
         if (mockAgent) {
           await beforeDelete();
@@ -546,6 +595,50 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       },
     },
   );
+
+  const commands = new CommandExecutionManager({
+    journal,
+    admission,
+    repositories,
+    supervisor: nativeCommandSupervisor,
+    connection: () => ({
+      sealed: sealedConnection && !!channel,
+      negotiated: commandExecutionsNegotiated,
+      nodeId: credentials.nodeId,
+      hostId:
+        credentials.authProtocol === MUTUAL_AUTH_PROTOCOL ? credentials.host.hostId : "",
+    }),
+    send: (message) =>
+      sealedConnection && !!channel && commandExecutionsNegotiated
+        ? send(message)
+        : false,
+    validateTarget: async (request, target) => {
+      const allowed = await Promise.all(
+        settings.commandExecutionRoots.map((path) => repositories.resolve(path)),
+      );
+      if (!allowed.some((root) => root.repository.key === target.repository.key))
+        throw new Error("This repository is not in this Node owner's enabled root list.");
+      await worktrees.validateCommandTarget(request, target);
+    },
+    locks: worktrees.locks,
+    warn,
+  });
+  await commands.recoverAll();
+  if (commands.unsettled) admission.quarantine(RECOVERED_COMMAND_OWNERSHIP);
+  if (settings.remoteCommandsEnabled) {
+    try {
+      await commands.configure(true);
+      await repositories.activate(
+        settings.commandExecutionRoots,
+        settings.commandIsolationConfirmed,
+      );
+    } catch (error) {
+      warn(`Remote commands unavailable: ${errorMessage(error)}`);
+      await commands
+        .configure(false)
+        .catch((failure: unknown) => admission.quarantine(String(failure)));
+    }
+  }
 
   /**
    * The identity this process speaks as, enrolling when it must.
@@ -602,6 +695,47 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   ): Promise<void> {
     const previous = settings;
     const settled = operatorEdit ? endpointsAfterOperatorEdit(previous, next) : next;
+    const commandPolicyChanged =
+      previous.remoteCommandsEnabled !== settled.remoteCommandsEnabled ||
+      previous.commandIsolationConfirmed !== settled.commandIsolationConfirmed ||
+      JSON.stringify(previous.commandExecutionRoots) !==
+        JSON.stringify(settled.commandExecutionRoots);
+    if (commandPolicyChanged) {
+      const reopen = admission.close("Local command policy is changing.");
+      try {
+        if (settled.remoteCommandsEnabled) {
+          admission.assertIdle();
+          if (
+            router.activeSessionIds.length ||
+            worktrees.hasUnresolvedWork ||
+            commands.unsettled ||
+            leadDeliveries.unsettled
+          )
+            throw new Error(
+              "Drain/reconcile existing Fleet work before enabling command execution.",
+            );
+          await commands.configure(true);
+          await repositories.activate(
+            settled.commandExecutionRoots,
+            settled.commandIsolationConfirmed,
+          );
+        } else {
+          // Persist local revocation before waiting for cancellation, including unknown outcomes.
+          await saveSettings(settled);
+          settings = settled;
+          await commands.configure(false);
+        }
+      } catch (error) {
+        if (settled.remoteCommandsEnabled && !previous.remoteCommandsEnabled)
+          await commands
+            .configure(false)
+            .catch((failure: unknown) => admission.quarantine(String(failure)));
+        if (commands.unsettled) admission.quarantine(String(error));
+        throw error;
+      } finally {
+        reopen();
+      }
+    }
     settings = settled;
     await saveSettings(settled);
     router.setMaxSessions(settled.maxSessions);
@@ -626,7 +760,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * both identity files, and dial the Host as that node.
    */
   async function applyBackup(archive: NodeBackup): Promise<void> {
+    const reopen = admission.close("Node identity restore is in progress.");
     const errors: unknown[] = [];
+    try {
+      await commands.restore();
+    } catch (error) {
+      errors.push(error);
+    }
     try {
       await router.stopAll();
     } catch (error) {
@@ -638,13 +778,21 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         errors.push(error);
       }
     }
-    if (errors.length)
+    if (errors.length) {
+      admission.quarantine(
+        "Backup restore could not prove all process ownership quiescent.",
+      );
       throw new AggregateError(
         errors,
         "Backup import aborted: sessions could not be safely stopped and quarantined.",
       );
+    }
     credentials = archive.credentials;
-    settings = SettingsSchema.parse(archive.settings);
+    settings = SettingsSchema.parse({
+      ...archive.settings,
+      remoteCommandsEnabled: false,
+      commandIsolationConfirmed: false,
+    });
     await saveCredentials(credentials);
     await saveSettings(settings);
     router.setMaxSessions(settings.maxSessions);
@@ -658,6 +806,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     log(
       `Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`,
     );
+    // Old approval namespace is permanently retired; reactivation must be a local edit.
+    reopen();
     reconnect();
   }
 
@@ -739,10 +889,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /**
    * Pulls, rebuilds and restarts this Node on the Host's instruction.
    *
-   * The build runs before anything is torn down, so a checkout that fails to
-   * compile leaves the machine exactly as it was — connected and running the
-   * code it already had — instead of exiting into a broken tree that nobody is
-   * there to fix.
+   * Admission closes before mutations. Failed mutations persist a quarantine;
+   * an explicit retry rebuilds even if Git already reached the target revision.
    */
   async function runSelfUpdate(updateId: string): Promise<void> {
     if (updating) {
@@ -750,23 +898,72 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       return;
     }
     updating = true;
+    const reopen = admission.close("Node self-update is in progress.");
+    let maintenanceLeases: Awaited<ReturnType<RepositoryParticipation["acquire"]>> = [];
     const root = repoRoot();
     log(`Self-update requested; using checkout ${root}`);
     try {
+      const forceRebuild = updateQuarantine.prepareRetry();
+      admission.assertIdle();
+      if (
+        router.activeSessionIds.length ||
+        worktrees.hasUnresolvedWork ||
+        commands.unsettled ||
+        leadDeliveries.unsettled
+      )
+        throw new Error(
+          "Self-update refused: active or unknown Fleet work must be drained before Git or npm mutation.",
+        );
+      const target = await repositories.resolve(root);
+      maintenanceLeases = await repositories.acquire(
+        [target],
+        "node-self-update",
+        "exclusive",
+        false,
+        true,
+      );
+      if (target.checkout && target.repository) {
+        const locks = worktrees.locks ?? new CheckoutLocks();
+        locks.bindScope(target.checkout, target.git ? target.repository : undefined);
+        if (target.git) {
+          locks.bindScope(target.repository, target.repository);
+          maintenanceLeases.push(
+            locks.acquire(target.repository, {
+              owner: "node-self-update",
+              attempt: updateId,
+              kind: "admin",
+            }),
+          );
+        }
+        maintenanceLeases.push(
+          locks.acquire(target.checkout, {
+            owner: "node-self-update",
+            attempt: updateId,
+            kind: "maintenance",
+          }),
+        );
+      }
       const outcome = await updateCheckout({
         repoRoot: root,
         runningRevision: REVISION,
         report,
+        beforeMutation: () => updateQuarantine.beforeMutation(),
+        forceRebuild,
       });
+      // process.exit does not run finally; retire durable maintenance locks before restart.
+      for (const lease of [...maintenanceLeases].reverse()) lease.release();
+      maintenanceLeases = [];
       if (outcome.action === "failed") {
         report("failed", outcome.reason);
         return;
       }
       if (outcome.action === "none") {
+        updateQuarantine.clear();
         log(`Self-update: ${outcome.reason}`);
         report("up_to_date", outcome.reason);
         return;
       }
+      updateQuarantine.built(outcome.revision);
       log(`Updated to ${outcome.revision}; restarting`);
       const supervised = restartHandledBySupervisor(env);
       if (restartWouldRaceAWatcher(env)) {
@@ -831,6 +1028,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // Once shutdown has closed the listeners, staying alive cannot recover.
       if (shuttingDown) throw error;
     } finally {
+      for (const lease of maintenanceLeases.reverse()) lease.release();
+      updateQuarantine.restoreBlock();
+      if (!shuttingDown) reopen();
       updating = false;
     }
 
@@ -864,6 +1064,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       connected: socket?.readyState === WebSocket.OPEN,
       activeSessions: router.activeSessionIds.length,
       mockAgent,
+      commandExecution: commands.readiness,
       ...(devTunnelId
         ? { devTunnel: { id: devTunnelId, url: devTunnel?.url ?? "" } }
         : {}),
@@ -935,12 +1136,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     socket = active;
     channel = undefined;
     sealedConnection = session !== undefined;
+    commandExecutionsNegotiated = false;
+    leadDeliveryNegotiated = false;
     // Registered before the close handler below so the watchdog is gone before
     // anything decides what to do about the disconnection.
     active.once("close", () => {
       if (socket === active) {
         releaseLiveness();
         channel = undefined;
+        commandExecutionsNegotiated = false;
+        leadDeliveryNegotiated = false;
       }
     });
 
@@ -958,7 +1163,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         arch: arch(),
         version: VERSION,
         revision: REVISION,
-        capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
+        capabilities: [
+          ...NODE_CAPABILITIES,
+          mockAgent ? "mock" : "real",
+          ...(session ? [DURABLE_LEAD_DELIVERY_CAPABILITY] : []),
+          // Receipt reconciliation remains available after local opt-out or readiness failure.
+          ...(session ? [COMMAND_EXECUTION_CAPABILITY] : []),
+        ],
+        ...(session ? { commandExecution: commands.readiness } : {}),
         agents: advertisedAgents,
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
@@ -1044,8 +1256,15 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       if (frame.value.type === "welcome") {
         welcomed = true;
         acknowledgeOutbox = frame.value.acknowledgeOutbox;
+        commandExecutionsNegotiated =
+          !!session && !!channel && frame.value.commandExecutions;
+        leadDeliveryNegotiated =
+          !!session && !!channel && frame.value.durableLeadDelivery;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
+        if (commandExecutionsNegotiated) commands.inventory();
+        if (leadDeliveryNegotiated && credentials.authProtocol === MUTUAL_AUTH_PROTOCOL)
+          leadDeliveries.replay(credentials.host.hostId);
         if (holdEventsForReconnectFlush) {
           if (acknowledgeOutbox && !frame.value.reconcileAfterOutbox) {
             errorLog(
@@ -1057,6 +1276,41 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           flushOutbox(active, frame.value.reconcileAfterOutbox, acknowledgeOutbox);
         } else {
           void router.refreshMcpSessions();
+        }
+        return;
+      }
+      const executionFrame = CommandExecutionHostMessageSchema.safeParse(frame.value);
+      if (executionFrame.success) {
+        try {
+          if (!welcomed || !session || !channel)
+            throw new Error(
+              "Remote execution/delivery requires a welcomed sealed connection.",
+            );
+          if (executionFrame.data.type === "deliver_lead_prompt") {
+            if (
+              !leadDeliveryNegotiated ||
+              credentials.authProtocol !== MUTUAL_AUTH_PROTOCOL
+            )
+              throw new Error("Durable lead delivery was not negotiated.");
+            // Refuse unknown delivery fields rather than silently discarding future prompt content.
+            const rawDelivery = (JSON.parse(plaintext) as { delivery: unknown }).delivery;
+            const delivery = LeadPromptDeliverySchema.strict().safeParse(rawDelivery);
+            if (!delivery.success) {
+              router.rejectLeadPrompt(
+                credentials.host.hostId,
+                executionFrame.data.delivery,
+                "Unsupported durable delivery fields; upgrade both peers or send a new supported delivery.",
+              );
+              return;
+            }
+            await router.deliverLeadPrompt(credentials.host.hostId, delivery.data);
+          } else {
+            if (!commandExecutionsNegotiated)
+              throw new Error("Command execution was not negotiated.");
+            await commands.handle(executionFrame.data);
+          }
+        } catch (error) {
+          warn(`Execution message refused: ${errorMessage(error)}`);
         }
         return;
       }
@@ -1277,6 +1531,15 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     if (socket !== target || target.readyState !== WebSocket.OPEN) return false;
     if (sealedConnection && !channel) return false;
     const payload = JSON.stringify(NodeToHostMessageSchema.parse(message));
+    if (
+      (message.type.startsWith("command_execution_") ||
+        message.type === "lead_prompt_receipt") &&
+      target.bufferedAmount + Buffer.byteLength(payload) * 2 + 2048 >
+        (message.type === "command_execution_output"
+          ? COMMAND_LIMITS.queueBytes * 0.75
+          : COMMAND_LIMITS.queueBytes)
+    )
+      return false;
     target.send(channel ? JSON.stringify(channel.seal(payload)) : payload);
     return true;
   }
@@ -1372,7 +1635,30 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   connect();
 
   const health = startHealthSampler(errorLog);
+  let recovering = false;
+  let recovery: Promise<void> | undefined;
+  let journalsClosed = false;
   const heartbeatTimer = setInterval(() => {
+    if (commands.unsettled && !recovering) {
+      recovering = true;
+      recovery = commands
+        .recoverAll()
+        .then(() => {
+          if (!commands.unsettled && admission.reason === RECOVERED_COMMAND_OWNERSHIP) {
+            admission.reconcileQuarantine(RECOVERED_COMMAND_OWNERSHIP);
+            if (!shuttingDown) reconnect();
+          }
+        })
+        .catch((error: unknown) =>
+          warn(`Command recovery remains blocked: ${String(error)}`),
+        )
+        .finally(() => {
+          recovering = false;
+        });
+    }
+    commands.flush();
+    if (credentials.authProtocol === MUTUAL_AUTH_PROTOCOL)
+      leadDeliveries.flush(credentials.host.hostId);
     send({
       type: "heartbeat",
       activeSessionIds: router.activeSessionIds,
@@ -1384,7 +1670,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   heartbeatTimer.unref();
 
   async function shutdown(): Promise<void> {
+    if (journalsClosed) return;
     shuttingDown = true;
+    admission.close("Node shutdown is in progress.");
     if (reconnectTimer) clearTimeout(reconnectTimer);
     // An unref'd timer does not hold the loop open, but it does keep firing while
     // the process winds down, which resurrects a socket we are trying to close.
@@ -1395,6 +1683,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         () => health.stop(),
         () => releaseLiveness(),
         () => configServer.close(),
+        () => recovery,
+        () => commands.cancelAll("Node shutdown requested."),
         () => socket?.close(),
         () => router.stopAll(),
       ]) {
@@ -1410,6 +1700,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       } catch (error) {
         errors.push(error);
       }
+    }
+    if (!errors.length && !journalsClosed) {
+      journal.close();
+      leadDeliveries.close();
+      journalsClosed = true;
     }
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1)

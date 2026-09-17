@@ -73,6 +73,7 @@ import { TerminalView } from "./components/TerminalView";
 import { TopBar } from "./components/TopBar";
 import { LifecycleNotificationControl } from "./components/LifecycleNotificationControl";
 import { OnboardingTour } from "./components/OnboardingTour";
+import { CommandExecutionsDialog } from "./components/CommandExecutionsDialog";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
@@ -227,6 +228,7 @@ export function App() {
     snapshot,
     liveNotificationUpdates,
     events,
+    commandOutput,
     runSteps,
     runNotes,
     connected,
@@ -258,6 +260,10 @@ export function App() {
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [orchestrationDialogOpen, setOrchestrationDialogOpen] = useState(false);
+  const [commandPanel, setCommandPanel] = useState<{
+    executionId?: string;
+    leadSessionId?: string;
+  }>();
   const [bulkStopScope, setBulkStopScope] = useState<
     { kind: "all" } | { kind: "orchestrator"; sessionId: string }
   >();
@@ -701,6 +707,10 @@ export function App() {
         snapshot.sessions,
         orchestratorRuns,
       );
+      if (target.kind === "command_execution") {
+        setCommandPanel({ executionId: target.executionId });
+        return;
+      }
       if (target.kind === "session") {
         if (target.returnRunId) {
           setSelectedRunId(target.returnRunId);
@@ -1057,6 +1067,12 @@ export function App() {
           onDismissAllNotifications={() => void dismissAllNotifications()}
           onDismissNotification={dismissNotification}
           onSignOut={() => void signOut()}
+          onOpenCommandExecutions={() => setCommandPanel({})}
+          commandApprovalCount={
+            (snapshot.commandExecutions ?? []).filter(
+              (execution) => execution.state === "awaiting_approval",
+            ).length
+          }
           onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}
           navOpen={navOpen}
           onToggleNavCollapsed={view === "overview" ? undefined : () => setNavCollapsed()}
@@ -1072,6 +1088,16 @@ export function App() {
                 : undefined
           }
         />
+        {commandPanel && (
+          <CommandExecutionsDialog
+            executions={snapshot.commandExecutions ?? []}
+            output={commandOutput}
+            connected={connected}
+            initialExecutionId={commandPanel.executionId}
+            leadSessionId={commandPanel.leadSessionId}
+            onClose={() => setCommandPanel(undefined)}
+          />
+        )}
         <div className={styles.body}>
           {view === "overview" ? (
             <SessionGrid
@@ -1179,6 +1205,14 @@ export function App() {
                       handleSelectSession(sessionId, { kind: "orchestrator" })
                     }
                     onNewRun={() => setOrchestrationDialogOpen(true)}
+                    onOpenCommands={() =>
+                      setCommandPanel({ leadSessionId: orchestrator.id })
+                    }
+                    commandExecutionCount={
+                      (snapshot.commandExecutions ?? []).filter(
+                        (execution) => execution.leadSessionId === orchestrator.id,
+                      ).length
+                    }
                     activeAgentCount={orchestratorAgentCount}
                     onStopAgents={() =>
                       setBulkStopScope({

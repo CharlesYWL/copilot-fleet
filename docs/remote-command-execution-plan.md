@@ -1,13 +1,15 @@
 # Approved remote command execution
 
-Status: Review-amended implementation plan; feasibility gates remain open.
+Status: Implemented and validated locally; disabled by default, not deployed.
 Date: 2026-09-16
 Repository: copilot-fleet
 Review baseline: `80a01c02a6990fcfde4b93abf3109b430ac7ed3c`.
 
-This revision incorporates the source-checked Opus feedback R1-R6. It changes the
-plan only: no execution feature, supervision guarantee, or migration described
-below has been implemented or experimentally proven by this document.
+This revision incorporates the source-checked Opus feedback R1-R6. The local
+implementation now includes the command runner, approval UI, durable delivery,
+portable evidence, and recovery regressions. The sections below remain the
+design and acceptance contract; they are not a claim of deployment to existing
+Nodes or of sandboxing arbitrary code.
 
 ## 1. Outcome
 
@@ -39,7 +41,7 @@ probe or a filesystem sandbox.
 | Platform rollout | Windows execution first, after extending and proving Job Object supervision. The lead may be elsewhere, but its Node must independently support durable wake delivery. |
 | Node control | Local opt-in, default off. The Host cannot remotely turn this setting on. |
 | Admission | Every Fleet-admitted participant on an eligible repository must honor shared cross-installation exclusion, including legacy/source-placement sessions. |
-| Public API names | Proposed names in this plan; not currently implemented. |
+| Public API names | `fleet_run_command`, `fleet_get_execution`, and `fleet_cancel_execution`. |
 
 Out of scope: interactive terminals/PTYs, stdin conversations, permanent services
 such as an indefinitely running dev server, SSH, a new MCP server on every Node,
@@ -690,3 +692,38 @@ Official Windows contracts consulted:
   non-ASCII script files need the appropriate BOM; native output has a separate encoding contract.
 - [PowerShell language modes](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_language_modes?view=powershell-5.1):
   application-control policy can constrain the helper; never weaken policy to advertise readiness.
+
+## 15. Local implementation evidence (2026-09-17)
+
+This section records validation performed before the implementation review PR.
+The revised design document was pushed separately as `4585055`; neither that
+push nor publishing the implementation for review deploys it to existing Nodes.
+
+- Real Windows execution was exercised through the Host controller, operator
+  session/CSRF checks, sealed application frames, Node journal, and native
+  supervisor. The five end-to-end cases cover denial, Git branch inspection,
+  exact npm exit code/output, idempotent start, cancellation/replay, a distinct
+  lead Node, native delivery identities, existing attachments, backup/restore,
+  and local no-start refusal with a skewed Node clock.
+- Eight consecutive real cancellation/replay stress runs passed after verifying
+  actual script output before cancellation, rather than relying on a provisional
+  running announcement. The supervisor's own Windows suite also covers
+  parent loss, aliases, control-file sharing, and deadline enforcement.
+- Recovery regressions cover pre-launch interruption, immutable cancellation
+  receipts during admission unwind, retained native output replay, atomic
+  per-stream offsets, and no-start parent loss. Maintenance regressions cover
+  durable mutation quarantine and explicit rebuild/restart recovery.
+- The five integration-review findings were rechecked and closed. Git
+  administration-directory admission and native storage-footprint checks have
+  additional targeted coverage.
+- Repository type-checking, lint, and production builds passed. The complete
+  regression run reported 3,539 passed, three skipped, and one failure in an
+  unchanged `TunnelPanel` notification-timing test. All ten tests in that UI file
+  passed when rerun in isolation; no unrelated product code was changed for it.
+- Late recovery refinements were independently rechecked with 83 targeted
+  manager, recovery, maintenance, runtime, and real end-to-end tests, all passing.
+  Type-checking and lint passed again, and the local Node build was refreshed.
+
+These checks do not establish sandboxing, production deployment, or exactly-once
+model consumption. Existing fleet configuration was not enabled or replaced by
+the local fixtures.

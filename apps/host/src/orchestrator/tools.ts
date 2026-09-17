@@ -27,6 +27,7 @@ import { HANDOVER_SHAPE } from "./briefing.js";
 import { archiveRun, purgeRun } from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
+import { CommandConflict } from "../command-execution-store.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export const WORKER_CATEGORIES = [
@@ -1224,6 +1225,7 @@ export class FleetTools {
     return ok(
       [
         lines.join("\n"),
+        this.service.commands.discovery(this.leadSessionId),
         "",
         // The names above are the only place these come from, so the tool that
         // takes one says so here rather than leaving the orchestrator to guess
@@ -1237,6 +1239,59 @@ export class FleetTools {
           : []),
       ].join("\n"),
     );
+  }
+
+  runCommand(input: unknown): ToolResult {
+    return this.commandTool(() => {
+      const execution = this.service.commands.request(this.leadSessionId, input);
+      return {
+        executionId: execution.id,
+        state: execution.state,
+        status: execution.state,
+        nodeId: execution.nodeId,
+        requestedPath: execution.requestedPath,
+        nextAction: "End this turn; Fleet will notify you when the execution settles.",
+      };
+    });
+  }
+
+  getExecution(input: unknown): ToolResult {
+    return this.commandTool(() => {
+      const page = this.service.commands.read(this.leadSessionId, input);
+      if ((input as { format?: string }).format === "raw") return page;
+      let decodingLoss = false;
+      const events = page.events.map((event) => {
+        const bytes = Buffer.from(event.data, "base64");
+        try {
+          new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+        } catch {
+          decodingLoss = true;
+        }
+        return { ...event, text: bytes.toString("utf8") };
+      });
+      return {
+        ...page,
+        events,
+        encoding: "UTF-8 assumed; native programs may use other encodings",
+        decodingLoss,
+      };
+    });
+  }
+
+  cancelExecution(input: { executionId: string }): ToolResult {
+    return this.commandTool(() => ({
+      execution: this.service.commands.cancel(input.executionId, this.leadSessionId),
+    }));
+  }
+
+  private commandTool(act: () => unknown): ToolResult {
+    try {
+      return ok(JSON.stringify(act()));
+    } catch (error) {
+      if (error instanceof CommandConflict)
+        return { ok: false, text: `${error.code}: ${error.message}` };
+      throw error;
+    }
   }
 
   /**
@@ -1514,6 +1569,18 @@ export class FleetTools {
       `task: ${JSON.stringify(run.name)} - ${run.state} - ${this.phaseLine(run)}`,
       `  task id: ${run.id}`,
       `  updated: ${run.updatedAt}`,
+      `  recent command executions: ${
+        this.service.commands
+          .list({ leadSessionId: this.leadSessionId, taskId: run.id, limit: 20 })
+          .map(
+            (execution) =>
+              `${execution.id} (${execution.state}; delivery ${execution.delivery})`,
+          )
+          .join(", ") || "(none)"
+      }`,
+      ...(this.store.commands.fence(run.id)
+        ? [`  command evidence: ${JSON.stringify(this.store.commands.fence(run.id))}`]
+        : []),
       `  workspace: ${this.store.getWorkspace(run.workspaceId)?.name ?? run.workspaceId}`,
       `  objective: ${truncateMiddle(run.objective, 600)}`,
       ...(placement

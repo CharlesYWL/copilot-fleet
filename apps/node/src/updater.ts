@@ -86,6 +86,8 @@ export type UpdateOptions = {
   runningRevision?: string;
   report: UpdateReport;
   run?: RunCommand;
+  beforeMutation?: () => void | Promise<void>;
+  forceRebuild?: boolean;
 };
 
 export type UpdateOutcome =
@@ -119,6 +121,8 @@ export function updateCheckout({
   runningRevision,
   report,
   run = runCommand,
+  beforeMutation,
+  forceRebuild = false,
 }: UpdateOptions): Promise<UpdateOutcome> {
   return (async () => {
     report("checking", "Inspecting the checkout");
@@ -130,6 +134,7 @@ export function updateCheckout({
       return { action: "failed", reason: `git rev-parse: ${before.output}` };
     }
 
+    await beforeMutation?.();
     report("pulling", "git fetch --prune");
     const fetched = await run("git", ["fetch", "--prune"], repoRoot);
     if (!fetched.ok) return { action: "failed", reason: `git fetch: ${fetched.output}` };
@@ -154,6 +159,7 @@ export function updateCheckout({
     const targetRevision = after.output.trim();
     const currentRevision = runningRevision?.trim() ?? before.output.trim();
     if (
+      !forceRebuild &&
       targetRevision === before.output.trim() &&
       currentRevision &&
       targetRevision.startsWith(currentRevision)

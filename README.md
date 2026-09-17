@@ -103,6 +103,7 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [alerts, sounds, and notifications](#alerts).
 - **Coordinate multi-agent work:**
   [Orchestrator quick guide](#orchestrator-quick-guide),
+  [approved remote commands](#approved-remote-commands),
   [Runs: several sessions toward one objective](#runs-several-sessions-toward-one-objective),
   and [Chats as a destination](#chats-as-a-destination).
 - **Recover, move, back up, or troubleshoot:**
@@ -1350,6 +1351,89 @@ undone by a stale `.env` on the next start. Command-line flags outrank both.
 The listener binds to loopback only and is deliberately not exposed: anything
 that can repoint a node at a different Host can run commands on that machine.
 Reach a remote node's page over SSH port forwarding rather than binding wider.
+
+### Approved remote commands
+
+An Orchestrator can request a finite command on a Node without starting a Copilot
+worker. `fleet_run_command` prepares an exact target and returns an execution ID;
+it does **not** approve or execute the command. In the Host, **Commands** opens
+execution history and the full approval details. Review the Node, physical
+directory, exact script, shell executable, reason, and limits, then choose
+**Allow once** or **Deny**. Session/task YOLO never grants command approval.
+
+Execution is **off by default**. On each intended Windows Node's local config
+page, list **Eligible repository roots**, confirm that every Fleet installation
+using them has been upgraded and all older/untracked sessions are drained, and
+enable **Approved remote commands**. The persisted settings are
+`remoteCommandsEnabled`, `commandExecutionRoots`, and
+`commandIsolationConfirmed`; there is no Host switch or environment override
+that silently enables them. Setup checks the actual supervisor, not just whether
+PowerShell is installed, and does not weaken execution or application-control
+policy.
+
+Select a working directory, not a bare repository or a `.git` administration
+directory. Those targets are refused rather than placed in a separate exclusion
+namespace. Actual journal and native-supervisor files, as well as output rows,
+count toward admission storage limits; low free space refuses new work.
+
+The initial shell is explicitly **Windows PowerShell 5.1**
+(`windows-powershell-5.1`). Each execution has a fresh, noninteractive shell and
+a separate starting directory. Git and `npm run` work there; `cd` and variables
+do not persist to later executions. Scripts are limited to 16 KiB of UTF-8 text,
+with a five-minute default and one-hour maximum runtime. An unstarted request
+expires 30 minutes after creation. Only one command runs on a Node at a time.
+Interactive prompts, permanent dev servers, and implicit fallback to another
+shell are not supported.
+
+The existing sealed Host–Node connection carries requests and output. The Node
+hosting the Orchestrator must independently support durable completion delivery,
+even if a different Node executes the command. Use `fleet_get_execution` for
+status and additional bounded output, and `fleet_cancel_execution` to cancel.
+The Orchestrator is notified when the execution settles; it should not poll or
+start another worker merely to check progress. Retrying a request key cannot
+launch the same command again; a deliberate rerun needs a new key and approval.
+
+Eligible repository roots coordinate commands with Fleet agent processes across
+aliases, sibling worktrees, and upgraded installations. A command can therefore
+be refused while another Fleet process owns the repository, including an idle
+worker. Fleet does not silently stop the requesting lead. Managed task targets
+must be mutable and unsealed/unreviewed; protected, composing, or integrating
+results require a separately designed revision flow, not a source-checkout
+fallback.
+
+**This is trusted remote code execution, not a sandbox.** Commands run as the
+Node's OS user and may read credentials, modify files outside cwd, invoke other
+tools, or access the network. Registry locks coordinate cooperating Fleet work;
+they cannot constrain arbitrary OS processes or an older nonparticipating Node.
+Do not enable a root if that deployment prerequisite cannot be established.
+
+Output streams to the Host UI and is bounded to 10 MiB per execution, with a
+64 KiB maximum read page and separate transport/storage limits. Gap markers,
+incomplete transfer, and UTF-8 decoding assumptions are visible. **Download
+loaded raw output** preserves the bytes currently loaded in the dialog rather
+than promising a complete transcript. Commands and output may contain sensitive
+data; they are not automatically redacted or copied into global diagnostic logs.
+
+A disconnect is not proof of completion. Cancellation stays pending until
+termination is verified. An interrupted result can have known quiescence but an
+unknown exit code; unknown process ownership blocks reuse instead. Parent-Node
+loss and deadlines are enforced by the independent Windows supervisor. Remaining
+descendants are stopped when the root exits, and forced cleanup is reported rather
+than presented as ordinary success.
+
+Settled verbose history has a 30-day retention period; compact deduplication and
+unresolved ownership records outlive it. Reconnect does not rerun arbitrary
+commands. Restored execution authority is quarantined. Disabling local execution
+cancels outstanding work, and updates/restores refuse to mutate under unresolved
+ownership. See the [implementation plan](docs/remote-command-execution-plan.md)
+for the contracts, recovery boundaries, and acceptance scenarios.
+
+If a Node update fails after Git/npm mutation has begun, admission stays blocked
+and `update-incomplete.json` records the recovery requirement in the Node data
+directory. **Retry Update Node** explicitly: the retry runs installation and build
+even if Git already reached the requested revision. A failed-mutation marker
+survives restart; after a successful build, a fresh Node at the recorded repository
+and revision clears the block. Do not delete the marker to bypass a failed update.
 
 ### Following the Host to a new URL
 

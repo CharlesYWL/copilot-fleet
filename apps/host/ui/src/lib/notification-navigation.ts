@@ -1,6 +1,7 @@
 import type { FleetSession, Notification, Run, RunStep } from "@fleet/protocol";
 
 export type NotificationTarget =
+  | { kind: "command_execution"; executionId: string }
   | { kind: "fleet" }
   | { kind: "node"; nodeId: string }
   | { kind: "orchestrator" }
@@ -22,6 +23,15 @@ export function notificationTarget(
   const nodeId =
     typeof notification.data.nodeId === "string" ? notification.data.nodeId : undefined;
   const hasRun = (runId: string) => reachableRuns.some((run) => run.id === runId);
+  if (
+    notification.navigation.type === "command_execution" &&
+    notification.navigation.executionId
+  ) {
+    return {
+      kind: "command_execution",
+      executionId: notification.navigation.executionId,
+    };
+  }
   if (navigationType === "node" && nodeId) return { kind: "node", nodeId };
 
   if (

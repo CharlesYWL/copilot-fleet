@@ -91,6 +91,11 @@ textarea {
   resize: vertical;
 }
 
+input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--accent);
+}
+
 .app-shell {
   min-height: 100vh;
   display: grid;

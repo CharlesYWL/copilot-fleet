@@ -207,6 +207,55 @@
               </select>
               <span class="hint">Applies to sessions started from here on.</span>
             </label>
+            <label>
+              <span class="label">Approved remote commands</span>
+              <span
+                ><input
+                  id="remoteCommandsEnabled"
+                  name="remoteCommandsEnabled"
+                  type="checkbox"
+                />
+                Enable on this Node (default off)</span
+              >
+              <span class="hint"
+                >Trusted administrator code execution, not a sandbox. Every command still
+                requires Host approval. Disabling cancels active commands; unknown process
+                ownership keeps admission closed.</span
+              >
+            </label>
+            <label>
+              <span class="label"
+                >Eligible repository roots (one absolute path per line)</span
+              >
+              <textarea
+                id="commandExecutionRoots"
+                name="commandExecutionRoots"
+                rows="3"
+              ></textarea>
+              <span class="hint"
+                >Activation requires all existing Fleet work to be drained. All aliases
+                and sibling worktrees share exclusion across installations. Private
+                coordinator leads are not stopped automatically.</span
+              >
+            </label>
+            <label>
+              <span
+                ><input
+                  id="commandIsolationConfirmed"
+                  name="commandIsolationConfirmed"
+                  type="checkbox"
+                />
+                I confirm every Fleet installation using these roots is upgraded and all
+                older/untracked sessions are stopped and reconciled.</span
+              >
+              <span class="hint"
+                >Old installations and arbitrary OS processes cannot be excluded by Fleet
+                locks. Do not enable if that prerequisite cannot be established.
+                Repository participation remains in force after local opt-out for other
+                installations.</span
+              >
+            </label>
+            <p id="commandExecutionStatus" role="status"></p>
             <div class="full-span">
               <span class="hint" id="unsaved"></span>
               <div class="row">

@@ -1,4 +1,4 @@
-import type { NodeBackup } from "@fleet/protocol";
+import type { NodeBackup, CommandReadiness } from "@fleet/protocol";
 import type { LogEntry } from "@fleet/protocol/log-buffer";
 import type { Credentials } from "./config.js";
 import type {
@@ -19,6 +19,7 @@ export type ConfigStatus = {
   activeSessions: number;
   mockAgent: boolean;
   devTunnel?: { id: string; url: string };
+  commandExecution?: CommandReadiness;
 };
 
 export type FleetApi = {

@@ -25,6 +25,19 @@ export const SettingsSchema = z.object({
    * fallback for older Hosts and for local session discovery.
    */
   contextTier: ContextTierSchema.default("long_context"),
+  /** Local-only opt-in. No environment or Host flag can silently enable execution. */
+  remoteCommandsEnabled: z.boolean().default(false),
+  commandExecutionRoots: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(32768)
+        .refine((path) => !path.includes("\0")),
+    )
+    .max(64)
+    .default([]),
+  commandIsolationConfirmed: z.boolean().default(false),
   /**
    * Addresses this node has reached the Host on before, newest first.
    *
@@ -49,7 +62,12 @@ export const EditableSettingsSchema = SettingsSchema.omit({ knownHostUrls: true 
 export type EditableSettings = z.infer<typeof EditableSettingsSchema>;
 
 /** Changing any of these requires a fresh hello frame to take effect. */
-const RECONNECT_KEYS = ["hostUrl", "nodeName", "maxSessions"] as const;
+const RECONNECT_KEYS = [
+  "hostUrl",
+  "nodeName",
+  "maxSessions",
+  "remoteCommandsEnabled",
+] as const;
 
 export function needsReconnect(before: Settings, after: Settings): boolean {
   return RECONNECT_KEYS.some((key) => before[key] !== after[key]);

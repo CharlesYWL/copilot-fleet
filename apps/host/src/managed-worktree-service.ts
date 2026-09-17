@@ -787,6 +787,7 @@ export class ManagedWorktreeService {
   }
 
   finalizeStep(run: Run, step: RunStep): boolean {
+    this.store.commands.assertTaskUnfenced(run.id);
     if (
       run.workspaceBinding?.effectiveMode !== "managed" ||
       !isWritingCategory(step.category)
@@ -1343,6 +1344,7 @@ export class ManagedWorktreeService {
   }
 
   beginAggregation(runId: string): Run {
+    this.store.assertCommandVerification(runId);
     const run = this.store.getRun(runId);
     const binding = run?.workspaceBinding;
     if (!run || !binding || binding.effectiveMode !== "managed")
@@ -1952,6 +1954,17 @@ export class ManagedWorktreeService {
     }
   }
 
+  observeCommandTarget(
+    runId: string,
+    worktreeId: string,
+    generation: number,
+  ): Promise<WorktreeOperation> {
+    return this.requestWorkspace(runId, worktreeId, generation, {
+      kind: "observe",
+      actor: "command-reconciliation",
+    });
+  }
+
   private async requestWorkspace(
     runId: string,
     worktreeId: string,
@@ -1960,6 +1973,10 @@ export class ManagedWorktreeService {
       Pick<WorktreeOperationRequest, "kind" | "actor">,
     waitMs = 30_000,
   ): Promise<WorktreeOperation> {
+    if (!["observe", "reconcile", "quiesce"].includes(input.kind))
+      this.store.commands.assertTaskUnfenced(runId);
+    if (["integrate", "publish", "integration_preview"].includes(input.kind))
+      this.store.assertCommandVerification(runId);
     const run = this.store.getRun(runId);
     const binding = run?.workspaceBinding;
     if (!run || binding?.effectiveMode !== "managed")
@@ -2818,6 +2835,8 @@ export class ManagedWorktreeService {
   }
 
   validateSession(session: FleetSession): void {
+    if (session.runId && session.runRole !== "lead")
+      this.store.commands.assertTaskUnfenced(session.runId);
     const binding = session.executionBinding;
     const run = session.runId ? this.store.getRun(session.runId) : undefined;
     if (

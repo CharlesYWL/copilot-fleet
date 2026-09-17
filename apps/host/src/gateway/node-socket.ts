@@ -252,12 +252,17 @@ export function registerNodeGateway(
         rejectOutbox(nodeId, "node inventory identified a batch it did not advertise");
         return;
       }
+      const commandSupport = service.commands.nodeReady(nodeId, inventory);
       service.send(input.link, {
         type: "welcome",
         nodeId,
         reconcileAfterOutbox: awaitingOutboxFlush,
         acknowledgeOutbox,
+        ...(commandSupport.commandExecutions || commandSupport.durableLeadDelivery
+          ? commandSupport
+          : {}),
       });
+      service.commands.reconnect(nodeId);
       if (!awaitingOutboxFlush) {
         try {
           service.reconcile(nodeId, activeSessionIds, inventory.busySessionIds);
@@ -287,6 +292,17 @@ export function registerNodeGateway(
           return;
         }
         try {
+          if (
+            message.type.startsWith("command_execution_") ||
+            message.type === "lead_prompt_receipt"
+          ) {
+            if (!service.commands.handleNodeMessage(nodeId, message))
+              socket.close(
+                1008,
+                "Command execution receipt identity or capability mismatch",
+              );
+            return;
+          }
           if (message.type === "managed_worktree_result") {
             try {
               if (!service.worktrees.handleResult(nodeId, message.result)) {

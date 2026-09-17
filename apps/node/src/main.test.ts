@@ -1,10 +1,15 @@
 import { randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   MUTUAL_AUTH_PROTOCOL,
   OUTBOX_ACK_CAPABILITY,
   SESSION_RETENTION_CAPABILITY,
+  DURABLE_LEAD_DELIVERY_CAPABILITY,
+  COMMAND_EXECUTION_CAPABILITY,
   NodeBackupSchema,
   NODE_BACKUP_KIND,
   BACKUP_VERSION,
@@ -56,9 +61,17 @@ class TestSocket extends EventEmitter {
 }
 
 const sockets: TestSocket[] = [];
+let testConfigDirectory = "";
 let emitEvent: (event: SessionEvent) => void;
 const refreshMcpSessions = vi.fn(async () => {});
 const stopAll = vi.fn(async () => {});
+let activeSessionIds = ["session-1"];
+const remoteCommandHandle = vi.fn(async () => {});
+const commandCancelAll = vi.fn(async () => {});
+const deliverLeadPrompt = vi.fn(async () => {});
+const rejectLeadPrompt = vi.fn();
+const leadReplay = vi.fn();
+const maintenanceRelease = vi.fn();
 const quarantine = vi.fn();
 const worktreesShutdown = vi.fn(async () => {});
 const route = vi.fn<(command: NodeCommand) => Promise<CommandResult>>(
@@ -104,7 +117,7 @@ vi.mock("./health.js", () => ({
   startHealthSampler: () => ({ latest: () => sampledHealth, stop: stopHealthSampler }),
 }));
 vi.mock("./config.js", () => ({
-  configDirectory: () => process.cwd(),
+  configDirectory: () => testConfigDirectory,
   loadCredentials: vi.fn(async () => credentials),
   saveCredentials: vi.fn(),
 }));
@@ -145,12 +158,16 @@ vi.mock("./copilot-sessions.js", () => ({
 vi.mock("./router.js", () => ({
   validateWorkspacePath: vi.fn(),
   CommandRouter: class {
-    activeSessionIds = ["session-1"];
+    get activeSessionIds() {
+      return activeSessionIds;
+    }
     busySessionIds = ["session-1"];
     refreshMcpSessions = refreshMcpSessions;
     route = route;
     setMaxSessions = vi.fn();
     stopAll = stopAll;
+    deliverLeadPrompt = deliverLeadPrompt;
+    rejectLeadPrompt = rejectLeadPrompt;
     constructor(
       _factory: unknown,
       _capacity: number,
@@ -172,15 +189,57 @@ vi.mock("./managed-worktrees.js", () => ({
     shutdown = worktreesShutdown;
   },
 }));
+vi.mock("./command-journal.js", () => ({
+  CommandJournal: class {
+    close = vi.fn();
+  },
+}));
+vi.mock("./lead-prompt-delivery.js", () => ({
+  LeadPromptJournal: class {
+    replay = leadReplay;
+    flush = vi.fn();
+    close = vi.fn();
+  },
+}));
+vi.mock("./repository-participation.js", () => ({
+  RepositoryParticipation: class {
+    resolve = vi.fn(async () => ({}));
+    acquire = vi.fn(async () => [{ release: maintenanceRelease }]);
+    activate = vi.fn(async () => {});
+  },
+}));
+vi.mock("./command-execution-manager.js", () => ({
+  CommandExecutionManager: class {
+    readiness = {
+      enabled: false,
+      supported: false,
+      reason: "Disabled locally",
+      shells: [],
+      admissionVersion: 1,
+    };
+    unsettled = false;
+    recoverAll = vi.fn(async () => {});
+    configure = vi.fn(async () => {});
+    handle = remoteCommandHandle;
+    inventory = vi.fn();
+    flush = vi.fn();
+    restore = vi.fn(async () => {});
+    cancelAll = commandCancelAll;
+  },
+}));
+vi.mock("./command-supervisor-adapter.js", () => ({ nativeCommandSupervisor: {} }));
 
 beforeEach(() => {
+  testConfigDirectory = mkdtempSync(join(tmpdir(), "fleet-main-config-"));
   sockets.length = 0;
   vi.clearAllMocks();
+  activeSessionIds = ["session-1"];
 });
 
 it.each([false, true])(
   "reports failures and verifies service restart handoff (shutdown failure: %s)",
   async (failShutdown) => {
+    activeSessionIds = [];
     vi.useFakeTimers();
     vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
     vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
@@ -211,6 +270,7 @@ it.each([false, true])(
         NodeToHostMessage,
         { type: "hello" }
       >;
+      expect(hello.capabilities).not.toContain(COMMAND_EXECUTION_CAPABILITY);
       vi.mocked(updateCheckout).mockResolvedValueOnce({
         action: "failed",
         reason: "Build failed",
@@ -254,6 +314,8 @@ it.each([false, true])(
         repoRoot: expect.any(String),
         runningRevision: hello.revision,
         report: expect.any(Function),
+        beforeMutation: expect.any(Function),
+        forceRebuild: false,
       });
       expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
         type: "update_status",
@@ -263,6 +325,11 @@ it.each([false, true])(
       });
       if (failShutdown) expect(exit).not.toHaveBeenCalled();
       else expect(exit).toHaveBeenCalledExactlyOnceWith(75);
+      expect(maintenanceRelease).toHaveBeenCalledTimes(3);
+      if (!failShutdown)
+        expect(maintenanceRelease.mock.invocationCallOrder.at(-1)!).toBeLessThan(
+          exit.mock.invocationCallOrder[0]!,
+        );
       expect(respawn).not.toHaveBeenCalled();
     } finally {
       await runtime.shutdown();
@@ -277,14 +344,289 @@ afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
+  rmSync(testConfigDirectory, { recursive: true, force: true });
 });
 
-it("replays events produced during mutual authentication before refreshing MCP sessions", async () => {
+it.each([
+  [false, false],
+  [true, false],
+  [false, true],
+] as const)(
+  "replays events with independent durable lead delivery=%s and command reconciliation=%s",
+  async (deliveryEnabled, commandsEnabled) => {
+    vi.useFakeTimers();
+    vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+    vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+    vi.stubEnv("FLEET_MOCK_AGENT", "1");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const exits = process.listeners("exit");
+    const { main } = await import("./main.js");
+    const runtime = await main([]);
+    try {
+      const socket = sockets[0]!;
+      socket.readyState = TestSocket.OPEN;
+      socket.emit("open");
+      const hello = JSON.parse(socket.send.mock.calls[0]![0]) as NodeClientHello;
+      expect(hello.type).toBe("client_hello");
+
+      const event: SessionEvent = {
+        eventId: "event-1",
+        sessionId: "session-1",
+        sequence: 1,
+        type: "turn_complete",
+        payload: {},
+        createdAt: new Date().toISOString(),
+      };
+      emitEvent(event);
+      expect(socket.send).toHaveBeenCalledTimes(1);
+
+      const ephemeral = createEphemeralKeyPair();
+      const transcript = {
+        protocol: MUTUAL_AUTH_PROTOCOL,
+        hostId: credentials.host.hostId,
+        nodeId: credentials.nodeId,
+        connectionId: "connection-1",
+        hostNonce: randomBytes(32).toString("base64"),
+        nodeNonce: hello.nodeNonce,
+        hostPublicKey: hostKeys.publicKey,
+        nodePublicKey: nodeKeys.publicKey,
+        hostEphemeralPublicKey: ephemeral.publicKey,
+        nodeEphemeralPublicKey: hello.nodeEphemeralPublicKey,
+        dialedHostUrl: hello.dialedHostUrl,
+      };
+      const hostChannel = new AuthenticatedChannel({
+        keys: deriveChannelKeys({
+          privateKey: ephemeral.privateKey,
+          peerPublicKey: hello.nodeEphemeralPublicKey,
+          transcript: handshakeTranscript(CHANNEL_KEY_LABEL, transcript),
+        }),
+        binding: transcript,
+        seals: "host-to-node",
+      });
+      await socket.receive({
+        type: "host_challenge",
+        ...transcript,
+        hostFingerprint: hostKeys.fingerprint,
+        signature: signWithIdentity(
+          hostKeys.privateKey,
+          handshakeTranscript(HOST_CHALLENGE_LABEL, transcript),
+        ),
+      });
+      expect(JSON.parse(socket.send.mock.calls[1]![0]).type).toBe("node_proof");
+      const open = (index: number): NodeToHostMessage => {
+        const envelope = JSON.parse(socket.send.mock.calls[index]![0]);
+        expect(envelope.type).toBe("envelope");
+        const opened = hostChannel.open(envelope);
+        if (!opened.ok) throw new Error(opened.reason);
+        return JSON.parse(opened.plaintext) as NodeToHostMessage;
+      };
+      const ready = open(2);
+      expect(ready).toMatchObject({
+        type: "ready",
+        capabilities: expect.arrayContaining([
+          OUTBOX_ACK_CAPABILITY,
+          SESSION_RETENTION_CAPABILITY,
+          DURABLE_LEAD_DELIVERY_CAPABILITY,
+        ]),
+        pendingOutbox: true,
+        pendingOutboxCount: 1,
+        outboxFlush: { eventCount: 1 },
+      });
+      if (ready.type !== "ready" || !ready.outboxFlush) throw new Error("No outbox");
+      expect(ready.capabilities).toContain(COMMAND_EXECUTION_CAPABILITY);
+      expect(ready.commandExecution).toMatchObject({ enabled: false, supported: false });
+      const receive = (message: HostToNodeMessage) =>
+        socket.receive(hostChannel.seal(JSON.stringify(message)));
+      await receive({
+        type: "welcome",
+        nodeId: credentials.nodeId,
+        reconcileAfterOutbox: true,
+        acknowledgeOutbox: true,
+        commandExecutions: commandsEnabled,
+        durableLeadDelivery: deliveryEnabled,
+      });
+      await receive({
+        type: "deliver_lead_prompt",
+        delivery: {
+          deliveryId: "a8477b16-2993-4d19-a035-b9c8063ba6ae",
+          sessionId: "session-1",
+          prompt: "not negotiated",
+        },
+      });
+      expect(deliverLeadPrompt).toHaveBeenCalledTimes(deliveryEnabled ? 1 : 0);
+      expect(leadReplay).toHaveBeenCalledTimes(deliveryEnabled ? 1 : 0);
+      await socket.receive(
+        hostChannel.seal(
+          JSON.stringify({
+            type: "deliver_lead_prompt",
+            delivery: {
+              deliveryId: "ab477b16-2993-4d19-a035-b9c8063ba6ae",
+              sessionId: "session-1",
+              prompt: "attachment must not disappear",
+              attachments: [
+                { name: "evidence.txt", mimeType: "text/plain", data: "ZXZpZGVuY2U=" },
+              ],
+            },
+          }),
+        ),
+      );
+      expect(rejectLeadPrompt).not.toHaveBeenCalled();
+      expect(deliverLeadPrompt).toHaveBeenCalledTimes(deliveryEnabled ? 2 : 0);
+      if (deliveryEnabled)
+        expect(deliverLeadPrompt).toHaveBeenLastCalledWith(
+          credentials.host.hostId,
+          expect.objectContaining({
+            attachments: [
+              { name: "evidence.txt", mimeType: "text/plain", data: "ZXZpZGVuY2U=" },
+            ],
+          }),
+        );
+      await socket.receive(
+        hostChannel.seal(
+          JSON.stringify({
+            type: "deliver_lead_prompt",
+            delivery: {
+              deliveryId: "ac477b16-2993-4d19-a035-b9c8063ba6ae",
+              sessionId: "session-1",
+              prompt: "unknown content must not disappear",
+              unsupportedContent: "future payload",
+            },
+          }),
+        ),
+      );
+      expect(rejectLeadPrompt).toHaveBeenCalledTimes(deliveryEnabled ? 1 : 0);
+      await receive({
+        type: "reconcile_command_executions",
+        hostId: credentials.host.hostId,
+        executions: [],
+      });
+      expect(remoteCommandHandle).toHaveBeenCalledTimes(commandsEnabled ? 1 : 0);
+      expect(open(3)).toMatchObject({
+        type: "event",
+        event,
+        outboxFlush: { ...ready.outboxFlush, eventIndex: 0 },
+      });
+
+      expect(open(4)).toMatchObject({
+        type: "outbox_flushed",
+        outboxFlush: ready.outboxFlush,
+      });
+      expect(refreshMcpSessions).not.toHaveBeenCalled();
+      const later = { ...event, eventId: "event-2", sequence: 2 };
+      emitEvent(later);
+      expect(socket.send).toHaveBeenCalledTimes(5);
+      await receive({ type: "outbox_flush_ack", flushId: ready.outboxFlush.flushId });
+      expect(open(5)).toMatchObject({ type: "event", event: later });
+      const nextBatch = open(6);
+      if (nextBatch.type !== "outbox_flushed" || !nextBatch.outboxFlush) {
+        throw new Error("No subsequent outbox batch");
+      }
+      expect(nextBatch.outboxFlush.flushId).not.toBe(ready.outboxFlush.flushId);
+      expect(refreshMcpSessions).not.toHaveBeenCalled();
+      await receive({ type: "outbox_flush_ack", flushId: nextBatch.outboxFlush.flushId });
+      expect(refreshMcpSessions).toHaveBeenCalledOnce();
+
+      const heartbeatIndex = socket.send.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(open(heartbeatIndex)).toMatchObject({
+        type: "heartbeat",
+        health: sampledHealth,
+      });
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(open(heartbeatIndex + 1)).toMatchObject({
+        type: "heartbeat",
+        health: sampledHealth,
+      });
+
+      const beforeDelete = vi.fn(async () => {});
+      await routerOptions.deleteInactiveSession!(
+        "mock-session",
+        Date.now(),
+        beforeDelete,
+      );
+      expect(beforeDelete).toHaveBeenCalledOnce();
+      expect(createDiscovery).not.toHaveBeenCalled();
+      expect(deleteInactiveSession).not.toHaveBeenCalled();
+
+      const cleanup: Extract<NodeCommand, { type: "delete_session" }> = {
+        type: "delete_session",
+        commandId: "cleanup-1",
+        sessionId: "session-1",
+        agentSessionId: "mock-session",
+        inactiveBefore: new Date(Date.now() - 30 * 86_400_000).toISOString(),
+        retentionDays: 30,
+      };
+      let responseIndex = socket.send.mock.calls.length;
+      await receive({ type: "command", command: cleanup });
+      expect(open(responseIndex)).toEqual({
+        type: "session_cleanup_result",
+        commandId: "cleanup-1",
+        sessionId: "session-1",
+        ok: true,
+      });
+      route.mockResolvedValueOnce({
+        commandId: "cleanup-2",
+        ok: false,
+        fatal: false,
+        error: "session_active",
+      });
+      responseIndex = socket.send.mock.calls.length;
+      await receive({
+        type: "command",
+        command: { ...cleanup, commandId: "cleanup-2" },
+      });
+      expect(open(responseIndex)).toEqual({
+        type: "session_cleanup_result",
+        commandId: "cleanup-2",
+        sessionId: "session-1",
+        ok: false,
+        error: "session_active",
+      });
+      responseIndex = socket.send.mock.calls.length;
+      await receive({
+        type: "command",
+        command: {
+          type: "prompt",
+          commandId: "normal-prompt",
+          sessionId: "session-1",
+          prompt: "hello",
+          attachments: [],
+        },
+      });
+      expect(open(responseIndex)).toEqual({
+        type: "command_result",
+        commandId: "normal-prompt",
+        sessionId: "session-1",
+        ok: true,
+        fatal: true,
+      });
+    } finally {
+      await runtime.shutdown();
+      expect(stopHealthSampler).toHaveBeenCalledOnce();
+      for (const listener of process.listeners("exit")) {
+        if (!exits.includes(listener)) process.removeListener("exit", listener);
+      }
+    }
+  },
+);
+
+it("refuses self-update before invoking the updater with live sessions or pending admission", async () => {
   vi.useFakeTimers();
   vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
   vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
   vi.stubEnv("FLEET_MOCK_AGENT", "1");
   vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const { loadCredentials } = await import("./config.js");
+  vi.mocked(loadCredentials).mockResolvedValueOnce({
+    hostUrl: credentials.hostUrl,
+    nodeId: credentials.nodeId,
+    name: credentials.name,
+    authProtocol: "legacy-secret",
+    secret: "test-secret",
+  });
+
+  const { updateCheckout } = await import("./updater.js");
   const exits = process.listeners("exit");
   const { main } = await import("./main.js");
   const runtime = await main([]);
@@ -292,180 +634,66 @@ it("replays events produced during mutual authentication before refreshing MCP s
     const socket = sockets[0]!;
     socket.readyState = TestSocket.OPEN;
     socket.emit("open");
-    const hello = JSON.parse(socket.send.mock.calls[0]![0]) as NodeClientHello;
-    expect(hello.type).toBe("client_hello");
-
-    const event: SessionEvent = {
-      eventId: "event-1",
-      sessionId: "session-1",
-      sequence: 1,
-      type: "turn_complete",
-      payload: {},
-      createdAt: new Date().toISOString(),
-    };
-    emitEvent(event);
-    expect(socket.send).toHaveBeenCalledTimes(1);
-
-    const ephemeral = createEphemeralKeyPair();
-    const transcript = {
-      protocol: MUTUAL_AUTH_PROTOCOL,
-      hostId: credentials.host.hostId,
-      nodeId: credentials.nodeId,
-      connectionId: "connection-1",
-      hostNonce: randomBytes(32).toString("base64"),
-      nodeNonce: hello.nodeNonce,
-      hostPublicKey: hostKeys.publicKey,
-      nodePublicKey: nodeKeys.publicKey,
-      hostEphemeralPublicKey: ephemeral.publicKey,
-      nodeEphemeralPublicKey: hello.nodeEphemeralPublicKey,
-      dialedHostUrl: hello.dialedHostUrl,
-    };
-    const hostChannel = new AuthenticatedChannel({
-      keys: deriveChannelKeys({
-        privateKey: ephemeral.privateKey,
-        peerPublicKey: hello.nodeEphemeralPublicKey,
-        transcript: handshakeTranscript(CHANNEL_KEY_LABEL, transcript),
-      }),
-      binding: transcript,
-      seals: "host-to-node",
+    await socket.receive({ type: "update_node", updateId: "live" });
+    expect(updateCheckout).not.toHaveBeenCalled();
+    expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+      type: "update_status",
+      stage: "failed",
     });
-    await socket.receive({
-      type: "host_challenge",
-      ...transcript,
-      hostFingerprint: hostKeys.fingerprint,
-      signature: signWithIdentity(
-        hostKeys.privateKey,
-        handshakeTranscript(HOST_CHALLENGE_LABEL, transcript),
-      ),
-    });
-    expect(JSON.parse(socket.send.mock.calls[1]![0]).type).toBe("node_proof");
-    const open = (index: number): NodeToHostMessage => {
-      const envelope = JSON.parse(socket.send.mock.calls[index]![0]);
-      expect(envelope.type).toBe("envelope");
-      const opened = hostChannel.open(envelope);
-      if (!opened.ok) throw new Error(opened.reason);
-      return JSON.parse(opened.plaintext) as NodeToHostMessage;
-    };
-    const ready = open(2);
-    expect(ready).toMatchObject({
-      type: "ready",
-      capabilities: expect.arrayContaining([
-        OUTBOX_ACK_CAPABILITY,
-        SESSION_RETENTION_CAPABILITY,
-      ]),
-      pendingOutbox: true,
-      pendingOutboxCount: 1,
-      outboxFlush: { eventCount: 1 },
-    });
-    if (ready.type !== "ready" || !ready.outboxFlush) throw new Error("No outbox");
-    const receive = (message: HostToNodeMessage) =>
-      socket.receive(hostChannel.seal(JSON.stringify(message)));
-    await receive({
-      type: "welcome",
-      nodeId: credentials.nodeId,
-      reconcileAfterOutbox: true,
-      acknowledgeOutbox: true,
-    });
-    expect(open(3)).toMatchObject({
-      type: "event",
-      event,
-      outboxFlush: { ...ready.outboxFlush, eventIndex: 0 },
-    });
-    expect(open(4)).toMatchObject({
-      type: "outbox_flushed",
-      outboxFlush: ready.outboxFlush,
-    });
-    expect(refreshMcpSessions).not.toHaveBeenCalled();
-    const later = { ...event, eventId: "event-2", sequence: 2 };
-    emitEvent(later);
-    expect(socket.send).toHaveBeenCalledTimes(5);
-    await receive({ type: "outbox_flush_ack", flushId: ready.outboxFlush.flushId });
-    expect(open(5)).toMatchObject({ type: "event", event: later });
-    const nextBatch = open(6);
-    if (nextBatch.type !== "outbox_flushed" || !nextBatch.outboxFlush) {
-      throw new Error("No subsequent outbox batch");
-    }
-    expect(nextBatch.outboxFlush.flushId).not.toBe(ready.outboxFlush.flushId);
-    expect(refreshMcpSessions).not.toHaveBeenCalled();
-    await receive({ type: "outbox_flush_ack", flushId: nextBatch.outboxFlush.flushId });
-    expect(refreshMcpSessions).toHaveBeenCalledOnce();
-
-    const heartbeatIndex = socket.send.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(open(heartbeatIndex)).toMatchObject({
-      type: "heartbeat",
-      health: sampledHealth,
-    });
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(open(heartbeatIndex + 1)).toMatchObject({
-      type: "heartbeat",
-      health: sampledHealth,
-    });
-
-    const beforeDelete = vi.fn(async () => {});
-    await routerOptions.deleteInactiveSession!("mock-session", Date.now(), beforeDelete);
-    expect(beforeDelete).toHaveBeenCalledOnce();
-    expect(createDiscovery).not.toHaveBeenCalled();
-    expect(deleteInactiveSession).not.toHaveBeenCalled();
-
-    const cleanup: Extract<NodeCommand, { type: "delete_session" }> = {
-      type: "delete_session",
-      commandId: "cleanup-1",
-      sessionId: "session-1",
-      agentSessionId: "mock-session",
-      inactiveBefore: new Date(Date.now() - 30 * 86_400_000).toISOString(),
-      retentionDays: 30,
-    };
-    let responseIndex = socket.send.mock.calls.length;
-    await receive({ type: "command", command: cleanup });
-    expect(open(responseIndex)).toEqual({
-      type: "session_cleanup_result",
-      commandId: "cleanup-1",
-      sessionId: "session-1",
-      ok: true,
-    });
-    route.mockResolvedValueOnce({
-      commandId: "cleanup-2",
-      ok: false,
-      fatal: false,
-      error: "session_active",
-    });
-    responseIndex = socket.send.mock.calls.length;
-    await receive({
-      type: "command",
-      command: { ...cleanup, commandId: "cleanup-2" },
-    });
-    expect(open(responseIndex)).toEqual({
-      type: "session_cleanup_result",
-      commandId: "cleanup-2",
-      sessionId: "session-1",
-      ok: false,
-      error: "session_active",
-    });
-    responseIndex = socket.send.mock.calls.length;
-    await receive({
-      type: "command",
-      command: {
-        type: "prompt",
-        commandId: "normal-prompt",
-        sessionId: "session-1",
-        prompt: "hello",
-        attachments: [],
-      },
-    });
-    expect(open(responseIndex)).toEqual({
-      type: "command_result",
-      commandId: "normal-prompt",
-      sessionId: "session-1",
-      ok: true,
-      fatal: true,
-    });
+    activeSessionIds = [];
+    const pending = routerOptions.admission!.enter("session:resolving-root");
+    await socket.receive({ type: "update_node", updateId: "pending" });
+    expect(updateCheckout).not.toHaveBeenCalled();
+    pending.release();
+    expect(routerOptions.admission!.reason).toBe("");
   } finally {
     await runtime.shutdown();
-    expect(stopHealthSampler).toHaveBeenCalledOnce();
-    for (const listener of process.listeners("exit")) {
+    for (const listener of process.listeners("exit"))
       if (!exits.includes(listener)) process.removeListener("exit", listener);
-    }
+  }
+});
+
+it("keeps command admission quarantined after updater mutation failure and forces explicit retry rebuild", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  activeSessionIds = [];
+  const { loadCredentials } = await import("./config.js");
+  vi.mocked(loadCredentials).mockResolvedValueOnce({
+    hostUrl: credentials.hostUrl,
+    nodeId: credentials.nodeId,
+    name: credentials.name,
+    authProtocol: "legacy-secret",
+    secret: "fixture",
+  });
+  const { updateCheckout } = await import("./updater.js");
+  vi.mocked(updateCheckout).mockImplementation(async (options) => {
+    await options.beforeMutation?.();
+    return { action: "failed", reason: "npm install failed after reset" };
+  });
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    const socket = sockets[0]!;
+    socket.readyState = TestSocket.OPEN;
+    socket.emit("open");
+    await socket.receive({ type: "update_node", updateId: "mutating-update" });
+    expect(updateCheckout).toHaveBeenCalledOnce();
+    expect(routerOptions.admission!.reason).toContain("update is incomplete");
+    expect(() => routerOptions.admission!.enter("command:must-not-start")).toThrow();
+    await socket.receive({ type: "update_node", updateId: "explicit-retry" });
+    expect(updateCheckout).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(updateCheckout).mock.lastCall![0].forceRebuild).toBe(true);
+    expect(routerOptions.admission!.reason).toContain("update is incomplete");
+  } finally {
+    await runtime.shutdown();
+    vi.mocked(updateCheckout).mockReset();
+    for (const listener of process.listeners("exit"))
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
   }
 });
 
