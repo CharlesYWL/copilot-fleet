@@ -39,8 +39,12 @@ export function sendBackPrompt(task: string, note: string): string {
     note,
     "</fleet-review>",
     "",
-    "Act on this: dispatch the work it calls for, then end your turn.",
-    "Call fleet_submit_task again once it is addressed.",
+    "Act on this only through Fleet: dispatch a worker or fixer for the requested",
+    "change, then end your turn. Do not edit the repository, commit, create or",
+    "move a branch, push, publish, or claim publication yourself. The Host owns",
+    "integration and publication evidence.",
+    "After dispatched work settles, call fleet_submit_task again so Fleet creates",
+    "a new sealed result, integration preview, and publication approval.",
   ].join("\n");
 }
 
@@ -60,7 +64,11 @@ export function reopenPrompt(task: string, note: string): string {
     "",
     "This task was finished and has been reopened, so its notes and criteria",
     "describe work you already did. Read them before deciding anything.",
-    "Act on the above: dispatch what it calls for, then end your turn.",
-    "Call fleet_submit_task again once it is addressed.",
+    "Act on the above only through Fleet: dispatch a worker or fixer, then end your turn.",
+    "Do not edit the repository, commit, create or move a branch,",
+    "push, publish, or claim publication yourself. The Host owns integration",
+    "and publication evidence.",
+    "After dispatched work settles, call fleet_submit_task again so Fleet creates",
+    "a new sealed result, integration preview, and publication approval.",
   ].join("\n");
 }
