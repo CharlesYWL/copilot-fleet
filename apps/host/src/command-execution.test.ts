@@ -2663,6 +2663,7 @@ describe("command MCP and administrator routes", () => {
     apps.push(app);
     const auth = {
       classify: () => ({ kind: "loopback-http" }),
+      noAuthEnabled: () => false,
       audit() {},
       verifySession: (token: string) =>
         token === "test" ? { tokenHash: "test-hash" } : undefined,
