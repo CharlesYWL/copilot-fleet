@@ -349,6 +349,127 @@ describe("orchestrator lifecycle routes", () => {
     expect(store.getSession(worker.id)?.state).toBe("idle");
   });
 
+  it.each(["running", "cancelling", "offline", "idle"] as const)(
+    "resumes a failed lead without interrupting a worker in %s state",
+    async (workerState) => {
+      const { app, store, service, leadId, run, worker } = await setup();
+      store.transitionSession(worker.id, workerState);
+      service.handleEvent({
+        eventId: "lead-mcp-refresh-failed",
+        sessionId: leadId,
+        sequence: 2,
+        type: "state",
+        payload: {
+          state: "failed",
+          activity: "Copilot could not be restarted to restore MCP tools",
+        },
+        createdAt: new Date().toISOString(),
+      });
+      const originalWorker = store.getSession(worker.id);
+      const originalRun = store.getRun(run.id);
+      const originalSteps = store.listRunSteps(run.id);
+      const originalEvents = store.listEvents(leadId);
+      const dispatch = vi.spyOn(service, "dispatch");
+
+      const resumed = await app.inject({
+        method: "POST",
+        url: `/api/orchestrators/${leadId}/resume`,
+      });
+      const repeated = await app.inject({
+        method: "POST",
+        url: `/api/orchestrators/${leadId}/resume`,
+      });
+
+      expect(resumed.statusCode).toBe(202);
+      expect(resumed.json()).toMatchObject({ ok: true, recovered: false });
+      expect(repeated.statusCode).toBe(409);
+      expect(store.getSession(leadId)).toMatchObject({
+        state: "starting",
+        agentSessionId: "lead-agent-session",
+        stopRequested: false,
+      });
+      expect(store.getSession(worker.id)).toEqual(originalWorker);
+      expect(store.getRun(run.id)).toEqual(originalRun);
+      expect(store.listRunSteps(run.id)).toEqual(originalSteps);
+      expect(store.listEvents(leadId)).toEqual(originalEvents);
+      expect(dispatch).toHaveBeenCalledTimes(1);
+      expect(dispatch).toHaveBeenCalledWith(
+        store.getSession(leadId)!.nodeId,
+        expect.objectContaining({
+          type: "resume_session",
+          sessionId: leadId,
+          agentSessionId: "lead-agent-session",
+          mcpServers: [expect.objectContaining({ name: "fleet" })],
+        }),
+        expect.anything(),
+      );
+    },
+  );
+
+  it.each([
+    ["running", true],
+    ["idle", true],
+    ["offline", true],
+    ["running", false],
+    ["offline", false],
+  ] as const)(
+    "keeps Stop safeguards for worker state=%s, stopRequested=%s after the lead acknowledges",
+    async (workerState, stopRequested) => {
+      const { app, store, service, leadId, run, worker } = await setup();
+      await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+      service.handleEvent({
+        eventId: "lead-stopped-before-worker",
+        sessionId: leadId,
+        sequence: 2,
+        type: "state",
+        payload: { state: "stopped", activity: "Stopped" },
+        createdAt: new Date().toISOString(),
+      });
+      store.transitionSession(worker.id, workerState);
+      store.setSessionControls(worker.id, { stopRequested });
+      const originalSteps = store.listRunSteps(run.id);
+      const dispatch = vi.spyOn(service, "dispatch");
+
+      const resumed = await app.inject({
+        method: "POST",
+        url: `/api/orchestrators/${leadId}/resume`,
+      });
+
+      expect(resumed.statusCode).toBe(409);
+      expect(resumed.json()).toEqual({
+        error: "Wait for every node to acknowledge Stop before resuming",
+      });
+      expect(store.getSession(leadId)).toMatchObject({
+        state: "stopped",
+        stopRequested: false,
+      });
+      expect(store.getRun(run.id)?.state).toBe("cancelled");
+      expect(store.listRunSteps(run.id)).toEqual(originalSteps);
+      expect(dispatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not bypass a pending worker Stop when recovering a failed lead", async () => {
+    const { app, store, service, leadId, run, worker } = await setup();
+    store.transitionSession(leadId, "failed");
+    store.setSessionControls(worker.id, { stopRequested: true });
+    const dispatch = vi.spyOn(service, "dispatch");
+
+    const resumed = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/resume`,
+    });
+
+    expect(resumed.statusCode).toBe(409);
+    expect(resumed.json()).toEqual({
+      error: "Wait for every node to acknowledge Stop before resuming",
+    });
+    expect(store.getRun(run.id)?.state).toBe("running");
+    expect(store.getSession(leadId)?.state).toBe("failed");
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
   it("bulk stops only agents owned by the selected orchestrator", async () => {
     const { app, store, leadId, worker } = await setup();
     const lead = store.getSession(leadId)!;
@@ -588,7 +709,7 @@ describe("orchestrator lifecycle routes", () => {
   });
 
   it("finishes run reopening after a restart interrupted lead resume", async () => {
-    const { app, store, service, leadId, run, worker } = await setup();
+    const { app, store, service, leadId, run, worker, addNode } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
     service.handleEvent({
       eventId: "worker-stopped",
@@ -611,6 +732,40 @@ describe("orchestrator lifecycle routes", () => {
     expect(store.getSession(leadId)?.state).toBe("starting");
     expect(store.getRun(run.id)?.state).toBe("cancelled");
 
+    const remoteNode = addNode("remote");
+    const ongoingRun = store.createRun({
+      workspaceId: run.workspaceId,
+      name: "Already resumed",
+      objective: "keep working",
+    });
+    store.updateRun(ongoingRun.id, { leadSessionId: leadId, state: "running" });
+    const ongoingWorker = store.createSession(
+      store
+        .listPlacements()
+        .find(
+          (placement) =>
+            placement.nodeId === remoteNode.id &&
+            placement.workspaceId === run.workspaceId,
+        )!,
+      "keep working",
+      false,
+      "Remote worker",
+      { runId: ongoingRun.id, runRole: "worker" },
+    );
+    store.transitionSession(ongoingWorker.id, "starting");
+    store.transitionSession(ongoingWorker.id, "running");
+    const [ongoingStep] = store.replaceRunSteps(ongoingRun.id, [
+      { stepKey: "active", title: "Active", prompt: "keep working" },
+    ]);
+    store.updateRunStep(ongoingStep!.id, {
+      state: "running",
+      sessionId: ongoingWorker.id,
+    });
+    const originalWorker = store.getSession(ongoingWorker.id);
+    const originalRun = store.getRun(ongoingRun.id);
+    const originalSteps = store.listRunSteps(ongoingRun.id);
+    const dispatch = vi.spyOn(service, "dispatch");
+
     const recovered = await app.inject({
       method: "POST",
       url: `/api/orchestrators/${leadId}/resume`,
@@ -619,5 +774,15 @@ describe("orchestrator lifecycle routes", () => {
     expect(recovered.statusCode).toBe(202);
     expect(recovered.json()).toMatchObject({ ok: true, recovered: true });
     expect(store.getRun(run.id)?.state).toBe("running");
+    expect(store.getSession(ongoingWorker.id)).toEqual(originalWorker);
+    expect(store.getRun(ongoingRun.id)).toEqual(originalRun);
+    expect(store.listRunSteps(ongoingRun.id)).toEqual(originalSteps);
+    expect(
+      dispatch.mock.calls.some(
+        ([, command]) =>
+          "sessionId" in command &&
+          (command.sessionId === ongoingWorker.id || command.sessionId === leadId),
+      ),
+    ).toBe(false);
   });
 });

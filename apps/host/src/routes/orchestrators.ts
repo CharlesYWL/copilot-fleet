@@ -547,14 +547,15 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         )
         .map((run) => run.id),
     );
-    const unsettledWorker = store
-      .listSessions()
-      .find(
-        (worker) =>
-          ownedRunIds.has(worker.runId) &&
-          (worker.stopRequested ||
-            (!terminalSessionStates.has(worker.state) && worker.state !== "idle")),
-      );
+    const unsettledWorker = store.listSessions().find(
+      (worker) =>
+        ownedRunIds.has(worker.runId) &&
+        (worker.stopRequested ||
+          // Live workers only block reopening runs cancelled by orchestration Stop.
+          (resumableRunIds.has(worker.runId) &&
+            !terminalSessionStates.has(worker.state) &&
+            worker.state !== "idle")),
+    );
     if (session.stopRequested || unsettledWorker) {
       return reply.code(409).send({
         error: "Wait for every node to acknowledge Stop before resuming",
