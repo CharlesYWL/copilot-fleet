@@ -58,6 +58,7 @@ class TestSocket extends EventEmitter {
 const sockets: TestSocket[] = [];
 let emitEvent: (event: SessionEvent) => void;
 const refreshMcpSessions = vi.fn(async () => {});
+const setMcpAvailable = vi.fn<(available: boolean) => void>();
 const stopAll = vi.fn(async () => {});
 const quarantine = vi.fn();
 const worktreesShutdown = vi.fn(async () => {});
@@ -148,6 +149,7 @@ vi.mock("./router.js", () => ({
     activeSessionIds = ["session-1"];
     busySessionIds = ["session-1"];
     refreshMcpSessions = refreshMcpSessions;
+    setMcpAvailable = setMcpAvailable;
     route = route;
     setMaxSessions = vi.fn();
     stopAll = stopAll;
@@ -376,6 +378,7 @@ it("replays events produced during mutual authentication before refreshing MCP s
       outboxFlush: ready.outboxFlush,
     });
     expect(refreshMcpSessions).not.toHaveBeenCalled();
+    expect(setMcpAvailable).not.toHaveBeenCalledWith(true);
     const later = { ...event, eventId: "event-2", sequence: 2 };
     emitEvent(later);
     expect(socket.send).toHaveBeenCalledTimes(5);
@@ -389,6 +392,7 @@ it("replays events produced during mutual authentication before refreshing MCP s
     expect(refreshMcpSessions).not.toHaveBeenCalled();
     await receive({ type: "outbox_flush_ack", flushId: nextBatch.outboxFlush.flushId });
     expect(refreshMcpSessions).toHaveBeenCalledOnce();
+    expect(setMcpAvailable).toHaveBeenLastCalledWith(true);
 
     const heartbeatIndex = socket.send.mock.calls.length;
     await vi.advanceTimersByTimeAsync(5_000);
