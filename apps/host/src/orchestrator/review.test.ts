@@ -47,6 +47,10 @@ describe("reviewOutcome", () => {
     expect(outcome.prompt).toContain("<fleet-review");
     expect(outcome.prompt).toContain("The migration is missing.");
     expect(outcome.prompt).toContain("fleet_submit_task");
+    expect(outcome.prompt).toContain("dispatch a worker or fixer");
+    expect(outcome.prompt).toContain("Do not edit the repository");
+    expect(outcome.prompt).toContain("push, publish");
+    expect(outcome.prompt).toContain("new sealed result");
   });
 
   it("will not send a task back with nothing to act on", () => {
@@ -94,5 +98,6 @@ describe("reopening a finished task", () => {
     // the same situation: act, end the turn, submit again.
     expect(reopenPrompt("Ship it", "not done")).toContain("fleet_submit_task");
     expect(reopenPrompt("Ship it", "not done")).toContain("end your turn");
+    expect(reopenPrompt("Ship it", "not done")).toContain("Do not edit the repository");
   });
 });
