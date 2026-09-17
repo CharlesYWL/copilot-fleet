@@ -170,17 +170,23 @@ export function AuthGate({ children }: { children: ReactNode }) {
   useEffect(
     () =>
       onSignedOut(() => {
+        if (status?.state === "no-auth") {
+          setStatus(undefined);
+          void refresh();
+          return;
+        }
         setStatus((current) =>
           current ? { ...current, authenticated: false } : current,
         );
       }),
-    [],
+    [refresh, status?.state],
   );
 
   useEffect(() => {
     if (
       status &&
       !status.unreachable &&
+      status.state !== "no-auth" &&
       (!status.authenticated || status.claimCodeRequired)
     ) {
       saveTourProgress();
@@ -196,7 +202,12 @@ export function AuthGate({ children }: { children: ReactNode }) {
    * whose Security tab is the only thing that can finish the migration, with
    * nothing telling them they are half way through one.
    */
-  if (status?.authenticated && !status.claimCodeRequired && !notice)
+  if (
+    status &&
+    !status.unreachable &&
+    ((status.state === "no-auth" && status.canSignIn) ||
+      (status.authenticated && !status.claimCodeRequired && !notice))
+  )
     return <>{children}</>;
 
   return (
@@ -206,6 +217,7 @@ export function AuthGate({ children }: { children: ReactNode }) {
         notice={notice}
         onDismissNotice={() => setNotice(undefined)}
         onChanged={refresh}
+        allowSkip
       />
     </div>
   );
@@ -220,6 +232,7 @@ function viewFor(
   if (notice?.code === "pending-approval") return "pending";
   if (notice && (notice.code !== "cancelled" || status.authenticated)) return "denied";
   if (!status.canSignIn) return "endpoint-refused";
+  if (status.state === "no-auth") return status.entraConfigured ? "claim" : "configure";
   /*
    * The migration checkpoint: signed in, and still nobody's Host.
    *
@@ -258,6 +271,7 @@ const HEADINGS: Record<GateView, string> = {
 
 function stagesFor(status: BrowserAuthStatus | undefined): TrustStage[] {
   const reachable = status !== undefined && !status.unreachable;
+  const noAuth = status?.state === "no-auth";
   const configured = Boolean(status?.entraConfigured);
   const claimed = Boolean(status && !status.claimCodeRequired);
   // A password session on an unclaimed Host is a way in, not an identity: the
@@ -268,23 +282,31 @@ function stagesFor(status: BrowserAuthStatus | undefined): TrustStage[] {
       name: "Host",
       detail: !reachable
         ? "not answering"
-        : configured
-          ? "reachable and configured"
-          : "reachable, not configured",
-      state: reachable && configured ? "done" : reachable ? "active" : "todo",
+        : noAuth
+          ? "reachable"
+          : configured
+            ? "reachable and configured"
+            : "reachable, not configured",
+      state: reachable && (configured || noAuth) ? "done" : reachable ? "active" : "todo",
     },
     {
       name: "Microsoft identity",
-      detail: identified
-        ? "signed in"
-        : claimed
-          ? "sign-in required"
-          : "no administrator yet",
-      state: identified ? "done" : configured ? "active" : "todo",
+      detail: noAuth
+        ? "optional, not enabled"
+        : identified
+          ? "signed in"
+          : claimed
+            ? "sign-in required"
+            : "no administrator yet",
+      state: noAuth ? "todo" : identified ? "done" : configured ? "active" : "todo",
     },
     {
       name: "Nodes",
-      detail: claimed ? "enrol after sign-in" : "after this Fleet is claimed",
+      detail: noAuth
+        ? "ready to enrol"
+        : claimed
+          ? "enrol after sign-in"
+          : "after this Fleet is claimed",
       state: "todo",
     },
   ];
@@ -295,7 +317,26 @@ type CheckpointProps = {
   notice: AuthErrorNotice | undefined;
   onDismissNotice: () => void;
   onChanged: () => Promise<void>;
+  allowSkip?: boolean;
 };
+
+/** Reuses the console-protected setup when sign-in is enabled later in Settings. */
+export function MicrosoftSignInSetup({
+  status,
+  onChanged,
+}: {
+  status: BrowserAuthStatus;
+  onChanged: () => Promise<void>;
+}) {
+  return (
+    <Checkpoint
+      status={status}
+      notice={undefined}
+      onDismissNotice={() => {}}
+      onChanged={onChanged}
+    />
+  );
+}
 
 /**
  * One card, one question at a time.
@@ -304,7 +345,13 @@ type CheckpointProps = {
  * only things reachable from here are the two proofs a claim takes and the
  * sign-in that follows them.
  */
-function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointProps) {
+function Checkpoint({
+  status,
+  notice,
+  onDismissNotice,
+  onChanged,
+  allowSkip = false,
+}: CheckpointProps) {
   const styles = useStyles();
   const [bootstrapped, setBootstrapped] = useState(false);
   const [configured, setConfigured] = useState(false);
@@ -390,6 +437,11 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
           />
         )}
 
+        {allowSkip &&
+          !status?.passwordEnabled &&
+          (view === "configure" || view === "claim") &&
+          bootstrapped && <SkipMicrosoftStep onChanged={onChanged} />}
+
         {/*
          * The Host that most needs restoring is the one that cannot sign
          * anyone in. A move lands a new machine in exactly these two states —
@@ -422,15 +474,47 @@ function Checkpoint({ status, notice, onDismissNotice, onChanged }: CheckpointPr
   );
 }
 
+function SkipMicrosoftStep({ onChanged }: { onChanged: () => Promise<void> }) {
+  const { busy, error, errorStatus, clearError, submit } = useAuthForm(
+    "/api/auth/skip",
+    "Could not skip Microsoft sign-in",
+    async () => {
+      markFirstClaimTour();
+      await onChanged();
+    },
+  );
+  return (
+    <>
+      <Text>
+        Microsoft sign-in is optional. Without it, anyone who can reach this Host can
+        operate Fleet. Keep the Host listener on loopback and use private, authenticated
+        Dev Tunnels for remote access. Public tunnels are disabled.
+      </Text>
+      <Button disabled={busy} onClick={() => void submit({})}>
+        {busy ? "Continuing…" : "Continue without Microsoft sign-in"}
+      </Button>
+      {error && (
+        <MessageBar intent="error">
+          <MessageBarBody>{error}</MessageBarBody>
+        </MessageBar>
+      )}
+      {errorStatus === 401 && (
+        <ClaimCodeForm action="Unlock setup again" onDone={clearError} />
+      )}
+    </>
+  );
+}
+
 function EndpointRefused() {
   const styles = useStyles();
   return (
     <>
       <MessageBar intent="error">
         <MessageBarBody>
-          This Host will not issue a session over this address. A plain-HTTP tunnel would
-          carry the session cookie in clear text, and a name this Host never published is
-          not one it trusts.
+          Use loopback or a private Dev Tunnel when Microsoft sign-in is skipped. This
+          Host will not issue a session over this address. A plain-HTTP tunnel would carry
+          the session cookie in clear text, and a name this Host never published is not
+          one it trusts.
         </MessageBarBody>
       </MessageBar>
       <Text className={styles.caption}>
@@ -633,10 +717,10 @@ function ConfigureStep({
     return (
       <>
         <Text className={styles.caption}>
-          This Host has no Microsoft sign-in configuration yet. The code on its own
-          console is what proves you are the person setting it up. No approved Fleet
-          client ID is bundled; its publisher or operator must provide an approved
-          application registration.
+          Microsoft sign-in is optional. The code on this Host&apos;s own console proves
+          you are the person setting it up. A fresh Host can continue without Microsoft
+          sign-in after unlocking setup; enabling sign-in requires your own approved
+          application registration. No approved Fleet client ID is bundled.
         </Text>
         <MicrosoftSignInSetupGuide />
         <ClaimCodeForm action="Unlock setup" onDone={onBootstrapped} />
@@ -777,7 +861,8 @@ function ClaimStep({
       <>
         <Text className={styles.caption}>
           Nobody administers this Fleet yet. Claiming it takes two proofs: the code
-          printed on the Host&apos;s console, and a Microsoft account.
+          printed on the Host&apos;s console, and a Microsoft account. Microsoft sign-in
+          is optional; a fresh Host can also complete setup without it.
         </Text>
         <ClaimCodeForm action="Unlock claim" onDone={onBootstrapped} />
       </>

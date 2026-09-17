@@ -11,7 +11,7 @@ import { errorMessage } from "@fleet/protocol";
 import { cachedGitRevision } from "./host-revision.js";
 import { announceClaimCode } from "./claim-announcement.js";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
-import { FleetAuth } from "./auth/service.js";
+import { FleetAuth, NO_AUTH_PRINCIPAL } from "./auth/service.js";
 import { EnrollmentGrants } from "./auth/enrollment-grants.js";
 import { HostIdentityService } from "./auth/host-identity.js";
 import { NodeEnrollment } from "./auth/node-enrollment.js";
@@ -141,7 +141,8 @@ export async function buildServer(
   const heartbeatTimeoutMs = Number(process.env.HEARTBEAT_TIMEOUT_MS ?? 15_000);
   const listenPort = process.env.PORT ?? "8787";
 
-  const tunnel = new TunnelSupervisor({
+  const tunnel: TunnelSupervisor = new TunnelSupervisor({
+    privateOnly: () => auth.noAuthEnabled(),
     localTarget: `http://127.0.0.1:${listenPort}`,
     onEnabledCleared: (provider) => store.setTunnelProviderEnabled(provider, false),
     persistedTunnelId: {
@@ -166,6 +167,9 @@ export async function buildServer(
    */
   const browsers: BrowserSessionRegistry = new BrowserSessionRegistry({
     lookup: (tokenHash) => {
+      if (tokenHash === NO_AUTH_PRINCIPAL && auth.noAuthEnabled()) {
+        return { administratorId: "", expiresAt: Infinity };
+      }
       const session = auth.sessions.inspect(tokenHash);
       if (!session) return undefined;
       return {
@@ -175,7 +179,7 @@ export async function buildServer(
     },
   });
 
-  const auth = new FleetAuth({
+  const auth: FleetAuth = new FleetAuth({
     store,
     configuredPassword: options.resetOperatorAuth
       ? ""

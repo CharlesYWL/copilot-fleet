@@ -23,6 +23,19 @@ describe("deriveAuthState", () => {
     expect(deriveAuthState({ ...base, entraConfigured: true })).toBe("unclaimed");
   });
 
+  it("honors a skipped setup without overriding existing protection", () => {
+    expect(deriveAuthState({ ...base, noAuthEnabled: true })).toBe("no-auth");
+    expect(deriveAuthState({ ...base, noAuthEnabled: true, entraConfigured: true })).toBe(
+      "no-auth",
+    );
+    expect(deriveAuthState({ ...base, noAuthEnabled: true, administrators: 1 })).toBe(
+      "microsoft-only",
+    );
+    expect(deriveAuthState({ ...base, noAuthEnabled: true, passwordEnabled: true })).toBe(
+      "legacy-password",
+    );
+  });
+
   it("names an upgraded password-only Host legacy-password", () => {
     expect(deriveAuthState({ ...base, passwordEnabled: true })).toBe("legacy-password");
     // Configuration alone does not claim it, so the password still rules.

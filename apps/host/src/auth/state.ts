@@ -4,7 +4,7 @@ import { hashPassword, verifyPassword } from "../auth.js";
 /**
  * What this Host currently is, from the point of view of "who may drive it".
  *
- * Six named states rather than a pair of booleans because each one answers a
+ * Named states rather than a pair of booleans because each one answers a
  * different question at the front door, and the UI has to say which. A Host
  * that cannot tell `entra-unconfigured` from `unclaimed` shows a login form
  * that cannot possibly work. The list itself lives in the protocol package,
@@ -19,6 +19,7 @@ export type AuthStateInput = {
   entraConfigured: boolean;
   /** Set by the local recovery command, which is deliberately temporary. */
   recoveryPassword: boolean;
+  noAuthEnabled?: boolean;
 };
 
 /**
@@ -35,6 +36,7 @@ export function deriveAuthState(input: AuthStateInput): AuthState {
     return input.passwordEnabled ? "hybrid" : "microsoft-only";
   }
   if (input.passwordEnabled) return "legacy-password";
+  if (input.noAuthEnabled) return "no-auth";
   return input.entraConfigured ? "unclaimed" : "entra-unconfigured";
 }
 

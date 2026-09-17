@@ -36,6 +36,7 @@ export const GUARD_RULES: readonly GuardRule[] = [
   { method: "GET", pattern: /^\/api\/auth\/status$/, principal: "anonymous" },
   { method: "POST", pattern: /^\/api\/auth\/bootstrap$/, principal: "anonymous" },
   { method: "POST", pattern: /^\/api\/auth\/configure$/, principal: "bootstrap" },
+  { method: "POST", pattern: /^\/api\/auth\/skip$/, principal: "bootstrap" },
   { method: "POST", pattern: /^\/api\/auth\/code\/start$/, principal: "anonymous" },
   { method: "GET", pattern: /^\/api\/auth\/entra\/callback$/, principal: "transaction" },
   { method: "POST", pattern: /^\/api\/auth\/device\/start$/, principal: "anonymous" },

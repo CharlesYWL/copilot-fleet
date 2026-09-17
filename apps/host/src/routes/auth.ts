@@ -28,7 +28,7 @@ import {
   classifyEntraFailure,
 } from "../auth/entra.js";
 import { OPERATOR_SESSION_ABSOLUTE_MS } from "../auth/sessions.js";
-import type { FleetAuth } from "../auth/service.js";
+import { NO_AUTH_PRINCIPAL, type FleetAuth } from "../auth/service.js";
 import { hostnameOf } from "../request-guard.js";
 import { requireAdministrator } from "./require-administrator.js";
 
@@ -172,10 +172,12 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
       passwordEnabled: auth.passwordEnabled(),
       entraConfigured: config !== undefined,
       deviceFlowEnabled: auth.deviceFlowEnabled(),
-      claimCodeRequired: !auth.claimed(),
+      claimCodeRequired: !auth.claimed() && !auth.noAuthEnabled(),
       // Whether this endpoint can carry a credential at all, so the page can
       // explain a refusal instead of looping on a login that cannot finish.
-      canSignIn: auth.mayIssueCredential(request.headers.host),
+      canSignIn: auth.noAuthEnabled()
+        ? auth.noAuthEndpointAllowed(request.headers.host)
+        : auth.mayIssueCredential(request.headers.host),
       // And whether the loopback flow can complete here, so the page can move
       // itself to the name Entra redirects back to rather than failing at the
       // callback with a transaction cookie that was set for a different one.
@@ -246,6 +248,21 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
     const input = ConfigureSchema.parse(request.body);
     const config = auth.configureEntra(input);
     return reply.send({ ok: true, tenantId: config.tenantId, clientId: config.clientId });
+  });
+
+  app.post("/api/auth/skip", async (request, reply) => {
+    z.strictObject({}).parse(request.body ?? {});
+    const outcome = auth.skipMicrosoftSetup({
+      token: readCookie(request.headers.cookie, BOOTSTRAP_COOKIE),
+      binding: readCookie(request.headers.cookie, BINDING_COOKIE) ?? "",
+      host: request.headers.host,
+    });
+    if (!outcome.ok) return reply.code(outcome.status).send({ error: outcome.error });
+    reply.header(
+      "set-cookie",
+      clearedBootstrapCookie(auth.secureCookies(request.headers.host)),
+    );
+    return reply.send({ ok: true });
   });
 
   app.post("/api/auth/configuration/start", async (request, reply) => {
@@ -464,6 +481,9 @@ export const authRoutes: FastifyPluginAsync<AuthRouteOptions> = async (
   });
 
   app.get("/api/auth/csrf", async (request, reply) => {
+    if (auth.noAuthEnabled()) {
+      return reply.send({ csrfToken: auth.sessions.csrfToken(NO_AUTH_PRINCIPAL) });
+    }
     const session = auth.verifySession(
       readCookie(request.headers.cookie, OPERATOR_COOKIE),
     );

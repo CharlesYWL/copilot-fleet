@@ -86,7 +86,7 @@ Fleet 与 Copilot 各自的会话 ID，并提供路径、ID 和带 shell 转义�
   1.0.69 或更高版本，且订阅与组织策略允许使用 Copilot
 - 每个工作区放置（placement）都需要一个已经存在的绝对本地目录；这个目录在运行会话的
   Node 上，而不一定在 Host 上
-- Host 登录需要发布者或运维者合法拥有并获准使用的 Microsoft 应用注册，见
+- Microsoft 登录可选；启用时需要发布者或运维者合法拥有并获准使用的应用注册，见
   [注册与账号范围](#microsoft-登录注册与账号范围)
 - 多机器访问推荐使用 Microsoft Dev Tunnels（`devtunnel`）：Host 需要登录隧道服务；私有
   隧道下，远端 Node 也需要登录同一个隧道 provider
@@ -144,7 +144,10 @@ one-time code:
 It expires in 30 minutes and is printed only here.
 ```
 
-认领需要两个证据，具体见[首次运行：认领一个 Fleet](#首次运行认领一个-fleet)。普通的全新
+Microsoft 认领需要两个证据，具体见[首次运行：认领一个 Fleet](#首次运行认领一个-fleet)。
+也可以用控制台认领码解锁后选择 **Continue without Microsoft sign-in**，无需 client/tenant ID，
+直接进入引导。跳过选择会持久保存；保持 Host 监听 loopback，并用私有、需要认证的 Dev Tunnels
+远程访问。任何能访问 Host 的人都能操作 Fleet，不能启用匿名隧道访问。普通的全新
 公共 Microsoft 登录需要运维者或发布者提供已注册的 public client/config；本仓库没有内置可
 公开使用的默认客户端。
 
@@ -204,15 +207,20 @@ npm start
    `npm run host` 前先运行 `npm run build -w @fleet/protocol`。也可以运行
    `npm run build`，再用 `npm run start:host` 启动生产构建。保持 Host 控制台打开：
    认领码只打印在那里，30 分钟后过期。
-2. **认领 Host。** 开发模式打开 `http://localhost:5173`，生产模式打开
+2. **选择 Host 登录方式。** 开发模式打开 `http://localhost:5173`，生产模式打开
    `http://localhost:8787`。如果显示 **Configure Microsoft sign-in**，输入认领码并点击
-   **Unlock setup**。填写获准使用的 Microsoft Application (client) ID，选择
+   **Unlock setup**。可以选择 **Continue without Microsoft sign-in**，不用配置 Microsoft
+   应用注册，采用本地无登录加私有 Dev Tunnel 认证的方式；公网隧道 provider 会被禁用。
+   保持 `HOST=127.0.0.1`，不要开启匿名隧道访问，Node 的注册授权与密钥认证仍然保留。
+   也可以填写获准使用的 Microsoft Application (client) ID，选择
    **Work/school and personal Microsoft accounts** 或 **One organization (fixed
    directory)**，再点击 **Save and continue**。如果已配置好登录，则输入认领码并使用
    **Unlock claim**。最后点击 **Claim with Microsoft**，用将要管理这台 Host 的账号完成
    登录。**认领成功也就完成了登录**；之后访问时使用已获授权的账号 **Sign in with
-   Microsoft**，不需要再次认领。
-3. **跟随教学气泡，或继续阅读下面的步骤。** 引导会在第一次认领成功后自动打开，不会在
+   Microsoft**，不需要再次认领。跳过后可以在 **Settings → Security** 用当前控制台认领码
+   和自己的应用注册启用 Microsoft 登录；保存配置不会锁住现有访问，首次认领成功后才启用。
+   已受 Microsoft 或密码保护的 Host 不会因为缺少配置而自动降级。
+3. **跟随教学气泡，或继续阅读下面的步骤。** 引导会在跳过登录或第一次认领成功后自动打开，不会在
    每次登录时重复出现。10 个步骤会高亮隧道、Node、工作区、放置、会话、权限、
    Orchestrator、任务审查和其他设置的相关控件。用 **Back** 和 **Next** 浏览，不会自动
    更改设置或启动代理。需要实际操作时，点击 **Let me do this step** 暂时收起气泡，完成
@@ -327,9 +335,12 @@ Node 的 `PATH` 中没有 Agency 时，会回退到它配置的 Copilot 命令
 
 ## 首次运行：认领一个 Fleet
 
-一台 Fleet Host 能在所有已注册的机器上启动进程、读取全部记录。谁可以做这件事，由
-Microsoft Entra ID 加上这台 Host 自己的管理员名单决定 —— 除此之外没有别的依据。隧道
-决定谁能**够到**这台 Host，它从不决定谁可以**操作**它。
+一台 Fleet Host 能在所有已注册的机器上启动进程、读取全部记录。Microsoft 登录可选：
+用控制台码解锁并跳过后，任何能到达 Host 的人都能操作它。使用 loopback 监听及需要认证的
+私有 Dev Tunnel，不要启用匿名访问；公网 provider 和直接公网/LAN 访问会被拒绝。
+
+启用 Microsoft 登录时，由 Entra ID 加上 Host 自己的管理员名单决定谁可以操作；
+此时隧道只决定谁能**够到** Host，并不授予 Fleet 管理员权限。
 
 认领一台全新的 Host 需要两个互相独立的证据，任何一个单独都不算数：
 
@@ -350,8 +361,8 @@ Microsoft Entra ID 加上这台 Host 自己的管理员名单决定 —— 除�
 Microsoft 账号**。组织的同意策略和条件访问仍可能拒绝登录；Fleet 不会绕过这些策略。
 企业配置则可以把认证范围限定在一个目录内。
 
-**发布者或运维者必须先提供合法拥有并获准使用的应用注册。** 本仓库目前没有内置获准使用的
-Fleet 自有客户端 ID。全新安装在未提供客户端 ID 时会要求完成设置，绝不会悄悄退回借用的
+**启用 Microsoft 登录时，发布者或运维者必须先提供合法拥有并获准使用的应用注册。** 本仓库目前没有内置获准使用的
+Fleet 自有客户端 ID。全新安装在未提供客户端 ID 时可选择配置或明确跳过，绝不会悄悄退回借用的
 Visual Studio 客户端。如果某个发行版本已经提供了合法配置，普通使用者无需再配置自己的
 租户 —— 一次性的应用注册工作已经由发布者完成。
 
@@ -1277,7 +1288,11 @@ home directory 里发生的修改会把整个 task 钉在那里，后续步骤�
 
 ## 安全说明
 
-- 网页界面和整个 `/api` 面都要求一个属于在用管理员的 Fleet 会话。会话只在 Microsoft
+- 明确跳过 Microsoft 登录后，允许本地或私有 Dev Tunnel 访问，不需要 Fleet 登录。
+  任何能到达 Host 的人都能操作它；必须保持 loopback 监听并禁止匿名隧道访问。Host、Origin、
+  CSRF 和 Node 密钥检查仍有效。Microsoft 管理员操作及便携安全导出仍需 Microsoft 身份，
+  日常 Fleet 操作、Node 管理和数据备份不需要。
+- 启用 Microsoft 登录时，网页界面和操作 API 要求一个属于在用管理员的 Fleet 会话。会话只在 Microsoft
   Entra ID 认证了这个人**并且**这台 Host 自己的管理员表授权了他之后才签发：即使属于支持的
   Microsoft 账号类型，只要没被添加过，就会收到明确的 `403`，并且拿不到任何会话。会话是 256 位
   不透明值，只以 SHA-256 摘要存储，`HttpOnly`/`SameSite=Strict`，在已发布的 HTTPS 端点

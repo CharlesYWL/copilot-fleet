@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyRequest } from "fastify";
 import type { WebSocket } from "ws";
 import type { FleetService } from "../fleet-service.js";
 import { OPERATOR_COOKIE, readCookie } from "../auth.js";
-import type { FleetAuth } from "../auth/service.js";
+import { NO_AUTH_PRINCIPAL, type FleetAuth } from "../auth/service.js";
 import {
   AUTHENTICATION_CLOSE_CODE,
   type BrowserSessionRegistry,
@@ -39,15 +39,24 @@ export function registerBrowserGateway(
       // The guard has already refused an unauthenticated handshake; this asks
       // the same question at the moment the stream starts, because the two are
       // not the same moment and this is the one that lasts.
-      if (!session || !auth.sessionStillAuthorized(session)) {
+      const noAuth =
+        auth.noAuthEnabled() && auth.noAuthEndpointAllowed(request.headers.host);
+      if (noAuth) {
+        registry.add(socket, {
+          tokenHash: NO_AUTH_PRINCIPAL,
+          administratorId: "",
+          expiresAt: Infinity,
+        });
+      } else if (session && auth.sessionStillAuthorized(session)) {
+        registry.add(socket, {
+          tokenHash: session.tokenHash,
+          administratorId: session.administratorId,
+          expiresAt: session.expiresAt,
+        });
+      } else {
         socket.close(AUTHENTICATION_CLOSE_CODE, "Session ended — sign in again");
         return;
       }
-      registry.add(socket, {
-        tokenHash: session.tokenHash,
-        administratorId: session.administratorId,
-        expiresAt: session.expiresAt,
-      });
       service.addBrowser(socket);
       service.send(socket, { type: "snapshot", data: service.snapshot() });
       socket.on("close", () => {

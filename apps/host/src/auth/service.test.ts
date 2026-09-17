@@ -36,6 +36,56 @@ function setup(
 }
 
 describe("FleetAuth", () => {
+  it("persists an explicit no-auth choice and still permits console-protected Microsoft setup", () => {
+    const { auth, store, announced, warnings } = setup();
+    const granted = auth.redeemClaimCode(announced[0]!, "browser", "localhost");
+    if (!granted.ok) throw new Error(granted.error);
+    expect(
+      auth.skipMicrosoftSetup({
+        token: granted.token,
+        binding: "browser",
+        host: "localhost",
+      }),
+    ).toEqual({ ok: true });
+    expect(auth.state()).toBe("no-auth");
+    expect(auth.claimed()).toBe(false);
+    expect(auth.passwordEnabled()).toBe(false);
+    expect(warnings.join(" ")).toMatch(/anyone who can reach/i);
+    expect(auth.claim.verifyBootstrap(granted.token)).toBeUndefined();
+
+    const restarted = setup({ store });
+    expect(restarted.auth.state()).toBe("no-auth");
+    expect(restarted.announced).toHaveLength(1);
+    expect(
+      restarted.auth.redeemClaimCode(restarted.announced[0]!, "browser", "localhost").ok,
+    ).toBe(true);
+    restarted.auth.configureEntra({ clientId: "11111111-2222-3333-4444-555555555555" });
+    // Saving a registration alone must not lock out a working tunnel-only fleet.
+    expect(restarted.auth.state()).toBe("no-auth");
+  });
+
+  it("never uses a no-auth setting to override an administrator or password", () => {
+    const { auth, store } = setup({ configuredPassword: "existing-password" });
+    store.setSetting("auth.mode", "no-auth");
+    expect(auth.noAuthEnabled()).toBe(false);
+    expect(auth.state()).toBe("legacy-password");
+    expect(
+      auth.skipMicrosoftSetup({
+        token: undefined,
+        binding: "browser",
+        host: "localhost",
+      }),
+    ).toMatchObject({ ok: false, status: 409 });
+    store.insertAdministrator({
+      tenantId: MICROSOFT_CORP_TENANT_ID,
+      objectId: "owner",
+      username: "owner@microsoft.com",
+      displayName: "Owner",
+      addedVia: "claim",
+    });
+    expect(setup({ store }).auth.noAuthEnabled()).toBe(false);
+  });
+
   describe("Agency staff eligibility", () => {
     it.each([
       ["alias@microsoft.com", MICROSOFT_CORP_TENANT_ID, true],

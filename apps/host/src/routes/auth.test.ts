@@ -3,6 +3,7 @@ import type { FastifyInstance } from "fastify";
 import { buildServer } from "../server.js";
 import { BOOTSTRAP_GRANT_TTL_MS } from "../auth/claim.js";
 import type { EntraConfig, EntraIdentity } from "../auth/entra.js";
+import { TunnelSupervisor } from "../tunnel.js";
 
 const TENANT = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 const CLIENT = "11111111-2222-3333-4444-555555555555";
@@ -156,6 +157,145 @@ describe("Microsoft identity routes", () => {
         headers: { cookie: cookieHeader() },
       })
     ).json<{ csrfToken: string }>().csrfToken;
+
+  describe("optional Microsoft setup", () => {
+    const skip = async () =>
+      remember(
+        await app.inject({
+          method: "POST",
+          url: "/api/auth/skip",
+          headers: { cookie: cookieHeader() },
+          payload: {},
+        }),
+      );
+
+    it("allows only loopback and a known private Dev Tunnel, not public HTTPS endpoints", async () => {
+      vi.spyOn(TunnelSupervisor.prototype, "allTunnelEndpoints").mockReturnValue([
+        { provider: "devtunnel", url: "https://private.example" },
+        { provider: "cloudflare", url: "https://public.example" },
+      ]);
+      vi.spyOn(TunnelSupervisor.prototype, "allTunnelUrls").mockReturnValue([
+        "https://private.example",
+        "https://public.example",
+      ]);
+      await bootstrap();
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/auth/skip",
+            headers: { cookie: cookieHeader(), host: "public.example" },
+            payload: {},
+          })
+        ).statusCode,
+      ).toBe(409);
+      expect((await skip()).statusCode).toBe(200);
+      for (const [host, expected] of [
+        ["private.example", 200],
+        ["public.example", 403],
+      ] as const) {
+        expect(
+          (await app.inject({ url: "/api/snapshot", headers: { host } })).statusCode,
+        ).toBe(expected);
+        const response = await app.inject({ url: "/api/auth/status", headers: { host } });
+        expect(response.json()).toMatchObject({
+          state: "no-auth",
+          canSignIn: expected === 200,
+        });
+      }
+    });
+
+    it("requires a browser-bound console grant, not just an accessible setup page", async () => {
+      expect((await skip()).statusCode).toBe(401);
+      expect((await bootstrap()).statusCode).toBe(200);
+      const copied = await app.inject({
+        method: "POST",
+        url: "/api/auth/skip",
+        headers: { cookie: `fleet_bootstrap=${jar.get("fleet_bootstrap")}` },
+        payload: {},
+      });
+      expect(copied.statusCode).toBe(401);
+      expect(await status()).toMatchObject({ state: "entra-unconfigured" });
+    });
+
+    it("opens the console and node enrollment without identity while retaining CSRF and origin checks", async () => {
+      await bootstrap();
+      expect((await skip()).statusCode).toBe(200);
+      jar.clear();
+      expect(await status()).toMatchObject({
+        state: "no-auth",
+        authenticated: false,
+        claimCodeRequired: false,
+        entraConfigured: false,
+        canSignIn: true,
+      });
+      expect((await app.inject({ url: "/api/snapshot" })).statusCode).toBe(200);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/enrollment-grants",
+            payload: {},
+          })
+        ).statusCode,
+      ).toBe(403);
+      const token = await csrf();
+      const grant = await app.inject({
+        method: "POST",
+        url: "/api/enrollment-grants",
+        headers: { "x-csrf-token": token },
+        payload: {},
+      });
+      expect(grant.statusCode).toBe(201);
+      expect(grant.json()).toMatchObject({
+        grant: expect.any(String),
+        command: { hostFingerprint: expect.any(String) },
+      });
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/enrollment-grants",
+            headers: { "x-csrf-token": token, origin: "https://evil.example" },
+            payload: {},
+          })
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await app.inject({
+            url: "/api/snapshot",
+            headers: { host: "evil.example" },
+          })
+        ).statusCode,
+      ).toBe(403);
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: "/api/auth/password/enable",
+            headers: { "x-csrf-token": token },
+            payload: { password: "Secret-password!" },
+          })
+        ).statusCode,
+      ).toBe(403);
+    });
+
+    it("can enable Microsoft ownership later and closes the no-auth door", async () => {
+      await bootstrap();
+      expect((await skip()).statusCode).toBe(200);
+      await bootstrap();
+      expect((await configure()).statusCode).toBe(200);
+      expect(await status()).toMatchObject({ state: "no-auth" });
+      expect((await signIn()).statusCode).toBe(302);
+      expect(await status()).toMatchObject({
+        state: "microsoft-only",
+        authenticated: true,
+      });
+      expect((await app.inject({ url: "/api/snapshot" })).statusCode).toBe(401);
+      expect((await skip()).statusCode).not.toBe(200);
+    });
+  });
 
   describe("public configuration routes", () => {
     const publicConfig = {

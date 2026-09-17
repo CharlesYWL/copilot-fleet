@@ -93,7 +93,13 @@ export const RESTART_DELAYS_MS = [1_000, 5_000, 15_000, 30_000, 60_000];
  * refuses the request — three readings of the same rule that only have to
  * disagree once to become two rules.
  */
-export function ineligibleProviderMessage(provider: TunnelProvider): string {
+export function ineligibleProviderMessage(
+  provider: TunnelProvider,
+  privateOnly = false,
+): string {
+  if (privateOnly && providerSpecs[provider].controlPlaneEligible) {
+    return `${providerSpecs[provider].label} is public. Without Microsoft sign-in, use private Dev Tunnels or keep the Host local.`;
+  }
   return `${providerSpecs[provider].label} publishes plain HTTP, so Fleet will not expose the operator console, node credentials or lead tokens through it. Use an HTTPS provider such as Dev Tunnels.`;
 }
 
@@ -128,6 +134,7 @@ export function shouldAdoptTunnelId(
 }
 
 type TunnelManagerOptions = {
+  privateOnly?: () => boolean;
   /** Loopback target the tunnel should forward to, e.g. http://127.0.0.1:8787 */
   localTarget: string;
   /**
@@ -182,8 +189,10 @@ export class TunnelManager {
   /** Invalidates setup/output still arriving from a pre-restore start. */
   private generation = 0;
   private stopping: Promise<void> | undefined;
+  private readonly privateOnly: () => boolean;
 
   constructor(options: TunnelManagerOptions) {
+    this.privateOnly = options.privateOnly ?? (() => false);
     this.target = parseLocalTarget(options.localTarget);
     this.onEnabledCleared = options.onEnabledCleared;
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
@@ -192,6 +201,23 @@ export class TunnelManager {
     this.probe = options.probe ?? new BinaryProbe();
     this.persistedTunnelId = options.persistedTunnelId;
     if (options.provider) this.provider = options.provider;
+  }
+
+  private eligible(provider = this.provider): boolean {
+    const spec = providerSpecs[provider];
+    return (
+      spec.controlPlaneEligible &&
+      (!this.privateOnly() || spec.access === "creator-private")
+    );
+  }
+
+  private assertEligible(): void {
+    if (this.eligible()) return;
+    this.status = "error";
+    this.error = ineligibleProviderMessage(this.provider, this.privateOnly());
+    this.wantEnabled = false;
+    this.onEnabledCleared?.(this.provider);
+    throw new Error(this.error);
   }
 
   /**
@@ -208,14 +234,14 @@ export class TunnelManager {
   private ownExternal(): ExternalTunnel | undefined {
     const external = this.readExternal();
     if (external?.provider !== this.provider) return undefined;
-    return providerSpecs[this.provider].controlPlaneEligible ? external : undefined;
+    return this.eligible() ? external : undefined;
   }
 
   /** Whether an external tunnel is running that this manager refuses to adopt. */
   private refusedExternal(): ExternalTunnel | undefined {
     const external = this.readExternal();
     if (external?.provider !== this.provider) return undefined;
-    return providerSpecs[this.provider].controlPlaneEligible ? undefined : external;
+    return this.eligible() ? undefined : external;
   }
 
   get activeProvider(): TunnelProvider {
@@ -235,7 +261,7 @@ export class TunnelManager {
         docsUrl: spec.docsUrl,
         externalScheme: spec.externalScheme,
         access: spec.access,
-        controlPlaneEligible: spec.controlPlaneEligible,
+        controlPlaneEligible: this.eligible(spec.id),
         ...(spec.caveat ? { caveat: spec.caveat } : {}),
       })),
     );
@@ -243,6 +269,7 @@ export class TunnelManager {
 
   /** Live tunnel URL when online; otherwise undefined so callers use fallbacks. */
   activeTunnelUrl(): string | undefined {
+    if (!this.eligible()) return undefined;
     const external = this.ownExternal();
     if (external) return external.url;
     return this.status === "on" ? this.tunnelUrl : undefined;
@@ -263,7 +290,7 @@ export class TunnelManager {
         provider: this.provider,
         enabled: false,
         status: "error",
-        error: ineligibleProviderMessage(this.provider),
+        error: ineligibleProviderMessage(this.provider, this.privateOnly()),
         external: true,
       };
     }
@@ -292,7 +319,14 @@ export class TunnelManager {
     // A separately running tunnel owns its own lifecycle; toggling here would
     // either kill a process this manager never started or start a second one
     // competing for the same local port.
-    if (this.readExternal()?.provider === (provider ?? this.provider)) return;
+    if (this.readExternal()?.provider === (provider ?? this.provider)) {
+      if (enabled && !this.eligible(provider)) {
+        throw new Error(
+          ineligibleProviderMessage(provider ?? this.provider, this.privateOnly()),
+        );
+      }
+      return;
+    }
     const generation = this.generation;
     if (this.stopping) await this.stopping;
     if (generation !== this.generation) return;
@@ -322,13 +356,7 @@ export class TunnelManager {
      * would carry the Fleet session cookie, the node credentials and every
      * transcript in clear text, and none of that depends on who asked.
      */
-    if (!spec.controlPlaneEligible) {
-      this.status = "error";
-      this.error = ineligibleProviderMessage(this.provider);
-      this.wantEnabled = false;
-      this.onEnabledCleared?.(this.provider);
-      throw new Error(this.error);
-    }
+    this.assertEligible();
     this.status = "starting";
     const present = await this.probe.present(spec);
     if (generation !== this.generation) return;
@@ -374,6 +402,8 @@ export class TunnelManager {
       this.tunnelId = reusedId;
     }
 
+    // Setup can finish while a provider probe or registration is awaiting I/O.
+    this.assertEligible();
     const child = spawn(spec.binary, spec.args(this.target, reusedId), {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,

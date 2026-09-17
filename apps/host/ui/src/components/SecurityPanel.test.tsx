@@ -113,6 +113,36 @@ const show = (notify = vi.fn()) =>
   );
 
 describe("SecurityPanel", () => {
+  it("offers console-protected Microsoft setup without querying administrator-only APIs in no-auth mode", async () => {
+    const fetchMock = host(
+      {},
+      {
+        "/api/auth/status": {
+          state: "no-auth",
+          authenticated: false,
+          passwordEnabled: false,
+          entraConfigured: false,
+          deviceFlowEnabled: false,
+          claimCodeRequired: false,
+          canSignIn: true,
+          codeLogin: { available: true, localForwardRequired: false },
+        },
+      },
+    );
+    show();
+    expect(await screen.findByText("No Fleet sign-in")).toBeTruthy();
+    expect(screen.getByText("Microsoft identity — optional, not enabled")).toBeTruthy();
+    expect(screen.getByText("Nodes — ready to enrol")).toBeTruthy();
+    expect(screen.getByLabelText("Claim code")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Unlock setup" })).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.some(([url]) =>
+        /administrators|security\/audit/.test(String(url)),
+      ),
+    ).toBe(false);
+    expect(screen.queryByRole("button", { name: /erase auth settings/i })).toBeNull();
+  });
+
   describe("erase auth settings", () => {
     const openErase = async () => {
       fireEvent.click(
