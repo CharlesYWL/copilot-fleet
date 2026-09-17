@@ -25,6 +25,12 @@ Orchestration control uses separate persisted facts:
 Dismiss and restore never change run, step, or worker state. A dismissed lead and
 its tasks remain in persistence and continue accepting late terminal events.
 
+An unexpected lead failure, including failure to restore MCP tools, does not
+require stopping its workers before Resume. Resume reattaches the existing lead
+conversation while workers in ongoing tasks keep their sessions and progress.
+Outstanding Stop requests still block Resume. Runs cancelled by orchestration
+Stop additionally wait for their workers to be terminal or idle before reopening.
+
 ## Dependency rules
 
 A step is runnable only when every prerequisite is `succeeded`. Failed,
