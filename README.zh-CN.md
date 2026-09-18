@@ -1337,26 +1337,41 @@ worker、审查和归档状态留在同一处。
 任务详情中的 **PR maintenance** 面向已归属 Orchestrator 的现有 worker。
 V1 每个任务只保留一个 PR 维护注册；为同一任务注册另一个 PR 前，
 需先核实并释放原有维护。
-可以直接向 Orchestrator 请求为某个 PR 启用维护。它通过
+可以直接提供 **Azure DevOps 或 GitHub** PR URL，向 Orchestrator 请求启用维护，
+也支持旧版 `organization.visualstudio.com` 链接。它通过
 `fleet_propose_pr_maintenance` 保存待授权提案并通知你。在任务面板点击
 **Review PR maintenance proposal**，审阅已填好的范围后，以登录身份点击
 **Authorize maintenance**。无需复制 JSON，agent 也不能自行授权。
 之后沿用现有唤醒流程；也可发送普通聊天消息要求立即检查。
 
-通过 **Enable PR maintenance** 审阅准确的 GitHub PR、仓库稳定 ID、
+通过 **Review PR maintenance proposal** 审阅准确的平台与 PR、仓库稳定 ID、
 head/base 完整分支引用、worker 与检出绑定、任务/设计基线、验证要求，
 以及 helper、凭据和发布权限的证据。授权来自已登录的浏览器操作，
 不能由 MCP 或 PR 中声称“已批准”的评论代替。前置条件未知或绑定不受
 支持时不能启用；即使 Host 选择免登录，维护授权仍需先登录。
+
+Azure DevOps 复用同一面板、注册表、worker、授权和唤醒预算，并保留组织、
+项目/仓库 GUID 及完整分支引用。Node 自带平台路由 helper 和 ADO 使用指导，
+不依赖个人 skill 或 Azure DevOps CLI 扩展。ADO 读取要求该 Node 的 `az`
+已登录；GitHub 仍使用已认证的 `gh`。Node 凭据与 Host 登录相互独立；
+helper 不会安装扩展、自动登录、持久保存或复制 token，也不会修改 PR。
+凭据不可用时明确阻塞，不能自行绕过。
+
+**完整收集的反馈仍可用于已授权的局部修复，但策略证据不足时不能标为就绪。**
+当前实现不会仅凭审查者投票或不透明的策略上下文，将构建/审查策略批准认定为
+当前修订已通过；未知、缺失或过期的策略证据也会阻止自动就绪。
+仅支持 Azure DevOps Services 和身份可核实的同项目 fork；非评论副作用需要
+操作回执或人工核实。详见 [ADO helper 契约](apps/node/skills/pr-maintenance/ado-contract.md)
+中的受支持证据及保守限制。就绪不会触发合并或 auto-complete。
 
 Host 数据库保存注册、检查点、决策、预算及尚未确认的副作用。现有 lead
 在普通唤醒和空闲提醒中读取这些状态；没有新增观察进程或定时器，
 也不保证严格每 30 分钟检查。未变化的反馈不启动新的修复轮次。
 就绪不等于已合并：本版本不会自动合并、强推、rebase 或新建审查 agent。
 
-![PR 维护修复循环：人工授权保存在 Host 数据库中；现有 lead 被唤醒后恢复记录，通过受限 helper 读取 GitHub，将局部修复派回原 worker，并核实处理结果。](docs/pr-maintenance-repair-loop.png)
+![PR 维护修复循环：人工授权保存在 Host 数据库中；现有 lead 被唤醒后恢复记录，通过受限 helper 读取 PR 平台证据，将局部修复派回原 worker，并核实处理结果。](docs/pr-maintenance-repair-loop.png)
 
-_常规修复循环复用原 worker，并在现有 lead 唤醒时核实处理结果。_
+_常规修复循环复用原 worker，并在现有 lead 唤醒时核实处理结果。原图中的 GitHub 标签同样适用于 Azure DevOps；控制流程没有变化。_
 
 **Pause / Resume / Release** 使用页面显示的记录版本；过期操作会失败，
 必须刷新并重新审阅。遇到设计选择时暂停整个 PR；使用任务的
