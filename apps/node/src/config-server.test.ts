@@ -100,6 +100,120 @@ function relayingRouter(overrides: Partial<ConfigServerOptions> = {}) {
   return createConfigRouter({ ...baseOptions(), ...overrides });
 }
 
+describe("Node command permission settings", () => {
+  const rule = {
+    id: "git-status",
+    commandKey: "git status",
+    path: "C:\\work",
+    builtin: false,
+  };
+  it("reads the Node-owned rule list independently of discovery or Host availability", async () => {
+    const f = router({ getCommandPermissions: () => ({ version: 1, rules: [rule] }) });
+    expect(await f.route("GET", "/api/command-permissions", "")).toEqual({
+      status: 200,
+      body: { version: 1, rules: [rule] },
+    });
+    expect(f.fleet.listOwnSessions).not.toHaveBeenCalled();
+    expect(f.options.sessionDiscovery?.list).not.toHaveBeenCalled();
+  });
+  it("updates only permission rules through a versioned callback", async () => {
+    const updateCommandPermissions = vi.fn(async () => ({ version: 2, rules: [rule] }));
+    const f = router({
+      getCommandPermissions: () => ({ version: 1, rules: [] }),
+      updateCommandPermissions,
+    });
+    expect(
+      await f.route(
+        "POST",
+        "/api/command-permissions",
+        JSON.stringify({ expectedVersion: 1, rules: [rule] }),
+      ),
+    ).toEqual({ status: 200, body: { version: 2, rules: [rule] } });
+    expect(updateCommandPermissions).toHaveBeenCalledWith(1, [rule]);
+    expect(f.options.applySettings).not.toHaveBeenCalled();
+    expect(f.options.applyBackup).not.toHaveBeenCalled();
+  });
+  it("saves a readable editor document independently from the legacy rule endpoint", async () => {
+    const entries = [
+      { command: "git *", path: "C:\\work\\*", match: "pattern" as const },
+    ];
+    const update = vi.fn(async () => ({ version: 2, rules: [], entries }));
+    const f = router({
+      getCommandPermissions: () => ({ version: 1, rules: [], entries: [] }),
+      updateCommandPermissionEntries: update,
+    });
+    expect(
+      await f.route(
+        "POST",
+        "/api/command-permissions",
+        JSON.stringify({ expectedVersion: 1, entries }),
+      ),
+    ).toMatchObject({ status: 200, body: { version: 2, entries } });
+    expect(update).toHaveBeenCalledWith(1, entries);
+    expect(
+      (
+        await f.route(
+          "POST",
+          "/api/command-permissions",
+          JSON.stringify({ expectedVersion: 0, entries }),
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await f.route(
+          "POST",
+          "/api/command-permissions",
+          JSON.stringify({ expectedVersion: 1, entries, rules: [] }),
+        )
+      ).status,
+    ).toBe(400);
+    expect(update).toHaveBeenCalledTimes(1);
+  });
+  it("refuses stale or malformed edits", async () => {
+    const updateCommandPermissions = vi.fn(async () => ({ version: 2, rules: [] }));
+    const f = router({
+      getCommandPermissions: () => ({ version: 1, rules: [rule] }),
+      updateCommandPermissions,
+    });
+    expect(
+      (
+        await f.route(
+          "POST",
+          "/api/command-permissions",
+          JSON.stringify({ expectedVersion: 0, rules: [] }),
+        )
+      ).status,
+    ).toBe(409);
+    expect((await f.route("POST", "/api/command-permissions", "{")).status).toBe(400);
+    expect((await f.route("POST", "/api/command-permissions", "{}")).status).toBe(400);
+    expect(updateCommandPermissions).not.toHaveBeenCalled();
+  });
+  it("reports persistence failures and exposes no stop-sessions endpoint", async () => {
+    const log = vi.fn();
+    const f = router({
+      getCommandPermissions: () => ({ version: 1, rules: [rule] }),
+      updateCommandPermissions: async () => {
+        throw new Error("Cannot save Node permissions");
+      },
+      log,
+    });
+    const result = await f.route(
+      "POST",
+      "/api/command-permissions",
+      JSON.stringify({ expectedVersion: 1, rules: [] }),
+    );
+    expect(result).toEqual({
+      status: 409,
+      body: { error: "Cannot save Node permissions" },
+    });
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Cannot save Node permissions"),
+    );
+    expect((await f.route("POST", "/api/managed-sessions/stop", "{}")).status).toBe(404);
+  });
+});
+
 describe("config listener ports", () => {
   const servers: Server[] = [];
   const events = (log: ReturnType<typeof vi.fn>) =>

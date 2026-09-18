@@ -2,7 +2,13 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { z } from "zod";
-import { terminalRunStates, terminalSessionStates } from "@fleet/protocol";
+import {
+  RunCommandSchema,
+  GetCommandExecutionSchema,
+  CancelCommandExecutionSchema,
+  terminalRunStates,
+  terminalSessionStates,
+} from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { hostnameOf } from "../request-guard.js";
 import type { SecurityAuditInput } from "../store.js";
@@ -110,7 +116,7 @@ function authorizeLead(
   if (!lead) return { ok: false, status: 401, why: "no such session" };
   if (lead.runRole !== "lead")
     return { ok: false, status: 401, why: "session is not a lead" };
-  if (terminalSessionStates.has(lead.state)) {
+  if (terminalSessionStates.has(lead.state) || lead.stopRequested) {
     return { ok: false, status: 401, why: "lead has finished" };
   }
   if (lead.cleanupRequested) {
@@ -251,6 +257,40 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       inputSchema: {},
     },
     async () => reply(tools.listNodes()),
+  );
+  server.registerTool(
+    "fleet_run_command",
+    {
+      title: "Request an approved command",
+      description:
+        "Request a finite shell command on an exact Node target. The Node checks its command/path permissions; a matching built-in, orchestrator-session, or always rule can run automatically. Otherwise the Host prompts a Microsoft administrator for Once, this session, or Always. Simple command identities may ignore recognized flags; compound/dynamic requests require an exact full-script grant, never a first-token rule. Ordinary placement commands can coexist with sessions; managed task worktrees and maintenance remain protected. This tool cannot approve itself or edit permissions. Save the execution ID, end this turn, and Fleet will notify you when it settles. A durable-delivery capable lead Node is required independently of the target; older Nodes retain their Once-only flow.",
+      inputSchema: RunCommandSchema.shape,
+    },
+    guard("fleet_run_command", RunCommandSchema, (input) => tools.runCommand(input)),
+  );
+  server.registerTool(
+    "fleet_get_execution",
+    {
+      title: "Read command evidence",
+      description:
+        "Read an owned execution and bounded stdout/stderr evidence by cursor. Raw bytes are Base64; text decoding assumes UTF-8 and reports loss. Use for evidence, not a polling loop.",
+      inputSchema: GetCommandExecutionSchema.shape,
+    },
+    guard("fleet_get_execution", GetCommandExecutionSchema, (input) =>
+      tools.getExecution(input),
+    ),
+  );
+  server.registerTool(
+    "fleet_cancel_execution",
+    {
+      title: "Cancel an owned command",
+      description:
+        "Revoke a queued command or durably request cancellation. A dispatched attempt stays unresolved until its Node proves no launch or quiescence.",
+      inputSchema: CancelCommandExecutionSchema.shape,
+    },
+    guard("fleet_cancel_execution", CancelCommandExecutionSchema, (input) =>
+      tools.cancelExecution(input),
+    ),
   );
 
   server.registerTool(

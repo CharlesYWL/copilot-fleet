@@ -48,6 +48,7 @@ import { catalogRoutes } from "./routes/catalog.js";
 import { nodeRoutes } from "./routes/nodes.js";
 import { portableBackupRoutes } from "./routes/portable-backup.js";
 import { notificationRoutes } from "./routes/notifications.js";
+import { commandExecutionRoutes } from "./routes/command-executions.js";
 import { startNotificationRetentionMonitor } from "./notifications/retention.js";
 import { startSessionRetentionMonitor } from "./session-retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
@@ -347,6 +348,7 @@ export async function buildServer(
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
   await app.register(notificationRoutes, { service });
+  await app.register(commandExecutionRoutes, { service, auth });
 
   /*
    * Constructed after the service and subscribed to its events, so the engine

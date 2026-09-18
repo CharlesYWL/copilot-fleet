@@ -1,7 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { rmSync } from "node:fs";
+import { resolve } from "node:path";
 import type { NodeCommand, SessionEvent } from "@fleet/protocol";
 import { AgentStartupCleanupError, type AgentFactory, type EventSink } from "./agents.js";
-import { CommandRouter } from "./router.js";
+import { CommandRouter, type CommandRouterOptions } from "./router.js";
+import { LeadPromptJournal } from "./lead-prompt-delivery.js";
+import { NodeAdmission } from "./node-admission.js";
+import { RepositoryParticipation } from "./repository-participation.js";
+import type { CheckoutLease } from "./checkout-locks.js";
 import { MCP_CONNECTION_STABLE_MS, MCP_RECOVERY_DELAYS_MS } from "./mcp-recovery.js";
 
 const resume = (
@@ -34,7 +41,15 @@ function agent() {
   };
 }
 
-async function setup() {
+const journals: { journal: LeadPromptJournal; directory: string }[] = [];
+function deliveryJournal() {
+  const directory = resolve(`.lead-delivery-test-${randomUUID()}`);
+  const journal = new LeadPromptJournal(directory, () => {}, false);
+  journals.push({ journal, directory });
+  return journal;
+}
+
+async function setup(options: CommandRouterOptions = {}) {
   const events: SessionEvent[] = [];
   const agents: ReturnType<typeof agent>[] = [];
   const sinks: EventSink[] = [];
@@ -66,6 +81,9 @@ async function setup() {
     (event) => events.push(event),
     async (path) => path,
     () => "http://localhost:8787",
+    async () => [],
+    () => {},
+    options,
   );
   expect((await router.route(resume())).ok).toBe(true);
   return { router, start, events, agents, sinks };
@@ -80,6 +98,127 @@ describe("bounded MCP session recovery", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    for (const { journal, directory } of journals.splice(0)) {
+      journal.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it("defers recovery for a durable prompt and does not advertise recovery until that turn settles", async () => {
+    const journal = deliveryJournal();
+    const f = await setup({ leadDeliveries: journal });
+    let finish!: () => void;
+    f.agents[0]!.prompt.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const delivery = {
+      deliveryId: randomUUID(),
+      sessionId: "lead",
+      prompt: "command result",
+    };
+    expect((await f.router.deliverLeadPrompt("host", delivery)).state).toBe("accepted");
+    await f.router.refreshMcpSessions();
+    expect(f.start).toHaveBeenCalledTimes(1);
+    expect(f.agents[0]!.stop).not.toHaveBeenCalled();
+    expect(f.router.busySessionIds).toContain("lead");
+    f.sinks[0]!({
+      eventId: "waiting-idle",
+      sessionId: "lead",
+      sequence: 13,
+      type: "state",
+      payload: { state: "idle", activity: "Ready" },
+      createdAt: new Date().toISOString(),
+    });
+    expect(f.events.at(-1)?.payload.state).toBe("idle");
+    f.sinks[0]!({
+      eventId: "completed",
+      sessionId: "lead",
+      sequence: 14,
+      type: "turn_complete",
+      payload: { stopReason: "end_turn" },
+      createdAt: new Date().toISOString(),
+    });
+    finish();
+    await flush();
+    expect(journal.reserved("lead", "saved-lead")).toBe(false);
+    f.sinks[0]!({
+      eventId: "settled-idle",
+      sessionId: "lead",
+      sequence: 15,
+      type: "state",
+      payload: { state: "idle", activity: "Ready" },
+      createdAt: new Date().toISOString(),
+    });
+    await flush();
+    expect(f.start).toHaveBeenCalledTimes(2);
+    expect(f.agents[0]!.prompt).toHaveBeenCalledTimes(1);
+    expect(failures(f.events)).toEqual([]);
+  });
+
+  it("rejects new durable handoffs as busy while recovery waits for reconnect", async () => {
+    const journal = deliveryJournal();
+    const f = await setup({ leadDeliveries: journal });
+    f.router.setMcpAvailable(false);
+    const recovery = f.router.refreshMcpSessions();
+    await flush();
+    const receipt = await f.router.deliverLeadPrompt("host", {
+      deliveryId: randomUUID(),
+      sessionId: "lead",
+      prompt: "do not queue behind recovery",
+    });
+    expect(receipt.state).toBe("rejected_busy");
+    expect(f.agents[0]!.prompt).not.toHaveBeenCalled();
+    f.router.setMcpAvailable(true);
+    await vi.advanceTimersByTimeAsync(MCP_CONNECTION_STABLE_MS);
+    await recovery;
+    expect(f.start).toHaveBeenCalledTimes(2);
+    expect(f.agents.every((agent) => agent.prompt.mock.calls.length === 0)).toBe(true);
+  });
+
+  it("does not replace a healthy session while Node maintenance has closed admission", async () => {
+    const admission = new NodeAdmission();
+    const f = await setup({ admission });
+    const reopen = admission.close("Maintenance");
+    await f.router.refreshMcpSessions();
+    expect(f.start).toHaveBeenCalledTimes(1);
+    expect(f.router.activeSessionIds).toContain("lead");
+    expect(failures(f.events)).toEqual([]);
+    reopen();
+    await f.router.refreshMcpSessions();
+    expect(f.start).toHaveBeenCalledTimes(2);
+  });
+
+  it("persists unknown shared participation after MCP shutdown retries are exhausted", async () => {
+    const lease: CheckoutLease = {
+      key: "source",
+      owner: "session:lead",
+      release: vi.fn(),
+      revalidate: vi.fn(async () => {}),
+      processPending: vi.fn(),
+      processStarted: vi.fn(),
+      processesQuiesced: vi.fn(),
+      requireReconciliation: vi.fn(),
+      reattach: vi.fn(),
+    };
+    const repositories = new RepositoryParticipation();
+    vi.spyOn(repositories, "participate").mockResolvedValue({
+      leases: [lease],
+      supervised: true,
+    });
+    const f = await setup({ repositories });
+    f.agents[0]!.stop.mockRejectedValue(new Error("Process exit not verified"));
+    const recovery = f.router.refreshMcpSessions();
+    await flush();
+    for (const delay of MCP_RECOVERY_DELAYS_MS) await vi.advanceTimersByTimeAsync(delay);
+    await recovery;
+    expect(lease.requireReconciliation).toHaveBeenCalledWith(
+      expect.stringContaining("MCP recovery blocked"),
+    );
+    expect(lease.release).not.toHaveBeenCalled();
+    expect(f.start).toHaveBeenCalledTimes(1);
   });
 
   it("retries cleanup before replacement without prompting or disturbing workers", async () => {

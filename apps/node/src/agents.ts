@@ -154,7 +154,11 @@ export function configRecoveryRequest(
 }
 
 export interface SessionAgent {
-  prompt(text: string, attachments?: readonly PromptAttachment[]): Promise<void>;
+  prompt(
+    text: string,
+    attachments?: readonly PromptAttachment[],
+    options?: { allowContextRollover?: boolean },
+  ): Promise<void>;
   cancel(): Promise<void>;
   stop(announce?: boolean): Promise<void>;
   resolvePermission(requestId: string, decision: PermissionDecision): void;
@@ -987,6 +991,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   async prompt(
     text: string,
     attachments: readonly PromptAttachment[] = [],
+    options: { allowContextRollover?: boolean } = {},
   ): Promise<void> {
     this.assertActive();
     if (!this.agentSessionId || !this.connection) {
@@ -1035,7 +1040,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.emit("state", { state: "idle", activity: "Ready for follow-up" });
     } catch (error) {
       let failure = error;
-      if (isCapiRequestTooLarge(error)) {
+      if (isCapiRequestTooLarge(error) && options.allowContextRollover !== false) {
         try {
           await this.rollOverConversation(
             contextRolloverPrompt(this.contextOverflowRecoveryPrompt, text, attachments),

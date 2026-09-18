@@ -61,6 +61,11 @@ button:disabled {
   cursor: default;
 }
 
+button.danger {
+  background: var(--danger);
+  color: var(--bg);
+}
+
 button.secondary,
 .row button {
   border-color: var(--border);
@@ -71,6 +76,7 @@ button:focus-visible,
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
+summary:focus-visible,
 [tabindex]:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
@@ -89,6 +95,11 @@ textarea {
 
 textarea {
   resize: vertical;
+}
+
+input[type="checkbox"] {
+  width: auto;
+  accent-color: var(--accent);
 }
 
 .app-shell {
@@ -647,6 +658,61 @@ dialog::backdrop {
 
 .dialog-actions {
   justify-content: flex-end;
+}
+
+.command-permissions .section-heading {
+  margin-top: 0;
+  flex-wrap: wrap;
+}
+
+.command-permission-editor,
+.command-permission-example {
+  font:
+    13px/1.6 "Cascadia Mono",
+    ui-monospace,
+    monospace;
+  background: var(--bg);
+}
+
+.command-permission-editor {
+  min-height: 320px;
+  resize: vertical;
+  white-space: pre;
+}
+
+.command-permission-editor[aria-invalid="true"] {
+  border-color: var(--danger);
+}
+
+.command-permission-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.command-permission-legacy {
+  padding: 10px 12px;
+  border-left: 3px solid var(--warning);
+  background: var(--surface-raised);
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.command-permission-example {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+}
+
+.command-permission-matching {
+  margin: 14px 0 0;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .optional {

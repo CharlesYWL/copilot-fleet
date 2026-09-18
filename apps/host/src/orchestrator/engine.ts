@@ -164,6 +164,7 @@ export class OrchestratorEngine {
 
   /** Advances every run that is not already finished. */
   tick(nowMs = Date.now()): void {
+    this.service.commands.tick(nowMs);
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
     for (const run of this.store.listRuns()) {
@@ -176,6 +177,12 @@ export class OrchestratorEngine {
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
     if (!run || terminalRunStates.has(run.state)) return;
+    const commandFence = this.store.commands.fence(runId);
+    if (
+      commandFence &&
+      ["executing", "observation_required"].includes(commandFence.state)
+    )
+      return;
     if (run.state === "aggregating") {
       this.service.worktrees.advanceAggregation(run.id);
       return;
@@ -314,6 +321,7 @@ export class OrchestratorEngine {
       ...(step.executionBinding ? { executionBinding: step.executionBinding } : {}),
     });
     if (!starting) return false;
+    this.store.commands.recordStepEvidence(run.id, step.id);
 
     const result = this.service.createAndStartSession({
       placement,
@@ -377,6 +385,7 @@ export class OrchestratorEngine {
     }
     if (!terminalSessionStates.has(session.state)) return false;
     this.store.updateRunStep(step.id, { dispatchedAt: new Date().toISOString() });
+    this.store.commands.recordStepEvidence(run.id, step.id);
     const resumed = this.service.resumeSession(
       session.id,
       "Resuming for orchestrator follow-up",
@@ -407,6 +416,7 @@ export class OrchestratorEngine {
       eventSeqFrom: this.store.maxEventSequence(session.id),
       dispatchedAt: new Date().toISOString(),
     });
+    this.store.commands.recordStepEvidence(run.id, step.id);
     const sent = this.service.dispatch(session.nodeId, {
       type: "prompt",
       sessionId: session.id,
@@ -490,6 +500,27 @@ export class OrchestratorEngine {
   private deliverPrompt(run: Run, prompt: string, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
     if (!lead || lead.state !== "idle" || lead.cleanupRequested) return false;
+    if (this.service.commands.durableLead(lead.id)) {
+      const queued = this.store.writeAtomically(() => {
+        if (
+          !this.store.recordRunPromptDelivery(
+            run.id,
+            lead.id,
+            prompt,
+            new Date(nowMs).toISOString(),
+          )
+        )
+          return false;
+        this.service.commands.queueLeadPrompt(
+          lead.id,
+          prompt,
+          `run-prompt:${run.id}:${run.updatedAt}`,
+        );
+        return true;
+      });
+      if (queued) this.service.commands.pumpLead(lead.id);
+      return queued;
+    }
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     if (
@@ -521,6 +552,23 @@ export class OrchestratorEngine {
   private wakeLead(run: Run, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
     if (!lead || lead.state !== "idle" || lead.cleanupRequested) return false;
+    if (this.service.commands.durableLead(lead.id)) {
+      const queued = this.store.writeAtomically(() => {
+        const prompt = this.wakeEnvelope(run);
+        if (
+          !this.store.recordRunWakePrompt(run.id, lead.id, new Date(nowMs).toISOString())
+        )
+          return false;
+        this.service.commands.queueLeadPrompt(
+          lead.id,
+          prompt,
+          `run-wake:${run.id}:${run.settleSeq}`,
+        );
+        return true;
+      });
+      if (queued) this.service.commands.pumpLead(lead.id);
+      return queued;
+    }
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     if (!this.store.recordRunWakePrompt(run.id, lead.id, new Date(nowMs).toISOString())) {
@@ -607,6 +655,18 @@ export class OrchestratorEngine {
       });
 
       this.promptedThisTick.add(lead.id);
+      if (this.service.commands.durableLead(lead.id)) {
+        this.store.writeAtomically(() => {
+          this.service.commands.queueLeadPrompt(
+            lead.id,
+            statusCheckEnvelope(tasks),
+            `status:${lead.id}:${baseline}`,
+          );
+          this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+        });
+        this.service.commands.pumpLead(lead.id);
+        continue;
+      }
       this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
       this.service.dispatch(lead.nodeId, {
         type: "prompt",

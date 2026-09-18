@@ -12,7 +12,7 @@ export type TerminalBlockKind =
   | "state"
   | "error"
   | "system"
-  /** Fleet control envelopes: worker wakes, reviews, task briefs and status checks. */
+  /** Fleet control envelopes: worker/command results, reviews, task briefs and status checks. */
   | "wake";
 
 export type TerminalBlock = {

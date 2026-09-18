@@ -70,6 +70,8 @@ export type OrchestratorPageProps = {
   onStopOrchestrator: () => void;
   onResumeOrchestrator: () => void;
   onDismissOrchestrator: () => void;
+  onOpenCommands?: (() => void) | undefined;
+  commandExecutionCount?: number;
 };
 
 /**
@@ -95,6 +97,8 @@ export const OrchestratorPage = ({
   onStopOrchestrator,
   onResumeOrchestrator,
   onDismissOrchestrator,
+  onOpenCommands,
+  commandExecutionCount = 0,
 }: OrchestratorPageProps) => {
   const styles = useStyles();
   const ended = terminalSessionStates.has(conversation.state);
@@ -154,6 +158,11 @@ export const OrchestratorPage = ({
       )}
 
       <div className={styles.footer}>
+        {onOpenCommands && (
+          <Button size="small" onClick={onOpenCommands}>
+            Commands ({commandExecutionCount})
+          </Button>
+        )}
         {activeAgentCount > 0 && (
           <Button
             size="small"

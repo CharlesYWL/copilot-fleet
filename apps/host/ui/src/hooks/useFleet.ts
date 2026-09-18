@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
+  CommandExecutionSchema,
+  CommandOutputEventSchema,
+  type CommandOutputEvent,
   type MarkAllNotificationsReadResponse,
   type BrowserMessage,
   type Notification,
@@ -13,6 +16,7 @@ import {
 import { announceSignedOut, csrfToken, forgetCsrfToken } from "../lib/auth";
 import { reconnectDelay } from "./reconnect-delay";
 import { mergeEvents } from "../lib/merge-events";
+import { mergeCommandExecutions, mergeCommandOutput } from "../lib/command-output";
 
 export type { Snapshot };
 
@@ -67,6 +71,7 @@ export function useFleet(notify: Notify) {
     LiveNotificationUpdate[]
   >([]);
   const [events, setEvents] = useState<Record<string, SessionEvent[]>>({});
+  const [commandOutput, setCommandOutput] = useState<CommandOutputEvent[]>([]);
   /**
    * Steps per run, kept beside the snapshot rather than inside it.
    *
@@ -426,6 +431,8 @@ export function useFleet(notify: Notify) {
   useEffect(() => {
     let socket: WebSocket | undefined;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let commandFlushTimer: ReturnType<typeof setTimeout> | undefined;
+    let pendingCommandOutput: CommandOutputEvent[] = [];
     let attempt = 0;
     let closed = false;
     let connectionLost = false;
@@ -469,6 +476,39 @@ export function useFleet(notify: Notify) {
         if (!message) {
           notifyRef.current("Malformed live update", "error");
           socket?.close(1007, "Malformed JSON");
+          return;
+        }
+        if (message.type === "command_execution") {
+          const parsed = CommandExecutionSchema.safeParse(message.execution);
+          if (!parsed.success) {
+            notifyRef.current("Malformed command execution update", "error");
+            socket?.close(1007, "Malformed command execution");
+            return;
+          }
+          setSnapshot((value) => ({
+            ...value,
+            commandExecutions: mergeCommandExecutions(value.commandExecutions ?? [], [
+              parsed.data,
+            ]).slice(0, 200),
+          }));
+          return;
+        }
+        if (message.type === "command_execution_output") {
+          const parsed = CommandOutputEventSchema.safeParse(message.event);
+          if (!parsed.success) {
+            notifyRef.current("Malformed command output", "error");
+            socket?.close(1007, "Malformed command output");
+            return;
+          }
+          pendingCommandOutput = mergeCommandOutput(pendingCommandOutput, [parsed.data]);
+          if (!commandFlushTimer) {
+            commandFlushTimer = setTimeout(() => {
+              const batch = pendingCommandOutput;
+              pendingCommandOutput = [];
+              commandFlushTimer = undefined;
+              if (!closed) setCommandOutput((value) => mergeCommandOutput(value, batch));
+            }, 100);
+          }
           return;
         }
         if (message.type === "snapshot") {
@@ -577,6 +617,7 @@ export function useFleet(notify: Notify) {
     return () => {
       closed = true;
       if (retryTimer) clearTimeout(retryTimer);
+      if (commandFlushTimer) clearTimeout(commandFlushTimer);
       socket?.close();
     };
   }, [
@@ -591,6 +632,7 @@ export function useFleet(notify: Notify) {
     snapshot,
     liveNotificationUpdates,
     events,
+    commandOutput,
     runSteps,
     runNotes,
     connected,

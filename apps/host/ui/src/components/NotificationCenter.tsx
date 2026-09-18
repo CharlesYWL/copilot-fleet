@@ -226,6 +226,8 @@ const useStyles = makeStyles({
 });
 
 const kindLabels: Record<AppNotification["kind"], string> = {
+  command_approval: "Command approval",
+  command_completion: "Command finished",
   managed_worktree_attention: "Worktree needs attention",
   app_message: "Application message",
   agent_completion: "Agent completed",

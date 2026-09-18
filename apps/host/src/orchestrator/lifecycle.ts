@@ -63,6 +63,7 @@ export function stopSessions(
 
 /** Stops every session a run still holds. Idempotent, so cancel-then-delete is safe. */
 export function stopRunSessions(service: FleetService, runId: string): void {
+  service.commands.revokeTask(runId);
   stopSessions(
     service,
     service.store.listSessions().filter((session) => session.runId === runId),

@@ -52,6 +52,12 @@ import {
   parseWorktreeRegistry,
   type WorktreeRegistryEntry,
 } from "./git-runner.js";
+import type { NodeAdmission } from "./node-admission.js";
+import type {
+  RepositoryParticipation,
+  RepositoryTarget,
+} from "./repository-participation.js";
+import type { CommandPreparation } from "@fleet/protocol";
 
 export class WorktreeCrash extends Error {}
 export type ManagedWorktreeOptions = {
@@ -60,6 +66,8 @@ export type ManagedWorktreeOptions = {
   locks?: CheckoutLocks;
   git?: GitRunner;
   root?: string;
+  admission?: NodeAdmission;
+  repositories?: RepositoryParticipation;
   quiesce?: (worktreeId: string, targetPath?: string) => Promise<void>;
   checkpoint?: (
     stage: "intent" | "git" | "receipt",
@@ -218,6 +226,57 @@ export class ManagedWorktrees {
     return row ? ManagedWorktreeSchema.parse(JSON.parse(String(row.data))) : undefined;
   }
 
+  get hasUnresolvedWork(): boolean {
+    if (this.inFlight.size || this.integrationLeases.size) return true;
+    return this.db
+      .prepare("SELECT data FROM trees")
+      .all()
+      .some((row) => {
+        const tree = ManagedWorktreeSchema.parse(JSON.parse(String(row.data)));
+        return (
+          ["needs_reconciliation", "quarantined", "creating", "removing"].includes(
+            tree.state,
+          ) || unresolved.has(tree.integrationState)
+        );
+      });
+  }
+
+  async validateCommandTarget(
+    request: CommandPreparation,
+    target: RepositoryTarget,
+  ): Promise<void> {
+    if (!("worktreeId" in request.target)) {
+      this.assertManagedPathBound(target.checkout);
+      return;
+    }
+    const tree = this.get(request.target.worktreeId);
+    if (
+      !tree ||
+      tree.generation !== request.target.generation ||
+      tree.nodeId !== this.options.nodeId() ||
+      tree.nodeInstallationId !== this.installationId ||
+      tree.checkout?.key !== target.checkout.key ||
+      tree.commonDirectory.key !== target.repository.key ||
+      tree.path !== target.cwd ||
+      tree.abandonedAt ||
+      tree.orphanedAt ||
+      tree.state !== "ready" ||
+      tree.resultSha ||
+      tree.resultRecordedAt ||
+      tree.sealedFiles.length ||
+      tree.importedWorkspaceResults.length ||
+      tree.composition?.predecessors.length ||
+      !["not_requested", "not_ready"].includes(tree.integrationState) ||
+      this.integrations(tree.id).length
+    ) {
+      throw new WorktreeConflict(
+        "managed_target_not_mutable",
+        "Only an explicitly bound, mutable, unsealed and uncomposed managed generation may run commands.",
+      );
+    }
+    await this.verifyTree(tree);
+  }
+
   private save(tree: ManagedWorktree): void {
     this.db
       .prepare(
@@ -271,12 +330,17 @@ export class ManagedWorktrees {
       return pending;
     }
     const prior = this.worktreeTails.get(request.worktreeId) ?? Promise.resolve();
+    const ticket = this.options.admission?.enter(`operation:${request.operationId}`);
     this.queuedRequests.set(request.operationId, request);
     const promise = prior
-      .then(() => this.runOperation(request))
+      .then(() => {
+        ticket?.revalidate();
+        return this.runOperation(request);
+      })
       .finally(() => {
         this.inFlight.delete(request.operationId);
         this.queuedRequests.delete(request.operationId);
+        ticket?.release();
       });
     const tail = promise.then(
       () => undefined,
@@ -466,6 +530,13 @@ export class ManagedWorktrees {
       await this.options.quiesce(tree.id, request.targetPath);
     }
     if (request.kind === "reconcile") this.locks.reconcileAdmin(common);
+    const participation = this.options.repositories
+      ? await this.options.repositories.acquire(
+          [{ cwd: source.path, checkout: source, repository: common, git: true }],
+          `operation:${request.operationId}`,
+          "exclusive",
+        )
+      : [];
     const leaveQueue = await this.enterAdminQueue(common.key);
     let admin: CheckoutLease | undefined;
     try {
@@ -586,10 +657,23 @@ export class ManagedWorktrees {
       }
       return await this.integrate(tree, request, admin);
     } finally {
+      let quiescent = false;
       try {
         admin?.release();
+        quiescent = true;
       } finally {
         leaveQueue();
+        for (const lease of participation.reverse()) {
+          if (quiescent) lease.release();
+          else {
+            lease.requireReconciliation(
+              "Repository administration process ownership is unknown.",
+            );
+            this.options.admission?.quarantine(
+              "Repository administration process ownership is unknown.",
+            );
+          }
+        }
       }
     }
   }

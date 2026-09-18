@@ -6,6 +6,7 @@
  */
 
 import { initDiagnostics } from "./diagnostics.js";
+import { initCommandPermissions } from "./command-permissions.js";
 import { initFleetWorkspaces } from "./fleet-workspaces.js";
 import { initNodeSettings } from "./node-settings.js";
 import { initSessions } from "./sessions.js";
@@ -13,6 +14,7 @@ import { initShell } from "./ui.js";
 
 initShell();
 const settings = initNodeSettings();
+initCommandPermissions();
 initDiagnostics({
   loadConfig: settings.load,
   renderConfig: settings.render,

@@ -110,6 +110,7 @@ function mechanics(): string[] {
     "",
     "`fleet_transcript` gets a worker's full output when the wake summary is not enough to judge by.",
     "`fleet_get_task` reads its objective, criteria, notes, worker context and continuation actions. Use task IDs as `task` in later calls: display names can change or be ambiguous.",
+    "`fleet_run_command` requests a finite command on an exact Node/path. A Node-owned permission may allow it automatically; otherwise the Host asks for Once, this orchestrator session, or Always. Recognized simple commands match command/subcommand and canonical cwd without ordinary flags. Compound/dynamic commands can be remembered only as the exact full script; changing any text asks again. Ordinary placement commands may run alongside sessions; coordinate writes, and do not bypass managed worktree or maintenance protections. You cannot approve yourself or edit permissions through MCP. Do not ask for local opt-in setup. Keep the execution ID, end your turn, and await Fleet's completion notification.",
     "",
     "## How a task ends",
     "",

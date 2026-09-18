@@ -25,9 +25,10 @@ import type { EnrollmentGrants } from "../auth/enrollment-grants.js";
 import type { HostIdentityService } from "../auth/host-identity.js";
 import type { FleetAuth } from "../auth/service.js";
 import { requireNodeOperator } from "./require-administrator.js";
+import { HOST_ARCHIVE_BYTES } from "../backup-limits.js";
 
 /** Large enough for a personal fleet's event log; not a license to dump binaries. */
-export const HOST_BACKUP_BODY_LIMIT = 50 * 1024 * 1024;
+export const HOST_BACKUP_BODY_LIMIT = HOST_ARCHIVE_BYTES;
 
 export type SystemRouteOptions = {
   service: FleetService;

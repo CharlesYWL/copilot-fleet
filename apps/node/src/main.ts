@@ -24,6 +24,12 @@ import {
   type ArtifactTransferAck,
   type WorkspaceResult,
   WORKSPACE_ARTIFACT_CHUNK_BYTES,
+  COMMAND_EXECUTION_CAPABILITY,
+  COMMAND_PERMISSIONS_CAPABILITY,
+  DURABLE_LEAD_DELIVERY_CAPABILITY,
+  COMMAND_LIMITS,
+  CommandExecutionHostMessageSchema,
+  LeadPromptDeliverySchema,
 } from "@fleet/protocol";
 import { type AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
@@ -79,6 +85,21 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { ManagedWorktrees } from "./managed-worktrees.js";
+import { NodeAdmission } from "./node-admission.js";
+import { UpdateQuarantine } from "./update-quarantine.js";
+import { RepositoryParticipation } from "./repository-participation.js";
+import { CommandJournal } from "./command-journal.js";
+import { CommandExecutionManager } from "./command-execution-manager.js";
+import {
+  CommandPermissions,
+  commandPermissionEntries,
+  compileCommandPermissionEntries,
+  recoverCommandPermissionText,
+  validateCommandPermissionRules,
+} from "./command-permissions.js";
+import { nativeCommandSupervisor } from "./command-supervisor-adapter.js";
+import { LeadPromptJournal } from "./lead-prompt-delivery.js";
+import { CheckoutLocks } from "./checkout-locks.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 import { EventOutbox } from "./outbox.js";
 import { NODE_CAPABILITIES } from "./node-capabilities.js";
@@ -95,6 +116,7 @@ import {
   loadSettings,
   needsReconnect,
   saveSettings,
+  createSettingsUpdater,
   settingsOverridesFromEnv,
   SettingsSchema,
   type Settings,
@@ -114,6 +136,8 @@ import {
 const VERSION = packageVersion();
 const REVISION = gitRevision();
 const RECONNECT_DELAY_MS = 2_000;
+const RECOVERED_COMMAND_OWNERSHIP =
+  "Recovered command ownership remains unknown; reconcile before admitting work.";
 /**
  * Dials that never reached the Host before the tunnel is assumed dead.
  *
@@ -213,6 +237,23 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   if (devTunnel) {
     settings = endpointsBehindLocalForward(settings, devTunnel.url);
   }
+  const commandPermissions = new CommandPermissions({
+    getRules: () => settings.commandPermissionRules,
+    saveRules: async (update) => {
+      await updateSettings((current) => ({
+        ...current,
+        commandPermissionRules: update(current.commandPermissionRules),
+      }));
+    },
+  });
+  const updateSettings = createSettingsUpdater({
+    get: () => settings,
+    set: (next) => {
+      settings = next;
+      commandPermissions.refreshPolicy();
+    },
+    save: saveSettings,
+  });
 
   // A respawned tunnel can land on a different port. Without following it the
   // node keeps dialing the old one, which nothing is listening on any more.
@@ -326,6 +367,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * talking over the plain connection it authenticated with.
    */
   let sealedConnection = false;
+  let commandExecutionsNegotiated = false;
+  let commandPermissionsNegotiated = false;
+  let leadDeliveryNegotiated = false;
   /**
    * Stops the liveness watchdog on whichever socket is current.
    *
@@ -342,6 +386,44 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   let updating = false;
   let reconnectTimer: NodeJS.Timeout | undefined;
   const outbox = new EventOutbox();
+  const admission = new NodeAdmission();
+  const updateQuarantine = new UpdateQuarantine(
+    admission,
+    configDirectory(),
+    repoRoot(),
+    REVISION,
+  );
+  const repositories = new RepositoryParticipation();
+  const journal = new CommandJournal(join(configDirectory(), "remote-commands"));
+  if (settings.commandPermissionRules.some((rule) => rule.command === undefined)) {
+    const recovered = recoverCommandPermissionText(
+      settings.commandPermissionRules,
+      journal.all().map((record) => record.descriptor),
+    );
+    if (JSON.stringify(recovered) !== JSON.stringify(settings.commandPermissionRules))
+      await updateSettings((current) => ({
+        ...current,
+        commandPermissionRules: recovered,
+      }));
+  }
+  const leadDeliveries = new LeadPromptJournal(
+    join(configDirectory(), "lead-deliveries"),
+    (receipt, hostId) => {
+      if (
+        sealedConnection &&
+        channel &&
+        leadDeliveryNegotiated &&
+        credentials.authProtocol === MUTUAL_AUTH_PROTOCOL &&
+        credentials.host.hostId === hostId
+      )
+        return send({ type: "lead_prompt_receipt", receipt });
+      return false;
+    },
+  );
+  leadDeliveries.onFailure = (error) =>
+    admission.quarantine(
+      `Durable lead receipt journal cannot persist evidence: ${String(error)}`,
+    );
   let outboxReconciliationPending = false;
   let holdEventsForReconnectFlush = false;
   const sessionDiscovery = mockAgent
@@ -514,6 +596,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     quiesce: (id, target): Promise<void> => router.quiesceWorktree(id, target),
     uploadArtifact,
     downloadArtifact,
+    admission,
+    repositories,
     ...(process.env.FLEET_WORKTREE_ROOT ? { root: process.env.FLEET_WORKTREE_ROOT } : {}),
   });
   const router: CommandRouter = new CommandRouter(
@@ -533,6 +617,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     warn,
     {
       worktrees,
+      admission,
+      repositories,
+      leadDeliveries,
       deleteInactiveSession: async (agentSessionId, inactiveBefore, beforeDelete) => {
         if (mockAgent) {
           await beforeDelete();
@@ -546,6 +633,36 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       },
     },
   );
+
+  const commands = new CommandExecutionManager({
+    journal,
+    admission,
+    repositories,
+    supervisor: nativeCommandSupervisor,
+    connection: () => ({
+      sealed: sealedConnection && !!channel,
+      negotiated: commandExecutionsNegotiated,
+      permissions: commandPermissionsNegotiated,
+      nodeId: credentials.nodeId,
+      hostId:
+        credentials.authProtocol === MUTUAL_AUTH_PROTOCOL ? credentials.host.hostId : "",
+    }),
+    send: (message) =>
+      sealedConnection && !!channel && commandExecutionsNegotiated
+        ? send(message)
+        : false,
+    validateTarget: (request, target) => worktrees.validateCommandTarget(request, target),
+    permissions: commandPermissions,
+    locks: worktrees.locks,
+    warn,
+  });
+  await commands.recoverAll();
+  if (commands.unsettled) admission.quarantine(RECOVERED_COMMAND_OWNERSHIP);
+  try {
+    await commands.configure(true);
+  } catch (error) {
+    warn(`Remote commands unavailable: ${errorMessage(error)}`);
+  }
 
   /**
    * The identity this process speaks as, enrolling when it must.
@@ -601,9 +718,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     { operatorEdit = true }: { operatorEdit?: boolean } = {},
   ): Promise<void> {
     const previous = settings;
-    const settled = operatorEdit ? endpointsAfterOperatorEdit(previous, next) : next;
-    settings = settled;
-    await saveSettings(settled);
+    const changes = Object.fromEntries(
+      Object.entries(next).filter(
+        ([key, value]) =>
+          key !== "commandPermissionRules" &&
+          key !== "commandPermissionRevision" &&
+          JSON.stringify(previous[key as keyof Settings]) !== JSON.stringify(value),
+      ),
+    );
+    const settled = await updateSettings(async (current) => {
+      const merged = SettingsSchema.parse({ ...current, ...changes });
+      return operatorEdit ? endpointsAfterOperatorEdit(current, merged) : merged;
+    });
     router.setMaxSessions(settled.maxSessions);
     if (factory instanceof AcpAgentFactory) {
       factory.configure(
@@ -626,7 +752,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    * both identity files, and dial the Host as that node.
    */
   async function applyBackup(archive: NodeBackup): Promise<void> {
+    const reopen = admission.close("Node identity restore is in progress.");
     const errors: unknown[] = [];
+    try {
+      await commands.restore();
+    } catch (error) {
+      errors.push(error);
+    }
     try {
       await router.stopAll();
     } catch (error) {
@@ -638,15 +770,24 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         errors.push(error);
       }
     }
-    if (errors.length)
+    if (errors.length) {
+      admission.quarantine(
+        "Backup restore could not prove all process ownership quiescent.",
+      );
       throw new AggregateError(
         errors,
         "Backup import aborted: sessions could not be safely stopped and quarantined.",
       );
-    credentials = archive.credentials;
-    settings = SettingsSchema.parse(archive.settings);
-    await saveCredentials(credentials);
-    await saveSettings(settings);
+    }
+    await updateSettings(async () => {
+      const restored = SettingsSchema.parse(archive.settings);
+      restored.commandPermissionRules = await validateCommandPermissionRules(
+        restored.commandPermissionRules,
+      );
+      credentials = archive.credentials;
+      await saveCredentials(credentials);
+      return restored;
+    });
     router.setMaxSessions(settings.maxSessions);
     if (factory instanceof AcpAgentFactory) {
       factory.configure(
@@ -658,6 +799,13 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     log(
       `Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`,
     );
+    // Old preparation and session-grant namespaces are permanently retired.
+    try {
+      await commands.configure(true);
+    } catch (error) {
+      warn(`Remote commands unavailable: ${errorMessage(error)}`);
+    }
+    reopen();
     reconnect();
   }
 
@@ -679,8 +827,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   /** Writes a change of Host address to both files that remember one. */
   async function persistEndpoints(endpoints: HostEndpoints): Promise<void> {
-    settings = { ...settings, ...endpoints };
-    await saveSettings(settings);
+    await updateSettings((current) => ({ ...current, ...endpoints }));
     if (sameHostUrl(credentials.hostUrl, settings.hostUrl)) return;
     credentials = { ...credentials, hostUrl: settings.hostUrl };
     await saveCredentials(credentials);
@@ -698,8 +845,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   async function applyAnnouncedName(name: string): Promise<void> {
     if (name === settings.nodeName && name === credentials.name) return;
     const previous = settings.nodeName;
-    settings = { ...settings, nodeName: name };
-    await saveSettings(settings);
+    await updateSettings((current) => ({ ...current, nodeName: name }));
     credentials = { ...credentials, name };
     await saveCredentials(credentials);
     if (previous !== name) log(`Host renamed this node "${previous}" -> "${name}"`);
@@ -739,10 +885,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /**
    * Pulls, rebuilds and restarts this Node on the Host's instruction.
    *
-   * The build runs before anything is torn down, so a checkout that fails to
-   * compile leaves the machine exactly as it was — connected and running the
-   * code it already had — instead of exiting into a broken tree that nobody is
-   * there to fix.
+   * Admission closes before mutations. Failed mutations persist a quarantine;
+   * an explicit retry rebuilds even if Git already reached the target revision.
    */
   async function runSelfUpdate(updateId: string): Promise<void> {
     if (updating) {
@@ -750,23 +894,72 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       return;
     }
     updating = true;
+    const reopen = admission.close("Node self-update is in progress.");
+    let maintenanceLeases: Awaited<ReturnType<RepositoryParticipation["acquire"]>> = [];
     const root = repoRoot();
     log(`Self-update requested; using checkout ${root}`);
     try {
+      const forceRebuild = updateQuarantine.prepareRetry();
+      admission.assertIdle();
+      if (
+        router.activeSessionIds.length ||
+        worktrees.hasUnresolvedWork ||
+        commands.unsettled ||
+        leadDeliveries.unsettled
+      )
+        throw new Error(
+          "Self-update refused: active or unknown Fleet work must be drained before Git or npm mutation.",
+        );
+      const target = await repositories.resolve(root);
+      maintenanceLeases = await repositories.acquire(
+        [target],
+        "node-self-update",
+        "exclusive",
+        false,
+        true,
+      );
+      if (target.checkout && target.repository) {
+        const locks = worktrees.locks ?? new CheckoutLocks();
+        locks.bindScope(target.checkout, target.git ? target.repository : undefined);
+        if (target.git) {
+          locks.bindScope(target.repository, target.repository);
+          maintenanceLeases.push(
+            locks.acquire(target.repository, {
+              owner: "node-self-update",
+              attempt: updateId,
+              kind: "admin",
+            }),
+          );
+        }
+        maintenanceLeases.push(
+          locks.acquire(target.checkout, {
+            owner: "node-self-update",
+            attempt: updateId,
+            kind: "maintenance",
+          }),
+        );
+      }
       const outcome = await updateCheckout({
         repoRoot: root,
         runningRevision: REVISION,
         report,
+        beforeMutation: () => updateQuarantine.beforeMutation(),
+        forceRebuild,
       });
+      // process.exit does not run finally; retire durable maintenance locks before restart.
+      for (const lease of [...maintenanceLeases].reverse()) lease.release();
+      maintenanceLeases = [];
       if (outcome.action === "failed") {
         report("failed", outcome.reason);
         return;
       }
       if (outcome.action === "none") {
+        updateQuarantine.clear();
         log(`Self-update: ${outcome.reason}`);
         report("up_to_date", outcome.reason);
         return;
       }
+      updateQuarantine.built(outcome.revision);
       log(`Updated to ${outcome.revision}; restarting`);
       const supervised = restartHandledBySupervisor(env);
       if (restartWouldRaceAWatcher(env)) {
@@ -798,7 +991,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // process was started with, so what is in memory now has to be on disk
       // before it looks. Without this a node whose address was corrected from
       // the config page comes back on the address it was launched with.
-      await saveSettings(settings);
+      await updateSettings((current) => current);
       // The Host verifies this revision when the supervisor's child reconnects.
       report(
         "restarting",
@@ -831,6 +1024,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // Once shutdown has closed the listeners, staying alive cannot recover.
       if (shuttingDown) throw error;
     } finally {
+      for (const lease of maintenanceLeases.reverse()) lease.release();
+      updateQuarantine.restoreBlock();
+      if (!shuttingDown) reopen();
       updating = false;
     }
 
@@ -855,6 +1051,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     log(`Reached the Host at ${promoted.hostUrl}; dialing it first from now on`);
   }
 
+  const permissionSnapshot = (current: Settings) => ({
+    version: current.commandPermissionRevision,
+    rules: current.commandPermissionRules,
+    entries: commandPermissionEntries(
+      current.commandPermissionRules,
+      credentials.authProtocol === MUTUAL_AUTH_PROTOCOL
+        ? credentials.host.hostId
+        : undefined,
+    ),
+  });
   const configServer = startConfigServer({
     ...(sessionDiscovery ? { sessionDiscovery } : {}),
     getSettings: () => settings,
@@ -864,11 +1070,53 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       connected: socket?.readyState === WebSocket.OPEN,
       activeSessions: router.activeSessionIds.length,
       mockAgent,
+      commandExecution: commands.readiness,
       ...(devTunnelId
         ? { devTunnel: { id: devTunnelId, url: devTunnel?.url ?? "" } }
         : {}),
     }),
     applySettings,
+    getCommandPermissions: () => permissionSnapshot(settings),
+    updateCommandPermissionEntries: async (expectedVersion, entries) => {
+      const result = await updateSettings(async (current) => {
+        if (current.commandPermissionRevision !== expectedVersion)
+          throw new Error(
+            "Command permissions changed. Reload saved rules before editing them.",
+          );
+        const hostId =
+          credentials.authProtocol === MUTUAL_AUTH_PROTOCOL
+            ? credentials.host.hostId
+            : undefined;
+        const rules = await compileCommandPermissionEntries(
+          current.commandPermissionRules,
+          entries,
+          hostId,
+        ).catch((error: unknown) => {
+          throw Object.assign(new Error(errorMessage(error), { cause: error }), {
+            statusCode: 400,
+          });
+        });
+        return { ...current, commandPermissionRules: rules };
+      });
+      return permissionSnapshot(result);
+    },
+    updateCommandPermissions: async (expectedVersion, rules) => {
+      const result = await updateSettings(async (current) => {
+        if (current.commandPermissionRevision !== expectedVersion)
+          throw new Error("Command permissions changed. Refresh before editing them.");
+        const hostId =
+          credentials.authProtocol === MUTUAL_AUTH_PROTOCOL
+            ? credentials.host.hostId
+            : undefined;
+        const normalized = await validateCommandPermissionRules(
+          rules.map((rule) =>
+            !rule.builtin && !rule.hostId && hostId ? { ...rule, hostId } : rule,
+          ),
+        );
+        return { ...current, commandPermissionRules: normalized };
+      });
+      return permissionSnapshot(result);
+    },
     getCredentials: () => credentials,
     applyBackup,
     log,
@@ -936,6 +1184,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     socket = active;
     channel = undefined;
     sealedConnection = session !== undefined;
+    commandExecutionsNegotiated = false;
+    commandPermissionsNegotiated = false;
+    leadDeliveryNegotiated = false;
     // Registered before the close handler below so the watchdog is gone before
     // anything decides what to do about the disconnection.
     active.once("close", () => {
@@ -943,6 +1194,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         router.setMcpAvailable(false);
         releaseLiveness();
         channel = undefined;
+        commandExecutionsNegotiated = false;
+        commandPermissionsNegotiated = false;
+        leadDeliveryNegotiated = false;
       }
     });
 
@@ -960,7 +1214,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         arch: arch(),
         version: VERSION,
         revision: REVISION,
-        capabilities: [...NODE_CAPABILITIES, mockAgent ? "mock" : "real"],
+        capabilities: [
+          ...NODE_CAPABILITIES,
+          mockAgent ? "mock" : "real",
+          ...(session ? [DURABLE_LEAD_DELIVERY_CAPABILITY] : []),
+          // Receipt reconciliation remains available after local opt-out or readiness failure.
+          ...(session
+            ? [COMMAND_EXECUTION_CAPABILITY, COMMAND_PERMISSIONS_CAPABILITY]
+            : []),
+        ],
+        ...(session ? { commandExecution: commands.readiness } : {}),
         agents: advertisedAgents,
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
@@ -1049,9 +1312,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       if (frame.value.type === "welcome") {
         welcomed = true;
         acknowledgeOutbox = frame.value.acknowledgeOutbox;
+        commandExecutionsNegotiated =
+          !!session && !!channel && frame.value.commandExecutions;
+        leadDeliveryNegotiated =
+          !!session && !!channel && frame.value.durableLeadDelivery;
+        commandPermissionsNegotiated =
+          commandExecutionsNegotiated && frame.value.commandPermissions;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
         if (socket !== active || active.readyState !== WebSocket.OPEN) return;
+        if (commandExecutionsNegotiated) commands.inventory();
+        if (leadDeliveryNegotiated && credentials.authProtocol === MUTUAL_AUTH_PROTOCOL)
+          leadDeliveries.replay(credentials.host.hostId);
         if (holdEventsForReconnectFlush) {
           if (acknowledgeOutbox && !frame.value.reconcileAfterOutbox) {
             errorLog(
@@ -1064,6 +1336,41 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         } else {
           router.setMcpAvailable(true);
           void router.refreshMcpSessions();
+        }
+        return;
+      }
+      const executionFrame = CommandExecutionHostMessageSchema.safeParse(frame.value);
+      if (executionFrame.success) {
+        try {
+          if (!welcomed || !session || !channel)
+            throw new Error(
+              "Remote execution/delivery requires a welcomed sealed connection.",
+            );
+          if (executionFrame.data.type === "deliver_lead_prompt") {
+            if (
+              !leadDeliveryNegotiated ||
+              credentials.authProtocol !== MUTUAL_AUTH_PROTOCOL
+            )
+              throw new Error("Durable lead delivery was not negotiated.");
+            // Refuse unknown delivery fields rather than silently discarding future prompt content.
+            const rawDelivery = (JSON.parse(plaintext) as { delivery: unknown }).delivery;
+            const delivery = LeadPromptDeliverySchema.strict().safeParse(rawDelivery);
+            if (!delivery.success) {
+              router.rejectLeadPrompt(
+                credentials.host.hostId,
+                executionFrame.data.delivery,
+                "Unsupported durable delivery fields; upgrade both peers or send a new supported delivery.",
+              );
+              return;
+            }
+            await router.deliverLeadPrompt(credentials.host.hostId, delivery.data);
+          } else {
+            if (!commandExecutionsNegotiated)
+              throw new Error("Command execution was not negotiated.");
+            await commands.handle(executionFrame.data);
+          }
+        } catch (error) {
+          warn(`Execution message refused: ${errorMessage(error)}`);
         }
         return;
       }
@@ -1285,6 +1592,15 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     if (socket !== target || target.readyState !== WebSocket.OPEN) return false;
     if (sealedConnection && !channel) return false;
     const payload = JSON.stringify(NodeToHostMessageSchema.parse(message));
+    if (
+      (message.type.startsWith("command_execution_") ||
+        message.type === "lead_prompt_receipt") &&
+      target.bufferedAmount + Buffer.byteLength(payload) * 2 + 2048 >
+        (message.type === "command_execution_output"
+          ? COMMAND_LIMITS.queueBytes * 0.75
+          : COMMAND_LIMITS.queueBytes)
+    )
+      return false;
     target.send(channel ? JSON.stringify(channel.seal(payload)) : payload);
     return true;
   }
@@ -1381,7 +1697,30 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   connect();
 
   const health = startHealthSampler(errorLog);
+  let recovering = false;
+  let recovery: Promise<void> | undefined;
+  let journalsClosed = false;
   const heartbeatTimer = setInterval(() => {
+    if (commands.unsettled && !recovering) {
+      recovering = true;
+      recovery = commands
+        .recoverAll()
+        .then(() => {
+          if (!commands.unsettled && admission.reason === RECOVERED_COMMAND_OWNERSHIP) {
+            admission.reconcileQuarantine(RECOVERED_COMMAND_OWNERSHIP);
+            if (!shuttingDown) reconnect();
+          }
+        })
+        .catch((error: unknown) =>
+          warn(`Command recovery remains blocked: ${String(error)}`),
+        )
+        .finally(() => {
+          recovering = false;
+        });
+    }
+    commands.flush();
+    if (credentials.authProtocol === MUTUAL_AUTH_PROTOCOL)
+      leadDeliveries.flush(credentials.host.hostId);
     send({
       type: "heartbeat",
       activeSessionIds: router.activeSessionIds,
@@ -1393,7 +1732,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   heartbeatTimer.unref();
 
   async function shutdown(): Promise<void> {
+    if (journalsClosed) return;
     shuttingDown = true;
+    admission.close("Node shutdown is in progress.");
     if (reconnectTimer) clearTimeout(reconnectTimer);
     // An unref'd timer does not hold the loop open, but it does keep firing while
     // the process winds down, which resurrects a socket we are trying to close.
@@ -1404,6 +1745,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         () => health.stop(),
         () => releaseLiveness(),
         () => configServer.close(),
+        () => recovery,
+        () => commands.cancelAll("Node shutdown requested."),
         () => socket?.close(),
         () => router.stopAll(),
       ]) {
@@ -1419,6 +1762,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       } catch (error) {
         errors.push(error);
       }
+    }
+    if (!errors.length && !journalsClosed) {
+      journal.close();
+      leadDeliveries.close();
+      journalsClosed = true;
     }
     if (errors.length === 1) throw errors[0];
     if (errors.length > 1)

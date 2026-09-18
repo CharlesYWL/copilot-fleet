@@ -219,6 +219,98 @@
             </div>
           </form>
 
+          <section
+            class="card command-permissions"
+            id="commandPermissions"
+            aria-labelledby="commandPermissionsTitle"
+          >
+            <div class="section-heading">
+              <h3 id="commandPermissionsTitle">Command allowlist</h3>
+            </div>
+            <p class="sub spaced">
+              Only persistent permissions are listed here. Temporary approvals are not
+              shown or changed. The Host asks automatically when a command needs
+              permission.
+            </p>
+            <form id="commandPermissionForm" aria-busy="true">
+              <label for="commandPermissionEditor">
+                <span class="label">Persistent allowlist (JSON)</span>
+                <span class="hint" id="commandPermissionInstructions">
+                  Add or delete objects in this array, one per line. Save allowlist
+                  replaces the entire saved list. Use [] to remove all entries.
+                </span>
+              </label>
+              <textarea
+                id="commandPermissionEditor"
+                class="command-permission-editor"
+                rows="18"
+                wrap="off"
+                autocomplete="off"
+                spellcheck="false"
+                autocapitalize="off"
+                aria-describedby="commandPermissionInstructions commandPermissionMatching commandPermissionsLegacy commandPermissionsMessage"
+                placeholder="Loading saved allowlist…"
+                readonly
+              ></textarea>
+              <p
+                id="commandPermissionsLegacy"
+                class="command-permission-legacy"
+                role="status"
+                hidden
+              >
+                Warning: some entries have no recoverable command text. Their
+                <code>legacyKey</code> is a read-only authority reference, not an editable
+                command. Keep these rows unchanged or delete them; do not edit their keys,
+                paths, or Host scope.
+              </p>
+              <div class="command-permission-actions">
+                <button type="submit" id="commandPermissionSave" disabled>
+                  Save allowlist
+                </button>
+                <button
+                  type="button"
+                  class="secondary"
+                  id="commandPermissionFormat"
+                  disabled
+                >
+                  Format JSON
+                </button>
+                <button type="button" class="secondary" id="commandPermissionsRefresh">
+                  Reload saved
+                </button>
+                <span class="hint" id="commandPermissionsDraft" role="status"></span>
+              </div>
+            </form>
+            <details class="command-permission-matching" id="commandPermissionMatching">
+              <summary>JSON examples and matching</summary>
+              <pre class="command-permission-example"><code>[
+  {"command":"cd","path":"*"},
+  {"command":"git status","path":"Q:\\Repos\\TridentWarehouse-UX"},
+  {"command":"git *","path":"Q:\\Repos\\*","match":"pattern"}
+]</code></pre>
+              <p>
+                Escape each Windows backslash as <code>\\</code> in JSON. Use
+                <code>"match":"pattern"</code> for command or argument patterns with
+                <code>*</code> wildcards. Patterns include flags and arguments as written.
+                Folder patterns work in every mode. Ordinary rows only need
+                <code>command</code> and <code>path</code>; known command-family flags are
+                ignored. Wildcard rules can trust future matching program versions.
+              </p>
+              <p>
+                Compound scripts use <code>"match":"exact"</code> and the actual script
+                text, not a hash. Escape newlines as <code>\n</code> and quotes as
+                <code>\"</code>. Any script text change asks again. Keep any
+                <code>hostId</code> on existing rows to retain their Host scope; omit it
+                on new rows for the current Host.
+              </p>
+              <p>
+                Commands run as your OS account, not in a sandbox. A folder selects where
+                a command starts; it does not restrict file access.
+              </p>
+            </details>
+            <div id="commandPermissionsMessage" role="status" aria-live="polite"></div>
+          </section>
+
           <div class="card hidden" id="tunnelCard">
             <h3>Dev tunnel</h3>
             <p class="sub spaced">

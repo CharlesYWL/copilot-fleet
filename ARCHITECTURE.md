@@ -44,10 +44,71 @@ Already-running sessions keep their launcher until stopped and resumed.
 The execution backend remains ACP. Validate the upstream context-flag fix before
 considering a separately approved migration of the Node-side adapter.
 
-The [remote command execution plan](docs/remote-command-execution-plan.md) proposes
-a permission-gated Node command runner exposed through Fleet MCP without starting
-a Copilot worker. It is a planned capability, not shipped behavior, and does not
-replace ACP for Copilot sessions.
+Approved remote commands are a separate, Host-approved Node execution path;
+they do not replace ACP for Copilot sessions. The
+[implementation plan](docs/remote-command-execution-plan.md) records the contracts
+and review requirements.
+
+### Approved command execution
+
+The Host persists a dedicated execution record and immutable prepared target
+before asking an administrator for once, session, or persistent approval. The three Fleet MCP tools
+request, read, and cancel work; none grants approval or creates a synthetic
+Copilot Session/RunStep. Requests and receipts use capability-gated messages on
+the sealed outbound Node connection.
+
+The Node is the permission authority. Preparation identifies a reusable
+command/subcommand and canonical working folder where possible; recognized ordinary flags
+do not form new rule keys. Once approval binds the exact request, session grants
+live in Node memory, and persistent rules live in Node configuration. The Host
+opens an approval popup for unmatched requests; it does not maintain an
+independent allowlist or let the Orchestrator approve itself. Rules are rechecked
+on the Node at execution. Other scripts use exact full-text hashes for explicit
+Session/Always grants, never inferred command-family authority.
+External-command rules pin the resolved executable identity and content, so
+replacing or updating it does not silently inherit approval.
+The Node settings page provides a persistent-only bulk JSON editor over readable
+command/path/match fields, including removable directory-change defaults. Its
+versioned entries API preserves unchanged private pins and Host scope. Explicit
+wildcard command rules match argument-preserving simple invocations and canonical local folder
+patterns, never compound scripts; exact-script rules preserve literal text.
+Legacy script text is recovered only from hash-verified local journal evidence.
+The prior opt-in/drain setup and
+stop-all dialog are no longer part of this flow.
+
+The Node journals launch/cancel identities and uses a command-specific Windows
+supervisor with suspended process admission, independent deadlines, parent-loss
+termination, and durable quiescence evidence. Windows PowerShell 5.1 receives
+script files rather than an oversized encoded command line. Outcome, process
+ownership, and output completeness are distinct facts; neither lost receipts nor
+forced descendant cleanup are reported as ordinary success.
+
+Per-stream output offsets commit atomically with journal events. Recovery reads
+retained native bytes before deleting their files, without assigning new
+sequences to already-journaled bytes. Host receipt time, not a skewed Node clock,
+controls settled-history retention; the raw Node receipt remains evidence.
+
+Physical repository roots use shared participation across agent
+start/resume/additional roots and installations. Ordinary placement commands use
+tracked command participation, which coexists with sessions and tolerates legacy
+untracked shared session markers without removing them. Explicitly unresolved
+ownership and exclusive maintenance still conflict. Managed task commands and
+Fleet Git administration retain exclusive participation and checkout locks;
+legacy Host requests retain their earlier exclusive behavior. Maintenance closes
+admission before snapshots or updater mutations. Nonparticipating old installations and
+arbitrary OS access remain deployment/trust constraints, not sandbox guarantees.
+
+An incomplete update leaves a durable admission quarantine. Explicit retry forces
+dependency installation and a rebuild; only a fresh process at the recorded
+successfully built repository/revision clears the block. Restarting after a
+failed mutation alone cannot admit new commands.
+
+Completion delivery has a separate capability on the lead's Node and a persistent
+per-lead prompt reservation across ticks. Competing command completions, ordinary
+Run wakes, and human prompts cannot overwrite an in-flight handoff. Receiver-side
+deduplication records admission and settlement, not exactly-once model consumption.
+The browser receives bounded live output and reads retained bytes by cursor;
+slow consumers recover explicitly instead of growing unbounded queues.
 
 ## Domain model
 

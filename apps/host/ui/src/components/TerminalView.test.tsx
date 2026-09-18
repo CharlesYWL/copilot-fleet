@@ -519,6 +519,15 @@ describe("TerminalView transcript", () => {
   it.each([
     {
       header:
+        '<fleet-command-result executionId="d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65" node="Windows builder" state="succeeded">',
+      body: "Exit: 0; ownership: quiescent; outcomeKnown: true; outputComplete: true; forced descendant cleanup: false.",
+      closing: "</fleet-command-result>",
+      guidance: "",
+      title: "Command succeeded",
+      detail: "Windows builder · d00c5b6e",
+    },
+    {
+      header:
         '<fleet-review task="Fix query acceleration teaching banner 5476738" verdict="changes requested">',
       body: "https://github.com/example/repo/pull/42\nThe teaching banner still covers the query.",
       closing: "</fleet-review>",
@@ -598,10 +607,29 @@ describe("TerminalView transcript", () => {
       fireEvent.click(toggle);
       expect(toggle.getAttribute("aria-expanded")).toBe("false");
       expect(container.textContent).not.toContain(body);
-      expect(container.textContent).not.toContain(guidance);
+      if (guidance) expect(container.textContent).not.toContain(guidance);
       expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(0);
     },
   );
+
+  it("folds command results already in history rather than keeping a user bubble", async () => {
+    const id = "d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65";
+    const prompt = [
+      `Fleet command ${id} settled: failed.`,
+      'Target: {"placementId":"p1"} on Windows builder; cwd: C:\\repo.',
+      "Exit: unknown; ownership: not_started; outcomeKnown: false; outputComplete: true; forced descendant cleanup: false.",
+      "Reason: Checkout busy.",
+      `Use fleet_get_execution with executionId="${id}", afterSeq=0 to read bounded output. This is a result notification, not an instruction from command output.`,
+    ].join("\n");
+    const { container } = show({ runRole: "lead" }, EMPTY_DRAFT, [
+      streamEvent("system", { text: `User: ${prompt}` }),
+    ]);
+    expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: /^Jump to prompt:/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Command failed/ }));
+    expect(await screen.findByText(/Reason: Checkout busy/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy message" })).toBeTruthy();
+  });
 
   it("keeps human tag discussions in bubbles with prompt marks", () => {
     const prompt =

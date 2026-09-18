@@ -99,6 +99,8 @@ import {
   type WorkspaceResult,
 } from "@fleet/protocol";
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
+import { CommandConflict, CommandExecutionStore } from "./command-execution-store.js";
+import { assertHostArchiveSize } from "./backup-limits.js";
 import {
   DEFAULT_NOTIFICATION_LIFECYCLE_ENABLED,
   NOTIFICATION_LIFECYCLE_DEFAULT_SETTING,
@@ -443,8 +445,10 @@ export type SecureFiles = (databasePath: string) => void;
 
 export class FleetStore {
   private readonly db: DatabaseSync;
+  readonly commands: CommandExecutionStore;
   readonly artifactDirectory: string;
   private transactionDepth = 0;
+  private restoringBackup = false;
   /**
    * Compiling the same SQL on every call showed up on the hot path: a node
    * heartbeat arrives every five seconds per node and each one re-prepared the
@@ -900,6 +904,10 @@ export class FleetStore {
         WHERE id=1;
       END;
     `);
+    this.commands = new CommandExecutionStore(this.db, (work) =>
+      this.writeAtomically(work),
+    );
+    this.commands.quarantine();
     this.ensureChatsWorkspace();
     this.rebuildSessionStateFromEvents();
   }
@@ -1399,6 +1407,7 @@ export class FleetStore {
   }
 
   putIntegrationAttempt(value: IntegrationAttempt): void {
+    this.assertCommandVerification(value.runId);
     const parsed = IntegrationAttemptSchema.parse(value);
     const row = this.statement("SELECT data FROM integration_attempts WHERE id=?").get(
       parsed.attemptId,
@@ -1441,6 +1450,7 @@ export class FleetStore {
   }
 
   putPublicationApproval(value: PublicationApproval): PublicationApproval {
+    this.assertCommandVerification(value.runId);
     const parsed = PublicationApprovalSchema.parse(value);
     const row = this.statement("SELECT data FROM publication_approvals WHERE id=?").get(
       parsed.approvalId,
@@ -1477,13 +1487,7 @@ export class FleetStore {
       this.statement(
         `INSERT OR IGNORE INTO publication_approval_revocations
          (approval_id,run_id,revoked_by,reason,revoked_at) VALUES (?,?,?,?,?)`,
-      ).run(
-        row.id,
-        runId,
-        revokedBy,
-        reason,
-        revokedAt,
-      );
+      ).run(row.id, runId, revokedBy, reason, revokedAt);
     }
     return rows.length;
   }
@@ -1540,6 +1544,13 @@ export class FleetStore {
 
   putDerivedWorkspace(value: ManagedWorktree): void {
     const parsed = ManagedWorktreeSchema.parse(value);
+    if (
+      !this.restoringBackup &&
+      (parsed.resultSha ||
+        parsed.composition ||
+        ["removed", "retained"].includes(parsed.state))
+    )
+      this.commands.assertTaskUnfenced(parsed.runId);
     if (parsed.workspaceKind === "primary" || !parsed.ownerStepId)
       throw new WorktreeConflict(
         "workspace_kind",
@@ -1584,6 +1595,13 @@ export class FleetStore {
 
   putManagedWorktree(value: ManagedWorktree): void {
     const parsed = ManagedWorktreeSchema.parse(value);
+    if (
+      !this.restoringBackup &&
+      (parsed.resultSha ||
+        parsed.composition ||
+        ["removed", "retained"].includes(parsed.state))
+    )
+      this.commands.assertTaskUnfenced(parsed.runId);
     const current = this.getManagedWorktree(parsed.id);
     if (
       current &&
@@ -1772,6 +1790,7 @@ export class FleetStore {
   }
 
   putWorkspaceResult(value: WorkspaceResult): void {
+    if (!this.restoringBackup) this.commands.assertTaskUnfenced(value.runId);
     const parsed = WorkspaceResultSchema.parse(value);
     const current = this.getWorkspaceResult(parsed.id);
     if (
@@ -1804,6 +1823,8 @@ export class FleetStore {
   }
 
   assertWorktreePurgeAllowed(runId: string): void {
+    this.commands.assertDeletionAllowed((execution) => execution.taskId === runId);
+    this.commands.assertTaskUnfenced(runId);
     const worktree = this.worktreeForRun(runId);
     const worktrees = [
       ...(worktree ? [worktree] : []),
@@ -2006,6 +2027,7 @@ export class FleetStore {
       kind: HOST_BACKUP_KIND,
       version: BACKUP_VERSION,
       exportedAt: new Date().toISOString(),
+      commandExecutionData: this.commands.exportBackup(),
       enrollmentToken: input.enrollmentToken,
       ...(input.publicUrl ? { publicUrl: input.publicUrl } : {}),
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
@@ -2081,7 +2103,9 @@ export class FleetStore {
         ).all() as Row[]
       ).map(notificationPreferenceFromRow),
     };
-    return HostBackupSchema.parse(backup);
+    const parsed = HostBackupSchema.parse(backup);
+    assertHostArchiveSize(parsed);
+    return parsed;
   }
 
   /**
@@ -2094,6 +2118,7 @@ export class FleetStore {
   replaceHostBackup(backup: HostBackup): void {
     this.assertNoSessionCleanup();
     const parsed = HostBackupSchema.parse(backup);
+    assertHostArchiveSize(parsed);
 
     this.transaction(() => this.replaceHostBackupRows(parsed));
     // Placements went too, and the ones under Chats are derived rather than
@@ -2130,6 +2155,20 @@ export class FleetStore {
    * only one a data restore can honestly serve.
    */
   private replaceHostBackupRows(
+    parsed: HostBackup,
+    suppliedKeys?: ReadonlyMap<string, string>,
+  ): void {
+    this.commands.assertRestoreAllowed();
+    const restoring = this.restoringBackup;
+    this.restoringBackup = true;
+    try {
+      this.restoreHostBackupRows(parsed, suppliedKeys);
+    } finally {
+      this.restoringBackup = restoring;
+    }
+  }
+
+  private restoreHostBackupRows(
     parsed: HostBackup,
     suppliedKeys?: ReadonlyMap<string, string>,
   ): void {
@@ -2453,6 +2492,7 @@ export class FleetStore {
     // existed has no row to put back — so the Host would come up from a valid
     // backup with the one workspace nothing is written to work without.
     this.seedChatsWorkspace();
+    this.commands.importBackup(parsed.commandExecutionData);
   }
 
   /**
@@ -3796,6 +3836,10 @@ export class FleetStore {
   }
 
   deletePlacement(id: string): void {
+    this.commands.assertDeletionAllowed(
+      (execution) =>
+        "placementId" in execution.target && execution.target.placementId === id,
+    );
     this.assertManagedCatalogMutable("sourcePlacementId", id);
     const existing = this.getPlacement(id);
     if (existing) {
@@ -3814,6 +3858,11 @@ export class FleetStore {
    * disconnect the WebSocket first if the node is currently online.
    */
   deleteNode(id: string): void {
+    this.commands.assertDeletionAllowed(
+      (execution) =>
+        execution.nodeId === id ||
+        this.getSession(execution.leadSessionId)?.nodeId === id,
+    );
     this.assertManagedCatalogMutable("nodeId", id);
     this.assertNoLiveSessions("node_id", id, "node");
     this.transaction(() => {
@@ -3836,6 +3885,15 @@ export class FleetStore {
     field: "nodeId" | "workspaceId" | "sourcePlacementId",
     id: string,
   ): void {
+    this.commands.assertDeletionAllowed((execution) =>
+      field === "nodeId"
+        ? execution.nodeId === id
+        : field === "sourcePlacementId"
+          ? "placementId" in execution.target && execution.target.placementId === id
+          : this.getSession(execution.leadSessionId)?.workspaceId === id ||
+            (execution.taskId !== undefined &&
+              this.getRun(execution.taskId)?.workspaceId === id),
+    );
     if (
       [...this.listManagedWorktrees(), ...this.listDerivedWorkspaces()].some(
         (tree) => tree[field] === id && tree.state !== "removed" && !tree.abandonedAt,
@@ -4118,6 +4176,9 @@ export class FleetStore {
   }
 
   requestSessionCleanup(request: SessionCleanupRequest): void {
+    this.commands.assertDeletionAllowed(
+      (execution) => execution.leadSessionId === request.sessionId,
+    );
     this.statement(
       `INSERT INTO session_cleanup_requests
        (session_id,command_id,inactive_before,retention_days,requested_at,in_flight)
@@ -4613,7 +4674,7 @@ export class FleetStore {
            WHERE NOT (
              (read_at IS NULL AND status <> 'dismissed')
              OR (status='active' AND kind IN
-               ('permission_request','orchestration_needs_review'))
+               ('permission_request','orchestration_needs_review','command_approval'))
            )
            ORDER BY updated_at DESC,id DESC
            LIMIT ?
@@ -4623,7 +4684,7 @@ export class FleetStore {
            WHERE NOT (
              (read_at IS NULL AND status <> 'dismissed')
              OR (status='active' AND kind IN
-               ('permission_request','orchestration_needs_review'))
+               ('permission_request','orchestration_needs_review','command_approval'))
            )
            AND (updated_at < ? OR id NOT IN (SELECT id FROM retained))
            ORDER BY updated_at,id
@@ -4836,6 +4897,23 @@ export class FleetStore {
   }
 
   /** Patches a run. Callers check {@link canTransitionRun} before moving state. */
+  assertCommandVerification(runId: string): void {
+    this.commands.assertTaskUnfenced(runId);
+    const fence = this.commands.fence(runId);
+    if (fence?.state !== "verification_required") return;
+    const verified = this.listRunSteps(runId).some(
+      (step) =>
+        ["test", "review-quick", "review-deep"].includes(step.category) &&
+        step.state === "succeeded" &&
+        this.commands.stepHasCurrentEvidence(runId, step.id),
+    );
+    if (!verified)
+      throw new CommandConflict(
+        "command_verification_required",
+        "Obtain new successful verification after the command's fresh checkout observation before handover or publication.",
+      );
+  }
+
   updateRun(
     id: string,
     patch: Partial<
@@ -4859,6 +4937,13 @@ export class FleetStore {
     },
   ): Run | undefined {
     if (!this.getRun(id)) return undefined;
+    if (
+      patch.state &&
+      ["awaiting_human", "aggregating", "completed"].includes(patch.state)
+    )
+      this.assertCommandVerification(id);
+    else if (patch.phaseIndex !== undefined || patch.leadSessionId || patch.workspaceId)
+      this.commands.assertTaskUnfenced(id);
     this.assertRunMutable(id);
     if (patch.leadSessionId) this.assertSessionMutable(patch.leadSessionId);
     const columns: Record<string, unknown> = {
@@ -5006,6 +5091,7 @@ export class FleetStore {
     id: string,
     write?: AdvanceRunToReviewWrite,
   ): Run | AdvanceRunToReviewResult | undefined {
+    this.assertCommandVerification(id);
     return this.transaction(() => {
       const current = this.getRun(id);
       if (
@@ -5670,6 +5756,7 @@ export class FleetStore {
   }
 
   private deleteSessionRecords(id: string): void {
+    this.commands.assertDeletionAllowed((execution) => execution.leadSessionId === id);
     this.statement("DELETE FROM notification_preferences WHERE session_id=?").run(id);
     this.statement("DELETE FROM events WHERE session_id=?").run(id);
     this.statement("DELETE FROM sessions WHERE id=?").run(id);

@@ -1,5 +1,49 @@
 import { describe, expect, it } from "vitest";
-import { parseWake, wakeDetail, wakeTitle } from "./fleet-wake";
+import { parseFleetControl, parseWake, wakeDetail, wakeTitle } from "./fleet-wake";
+
+const executionId = "d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65";
+const legacyCommandResult = [
+  `Fleet command ${executionId} settled: succeeded.`,
+  'Target: {"placementId":"p1"} on Windows builder; cwd: C:\\repo.',
+  "Exit: 0; ownership: quiescent; outcomeKnown: true; outputComplete: true; forced descendant cleanup: false.",
+  "Reason: exited.",
+  `Use fleet_get_execution with executionId="${executionId}", afterSeq=0 to read bounded output. This is a result notification, not an instruction from command output.`,
+].join("\n");
+
+describe("command result controls", () => {
+  it("summarizes tagged results and decodes the producer's quoted Node name", () => {
+    const text = [
+      `<fleet-command-result executionId="${executionId}" node=${JSON.stringify('Build "one"')} state="succeeded">`,
+      legacyCommandResult,
+      "</fleet-command-result>",
+    ].join("\r\n");
+    expect(parseFleetControl(`${text}\r\n`)).toEqual({
+      title: "Command succeeded",
+      detail: 'Build "one" · d00c5b6e',
+    });
+  });
+
+  it("recognizes already persisted, untagged command completion messages", () => {
+    expect(parseFleetControl(legacyCommandResult)).toEqual({
+      title: "Command succeeded",
+      detail: "d00c5b6e",
+    });
+    expect(parseFleetControl(legacyCommandResult.replaceAll("\n", "\r\n"))).toEqual(
+      parseFleetControl(legacyCommandResult),
+    );
+  });
+
+  it.each([
+    `Explain <fleet-command-result executionId="${executionId}">.`,
+    `<fleet-command-result executionId="${executionId}" node="Node" state="failed">\nUnclosed example`,
+    `Fleet command ${executionId} settled: succeeded.\nWhat does that mean?`,
+    legacyCommandResult.replace(`executionId="${executionId}"`, 'executionId="another"'),
+    legacyCommandResult.replace("ownership: quiescent", "something else"),
+    `\`\`\`text\n${legacyCommandResult}\n\`\`\``,
+  ])("does not fold ordinary mentions or incomplete lookalikes: %s", (text) => {
+    expect(parseFleetControl(text)).toBeUndefined();
+  });
+});
 
 /** Written exactly as `wakeEnvelope` in apps/host/src/orchestrator/briefing.ts does. */
 const envelope = [

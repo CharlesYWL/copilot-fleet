@@ -25,9 +25,10 @@ import { isTransferableHostUrl } from "../host-url.js";
 import type { LeadTokens } from "../orchestrator/lead-tokens.js";
 import type { TunnelSupervisor } from "../tunnel.js";
 import { requireAdministrator } from "./require-administrator.js";
+import { assertHostArchiveSize, HOST_ARCHIVE_BYTES } from "../backup-limits.js";
 
 /** The same ceiling the data restore uses; the security half adds kilobytes. */
-export const PORTABLE_BACKUP_BODY_LIMIT = 50 * 1024 * 1024;
+export const PORTABLE_BACKUP_BODY_LIMIT = HOST_ARCHIVE_BYTES;
 
 export const PORTABLE_BACKUP_PATH = "/api/backup/portable";
 export const PORTABLE_BACKUP_IMPORT_PATH = "/api/backup/portable/import";
@@ -119,18 +120,15 @@ export const portableBackupRoutes: FastifyPluginAsync<
         store.exportSecurityBackup(),
         input.data.passphrase,
       );
+      const backup = { ...portable, nodes, version: PORTABLE_BACKUP_VERSION, security };
+      assertHostArchiveSize({ passphrase: input.data.passphrase, backup });
       auth.audit({
         eventType: "security_backup_exported",
         actorKind: "administrator",
         actorId: administrator.id,
         outcome: "allowed",
       });
-      return reply.send({
-        ...portable,
-        nodes,
-        version: PORTABLE_BACKUP_VERSION,
-        security,
-      });
+      return reply.send(backup);
     },
   );
 

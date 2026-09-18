@@ -7,6 +7,8 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   NODE_BACKUP_KIND,
   NodeBackupSchema,
+  CommandPermissionRuleSchema,
+  CommandPermissionEntrySchema,
   backupKind,
   errorMessage,
   type ConfigUiEvent,
@@ -46,6 +48,21 @@ const PlacementInputSchema = z.object({
   workspaceId: z.string().default(""),
   localPath: z.string().min(1).max(4096),
 });
+
+const CommandPermissionsInputSchema = z.union([
+  z
+    .object({
+      expectedVersion: z.number().int().nonnegative(),
+      rules: z.array(CommandPermissionRuleSchema).max(1024),
+    })
+    .strict(),
+  z
+    .object({
+      expectedVersion: z.number().int().nonnegative(),
+      entries: z.array(CommandPermissionEntrySchema).max(1024),
+    })
+    .strict(),
+]);
 
 /** A handler answers one method+path; the body arrives already read. */
 type Handler = (body: string) => Promise<ConfigReply>;
@@ -209,6 +226,77 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
 
   const routes = new Map<string, Handler>([
     ["GET /api/config", async () => state()],
+    [
+      "GET /api/command-permissions",
+      async () => {
+        if (!options.getCommandPermissions)
+          return {
+            status: 503,
+            body: {
+              error: "Command permission settings are unavailable. Update this Node.",
+            },
+          };
+        return ok(options.getCommandPermissions());
+      },
+    ],
+    [
+      "POST /api/command-permissions",
+      async (body) => {
+        let input: unknown;
+        try {
+          input = JSON.parse(body);
+        } catch {
+          return badRequest("Not valid JSON.");
+        }
+        const parsed = CommandPermissionsInputSchema.safeParse(input);
+        if (!parsed.success)
+          return badRequest(
+            "Provide the current permission version and a valid rule list.",
+          );
+        if (
+          !options.getCommandPermissions ||
+          ("entries" in parsed.data
+            ? !options.updateCommandPermissionEntries
+            : !options.updateCommandPermissions)
+        )
+          return {
+            status: 503,
+            body: {
+              error: "Command permission settings are unavailable. Update this Node.",
+            },
+          };
+        if (parsed.data.expectedVersion !== options.getCommandPermissions().version) {
+          return {
+            status: 409,
+            body: { error: "Command permissions changed. Refresh before editing them." },
+          };
+        }
+        try {
+          const updated =
+            "entries" in parsed.data
+              ? await options.updateCommandPermissionEntries!(
+                  parsed.data.expectedVersion,
+                  parsed.data.entries,
+                )
+              : await options.updateCommandPermissions!(
+                  parsed.data.expectedVersion,
+                  parsed.data.rules,
+                );
+          options.log("Command permission rules updated from the local config page.");
+          return ok(updated);
+        } catch (error) {
+          const details = errorMessage(error);
+          options.log(`Command permission update failed: ${details}`);
+          return {
+            status:
+              error instanceof Error && "statusCode" in error && error.statusCode === 400
+                ? 400
+                : 409,
+            body: { error: details.slice(0, 4000) },
+          };
+        }
+      },
+    ],
     [
       "GET /api/backup",
       async () => {

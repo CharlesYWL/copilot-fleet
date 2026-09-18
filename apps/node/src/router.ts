@@ -24,6 +24,10 @@ type SessionKind = "writing" | "read-only";
 import { resolveMcpServers } from "./mcp-endpoint.js";
 import type { ManagedWorktrees } from "./managed-worktrees.js";
 import type { CheckoutLease } from "./checkout-locks.js";
+import type { NodeAdmission, AdmissionTicket } from "./node-admission.js";
+import type { RepositoryParticipation } from "./repository-participation.js";
+import type { LeadPromptJournal } from "./lead-prompt-delivery.js";
+import type { LeadPromptDelivery, LeadPromptReceipt } from "@fleet/protocol";
 import {
   MCP_RECOVERY_DELAYS_MS,
   McpRecoveryConnection,
@@ -49,6 +53,9 @@ export class CommandRefused extends Error {}
 
 export type CommandRouterOptions = {
   worktrees?: ManagedWorktrees;
+  admission?: NodeAdmission;
+  repositories?: RepositoryParticipation;
+  leadDeliveries?: LeadPromptJournal;
   deleteInactiveSession?: (
     agentSessionId: string,
     inactiveBefore: number,
@@ -64,6 +71,11 @@ type SessionActivity = {
 
 type SessionSlot = {
   leases?: CheckoutLease[];
+  participation?: CheckoutLease[];
+  supervisedParticipation?: boolean;
+  ticket?: AdmissionTicket;
+  deliveryId?: string;
+  deliverySequence?: number;
   binding?: ExecutionBinding;
   terminalEvent?: SessionEvent;
   terminalEmitted?: boolean;
@@ -193,7 +205,12 @@ export class CommandRouter {
   /** Sessions with a turn still in flight, for the Host's reconnect bookkeeping. */
   get busySessionIds(): string[] {
     return [...this.slots.entries()]
-      .filter(([, slot]) => slot.mcpRecovery || slot.agent?.busy)
+      .filter(
+        ([id, slot]) =>
+          slot.mcpRecovery ||
+          slot.agent?.busy ||
+          this.options.leadDeliveries?.reserved(id, slot.agentSessionId),
+      )
       .map(([sessionId]) => sessionId);
   }
 
@@ -308,6 +325,8 @@ export class CommandRouter {
         : this.slots.get(command.sessionId)?.agentSessionId,
     );
     if (command.type === "start_session" || command.type === "resume_session") {
+      if (this.options.admission?.reason)
+        throw new CommandRefused(this.options.admission.reason);
       return this.startSession(command);
     }
 
@@ -332,17 +351,23 @@ export class CommandRouter {
       throw new Error("Session is not active on this node");
     }
     if (command.type === "prompt") {
+      if (this.options.admission?.reason)
+        throw new CommandRefused(this.options.admission.reason);
       // Admission itself is in flight: cleanup must not stop the process while
       // physical checkout/lease validation is waiting on the filesystem.
       await this.withActivity(slot, async () => {
         await this.revalidate(slot, command.executionBinding);
+        slot.ticket?.revalidate();
         this.assertNotDeleting(command.sessionId, slot.agentSessionId);
         if (this.slots.get(command.sessionId) !== slot || slot.agent !== agent) {
           throw new CommandRefused("Session changed during prompt admission");
         }
         // Refused rather than dropped: acknowledge only after admission, but
         // keep the turn tracked without making the Host wait for its completion.
-        if (agent.busy) {
+        if (
+          agent.busy ||
+          this.options.leadDeliveries?.reserved(command.sessionId, slot.agentSessionId)
+        ) {
           agent.resync();
           throw new CommandRefused(
             "Copilot is still working on the previous turn; wait for it to finish or cancel it",
@@ -392,6 +417,79 @@ export class CommandRouter {
         }
       });
     }
+  }
+
+  rejectLeadPrompt(
+    hostId: string,
+    delivery: LeadPromptDelivery,
+    reason: string,
+  ): LeadPromptReceipt {
+    const journal = this.options.leadDeliveries;
+    if (!journal) throw new CommandRefused("Durable lead delivery is unavailable.");
+    return journal.accept(hostId, delivery, "", false, reason).receipt;
+  }
+
+  async deliverLeadPrompt(
+    hostId: string,
+    delivery: LeadPromptDelivery,
+  ): Promise<LeadPromptReceipt> {
+    const journal = this.options.leadDeliveries;
+    if (!journal) throw new CommandRefused("Durable lead delivery is unavailable.");
+    const slot = this.slots.get(delivery.sessionId);
+    if (slot?.mcpRecovery || slot?.stopping)
+      return journal.accept(hostId, delivery, slot.agentSessionId ?? "", true).receipt;
+    await slot?.ready;
+    if (slot?.mcpRecovery || slot?.stopping)
+      return journal.accept(hostId, delivery, slot.agentSessionId ?? "", true).receipt;
+    const agent = slot?.agent;
+    const usable =
+      !!slot && !!agent && this.slots.get(delivery.sessionId) === slot && !slot.quiescing;
+    if (usable) await this.revalidate(slot, delivery.executionBinding);
+    const stillUsable =
+      usable &&
+      this.slots.get(delivery.sessionId) === slot &&
+      slot.agent === agent &&
+      !slot.quiescing;
+    const accepted = journal.accept(
+      hostId,
+      delivery,
+      stillUsable || slot?.mcpRecovery || slot?.stopping
+        ? (slot?.agentSessionId ?? "")
+        : "",
+      !!this.options.admission?.reason ||
+        !!agent?.busy ||
+        !!slot?.refreshing ||
+        !!slot?.initializing ||
+        !!slot?.mcpRecovery ||
+        !!slot?.stopping ||
+        this.deleting.has(delivery.sessionId),
+    );
+    if (accepted.invoke && slot && agent) {
+      slot.deliveryId = delivery.deliveryId;
+      slot.deliverySequence = slot.sequenceOffset;
+      void this.withActivity(slot, () =>
+        agent.prompt(delivery.prompt, delivery.attachments, {
+          allowContextRollover: false,
+        }),
+      )
+        .then(
+          () => {
+            // Only turn_complete settles a delivery. Rollover/replay/stop is not consumption proof.
+            journal.uncertain(
+              delivery.deliveryId,
+              "Native prompt returned without an authoritative current-turn completion.",
+            );
+          },
+          (error: unknown) => journal.uncertain(delivery.deliveryId, String(error)),
+        )
+        .catch((error: unknown) => {
+          this.options.admission?.quarantine(
+            `Durable lead receipt persistence failed: ${String(error)}`,
+          );
+          this.warn(String(error));
+        });
+    }
+    return accepted.receipt;
   }
 
   private assertNotDeleting(sessionId: string, agentSessionId?: string): void {
@@ -628,6 +726,16 @@ export class CommandRouter {
         await this.revalidate(existing, command.executionBinding);
       });
     }
+    if (
+      command.type === "resume_session" &&
+      this.options.leadDeliveries?.reserved(command.sessionId, command.agentSessionId)
+    ) {
+      return Promise.reject(
+        new CommandRefused(
+          "A durable native prompt handoff is unresolved; automatic resume/re-prompt is blocked.",
+        ),
+      );
+    }
     const kind: SessionKind = command.readOnly ? "read-only" : "writing";
     const held = [...new Map([...this.reconciliation, ...this.slots]).values()].filter(
       (slot) => slot.kind === kind,
@@ -652,6 +760,9 @@ export class CommandRouter {
       kind,
       sequenceOffset: command.type === "resume_session" ? command.sequenceOffset : 0,
       toolTitles: new Map(),
+      ...(this.options.admission
+        ? { ticket: this.options.admission.enter(`session:${command.sessionId}`) }
+        : {}),
     };
     this.noteActivity(slot, lastActivityAt);
     this.sessionActivity.set(command.sessionId, activity);
@@ -699,13 +810,6 @@ export class CommandRouter {
         if (binding) {
           await worktrees.validateExecution(binding);
           slot.binding = binding;
-          slot.leases = [
-            worktrees.locks.acquire(checkout, {
-              owner: `session:${command.sessionId}`,
-              attempt: binding.leaseAttempt,
-              kind: "worker",
-            }),
-          ];
           this.bindings.set(command.sessionId, binding);
         }
       }
@@ -742,7 +846,25 @@ export class CommandRouter {
           worktrees.assertManagedPathBound(identity);
         }
       }
+      if (this.options.repositories) {
+        const participation = await this.options.repositories.participate(
+          [cwd, ...additionalDirectories],
+          `session:${command.sessionId}`,
+        );
+        slot.participation = participation.leases;
+        slot.supervisedParticipation = participation.supervised;
+      }
+      if (slot.binding && worktrees) {
+        slot.leases = [
+          worktrees.locks.acquire(await worktrees.checkoutIdentity(cwd), {
+            owner: `session:${command.sessionId}`,
+            attempt: slot.binding.leaseAttempt,
+            kind: "worker",
+          }),
+        ];
+      }
       await this.revalidate(slot, command.executionBinding);
+      slot.ticket?.revalidate();
       const generation = slot.generation;
       const sink = (event: SessionEvent) =>
         this.handleSessionEvent(
@@ -766,6 +888,7 @@ export class CommandRouter {
       slot.cwd = cwd;
       slot.additionalDirectories = additionalDirectories;
       slot.selectedAgent = requested.selected;
+      slot.ticket?.revalidate();
       if (command.type === "resume_session") {
         slot.agentSessionId = command.agentSessionId;
         slot.activity.agentSessionId = command.agentSessionId;
@@ -814,6 +937,10 @@ export class CommandRouter {
       }
       // A resumed session waits for the operator's next prompt.
       if (command.type === "start_session" && !slot.terminalEvent) {
+        if (this.options.leadDeliveries?.reserved(command.sessionId, slot.agentSessionId))
+          throw new CommandRefused(
+            "This native conversation has an unresolved durable prompt handoff.",
+          );
         void this.withActivity(slot, () => agent.prompt(command.prompt))
           .catch(() => this.quiesce(command.sessionId, slot))
           .catch((error: unknown) => this.warn(String(error)));
@@ -846,7 +973,10 @@ export class CommandRouter {
 
   private release(sessionId: string, slot: SessionSlot): void {
     const errors: unknown[] = [];
-    for (const lease of slot.leases ?? []) {
+    for (const lease of [
+      ...(slot.leases ?? []),
+      ...[...(slot.participation ?? [])].reverse(),
+    ]) {
       try {
         lease.release();
       } catch (error) {
@@ -875,19 +1005,24 @@ export class CommandRouter {
     }
     if (this.reconciliation.get(sessionId) === slot)
       this.reconciliation.delete(sessionId);
+    slot.ticket?.release();
   }
 
   private processOwnership(slot: SessionSlot) {
-    if (!slot.leases?.length) return {};
+    const leases = [
+      ...(slot.leases ?? []),
+      ...(slot.supervisedParticipation ? (slot.participation ?? []) : []),
+    ];
+    if (!leases.length) return {};
     return {
       processStarting: () => {
-        for (const lease of slot.leases!) lease.processPending();
+        for (const lease of leases) lease.processPending();
       },
       processStarted: (pid: number) => {
-        for (const lease of slot.leases!) lease.processStarted(pid);
+        for (const lease of leases) lease.processStarted(pid);
       },
       processesQuiesced: () => {
-        for (const lease of slot.leases!) lease.processesQuiesced();
+        for (const lease of leases) lease.processesQuiesced();
       },
     };
   }
@@ -896,6 +1031,7 @@ export class CommandRouter {
     slot: SessionSlot,
     expected?: ExecutionBinding,
   ): Promise<void> {
+    for (const lease of slot.participation ?? []) await lease.revalidate();
     if (!slot.binding) {
       if (expected?.worktreeId)
         throw new WorktreeConflict(
@@ -994,7 +1130,8 @@ export class CommandRouter {
         try {
           // Without a managed lease, a failed stop must not manufacture a
           // terminal receipt and free the Host's legacy placement reservation.
-          if (stopped || slot.binding?.worktreeId) this.release(sessionId, slot);
+          if (stopped || slot.binding?.worktreeId || slot.supervisedParticipation)
+            this.release(sessionId, slot);
         } catch (error) {
           errors.push(error);
         } finally {
@@ -1093,9 +1230,24 @@ export class CommandRouter {
     }
     const state = eventPayload(event, "state")?.state;
     if (
+      slot.deliveryId &&
+      event.type === "turn_complete" &&
+      !event.payload.historyReplay &&
+      event.sequence > (slot.deliverySequence ?? 0)
+    ) {
+      this.options.leadDeliveries?.settle(slot.deliveryId, slot.agentSessionId ?? "");
+      delete slot.deliveryId;
+      delete slot.deliverySequence;
+    }
+    if (slot.deliveryId && state && terminalSessionStates.has(state))
+      this.options.leadDeliveries?.uncertain(
+        slot.deliveryId,
+        "Native session ended before authoritative delivery settlement.",
+      );
+    if (
       state &&
       terminalSessionStates.has(state) &&
-      (slot.leases?.length || slot.initializing)
+      (slot.leases?.length || slot.supervisedParticipation || slot.initializing)
     ) {
       slot.terminalEvent ??= event;
       if (!slot.initializing)
@@ -1110,7 +1262,9 @@ export class CommandRouter {
       state === "idle" &&
       slot.refreshMcpPending &&
       !this.deleting.has(sessionId) &&
-      !slot.stopping
+      !slot.stopping &&
+      !this.options.admission?.reason &&
+      !this.options.leadDeliveries?.reserved(sessionId, slot.agentSessionId)
     ) {
       slot.refreshMcpPending = false;
       // Do not invite a scheduler wake between turn completion and MCP recovery.
@@ -1136,8 +1290,19 @@ export class CommandRouter {
     slot: SessionSlot,
     contextTier?: ContextTier,
   ): Promise<void> {
-    if (contextTier === undefined) return this.recoverMcpSession(sessionId, slot);
     if (this.deleting.has(sessionId)) return;
+    if (
+      this.options.admission?.reason ||
+      this.options.leadDeliveries?.reserved(sessionId, slot.agentSessionId)
+    ) {
+      if (contextTier !== undefined)
+        throw new CommandRefused(
+          "Session has a durable prompt reservation or Node maintenance is active.",
+        );
+      slot.refreshMcpPending = true;
+      return;
+    }
+    if (contextTier === undefined) return this.recoverMcpSession(sessionId, slot);
     if (slot.refreshing) {
       await slot.refreshing;
       return;
@@ -1213,6 +1378,15 @@ export class CommandRouter {
     ++slot.generation;
     if (slot.agent) {
       // Unknown process ownership must survive failure and refuse another launch.
+      for (const lease of [...(slot.leases ?? []), ...(slot.participation ?? [])]) {
+        try {
+          lease.requireReconciliation(activity);
+        } catch (error) {
+          const reason = `MCP recovery ownership could not be persisted: ${String(error)}`;
+          this.options.admission?.quarantine(reason);
+          this.warn(reason);
+        }
+      }
       this.reconciliation.set(sessionId, slot);
       this.slots.delete(sessionId);
     } else {
@@ -1331,11 +1505,13 @@ export class CommandRouter {
     const generation = ++slot.generation;
     const nextContextTier = contextTier ?? launch.contextTier;
     await this.revalidate(slot, slot.binding);
+    slot.ticket?.revalidate();
     signal?.throwIfAborted();
     await slot.agent?.stop(false);
     slot.agent = undefined;
     if (signal) await this.mcpConnection.wait(signal);
     await this.revalidate(slot, slot.binding);
+    slot.ticket?.revalidate();
     signal?.throwIfAborted();
     if (this.slots.get(sessionId) !== slot || slot.stopping || this.draining)
       throw new CommandRefused("Session is being stopped");

@@ -272,6 +272,9 @@ describe("protocol validation", () => {
     expect(HostToNodeMessageSchema.parse({ type: "welcome", nodeId: "n1" })).toEqual({
       type: "welcome",
       nodeId: "n1",
+      commandExecutions: false,
+      commandPermissions: false,
+      durableLeadDelivery: false,
       reconcileAfterOutbox: false,
       acknowledgeOutbox: false,
     });
