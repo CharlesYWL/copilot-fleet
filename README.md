@@ -1820,6 +1820,8 @@ state stay together.
 ### PR maintenance (opt-in pilot)
 
 Task detail includes **PR maintenance** for an existing Orchestrator-owned worker.
+V1 supports one retained PR registration per task; release settled maintenance
+before registering another PR for that task.
 Use **Enable PR maintenance** to review the proposed exact GitHub PR, stable
 repository identities, head/base refs, retained worker and checkout, task/design
 baseline, verification, and helper/credential/publication evidence. Confirmation

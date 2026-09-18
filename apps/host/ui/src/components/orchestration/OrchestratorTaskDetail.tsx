@@ -235,6 +235,7 @@ export type OrchestratorTaskDetailProps = {
   model: RunViewModel;
   notes: RunNote[];
   sessions: readonly FleetSession[];
+  snapshotRevision?: number;
   onBack: () => void;
   /**
    * What Back goes back to, when it is not the board.
@@ -270,6 +271,7 @@ export const OrchestratorTaskDetail = ({
   model,
   notes,
   sessions,
+  snapshotRevision = 0,
   onBack,
   backLabel = "All tasks",
   onOpenLead,
@@ -286,6 +288,11 @@ export const OrchestratorTaskDetail = ({
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [reopenNote, setReopenNote] = useState("");
   const [sendBackOpen, setSendBackOpen] = useState(false);
+  const [sendBackContext, setSendBackContext] = useState<{
+    taskId: string;
+    reference: MaintenanceReviewReference | undefined;
+    proposal: string;
+  }>();
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [maintenance, setMaintenance] = useState<TaskMaintenanceView>();
@@ -293,6 +300,30 @@ export const OrchestratorTaskDetail = ({
   const maintenanceHold = maintenance?.records.find(
     (record) => !record.ownershipReleasedAt && record.decision?.state === "pending",
   );
+  const maintenanceReference = maintenanceHold?.decision
+    ? {
+        recordId: maintenanceHold.id,
+        expectedVersion: maintenanceHold.version,
+        decisionId: maintenanceHold.decision.id,
+        decisionVersion: maintenanceHold.decision.version,
+      }
+    : undefined;
+  const sendBackChanged = Boolean(
+    sendBackContext &&
+    (sendBackContext.taskId !== run.id ||
+      JSON.stringify(sendBackContext.reference) !==
+        JSON.stringify(maintenanceReference) ||
+      sendBackContext.proposal !== (maintenanceHold?.decision?.proposal ?? "")),
+  );
+  const openSendBack = () => {
+    setSendBackContext({
+      taskId: run.id,
+      reference: maintenanceReference,
+      proposal: maintenanceHold?.decision?.proposal ?? "",
+    });
+    setNote("");
+    setSendBackOpen(true);
+  };
   const finished =
     run.state === "completed" || run.state === "cancelled" || run.state === "failed";
   const latestNote = notes[notes.length - 1]?.body ?? "";
@@ -310,17 +341,12 @@ export const OrchestratorTaskDetail = ({
   };
 
   const answer = async (approved: boolean, text: string) => {
+    if (!approved && sendBackChanged) return;
     setBusy(true);
-    const decision = maintenanceHold?.decision;
-    const ok =
-      maintenanceHold && decision
-        ? await onReview(approved, text, {
-            recordId: maintenanceHold.id,
-            expectedVersion: maintenanceHold.version,
-            decisionId: decision.id,
-            decisionVersion: decision.version,
-          })
-        : await onReview(approved, text);
+    const reference = approved ? undefined : sendBackContext?.reference;
+    const ok = reference
+      ? await onReview(approved, text, reference)
+      : await onReview(approved, text);
     setBusy(false);
     if (ok) {
       setSendBackOpen(false);
@@ -403,7 +429,12 @@ export const OrchestratorTaskDetail = ({
 
       <div className={styles.body}>
         <ManagedWorktreePanel run={run} />
-        <PrMaintenancePanel run={run} sessions={sessions} onChange={setMaintenance} />
+        <PrMaintenancePanel
+          run={run}
+          sessions={sessions}
+          onChange={setMaintenance}
+          snapshotRevision={snapshotRevision}
+        />
         {(run.state === "awaiting_human" || maintenanceHold) && (
           <section className={mergeClasses(styles.section, styles.review)}>
             <Text weight="semibold">
@@ -435,17 +466,13 @@ export const OrchestratorTaskDetail = ({
                 <Button
                   appearance="primary"
                   disabled={busy || !maintenance?.canAuthorize}
-                  onClick={() => setSendBackOpen(true)}
+                  onClick={openSendBack}
                 >
                   Send back with instructions
                 </Button>
               ) : blockedReview ? (
                 <>
-                  <Button
-                    appearance="primary"
-                    disabled={busy}
-                    onClick={() => setSendBackOpen(true)}
-                  >
+                  <Button appearance="primary" disabled={busy} onClick={openSendBack}>
                     Resume with guidance
                   </Button>
                   <Button disabled={busy} onClick={() => void answer(true, "")}>
@@ -461,7 +488,7 @@ export const OrchestratorTaskDetail = ({
                   >
                     Approve
                   </Button>
-                  <Button disabled={busy} onClick={() => setSendBackOpen(true)}>
+                  <Button disabled={busy} onClick={openSendBack}>
                     Send back
                   </Button>
                 </>
@@ -569,15 +596,31 @@ export const OrchestratorTaskDetail = ({
         <DialogSurface>
           <DialogBody>
             <DialogTitle>
-              {maintenanceHold
+              {sendBackContext?.reference
                 ? "Record bounded maintenance direction"
                 : "Send this task back"}
             </DialogTitle>
             <DialogContent>
+              {sendBackContext?.reference ? (
+                <>
+                  <p className={styles.meta}>
+                    {sendBackContext.reference.decisionId} v
+                    {sendBackContext.reference.decisionVersion}
+                  </p>
+                  <p>{sendBackContext.proposal}</p>
+                </>
+              ) : null}
+              {sendBackChanged ? (
+                <p role="alert">
+                  The decision changed or is being refreshed. Close this dialog and review
+                  the current proposal before submitting; this draft will not be
+                  retargeted.
+                </p>
+              ) : null}
               <Field
                 label="What needs changing?"
                 hint={
-                  maintenanceHold
+                  sendBackContext?.reference
                     ? "Name the chosen approach and its limits. This resolves only the displayed decision version, not the defect or task criteria; changed assumptions need a new decision."
                     : "This goes to the orchestrator as an instruction, and it will dispatch the work it calls for."
                 }
@@ -595,7 +638,7 @@ export const OrchestratorTaskDetail = ({
               </Button>
               <Button
                 appearance="primary"
-                disabled={busy || note.trim().length === 0}
+                disabled={busy || sendBackChanged || note.trim().length === 0}
                 onClick={() => void answer(false, note.trim())}
               >
                 Send back

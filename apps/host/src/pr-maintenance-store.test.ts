@@ -125,6 +125,7 @@ function prepare(
   record: PrMaintenanceRegistration,
   id = "batch-1",
   kind: "repair" | "answer" = "repair",
+  headSha = sha,
 ) {
   return f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
     kind: "prepare_batch",
@@ -132,7 +133,7 @@ function prepare(
       id,
       kind,
       sources: [source],
-      headSha: sha,
+      headSha,
       prompt: "Repair the null boundary; verify, publish, and reply.",
       scope: "Existing null invariant only.",
       reservedMutations: 3,
@@ -186,6 +187,7 @@ function result(
         responseRequired: true,
         responseIds: ["response-1"],
         progress: true,
+        ...(record.batches.at(-1)!.kind === "repair" ? { publishedCommit: sha } : {}),
       },
     ],
     effects: [],
@@ -196,7 +198,287 @@ function result(
   };
 }
 
+function publishedRepair(f: ReturnType<typeof setup>) {
+  let record = accept(
+    f,
+    prepare(
+      f,
+      observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator"), {
+        mergeability: "mergeable",
+        checks: [{ key: "unit", state: "passed", headSha: sha, evidence: "ci:A passed" }],
+        reviews: [
+          {
+            key: "review",
+            reviewer: "owner",
+            state: "approved",
+            headSha: sha,
+            revision: "review-A",
+            evidence: "github:A approved",
+          },
+        ],
+      }),
+    ),
+  );
+  f.store.updateRunStep(f.step.id, { state: "succeeded" });
+  const receipt = result(record);
+  if (receipt.kind !== "batch") throw new Error("fixture");
+  receipt.findings[0]!.publishedCommit = otherSha;
+  record = f.store.prMaintenance.checkpoint(
+    f.lead.id,
+    record.id,
+    record.version,
+    receipt,
+  );
+  return f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+    ...receipt,
+    state: "succeeded",
+  });
+}
+
 describe("durable PR maintenance registry", () => {
+  it("invalidates HEAD-A readiness after a known repair publication to HEAD B", () => {
+    const f = setup();
+    let record = publishedRepair(f);
+    expect(() =>
+      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "ready",
+        fingerprint: "fingerprint-1",
+        evidence: "Reusing the pre-publication checks",
+      }),
+    ).toThrow(/Readiness/);
+    record = observe(f, record, {
+      headSha: otherSha,
+      fingerprint: "head-B",
+      mergeability: "mergeable",
+      checks: [
+        { key: "unit", state: "passed", headSha: otherSha, evidence: "ci:B passed" },
+      ],
+      reviews: [
+        {
+          key: "review",
+          reviewer: "owner",
+          state: "approved",
+          headSha: otherSha,
+          revision: "review-B",
+          evidence: "github:B approved",
+        },
+      ],
+    });
+    expect(
+      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "ready",
+        fingerprint: "head-B",
+        evidence: "Fresh HEAD-B evidence",
+      }).readyFingerprint,
+    ).toBe("head-B");
+  });
+
+  it("keeps same-HEAD deduplication but allows unchanged feedback to be revalidated on an external HEAD", () => {
+    const f = setup();
+    let record = observe(f, publishedRepair(f), {
+      headSha: otherSha,
+      fingerprint: "head-B",
+    });
+    expect(() => prepare(f, record, "duplicate-B", "repair", otherSha)).toThrow(
+      /unchanged/,
+    );
+    const externalHead = "c".repeat(40);
+    record = observe(f, record, {
+      headSha: externalHead,
+      fingerprint: "external-C",
+      mergeability: "mergeable",
+      checks: [
+        { key: "unit", state: "passed", headSha: externalHead, evidence: "ci:C passed" },
+      ],
+      reviews: [
+        {
+          key: "review",
+          reviewer: "owner",
+          state: "approved",
+          headSha: externalHead,
+          revision: "review-C",
+          evidence: "github:C approved",
+        },
+      ],
+    });
+    expect(() =>
+      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "ready",
+        fingerprint: "external-C",
+        evidence: "The old disposition alone is insufficient",
+      }),
+    ).toThrow(/Readiness/);
+    expect(() =>
+      prepare(f, record, "regression-C", "repair", externalHead),
+    ).not.toThrow();
+  });
+
+  it("revalidates a still-valid finding on HEAD C without treating its historical HEAD-B publication as a new push", () => {
+    const f = setup();
+    const externalHead = "c".repeat(40);
+    let record = observe(f, publishedRepair(f), {
+      headSha: externalHead,
+      fingerprint: "head-C",
+      mergeability: "mergeable",
+      checks: [
+        { key: "unit", state: "passed", headSha: externalHead, evidence: "ci:C passed" },
+      ],
+      reviews: [
+        {
+          key: "review",
+          reviewer: "owner",
+          state: "approved",
+          headSha: externalHead,
+          revision: "review-C",
+          evidence: "github:C approved",
+        },
+      ],
+    });
+    record = accept(
+      f,
+      prepare(f, record, "revalidate-C", "answer", externalHead),
+      "revalidate-C",
+    );
+    f.store.updateRunStep(f.step.id, { state: "succeeded" });
+    const receipt = result(record);
+    if (receipt.kind !== "batch") throw new Error("fixture");
+    receipt.published = false;
+    receipt.usedMutations = 0;
+    receipt.findings[0] = {
+      ...receipt.findings[0]!,
+      outcome: "already_satisfied",
+      publishedCommit: otherSha,
+      verifiedHeadSha: externalHead,
+    };
+    record = f.store.prMaintenance.checkpoint(
+      f.lead.id,
+      record.id,
+      record.version,
+      receipt,
+    );
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      ...receipt,
+      state: "succeeded",
+    });
+    expect(record.batches.at(-1)!.published).toBe(false);
+    expect(record.findings[0]!.verifiedHeadSha).toBe(externalHead);
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      kind: "ready",
+      fingerprint: "head-C",
+      evidence: "Existing fix verified against current code",
+    });
+    expect(record.readyFingerprint).toBe("head-C");
+    expect(() => prepare(f, record, "duplicate-C", "answer", externalHead)).toThrow(
+      /unchanged/,
+    );
+  });
+
+  it.each([0, 1])(
+    "permits a new reservation after confirmed review-request nonperformance, retaining %i used attempts",
+    (usedAttempts) => {
+      const f = setup();
+      let record = observe(
+        f,
+        f.store.prMaintenance.enableFromOperator(
+          {
+            ...f.input,
+            scope: { ...scope, reviewers: ["reviewer"] },
+          },
+          "operator",
+        ),
+      );
+      const effect = {
+        key: "request-before-local-failure",
+        kind: "review_request" as const,
+        state: "reserved" as const,
+        actor: "lead",
+        headSha: sha,
+        recipient: "reviewer",
+        actionIdentity: "same-review-obligation",
+        attempts: 1,
+      };
+      record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "action",
+        effect,
+      });
+      record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "action",
+        effect: {
+          ...effect,
+          state: "not_performed",
+          usedAttempts,
+          evidence:
+            usedAttempts === 0
+              ? "The local command failed before HTTP."
+              : "GitHub rejected the request without adding a reviewer.",
+        },
+      });
+      expect(record.counters.mutationAttempts).toBe(usedAttempts);
+      expect(() =>
+        f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+          kind: "action",
+          effect,
+        }),
+      ).toThrow(/immutable/);
+      record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "action",
+        effect: { ...effect, key: "new-reservation-after-local-fix" },
+      });
+      expect(record.actions.map((entry) => entry.state)).toEqual([
+        "not_performed",
+        "reserved",
+      ]);
+      expect(record.counters.mutationAttempts).toBe(usedAttempts + 1);
+    },
+  );
+
+  it("rejects a second retained PR for the same task even with an independent worker and checkout", () => {
+    const f = setup();
+    const secondNode = f.store.registerNode({
+      name: "second",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 20,
+    }).node;
+    const placement = f.store.createPlacement(
+      f.workspace.id,
+      secondNode.id,
+      "C:\\other-checkout",
+    );
+    const worker = f.store.createSession(placement, "Second worker", false, "", {
+      runId: f.task.id,
+      runRole: "worker",
+    });
+    f.store.transitionSession(worker.id, "starting");
+    f.store.transitionSession(worker.id, "idle");
+    const step = f.store.upsertRunStep(f.task.id, {
+      stepKey: "second-worker",
+      title: "Second worker",
+      prompt: "Independent checkout",
+    });
+    f.store.updateRunStep(step.id, {
+      sessionId: worker.id,
+      placementId: placement.id,
+      state: "succeeded",
+    });
+    const first = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    expect(() =>
+      f.store.prMaintenance.enableFromOperator(
+        {
+          ...f.input,
+          workerSessionId: worker.id,
+          identity: { ...identity, prNumber: 2, headRef: "refs/heads/Other" },
+        },
+        "operator",
+      ),
+    ).toThrow(/task.*already|one.*task/i);
+    expect(f.store.prMaintenance.enableFromOperator(f.input, "operator").id).toBe(
+      first.id,
+    );
+  });
+
   it("rejects fabricated approval, mutable identity fields and unbounded checkpoints", () => {
     const f = setup();
     expect(() =>
@@ -563,6 +845,8 @@ describe("durable PR maintenance registry", () => {
     expect(record.counters.repairBatches).toBe(1);
     expect(record.counters.mutationAttempts).toBe(1);
     expect(prMaintenanceUnsettled(record)).toBe(false);
+    expect(() => prepare(f, record, "before-refresh")).toThrow(/complete/);
+    record = observe(f, record);
     expect(() => prepare(f, record, "duplicate-feedback")).toThrow(/unchanged/);
   });
 
@@ -997,6 +1281,20 @@ describe("durable PR maintenance registry", () => {
       kind: "ci_retry" as const,
       actionIdentity: "check:incident-1",
     };
+    const unsentRetry = { ...retry, key: "ci-command-not-started" };
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      kind: "action",
+      effect: unsentRetry,
+    });
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      kind: "action",
+      effect: {
+        ...unsentRetry,
+        state: "not_performed",
+        usedAttempts: 0,
+        evidence: "Local command failed before starting the retry request.",
+      },
+    });
     record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
       kind: "action",
       effect: retry,

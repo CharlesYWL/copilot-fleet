@@ -48,6 +48,127 @@ const complete = (value: unknown = snapshot()) => ({
 });
 
 describe("GitHub helper to durable Host observation", () => {
+  it.each(["classic", "ruleset"] as const)(
+    "blocks behind and unknown base readiness under %s strict policy",
+    (policy) => {
+      for (const mergeStateStatus of ["BEHIND", "UNKNOWN", "CLEAN"]) {
+        const rule = {
+          type: "required_status_checks",
+          parameters: {
+            strict_required_status_checks_policy: true,
+            required_status_checks: [{ context: "unit" }],
+          },
+        };
+        const value = {
+          ...snapshot(),
+          mergeStateStatus,
+          rules: policy === "ruleset" ? [rule] : [],
+          requiredChecks: [
+            {
+              name: "unit",
+              appId: null,
+              states: [{ status: "COMPLETED", conclusion: "SUCCESS" }],
+            },
+          ],
+          obligationKeys: {
+            checks: [{ name: "unit", appId: null, key: "unit" }],
+            review: "review",
+          },
+          reviewPolicy: {
+            branchProtection:
+              policy === "classic"
+                ? { requiresStatusChecks: true, requiresStrictStatusChecks: true }
+                : null,
+            rules: [],
+          },
+        };
+        const observation = toHostObservation(complete(value), {});
+        expect(observation.checks).toContainEqual(
+          expect.objectContaining({
+            key: `strict-base:${value.baseSha}`,
+            state:
+              mergeStateStatus === "CLEAN"
+                ? "passed"
+                : mergeStateStatus === "BEHIND"
+                  ? "pending"
+                  : "unknown",
+            headSha: sha,
+          }),
+        );
+      }
+    },
+  );
+
+  it("does not invent a base-update requirement from an inactive strict flag", () => {
+    const observation = toHostObservation(
+      complete({
+        ...snapshot(),
+        mergeStateStatus: "UNKNOWN",
+        reviewPolicy: {
+          branchProtection: {
+            requiresStatusChecks: false,
+            requiresStrictStatusChecks: true,
+          },
+          rules: [],
+        },
+        rules: [
+          {
+            type: "required_status_checks",
+            parameters: {
+              strict_required_status_checks_policy: true,
+              required_status_checks: [],
+            },
+          },
+        ],
+      }),
+      {},
+    );
+    expect(observation.checks).toEqual([]);
+  });
+
+  it("retains an outstanding required-team review when the general approval count is zero", () => {
+    const rule = {
+      type: "pull_request",
+      parameters: {
+        required_approving_review_count: 0,
+        require_code_owner_review: false,
+        require_last_push_approval: false,
+        required_reviewers: [
+          {
+            reviewer: { id: 42, type: "Team" },
+            minimum_approvals: 1,
+            file_patterns: ["*"],
+          },
+        ],
+      },
+    };
+    for (const reviewDecision of ["REVIEW_REQUIRED", "UNKNOWN", "APPROVED"]) {
+      const observation = toHostObservation(
+        complete({
+          ...snapshot(),
+          reviewDecision,
+          rules: [rule],
+          reviewPolicy: { branchProtection: null, rules: [rule] },
+        }),
+        {},
+      );
+      expect(observation.reviews).toContainEqual(
+        expect.objectContaining({
+          state: reviewDecision === "APPROVED" ? "approved" : "required",
+        }),
+      );
+    }
+  });
+
+  it("does not discard GitHub's aggregate REVIEW_REQUIRED decision when policy detail has no count", () => {
+    expect(
+      toHostObservation(
+        complete({ ...snapshot(), reviewDecision: "REVIEW_REQUIRED" }),
+        {},
+      ).reviews,
+    ).toContainEqual(expect.objectContaining({ state: "required" }));
+  });
+
   it("preserves opaque GitHub IDs and explicit absence of required gates", () => {
     const observation = PrMaintenanceObservationSchema.parse(
       toHostObservation(complete(), {}),

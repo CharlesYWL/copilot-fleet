@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -104,6 +104,113 @@ beforeEach(() => {
 });
 
 describe("PR maintenance task controls", () => {
+  it("refreshes maintenance-only snapshot revisions without a task timestamp change", async () => {
+    const onChange = vi.fn();
+    const panel = (snapshotRevision: number) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel
+          run={task}
+          sessions={[]}
+          onChange={onChange}
+          snapshotRevision={snapshotRevision}
+        />
+      </FluentProvider>
+    );
+    const rendered = render(panel(1));
+    await screen.findByText(/refs\/heads\/Fix/);
+    const updated = {
+      ...registration(),
+      version: 9,
+      lifecycle: "active" as const,
+      pauseReason: "",
+      lastSuccessAt: "2026-09-18T08:00:00.000Z",
+    };
+    let finishRefresh!: () => void;
+    vi.mocked(getTaskMaintenance).mockReturnValue(
+      new Promise<Awaited<ReturnType<typeof getTaskMaintenance>>>((resolve) => {
+        finishRefresh = () => resolve({ records: [updated], canAuthorize: true });
+      }),
+    );
+    rendered.rerender(panel(2));
+    await waitFor(() => expect(getTaskMaintenance).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(/refs\/heads\/Fix/)).toBeTruthy();
+    await act(async () => finishRefresh());
+    expect(await screen.findByText(updated.lastSuccessAt)).toBeTruthy();
+    expect(onChange).toHaveBeenLastCalledWith({ records: [updated], canAuthorize: true });
+  });
+
+  it("never retargets an open decision-A draft to newly arrived decision B", async () => {
+    const first = registration();
+    first.decision = {
+      id: "decision-A",
+      version: 1,
+      proposal: "Proposal A: preserve the existing contract",
+      headSha: "a".repeat(40),
+      scope: "Existing contract",
+      state: "pending",
+    };
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [first],
+      canAuthorize: true,
+    });
+    const review = vi.fn().mockResolvedValue(false);
+    const detail = (updatedAt: string) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <OrchestratorTaskDetail
+          model={
+            buildRunViewModels({
+              runs: [{ ...task, updatedAt }],
+              stepsByRun: {},
+              sessions: [],
+            })[0]!
+          }
+          notes={[]}
+          sessions={[]}
+          onBack={vi.fn()}
+          onOpenLead={vi.fn()}
+          onOpenWorker={vi.fn()}
+          onReview={review}
+          onArchive={vi.fn()}
+          onReopen={vi.fn()}
+          onDelete={vi.fn()}
+        />
+      </FluentProvider>
+    );
+    const rendered = render(detail(at));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Send back with instructions" }),
+    );
+    const dialog = screen.getByRole("dialog");
+    fireEvent.change(
+      within(dialog).getByRole("textbox", { name: "What needs changing?" }),
+      {
+        target: { value: "Instructions for A only" },
+      },
+    );
+    const second = {
+      ...first,
+      version: 9,
+      decision: {
+        ...first.decision,
+        id: "decision-B",
+        proposal: "Proposal B: replace the API",
+      },
+    };
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [second],
+      canAuthorize: true,
+    });
+    rendered.rerender(detail("2026-09-18T08:00:00.000Z"));
+    await screen.findByText(/decision-B v1/);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Send back" }));
+    expect(review).not.toHaveBeenCalled();
+    expect(within(dialog).getByText(first.decision.proposal)).toBeTruthy();
+    expect(within(dialog).getByRole("alert").textContent).toMatch(/changed|review/i);
+    expect((within(dialog).getByRole("textbox") as HTMLTextAreaElement).value).toBe(
+      "Instructions for A only",
+    );
+  });
+
   it("shows exact ref, unknown observation and versioned resume without an actor field", async () => {
     vi.mocked(actOnTaskMaintenance).mockResolvedValue(registration());
     show();

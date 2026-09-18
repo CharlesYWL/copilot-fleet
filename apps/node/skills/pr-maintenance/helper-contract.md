@@ -22,6 +22,7 @@ file; never interpolate PR/review text into executable command text.
     "number": 123,
     "repositoryId": "R_graphqlNodeId",
     "headRepositoryId": "R_forkNodeId",
+    "headRepository": "fork-owner/repository",
     "headRef": "refs/heads/FixCaseSensitive",
     "baseRepositoryId": "R_graphqlNodeId",
     "baseRef": "refs/heads/main"
@@ -51,6 +52,9 @@ then records the returned GraphQL **node IDs** (not numeric database IDs), head
 and base refs, and the authorized scope. Every maintenance read must supply all
 five pins. The PR repository is the base repository, which may differ from the
 head repository. Host/names are case-insensitive; Git refs are not.
+Also pass the registered `headRepository` name. If GitHub confirms closure/merge
+after deleting the fork, the helper retains that pinned ID/name for terminal
+settlement. An open PR with a missing head repository still blocks observation.
 
 Every outcome is one JSON object; exit 0 means complete, exit 2 incomplete:
 
@@ -99,13 +103,23 @@ verification pass. If it cannot fit even the 40-request maximum, retain incomple
 evidence and request human attention instead of certifying a stale snapshot.
 
 Reads use GraphQL connections and the effective REST branch-rules endpoint.
+REST rule pages follow validated next-page links through the same bounded,
+resumable scan and fresh consistency pass as GraphQL pages.
 No required checks reported is not the same as missing expected checks passing:
 expected contexts from branch protection/rules appear with `MISSING/UNKNOWN`.
 Unknown review decision/mergeability or unsupported policy requirements prevent
 readiness. API access must expose all evidence; permission/unsupported-endpoint
 failures are deliberately fail-closed, including on older GitHub Enterprise.
+Strict base-update policies require a `CLEAN` GitHub merge state; behind or
+unknown status blocks readiness. Required team reviews and GitHub's aggregate
+`REVIEW_REQUIRED` decision remain obligations even with a zero general approval count.
 
-`handledSources` entries are `{kind,id,revision}` from verified dispositions.
+`handledSources` entries are `{kind,id,revision,headSha}` from verified dispositions.
+Only `addressed` or `already_satisfied` findings belong here; incomplete reply
+obligations remain unhandled.
+Use the registry finding's `verifiedHeadSha` (or its explicit `publishedCommit`
+for an older record) as `headSha`. Suppression applies only when that SHA is the
+current PR HEAD; missing or changed verification HEADs require revalidation.
 Unmatched source revisions remain input even for the current login or bots.
 Persist each successful `snapshot.threadStates` and pass it as `previousThreads`
 on the next observation. Entries `{id,stateHash,revision}` keep observed thread

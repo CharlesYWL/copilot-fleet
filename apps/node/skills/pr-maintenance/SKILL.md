@@ -68,6 +68,8 @@ once: do not choose reviewers or add a blanket review stage.
 Paused registrations keep ownership/retention. After 30 days paused, notify once
 to resume or release; polling does not renew their age and unknown work never
 expires. Portable restore is paused pending authorized reconciliation.
+V1 retains at most one PR registration per task. Release settled maintenance
+before assigning that task to a different PR.
 
 ## Observe with the packaged read-only helper
 
@@ -91,6 +93,11 @@ Incomplete means **no triage, consumption of findings, or readiness**. A resume
 checkpoint is opaque data from the registry; revalidate with the helper before
 using it. An inconsistent scan is discarded, not relabeled complete.
 Keep full helper snapshot evidence and source URLs retrievable without replaying all text.
+Pass the registered head repository name as well as its stable ID/ref, so a
+confirmed terminal PR can settle even if its fork was deleted.
+Only suppress `addressed` / `already_satisfied` sources at their verified code HEAD: include
+`headSha` from the disposition's `verifiedHeadSha` in each `handledSources` entry.
+External HEAD changes require revalidation, not permanent suppression.
 The helper maps failed required checks to stable `check:` sources, so CI-only
 repairs can be batched. In the prepared batch, assign the same stable `groupKey`
 to semantically identical findings, using prior finding groups; keep source IDs,
@@ -157,6 +164,10 @@ external decision/policy revision; our own request/notice cannot create a new
 revision. Persist intended lead actions, recipients, reserved allowance, provider
 IDs and known/uncertain result before remote mutation. A lost response requires
 reobservation before retry. Changed fingerprint does not replay previous actions.
+When a review request is evidenced `not_performed`, reserve a new key after
+correcting the failure; preserve the old receipt and any consumed attempt budget.
+Successful or uncertain requests cannot be repeated. CI's once-per-incident
+allowance is reusable only when no HTTP request was sent (`usedAttempts: 0`).
 
 ## Prepare once, then continue the same worker
 
@@ -176,6 +187,9 @@ and the **complete immutable follow-up prompt**. Include all of:
 6. Requested per-finding report: `addressed`, `already_satisfied`, `needs_human`,
    `failed`, `superseded`, or `incomplete`; last verified stage, verification and
    repair/published SHA, response obligations/IDs, mutation attempts, next action.
+   Use `verifiedHeadSha` for the code actually checked; historical
+   `publishedCommit` is not a new push. A known new publication invalidates
+   pre-publication readiness and requires a fresh complete helper observation.
 
 Then use `fleet_follow_up` with that exact prompt and the record/batch reference.
 Its concrete shape is `maintenance: {recordId, generation, batchId}`.

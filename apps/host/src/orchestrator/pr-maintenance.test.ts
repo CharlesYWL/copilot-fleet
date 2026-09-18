@@ -366,6 +366,7 @@ describe("PR maintenance orchestration", () => {
       }).ok,
     ).toBe(true);
     const accepted = world.store.prMaintenance.get(record.id)!;
+    const publishSnapshot = vi.spyOn(world.service, "publishSnapshot");
     expect(
       tools.setPrMaintenance({
         recordId: record.id,
@@ -374,6 +375,7 @@ describe("PR maintenance orchestration", () => {
         reason: "Operator pause",
       }).ok,
     ).toBe(true);
+    expect(publishSnapshot).toHaveBeenCalled();
     new OrchestratorEngine(world.service).tickRun(step.runId);
     expect(world.store.getRunStep(step.id)!.state).toBe("cancelled");
     expect(world.store.prMaintenance.get(record.id)!.batches[0]).toMatchObject({

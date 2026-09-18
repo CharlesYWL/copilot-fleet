@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Button,
   Checkbox,
@@ -47,13 +47,16 @@ export function PrMaintenancePanel({
   run,
   sessions,
   onChange,
+  snapshotRevision = 0,
 }: {
   run: Run;
   sessions: readonly FleetSession[];
   onChange: (view: TaskMaintenanceView | undefined) => void;
+  snapshotRevision?: number;
 }) {
   const styles = useStyles();
   const [view, setView] = useState<TaskMaintenanceView>();
+  const loadedTaskId = useRef<string | undefined>(undefined);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -66,11 +69,14 @@ export function PrMaintenancePanel({
   const [progress, setProgress] = useState("");
   useEffect(() => {
     let active = true;
-    setView(undefined);
-    onChange(undefined);
+    if (loadedTaskId.current !== run.id) {
+      setView(undefined);
+      onChange(undefined);
+    }
     void getTaskMaintenance(run.id)
       .then((next) => {
         if (!active) return;
+        loadedTaskId.current = run.id;
         setView(next);
         onChange(next);
         setError("");
@@ -84,7 +90,7 @@ export function PrMaintenancePanel({
     return () => {
       active = false;
     };
-  }, [run.id, run.updatedAt, refreshKey, onChange]);
+  }, [run.id, run.updatedAt, refreshKey, snapshotRevision, onChange]);
 
   const execute = async (action: () => Promise<unknown>) => {
     setBusy(true);
@@ -244,12 +250,13 @@ export function PrMaintenancePanel({
               </dd>
               <dt>Last successful check</dt>
               <dd>{record.lastSuccessAt || "Unknown — no successful observation"}</dd>
-              {record.lastAttempt && !record.lastAttempt.complete ? (
+              {!record.lastAttempt?.complete ? (
                 <>
                   <dt>Current evidence</dt>
                   <dd>
-                    Incomplete or failed observation — prior success is not current
-                    validation.
+                    {record.lastAttempt
+                      ? "Incomplete or failed observation — prior success is not current validation."
+                      : "Awaiting a fresh observation — historical success is not current validation."}
                   </dd>
                 </>
               ) : null}

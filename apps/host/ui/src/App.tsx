@@ -228,6 +228,7 @@ export function App() {
 
   const {
     snapshot,
+    snapshotRevision,
     liveNotificationUpdates,
     events,
     commandOutput,
@@ -1271,6 +1272,7 @@ export function App() {
               {view === "orchestrator-task" && selectedRunModel && orchestrator && (
                 <OrchestratorTaskDetail
                   model={selectedRunModel}
+                  snapshotRevision={snapshotRevision}
                   notes={runNotes[selectedRunModel.run.id] ?? noNotes}
                   sessions={snapshot.sessions}
                   onBack={handleBackFromTask}

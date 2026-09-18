@@ -777,6 +777,7 @@ export class FleetTools {
         ...(input.reason ? { reason: input.reason } : {}),
       });
       this.service.cancelPausedPrMaintenance();
+      this.service.publishSnapshot();
       return record;
     });
   }

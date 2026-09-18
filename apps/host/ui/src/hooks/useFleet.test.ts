@@ -112,6 +112,18 @@ afterEach(() => {
 });
 
 describe("useFleet durable notifications", () => {
+  it("advances snapshot revisions for registry refresh without requiring a changed task", () => {
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const socket = MockWebSocket.instances[0]!;
+    expect(result.current.snapshotRevision).toBe(0);
+    act(() => socket.send({ type: "snapshot", data: snapshot() }));
+    expect(result.current.snapshotRevision).toBe(1);
+    act(() => socket.send({ type: "snapshot", data: snapshot() }));
+    expect(result.current.snapshotRevision).toBe(2);
+    act(() => socket.send({ type: "notification_unread_count", unreadCount: 1 }));
+    expect(result.current.snapshotRevision).toBe(2);
+  });
+
   it("reports connection loss once per outage and reports recovery, but not initial connection or unmount", async () => {
     vi.useFakeTimers();
     const notify = vi.fn();

@@ -1,4 +1,4 @@
-/* global Buffer, process, structuredClone, setTimeout, clearTimeout */
+/* global Buffer, process, structuredClone, setTimeout, clearTimeout, URL */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
@@ -23,7 +23,7 @@ const reviewer =
   "requestedReviewer { ... on User { id login } ... on Team { id slug } ... on Mannequin { id login } }";
 const metadataFields = `
   id number url title body state mergedAt headRefName headRefOid baseRefName baseRefOid
-  mergeable reviewDecision
+  mergeable mergeStateStatus reviewDecision
   repository { id nameWithOwner }
   headRepository { id nameWithOwner }
   baseRef { branchProtectionRule {
@@ -101,6 +101,16 @@ function validate(input, now) {
       throw fail("invalid_input", `${key} must be a stable GitHub GraphQL node ID.`);
     }
   }
+  if (
+    pr.headRepository !== undefined &&
+    (typeof pr.headRepository !== "string" ||
+      !/^[a-z\d_.-]+\/[a-z\d_.-]+$/i.test(pr.headRepository))
+  ) {
+    throw fail(
+      "invalid_input",
+      "headRepository must be the registered owner/repository name.",
+    );
+  }
   const budget = input.budget;
   if (
     !Number.isInteger(budget?.maxRequests) ||
@@ -149,26 +159,29 @@ function validate(input, now) {
       !source ||
       typeof source.id !== "string" ||
       typeof source.kind !== "string" ||
-      !/^[a-f\d]{64}$/.test(source.revision)
+      !/^[a-f\d]{64}$/.test(source.revision) ||
+      (source.headSha !== undefined &&
+        (typeof source.headSha !== "string" ||
+          !/^(?:[a-f\d]{40}|[a-f\d]{64})$/.test(source.headSha)))
     ) {
       throw fail(
         "invalid_input",
-        "Each handled source needs kind, id, and exact revision hash.",
+        "Each handled source needs kind, id, exact revision hash and a valid verification headSha when supplied.",
       );
     }
-    for (const state of input.previousThreads ?? []) {
-      if (
-        !state ||
-        typeof state.id !== "string" ||
-        !/^[a-f\d]{64}$/.test(state.stateHash) ||
-        !Number.isSafeInteger(state.revision) ||
-        state.revision < 0
-      ) {
-        throw fail(
-          "invalid_input",
-          "Each previous thread needs id, stateHash, and a nonnegative revision.",
-        );
-      }
+  }
+  for (const state of input.previousThreads ?? []) {
+    if (
+      !state ||
+      typeof state.id !== "string" ||
+      !/^[a-f\d]{64}$/.test(state.stateHash) ||
+      !Number.isSafeInteger(state.revision) ||
+      state.revision < 0
+    ) {
+      throw fail(
+        "invalid_input",
+        "Each previous thread needs id, stateHash, and a nonnegative revision.",
+      );
     }
   }
   return {
@@ -325,6 +338,7 @@ export function ghRequest({ host, endpoint, payload, timeoutMs, maxBytes }) {
 }
 
 function identity(pr, metadata) {
+  const deletedFork = metadata.state !== "OPEN" && metadata.headRepository === null;
   const result = {
     host: pr.host.toLowerCase(),
     repositoryId: metadata.repository?.id,
@@ -332,8 +346,11 @@ function identity(pr, metadata) {
     number: metadata.number,
     prId: metadata.id,
     url: metadata.url,
-    headRepositoryId: metadata.headRepository?.id,
-    headRepository: metadata.headRepository?.nameWithOwner,
+    headRepositoryId:
+      metadata.headRepository?.id ?? (deletedFork ? pr.headRepositoryId : undefined),
+    headRepository:
+      metadata.headRepository?.nameWithOwner ??
+      (deletedFork ? pr.headRepository : undefined),
     headRef: `refs/heads/${metadata.headRefName}`,
     baseRepositoryId: metadata.repository?.id,
     baseRepository: metadata.repository?.nameWithOwner,
@@ -361,6 +378,12 @@ function identity(pr, metadata) {
     (!result.headRepositoryId || !metadata.headRefOid || !validRef(result.headRef))
   ) {
     throw fail("unavailable_ref", "The open PR has no usable head repository/ref.");
+  }
+  if (!result.headRepositoryId || !result.headRepository) {
+    throw fail(
+      "unavailable_ref",
+      "A terminal deleted fork needs its registered headRepositoryId and headRepository name.",
+    );
   }
   for (const key of [
     "repositoryId",
@@ -615,7 +638,8 @@ export function buildSnapshot(input, scan) {
         (handled) =>
           handled.kind === item.kind &&
           handled.id === item.id &&
-          handled.revision === item.revision,
+          handled.revision === item.revision &&
+          handled.headSha === metadata.headRefOid,
       ),
   );
   const checks = requiredChecks(metadata, data.rules, data.checks);
@@ -680,6 +704,7 @@ export function buildSnapshot(input, scan) {
     title: metadata.title,
     body: metadata.body,
     mergeable: metadata.mergeable,
+    mergeStateStatus: metadata.mergeStateStatus ?? "UNKNOWN",
     threads,
     threadStates,
     reviews: data.reviews,
@@ -698,6 +723,7 @@ export function buildSnapshot(input, scan) {
       state: metadata.state,
       design: { title: metadata.title, body: metadata.body },
       mergeable: metadata.mergeable,
+      mergeStateStatus: metadata.mergeStateStatus ?? "UNKNOWN",
       checks,
       rules: data.rules,
       externalReviewRevision,
@@ -770,7 +796,16 @@ export async function observe(input, { request = ghRequest, now = Date.now } = {
       let endpoint;
       let payload;
       if (job.kind === "rules") {
-        endpoint = `repos/${encodeURIComponent(input.pr.owner)}/${encodeURIComponent(input.pr.repo)}/rules/branches/${encodeURIComponent(metadata.baseRefName)}`;
+        if (
+          job.cursor !== null &&
+          job.cursor !== undefined &&
+          (typeof job.cursor !== "string" || !/^[1-9]\d*$/.test(job.cursor))
+        )
+          throw fail(
+            "invalid_resume",
+            "The rule-page cursor must be a positive page number.",
+          );
+        endpoint = `repos/${encodeURIComponent(input.pr.owner)}/${encodeURIComponent(input.pr.repo)}/rules/branches/${encodeURIComponent(metadata.baseRefName)}?per_page=100${job.cursor ? `&page=${job.cursor}` : ""}`;
       } else payload = queryFor(input.pr, job);
       requestsConsumed += 1;
       const response = await request({
@@ -849,7 +884,40 @@ export async function observe(input, { request = ghRequest, now = Date.now } = {
             "malformed_response",
             "GitHub returned no effective branch-rule array.",
           );
-        return { nodes: body, pageInfo: { hasNextPage: false, endCursor: null } };
+        const nextLink = /<([^>]+)>[^,]*?\brel\s*=\s*"?next"?(?=\s*(?:[,;]|$))/i.exec(
+          headers.link ?? "",
+        );
+        let nextPage = null;
+        if (nextLink) {
+          let url;
+          try {
+            url = new URL(nextLink[1]);
+          } catch {
+            throw fail("malformed_response", "The next rule-page link is invalid.");
+          }
+          nextPage = url.searchParams.get("page");
+          const host = input.pr.host.toLowerCase();
+          if (
+            url.protocol !== "https:" ||
+            ![host, `api.${host}`].includes(url.host) ||
+            !url.pathname.endsWith(`/${endpoint.split("?")[0]}`) ||
+            !/^[1-9]\d*$/.test(nextPage ?? "") ||
+            !Number.isSafeInteger(Number(nextPage)) ||
+            Number(nextPage) !== Number(job.cursor ?? 1) + 1 ||
+            (url.searchParams.has("per_page") &&
+              url.searchParams.get("per_page") !== "100")
+          )
+            throw fail(
+              "malformed_response",
+              "The next rule page does not match this branch and scan.",
+            );
+        } else if (/\brel\s*=\s*"?next\b/i.test(headers.link ?? "")) {
+          throw fail("malformed_response", "The next rule-page link is incomplete.");
+        }
+        return {
+          nodes: body,
+          pageInfo: { hasNextPage: nextPage !== null, endCursor: nextPage },
+        };
       }
       const result = connection(body, job, metadata);
       if (

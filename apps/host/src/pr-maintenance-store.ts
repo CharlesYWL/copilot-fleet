@@ -28,6 +28,8 @@ import type { FleetStore } from "./store.js";
 const outstanding = new Set(["prepared", "accepted", "reconciling", "uncertain"]);
 const unsettledEffect = (effect: PrMaintenanceEffect) =>
   effect.state === "reserved" || effect.state === "uncertain";
+const neverSentEffect = (effect: PrMaintenanceEffect) =>
+  effect.state === "not_performed" && effect.usedAttempts === 0;
 const nowIso = () => new Date().toISOString();
 const emptyCounters = () => ({
   repairBatches: 0,
@@ -388,7 +390,8 @@ export class PrMaintenanceStore {
       this.store.assertRunMutable(task.id);
       this.store.assertSessionMutable(lead.id);
       this.store.assertSessionMutable(worker.id);
-      const previous = this.retained().find(
+      const retained = this.retained();
+      const previous = retained.find(
         (entry) =>
           entry.identity.host === parsed.identity.host &&
           entry.identity.repositoryId === parsed.identity.repositoryId &&
@@ -407,6 +410,12 @@ export class PrMaintenanceStore {
         refuse(
           "ownership_conflict",
           "Existing maintenance owns this PR; enablement cannot adopt, rebind or renew it.",
+        );
+      }
+      if (retained.some((entry) => entry.taskId === task.id)) {
+        refuse(
+          "task_already_registered",
+          "This task is already reserved for PR maintenance. V1 supports one PR per task; release it before registering another.",
         );
       }
       if (
@@ -851,8 +860,7 @@ export class PrMaintenanceStore {
           batch.state !== "accepted"
         )
           return denied("batch_not_accepted");
-        if (record.lastAttempt && !record.lastAttempt.complete)
-          return denied("observation_incomplete");
+        if (!record.lastAttempt?.complete) return denied("observation_incomplete");
         if (!record.observation?.complete || batch.headSha !== record.observation.headSha)
           return denied("stale_observation");
         if (
@@ -1072,7 +1080,11 @@ export class PrMaintenanceStore {
             (entry) =>
               entry.source.id === source.id && entry.source.revision === source.revision,
           );
-          if (finding && ["addressed", "already_satisfied"].includes(finding.outcome))
+          if (
+            finding &&
+            ["addressed", "already_satisfied"].includes(finding.outcome) &&
+            (finding.verifiedHeadSha ?? finding.publishedCommit) === prepared.headSha
+          )
             refuse(
               "already_addressed",
               "Verified unchanged feedback must not dispatch again.",
@@ -1133,6 +1145,8 @@ export class PrMaintenanceStore {
                 (finding) =>
                   finding.source.id === source.id &&
                   finding.source.revision === source.revision &&
+                  (finding.verifiedHeadSha ?? finding.publishedCommit) ===
+                    record.observation!.headSha &&
                   ["addressed", "already_satisfied"].includes(finding.outcome),
               ),
           )
@@ -1301,8 +1315,19 @@ export class PrMaintenanceStore {
     }
     if (batch.published && !update.published)
       refuse("receipt_conflict", "A verified published repair cannot be erased.");
+    const verificationHeads = new Set([
+      batch.headSha,
+      ...update.findings.flatMap((finding) =>
+        finding.publishedCommit ? [finding.publishedCommit] : [],
+      ),
+    ]);
     const findings = new Map<string, (typeof update.findings)[number]>();
     for (const finding of update.findings) {
+      if (finding.verifiedHeadSha && !verificationHeads.has(finding.verifiedHeadSha))
+        refuse(
+          "verification_head_mismatch",
+          "Verification must name this batch's base or an evidenced published commit.",
+        );
       const key = `${finding.source.id}\0${finding.source.revision}`;
       if (
         findings.has(key) ||
@@ -1399,10 +1424,21 @@ export class PrMaintenanceStore {
       ) > batch.reservedMutations
     )
       refuse("allowance_exceeded", "Effects exceed the reserved worker allowance.");
+    const knownPublications = new Set(
+      record.batches.flatMap((entry) =>
+        entry.findings.flatMap((finding) =>
+          finding.publishedCommit ? [finding.publishedCommit] : [],
+        ),
+      ),
+    );
     const published =
       update.published ||
-      update.findings.some((finding) => finding.publishedCommit) ||
+      update.findings.some(
+        (finding) =>
+          finding.publishedCommit && !knownPublications.has(finding.publishedCommit),
+      ) ||
       update.effects.some((effect) => effect.kind === "push" && effect.state === "known");
+    const newPublication = published && !batch.published;
     if (
       final &&
       update.usedMutations! <
@@ -1427,13 +1463,19 @@ export class PrMaintenanceStore {
       ...(update.reason ? { reason: update.reason } : {}),
     });
     for (const finding of update.findings) {
+      const disposition = {
+        ...finding,
+        verifiedHeadSha:
+          finding.verifiedHeadSha ??
+          (published ? finding.publishedCommit : batch.headSha),
+      };
       const index = record.findings.findIndex(
         (entry) =>
           entry.source.id === finding.source.id &&
           entry.source.revision === finding.source.revision,
       );
-      if (index < 0) record.findings.push(finding);
-      else record.findings[index] = finding;
+      if (index < 0) record.findings.push(disposition);
+      else record.findings[index] = disposition;
     }
     if (update.findings.some((finding) => finding.outcome === "needs_human"))
       this.pause(record, "finding_needs_human");
@@ -1469,6 +1511,12 @@ export class PrMaintenanceStore {
         )
           this.pause(record, "no_progress");
       }
+    }
+    if (newPublication) {
+      // Retain historical evidence, but require a new observation attempt after a push.
+      delete record.lastAttempt;
+      delete record.readyFingerprint;
+      record.nextCheckAt = nowIso();
     }
   }
 
@@ -1571,7 +1619,8 @@ export class PrMaintenanceStore {
           (entry) =>
             entry.kind === "ci_retry" &&
             entry.headSha === effect.headSha &&
-            entry.actionIdentity === effect.actionIdentity,
+            entry.actionIdentity === effect.actionIdentity &&
+            !neverSentEffect(entry),
         ))
     )
       refuse(
@@ -1597,7 +1646,8 @@ export class PrMaintenanceStore {
           entry.kind === effect.kind &&
           entry.headSha === effect.headSha &&
           entry.recipient === effect.recipient &&
-          entry.actionIdentity === effect.actionIdentity,
+          entry.actionIdentity === effect.actionIdentity &&
+          entry.state !== "not_performed",
       )
     )
       refuse(

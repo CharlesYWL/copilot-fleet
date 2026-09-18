@@ -11,6 +11,9 @@ const helper = join(assets, "github-snapshot.mjs");
 const { observe, contentHash, buildSnapshot, matchEffects } = await import(
   pathToFileURL(helper).href
 );
+const { toHostObservation } = await import(
+  pathToFileURL(join(assets, "host-observation.mjs")).href
+);
 const start = Date.parse("2026-09-17T12:00:00Z");
 const input = (extra: Record<string, unknown> = {}) => ({
   schemaVersion: 1,
@@ -29,7 +32,12 @@ const input = (extra: Record<string, unknown> = {}) => ({
   budget: { maxRequests: 40, deadlineAt: new Date(start + 120_000).toISOString() },
   ...extra,
 });
-const metadata = () => ({
+const metadata = (
+  headRepository: { id: string; nameWithOwner: string } | null = {
+    id: "R_fork",
+    nameWithOwner: "contributor/repo",
+  },
+) => ({
   id: "PR_7",
   number: 7,
   url: "https://github.com/org/repo/pull/7",
@@ -38,7 +46,7 @@ const metadata = () => ({
   state: "OPEN",
   mergedAt: null,
   repository: { id: "R_base", nameWithOwner: "org/repo" },
-  headRepository: { id: "R_fork", nameWithOwner: "contributor/repo" },
+  headRepository,
   headRefName: "Fix",
   headRefOid: "a".repeat(40),
   baseRefName: "main",
@@ -128,7 +136,9 @@ function fixture(
       checks: "contexts",
     };
     if (args.endpoint) {
-      expect(args.endpoint).toBe("repos/org/repo/rules/branches/main");
+      expect(new URL(args.endpoint, "https://api.github.com/").pathname).toBe(
+        "/repos/org/repo/rules/branches/main",
+      );
       kind = "rules";
     } else if (args.payload.variables.id)
       kind = `threadComments:${args.payload.variables.id}`;
@@ -137,7 +147,12 @@ function fixture(
         if (query.includes(`${field}(first:`)) kind = candidate;
       }
     }
-    const key = `${kind}${args.payload?.variables.cursor ? `:${args.payload.variables.cursor}` : ""}`;
+    const cursor =
+      args.payload?.variables.cursor ??
+      (args.endpoint
+        ? new URL(args.endpoint, "https://api.github.com/").searchParams.get("page")
+        : null);
+    const key = `${kind}${cursor ? `:${cursor}` : ""}`;
     calls.push(key);
     const count = (counts.get(key) ?? 0) + 1;
     counts.set(key, count);
@@ -176,6 +191,103 @@ function fixture(
 }
 
 describe("bounded read-only PR snapshot", () => {
+  it("collects and revalidates every REST rule page, including across a bounded continuation", async () => {
+    const required = {
+      type: "required_status_checks",
+      parameters: {
+        required_status_checks: [
+          { context: "second-page-required", integration_id: null },
+        ],
+      },
+    };
+    const f = fixture({
+      pages: {
+        rules: Array.from({ length: 30 }, () => ({ type: "deletion" })),
+        "rules:2": [required],
+      },
+      intercept: (key, _count, body) => ({
+        status: 200,
+        body,
+        ...(key === "rules"
+          ? {
+              headers: {
+                link: '<https://api.github.com/repos/org/repo/rules/branches/main?page=2>; rel="next"',
+              },
+            }
+          : {}),
+      }),
+    });
+    const first = await observe(
+      input({
+        budget: { maxRequests: 2, deadlineAt: new Date(start + 120_000).toISOString() },
+      }),
+      f,
+    );
+    expect(first.complete).toBe(false);
+    expect(first.resume.jobs[0]).toMatchObject({ kind: "rules", cursor: "2" });
+    const resumed = await observe(input({ resume: first.resume }), f);
+    expect(resumed.complete).toBe(true);
+    expect(resumed.snapshot.rules).toHaveLength(31);
+    expect(f.calls.filter((key) => key === "rules:2")).toHaveLength(2);
+    expect(resumed.snapshot.requiredChecks).toContainEqual(
+      expect.objectContaining({
+        name: "second-page-required",
+        states: [{ status: "MISSING", conclusion: "UNKNOWN" }],
+      }),
+    );
+  });
+
+  it.each([
+    "https://example.invalid/repos/org/repo/rules/branches/main?page=2",
+    "https://api.github.com/repos/org/repo/rules/branches/main?page=1",
+  ])(
+    "refuses an invalid next policy page without treating the first page as complete: %s",
+    async (next) => {
+      const f = fixture({
+        intercept: (key, _count, body) => ({
+          status: 200,
+          body,
+          ...(key === "rules" ? { headers: { link: `<${next}>; rel="next"` } } : {}),
+        }),
+      });
+      const result = await observe(input(), f);
+      expect(result.complete).toBe(false);
+      expect(result.error.code).toBe("malformed_response");
+      expect(f.calls).toEqual(["metadata", "rules"]);
+    },
+  );
+
+  it("converts a confirmed closed PR with a deleted fork using its registered head identity", async () => {
+    const requestInput = input({
+      pr: { ...input().pr, headRepository: "contributor/repo" },
+    });
+    const closed = await observe(
+      requestInput,
+      fixture({
+        meta: { ...metadata(null), state: "CLOSED" },
+      }),
+    );
+    expect(closed.complete).toBe(true);
+    expect(toHostObservation(closed, requestInput)).toMatchObject({
+      complete: true,
+      state: "closed",
+      identity: {
+        headRepositoryId: "R_fork",
+        headRepository: "contributor/repo",
+        headRef: "refs/heads/Fix",
+      },
+    });
+    const open = await observe(requestInput, fixture({ meta: metadata(null) }));
+    expect(open.complete).toBe(false);
+    expect(open.error.code).toBe("unavailable_ref");
+    const unpinnedName = await observe(
+      input(),
+      fixture({ meta: { ...metadata(null), state: "CLOSED" } }),
+    );
+    expect(unpinnedName.complete).toBe(false);
+    expect(unpinnedName.error.code).toBe("unavailable_ref");
+  });
+
   it("reads all categories and verifies every page, with explicit fork/ref identity", async () => {
     const f = fixture();
     const result = await observe(input(), f);
@@ -535,6 +647,42 @@ function snapshot(
 }
 
 describe("canonical actionable inputs and independent obligations", () => {
+  it("suppresses a handled revision only on the HEAD that verified it", () => {
+    const original = snapshot();
+    const handledSources = original.value.actionableSources.map(
+      ({ kind, id, revision }: { kind: string; id: string; revision: string }) => ({
+        kind,
+        id,
+        revision,
+        headSha: original.value.headSha,
+      }),
+    );
+    expect(
+      buildSnapshot(input({ handledSources }), original.scan).actionableSources,
+    ).toHaveLength(0);
+    expect(
+      buildSnapshot(
+        input({
+          handledSources: handledSources.map(
+            ({ kind, id, revision }: { kind: string; id: string; revision: string }) => ({
+              kind,
+              id,
+              revision,
+            }),
+          ),
+        }),
+        original.scan,
+      ).actionableSources,
+    ).toHaveLength(1);
+    const external = snapshot(
+      {},
+      { metadata: { ...metadata(), headRefOid: "c".repeat(40) } },
+    );
+    expect(
+      buildSnapshot(input({ handledSources }), external.scan).actionableSources,
+    ).toHaveLength(1);
+  });
+
   it("retains new feedback in a resolved thread instead of treating resolution as disposition", () => {
     const resolvedThread = { ...thread(), isResolved: true };
     const original = snapshot({ threads: [resolvedThread] });
@@ -555,6 +703,7 @@ describe("canonical actionable inputs and independent obligations", () => {
             kind,
             id,
             revision,
+            headSha: original.value.headSha,
           }),
         ),
       }),
@@ -641,7 +790,12 @@ describe("canonical actionable inputs and independent obligations", () => {
         ],
         handledSources: value.actionableSources
           .filter((item: any) => item.kind === "thread_comment")
-          .map(({ kind, id, revision }: any) => ({ kind, id, revision })),
+          .map(({ kind, id, revision }: any) => ({
+            kind,
+            id,
+            revision,
+            headSha: value.headSha,
+          })),
       }),
       scan,
     );
@@ -774,7 +928,12 @@ describe("canonical actionable inputs and independent obligations", () => {
       input({
         previousThreads: resolved.threadStates,
         handledSources: open.value.actionableSources.map(
-          ({ kind, id, revision }: any) => ({ kind, id, revision }),
+          ({ kind, id, revision }: any) => ({
+            kind,
+            id,
+            revision,
+            headSha: open.value.headSha,
+          }),
         ),
       }),
       open.scan,
@@ -804,6 +963,7 @@ describe("canonical actionable inputs and independent obligations", () => {
             kind,
             id,
             revision,
+            headSha: open.value.headSha,
           }),
         ),
         knownEffects: [

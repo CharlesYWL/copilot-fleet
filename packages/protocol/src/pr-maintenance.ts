@@ -136,6 +136,7 @@ export const PrMaintenanceFindingSchema = z
     evidence: z.array(text).max(20).default([]),
     repairCommit: sha.optional(),
     publishedCommit: sha.optional(),
+    verifiedHeadSha: sha.optional(),
     responseRequired: z.boolean().default(true),
     responseIds: z.array(id).max(20).default([]),
     nextAction: text.optional(),

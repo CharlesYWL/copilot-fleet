@@ -119,11 +119,15 @@ export function toHostObservation(result, input, attemptedAt = new Date().toISOS
   const reviewRule = snapshot.reviewPolicy.branchProtection;
   const requiredReviews =
     Boolean(reviewRule?.requiresApprovingReviews) ||
+    snapshot.reviewDecision === "REVIEW_REQUIRED" ||
     snapshot.reviewPolicy.rules.some(
       (rule) =>
         (rule.parameters?.required_approving_review_count ?? 0) > 0 ||
         rule.parameters?.require_code_owner_review ||
-        rule.parameters?.require_last_push_approval,
+        rule.parameters?.require_last_push_approval ||
+        rule.parameters?.required_reviewers?.some(
+          (reviewer) => reviewer.minimum_approvals > 0,
+        ),
     );
   // GitHub's aggregate decision supersedes historical reviews by the same reviewer.
   const reviewState =
@@ -183,6 +187,27 @@ export function toHostObservation(result, input, attemptedAt = new Date().toISOS
       revision: check.key,
       groupKey: `check:${requirement.name}:${requirement.appId ?? "*"}`,
       evidence: check.evidence,
+    });
+  }
+  if (
+    (reviewRule?.requiresStatusChecks && reviewRule.requiresStrictStatusChecks) ||
+    snapshot.rules.some(
+      (rule) =>
+        rule.type === "required_status_checks" &&
+        rule.parameters?.strict_required_status_checks_policy &&
+        rule.parameters?.required_status_checks?.length > 0,
+    )
+  ) {
+    observation.checks.push({
+      key: `strict-base:${baseSha}`,
+      headSha,
+      state:
+        snapshot.mergeStateStatus === "CLEAN"
+          ? "passed"
+          : snapshot.mergeStateStatus === "BEHIND"
+            ? "pending"
+            : "unknown",
+      evidence: `${identity.url}; strict base-update policy at ${baseSha}: ${snapshot.mergeStateStatus ?? "UNKNOWN"}.`,
     });
   }
   observation.knownSelfEffectIds = snapshot.effects.matched.map(

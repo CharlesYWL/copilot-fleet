@@ -117,6 +117,11 @@ Existing lead wakes handle due observation and reconciliation; there is no new
 timer or direct-to-worker observer. A completed task is not reopened just to make
 its lead eligible for a reminder.
 
+V1 permits one retained PR registration per task, including paused registrations.
+A known new publication invalidates the pre-push observation for new work and
+readiness. Finding dispositions are scoped to their verified code HEAD; after an
+external commit, unchanged feedback can be revalidated without losing its history.
+
 The authenticated task action surface is
 `GET/POST /api/runs/:id/pr-maintenance`. Enablement names the exact PR, stable
 head/base repository IDs and full refs, owned worker, baseline, verification,
@@ -148,6 +153,9 @@ resume or release; polling and reconnects do not renew that age.
 The small task panel displays last successful observation separately from the
 next due time, exact worker/provider/ref binding, remaining budgets and pending
 direction. Refresh after a stale-version error before reviewing another action.
+Mounted maintenance panels refresh on existing fleet snapshots independently of
+task timestamps. An open Send-back dialog retains its original decision and
+proposal; a changed reference requires reviewing the new decision explicitly.
 No-login mode cannot provide an authenticated maintenance authorization.
 
 This pilot supports only an already eligible mutable Orchestrator worker.
