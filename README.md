@@ -1817,6 +1817,62 @@ session from **New session**. For shared multi-agent goals, use Orchestrator's
 lead **Conversation** and task board so the plan, workers, review, and archive
 state stay together.
 
+### PR maintenance (opt-in pilot)
+
+Task detail includes **PR maintenance** for an existing Orchestrator-owned worker.
+V1 supports one retained PR registration per task; release settled maintenance
+before registering another PR for that task.
+You can ask the Orchestrator to enable maintenance for a PR. It uses
+`fleet_propose_pr_maintenance` to store an unapproved proposal and notify you.
+Open **Review PR maintenance proposal** in the task panel, inspect the prefilled
+scope, and select **Authorize maintenance** while signed in. No JSON copy/paste
+is needed; the agent cannot authorize itself. Checks then use the existing wake
+loop, and a normal chat message can request an immediate first check.
+
+Use **Enable PR maintenance** to review the proposed exact GitHub PR, stable
+repository identities, head/base refs, retained worker and checkout, task/design
+baseline, verification, and helper/credential/publication evidence. Confirmation
+is an authenticated browser action, not an MCP approval or a review comment.
+Unknown prerequisites and unsupported bindings cannot be enabled. Sign-in is
+required for these authorization controls, including on a no-login Host.
+
+Fleet stores registrations, checkpoints, decisions, budgets and unsettled effects
+in its Host database. The existing lead reads them on ordinary wakes and idle
+reminders; this is best-effort observation, not a separate observer or an exact
+30-minute SLA. Unchanged feedback needs no new worker repair turn. Ready remains
+nonterminal: this release never merges, force-pushes, automatically rebases, or
+starts extra reviewer sessions.
+
+![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read GitHub through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)
+
+_The normal repair loop reuses the original worker and reconciles outcomes on existing lead wakes._
+
+**Pause**, **Resume**, and **Release** operate on the displayed record version;
+stale actions fail and require a fresh review. Design uncertainty pauses the
+whole PR. Use the task's **Send back with instructions** to record bounded,
+versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
+hold, certify a defect fixed, or approve a redesign.
+
+![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](docs/pr-maintenance-human-gate.png)
+
+_Design choices stay human: record direction, then explicitly resume maintenance._
+
+[Editable diagram source (HTML)](docs/pr-maintenance-flow.html).
+
+Stop/archive/delete pause linked maintenance. Accepted work and unknown push/reply
+effects retain ownership and block cleanup until reconciled; Stop is not proof
+that remote effects ended. Retained active/paused registrations protect continuity
+from automatic inactivity cleanup. Explicit settled release permits later cleanup
+and a future registration must revalidate its binding.
+
+V1 does not support standalone-session handoff or reuse of sealed, published, or
+cleaned managed results. Follow the displayed eligibility reason rather than
+clearing immutable result evidence. The default allowances are pilot workflow
+limits, not a shell sandbox. Deterministic tests do not establish the proposed
+30-scenario, three-repeat model evaluation thresholds or production repair rates;
+those measurements still require an authorized pilot.
+See [Orchestration lifecycle](docs/orchestration-lifecycle.md).
+
 ### Runs: several sessions toward one objective
 
 There are two ways to put several agents on one job.

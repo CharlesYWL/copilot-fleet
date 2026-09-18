@@ -67,6 +67,7 @@ export type NodeUpdateProgress = Record<
 
 export function useFleet(notify: Notify) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
+  const [snapshotRevision, setSnapshotRevision] = useState(0);
   const [liveNotificationUpdates, setLiveNotificationUpdates] = useState<
     LiveNotificationUpdate[]
   >([]);
@@ -169,6 +170,7 @@ export function useFleet(notify: Notify) {
         ...next,
         notifications: sortNotifications(next.notifications),
       });
+      setSnapshotRevision((value) => value + 1);
     },
     [recordHydrationChange],
   );
@@ -240,6 +242,7 @@ export function useFleet(notify: Notify) {
         notifications: sortNotifications(notifications),
         notificationUnreadCount: unreadCount,
       });
+      setSnapshotRevision((value) => value + 1);
       currentUnreadCount.current = unreadCount;
       return true;
     },
@@ -630,6 +633,7 @@ export function useFleet(notify: Notify) {
 
   return {
     snapshot,
+    snapshotRevision,
     liveNotificationUpdates,
     events,
     commandOutput,

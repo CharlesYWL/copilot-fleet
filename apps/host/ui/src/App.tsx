@@ -28,6 +28,7 @@ import { NotificationContext, useAppNotifications } from "./hooks/useAppNotifica
 import { useStickyFlag } from "./hooks/useStickyFlag";
 import { useOnboardingTour } from "./hooks/useOnboardingTour";
 import type { TourStep } from "./lib/onboarding";
+import type { MaintenanceReviewReference } from "./lib/pr-maintenance";
 import { signOut } from "./lib/auth";
 import { notificationTarget } from "./lib/notification-navigation";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
@@ -227,6 +228,7 @@ export function App() {
 
   const {
     snapshot,
+    snapshotRevision,
     liveNotificationUpdates,
     events,
     commandOutput,
@@ -855,10 +857,15 @@ export function App() {
    * The one decision left to a human. Approving closes the task; sending it
    * back returns it to the orchestrator with the note, which it acts on.
    */
-  const handleReviewTask = async (runId: string, approved: boolean, note: string) => {
+  const handleReviewTask = async (
+    runId: string,
+    approved: boolean,
+    note: string,
+    maintenance?: MaintenanceReviewReference,
+  ) => {
     const answered = await request(`/api/runs/${runId}/review`, {
       method: "POST",
-      body: JSON.stringify({ approved, note }),
+      body: JSON.stringify({ approved, note, ...(maintenance ? { maintenance } : {}) }),
     });
     if (!answered.ok) return false;
     await refresh();
@@ -879,10 +886,19 @@ export function App() {
   };
 
   const handleResumeOrchestrator = async (sessionId: string) => {
-    const resumed = await request(`/api/orchestrators/${sessionId}/resume`, {
-      method: "POST",
-    });
+    const resumed = await request<{ blockedRuns?: { runId: string; reason?: string }[] }>(
+      `/api/orchestrators/${sessionId}/resume`,
+      {
+        method: "POST",
+      },
+    );
     if (!resumed.ok) return false;
+    if (resumed.data.blockedRuns?.length) {
+      notify(
+        `Orchestrator resumed; ${resumed.data.blockedRuns.length} task(s) remain held by PR maintenance. Open task detail for direction or release.`,
+        "warning",
+      );
+    }
     await refresh();
     return true;
   };
@@ -1256,6 +1272,7 @@ export function App() {
               {view === "orchestrator-task" && selectedRunModel && orchestrator && (
                 <OrchestratorTaskDetail
                   model={selectedRunModel}
+                  snapshotRevision={snapshotRevision}
                   notes={runNotes[selectedRunModel.run.id] ?? noNotes}
                   sessions={snapshot.sessions}
                   onBack={handleBackFromTask}
@@ -1277,8 +1294,8 @@ export function App() {
                       runId: selectedRunModel.run.id,
                     })
                   }
-                  onReview={(approved, note) =>
-                    handleReviewTask(selectedRunModel.run.id, approved, note)
+                  onReview={(approved, note, maintenance) =>
+                    handleReviewTask(selectedRunModel.run.id, approved, note, maintenance)
                   }
                   onArchive={() => handleArchiveRun(selectedRunModel.run.id)}
                   onReopen={(note) => handleReopenRun(selectedRunModel.run.id, note)}

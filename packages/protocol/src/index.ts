@@ -37,6 +37,8 @@ import {
   CommandExecutionBackupSchema,
 } from "./command-execution.js";
 export * from "./command-execution.js";
+export * from "./pr-maintenance.js";
+import { PrMaintenanceBackupSchema } from "./pr-maintenance.js";
 
 /** Local startup events consumed by the service CLI, independent of log formatting. */
 export const CONFIG_UI_EVENT_MARKER = "FLEET_CONFIG_UI ";
@@ -1570,6 +1572,7 @@ export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
 export const NotificationKindSchema = z.enum([
   "command_approval",
   "command_completion",
+  "pr_maintenance_attention",
   "managed_worktree_attention",
   "agent_completion",
   "agent_failure",
@@ -2591,6 +2594,7 @@ const hostBackupDataShape = {
    * importing — the one failure mode a backup format may not have.
    */
   runs: z.array(RunSchema).default([]),
+  prMaintenance: PrMaintenanceBackupSchema.optional(),
   managedWorktrees: z.array(ManagedWorktreeSchema).default([]).optional(),
   derivedWorkspaces: z.array(ManagedWorktreeSchema).default([]).optional(),
   worktreeOperations: z.array(WorktreeOperationSchema).default([]).optional(),

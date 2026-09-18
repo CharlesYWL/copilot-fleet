@@ -69,6 +69,28 @@ export class SessionRetention {
 
   sweep(nodeId?: string, now = Date.now(), reconnect = false): number {
     const { store } = this.service;
+    const notices: ReturnType<typeof store.insertNotification>[] = [];
+    store.prMaintenance.notifyLongPauses(new Date(now).toISOString(), (record) => {
+      notices.push(
+        store.insertNotification({
+          sourceKey: `pr-maintenance:${record.id}:paused:${record.renewedAt}`,
+          category: "orchestration",
+          kind: "pr_maintenance_attention",
+          severity: "warning",
+          title: "Resume or release PR maintenance",
+          body:
+            `${record.identity.repository}#${record.identity.prNumber} has been paused for 30 days. ` +
+            "Continuity is still retained. Resume with authorization, or release after all accepted work and effects settle.",
+          subject: { type: "run", id: record.taskId, label: "PR maintenance" },
+          navigation: { type: "run", runId: record.taskId },
+          data: { maintenanceRecordId: record.id, purpose: "maintenance_retention" },
+          createdAt: new Date(now).toISOString(),
+        }),
+      );
+    });
+    for (const notice of notices) {
+      if (notice.created) this.service.publishNotification(notice.notification);
+    }
     const requests = store.listSessionCleanupRequests();
     const busyNodes = new Set<string>();
     let requested = 0;

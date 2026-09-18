@@ -1332,6 +1332,55 @@ worker 有结果后唤醒自己，并把交付记录留给你审查。
 如果是共享的多代理目标，请使用 Orchestrator 的 lead **Conversation** 和 task board，让计划、
 worker、审查和归档状态留在同一处。
 
+### PR 维护（需显式启用的试点功能）
+
+任务详情中的 **PR maintenance** 面向已归属 Orchestrator 的现有 worker。
+V1 每个任务只保留一个 PR 维护注册；为同一任务注册另一个 PR 前，
+需先核实并释放原有维护。
+可以直接向 Orchestrator 请求为某个 PR 启用维护。它通过
+`fleet_propose_pr_maintenance` 保存待授权提案并通知你。在任务面板点击
+**Review PR maintenance proposal**，审阅已填好的范围后，以登录身份点击
+**Authorize maintenance**。无需复制 JSON，agent 也不能自行授权。
+之后沿用现有唤醒流程；也可发送普通聊天消息要求立即检查。
+
+通过 **Enable PR maintenance** 审阅准确的 GitHub PR、仓库稳定 ID、
+head/base 完整分支引用、worker 与检出绑定、任务/设计基线、验证要求，
+以及 helper、凭据和发布权限的证据。授权来自已登录的浏览器操作，
+不能由 MCP 或 PR 中声称“已批准”的评论代替。前置条件未知或绑定不受
+支持时不能启用；即使 Host 选择免登录，维护授权仍需先登录。
+
+Host 数据库保存注册、检查点、决策、预算及尚未确认的副作用。现有 lead
+在普通唤醒和空闲提醒中读取这些状态；没有新增观察进程或定时器，
+也不保证严格每 30 分钟检查。未变化的反馈不启动新的修复轮次。
+就绪不等于已合并：本版本不会自动合并、强推、rebase 或新建审查 agent。
+
+![PR 维护修复循环：人工授权保存在 Host 数据库中；现有 lead 被唤醒后恢复记录，通过受限 helper 读取 GitHub，将局部修复派回原 worker，并核实处理结果。](docs/pr-maintenance-repair-loop.png)
+
+_常规修复循环复用原 worker，并在现有 lead 唤醒时核实处理结果。_
+
+**Pause / Resume / Release** 使用页面显示的记录版本；过期操作会失败，
+必须刷新并重新审阅。遇到设计选择时暂停整个 PR；使用任务的
+**Send back with instructions** 记录有界、关联到决策版本的指导。
+普通 **Approve task / Reopen** 不会解除该暂停，也不会将缺陷标为已修复。
+
+![PR 维护人工决策关卡：局部修复沿用保留的 worker；设计变更或不确定性会暂停整个 PR，直到人工记录有界指导，重新核验授权和绑定后显式恢复维护。](docs/pr-maintenance-human-gate.png)
+
+_设计选择由人决定：先记录指导，再显式恢复维护。_
+
+[可编辑的图表源文件（HTML）](docs/pr-maintenance-flow.html)。
+
+Stop、归档或删除会先暂停关联的维护。已接受的工作及结果未知的 push/reply
+会继续保留所有权，并阻止清理，直到完成核实；Stop 不是远端副作用已结束的
+证明。仍持有所有权的 active/paused 注册会保护会话与任务，不受自动过期
+清理影响。显式释放已核实的维护后，后续清理可能移除上下文，重新启用需
+再次验证绑定。
+
+V1 不支持独立会话的所有权交接，也不复用已封存、发布或清理的 managed
+结果。应遵循页面的资格阻塞原因，不能清除不可变证据绕过限制。默认预算
+是试点工作流限制，而非 shell 沙箱。确定性测试不等于完成设计中提出的
+30 个场景、每模型三次重复的评估，也不代表实际修复成功率；这些仍需
+经授权的试点评估。详见 [Orchestration lifecycle](docs/orchestration-lifecycle.md)。
+
 ### Run：多个会话朝一个目标
 
 把多个 agent 放到同一件事上，有两条路。

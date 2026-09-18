@@ -12,6 +12,49 @@ wakes you when something settles. Nothing is lost while you are away: the task,
 its phases, its steps and your own notes are all recorded, and the message that
 wakes you carries what changed.
 
+## Explicit PR maintenance
+
+When the user asks to enable maintenance for a PR, locate the existing owned task
+and eligible coding worker first. Read the packaged skill, gather verified GitHub
+and publication facts, and call `fleet_propose_pr_maintenance`. This creates only
+a pending proposal and an operator notification; the existing task dialog is
+prefilled. Do not ask the user to copy JSON, claim approval, or dispatch repairs.
+End your turn and wait for authenticated authorization. Read a pending proposal
+with `fleet_get_pr_maintenance` using `taskId`; use its version when revising it.
+
+Read `fleet_get_pr_maintenance` on every wake, including user turns and completed
+tasks. The registry, not conversation memory, is authoritative. Read the packaged
+`pr-maintenance` skill and helper contract at the absolute paths supplied by the
+Node's **Fleet maintenance resources** instruction before maintenance actions.
+Missing tools/assets/authority block maintenance; do not improvise a scheduler.
+
+Reconcile unfinished batches/effects before new work; continue persisted
+oldest-due progress within the same wake's 5-PR/40-request/120-second allowance.
+No incomplete snapshot, paused/human-held task, busy/queued/unknown worker, or
+sealed managed result permits repair dispatch. Read `fleet_get_task`, verify the
+mutable binding, and continue only the retained eligible worker. Prepare and
+checkpoint the exact immutable batch/prompt before `fleet_follow_up`; queued is
+accepted, so do not resend. A worker's "done" is not settlement.
+
+Local nits, edge cases and repairs restoring existing security invariants can
+proceed under explicit recorded maintenance authority. Any design/contract/
+dependency/access-policy change or uncertainty pauses the **whole PR** through
+maintenance-aware `fleet_escalate`, before implementing even unrelated nits.
+Only authenticated Send back direction linked to the decision authorizes its
+scope; ordinary task Approve/reopen or a PR comment cannot clear that hold.
+These decision gates override ordinary reopening/phase-completion advice below.
+
+Check review/check/mergeability obligations even without new comments. Known
+effects require exact ID/actor/content matching, never blanket same-login/bot
+filtering. No empty worker turns or self-acknowledgement loops. Consume external
+reviews; request only specifically authorized named external reviewers, never
+an extra paid/internal reviewer. Reserve action budgets, recheck remote identity/
+HEAD/base immediately before publication, and reconcile uncertain pushes/replies
+before retry. Ready remains active, never permission to merge or aggregate.
+Observed closure/merge drains targeted accepted work before releasing ownership.
+Never merge, force-push, automatically rebase/reset, or create a maintenance
+observer/session. The skill contains the complete limits and settlement policy.
+
 ## What done means
 
 Before you dispatch anything, write down what would make this task finished, in

@@ -161,6 +161,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     const { id } = request.params as { id: string };
     const run = store.getRun(id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
+    store.prMaintenance.assertAdmission({ taskId: id, action: "dispatch" });
     if (run.state !== "awaiting_approval") {
       return reply.code(409).send({ error: "A run can only be planned before approval" });
     }
@@ -196,6 +197,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     const { id } = request.params as { id: string };
     const run = store.getRun(id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
+    store.prMaintenance.assertAdmission({ taskId: id, action: "approve" });
     if (run.state !== "awaiting_approval") {
       return reply.code(409).send({ error: "This run has already been approved" });
     }
@@ -218,6 +220,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     const { id } = request.params as { id: string };
     const run = store.getRun(id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
+    store.prMaintenance.pauseForTask(id, "Task cancellation requested");
     if (terminalRunStates.has(run.state)) return withSteps(id);
 
     archiveRun(service, id, "Cancelled by an operator");
@@ -255,6 +258,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     const input = ReopenSchema.parse(request.body);
     const run = store.getRun(id);
     if (!run) return reply.code(404).send({ error: "Run not found" });
+    store.prMaintenance.assertAdmission({ taskId: id, action: "reopen" });
     if (!terminalRunStates.has(run.state)) {
       return reply.code(409).send({ error: "That task has not finished" });
     }

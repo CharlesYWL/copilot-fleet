@@ -42,6 +42,7 @@ const stores: FleetStore[] = [];
 const directories: string[] = [];
 const apps: ReturnType<typeof Fastify>[] = [];
 afterEach(async () => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   for (const app of apps.splice(0)) await app.close();
   for (const store of stores.splice(0)) store.close();
@@ -2386,6 +2387,218 @@ describe("durable command output", () => {
     expect(f.frames.filter((frame) => frame.type === "deliver_lead_prompt")).toHaveLength(
       1,
     );
+  });
+});
+
+describe("PR maintenance with durable commands", () => {
+  function enableMaintenance(f: ReturnType<typeof setup>) {
+    const run = f.store.createRun({
+      workspaceId: f.workspace.id,
+      name: "Maintained PR",
+      objective: "Preserve the approved change.",
+    });
+    f.store.updateRun(run.id, { leadSessionId: f.lead.id, state: "running" });
+    const worker = f.store.createSession(f.placement, "Implement", false, "coder", {
+      runId: run.id,
+      runRole: "worker",
+    });
+    f.store.transitionSession(worker.id, "starting");
+    f.store.transitionSession(worker.id, "idle");
+    const step = f.store.upsertRunStep(run.id, {
+      stepKey: "implement",
+      title: "Implement",
+      prompt: "Implement",
+      category: "implement",
+      placementId: f.placement.id,
+    });
+    f.store.updateRunStep(step.id, { sessionId: worker.id, state: "succeeded" });
+    return f.store.prMaintenance.enableFromOperator(
+      {
+        taskId: run.id,
+        workerSessionId: worker.id,
+        identity: {
+          host: "github.com",
+          repositoryId: "r1",
+          repository: "example/repo",
+          prNumber: 42,
+          headRepositoryId: "r1",
+          headRepository: "example/repo",
+          headRef: "refs/heads/fix",
+          baseRepositoryId: "r1",
+          baseRepository: "example/repo",
+          baseRef: "refs/heads/main",
+        },
+        headSha: "a".repeat(40),
+        scope: {
+          baseline: "Preserve the approved API.",
+          verification: "Run focused tests.",
+          publicationAuthorized: true,
+        },
+        eligibilityEvidence: "Helper, authentication and branch verified.",
+      },
+      "operator",
+    );
+  }
+
+  it("reserves the task and legacy placement, including held work, but permits a separate helper target", () => {
+    const f = setup();
+    const pending = f.prepare(f.request());
+    const record = enableMaintenance(f);
+    expect(() => f.approve(pending)).toThrow("maintenance_batch_required");
+    expect(() => f.request({ taskId: record.taskId })).toThrow(
+      "maintenance_batch_required",
+    );
+    expect(() => f.request()).toThrow("maintenance_batch_required");
+    f.store.prMaintenance.holdForDecision(
+      f.lead.id,
+      record.id,
+      record.version,
+      {
+        id: "design-decision",
+        version: 1,
+        proposal: "The review would change the API.",
+        headSha: record.authorization.headSha,
+        scope: record.authorization.scope.baseline,
+      },
+      () => f.store.setRunState(record.taskId, "awaiting_human"),
+    );
+    expect(() => f.request({ taskId: record.taskId })).toThrow("wait_for_human");
+    expect(() => f.request()).toThrow("wait_for_human");
+    const helper = f.store.createPlacement(
+      f.store.createWorkspace("Helper context", "").id,
+      f.node.id,
+      "C:\\separate-helper",
+    );
+    const execution = f.prepare(f.request({ target: { placementId: helper.id } }));
+    expect(execution.state).toBe("awaiting_approval");
+    expect(f.approve(execution).state).toBe("starting");
+  });
+
+  it("rechecks queued remote commands when maintenance reserves their target", () => {
+    const f = setup();
+    const blocker = f.start();
+    const queued = f.approve(f.prepare(f.request()));
+    expect(queued.state).toBe("queued");
+    enableMaintenance(f);
+    f.result(blocker);
+    f.service.commands.tick();
+    expect(f.service.commands.get(queued.id)).toMatchObject({
+      state: "failed",
+      reasonCode: "maintenance_target_reserved",
+    });
+    expect(f.store.commands.attempt(queued.id)).toMatchObject({
+      start_version: null,
+      cancelled: 1,
+    });
+    expect(
+      f.frames.some(
+        (frame) =>
+          frame.type === "start_command_execution" &&
+          frame.descriptor.executionId === queued.id,
+      ),
+    ).toBe(false);
+  });
+
+  it("changes the maintenance wake allowance only on accepted durable delivery, not reservations or replays", () => {
+    const f = setup();
+    const record = enableMaintenance(f);
+    const tools = new FleetTools(f.service, f.lead.id);
+    const previous = {
+      commandId: randomUUID(),
+      eventSeqFrom: 0,
+      attempt: `session:${f.lead.id}`,
+    };
+    f.store.setSessionDispatchAttempt(f.lead.id, previous);
+    f.store.prMaintenance.beginWake(f.lead.id, previous.commandId);
+    f.store.prMaintenance.chargeWake(f.lead.id, previous.commandId, {
+      requests: 40,
+      milliseconds: 0,
+    });
+    const claim = () => {
+      const result = tools.getPrMaintenance({ takeDue: true, reserveRequests: 40 });
+      expect(result.ok, result.text).toBe(true);
+      return JSON.parse(result.text);
+    };
+    const prompt = f.service.commands.queueLeadPrompt(f.lead.id, "Check maintained PRs.");
+    f.service.commands.pumpLead(f.lead.id);
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual(previous);
+    expect(claim()).toMatchObject({ record: null, allowance: { requests: 0 } });
+    const receipt = nativeReceipt({
+      deliveryId: prompt.delivery.deliveryId,
+      sessionId: f.lead.id,
+      state: "accepted",
+      at: new Date().toISOString(),
+    });
+    const receive = (value: LeadPromptReceipt) =>
+      f.service.commands.handleNodeMessage(f.node.id, {
+        type: "lead_prompt_receipt",
+        receipt: value,
+      });
+    expect(receive({ ...receipt, state: "rejected_busy" })).toBe(true);
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual(previous);
+    const event = (sequence: number) =>
+      f.store.appendEvent({
+        eventId: randomUUID(),
+        sessionId: f.lead.id,
+        sequence,
+        type: "state",
+        payload: { state: "idle" },
+        createdAt: new Date().toISOString(),
+      });
+    event(1);
+    f.service.commands.pumpLead(f.lead.id);
+    expect(receive(receipt)).toBe(true);
+    const accepted = {
+      ...previous,
+      commandId: receipt.deliveryId,
+      eventSeqFrom: 1,
+    };
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual(accepted);
+    expect(claim()).toMatchObject({
+      record: { id: record.id },
+      observationAllowance: { requests: 40 },
+      allowance: { requests: 0 },
+    });
+    event(2);
+    expect(receive(receipt)).toBe(true);
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual(accepted);
+    expect(claim()).toMatchObject({ record: null, allowance: { requests: 0 } });
+    expect(receive({ ...receipt, state: "settled" })).toBe(true);
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual(accepted);
+    const next = f.service.commands.queueLeadPrompt(f.lead.id, "Next maintenance wake.");
+    f.service.commands.pumpLead(f.lead.id);
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual(accepted);
+    expect(receive({ ...receipt, deliveryId: next.delivery.deliveryId })).toBe(true);
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)).toEqual({
+      ...previous,
+      commandId: next.delivery.deliveryId,
+      eventSeqFrom: 2,
+    });
+    expect(claim()).toMatchObject({
+      record: { id: record.id },
+      observationAllowance: { requests: 40 },
+    });
+    expect(receive(receipt)).toBe(false);
+    expect(f.store.getSessionDispatchAttempt(f.lead.id)?.commandId).toBe(
+      next.delivery.deliveryId,
+    );
+  });
+
+  it("includes maintenance recovery in durable reminders for completed tasks without reopening them", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const f = setup();
+    const record = enableMaintenance(f);
+    f.store.setRunState(record.taskId, "completed");
+    const engine = new OrchestratorEngine(f.service);
+    vi.setSystemTime(Date.now() + 30 * 60_000);
+    engine.tick();
+    const reminders = f.frames.filter((frame) => frame.type === "deliver_lead_prompt");
+    expect(reminders).toHaveLength(1);
+    expect(reminders[0]!.delivery.prompt).toContain(record.id);
+    expect(reminders[0]!.delivery.prompt).toContain("fleet_get_pr_maintenance");
+    expect(f.store.getRun(record.taskId)?.state).toBe("completed");
+    engine.tick();
+    expect(f.store.commands.prompts(f.lead.id)).toHaveLength(1);
   });
 });
 
