@@ -1346,10 +1346,20 @@ Host 数据库保存注册、检查点、决策、预算及尚未确认的副作
 也不保证严格每 30 分钟检查。未变化的反馈不启动新的修复轮次。
 就绪不等于已合并：本版本不会自动合并、强推、rebase 或新建审查 agent。
 
+![PR 维护修复循环：人工授权保存在 Host 数据库中；现有 lead 被唤醒后恢复记录，通过受限 helper 读取 GitHub，将局部修复派回原 worker，并核实处理结果。](docs/pr-maintenance-repair-loop.png)
+
+_常规修复循环复用原 worker，并在现有 lead 唤醒时核实处理结果。_
+
 **Pause / Resume / Release** 使用页面显示的记录版本；过期操作会失败，
 必须刷新并重新审阅。遇到设计选择时暂停整个 PR；使用任务的
 **Send back with instructions** 记录有界、关联到决策版本的指导。
 普通 **Approve task / Reopen** 不会解除该暂停，也不会将缺陷标为已修复。
+
+![PR 维护人工决策关卡：局部修复沿用保留的 worker；设计变更或不确定性会暂停整个 PR，直到人工记录有界指导，重新核验授权和绑定后显式恢复维护。](docs/pr-maintenance-human-gate.png)
+
+_设计选择由人决定：先记录指导，再显式恢复维护。_
+
+[可编辑的图表源文件（HTML）](docs/pr-maintenance-flow.html)。
 
 Stop、归档或删除会先暂停关联的维护。已接受的工作及结果未知的 push/reply
 会继续保留所有权，并阻止清理，直到完成核实；Stop 不是远端副作用已结束的

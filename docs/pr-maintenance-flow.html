@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How PR maintenance works - Copilot Fleet</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      --paper: #f5f5f5;
+      --paper-2: #ececec;
+      --ink: #2d3142;
+      --muted: #4f5d75;
+      --soft: #7a8399;
+      --rule: rgba(45,49,66,.12);
+      --rule-solid: #bfc0c0;
+      --accent: #eb6c36;
+      --accent-tint: rgba(235,108,54,.08);
+      --link: #2e5aa8;
+      --sans: "Geist", Arial, sans-serif;
+      --serif: "Instrument Serif", Georgia, serif;
+      --mono: "Geist Mono", Consolas, monospace;
+    }
+    body { margin: 0; background: var(--paper); color: var(--ink); font: 16px/1.6 var(--sans); }
+    main { max-width: 1376px; margin: 0 auto; padding: 48px 48px 32px; }
+    .eyebrow { margin: 0 0 8px; font: 12px/1.6 var(--mono); letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+    h1 { margin: 0 0 12px; font: 400 40px/1.12 var(--serif); }
+    .intro { max-width: 960px; margin: 0; color: var(--muted); }
+    .thesis { margin: 24px 0 0; padding-left: 16px; border-left: 4px solid var(--accent); font-weight: 500; }
+    .draft { margin: 16px 0 0; color: var(--muted); font-size: 12px; }
+    section { margin-top: 40px; }
+    .section-heading { display: flex; align-items: baseline; gap: 16px; border-top: 1px solid var(--rule-solid); padding-top: 24px; }
+    .section-number { font: 12px var(--mono); color: var(--muted); }
+    h2 { margin: 0; font: 600 24px/1.3 var(--sans); }
+    .section-note { margin: 8px 0 8px 36px; max-width: 1000px; color: var(--muted); font-size: 16px; }
+    figure { margin: 0; }
+    .diagram { overflow-x: auto; }
+    .diagram:focus-visible { outline: 2px solid var(--link); outline-offset: 4px; }
+    svg { display: block; width: 100%; min-width: 960px; height: auto; }
+    svg text { fill: var(--ink); font-family: var(--sans); }
+    .name { font-size: 16px; font-weight: 600; }
+    .sub { font-size: 12px; fill: var(--muted); font-family: var(--mono); }
+    .tag { font-size: 8px; fill: var(--muted); font-family: var(--mono); letter-spacing: .12em; }
+    .annotation { font-size: 12px; fill: var(--muted); }
+    .label { font: 12px var(--mono); fill: var(--muted); letter-spacing: .04em; }
+    .paper-mask { fill: var(--paper); }
+    .box { fill: white; stroke: var(--ink); stroke-width: 1.2; }
+    .input { fill: rgba(79,93,117,.10); stroke: var(--soft); }
+    .store { fill: rgba(45,49,66,.05); stroke: var(--muted); }
+    .external { fill: rgba(45,49,66,.03); stroke: rgba(45,49,66,.30); }
+    .focal { fill: var(--accent-tint); stroke: var(--accent); stroke-width: 1.2; }
+    .async { fill: rgba(45,49,66,.02); stroke: var(--muted); stroke-dasharray: 4 4; }
+    .badge { fill: transparent; stroke: var(--rule-solid); stroke-width: .8; }
+    .connector { fill: none; stroke: var(--muted); stroke-width: 1.2; }
+    .api { stroke: var(--link); }
+    .return { stroke-dasharray: 4 4; }
+    .highlight { stroke: var(--accent); }
+    .rule { stroke: var(--rule-solid); stroke-width: .8; }
+    figcaption { padding: 12px 0 0 36px; max-width: 1120px; color: var(--muted); font-size: 16px; }
+    .outcomes { display: grid; grid-template-columns: 1fr 1.1fr 1.5fr; gap: 16px; margin-top: 32px; }
+    .outcome { background: white; border: 1px solid var(--rule); border-radius: 8px; padding: 20px; }
+    h3 { margin: 8px 0; font: 600 20px/1.3 var(--sans); }
+    .outcome p { margin: 0; color: var(--muted); }
+    .outcome .eyebrow { color: var(--ink); }
+    .guardrail { margin-top: 24px; padding: 16px 0; border-top: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+    .guardrail strong { font-weight: 600; }
+    footer { margin-top: 32px; color: var(--muted); font: 12px/1.8 var(--mono); }
+    footer p { margin: 8px 0; overflow-wrap: anywhere; }
+    code { font: inherit; }
+    @media (max-width: 800px) {
+      main { padding: 32px 20px; }
+      h1 { font-size: 32px; }
+      .outcomes { grid-template-columns: 1fr; }
+      .section-note, figcaption { margin-left: 0; padding-left: 0; }
+    }
+    @media print {
+      main { padding: 24px; }
+      .diagram { overflow: visible; }
+      svg { min-width: 0; }
+      section, .outcomes { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <p class="eyebrow">Copilot Fleet / PR maintenance / workflow draft</p>
+    <h1>Keep the PR moving. Keep design decisions human.</h1>
+    <p class="intro">Maintenance continues an existing, eligible coding worker through review and repair rounds. The same Orchestrator coordinates it on its existing wakes; there is no second scheduler or always-on observer agent.</p>
+    <p class="thesis">The Host remembers. The helper reads GitHub. The lead decides. The worker repairs. The human controls design.</p>
+    <p class="draft">This explains the implemented control flow, not a proven live-agent outcome. Real-agent maintenance evaluation is still pending.</p>
+  </header>
+
+  <section aria-labelledby="loop-heading">
+    <div class="section-heading"><span class="section-number">01</span><h2 id="loop-heading">The normal repair loop</h2></div>
+    <p class="section-note">The local-repair path is shown here. Every dispatch still needs valid authority, complete evidence, an eligible worker and available budget.</p>
+    <figure>
+      <div class="diagram" tabindex="0" role="region" aria-label="Repair loop diagram; scroll horizontally on narrow screens">
+        <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="pr-maintenance-flow-loop-title pr-maintenance-flow-loop-desc">
+          <title id="pr-maintenance-flow-loop-title">The PR maintenance repair loop</title>
+          <desc id="pr-maintenance-flow-loop-desc">A human authorizes a durable PR registration; existing lead wakes recover it, read GitHub through a bounded helper, prepare local repairs for the original worker, and reconcile the results before the next wake.</desc>
+          <defs>
+            <marker id="loop-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#4f5d75"/></marker>
+            <marker id="loop-arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#eb6c36"/></marker>
+            <marker id="loop-arrow-link" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#2e5aa8"/></marker>
+          </defs>
+          <rect width="1280" height="720" fill="#f5f5f5"/>
+
+          <g class="connectors">
+            <path class="connector" d="M184 128 V224" marker-end="url(#loop-arrow)"/>
+            <path class="connector" d="M640 128 V208" marker-end="url(#loop-arrow)"/>
+            <path class="connector" d="M304 248 H480" marker-end="url(#loop-arrow)"/>
+            <path class="connector api" d="M800 248 H960" marker-end="url(#loop-arrow-link)"/>
+            <path class="connector api" d="M1080 320 V424 A8 8 0 0 1 1072 432 H800" marker-end="url(#loop-arrow-link)"/>
+            <path class="connector" d="M480 432 H192 A8 8 0 0 1 184 424 V384" marker-end="url(#loop-arrow)"/>
+            <path class="connector highlight" d="M640 480 V552" marker-end="url(#loop-arrow-accent)"/>
+            <path class="connector" d="M800 592 H960" marker-end="url(#loop-arrow)"/>
+            <path class="connector return" d="M1200 600 H1224 A8 8 0 0 0 1232 592 V96 A8 8 0 0 0 1224 88 H800" marker-end="url(#loop-arrow)"/>
+          </g>
+          <g class="edge-labels">
+            <g><rect class="paper-mask" x="192" y="164" width="104" height="20"/><text class="label" x="200" y="180">SAVE GRANT</text></g>
+            <g><rect class="paper-mask" x="648" y="156" width="64" height="20"/><text class="label" x="656" y="172">WAKE</text></g>
+            <g><rect class="paper-mask" x="344" y="220" width="96" height="20"/><text class="label" x="392" y="236" text-anchor="middle">RECOVER</text></g>
+            <g><rect class="paper-mask" x="844" y="220" width="72" height="20"/><text class="label" x="880" y="236" text-anchor="middle">CHECK</text></g>
+            <g><rect class="paper-mask" x="832" y="404" width="112" height="20"/><text class="label" x="888" y="420" text-anchor="middle">SNAPSHOT</text></g>
+            <g><rect class="paper-mask" x="280" y="404" width="120" height="20"/><text class="label" x="340" y="420" text-anchor="middle">CHECKPOINT</text></g>
+            <g><rect class="paper-mask" x="648" y="492" width="112" height="20"/><text class="label" x="656" y="508">LOCAL ONLY</text></g>
+            <g><rect class="paper-mask" x="840" y="564" width="80" height="20"/><text class="label" x="880" y="580" text-anchor="middle">REPORT</text></g>
+            <g><rect class="paper-mask" x="840" y="60" width="112" height="20"/><text class="label" x="896" y="76" text-anchor="middle">NEXT WAKE</text></g>
+          </g>
+
+          <g data-node="enable">
+            <rect class="paper-mask" x="64" y="48" width="240" height="80" rx="8"/>
+            <rect class="box input" x="64" y="48" width="240" height="80" rx="8"/>
+            <rect class="badge" x="80" y="60" width="80" height="16" rx="4"/><text class="tag" x="88" y="72">OPERATOR</text>
+            <text class="name" x="80" y="96">Enable maintenance</text>
+            <text class="sub" x="80" y="116">Exact PR + bounded scope</text>
+          </g>
+          <g data-node="wake">
+            <rect class="paper-mask" x="480" y="48" width="320" height="80" rx="40"/>
+            <rect class="box async" x="480" y="48" width="320" height="80" rx="40"/>
+            <text class="tag" x="640" y="68" text-anchor="middle">EXISTING TRIGGER</text>
+            <text class="name" x="640" y="92" text-anchor="middle">Existing lead wake</text>
+            <text class="sub" x="640" y="112" text-anchor="middle">User / worker result / reminder</text>
+          </g>
+          <g data-node="registry">
+            <rect class="paper-mask" x="64" y="224" width="240" height="160" rx="8"/>
+            <rect class="box store" x="64" y="224" width="240" height="160" rx="8"/>
+            <rect class="badge" x="80" y="236" width="96" height="16" rx="4"/><text class="tag" x="88" y="248">HOST SQLITE</text>
+            <text class="name" x="80" y="280">Durable PR record</text>
+            <text class="sub" x="80" y="308">PR + task + worker</text>
+            <text class="sub" x="80" y="328">Grant, holds, budgets</text>
+            <text class="sub" x="80" y="348">Batches + effect receipts</text>
+            <text class="tag" x="80" y="372">SURVIVES COMPACTION / RESTART</text>
+          </g>
+          <g data-node="recover">
+            <rect class="paper-mask" x="480" y="208" width="320" height="80" rx="8"/>
+            <rect class="box" x="480" y="208" width="320" height="80" rx="8"/>
+            <rect class="badge" x="496" y="220" width="48" height="16" rx="4"/><text class="tag" x="504" y="232">LEAD</text>
+            <text class="name" x="496" y="252">Recover work from MCP</text>
+            <text class="sub" x="496" y="272">Reconcile first; claim due PRs</text>
+          </g>
+          <g data-node="helper">
+            <rect class="paper-mask" x="960" y="208" width="240" height="112" rx="8"/>
+            <rect class="box external" x="960" y="208" width="240" height="112" rx="8"/>
+            <rect class="badge" x="976" y="220" width="80" height="16" rx="4"/><text class="tag" x="984" y="232">READ ONLY</text>
+            <text class="name" x="976" y="256">Read GitHub</text>
+            <text class="sub" x="976" y="280">Bounded helper command</text>
+            <text class="sub" x="976" y="300">Reviews, CI, HEAD, refs</text>
+          </g>
+          <g data-node="triage">
+            <rect class="paper-mask" x="480" y="384" width="320" height="96" rx="8"/>
+            <rect class="box focal" x="480" y="384" width="320" height="96" rx="8"/>
+            <rect class="badge" x="496" y="396" width="48" height="16" rx="4"/><text class="tag" x="504" y="408">LEAD</text>
+            <text class="name" x="496" y="432">Triage + prepare one batch</text>
+            <text class="sub" x="496" y="456">Local repair; exact saved prompt</text>
+            <text class="tag" x="496" y="472">OTHER OUTCOMES IN PANEL 02 / BELOW</text>
+          </g>
+          <g data-node="worker">
+            <rect class="paper-mask" x="480" y="552" width="320" height="96" rx="8"/>
+            <rect class="box" x="480" y="552" width="320" height="96" rx="8"/>
+            <rect class="badge" x="496" y="564" width="72" height="16" rx="4"/><text class="tag" x="504" y="576">WORKER</text>
+            <text class="name" x="496" y="600">Continue original worker</text>
+            <text class="sub" x="496" y="624">Repair, test, allowed push / reply</text>
+            <text class="tag" x="496" y="640">EXISTING TOOLS + EXISTING PERMISSIONS</text>
+          </g>
+          <g data-node="reconcile">
+            <rect class="paper-mask" x="960" y="552" width="240" height="96" rx="8"/>
+            <rect class="box" x="960" y="552" width="240" height="96" rx="8"/>
+            <rect class="badge" x="976" y="564" width="48" height="16" rx="4"/><text class="tag" x="984" y="576">LEAD</text>
+            <text class="name" x="976" y="600">Reconcile the result</text>
+            <text class="sub" x="976" y="624">Verify + save outcomes</text>
+            <text class="tag" x="976" y="640">&quot;DONE&quot; IS NOT SETTLEMENT</text>
+          </g>
+          <g aria-label="Cadence and budget">
+            <text class="tag" x="64" y="480">NO NEW POLLER</text>
+            <text class="name" x="64" y="508">Best-effort cadence</text>
+            <text class="annotation" x="64" y="532">Due checks: about 30 minutes.</text>
+            <text class="annotation" x="64" y="552">Ordinary lead wakes also check.</text>
+            <text class="sub" x="64" y="592">Per wake: 5 PR visits,</text>
+            <text class="sub" x="64" y="612">40 requests, 120 seconds.</text>
+          </g>
+          <g class="legend">
+            <line class="rule" x1="64" y1="676" x2="1216" y2="676"/>
+            <text class="tag" x="64" y="704">LEGEND</text>
+            <rect class="box input" x="160" y="692" width="16" height="16" rx="4"/><text class="annotation" x="184" y="704">Human</text>
+            <rect class="box" x="312" y="692" width="16" height="16" rx="4"/><text class="annotation" x="336" y="704">Lead / worker</text>
+            <rect class="box store" x="560" y="692" width="16" height="16" rx="4"/><text class="annotation" x="584" y="704">Stored state</text>
+            <line class="connector api" x1="784" y1="700" x2="816" y2="700"/><text class="annotation" x="832" y="704">GitHub read</text>
+            <line class="connector return" x1="1044" y1="700" x2="1076" y2="700"/><text class="annotation" x="1088" y="704">Later wake</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>The lead ends its turn after dispatch. A worker result wakes that same lead; it records verified progress and keeps unknown outcomes reserved. Completing the original task does not erase the PR registration.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="gate-heading">
+    <div class="section-heading"><span class="section-number">02</span><h2 id="gate-heading">Design choices stop the whole PR</h2></div>
+    <p class="section-note">The lead classifies the feedback, and the worker must reconsider the boundary when inspecting the code. A small diff is not automatically a local repair.</p>
+    <figure>
+      <div class="diagram" tabindex="0" role="region" aria-label="Human decision diagram; scroll horizontally on narrow screens">
+        <svg viewBox="0 0 1280 720" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="pr-maintenance-flow-gate-title pr-maintenance-flow-gate-desc">
+          <title id="pr-maintenance-flow-gate-title">The human design-decision gate</title>
+          <desc id="pr-maintenance-flow-gate-desc">Local repairs use the retained worker, while design changes or uncertainty pause the entire PR until a human records bounded direction and explicitly resumes maintenance with current eligibility rechecked.</desc>
+          <defs>
+            <marker id="gate-arrow" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#4f5d75"/></marker>
+            <marker id="gate-arrow-accent" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#eb6c36"/></marker>
+            <marker id="gate-arrow-link" markerWidth="8" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 Z" fill="#2e5aa8"/></marker>
+          </defs>
+          <rect width="1280" height="720" fill="#f5f5f5"/>
+          <g class="connectors">
+            <path class="connector" d="M640 112 V152" marker-end="url(#gate-arrow)"/>
+            <path class="connector" d="M640 296 V376" marker-end="url(#gate-arrow)"/>
+            <path class="connector highlight" d="M800 224 H960" marker-end="url(#gate-arrow-accent)"/>
+            <path class="connector" d="M1080 288 V368" marker-end="url(#gate-arrow)"/>
+            <path class="connector" d="M1080 448 V528" marker-end="url(#gate-arrow)"/>
+            <path class="connector return" d="M1200 568 H1224 A8 8 0 0 0 1232 560 V88 A8 8 0 0 0 1224 80 H800" marker-end="url(#gate-arrow)"/>
+            <path class="connector" d="M640 456 V552" marker-end="url(#gate-arrow)"/>
+          </g>
+          <g class="edge-labels">
+            <g><rect class="paper-mask" x="648" y="120" width="80" height="20"/><text class="label" x="656" y="136">TRIAGE</text></g>
+            <g><rect class="paper-mask" x="648" y="324" width="48" height="20"/><text class="label" x="656" y="340">NO</text></g>
+            <g><rect class="paper-mask" x="856" y="196" width="48" height="20"/><text class="label" x="880" y="212" text-anchor="middle">YES</text></g>
+            <g><rect class="paper-mask" x="1088" y="312" width="104" height="20"/><text class="label" x="1096" y="328">OPERATOR</text></g>
+            <g><rect class="paper-mask" x="1088" y="472" width="120" height="20"/><text class="label" x="1096" y="488">REVALIDATE</text></g>
+            <g><rect class="paper-mask" x="840" y="52" width="112" height="20"/><text class="label" x="896" y="68" text-anchor="middle">REOBSERVE</text></g>
+            <g><rect class="paper-mask" x="648" y="492" width="80" height="20"/><text class="label" x="656" y="508">VERIFY</text></g>
+          </g>
+          <g data-node="evidence">
+            <rect class="paper-mask" x="480" y="48" width="320" height="64" rx="32"/>
+            <rect class="box" x="480" y="48" width="320" height="64" rx="32"/>
+            <text class="name" x="640" y="76" text-anchor="middle">Valid, complete observation</text>
+            <text class="sub" x="640" y="96" text-anchor="middle">Actionable work; no existing hold</text>
+          </g>
+          <g data-node="design">
+            <path class="paper-mask" d="M640 152 L800 224 L640 296 L480 224 Z"/>
+            <path class="focal" d="M640 152 L800 224 L640 296 L480 224 Z"/>
+            <text class="name" x="640" y="216" text-anchor="middle">Design change</text>
+            <text class="name" x="640" y="240" text-anchor="middle">or uncertain?</text>
+          </g>
+          <g data-node="local">
+            <rect class="paper-mask" x="480" y="376" width="320" height="80" rx="8"/>
+            <rect class="box" x="480" y="376" width="320" height="80" rx="8"/>
+            <rect class="badge" x="496" y="388" width="104" height="16" rx="4"/><text class="tag" x="504" y="400">LEAD + WORKER</text>
+            <text class="name" x="496" y="424">Repair the existing invariant</text>
+            <text class="sub" x="496" y="444">One prepared batch, same worker</text>
+          </g>
+          <g data-node="verify">
+            <rect class="paper-mask" x="480" y="552" width="320" height="80" rx="8"/>
+            <rect class="box" x="480" y="552" width="320" height="80" rx="8"/>
+            <rect class="badge" x="496" y="564" width="80" height="16" rx="4"/><text class="tag" x="504" y="576">EVIDENCE</text>
+            <text class="name" x="496" y="600">Verify, publish, reconcile</text>
+            <text class="sub" x="496" y="620">Only within the recorded grant</text>
+          </g>
+          <g data-node="pause">
+            <rect class="paper-mask" x="960" y="176" width="240" height="112" rx="8"/>
+            <rect class="box focal" x="960" y="176" width="240" height="112" rx="8"/>
+            <rect class="badge" x="976" y="188" width="96" height="16" rx="4"/><text class="tag" x="984" y="200">HUMAN GATE</text>
+            <text class="name" x="976" y="224">Pause the whole PR</text>
+            <text class="sub" x="976" y="248">Escalate the decision.</text>
+            <text class="sub" x="976" y="268">No design repair yet.</text>
+          </g>
+          <g data-node="direction">
+            <rect class="paper-mask" x="960" y="368" width="240" height="80" rx="8"/>
+            <rect class="box input" x="960" y="368" width="240" height="80" rx="8"/>
+            <rect class="badge" x="976" y="380" width="80" height="16" rx="4"/><text class="tag" x="984" y="392">OPERATOR</text>
+            <text class="name" x="976" y="416">Send back instructions</text>
+            <text class="sub" x="976" y="436">Record exact direction</text>
+          </g>
+          <g data-node="resume">
+            <rect class="paper-mask" x="960" y="528" width="240" height="80" rx="8"/>
+            <rect class="box input" x="960" y="528" width="240" height="80" rx="8"/>
+            <rect class="badge" x="976" y="540" width="80" height="16" rx="4"/><text class="tag" x="984" y="552">OPERATOR</text>
+            <text class="name" x="976" y="576">Resume explicitly</text>
+            <text class="sub" x="976" y="596">Recheck grant + binding</text>
+          </g>
+          <g aria-label="Examples of local repairs and design changes">
+            <text class="tag" x="64" y="208">LOCAL REPAIR</text>
+            <text class="name" x="64" y="240">Restore an established rule</text>
+            <text class="annotation" x="64" y="264">Missing null check. Existing boundary test.</text>
+            <text class="annotation" x="64" y="284">An omitted, already-required auth guard.</text>
+            <text class="tag" x="64" y="376">HUMAN DECISION</text>
+            <text class="name" x="64" y="408">Change what the system means</text>
+            <text class="annotation" x="64" y="432">New dependency, API contract or storage design.</text>
+            <text class="annotation" x="64" y="452">Different access policy, or unclear intent.</text>
+            <text class="tag" x="64" y="544">NOT AUTHORIZATION</text>
+            <text class="annotation" x="64" y="568">A reviewer saying &quot;approved&quot; is not an operator grant.</text>
+            <text class="annotation" x="64" y="588">Approve task does not approve a new design.</text>
+          </g>
+          <g class="legend">
+            <line class="rule" x1="64" y1="676" x2="1216" y2="676"/>
+            <text class="tag" x="64" y="704">LEGEND</text>
+            <rect class="box" x="160" y="692" width="16" height="16" rx="4"/><text class="annotation" x="184" y="704">Action</text>
+            <path class="focal" d="M340 688 L352 700 L340 712 L328 700 Z"/><text class="annotation" x="368" y="704">Design boundary</text>
+            <rect class="box input" x="592" y="692" width="16" height="16" rx="4"/><text class="annotation" x="616" y="704">Authenticated human action</text>
+            <line class="connector return" x1="992" y1="700" x2="1024" y2="700"/><text class="annotation" x="1036" y="704">Later observation</text>
+          </g>
+        </svg>
+      </div>
+      <figcaption>Send back records the chosen direction, but does not silently resume maintenance. The operator resumes explicitly. A substantial redesign belongs in normal implementation first, with a newly accepted baseline.</figcaption>
+    </figure>
+  </section>
+
+  <section aria-labelledby="outcome-heading">
+    <div class="section-heading"><span class="section-number">03</span><h2 id="outcome-heading">Watching, ready, and finished are different</h2></div>
+    <div class="outcomes">
+      <article class="outcome">
+        <p class="eyebrow">Unchanged / pending</p>
+        <h3>Wait without busywork</h3>
+        <p>No new actionable input means no repair turn or duplicate reply. Pending checks wait; CI failures can become work even without a new comment.</p>
+      </article>
+      <article class="outcome">
+        <p class="eyebrow">Ready to merge</p>
+        <h3>Notify, then keep watching</h3>
+        <p>Current feedback, required checks, reviews and mergeability must all permit readiness. Ready is nonterminal. Maintenance never merges the PR.</p>
+      </article>
+      <article class="outcome">
+        <p class="eyebrow">Merged / closed</p>
+        <h3>Stop admission, then settle</h3>
+        <p>No new repairs. Request cancellation of the bound in-flight work, reconcile accepted pushes and replies, and release ownership only after settlement. Unknown effects keep their reservation.</p>
+      </article>
+    </div>
+    <p class="guardrail"><strong>Fail closed:</strong> a busy or offline worker, incomplete snapshot, stale binding, exhausted budget, or uncertain effect means wait, reconcile or seek human attention. Never substitute a new worker or pretend the action succeeded. An explicit pause stays paused.</p>
+  </section>
+
+  <footer>
+    <p>Draft assumptions: two 1280 x 720 flowcharts; static light default palette; readable enlarged type. No brand profile was configured. Google Fonts have local serif / sans / monospace fallbacks.</p>
+    <p>Scope: the implemented eligible-worker flow at commit 1083a02. Immutable managed results and standalone-worker handoff are outside v1. DB columns, low-level retry states and command transport are intentionally omitted.</p>
+    <p>Sources: docs\superpowers\specs\2026-09-17-pr-maintenance-mode.md; docs\orchestration-lifecycle.md; apps\host\src\routes\orchestrators.ts.</p>
+  </footer>
+</main>
+</body>
+</html>

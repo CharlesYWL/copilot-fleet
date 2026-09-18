@@ -1834,11 +1834,21 @@ reminders; this is best-effort observation, not a separate observer or an exact
 nonterminal: this release never merges, force-pushes, automatically rebases, or
 starts extra reviewer sessions.
 
+![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read GitHub through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)
+
+_The normal repair loop reuses the original worker and reconciles outcomes on existing lead wakes._
+
 **Pause**, **Resume**, and **Release** operate on the displayed record version;
 stale actions fail and require a fresh review. Design uncertainty pauses the
 whole PR. Use the task's **Send back with instructions** to record bounded,
 versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
 hold, certify a defect fixed, or approve a redesign.
+
+![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](docs/pr-maintenance-human-gate.png)
+
+_Design choices stay human: record direction, then explicitly resume maintenance._
+
+[Editable diagram source (HTML)](docs/pr-maintenance-flow.html).
 
 Stop/archive/delete pause linked maintenance. Accepted work and unknown push/reply
 effects retain ownership and block cleanup until reconciled; Stop is not proof
