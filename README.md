@@ -1016,6 +1016,10 @@ reviews, appear as compact expandable steps rather than user chat bubbles.
 Expand a step to read its full original message. These messages do not add
 marks to the user-prompt rail.
 
+Consecutive diagnostic messages, including Agency startup output, share one
+**Output** label while keeping every line visible. Errors, prompts, and other
+transcript entries stay separate.
+
 ### Attaching files and images
 
 The composer takes files: paste a screenshot straight into the box, or use the
