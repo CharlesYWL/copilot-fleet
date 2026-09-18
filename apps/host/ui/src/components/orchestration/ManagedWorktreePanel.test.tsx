@@ -359,6 +359,36 @@ describe("accessible managed workspace controls", () => {
     expect(screen.getByText(/deterministic composed workspace/)).toBeTruthy();
   });
 
+  it("shows removed worktrees as already cleaned without stale recovery actions", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() =>
+        response({
+          ...initialView(),
+          worktree: {
+            ...tree,
+            state: "removed",
+            removedAt: at,
+            observation: {
+              generation: tree.generation,
+              observedAt: at,
+              head: tree.baseSha,
+              dirty: false,
+            },
+          },
+        }),
+      ),
+    );
+    show();
+
+    expect(await screen.findByText("Already cleaned")).toBeTruthy();
+    expect(screen.getByText("Historical observation")).toBeTruthy();
+    expect(screen.getByText(/captured before cleanup/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Reconcile worktree" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Refresh Git observation" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Remove clean worktree" })).toBeNull();
+  });
+
   it("requires explicit consent before retrying a blocked task with Git hooks", async () => {
     const blocked = RunSchema.parse({
       ...run,

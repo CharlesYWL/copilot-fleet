@@ -1638,12 +1638,7 @@ export class ManagedWorktrees {
     await this.noGitOperation(tree.path);
     tree.observation = await this.observe(tree);
     const status = await this.status(tree.path);
-    if (status.untracked)
-      throw new WorktreeConflict(
-        "unknown_untracked_files",
-        "Fleet cannot seal unknown untracked files. Declare and stage safe source files or remove unrelated output explicitly.",
-      );
-    if (status.staged || status.unstaged) {
+    if (status.staged || status.unstaged || status.untracked) {
       const changed = new Set(
         (
           await this.git.run(tree.path, ["diff", "--name-only", "-z", "HEAD", "--"])
@@ -1664,24 +1659,18 @@ export class ManagedWorktrees {
         .split("\0")
         .filter(Boolean))
         changed.add(path);
-      const added = (
+      for (const path of (
         await this.git.run(tree.path, [
-          "diff",
-          "--cached",
-          "--name-only",
-          "--diff-filter=A",
+          "ls-files",
+          "--others",
+          "--exclude-standard",
           "-z",
-          "HEAD",
           "--",
         ])
       ).stdout
         .split("\0")
-        .filter(Boolean);
-      if (added.length)
-        throw new WorktreeConflict(
-          "undeclared_created_files",
-          "Fleet will not checkpoint newly created files until the execution contract explicitly declares them as source output.",
-        );
+        .filter(Boolean))
+        changed.add(path);
       if (
         [...changed].some((path) =>
           /(^|[\\/])(?:\.env(?:\.|$)|credentials?|secrets?)(?:[\\/]|\.|$)/i.test(path),
@@ -1693,7 +1682,7 @@ export class ManagedWorktrees {
         );
       const hooks = join(this.options.directory, "empty-hooks");
       await mkdir(hooks, { recursive: true });
-      await this.git.run(tree.path, ["add", "-u", "--"]);
+      await this.git.run(tree.path, ["add", "--all", "--"]);
       if (!(await this.noninteractivePolicy(tree.path, true, tree.allowGitHooks)))
         throw new WorktreeConflict(
           "checkpoint_identity_required",
@@ -1763,6 +1752,10 @@ export class ManagedWorktrees {
         finalTreeOid: await this.treeOid(tree.path, tree.resultSha),
         includedFiles: tree.sealedFiles,
         checkpointCreated: Boolean(tree.fleetCheckpointSha),
+        purpose:
+          request.actor === "host-finalization-controller"
+            ? ("recovery" as const)
+            : ("task_result" as const),
         sourceWorktreeId: tree.id,
         sourceNodeId: tree.nodeId,
         sourcePlacementId: tree.sourcePlacementId,

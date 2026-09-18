@@ -329,6 +329,41 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     ).resolves.toBe("generated\n");
   });
 
+  it("checkpoints meaningful untracked files before managed cleanup", async () => {
+    const uploadArtifact = vi.fn(async (result) => ({
+      ...result,
+      state: "available" as const,
+      verifiedAt: new Date().toISOString(),
+    }));
+    const { source, manager } = await fixture(undefined, { uploadArtifact });
+    const reserved = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source),
+        workspaceKind: "step",
+        ownerStepId: "failed-writer",
+      }),
+    );
+    const created = await operation(manager, reserved.worktree!, "create", {
+      workspaceKind: "step",
+      ownerStepId: "failed-writer",
+    });
+    await writeFile(join(created.worktree!.path, "unfinished-source.ts"), "export {};\n");
+
+    const finalized = await operation(manager, created.worktree!, "finalize", {
+      workspaceKind: "step",
+      ownerStepId: "failed-writer",
+    });
+
+    expect(finalized.ok).toBe(true);
+    expect(finalized.worktree?.resultSha).not.toBe(finalized.worktree?.baseSha);
+    expect(finalized.worktree?.observation?.dirty).toBe(false);
+    expect(finalized.workspaceResult?.state).toBe("available");
+    expect(uploadArtifact).toHaveBeenCalledTimes(1);
+    await expect(
+      git.run(created.worktree!.path, ["show", "--format=", "--name-only", "HEAD"]),
+    ).resolves.toMatchObject({ stdout: expect.stringContaining("unfinished-source.ts") });
+  });
+
   it("moves a sealed result between node-local repositories without changing remotes", async () => {
     const root = resolve(".mwi-test-work", randomUUID());
     roots.push(root);

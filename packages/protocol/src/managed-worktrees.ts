@@ -73,6 +73,10 @@ export const RunWorkspaceBindingSchema = z
     aggregationSummary: z.string().default(""),
     aggregationTargetRef: z.string().default(""),
     aggregationUpdatedAt: z.string().default(""),
+    finalizationOutcome: z
+      .enum(["completed", "failed", "cancelled"])
+      .default("completed"),
+    finalizationReason: z.string().default(""),
     error: z.string().default(""),
   })
   .transform((value) => ({
@@ -645,6 +649,7 @@ export const WorkspaceResultSchema = z.object({
   finalTreeOid: GitShaSchema.optional(),
   includedFiles: z.array(z.string()).default([]),
   checkpointCreated: z.boolean().default(false),
+  purpose: z.enum(["task_result", "recovery"]).default("task_result"),
   sourceWorktreeId: identity,
   sourceNodeId: identity,
   sourcePlacementId: identity,

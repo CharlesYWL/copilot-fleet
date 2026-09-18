@@ -1100,8 +1100,7 @@ export class ManagedWorktreeService {
       .filter((tree) => {
         if (tree.workspaceKind === "primary" || !tree.ownerStepId) return true;
         const step = steps.get(tree.ownerStepId);
-        if (!step || !terminalRunStepStates.has(step.state) || step.state === "succeeded")
-          return true;
+        if (step) return true;
         return sessions.some(
           (session) =>
             session.executionBinding?.worktreeId === tree.id &&
@@ -1224,7 +1223,8 @@ export class ManagedWorktreeService {
       this.aggregationRecoveryTimers.delete(runId);
       const current = this.store.getRun(runId);
       if (
-        current?.state === "aggregating" &&
+        current &&
+        (current.state === "aggregating" || terminalRunStates.has(current.state)) &&
         current.workspaceBinding?.aggregationState === "in_progress"
       )
         this.advanceAggregation(runId);
@@ -1334,7 +1334,11 @@ export class ManagedWorktreeService {
     const run = this.store.getRun(runId);
     if (
       !run ||
-      run.state !== "aggregating" ||
+      (run.state !== "aggregating" &&
+        !(
+          terminalRunStates.has(run.state) &&
+          run.workspaceBinding?.aggregationState === "in_progress"
+        )) ||
       run.workspaceBinding?.effectiveMode !== "managed"
     )
       return;
@@ -1343,6 +1347,14 @@ export class ManagedWorktreeService {
   }
 
   beginAggregation(runId: string): Run {
+    return this.beginFinalization(runId, "completed", "");
+  }
+
+  beginFinalization(
+    runId: string,
+    outcome: "completed" | "failed" | "cancelled",
+    reason: string,
+  ): Run {
     const run = this.store.getRun(runId);
     const binding = run?.workspaceBinding;
     if (!run || !binding || binding.effectiveMode !== "managed")
@@ -1351,10 +1363,19 @@ export class ManagedWorktreeService {
         "Automatic integration is available only for managed tasks.",
       );
     if (run.state === "aggregating") {
+      if (
+        binding.finalizationOutcome !== outcome ||
+        binding.finalizationReason !== reason
+      )
+        this.store.setRunWorkspaceBinding(runId, {
+          ...binding,
+          finalizationOutcome: outcome,
+          finalizationReason: reason,
+        });
       this.advanceAggregation(runId);
-      return run;
+      return this.store.getRun(runId)!;
     }
-    if (!canTransitionRun(run.state, "aggregating"))
+    if (!terminalRunStates.has(run.state) && !canTransitionRun(run.state, "aggregating"))
       throw new WorktreeConflict(
         "integration_not_ready",
         "This task cannot begin automatic integration from its current state.",
@@ -1369,8 +1390,11 @@ export class ManagedWorktreeService {
       aggregationSummary: "",
       aggregationTargetRef: binding.integrationTargetRef || binding.baseRef,
       aggregationUpdatedAt: new Date().toISOString(),
+      finalizationOutcome: outcome,
+      finalizationReason: reason,
     });
-    this.store.setRunState(runId, "aggregating", "");
+    if (!terminalRunStates.has(run.state))
+      this.store.setRunState(runId, "aggregating", "");
     this.publish(runId);
     this.advanceAggregation(runId);
     return this.store.getRun(runId)!;
@@ -1389,7 +1413,9 @@ export class ManagedWorktreeService {
         "retry_not_available",
         "Retry integration is available only when automatic integration needs attention.",
       );
-    if (!canTransitionRun(run.state, "aggregating"))
+    const terminalFinalization =
+      terminalRunStates.has(run.state) && binding.finalizationOutcome !== "completed";
+    if (!terminalFinalization && !canTransitionRun(run.state, "aggregating"))
       throw new WorktreeConflict(
         "retry_not_available",
         "This task cannot resume automatic integration from its current state.",
@@ -1404,7 +1430,7 @@ export class ManagedWorktreeService {
       aggregationSummary: "",
       aggregationUpdatedAt: new Date().toISOString(),
     });
-    this.store.setRunState(runId, "aggregating", "");
+    if (!terminalFinalization) this.store.setRunState(runId, "aggregating", "");
     this.publish(runId);
     this.advanceAggregation(runId);
   }
@@ -1565,7 +1591,14 @@ export class ManagedWorktreeService {
   private async runAggregation(runId: string): Promise<void> {
     let run = this.store.getRun(runId);
     let binding = run?.workspaceBinding;
-    if (!run || !binding || run.state !== "aggregating") return;
+    if (
+      !run ||
+      !binding ||
+      (run.state !== "aggregating" &&
+        !(terminalRunStates.has(run.state) && binding.aggregationState === "in_progress"))
+    )
+      return;
+    const finalizationOutcome = binding.finalizationOutcome ?? "completed";
     const targetRef = binding.integrationTargetRef || binding.baseRef;
     let phase =
       binding.aggregationPhase === "idle" ? "preview" : binding.aggregationPhase;
@@ -1648,7 +1681,33 @@ export class ManagedWorktreeService {
         })
       )
         return;
-      if (sinks.length > 1) {
+      for (const workspace of workspaces) {
+        const fresh = this.store.getAnyManagedWorkspace(workspace.id);
+        if (
+          !fresh ||
+          fresh.state === "removed" ||
+          fresh.abandonedAt ||
+          !fresh.ownerStepId ||
+          !fresh.observation?.dirty
+        )
+          continue;
+        const owner = this.store.getRunStep(fresh.ownerStepId);
+        if (!owner || owner.state === "succeeded") continue;
+        if (
+          fresh.observation.ignored === true &&
+          fresh.observation.staged === false &&
+          fresh.observation.unstaged === false &&
+          fresh.observation.untracked === false
+        )
+          continue;
+        const recovery = await this.automaticOperation(run, fresh, "recover", {
+          kind: "finalize",
+          actor: "host-finalization-controller",
+        });
+        if (!recovery) return;
+      }
+      workspaces = this.aggregationWorkspaces(runId);
+      if (finalizationOutcome === "completed" && sinks.length > 1) {
         selectedResultTree = await this.ensureSyntheticFanIn(run);
         if (!selectedResultTree) return;
         workspaces = this.aggregationWorkspaces(runId);
@@ -1685,12 +1744,14 @@ export class ManagedWorktreeService {
             updatedAt: new Date().toISOString(),
           });
       }
-      const verifiedNoChanges = this.isVerifiedNoChangeRun(
-        runId,
-        workspaces
-          .map((workspace) => this.store.getAnyManagedWorkspace(workspace.id))
-          .filter((workspace): workspace is ManagedWorktree => Boolean(workspace)),
-      );
+      const verifiedNoChanges =
+        finalizationOutcome !== "completed" ||
+        this.isVerifiedNoChangeRun(
+          runId,
+          workspaces
+            .map((workspace) => this.store.getAnyManagedWorkspace(workspace.id))
+            .filter((workspace): workspace is ManagedWorktree => Boolean(workspace)),
+        );
       if (!verifiedNoChanges && (!targetRef || !targetRef.startsWith("refs/heads/")))
         throw new WorktreeConflict(
           "target_unpinned",
@@ -1914,11 +1975,14 @@ export class ManagedWorktreeService {
         aggregationState: "completed",
         aggregationPhase: "done",
         aggregationCode: "",
-        aggregationSummary: verifiedNoChanges
-          ? `No committed changes; verified task workspaces and cleaned them without merge integration.${cleanupSuffix}`
-          : integration?.state === "no_changes"
-            ? `No committed changes; verified ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`
-            : `Integrated into ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`,
+        aggregationSummary:
+          finalizationOutcome !== "completed"
+            ? `Preserved unfinished changes and cleaned managed workspaces for the ${finalizationOutcome} task.${cleanupSuffix}`
+            : verifiedNoChanges
+              ? `No committed changes; verified task workspaces and cleaned them without merge integration.${cleanupSuffix}`
+              : integration?.state === "no_changes"
+                ? `No committed changes; verified ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`
+                : `Integrated into ${targetRef.replace(/^refs\/heads\//, "")} and cleaned isolated workspaces.${cleanupSuffix}`,
         aggregationTargetRef: verifiedNoChanges ? "" : targetRef,
         aggregationUpdatedAt: new Date().toISOString(),
       });
@@ -1942,8 +2006,10 @@ export class ManagedWorktreeService {
         }
       }
       const completed = this.store.getRun(runId)!;
-      if (canTransitionRun(completed.state, "completed"))
-        this.store.setRunState(runId, "completed", "");
+      if (completed.state !== finalizationOutcome) {
+        if (canTransitionRun(completed.state, finalizationOutcome))
+          this.store.setRunState(runId, finalizationOutcome, binding.finalizationReason);
+      }
       this.publish(runId);
     } catch (error) {
       const code = error instanceof WorktreeConflict ? error.code : "integration_failed";

@@ -167,7 +167,14 @@ export class OrchestratorEngine {
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
     for (const run of this.store.listRuns()) {
-      if (terminalRunStates.has(run.state)) continue;
+      if (terminalRunStates.has(run.state)) {
+        if (
+          run.workspaceBinding?.effectiveMode === "managed" &&
+          run.workspaceBinding.aggregationState === "in_progress"
+        )
+          this.service.worktrees.advanceAggregation(run.id);
+        continue;
+      }
       this.tickRun(run.id, nowMs);
     }
     this.remindIdleLeads(nowMs);
@@ -664,9 +671,17 @@ export class OrchestratorEngine {
   }
 
   private finishRun(run: Run, state: Run["state"], reason: string): boolean {
-    if (state === "completed" && run.workspaceBinding?.effectiveMode === "managed") {
-      this.service.worktrees.beginAggregation(run.id);
-      return true;
+    if (run.workspaceBinding?.effectiveMode === "managed") {
+      if (state === "completed") {
+        this.service.worktrees.beginFinalization(run.id, state, reason);
+        return true;
+      }
+      if (state === "failed" || state === "cancelled") {
+        if (!canTransitionRun(run.state, state)) return false;
+        this.store.setRunState(run.id, state, reason);
+        this.service.worktrees.beginFinalization(run.id, state, reason);
+        return true;
+      }
     }
     if (!canTransitionRun(run.state, state)) return false;
     this.store.setRunState(run.id, state, reason);

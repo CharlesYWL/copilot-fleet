@@ -281,12 +281,13 @@ Integration has independent `not_requested`, `not_ready`, `ready`, `integrating`
 `validating`, `integrated`, `no_changes`, `conflicted`, `resolving`, `aborting`,
 `aborted`, `uncertain` and `needs_reconciliation` states. Approval never implies
 integration. `no_changes` is a reviewed terminal outcome, not an alias for
-“already integrated.” For managed Runs, successful orchestration now enters the
-nonterminal `aggregating` Run state. A Host-owned Integration Controller resumes
-from durable Node operation receipts after restart/reconnect, and the Run becomes
-`completed` only after exact-tree validation, publication, task-workspace
-quiescence, retention and safe cleanup of primary, step, derived, synthetic fan-in
-and integration workspaces.
+“already integrated.” Successful managed Runs enter the nonterminal `aggregating`
+state. Failed and cancelled Runs keep their terminal outcome while the same
+Host-owned finalization controller continues from durable Node operation receipts
+after restart/reconnect. The controller freshly inspects every owned workspace,
+including workspaces from failed or cancelled writer steps, before classifying the
+task or cleaning primary, step, derived, synthetic fan-in and integration
+workspaces.
 
 Recovery checks `git worktree list --porcelain -z`, physical roots/marker, refs,
 HEAD, status and lease/process inventory. Missing/moved directories, replacement
@@ -399,9 +400,14 @@ reviewed SHA remains an ancestor. Validation outcome and timestamp are persisted
 
 ## Retention, cleanup and quotas
 
-Stop, archive, dismissal and retry do not delete worktrees. Managed approval starts
-automatic integration and safe cleanup; failures retain all work for recovery. Purge first
-persists a cleanup tombstone and refuses while filesystem ownership remains.
+Stop and retry do not directly delete worktrees. Managed completion, failure,
+cancellation and archive all enter the durable finalization controller. Meaningful
+tracked or untracked unfinished files are committed with hooks disabled and stored
+as a private recovery-purpose artifact before the checkout is cleaned; recovery
+artifacts are not eligible for publication as successful task results. Unknown
+process ownership, identity conflicts and sensitive-looking paths still fail
+closed and retain the checkout for attention. Purge first persists a cleanup
+tombstone and refuses while filesystem ownership remains.
 Tombstones and ownership records survive Run/session deletion and backup restore.
 
 Defaults: seven-day retention for clean integrated inactive trees, eight owned
@@ -410,10 +416,11 @@ managed-byte budget. General settings and the defaults API configure these limit
 Retention sweeps perform at most two operations/minute. Quotas include reservations;
 tracked-byte estimates and bounded filesystem observations are approximate, not
 an OS disk quota. Dirty/unknown work is never evicted to make room.
-Node reconciliation triggers an immediate bounded sweep. A terminal task's valid,
-inactive checkout is first marked as a retained orphan candidate, with durable
-reason and timestamp, rather than deleted. The normal retention window remains
-available for review and crash debugging before safe cleanup is considered.
+Node reconciliation triggers an immediate bounded sweep. Terminal finalization
+normally leaves zero physical task worktrees once recovery evidence and durable
+receipts exist. A checkout is retained only when Fleet cannot prove safe cleanup,
+such as unknown process ownership, identity disagreement, sensitive content or
+ignored-only output without a trusted cleanup classification.
 
 Normal cleanup requires fresh ownership, registry and containment validation, no
 active readers/writers or unresolved integration, and clean staged/unstaged/
