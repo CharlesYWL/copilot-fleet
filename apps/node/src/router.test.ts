@@ -918,7 +918,8 @@ describe("CommandRouter", () => {
     expect(stops).toEqual([false, false]);
   });
 
-  it("reports a terminal state when an MCP refresh cannot restart Copilot", async () => {
+  it("recovers when an MCP refresh transiently cannot restart Copilot", async () => {
+    vi.useFakeTimers();
     let starts = 0;
     const warnings: string[] = [];
     const events: SessionEvent[] = [];
@@ -956,20 +957,24 @@ describe("CommandRouter", () => {
       prompt: "first",
     });
 
-    await router.refreshMcpSessions();
+    const recovery = router.refreshMcpSessions();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await recovery;
+    vi.useRealTimers();
 
     expect(warnings).toEqual([
-      "session s1: could not restore MCP tools: copilot unavailable",
+      "session s1: MCP recovery attempt 1 failed: copilot unavailable",
     ]);
     expect(events.at(-1)).toMatchObject({
       sessionId: "s1",
       type: "state",
       payload: {
-        state: "failed",
-        activity: "Copilot could not be restarted to restore MCP tools",
+        state: "idle",
+        activity: "MCP tools restored; ready for follow-up",
       },
     });
-    expect(router.activeSessionIds).toEqual([]);
+    expect(router.activeSessionIds).toEqual(["s1"]);
+    expect(starts).toBe(3);
   });
 
   it("deduplicates concurrent MCP refreshes", async () => {

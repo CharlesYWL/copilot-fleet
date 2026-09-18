@@ -177,6 +177,18 @@ export interface SessionAgent {
   resync(): void;
 }
 
+/** Startup failed without verified cleanup; the caller must retain and stop this agent. */
+export class AgentStartupCleanupError extends AggregateError {
+  constructor(
+    readonly agent: SessionAgent,
+    failure: Error,
+    cleanupError: unknown,
+  ) {
+    super([failure, cleanupError], failure.message, { cause: cleanupError });
+    this.name = "AgentStartupCleanupError";
+  }
+}
+
 /**
  * Which of an option's choices the Host meant.
  *
@@ -218,11 +230,15 @@ export function resolveConfigValue(
 export type EventSink = (event: SessionEvent) => void;
 
 export type StartAgentOptions = {
+  /** Cancels startup and verifies process cleanup before rejecting. */
+  signal?: AbortSignal;
   processStarting?: (() => void) | undefined;
   processStarted?: ((pid: number) => void) | undefined;
   processesQuiesced?: (() => void) | undefined;
   /** Copilot session id to re-attach to via ACP `session/load`. */
   resumeAgentSessionId?: string;
+  /** Allow an oversized `session/load` to create and prompt a new conversation. Defaults to true. */
+  allowResumeRollover?: boolean;
   /** Bounded handoff for replacing a conversation that exceeds CAPI's request limit. */
   contextOverflowRecoveryPrompt?: string;
   /** Workspace roots that were attached to the original Copilot session. */
@@ -461,6 +477,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private stderrTail = "";
   private prompting = false;
   private stopping = false;
+  private startupAborted = false;
+  private abortStartupWait: (() => void) | undefined;
+  private readonly managedProcess: boolean;
   /** `session/load` replays the whole history; the host already stored it. */
   private replaying = false;
   private creditReader: SessionCreditReader | undefined;
@@ -521,6 +540,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     /** Workspace roots to restore when loading an existing Copilot session. */
     private readonly additionalDirectories: readonly string[] = [],
     private readonly contextOverflowRecoveryPrompt = "",
+    private readonly allowResumeRollover = true,
     /** Internal reconnect recovery must not look like an operator restart. */
     private readonly announceLifecycle = true,
     private readonly processOwnership?: Pick<
@@ -529,6 +549,22 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     >,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
+    this.managedProcess =
+      Boolean(processOwnership) ||
+      (process.platform === "win32" && mcpServerConfigs.length > 0);
+  }
+
+  /** A startup deadline does not cancel its promise; fence late continuations at cleanup. */
+  private assertActive(): void {
+    if (this.stopping) {
+      throw new Error("ACP session is no longer active");
+    }
+  }
+
+  abortStartup(): void {
+    this.startupAborted = true;
+    this.stopping = true;
+    this.abortStartupWait?.();
   }
 
   /**
@@ -551,6 +587,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   }
 
   async start(cwd: string, resumeAgentSessionId?: string): Promise<void> {
+    this.assertActive();
     this.cwd = cwd;
     if (this.announceLifecycle) {
       this.emit("state", {
@@ -567,8 +604,10 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
     const args = [...this.launch.args, ...copilotLaunchArgs(this.yolo, this.contextTier)];
     const { command, shell } = copilotSpawnTarget(this.launch.command);
+    this.assertActive();
     this.processOwnership?.processStarting?.();
-    const child = (this.processOwnership ? spawnManagedProcess : spawn)(command, args, {
+    this.assertActive();
+    const child = (this.managedProcess ? spawnManagedProcess : spawn)(command, args, {
       cwd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
@@ -600,12 +639,14 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       }
     });
 
+    this.assertActive();
     const app = acp
       .client({ name: "copilot-fleet-node" })
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) =>
         this.requestPermission(params),
       )
       .onNotification(acp.methods.client.session.update, ({ params }) => {
+        if (this.stopping) return;
         if (
           this.contextCapture &&
           params.update.sessionUpdate === "agent_message_chunk" &&
@@ -658,6 +699,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         },
       },
     );
+    this.assertActive();
     if (resumeAgentSessionId) {
       this.replaying = true;
       try {
@@ -674,9 +716,11 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
               mcpServers: this.mcpServers(),
             },
           );
+          this.assertActive();
           this.captureConfigOptions(loaded.configOptions);
         } catch (error) {
-          if (!isCapiRequestTooLarge(error)) throw error;
+          this.assertActive();
+          if (!this.allowResumeRollover || !isCapiRequestTooLarge(error)) throw error;
           this.replaying = false;
           await this.rollOverConversation(
             contextRolloverPrompt(this.contextOverflowRecoveryPrompt, ""),
@@ -684,7 +728,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           return;
         }
       } finally {
-        this.replaying = false;
+        if (!this.stopping) this.replaying = false;
       }
       this.agentSessionId = resumeAgentSessionId;
     } else {
@@ -692,6 +736,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         cwd,
         mcpServers: this.mcpServers(),
       });
+      this.assertActive();
       this.agentSessionId = created.sessionId;
       this.captureConfigOptions(created.configOptions);
     }
@@ -700,11 +745,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     // machine in this fleet — same Copilot build, same fleet build, same agent
     // otherwise working, and a composer with nothing on it.
     await this.recoverConfigOptions();
+    this.assertActive();
     await this.selectCustomAgent();
+    this.assertActive();
     await this.applyStartupConfig();
+    this.assertActive();
     this.captureConfigOptions(this.configOptions);
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
     await this.trackUsage(this.agentSessionId);
+    this.assertActive();
     if (resumeAgentSessionId) {
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
     }
@@ -723,6 +772,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
    */
   private async applyStartupConfig(): Promise<void> {
     for (const wanted of this.startupConfig) {
+      this.assertActive();
       if (wanted.id === CONTEXT_TIER_CONFIG_ID) continue;
       const option = this.configOptions.find((entry) => entry.id === wanted.id);
       if (!option) {
@@ -742,6 +792,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       try {
         await this.setConfigOption(wanted.id, value);
       } catch (error) {
+        this.assertActive();
         this.emit("system", {
           message: `Could not set ${wanted.id} to "${wanted.value}": ${errorMessage(error)}`,
         });
@@ -776,6 +827,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     try {
       await this.setConfigOption(picker.id, this.customAgent);
     } catch (error) {
+      this.assertActive();
       this.emit("system", {
         message: `Could not select agent "${this.customAgent}": ${errorMessage(error)}`,
       });
@@ -789,6 +841,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     try {
       await this.setConfigOption(request.configId, request.value);
     } catch {
+      this.assertActive();
       // An agent without this option is one that was never going to offer
       // pickers, and a resumed session is worth more than the pickers on it.
     }
@@ -839,6 +892,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private async trackUsage(agentSessionId: string, reset = false): Promise<void> {
     clearInterval(this.creditTimer);
     await this.creditRead;
+    this.assertActive();
     this.creditReader = new SessionCreditReader(agentSessionId);
     if (reset) {
       this.reportUsage({
@@ -861,10 +915,12 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     const read = this.creditReader
       .read()
       .then((aiCredits) => {
+        if (this.startupAborted) return;
         this.creditError = undefined;
         if (aiCredits !== undefined) this.reportUsage({ aiCredits });
       })
       .catch((error: unknown) => {
+        if (this.startupAborted) return;
         const message = `Session AI credit usage is unavailable: ${errorMessage(error)}`;
         if (this.creditError !== message) this.emit("system", { text: message });
         this.creditError = message;
@@ -937,6 +993,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     attachments: readonly PromptAttachment[] = [],
     options: { allowContextRollover?: boolean } = {},
   ): Promise<void> {
+    this.assertActive();
     if (!this.agentSessionId || !this.connection) {
       throw new Error("ACP session is not initialized");
     }
@@ -1010,6 +1067,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   }
 
   private async rollOverConversation(prompt: string): Promise<void> {
+    this.assertActive();
     if (!this.connection) throw new Error("ACP session is not initialized");
     this.denyPendingPermissions();
     this.contextCapture = undefined;
@@ -1024,13 +1082,18 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       cwd: this.cwd,
       mcpServers: this.mcpServers(),
     });
+    this.assertActive();
     this.agentSessionId = created.sessionId;
     this.captureConfigOptions(created.configOptions);
     await this.recoverConfigOptions();
+    this.assertActive();
     await this.selectCustomAgent();
+    this.assertActive();
     await this.applyStartupConfig();
+    this.assertActive();
     this.emit("agent_session", { agentSessionId: created.sessionId });
     await this.trackUsage(created.sessionId, true);
+    this.assertActive();
     this.emit("state", { state: "running", activity: "Continuing in fresh context" });
     const response = await this.connection.agent.request(
       acp.methods.agent.session.prompt,
@@ -1039,8 +1102,11 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         prompt: toPromptBlocks(prompt, []),
       },
     );
+    this.assertActive();
     await this.refreshContext();
+    this.assertActive();
     await this.refreshCredits();
+    this.assertActive();
     this.emit("turn_complete", { stopReason: response.stopReason });
     this.prompting = false;
     this.emit("state", { state: "idle", activity: "Ready for follow-up" });
@@ -1088,6 +1154,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
    * on offer too, and the caller only asked about one of them.
    */
   async setConfigOption(configId: string, value: string): Promise<void> {
+    this.assertActive();
     if (!this.agentSessionId || !this.connection) {
       throw new Error("ACP session is not initialized");
     }
@@ -1099,6 +1166,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
         value: configValueFor(this.configOptions, configId, value),
       } as acp.SetSessionConfigOptionRequest,
     );
+    this.assertActive();
     this.captureConfigOptions(response.configOptions);
   }
 
@@ -1113,10 +1181,23 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.denyPendingPermissions();
       this.connection?.close();
       if (this.child) {
-        await stopProcessTree(this.child, Boolean(this.processOwnership));
+        await stopProcessTree(this.child, this.managedProcess);
       }
       this.processOwnership?.processesQuiesced?.();
-      await this.refreshCredits();
+      // Internal replacements and aborted startups must not wait on optional usage metadata.
+      if (announce && !this.startupAborted) {
+        try {
+          await Promise.race([
+            this.refreshCredits(),
+            new Promise<void>((resolve) => {
+              if (this.startupAborted) resolve();
+              else this.abortStartupWait = resolve;
+            }),
+          ]);
+        } finally {
+          this.abortStartupWait = undefined;
+        }
+      }
       if (announce && !this.hasTerminated) {
         this.emit("state", { state: "stopped", activity: "Process stopped" });
       }
@@ -1170,6 +1251,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private requestPermission(
     params: acp.RequestPermissionRequest,
   ): Promise<acp.RequestPermissionResponse> {
+    if (this.stopping) {
+      return Promise.resolve({ outcome: { outcome: "cancelled" } });
+    }
     const requestId = randomUUID();
     this.emit("permission", {
       requestId,
@@ -1311,46 +1395,67 @@ export class AcpAgentFactory implements AgentFactory {
     sink: EventSink,
     options: StartAgentOptions = {},
   ): Promise<SessionAgent> {
-    const launch = await resolveCopilotLaunch(
-      options.agencyMode ?? false,
-      this.copilotCommand,
-    );
-    await this.validateCopilot(launch);
-    const supportsContext = await this.acceptsContextTier(launch);
-    const agent = new AcpAgent(
-      sessionId,
-      sink,
-      this.permissionTimeoutMs,
-      options.sequenceOffset ?? 0,
-      options.yolo ?? false,
-      launch,
-      supportsContext ? (options.contextTier ?? this.contextTier) : undefined,
-      options.mcpServers ?? [],
-      options.agent ?? "",
-      options.config ?? [],
-      options.additionalDirectories ?? [],
-      options.contextOverflowRecoveryPrompt ?? "",
-      options.announceLifecycle ?? true,
-      options.processStarting || options.processStarted || options.processesQuiesced
-        ? options
-        : undefined,
-    );
+    const signal = options.signal;
+    signal?.throwIfAborted();
+    let agent: AcpAgent | undefined;
+    let onAbort: (() => void) | undefined;
+    const aborted =
+      signal &&
+      new Promise<never>((_, reject) => {
+        onAbort = () => {
+          agent?.abortStartup();
+          reject(signal.reason);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+    const wait = <T>(operation: Promise<T>): Promise<T> =>
+      aborted ? Promise.race([operation, aborted]) : operation;
     try {
+      const launch = await wait(
+        resolveCopilotLaunch(options.agencyMode ?? false, this.copilotCommand),
+      );
+      signal?.throwIfAborted();
+      await wait(this.validateCopilot(launch));
+      signal?.throwIfAborted();
+      const supportsContext = await wait(this.acceptsContextTier(launch));
+      signal?.throwIfAborted();
+      agent = new AcpAgent(
+        sessionId,
+        sink,
+        this.permissionTimeoutMs,
+        options.sequenceOffset ?? 0,
+        options.yolo ?? false,
+        launch,
+        supportsContext ? (options.contextTier ?? this.contextTier) : undefined,
+        options.mcpServers ?? [],
+        options.agent ?? "",
+        options.config ?? [],
+        options.additionalDirectories ?? [],
+        options.contextOverflowRecoveryPrompt ?? "",
+        options.allowResumeRollover ?? true,
+        options.announceLifecycle ?? true,
+        options.processStarting || options.processStarted || options.processesQuiesced
+          ? options
+          : undefined,
+      );
       await withCopilotStartupTimeout(
-        agent.start(cwd, options.resumeAgentSessionId),
+        wait(agent.start(cwd, options.resumeAgentSessionId)),
         this.startTimeoutMs,
       );
+      signal?.throwIfAborted();
       return agent;
     } catch (error) {
-      const failure = agent.failStartup(error);
+      const startupError = signal?.aborted ? signal.reason : error;
+      if (!agent) throw startupError;
+      const failure = agent.failStartup(startupError);
       try {
         await agent.stop();
       } catch (cleanupError) {
-        throw new AggregateError([failure, cleanupError], failure.message, {
-          cause: cleanupError,
-        });
+        throw new AgentStartupCleanupError(agent, failure, cleanupError);
       }
       throw failure;
+    } finally {
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   }
 

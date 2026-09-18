@@ -68,6 +68,7 @@ const journalRecords: { descriptor: PreparedCommand }[] = [];
 let testConfigDirectory = "";
 let emitEvent: (event: SessionEvent) => void;
 const refreshMcpSessions = vi.fn(async () => {});
+const setMcpAvailable = vi.fn<(available: boolean) => void>();
 const stopAll = vi.fn(async () => {});
 const configureCommands = vi.fn(async (_enabled: boolean) => {});
 let activeSessionIds = ["session-1"];
@@ -168,6 +169,7 @@ vi.mock("./router.js", () => ({
     }
     busySessionIds = ["session-1"];
     refreshMcpSessions = refreshMcpSessions;
+    setMcpAvailable = setMcpAvailable;
     route = route;
     setMaxSessions = vi.fn();
     stopAll = stopAll;
@@ -523,6 +525,7 @@ it.each([
         outboxFlush: ready.outboxFlush,
       });
       expect(refreshMcpSessions).not.toHaveBeenCalled();
+      expect(setMcpAvailable).not.toHaveBeenCalledWith(true);
       const later = { ...event, eventId: "event-2", sequence: 2 };
       emitEvent(later);
       expect(socket.send).toHaveBeenCalledTimes(5);
@@ -536,6 +539,7 @@ it.each([
       expect(refreshMcpSessions).not.toHaveBeenCalled();
       await receive({ type: "outbox_flush_ack", flushId: nextBatch.outboxFlush.flushId });
       expect(refreshMcpSessions).toHaveBeenCalledOnce();
+      expect(setMcpAvailable).toHaveBeenLastCalledWith(true);
 
       const heartbeatIndex = socket.send.mock.calls.length;
       await vi.advanceTimersByTimeAsync(5_000);
