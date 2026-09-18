@@ -60,6 +60,33 @@ a stopped session still present on the Node receives Stop again; a session no
 longer present is confirmed `stopped`. Resume resets only steps explicitly
 marked by the orchestration Stop transaction.
 
+### MCP reconnect recovery
+
+The Node restores retained MCP-equipped sessions without stopping their workers.
+It waits for authentication and buffered-event reconciliation, then for five
+seconds of connection stability. A busy lead finishes its current turn before
+restoration begins.
+
+An unsuccessful restoration retries after 5, 30, and 120 seconds, for at most
+four attempts. Disconnection pauses recovery without consuming attempts, and
+overlapping reconnects share the same recovery operation. The existing session
+and conversation identifiers, attached directories, agent, and picker settings
+are retained. Recovery does not replay the original prompt or dispatch worker
+work. While recovering, the lead is reserved as busy with an explicit MCP
+recovery activity; new prompts, resumes, and picker changes are refused.
+
+Each replacement must confirm that the previous process tree has stopped.
+Windows MCP-equipped ACP sessions use the same Job Object containment as leased
+sessions, even when the lead has no workspace lease. Failed startup cleanup
+retains its process handle so a retry cannot create an overlapping replacement.
+
+Stop and Node shutdown cancel recovery waits and startup, then stop the retained
+process. Exhausted startup retries become a failed session with a manual Resume
+action. If process shutdown cannot be verified, recovery instead reports
+`MCP recovery blocked`, retains the process for reconciliation, and refuses a
+replacement until safe shutdown is confirmed. Reconnect does not reset an
+exhausted retry budget.
+
 ## MCP follow-up decisions
 
 Task identity and worker identity are separate. `fleet_list_work` searches the

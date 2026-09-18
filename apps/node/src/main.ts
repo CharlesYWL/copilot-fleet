@@ -880,6 +880,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   });
 
   function connect(): void {
+    router.setMcpAvailable(false);
     const auth = credentials;
     /*
      * The last gate before this machine's credential goes on a wire.
@@ -939,6 +940,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     // anything decides what to do about the disconnection.
     active.once("close", () => {
       if (socket === active) {
+        router.setMcpAvailable(false);
         releaseLiveness();
         channel = undefined;
       }
@@ -987,10 +989,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
     active.on("open", () => {
       stopLiveness = watchHostLiveness(active, {
-        onDead: (silentMs) =>
+        onDead: (silentMs) => {
+          if (socket === active) router.setMcpAvailable(false);
           warn(
             `Host stopped answering for ${Math.round(silentMs / 1000)}s; dropping the connection so it can be rebuilt`,
-          ),
+          );
+        },
       });
       if (session) {
         // Nothing about this machine travels yet: `client_hello` says who is
@@ -1008,6 +1012,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     });
 
     active.on("message", async (raw: unknown) => {
+      if (socket !== active || shuttingDown) return;
       const text = String(raw);
       if (session && !channel) {
         const handshake = decodeFrame(text, HostHandshakeFrameSchema);
@@ -1046,6 +1051,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         acknowledgeOutbox = frame.value.acknowledgeOutbox;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
+        if (socket !== active || active.readyState !== WebSocket.OPEN) return;
         if (holdEventsForReconnectFlush) {
           if (acknowledgeOutbox && !frame.value.reconcileAfterOutbox) {
             errorLog(
@@ -1056,6 +1062,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           }
           flushOutbox(active, frame.value.reconcileAfterOutbox, acknowledgeOutbox);
         } else {
+          router.setMcpAvailable(true);
           void router.refreshMcpSessions();
         }
         return;
@@ -1085,6 +1092,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         }
         outboxReconciliationPending = false;
         holdEventsForReconnectFlush = false;
+        router.setMcpAvailable(true);
         void router.refreshMcpSessions();
         return;
       }
@@ -1366,6 +1374,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     if (outbox.size > 0 || !result.reconciliationSent) return;
     outboxReconciliationPending = false;
     holdEventsForReconnectFlush = false;
+    router.setMcpAvailable(true);
     void router.refreshMcpSessions();
   }
 

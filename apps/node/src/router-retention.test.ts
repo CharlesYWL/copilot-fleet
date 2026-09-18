@@ -594,9 +594,11 @@ describe("CommandRouter session retention", () => {
 
     await router.refreshMcpSessions();
 
-    expect(events.slice(-replay.length)).toEqual(
+    const replayIds = new Set(replay.map((item) => item.eventId));
+    expect(events.filter((item) => replayIds.has(item.eventId))).toEqual(
       replay.map((item) => ({
         ...item,
+        sequence: item.sequence + 1,
         payload: { ...item.payload, historyReplay: true },
       })),
     );
@@ -619,9 +621,10 @@ describe("CommandRouter session retention", () => {
     });
     await router.refreshMcpSessions();
 
+    const previousSequence = events.at(-1)!.sequence;
     const live = event("agent_text", { text: "New autonomous turn" });
     refreshedSink(live);
-    expect(events.at(-1)).toEqual(live);
+    expect(events.at(-1)).toEqual({ ...live, sequence: previousSequence + 1 });
     expect(events.at(-1)?.payload.historyReplay).toBeUndefined();
     expect(await router.route(cleanup())).toMatchObject({ ok: false, fatal: false });
   });
