@@ -17,10 +17,12 @@ import {
   PrMaintenanceEnableSchema,
   type FleetSession,
   type PrMaintenanceRegistration,
+  type PrMaintenanceProposal,
   type Run,
 } from "@fleet/protocol";
 import {
   actOnTaskMaintenance,
+  authorizeTaskMaintenanceProposal,
   enableTaskMaintenance,
   getTaskMaintenance,
   type TaskMaintenanceView,
@@ -62,6 +64,8 @@ export function PrMaintenancePanel({
   const [refreshKey, setRefreshKey] = useState(0);
   const [enableOpen, setEnableOpen] = useState(false);
   const [proposal, setProposal] = useState("");
+  const [proposalReference, setProposalReference] =
+    useState<Pick<PrMaintenanceProposal, "id" | "version">>();
   const [confirmed, setConfirmed] = useState(false);
   const [release, setRelease] = useState<PrMaintenanceRegistration>();
   const [renew, setRenew] = useState<PrMaintenanceRegistration>();
@@ -99,6 +103,7 @@ export function PrMaintenancePanel({
     try {
       await action();
       setEnableOpen(false);
+      setProposalReference(undefined);
       setRelease(undefined);
       setRenew(undefined);
       setConfirmed(false);
@@ -140,8 +145,21 @@ export function PrMaintenancePanel({
   const pending = view?.records.find(
     (entry) => !entry.ownershipReleasedAt && entry.decision?.state === "pending",
   );
+  const proposalChanged = Boolean(
+    proposalReference &&
+    (view?.proposal?.id !== proposalReference.id ||
+      view?.proposal?.version !== proposalReference.version),
+  );
   const startEnable = () => {
     setError("");
+    if (view?.proposal) {
+      setProposalReference({ id: view.proposal.id, version: view.proposal.version });
+      setProposal(JSON.stringify(view.proposal.registration, null, 2));
+      setConfirmed(false);
+      setEnableOpen(true);
+      return;
+    }
+    setProposalReference(undefined);
     setProposal(
       JSON.stringify(
         {
@@ -200,6 +218,15 @@ export function PrMaintenancePanel({
       {view && !view.canAuthorize ? (
         <p>
           Sign in to authorize maintenance. Node and MCP credentials cannot approve it.
+        </p>
+      ) : null}
+      {view?.proposal ? (
+        <p role="status">
+          The Orchestrator proposed maintenance for{" "}
+          {view.proposal.registration.identity.repository} #
+          {view.proposal.registration.identity.prNumber}. It is not enabled. Review and
+          authorize the proposal below; ordinary task approval does not enable
+          maintenance.
         </p>
       ) : null}
       {view?.records.map((record) => {
@@ -420,7 +447,7 @@ export function PrMaintenancePanel({
           }
           onClick={startEnable}
         >
-          Enable PR maintenance
+          {view?.proposal ? "Review PR maintenance proposal" : "Enable PR maintenance"}
         </Button>
         <Button disabled={busy} onClick={() => setRefreshKey((current) => current + 1)}>
           Refresh maintenance status
@@ -434,26 +461,39 @@ export function PrMaintenancePanel({
           <DialogBody>
             <DialogTitle>Authorize bounded PR maintenance</DialogTitle>
             <DialogContent>
+              {proposalChanged ? (
+                <p role="alert">
+                  This proposal changed or was already handled. Close this dialog and
+                  review the current proposal before authorizing.
+                </p>
+              ) : null}
               {error ? (
                 <p role="alert">
                   {error} Close this dialog and refresh before authorizing again.
                 </p>
               ) : null}
-              <Field
-                label="Registration proposal"
-                hint="Paste the Orchestrator's proposal backed by current helper, credential and publication evidence. The task baseline is seeded below; unknown prerequisites cannot enable maintenance."
-              >
-                <Textarea
-                  value={proposal}
-                  rows={8}
-                  resize="vertical"
-                  disabled={busy}
-                  onChange={(_, data) => {
-                    setProposal(data.value);
-                    setConfirmed(false);
-                  }}
-                />
-              </Field>
+              {proposalReference ? (
+                <p>
+                  Prepared by the Orchestrator. Review the exact scope below; ask it to
+                  revise the proposal if changes are needed.
+                </p>
+              ) : (
+                <Field
+                  label="Registration proposal"
+                  hint="Paste the Orchestrator's proposal backed by current helper, credential and publication evidence. The task baseline is seeded below; unknown prerequisites cannot enable maintenance."
+                >
+                  <Textarea
+                    value={proposal}
+                    rows={8}
+                    resize="vertical"
+                    disabled={busy}
+                    onChange={(_, data) => {
+                      setProposal(data.value);
+                      setConfirmed(false);
+                    }}
+                  />
+                </Field>
+              )}
               {candidate ? (
                 <>
                   <p>
@@ -513,7 +553,7 @@ export function PrMaintenancePanel({
               )}
               <Checkbox
                 checked={confirmed}
-                disabled={!candidate || !proposalMatchesTask || busy}
+                disabled={!candidate || !proposalMatchesTask || proposalChanged || busy}
                 onChange={(_, data) => setConfirmed(data.checked === true)}
                 label="I verified the exact PR, worker, approved design baseline, helper access, credentials and permitted publication path. I authorize only this bounded scope, never merge, force-push or unapproved design changes."
               />
@@ -524,10 +564,20 @@ export function PrMaintenancePanel({
               </Button>
               <Button
                 appearance="primary"
-                disabled={busy || !candidate || !proposalMatchesTask || !confirmed}
+                disabled={
+                  busy ||
+                  !candidate ||
+                  !proposalMatchesTask ||
+                  proposalChanged ||
+                  !confirmed
+                }
                 onClick={() =>
-                  candidate &&
-                  void execute(() => enableTaskMaintenance(run.id, candidate))
+                  proposalReference
+                    ? void execute(() =>
+                        authorizeTaskMaintenanceProposal(run.id, proposalReference),
+                      )
+                    : candidate &&
+                      void execute(() => enableTaskMaintenance(run.id, candidate))
                 }
               >
                 Authorize maintenance

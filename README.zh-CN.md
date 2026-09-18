@@ -1337,6 +1337,12 @@ worker、审查和归档状态留在同一处。
 任务详情中的 **PR maintenance** 面向已归属 Orchestrator 的现有 worker。
 V1 每个任务只保留一个 PR 维护注册；为同一任务注册另一个 PR 前，
 需先核实并释放原有维护。
+可以直接向 Orchestrator 请求为某个 PR 启用维护。它通过
+`fleet_propose_pr_maintenance` 保存待授权提案并通知你。在任务面板点击
+**Review PR maintenance proposal**，审阅已填好的范围后，以登录身份点击
+**Authorize maintenance**。无需复制 JSON，agent 也不能自行授权。
+之后沿用现有唤醒流程；也可发送普通聊天消息要求立即检查。
+
 通过 **Enable PR maintenance** 审阅准确的 GitHub PR、仓库稳定 ID、
 head/base 完整分支引用、worker 与检出绑定、任务/设计基线、验证要求，
 以及 helper、凭据和发布权限的证据。授权来自已登录的浏览器操作，

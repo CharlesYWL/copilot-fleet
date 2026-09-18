@@ -1822,6 +1822,13 @@ state stay together.
 Task detail includes **PR maintenance** for an existing Orchestrator-owned worker.
 V1 supports one retained PR registration per task; release settled maintenance
 before registering another PR for that task.
+You can ask the Orchestrator to enable maintenance for a PR. It uses
+`fleet_propose_pr_maintenance` to store an unapproved proposal and notify you.
+Open **Review PR maintenance proposal** in the task panel, inspect the prefilled
+scope, and select **Authorize maintenance** while signed in. No JSON copy/paste
+is needed; the agent cannot authorize itself. Checks then use the existing wake
+loop, and a normal chat message can request an immediate first check.
+
 Use **Enable PR maintenance** to review the proposed exact GitHub PR, stable
 repository identities, head/base refs, retained worker and checkout, task/design
 baseline, verification, and helper/credential/publication evidence. Confirmation

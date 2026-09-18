@@ -60,6 +60,13 @@ const MaintenanceActionSchema = z.discriminatedUnion("action", [
     .strict(),
   z
     .object({
+      action: z.literal("authorize_proposal"),
+      proposalId: z.string().min(1),
+      expectedVersion: z.number().int().positive(),
+    })
+    .strict(),
+  z
+    .object({
       action: z.literal("update"),
       recordId: z.string().min(1),
       expectedVersion: z.number().int().positive(),
@@ -163,6 +170,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           : undefined;
     return {
       records,
+      proposal: store.prMaintenance.getProposal(id),
       canAuthorize: Boolean(maintenanceOperator(request)),
       ...(unsupportedReason ? { unsupportedReason } : {}),
     };
@@ -180,12 +188,26 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       });
     const input = MaintenanceActionSchema.parse(request.body);
     let updated: PrMaintenanceRegistration;
-    if (input.action === "enable") {
-      if (input.registration.taskId !== id)
+    if (input.action === "enable" || input.action === "authorize_proposal") {
+      if (input.action === "enable" && input.registration.taskId !== id)
         return reply
           .code(409)
           .send({ error: "The maintenance proposal names another task." });
-      updated = store.prMaintenance.enableFromOperator(input.registration, actor);
+      updated = service.notifications.commitAtomically(() => {
+        const proposal = store.prMaintenance.getProposal(id);
+        const record =
+          input.action === "authorize_proposal"
+            ? store.prMaintenance.authorizeProposal(
+                id,
+                input.proposalId,
+                input.expectedVersion,
+                actor,
+              )
+            : store.prMaintenance.enableFromOperator(input.registration, actor);
+        if (proposal) service.notifications.resolvePrMaintenanceProposal(proposal);
+        return record;
+      });
+      service.publishSnapshot();
     } else {
       const record = store.prMaintenance.get(input.recordId);
       if (!record || record.taskId !== id)

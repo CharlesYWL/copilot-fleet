@@ -2,6 +2,7 @@ import type {
   PrMaintenanceEnable,
   PrMaintenanceOperatorAction,
   PrMaintenanceRegistration,
+  PrMaintenanceProposal,
 } from "@fleet/protocol";
 import { api } from "../hooks/useFleet";
 
@@ -14,6 +15,7 @@ export type MaintenanceReviewReference = {
 
 export type TaskMaintenanceView = {
   records: PrMaintenanceRegistration[];
+  proposal?: PrMaintenanceProposal;
   canAuthorize: boolean;
   unsupportedReason?: string;
 };
@@ -28,6 +30,23 @@ export function enableTaskMaintenance(taskId: string, registration: PrMaintenanc
   return api<PrMaintenanceRegistration>(
     `/api/runs/${encodeURIComponent(taskId)}/pr-maintenance`,
     { method: "POST", body: JSON.stringify({ action: "enable", registration }) },
+  );
+}
+
+export function authorizeTaskMaintenanceProposal(
+  taskId: string,
+  proposal: Pick<PrMaintenanceProposal, "id" | "version">,
+) {
+  return api<PrMaintenanceRegistration>(
+    `/api/runs/${encodeURIComponent(taskId)}/pr-maintenance`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: "authorize_proposal",
+        proposalId: proposal.id,
+        expectedVersion: proposal.version,
+      }),
+    },
   );
 }
 

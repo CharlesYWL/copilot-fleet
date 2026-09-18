@@ -6,6 +6,7 @@ import type {
   MarkAllNotificationsReadResponse,
   Notification,
   PrMaintenanceRegistration,
+  PrMaintenanceProposal,
   Run,
   RunRole,
   RunStep,
@@ -545,6 +546,36 @@ export class NotificationService {
       navigation: { type: "run", runId: record.taskId },
       data: { recordId: record.id, reason },
     });
+  }
+
+  createPrMaintenanceProposal(proposal: PrMaintenanceProposal): InsertNotificationResult {
+    const { taskId, identity } = proposal.registration;
+    return this.insert({
+      sourceKey: `pr-maintenance-proposal:${proposal.id}:${proposal.version}`,
+      category: "orchestration",
+      kind: "pr_maintenance_attention",
+      severity: "info",
+      title: "PR maintenance needs your authorization",
+      body: `Review the proposed maintenance for ${identity.repository} #${identity.prNumber}. Nothing is enabled until you authorize its exact scope.`,
+      subject: {
+        type: "run",
+        id: taskId,
+        label: this.store.getRun(taskId)?.name ?? "Task",
+      },
+      navigation: { type: "run", runId: taskId },
+      data: {
+        proposalId: proposal.id,
+        proposalVersion: proposal.version,
+        reason: "authorization",
+      },
+    });
+  }
+
+  resolvePrMaintenanceProposal(proposal: PrMaintenanceProposal): void {
+    const notification = this.store.getNotificationBySourceKey(
+      `pr-maintenance-proposal:${proposal.id}:${proposal.version}`,
+    );
+    if (notification) this.resolve(notification.id);
   }
 
   createOrchestrationStepFailure(run: Run, step: RunStep): InsertNotificationResult {

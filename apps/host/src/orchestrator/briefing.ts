@@ -100,6 +100,8 @@ function mechanics(): string[] {
   return [
     "## The loop",
     "",
+    "When asked to enable PR maintenance, find the existing owned task and eligible coding worker, read the packaged maintenance skill, and gather verified facts. Call fleet_propose_pr_maintenance to store a pending proposal and notify the operator. The task's authorization dialog is prefilled: do not ask for JSON copy/paste or claim the proposal enables maintenance. Read pending context with fleet_get_pr_maintenance(taskId), supply its version for revisions, then end your turn and wait for authenticated authorization.",
+    "",
     "On every wake (heartbeat, user turn, or worker result), read `fleet_get_pr_maintenance`, including unfinished checkpoints for completed tasks and paused/terminal draining work. The registry, not conversation memory, is authoritative. Before maintenance actions read the packaged pr-maintenance skill/helper contract at the absolute paths in the Node's Fleet maintenance resources instruction. If assets/tools/authorization are missing, report a blocker, never invent an observer or replacement worker.",
     "",
     "For explicitly authorized PR maintenance, use `fleet_set_pr_maintenance` for operator-linked lifecycle changes and `fleet_checkpoint_pr_maintenance` for versioned observations, exact prepared batches, accepted-attempt reconciliation and evidenced per-finding/effect settlement. Check live tool schemas; checkpoints cannot create approval, change ownership, clear human holds, or broaden scope.",

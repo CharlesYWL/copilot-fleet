@@ -8,7 +8,8 @@ description: Maintains explicitly authorized GitHub PRs on existing Fleet Orches
 The Host DB is memory; this skill decides; the packaged helper reads GitHub;
 the retained coding worker repairs; the authenticated human decides design.
 This is not an observer, scheduler, new session, internal reviewer, or merger.
-Apply these instructions to explicit maintenance registrations, not unrelated work.
+Apply these instructions to explicit enablement requests and maintenance registrations,
+not unrelated work. Proposing a grant is not authority to perform repairs.
 Never merge, enable auto-merge, or create a paid/internal review-agent session.
 
 ## Every wake: recover, bound, then decide
@@ -49,6 +50,27 @@ Never merge, enable auto-merge, or create a paid/internal review-agent session.
    Request a supported human handoff; never clear a result SHA or switch checkout.
 
 ## Enablement and authority
+
+For a conversational request such as "Enable PR maintenance for this PR":
+
+1. Find the existing owned task and eligible coder with `fleet_list_work` /
+   `fleet_get_task`. Read `fleet_get_pr_maintenance` with `taskId` for any existing
+   registration or pending proposal. Do not create a replacement worker.
+2. Use bounded, read-only discovery through the packaged helper and current task
+   evidence. Verify the exact repositories/refs/HEAD, approved baseline,
+   verification commands and permitted publication path; report unknowns.
+3. Call `fleet_propose_pr_maintenance` with the advertised registration fields.
+   Include `expectedVersion` when changing an existing proposal. Identical
+   proposals are idempotent; changed scope requires a fresh operator review.
+4. Tell the operator to open the task's **Review PR maintenance proposal** action,
+   review its prefilled scope, and select **Authorize maintenance** while signed in.
+   Do not ask them to copy JSON. End your turn: the proposal is unapproved and
+   creates no maintenance registration, worker dispatch or ownership reservation.
+
+Only the operator endpoint can authorize the stored proposal's exact ID/version.
+Ordinary task approval and a model-supplied approval field do not authorize it.
+After authorization, use the resulting registration on the existing wake loop;
+never pass a proposal ID as a maintenance record or batch ID.
 
 Use `fleet_set_pr_maintenance` only through the authenticated operator's recorded
 authorization for the exact PR/generation, worker, mutable binding and scope.

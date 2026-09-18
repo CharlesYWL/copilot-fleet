@@ -6,6 +6,7 @@ import {
   WorkspaceModeSchema,
   AccessIntentSchema,
   PrMaintenanceCheckpointSchema,
+  PrMaintenanceEnableSchema,
   type PrMaintenanceAdmission,
   checkoutLockKey,
   type WorkspaceMode,
@@ -421,9 +422,27 @@ export const SetPrMaintenanceSchema = z
   })
   .strict();
 
+export const ProposePrMaintenanceSchema = PrMaintenanceEnableSchema.extend({
+  expectedVersion: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .describe(
+      "Current pending proposal version when replacing its contents. Omit for the first proposal.",
+    ),
+});
+
 export const GetPrMaintenanceSchema = z
   .object({
     recordId: z.string().min(1).optional(),
+    taskId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Read an owned task's pending authorization proposal and retained registration.",
+      ),
     limit: z.number().int().min(1).max(100).default(20),
     cursor: z.string().min(1).optional(),
     takeDue: z.boolean().default(false),
@@ -782,10 +801,62 @@ export class FleetTools {
     });
   }
 
+  proposePrMaintenance(input: z.infer<typeof ProposePrMaintenanceSchema>): ToolResult {
+    return this.maintenanceResult(() => {
+      const { expectedVersion, ...registration } = input;
+      const proposal = this.service.notifications.commitAtomically(() => {
+        const previous = this.store.prMaintenance.getProposal(
+          registration.taskId,
+          this.leadSessionId,
+        );
+        const proposed = this.store.prMaintenance.propose(
+          this.leadSessionId,
+          registration,
+          expectedVersion,
+        );
+        if (previous && previous.version !== proposed.version)
+          this.service.notifications.resolvePrMaintenanceProposal(previous);
+        this.service.notifications.createPrMaintenanceProposal(proposed);
+        return proposed;
+      });
+      this.service.publishSnapshot();
+      return {
+        proposalId: proposal.id,
+        version: proposal.version,
+        taskId: proposal.registration.taskId,
+        status: "awaiting_operator_authorization",
+        instruction:
+          "Nothing is enabled. The operator can open the task's PR maintenance panel and review the prefilled proposal. Do not ask them to copy JSON or dispatch maintenance work. End your turn.",
+      };
+    });
+  }
+
   getPrMaintenance(input: z.input<typeof GetPrMaintenanceSchema> = {}): ToolResult {
     const parsed = GetPrMaintenanceSchema.parse(input);
     return this.maintenanceResult(() => {
       const registry = this.store.prMaintenance;
+      if (parsed.taskId) {
+        if (parsed.recordId || parsed.takeDue || parsed.reserveRequests)
+          throw new PrMaintenanceError(
+            "invalid_scan",
+            "Read task context separately from a record or due-work claim.",
+          );
+        if (this.store.getRun(parsed.taskId)?.leadSessionId !== this.leadSessionId)
+          throw new PrMaintenanceError(
+            "ownership",
+            "That task does not belong to this lead.",
+          );
+        return {
+          ...registry.list({
+            leadSessionId: this.leadSessionId,
+            taskId: parsed.taskId,
+            retainedOnly: true,
+            limit: parsed.limit,
+            ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
+          }),
+          proposal: registry.getProposal(parsed.taskId, this.leadSessionId) ?? null,
+        };
+      }
       if (parsed.recordId) {
         const record = registry.get(parsed.recordId, this.leadSessionId);
         if (!record)
@@ -1791,10 +1862,17 @@ export class FleetTools {
       .filter((run) => {
         if (!words.length) return true;
         const steps = this.store.listRunSteps(run.id);
+        const proposal = this.store.prMaintenance.getProposal(run.id);
         const searchable = [
           run.id,
           run.name,
           run.objective,
+          ...(proposal?.leadSessionId === this.leadSessionId
+            ? [
+                proposal.registration.identity.repository,
+                String(proposal.registration.identity.prNumber),
+              ]
+            : []),
           this.store.getWorkspace(run.workspaceId)?.name ?? "",
           ...steps.flatMap((step) => [
             step.title,
@@ -1890,6 +1968,7 @@ export class FleetTools {
 
   private taskSummary(run: Run, steps: readonly RunStep[]): string {
     const placement = this.store.getPlacement(run.placementId);
+    const proposal = this.store.prMaintenance.getProposal(run.id);
     const maintenance = this.store.prMaintenance.list({
       taskId: run.id,
       leadSessionId: this.leadSessionId,
@@ -1917,6 +1996,11 @@ export class FleetTools {
         ? [`  pinned checkout: ${placement.nodeName}, ${placement.localPath}`]
         : []),
       `  budget: ${steps.length}/${run.policy.maxSessions} sessions, ${run.wakeSeq}/${run.policy.maxWakes} wakes`,
+      ...(proposal?.leadSessionId === this.leadSessionId
+        ? [
+            `  PR maintenance proposal: ${proposal.id} v${proposal.version} for ${proposal.registration.identity.repository} #${proposal.registration.identity.prNumber} - awaiting operator authorization, not enabled. Read fleet_get_pr_maintenance with taskId: "${run.id}".`,
+          ]
+        : []),
       ...maintenance.records.map(
         (record) =>
           `  PR maintenance: ${record.id} - ${record.lifecycle}${record.pauseReason ? ` (${record.pauseReason})` : ""}; read fleet_get_pr_maintenance before continuation.`,

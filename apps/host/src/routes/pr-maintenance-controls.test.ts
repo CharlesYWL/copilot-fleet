@@ -4,6 +4,8 @@ import { PrMaintenanceEnableSchema } from "@fleet/protocol";
 import { z } from "zod";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
+import { LeadTokens } from "../orchestrator/lead-tokens.js";
+import { mcpRoutes } from "../orchestrator/mcp-routes.js";
 import { orchestratorRoutes } from "./orchestrators.js";
 import { runRoutes } from "./runs.js";
 import { sessionRoutes } from "./sessions.js";
@@ -90,6 +92,9 @@ async function setup() {
   await app.register(orchestratorRoutes, { service, engine });
   await app.register(runRoutes, { service, engine });
   await app.register(sessionRoutes, { service });
+  const tokens = new LeadTokens(store);
+  const leadToken = tokens.mint(state.leadSubject);
+  await app.register(mcpRoutes, { service, tokens });
   await app.ready();
   cleanup.push(async () => {
     await app.close();
@@ -127,10 +132,236 @@ async function setup() {
       },
     );
   };
-  return { ...state, app, run, worker, step: step!, registration, authorize, hold };
+  const mcp = async (name: string, args: unknown) => {
+    const response = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${leadToken}`,
+        accept: "application/json, text/event-stream",
+      },
+      payload: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name, arguments: args },
+      },
+    });
+    const body = response.json<{
+      error?: { message: string };
+      result?: { isError?: boolean; content?: { text: string }[] };
+    }>();
+    return {
+      ok: !body.error && !body.result?.isError,
+      text:
+        body.error?.message ??
+        body.result?.content?.map((entry) => entry.text).join("\n") ??
+        "",
+    };
+  };
+  return {
+    ...state,
+    app,
+    run,
+    worker,
+    step: step!,
+    registration,
+    authorize,
+    hold,
+    mcp,
+    leadToken,
+  };
 }
 
 describe("authenticated PR maintenance controls", () => {
+  it("turns a scoped MCP request into a durable, idempotent proposal, not authorization or worker execution", async () => {
+    const { store, service, run, registration, mcp } = await setup();
+    store.setRunState(run.id, "completed");
+    const dispatch = vi.spyOn(service, "dispatch");
+    const first = await mcp("fleet_propose_pr_maintenance", registration);
+    expect(first.ok, first.text).toBe(true);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    expect(JSON.parse(first.text)).toMatchObject({
+      proposalId: proposal.id,
+      version: 1,
+      status: "awaiting_operator_authorization",
+    });
+    expect(store.prMaintenance.list().records).toHaveLength(0);
+    expect(
+      (
+        await mcp("fleet_set_pr_maintenance", {
+          recordId: proposal.id,
+          expectedVersion: 1,
+          action: "enable",
+        })
+      ).ok,
+    ).toBe(false);
+    expect(store.getRun(run.id)!.state).toBe("completed");
+    expect(dispatch).not.toHaveBeenCalled();
+    const duplicate = await mcp("fleet_propose_pr_maintenance", registration);
+    expect(JSON.parse(duplicate.text).proposalId).toBe(proposal.id);
+    expect(store.prMaintenance.getProposal(run.id)!.version).toBe(1);
+    expect(
+      store.getNotificationBySourceKey(`pr-maintenance-proposal:${proposal.id}:1`),
+    ).toMatchObject({
+      status: "active",
+      navigation: { type: "run", runId: run.id },
+    });
+    const context = await mcp("fleet_get_pr_maintenance", { taskId: run.id });
+    expect(JSON.parse(context.text)).toMatchObject({
+      proposal: { id: proposal.id },
+      records: [],
+    });
+    expect((await mcp("fleet_list_work", { query: "17" })).text).toContain(proposal.id);
+  });
+
+  it("authorizes only the exact stored proposal through an authenticated operator action", async () => {
+    const { app, store, run, registration, mcp, leadToken } = await setup();
+    expect((await mcp("fleet_propose_pr_maintenance", registration)).ok).toBe(true);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    const payload = {
+      action: "authorize_proposal",
+      proposalId: proposal.id,
+      expectedVersion: proposal.version,
+    };
+    for (const headers of [
+      {},
+      { authorization: `Bearer ${leadToken}` },
+      { "fixture-node": "yes" },
+    ]) {
+      const refused = await app.inject({
+        method: "POST",
+        url: `/api/runs/${run.id}/pr-maintenance`,
+        headers,
+        payload,
+      });
+      expect(refused.statusCode).toBe(403);
+    }
+    expect(store.prMaintenance.list().records).toHaveLength(0);
+    const swapped = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: { ...payload, registration: { ...registration, headSha: "b".repeat(40) } },
+    });
+    expect(swapped.statusCode).toBe(400);
+    const accepted = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload,
+    });
+    expect(accepted.statusCode, accepted.body).toBe(200);
+    expect(accepted.json()).toMatchObject({
+      lifecycle: "active",
+      authorization: { operatorId: "real-browser-principal", scope: registration.scope },
+    });
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(
+      store.getNotificationBySourceKey(`pr-maintenance-proposal:${proposal.id}:1`)
+        ?.status,
+    ).toBe("resolved");
+  });
+
+  it("requires a versioned proposal replacement and rejects authorization of the older scope", async () => {
+    const { app, store, run, registration, mcp } = await setup();
+    await mcp("fleet_propose_pr_maintenance", registration);
+    const first = store.prMaintenance.getProposal(run.id)!;
+    const revised = {
+      ...registration,
+      scope: {
+        ...registration.scope,
+        verification: "Run updated regression tests and lint",
+      },
+    };
+    expect((await mcp("fleet_propose_pr_maintenance", revised)).ok).toBe(false);
+    expect(
+      (
+        await mcp("fleet_propose_pr_maintenance", {
+          ...revised,
+          expectedVersion: first.version,
+        })
+      ).ok,
+    ).toBe(true);
+    const second = store.prMaintenance.getProposal(run.id)!;
+    expect(second).toMatchObject({ id: first.id, version: 2 });
+    expect(
+      store.getNotificationBySourceKey(`pr-maintenance-proposal:${first.id}:1`)?.status,
+    ).toBe("resolved");
+    const stale = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: {
+        action: "authorize_proposal",
+        proposalId: first.id,
+        expectedVersion: first.version,
+      },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(store.prMaintenance.list().records).toHaveLength(0);
+    expect(store.prMaintenance.getProposal(run.id)).toEqual(second);
+  });
+
+  it("cannot propose for a foreign task or overwrite an existing maintenance decision", async () => {
+    const { store, run, registration, mcp, hold } = await setup();
+    const foreign = store.createRun({
+      workspaceId: run.workspaceId,
+      name: "Foreign",
+      objective: "Another lead's work",
+    });
+    expect(
+      (await mcp("fleet_propose_pr_maintenance", { ...registration, taskId: foreign.id }))
+        .ok,
+    ).toBe(false);
+    expect((await mcp("fleet_get_pr_maintenance", { taskId: foreign.id })).ok).toBe(
+      false,
+    );
+    const held = hold();
+    expect((await mcp("fleet_propose_pr_maintenance", registration)).ok).toBe(false);
+    expect(store.prMaintenance.get(held.id)?.decision?.state).toBe("pending");
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+  });
+
+  it("rolls back an invisible proposal if recording its human notification fails", async () => {
+    const { store, service, run, registration, mcp } = await setup();
+    const broadcast = vi.spyOn(service, "broadcast");
+    vi.spyOn(service.notifications, "createPrMaintenanceProposal").mockImplementation(
+      () => {
+        throw new Error("simulated notification failure");
+      },
+    );
+    expect((await mcp("fleet_propose_pr_maintenance", registration)).ok).toBe(false);
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
+  it("rolls back authorization if its linked proposal notification cannot be resolved", async () => {
+    const { app, store, service, run, registration, mcp } = await setup();
+    await mcp("fleet_propose_pr_maintenance", registration);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    const broadcast = vi.spyOn(service, "broadcast");
+    vi.spyOn(service.notifications, "resolvePrMaintenanceProposal").mockImplementation(
+      () => {
+        throw new Error("simulated resolution failure");
+      },
+    );
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: {
+        action: "authorize_proposal",
+        proposalId: proposal.id,
+        expectedVersion: proposal.version,
+      },
+    });
+    expect(response.statusCode).toBe(500);
+    expect(store.prMaintenance.list().records).toHaveLength(0);
+    expect(store.prMaintenance.getProposal(run.id)).toEqual(proposal);
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
   it("cannot authorize with fabricated actor, Node credentials, or no browser principal", async () => {
     const { app, run, registration, store, authorize } = await setup();
     for (const headers of [{}, { "fixture-node": "yes" }]) {

@@ -217,6 +217,18 @@ describe("what the orchestrator is told", () => {
     expect(text).toContain("waiting on dispatched work");
   });
 
+  it("routes enablement through a pending proposal instead of JSON copying or self-authorization", () => {
+    for (const text of [
+      orchestratorBriefing("nodes", { hasAgent: true }),
+      orchestratorBriefing("nodes", { hasAgent: false }),
+      agentFile,
+    ]) {
+      expect(text).toContain("fleet_propose_pr_maintenance");
+      expect(text).toMatch(/prefilled/i);
+      expect(text).toMatch(/authenticated authorization/i);
+    }
+  });
+
   it("recovers maintenance on all wake types without reopening a completed task", () => {
     const status = statusCheckEnvelope([], { ids: ["maintenance-1"], count: 1 });
     const wake = wakeEnvelope({

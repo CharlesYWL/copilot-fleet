@@ -3,11 +3,18 @@ import { FluentProvider } from "@fluentui/react-components";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PrMaintenanceRegistrationSchema,
+  PrMaintenanceProposalSchema,
   RunPolicySchema,
+  type FleetSession,
   type Run,
 } from "@fleet/protocol";
 import { fleetDarkTheme } from "../../theme";
-import { actOnTaskMaintenance, getTaskMaintenance } from "../../lib/pr-maintenance";
+import {
+  actOnTaskMaintenance,
+  authorizeTaskMaintenanceProposal,
+  enableTaskMaintenance,
+  getTaskMaintenance,
+} from "../../lib/pr-maintenance";
 import { PrMaintenancePanel } from "./PrMaintenancePanel";
 import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
 import { buildRunViewModels } from "../../lib/orchestration-view";
@@ -16,6 +23,7 @@ vi.mock("../../lib/pr-maintenance", () => ({
   getTaskMaintenance: vi.fn(),
   actOnTaskMaintenance: vi.fn(),
   enableTaskMaintenance: vi.fn(),
+  authorizeTaskMaintenanceProposal: vi.fn(),
 }));
 vi.mock("./ManagedWorktreePanel", () => ({ ManagedWorktreePanel: () => null }));
 
@@ -95,6 +103,48 @@ const show = () =>
     </FluentProvider>,
   );
 
+const worker: FleetSession = {
+  id: "worker",
+  workspaceId: "workspace",
+  workspaceName: "Repository",
+  placementId: "placement",
+  nodeId: "node",
+  nodeName: "Node",
+  state: "idle",
+  name: "Original coder",
+  initialPrompt: "Implement the task",
+  currentActivity: "",
+  lastText: "",
+  createdAt: at,
+  updatedAt: at,
+  agentSessionId: "native-worker",
+  yolo: false,
+  commands: [],
+  configOptions: [],
+  runId: task.id,
+  runRole: "worker",
+  readOnly: false,
+};
+const proposal = () => {
+  const record = registration();
+  return PrMaintenanceProposalSchema.parse({
+    id: "proposal",
+    version: 1,
+    leadSessionId: "lead",
+    createdAt: at,
+    updatedAt: at,
+    registration: {
+      taskId: task.id,
+      workerSessionId: worker.id,
+      identity: record.identity,
+      scope: record.authorization.scope,
+      budgets: record.authorization.budgets,
+      headSha: record.authorization.headSha,
+      eligibilityEvidence: record.eligibilityEvidence,
+    },
+  });
+};
+
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(getTaskMaintenance).mockResolvedValue({
@@ -104,6 +154,95 @@ beforeEach(() => {
 });
 
 describe("PR maintenance task controls", () => {
+  it("reviews a prefilled proposal without copying JSON and authorizes only its captured reference", async () => {
+    const pending = proposal();
+    const enabled = { ...registration(), lifecycle: "active" as const, pauseReason: "" };
+    vi.mocked(getTaskMaintenance)
+      .mockResolvedValueOnce({ records: [], proposal: pending, canAuthorize: true })
+      .mockResolvedValue({ records: [enabled], canAuthorize: true });
+    vi.mocked(authorizeTaskMaintenanceProposal).mockResolvedValue(enabled);
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel
+          run={{ ...task, state: "completed" }}
+          sessions={[worker]}
+          onChange={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Review PR maintenance proposal" }),
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(
+      within(dialog).queryByRole("textbox", { name: "Registration proposal" }),
+    ).toBeNull();
+    expect(within(dialog).getByText(/Original coder/)).toBeTruthy();
+    const authorize = within(dialog).getByRole("button", {
+      name: "Authorize maintenance",
+    });
+    expect((authorize as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    fireEvent.click(authorize);
+    await waitFor(() =>
+      expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledWith(task.id, {
+        id: "proposal",
+        version: 1,
+      }),
+    );
+    expect(enableTaskMaintenance).not.toHaveBeenCalled();
+  });
+
+  it("does not retarget an open authorization dialog when the Orchestrator revises the proposal", async () => {
+    const pending = proposal();
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [],
+      proposal: pending,
+      canAuthorize: true,
+    });
+    const onChange = vi.fn();
+    const panel = (snapshotRevision: number) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel
+          run={{ ...task, state: "completed" }}
+          sessions={[worker]}
+          onChange={onChange}
+          snapshotRevision={snapshotRevision}
+        />
+      </FluentProvider>
+    );
+    const rendered = render(panel(1));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Review PR maintenance proposal" }),
+    );
+    const dialog = screen.getByRole("dialog");
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [],
+      canAuthorize: true,
+      proposal: {
+        ...pending,
+        version: 2,
+        registration: {
+          ...pending.registration,
+          scope: {
+            ...pending.registration.scope,
+            verification: "New verification command",
+          },
+        },
+      },
+    });
+    rendered.rerender(panel(2));
+    expect(await within(dialog).findByRole("alert")).toBeTruthy();
+    const authorize = within(dialog).getByRole("button", {
+      name: "Authorize maintenance",
+    });
+    expect((authorize as HTMLButtonElement).disabled).toBe(true);
+    expect(within(dialog).getByText(/Run regression tests/)).toBeTruthy();
+    fireEvent.click(authorize);
+    expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
+  });
+
   it("refreshes maintenance-only snapshot revisions without a task timestamp change", async () => {
     const onChange = vi.fn();
     const panel = (snapshotRevision: number) => (

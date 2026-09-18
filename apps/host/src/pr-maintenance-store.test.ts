@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   PrMaintenanceEnableSchema,
+  HostBackupSchema,
   type PrMaintenanceCheckpoint,
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
@@ -236,6 +237,59 @@ function publishedRepair(f: ReturnType<typeof setup>) {
 }
 
 describe("durable PR maintenance registry", () => {
+  it("preserves pending proposals in backups without restoring authorization", () => {
+    const f = setup();
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    const backup = f.store.exportHostBackup({ enrollmentToken: "fixture-enrollment" });
+    const restored = storeAt();
+    restored.replaceHostBackup(backup);
+    expect(restored.prMaintenance.getProposal(f.task.id)).toEqual(proposal);
+    expect(restored.prMaintenance.list().records).toHaveLength(0);
+    const { proposals: _proposals, ...legacy } = backup.prMaintenance!;
+    restored.replaceHostBackup(
+      HostBackupSchema.parse({ ...backup, prMaintenance: legacy }),
+    );
+    expect(restored.prMaintenance.getProposal(f.task.id)).toBeUndefined();
+  });
+
+  it("rechecks ownership and binding on proposal authorization, and never clears an existing grant", () => {
+    const f = setup();
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    const other = f.store.createSession(f.placement, "Other lead", false, "", {
+      runRole: "lead",
+    });
+    f.store.updateRun(f.task.id, { leadSessionId: other.id });
+    expect(() =>
+      f.store.prMaintenance.authorizeProposal(
+        f.task.id,
+        proposal.id,
+        proposal.version,
+        "operator",
+      ),
+    ).toThrow(/owner changed/);
+    expect(f.store.prMaintenance.list().records).toHaveLength(0);
+    f.store.updateRun(f.task.id, { leadSessionId: f.lead.id });
+    f.store.updateRunStep(f.step.id, { resultSha: sha });
+    const record = f.store.prMaintenance.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "operator",
+    );
+    expect(record.authorization.operatorId).toBe("operator");
+    expect(record).toMatchObject({
+      lifecycle: "paused",
+      pauseReason: "sealed_managed_result",
+    });
+    expect(f.store.prMaintenance.getProposal(f.task.id)).toBeUndefined();
+    expect(() => f.store.prMaintenance.propose(f.lead.id, f.input)).toThrow(
+      /already retains/,
+    );
+    expect(f.store.prMaintenance.get(record.id)?.authorization).toEqual(
+      record.authorization,
+    );
+  });
+
   it("invalidates HEAD-A readiness after a known repair publication to HEAD B", () => {
     const f = setup();
     let record = publishedRepair(f);

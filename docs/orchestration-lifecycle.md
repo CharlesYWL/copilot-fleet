@@ -131,6 +131,16 @@ overwrite newer state. MCP may propose bounded maintenance but cannot fabricate
 the browser operator's authorization. Unknown helper/credentials/publication
 evidence and unsupported immutable/standalone bindings fail closed.
 
+`fleet_propose_pr_maintenance` lets the owning lead prepare a durable, unapproved
+proposal for an existing eligible worker. It changes neither task state nor
+maintenance authority and dispatches no worker. The operator receives an existing
+task notification and reviews the prefilled authorization dialog. Approval uses
+`authorize_proposal` with the captured proposal ID/version, then revalidates the
+binding through normal operator enablement. A changed proposal requires review
+again; task approval is not maintenance approval. Proposals survive backup and
+restart without acquiring authority. Read them through
+`fleet_get_pr_maintenance(taskId)` or the existing task discovery surfaces.
+
 | Action | Maintenance effect |
 |---|---|
 | Task Approve / aggregate | Reject a pending design decision; readiness does not authorize completion or redesign |

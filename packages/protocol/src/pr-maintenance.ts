@@ -104,6 +104,18 @@ export const PrMaintenanceEnableSchema = z
   .strict();
 export type PrMaintenanceEnable = z.infer<typeof PrMaintenanceEnableSchema>;
 
+export const PrMaintenanceProposalSchema = z
+  .object({
+    id,
+    version: z.number().int().positive(),
+    leadSessionId: id,
+    registration: PrMaintenanceEnableSchema,
+    createdAt: time,
+    updatedAt: time,
+  })
+  .strict();
+export type PrMaintenanceProposal = z.infer<typeof PrMaintenanceProposalSchema>;
+
 export const PrMaintenanceSourceSchema = z
   .object({
     id,
@@ -519,6 +531,7 @@ export const PrMaintenanceBackupSchema = z
     registrations: z.array(PrMaintenanceRegistrationSchema).max(10_000),
     wakes: z.array(PrMaintenanceWakeSchema).max(100_000),
     scans: z.array(PrMaintenanceScanSchema).max(10_000),
+    proposals: z.array(PrMaintenanceProposalSchema).max(10_000).default([]),
   })
   .strict();
 export type PrMaintenanceBackup = z.infer<typeof PrMaintenanceBackupSchema>;

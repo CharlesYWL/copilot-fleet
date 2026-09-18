@@ -11,6 +11,7 @@ import {
   PrMaintenanceDecisionInputSchema,
   PrMaintenanceEnableSchema,
   PrMaintenanceOperatorActionSchema,
+  PrMaintenanceProposalSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceScanSchema,
   PrMaintenanceWakeSchema,
@@ -21,6 +22,7 @@ import {
   type PrMaintenanceEffect,
   type PrMaintenanceObservation,
   type PrMaintenanceOperatorAction,
+  type PrMaintenanceProposal,
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
@@ -116,6 +118,10 @@ export class PrMaintenanceStore {
       CREATE TABLE IF NOT EXISTS pr_maintenance_scans (
         lead_session_id TEXT PRIMARY KEY, data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS pr_maintenance_proposals (
+        task_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+        data TEXT NOT NULL
+      );
     `);
     if (
       Number(db.prepare("SELECT version FROM pr_maintenance_schema").get()?.version) !== 1
@@ -175,6 +181,125 @@ export class PrMaintenanceStore {
       .prepare("SELECT data FROM pr_maintenance WHERE released_at IS NULL")
       .all()
       .map((row) => PrMaintenanceRegistrationSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  getProposal(taskId: string, leadSessionId?: string): PrMaintenanceProposal | undefined {
+    const row = this.db
+      .prepare("SELECT data FROM pr_maintenance_proposals WHERE task_id=?")
+      .get(taskId);
+    if (!row) return undefined;
+    const proposal = PrMaintenanceProposalSchema.parse(JSON.parse(String(row.data)));
+    if (leadSessionId !== undefined && proposal.leadSessionId !== leadSessionId)
+      refuse("ownership", "Maintenance proposal belongs to another lead.");
+    return proposal;
+  }
+
+  propose(
+    leadSessionId: string,
+    input: z.input<typeof PrMaintenanceEnableSchema>,
+    expectedVersion?: number,
+  ): PrMaintenanceProposal {
+    const registration = PrMaintenanceEnableSchema.parse(input);
+    return this.store.writeAtomically(() => {
+      const { task, worker, lead } = this.ownedWorker(
+        registration.taskId,
+        registration.workerSessionId,
+      );
+      if (lead.id !== leadSessionId)
+        refuse("ownership", "Only the task's owning lead can propose maintenance.");
+      if (this.retained().some((record) => record.taskId === task.id))
+        refuse(
+          "already_registered",
+          "This task already retains maintenance; use its existing registration.",
+        );
+      const bindingReason = this.binding({
+        taskId: task.id,
+        workerSessionId: worker.id,
+        leadSessionId,
+        placementId: worker.placementId,
+        checkoutKey:
+          worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`,
+        bindingGeneration: worker.executionBinding?.generation ?? 0,
+      });
+      if (bindingReason)
+        refuse(bindingReason, "This worker binding cannot be proposed for maintenance.");
+      if (
+        !["running", "awaiting_lead", "completed"].includes(task.state) ||
+        worker.stopRequested ||
+        !(
+          worker.state === "idle" ||
+          (["completed", "stopped"].includes(worker.state) && worker.agentSessionId)
+        ) ||
+        this.store
+          .listRunSteps(task.id)
+          .some(
+            (step) =>
+              step.sessionId === worker.id &&
+              !["succeeded", "failed", "cancelled", "skipped"].includes(step.state),
+          )
+      )
+        refuse(
+          "proposal_not_ready",
+          "Settle existing work and task approvals before proposing maintenance.",
+        );
+      const previous = this.getProposal(task.id, leadSessionId);
+      if (previous && isDeepStrictEqual(previous.registration, registration))
+        return previous;
+      if (previous?.version !== expectedVersion)
+        refuse(
+          "version_conflict",
+          "Read the current proposal and supply its version before replacing it.",
+        );
+      if (
+        !previous &&
+        Number(
+          this.db.prepare("SELECT COUNT(*) count FROM pr_maintenance_proposals").get()
+            ?.count,
+        ) >= 10_000
+      )
+        refuse(
+          "proposal_overflow",
+          "The bounded proposal registry is full; remove obsolete tasks before proposing more maintenance.",
+        );
+      const now = nowIso();
+      const proposal = PrMaintenanceProposalSchema.parse({
+        id: previous?.id ?? randomUUID(),
+        version: (previous?.version ?? 0) + 1,
+        leadSessionId,
+        registration,
+        createdAt: previous?.createdAt ?? now,
+        updatedAt: now,
+      });
+      this.db
+        .prepare(
+          `INSERT INTO pr_maintenance_proposals(task_id,data) VALUES (?,?)
+        ON CONFLICT(task_id) DO UPDATE SET data=excluded.data`,
+        )
+        .run(task.id, JSON.stringify(proposal));
+      return proposal;
+    });
+  }
+
+  authorizeProposal(
+    taskId: string,
+    proposalId: string,
+    expectedVersion: number,
+    actorId: string,
+  ): PrMaintenanceRegistration {
+    return this.store.writeAtomically(() => {
+      const proposal = this.getProposal(taskId);
+      if (!proposal || proposal.id !== proposalId || proposal.version !== expectedVersion)
+        refuse(
+          "version_conflict",
+          "The proposal changed or was already handled. Refresh and review it again.",
+        );
+      if (this.store.getRun(taskId)?.leadSessionId !== proposal.leadSessionId)
+        refuse(
+          "ownership",
+          "The task owner changed; its current lead must prepare a new proposal.",
+        );
+      return this.enableFromOperator(proposal.registration, actorId);
+    });
   }
 
   private required(
@@ -363,6 +488,29 @@ export class PrMaintenanceStore {
     return undefined;
   }
 
+  private ownedWorker(taskId: string, workerSessionId: string) {
+    const task = this.store.getRun(taskId);
+    const worker = this.store.getSession(workerSessionId);
+    const lead = task && this.store.getSession(task.leadSessionId);
+    if (
+      !task ||
+      !worker ||
+      !lead ||
+      lead.runRole !== "lead" ||
+      worker.runId !== task.id ||
+      worker.runRole !== "worker" ||
+      !this.store.listRunSteps(task.id).some((step) => step.sessionId === worker.id)
+    )
+      refuse(
+        "ownership",
+        "Enablement requires the task's existing lead-owned worker, not a standalone or replacement session.",
+      );
+    this.store.assertRunMutable(task.id);
+    this.store.assertSessionMutable(lead.id);
+    this.store.assertSessionMutable(worker.id);
+    return { task, worker, lead };
+  }
+
   /** This is an operator-route seam; never expose it as an MCP/model capability. */
   enableFromOperator(
     input: z.input<typeof PrMaintenanceEnableSchema>,
@@ -371,25 +519,10 @@ export class PrMaintenanceStore {
     const parsed = PrMaintenanceEnableSchema.parse(input);
     const operatorId = actorSchema.parse(actorId);
     return this.store.writeAtomically(() => {
-      const task = this.store.getRun(parsed.taskId);
-      const worker = this.store.getSession(parsed.workerSessionId);
-      const lead = task && this.store.getSession(task.leadSessionId);
-      if (
-        !task ||
-        !worker ||
-        !lead ||
-        lead.runRole !== "lead" ||
-        worker.runId !== task.id ||
-        worker.runRole !== "worker" ||
-        !this.store.listRunSteps(task.id).some((step) => step.sessionId === worker.id)
-      )
-        refuse(
-          "ownership",
-          "Enablement requires the task's existing lead-owned worker, not a standalone or replacement session.",
-        );
-      this.store.assertRunMutable(task.id);
-      this.store.assertSessionMutable(lead.id);
-      this.store.assertSessionMutable(worker.id);
+      const { task, worker, lead } = this.ownedWorker(
+        parsed.taskId,
+        parsed.workerSessionId,
+      );
       const retained = this.retained();
       const previous = retained.find(
         (entry) =>
@@ -501,7 +634,11 @@ export class PrMaintenanceStore {
               ? "stopped"
               : undefined);
       if (reason) this.pause(record, reason, now);
-      return this.write(record, true);
+      const saved = this.write(record, true);
+      this.db
+        .prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?")
+        .run(task.id);
+      return saved;
     });
   }
 
@@ -1916,6 +2053,10 @@ export class PrMaintenanceStore {
         .prepare("SELECT data FROM pr_maintenance_scans ORDER BY lead_session_id")
         .all()
         .map((row) => JSON.parse(String(row.data))),
+      proposals: this.db
+        .prepare("SELECT data FROM pr_maintenance_proposals ORDER BY task_id")
+        .all()
+        .map((row) => JSON.parse(String(row.data))),
     });
   }
 
@@ -1923,7 +2064,7 @@ export class PrMaintenanceStore {
   importBackup(input: PrMaintenanceBackup | undefined): void {
     const backup = input ? PrMaintenanceBackupSchema.parse(input) : undefined;
     this.db.exec(
-      "DELETE FROM pr_maintenance; DELETE FROM pr_maintenance_wakes; DELETE FROM pr_maintenance_scans;",
+      "DELETE FROM pr_maintenance; DELETE FROM pr_maintenance_wakes; DELETE FROM pr_maintenance_scans; DELETE FROM pr_maintenance_proposals;",
     );
     for (const record of backup?.registrations ?? []) {
       if (!record.ownershipReleasedAt) {
@@ -1947,5 +2088,9 @@ export class PrMaintenanceStore {
       this.db
         .prepare("INSERT INTO pr_maintenance_scans VALUES (?,?)")
         .run(scan.leadSessionId, JSON.stringify(scan));
+    for (const proposal of backup?.proposals ?? [])
+      this.db
+        .prepare("INSERT INTO pr_maintenance_proposals(task_id,data) VALUES (?,?)")
+        .run(proposal.registration.taskId, JSON.stringify(proposal));
   }
 }

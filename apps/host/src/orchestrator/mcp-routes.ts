@@ -24,6 +24,7 @@ import {
   GetPrMaintenanceSchema,
   ListWorkSchema,
   PlanTaskSchema,
+  ProposePrMaintenanceSchema,
   ReopenTaskSchema,
   SessionRefSchema,
   SetPrMaintenanceSchema,
@@ -460,6 +461,19 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
   );
 
   server.registerTool(
+    "fleet_propose_pr_maintenance",
+    {
+      title: "Propose PR maintenance for human authorization",
+      description:
+        "When the user asks to enable PR maintenance, collect verified PR/task/worker facts and propose the bounded scope here. This stores an unapproved proposal and notifies the operator; it cannot enable maintenance or grant permissions. The existing task authorization dialog is prefilled, so never ask the user to copy JSON. Read an existing proposal with fleet_get_pr_maintenance(taskId) before revising it. End your turn after proposing.",
+      inputSchema: ProposePrMaintenanceSchema.shape,
+    },
+    guard("fleet_propose_pr_maintenance", ProposePrMaintenanceSchema, (input) =>
+      tools.proposePrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
     "fleet_set_pr_maintenance",
     {
       title: "Set owned PR maintenance",
@@ -477,7 +491,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Read PR maintenance and claim due work",
       description:
-        "Read this lead's durable registrations on every wake. List bounded summaries with nextCursor, or read a complete record by recordId. takeDue claims the next persisted oldest-due visit and reserves a bounded helper request allowance for this Host-recorded turn; it does not start a worker. A lost claim stays charged. Reconcile paused or terminal work without repairs.",
+        "Read this lead's durable registrations on every wake. Use taskId for an owned task's pending authorization proposal and retained registration. List bounded summaries with nextCursor, or read a complete record by recordId. takeDue claims the next persisted oldest-due visit and reserves a bounded helper request allowance for this Host-recorded turn; it does not start a worker. A lost claim stays charged. Reconcile paused or terminal work without repairs.",
       inputSchema: GetPrMaintenanceSchema.shape,
     },
     guard("fleet_get_pr_maintenance", GetPrMaintenanceSchema, (input) =>

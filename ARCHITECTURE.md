@@ -315,6 +315,12 @@ eligible worker through the existing follow-up path. Browser task actions supply
 human authorization; MCP cannot mint an operator principal or approve its own
 scope. Node credentials and provider tokens stay on their existing boundary.
 
+Conversational enablement uses `fleet_propose_pr_maintenance` to save one versioned,
+unapproved proposal per task and publish an existing task notification. The task
+dialog is prefilled, and the authenticated operator approves the stored ID/version.
+Proposal creation never dispatches a worker or reserves PR ownership; activation
+reuses normal enablement checks and consumes the proposal atomically.
+
 Registrations separately retain identity/binding, lifecycle, optimistic version,
 authorization, decisions, observations, batches, per-finding outcomes, remote
 effects and budgets. A terminal PR is not a settled batch. PR, remote head-ref and
