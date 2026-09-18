@@ -282,6 +282,27 @@ describe("TerminalView composer", () => {
 });
 
 describe("TerminalView transcript", () => {
+  it("shows one Output label per consecutive group and keeps errors separate", () => {
+    const { container } = show({}, EMPTY_DRAFT, [
+      streamEvent("system", { text: "Agency startup" }),
+      streamEvent("system", { text: "Resolving Copilot CLI..." }),
+      streamEvent("system", { text: "Launched MCP proxies:\n  - calendar\n  - workiq" }),
+      streamEvent("error", { message: "Copilot did not become ready" }),
+      streamEvent("system", { text: "Retrying startup" }),
+      streamEvent("system", { text: "Copilot CLI resolved" }),
+    ]);
+
+    expect(screen.getAllByText("Output")).toHaveLength(2);
+    expect(screen.getAllByText("Error")).toHaveLength(1);
+    const notes = [...container.querySelectorAll("p")];
+    expect(notes.map((note) => note.textContent)).toEqual([
+      "Agency startup\nResolving Copilot CLI...\nLaunched MCP proxies:\n  - calendar\n  - workiq",
+      "Copilot did not become ready",
+      "Retrying startup\nCopilot CLI resolved",
+    ]);
+    expect(getComputedStyle(notes[0]!).whiteSpace).toBe("pre-wrap");
+  });
+
   it("offers Jump to latest on an idle transcript without waiting for new output", () => {
     show({}, EMPTY_DRAFT, [streamEvent("agent_text", { text: "An existing answer" })]);
     const transcript = screen.getByRole("region", { name: "Chat transcript" });

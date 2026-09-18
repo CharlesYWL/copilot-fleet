@@ -38,16 +38,21 @@ const noisyStates = new Set(["queued", "starting", "running", "idle", "cancellin
 
 /**
  * Collapses the raw ACP event stream into terminal lines: streamed text chunks
- * become one flowing block and repeated tool updates collapse onto one line.
+ * become one flowing block, consecutive output shares one block, and repeated
+ * tool updates collapse onto one line.
  */
 export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
   const blocks: TerminalBlock[] = [];
   const toolBlockIndex = new Map<string, number>();
 
-  const appendMerged = (kind: "agent" | "thought", event: SessionEvent, text: string) => {
+  const appendMerged = (
+    kind: "agent" | "thought" | "system",
+    event: SessionEvent,
+    text: string,
+  ) => {
     const last = blocks[blocks.length - 1];
     if (last?.kind === kind) {
-      last.text += text;
+      last.text += (kind === "system" ? "\n" : "") + text;
       return;
     }
     blocks.push({ key: event.eventId, kind, text, createdAt: event.createdAt });
@@ -118,15 +123,18 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
       const payload = eventPayload(event, "system");
       const text = payload?.text ?? "";
       if (!text) continue;
-      const isUser = text.startsWith(USER_PREFIX);
-      const prompt = isUser ? text.slice(USER_PREFIX.length) : text;
+      if (!text.startsWith(USER_PREFIX)) {
+        appendMerged("system", event, text);
+        continue;
+      }
+      const prompt = text.slice(USER_PREFIX.length);
 
       /*
        * Fleet control envelopes use the prompt channel to reach the agent,
        * but are not chat prompts. Reuse the wake's folded step instead of the
        * operator's column (and its prompt-rail marks).
        */
-      const control = isUser ? parseFleetControl(prompt) : undefined;
+      const control = parseFleetControl(prompt);
       if (control) {
         blocks.push({
           key: event.eventId,
@@ -141,7 +149,7 @@ export function toTerminalBlocks(events: SessionEvent[]): TerminalBlock[] {
 
       blocks.push({
         key: event.eventId,
-        kind: isUser ? "user" : "system",
+        kind: "user",
         text: prompt,
         createdAt: event.createdAt,
         // The bytes are never stored, so this list is the only trace a prompt
