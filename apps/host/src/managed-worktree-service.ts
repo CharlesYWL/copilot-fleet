@@ -1293,6 +1293,44 @@ export class ManagedWorktreeService {
     if (!operation.result) return undefined;
     if (
       !operation.result.ok &&
+      ["registry_moved", "registry_mismatch", "registry_locked"].includes(
+        operation.result.code,
+      )
+    ) {
+      const repairId = this.aggregationOperationId(run, `repair-${phase}`, tree.id);
+      const existingRepair = this.store.getWorktreeOperation(repairId);
+      const repair = existingRepair?.result
+        ? existingRepair
+        : existingRepair
+          ? await this.send(existingRepair, 30_000)
+          : await this.requestWorkspace(run.id, tree.id, tree.generation, {
+              kind: "reconcile",
+              actor: "host-finalization-controller",
+              operationId: repairId,
+              expectedVersion: operation.result.worktree?.version ?? tree.version,
+              workspaceKind: tree.workspaceKind,
+              ownerStepId: tree.ownerStepId,
+            });
+      if (!repair.result) return undefined;
+      if (!repair.result.ok)
+        throw new WorktreeConflict(
+          repair.result.code || "reconciliation_failed",
+          repair.result.error || "Automatic Git administration repair failed.",
+        );
+      const binding = this.store.getRun(run.id)?.workspaceBinding;
+      if (binding)
+        this.setAggregation(run.id, {
+          aggregationAttempt: Math.max(1, binding.aggregationAttempt) + 1,
+          aggregationCode: "",
+          aggregationSummary:
+            "Fleet repaired stale Git worktree administration and is resuming finalization.",
+        });
+      const timer = setTimeout(() => this.advanceAggregation(run.id), 0);
+      timer.unref();
+      return undefined;
+    }
+    if (
+      !operation.result.ok &&
       operation.result.retryable &&
       ["quiesce", "cleanup"].includes(phase) &&
       !/(dirty|unknown|reconcil|mismatch|conflict)/i.test(operation.result.code)

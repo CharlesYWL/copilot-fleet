@@ -430,6 +430,18 @@ Temporary Fleet worktrees and owned private refs are removed only after sealed
 results and receipts make recovery safe. Cleanup never deletes adopted or
 user-created refs.
 
+The managed-worktree policy may explicitly enable `cleanupIgnoredOnly`. When
+enabled, Fleet deletes only Git-classified ignored output with `git clean -fdX`
+after confirming there are no staged, unstaged or ordinary untracked files.
+Sensitive-looking ignored paths still block cleanup. The default remains disabled.
+
+Reconciliation automatically repairs stale Git administrative paths with
+`git worktree repair` only when the original checkout still has the recorded
+physical identity, repository common directory, branch, HEAD, managed-root owner
+marker and safe process ownership, and the stale registered path is physically
+absent. A live conflicting path, branch/HEAD disagreement, unknown process owner
+or identity mismatch remains a non-destructive attention state.
+
 **Abandon ownership** is deliberately nondestructive v1: an exact branch/path
 confirmation relinquishes Fleet management while keeping files and branch.
 It still verifies ownership, containment, no active session and no unresolved

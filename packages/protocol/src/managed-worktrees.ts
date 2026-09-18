@@ -154,6 +154,7 @@ export const ManagedWorktreePolicySchema = z.object({
   maxPerNode: z.number().int().min(1).max(1024).default(32),
   freeSpaceFloorBytes: z.number().int().nonnegative().default(1_073_741_824),
   byteBudget: z.number().int().positive().default(10_737_418_240),
+  cleanupIgnoredOnly: z.boolean().default(false),
 });
 export type ManagedWorktreePolicy = z.infer<typeof ManagedWorktreePolicySchema>;
 

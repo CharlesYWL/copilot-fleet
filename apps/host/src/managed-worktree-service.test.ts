@@ -863,6 +863,51 @@ describe("Host managed workspace orchestration", () => {
     expect(kit.store.listNotifications().notifications).toHaveLength(1);
   });
 
+  it("repairs stale Git administration and resumes finalization automatically", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit);
+    kit.frames.splice(0);
+    kit.service.worktrees.advanceAggregation(run.id);
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(0);
+    const quiesce = lastRequest(kit.frames);
+    expect(quiesce.kind).toBe("quiesce");
+    const current = kit.store.getAnyManagedWorkspace(quiesce.worktreeId)!;
+    kit.service.worktrees.handleResult(
+      kit.node.id,
+      WorktreeOperationResultSchema.parse({
+        operationId: quiesce.operationId,
+        worktreeId: quiesce.worktreeId,
+        generation: quiesce.generation,
+        nodeId: quiesce.nodeId,
+        hostInstallationId: quiesce.hostInstallationId,
+        ok: false,
+        retryable: false,
+        code: "registry_moved",
+        error: "Git registration points to a stale missing path.",
+        worktree: { ...current, version: quiesce.expectedVersion + 1 },
+        acknowledgedAt: new Date().toISOString(),
+      }),
+    );
+
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(1);
+    const repair = lastRequest(kit.frames);
+    expect(repair).toMatchObject({
+      kind: "reconcile",
+      actor: "host-finalization-controller",
+    });
+    kit.service.worktrees.handleResult(kit.node.id, operationResult(kit.store, repair));
+
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(2);
+    expect(lastRequest(kit.frames)).toMatchObject({
+      kind: "quiesce",
+      worktreeId: current.id,
+    });
+    expect(kit.store.getRun(run.id)?.workspaceBinding).toMatchObject({
+      aggregationAttempt: 2,
+      aggregationState: "in_progress",
+    });
+  });
+
   it("uses plan-approved recovery for transient Node loss without blocking the task", async () => {
     vi.useFakeTimers();
     const kit = fixture();

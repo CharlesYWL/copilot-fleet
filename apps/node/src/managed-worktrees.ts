@@ -2339,16 +2339,18 @@ export class ManagedWorktrees {
     admin: CheckoutLease,
   ): Promise<{ worktree: ManagedWorktree; integration?: WorktreeIntegration }> {
     this.recoverTaskMaintenance(tree);
-    const entries = await this.registry(tree);
-    if (
-      entries.some(
-        (entry) => entry.branch === tree.branchRef && !samePath(entry.path, tree.path),
-      )
-    ) {
-      throw new WorktreeConflict(
-        "registry_moved",
-        "The owned task branch is registered at an unexpected path; no deletion or adoption is safe.",
-      );
+    let entries = await this.registry(tree);
+    const misplaced = entries.find(
+      (entry) => entry.branch === tree.branchRef && !samePath(entry.path, tree.path),
+    );
+    if (misplaced) {
+      if ((await exists(misplaced.path)) || !(await exists(tree.path)))
+        throw new WorktreeConflict(
+          "registry_moved",
+          "The owned task branch is registered at an unexpected path; no deletion or adoption is safe.",
+        );
+      await this.repairWorktreeRegistration(tree, admin);
+      entries = await this.registry(tree);
     }
     const registered = entries.some((entry) => samePath(entry.path, tree.path));
     const present = await exists(tree.path);
@@ -2367,6 +2369,14 @@ export class ManagedWorktrees {
           "Worktree is missing. Its retained branch and filesystem must be reconciled manually; it is not recreated.";
       }
       return { worktree: tree };
+    }
+    const registeredEntry = entries.find((entry) => samePath(entry.path, tree.path));
+    if (
+      present &&
+      registeredEntry?.prunable &&
+      registeredEntry.branch === tree.branchRef
+    ) {
+      await this.repairWorktreeRegistration(tree, admin);
     }
     await this.verifyTree(tree);
     const pending = this.integrations(tree.id).find((entry) => {
@@ -2473,6 +2483,52 @@ export class ManagedWorktrees {
     return { worktree: tree };
   }
 
+  private async repairWorktreeRegistration(
+    tree: ManagedWorktree,
+    admin: CheckoutLease,
+  ): Promise<void> {
+    const holder = tree.checkout ? this.locks.holder(tree.checkout.key) : undefined;
+    if (
+      holder &&
+      (!this.locks.locallyOwned(tree.checkout!.key) || holder.reconciliationRequired)
+    )
+      throw new WorktreeConflict(
+        "process_unknown",
+        "A previous Node incarnation owns this checkout and process quiescence is unknown.",
+      );
+    await this.verifyRoots(tree);
+    if ((await lstat(tree.path)).isSymbolicLink())
+      throw new WorktreeConflict(
+        "path_alias",
+        "The owned task directory was replaced with a symlink or junction.",
+      );
+    const physical = await canonicalPath(tree.path);
+    if (
+      !tree.checkout ||
+      physical.key !== tree.checkout.key ||
+      (await this.commonDirectory(tree.path)).key !== tree.commonDirectory.key ||
+      (await this.ref(tree.path, "HEAD")) !==
+        (tree.resultSha || tree.observation?.head || tree.baseSha)
+    )
+      throw new WorktreeConflict(
+        "registry_identity",
+        "Fleet cannot prove that the stale Git registration still describes this owned checkout.",
+      );
+    const branch = (
+      await this.git.run(tree.path, ["symbolic-ref", "-q", "HEAD"], {
+        allowedExitCodes: [0, 1],
+      })
+    ).stdout.trim();
+    if (branch !== tree.branchRef)
+      throw new WorktreeConflict(
+        "registry_mismatch",
+        "The owned checkout branch does not match the stale Git registration.",
+      );
+    await this.git.run(tree.repository.path, ["worktree", "repair", tree.path], {
+      lease: admin,
+    });
+  }
+
   private async cleanup(
     tree: ManagedWorktree,
     request: WorktreeOperationRequest,
@@ -2510,6 +2566,37 @@ export class ManagedWorktrees {
       if (request.kind === "abandon") {
         this.confirmAbandon(tree, request);
         return tree;
+      }
+      if (
+        request.policy.cleanupIgnoredOnly &&
+        tree.observation.ignored === true &&
+        tree.observation.staged === false &&
+        tree.observation.unstaged === false &&
+        tree.observation.untracked === false
+      ) {
+        const ignored = (
+          await this.git.run(tree.path, [
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+          ])
+        ).stdout
+          .split("\0")
+          .filter(Boolean);
+        if (
+          ignored.some((path) =>
+            /(^|[\\/])(?:\.env(?:\.|$)|credentials?|secrets?)(?:[\\/]|\.|$)/i.test(path),
+          )
+        )
+          throw new WorktreeConflict(
+            "sensitive_cleanup_path",
+            "Fleet refuses to delete ignored output that appears to contain credentials or secrets.",
+          );
+        await this.git.run(tree.path, ["clean", "-fdX", "--"]);
+        tree.observation = await this.observe(tree);
       }
       this.requireClean(tree.observation);
       tree.state = "removing";
