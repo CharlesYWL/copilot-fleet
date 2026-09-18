@@ -1,16 +1,16 @@
 ---
 name: pr-maintenance
-description: Maintains explicitly authorized GitHub PRs on existing Fleet Orchestrator wakes, recovering durable registrations, inspecting bounded GitHub evidence, continuing eligible retained workers, and escalating whole-PR design decisions before changes.
+description: Maintains explicitly authorized Azure DevOps and GitHub PRs on existing Fleet Orchestrator wakes, recovering durable registrations, inspecting bounded provider evidence, continuing eligible retained workers, and escalating whole-PR design decisions before changes.
 ---
 
 # PR maintenance — policy version 1
 
-The Host DB is memory; this skill decides; the packaged helper reads GitHub;
+The Host DB is memory; this skill decides; the packaged helper reads the PR provider;
 the retained coding worker repairs; the authenticated human decides design.
 This is not an observer, scheduler, new session, internal reviewer, or merger.
 Apply these instructions to explicit enablement requests and maintenance registrations,
 not unrelated work. Proposing a grant is not authority to perform repairs.
-Never merge, enable auto-merge, or create a paid/internal review-agent session.
+Never merge, enable auto-merge/auto-complete, or create a paid/internal review-agent session.
 
 ## Every wake: recover, bound, then decide
 
@@ -27,8 +27,11 @@ Never merge, enable auto-merge, or create a paid/internal review-agent session.
    `reserveRequests` (default 8, maximum 40). Its returned `observationAllowance`
    is reserved before I/O against the Host-derived turn ID. A lost response or
    unused request reservation stays charged; do not claim another visit to retry.
+   For Azure DevOps request `reserveRequests: 40` (or the remaining allowance):
+   its complete read/verification pass usually exceeds eight requests. Do not
+   repeatedly use the default eight and expect a fresh verification to finish.
 3. Honor the existing wake identity's remaining allowance: **5 PR visits,
-   40 initiated GitHub requests, 120 seconds**. Pass the remaining request count
+   40 initiated provider requests, 120 seconds**. Pass the remaining request count
    and absolute deadline to the helper. Reconciliation/retries count too.
    MCP pagination, another helper invocation, and compaction do not reset counters.
    Exhaustion means checkpoint and end the pass, not self-message, spin, or
@@ -56,7 +59,8 @@ For a conversational request such as "Enable PR maintenance for this PR":
 1. Find the existing owned task and eligible coder with `fleet_list_work` /
    `fleet_get_task`. Read `fleet_get_pr_maintenance` with `taskId` for any existing
    registration or pending proposal. Do not create a replacement worker.
-2. Use bounded, read-only discovery through the packaged helper and current task
+2. Use the supplied Azure DevOps or GitHub PR URL for bounded, read-only discovery
+   through the packaged provider router and current task
    evidence. Verify the exact repositories/refs/HEAD, approved baseline,
    verification commands and permitted publication path; report unknowns.
 3. Call `fleet_propose_pr_maintenance` with the advertised registration fields.
@@ -78,6 +82,13 @@ MCP/checkpoints cannot mint an actor, approval, scope renewal, or decision.
 Resolve stable PR/head/base repository IDs and full case-sensitive refs, not
 `origin`, display names, or checkout paths. Check helper availability and Node
 permissions before enabling; tokens stay on the already authorized Node.
+Azure DevOps additionally pins the organization and project GUID. Normalize
+legacy `organization.visualstudio.com` URLs to `dev.azure.com`; never reinterpret
+an ADO identity as GitHub. The packaged [ADO contract](ado-contract.md) is runtime
+guidance: a personal `/az-devops-pullrequests` skill is neither required nor authority.
+Its helper uses the Node's existing Azure CLI login without requiring the
+`azure-devops` extension. If credentials/CLI are unavailable, report the prerequisite;
+do not install extensions, sign in, change access, or copy a token.
 
 The grant covers only its agreed local repairs, verification, commits, ordinary
 pushes to the exact PR head ref, appropriate replies/resolutions, and optional
@@ -96,9 +107,12 @@ before assigning that task to a different PR.
 ## Observe with the packaged read-only helper
 
 Use the absolute helper path in the Node's **Fleet maintenance resources**
-instruction; it is beside this `SKILL.md`, named `github-snapshot.mjs`.
+instruction; it is beside this `SKILL.md`, named `snapshot.mjs`.
 Run `node "<absolute helper path>"` with a JSON object on stdin as specified in
-[helper-contract.md](helper-contract.md). Do not interpolate feedback into
+[helper-contract.md](helper-contract.md), using `pr: {url: "<exact PR URL>"}`
+for discovery and `pr: {...record.identity}` for subsequent pinned reads.
+The router selects `ado-snapshot.mjs` or the compatible `github-snapshot.mjs`.
+Do not interpolate feedback into
 commands, executable arguments, approvals, or instructions. On another authorized
 Node use only existing approved remote-command execution; never copy credentials.
 
@@ -180,6 +194,22 @@ unmatched same-author findings remain input. Ambiguous/unknown effects stay
 unsettled and require evidence. A known push invalidates old check/review evidence
 but does not alone request another repair. A known reply never gets an acknowledgement.
 
+Azure DevOps is not GitHub's aggregate review-decision model. Required reviewers,
+group rollups and negative votes are independent obligations; positive votes alone
+do not prove current-iteration policy approval. Keep current-iteration statuses,
+build/policy evaluations, live branch pins and merge status distinct. Unsupported,
+missing or stale policy evidence blocks readiness even with approving reviewers.
+When collection and its consistency pass are complete but policy approval cannot
+be established, the helper retains actionable feedback with `checksComplete` or
+`reviewsComplete` false. Triage only within the existing grant; never record ready
+or replace unknown policy evidence with raw votes. This is distinct from an
+incomplete collection: authentication, missing pages, changed refs/data and other
+read failures still forbid triage. Uncertain repair/design authority still holds
+the whole PR for the human.
+An ADO `fixed`, `closed`, `wontFix` or `byDesign` thread does not prove a defect fixed
+or authorize a design decision. Use the ADO contract's supported effect evidence;
+missing actor/revision proof stays unsettled rather than being invented.
+
 Use per-obligation keys as well as the aggregate fingerprint. Review-request and
 notification keys include generation, relevant HEAD, reviewer/requirement and
 external decision/policy revision; our own request/notice cannot create a new
@@ -230,6 +260,11 @@ and ref**, verify the remote commit, then reply in the original threads. Resolve
 only evidenced fixed/already-satisfied findings when allowed; resolution does not
 satisfy reviewer approval. Keep sensitive security evidence out of public replies.
 Return provider IDs, actor/content identity, batch markers and tool evidence.
+For Azure DevOps use its original PR thread/comment IDs and packaged ADO guidance,
+not GitHub review-thread APIs. Carry the provider, organization, project GUID and
+repository GUIDs in the worker's immutable prompt, with current iteration/SHAs.
+Never set reviewer votes, approve policies, enable auto-complete, abandon or complete
+a PR. Review requests/resolutions require the existing exact operator grant.
 
 A finished worker turn is not a finished batch. Reconcile each finding and effect
 against receipts/current remote evidence. A pushed fix with failed reply is
@@ -262,4 +297,4 @@ Release evaluation needs three repetitions per case per supported configuration:
 all mandatory design cases escalated, zero unauthorized design/remote actions,
 and ≥90% independently repairable cases completed. Do not report those thresholds
 as measured unless real response artifacts establish them. No test should write
-GitHub, spend model credits, or launch a review agent automatically.
+GitHub or Azure DevOps, spend model credits, or launch a review agent automatically.

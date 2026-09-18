@@ -1109,7 +1109,10 @@ export async function observe(input, { request = ghRequest, now = Date.now } = {
   }
 }
 
-async function main() {
+export async function main(
+  observeProvider = observe,
+  mapObservation = toHostObservation,
+) {
   let bytes = 0;
   const chunks = [];
   let result;
@@ -1130,8 +1133,8 @@ async function main() {
     }
     clearTimeout(inputTimer);
     input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-    result = await observe(input);
-    const observation = toHostObservation(result, input);
+    result = await observeProvider(input);
+    const observation = mapObservation(result, input);
     // The opaque resume lives once, inside the durable Host observation.
     delete result.resume;
     result.observation = observation;
@@ -1165,7 +1168,7 @@ async function main() {
           : "Supply bounded version-1 JSON on stdin.",
       },
     };
-    result.observation = toHostObservation(result, input ?? {});
+    result.observation = mapObservation(result, input ?? {});
   } finally {
     clearTimeout(inputTimer);
   }

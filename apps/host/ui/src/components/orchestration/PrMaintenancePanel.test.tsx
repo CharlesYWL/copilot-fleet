@@ -154,6 +154,66 @@ beforeEach(() => {
 });
 
 describe("PR maintenance task controls", () => {
+  it("shows canonical ADO links and authorizes its prefilled proposal without JSON", async () => {
+    const pending = proposal();
+    pending.registration.identity = {
+      ...pending.registration.identity,
+      provider: "azure-devops",
+      host: "dev.azure.com",
+      organization: "sample-org",
+      project: "Sample Project",
+      projectId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      repositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      repository: "Sample Project/Repo Name",
+      headRepositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      headRepository: "Sample Project/Repo Name",
+      baseRepositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+      baseRepository: "Sample Project/Repo Name",
+    };
+    const enabled = {
+      ...registration(),
+      identity: pending.registration.identity,
+      lifecycle: "active" as const,
+      pauseReason: "",
+    };
+    vi.mocked(getTaskMaintenance)
+      .mockResolvedValueOnce({ records: [], proposal: pending, canAuthorize: true })
+      .mockResolvedValue({ records: [enabled], canAuthorize: true });
+    vi.mocked(authorizeTaskMaintenanceProposal).mockResolvedValue(enabled);
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} />
+      </FluentProvider>,
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Review PR maintenance proposal" }),
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(
+      within(dialog).queryByRole("textbox", { name: "Registration proposal" }),
+    ).toBeNull();
+    expect(within(dialog).getByText(/Azure DevOps/)).toBeTruthy();
+    const url =
+      "https://dev.azure.com/sample-org/Sample%20Project/_git/Repo%20Name/pullrequest/7";
+    expect(within(dialog).getByRole("link").getAttribute("href")).toBe(url);
+    fireEvent.click(within(dialog).getByRole("checkbox"));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Authorize maintenance" }),
+    );
+    await waitFor(() =>
+      expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledWith(task.id, {
+        id: pending.id,
+        version: pending.version,
+      }),
+    );
+    expect(
+      (
+        await screen.findByRole("link", { name: "Sample Project/Repo Name #7" })
+      ).getAttribute("href"),
+    ).toBe(url);
+    expect(enableTaskMaintenance).not.toHaveBeenCalled();
+  });
+
   it("reviews a prefilled proposal without copying JSON and authorizes only its captured reference", async () => {
     const pending = proposal();
     const enabled = { ...registration(), lifecycle: "active" as const, pauseReason: "" };

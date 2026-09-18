@@ -40,7 +40,24 @@ describe("PR maintenance orchestration", () => {
     world.store.close();
   });
 
-  const setup = (claimVisit = true) => {
+  const setup = (claimVisit = true, provider: "github" | "azure-devops" = "github") => {
+    const providerIdentity =
+      provider === "azure-devops"
+        ? {
+            ...identity,
+            provider,
+            host: "dev.azure.com" as const,
+            organization: "sample-org",
+            project: "Project",
+            projectId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            repositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            repository: "Project/Repo",
+            headRepositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            headRepository: "Project/Repo",
+            baseRepositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            baseRepository: "Project/Repo",
+          }
+        : identity;
     const lead = world.store.getSession(world.leadId)!;
     const placement = world.store.getPlacement(lead.placementId)!;
     const run = world.store.createRun({
@@ -68,7 +85,7 @@ describe("PR maintenance orchestration", () => {
       {
         taskId: run.id,
         workerSessionId: worker.id,
-        identity,
+        identity: providerIdentity,
         headSha,
         scope: {
           baseline: "Keep the approved API and storage design unchanged.",
@@ -76,7 +93,7 @@ describe("PR maintenance orchestration", () => {
           publicationAuthorized: true,
         },
         eligibilityEvidence:
-          "Helper v1 and gh authentication checked on the bound Node; branch HEAD verified.",
+          "Provider helper and authentication checked on the bound Node; branch HEAD verified.",
       },
       "authenticated-operator",
     );
@@ -89,7 +106,7 @@ describe("PR maintenance orchestration", () => {
         observation: PrMaintenanceObservationSchema.parse({
           attemptedAt: new Date().toISOString(),
           complete: true,
-          identity,
+          identity: providerIdentity,
           snapshotId: "snapshot-1",
           headSha,
           baseSha: "b".repeat(40),
@@ -229,37 +246,40 @@ describe("PR maintenance orchestration", () => {
     ).toBe(false);
   });
 
-  it("requires batch metadata and links one accepted attempt atomically", () => {
-    const { record, worker, step } = setup();
-    const prepared = prepare(record.id);
-    const prompt = prepared.batches[0]!.prompt;
-    expect(tools.followUp({ sessionId: worker.id, prompt }).ok).toBe(false);
-    const result = tools.followUp({
-      sessionId: worker.id,
-      prompt,
-      maintenance: reference(record.id),
-    });
-    expect(result.ok, result.text).toBe(true);
-    const accepted = world.store.prMaintenance.get(record.id)!.batches[0]!;
-    expect(accepted).toMatchObject({ state: "accepted", stepId: step.id, attempt: 2 });
-    expect(
-      world.store.listSessions().filter((session) => session.runRole === "worker"),
-    ).toHaveLength(1);
-    const retry = tools.followUp({
-      sessionId: worker.id,
-      prompt,
-      maintenance: reference(record.id),
-    });
-    expect(retry.ok, retry.text).toBe(true);
-    expect(world.store.getRunStep(step.id)?.attempts).toBe(2);
-    expect(
-      tools.followUp({
+  it.each(["github", "azure-devops"] as const)(
+    "requires %s batch metadata and links one retained worker attempt atomically",
+    (provider) => {
+      const { record, worker, step } = setup(true, provider);
+      const prepared = prepare(record.id);
+      const prompt = prepared.batches[0]!.prompt;
+      expect(tools.followUp({ sessionId: worker.id, prompt }).ok).toBe(false);
+      const result = tools.followUp({
         sessionId: worker.id,
-        prompt: "A different prompt",
+        prompt,
         maintenance: reference(record.id),
-      }).ok,
-    ).toBe(false);
-  });
+      });
+      expect(result.ok, result.text).toBe(true);
+      const accepted = world.store.prMaintenance.get(record.id)!.batches[0]!;
+      expect(accepted).toMatchObject({ state: "accepted", stepId: step.id, attempt: 2 });
+      expect(
+        world.store.listSessions().filter((session) => session.runRole === "worker"),
+      ).toHaveLength(1);
+      const retry = tools.followUp({
+        sessionId: worker.id,
+        prompt,
+        maintenance: reference(record.id),
+      });
+      expect(retry.ok, retry.text).toBe(true);
+      expect(world.store.getRunStep(step.id)?.attempts).toBe(2);
+      expect(
+        tools.followUp({
+          sessionId: worker.id,
+          prompt: "A different prompt",
+          maintenance: reference(record.id),
+        }).ok,
+      ).toBe(false);
+    },
+  );
 
   it("rolls back step retry when atomic maintenance acceptance fails", () => {
     const { record, worker, step } = setup();
@@ -282,46 +302,51 @@ describe("PR maintenance orchestration", () => {
     expect(world.store.prMaintenance.get(record.id)!.batches[0]!.state).toBe("prepared");
   });
 
-  it("preserves the whole-PR human hold across discovery and alternate mutations", () => {
-    const { record, run, worker } = setup();
-    expect(hold(record.id).ok).toBe(true);
-    expect(tools.getTask({ task: run.id }).text).toContain("wait_for_human");
-    const reviewSeq = world.store.getRun(run.id)!.reviewSeq;
-    expect(
-      tools.reopenTask({
-        task: run.id,
-        reason: "Try to resume without operator direction.",
-      }).ok,
-    ).toBe(false);
-    expect(tools.advanceTask({ task: run.id, note: "Try another phase" }).ok).toBe(false);
-    expect(tools.followUp({ sessionId: worker.id, prompt: "Continue anyway" }).ok).toBe(
-      false,
-    );
-    expect(() =>
-      world.service.dispatch(worker.nodeId, {
-        type: "prompt",
-        sessionId: worker.id,
-        prompt: "Bypass MCP",
-        attachments: [],
-      }),
-    ).toThrow("wait_for_human");
-    const replacement = world.service.createAndStartSession({
-      placement: world.store.getPlacement(worker.placementId)!,
-      prompt: "Replacement coder",
-      yolo: true,
-    });
-    expect(replacement.ok).toBe(false);
-    expect(world.store.getRun(run.id)).toMatchObject({
-      state: "awaiting_human",
-      reviewSeq,
-    });
-    expect(
-      world.store.getNotificationBySourceKey(`review:${run.id}:${reviewSeq}`)?.status,
-    ).toBe("active");
-    const second = hold(record.id);
-    expect(second.ok, second.text).toBe(true);
-    expect(world.store.getRun(run.id)!.reviewSeq).toBe(reviewSeq);
-  });
+  it.each(["github", "azure-devops"] as const)(
+    "preserves the whole-%s-PR human hold across discovery and alternate mutations",
+    (provider) => {
+      const { record, run, worker } = setup(true, provider);
+      expect(hold(record.id).ok).toBe(true);
+      expect(tools.getTask({ task: run.id }).text).toContain("wait_for_human");
+      const reviewSeq = world.store.getRun(run.id)!.reviewSeq;
+      expect(
+        tools.reopenTask({
+          task: run.id,
+          reason: "Try to resume without operator direction.",
+        }).ok,
+      ).toBe(false);
+      expect(tools.advanceTask({ task: run.id, note: "Try another phase" }).ok).toBe(
+        false,
+      );
+      expect(tools.followUp({ sessionId: worker.id, prompt: "Continue anyway" }).ok).toBe(
+        false,
+      );
+      expect(() =>
+        world.service.dispatch(worker.nodeId, {
+          type: "prompt",
+          sessionId: worker.id,
+          prompt: "Bypass MCP",
+          attachments: [],
+        }),
+      ).toThrow("wait_for_human");
+      const replacement = world.service.createAndStartSession({
+        placement: world.store.getPlacement(worker.placementId)!,
+        prompt: "Replacement coder",
+        yolo: true,
+      });
+      expect(replacement.ok).toBe(false);
+      expect(world.store.getRun(run.id)).toMatchObject({
+        state: "awaiting_human",
+        reviewSeq,
+      });
+      expect(
+        world.store.getNotificationBySourceKey(`review:${run.id}:${reviewSeq}`)?.status,
+      ).toBe("active");
+      const second = hold(record.id);
+      expect(second.ok, second.text).toBe(true);
+      expect(world.store.getRun(run.id)!.reviewSeq).toBe(reviewSeq);
+    },
+  );
 
   it("blocks managed finalization and cleanup under the same maintenance hold", async () => {
     const { record, run } = setup();

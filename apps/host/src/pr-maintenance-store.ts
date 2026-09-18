@@ -5,6 +5,7 @@ import { z } from "zod";
 import {
   PR_MAINTENANCE_CADENCE_MS,
   PR_MAINTENANCE_WAKE_LIMITS,
+  prMaintenanceProviderKey,
   PrMaintenanceAdmissionSchema,
   PrMaintenanceBackupSchema,
   PrMaintenanceCheckpointSchema,
@@ -20,6 +21,7 @@ import {
   type PrMaintenanceBatch,
   type PrMaintenanceCheckpoint,
   type PrMaintenanceEffect,
+  type PrMaintenanceIdentity,
   type PrMaintenanceObservation,
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
@@ -45,6 +47,11 @@ const emptyCounters = () => ({
 const actorSchema = z.string().trim().min(1).max(512);
 const wakeIdSchema = z.string().min(1).max(512);
 const atSchema = z.string().datetime();
+const sameIdentity = (left: PrMaintenanceIdentity, right: PrMaintenanceIdentity) =>
+  isDeepStrictEqual(
+    { ...left, provider: left.provider ?? "github" },
+    { ...right, provider: right.provider ?? "github" },
+  );
 const listSchema = z
   .object({
     leadSessionId: actorSchema.optional(),
@@ -360,7 +367,7 @@ export class PrMaintenanceStore {
             parsed.id,
             parsed.version,
             parsed.generation,
-            parsed.identity.host,
+            prMaintenanceProviderKey(parsed.identity),
             parsed.identity.repositoryId,
             parsed.identity.prNumber,
             parsed.identity.headRepositoryId,
@@ -526,7 +533,8 @@ export class PrMaintenanceStore {
       const retained = this.retained();
       const previous = retained.find(
         (entry) =>
-          entry.identity.host === parsed.identity.host &&
+          prMaintenanceProviderKey(entry.identity) ===
+            prMaintenanceProviderKey(parsed.identity) &&
           entry.identity.repositoryId === parsed.identity.repositoryId &&
           entry.identity.prNumber === parsed.identity.prNumber,
       );
@@ -535,7 +543,7 @@ export class PrMaintenanceStore {
           previous.taskId === parsed.taskId &&
           previous.workerSessionId === parsed.workerSessionId &&
           previous.leadSessionId === lead.id &&
-          isDeepStrictEqual(previous.identity, parsed.identity) &&
+          sameIdentity(previous.identity, parsed.identity) &&
           isDeepStrictEqual(previous.authorization.scope, parsed.scope) &&
           isDeepStrictEqual(previous.authorization.budgets, parsed.budgets)
         )
@@ -574,7 +582,7 @@ export class PrMaintenanceStore {
         WHERE host=? AND repository_id=? AND pr_number=?`,
             )
             .get(
-              parsed.identity.host,
+              prMaintenanceProviderKey(parsed.identity),
               parsed.identity.repositoryId,
               parsed.identity.prNumber,
             )?.generation ?? 0,
@@ -1265,12 +1273,12 @@ export class PrMaintenanceStore {
           !record.lastAttempt?.complete ||
           record.observation.fingerprint !== checkpoint.fingerprint ||
           record.observation.mergeability !== "mergeable" ||
-          (!record.observation.checks.length && !record.observation.checksComplete) ||
+          !record.observation.checksComplete ||
           record.observation.checks.some(
             (check) =>
               check.state !== "passed" || check.headSha !== record.observation!.headSha,
           ) ||
-          (!record.observation.reviews.length && !record.observation.reviewsComplete) ||
+          !record.observation.reviewsComplete ||
           record.observation.reviews.some(
             (review) =>
               review.state !== "approved" ||
@@ -1329,10 +1337,7 @@ export class PrMaintenanceStore {
         observation.retryAfter ? Date.parse(observation.retryAfter) : 0,
       ),
     ).toISOString();
-    if (
-      observation.identity &&
-      !isDeepStrictEqual(observation.identity, record.identity)
-    ) {
+    if (observation.identity && !sameIdentity(observation.identity, record.identity)) {
       this.pause(record, "remote_identity_changed");
       return;
     }

@@ -1,18 +1,46 @@
 # Helper contract v1
 
-The Node ships `SKILL.md`, this contract, `github-snapshot.mjs`, and offline
+The Node ships `SKILL.md`, this contract, `snapshot.mjs`, `ado-snapshot.mjs`,
+`ado-contract.md`, `github-snapshot.mjs`, and offline
 evaluation assets and `host-observation.mjs` together in its package-root
 `skills/pr-maintenance` directory.
 `tsc` builds the Node code, not these already-runnable assets. Lead ACP prompts
 advertise their resolved absolute paths, including fallback agents and rollover.
 No personal skill installation, new runtime, registry mutation, or token copy.
 
-Execute `node "<absolute path to github-snapshot.mjs>"`. Feed JSON through stdin
+Execute `node "<absolute path to snapshot.mjs>"`. Feed JSON through stdin
 using the existing approved command tool's data input or a local JSON evidence
 file; never interpolate PR/review text into executable command text.
 For `fleet_run_command`, use a separate authorized helper placement, without the
 maintenance task ID. The retained task and checkout reject independent commands,
 including observation helpers; repairs stay with the retained worker.
+
+## Provider routing (Azure DevOps first, GitHub compatible)
+
+For enablement discovery, provide `pr: {"url":
+"https://dev.azure.com/example/Project/_git/Repo/pullrequest/123"}` with the
+same `schemaVersion`, `generation` and remaining `budget` as below. The router
+also accepts `https://example.visualstudio.com/Project/_git/Repo/pullrequest/123`
+(including the legacy `DefaultCollection` segment) and GitHub
+`https://github.com/owner/repository/pull/123`. It rejects conflicting explicit
+scope, credentials, query strings, fragments and non-HTTPS URLs.
+
+After authorization, use **`pr: {...record.identity}`**: the router derives
+provider-specific discovery fields while preserving all exact pins. ADO identities
+include `provider: "azure-devops"`, `host: "dev.azure.com"`, organization, project
+display name/GUID, repository GUIDs, display names, PR number and full refs.
+See [ADO reads, policy limits and worker guidance](ado-contract.md). Reads use the
+already authenticated Node-local `az` CLI, not a personal skill, copied token,
+automatic login or extension installation. Request `reserveRequests: 40` (or
+the remaining wake allowance) before an ADO scan, not the default eight.
+
+GitHub records without `provider` remain GitHub; explicit `"github"` is also
+accepted. Existing schema-v1 records/backups and `github-snapshot.mjs` inputs
+continue to work. The following detailed GraphQL contract applies **only to GitHub**.
+Provider output always includes the shared schema-validated `observation`;
+checkpoint it unchanged regardless of provider.
+
+## GitHub compatibility helper
 
 ```json
 {
