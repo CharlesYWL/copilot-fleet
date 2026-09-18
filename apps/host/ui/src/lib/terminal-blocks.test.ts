@@ -62,6 +62,63 @@ describe("toTerminalBlocks", () => {
     ]);
   });
 
+  it("groups consecutive output with stable identity as more lines arrive", () => {
+    const first = event("system", { text: "Agency startup" });
+    const events = [
+      first,
+      event("system", { text: "Resolving Copilot CLI..." }),
+      event("state", { state: "starting", activity: "Starting Copilot ACP" }),
+      event("agent_session", { agentSessionId: "copilot-abc" }),
+      event("system", { update: { sessionUpdate: "plan" } }),
+      event("system", { text: "" }),
+      event("usage", { aiCredits: 0 }),
+      event("system", { text: "Launched MCP proxies:\n  - calendar\n  - workiq" }),
+    ];
+    const original = structuredClone(events);
+    const blocks = toTerminalBlocks(events);
+    const text = [
+      "Agency startup",
+      "Resolving Copilot CLI...",
+      "Launched MCP proxies:\n  - calendar\n  - workiq",
+    ].join("\n");
+
+    expect(blocks).toEqual([
+      { key: first.eventId, kind: "system", text, createdAt: first.createdAt },
+    ]);
+    expect(
+      toTerminalBlocks([...events, event("system", { text: "Copilot CLI resolved" })]),
+    ).toEqual([{ ...blocks[0], text: `${text}\nCopilot CLI resolved` }]);
+    expect(events).toEqual(original);
+    expect(blocks[0]?.text).toBe(text);
+  });
+
+  it.each([
+    event("system", { text: "User: continue" }),
+    event("system", { text: `User: ${reopenPrompt("Fix the banner", "Try again.")}` }),
+    event("agent_text", { text: "Working on it." }),
+    event("agent_thought", { text: "Considering the next step." }),
+    event("tool", { toolCallId: "t1", title: "Read file", status: "pending" }),
+    event("permission", { requestId: "r1", title: "Run tests" }),
+    event("permission_result", { requestId: "r1", outcome: "allow_once" }),
+    event("turn_complete", { stopReason: "end_turn" }),
+    event("state", { state: "failed", activity: "Copilot exited (1)" }),
+    event("error", { message: "Copilot did not become ready" }),
+  ])("does not group output across $type $eventId", (boundary) => {
+    const before = event("system", { text: "Before" });
+    const after = event("system", { text: "After" });
+
+    expect(toTerminalBlocks([before, boundary, after])).toEqual([
+      {
+        key: before.eventId,
+        kind: "system",
+        text: "Before",
+        createdAt: before.createdAt,
+      },
+      ...toTerminalBlocks([boundary]),
+      { key: after.eventId, kind: "system", text: "After", createdAt: after.createdAt },
+    ]);
+  });
+
   it("collapses repeated tool updates onto the originating line", () => {
     const blocks = toTerminalBlocks([
       event("tool", { toolCallId: "t1", title: "read_file", status: "pending" }),

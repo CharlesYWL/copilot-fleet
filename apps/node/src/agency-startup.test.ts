@@ -1,11 +1,21 @@
-import { ChildProcess, spawn } from "node:child_process";
+import {
+  ChildProcess,
+  spawn,
+  type ChildProcessWithoutNullStreams,
+} from "node:child_process";
 import type * as childProcess from "node:child_process";
+import { getEventListeners } from "node:events";
 import { PassThrough } from "node:stream";
 import { CONTEXT_TIER_CONFIG_ID, type SessionEvent } from "@fleet/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AcpAgentFactory, type SessionAgent } from "./agents.js";
+import {
+  AcpAgentFactory,
+  AgentStartupCleanupError,
+  type SessionAgent,
+} from "./agents.js";
 import type * as copilotLaunch from "./copilot-launch.js";
-import { stopProcessTree } from "./process-quiescence.js";
+import { resolveCopilotLaunch } from "./copilot-launch.js";
+import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
 
 const installation = vi.hoisted(() => ({
   path: "C:\\Program Files\\Agency\\agency.exe" as string | undefined,
@@ -14,6 +24,7 @@ const credits = vi.hoisted(() => ({
   value: undefined as number | undefined,
   bySession: new Map<string, number>(),
   readers: [] as string[],
+  pending: undefined as Promise<number | undefined> | undefined,
 }));
 vi.mock("./session-credits.js", () => ({
   SessionCreditReader: class {
@@ -21,7 +32,7 @@ vi.mock("./session-credits.js", () => ({
       credits.readers.push(sessionId);
     }
     async read() {
-      return credits.bySession.get(this.sessionId) ?? credits.value;
+      return credits.pending ?? credits.bySession.get(this.sessionId) ?? credits.value;
     }
   },
 }));
@@ -39,6 +50,7 @@ vi.mock("node:child_process", async (importOriginal) => ({
   spawn: vi.fn(),
 }));
 vi.mock("./process-quiescence.js", () => ({
+  spawnManagedProcess: vi.fn(),
   stopProcessTree: vi.fn(async (child: ChildProcess) => {
     child.kill();
   }),
@@ -54,6 +66,7 @@ const processes: Array<{ command: string; args: string[]; child: ChildProcess }>
 const agents: SessionAgent[] = [];
 let metadataFailure: string | undefined;
 let startupFailure: string | undefined;
+let startupHangs: string | undefined;
 let metadataHangs = false;
 let agencyVersion = "1.0.84";
 let loadUsage: { used: number; size: number } | undefined;
@@ -66,6 +79,7 @@ let splitContextResponse = false;
 let oversizedLoad = false;
 let oversizedPrompts = 0;
 let createdSessions = 0;
+const platform = process.platform;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -74,11 +88,13 @@ beforeEach(() => {
   installation.path = "C:\\Program Files\\Agency\\agency.exe";
   metadataFailure = undefined;
   startupFailure = undefined;
+  startupHangs = undefined;
   metadataHangs = false;
   agencyVersion = "1.0.84";
   credits.value = undefined;
   credits.bySession.clear();
   credits.readers.length = 0;
+  credits.pending = undefined;
   loadUsage = undefined;
   advertiseContext = false;
   contextResponse =
@@ -90,12 +106,20 @@ beforeEach(() => {
   oversizedLoad = false;
   oversizedPrompts = 0;
   createdSessions = 0;
-  vi.mocked(spawn).mockImplementation((command, args) => {
-    const argv: string[] = Array.isArray(args) ? args : [];
+  const spawnProcess = (command: string, argv: readonly string[]) => {
+    const stdio = [
+      new PassThrough(),
+      new PassThrough(),
+      new PassThrough(),
+      null,
+      null,
+    ] satisfies ChildProcessWithoutNullStreams["stdio"];
     const child = Object.assign(new ChildProcess(), {
-      stdin: new PassThrough(),
-      stdout: new PassThrough(),
-      stderr: new PassThrough(),
+      pid: 123_456 + processes.length,
+      stdin: stdio[0],
+      stdout: stdio[1],
+      stderr: stdio[2],
+      stdio,
     });
     const close = (code: number) => {
       Object.defineProperty(child, "exitCode", { value: code, configurable: true });
@@ -108,7 +132,7 @@ beforeEach(() => {
       close(0);
       return true;
     });
-    processes.push({ command, args: argv, child });
+    processes.push({ command, args: [...argv], child });
     const agency = argv[0] === "copilot";
     if (!argv.includes("--acp")) {
       queueMicrotask(() => {
@@ -217,6 +241,7 @@ beforeEach(() => {
                 }
               : { id: request.id, result };
         queueMicrotask(() => {
+          if (request.method === startupHangs) return;
           const notify = (update: Record<string, unknown>) =>
             child.stdout.write(
               `${JSON.stringify({
@@ -284,11 +309,16 @@ beforeEach(() => {
       }
     });
     return child;
-  });
+  };
+  vi.mocked(spawn).mockImplementation((command, args) =>
+    spawnProcess(command, Array.isArray(args) ? args : []),
+  );
+  vi.mocked(spawnManagedProcess).mockImplementation(spawnProcess);
 });
 
 afterEach(async () => {
   for (const agent of agents.splice(0)) await agent.stop();
+  Object.defineProperty(process, "platform", { value: platform });
   vi.useRealTimers();
 });
 
@@ -493,7 +523,8 @@ describe("Agency ACP startup", () => {
       ["copilot", "--acp", "--stdio", "--allow-all", "--context", "long_context"],
     ]);
     expect(processes.every(({ command }) => command === installation.path)).toBe(true);
-    expect(vi.mocked(spawn).mock.calls.at(-1)?.[2]).toMatchObject({
+    const launcher = process.platform === "win32" ? spawnManagedProcess : spawn;
+    expect(vi.mocked(launcher).mock.calls.at(-1)?.[2]).toMatchObject({
       cwd: "C:\\repo",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
@@ -515,7 +546,7 @@ describe("Agency ACP startup", () => {
     );
   });
 
-  it("replaces an oversized loaded conversation and continues from a bounded handoff", async () => {
+  it("replaces an oversized loaded conversation and continues from a bounded handoff by default", async () => {
     oversizedLoad = true;
     const events: SessionEvent[] = [];
     const factory = new AcpAgentFactory(60_000, "standard-copilot");
@@ -545,6 +576,58 @@ describe("Agency ACP startup", () => {
       ]),
     );
     expect(events.some((event) => event.type === "error")).toBe(false);
+  });
+
+  it("surfaces an oversized load without creating or prompting a conversation when resume rollover is disabled", async () => {
+    oversizedLoad = true;
+    const events: SessionEvent[] = [];
+    const factory = new AcpAgentFactory(60_000, "standard-copilot");
+    await expect(
+      factory.start("s1", "C:\\repo", (event) => events.push(event), {
+        resumeAgentSessionId: "oversized-session",
+        allowResumeRollover: false,
+        contextOverflowRecoveryPrompt: "Original assignment: finish the feature",
+        mcpServers: fleetMcp,
+      }),
+    ).rejects.toThrow("The request is too large to send through CAPI Responses");
+
+    expect(requests.map((request) => request.method)).toEqual([
+      "initialize",
+      "session/load",
+    ]);
+    expect(stopProcessTree).toHaveBeenCalledWith(
+      launches()[0]?.child,
+      process.platform === "win32",
+    );
+    expect(launches()[0]?.child.kill).toHaveBeenCalledOnce();
+    expect(events.some((event) => event.type === "agent_session")).toBe(false);
+    expect(events.some((event) => event.payload.state === "idle")).toBe(false);
+    expect(events.at(-1)?.payload.state).toBe("failed");
+  });
+
+  it("still allows prompt-time rollover after resuming with resume rollover disabled", async () => {
+    const factory = new AcpAgentFactory(60_000, "standard-copilot");
+    const agent = await factory.start("s1", "C:\\repo", () => {}, {
+      resumeAgentSessionId: "saved-session",
+      allowResumeRollover: false,
+      contextOverflowRecoveryPrompt: "Original assignment: preserve current edits",
+    });
+    agents.push(agent);
+    expect(
+      requests.filter((request) =>
+        ["session/new", "session/prompt"].includes(request.method),
+      ),
+    ).toHaveLength(0);
+
+    oversizedPrompts = 1;
+    await agent.prompt("finish and report");
+
+    expect(requests.filter((request) => request.method === "session/new")).toHaveLength(
+      1,
+    );
+    expect(
+      requests.filter((request) => request.method === "session/prompt"),
+    ).toHaveLength(2);
   });
 
   it("starts usage tracking when loading an oversized conversation rolls over", async () => {
@@ -781,6 +864,545 @@ describe("Agency ACP startup", () => {
     expect(stopProcessTree).toHaveBeenCalledWith(launches()[0]?.child, false);
     expect(launches()[0]?.child.kill).toHaveBeenCalled();
     expect(events.some((event) => event.payload.state === "failed")).toBe(true);
+  });
+
+  it.each([
+    { platform: "win32", mcpServers: fleetMcp, managed: true },
+    { platform: "win32", mcpServers: [], managed: false },
+    { platform: "linux", mcpServers: fleetMcp, managed: false },
+    { platform: "linux", mcpServers: [], managed: false },
+    { platform: "darwin", mcpServers: fleetMcp, managed: false },
+    { platform: "darwin", mcpServers: [], managed: false },
+  ])(
+    "contains unleased MCP processes only on Windows: $platform, managed=$managed",
+    async ({ platform, mcpServers, managed }) => {
+      Object.defineProperty(process, "platform", { value: platform });
+      const agent = await new AcpAgentFactory(60_000, "copilot").start(
+        "s1",
+        "C:\\repo",
+        () => {},
+        { mcpServers },
+      );
+      agents.push(agent);
+
+      expect(Reflect.get(agent, "processOwnership")).toBeUndefined();
+      expect(spawnManagedProcess).toHaveBeenCalledTimes(managed ? 1 : 0);
+      expect(
+        vi.mocked(spawn).mock.calls.filter(([, args]) => args?.includes("--acp")),
+      ).toHaveLength(managed ? 0 : 1);
+      expect(
+        requests.find((request) => request.method === "session/new")?.params,
+      ).toEqual({
+        cwd: "C:\\repo",
+        mcpServers: mcpServers.map((server) => ({ ...server, type: "http" })),
+      });
+      await agent.prompt("Continue");
+      expect(
+        requests.filter((request) => request.method === "session/prompt"),
+      ).toHaveLength(1);
+      await agent.stop();
+      expect(stopProcessTree).toHaveBeenCalledWith(launches()[0]?.child, managed);
+    },
+  );
+
+  it("retains managed process ownership and release callbacks for leased sessions without MCP", async () => {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const processStarting = vi.fn(() => expect(launches()).toHaveLength(0));
+    const processStarted = vi.fn();
+    const processesQuiesced = vi.fn();
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      () => {},
+      { processStarting, processStarted, processesQuiesced },
+    );
+    agents.push(agent);
+    expect(spawnManagedProcess).toHaveBeenCalledOnce();
+    expect(processStarting).toHaveBeenCalledOnce();
+    expect(processStarted).toHaveBeenCalledExactlyOnceWith(launches()[0]?.child.pid);
+    expect(processesQuiesced).not.toHaveBeenCalled();
+
+    await agent.stop();
+    expect(stopProcessTree).toHaveBeenCalledWith(launches()[0]?.child, true);
+    expect(processesQuiesced).toHaveBeenCalledOnce();
+    expect(processesQuiesced.mock.invocationCallOrder[0]).toBeGreaterThan(
+      vi.mocked(stopProcessTree).mock.invocationCallOrder[0]!,
+    );
+  });
+
+  it.each([false, true])(
+    "retains a failed startup agent until cleanup can be retried (leased=%s)",
+    async (leased) => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      startupFailure = "Authentication required";
+      const cleanupError = new Error(
+        "Process-tree ownership is unknown; reconciliation is required.",
+      );
+      vi.mocked(stopProcessTree).mockRejectedValueOnce(cleanupError);
+      const processesQuiesced = vi.fn();
+      const controller = new AbortController();
+      const events: SessionEvent[] = [];
+      const failure: unknown = await new AcpAgentFactory(60_000, "copilot")
+        .start("s1", "C:\\repo", (event) => events.push(event), {
+          signal: controller.signal,
+          mcpServers: fleetMcp,
+          ...(leased ? { processesQuiesced } : {}),
+        })
+        .catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(AgentStartupCleanupError);
+      expect(failure).toBeInstanceOf(AggregateError);
+      if (!(failure instanceof AgentStartupCleanupError)) {
+        throw new Error("Expected retained startup agent");
+      }
+      agents.push(failure.agent);
+      expect(failure.name).toBe("AgentStartupCleanupError");
+      expect(failure.message).toBe(
+        "Authentication required. Run `copilot login` on this node, then retry.",
+      );
+      expect(failure.errors).toEqual([new Error(failure.message), cleanupError]);
+      expect(failure.cause).toBe(cleanupError);
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+      expect(processesQuiesced).not.toHaveBeenCalled();
+      expect(launches()[0]?.child.kill).not.toHaveBeenCalled();
+      expect(events.some((event) => event.payload.state === "stopped")).toBe(false);
+      await expect(failure.agent.prompt("Do not run")).rejects.toThrow(
+        "ACP session is no longer active",
+      );
+      const recorded = [...events];
+      failure.agent.resync();
+      expect(events).toEqual(recorded);
+
+      await failure.agent.stop(false);
+      expect(launches()[0]?.child.kill).toHaveBeenCalledOnce();
+      expect(vi.mocked(stopProcessTree).mock.calls).toEqual([
+        [launches()[0]?.child, true],
+        [launches()[0]?.child, true],
+      ]);
+      expect(processesQuiesced).toHaveBeenCalledTimes(leased ? 1 : 0);
+      expect(events).toEqual(recorded);
+    },
+  );
+
+  it("keeps a timed-out load inactive and replay-suppressed when cleanup must be retried", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(process, "platform", { value: "win32" });
+    startupHangs = "session/load";
+    vi.mocked(stopProcessTree).mockRejectedValueOnce(
+      new Error("Process-tree ownership is unknown; reconciliation is required."),
+    );
+    const events: SessionEvent[] = [];
+    const controller = new AbortController();
+    const started = new AcpAgentFactory(60_000, "copilot", "default", 1_000)
+      .start("s1", "C:\\repo", (event) => events.push(event), {
+        signal: controller.signal,
+        resumeAgentSessionId: "saved-id",
+        mcpServers: fleetMcp,
+      })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const failure = await started;
+    if (!(failure instanceof AgentStartupCleanupError)) {
+      throw new Error("Expected retained startup agent");
+    }
+    agents.push(failure.agent);
+    expect(failure.message).toMatch(/within 1s/);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(Reflect.get(failure.agent, "replaying")).toBe(true);
+    expect(requests.map((request) => request.method)).toEqual([
+      "initialize",
+      "session/load",
+    ]);
+    expect(events.some((event) => event.type === "agent_session")).toBe(false);
+    expect(events.at(-1)?.payload.state).toBe("failed");
+    const recorded = [...events];
+    await failure.agent.stop(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(events).toEqual(recorded);
+    expect(Reflect.get(failure.agent, "replaying")).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([false, true])(
+    "does not resume startup or send a handoff after a timed-out credit read (rollover=%s)",
+    async (rollover) => {
+      vi.useFakeTimers();
+      oversizedLoad = rollover;
+      let finishRead!: (value: number) => void;
+      credits.pending = new Promise<number>((resolve) => {
+        finishRead = resolve;
+      });
+      const events: SessionEvent[] = [];
+      const started = new AcpAgentFactory(60_000, "copilot", "default", 1_000)
+        .start("s1", "C:\\repo", (event) => events.push(event), {
+          resumeAgentSessionId: "saved-id",
+          contextOverflowRecoveryPrompt: "Do not send this after cleanup",
+        })
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(stopProcessTree).toHaveBeenCalledOnce();
+      const failedAt = events.findIndex((event) => event.payload.state === "failed");
+      expect(failedAt).toBeGreaterThanOrEqual(0);
+      const requested = [...requests];
+      finishRead(1);
+      const failure = await started;
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure).not.toBeInstanceOf(AgentStartupCleanupError);
+      expect(events.slice(failedAt + 1).map((event) => event.type)).toEqual(["usage"]);
+      expect(requests).toEqual(requested);
+      expect(requests.some((request) => request.method === "session/prompt")).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("does not launch anything for an already aborted startup", async () => {
+    const controller = new AbortController();
+    const reason = new Error("Recovery cancelled");
+    controller.abort(reason);
+    await expect(
+      new AcpAgentFactory(60_000, "copilot").start("s1", "C:\\repo", () => {}, {
+        signal: controller.signal,
+        mcpServers: fleetMcp,
+      }),
+    ).rejects.toBe(reason);
+    expect(processes).toHaveLength(0);
+    expect(stopProcessTree).not.toHaveBeenCalled();
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it("does not launch ACP when the startup sink aborts synchronously", async () => {
+    const controller = new AbortController();
+    const reason = new Error("Recovery cancelled");
+    await expect(
+      new AcpAgentFactory(60_000, "copilot").start(
+        "s1",
+        "C:\\repo",
+        (event) => {
+          if (event.payload.state === "starting") controller.abort(reason);
+        },
+        { signal: controller.signal, mcpServers: fleetMcp },
+      ),
+    ).rejects.toThrow(reason.message);
+    expect(launches()).toHaveLength(0);
+    expect(stopProcessTree).not.toHaveBeenCalled();
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+  });
+
+  it("rejects during launcher resolution and never resumes preflight after abort", async () => {
+    vi.useFakeTimers();
+    let resolveLaunch!: (launch: copilotLaunch.CopilotLaunch) => void;
+    vi.mocked(resolveCopilotLaunch).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveLaunch = resolve;
+      }),
+    );
+    const controller = new AbortController();
+    const reason = new Error("Recovery cancelled");
+    const started = new AcpAgentFactory(60_000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      () => {},
+      { signal: controller.signal, mcpServers: fleetMcp },
+    );
+    const failed = expect(started).rejects.toBe(reason);
+    controller.abort(reason);
+    await failed;
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    resolveLaunch({ command: "copilot", args: [], provider: "copilot" });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(processes).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cancels a preflight wait without interrupting a concurrent startup sharing its probe", async () => {
+    vi.useFakeTimers();
+    metadataHangs = true;
+    const factory = new AcpAgentFactory(60_000, "copilot");
+    const controller = new AbortController();
+    const reason = new Error("Recovery cancelled");
+    const started = factory.start("cancelled", "C:\\repo", () => {}, {
+      signal: controller.signal,
+      mcpServers: fleetMcp,
+    });
+    const other = factory.start("other", "C:\\repo", () => {});
+    const failed = expect(started).rejects.toBe(reason);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(processes).toHaveLength(1);
+    controller.abort(reason);
+    await failed;
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(processes[0]?.child.kill).not.toHaveBeenCalled();
+
+    metadataHangs = false;
+    (processes[0]?.child.stdout as PassThrough).write("GitHub Copilot CLI 1.0.84");
+    processes[0]?.child.kill();
+    const agent = await other;
+    agents.push(agent);
+    expect(launches()).toHaveLength(1);
+    await agent.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["initialize", "session/new", "session/load", "session/set_config_option"])(
+    "cleans up promptly when %s is aborted and removes its listener",
+    async (phase) => {
+      vi.useFakeTimers();
+      Object.defineProperty(process, "platform", { value: "win32" });
+      startupHangs = phase;
+      advertiseContext = true;
+      const controller = new AbortController();
+      const reason = new Error("Recovery cancelled");
+      const events: SessionEvent[] = [];
+      const started = new AcpAgentFactory(60_000, "copilot")
+        .start("s1", "C:\\repo", (event) => events.push(event), {
+          signal: controller.signal,
+          mcpServers: fleetMcp,
+          ...(phase === "session/load" ? { resumeAgentSessionId: "saved-id" } : {}),
+          config: [{ id: "model", value: "model-b" }],
+        })
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(requests.at(-1)?.method).toBe(phase);
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(1);
+      controller.abort(reason);
+      const failure = await started;
+      expect(failure).toEqual(reason);
+      expect(failure).not.toBeInstanceOf(AgentStartupCleanupError);
+      expect(stopProcessTree).toHaveBeenCalledExactlyOnceWith(launches()[0]?.child, true);
+      expect(launches()[0]?.child.kill).toHaveBeenCalledOnce();
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+      const recorded = [...events];
+      const requested = [...requests];
+      await vi.advanceTimersByTimeAsync(180_000);
+      expect(events).toEqual(recorded);
+      expect(requests).toEqual(requested);
+      expect(events.at(-1)?.payload.state).toBe("failed");
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("retains the aborted agent when ownership cannot be verified and retries cleanup", async () => {
+    vi.useFakeTimers();
+    Object.defineProperty(process, "platform", { value: "win32" });
+    startupHangs = "session/load";
+    const cleanupError = new Error(
+      "Process-tree ownership is unknown; reconciliation is required.",
+    );
+    vi.mocked(stopProcessTree).mockRejectedValueOnce(cleanupError);
+    const controller = new AbortController();
+    const reason = new Error("Recovery cancelled");
+    const events: SessionEvent[] = [];
+    const started = new AcpAgentFactory(60_000, "copilot")
+      .start("s1", "C:\\repo", (event) => events.push(event), {
+        signal: controller.signal,
+        mcpServers: fleetMcp,
+        resumeAgentSessionId: "saved-id",
+      })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(reason);
+    const failure = await started;
+    if (!(failure instanceof AgentStartupCleanupError)) {
+      throw new Error("Expected retained aborted agent");
+    }
+    agents.push(failure.agent);
+    expect(failure.message).toBe(reason.message);
+    expect(failure.errors).toEqual([reason, cleanupError]);
+    expect(failure.cause).toBe(cleanupError);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(launches()[0]?.child.kill).not.toHaveBeenCalled();
+    expect(Reflect.get(failure.agent, "replaying")).toBe(true);
+    const recorded = [...events];
+    await failure.agent.stop(false);
+    expect(stopProcessTree).toHaveBeenLastCalledWith(launches()[0]?.child, true);
+    expect(launches()[0]?.child.kill).toHaveBeenCalledOnce();
+    expect(events).toEqual(recorded);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([false, true])(
+    "does not wait on credits or revive an aborted startup (rollover=%s)",
+    async (rollover) => {
+      vi.useFakeTimers();
+      oversizedLoad = rollover;
+      let finishRead!: (value: number) => void;
+      credits.pending = new Promise<number>((resolve) => {
+        finishRead = resolve;
+      });
+      const controller = new AbortController();
+      const reason = new Error("Recovery cancelled");
+      const events: SessionEvent[] = [];
+      const started = new AcpAgentFactory(60_000, "copilot")
+        .start("s1", "C:\\repo", (event) => events.push(event), {
+          signal: controller.signal,
+          mcpServers: fleetMcp,
+          resumeAgentSessionId: "saved-id",
+          contextOverflowRecoveryPrompt: "Do not send after cancellation",
+        })
+        .catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(credits.readers).toHaveLength(1);
+      controller.abort(reason);
+      const failure = await started;
+      expect(failure).toEqual(reason);
+      expect(stopProcessTree).toHaveBeenCalledOnce();
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+      const recorded = [...events];
+      const requested = [...requests];
+      finishRead(1);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(recorded);
+      expect(requests).toEqual(requested);
+      expect(requests.some((request) => request.method === "session/prompt")).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("removes the cancellation listener after success without stopping the returned agent", async () => {
+    const controller = new AbortController();
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "s1",
+      "C:\\repo",
+      () => {},
+      { signal: controller.signal, mcpServers: fleetMcp },
+    );
+    agents.push(agent);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    controller.abort(new Error("Too late"));
+    await agent.prompt("Continue");
+    expect(stopProcessTree).not.toHaveBeenCalled();
+    expect(requests.some((request) => request.method === "session/prompt")).toBe(true);
+  });
+
+  it.each([false, true])(
+    "waits for verified shutdown but only announced stops await pending credits (announce=%s)",
+    async (announce) => {
+      vi.useFakeTimers();
+      Object.defineProperty(process, "platform", { value: "win32" });
+      credits.value = 1;
+      const controller = new AbortController();
+      const events: SessionEvent[] = [];
+      const agent = await new AcpAgentFactory(60_000, "copilot").start(
+        "s1",
+        "C:\\repo",
+        (event) => events.push(event),
+        { signal: controller.signal, mcpServers: fleetMcp },
+      );
+      agents.push(agent);
+      expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+
+      let finishRead!: (value: number) => void;
+      credits.pending = new Promise<number>((resolve) => {
+        finishRead = resolve;
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(Reflect.get(agent, "creditRead")).toBeInstanceOf(Promise);
+      let finishCleanup!: () => void;
+      vi.mocked(stopProcessTree).mockImplementationOnce(
+        (child) =>
+          new Promise<void>((resolve) => {
+            finishCleanup = () => {
+              child.kill();
+              resolve();
+            };
+          }),
+      );
+      let settled = false;
+      const stopped = agent.stop(announce).then(() => {
+        settled = true;
+      });
+      try {
+        await vi.advanceTimersByTimeAsync(0);
+        expect(stopProcessTree).toHaveBeenCalledExactlyOnceWith(
+          launches()[0]?.child,
+          true,
+        );
+        expect(settled).toBe(false);
+        expect(launches()[0]?.child.kill).not.toHaveBeenCalled();
+
+        finishCleanup();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(launches()[0]?.child.kill).toHaveBeenCalledOnce();
+        expect(settled).toBe(!announce);
+        expect(events.some((event) => event.payload.state === "stopped")).toBe(false);
+      } finally {
+        if (launches()[0]?.child.exitCode === null) finishCleanup();
+        finishRead(2);
+        await stopped;
+      }
+      if (announce) {
+        expect(events.filter((event) => event.type === "usage").at(-1)?.payload).toEqual({
+          aiCredits: 2,
+        });
+        expect(events.at(-1)?.payload.state).toBe("stopped");
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it("aborts a timed-out startup already waiting for optional cleanup usage", async () => {
+    vi.useFakeTimers();
+    let finishRead!: (value: number) => void;
+    credits.pending = new Promise<number>((resolve) => {
+      finishRead = resolve;
+    });
+    const controller = new AbortController();
+    const events: SessionEvent[] = [];
+    const started = new AcpAgentFactory(60_000, "copilot", "default", 1_000)
+      .start("s1", "C:\\repo", (event) => events.push(event), {
+        signal: controller.signal,
+        mcpServers: fleetMcp,
+        resumeAgentSessionId: "saved-id",
+      })
+      .catch((error: unknown) => error);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(stopProcessTree).toHaveBeenCalledOnce();
+    controller.abort(new Error("Stop recovery cleanup"));
+    const failure = await started;
+    expect(failure).toBeInstanceOf(Error);
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    const recorded = [...events];
+    finishRead(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events).toEqual(recorded);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("still waits for verified process termination when startup is aborted", async () => {
+    vi.useFakeTimers();
+    startupHangs = "initialize";
+    let finishCleanup!: () => void;
+    vi.mocked(stopProcessTree).mockImplementationOnce(
+      (child) =>
+        new Promise<void>((resolve) => {
+          finishCleanup = () => {
+            child.kill();
+            resolve();
+          };
+        }),
+    );
+    const controller = new AbortController();
+    let settled = false;
+    const started = new AcpAgentFactory(60_000, "copilot")
+      .start("s1", "C:\\repo", () => {}, {
+        signal: controller.signal,
+        mcpServers: fleetMcp,
+      })
+      .catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+    await vi.advanceTimersByTimeAsync(0);
+    controller.abort(new Error("Recovery cancelled"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);
+    expect(launches()[0]?.child.kill).not.toHaveBeenCalled();
+    finishCleanup();
+    await started;
+    expect(settled).toBe(true);
+    expect(launches()[0]?.child.kill).toHaveBeenCalledOnce();
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("bounds an Agency metadata probe that never responds", async () => {

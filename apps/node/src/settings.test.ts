@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import {
   DEFAULT_MAX_SESSIONS,
   DEFAULT_PERMISSION_TIMEOUT_MS,
@@ -9,11 +9,23 @@ import {
   needsReconnect,
   settingsFromEnv,
   settingsOverridesFromEnv,
+  createSettingsUpdater,
+  saveSettings,
+  EditableSettingsSchema,
 } from "./settings.js";
 import { configDirectory } from "./config.js";
 import { configServerPort } from "./config-server.js";
 
 describe("settingsFromEnv", () => {
+  it("excludes rules and their revision from the generic editable form, including defaults", () => {
+    const parsed = EditableSettingsSchema.parse({
+      ...settingsFromEnv({}),
+      commandPermissionRules: [],
+      commandPermissionRevision: 42,
+    });
+    expect(parsed).not.toHaveProperty("commandPermissionRules");
+    expect(parsed).not.toHaveProperty("commandPermissionRevision");
+  });
   it("falls back to loopback and this machine's hostname", () => {
     const settings = settingsFromEnv({});
     expect(settings.hostUrl).toBe("http://127.0.0.1:8787");
@@ -77,7 +89,8 @@ describe("loadSettings", () => {
   const previousAppData = process.env.APPDATA;
 
   function isolatedConfigDirectory(): string {
-    const root = mkdtempSync(join(tmpdir(), "fleet-settings-"));
+    const root = resolve(`.fleet-settings-${randomUUID()}`);
+    mkdirSync(root);
     directories.push(root);
     process.env.XDG_CONFIG_HOME = root;
     process.env.APPDATA = root;
@@ -136,6 +149,79 @@ describe("loadSettings", () => {
   it("rejects an override the settings schema cannot accept", async () => {
     isolatedConfigDirectory();
     await expect(loadSettings({}, { maxSessions: Number("many") })).rejects.toThrow();
+  });
+
+  it("ignores legacy opt-in and eligible roots instead of converting them into grants", async () => {
+    writeStoredSettings({
+      remoteCommandsEnabled: true,
+      commandExecutionRoots: ["C:\\old"],
+      commandIsolationConfirmed: true,
+    });
+    const settings = await loadSettings({});
+    expect(settings).not.toHaveProperty("remoteCommandsEnabled");
+    expect(settings.commandPermissionRules.map((rule) => rule.commandKey)).toEqual([
+      "cd",
+      "set-location",
+    ]);
+  });
+
+  it("persists explicit builtin removal rather than restoring defaults on restart", async () => {
+    isolatedConfigDirectory();
+    await saveSettings({ ...settingsFromEnv({}), commandPermissionRules: [] });
+    expect((await loadSettings({})).commandPermissionRules).toEqual([]);
+  });
+});
+
+describe("serialized settings mutations", () => {
+  it("merges concurrent permission, config and restore writes against the latest committed state", async () => {
+    let current = settingsFromEnv({});
+    const writes: (typeof current)[] = [];
+    const update = createSettingsUpdater({
+      get: () => current,
+      set: (settings) => {
+        current = settings;
+      },
+      save: async (settings) => {
+        await Promise.resolve();
+        writes.push(settings);
+      },
+    });
+    await Promise.all([
+      update((settings) => ({ ...settings, commandPermissionRules: [] })),
+      update((settings) => ({ ...settings, nodeName: "renamed" })),
+      update((settings) => ({ ...settings, hostUrl: "https://restored.example.com" })),
+    ]);
+    expect(writes).toHaveLength(3);
+    expect(current).toMatchObject({
+      commandPermissionRules: [],
+      commandPermissionRevision: 1,
+      nodeName: "renamed",
+      hostUrl: "https://restored.example.com",
+    });
+  });
+
+  it("does not publish failed writes and keeps the queue usable", async () => {
+    let current = settingsFromEnv({});
+    const save = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("disk full"))
+      .mockResolvedValue(undefined);
+    const update = createSettingsUpdater({
+      get: () => current,
+      set: (settings) => {
+        current = settings;
+      },
+      save,
+    });
+    await expect(
+      update((settings) => ({ ...settings, commandPermissionRules: [] })),
+    ).rejects.toThrow("disk full");
+    expect(current.commandPermissionRules).toHaveLength(2);
+    expect(current.commandPermissionRevision).toBe(0);
+    await update((settings) => ({ ...settings, nodeName: "after-failure" }));
+    expect(current.nodeName).toBe("after-failure");
+    expect(current.commandPermissionRules).toHaveLength(2);
+    expect(current.commandPermissionRevision).toBe(0);
   });
 });
 

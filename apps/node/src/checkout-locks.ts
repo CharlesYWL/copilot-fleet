@@ -225,6 +225,30 @@ export class CheckoutLocks {
     return lease;
   }
 
+  /** Called only after the command supervisor proves this exact attempt quiescent. */
+  releaseRecoveredCommand(
+    identity: CheckoutIdentity,
+    owner: string,
+    attempt: string,
+    admin = false,
+  ): void {
+    if (!owner.startsWith("command:"))
+      throw new Error("Only a verified command supervisor can reconcile this owner.");
+    const key = admin ? `admin:${identity.key}` : identity.key;
+    const record = this.holder(key);
+    if (!record) return;
+    if (record.owner !== owner) return;
+    if (record.attempt !== attempt)
+      throw new WorktreeConflict(
+        "lease_changed",
+        "Recovered command no longer owns this lease.",
+      );
+    if (this.holder(key)?.token !== record.token)
+      throw new WorktreeConflict("lease_changed", "Recovered command lease changed.");
+    unlinkIfPresent(this.file(key));
+    this.held.delete(key);
+  }
+
   /** Only administrative commands have a bounded, recorded child-process set. */
   reconcileAdmin(identity: CheckoutIdentity): void {
     const key = `admin:${identity.key}`;

@@ -6,6 +6,7 @@ export type ReviewOutcome =
   | { kind: "not_found" }
   | { kind: "not_waiting" }
   | { kind: "needs_reason" }
+  | { kind: "maintenance_direction_required" }
   | { kind: "approve"; note: string }
   | { kind: "send_back"; note: string; prompt: string };
 
@@ -16,14 +17,41 @@ export type ReviewOutcome =
  * it: a task that nobody handed over cannot be answered, and sending one back
  * without saying why would restart the work with nothing to act on.
  */
-export function reviewOutcome(run: Run | undefined, input: ReviewInput): ReviewOutcome {
+export function reviewOutcome(
+  run: Run | undefined,
+  input: ReviewInput,
+  maintenanceDecisionPending = false,
+): ReviewOutcome {
   if (!run) return { kind: "not_found" };
-  if (run.state !== "awaiting_human") return { kind: "not_waiting" };
+  if (maintenanceDecisionPending && input.approved) {
+    return { kind: "maintenance_direction_required" };
+  }
+  if (run.state !== "awaiting_human" && !maintenanceDecisionPending)
+    return { kind: "not_waiting" };
   if (input.approved) return { kind: "approve", note: input.note?.trim() ?? "" };
 
   const note = input.note?.trim() ?? "";
   if (!note) return { kind: "needs_reason" };
   return { kind: "send_back", note, prompt: sendBackPrompt(run.name, note) };
+}
+
+export function maintenanceDirectionPrompt(
+  task: string,
+  decisionId: string,
+  note: string,
+): string {
+  return [
+    `<fleet-review task=${JSON.stringify(task)} verdict="maintenance direction" decision=${JSON.stringify(decisionId)}>`,
+    note,
+    "</fleet-review>",
+    "",
+    "Read fleet_get_pr_maintenance and fleet_get_task before acting.",
+    "This is bounded human direction, not proof that a defect is fixed or task criteria are met.",
+    "Preserve unresolved findings and history. Revalidate the exact proposal, scope, HEAD,",
+    "worker binding and permissions before requesting maintenance resume.",
+    "A substantial redesign returns to normal implementation and needs an accepted baseline.",
+    "Do not complete or aggregate the task merely because direction was recorded.",
+  ].join("\n");
 }
 
 /**

@@ -21,6 +21,24 @@ import {
   RepositoryProbeResultSchema,
 } from "./managed-worktrees.js";
 export * from "./managed-worktrees.js";
+import {
+  PromptAttachmentSchema,
+  MAX_ATTACHMENTS_PER_PROMPT,
+  base64Bytes,
+  type PromptAttachment,
+} from "./attachments.js";
+export * from "./attachments.js";
+import {
+  CommandExecutionHostSchemas,
+  CommandExecutionNodeSchemas,
+  CommandExecutionSchema,
+  CommandOutputEventSchema,
+  CommandReadinessSchema,
+  CommandExecutionBackupSchema,
+} from "./command-execution.js";
+export * from "./command-execution.js";
+export * from "./pr-maintenance.js";
+import { PrMaintenanceBackupSchema } from "./pr-maintenance.js";
 
 /** Local startup events consumed by the service CLI, independent of log formatting. */
 export const CONFIG_UI_EVENT_MARKER = "FLEET_CONFIG_UI ";
@@ -334,43 +352,6 @@ export const SessionUsageSchema = z.object({
   context: ContextUsageSchema.nullable().optional(),
 });
 export type SessionUsage = z.infer<typeof SessionUsageSchema>;
-
-/**
- * A file riding along with a prompt.
- *
- * Bytes travel base64 in one piece rather than through an upload endpoint: the
- * agent is on another machine, often behind a tunnel, and giving it a URL to
- * fetch would mean the Node needs credentials and reachability back to the Host
- * for something that is already in the operator's hand. The size ceilings below
- * are what keep that honest.
- *
- * The Node decides how to present each one from `mimeType`: images become ACP
- * image blocks, everything else is embedded as text. Copilot reports both
- * `image` and `embeddedContext` support, and both are verified working.
- */
-export const PromptAttachmentSchema = z.object({
-  name: z.string().min(1).max(255),
-  mimeType: z.string().min(1).max(200),
-  /** Base64, for text files too, so one field carries every kind. */
-  data: z.string().min(1),
-});
-export type PromptAttachment = z.infer<typeof PromptAttachmentSchema>;
-
-/**
- * What a prompt may carry, before base64 turns each byte into about 1.37.
- *
- * A screenshot is the common case and lands well under this; the ceiling exists
- * so one paste cannot sit in a WebSocket frame big enough to stall every other
- * session sharing that connection.
- */
-export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
-export const MAX_ATTACHMENTS_PER_PROMPT = 6;
-
-/** Decoded size of base64, without allocating the bytes to find out. */
-export function base64Bytes(data: string): number {
-  const padding = data.endsWith("==") ? 2 : data.endsWith("=") ? 1 : 0;
-  return Math.max(0, Math.floor((data.length * 3) / 4) - padding);
-}
 
 /** What the transcript keeps: enough to show the file, never its bytes. */
 export const AttachmentSummarySchema = z.object({
@@ -879,6 +860,7 @@ const nodeInventoryShape = {
   version: z.string().min(1),
   revision: z.string().default(""),
   capabilities: z.array(z.string()),
+  commandExecution: CommandReadinessSchema.optional(),
   agents: z.array(NodeAgentSchema).default([]),
   maxSessions: z.number().int().positive(),
   homeDir: z.string().default(""),
@@ -959,6 +941,7 @@ export const NodeReadySchema = z.object({
 export type NodeReady = z.infer<typeof NodeReadySchema>;
 
 export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
+  ...CommandExecutionNodeSchemas,
   z.object({
     type: z.literal("repository_probe_result"),
     result: RepositoryProbeResultSchema,
@@ -1060,6 +1043,7 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
 export type NodeToHostMessage = z.infer<typeof NodeToHostMessageSchema>;
 
 export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
+  ...CommandExecutionHostSchemas,
   z.object({
     type: z.literal("repository_probe"),
     request: RepositoryProbeRequestSchema,
@@ -1079,6 +1063,9 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("welcome"),
     nodeId: z.string().min(1),
+    commandExecutions: z.boolean().default(false),
+    commandPermissions: z.boolean().default(false),
+    durableLeadDelivery: z.boolean().default(false),
     /**
      * Confirms this Host deferred reconciliation for the advertised outbox.
      *
@@ -1583,6 +1570,9 @@ export const NotificationCategorySchema = z.enum([
 export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
 
 export const NotificationKindSchema = z.enum([
+  "command_approval",
+  "command_completion",
+  "pr_maintenance_attention",
   "managed_worktree_attention",
   "agent_completion",
   "agent_failure",
@@ -1611,7 +1601,14 @@ export type NotificationStatus = z.infer<typeof NotificationStatusSchema>;
  * or run has been removed.
  */
 export const NotificationSubjectSchema = z.object({
-  type: z.enum(["session", "agent", "run", "run_step", "permission_request"]),
+  type: z.enum([
+    "session",
+    "agent",
+    "run",
+    "run_step",
+    "permission_request",
+    "command_execution",
+  ]),
   id: z.string().min(1).max(200),
   label: z.string().min(1).max(200),
   parentId: z.string().min(1).max(200).optional(),
@@ -1621,7 +1618,15 @@ export type NotificationSubject = z.infer<typeof NotificationSubjectSchema>;
 
 /** Where a browser should navigate using identifiers copied into the record. */
 export const NotificationNavigationSchema = z.object({
-  type: z.enum(["fleet", "session", "run", "run_step", "permission_request"]),
+  type: z.enum([
+    "fleet",
+    "session",
+    "run",
+    "run_step",
+    "permission_request",
+    "command_execution",
+  ]),
+  executionId: z.string().uuid().optional(),
   sessionId: z.string().min(1).max(200).optional(),
   runId: z.string().min(1).max(200).optional(),
   stepId: z.string().min(1).max(200).optional(),
@@ -1747,10 +1752,16 @@ export const SnapshotSchema = z.object({
    * says nothing an operator can act on.
    */
   hostRevision: z.string().default(""),
+  commandExecutions: z.array(CommandExecutionSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
 export const BrowserMessageSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("command_execution"), execution: CommandExecutionSchema }),
+  z.object({
+    type: z.literal("command_execution_output"),
+    event: CommandOutputEventSchema,
+  }),
   z.object({ type: z.literal("snapshot"), data: SnapshotSchema }),
   z.object({ type: z.literal("node"), node: NodeSchema }),
   z.object({ type: z.literal("session"), session: SessionSchema }),
@@ -2577,11 +2588,13 @@ const hostBackupDataShape = {
   placements: z.array(HostBackupPlacementSchema),
   sessions: z.array(HostBackupSessionSchema),
   events: z.array(SessionEventSchema),
+  commandExecutionData: CommandExecutionBackupSchema.optional(),
   /**
    * Defaulted, or every archive written before orchestration existed stops
    * importing — the one failure mode a backup format may not have.
    */
   runs: z.array(RunSchema).default([]),
+  prMaintenance: PrMaintenanceBackupSchema.optional(),
   managedWorktrees: z.array(ManagedWorktreeSchema).default([]).optional(),
   derivedWorkspaces: z.array(ManagedWorktreeSchema).default([]).optional(),
   worktreeOperations: z.array(WorktreeOperationSchema).default([]).optional(),

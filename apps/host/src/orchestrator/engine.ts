@@ -60,6 +60,9 @@ export class OrchestratorEngine {
    * flag here rather than re-reading the log keeps the tick cheap.
    */
   handleSessionEvent(event: SessionEvent): void {
+    if (event.type === "turn_complete" || event.type === "state") {
+      this.service.reconcilePrMaintenanceExecution(event.sessionId);
+    }
     if (event.type === "turn_complete") {
       const completion = this.store.getSessionTurnCompletion(event.sessionId);
       if (completion) {
@@ -164,6 +167,8 @@ export class OrchestratorEngine {
 
   /** Advances every run that is not already finished. */
   tick(nowMs = Date.now()): void {
+    this.service.commands.tick(nowMs);
+    this.service.cancelPausedPrMaintenance(new Date(nowMs).toISOString());
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
     for (const run of this.store.listRuns()) {
@@ -183,7 +188,18 @@ export class OrchestratorEngine {
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
     if (!run || terminalRunStates.has(run.state)) return;
+    const commandFence = this.store.commands.fence(runId);
+    if (
+      commandFence &&
+      ["executing", "observation_required"].includes(commandFence.state)
+    )
+      return;
     if (run.state === "aggregating") {
+      if (
+        !this.store.prMaintenance.admission({ action: "aggregate", taskId: run.id })
+          .allowed
+      )
+        return;
       this.service.worktrees.advanceAggregation(run.id);
       return;
     }
@@ -233,7 +249,12 @@ export class OrchestratorEngine {
         completedTurns.add(session.id);
       }
     }
-    const workspaceReady = steps.length ? this.service.worktrees.ensureReady(run) : true;
+    const mayContinue = this.store.prMaintenance.admission({
+      action: "discover",
+      taskId: run.id,
+    }).allowed;
+    const workspaceReady =
+      mayContinue && (steps.length ? this.service.worktrees.ensureReady(run) : true);
     if (workspaceReady && run.workspaceBinding?.effectiveMode === "managed") {
       for (const step of steps)
         if (step.state === "pending") this.service.worktrees.ensureStepReady(run, step);
@@ -312,6 +333,17 @@ export class OrchestratorEngine {
     const placement = this.store.getPlacement(action.placementId);
     const step = this.store.getRunStep(action.stepId);
     if (!placement || !step) return false;
+    if (
+      !this.store.prMaintenance.admission({
+        action: "execute",
+        taskId: run.id,
+        placementId: placement.id,
+        ...(step.executionBinding
+          ? { checkoutKey: step.executionBinding.checkoutKey }
+          : {}),
+      }).allowed
+    )
+      return false;
     if (!canTransitionRunStep(step.state, "starting")) return false;
 
     const starting = this.store.updateRunStep(step.id, {
@@ -321,6 +353,7 @@ export class OrchestratorEngine {
       ...(step.executionBinding ? { executionBinding: step.executionBinding } : {}),
     });
     if (!starting) return false;
+    this.store.commands.recordStepEvidence(run.id, step.id);
 
     const result = this.service.createAndStartSession({
       placement,
@@ -382,8 +415,19 @@ export class OrchestratorEngine {
     if (!step || step.state !== "pending" || !session || session.cleanupRequested) {
       return false;
     }
+    if (
+      !this.store.prMaintenance.admission({
+        action: "execute",
+        taskId: run.id,
+        sessionId: session.id,
+        placementId: session.placementId,
+        ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
+      }).allowed
+    )
+      return false;
     if (!terminalSessionStates.has(session.state)) return false;
     this.store.updateRunStep(step.id, { dispatchedAt: new Date().toISOString() });
+    this.store.commands.recordStepEvidence(run.id, step.id);
     const resumed = this.service.resumeSession(
       session.id,
       "Resuming for orchestrator follow-up",
@@ -408,12 +452,23 @@ export class OrchestratorEngine {
     if (!step || step.state !== "pending" || session?.state !== "idle") return false;
     if (session.stopRequested || session.dismissed || session.cleanupRequested)
       return false;
+    if (
+      !this.store.prMaintenance.admission({
+        action: "execute",
+        taskId: run.id,
+        sessionId: session.id,
+        placementId: session.placementId,
+        ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
+      }).allowed
+    )
+      return false;
 
     this.store.updateRunStep(step.id, {
       state: "starting",
       eventSeqFrom: this.store.maxEventSequence(session.id),
       dispatchedAt: new Date().toISOString(),
     });
+    this.store.commands.recordStepEvidence(run.id, step.id);
     const sent = this.service.dispatch(session.nodeId, {
       type: "prompt",
       sessionId: session.id,
@@ -441,7 +496,11 @@ export class OrchestratorEngine {
     if (action.state === "failed") {
       return this.failStep(run, step, action.output);
     }
-    if (action.state === "succeeded" && !this.service.worktrees.finalizeStep(run, step))
+    if (
+      action.state === "succeeded" &&
+      !this.store.prMaintenance.referenceForStep(step.id, step.attempts) &&
+      !this.service.worktrees.finalizeStep(run, step)
+    )
       return true;
     const settled = this.service.settleOrchestrationStep({
       runId: run.id,
@@ -497,6 +556,27 @@ export class OrchestratorEngine {
   private deliverPrompt(run: Run, prompt: string, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
     if (!lead || lead.state !== "idle" || lead.cleanupRequested) return false;
+    if (this.service.commands.durableLead(lead.id)) {
+      const queued = this.store.writeAtomically(() => {
+        if (
+          !this.store.recordRunPromptDelivery(
+            run.id,
+            lead.id,
+            prompt,
+            new Date(nowMs).toISOString(),
+          )
+        )
+          return false;
+        this.service.commands.queueLeadPrompt(
+          lead.id,
+          prompt,
+          `run-prompt:${run.id}:${run.updatedAt}`,
+        );
+        return true;
+      });
+      if (queued) this.service.commands.pumpLead(lead.id);
+      return queued;
+    }
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     if (
@@ -528,6 +608,23 @@ export class OrchestratorEngine {
   private wakeLead(run: Run, nowMs: number): boolean {
     const lead = run.leadSessionId ? this.store.getSession(run.leadSessionId) : undefined;
     if (!lead || lead.state !== "idle" || lead.cleanupRequested) return false;
+    if (this.service.commands.durableLead(lead.id)) {
+      const queued = this.store.writeAtomically(() => {
+        const prompt = this.wakeEnvelope(run);
+        if (
+          !this.store.recordRunWakePrompt(run.id, lead.id, new Date(nowMs).toISOString())
+        )
+          return false;
+        this.service.commands.queueLeadPrompt(
+          lead.id,
+          prompt,
+          `run-wake:${run.id}:${run.settleSeq}`,
+        );
+        return true;
+      });
+      if (queued) this.service.commands.pumpLead(lead.id);
+      return queued;
+    }
     if (this.promptedThisTick.has(lead.id)) return false;
     this.promptedThisTick.add(lead.id);
     if (!this.store.recordRunWakePrompt(run.id, lead.id, new Date(nowMs).toISOString())) {
@@ -568,6 +665,9 @@ export class OrchestratorEngine {
       const owned = activeByLead.get(run.leadSessionId) ?? [];
       owned.push(run);
       activeByLead.set(run.leadSessionId, owned);
+    }
+    for (const leadId of this.store.prMaintenance.wakeEligibleLeadIds()) {
+      if (!activeByLead.has(leadId)) activeByLead.set(leadId, []);
     }
 
     for (const [leadSessionId, runs] of activeByLead) {
@@ -613,12 +713,37 @@ export class OrchestratorEngine {
         };
       });
 
+      const maintenance = this.store.prMaintenance.list({
+        leadSessionId: lead.id,
+        retainedOnly: true,
+        limit: 5,
+      });
+      const prompt = [
+        statusCheckEnvelope(tasks),
+        ...(maintenance.records.length
+          ? [
+              `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,
+            ]
+          : []),
+      ].join("\n\n");
       this.promptedThisTick.add(lead.id);
+      if (this.service.commands.durableLead(lead.id)) {
+        this.store.writeAtomically(() => {
+          this.service.commands.queueLeadPrompt(
+            lead.id,
+            prompt,
+            `status:${lead.id}:${baseline}`,
+          );
+          this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+        });
+        this.service.commands.pumpLead(lead.id);
+        continue;
+      }
       this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
       this.service.dispatch(lead.nodeId, {
         type: "prompt",
         sessionId: lead.id,
-        prompt: statusCheckEnvelope(tasks),
+        prompt,
         attachments: [],
       });
     }
@@ -673,7 +798,14 @@ export class OrchestratorEngine {
   private finishRun(run: Run, state: Run["state"], reason: string): boolean {
     if (run.workspaceBinding?.effectiveMode === "managed") {
       if (state === "completed") {
-        this.service.worktrees.beginFinalization(run.id, state, reason);
+        if (
+          !this.store.prMaintenance.admission({
+            action: "aggregate",
+            taskId: run.id,
+          }).allowed
+        )
+          return false;
+        this.service.worktrees.beginAggregation(run.id);
         return true;
       }
       if (state === "failed" || state === "cancelled") {

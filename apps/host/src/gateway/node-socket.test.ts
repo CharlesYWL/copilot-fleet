@@ -511,6 +511,100 @@ describe("node gateway mutual authentication", () => {
     socket.close();
   });
 
+  it("negotiates command execution and independent durable delivery only on a sealed ready", async () => {
+    const { keys, receipt } = await enrollNode();
+    const { socket, channel } = await handshake({
+      nodeId: receipt.nodeId,
+      keys,
+      inventory: {
+        capabilities: [
+          ...registration.capabilities,
+          "remote-command-execution-v1",
+          "durable-lead-delivery-v1",
+        ],
+        commandExecution: {
+          enabled: true,
+          supported: true,
+          reason: "",
+          shells: ["windows-powershell-5.1"],
+          admissionVersion: 1,
+        },
+      },
+    });
+    const welcome = channel.open(
+      (await nextFrame(socket)) as unknown as AuthenticatedEnvelope,
+    );
+    expect(welcome.ok && JSON.parse(welcome.plaintext)).toMatchObject({
+      commandExecutions: true,
+      durableLeadDelivery: true,
+    });
+    const closed = closeCode(socket);
+    socket.send(
+      JSON.stringify(
+        channel.seal(
+          JSON.stringify({
+            type: "command_execution_prepared",
+            executionId: "11111111-2222-4333-8444-555555555555",
+            attemptId: "11111111-2222-4333-8444-666666666666",
+            ok: false,
+            error: "unknown execution",
+          }),
+        ),
+      ),
+    );
+    expect(await closed).toBe(1008);
+  });
+
+  it("negotiates sealed command recovery when a locally disabled Node omits execution admission capability", async () => {
+    const { keys, receipt } = await enrollNode();
+    const { socket, channel } = await handshake({
+      nodeId: receipt.nodeId,
+      keys,
+      inventory: {
+        capabilities: registration.capabilities,
+        commandExecution: {
+          enabled: false,
+          supported: false,
+          reason: "Local opt-out; recovery only",
+          shells: [],
+          admissionVersion: 1,
+        },
+      },
+    });
+    const welcome = channel.open(
+      (await nextFrame(socket)) as unknown as AuthenticatedEnvelope,
+    );
+    expect(welcome.ok && JSON.parse(welcome.plaintext)).toMatchObject({
+      commandExecutions: true,
+    });
+    socket.close();
+  });
+
+  it("does not let inventory upgrade a connection that omitted command support in ready", async () => {
+    const { keys, receipt } = await enrollNode();
+    const { socket, channel } = await handshake({ nodeId: receipt.nodeId, keys });
+    channel.open((await nextFrame(socket)) as unknown as AuthenticatedEnvelope);
+    const closed = closeCode(socket);
+    socket.send(
+      JSON.stringify(
+        channel.seal(
+          JSON.stringify({
+            type: "command_execution_inventory",
+            readiness: {
+              enabled: true,
+              supported: true,
+              reason: "",
+              shells: ["windows-powershell-5.1"],
+              admissionVersion: 1,
+            },
+            executions: [],
+          }),
+        ),
+      ),
+    );
+    expect(await closed).toBe(1008);
+  });
+
   it("erases browser authentication without restarting the Host or closing the Node channel", async () => {
     const { keys, receipt } = await enrollNode();
     const { socket, channel } = await handshake({ nodeId: receipt.nodeId, keys });

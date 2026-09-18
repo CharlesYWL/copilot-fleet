@@ -14,12 +14,25 @@ import {
   type ExecutionBinding,
   WorktreeConflict,
 } from "@fleet/protocol";
-import type { AgentFactory, SessionAgent } from "./agents.js";
+import {
+  AgentStartupCleanupError,
+  type AgentFactory,
+  type SessionAgent,
+} from "./agents.js";
 import { installRequestedAgent, type CatalogEntry } from "./agent-catalog.js";
 type SessionKind = "writing" | "read-only";
 import { resolveMcpServers } from "./mcp-endpoint.js";
 import type { ManagedWorktrees } from "./managed-worktrees.js";
 import type { CheckoutLease } from "./checkout-locks.js";
+import type { NodeAdmission, AdmissionTicket } from "./node-admission.js";
+import type { RepositoryParticipation } from "./repository-participation.js";
+import type { LeadPromptJournal } from "./lead-prompt-delivery.js";
+import type { LeadPromptDelivery, LeadPromptReceipt } from "@fleet/protocol";
+import {
+  MCP_RECOVERY_DELAYS_MS,
+  McpRecoveryConnection,
+  recoveryDelay,
+} from "./mcp-recovery.js";
 
 export type CommandResult = {
   commandId: string;
@@ -40,6 +53,9 @@ export class CommandRefused extends Error {}
 
 export type CommandRouterOptions = {
   worktrees?: ManagedWorktrees;
+  admission?: NodeAdmission;
+  repositories?: RepositoryParticipation;
+  leadDeliveries?: LeadPromptJournal;
   deleteInactiveSession?: (
     agentSessionId: string,
     inactiveBefore: number,
@@ -55,6 +71,11 @@ type SessionActivity = {
 
 type SessionSlot = {
   leases?: CheckoutLease[];
+  participation?: CheckoutLease[];
+  supervisedParticipation?: boolean;
+  ticket?: AdmissionTicket;
+  deliveryId?: string;
+  deliverySequence?: number;
   binding?: ExecutionBinding;
   terminalEvent?: SessionEvent;
   terminalEmitted?: boolean;
@@ -66,6 +87,9 @@ type SessionSlot = {
   activity: SessionActivity;
   refreshing?: Promise<void>;
   refreshMcpPending?: boolean;
+  mcpRecovery?: AbortController;
+  stopping?: boolean;
+  silentReplacement?: boolean;
   launch?: LaunchCommand;
   cwd?: string;
   additionalDirectories?: string[];
@@ -99,6 +123,7 @@ export class CommandRouter {
   private readonly bindings = new Map<string, ExecutionBinding>();
   private readonly reconciliation = new Map<string, SessionSlot>();
   private draining = false;
+  private readonly mcpConnection = new McpRecoveryConnection();
 
   constructor(
     private readonly factory: AgentFactory,
@@ -180,12 +205,29 @@ export class CommandRouter {
   /** Sessions with a turn still in flight, for the Host's reconnect bookkeeping. */
   get busySessionIds(): string[] {
     return [...this.slots.entries()]
-      .filter(([, slot]) => slot.agent?.busy)
+      .filter(
+        ([id, slot]) =>
+          slot.mcpRecovery ||
+          slot.agent?.busy ||
+          this.options.leadDeliveries?.reserved(id, slot.agentSessionId),
+      )
       .map(([sessionId]) => sessionId);
   }
 
   denyPendingPermissions(): void {
     for (const slot of this.slots.values()) slot.agent?.denyPendingPermissions();
+  }
+
+  setMcpAvailable(available: boolean): void {
+    this.mcpConnection.setAvailable(available);
+  }
+
+  private cancelMcpRecovery(slot: SessionSlot): void {
+    slot.refreshMcpPending = false;
+    if (slot.mcpRecovery) {
+      slot.silentReplacement = true;
+      slot.mcpRecovery.abort(new Error("MCP recovery cancelled by Stop"));
+    }
   }
 
   /**
@@ -198,7 +240,7 @@ export class CommandRouter {
   async refreshMcpSessions(): Promise<void> {
     await Promise.allSettled(
       [...this.slots].map(async ([sessionId, slot]) => {
-        if (this.deleting.has(sessionId)) return;
+        if (this.deleting.has(sessionId) || slot.stopping || this.draining) return;
         if (slot.refreshing) {
           await slot.refreshing;
           return;
@@ -207,7 +249,8 @@ export class CommandRouter {
         if (
           this.deleting.has(sessionId) ||
           this.slots.get(sessionId) !== slot ||
-          !slot.agent
+          !slot.agent ||
+          !slot.launch?.mcpServers.length
         )
           return;
         if (slot.agent.busy) {
@@ -222,6 +265,10 @@ export class CommandRouter {
   async stopAll(): Promise<void> {
     this.draining = true;
     const slots = [...new Map([...this.reconciliation, ...this.slots])];
+    for (const [, slot] of slots) {
+      slot.stopping = true;
+      this.cancelMcpRecovery(slot);
+    }
     const results = await Promise.allSettled(
       slots.map(async ([sessionId, slot]) => {
         await slot.ready.catch(() => undefined);
@@ -254,6 +301,8 @@ export class CommandRouter {
             (!target || checkoutKey !== target.key)
           )
             return;
+          slot.stopping = true;
+          this.cancelMcpRecovery(slot);
           await slot.ready.catch(() => undefined);
           await this.quiesce(sessionId, slot, true);
         },
@@ -276,28 +325,49 @@ export class CommandRouter {
         : this.slots.get(command.sessionId)?.agentSessionId,
     );
     if (command.type === "start_session" || command.type === "resume_session") {
+      if (this.options.admission?.reason)
+        throw new CommandRefused(this.options.admission.reason);
       return this.startSession(command);
     }
 
-    const slot = this.slots.get(command.sessionId);
+    const slot =
+      this.slots.get(command.sessionId) ??
+      (command.type === "stop" ? this.reconciliation.get(command.sessionId) : undefined);
+    if (command.type === "stop" && slot) {
+      slot.stopping = true;
+      this.cancelMcpRecovery(slot);
+    } else if (slot?.mcpRecovery || slot?.stopping) {
+      throw new CommandRefused("Session is recovering MCP tools or being stopped");
+    }
     await slot?.ready;
     this.assertNotDeleting(command.sessionId, slot?.agentSessionId);
+    if (command.type === "stop") {
+      if (!slot) throw new Error("Session is not active on this node");
+      await this.withActivity(slot, () => this.quiesce(command.sessionId, slot, true));
+      return;
+    }
     const agent = slot?.agent;
     if (!agent || this.slots.get(command.sessionId) !== slot) {
       throw new Error("Session is not active on this node");
     }
     if (command.type === "prompt") {
+      if (this.options.admission?.reason)
+        throw new CommandRefused(this.options.admission.reason);
       // Admission itself is in flight: cleanup must not stop the process while
       // physical checkout/lease validation is waiting on the filesystem.
       await this.withActivity(slot, async () => {
         await this.revalidate(slot, command.executionBinding);
+        slot.ticket?.revalidate();
         this.assertNotDeleting(command.sessionId, slot.agentSessionId);
         if (this.slots.get(command.sessionId) !== slot || slot.agent !== agent) {
           throw new CommandRefused("Session changed during prompt admission");
         }
         // Refused rather than dropped: acknowledge only after admission, but
         // keep the turn tracked without making the Host wait for its completion.
-        if (agent.busy) {
+        if (
+          agent.busy ||
+          this.options.leadDeliveries?.reserved(command.sessionId, slot.agentSessionId)
+        ) {
           agent.resync();
           throw new CommandRefused(
             "Copilot is still working on the previous turn; wait for it to finish or cancel it",
@@ -311,8 +381,6 @@ export class CommandRouter {
       await this.withActivity(slot, async () => {
         if (command.type === "cancel") {
           await agent.cancel();
-        } else if (command.type === "stop") {
-          await this.quiesce(command.sessionId, slot, true);
         } else if (command.type === "set_config_option") {
           // A rejected picker change must not tear down an otherwise healthy session.
           try {
@@ -349,6 +417,79 @@ export class CommandRouter {
         }
       });
     }
+  }
+
+  rejectLeadPrompt(
+    hostId: string,
+    delivery: LeadPromptDelivery,
+    reason: string,
+  ): LeadPromptReceipt {
+    const journal = this.options.leadDeliveries;
+    if (!journal) throw new CommandRefused("Durable lead delivery is unavailable.");
+    return journal.accept(hostId, delivery, "", false, reason).receipt;
+  }
+
+  async deliverLeadPrompt(
+    hostId: string,
+    delivery: LeadPromptDelivery,
+  ): Promise<LeadPromptReceipt> {
+    const journal = this.options.leadDeliveries;
+    if (!journal) throw new CommandRefused("Durable lead delivery is unavailable.");
+    const slot = this.slots.get(delivery.sessionId);
+    if (slot?.mcpRecovery || slot?.stopping)
+      return journal.accept(hostId, delivery, slot.agentSessionId ?? "", true).receipt;
+    await slot?.ready;
+    if (slot?.mcpRecovery || slot?.stopping)
+      return journal.accept(hostId, delivery, slot.agentSessionId ?? "", true).receipt;
+    const agent = slot?.agent;
+    const usable =
+      !!slot && !!agent && this.slots.get(delivery.sessionId) === slot && !slot.quiescing;
+    if (usable) await this.revalidate(slot, delivery.executionBinding);
+    const stillUsable =
+      usable &&
+      this.slots.get(delivery.sessionId) === slot &&
+      slot.agent === agent &&
+      !slot.quiescing;
+    const accepted = journal.accept(
+      hostId,
+      delivery,
+      stillUsable || slot?.mcpRecovery || slot?.stopping
+        ? (slot?.agentSessionId ?? "")
+        : "",
+      !!this.options.admission?.reason ||
+        !!agent?.busy ||
+        !!slot?.refreshing ||
+        !!slot?.initializing ||
+        !!slot?.mcpRecovery ||
+        !!slot?.stopping ||
+        this.deleting.has(delivery.sessionId),
+    );
+    if (accepted.invoke && slot && agent) {
+      slot.deliveryId = delivery.deliveryId;
+      slot.deliverySequence = slot.sequenceOffset;
+      void this.withActivity(slot, () =>
+        agent.prompt(delivery.prompt, delivery.attachments, {
+          allowContextRollover: false,
+        }),
+      )
+        .then(
+          () => {
+            // Only turn_complete settles a delivery. Rollover/replay/stop is not consumption proof.
+            journal.uncertain(
+              delivery.deliveryId,
+              "Native prompt returned without an authoritative current-turn completion.",
+            );
+          },
+          (error: unknown) => journal.uncertain(delivery.deliveryId, String(error)),
+        )
+        .catch((error: unknown) => {
+          this.options.admission?.quarantine(
+            `Durable lead receipt persistence failed: ${String(error)}`,
+          );
+          this.warn(String(error));
+        });
+    }
+    return accepted.receipt;
   }
 
   private assertNotDeleting(sessionId: string, agentSessionId?: string): void {
@@ -394,7 +535,12 @@ export class CommandRouter {
     const activity = this.sessionActivity.get(command.sessionId);
     if (
       (activity && (activity.lastActivityAt > cutoff || activity.inFlightCommands > 0)) ||
-      (slot && (slot.initializing || slot.refreshing || !slot.agent || slot.agent.busy))
+      (slot &&
+        (slot.initializing ||
+          slot.refreshing ||
+          slot.stopping ||
+          !slot.agent ||
+          slot.agent.busy))
     ) {
       throw new CommandRefused(
         "session_active: The local session is active, recent, or has work in flight",
@@ -554,6 +700,10 @@ export class CommandRouter {
     }
     const existing = this.slots.get(command.sessionId);
     if (existing) {
+      if (existing.mcpRecovery || existing.stopping)
+        return Promise.reject(
+          new CommandRefused("Session is recovering MCP tools or being stopped"),
+        );
       this.noteActivity(existing, lastActivityAt);
       return existing.ready.then(async () => {
         if (this.slots.get(command.sessionId) !== existing || existing.quiescing)
@@ -576,8 +726,20 @@ export class CommandRouter {
         await this.revalidate(existing, command.executionBinding);
       });
     }
+    if (
+      command.type === "resume_session" &&
+      this.options.leadDeliveries?.reserved(command.sessionId, command.agentSessionId)
+    ) {
+      return Promise.reject(
+        new CommandRefused(
+          "A durable native prompt handoff is unresolved; automatic resume/re-prompt is blocked.",
+        ),
+      );
+    }
     const kind: SessionKind = command.readOnly ? "read-only" : "writing";
-    const held = [...this.slots.values()].filter((slot) => slot.kind === kind).length;
+    const held = [...new Map([...this.reconciliation, ...this.slots]).values()].filter(
+      (slot) => slot.kind === kind,
+    ).length;
     if (held >= this.maxSessions) {
       return Promise.reject(new Error(`Node is at capacity for ${kind} work`));
     }
@@ -598,6 +760,9 @@ export class CommandRouter {
       kind,
       sequenceOffset: command.type === "resume_session" ? command.sequenceOffset : 0,
       toolTitles: new Map(),
+      ...(this.options.admission
+        ? { ticket: this.options.admission.enter(`session:${command.sessionId}`) }
+        : {}),
     };
     this.noteActivity(slot, lastActivityAt);
     this.sessionActivity.set(command.sessionId, activity);
@@ -645,13 +810,6 @@ export class CommandRouter {
         if (binding) {
           await worktrees.validateExecution(binding);
           slot.binding = binding;
-          slot.leases = [
-            worktrees.locks.acquire(checkout, {
-              owner: `session:${command.sessionId}`,
-              attempt: binding.leaseAttempt,
-              kind: "worker",
-            }),
-          ];
           this.bindings.set(command.sessionId, binding);
         }
       }
@@ -688,7 +846,25 @@ export class CommandRouter {
           worktrees.assertManagedPathBound(identity);
         }
       }
+      if (this.options.repositories) {
+        const participation = await this.options.repositories.participate(
+          [cwd, ...additionalDirectories],
+          `session:${command.sessionId}`,
+        );
+        slot.participation = participation.leases;
+        slot.supervisedParticipation = participation.supervised;
+      }
+      if (slot.binding && worktrees) {
+        slot.leases = [
+          worktrees.locks.acquire(await worktrees.checkoutIdentity(cwd), {
+            owner: `session:${command.sessionId}`,
+            attempt: slot.binding.leaseAttempt,
+            kind: "worker",
+          }),
+        ];
+      }
       await this.revalidate(slot, command.executionBinding);
+      slot.ticket?.revalidate();
       const generation = slot.generation;
       const sink = (event: SessionEvent) =>
         this.handleSessionEvent(
@@ -712,6 +888,7 @@ export class CommandRouter {
       slot.cwd = cwd;
       slot.additionalDirectories = additionalDirectories;
       slot.selectedAgent = requested.selected;
+      slot.ticket?.revalidate();
       if (command.type === "resume_session") {
         slot.agentSessionId = command.agentSessionId;
         slot.activity.agentSessionId = command.agentSessionId;
@@ -755,20 +932,27 @@ export class CommandRouter {
           replaying = false;
         });
       slot.agent = agent;
-      if (this.slots.get(command.sessionId) !== slot) {
-        await agent.stop();
+      if (this.slots.get(command.sessionId) !== slot || slot.terminalEvent) {
         throw new Error("Session terminated during startup");
       }
       // A resumed session waits for the operator's next prompt.
       if (command.type === "start_session" && !slot.terminalEvent) {
+        if (this.options.leadDeliveries?.reserved(command.sessionId, slot.agentSessionId))
+          throw new CommandRefused(
+            "This native conversation has an unresolved durable prompt handoff.",
+          );
         void this.withActivity(slot, () => agent.prompt(command.prompt))
           .catch(() => this.quiesce(command.sessionId, slot))
           .catch((error: unknown) => this.warn(String(error)));
       }
     } catch (error) {
+      if (error instanceof AgentStartupCleanupError) slot.agent = error.agent;
       try {
         await this.quiesce(command.sessionId, slot);
       } catch (cleanupError) {
+        this.reconciliation.set(command.sessionId, slot);
+        if (this.slots.get(command.sessionId) === slot)
+          this.slots.delete(command.sessionId);
         throw new AggregateError([error, cleanupError], String(error), {
           cause: cleanupError,
         });
@@ -789,7 +973,10 @@ export class CommandRouter {
 
   private release(sessionId: string, slot: SessionSlot): void {
     const errors: unknown[] = [];
-    for (const lease of slot.leases ?? []) {
+    for (const lease of [
+      ...(slot.leases ?? []),
+      ...[...(slot.participation ?? [])].reverse(),
+    ]) {
       try {
         lease.release();
       } catch (error) {
@@ -818,19 +1005,24 @@ export class CommandRouter {
     }
     if (this.reconciliation.get(sessionId) === slot)
       this.reconciliation.delete(sessionId);
+    slot.ticket?.release();
   }
 
   private processOwnership(slot: SessionSlot) {
-    if (!slot.leases?.length) return {};
+    const leases = [
+      ...(slot.leases ?? []),
+      ...(slot.supervisedParticipation ? (slot.participation ?? []) : []),
+    ];
+    if (!leases.length) return {};
     return {
       processStarting: () => {
-        for (const lease of slot.leases!) lease.processPending();
+        for (const lease of leases) lease.processPending();
       },
       processStarted: (pid: number) => {
-        for (const lease of slot.leases!) lease.processStarted(pid);
+        for (const lease of leases) lease.processStarted(pid);
       },
       processesQuiesced: () => {
-        for (const lease of slot.leases!) lease.processesQuiesced();
+        for (const lease of leases) lease.processesQuiesced();
       },
     };
   }
@@ -839,6 +1031,7 @@ export class CommandRouter {
     slot: SessionSlot,
     expected?: ExecutionBinding,
   ): Promise<void> {
+    for (const lease of slot.participation ?? []) await lease.revalidate();
     if (!slot.binding) {
       if (expected?.worktreeId)
         throw new WorktreeConflict(
@@ -929,7 +1122,7 @@ export class CommandRouter {
         const errors: unknown[] = [];
         let stopped = false;
         try {
-          await slot.agent?.stop(announce);
+          await slot.agent?.stop(announce && !slot.silentReplacement);
           stopped = true;
         } catch (error) {
           errors.push(error);
@@ -937,10 +1130,27 @@ export class CommandRouter {
         try {
           // Without a managed lease, a failed stop must not manufacture a
           // terminal receipt and free the Host's legacy placement reservation.
-          if (stopped || slot.binding?.worktreeId) this.release(sessionId, slot);
+          if (stopped || slot.binding?.worktreeId || slot.supervisedParticipation)
+            this.release(sessionId, slot);
         } catch (error) {
           errors.push(error);
         } finally {
+          if (
+            stopped &&
+            announce &&
+            slot.silentReplacement &&
+            !slot.terminalEmitted &&
+            !slot.terminalEvent
+          ) {
+            slot.terminalEvent = {
+              eventId: `stopped-${sessionId}-${++slot.sequenceOffset}`,
+              sessionId,
+              sequence: slot.sequenceOffset,
+              type: "state",
+              payload: { state: "stopped", activity: "Process stopped" },
+              createdAt: new Date().toISOString(),
+            };
+          }
           if (
             errors.length &&
             slot.binding?.worktreeId &&
@@ -983,6 +1193,9 @@ export class CommandRouter {
     event: SessionEvent,
   ): void {
     if (slot.generation !== generation || this.slots.get(sessionId) !== slot) return;
+    if (slot.mcpRecovery) {
+      event = { ...event, sequence: Math.max(event.sequence, slot.sequenceOffset + 1) };
+    }
     if (isSessionActivityEvent(event)) this.noteActivity(slot);
     slot.sequenceOffset = Math.max(slot.sequenceOffset, event.sequence);
     const agentSession = eventPayload(event, "agent_session");
@@ -1016,7 +1229,26 @@ export class CommandRouter {
       }
     }
     const state = eventPayload(event, "state")?.state;
-    if (state && terminalSessionStates.has(state) && slot.leases?.length) {
+    if (
+      slot.deliveryId &&
+      event.type === "turn_complete" &&
+      !event.payload.historyReplay &&
+      event.sequence > (slot.deliverySequence ?? 0)
+    ) {
+      this.options.leadDeliveries?.settle(slot.deliveryId, slot.agentSessionId ?? "");
+      delete slot.deliveryId;
+      delete slot.deliverySequence;
+    }
+    if (slot.deliveryId && state && terminalSessionStates.has(state))
+      this.options.leadDeliveries?.uncertain(
+        slot.deliveryId,
+        "Native session ended before authoritative delivery settlement.",
+      );
+    if (
+      state &&
+      terminalSessionStates.has(state) &&
+      (slot.leases?.length || slot.supervisedParticipation || slot.initializing)
+    ) {
       slot.terminalEvent ??= event;
       if (!slot.initializing)
         void this.quiesce(sessionId, slot).catch((error: unknown) =>
@@ -1026,17 +1258,31 @@ export class CommandRouter {
         );
       return;
     }
+    if (
+      state === "idle" &&
+      slot.refreshMcpPending &&
+      !this.deleting.has(sessionId) &&
+      !slot.stopping &&
+      !this.options.admission?.reason &&
+      !this.options.leadDeliveries?.reserved(sessionId, slot.agentSessionId)
+    ) {
+      slot.refreshMcpPending = false;
+      // Do not invite a scheduler wake between turn completion and MCP recovery.
+      this.emit({
+        ...event,
+        payload: {
+          ...event.payload,
+          state: "running",
+          activity: "Restoring MCP tools",
+          historyReplay: true,
+        },
+      });
+      void this.restartSession(sessionId, slot);
+      return;
+    }
     if (state && terminalSessionStates.has(state)) slot.terminalEmitted = true;
     this.emit(event);
     if (state && terminalSessionStates.has(state)) this.release(sessionId, slot);
-    else if (
-      state === "idle" &&
-      slot.refreshMcpPending &&
-      !this.deleting.has(sessionId)
-    ) {
-      slot.refreshMcpPending = false;
-      void this.restartSession(sessionId, slot);
-    }
   }
 
   private async restartSession(
@@ -1045,6 +1291,18 @@ export class CommandRouter {
     contextTier?: ContextTier,
   ): Promise<void> {
     if (this.deleting.has(sessionId)) return;
+    if (
+      this.options.admission?.reason ||
+      this.options.leadDeliveries?.reserved(sessionId, slot.agentSessionId)
+    ) {
+      if (contextTier !== undefined)
+        throw new CommandRefused(
+          "Session has a durable prompt reservation or Node maintenance is active.",
+        );
+      slot.refreshMcpPending = true;
+      return;
+    }
+    if (contextTier === undefined) return this.recoverMcpSession(sessionId, slot);
     if (slot.refreshing) {
       await slot.refreshing;
       return;
@@ -1058,97 +1316,32 @@ export class CommandRouter {
         !current ||
         !launch ||
         !slot.cwd ||
-        !slot.agentSessionId ||
-        (contextTier === undefined && launch.mcpServers.length === 0)
+        !slot.agentSessionId
       ) {
-        if (contextTier !== undefined) {
-          throw new CommandRefused(
-            "Session cannot be restarted without its saved conversation",
-          );
-        }
-        return;
+        throw new CommandRefused(
+          "Session cannot be restarted without its saved conversation",
+        );
       }
       if (current.busy) {
-        if (contextTier !== undefined) {
-          current.resync();
-          throw new CommandRefused("Wait for the current turn before changing context");
-        }
-        slot.refreshMcpPending = true;
-        return;
+        current.resync();
+        throw new CommandRefused("Wait for the current turn before changing context");
       }
-      const generation = ++slot.generation;
-      const nextContextTier = contextTier ?? launch.contextTier;
-      await this.revalidate(slot, slot.binding);
-      await current.stop(false);
-      slot.agent = undefined;
-      await this.revalidate(slot, slot.binding);
-      // Only load-time replay is historical; the retained sink goes live once startup settles.
-      let replaying = true;
-      const next = await this.factory
-        .start(
-          sessionId,
-          slot.cwd,
-          (event) =>
-            this.handleSessionEvent(
-              sessionId,
-              slot,
-              generation,
-              replaying
-                ? { ...event, payload: { ...event.payload, historyReplay: true } }
-                : event,
-            ),
-          {
-            resumeAgentSessionId: slot.agentSessionId,
-            contextOverflowRecoveryPrompt:
-              launch.type === "start_session"
-                ? launch.prompt
-                : (launch.contextOverflowRecoveryPrompt ?? ""),
-            additionalDirectories: slot.additionalDirectories ?? [],
-            sequenceOffset: slot.sequenceOffset,
-            yolo: launch.yolo,
-            agencyMode: launch.agencyMode ?? false,
-            ...(nextContextTier ? { contextTier: nextContextTier } : {}),
-            mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
-            agent: slot.selectedAgent ?? "",
-            config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
-            announceLifecycle: false,
-            ...this.processOwnership(slot),
-          },
-        )
-        .finally(() => {
-          replaying = false;
-        });
-      if (this.slots.get(sessionId) !== slot) {
-        await next.stop(false);
-        return;
-      }
-      slot.agent = next;
-      if (contextTier !== undefined) slot.launch = { ...launch, contextTier };
+      await this.replaceAgent(sessionId, slot, contextTier);
     });
     const handled = refresh.catch((error) => {
       if (error instanceof CommandRefused) throw error;
-      const purpose =
-        contextTier === undefined ? "restore MCP tools" : "change context window";
+      const purpose = "change context window";
       this.warn(
         `session ${sessionId.slice(0, 8)}: could not ${purpose}: ${
           error instanceof Error ? error.message : "unknown error"
         }`,
       );
-      if (this.slots.get(sessionId) === slot) {
-        slot.sequenceOffset += 1;
-        this.handleSessionEvent(sessionId, slot, slot.generation, {
-          eventId: `mcp-refresh-failed-${sessionId}-${slot.sequenceOffset}`,
-          sessionId,
-          sequence: slot.sequenceOffset,
-          type: "state",
-          payload: {
-            state: "failed",
-            activity: `Copilot could not be restarted to ${purpose}`,
-          },
-          createdAt: new Date().toISOString(),
-        });
-      }
-      if (contextTier !== undefined) throw error;
+      this.failReplacement(
+        sessionId,
+        slot,
+        `Copilot could not be restarted to ${purpose}`,
+      );
+      throw error;
     });
     slot.refreshing = handled;
     slot.ready = handled;
@@ -1157,6 +1350,234 @@ export class CommandRouter {
     } finally {
       if (slot.refreshing === handled) delete slot.refreshing;
       if (slot.ready === handled) slot.ready = Promise.resolve();
+    }
+  }
+
+  private publishRecoveryState(
+    sessionId: string,
+    slot: SessionSlot,
+    state: "running" | "idle" | "failed",
+    activity: string,
+  ): void {
+    this.emit({
+      eventId: `mcp-recovery-${sessionId}-${++slot.sequenceOffset}`,
+      sessionId,
+      sequence: slot.sequenceOffset,
+      type: "state",
+      payload: {
+        state,
+        activity,
+        ...(state === "failed" ? {} : { historyReplay: true }),
+      },
+      createdAt: new Date().toISOString(),
+    });
+  }
+
+  private failReplacement(sessionId: string, slot: SessionSlot, activity: string): void {
+    if (this.slots.get(sessionId) !== slot) return;
+    ++slot.generation;
+    if (slot.agent) {
+      // Unknown process ownership must survive failure and refuse another launch.
+      for (const lease of [...(slot.leases ?? []), ...(slot.participation ?? [])]) {
+        try {
+          lease.requireReconciliation(activity);
+        } catch (error) {
+          const reason = `MCP recovery ownership could not be persisted: ${String(error)}`;
+          this.options.admission?.quarantine(reason);
+          this.warn(reason);
+        }
+      }
+      this.reconciliation.set(sessionId, slot);
+      this.slots.delete(sessionId);
+    } else {
+      try {
+        this.release(sessionId, slot);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        activity = `MCP recovery blocked: ${detail}`;
+        this.warn(`session ${sessionId.slice(0, 8)}: ${activity}`);
+      }
+    }
+    slot.terminalEmitted = true;
+    this.publishRecoveryState(sessionId, slot, "failed", activity);
+  }
+
+  private async recoverMcpSession(sessionId: string, slot: SessionSlot): Promise<void> {
+    if (slot.refreshing) return slot.refreshing;
+    if (slot.stopping || this.draining || this.deleting.has(sessionId)) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    slot.mcpRecovery = controller;
+    const recovery = slot.ready.then(async () => {
+      if (
+        !slot.launch?.mcpServers.length ||
+        !slot.agentSessionId ||
+        !slot.cwd ||
+        this.slots.get(sessionId) !== slot ||
+        signal.aborted
+      )
+        return;
+      if (slot.agent?.busy) {
+        slot.refreshMcpPending = true;
+        return;
+      }
+      slot.refreshMcpPending = false;
+      for (let attempt = 0; attempt <= MCP_RECOVERY_DELAYS_MS.length; attempt++) {
+        try {
+          if (attempt > 0)
+            await recoveryDelay(MCP_RECOVERY_DELAYS_MS[attempt - 1]!, signal);
+          signal.throwIfAborted();
+          if (this.slots.get(sessionId) !== slot) return;
+          this.publishRecoveryState(
+            sessionId,
+            slot,
+            "running",
+            `Restoring MCP tools (attempt ${attempt + 1}/${MCP_RECOVERY_DELAYS_MS.length + 1})`,
+          );
+          await this.mcpConnection.wait(signal);
+          signal.throwIfAborted();
+          if (this.slots.get(sessionId) !== slot) return;
+          if (attempt === 0 && slot.agent?.busy) {
+            slot.refreshMcpPending = true;
+            return;
+          }
+          await this.replaceAgent(sessionId, slot, undefined, signal);
+          signal.throwIfAborted();
+          this.publishRecoveryState(
+            sessionId,
+            slot,
+            slot.agent?.busy ? "running" : "idle",
+            slot.agent?.busy
+              ? "MCP tools restored; Copilot is working"
+              : "MCP tools restored; ready for follow-up",
+          );
+          return;
+        } catch (error) {
+          ++slot.generation;
+          if (signal.aborted) return;
+          if (this.slots.get(sessionId) !== slot) return;
+          const detail = error instanceof Error ? error.message : String(error);
+          this.warn(
+            `session ${sessionId.slice(0, 8)}: MCP recovery attempt ${attempt + 1} failed: ${detail}`,
+          );
+          const admissionBlocked =
+            error instanceof WorktreeConflict || error instanceof CommandRefused;
+          if (admissionBlocked || attempt === MCP_RECOVERY_DELAYS_MS.length) {
+            this.failReplacement(
+              sessionId,
+              slot,
+              admissionBlocked
+                ? `MCP recovery blocked: ${detail}`
+                : slot.agent
+                  ? `MCP recovery blocked: process shutdown could not be verified. ${detail}`
+                  : `MCP recovery exhausted after ${attempt + 1} attempts. Resume to retry. ${detail}`,
+            );
+            return;
+          }
+          this.publishRecoveryState(
+            sessionId,
+            slot,
+            "running",
+            `MCP recovery retry in ${MCP_RECOVERY_DELAYS_MS[attempt]! / 1000}s: ${detail}`,
+          );
+        }
+      }
+    });
+    slot.refreshing = recovery;
+    slot.ready = recovery;
+    try {
+      await recovery;
+    } finally {
+      if (slot.mcpRecovery === controller) delete slot.mcpRecovery;
+      if (slot.refreshing === recovery) delete slot.refreshing;
+      if (slot.ready === recovery) slot.ready = Promise.resolve();
+    }
+  }
+
+  private async replaceAgent(
+    sessionId: string,
+    slot: SessionSlot,
+    contextTier?: ContextTier,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const launch = slot.launch!;
+    slot.silentReplacement = true;
+    const generation = ++slot.generation;
+    const nextContextTier = contextTier ?? launch.contextTier;
+    await this.revalidate(slot, slot.binding);
+    slot.ticket?.revalidate();
+    signal?.throwIfAborted();
+    await slot.agent?.stop(false);
+    slot.agent = undefined;
+    if (signal) await this.mcpConnection.wait(signal);
+    await this.revalidate(slot, slot.binding);
+    slot.ticket?.revalidate();
+    signal?.throwIfAborted();
+    if (this.slots.get(sessionId) !== slot || slot.stopping || this.draining)
+      throw new CommandRefused("Session is being stopped");
+    let replaying = true;
+    try {
+      const next = await this.factory.start(
+        sessionId,
+        slot.cwd!,
+        (event) => {
+          if (slot.generation !== generation || this.slots.get(sessionId) !== slot)
+            return;
+          // Router recovery notices also consume sequence numbers between agent events.
+          event = {
+            ...event,
+            sequence: Math.max(event.sequence, slot.sequenceOffset + 1),
+          };
+          const startupState = eventPayload(event, "state")?.state;
+          if (
+            replaying &&
+            event.type === "state" &&
+            (signal || (startupState && terminalSessionStates.has(startupState)))
+          ) {
+            slot.sequenceOffset = Math.max(slot.sequenceOffset, event.sequence);
+            return;
+          }
+          this.handleSessionEvent(
+            sessionId,
+            slot,
+            generation,
+            replaying
+              ? { ...event, payload: { ...event.payload, historyReplay: true } }
+              : event,
+          );
+        },
+        {
+          resumeAgentSessionId: slot.agentSessionId!,
+          contextOverflowRecoveryPrompt:
+            launch.type === "start_session"
+              ? launch.prompt
+              : (launch.contextOverflowRecoveryPrompt ?? ""),
+          additionalDirectories: slot.additionalDirectories ?? [],
+          sequenceOffset: slot.sequenceOffset,
+          yolo: launch.yolo,
+          agencyMode: launch.agencyMode ?? false,
+          ...(nextContextTier ? { contextTier: nextContextTier } : {}),
+          mcpServers: resolveMcpServers(launch.mcpServers, this.hostUrl()),
+          agent: slot.selectedAgent ?? "",
+          config: [...slot.config].map(([id, value]): StartupConfig => ({ id, value })),
+          announceLifecycle: false,
+          ...(signal ? { signal, allowResumeRollover: false } : {}),
+          ...this.processOwnership(slot),
+        },
+      );
+      slot.agent = next;
+      signal?.throwIfAborted();
+      if (this.slots.get(sessionId) !== slot) {
+        await next.stop(false);
+        return;
+      }
+      slot.silentReplacement = false;
+      if (contextTier !== undefined) slot.launch = { ...launch, contextTier };
+    } catch (error) {
+      if (error instanceof AgentStartupCleanupError) slot.agent = error.agent;
+      throw error;
+    } finally {
+      replaying = false;
     }
   }
 }

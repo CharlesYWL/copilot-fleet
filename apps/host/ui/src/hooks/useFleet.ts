@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
+  CommandExecutionSchema,
+  CommandOutputEventSchema,
+  type CommandOutputEvent,
   type MarkAllNotificationsReadResponse,
   type BrowserMessage,
   type Notification,
@@ -13,6 +16,7 @@ import {
 import { announceSignedOut, csrfToken, forgetCsrfToken } from "../lib/auth";
 import { reconnectDelay } from "./reconnect-delay";
 import { mergeEvents } from "../lib/merge-events";
+import { mergeCommandExecutions, mergeCommandOutput } from "../lib/command-output";
 
 export type { Snapshot };
 
@@ -63,10 +67,12 @@ export type NodeUpdateProgress = Record<
 
 export function useFleet(notify: Notify) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
+  const [snapshotRevision, setSnapshotRevision] = useState(0);
   const [liveNotificationUpdates, setLiveNotificationUpdates] = useState<
     LiveNotificationUpdate[]
   >([]);
   const [events, setEvents] = useState<Record<string, SessionEvent[]>>({});
+  const [commandOutput, setCommandOutput] = useState<CommandOutputEvent[]>([]);
   /**
    * Steps per run, kept beside the snapshot rather than inside it.
    *
@@ -164,6 +170,7 @@ export function useFleet(notify: Notify) {
         ...next,
         notifications: sortNotifications(next.notifications),
       });
+      setSnapshotRevision((value) => value + 1);
     },
     [recordHydrationChange],
   );
@@ -235,6 +242,7 @@ export function useFleet(notify: Notify) {
         notifications: sortNotifications(notifications),
         notificationUnreadCount: unreadCount,
       });
+      setSnapshotRevision((value) => value + 1);
       currentUnreadCount.current = unreadCount;
       return true;
     },
@@ -426,6 +434,8 @@ export function useFleet(notify: Notify) {
   useEffect(() => {
     let socket: WebSocket | undefined;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
+    let commandFlushTimer: ReturnType<typeof setTimeout> | undefined;
+    let pendingCommandOutput: CommandOutputEvent[] = [];
     let attempt = 0;
     let closed = false;
     let connectionLost = false;
@@ -469,6 +479,39 @@ export function useFleet(notify: Notify) {
         if (!message) {
           notifyRef.current("Malformed live update", "error");
           socket?.close(1007, "Malformed JSON");
+          return;
+        }
+        if (message.type === "command_execution") {
+          const parsed = CommandExecutionSchema.safeParse(message.execution);
+          if (!parsed.success) {
+            notifyRef.current("Malformed command execution update", "error");
+            socket?.close(1007, "Malformed command execution");
+            return;
+          }
+          setSnapshot((value) => ({
+            ...value,
+            commandExecutions: mergeCommandExecutions(value.commandExecutions ?? [], [
+              parsed.data,
+            ]).slice(0, 200),
+          }));
+          return;
+        }
+        if (message.type === "command_execution_output") {
+          const parsed = CommandOutputEventSchema.safeParse(message.event);
+          if (!parsed.success) {
+            notifyRef.current("Malformed command output", "error");
+            socket?.close(1007, "Malformed command output");
+            return;
+          }
+          pendingCommandOutput = mergeCommandOutput(pendingCommandOutput, [parsed.data]);
+          if (!commandFlushTimer) {
+            commandFlushTimer = setTimeout(() => {
+              const batch = pendingCommandOutput;
+              pendingCommandOutput = [];
+              commandFlushTimer = undefined;
+              if (!closed) setCommandOutput((value) => mergeCommandOutput(value, batch));
+            }, 100);
+          }
           return;
         }
         if (message.type === "snapshot") {
@@ -577,6 +620,7 @@ export function useFleet(notify: Notify) {
     return () => {
       closed = true;
       if (retryTimer) clearTimeout(retryTimer);
+      if (commandFlushTimer) clearTimeout(commandFlushTimer);
       socket?.close();
     };
   }, [
@@ -589,8 +633,10 @@ export function useFleet(notify: Notify) {
 
   return {
     snapshot,
+    snapshotRevision,
     liveNotificationUpdates,
     events,
+    commandOutput,
     runSteps,
     runNotes,
     connected,

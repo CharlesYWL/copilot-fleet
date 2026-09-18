@@ -91,6 +91,107 @@ function keyedNode(store: FleetStore, name = "keyed-box") {
 }
 
 describe("stable tunnel backup settings", () => {
+  it("restores PR maintenance paused with retained authority, batch identity and wake allowances", () => {
+    const source = secured(setup());
+    const { node } = source.registerNode({
+      name: "maintenance-node",
+      os: "win32",
+      arch: "x64",
+      version: "0.1.0",
+      capabilities: ["copilot-acp"],
+      maxSessions: 2,
+    });
+    const workspace = source.createWorkspace("maintenance-repo", "");
+    const placement = source.createPlacement(
+      workspace.id,
+      node.id,
+      "C:\\maintenance-repo",
+    );
+    const task = source.createRun({
+      workspaceId: workspace.id,
+      name: "Repair",
+      objective: "Preserve the API",
+    });
+    const lead = source.createSession(placement, "Lead", false, "", { runRole: "lead" });
+    const worker = source.createSession(placement, "Worker", false, "", {
+      runId: task.id,
+      runRole: "worker",
+    });
+    source.updateRun(task.id, { leadSessionId: lead.id, state: "running" });
+    const step = source.upsertRunStep(task.id, {
+      stepKey: "repair",
+      title: "Repair",
+      prompt: "Inspect invariant",
+    });
+    source.updateRunStep(step.id, { sessionId: worker.id, state: "succeeded" });
+    source.transitionSession(worker.id, "starting");
+    source.transitionSession(worker.id, "idle");
+    let record = source.prMaintenance.enableFromOperator(
+      {
+        taskId: task.id,
+        workerSessionId: worker.id,
+        identity: {
+          host: "github.com",
+          repositoryId: "100",
+          repository: "example/repo",
+          prNumber: 42,
+          headRepositoryId: "101",
+          headRepository: "example/fork",
+          headRef: "refs/heads/Repair",
+          baseRepositoryId: "100",
+          baseRepository: "example/repo",
+          baseRef: "refs/heads/main",
+        },
+        scope: {
+          baseline: "Existing null invariant",
+          verification: "Existing unit tests",
+          publicationAuthorized: true,
+        },
+        headSha: "a".repeat(40),
+        eligibilityEvidence:
+          "Operator verified mutable checkout and existing authorized publication.",
+      },
+      "authenticated-operator",
+    );
+    record = source.prMaintenance.holdForDecision(
+      lead.id,
+      record.id,
+      record.version,
+      {
+        id: "decision-1",
+        version: 1,
+        proposal: "Keep existing API?",
+        scope: "Null contract",
+        headSha: "a".repeat(40),
+      },
+      () => {
+        source.advanceRunToReview(task.id);
+        source.appendRunNote(task.id, 0, "Maintenance human decision");
+      },
+    );
+    source.prMaintenance.beginWake(lead.id, "wake-1");
+    source.prMaintenance.chargeWake(lead.id, "wake-1", { requests: 9, milliseconds: 2 });
+    const target = secured(setup());
+    target.importPortableBackup({
+      data: portableData(source),
+      security: source.exportSecurityBackup(),
+    });
+    const restored = target.prMaintenance.get(record.id)!;
+    expect(restored.lifecycle).toBe("paused");
+    expect(restored.pauseReason).toContain("restore");
+    expect(restored.authorization).toEqual(record.authorization);
+    expect(restored.decision).toEqual(record.decision);
+    expect(restored.generation).toBe(record.generation);
+    expect(restored.ownershipReleasedAt).toBeUndefined();
+    expect(
+      target.hasSessionRetentionBlockers(worker.id, "2099-01-01T00:00:00.000Z"),
+    ).toBe(true);
+    expect(target.prMaintenance.beginWake(lead.id, "wake-1").requests).toBe(9);
+    expect(target.listRunNotes(task.id).map((note) => note.body)).toContain(
+      "Maintenance human decision",
+    );
+  });
+
   it.each(["data", "portable"] as const)(
     "moves the source tunnel IDs and enabled providers through a %s restore",
     (format) => {

@@ -45,6 +45,88 @@ const START_DEFAULTS: Pick<
 > = { yolo: false, mcpServers: [], agent: "", readOnly: false, config: [] };
 
 describe("CommandRouter", () => {
+  it("stops idle and busy sessions through the existing shutdown path", async () => {
+    const stops = new Map<string, ReturnType<typeof vi.fn>>();
+    const router = new CommandRouter(
+      {
+        async start(id, _cwd, sink) {
+          const stop = vi.fn(async () => {});
+          stops.set(id, stop);
+          return { ...inertAgent(id, sink), stop, busy: id === "busy" };
+        },
+      },
+      3,
+      () => {},
+      async (path) => path,
+    );
+    for (const id of ["idle", "busy"]) {
+      expect(
+        (
+          await router.route({
+            ...START_DEFAULTS,
+            type: "start_session",
+            commandId: id,
+            sessionId: id,
+            localPath: `C:\\${id}`,
+            prompt: "fixture",
+          })
+        ).ok,
+      ).toBe(true);
+    }
+    expect(router.activeSessionIds).toEqual(["idle", "busy"]);
+    await router.stopAll();
+    expect(router.activeSessionIds).toEqual([]);
+    expect(stops.get("idle")).toHaveBeenCalledWith(true);
+    expect(stops.get("busy")).toHaveBeenCalledWith(true);
+  });
+
+  it("rejects new launches while sessions are stopping for shutdown", async () => {
+    let finish!: () => void;
+    let stopping!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      stopping = resolve;
+    });
+    const router = new CommandRouter(
+      {
+        async start(id, _cwd, sink) {
+          return {
+            ...inertAgent(id, sink),
+            async stop() {
+              stopping();
+              await pending;
+            },
+          };
+        },
+      },
+      2,
+      () => {},
+      async (path) => path,
+    );
+    const command: NodeCommand = {
+      ...START_DEFAULTS,
+      type: "start_session",
+      commandId: "first",
+      sessionId: "first",
+      localPath: "C:\\repo",
+      prompt: "fixture",
+    };
+    await router.route(command);
+    const done = router.stopAll();
+    await entered;
+    try {
+      expect(
+        await router.route({ ...command, commandId: "new", sessionId: "new" }),
+      ).toMatchObject({ ok: false, fatal: false });
+    } finally {
+      finish();
+      await done;
+    }
+    expect(router.activeSessionIds).toEqual([]);
+  });
+
   it.each([false, true])(
     "restarts context in place with saved history and pickers (orchestrator: %s)",
     async (orchestrator) => {
@@ -836,7 +918,8 @@ describe("CommandRouter", () => {
     expect(stops).toEqual([false, false]);
   });
 
-  it("reports a terminal state when an MCP refresh cannot restart Copilot", async () => {
+  it("recovers when an MCP refresh transiently cannot restart Copilot", async () => {
+    vi.useFakeTimers();
     let starts = 0;
     const warnings: string[] = [];
     const events: SessionEvent[] = [];
@@ -874,20 +957,24 @@ describe("CommandRouter", () => {
       prompt: "first",
     });
 
-    await router.refreshMcpSessions();
+    const recovery = router.refreshMcpSessions();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await recovery;
+    vi.useRealTimers();
 
     expect(warnings).toEqual([
-      "session s1: could not restore MCP tools: copilot unavailable",
+      "session s1: MCP recovery attempt 1 failed: copilot unavailable",
     ]);
     expect(events.at(-1)).toMatchObject({
       sessionId: "s1",
       type: "state",
       payload: {
-        state: "failed",
-        activity: "Copilot could not be restarted to restore MCP tools",
+        state: "idle",
+        activity: "MCP tools restored; ready for follow-up",
       },
     });
-    expect(router.activeSessionIds).toEqual([]);
+    expect(router.activeSessionIds).toEqual(["s1"]);
+    expect(starts).toBe(3);
   });
 
   it("deduplicates concurrent MCP refreshes", async () => {

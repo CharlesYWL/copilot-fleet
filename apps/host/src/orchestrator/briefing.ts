@@ -93,9 +93,24 @@ function standalone(): string[] {
  * Everything here is a fact about the current build. If a tool is renamed or a
  * category added, this is the one place that has to change.
  */
+export const PR_MAINTENANCE_WAKE_INSTRUCTION =
+  "Read fleet_get_pr_maintenance on this wake. The registry is authoritative: reconcile accepted batches and effects, claim due active PRs within the persisted allowance, honor paused/human-held work, and continue only the eligible retained worker. Use the packaged maintenance skill and helper. Do not reopen a hold, create a replacement, or merge.";
+
 function mechanics(): string[] {
   return [
     "## The loop",
+    "",
+    "When asked to enable PR maintenance, find the existing owned task and eligible coding worker, read the packaged maintenance skill, and gather verified facts. Call fleet_propose_pr_maintenance to store a pending proposal and notify the operator. The task's authorization dialog is prefilled: do not ask for JSON copy/paste or claim the proposal enables maintenance. Read pending context with fleet_get_pr_maintenance(taskId), supply its version for revisions, then end your turn and wait for authenticated authorization.",
+    "",
+    "On every wake (heartbeat, user turn, or worker result), read `fleet_get_pr_maintenance`, including unfinished checkpoints for completed tasks and paused/terminal draining work. The registry, not conversation memory, is authoritative. Before maintenance actions read the packaged pr-maintenance skill/helper contract at the absolute paths in the Node's Fleet maintenance resources instruction. If assets/tools/authorization are missing, report a blocker, never invent an observer or replacement worker.",
+    "",
+    "For explicitly authorized PR maintenance, use `fleet_set_pr_maintenance` for operator-linked lifecycle changes and `fleet_checkpoint_pr_maintenance` for versioned observations, exact prepared batches, accepted-attempt reconciliation and evidenced per-finding/effect settlement. Check live tool schemas; checkpoints cannot create approval, change ownership, clear human holds, or broaden scope.",
+    "",
+    "Continue the persisted oldest-due scan and existing wake counters (5 PR visits, 40 GitHub requests, 120 seconds). Charge failed/incomplete attempts and carry unserved records; no self-message/timer to drain them. Reconcile accepted work before new batches, require complete helper evidence and fleet_get_task eligibility plus mutable binding, checkpoint the exact immutable batch/prompt before fleet_follow_up with its maintenance reference, then end your turn. No empty worker turns; queued means accepted, not retryable failure.",
+    "",
+    "Maintenance design/contract/dependency/access-policy changes or uncertainty pause the whole PR via maintenance-aware fleet_escalate before any repairs. Only authenticated Send back direction for the linked decision/scope clears that gate; normal Approve task, reopen or a PR comment cannot. These gates override ordinary task reopening/advancement advice below. No sealed managed-result reuse, replacement worker, observer, paid/internal review agent, automatic rebase/force-push, or merge. Only specifically authorized named external reviewers may be requested; otherwise consume external review and notify once.",
+    "",
+    "Checks, required re-review and mergeability advance independently of comments. Match known effects by exact provider ID/actor/content, not login-wide filtering. Recheck remote identity/open state/head/base and material scope before publication. Reserve budgets and reconcile unknown pushes/replies, never blindly retry. Ready remains active, not task/design approval. Closure/merge inhibits new work and drains targeted accepted effects before ownership release; a finished worker turn alone is not settlement.",
     "",
     "For follow-up requests, discover before dispatching: call `fleet_list_work` with a short query such as the PR number, then `fleet_get_task` with the returned stable task ID. Discovery includes closed tasks but only those owned by this orchestrator. An exact-name lookup miss does not prove that a task or conversation was deleted; it may have another name or belong to another orchestrator. Never create replacement work solely because a remembered title was not found.",
     "",
@@ -110,6 +125,7 @@ function mechanics(): string[] {
     "",
     "`fleet_transcript` gets a worker's full output when the wake summary is not enough to judge by.",
     "`fleet_get_task` reads its objective, criteria, notes, worker context and continuation actions. Use task IDs as `task` in later calls: display names can change or be ambiguous.",
+    "`fleet_run_command` requests a finite command on an exact Node/path. A Node-owned permission may allow it automatically; otherwise the Host asks for Once, this orchestrator session, or Always. Recognized simple commands match command/subcommand and canonical cwd without ordinary flags. Compound/dynamic commands can be remembered only as the exact full script; changing any text asks again. Ordinary placement commands may run alongside sessions; coordinate writes, and do not bypass managed worktree or maintenance protections. You cannot approve yourself or edit permissions through MCP. Do not ask for local opt-in setup. Keep the execution ID, end your turn, and await Fleet's completion notification.",
     "",
     "## How a task ends",
     "",
@@ -216,6 +232,7 @@ export function statusCheckEnvelope(
     openSteps: number;
     dispatchedSteps: number;
   }[],
+  maintenance: { ids?: readonly string[]; count?: number } = {},
 ): string {
   const lines = [
     '<fleet-status-check interval="30m">',
@@ -224,6 +241,11 @@ export function statusCheckEnvelope(
       (task) =>
         `- ${task.name} — ${task.state}; ${task.phase}; ${task.openSteps} open step(s), ${task.dispatchedSteps} dispatched`,
     ),
+    ...(maintenance.count || maintenance.ids?.length
+      ? [
+          `PR-maintenance registrations: ${maintenance.count ?? maintenance.ids?.length}; IDs: ${(maintenance.ids ?? []).join(", ") || "read registry"}`,
+        ]
+      : []),
     "</fleet-status-check>",
     "",
     "Use fleet_list_work to inspect their current status. This is a read-only check:",
@@ -231,6 +253,7 @@ export function statusCheckEnvelope(
     "already starting or running. If every task is waiting on dispatched work, say so",
     "briefly and end your turn. If a task has no work in flight and needs your next",
     "decision, make that decision.",
+    "Read fleet_get_pr_maintenance on this wake even if the task list is empty. Reconcile unfinished batches; inspect only due active PRs within persisted wake budgets using the packaged pr-maintenance skill/helper. Honor paused/human-held work. Never resend queued work, create empty worker turns, reopen a hold, or merge.",
   ];
   return lines.join("\n");
 }
@@ -277,6 +300,10 @@ export function wakeEnvelope(input: {
     }
   }
   lines.push("</fleet-wake>", "");
+  lines.push(
+    "Read fleet_get_pr_maintenance on this wake: the registry is authoritative. Reconcile accepted batches/effects before a new exact prepared follow-up. Maintenance holds override reopening/advancement advice; readiness is not task approval. Use the packaged pr-maintenance skill, inspect due active PRs within persisted budgets, and never merge.",
+    "",
+  );
   lines.push(...nextMove(input));
   return lines.join("\n");
 }

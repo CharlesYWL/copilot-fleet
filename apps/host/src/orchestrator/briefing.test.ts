@@ -216,4 +216,50 @@ describe("what the orchestrator is told", () => {
     expect(text).toContain("do not prompt, follow up with, stop");
     expect(text).toContain("waiting on dispatched work");
   });
+
+  it("routes enablement through a pending proposal instead of JSON copying or self-authorization", () => {
+    for (const text of [
+      orchestratorBriefing("nodes", { hasAgent: true }),
+      orchestratorBriefing("nodes", { hasAgent: false }),
+      agentFile,
+    ]) {
+      expect(text).toContain("fleet_propose_pr_maintenance");
+      expect(text).toMatch(/prefilled/i);
+      expect(text).toMatch(/authenticated authorization/i);
+    }
+  });
+
+  it("recovers maintenance on all wake types without reopening a completed task", () => {
+    const status = statusCheckEnvelope([], { ids: ["maintenance-1"], count: 1 });
+    const wake = wakeEnvelope({
+      runId: "done-task",
+      wakes: 1,
+      maxWakes: 12,
+      settled: [],
+      running: [],
+    });
+    for (const text of [
+      status,
+      wake,
+      orchestratorBriefing("nodes", { hasAgent: true }),
+      orchestratorBriefing("nodes", { hasAgent: false }),
+      agentFile,
+    ]) {
+      expect(text).toContain("fleet_get_pr_maintenance");
+      expect(text).toContain("pr-maintenance");
+    }
+    expect(status).toContain("maintenance-1");
+    expect(status).toContain("task list is empty");
+    expect(wake).toContain("holds override");
+  });
+
+  it("states immutable batch, whole-PR human gate and external-review-only limits", () => {
+    for (const text of [agentFile, orchestratorBriefing("nodes")]) {
+      const normalized = text.replace(/\s+/g, " ");
+      expect(normalized).toContain("whole PR");
+      expect(normalized).toContain("immutable batch/prompt");
+      expect(normalized).toContain("Send back");
+      expect(normalized).toContain("named external reviewers");
+    }
+  });
 });

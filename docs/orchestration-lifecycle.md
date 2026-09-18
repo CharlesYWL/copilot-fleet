@@ -60,6 +60,33 @@ a stopped session still present on the Node receives Stop again; a session no
 longer present is confirmed `stopped`. Resume resets only steps explicitly
 marked by the orchestration Stop transaction.
 
+### MCP reconnect recovery
+
+The Node restores retained MCP-equipped sessions without stopping their workers.
+It waits for authentication and buffered-event reconciliation, then for five
+seconds of connection stability. A busy lead finishes its current turn before
+restoration begins.
+
+An unsuccessful restoration retries after 5, 30, and 120 seconds, for at most
+four attempts. Disconnection pauses recovery without consuming attempts, and
+overlapping reconnects share the same recovery operation. The existing session
+and conversation identifiers, attached directories, agent, and picker settings
+are retained. Recovery does not replay the original prompt or dispatch worker
+work. While recovering, the lead is reserved as busy with an explicit MCP
+recovery activity; new prompts, resumes, and picker changes are refused.
+
+Each replacement must confirm that the previous process tree has stopped.
+Windows MCP-equipped ACP sessions use the same Job Object containment as leased
+sessions, even when the lead has no workspace lease. Failed startup cleanup
+retains its process handle so a retry cannot create an overlapping replacement.
+
+Stop and Node shutdown cancel recovery waits and startup, then stop the retained
+process. Exhausted startup retries become a failed session with a manual Resume
+action. If process shutdown cannot be verified, recovery instead reports
+`MCP recovery blocked`, retains the process for reconciliation, and refuses a
+replacement until safe shutdown is confirmed. Reconnect does not reset an
+exhausted retry budget.
+
 ## MCP follow-up decisions
 
 Task identity and worker identity are separate. `fleet_list_work` searches the
@@ -71,7 +98,8 @@ establish that the conversation was deleted. Neither tool crosses into another
 orchestrator's records.
 
 For another revision of the same deliverable, reuse the worker with
-`fleet_follow_up`. Reopen a closed or handed-over task first. An accepted
+`fleet_follow_up`. Reopen a closed or handed-over task first, unless maintenance admission reports a
+human hold or retained-resource blocker. An accepted
 follow-up is persisted in its existing step and passes through the scheduler,
 including parallel limits and the original checkout's writer lock. Repeating
 the same queued or in-flight prompt does not send another turn, and a different
@@ -79,3 +107,76 @@ prompt cannot overwrite it. Busy, stopping and offline are temporary states,
 not evidence that the conversation must be replaced. A confirmed terminal
 worker without a resumable conversation needs replacement with the retained
 task context supplied explicitly.
+
+## PR maintenance lifecycle
+
+Maintenance registration lifecycle (`active`, `paused`, `merged`, `closed`) and
+batch settlement are independent of the implementation task's state. Discovery
+includes completed-task registrations and terminal/paused work needing settlement.
+Existing lead wakes handle due observation and reconciliation; there is no new
+timer or direct-to-worker observer. A completed task is not reopened just to make
+its lead eligible for a reminder.
+
+V1 permits one retained PR registration per task, including paused registrations.
+A known new publication invalidates the pre-push observation for new work and
+readiness. Finding dispositions are scoped to their verified code HEAD; after an
+external commit, unchanged feedback can be revalidated without losing its history.
+
+The authenticated task action surface is
+`GET/POST /api/runs/:id/pr-maintenance`. Enablement names the exact PR, stable
+head/base repository IDs and full refs, owned worker, baseline, verification,
+publication scope, budgets and current prerequisite evidence. Pause/resume/release
+use `recordId` and `expectedVersion`; stale input is a conflict, not permission to
+overwrite newer state. MCP may propose bounded maintenance but cannot fabricate
+the browser operator's authorization. Unknown helper/credentials/publication
+evidence and unsupported immutable/standalone bindings fail closed.
+
+`fleet_propose_pr_maintenance` lets the owning lead prepare a durable, unapproved
+proposal for an existing eligible worker. It changes neither task state nor
+maintenance authority and dispatches no worker. The operator receives an existing
+task notification and reviews the prefilled authorization dialog. Approval uses
+`authorize_proposal` with the captured proposal ID/version, then revalidates the
+binding through normal operator enablement. A changed proposal requires review
+again; task approval is not maintenance approval. Proposals survive backup and
+restart without acquiring authority. Read them through
+`fleet_get_pr_maintenance(taskId)` or the existing task discovery surfaces.
+
+| Action | Maintenance effect |
+|---|---|
+| Task Approve / aggregate | Reject a pending design decision; readiness does not authorize completion or redesign |
+| Generic task reopen, bound worker prompt/resume | Check shared admission before mutation or dispatch; cannot clear a decision |
+| Send back with instructions | Require exact record/decision versions and a nonempty bounded note; atomically preserve direction, task history and review resolution |
+| Pause or Stop/archive | Inhibit new repairs and request targeted cancellation; preserve accepted work/effects and pending human question |
+| Delete/cleanup | Pause first; reject while ownership or unsettled work still protects the task/session |
+| Resume maintenance | Revalidate current binding/authorization and matching direction; does not undo an explicit worker Stop |
+| Release | Explicit operator disposition after settlement; retain history and require a new generation for later enablement |
+| Observed merge/closure | Stop new work, drain accepted work/effects, then release only when settlement is established |
+
+`prepared`, `accepted`, `reconciling`, and `uncertain` batches remain outstanding.
+Worker “done”, Node offline, timeout, and a Stop request alone cannot settle
+publication or replies. Per-finding stages preserve a verified/published fix whose
+reply remains incomplete. An explicit pause does not silently resume on reconnect.
+Unknown execution/effects do not expire out of retention protection.
+Paused ownership has no automatic expiry. The 30-day reminder asks an operator to
+resume or release; polling and reconnects do not renew that age.
+
+The small task panel displays last successful observation separately from the
+next due time, exact worker/provider/ref binding, remaining budgets and pending
+direction. Refresh after a stale-version error before reviewing another action.
+Mounted maintenance panels refresh on existing fleet snapshots independently of
+task timestamps. An open Send-back dialog retains its original decision and
+proposal; a changed reference requires reviewing the new decision explicitly.
+No-login mode cannot provide an authenticated maintenance authorization.
+
+This pilot supports only an already eligible mutable Orchestrator worker.
+Published/sealed/cleaned managed results and standalone ownership handoff are not
+made mutable by maintenance. V1 never merges or force-pushes. Cadence and workflow
+budgets are best effort, not a hard SLA or shell sandbox; production repair rates
+and the proposed repeated model evaluations have not been established by unit
+tests.
+Pilot defaults are three repair batches, three answer-only batches and 100
+external mutation attempts per authorization. An existing lead wake admits at
+most five PR visits, 40 provider requests and 120 seconds of maintenance work,
+with persisted carried scan progress. **Renew maintenance budgets** authorizes
+another allowance for the same scope; it neither changes design authority nor
+automatically resumes paused work.

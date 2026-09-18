@@ -34,6 +34,7 @@ describe("toPromptMarks", () => {
       '<fleet-task name="Fix" workspace="repo">\nDo the work.\n</fleet-task>',
       '<fleet-status-check interval="30m">\nReview active tasks.\n</fleet-status-check>',
       '<fleet-wake task="Fix" taskId="task-1" wakes=1/12>\nJust finished:\n- Fix (implement, session worker-1): succeeded\n</fleet-wake>',
+      '<fleet-command-result executionId="d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65" node="Node" state="succeeded">\nExit: 0.\n</fleet-command-result>',
       "Now show me the fix.",
     ];
     const createdAt = "2026-08-18T20:39:00.000Z";
@@ -52,7 +53,7 @@ describe("toPromptMarks", () => {
 
     expect(marks).toEqual([
       { key: "e0", label: human, createdAt },
-      { key: "e6", label: "Now show me the fix.", createdAt },
+      { key: "e7", label: "Now show me the fix.", createdAt },
     ]);
   });
 

@@ -1,14 +1,18 @@
 import { createHash } from "node:crypto";
 import type {
   CreateNotification,
+  CommandExecution,
   FleetSession,
   MarkAllNotificationsReadResponse,
   Notification,
+  PrMaintenanceRegistration,
+  PrMaintenanceProposal,
   Run,
   RunRole,
   RunStep,
   SessionState,
 } from "@fleet/protocol";
+import { terminalCommandExecutionStates } from "@fleet/protocol";
 import type {
   FleetStore,
   InsertNotificationResult,
@@ -183,6 +187,102 @@ export class NotificationService {
 
   list(input: NotificationListInput = {}): NotificationPage {
     return this.store.listNotifications(input);
+  }
+
+  /** A durable phase receipt prevents replay from resurrecting pruned notifications. */
+  syncCommandExecution(
+    execution: Pick<
+      CommandExecution,
+      | "id"
+      | "leadSessionId"
+      | "nodeId"
+      | "nodeName"
+      | "taskId"
+      | "state"
+      | "createdAt"
+      | "updatedAt"
+      | "settledAt"
+      | "ownership"
+      | "outcomeKnown"
+      | "exitCode"
+      | "descendantCleanupForced"
+    >,
+  ): void {
+    const phase = this.store.commands.notificationPhase(execution.id);
+    const awaiting = execution.state === "awaiting_approval";
+    const terminal = terminalCommandExecutionStates.has(execution.state);
+    if (phase === "completion") {
+      const approval = this.store.getNotificationBySourceKey(
+        `command_approval:${execution.id}`,
+      );
+      if (!awaiting && approval?.status === "active") this.resolve(approval.id);
+      return;
+    }
+    if (
+      (awaiting && phase === "approval") ||
+      (!awaiting && !terminal && phase !== "approval")
+    )
+      return;
+    this.commitAtomically(() => {
+      const approvalKey = `command_approval:${execution.id}`;
+      if (!awaiting) {
+        const approval = this.store.getNotificationBySourceKey(approvalKey);
+        if (approval) this.resolve(approval.id);
+      }
+      if (awaiting || terminal) {
+        const kind = awaiting ? "command_approval" : "command_completion";
+        this.insert({
+          sourceKey: `${kind}:${execution.id}`,
+          category: awaiting ? "permission" : "orchestration",
+          kind,
+          severity:
+            awaiting ||
+            execution.state === "interrupted" ||
+            execution.state === "timed_out"
+              ? "warning"
+              : execution.state === "failed"
+                ? "error"
+                : "info",
+          title: titledLabel(
+            awaiting ? "Command approval: " : `Command ${execution.state}: `,
+            execution.nodeName,
+          ),
+          body: awaiting
+            ? "Review the complete command, Node-verified path, and reusable permission scope before allowing or denying it."
+            : "The command request has settled. Open the execution to inspect the outcome, retained output, and delivery status.",
+          subject: {
+            type: "command_execution",
+            id: execution.id,
+            label: titledLabel("Command on ", execution.nodeName),
+            parentId: execution.leadSessionId,
+            parentLabel: "Lead orchestrator",
+          },
+          navigation: { type: "command_execution", executionId: execution.id },
+          data: {
+            executionId: execution.id,
+            nodeId: execution.nodeId,
+            leadSessionId: execution.leadSessionId,
+            state: execution.state,
+            ...(execution.taskId ? { taskId: execution.taskId } : {}),
+            ...(terminal
+              ? {
+                  ownership: execution.ownership,
+                  outcomeKnown: execution.outcomeKnown,
+                  exitCode: execution.exitCode,
+                  descendantCleanupForced: execution.descendantCleanupForced,
+                }
+              : {}),
+          },
+          createdAt: awaiting
+            ? execution.updatedAt
+            : (execution.settledAt ?? execution.updatedAt),
+        });
+      }
+      this.store.commands.recordNotificationPhase(
+        execution.id,
+        awaiting ? "approval" : terminal ? "completion" : "closed",
+      );
+    });
   }
 
   effectivePreference(session: FleetSession): EffectiveSessionNotificationPreference {
@@ -409,6 +509,73 @@ export class NotificationService {
       `review:${run.id}:${run.reviewSeq}`,
     );
     return notification ? this.resolve(notification.id) : undefined;
+  }
+
+  createPrMaintenanceAttention(
+    record: PrMaintenanceRegistration,
+    reason: "paused" | "ready" | "long_pause",
+  ): InsertNotificationResult {
+    const identity =
+      reason === "ready"
+        ? record.readyFingerprint
+        : reason === "long_pause"
+          ? record.renewedAt
+          : record.pauseReason;
+    return this.insert({
+      sourceKey: `pr-maintenance:${record.id}:${record.authorization.id}:${reason}:${digest(identity ?? "")}`,
+      category: "orchestration",
+      kind: "pr_maintenance_attention",
+      severity: reason === "ready" ? "info" : "warning",
+      title:
+        reason === "ready"
+          ? "PR is ready for human merge"
+          : reason === "long_pause"
+            ? "Resume or release PR maintenance"
+            : "PR maintenance paused",
+      body:
+        reason === "ready"
+          ? "Current feedback, checks and reviews permit readiness. Fleet will not merge the PR."
+          : reason === "long_pause"
+            ? "Maintenance has been paused for 30 days. Continuity remains protected until an operator releases settled work."
+            : `Maintenance is waiting: ${record.pauseReason}. Open the task for its checkpoint and bounded recovery actions.`,
+      subject: {
+        type: "run",
+        id: record.taskId,
+        label: `PR #${record.identity.prNumber}`,
+      },
+      navigation: { type: "run", runId: record.taskId },
+      data: { recordId: record.id, reason },
+    });
+  }
+
+  createPrMaintenanceProposal(proposal: PrMaintenanceProposal): InsertNotificationResult {
+    const { taskId, identity } = proposal.registration;
+    return this.insert({
+      sourceKey: `pr-maintenance-proposal:${proposal.id}:${proposal.version}`,
+      category: "orchestration",
+      kind: "pr_maintenance_attention",
+      severity: "info",
+      title: "PR maintenance needs your authorization",
+      body: `Review the proposed maintenance for ${identity.repository} #${identity.prNumber}. Nothing is enabled until you authorize its exact scope.`,
+      subject: {
+        type: "run",
+        id: taskId,
+        label: this.store.getRun(taskId)?.name ?? "Task",
+      },
+      navigation: { type: "run", runId: taskId },
+      data: {
+        proposalId: proposal.id,
+        proposalVersion: proposal.version,
+        reason: "authorization",
+      },
+    });
+  }
+
+  resolvePrMaintenanceProposal(proposal: PrMaintenanceProposal): void {
+    const notification = this.store.getNotificationBySourceKey(
+      `pr-maintenance-proposal:${proposal.id}:${proposal.version}`,
+    );
+    if (notification) this.resolve(notification.id);
   }
 
   createOrchestrationStepFailure(run: Run, step: RunStep): InsertNotificationResult {

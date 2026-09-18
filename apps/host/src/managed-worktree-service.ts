@@ -787,6 +787,7 @@ export class ManagedWorktreeService {
   }
 
   finalizeStep(run: Run, step: RunStep): boolean {
+    this.store.commands.assertTaskUnfenced(run.id);
     if (
       run.workspaceBinding?.effectiveMode !== "managed" ||
       !isWritingCategory(step.category)
@@ -1380,11 +1381,18 @@ export class ManagedWorktreeService {
       run.workspaceBinding?.effectiveMode !== "managed"
     )
       return;
+    if (
+      run.workspaceBinding.finalizationOutcome === "completed" &&
+      !this.store.prMaintenance.admission({ action: "aggregate", taskId: runId }).allowed
+    )
+      return;
     this.aggregating.add(runId);
     void this.runAggregation(runId).finally(() => this.aggregating.delete(runId));
   }
 
   beginAggregation(runId: string): Run {
+    this.store.assertCommandVerification(runId);
+    this.store.prMaintenance.assertAdmission({ action: "aggregate", taskId: runId });
     return this.beginFinalization(runId, "completed", "");
   }
 
@@ -1453,6 +1461,8 @@ export class ManagedWorktreeService {
       );
     const terminalFinalization =
       terminalRunStates.has(run.state) && binding.finalizationOutcome !== "completed";
+    if (!terminalFinalization)
+      this.store.prMaintenance.assertAdmission({ action: "aggregate", taskId: runId });
     if (!terminalFinalization && !canTransitionRun(run.state, "aggregating"))
       throw new WorktreeConflict(
         "retry_not_available",
@@ -1474,6 +1484,7 @@ export class ManagedWorktreeService {
   }
 
   approvePublication(runId: string, approvalId: string, approvedBy: string) {
+    this.store.prMaintenance.assertAdmission({ action: "publish", taskId: runId });
     const run = this.store.getRun(runId);
     const binding = run?.workspaceBinding;
     if (!run || !binding || run.state !== "aggregating")
@@ -2056,6 +2067,17 @@ export class ManagedWorktreeService {
     }
   }
 
+  observeCommandTarget(
+    runId: string,
+    worktreeId: string,
+    generation: number,
+  ): Promise<WorktreeOperation> {
+    return this.requestWorkspace(runId, worktreeId, generation, {
+      kind: "observe",
+      actor: "command-reconciliation",
+    });
+  }
+
   private async requestWorkspace(
     runId: string,
     worktreeId: string,
@@ -2064,6 +2086,11 @@ export class ManagedWorktreeService {
       Pick<WorktreeOperationRequest, "kind" | "actor">,
     waitMs = 30_000,
   ): Promise<WorktreeOperation> {
+    if (!["observe", "reconcile", "quiesce"].includes(input.kind))
+      this.store.commands.assertTaskUnfenced(runId);
+    if (["integrate", "publish", "integration_preview"].includes(input.kind))
+      this.store.assertCommandVerification(runId);
+    this.assertMaintenanceWorkspaceOperation(runId, input.kind);
     const run = this.store.getRun(runId);
     const binding = run?.workspaceBinding;
     if (!run || binding?.effectiveMode !== "managed")
@@ -2191,6 +2218,10 @@ export class ManagedWorktreeService {
   }
 
   private send(operation: WorktreeOperation, waitMs: number): Promise<WorktreeOperation> {
+    this.assertMaintenanceWorkspaceOperation(
+      operation.request.runId,
+      operation.request.kind,
+    );
     const socket = this.service.nodeSocket(operation.request.nodeId);
     if (!socket) return Promise.resolve(operation);
     const previous = this.waiters.get(operation.request.operationId);
@@ -2206,11 +2237,23 @@ export class ManagedWorktreeService {
           this.store.putWorktreeOperation({ ...current, state: "uncertain" });
           this.publish(operation.request.runId);
         }
+
         resolve(this.store.getWorktreeOperation(operation.request.operationId)!);
       }, waitMs);
       timer.unref();
       this.waiters.set(operation.request.operationId, { timer, resolve });
       this.service.send(socket, { type: "managed_worktree", request: operation.request });
+    });
+  }
+
+  private assertMaintenanceWorkspaceOperation(
+    runId: string,
+    kind: WorktreeOperationRequest["kind"],
+  ): void {
+    if (["inspect", "reconcile", "quiesce", "retain"].includes(kind)) return;
+    this.store.prMaintenance.assertAdmission({
+      action: kind === "cleanup" ? "cleanup" : "publish",
+      taskId: runId,
     });
   }
 
@@ -2922,6 +2965,8 @@ export class ManagedWorktreeService {
   }
 
   validateSession(session: FleetSession): void {
+    if (session.runId && session.runRole !== "lead")
+      this.store.commands.assertTaskUnfenced(session.runId);
     const binding = session.executionBinding;
     const run = session.runId ? this.store.getRun(session.runId) : undefined;
     if (

@@ -12,6 +12,7 @@ describe("config assets", () => {
       "/diagnostics.js",
       "/fleet-workspaces.js",
       "/node-settings.js",
+      "/command-permissions.js",
       "/sessions.js",
       "/ui.js",
     ]) {
@@ -29,6 +30,8 @@ describe("config assets", () => {
     expect(html).toContain('id="sessionList"');
     expect(html).toContain('id="resumeSession"');
     expect(html).toContain('id="newSessionDialog"');
+    expect(html).toContain('id="commandPermissions"');
+    expect(html).toContain('id="commandPermissionForm"');
     expect(css).toContain("@media (max-width: 900px)");
   });
 

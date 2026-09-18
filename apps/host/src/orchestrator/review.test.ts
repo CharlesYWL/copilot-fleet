@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { RunPolicySchema, type Run } from "@fleet/protocol";
-import { reopenPrompt, reviewOutcome } from "./review.js";
+import { maintenanceDirectionPrompt, reopenPrompt, reviewOutcome } from "./review.js";
 
 const run = (overrides: Partial<Run> = {}): Run => ({
   id: "r1",
@@ -32,6 +32,20 @@ describe("reviewOutcome", () => {
       kind: "approve",
       note: "",
     });
+  });
+
+  it("never treats task approval as permission for a maintenance design change", () => {
+    expect(reviewOutcome(run(), { approved: true }, true)).toEqual({
+      kind: "maintenance_direction_required",
+    });
+    expect(reviewOutcome(run(), { approved: false, note: " " }, true).kind).toBe(
+      "needs_reason",
+    );
+    const prompt = maintenanceDirectionPrompt("Ship it", "decision-1", "Keep the API");
+    expect(prompt).toContain('decision="decision-1"');
+    expect(prompt).toContain("Keep the API");
+    expect(prompt).toContain("Preserve unresolved findings");
+    expect(prompt).not.toContain("Call fleet_submit_task");
   });
 
   it("sends a task back with the note as the instruction", () => {

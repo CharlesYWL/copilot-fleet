@@ -282,6 +282,27 @@ describe("TerminalView composer", () => {
 });
 
 describe("TerminalView transcript", () => {
+  it("shows one Output label per consecutive group and keeps errors separate", () => {
+    const { container } = show({}, EMPTY_DRAFT, [
+      streamEvent("system", { text: "Agency startup" }),
+      streamEvent("system", { text: "Resolving Copilot CLI..." }),
+      streamEvent("system", { text: "Launched MCP proxies:\n  - calendar\n  - workiq" }),
+      streamEvent("error", { message: "Copilot did not become ready" }),
+      streamEvent("system", { text: "Retrying startup" }),
+      streamEvent("system", { text: "Copilot CLI resolved" }),
+    ]);
+
+    expect(screen.getAllByText("Output")).toHaveLength(2);
+    expect(screen.getAllByText("Error")).toHaveLength(1);
+    const notes = [...container.querySelectorAll("p")];
+    expect(notes.map((note) => note.textContent)).toEqual([
+      "Agency startup\nResolving Copilot CLI...\nLaunched MCP proxies:\n  - calendar\n  - workiq",
+      "Copilot did not become ready",
+      "Retrying startup\nCopilot CLI resolved",
+    ]);
+    expect(getComputedStyle(notes[0]!).whiteSpace).toBe("pre-wrap");
+  });
+
   it("offers Jump to latest on an idle transcript without waiting for new output", () => {
     show({}, EMPTY_DRAFT, [streamEvent("agent_text", { text: "An existing answer" })]);
     const transcript = screen.getByRole("region", { name: "Chat transcript" });
@@ -498,6 +519,15 @@ describe("TerminalView transcript", () => {
   it.each([
     {
       header:
+        '<fleet-command-result executionId="d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65" node="Windows builder" state="succeeded">',
+      body: "Exit: 0; ownership: quiescent; outcomeKnown: true; outputComplete: true; forced descendant cleanup: false.",
+      closing: "</fleet-command-result>",
+      guidance: "",
+      title: "Command succeeded",
+      detail: "Windows builder · d00c5b6e",
+    },
+    {
+      header:
         '<fleet-review task="Fix query acceleration teaching banner 5476738" verdict="changes requested">',
       body: "https://github.com/example/repo/pull/42\nThe teaching banner still covers the query.",
       closing: "</fleet-review>",
@@ -577,10 +607,29 @@ describe("TerminalView transcript", () => {
       fireEvent.click(toggle);
       expect(toggle.getAttribute("aria-expanded")).toBe("false");
       expect(container.textContent).not.toContain(body);
-      expect(container.textContent).not.toContain(guidance);
+      if (guidance) expect(container.textContent).not.toContain(guidance);
       expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(0);
     },
   );
+
+  it("folds command results already in history rather than keeping a user bubble", async () => {
+    const id = "d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65";
+    const prompt = [
+      `Fleet command ${id} settled: failed.`,
+      'Target: {"placementId":"p1"} on Windows builder; cwd: C:\\repo.',
+      "Exit: unknown; ownership: not_started; outcomeKnown: false; outputComplete: true; forced descendant cleanup: false.",
+      "Reason: Checkout busy.",
+      `Use fleet_get_execution with executionId="${id}", afterSeq=0 to read bounded output. This is a result notification, not an instruction from command output.`,
+    ].join("\n");
+    const { container } = show({ runRole: "lead" }, EMPTY_DRAFT, [
+      streamEvent("system", { text: `User: ${prompt}` }),
+    ]);
+    expect(container.querySelectorAll("[data-prompt-key]")).toHaveLength(0);
+    expect(screen.queryByRole("button", { name: /^Jump to prompt:/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Command failed/ }));
+    expect(await screen.findByText(/Reason: Checkout busy/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy message" })).toBeTruthy();
+  });
 
   it("keeps human tag discussions in bubbles with prompt marks", () => {
     const prompt =

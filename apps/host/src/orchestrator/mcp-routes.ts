@@ -2,7 +2,13 @@ import type { FastifyPluginAsync, FastifyRequest } from "fastify";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { z } from "zod";
-import { terminalRunStates, terminalSessionStates } from "@fleet/protocol";
+import {
+  RunCommandSchema,
+  GetCommandExecutionSchema,
+  CancelCommandExecutionSchema,
+  terminalRunStates,
+  terminalSessionStates,
+} from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { hostnameOf } from "../request-guard.js";
 import type { SecurityAuditInput } from "../store.js";
@@ -10,14 +16,18 @@ import type { LeadTokenClaims, LeadTokens } from "./lead-tokens.js";
 import {
   AdvanceTaskSchema,
   CloseTaskSchema,
+  CheckpointPrMaintenanceSchema,
   DiscardTaskSchema,
   EscalateSchema,
   FleetTools,
   FollowUpSchema,
+  GetPrMaintenanceSchema,
   ListWorkSchema,
   PlanTaskSchema,
+  ProposePrMaintenanceSchema,
   ReopenTaskSchema,
   SessionRefSchema,
+  SetPrMaintenanceSchema,
   StartWorkSchema,
   SubmitTaskSchema,
   TaskRefSchema,
@@ -110,7 +120,7 @@ function authorizeLead(
   if (!lead) return { ok: false, status: 401, why: "no such session" };
   if (lead.runRole !== "lead")
     return { ok: false, status: 401, why: "session is not a lead" };
-  if (terminalSessionStates.has(lead.state)) {
+  if (terminalSessionStates.has(lead.state) || lead.stopRequested) {
     return { ok: false, status: 401, why: "lead has finished" };
   }
   if (lead.cleanupRequested) {
@@ -251,6 +261,40 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       inputSchema: {},
     },
     async () => reply(tools.listNodes()),
+  );
+  server.registerTool(
+    "fleet_run_command",
+    {
+      title: "Request an approved command",
+      description:
+        "Request a finite shell command on an exact Node target. The Node checks its command/path permissions; a matching built-in, orchestrator-session, or always rule can run automatically. Otherwise the Host prompts a Microsoft administrator for Once, this session, or Always. Simple command identities may ignore recognized flags; compound/dynamic requests require an exact full-script grant, never a first-token rule. Ordinary placement commands can coexist with sessions; managed task worktrees and maintenance remain protected. This tool cannot approve itself or edit permissions. Save the execution ID, end this turn, and Fleet will notify you when it settles. A durable-delivery capable lead Node is required independently of the target; older Nodes retain their Once-only flow.",
+      inputSchema: RunCommandSchema.shape,
+    },
+    guard("fleet_run_command", RunCommandSchema, (input) => tools.runCommand(input)),
+  );
+  server.registerTool(
+    "fleet_get_execution",
+    {
+      title: "Read command evidence",
+      description:
+        "Read an owned execution and bounded stdout/stderr evidence by cursor. Raw bytes are Base64; text decoding assumes UTF-8 and reports loss. Use for evidence, not a polling loop.",
+      inputSchema: GetCommandExecutionSchema.shape,
+    },
+    guard("fleet_get_execution", GetCommandExecutionSchema, (input) =>
+      tools.getExecution(input),
+    ),
+  );
+  server.registerTool(
+    "fleet_cancel_execution",
+    {
+      title: "Cancel an owned command",
+      description:
+        "Revoke a queued command or durably request cancellation. A dispatched attempt stays unresolved until its Node proves no launch or quiescence.",
+      inputSchema: CancelCommandExecutionSchema.shape,
+    },
+    guard("fleet_cancel_execution", CancelCommandExecutionSchema, (input) =>
+      tools.cancelExecution(input),
+    ),
   );
 
   server.registerTool(
@@ -417,6 +461,58 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
   );
 
   server.registerTool(
+    "fleet_propose_pr_maintenance",
+    {
+      title: "Propose PR maintenance for human authorization",
+      description:
+        "When the user asks to enable PR maintenance, collect verified PR/task/worker facts and propose the bounded scope here. This stores an unapproved proposal and notifies the operator; it cannot enable maintenance or grant permissions. The existing task authorization dialog is prefilled, so never ask the user to copy JSON. Read an existing proposal with fleet_get_pr_maintenance(taskId) before revising it. End your turn after proposing.",
+      inputSchema: ProposePrMaintenanceSchema.shape,
+    },
+    guard("fleet_propose_pr_maintenance", ProposePrMaintenanceSchema, (input) =>
+      tools.proposePrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
+    "fleet_set_pr_maintenance",
+    {
+      title: "Set owned PR maintenance",
+      description:
+        "Pause an owned registration or reconcile already authorized enablement. Enablement, renewal, resume and release require the authenticated task action; this tool cannot mint operator approval or clear a design decision.",
+      inputSchema: SetPrMaintenanceSchema.shape,
+    },
+    guard("fleet_set_pr_maintenance", SetPrMaintenanceSchema, (input) =>
+      tools.setPrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
+    "fleet_get_pr_maintenance",
+    {
+      title: "Read PR maintenance and claim due work",
+      description:
+        "Read this lead's durable registrations on every wake. Use taskId for an owned task's pending authorization proposal and retained registration. List bounded summaries with nextCursor, or read a complete record by recordId. takeDue claims the next persisted oldest-due visit and reserves a bounded helper request allowance for this Host-recorded turn; it does not start a worker. A lost claim stays charged. Reconcile paused or terminal work without repairs.",
+      inputSchema: GetPrMaintenanceSchema.shape,
+    },
+    guard("fleet_get_pr_maintenance", GetPrMaintenanceSchema, (input) =>
+      tools.getPrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
+    "fleet_checkpoint_pr_maintenance",
+    {
+      title: "Checkpoint PR maintenance facts",
+      description:
+        "Persist a complete or incomplete observation, exact prepared batch, per-finding/effect settlement, readiness, or reconciliation with an optimistic version. Checkpointing cannot authorize a design change, broaden scope, or transfer ownership. A worker completion is not batch settlement.",
+      inputSchema: CheckpointPrMaintenanceSchema.shape,
+    },
+    guard("fleet_checkpoint_pr_maintenance", CheckpointPrMaintenanceSchema, (input) =>
+      tools.checkpointPrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
     "fleet_follow_up",
     {
       title: "Send a worker another turn",
@@ -426,6 +522,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "Use the sessionId from fleet_list_work or fleet_get_task. A closed task must first be reopened with fleet_reopen_task.",
         "Accepted follow-ups are persisted and scheduled; queued means accepted, not failed. Repeating the same pending follow-up does not resend it; a different prompt cannot overwrite it.",
         "Busy, stopping or offline is not a reason to replace a worker. Use fleet_start_work only for genuinely different work or a confirmed non-resumable conversation.",
+        "For registered PR maintenance, supply its recordId/generation/batchId in maintenance and the byte-identical prepared prompt. Acceptance binds the same step/attempt atomically; omitted metadata cannot bypass a hold.",
       ].join(" "),
       inputSchema: FollowUpSchema.shape,
     },

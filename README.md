@@ -103,6 +103,7 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [alerts, sounds, and notifications](#alerts).
 - **Coordinate multi-agent work:**
   [Orchestrator quick guide](#orchestrator-quick-guide),
+  [approved remote commands](#approved-remote-commands),
   [Runs: several sessions toward one objective](#runs-several-sessions-toward-one-objective),
   and [Chats as a destination](#chats-as-a-destination).
 - **Recover, move, back up, or troubleshoot:**
@@ -1016,6 +1017,10 @@ reviews, appear as compact expandable steps rather than user chat bubbles.
 Expand a step to read its full original message. These messages do not add
 marks to the user-prompt rail.
 
+Consecutive diagnostic messages, including Agency startup output, share one
+**Output** label while keeping every line visible. Errors, prompts, and other
+transcript entries stay separate.
+
 ### Attaching files and images
 
 The composer takes files: paste a screenshot straight into the box, or use the
@@ -1351,6 +1356,170 @@ The listener binds to loopback only and is deliberately not exposed: anything
 that can repoint a node at a different Host can run commands on that machine.
 Reach a remote node's page over SSH port forwarding rather than binding wider.
 
+### Approved remote commands
+
+An Orchestrator can request a finite command on a Node without starting a Copilot
+worker. `fleet_run_command` prepares the target and returns an execution ID.
+When no Node permission matches, the **Host automatically opens a permission
+dialog** showing the target machine, working folder, full command, reason, and
+runtime limit. You do not need to visit the Node settings page or stop all its
+sessions to enable the feature.
+
+| Choice                        | What the Node remembers                                                                                                             |
+| ----------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| **Allow once**                | Only this exact prepared execution. Another request asks again.                                                                     |
+| **Allow during session**      | The command identity and folder for this Orchestrator session, in Node memory. It ends when the session stops or the Node restarts. |
+| **Always allow on this Node** | A command-and-folder rule saved in the target Node's configuration until removed.                                                   |
+| **Deny**                      | Nothing executes and no permission is granted.                                                                                      |
+
+Remembered permissions use the **command/subcommand + resolved working folder**,
+not the entire command line. Recognized ordinary flags may differ:
+`git status --short` and `git status --branch` share `git status`, while `git reset`
+is different. `npm run build` and `npm run deploy` are different identities.
+The approval dialog shows the exact rule being granted. Reusable rules are broad
+within that identity; they are not a claim that every argument is read-only.
+The Commands button highlights pending approvals with an amber pulse and count
+(a steady highlight when reduced motion is enabled). The dialog prioritizes
+**Waiting approval**; **Request history** keeps reviewed and other requests separate.
+If an approval conflicts with another update, Fleet refreshes its current state
+without automatically resubmitting your decision. Reload an old browser tab
+after upgrading if it reports unrecognized command fields.
+External-command rules also remember the resolved executable; updating or
+replacing it requires fresh approval.
+Other resolvable literal tools, such as `dotnet build`, `cargo test`, and
+`where.exe git`, support reusable rules too; their unrecognized flags and operands
+remain part of the displayed identity rather than being silently ignored.
+
+Scripts with dynamic commands, control flow, multiple commands, absolute
+executable paths, or uncertain executable resolution can use Session/Always with
+an **exact-script** rule. Any text change, including flags or whitespace, asks
+again. These rules approve the submitted script, not the contents of tools or
+files it loads at runtime. A first-command rule never implicitly approves the
+rest of a script. Session/task YOLO does not grant permission.
+
+Use **Node settings → Command permissions** to edit the persistent allowlist in
+one JSON text box. Each line is a command/folder object; **Save allowlist** commits
+the document, **Format JSON** only reformats it, and reloading explicitly discards
+an unsaved draft. Once and session grants are never included.
+
+```json
+[
+  { "command": "cd", "path": "*" },
+  { "command": "git status", "path": "Q:\\Repos\\TridentWarehouse-UX" },
+  { "command": "npm run *", "path": "Q:\\Repos\\*", "match": "pattern" },
+  {
+    "command": "cd 'C:\\Windows'; Get-Location",
+    "path": "C:\\Users\\charlesyin",
+    "match": "exact"
+  }
+]
+```
+
+`*` matches any text in a simple command pattern or resolved local folder path,
+including nested folders. Patterns do not authorize appended statements,
+pipelines, or dynamic shell expressions. They deliberately trust matching program
+names and arguments rather than pinning executable versions. Use `"match":"exact"`
+to keep a full script literal, including any `*` inside it. JSON backslashes must
+be escaped as `\\`.
+
+`"match":"pattern"` matches the whole simple invocation, including its flags and
+arguments (for example `git status --*`). Without a command wildcard, the default
+command-family matching still applies, even when the folder contains `*`.
+Omitting `match` or explicitly writing `"match":"command"` is equivalent and
+does not refresh an existing executable pin.
+
+Readable `command`, `path`, and `match` fields are persisted with each rule;
+the editor leaves internal IDs, unchanged executable pins, and Host bindings
+intact. Other-Host entries include `hostId`. On upgrade, retained Node journal
+evidence recovers old exact-script text after checking its hash. If the original
+text is unavailable, a `legacyKey` entry is explicitly flagged and may be kept,
+deleted, or replaced with the actual command; text is never guessed.
+
+The directory-change built-in rules (`cd` / `Set-Location` on
+Windows) are visible and removable there. They cover supported literal local
+directory changes, not arbitrary commands appended after them. `Set-Path` is not
+a PowerShell built-in. Removing a rule blocks future automatic use; it does not
+cancel a command already running.
+
+The old local enable switch, eligible-root checklist, safety acknowledgment, and
+stop-all-session setup dialog have been removed. Existing old enable settings do
+not become reusable grants. Both Host and Node must support the new permissions
+protocol, and command approvals still require an authenticated administrator.
+Readiness checks still enforce supervisor availability without weakening machine
+execution or application-control policy.
+
+Select a working directory, not a bare repository or a `.git` administration
+directory. Those targets are refused rather than placed in a separate exclusion
+namespace. Actual journal and native-supervisor files, as well as output rows,
+count toward admission storage limits; low free space refuses new work.
+
+The initial shell is explicitly **Windows PowerShell 5.1**
+(`windows-powershell-5.1`). Each execution has a fresh, noninteractive shell and
+a separate starting directory. Git and `npm run` work there; `cd` and variables
+do not persist to later executions. Scripts are limited to 16 KiB of UTF-8 text,
+with a five-minute default and one-hour maximum runtime. An unstarted request
+expires 30 minutes after creation. Only one command runs on a Node at a time.
+Interactive prompts, permanent dev servers, and implicit fallback to another
+shell are not supported.
+
+The existing sealed Host–Node connection carries requests and output. The Node
+hosting the Orchestrator must independently support durable completion delivery,
+even if a different Node executes the command. Use `fleet_get_execution` for
+status and additional bounded output, and `fleet_cancel_execution` to cancel.
+The Orchestrator is notified when the execution settles; it should not poll or
+start another worker merely to check progress. Retrying a request key cannot
+launch the same command again; a deliberate rerun needs a new key and is checked
+against the Node's current permission rules.
+
+Ordinary placement commands run alongside active or idle sessions, like an
+approved terminal command. Legacy untracked session markers do not block them
+and are not deleted. Coordinate writes with other work: approval is not file
+isolation. Commands still register ownership, block Fleet maintenance while
+running, and refuse explicitly unresolved process ownership. Managed task commands
+retain exclusive checkout admission, as do legacy Host exchanges. Fleet does not
+silently stop the requesting lead. Managed task targets
+must be mutable and unsealed/unreviewed; protected, composing, or integrating
+results require a separately designed revision flow, not a source-checkout
+fallback.
+
+**This is trusted remote code execution, not a sandbox.** Commands run as the
+Node's OS user and may read credentials, modify files outside cwd, invoke other
+tools, or access the network. Registry locks coordinate cooperating Fleet work;
+they cannot constrain arbitrary OS processes or an older nonparticipating Node.
+Do not treat a saved command rule as isolation from those processes.
+
+Output streams to the Host UI and is bounded to 10 MiB per execution, with a
+64 KiB maximum read page and separate transport/storage limits. Gap markers,
+incomplete transfer, and UTF-8 decoding assumptions are visible. **Download
+loaded raw output** preserves the bytes currently loaded in the dialog rather
+than promising a complete transcript. Commands and output may contain sensitive
+data; they are not automatically redacted or copied into global diagnostic logs.
+
+The history output panel is vertically resizable. Command completions appear
+as collapsible `<fleet-command-result>` entries, not human chat prompts; expand
+one to inspect or copy the full notification, including older untagged results.
+
+A disconnect is not proof of completion. Cancellation stays pending until
+termination is verified. An interrupted result can have known quiescence but an
+unknown exit code; unknown process ownership blocks reuse instead. Parent-Node
+loss and deadlines are enforced by the independent Windows supervisor. Remaining
+descendants are stopped when the root exits, and forced cleanup is reported rather
+than presented as ordinary success.
+
+Settled verbose history has a 30-day retention period; compact deduplication and
+unresolved ownership records outlive it. Reconnect does not rerun arbitrary
+commands. Restored execution authority is quarantined, and updates/restores
+refuse to mutate under unresolved ownership. See the
+[implementation plan](docs/remote-command-execution-plan.md)
+for the contracts, recovery boundaries, and acceptance scenarios.
+
+If a Node update fails after Git/npm mutation has begun, admission stays blocked
+and `update-incomplete.json` records the recovery requirement in the Node data
+directory. **Retry Update Node** explicitly: the retry runs installation and build
+even if Git already reached the requested revision. A failed-mutation marker
+survives restart; after a successful build, a fresh Node at the recorded repository
+and revision clears the block. Do not delete the marker to bypass a failed update.
+
 ### Following the Host to a new URL
 
 ![Settings → Tunnel: five providers — Cloudflare, Tailscale Funnel, Dev Tunnels, ngrok and bore — each with its own toggle and status, and a banner naming the address nodes are currently told to dial.](docs/screenshots/tunnel.png)
@@ -1647,6 +1816,62 @@ For one-off questions that do not need a checkout, start a direct **Chats**
 session from **New session**. For shared multi-agent goals, use Orchestrator's
 lead **Conversation** and task board so the plan, workers, review, and archive
 state stay together.
+
+### PR maintenance (opt-in pilot)
+
+Task detail includes **PR maintenance** for an existing Orchestrator-owned worker.
+V1 supports one retained PR registration per task; release settled maintenance
+before registering another PR for that task.
+You can ask the Orchestrator to enable maintenance for a PR. It uses
+`fleet_propose_pr_maintenance` to store an unapproved proposal and notify you.
+Open **Review PR maintenance proposal** in the task panel, inspect the prefilled
+scope, and select **Authorize maintenance** while signed in. No JSON copy/paste
+is needed; the agent cannot authorize itself. Checks then use the existing wake
+loop, and a normal chat message can request an immediate first check.
+
+Use **Enable PR maintenance** to review the proposed exact GitHub PR, stable
+repository identities, head/base refs, retained worker and checkout, task/design
+baseline, verification, and helper/credential/publication evidence. Confirmation
+is an authenticated browser action, not an MCP approval or a review comment.
+Unknown prerequisites and unsupported bindings cannot be enabled. Sign-in is
+required for these authorization controls, including on a no-login Host.
+
+Fleet stores registrations, checkpoints, decisions, budgets and unsettled effects
+in its Host database. The existing lead reads them on ordinary wakes and idle
+reminders; this is best-effort observation, not a separate observer or an exact
+30-minute SLA. Unchanged feedback needs no new worker repair turn. Ready remains
+nonterminal: this release never merges, force-pushes, automatically rebases, or
+starts extra reviewer sessions.
+
+![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read GitHub through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)
+
+_The normal repair loop reuses the original worker and reconciles outcomes on existing lead wakes._
+
+**Pause**, **Resume**, and **Release** operate on the displayed record version;
+stale actions fail and require a fresh review. Design uncertainty pauses the
+whole PR. Use the task's **Send back with instructions** to record bounded,
+versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
+hold, certify a defect fixed, or approve a redesign.
+
+![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](docs/pr-maintenance-human-gate.png)
+
+_Design choices stay human: record direction, then explicitly resume maintenance._
+
+[Editable diagram source (HTML)](docs/pr-maintenance-flow.html).
+
+Stop/archive/delete pause linked maintenance. Accepted work and unknown push/reply
+effects retain ownership and block cleanup until reconciled; Stop is not proof
+that remote effects ended. Retained active/paused registrations protect continuity
+from automatic inactivity cleanup. Explicit settled release permits later cleanup
+and a future registration must revalidate its binding.
+
+V1 does not support standalone-session handoff or reuse of sealed, published, or
+cleaned managed results. Follow the displayed eligibility reason rather than
+clearing immutable result evidence. The default allowances are pilot workflow
+limits, not a shell sandbox. Deterministic tests do not establish the proposed
+30-scenario, three-repeat model evaluation thresholds or production repair rates;
+those measurements still require an authorized pilot.
+See [Orchestration lifecycle](docs/orchestration-lifecycle.md).
 
 ### Runs: several sessions toward one objective
 

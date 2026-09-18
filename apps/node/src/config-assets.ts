@@ -31,6 +31,10 @@ const ASSETS: Record<string, { file: string; contentType: string }> = {
     file: "node-settings.js",
     contentType: "text/javascript; charset=utf-8",
   },
+  "/command-permissions.js": {
+    file: "command-permissions.js",
+    contentType: "text/javascript; charset=utf-8",
+  },
   "/sessions.js": {
     file: "sessions.js",
     contentType: "text/javascript; charset=utf-8",

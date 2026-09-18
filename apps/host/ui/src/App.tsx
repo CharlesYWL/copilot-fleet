@@ -28,6 +28,7 @@ import { NotificationContext, useAppNotifications } from "./hooks/useAppNotifica
 import { useStickyFlag } from "./hooks/useStickyFlag";
 import { useOnboardingTour } from "./hooks/useOnboardingTour";
 import type { TourStep } from "./lib/onboarding";
+import type { MaintenanceReviewReference } from "./lib/pr-maintenance";
 import { signOut } from "./lib/auth";
 import { notificationTarget } from "./lib/notification-navigation";
 import { pendingPermissionRequests } from "./lib/terminal-blocks";
@@ -73,6 +74,8 @@ import { TerminalView } from "./components/TerminalView";
 import { TopBar } from "./components/TopBar";
 import { LifecycleNotificationControl } from "./components/LifecycleNotificationControl";
 import { OnboardingTour } from "./components/OnboardingTour";
+import { CommandExecutionsDialog } from "./components/CommandExecutionsDialog";
+import { CommandPermissionPrompts } from "./components/CommandPermissionPrompts";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
@@ -225,8 +228,10 @@ export function App() {
 
   const {
     snapshot,
+    snapshotRevision,
     liveNotificationUpdates,
     events,
+    commandOutput,
     runSteps,
     runNotes,
     connected,
@@ -258,6 +263,10 @@ export function App() {
   const [focusOpen, setFocusOpen] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [orchestrationDialogOpen, setOrchestrationDialogOpen] = useState(false);
+  const [commandPanel, setCommandPanel] = useState<{
+    executionId?: string;
+    leadSessionId?: string;
+  }>();
   const [bulkStopScope, setBulkStopScope] = useState<
     { kind: "all" } | { kind: "orchestrator"; sessionId: string }
   >();
@@ -701,6 +710,10 @@ export function App() {
         snapshot.sessions,
         orchestratorRuns,
       );
+      if (target.kind === "command_execution") {
+        setCommandPanel({ executionId: target.executionId });
+        return;
+      }
       if (target.kind === "session") {
         if (target.returnRunId) {
           setSelectedRunId(target.returnRunId);
@@ -844,10 +857,15 @@ export function App() {
    * The one decision left to a human. Approving closes the task; sending it
    * back returns it to the orchestrator with the note, which it acts on.
    */
-  const handleReviewTask = async (runId: string, approved: boolean, note: string) => {
+  const handleReviewTask = async (
+    runId: string,
+    approved: boolean,
+    note: string,
+    maintenance?: MaintenanceReviewReference,
+  ) => {
     const answered = await request(`/api/runs/${runId}/review`, {
       method: "POST",
-      body: JSON.stringify({ approved, note }),
+      body: JSON.stringify({ approved, note, ...(maintenance ? { maintenance } : {}) }),
     });
     if (!answered.ok) return false;
     await refresh();
@@ -868,10 +886,19 @@ export function App() {
   };
 
   const handleResumeOrchestrator = async (sessionId: string) => {
-    const resumed = await request(`/api/orchestrators/${sessionId}/resume`, {
-      method: "POST",
-    });
+    const resumed = await request<{ blockedRuns?: { runId: string; reason?: string }[] }>(
+      `/api/orchestrators/${sessionId}/resume`,
+      {
+        method: "POST",
+      },
+    );
     if (!resumed.ok) return false;
+    if (resumed.data.blockedRuns?.length) {
+      notify(
+        `Orchestrator resumed; ${resumed.data.blockedRuns.length} task(s) remain held by PR maintenance. Open task detail for direction or release.`,
+        "warning",
+      );
+    }
     await refresh();
     return true;
   };
@@ -1057,6 +1084,12 @@ export function App() {
           onDismissAllNotifications={() => void dismissAllNotifications()}
           onDismissNotification={dismissNotification}
           onSignOut={() => void signOut()}
+          onOpenCommandExecutions={() => setCommandPanel({})}
+          commandApprovalCount={
+            (snapshot.commandExecutions ?? []).filter(
+              (execution) => execution.state === "awaiting_approval",
+            ).length
+          }
           onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}
           navOpen={navOpen}
           onToggleNavCollapsed={view === "overview" ? undefined : () => setNavCollapsed()}
@@ -1072,6 +1105,27 @@ export function App() {
                 : undefined
           }
         />
+        <CommandPermissionPrompts
+          executions={snapshot.commandExecutions ?? []}
+          connected={connected}
+          blocked={
+            !!commandPanel ||
+            dialogOpen ||
+            orchestrationDialogOpen ||
+            focusOpen ||
+            !!bulkStopScope
+          }
+        />
+        {commandPanel && (
+          <CommandExecutionsDialog
+            executions={snapshot.commandExecutions ?? []}
+            output={commandOutput}
+            connected={connected}
+            initialExecutionId={commandPanel.executionId}
+            leadSessionId={commandPanel.leadSessionId}
+            onClose={() => setCommandPanel(undefined)}
+          />
+        )}
         <div className={styles.body}>
           {view === "overview" ? (
             <SessionGrid
@@ -1179,6 +1233,14 @@ export function App() {
                       handleSelectSession(sessionId, { kind: "orchestrator" })
                     }
                     onNewRun={() => setOrchestrationDialogOpen(true)}
+                    onOpenCommands={() =>
+                      setCommandPanel({ leadSessionId: orchestrator.id })
+                    }
+                    commandExecutionCount={
+                      (snapshot.commandExecutions ?? []).filter(
+                        (execution) => execution.leadSessionId === orchestrator.id,
+                      ).length
+                    }
                     activeAgentCount={orchestratorAgentCount}
                     onStopAgents={() =>
                       setBulkStopScope({
@@ -1210,6 +1272,7 @@ export function App() {
               {view === "orchestrator-task" && selectedRunModel && orchestrator && (
                 <OrchestratorTaskDetail
                   model={selectedRunModel}
+                  snapshotRevision={snapshotRevision}
                   notes={runNotes[selectedRunModel.run.id] ?? noNotes}
                   sessions={snapshot.sessions}
                   onBack={handleBackFromTask}
@@ -1231,8 +1294,8 @@ export function App() {
                       runId: selectedRunModel.run.id,
                     })
                   }
-                  onReview={(approved, note) =>
-                    handleReviewTask(selectedRunModel.run.id, approved, note)
+                  onReview={(approved, note, maintenance) =>
+                    handleReviewTask(selectedRunModel.run.id, approved, note, maintenance)
                   }
                   onArchive={() => handleArchiveRun(selectedRunModel.run.id)}
                   onReopen={(note) => handleReopenRun(selectedRunModel.run.id, note)}

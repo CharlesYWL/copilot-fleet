@@ -51,6 +51,10 @@ import type {
 import { isBroadcastableHostUrl } from "./host-url.js";
 import { SessionRetention } from "./session-retention.js";
 import { ManagedWorktreeService } from "./managed-worktree-service.js";
+import { CommandExecutionService } from "./command-execution-service.js";
+import { CommandConflict } from "./command-execution-store.js";
+import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
+import { PrMaintenanceError } from "./pr-maintenance-store.js";
 import {
   NotificationService,
   notificationAttemptKey,
@@ -212,6 +216,7 @@ export class FleetService {
   readonly notifications: NotificationService;
   readonly sessionRetention: SessionRetention;
   readonly worktrees: ManagedWorktreeService;
+  readonly commands: CommandExecutionService;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -257,6 +262,8 @@ export class FleetService {
     });
     this.sessionRetention = new SessionRetention(this, log, sessionRetentionDays);
     this.worktrees = new ManagedWorktreeService(this);
+    this.commands = new CommandExecutionService(this);
+    this.commands.reconcileNotifications();
   }
 
   snapshot(): Snapshot {
@@ -269,6 +276,7 @@ export class FleetService {
       notifications: this.store.listNotificationHydration(),
       notificationUnreadCount: this.store.notificationUnreadCount(),
       hostRevision: this.hostRevision,
+      commandExecutions: this.commands.list({ limit: 100 }),
     };
   }
 
@@ -307,6 +315,7 @@ export class FleetService {
 
   /** Hangs up on a Node the operator deleted; no session bookkeeping follows. */
   evictNode(nodeId: string, code: number, reason: string): void {
+    this.commands.nodeDisconnected(nodeId);
     this.nodeHealth.delete(nodeId);
     const socket = this.nodeSockets.get(nodeId);
     if (!socket) return;
@@ -324,6 +333,7 @@ export class FleetService {
   evictAllNodes(code: number, reason: string): void {
     this.nodeHealth.clear();
     for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
+      this.commands.nodeDisconnected(nodeId);
       this.sessionRetention.nodeDisconnected(nodeId);
       this.nodeSockets.delete(nodeId);
       socket.close(code, reason);
@@ -337,9 +347,12 @@ export class FleetService {
    * under ids that no longer mean what they did a moment ago.
    */
   importHostBackup(backup: HostBackup): void {
+    this.store.commands.assertRestoreAllowed();
     this.store.assertNoSessionCleanup();
+    this.commands.revokeAllSessionGrants();
     this.evictAllNodes(4002, "Host restored from backup");
     this.store.replaceHostBackup(backup);
+    this.commands.reconcileNotifications();
     this.broadcast({ type: "snapshot", data: this.snapshot() });
   }
 
@@ -356,9 +369,13 @@ export class FleetService {
     data: HostPortableBackupData;
     security: SecurityBackupPayload;
   }): { revokedSessions: RevokedSession[] } {
+    this.store.commands.assertRestoreAllowed();
     this.store.assertNoSessionCleanup();
+    this.commands.revokeAllSessionGrants();
     this.evictAllNodes(4002, "Host restored from a portable backup");
-    return this.store.importPortableBackup(input);
+    const result = this.store.importPortableBackup(input);
+    this.commands.reconcileNotifications();
+    return result;
   }
 
   /** Publishes after restore-time credentials and sockets have been replaced. */
@@ -372,7 +389,19 @@ export class FleetService {
 
   broadcast(message: BrowserMessage): void {
     BrowserMessageSchema.parse(message);
-    for (const socket of this.browserSockets) this.send(socket, message);
+    for (const socket of this.browserSockets) {
+      // Slow consumers recover command bytes by durable cursor; lifecycle is not dropped.
+      if (
+        message.type === "command_execution_output" &&
+        socket.bufferedAmount > 1024 * 1024
+      )
+        continue;
+      if (message.type === "command_execution" && socket.bufferedAmount > 1024 * 1024) {
+        socket.close(1013, "Recover command evidence by cursor after reconnect");
+        continue;
+      }
+      this.send(socket, message);
+    }
   }
 
   publishNode(node: FleetNode): void {
@@ -380,6 +409,13 @@ export class FleetService {
   }
 
   publishSession(session: FleetSession): void {
+    if (
+      session.runRole === "lead" &&
+      (terminalSessionStates.has(session.state) ||
+        session.stopRequested ||
+        session.cleanupRequested)
+    )
+      this.commands.revokeLead(session.id);
     this.broadcast({ type: "session", session });
   }
 
@@ -467,6 +503,7 @@ export class FleetService {
           ...(input.patch ?? {}),
         });
         if (!updatedStep) return undefined;
+        this.recordPrMaintenanceExecution(updatedStep);
 
         this.store.recordRunSettle(run.id);
         let updatedRun = this.store.getRun(run.id)!;
@@ -527,6 +564,7 @@ export class FleetService {
           stoppedByOrchestrator: false,
         });
         if (!updatedStep) return undefined;
+        this.recordPrMaintenanceExecution(updatedStep);
         if (updatedStep.sessionId) {
           this.store.clearSessionTurnCompletion(updatedStep.sessionId);
         }
@@ -546,6 +584,128 @@ export class FleetService {
   /** Steps travel whole: a step that was removed has no row left to describe. */
   publishRunSteps(runId: string, steps: readonly RunStep[]): void {
     this.broadcast({ type: "run_steps", runId, steps: [...steps] });
+  }
+
+  reconcilePrMaintenanceExecution(sessionId: string): void {
+    const step = this.store.getRunStepBySession(sessionId);
+    if (!step || !terminalRunStepStates.has(step.state)) return;
+    this.store.writeAtomically(() => this.recordPrMaintenanceExecution(step));
+  }
+
+  private recordPrMaintenanceExecution(step: RunStep, neverDispatched = false): void {
+    const reference = this.store.prMaintenance.referenceForStep(step.id, step.attempts);
+    if (!reference) return;
+    const record = this.store.prMaintenance.get(reference.recordId)!;
+    const batch = record.batches.find((entry) => entry.id === reference.batchId)!;
+    if (batch.executionSettled) return;
+    const events = this.store
+      .listEvents(step.sessionId)
+      .filter((event) => event.sequence > step.eventSeqFrom);
+    const stateReceipt = events.filter((event) => event.type === "state").at(-1);
+    const receivedState = stateReceipt
+      ? eventPayload(stateReceipt, "state")?.state
+      : undefined;
+    const completed = events.some((event) => event.type === "turn_complete");
+    const executionSettled =
+      neverDispatched ||
+      (receivedState !== undefined &&
+        (terminalSessionStates.has(receivedState) ||
+          (receivedState === "idle" && completed)));
+    if (!executionSettled && batch.state === "uncertain") return;
+    const reconciled = this.store.prMaintenance.checkpoint(
+      record.leadSessionId,
+      record.id,
+      record.version,
+      {
+        kind: "batch",
+        batchId: batch.id,
+        generation: record.generation,
+        state: executionSettled ? "reconciling" : "uncertain",
+        findings: batch.findings,
+        effects: batch.effects,
+        executionSettled,
+        published: batch.published,
+        evidence: executionSettled
+          ? `Correlated execution receipt: step ${step.id}, attempt ${step.attempts}, state ${step.state}${neverDispatched ? "; queued dispatch was never sent" : ""}. Remote effects still require reconciliation.`
+          : `Host step ${step.id}, attempt ${step.attempts}, is ${step.state} without a correlated quiescence receipt. Execution and effects remain uncertain.`,
+      },
+    );
+    this.store.prMaintenance.checkpoint(
+      reconciled.leadSessionId,
+      reconciled.id,
+      reconciled.version,
+      {
+        kind: "reconcile",
+        progress: executionSettled,
+        immediateCheck: executionSettled,
+        evidence: `Execution reconciliation for step ${step.id}, attempt ${step.attempts}; settled=${executionSettled}.`,
+      },
+    );
+  }
+
+  /** Stop only the accepted bound attempt; a stop request is not an effect receipt. */
+  cancelPausedPrMaintenance(now = new Date().toISOString()): void {
+    let cursor: string | undefined;
+    do {
+      const page = this.store.prMaintenance.list({
+        retainedOnly: true,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const record of page.records) {
+        if (record.lifecycle === "paused" && record.decision?.state !== "pending") {
+          this.notifications.createPrMaintenanceAttention(record, "paused");
+        }
+        if (record.readyFingerprint)
+          this.notifications.createPrMaintenanceAttention(record, "ready");
+        for (const batch of record.batches) {
+          if (!batch.cancellationRequestedAt || batch.executionSettled || !batch.stepId)
+            continue;
+          const step = this.store.getRunStep(batch.stepId);
+          const worker = this.store.getSession(record.workerSessionId);
+          if (
+            !step ||
+            step.attempts !== batch.attempt ||
+            step.sessionId !== record.workerSessionId ||
+            !worker
+          )
+            continue;
+          const dispatch = this.store.getSessionDispatchAttempt(worker.id);
+          const currentAttempt = notificationAttemptKey(worker, {
+            step,
+            run: this.store.getRun(record.taskId),
+          });
+          if (
+            step.state === "pending" &&
+            !step.dispatchedAt &&
+            dispatch?.attempt !== currentAttempt
+          ) {
+            this.store.writeAtomically(() => {
+              const cancelled = this.store.updateRunStep(step.id, {
+                state: "cancelled",
+                output: "PR maintenance paused or terminal before queued execution.",
+              })!;
+              this.recordPrMaintenanceExecution(cancelled, true);
+            });
+            this.publishRunSteps(record.taskId, this.store.listRunSteps(record.taskId));
+          } else if (
+            this.store.getNode(worker.nodeId)?.online &&
+            !["idle", "offline", "completed", "stopped", "failed"].includes(
+              worker.state,
+            ) &&
+            !this.store.getSessionTransitionIntent(worker.id)
+          ) {
+            this.dispatch(worker.nodeId, { type: "cancel", sessionId: worker.id });
+          }
+        }
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
+    this.notifications.commitAtomically(() => {
+      this.store.prMaintenance.notifyLongPauses(now, (record) => {
+        this.notifications.createPrMaintenanceAttention(record, "long_pause");
+      });
+    });
   }
 
   /**
@@ -586,6 +746,23 @@ export class FleetService {
   }):
     | { ok: true; session: FleetSession }
     | { ok: false; status: number; error: string; session?: FleetSession } {
+    if (input.runRole !== "lead") {
+      const maintenance = this.store.prMaintenance.admission({
+        action: "dispatch",
+        placementId: input.placement.id,
+        ...(input.runId ? { taskId: input.runId } : {}),
+        ...(input.executionBinding
+          ? { checkoutKey: input.executionBinding.checkoutKey }
+          : {}),
+      });
+      if (!maintenance.allowed) {
+        return {
+          ok: false,
+          status: 409,
+          error: `PR maintenance: ${maintenance.reason}. Use the retained worker and prepared batch.`,
+        };
+      }
+    }
     const node = this.store.getNode(input.placement.nodeId);
     if (!node?.online) return { ok: false, status: 409, error: "Node is offline" };
     const kind = input.readOnly ? "read-only" : "writing";
@@ -738,6 +915,29 @@ export class FleetService {
   ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
+    if (session.runRole !== "lead") {
+      const step = this.store.getRunStepBySession(session.id);
+      const reference = step
+        ? this.store.prMaintenance.referenceForStep(step.id, step.attempts)
+        : undefined;
+      const maintenance = this.store.prMaintenance.admission({
+        action: "resume",
+        sessionId: session.id,
+        placementId: session.placementId,
+        ...(session.runId ? { taskId: session.runId } : {}),
+        ...(session.executionBinding
+          ? { checkoutKey: session.executionBinding.checkoutKey }
+          : {}),
+        ...(reference ?? {}),
+      });
+      if (!maintenance.allowed) {
+        return {
+          ok: false,
+          status: 409,
+          error: `PR maintenance: ${maintenance.reason}. Reconcile the registration before resuming.`,
+        };
+      }
+    }
     if (session.cleanupRequested) {
       return { ok: false, status: 409, error: "Session deletion is awaiting its Node" };
     }
@@ -905,8 +1105,55 @@ export class FleetService {
     fallback?: DispatchFallback,
     attemptOverride?: string,
   ): DispatchResult {
+    const commandSession = this.store.getSession(request.sessionId);
+    if (
+      ["stop", "cancel", "delete_session"].includes(request.type) &&
+      commandSession?.runRole === "lead"
+    )
+      this.commands.revokeLead(commandSession.id);
+    if (
+      ["start_session", "resume_session", "prompt"].includes(request.type) &&
+      commandSession?.runId &&
+      commandSession.runRole !== "lead"
+    )
+      this.store.commands.assertTaskUnfenced(commandSession.runId);
+    if (
+      request.type === "prompt" &&
+      commandSession?.runRole === "lead" &&
+      this.commands.durableLead(commandSession.id)
+    ) {
+      this.commands.queueLeadPrompt(
+        commandSession.id,
+        request.prompt,
+        undefined,
+        [],
+        commandSession.executionBinding,
+        request.attachments,
+      );
+      this.commands.pumpLead(commandSession.id);
+      return { sent: true };
+    }
+    if (
+      ["start_session", "resume_session", "prompt"].includes(request.type) &&
+      commandSession?.runRole === "lead" &&
+      this.store.commands.reserved(commandSession.id)
+    )
+      throw new CommandConflict("lead_prompt_reserved");
+    if (
+      ["start_session", "resume_session", "prompt"].includes(request.type) &&
+      commandSession?.runRole === "lead" &&
+      !this.commands.durableLead(commandSession.id) &&
+      this.store.commands.prompts(commandSession.id).length
+    )
+      throw new CommandConflict("durable_lead_delivery_required");
     if (request.type !== "delete_session") {
       this.store.assertSessionMutable(request.sessionId);
+    }
+    if (request.type === "stop" || request.type === "cancel") {
+      this.store.prMaintenance.pauseForSession(
+        request.sessionId,
+        "Session stop or cancellation requested",
+      );
     }
     if (
       request.type === "start_session" ||
@@ -914,7 +1161,35 @@ export class FleetService {
       request.type === "prompt"
     ) {
       const session = this.store.getSession(request.sessionId);
-      if (session) this.worktrees.validateSession(session);
+      if (session) {
+        if (session.runRole !== "lead") {
+          const step = this.store.getRunStepBySession(session.id);
+          const reference = step
+            ? this.store.prMaintenance.referenceForStep(step.id, step.attempts)
+            : undefined;
+          this.store.prMaintenance.assertAdmission({
+            action: "execute",
+            sessionId: session.id,
+            placementId: session.placementId,
+            ...(session.runId ? { taskId: session.runId } : {}),
+            ...(session.executionBinding
+              ? { checkoutKey: session.executionBinding.checkoutKey }
+              : {}),
+            ...(reference ?? {}),
+          });
+          if (
+            reference &&
+            request.type !== "resume_session" &&
+            request.prompt !== step?.prompt
+          ) {
+            throw new PrMaintenanceError(
+              "prompt_conflict",
+              "Only the exact accepted maintenance prompt may execute.",
+            );
+          }
+        }
+        this.worktrees.validateSession(session);
+      }
     }
     const lifecycleIntent =
       request.type === "cancel" || request.type === "stop" ? request.type : undefined;
@@ -964,6 +1239,16 @@ export class FleetService {
         // automatic recovery, and orchestration, not just the new-session UI.
         const command = {
           ...request,
+          ...(session.runRole === "lead" &&
+          this.store.prMaintenance.list({
+            leadSessionId: session.id,
+            retainedOnly: true,
+            limit: 1,
+          }).records.length > 0 &&
+          (request.type === "start_session" || request.type === "prompt") &&
+          !request.prompt.trimStart().startsWith("/")
+            ? { prompt: `${request.prompt}\n\n${PR_MAINTENANCE_WAKE_INSTRUCTION}` }
+            : {}),
           ...(binding?.worktreeId &&
           (request.type === "start_session" || request.type === "prompt")
             ? {
@@ -1470,6 +1755,7 @@ export class FleetService {
   }
 
   disconnectNode(nodeId: string, activity: string): void {
+    this.commands.nodeDisconnected(nodeId);
     this.worktrees.nodeLost(nodeId);
     this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeSockets.delete(nodeId);
@@ -1919,6 +2205,8 @@ export class FleetService {
 
   private acceptSessionTransition(transition: AcceptedSessionTransition): void {
     const { before, after, source, intent, completion, context } = transition;
+    if (after.runRole === "lead" && terminalSessionStates.has(after.state))
+      this.commands.revokeLead(after.id);
     if (before.state === after.state) return;
     const attempt = notificationAttemptKey(after, context);
     const completed =
