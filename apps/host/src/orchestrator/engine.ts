@@ -706,12 +706,25 @@ export class OrchestratorEngine {
         };
       });
 
+      const maintenance = this.store.prMaintenance.list({
+        leadSessionId: lead.id,
+        retainedOnly: true,
+        limit: 5,
+      });
+      const prompt = [
+        statusCheckEnvelope(tasks),
+        ...(maintenance.records.length
+          ? [
+              `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,
+            ]
+          : []),
+      ].join("\n\n");
       this.promptedThisTick.add(lead.id);
       if (this.service.commands.durableLead(lead.id)) {
         this.store.writeAtomically(() => {
           this.service.commands.queueLeadPrompt(
             lead.id,
-            statusCheckEnvelope(tasks),
+            prompt,
             `status:${lead.id}:${baseline}`,
           );
           this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
@@ -720,22 +733,10 @@ export class OrchestratorEngine {
         continue;
       }
       this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
-      const maintenance = this.store.prMaintenance.list({
-        leadSessionId: lead.id,
-        retainedOnly: true,
-        limit: 5,
-      });
       this.service.dispatch(lead.nodeId, {
         type: "prompt",
         sessionId: lead.id,
-        prompt: [
-          statusCheckEnvelope(tasks),
-          ...(maintenance.records.length
-            ? [
-                `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,
-              ]
-            : []),
-        ].join("\n\n"),
+        prompt,
         attachments: [],
       });
     }

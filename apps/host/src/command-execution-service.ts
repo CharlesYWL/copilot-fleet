@@ -298,6 +298,19 @@ export class CommandExecutionService {
       if (terminalRunStates.has(run.state)) throw new CommandConflict("task_not_active");
       this.records.assertTaskUnfenced(taskId);
     }
+    const maintenance = this.store.prMaintenance.admission({
+      action: "dispatch",
+      leadSessionId: leadId,
+      ...(taskId ? { taskId } : {}),
+      ...("placementId" in request.target
+        ? { placementId: request.target.placementId }
+        : {}),
+    });
+    if (!maintenance.allowed)
+      throw new CommandConflict(
+        "maintenance_target_reserved",
+        `PR maintenance reserves this task or checkout for its retained worker: ${maintenance.reason}. Run observation helpers in a separate lead context.`,
+      );
     return { nodeId, path, ...(taskId ? { taskId } : {}) };
   }
 
@@ -1522,6 +1535,16 @@ export class CommandExecutionService {
           ? { retryAfterSeq: this.store.maxEventSequence(receipt.sessionId) }
           : {}),
       });
+      if (receipt.state === "accepted" && this.store.getSession(receipt.sessionId)) {
+        const previousDispatch = this.store.getSessionDispatchAttempt(receipt.sessionId);
+        if (previousDispatch?.commandId !== receipt.deliveryId) {
+          this.store.setSessionDispatchAttempt(receipt.sessionId, {
+            commandId: receipt.deliveryId,
+            eventSeqFrom: this.store.maxEventSequence(receipt.sessionId),
+            attempt: previousDispatch?.attempt ?? `session:${receipt.sessionId}`,
+          });
+        }
+      }
       for (const id of record.executions) {
         const execution = this.records.get(id);
         if (execution)

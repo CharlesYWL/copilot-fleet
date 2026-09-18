@@ -10,6 +10,9 @@ No personal skill installation, new runtime, registry mutation, or token copy.
 Execute `node "<absolute path to github-snapshot.mjs>"`. Feed JSON through stdin
 using the existing approved command tool's data input or a local JSON evidence
 file; never interpolate PR/review text into executable command text.
+For `fleet_run_command`, use a separate authorized helper placement, without the
+maintenance task ID. The retained task and checkout reject independent commands,
+including observation helpers; repairs stay with the retained worker.
 
 ```json
 {
