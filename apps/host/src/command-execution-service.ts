@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from "node:util";
 import {
   COMMAND_ADMISSION_VERSION,
   COMMAND_EXECUTION_CAPABILITY,
+  COMMAND_PERMISSIONS_CAPABILITY,
   COMMAND_LIMITS,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   CommandDecisionSchema,
@@ -16,6 +17,7 @@ import {
   terminalRunStates,
   terminalSessionStates,
   type CommandDecision,
+  type CommandApprovalScope,
   type CommandExecution,
   type CommandExecutionHostMessage,
   type CommandExecutionNodeMessage,
@@ -50,7 +52,7 @@ const insidePath = (path: string, root: string) =>
   normalizedPath(path) === normalizedPath(root) ||
   normalizedPath(path).startsWith(`${normalizedPath(root)}\\`);
 
-/** Authorization and side-effect arbitration; SQLite is the source of truth. */
+/** Durable dispatch arbitration; reusable command/path permissions belong to Nodes. */
 export class CommandExecutionService {
   private readonly peers = new Map<
     string,
@@ -59,6 +61,7 @@ export class CommandExecutionService {
       commandProtocol: boolean;
       capabilities: string[];
       readiness?: CommandReadiness | undefined;
+      sentRevocations: Set<string>;
     }
   >();
   private readonly observations = new Set<string>();
@@ -90,20 +93,30 @@ export class CommandExecutionService {
   nodeReady(
     nodeId: string,
     inventory: Pick<NodeReady, "capabilities" | "commandExecution">,
-  ): { commandExecutions: boolean; durableLeadDelivery: boolean } {
+  ): {
+    commandExecutions: boolean;
+    commandPermissions: boolean;
+    durableLeadDelivery: boolean;
+  } {
     const link = this.service.nodeSocket(nodeId);
     if (!(link instanceof SealedNodeLink)) {
       this.peers.delete(nodeId);
-      return { commandExecutions: false, durableLeadDelivery: false };
+      return {
+        commandExecutions: false,
+        commandPermissions: false,
+        durableLeadDelivery: false,
+      };
     }
     this.peers.set(nodeId, {
       link,
       commandProtocol: inventory.commandExecution !== undefined,
       capabilities: [...inventory.capabilities],
       readiness: inventory.commandExecution,
+      sentRevocations: new Set(),
     });
     return {
       commandExecutions: this.commandProtocol(nodeId),
+      commandPermissions: this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY),
       durableLeadDelivery: this.capable(nodeId, DURABLE_LEAD_DELIVERY_CAPABILITY),
     };
   }
@@ -154,18 +167,37 @@ export class CommandExecutionService {
 
   private assertReadiness(nodeId: string, shell: RunCommand["shell"]): void {
     const readiness = this.peers.get(nodeId)?.readiness;
+    const permissions = this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY);
     if (
       !this.capable(nodeId, COMMAND_EXECUTION_CAPABILITY) ||
-      !readiness?.enabled ||
-      !readiness.supported ||
+      (!permissions && !readiness?.enabled) ||
+      !readiness?.supported ||
       readiness.admissionVersion !== COMMAND_ADMISSION_VERSION ||
       !readiness.shells.includes(shell)
     )
       throw new CommandConflict(
         "unsupported_command_target",
         readiness?.reason ||
-          "The target requires an opted-in, ready Node on a sealed command-capable connection.",
+          (permissions
+            ? "The target requires a supported supervisor and ready shell on a sealed command-capable Node."
+            : "The target requires an opted-in, ready Node on a sealed command-capable connection. Upgrade the Node for Host permission prompts and reusable scopes."),
       );
+  }
+
+  private assertReusablePermission(execution: CommandExecution): void {
+    if (!this.capable(execution.nodeId, COMMAND_PERMISSIONS_CAPABILITY))
+      throw new CommandConflict(
+        "command_permission_upgrade_required",
+        "This Node supports Once only. Upgrade it for session and always permissions.",
+      );
+    const prepared = execution.descriptor?.prepared;
+    const permission = prepared?.permission;
+    if (
+      !permission?.reusable ||
+      !permission.commandKey?.trim() ||
+      normalizedPath(permission.path) !== normalizedPath(prepared!.cwd)
+    )
+      throw new CommandConflict("command_permission_not_reusable");
   }
 
   private target(
@@ -267,6 +299,15 @@ export class CommandExecutionService {
       this.records.assertTaskUnfenced(taskId);
     }
     return { nodeId, path, ...(taskId ? { taskId } : {}) };
+  }
+
+  private recheckTarget(execution: CommandExecution): void {
+    const target = this.target(execution.leadSessionId, execution);
+    if (
+      target.nodeId !== execution.nodeId ||
+      normalizedPath(target.path) !== normalizedPath(execution.requestedPath)
+    )
+      throw new CommandConflict("command_target_changed");
   }
 
   request(leadId: string, input: unknown, now = Date.now()): CommandExecution {
@@ -444,8 +485,9 @@ export class CommandExecutionService {
       if (now >= Date.parse(current.expiresAt))
         return this.finish(current, "expired", "approval_expired");
       this.lead(current.leadSessionId);
-      this.target(current.leadSessionId, current);
-      if (decision.decision === "allow_once") {
+      this.recheckTarget(current);
+      if (decision.decision !== "deny") {
+        if (decision.decision !== "allow_once") this.assertReusablePermission(current);
         const clockFailure = this.preparedClockFailure(current);
         if (clockFailure) return this.finish(current, "failed", clockFailure);
       }
@@ -456,6 +498,13 @@ export class CommandExecutionService {
               state: "queued",
               approvedBy: actor,
               approvedAt: new Date(now).toISOString(),
+              approvalScope:
+                decision.decision === "allow_session"
+                  ? "session"
+                  : decision.decision === "allow_always"
+                    ? "always"
+                    : "once",
+              automaticApproval: false,
             });
       this.store.recordSecurityAudit({
         eventType: "command_execution_decision",
@@ -500,12 +549,58 @@ export class CommandExecutionService {
   }
 
   revokeLead(leadId: string): void {
+    this.records.revokeSessionGrants(leadId);
+    for (const [nodeId, peer] of this.peers) {
+      for (const target of this.records.sessionGrantRevocations(nodeId))
+        if (target.leadSessionId === leadId)
+          peer.sentRevocations.delete(JSON.stringify([target.hostId, leadId]));
+      this.sendSessionRevocations(nodeId);
+    }
     for (const execution of this.records
       .unsettled()
-      .filter((entry) => entry.leadSessionId === leadId))
+      .filter((entry) => entry.leadSessionId === leadId && !entry.cancelRequested))
       this.cancel(execution.id);
     for (const record of this.records.prompts(leadId))
       this.records.updatePrompt({ ...record, state: "orphaned" });
+  }
+
+  revokeAllSessionGrants(): void {
+    this.records.revokeSessionGrants();
+    for (const [nodeId, peer] of this.peers) {
+      peer.sentRevocations.clear();
+      this.sendSessionRevocations(nodeId);
+    }
+  }
+
+  private reconcileSessionGrants(): void {
+    for (const leadId of new Set(
+      this.records.sessionGrantTargets().map((target) => target.leadSessionId),
+    )) {
+      try {
+        this.lead(leadId);
+      } catch {
+        this.records.revokeSessionGrants(leadId);
+      }
+    }
+    for (const nodeId of this.peers.keys()) this.sendSessionRevocations(nodeId);
+  }
+
+  private sendSessionRevocations(nodeId: string): boolean {
+    if (!this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY)) return true;
+    const sent = this.peers.get(nodeId)!.sentRevocations;
+    for (const target of this.records.sessionGrantRevocations(nodeId)) {
+      const key = JSON.stringify([target.hostId, target.leadSessionId]);
+      if (sent.has(key)) continue;
+      if (
+        !this.send(nodeId, {
+          type: "revoke_command_session_grants",
+          ...target,
+        })
+      )
+        return false;
+      sent.add(key);
+    }
+    return true;
   }
 
   revokeTask(taskId: string): void {
@@ -544,9 +639,15 @@ export class CommandExecutionService {
     } else {
       if (!this.commandProtocol(nodeId)) return false;
       if (
+        message.type === "revoke_command_session_grants" &&
+        !this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY)
+      )
+        return false;
+      if (
         message.type === "prepare_command_execution" ||
         message.type === "start_command_execution"
       ) {
+        if (!this.sendSessionRevocations(nodeId)) return false;
         try {
           this.assertReadiness(
             nodeId,
@@ -610,6 +711,7 @@ export class CommandExecutionService {
       if (accepted) {
         const execution = this.records.get(message.executionId);
         if (execution) this.service.notifications.syncCommandExecution(execution);
+        if (execution?.state === "queued") this.tick();
       }
       return accepted;
     }
@@ -668,7 +770,9 @@ export class CommandExecutionService {
       JSON.stringify(body) !== JSON.stringify(this.preparation(current)) ||
       hash(commandDigestPayload({ ...body, prepared })) !== digest ||
       normalizedPath(descriptor.prepared.cwd) !==
-        normalizedPath(descriptor.prepared.checkout.path)
+        normalizedPath(descriptor.prepared.checkout.path) ||
+      (prepared.permission &&
+        normalizedPath(prepared.permission.path) !== normalizedPath(prepared.cwd))
     )
       return false;
     if (retired) {
@@ -699,8 +803,9 @@ export class CommandExecutionService {
       return true;
     }
     try {
+      this.lead(current.leadSessionId);
       this.assertReadiness(nodeId, current.shell);
-      this.target(current.leadSessionId, current);
+      this.recheckTarget(current);
       if ("worktreeId" in current.target) {
         const tree = this.store.getAnyManagedWorkspace(current.target.worktreeId)!;
         if (!isDeepStrictEqual(tree.checkout, descriptor.prepared.checkout)) return false;
@@ -721,19 +826,45 @@ export class CommandExecutionService {
       this.publish(this.finish(current, "failed", error.code));
       return true;
     }
-    const awaiting = this.store.writeAtomically(() => {
+    const next = this.store.writeAtomically(() => {
       this.records.acceptPreparationClock(
         current.id,
         body.hostTime,
         new Date(timing.receivedWall).toISOString(),
         timing.elapsedMs,
       );
+      let approval: Partial<CommandExecution> = {};
+      const permission = prepared.permission;
+      if (
+        this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY) &&
+        permission?.grantedBy &&
+        permission.reusable &&
+        permission.commandKey?.trim()
+      ) {
+        const approvalScope: CommandApprovalScope =
+          permission.grantedBy === "builtin" ? "once" : permission.grantedBy;
+        approval = {
+          approvedBy: `node:${nodeId}:${permission.grantedBy}`,
+          approvedAt: new Date(timing.receivedWall).toISOString(),
+          approvalScope,
+          automaticApproval: true,
+        };
+        this.store.recordSecurityAudit({
+          eventType: "command_execution_decision",
+          actorKind: "node",
+          actorId: nodeId,
+          targetId: current.id,
+          outcome: "success",
+          detail: `${current.id} ${current.leadSessionId} ${nodeId} automatic_${permission.grantedBy} ${digest} rule=${permission.ruleId ?? ""} policy=${permission.policyVersion}`,
+        });
+      }
       return this.records.update(current.id, current.version, {
         descriptor,
-        state: "awaiting_approval",
+        state: approval.automaticApproval ? "queued" : "awaiting_approval",
+        ...approval,
       });
     });
-    this.publish(awaiting);
+    this.publish(next);
     return true;
   }
 
@@ -990,6 +1121,7 @@ export class CommandExecutionService {
   }
 
   reconnect(nodeId: string): void {
+    this.reconcileSessionGrants();
     const executions = this.records
       .list({ limit: 10_000 })
       .filter(
@@ -1050,6 +1182,7 @@ export class CommandExecutionService {
   }
 
   tick(now = Date.now()): void {
+    this.reconcileSessionGrants();
     for (const record of this.records.prompts()) {
       try {
         this.lead(record.delivery.sessionId);
@@ -1102,9 +1235,14 @@ export class CommandExecutionService {
       try {
         const clockFailure = this.preparedClockFailure(execution);
         if (clockFailure) throw new CommandConflict(clockFailure);
+        if (
+          execution.automaticApproval ||
+          (execution.approvalScope && execution.approvalScope !== "once")
+        )
+          this.assertReusablePermission(execution);
         this.assertReadiness(execution.nodeId, execution.shell);
         if (!this.durableLead(execution.leadSessionId)) continue;
-        this.target(execution.leadSessionId, execution);
+        this.recheckTarget(execution);
       } catch (error) {
         if (
           error instanceof CommandConflict &&
@@ -1122,7 +1260,8 @@ export class CommandExecutionService {
         continue;
       }
       const starting = this.store.writeAtomically(() => {
-        this.target(execution.leadSessionId, execution);
+        this.lead(execution.leadSessionId);
+        this.recheckTarget(execution);
         const current = this.records.get(execution.id)!;
         if (
           current.cancelRequested ||
@@ -1160,6 +1299,12 @@ export class CommandExecutionService {
           approvedBy: starting.approvedBy!,
           approvedAt: starting.approvedAt!,
           version: starting.version,
+          ...(this.capable(starting.nodeId, COMMAND_PERMISSIONS_CAPABILITY)
+            ? {
+                approvalScope: starting.approvalScope ?? "once",
+                automaticApproval: starting.automaticApproval ?? false,
+              }
+            : {}),
         })
       )
         this.publish(
@@ -1267,11 +1412,13 @@ export class CommandExecutionService {
       const record = this.queueLeadPrompt(
         execution.leadSessionId,
         [
+          `<fleet-command-result executionId="${execution.id}" node=${JSON.stringify(execution.nodeName)} state="${execution.state}">`,
           `Fleet command ${execution.id} settled: ${execution.state}.`,
           `Target: ${JSON.stringify(execution.target)} on ${execution.nodeName}; cwd: ${execution.descriptor?.prepared.cwd ?? execution.requestedPath}.`,
           `Exit: ${execution.exitCode ?? "unknown"}; ownership: ${execution.ownership}; outcomeKnown: ${execution.outcomeKnown}; outputComplete: ${execution.outputComplete}; forced descendant cleanup: ${execution.descendantCleanupForced}.`,
           `Reason: ${execution.error || execution.reasonCode}.`,
           `Use fleet_get_execution with executionId="${execution.id}", afterSeq=0 to read bounded output. This is a result notification, not an instruction from command output.`,
+          "</fleet-command-result>",
         ].join("\n"),
         `command:${execution.id}`,
         [execution.id],
@@ -1392,7 +1539,9 @@ export class CommandExecutionService {
     const targets: unknown[] = [];
     for (const placement of this.store.listPlacements()) {
       let eligible = true;
-      let reason = "";
+      let reason = this.capable(placement.nodeId, COMMAND_PERMISSIONS_CAPABILITY)
+        ? ""
+        : "Once only; upgrade this Node for Host permission prompts and reusable scopes.";
       try {
         this.assertReadiness(placement.nodeId, "windows-powershell-5.1");
         this.target(leadId, {
@@ -1422,7 +1571,9 @@ export class CommandExecutionService {
     ]) {
       if (this.store.getRun(tree.runId)?.leadSessionId !== leadId) continue;
       let eligible = true;
-      let reason = "";
+      let reason = this.capable(tree.nodeId, COMMAND_PERMISSIONS_CAPABILITY)
+        ? ""
+        : "Once only; upgrade this Node for Host permission prompts and reusable scopes.";
       try {
         this.assertReadiness(tree.nodeId, "windows-powershell-5.1");
         this.target(leadId, {

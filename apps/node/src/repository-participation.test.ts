@@ -1,13 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalPath } from "./canonical-path.js";
 import {
   RepositoryParticipation,
   type RepositoryTarget,
 } from "./repository-participation.js";
-import { CheckoutLocks } from "./checkout-locks.js";
 import { CommandRouter } from "./router.js";
 import { NodeAdmission } from "./node-admission.js";
 import { GitRunner } from "./git-runner.js";
@@ -39,6 +39,101 @@ async function repository() {
 }
 
 describe("shared cross-installation participation", () => {
+  it("allows ordinary commands alongside sessions in both directions, but never through maintenance", async () => {
+    const f = await repository();
+    const sessions = await f.first.participate([f.target.cwd], "session:existing");
+    const commands = await f.second.acquire([f.target], "command:probe", "command");
+    const later = await f.first.participate([f.target.cwd], "session:later");
+    try {
+      await commands[0]!.revalidate();
+      await sessions.leases[0]!.revalidate();
+      await expect(
+        f.first.acquire([f.target], "maintenance", "exclusive"),
+      ).rejects.toThrow("Checkout busy");
+    } finally {
+      for (const lease of [...later.leases, ...sessions.leases, ...commands])
+        lease.release();
+    }
+    const maintenance = await f.first.acquire([f.target], "maintenance", "exclusive");
+    try {
+      await expect(
+        f.second.acquire([f.target], "command:probe", "command"),
+      ).rejects.toThrow("Checkout busy");
+    } finally {
+      maintenance[0]!.release();
+    }
+  });
+
+  it("does not let legacy untracked session markers block ordinary commands or delete them", async () => {
+    const f = await repository();
+    const legacy = await f.first.participate([f.target.cwd], "session:legacy");
+    const db = new DatabaseSync(
+      join(f.target.repository.path, "fleet-participation-v1", "participation.db"),
+    );
+    try {
+      db.prepare(
+        "UPDATE participants SET data=json_set(data,'$.tracked',json('false'))",
+      ).run();
+      const before = db.prepare("SELECT data FROM participants").get()!.data;
+      const command = await f.second.acquire([f.target], "command:probe", "command");
+      try {
+        expect(
+          db
+            .prepare(
+              "SELECT data FROM participants WHERE json_extract(data,'$.owner')='session:legacy'",
+            )
+            .get()!.data,
+        ).toBe(before);
+        await expect(
+          f.first.acquire([f.target], "managed command", "exclusive"),
+        ).rejects.toThrow();
+        await command[0]!.revalidate();
+      } finally {
+        command[0]!.release();
+      }
+      expect(db.prepare("SELECT data FROM participants").get()!.data).toBe(before);
+    } finally {
+      db.close();
+      legacy.leases[0]!.release();
+    }
+  });
+
+  it("continues to block explicitly unresolved process ownership and requires quiescence to release commands", async () => {
+    const f = await repository();
+    const command = await f.first.acquire([f.target], "command:unknown", "command");
+    command[0]!.processStarted(12345);
+    command[0]!.requireReconciliation("Unverified command descendants");
+    try {
+      expect(() => command[0]!.release()).toThrow("quiescence");
+      await expect(
+        f.second.acquire([f.target], "command:next", "command"),
+      ).rejects.toThrow("Checkout busy");
+    } finally {
+      command[0]!.processesQuiesced();
+      command[0]!.release();
+    }
+  });
+
+  it("keeps sessions in unrelated repositories concurrent with an exclusive command", async () => {
+    const commandRepository = await repository();
+    const sessionRepository = await repository();
+    const command = await commandRepository.first.acquire(
+      [commandRepository.target],
+      "command:one",
+      "exclusive",
+    );
+    const sessions = await sessionRepository.second.participate(
+      [sessionRepository.target.cwd],
+      "unrelated-session",
+    );
+    try {
+      await command[0]!.revalidate();
+      await sessions.leases[0]!.revalidate();
+    } finally {
+      command[0]!.release();
+      sessions.leases[0]!.release();
+    }
+  });
   it("rejects a second installation targeting the shared Git metadata directory or its alias", async () => {
     const f = await repository();
     await new GitRunner().run(f.target.cwd, ["-c", "init.templateDir=", "init"]);
@@ -93,13 +188,8 @@ describe("shared cross-installation participation", () => {
     for (const lease of exclusive) lease.release();
   });
 
-  it("tracks unbound/read-only aliases and excludes commands in both directions without changing non-opted rules", async () => {
+  it("automatically tracks unbound/read-only aliases and excludes commands in both directions", async () => {
     const f = await repository();
-    const legacy = await f.first.participate([f.target.cwd], "old-session");
-    expect(legacy.supervised).toBe(false);
-    await expect(f.second.activate([f.target.cwd], true)).rejects.toThrow("drain");
-    legacy.leases[0]!.release();
-    await f.first.activate([f.target.cwd], true);
     const shared = await f.first.participate(
       [f.target.cwd, f.target.cwd],
       "unbound-read-only",
@@ -132,22 +222,17 @@ describe("shared cross-installation participation", () => {
     leases[0]!.release();
   });
 
-  it("refuses activation for known existing managed ownership and requires explicit deployment attestation", async () => {
+  it("does not require activation or erase existing leases when an older caller activates", async () => {
     const f = await repository();
-    await expect(f.first.activate([f.target.cwd], false)).rejects.toThrow("confirm");
-    const locks = new CheckoutLocks();
-    locks.bindScope(f.target.checkout, f.target.repository);
-    const lease = locks.acquire(f.target.checkout, {
-      owner: "old-installation",
-      attempt: "attempt",
-      kind: "worker",
-    });
-    await expect(f.second.activate([f.target.cwd], true)).rejects.toThrow("ownership");
-    lease.release();
-    await f.second.activate([f.target.cwd], true);
+    const { leases } = await f.first.participate([f.target.cwd], "session");
+    await f.second.activate([f.target.cwd], false);
+    await expect(f.second.acquire([f.target], "command", "exclusive")).rejects.toThrow(
+      "Checkout busy",
+    );
+    leases[0]!.release();
   });
 
-  it("makes resumed unbound sessions participate in opted additional roots through junction aliases", async () => {
+  it("automatically makes resumed sessions participate in additional roots through junction aliases", async () => {
     const f = await repository();
     const plain = join(f.directory, "plain");
     const alias = join(f.directory, "alias");
@@ -166,7 +251,6 @@ describe("shared cross-installation participation", () => {
           };
     };
     const repositories = new RepositoryParticipation(resolver);
-    await repositories.activate([alias], true);
     let ownership: StartAgentOptions | undefined;
     let sequence = 0;
     let sink!: (event: SessionEvent) => void;

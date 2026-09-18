@@ -26,7 +26,7 @@ import {
 import { BrandMark } from "./BrandMark";
 import { ContextModeToggle, type ContextMode } from "./navigation/ContextModeToggle";
 import { fetchAuthStatus } from "../lib/auth";
-import { semanticColors } from "../theme";
+import { permissionSurface, semanticColors, statusVisuals } from "../theme";
 import { NotificationCenter } from "./NotificationCenter";
 import type { useAppNotifications } from "../hooks/useAppNotifications";
 
@@ -113,6 +113,31 @@ const useStyles = makeStyles({
     ...shorthands.padding("4px", "8px"),
   },
   commandButton: { minWidth: "auto" },
+  commandAttention: {
+    color: permissionSurface.accent,
+    backgroundColor: permissionSurface.background,
+    ...shorthands.borderColor(permissionSurface.border),
+    animationName: {
+      "0%,100%": { boxShadow: `0 0 0 0 ${statusVisuals.attention.surface}` },
+      "50%": {
+        backgroundColor: statusVisuals.attention.surface,
+        boxShadow: `0 0 0 4px ${statusVisuals.attention.surface}`,
+      },
+    },
+    animationDuration: "1.8s",
+    animationTimingFunction: "ease-in-out",
+    animationIterationCount: "infinite",
+    "@media (prefers-reduced-motion: reduce)": { animationName: "none" },
+  },
+  commandCount: {
+    minWidth: "20px",
+    padding: "1px 5px",
+    borderRadius: tokens.borderRadiusCircular,
+    backgroundColor: permissionSurface.accent,
+    color: permissionSurface.onAccent,
+    fontWeight: tokens.fontWeightBold,
+    fontVariantNumeric: "tabular-nums",
+  },
   commandLabel: { "@media (max-width: 900px)": { display: "none" } },
   warn: { color: semanticColors.permission },
   /** The connection state is reassurance, not information; a dot is enough. */
@@ -349,15 +374,20 @@ export const TopBar = ({
         )}
         {onOpenCommandExecutions && (
           <Button
-            appearance="subtle"
+            appearance={commandApprovalCount > 0 ? "secondary" : "subtle"}
             size="small"
-            className={styles.commandButton}
+            className={mergeClasses(
+              styles.commandButton,
+              commandApprovalCount > 0 && styles.commandAttention,
+            )}
             icon={<Code20Regular />}
             onClick={onOpenCommandExecutions}
             aria-label={`Command executions${commandApprovalCount ? `, ${commandApprovalCount} awaiting approval` : ""}`}
           >
             <span className={styles.commandLabel}>Commands</span>
-            {commandApprovalCount > 0 ? ` (${commandApprovalCount})` : ""}
+            {commandApprovalCount > 0 && (
+              <span className={styles.commandCount}>{commandApprovalCount}</span>
+            )}
           </Button>
         )}
         <NotificationCenter

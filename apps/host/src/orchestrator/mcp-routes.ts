@@ -263,7 +263,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Request an approved command",
       description:
-        "Request a finite shell command on an exact eligible target. Every new command requires explicit administrator allow-once; this tool never approves or immediately starts it. Save the execution ID, end this turn, and Fleet will notify you when it settles. A durable-delivery capable lead Node is required independently of the target.",
+        "Request a finite shell command on an exact Node target. The Node checks its command/path permissions; a matching built-in, orchestrator-session, or always rule can run automatically. Otherwise the Host prompts a Microsoft administrator for Once, this session, or Always. Simple command identities may ignore recognized flags; compound/dynamic requests require an exact full-script grant, never a first-token rule. Ordinary placement commands can coexist with sessions; managed task worktrees and maintenance remain protected. This tool cannot approve itself or edit permissions. Save the execution ID, end this turn, and Fleet will notify you when it settles. A durable-delivery capable lead Node is required independently of the target; older Nodes retain their Once-only flow.",
       inputSchema: RunCommandSchema.shape,
     },
     guard("fleet_run_command", RunCommandSchema, (input) => tools.runCommand(input)),

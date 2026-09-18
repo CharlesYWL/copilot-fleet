@@ -347,6 +347,7 @@ export class FleetService {
   importHostBackup(backup: HostBackup): void {
     this.store.commands.assertRestoreAllowed();
     this.store.assertNoSessionCleanup();
+    this.commands.revokeAllSessionGrants();
     this.evictAllNodes(4002, "Host restored from backup");
     this.store.replaceHostBackup(backup);
     this.commands.reconcileNotifications();
@@ -368,6 +369,7 @@ export class FleetService {
   }): { revokedSessions: RevokedSession[] } {
     this.store.commands.assertRestoreAllowed();
     this.store.assertNoSessionCleanup();
+    this.commands.revokeAllSessionGrants();
     this.evictAllNodes(4002, "Host restored from a portable backup");
     const result = this.store.importPortableBackup(input);
     this.commands.reconcileNotifications();
@@ -405,6 +407,13 @@ export class FleetService {
   }
 
   publishSession(session: FleetSession): void {
+    if (
+      session.runRole === "lead" &&
+      (terminalSessionStates.has(session.state) ||
+        session.stopRequested ||
+        session.cleanupRequested)
+    )
+      this.commands.revokeLead(session.id);
     this.broadcast({ type: "session", session });
   }
 
@@ -932,7 +941,7 @@ export class FleetService {
   ): DispatchResult {
     const commandSession = this.store.getSession(request.sessionId);
     if (
-      (request.type === "stop" || request.type === "cancel") &&
+      ["stop", "cancel", "delete_session"].includes(request.type) &&
       commandSession?.runRole === "lead"
     )
       this.commands.revokeLead(commandSession.id);
@@ -1986,6 +1995,8 @@ export class FleetService {
 
   private acceptSessionTransition(transition: AcceptedSessionTransition): void {
     const { before, after, source, intent, completion, context } = transition;
+    if (after.runRole === "lead" && terminalSessionStates.has(after.state))
+      this.commands.revokeLead(after.id);
     if (before.state === after.state) return;
     const attempt = notificationAttemptKey(after, context);
     const completed =

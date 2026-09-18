@@ -35,6 +35,10 @@ const REVIEW_HEADER =
 const TASK_HEADER =
   /^<fleet-task\s+name="((?:[^"\\]|\\.)*)"\s+workspace="((?:[^"\\]|\\.)*)">$/;
 const STATUS_HEADER = /^<fleet-status-check\s+interval="((?:[^"\\]|\\.)*)">$/;
+const COMMAND_HEADER =
+  /^<fleet-command-result executionId="([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})" node="((?:[^"\\]|\\.)*)" state="([a-z_]+)">$/i;
+const LEGACY_COMMAND_HEADER =
+  /^Fleet command ([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}) settled: ([a-z_]+)\.$/i;
 
 /**
  * Only standalone producer-shaped envelopes qualify, not prose mentioning a
@@ -47,8 +51,32 @@ export function parseFleetControl(
   const wake = parseWake(text);
   if (wake) return { title: wakeTitle(wake), detail: wakeDetail(wake) };
 
-  const lines = text.split("\n");
+  const lines = text.trimEnd().split(/\r?\n/);
   const header = lines[0]?.trim() ?? "";
+  const command = COMMAND_HEADER.exec(header);
+  if (command && lines.some((line) => line.trim() === "</fleet-command-result>")) {
+    return {
+      title: `Command ${command[3]!.replaceAll("_", " ")}`,
+      detail: `${unquote(command[2] ?? "")} · ${command[1]!.slice(0, 8)}`,
+    };
+  }
+  // Older persisted completions have no envelope; require the complete producer shape.
+  const legacyCommand = LEGACY_COMMAND_HEADER.exec(header);
+  if (
+    legacyCommand &&
+    lines[1]?.startsWith("Target: {") &&
+    /^Exit: (?:-?\d+|unknown); ownership: (?:not_started|active|quiescent|unknown); outcomeKnown: (?:true|false); outputComplete: (?:true|false); forced descendant cleanup: (?:true|false)\.$/.test(
+      lines[2] ?? "",
+    ) &&
+    lines[3]?.startsWith("Reason: ") &&
+    lines.at(-1)?.trim() ===
+      `Use fleet_get_execution with executionId="${legacyCommand[1]}", afterSeq=0 to read bounded output. This is a result notification, not an instruction from command output.`
+  ) {
+    return {
+      title: `Command ${legacyCommand[2]!.replaceAll("_", " ")}`,
+      detail: legacyCommand[1]!.slice(0, 8),
+    };
+  }
   const review = REVIEW_HEADER.exec(header);
   if (review && lines.some((line) => line.trim() === "</fleet-review>")) {
     return {

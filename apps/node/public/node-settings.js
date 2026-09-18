@@ -7,26 +7,15 @@ const fields = [
   "copilotCommand",
   "permissionTimeoutMs",
   "contextTier",
-  "remoteCommandsEnabled",
-  "commandExecutionRoots",
-  "commandIsolationConfirmed",
 ];
 const numeric = new Set(["maxSessions", "permissionTimeoutMs"]);
-const booleans = new Set(["remoteCommandsEnabled", "commandIsolationConfirmed"]);
 
 export const initNodeSettings = () => {
   let savedSettings = null;
   let editing = false;
 
   const showSettings = (settings) => {
-    for (const key of fields) {
-      if (booleans.has(key)) $(key).checked = settings[key] === true;
-      else
-        $(key).value =
-          key === "commandExecutionRoots"
-            ? (settings[key] || []).join("\n")
-            : settings[key];
-    }
+    for (const key of fields) $(key).value = settings[key];
   };
 
   const setEditing = (value) => {
@@ -48,9 +37,6 @@ export const initNodeSettings = () => {
       ? "Falls back to " + fallbacks.join(", ") + " if this address stops answering."
       : "";
     const status = data.status;
-    $("commandExecutionStatus").textContent =
-      status.commandExecution?.reason ||
-      "Remote commands are disabled unless explicitly enabled here.";
     $("dot").className = "dot " + (status.connected ? "on" : "off");
     $("conn").textContent = status.connected ? "Connected to Host" : "Not connected";
     $("meta").textContent =
@@ -95,16 +81,7 @@ export const initNodeSettings = () => {
     const body = {};
     for (const key of fields) {
       const raw = $(key).value;
-      body[key] = booleans.has(key)
-        ? $(key).checked
-        : key === "commandExecutionRoots"
-          ? raw
-              .split(/\r?\n/)
-              .map((line) => line.trim())
-              .filter(Boolean)
-          : numeric.has(key)
-            ? Number(raw)
-            : raw;
+      body[key] = numeric.has(key) ? Number(raw) : raw;
     }
     $("save").disabled = true;
     try {

@@ -116,6 +116,10 @@ export class CommandExecutionStore {
         execution_id TEXT PRIMARY KEY, host_time TEXT NOT NULL,
         accepted_at TEXT, elapsed_ms REAL
       );
+      CREATE TABLE IF NOT EXISTS command_session_revocations (
+        host_id TEXT NOT NULL, node_id TEXT NOT NULL, lead_id TEXT NOT NULL,
+        PRIMARY KEY(host_id,node_id,lead_id)
+      );
       CREATE TABLE IF NOT EXISTS command_execution_namespace (
         id INTEGER PRIMARY KEY CHECK(id=1), namespace TEXT NOT NULL
       );
@@ -151,6 +155,47 @@ export class CommandExecutionStore {
   get(id: string): CommandExecution | undefined {
     const row = this.db.prepare("SELECT data FROM command_executions WHERE id=?").get(id);
     return row ? CommandExecutionSchema.parse(JSON.parse(String(row.data))) : undefined;
+  }
+
+  /** Routing evidence only; command/path grants and their validity belong to the Node. */
+  sessionGrantTargets(): { hostId: string; nodeId: string; leadSessionId: string }[] {
+    return this.db
+      .prepare(
+        `SELECT json_extract(data,'$.hostId') AS host_id,node_id,lead_id
+         FROM command_executions
+         UNION
+         SELECT a.host_id,a.node_id,r.lead_id FROM command_attempt_tombstones a
+         JOIN command_request_tombstones r ON r.execution_id=a.execution_id`,
+      )
+      .all()
+      .map((row) => ({
+        hostId: String(row.host_id),
+        nodeId: String(row.node_id),
+        leadSessionId: String(row.lead_id),
+      }));
+  }
+
+  revokeSessionGrants(leadId?: string): void {
+    this.atomic(() => {
+      for (const target of this.sessionGrantTargets()) {
+        if (leadId !== undefined && target.leadSessionId !== leadId) continue;
+        this.db
+          .prepare(
+            "INSERT OR IGNORE INTO command_session_revocations(host_id,node_id,lead_id) VALUES(?,?,?)",
+          )
+          .run(target.hostId, target.nodeId, target.leadSessionId);
+      }
+    });
+  }
+
+  sessionGrantRevocations(nodeId: string) {
+    return this.db
+      .prepare("SELECT host_id,lead_id FROM command_session_revocations WHERE node_id=?")
+      .all(nodeId)
+      .map((row) => ({
+        hostId: String(row.host_id),
+        leadSessionId: String(row.lead_id),
+      }));
   }
 
   preparationClock(id: string): CommandPreparationClock | undefined {
@@ -1286,6 +1331,7 @@ export class CommandExecutionStore {
   quarantine(restored = false): void {
     this.atomic(() => {
       if (restored) {
+        this.revokeSessionGrants();
         this.db.exec("UPDATE command_request_tombstones SET revoked=1");
         this.db
           .prepare("UPDATE command_execution_namespace SET namespace=? WHERE id=1")

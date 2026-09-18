@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -127,13 +127,19 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function mount(item = record, connected = true) {
+function mount(
+  item = record,
+  connected = true,
+  others: CommandExecution[] = [],
+  initialExecutionId?: string,
+) {
   return render(
     <FluentProvider theme={fleetDarkTheme}>
       <CommandExecutionsDialog
-        executions={[item]}
+        executions={[item, ...others]}
         output={[]}
         connected={connected}
+        initialExecutionId={initialExecutionId}
         onClose={vi.fn()}
       />
     </FluentProvider>,
@@ -141,6 +147,106 @@ function mount(item = record, connected = true) {
 }
 
 describe("command approval UI", () => {
+  it("separates pending approvals from approved, denied, and completed requests", async () => {
+    const others = [
+      execution({
+        id: "00000000-0000-4000-8000-000000000001",
+        state: "running",
+        command: "running command",
+      }),
+      execution({
+        id: "00000000-0000-4000-8000-000000000002",
+        state: "denied",
+        command: "denied command",
+      }),
+      execution({
+        id: "00000000-0000-4000-8000-000000000003",
+        state: "succeeded",
+        command: "finished command",
+      }),
+    ];
+    mount(record, true, others);
+    expect(
+      screen
+        .getByRole("tab", { name: "Waiting approval (1)" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      within(
+        screen.getByRole("navigation", { name: "Waiting approval requests" }),
+      ).getAllByRole("button"),
+    ).toHaveLength(1);
+    expect(screen.queryByText("finished command")).toBeNull();
+    fireEvent.click(screen.getByRole("tab", { name: "Request history (3)" }));
+    expect(
+      within(screen.getByRole("navigation", { name: "Command history" })).getAllByRole(
+        "button",
+      ),
+    ).toHaveLength(3);
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    await act(async () => {});
+  });
+
+  it("opens a completed notification directly in history even with other requests pending", async () => {
+    const finished = execution({
+      id: "00000000-0000-4000-8000-000000000003",
+      state: "failed",
+      command: "finished command",
+    });
+    mount(record, true, [finished], finished.id);
+    expect(
+      screen
+        .getByRole("tab", { name: "Request history (1)" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(screen.getByLabelText("Exact command").textContent).toBe("finished command");
+    await act(async () => {});
+  });
+
+  it("moves an approved request into history and focuses the next waiting request", async () => {
+    const second = execution({
+      id: "00000000-0000-4000-8000-000000000002",
+      createdAt: "2026-09-16T15:00:00.000Z",
+      command: "next command",
+    });
+    mount(record, true, [second]);
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Exact command").textContent).toBe("next command"),
+    );
+    expect(
+      screen
+        .getByRole("tab", { name: "Waiting approval (1)" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(screen.getByRole("tab", { name: "Request history (1)" })).toBeTruthy();
+  });
+
+  it("refreshes a real approval conflict without submitting the decision again", async () => {
+    const original = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      if (String(url).endsWith("/decision")) {
+        record = execution({
+          state: "failed",
+          version: 8,
+          approvalScope: "once",
+          automaticApproval: false,
+          error: "Checkout busy",
+        });
+        return json({ code: "approval_conflict", error: "Conflict" }, 409);
+      }
+      return original(url, init);
+    });
+    mount();
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect(await screen.findByText("Checkout busy")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    expect(screen.getByText(/approval has not been retried/)).toBeTruthy();
+    expect(
+      vi.mocked(fetch).mock.calls.filter(([url]) => String(url).endsWith("/decision")),
+    ).toHaveLength(1);
+  });
+
   it("shows the exact multiline command and prepared context before any approval", async () => {
     const { container } = mount();
     expect(screen.getByLabelText("Exact command").textContent).toBe(command);
@@ -234,6 +340,20 @@ describe("command approval UI", () => {
       screen.getByText(/Remaining child processes were forcibly stopped/),
     ).toBeTruthy();
     expect(screen.getByText(/gaps or lossy decoding/)).toBeTruthy();
+    await act(async () => {});
+  });
+
+  it("gives short output a readable, non-shrinking, resizable panel", async () => {
+    record = execution({ state: "succeeded", ownership: "quiescent", exitCode: 0 });
+    mount();
+    const output = screen.getByLabelText("Command output");
+    const style = getComputedStyle(output);
+    expect(style.minHeight).toBe("200px");
+    expect(style.flexShrink).toBe("0");
+    expect(style.overflowY).toBe("auto");
+    expect(style.resize).toBe("vertical");
+    output.focus();
+    expect(document.activeElement).toBe(output);
     await act(async () => {});
   });
 

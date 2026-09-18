@@ -246,7 +246,7 @@ export class NotificationService {
             execution.nodeName,
           ),
           body: awaiting
-            ? "Review the complete command and Node-verified target before allowing it once or denying it."
+            ? "Review the complete command, Node-verified path, and reusable permission scope before allowing or denying it."
             : "The command request has settled. Open the execution to inspect the outcome, retained output, and delivery status.",
           subject: {
             type: "command_execution",

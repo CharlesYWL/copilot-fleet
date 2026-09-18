@@ -1,9 +1,11 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename, rm } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
-import { ContextTierSchema } from "@fleet/protocol";
+import { CommandPermissionRuleSchema, ContextTierSchema } from "@fleet/protocol";
 import { configDirectory } from "./config.js";
+import { DEFAULT_COMMAND_PERMISSION_RULES } from "./command-permissions.js";
 
 /**
  * Operator-editable settings, persisted separately from node.json so that
@@ -25,19 +27,12 @@ export const SettingsSchema = z.object({
    * fallback for older Hosts and for local session discovery.
    */
   contextTier: ContextTierSchema.default("long_context"),
-  /** Local-only opt-in. No environment or Host flag can silently enable execution. */
-  remoteCommandsEnabled: z.boolean().default(false),
-  commandExecutionRoots: z
-    .array(
-      z
-        .string()
-        .min(1)
-        .max(32768)
-        .refine((path) => !path.includes("\0")),
-    )
-    .max(64)
-    .default([]),
-  commandIsolationConfirmed: z.boolean().default(false),
+  // Legacy activation/allowlist fields are stripped, never migrated into grants.
+  commandPermissionRules: z
+    .array(CommandPermissionRuleSchema)
+    .max(1024)
+    .default(() => DEFAULT_COMMAND_PERMISSION_RULES.map((rule) => ({ ...rule }))),
+  commandPermissionRevision: z.number().int().nonnegative().default(0),
   /**
    * Addresses this node has reached the Host on before, newest first.
    *
@@ -54,20 +49,18 @@ export type Settings = z.infer<typeof SettingsSchema>;
 /**
  * The settings the config page owns.
  *
- * `knownHostUrls` is bookkeeping this process maintains, not a field anyone
- * types, and the page posts the whole form back — so leaving it in the schema
- * the page is parsed against would let every save wipe the fallbacks.
+ * Connection history and command permissions have independent update paths.
+ * The ordinary settings form must not erase them or restore removed defaults.
  */
-export const EditableSettingsSchema = SettingsSchema.omit({ knownHostUrls: true });
+export const EditableSettingsSchema = SettingsSchema.omit({
+  knownHostUrls: true,
+  commandPermissionRules: true,
+  commandPermissionRevision: true,
+});
 export type EditableSettings = z.infer<typeof EditableSettingsSchema>;
 
 /** Changing any of these requires a fresh hello frame to take effect. */
-const RECONNECT_KEYS = [
-  "hostUrl",
-  "nodeName",
-  "maxSessions",
-  "remoteCommandsEnabled",
-] as const;
+const RECONNECT_KEYS = ["hostUrl", "nodeName", "maxSessions"] as const;
 
 export function needsReconnect(before: Settings, after: Settings): boolean {
   return RECONNECT_KEYS.some((key) => before[key] !== after[key]);
@@ -169,7 +162,40 @@ export async function loadSettings(
 
 export async function saveSettings(settings: Settings): Promise<void> {
   await mkdir(configDirectory(), { recursive: true });
-  await writeFile(settingsPath(), JSON.stringify(settings, null, 2), {
-    mode: 0o600,
-  });
+  const staged = `${settingsPath()}.${randomUUID()}.pending`;
+  try {
+    await writeFile(staged, JSON.stringify(SettingsSchema.parse(settings), null, 2), {
+      mode: 0o600,
+      flag: "wx",
+    });
+    await rename(staged, settingsPath());
+  } finally {
+    await rm(staged, { force: true });
+  }
+}
+
+/** Read inside the queue; publish only after persistence succeeds. */
+export function createSettingsUpdater(options: {
+  get: () => Settings;
+  set: (settings: Settings) => void;
+  save: (settings: Settings) => Promise<void>;
+}): (update: (current: Settings) => Settings | Promise<Settings>) => Promise<Settings> {
+  let pending: Promise<unknown> = Promise.resolve();
+  return (update) => {
+    const next = pending.then(async () => {
+      const current = options.get();
+      const settings = SettingsSchema.parse(await update(current));
+      settings.commandPermissionRevision =
+        current.commandPermissionRevision +
+        (JSON.stringify(current.commandPermissionRules) !==
+        JSON.stringify(settings.commandPermissionRules)
+          ? 1
+          : 0);
+      await options.save(settings);
+      options.set(settings);
+      return settings;
+    });
+    pending = next.catch(() => undefined);
+    return next;
+  };
 }

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { WorktreeConflict, type CheckoutIdentity } from "@fleet/protocol";
@@ -63,14 +63,14 @@ type Participant = {
   token: string;
   owner: string;
   incarnation: string;
-  mode: "shared" | "exclusive";
+  mode: "shared" | "exclusive" | "command";
   tracked: boolean;
   processPending: boolean;
   processes: number[];
   unknown: string;
 };
 
-/** The common-directory database, never a per-installation config lock. No age/PID reclamation. */
+/** Shared registry across installations. Command participation coexists with sessions, not maintenance. */
 export class RepositoryParticipation {
   readonly incarnation = randomUUID();
 
@@ -91,7 +91,7 @@ export class RepositoryParticipation {
       CREATE TABLE IF NOT EXISTS policy (id INTEGER PRIMARY KEY CHECK(id=1), identity TEXT NOT NULL, enabled INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS participants (token TEXT PRIMARY KEY, data TEXT NOT NULL);
     `);
-    db.prepare("INSERT OR IGNORE INTO policy VALUES (1,?,0)").run(target.repository.key);
+    db.prepare("INSERT OR IGNORE INTO policy VALUES (1,?,1)").run(target.repository.key);
     const policy = db.prepare("SELECT identity FROM policy WHERE id=1").get();
     if (policy?.identity !== target.repository.key) {
       db.close();
@@ -104,70 +104,35 @@ export class RepositoryParticipation {
   }
 
   enabled(target: RepositoryTarget): boolean {
-    if (!existsSync(registryDirectory(target))) return false;
     const db = this.open(target);
     try {
-      return db.prepare("SELECT enabled FROM policy WHERE id=1").get()?.enabled === 1;
+      db.prepare("UPDATE policy SET enabled=1 WHERE id=1").run();
+      return true;
     } finally {
       db.close();
     }
   }
 
-  /** Operator attestation is necessary: a new registry cannot discover noncooperating old Nodes. */
+  /** Compatibility for older callers; every upgraded participant is automatic. */
   async activate(
     paths: readonly string[],
-    allInstallationsUpgraded: boolean,
+    _allInstallationsUpgraded: boolean,
   ): Promise<void> {
-    if (!allInstallationsUpgraded || !paths.length)
-      throw new WorktreeConflict(
-        "untracked_ownership",
-        "List eligible roots and confirm all Fleet installations are upgraded and old/untracked sessions drained.",
-      );
     const targets = await Promise.all(paths.map((path) => this.resolve(path)));
     for (const target of targets.sort((a, b) =>
       a.repository.key.localeCompare(b.repository.key),
     )) {
       await assertIdentity(target.repository);
-      if (this.enabled(target)) continue;
-      const legacy = join(
-        target.repository.path,
-        target.git ? "fleet-managed-locks-v1" : ".fleet-checkout-locks-v1",
-      );
-      if (
-        existsSync(legacy) &&
-        readdirSync(legacy).some((file) => file.endsWith(".json"))
-      ) {
-        // Even a stale PID is not proof that its old descendant tree is empty.
-        throw new WorktreeConflict(
-          "untracked_ownership",
-          "Existing checkout ownership must be drained/reconciled before activation.",
-        );
-      }
-      const db = this.open(target);
-      try {
-        db.exec("BEGIN IMMEDIATE");
-        if (db.prepare("SELECT token FROM participants LIMIT 1").get())
-          throw new WorktreeConflict(
-            "repository_busy",
-            "Existing Fleet participants must drain before activation.",
-          );
-        db.prepare("UPDATE policy SET enabled=1 WHERE id=1").run();
-        db.exec("COMMIT");
-      } catch (error) {
-        if (db.isTransaction) db.exec("ROLLBACK");
-        throw error;
-      } finally {
-        db.close();
-      }
+      this.enabled(target);
     }
   }
 
   async acquire(
     targets: readonly RepositoryTarget[],
     owner: string,
-    mode: "shared" | "exclusive",
-    requireEnabled = false,
-    forceExclusion = false,
+    mode: Participant["mode"],
+    _requireEnabled = false,
+    _forceExclusion = false,
   ): Promise<CheckoutLease[]> {
     const unique = [
       ...new Map(targets.map((target) => [target.repository.key, target])).values(),
@@ -176,7 +141,7 @@ export class RepositoryParticipation {
     try {
       for (const target of unique) {
         await assertIdentity(target.repository);
-        leases.push(this.acquireOne(target, owner, mode, requireEnabled, forceExclusion));
+        leases.push(this.acquireOne(target, owner, mode));
       }
       return leases;
     } catch (error) {
@@ -188,50 +153,44 @@ export class RepositoryParticipation {
   private acquireOne(
     target: RepositoryTarget,
     owner: string,
-    mode: "shared" | "exclusive",
-    requireEnabled: boolean,
-    forceExclusion: boolean,
+    mode: Participant["mode"],
   ): CheckoutLease {
     const db = this.open(target);
-    let enabled = false;
     const record: Participant = {
       token: randomUUID(),
       owner,
       incarnation: this.incarnation,
       mode,
-      tracked: false,
+      tracked: true,
       processPending: false,
       processes: [],
       unknown: "",
     };
     try {
       db.exec("BEGIN IMMEDIATE");
-      enabled = db.prepare("SELECT enabled FROM policy WHERE id=1").get()?.enabled === 1;
-      if (requireEnabled && !enabled)
-        throw new WorktreeConflict(
-          "repository_not_enabled",
-          "This physical repository was not locally activated.",
-        );
+      db.prepare("UPDATE policy SET enabled=1 WHERE id=1").run();
       const others = db
         .prepare("SELECT data FROM participants")
         .all()
         .map((row) => JSON.parse(String(row.data)) as Participant);
       if (
-        others.some((other) => other.tracked && other.mode === "exclusive") ||
-        ((enabled || forceExclusion) &&
-          others.some(
-            (other) =>
-              other.unknown ||
-              !other.tracked ||
-              mode === "exclusive" ||
-              other.mode === "exclusive",
-          ))
+        others.some(
+          (other) =>
+            other.unknown ||
+            (!other.tracked &&
+              !(
+                mode === "command" &&
+                other.mode === "shared" &&
+                other.owner.startsWith("session:")
+              )) ||
+            mode === "exclusive" ||
+            other.mode === "exclusive",
+        )
       )
         throw new WorktreeConflict(
           "repository_busy",
-          "Repository has active or unknown Fleet participation.",
+          "Checkout busy: repository has active or unknown Fleet participation.",
         );
-      record.tracked = enabled || forceExclusion;
       db.prepare("INSERT INTO participants VALUES (?,?)").run(
         record.token,
         JSON.stringify(record),
@@ -274,10 +233,7 @@ export class RepositoryParticipation {
       },
       release: () => {
         if (released) return;
-        if (
-          enabled &&
-          (record.unknown || record.processPending || record.processes.length)
-        )
+        if (record.unknown || record.processPending || record.processes.length)
           throw new WorktreeConflict(
             "process_unknown",
             "Repository participation requires verified quiescence.",
@@ -319,7 +275,44 @@ export class RepositoryParticipation {
   ): Promise<{ leases: CheckoutLease[]; supervised: boolean }> {
     const targets = await Promise.all(paths.map((path) => this.resolve(path)));
     const leases = await this.acquire(targets, owner, "shared");
-    return { leases, supervised: targets.some((target) => this.enabled(target)) };
+    return { leases, supervised: true };
+  }
+
+  requireRecoveredCommandReconciliation(
+    target: RepositoryTarget,
+    owner: string,
+    reason: string,
+  ): void {
+    if (!owner.startsWith("command:"))
+      throw new Error("Reconciliation requires a command owner.");
+    const db = this.open(target);
+    try {
+      db.exec("BEGIN IMMEDIATE");
+      let found = false;
+      for (const row of db.prepare("SELECT token,data FROM participants").all()) {
+        const record = JSON.parse(String(row.data)) as Participant;
+        if (record.owner !== owner) continue;
+        if (record.mode !== "exclusive" && record.mode !== "command")
+          throw new Error("Recovered command had unexpected session participation.");
+        record.unknown = reason || "Command process ownership requires reconciliation.";
+        db.prepare("UPDATE participants SET data=? WHERE token=?").run(
+          JSON.stringify(record),
+          String(row.token),
+        );
+        found = true;
+      }
+      if (!found)
+        throw new WorktreeConflict(
+          "lease_lost",
+          "Command participation is missing during recovery.",
+        );
+      db.exec("COMMIT");
+    } catch (error) {
+      if (db.isTransaction) db.exec("ROLLBACK");
+      throw error;
+    } finally {
+      db.close();
+    }
   }
 
   releaseRecoveredCommand(target: RepositoryTarget, owner: string): void {
@@ -331,8 +324,8 @@ export class RepositoryParticipation {
       for (const row of db.prepare("SELECT token,data FROM participants").all()) {
         const record = JSON.parse(String(row.data)) as Participant;
         if (record.owner !== owner) continue;
-        if (record.mode !== "exclusive")
-          throw new Error("Recovered command had unexpected shared participation.");
+        if (record.mode !== "exclusive" && record.mode !== "command")
+          throw new Error("Recovered command had unexpected session participation.");
         db.prepare("DELETE FROM participants WHERE token=?").run(String(row.token));
       }
       db.exec("COMMIT");

@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMMAND_LIMITS,
   GetCommandExecutionSchema,
+  PreparedCommandSchema,
   type CommandExecutionNodeMessage,
   type CommandPreparation,
   type PreparedCommand,
@@ -19,6 +20,8 @@ import {
 } from "./command-execution-manager.js";
 import { NodeAdmission } from "./node-admission.js";
 import { RepositoryParticipation } from "./repository-participation.js";
+import { CommandPermissions } from "./command-permissions.js";
+import type { CommandPermissionRule, CommandExecutionHostMessage } from "@fleet/protocol";
 
 vi.mock("node:fs/promises", async (original) => {
   const actual = await original<typeof fsPromises>();
@@ -43,7 +46,10 @@ const result = (overrides: Partial<CommandProcessResult> = {}): CommandProcessRe
   ...overrides,
 });
 
-async function fixture(clock: { now?: () => number; monotonic?: () => number } = {}) {
+async function fixture(
+  clock: { now?: () => number; monotonic?: () => number } = {},
+  negotiatedPermissions = true,
+) {
   const directory = resolve(`.command-manager-test-${randomUUID()}`);
   directories.push(directory);
   const cwd = join(directory, "checkout");
@@ -55,7 +61,6 @@ async function fixture(clock: { now?: () => number; monotonic?: () => number } =
     repository: checkout,
     git: false,
   }));
-  await repositories.activate([cwd], true);
   const journal = new CommandJournal(join(directory, "journal"), false);
   journals.push(journal);
   const admission = new NodeAdmission();
@@ -83,14 +88,38 @@ async function fixture(clock: { now?: () => number; monotonic?: () => number } =
     prepare,
     recover: vi.fn(async () => undefined),
   };
-  const context = { sealed: true, negotiated: true, hostId: "host", nodeId: "node" };
+  const context = {
+    sealed: true,
+    negotiated: true,
+    permissions: negotiatedPermissions,
+    hostId: "host",
+    nodeId: "node",
+  };
   let deliver = true;
+  let rules: CommandPermissionRule[] = [];
+  const saveRules = vi.fn(
+    async (
+      update: (current: readonly CommandPermissionRule[]) => CommandPermissionRule[],
+    ) => {
+      rules = update(rules);
+    },
+  );
+  const resolveExecutable = vi.fn((name: string) => ({
+    path: join(directory, "trusted-tools", `${name}.exe`),
+    fingerprint: "a".repeat(64),
+  }));
+  const permissions = new CommandPermissions({
+    getRules: () => rules,
+    saveRules,
+    resolveExecutable,
+  });
   const options = {
     ...clock,
     journal,
     admission,
     repositories,
     supervisor,
+    permissions,
     connection: () => context,
     send: (message: CommandExecutionNodeMessage) => {
       if (deliver) messages.push(message);
@@ -118,7 +147,9 @@ async function fixture(clock: { now?: () => number; monotonic?: () => number } =
   };
   const prepared = async () => {
     await manager.handle({ type: "prepare_command_execution", request });
-    const message = messages.find((entry) => entry.type === "command_execution_prepared");
+    const message = messages
+      .filter((entry) => entry.type === "command_execution_prepared")
+      .at(-1);
     expect(message).toMatchObject({ ok: true });
     return (
       message as Extract<
@@ -127,13 +158,19 @@ async function fixture(clock: { now?: () => number; monotonic?: () => number } =
       >
     ).descriptor!;
   };
-  const start = (descriptor: PreparedCommand) =>
+  const start = (
+    descriptor: PreparedCommand,
+    approval: Partial<
+      Extract<CommandExecutionHostMessage, { type: "start_command_execution" }>
+    > = {},
+  ) =>
     manager.handle({
       type: "start_command_execution",
       descriptor,
       approvedBy: "operator",
       approvedAt: new Date().toISOString(),
       version: 1,
+      ...approval,
     });
   return {
     ...options,
@@ -148,6 +185,12 @@ async function fixture(clock: { now?: () => number; monotonic?: () => number } =
     completion,
     messages,
     cwd,
+    saveRules,
+    resolveExecutable,
+    rules: () => rules,
+    setRules: (next: CommandPermissionRule[]) => {
+      rules = next;
+    },
     disconnect: () => {
       deliver = false;
     },
@@ -158,6 +201,258 @@ async function fixture(clock: { now?: () => number; monotonic?: () => number } =
 }
 
 describe("approved command execution", () => {
+  it.each(["session", "always"] as const)(
+    "accepts a %s flag variant after the prepared descriptor JSON/schema roundtrip",
+    async (scope) => {
+      const f = await fixture();
+      f.request.command = "git status --short";
+      await f.start(await f.prepared(), { approvalScope: scope });
+      f.complete(result());
+      await f.manager.cancelAll("wait for first completion");
+      Object.assign(f.request, {
+        executionId: randomUUID(),
+        attemptId: randomUUID(),
+        requestKey: randomUUID(),
+        command: "git status --branch",
+      });
+      const descriptor = PreparedCommandSchema.parse(
+        JSON.parse(JSON.stringify(await f.prepared())),
+      );
+      expect(descriptor.prepared.permission?.grantedBy).toBe(scope);
+      let finish!: (value: CommandProcessResult) => void;
+      const completion = new Promise<CommandProcessResult>((resolve) => {
+        finish = resolve;
+      });
+      f.prepare.mockResolvedValueOnce({
+        identity: { executionId: "second-native-process" },
+        release: f.release,
+        cancel: async () => {
+          finish(result({ cancelled: true }));
+        },
+        result: completion,
+      });
+      try {
+        await f.start(descriptor, { approvalScope: scope, automaticApproval: true });
+        expect(f.prepare).toHaveBeenCalledTimes(2);
+        expect(f.release).toHaveBeenCalledTimes(2);
+        expect(f.journal.get(descriptor.executionId)?.receipt.state).toBe("running");
+      } finally {
+        finish(result());
+        await f.manager.cancelAll("wait for second completion");
+      }
+    },
+  );
+
+  it("terminal-refuses changed executable identity before launch, including explicit Once", async () => {
+    const f = await fixture();
+    f.request.command = "git status --short";
+    const descriptor = await f.prepared();
+    f.resolveExecutable.mockReturnValue({
+      path: join(f.cwd, "..", "different-tools", "git.exe"),
+      fingerprint: "b".repeat(64),
+    });
+    await f.start(descriptor, { approvalScope: "once" });
+    expect(f.prepare).not.toHaveBeenCalled();
+    expect(f.journal.get(descriptor.executionId)?.receipt).toMatchObject({
+      state: "failed",
+      ownership: "not_started",
+      reason: expect.stringContaining("executable identity changed"),
+    });
+    expect(f.admission.active).toEqual([]);
+  });
+
+  it("omits permission evidence from the hashed descriptor for a legacy Host and still accepts Once", async () => {
+    const f = await fixture({}, false);
+    f.request.command = "git status";
+    const descriptor = await f.prepared();
+    expect(descriptor.prepared).not.toHaveProperty("permission");
+    await f.start(descriptor);
+    expect(f.release).toHaveBeenCalledTimes(1);
+    f.complete(result());
+    await f.manager.cancelAll("wait for completion");
+  });
+
+  it.each([
+    { approvalScope: "session" as const },
+    { approvalScope: "always" as const },
+    { automaticApproval: true },
+  ])("refuses unnegotiated permission reuse: %j", async (approval) => {
+    const f = await fixture({}, false);
+    const descriptor = await f.prepared();
+    await f.start(descriptor, approval);
+    expect(f.prepare).not.toHaveBeenCalled();
+    expect(f.journal.get(descriptor.executionId)?.receipt.reason).toContain("negotiate");
+  });
+
+  it("reports unavailable supervisor readiness, not a missing local opt-in", async () => {
+    const f = await fixture();
+    vi.mocked(f.supervisor.readiness).mockRejectedValueOnce(
+      new Error("native job supervision unavailable"),
+    );
+    await expect(f.manager.configure(true)).rejects.toThrow("supervision unavailable");
+    expect(f.manager.readiness).toMatchObject({
+      enabled: true,
+      supported: false,
+      reason: expect.stringContaining("Command supervisor unavailable"),
+    });
+    expect(f.prepare).not.toHaveBeenCalled();
+  });
+
+  it("prepares without local opt-in and waits for an explicit Host approval when no grant matches", async () => {
+    const f = await fixture();
+    f.request.command = "git status --short";
+    const descriptor = await f.prepared();
+    expect(descriptor.prepared.permission).toMatchObject({
+      reusable: true,
+      commandKey: `git status @sha256:${"a".repeat(64)}`,
+    });
+    expect(descriptor.prepared.permission?.grantedBy).toBeUndefined();
+    expect(descriptor.prepared.permission?.path).toBe(descriptor.prepared.cwd);
+    expect(f.journal.get(descriptor.executionId)?.receipt.state).toBe(
+      "awaiting_approval",
+    );
+    expect(f.prepare).not.toHaveBeenCalled();
+    await f.start(descriptor, { automaticApproval: true });
+    expect(f.prepare).not.toHaveBeenCalled();
+    expect(f.journal.get(descriptor.executionId)?.receipt).toMatchObject({
+      state: "failed",
+      ownership: "not_started",
+      reason: expect.stringContaining("fresh Host approval"),
+    });
+  });
+
+  it("a Once approval is exact-preparation-only, never a grant for another request", async () => {
+    const f = await fixture();
+    f.request.command = "git status";
+    await f.start(await f.prepared(), { approvalScope: "once" });
+    f.complete(result());
+    await f.manager.cancelAll("wait for completion");
+    Object.assign(f.request, {
+      executionId: randomUUID(),
+      attemptId: randomUUID(),
+      requestKey: randomUUID(),
+    });
+    const next = await f.prepared();
+    expect(next.prepared.permission?.grantedBy).toBeUndefined();
+    expect(f.journal.get(next.executionId)?.receipt.state).toBe("awaiting_approval");
+    expect(f.prepare).toHaveBeenCalledTimes(1);
+    expect(f.rules()).toEqual([]);
+  });
+
+  it("stores session permission before launch, matches flag variants, and honors authenticated Host revocation", async () => {
+    const f = await fixture();
+    f.request.command = "git status --short";
+    const descriptor = await f.prepared();
+    await f.start(descriptor, { approvalScope: "session" });
+    expect(f.permissions.evaluate(f.request, f.cwd).grantedBy).toBe("session");
+    expect(f.rules()).toEqual([]);
+    f.complete(result());
+    await f.manager.cancelAll("wait for completion");
+    Object.assign(f.request, {
+      executionId: randomUUID(),
+      attemptId: randomUUID(),
+      requestKey: randomUUID(),
+      command: "git status --branch",
+    });
+    const next = await f.prepared();
+    expect(next.prepared.permission?.grantedBy).toBe("session");
+    await expect(
+      f.manager.handle({
+        type: "revoke_command_session_grants",
+        hostId: "other",
+        leadSessionId: "lead",
+      }),
+    ).rejects.toThrow("identity mismatch");
+    await f.manager.handle({
+      type: "revoke_command_session_grants",
+      hostId: "host",
+      leadSessionId: "lead",
+    });
+    await f.start(next, { automaticApproval: true });
+    expect(f.prepare).toHaveBeenCalledTimes(1);
+    expect(f.journal.get(next.executionId)?.receipt.reason).toContain("revoked");
+  });
+
+  it("persists Always before launch and refuses a prepared automatic approval after rule removal", async () => {
+    const f = await fixture();
+    f.request.command = "npm run build";
+    const prepare = f.prepare.getMockImplementation()!;
+    f.prepare.mockImplementation(async (input) => {
+      expect(f.rules()).toEqual([
+        expect.objectContaining({
+          commandKey: `npm run build @sha256:${"a".repeat(64)}`,
+          hostId: "host",
+        }),
+      ]);
+      return prepare(input);
+    });
+    await f.start(await f.prepared(), { approvalScope: "always" });
+    f.complete(result());
+    await f.manager.cancelAll("wait for completion");
+    Object.assign(f.request, {
+      executionId: randomUUID(),
+      attemptId: randomUUID(),
+      requestKey: randomUUID(),
+    });
+    const next = await f.prepared();
+    expect(next.prepared.permission?.grantedBy).toBe("always");
+    f.setRules([]);
+    await f.start(next, { automaticApproval: true });
+    expect(f.prepare).toHaveBeenCalledTimes(1);
+    expect(f.journal.get(next.executionId)?.receipt.reason).toContain("revoked");
+  });
+
+  it("reports persistence failure without launching or leaking admission", async () => {
+    const f = await fixture();
+    f.request.command = "git status";
+    f.saveRules.mockRejectedValueOnce(new Error("settings disk full"));
+    const descriptor = await f.prepared();
+    await f.start(descriptor, { approvalScope: "always" });
+    expect(f.prepare).not.toHaveBeenCalled();
+    expect(f.journal.get(descriptor.executionId)?.receipt).toMatchObject({
+      state: "failed",
+      ownership: "not_started",
+      reason: expect.stringContaining("settings disk full"),
+    });
+    expect(f.admission.active).toEqual([]);
+  });
+
+  it("runs ordinary placement commands alongside existing participants without stopping them", async () => {
+    const f = await fixture();
+    const sessions = await f.repositories.participate([f.cwd], "existing-session");
+    try {
+      const descriptor = await f.prepared();
+      await f.start(descriptor);
+      expect(f.prepare).toHaveBeenCalledTimes(1);
+      await sessions.leases[0]!.revalidate();
+      f.complete(result());
+      await f.manager.cancelAll("wait for completion");
+    } finally {
+      sessions.leases[0]!.release();
+    }
+  });
+
+  it.each(["managed", "legacy"] as const)(
+    "retains exclusive checkout admission for %s commands",
+    async (kind) => {
+      const f = await fixture({}, kind !== "legacy");
+      if (kind === "managed")
+        f.request.target = { worktreeId: randomUUID(), generation: 1 };
+      const sessions = await f.repositories.participate([f.cwd], "session:existing");
+      try {
+        const descriptor = await f.prepared();
+        await f.start(descriptor);
+        expect(f.prepare).not.toHaveBeenCalled();
+        expect(f.journal.get(descriptor.executionId)?.receipt.reason).toContain(
+          "Checkout busy",
+        );
+        await sessions.leases[0]!.revalidate();
+      } finally {
+        sessions.leases[0]!.release();
+      }
+    },
+  );
+
   it("pairs the receive-time offset with preparedAt even when metadata preparation completes later", async () => {
     const hostTime = Date.parse("2026-09-16T15:41:25.382Z");
     let wall = hostTime + 5;
@@ -693,6 +988,54 @@ describe("approved command execution", () => {
     leases[0]!.release();
     expect(f.prepare).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["live", "recovered", "missing"] as const)(
+    "blocks other installations on %s unknown command ownership until verified recovery",
+    async (kind) => {
+      const f = await fixture();
+      const descriptor = await f.prepared();
+      await f.start(descriptor);
+      const uncertain = result({
+        ownership: "unknown",
+        exitCode: null,
+        reason: "Unverified descendants",
+      });
+      const restarted = new CommandExecutionManager({
+        ...f,
+        admission: new NodeAdmission(),
+      });
+      if (kind === "live") {
+        f.complete(uncertain);
+        await vi.waitFor(() =>
+          expect(f.journal.get(descriptor.executionId)?.receipt.state).toBe(
+            "reconciliation_required",
+          ),
+        );
+      } else {
+        vi.mocked(f.supervisor.recover).mockResolvedValue(
+          kind === "missing" ? undefined : uncertain,
+        );
+        await restarted.recoverAll();
+      }
+      expect(f.journal.get(descriptor.executionId)?.receipt.ownership).toBe("unknown");
+      const target = await f.repositories.resolve(f.cwd);
+      const other = new RepositoryParticipation(async () => target);
+      await expect(other.participate([f.cwd], "session:other")).rejects.toThrow(
+        "Checkout busy",
+      );
+      await expect(other.acquire([target], "command:other", "command")).rejects.toThrow(
+        "Checkout busy",
+      );
+      vi.mocked(f.supervisor.recover).mockResolvedValue(
+        result({ interrupted: true, exitCode: null }),
+      );
+      await restarted.recoverAll();
+      const leases = await other.acquire([target], "command:after-recovery", "command");
+      leases[0]!.release();
+      expect(f.journal.get(descriptor.executionId)?.leasesReleased).toBe(true);
+      expect(f.prepare).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("coalesces truncated output into explicit gaps and retires ACKed history without forgetting execution identity", async () => {
     let wall = Date.now();

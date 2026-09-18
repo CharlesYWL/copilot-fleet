@@ -15,6 +15,7 @@ import {
   type CommandReadiness,
   type PreparedCommand,
   type CommandOutputEvent,
+  type CommandApprovalScope,
 } from "@fleet/protocol";
 import type { CommandJournal, CommandJournalRecord } from "./command-journal.js";
 import type { NodeAdmission, AdmissionTicket } from "./node-admission.js";
@@ -24,6 +25,7 @@ import type {
 } from "./repository-participation.js";
 import { CheckoutLocks, type CheckoutLease } from "./checkout-locks.js";
 import { assertCommandStorage } from "./command-storage.js";
+import { CommandPermissions } from "./command-permissions.js";
 
 // Atomic sequence events must fit the Host's default 16 KiB output page.
 const OUTPUT_CHUNK_BYTES = Math.min(COMMAND_LIMITS.chunkBytes, 8 * 1024);
@@ -72,6 +74,7 @@ export type CommandSupervisor = {
 export type CommandConnection = {
   sealed: boolean;
   negotiated: boolean;
+  permissions?: boolean;
   hostId: string;
   nodeId: string;
 };
@@ -93,9 +96,10 @@ export class CommandExecutionManager {
   private readonly liveCursors = new Map<string, number>();
   private supported = false;
   private enabled = false;
-  private reason = "Remote command execution is disabled locally.";
+  private reason = "Command supervisor readiness has not been checked.";
   private shellPath = "";
   private stopped = false;
+  private readonly permissions: CommandPermissions;
 
   constructor(
     private readonly options: {
@@ -113,8 +117,17 @@ export class CommandExecutionManager {
       now?: () => number;
       monotonic?: () => number;
       warn?: (message: string) => void;
+      permissions?: CommandPermissions;
     },
   ) {
+    this.permissions =
+      options.permissions ??
+      new CommandPermissions({
+        getRules: () => [],
+        saveRules: async () => {
+          throw new Error("Persistent command permissions are unavailable.");
+        },
+      });
     options.journal.onFailure = (error) =>
       options.admission.quarantine(
         `Command lifecycle journal cannot persist evidence: ${String(error)}`,
@@ -159,7 +172,15 @@ export class CommandExecutionManager {
       await this.cancelAll("Local owner disabled remote commands.");
       return;
     }
-    const ready = await this.options.supervisor.readiness();
+    this.supported = false;
+    this.reason = "Command supervisor readiness is being checked.";
+    let ready: Awaited<ReturnType<CommandSupervisor["readiness"]>>;
+    try {
+      ready = await this.options.supervisor.readiness();
+    } catch (error) {
+      this.reason = `Command supervisor unavailable: ${String(error)}`;
+      throw error;
+    }
     this.supported = ready.supported && !!ready.shellPath;
     this.shellPath = ready.shellPath ?? "";
     this.reason = ready.reason;
@@ -202,36 +223,43 @@ export class CommandExecutionManager {
         await pending;
         return;
       }
-      const start = this.start(message.descriptor, message.approvedAt).catch(
-        (error: unknown) => {
-          const record = this.options.journal.get(message.descriptor.executionId);
-          if (
-            !record ||
-            record.launchIntent ||
-            record.descriptor.digest !== message.descriptor.digest ||
-            record.hostId !== this.options.connection().hostId ||
-            record.nodeId !== this.options.connection().nodeId
-          )
-            throw error;
-          if (terminalCommandExecutionStates.has(record.receipt.state)) throw error;
-          record.receipt = {
-            ...record.receipt,
-            state: this.startExpired(record.descriptor) ? "expired" : "failed",
-            ownership: "not_started",
-            reason: String(error).slice(0, 4000),
-            settledAt: this.iso(),
-            finalOutputSeq: 0,
-          };
-          this.options.journal.save(record);
-          this.sendReceipt(record);
-        },
-      );
+      const start = this.start(
+        message.descriptor,
+        message.approvedAt,
+        message.approvalScope ?? "once",
+        message.automaticApproval ?? false,
+      ).catch((error: unknown) => {
+        const record = this.options.journal.get(message.descriptor.executionId);
+        if (
+          !record ||
+          record.launchIntent ||
+          record.descriptor.digest !== message.descriptor.digest ||
+          record.hostId !== this.options.connection().hostId ||
+          record.nodeId !== this.options.connection().nodeId
+        )
+          throw error;
+        if (terminalCommandExecutionStates.has(record.receipt.state)) throw error;
+        record.receipt = {
+          ...record.receipt,
+          state: this.startExpired(record.descriptor) ? "expired" : "failed",
+          ownership: "not_started",
+          reason: String(error).slice(0, 4000),
+          settledAt: this.iso(),
+          finalOutputSeq: 0,
+        };
+        this.options.journal.save(record);
+        this.sendReceipt(record);
+      });
       this.starting.set(message.descriptor.executionId, start);
       try {
         await start;
       } finally {
         this.starting.delete(message.descriptor.executionId);
       }
+    } else if (message.type === "revoke_command_session_grants") {
+      if (message.hostId !== context.hostId)
+        throw new Error("Session grant revocation Host identity mismatch.");
+      this.permissions.revoke(message.hostId, message.leadSessionId);
     } else if (message.type === "cancel_command_execution") {
       if (message.hostId !== context.hostId)
         throw new Error("Cancellation Host identity mismatch.");
@@ -327,8 +355,6 @@ export class CommandExecutionManager {
         throw new Error(
           "V1 command placements must name a physical checkout root, not a nested directory.",
         );
-      if (!this.options.repositories.enabled(target))
-        throw new Error("This repository has not completed local activation.");
       await this.options.validateTarget?.(request, target);
       const current = this.connection(true);
       if (current.hostId !== context.hostId || current.nodeId !== context.nodeId)
@@ -361,6 +387,9 @@ export class CommandExecutionManager {
           clockUncertaintyMs: COMMAND_LIMITS.clockUncertaintyMs,
           // Host must bound send-to-reply RTT AND hostTime-to-reply age by five seconds.
           hostClockOffsetMs,
+          ...(context.permissions
+            ? { permission: this.permissions.evaluate(request, target.cwd) }
+            : {}),
         },
       };
       const descriptor = PreparedCommandSchema.parse({
@@ -498,10 +527,17 @@ export class CommandExecutionManager {
     );
   }
 
-  private async start(descriptor: PreparedCommand, approvedAt: string): Promise<void> {
+  private async start(
+    descriptor: PreparedCommand,
+    approvedAt: string,
+    scope: CommandApprovalScope,
+    automatic: boolean,
+  ): Promise<void> {
     const record = this.options.journal.get(descriptor.executionId);
     if (!record) throw new Error("Unknown command preparation; never execute history.");
     const context = this.connection();
+    if (!context.permissions && (scope !== "once" || automatic))
+      throw new Error("This Host did not negotiate reusable command permissions.");
     if (record.hostId !== context.hostId || record.nodeId !== context.nodeId)
       throw new Error("Command enrollment identity mismatch.");
     if (record.descriptor.digest !== descriptor.digest)
@@ -541,31 +577,35 @@ export class CommandExecutionManager {
       )
         throw new Error("Approved physical target changed.");
       await this.options.validateTarget?.(descriptor, target);
+      const concurrent =
+        "placementId" in descriptor.target && !!descriptor.prepared.permission;
       running.leases = await this.options.repositories.acquire(
         [target],
         `command:${descriptor.executionId}`,
-        "exclusive",
+        concurrent ? "command" : "exclusive",
         true,
       );
-      const locks = this.options.locks ?? new CheckoutLocks();
-      locks.bindScope(target.checkout, target.git ? target.repository : undefined);
-      if (target.git) {
-        locks.bindScope(target.repository, target.repository);
+      if (!concurrent) {
+        const locks = this.options.locks ?? new CheckoutLocks();
+        locks.bindScope(target.checkout, target.git ? target.repository : undefined);
+        if (target.git) {
+          locks.bindScope(target.repository, target.repository);
+          running.leases.push(
+            locks.acquire(target.repository, {
+              owner: `command:${descriptor.executionId}`,
+              attempt: descriptor.attemptId,
+              kind: "admin",
+            }),
+          );
+        }
         running.leases.push(
-          locks.acquire(target.repository, {
+          locks.acquire(target.checkout, {
             owner: `command:${descriptor.executionId}`,
             attempt: descriptor.attemptId,
-            kind: "admin",
+            kind: "worker",
           }),
         );
       }
-      running.leases.push(
-        locks.acquire(target.checkout, {
-          owner: `command:${descriptor.executionId}`,
-          attempt: descriptor.attemptId,
-          kind: "worker",
-        }),
-      );
       // The supervisor exclusively creates the attempt itself, not its namespace ancestors.
       await mkdir(dirname(this.attemptDirectory(record)), {
         recursive: true,
@@ -578,6 +618,18 @@ export class CommandExecutionManager {
       this.assertStart(record, descriptor, approvedAt);
       if (this.options.journal.cancellation(descriptor.executionId))
         throw new Error("Cancelled during launch admission.");
+      const assertPermission = await this.permissions.authorize(
+        descriptor,
+        target.cwd,
+        scope,
+        automatic,
+        descriptor.prepared.permission,
+      );
+      ticket.revalidate();
+      this.assertStart(record, descriptor, approvedAt);
+      assertPermission();
+      if (this.options.journal.cancellation(descriptor.executionId))
+        throw new Error("Cancelled while saving command permission.");
       record.launchIntent = true;
       record.receipt = {
         ...record.receipt,
@@ -613,6 +665,7 @@ export class CommandExecutionManager {
       await assertCommandStorage(this.options.journal.directory);
       ticket.revalidate();
       this.assertStart(record, descriptor, approvedAt);
+      assertPermission();
       if (this.options.journal.cancellation(descriptor.executionId)) {
         record.cancelRequested = true;
         record.receipt.state = "cancelling";
@@ -659,8 +712,7 @@ export class CommandExecutionManager {
           reason: record.supervisionError ?? String(error).slice(0, 4000),
         };
         this.options.journal.save(record);
-        for (const lease of running.leases)
-          lease.requireReconciliation(record.receipt.reason);
+        await this.requireReconciliation(record);
         this.sendReceipt(record);
       } else {
         record.receipt = {
@@ -769,6 +821,7 @@ export class CommandExecutionManager {
       ...(quiescent ? { settledAt: this.iso() } : {}),
     };
     if (notStarted) delete record.receipt.startedAt;
+    if (!quiescent) await this.requireReconciliation(record);
     this.options.journal.save(record);
     if (quiescent) {
       if (this.active.has(record.descriptor.executionId)) this.release(record, true);
@@ -853,6 +906,36 @@ export class CommandExecutionManager {
         await file.close();
       }
     }
+  }
+
+  private async requireReconciliation(record: CommandJournalRecord): Promise<void> {
+    if (!record.admissionIntent || record.leasesReleased) return;
+    const reason =
+      record.receipt.reason || "Command process ownership requires reconciliation.";
+    const running = this.active.get(record.descriptor.executionId);
+    if (running?.leases.length) {
+      for (const lease of running.leases) lease.requireReconciliation(reason);
+      return;
+    }
+    const target = await this.options.repositories.resolve(
+      record.descriptor.prepared.cwd,
+    );
+    if (
+      target.checkout.key !== record.descriptor.prepared.checkout.key ||
+      target.repository.key !== record.descriptor.prepared.repository.key
+    ) {
+      this.options.admission.quarantine(
+        "Recovered command target identity changed; ownership cannot be reconciled.",
+      );
+      throw new Error(
+        "Recovered command target identity changed; old ownership evidence must be retained.",
+      );
+    }
+    this.options.repositories.requireRecoveredCommandReconciliation(
+      target,
+      `command:${record.descriptor.executionId}`,
+      reason,
+    );
   }
 
   private async releaseRecovered(record: CommandJournalRecord): Promise<void> {
@@ -1126,6 +1209,7 @@ export class CommandExecutionManager {
         ownership: "unknown",
         reason: "No verified supervisor quiescence receipt. Never relaunch this attempt.",
       };
+      await this.requireReconciliation(record);
       this.options.journal.save(record);
     }
   }
@@ -1158,7 +1242,8 @@ export class CommandExecutionManager {
   async restore(): Promise<void> {
     this.stopped = true;
     this.enabled = false;
-    this.reason = "Node identity restored; explicit local reactivation is required.";
+    this.reason = "Node identity restore is in progress.";
+    this.permissions.clear();
     await this.cancelAll("Node identity is being restored.");
     this.options.journal.rotateNamespace();
   }

@@ -273,6 +273,7 @@ describe("protocol validation", () => {
       type: "welcome",
       nodeId: "n1",
       commandExecutions: false,
+      commandPermissions: false,
       durableLeadDelivery: false,
       reconcileAfterOutbox: false,
       acknowledgeOutbox: false,

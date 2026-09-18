@@ -8,6 +8,8 @@ import {
   DialogSurface,
   DialogTitle,
   Spinner,
+  Tab,
+  TabList,
   Text,
   makeStyles,
   tokens,
@@ -19,6 +21,7 @@ import {
   errorMessage,
   terminalCommandExecutionStates,
   type CommandExecution,
+  type CommandDecision,
   type CommandExecutionPage,
   type CommandOutputEvent,
 } from "@fleet/protocol";
@@ -29,6 +32,11 @@ import {
   mergeCommandOutput,
   visibleCommandText,
 } from "../lib/command-output";
+import {
+  CommandApprovalActions,
+  isCommandApprovalConflict,
+} from "./CommandApprovalActions";
+import { semanticColors } from "../theme";
 
 const useStyles = makeStyles({
   surface: { width: "min(1060px, calc(100vw - 32px))", maxWidth: "1060px" },
@@ -39,6 +47,8 @@ const useStyles = makeStyles({
     maxHeight: "70vh",
     "@media (max-width: 680px)": { flexDirection: "column" },
   },
+  tabs: { marginBottom: "14px" },
+  pendingTab: { color: semanticColors.permission },
   list: {
     width: "240px",
     flexShrink: 0,
@@ -93,7 +103,14 @@ const useStyles = makeStyles({
     padding: "12px",
     margin: 0,
   },
-  output: { maxHeight: "300px", overflowY: "auto", fontSize: tokens.fontSizeBase200 },
+  output: {
+    minHeight: "200px",
+    maxHeight: "min(520px, 50vh)",
+    flexShrink: 0,
+    overflowY: "auto",
+    resize: "vertical",
+    fontSize: tokens.fontSizeBase200,
+  },
   warning: {
     padding: "10px",
     backgroundColor: tokens.colorPaletteYellowBackground1,
@@ -125,6 +142,7 @@ export function CommandExecutionsDialog({
   const styles = useStyles();
   const [history, setHistory] = useState<CommandExecution[]>([]);
   const [selectedId, setSelectedId] = useState(initialExecutionId);
+  const [group, setGroup] = useState<"waiting" | "history">();
   const [detail, setDetail] = useState<CommandExecutionPage>();
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -139,12 +157,23 @@ export function CommandExecutionsDialog({
       ).filter((item) => !leadSessionId || item.leadSessionId === leadSessionId),
     [history, executions, detail, leadSessionId],
   );
-  const selected =
-    records.find((item) => item.id === selectedId) ??
-    (selectedId
-      ? undefined
-      : (records.find((item) => item.state === "awaiting_approval") ?? records[0]));
-  const currentId = selected?.id ?? selectedId;
+  const waiting = records.filter((item) => item.state === "awaiting_approval").reverse();
+  const reviewed = records.filter((item) => item.state !== "awaiting_approval");
+  const initial = records.find((item) => item.id === initialExecutionId);
+  const activeGroup =
+    group ??
+    (initial
+      ? initial.state === "awaiting_approval"
+        ? "waiting"
+        : "history"
+      : waiting.length
+        ? "waiting"
+        : "history");
+  const visible = activeGroup === "waiting" ? waiting : reviewed;
+  const selected = visible.find((item) => item.id === selectedId) ?? visible[0];
+  const currentId =
+    selected?.id ??
+    (records.some((item) => item.id === selectedId) ? undefined : selectedId);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -202,7 +231,7 @@ export function CommandExecutionsDialog({
     );
   }, [currentDetail, output, selected]);
 
-  async function decide(decision: "allow_once" | "deny") {
+  async function decide(decision: CommandDecision["decision"]) {
     if (!selected?.descriptor) return;
     setWorking(true);
     setError("");
@@ -220,8 +249,17 @@ export function CommandExecutionsDialog({
       );
       const execution = CommandExecutionSchema.parse(result.execution);
       setHistory((prior) => mergeCommandExecutions(prior, [execution]));
+      setGroup("waiting");
+      setSelectedId(undefined);
     } catch (failure) {
-      setError(errorMessage(failure));
+      if (isCommandApprovalConflict(failure)) {
+        setError(
+          "That request was already reviewed or changed. Refreshing its current status; approval has not been retried.",
+        );
+        setReload((value) => value + 1);
+      } else {
+        setError(errorMessage(failure));
+      }
     } finally {
       setWorking(false);
     }
@@ -310,16 +348,60 @@ export function CommandExecutionsDialog({
                 changed.
               </p>
             )}
-            <div className={styles.content}>
-              <nav className={styles.list} aria-label="Command history">
+            <TabList
+              className={styles.tabs}
+              aria-label="Command request sections"
+              selectedValue={activeGroup}
+              onTabSelect={(_event, data) => {
+                if (data.value !== "waiting" && data.value !== "history") return;
+                setGroup(data.value);
+                setSelectedId(undefined);
+                setError("");
+              }}
+            >
+              <Tab
+                id="commands-waiting-tab"
+                value="waiting"
+                className={waiting.length ? styles.pendingTab : undefined}
+                aria-controls="commands-panel"
+              >
+                Waiting approval ({waiting.length})
+              </Tab>
+              <Tab
+                id="commands-history-tab"
+                value="history"
+                aria-controls="commands-panel"
+              >
+                Request history ({reviewed.length})
+              </Tab>
+            </TabList>
+            <div
+              className={styles.content}
+              id="commands-panel"
+              role="tabpanel"
+              aria-labelledby={
+                activeGroup === "waiting"
+                  ? "commands-waiting-tab"
+                  : "commands-history-tab"
+              }
+            >
+              <nav
+                className={styles.list}
+                aria-label={
+                  activeGroup === "waiting"
+                    ? "Waiting approval requests"
+                    : "Command history"
+                }
+              >
                 {loading && <Spinner size="small" label="Loading command history" />}
-                {!loading && records.length === 0 && (
+                {!loading && visible.length === 0 && (
                   <Text>
-                    No commands requested. Ask an Orchestrator to inspect or run a command
-                    on an enabled Node.
+                    {activeGroup === "waiting"
+                      ? "No requests are waiting for approval."
+                      : "No other requests yet. Approved, denied, completed, and preparing requests appear here."}
                   </Text>
                 )}
-                {records.map((item) => (
+                {visible.map((item) => (
                   <Button
                     key={item.id}
                     className={styles.item}
@@ -327,6 +409,7 @@ export function CommandExecutionsDialog({
                     aria-current={item.id === currentId ? "true" : undefined}
                     onClick={() => {
                       setSelectedId(item.id);
+                      setGroup(activeGroup);
                       setError("");
                     }}
                   >
@@ -405,8 +488,8 @@ export function CommandExecutionsDialog({
                     {selected.state === "awaiting_approval" && (
                       <div className={styles.warning}>
                         This runs arbitrary code as the Node&apos;s OS user. The directory
-                        is not a sandbox. Approval applies only to this command, target,
-                        and runtime limit.
+                        is not a sandbox. Choose how long the Node should remember your
+                        permission below.
                       </div>
                     )}
                     {selected.error && (
@@ -428,21 +511,11 @@ export function CommandExecutionsDialog({
                     )}
                     <div className={styles.actions}>
                       {selected.state === "awaiting_approval" && selected.descriptor && (
-                        <>
-                          <Button
-                            appearance="primary"
-                            disabled={working || !connected}
-                            onClick={() => void decide("allow_once")}
-                          >
-                            Allow once
-                          </Button>
-                          <Button
-                            disabled={working || !connected}
-                            onClick={() => void decide("deny")}
-                          >
-                            Deny
-                          </Button>
-                        </>
+                        <CommandApprovalActions
+                          execution={selected}
+                          disabled={working || !connected}
+                          onDecide={(decision) => void decide(decision)}
+                        />
                       )}
                       {!terminalCommandExecutionStates.has(selected.state) && (
                         <Button
@@ -472,6 +545,7 @@ export function CommandExecutionsDialog({
                     <pre
                       className={`${styles.code} ${styles.output}`}
                       aria-label="Command output"
+                      tabIndex={0}
                     >
                       {renderedOutput.text || "No output received."}
                     </pre>

@@ -1,13 +1,15 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { setTimeout as delay } from "node:timers/promises";
 import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   AuthenticatedEnvelopeSchema,
   COMMAND_EXECUTION_CAPABILITY,
+  COMMAND_PERMISSIONS_CAPABILITY,
   CommandExecutionHostMessageSchema,
   CommandExecutionNodeMessageSchema,
   CommandExecutionPageSchema,
@@ -16,6 +18,9 @@ import {
   SessionEventSchema,
   terminalCommandExecutionStates,
   type CommandExecution,
+  type CommandDecision,
+  type CommandPermissionRule,
+  type CommandPermissionEntry,
   type CommandExecutionHostMessage,
   type CommandExecutionNodeMessage,
   type LeadPromptDelivery,
@@ -23,12 +28,19 @@ import {
 import { AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { CommandExecutionManager } from "../../node/src/command-execution-manager.js";
 import { CommandJournal } from "../../node/src/command-journal.js";
+import {
+  CommandPermissions,
+  DEFAULT_COMMAND_PERMISSION_RULES,
+  commandPermissionEntries,
+  compileCommandPermissionEntries,
+} from "../../node/src/command-permissions.js";
 import { nativeCommandSupervisor } from "../../node/src/command-supervisor-adapter.js";
 import { readCommandProcessReceipt } from "../../node/src/command-supervisor.js";
 import { LeadPromptJournal } from "../../node/src/lead-prompt-delivery.js";
 import { NodeAdmission } from "../../node/src/node-admission.js";
 import { RepositoryParticipation } from "../../node/src/repository-participation.js";
 import { GitRunner } from "../../node/src/git-runner.js";
+import { canonicalPath } from "../../node/src/canonical-path.js";
 import { OPERATOR_COOKIE } from "./auth.js";
 import { FleetAuth } from "./auth/service.js";
 import { HostIdentityService } from "./auth/host-identity.js";
@@ -43,19 +55,25 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function fixture(nodeClockOffsetMs = 0) {
+async function fixture(
+  nodeClockOffsetMs = 0,
+  scopedPermissions = false,
+  initializeGit = true,
+) {
   const root = await mkdtemp(join(tmpdir(), "fleet-command-e2e-"));
   const cwd = join(root, "workspace with spaces");
   const coordinator = join(root, "coordinator");
   await mkdir(cwd);
   await mkdir(coordinator);
   const git = new GitRunner();
-  await git.run(cwd, [
-    "-c",
-    "init.templateDir=",
-    "init",
-    "--initial-branch=command-fixture",
-  ]);
+  if (initializeGit) {
+    await git.run(cwd, [
+      "-c",
+      "init.templateDir=",
+      "init",
+      "--initial-branch=command-fixture",
+    ]);
+  }
   await writeFile(
     join(cwd, "package.json"),
     JSON.stringify({
@@ -101,7 +119,10 @@ async function fixture(nodeClockOffsetMs = 0) {
     os: "win32",
     arch: "x64",
     version: "fixture",
-    capabilities: [COMMAND_EXECUTION_CAPABILITY],
+    capabilities: [
+      COMMAND_EXECUTION_CAPABILITY,
+      ...(scopedPermissions ? [COMMAND_PERMISSIONS_CAPABILITY] : []),
+    ],
     maxSessions: 1,
   }).node;
   const leadNode = store.registerNode({
@@ -203,7 +224,7 @@ async function fixture(nodeClockOffsetMs = 0) {
   }
 
   const repositories = new RepositoryParticipation();
-  await repositories.activate([cwd], true);
+  if (!scopedPermissions) await repositories.activate([cwd], true);
   const journal = new CommandJournal(join(root, "node-journal"));
   const admission = new NodeAdmission();
   const processResults: unknown[] = [];
@@ -212,19 +233,44 @@ async function fixture(nodeClockOffsetMs = 0) {
     void process.result.then((result) => processResults.push(result));
     return process;
   });
+  let permissionRules: CommandPermissionRule[] = DEFAULT_COMMAND_PERMISSION_RULES.map(
+    (rule) => ({ ...rule }),
+  );
+  const createPermissions = () =>
+    new CommandPermissions({
+      getRules: () => permissionRules,
+      saveRules: async (update) => {
+        const next = update(permissionRules);
+        await writeFile(join(root, "permission-settings.json"), JSON.stringify(next));
+        permissionRules = next;
+      },
+    });
   const targetPeer = peer(targetNode.id, (message) => manager.handle(message));
-  const manager = new CommandExecutionManager({
+  const managerOptions = {
     journal,
     admission,
     repositories,
     supervisor: { ...nativeCommandSupervisor, prepare },
-    connection: () => ({ sealed: true, negotiated: true, hostId, nodeId: targetNode.id }),
+    connection: () => ({
+      sealed: true,
+      negotiated: true,
+      permissions: scopedPermissions,
+      hostId,
+      nodeId: targetNode.id,
+    }),
     send: targetPeer.send,
     now: () => Date.now() + nodeClockOffsetMs,
+  };
+  let manager = new CommandExecutionManager({
+    ...managerOptions,
+    ...(scopedPermissions ? { permissions: createPermissions() } : {}),
   });
   await manager.configure(true);
   service.commands.nodeReady(targetNode.id, {
-    capabilities: [COMMAND_EXECUTION_CAPABILITY],
+    capabilities: [
+      COMMAND_EXECUTION_CAPABILITY,
+      ...(scopedPermissions ? [COMMAND_PERMISSIONS_CAPABILITY] : []),
+    ],
     commandExecution: manager.readiness,
   });
   const prompts: string[] = [];
@@ -303,7 +349,11 @@ async function fixture(nodeClockOffsetMs = 0) {
       `Fixture ${root} did not settle: ${JSON.stringify(service.commands.get(id))}`,
     );
   }
-  async function request(command: string, requestKey = randomUUID()) {
+  async function request(
+    command: string,
+    requestKey = randomUUID(),
+    approvalExpected = true,
+  ) {
     const execution = service.commands.request(lead.id, {
       target: { placementId: placement.id },
       command,
@@ -312,11 +362,15 @@ async function fixture(nodeClockOffsetMs = 0) {
       requestKey,
       timeoutMs: 30_000,
     });
-    return waitFor(execution.id, (item) => item.state === "awaiting_approval");
+    return waitFor(execution.id, (item) =>
+      approvalExpected
+        ? item.state === "awaiting_approval"
+        : terminalCommandExecutionStates.has(item.state) && item.delivery === "accepted",
+    );
   }
   async function decision(
     execution: CommandExecution,
-    value: "allow_once" | "deny",
+    value: CommandDecision["decision"],
     authenticated = true,
   ) {
     return app.inject({
@@ -359,6 +413,7 @@ async function fixture(nodeClockOffsetMs = 0) {
     service,
     manager,
     journal,
+    repositories,
     admission,
     targetNode,
     targetPeer,
@@ -374,6 +429,29 @@ async function fixture(nodeClockOffsetMs = 0) {
     waitFor,
     flush,
     settleDelivery,
+    rules: () => permissionRules,
+    entries: () => commandPermissionEntries(permissionRules, hostId),
+    async setEntries(entries: CommandPermissionEntry[]) {
+      permissionRules = await compileCommandPermissionEntries(
+        permissionRules,
+        entries,
+        hostId,
+      );
+      await writeFile(
+        join(root, "permission-settings.json"),
+        JSON.stringify(permissionRules),
+      );
+    },
+    removeRules() {
+      permissionRules = [];
+    },
+    async restartPermissionMemory() {
+      manager = new CommandExecutionManager({
+        ...managerOptions,
+        permissions: createPermissions(),
+      });
+      await manager.configure(true);
+    },
     disconnect() {
       connected = false;
     },
@@ -384,6 +462,232 @@ async function fixture(nodeClockOffsetMs = 0) {
 }
 
 describe.skipIf(process.platform !== "win32")("real approved command end-to-end", () => {
+  it("uses a saved readable wildcard rule for simple commands, not appended scripts, and honors deletion", async () => {
+    const f = await fixture(0, true);
+    await f.setEntries([{ command: "git *", path: "*" }]);
+    expect(f.entries()).toEqual([{ command: "git *", path: "*", match: "pattern" }]);
+    const command = await f.request("git status --short", randomUUID(), false);
+    expect(command).toMatchObject({ state: "succeeded", automaticApproval: true });
+    f.settleDelivery(command);
+    expect((await f.request("git status; Write-Output separate-approval")).state).toBe(
+      "awaiting_approval",
+    );
+    await f.setEntries([]);
+    expect((await f.request("git status --branch")).state).toBe("awaiting_approval");
+    expect(f.prepare).toHaveBeenCalledTimes(1);
+  }, 90_000);
+
+  it.each(["once", "session", "always"] as const)(
+    "runs a real cd script with %s approval beside active and untracked home-style leases",
+    async (scope) => {
+      const f = await fixture(0, true, false);
+      const live = await f.repositories.participate([f.cwd], "session:active-fixture");
+      cleanups.push(async () => {
+        live.leases[0]!.release();
+      });
+      const registryPath = join(f.cwd, ".fleet-participation-v1", "participation.db");
+      const registry = new DatabaseSync(registryPath);
+      const old = Array.from({ length: 3 }, (_, i) => ({
+        token: randomUUID(),
+        owner: `session:legacy-${i}`,
+        incarnation: "old-installation",
+        mode: "shared",
+        tracked: false,
+        processPending: false,
+        processes: [],
+        unknown: "",
+      }));
+      try {
+        for (const record of old)
+          registry
+            .prepare("INSERT INTO participants VALUES (?,?)")
+            .run(record.token, JSON.stringify(record));
+        registry.prepare("UPDATE policy SET enabled=0").run();
+      } finally {
+        registry.close();
+      }
+      const destinationPath = join(f.root, "cd destination");
+      await mkdir(join(destinationPath, "child"), { recursive: true });
+      const destination = (await canonicalPath(destinationPath)).path;
+      const command = `cd '${destination.replace(/'/g, "''")}'; Write-Output ('ABS=' + (Get-Location).Path); cd child; Write-Output ('REL=' + (Get-Location).Path); cd '..'; Write-Output ('PARENT=' + (Get-Location).Path)`;
+      const first = await f.request(command);
+      expect(first.descriptor?.prepared.permission).toMatchObject({
+        reusable: true,
+        commandKey: expect.stringMatching(/^exact-script:sha256:[a-f0-9]{64}$/),
+      });
+      expect(first.descriptor!.prepared.permission!.grantedBy).toBeUndefined();
+      const decision =
+        scope === "once"
+          ? "allow_once"
+          : scope === "session"
+            ? "allow_session"
+            : "allow_always";
+      expect((await f.decision(first, decision)).statusCode).toBe(200);
+      const done = await f.waitFor(
+        first.id,
+        (item) => item.state === "succeeded" && item.delivery === "accepted",
+      );
+      const page = f.service.commands.read(undefined, { executionId: done.id });
+      const output = page.events
+        .map((event) => Buffer.from(event.data, "base64").toString("utf8"))
+        .join("");
+      expect(output).toContain(`ABS=${destination}`);
+      expect(output).toContain(`REL=${join(destination, "child")}`);
+      expect(output).toContain(`PARENT=${destination}`);
+      f.settleDelivery(done);
+      await live.leases[0]!.revalidate();
+      if (scope === "always")
+        expect(f.entries()).toContainEqual({
+          command,
+          path: first.descriptor!.prepared.cwd.toLowerCase(),
+          match: "exact",
+        });
+      else
+        expect(
+          f.entries().some((entry) => "command" in entry && entry.command === command),
+        ).toBe(false);
+      if (scope !== "once") {
+        const repeated = await f.request(command, randomUUID(), false);
+        expect(repeated).toMatchObject({ state: "succeeded", automaticApproval: true });
+        f.settleDelivery(repeated);
+      } else {
+        expect((await f.request(command)).state).toBe("awaiting_approval");
+        const executable = join(
+          process.env.SystemRoot ?? "C:\\Windows",
+          "System32",
+          "hostname.exe",
+        );
+        const probe = await f.request(`& '${executable.replace(/'/g, "''")}'`);
+        expect(probe.descriptor!.prepared.permission!.commandKey).toMatch(
+          /^exact-script:sha256:/,
+        );
+        expect((await f.decision(probe, "allow_once")).statusCode).toBe(200);
+        const probed = await f.waitFor(
+          probe.id,
+          (item) => item.state === "succeeded" && item.delivery === "accepted",
+        );
+        const probeOutput = f.service.commands
+          .read(undefined, { executionId: probed.id })
+          .events.map((event) => Buffer.from(event.data, "base64").toString("utf8"))
+          .join("")
+          .trim();
+        expect(probeOutput.toLowerCase()).toBe(hostname().toLowerCase());
+        f.settleDelivery(probed);
+      }
+      expect((await f.request(`${command}; Write-Output changed`)).state).toBe(
+        "awaiting_approval",
+      );
+      const check = new DatabaseSync(registryPath, { readOnly: true });
+      try {
+        for (const record of old)
+          expect(
+            JSON.parse(
+              String(
+                check
+                  .prepare("SELECT data FROM participants WHERE token=?")
+                  .get(record.token)!.data,
+              ),
+            ),
+          ).toEqual(record);
+      } finally {
+        check.close();
+      }
+    },
+    120_000,
+  );
+
+  it.each([
+    {
+      command: "git status --short",
+      repeatedCommand: "git status --branch",
+      key: /^git status @sha256:[a-f0-9]{64}$/,
+    },
+    {
+      command: "where.exe git",
+      repeatedCommand: "where.exe git",
+      key: /^where\.exe git @sha256:[a-f0-9]{64}$/,
+    },
+  ])(
+    "uses Host-only session approval for $command and asks again after Node memory restarts",
+    async ({ command, repeatedCommand, key }) => {
+      const f = await fixture(0, true);
+      const first = await f.request(command);
+      expect(first.descriptor?.prepared.permission).toMatchObject({
+        reusable: true,
+        commandKey: expect.stringMatching(key),
+      });
+      expect(f.prepare).not.toHaveBeenCalled();
+      expect((await f.decision(first, "allow_session")).statusCode).toBe(200);
+      const done = await f.waitFor(
+        first.id,
+        (item) => item.state === "succeeded" && item.delivery === "accepted",
+      );
+      f.settleDelivery(done);
+      const repeated = await f.request(repeatedCommand, randomUUID(), false);
+      expect(repeated, repeated.error || repeated.reasonCode).toMatchObject({
+        state: "succeeded",
+        automaticApproval: true,
+      });
+      expect(f.rules().every((rule) => rule.builtin)).toBe(true);
+      f.settleDelivery(repeated);
+      await f.restartPermissionMemory();
+      const afterRestart = await f.request(command);
+      expect(afterRestart.state).toBe("awaiting_approval");
+      expect(f.prepare).toHaveBeenCalledTimes(2);
+    },
+    120_000,
+  );
+
+  it("persists Always command-folder rules on the Node and honors their removal", async () => {
+    const f = await fixture(0, true);
+    const first = await f.request("git status --short");
+    expect((await f.decision(first, "allow_always")).statusCode).toBe(200);
+    const done = await f.waitFor(
+      first.id,
+      (item) => item.state === "succeeded" && item.delivery === "accepted",
+    );
+    f.settleDelivery(done);
+    const persisted = JSON.parse(
+      await readFile(join(f.root, "permission-settings.json"), "utf8"),
+    ) as CommandPermissionRule[];
+    expect(persisted).toContainEqual(
+      expect.objectContaining({
+        commandKey: first.descriptor!.prepared.permission!.commandKey,
+        path: first.descriptor!.prepared.permission!.path.toLowerCase(),
+        hostId: first.hostId,
+      }),
+    );
+    await f.restartPermissionMemory();
+    const repeated = await f.request("git status --branch", randomUUID(), false);
+    expect(repeated, repeated.error || repeated.reasonCode).toMatchObject({
+      state: "succeeded",
+      automaticApproval: true,
+    });
+    f.settleDelivery(repeated);
+    f.removeRules();
+    const afterRemoval = await f.request("git status --short");
+    expect(afterRemoval.state).toBe("awaiting_approval");
+    expect(f.prepare).toHaveBeenCalledTimes(2);
+  }, 120_000);
+
+  it("makes Once non-reusable and requires a separate exact grant for compound scripts", async () => {
+    const f = await fixture(0, true);
+    const first = await f.request("git status --short");
+    expect((await f.decision(first, "allow_once")).statusCode).toBe(200);
+    const done = await f.waitFor(
+      first.id,
+      (item) => item.state === "succeeded" && item.delivery === "accepted",
+    );
+    f.settleDelivery(done);
+    expect((await f.request("git status --branch")).state).toBe("awaiting_approval");
+    const compound = await f.request("git status; Write-Output not-covered-by-git");
+    expect(compound.descriptor?.prepared.permission).toMatchObject({
+      reusable: true,
+      commandKey: expect.stringMatching(/^exact-script:sha256:/),
+    });
+    expect(compound.descriptor!.prepared.permission!.grantedBy).toBeUndefined();
+    expect(f.prepare).toHaveBeenCalledTimes(1);
+  }, 90_000);
   it("accepts local no-start refusal and retains history using Host receipt time", async () => {
     const f = await fixture(-45 * 86_400_000);
     const execution = await f.request("Write-Output must-not-start");
@@ -514,7 +818,12 @@ describe.skipIf(process.platform !== "win32")("real approved command end-to-end"
   }, 90_000);
 
   it("runs real Git and npm without a worker, persists raw output, deduplicates start and wakes another Node", async () => {
-    const f = await fixture();
+    const f = await fixture(0, true);
+    const active = await f.repositories.participate([f.cwd], "session:active-source");
+    cleanups.push(async () => {
+      active.leases[0]!.release();
+    });
+    f.store.setNodeOnline(f.targetNode.id, true, 1);
     const branch = await f.request("git branch --show-current");
     expect((await f.decision(branch, "allow_once")).statusCode).toBe(200);
     const completed = await f.waitFor(

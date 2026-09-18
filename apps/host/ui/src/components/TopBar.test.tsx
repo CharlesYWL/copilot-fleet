@@ -25,6 +25,36 @@ const show = (overrides: Partial<Parameters<typeof TopBar>[0]> = {}) =>
   );
 
 describe("TopBar counts", () => {
+  it("highlights pending commands with a persistent count and a reduced-motion-safe pulse", () => {
+    const open = vi.fn();
+    const view = show({ onOpenCommandExecutions: open, commandApprovalCount: 3 });
+    const button = screen.getByRole("button", {
+      name: "Command executions, 3 awaiting approval",
+    });
+    expect(button.textContent).toBe("Commands3");
+    expect(getComputedStyle(button).animationIterationCount).toBe("infinite");
+    const reduced = [...document.styleSheets]
+      .flatMap((sheet) => [...sheet.cssRules])
+      .filter(
+        (rule): rule is CSSMediaRule =>
+          rule instanceof CSSMediaRule &&
+          rule.conditionText.includes("prefers-reduced-motion: reduce"),
+      )
+      .flatMap((rule) => [...rule.cssRules])
+      .filter(
+        (rule): rule is CSSStyleRule =>
+          rule instanceof CSSStyleRule && button.matches(rule.selectorText),
+      );
+    expect(reduced.some((rule) => rule.style.animationName === "none")).toBe(true);
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledTimes(1);
+    view.unmount();
+    show({ onOpenCommandExecutions: open, commandApprovalCount: 0 });
+    const quiet = screen.getByRole("button", { name: "Command executions" });
+    expect(quiet.textContent).toBe("Commands");
+    expect(getComputedStyle(quiet).animationIterationCount).not.toBe("infinite");
+  });
+
   it("keeps the notification badge numeric and hides zero", () => {
     const first = show({ notificationUnreadCount: 0 });
     const emptyBell = screen.getByRole("button", {

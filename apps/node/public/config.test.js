@@ -52,6 +52,13 @@ const respond = (path, init) => {
     return reply({ settings: stored, status });
   }
   if (path === "/api/config") return reply({ settings: stored, status });
+  if (path === "/api/command-permissions") {
+    return reply({
+      version: init?.method === "POST" ? 2 : 1,
+      rules: [],
+      entries: init?.method === "POST" ? JSON.parse(init.body).entries : [],
+    });
+  }
   if (path === "/api/logs") return reply({ entries: [] });
   if (path === "/api/fleet") return reply({ workspaces: [], placements: [] });
   if (path === "/api/sessions") return reply({ sessions: [] });
@@ -91,20 +98,41 @@ afterEach(() => {
 });
 
 describe("node settings form", () => {
-  it("defaults commands off and submits explicit local roots and deployment attestation as typed values", async () => {
+  it("keeps permission management separate from the settings save", async () => {
+    stored = {
+      ...stored,
+      commandPermissions: { version: 1, rules: [{ commandKey: "git status" }] },
+    };
     await startPage();
-    expect($("remoteCommandsEnabled").checked).toBe(false);
-    expect($("commandIsolationConfirmed").checked).toBe(false);
-    $("remoteCommandsEnabled").checked = true;
-    $("commandIsolationConfirmed").checked = true;
-    type("commandExecutionRoots", "C:\\work\\one\nD:\\work\\two\n");
+    expect($("commandPermissionForm").closest("#form")).toBeNull();
+    expect($("settingsPanel").querySelector('input[type="checkbox"]')).toBeNull();
+    const allowlistDraft = JSON.stringify([
+      { command: "npm run build", path: "C:\\project" },
+    ]);
+    type("commandPermissionEditor", allowlistDraft);
+    expect($("unsaved").textContent).toBe("");
     $("save").click();
     await vi.waitFor(() => expect($("msg").textContent).toBe("Saved."));
-    expect(posted[0]).toMatchObject({
-      remoteCommandsEnabled: true,
-      commandIsolationConfirmed: true,
-      commandExecutionRoots: ["C:\\work\\one", "D:\\work\\two"],
-    });
+    expect(posted).toEqual([
+      {
+        hostUrl: NODE_SETTINGS.hostUrl,
+        nodeName: NODE_SETTINGS.nodeName,
+        maxSessions: NODE_SETTINGS.maxSessions,
+        copilotCommand: NODE_SETTINGS.copilotCommand,
+        permissionTimeoutMs: NODE_SETTINGS.permissionTimeoutMs,
+        contextTier: NODE_SETTINGS.contextTier,
+      },
+    ]);
+    await poll();
+    expect($("commandPermissionEditor").value).toBe(allowlistDraft);
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(
+          ([path, init]) =>
+            path === "/api/command-permissions" && init?.method === "POST",
+        ),
+    ).toEqual([]);
   });
   it("keeps what was typed instead of the value the node reports", async () => {
     await startPage();
@@ -117,6 +145,33 @@ describe("node settings form", () => {
     // not be changed at all.
     expect($("maxSessions").value).toBe("24");
     expect(posted).toEqual([]);
+  });
+
+  it("keeps ordinary settings drafts while the separate permission editor saves", async () => {
+    await startPage();
+    type("maxSessions", "24");
+    type(
+      "commandPermissionEditor",
+      JSON.stringify([{ command: "git status", path: "C:\\project" }]),
+    );
+    $("commandPermissionSave").click();
+    await vi.waitFor(() =>
+      expect($("commandPermissionsMessage").textContent).toBe("Allowlist saved."),
+    );
+    await poll();
+    expect($("maxSessions").value).toBe("24");
+    expect($("revert").disabled).toBe(false);
+    expect(posted).toEqual([]);
+    const permissionWrites = vi
+      .mocked(fetch)
+      .mock.calls.filter(
+        ([path, init]) => path === "/api/command-permissions" && init?.method === "POST",
+      );
+    expect(permissionWrites).toHaveLength(1);
+    expect(JSON.parse(permissionWrites[0][1].body)).toMatchObject({
+      expectedVersion: 1,
+      entries: [{ command: "git status", path: "C:\\project" }],
+    });
   });
 
   it("still follows the node's status while the form is held", async () => {

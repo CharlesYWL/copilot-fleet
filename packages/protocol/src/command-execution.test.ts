@@ -4,6 +4,10 @@ import {
   COMMAND_LIMITS,
   CommandExecutionHostMessageSchema,
   CommandExecutionBackupSchema,
+  CommandExecutionSchema,
+  CommandExecutionPageSchema,
+  CommandDecisionSchema,
+  PreparedCommandTargetSchema,
   LeadPromptDeliverySchema,
   LeadPromptReceiptSchema,
   CommandOutputEventSchema,
@@ -12,7 +16,11 @@ import {
   RunCommandSchema,
   commandDigestPayload,
 } from "./command-execution.js";
-import { HostToNodeMessageSchema, NodeToHostMessageSchema } from "./index.js";
+import {
+  BrowserMessageSchema,
+  HostToNodeMessageSchema,
+  NodeToHostMessageSchema,
+} from "./index.js";
 
 const at = "2026-09-16T14:00:00.000Z";
 const request = {
@@ -54,6 +62,100 @@ const body = {
 };
 
 describe("remote command contracts", () => {
+  it("accepts approval metadata in detail and live updates while an old browser schema reproduces the reported error", () => {
+    const execution = CommandExecutionSchema.parse({
+      ...request,
+      id: body.executionId,
+      attemptId: body.attemptId,
+      version: 3,
+      hostId: body.hostId,
+      nodeId: body.nodeId,
+      nodeName: "Node",
+      leadSessionId: body.leadSessionId,
+      requestedPath: body.requestedPath,
+      requestDigest: "a".repeat(64),
+      state: "queued",
+      ownership: "not_started",
+      createdAt: at,
+      updatedAt: at,
+      expiresAt: at,
+      approvalScope: "once",
+      automaticApproval: false,
+    });
+    const page = {
+      execution,
+      events: [],
+      nextSeq: 0,
+      hasMore: false,
+      outputComplete: false,
+    };
+    const legacy = CommandExecutionPageSchema.extend({
+      execution: CommandExecutionSchema.omit({
+        approvalScope: true,
+        automaticApproval: true,
+      }),
+    }).safeParse(page);
+    expect(legacy.success).toBe(false);
+    if (!legacy.success)
+      expect(legacy.error.issues).toContainEqual(
+        expect.objectContaining({
+          code: "unrecognized_keys",
+          keys: ["approvalScope", "automaticApproval"],
+          path: ["execution"],
+        }),
+      );
+    expect(CommandExecutionPageSchema.parse(page).execution).toMatchObject({
+      approvalScope: "once",
+      automaticApproval: false,
+    });
+    expect(
+      BrowserMessageSchema.parse({ type: "command_execution", execution }),
+    ).toMatchObject({ execution: { approvalScope: "once", automaticApproval: false } });
+  });
+  it("carries all operator approval scopes without treating malformed decisions as approval", () => {
+    for (const decision of ["allow_once", "allow_session", "allow_always", "deny"]) {
+      expect(
+        CommandDecisionSchema.safeParse({
+          decision,
+          expectedVersion: 2,
+          digest: "a".repeat(64),
+        }).success,
+      ).toBe(true);
+    }
+    expect(
+      CommandDecisionSchema.safeParse({
+        decision: "allow_all",
+        expectedVersion: 2,
+        digest: "a".repeat(64),
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandDecisionSchema.safeParse({
+        decision: "allow_always",
+        expectedVersion: -1,
+        digest: "a".repeat(64),
+      }).success,
+    ).toBe(false);
+  });
+  it("includes the exact reusable rule and policy version in prepared target evidence", () => {
+    const permission = {
+      reusable: true,
+      commandKey: "git status",
+      path: body.prepared.cwd,
+      policyVersion: 3,
+      explanation: "Ordinary flags ignored",
+      grantedBy: "session" as const,
+    };
+    expect(
+      PreparedCommandTargetSchema.parse({ ...body.prepared, permission }).permission,
+    ).toEqual(permission);
+    expect(
+      commandDigestPayload({
+        ...body,
+        prepared: { ...body.prepared, permission },
+      }),
+    ).not.toEqual(commandDigestPayload(body));
+  });
   it("preserves bounded existing attachments through durable lead delivery", () => {
     const delivery = {
       deliveryId: randomUUID(),

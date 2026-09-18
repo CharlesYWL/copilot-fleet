@@ -207,55 +207,6 @@
               </select>
               <span class="hint">Applies to sessions started from here on.</span>
             </label>
-            <label>
-              <span class="label">Approved remote commands</span>
-              <span
-                ><input
-                  id="remoteCommandsEnabled"
-                  name="remoteCommandsEnabled"
-                  type="checkbox"
-                />
-                Enable on this Node (default off)</span
-              >
-              <span class="hint"
-                >Trusted administrator code execution, not a sandbox. Every command still
-                requires Host approval. Disabling cancels active commands; unknown process
-                ownership keeps admission closed.</span
-              >
-            </label>
-            <label>
-              <span class="label"
-                >Eligible repository roots (one absolute path per line)</span
-              >
-              <textarea
-                id="commandExecutionRoots"
-                name="commandExecutionRoots"
-                rows="3"
-              ></textarea>
-              <span class="hint"
-                >Activation requires all existing Fleet work to be drained. All aliases
-                and sibling worktrees share exclusion across installations. Private
-                coordinator leads are not stopped automatically.</span
-              >
-            </label>
-            <label>
-              <span
-                ><input
-                  id="commandIsolationConfirmed"
-                  name="commandIsolationConfirmed"
-                  type="checkbox"
-                />
-                I confirm every Fleet installation using these roots is upgraded and all
-                older/untracked sessions are stopped and reconciled.</span
-              >
-              <span class="hint"
-                >Old installations and arbitrary OS processes cannot be excluded by Fleet
-                locks. Do not enable if that prerequisite cannot be established.
-                Repository participation remains in force after local opt-out for other
-                installations.</span
-              >
-            </label>
-            <p id="commandExecutionStatus" role="status"></p>
             <div class="full-span">
               <span class="hint" id="unsaved"></span>
               <div class="row">
@@ -267,6 +218,98 @@
               <div id="msg"></div>
             </div>
           </form>
+
+          <section
+            class="card command-permissions"
+            id="commandPermissions"
+            aria-labelledby="commandPermissionsTitle"
+          >
+            <div class="section-heading">
+              <h3 id="commandPermissionsTitle">Command allowlist</h3>
+            </div>
+            <p class="sub spaced">
+              Only persistent permissions are listed here. Temporary approvals are not
+              shown or changed. The Host asks automatically when a command needs
+              permission.
+            </p>
+            <form id="commandPermissionForm" aria-busy="true">
+              <label for="commandPermissionEditor">
+                <span class="label">Persistent allowlist (JSON)</span>
+                <span class="hint" id="commandPermissionInstructions">
+                  Add or delete objects in this array, one per line. Save allowlist
+                  replaces the entire saved list. Use [] to remove all entries.
+                </span>
+              </label>
+              <textarea
+                id="commandPermissionEditor"
+                class="command-permission-editor"
+                rows="18"
+                wrap="off"
+                autocomplete="off"
+                spellcheck="false"
+                autocapitalize="off"
+                aria-describedby="commandPermissionInstructions commandPermissionMatching commandPermissionsLegacy commandPermissionsMessage"
+                placeholder="Loading saved allowlist…"
+                readonly
+              ></textarea>
+              <p
+                id="commandPermissionsLegacy"
+                class="command-permission-legacy"
+                role="status"
+                hidden
+              >
+                Warning: some entries have no recoverable command text. Their
+                <code>legacyKey</code> is a read-only authority reference, not an editable
+                command. Keep these rows unchanged or delete them; do not edit their keys,
+                paths, or Host scope.
+              </p>
+              <div class="command-permission-actions">
+                <button type="submit" id="commandPermissionSave" disabled>
+                  Save allowlist
+                </button>
+                <button
+                  type="button"
+                  class="secondary"
+                  id="commandPermissionFormat"
+                  disabled
+                >
+                  Format JSON
+                </button>
+                <button type="button" class="secondary" id="commandPermissionsRefresh">
+                  Reload saved
+                </button>
+                <span class="hint" id="commandPermissionsDraft" role="status"></span>
+              </div>
+            </form>
+            <details class="command-permission-matching" id="commandPermissionMatching">
+              <summary>JSON examples and matching</summary>
+              <pre class="command-permission-example"><code>[
+  {"command":"cd","path":"*"},
+  {"command":"git status","path":"Q:\\Repos\\TridentWarehouse-UX"},
+  {"command":"git *","path":"Q:\\Repos\\*","match":"pattern"}
+]</code></pre>
+              <p>
+                Escape each Windows backslash as <code>\\</code> in JSON. Use
+                <code>"match":"pattern"</code> for command or argument patterns with
+                <code>*</code> wildcards. Patterns include flags and arguments as written.
+                Folder patterns work in every mode. Ordinary rows only need
+                <code>command</code> and <code>path</code>; known command-family flags are
+                ignored. Wildcard rules can trust future matching program versions.
+              </p>
+              <p>
+                Compound scripts use <code>"match":"exact"</code> and the actual script
+                text, not a hash. Escape newlines as <code>\n</code> and quotes as
+                <code>\"</code>. Any script text change asks again. Keep any
+                <code>hostId</code> on existing rows to retain their Host scope; omit it
+                on new rows for the current Host.
+              </p>
+              <p>
+                Commands run as your OS account, not in a sandbox. A folder selects where
+                a command starts; it does not restrict file access.
+              </p>
+            </details>
+            <div id="commandPermissionsMessage" role="status" aria-live="polite"></div>
+          </section>
 
           <div class="card hidden" id="tunnelCard">
             <h3>Dev tunnel</h3>

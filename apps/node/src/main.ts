@@ -25,6 +25,7 @@ import {
   type WorkspaceResult,
   WORKSPACE_ARTIFACT_CHUNK_BYTES,
   COMMAND_EXECUTION_CAPABILITY,
+  COMMAND_PERMISSIONS_CAPABILITY,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   COMMAND_LIMITS,
   CommandExecutionHostMessageSchema,
@@ -89,6 +90,13 @@ import { UpdateQuarantine } from "./update-quarantine.js";
 import { RepositoryParticipation } from "./repository-participation.js";
 import { CommandJournal } from "./command-journal.js";
 import { CommandExecutionManager } from "./command-execution-manager.js";
+import {
+  CommandPermissions,
+  commandPermissionEntries,
+  compileCommandPermissionEntries,
+  recoverCommandPermissionText,
+  validateCommandPermissionRules,
+} from "./command-permissions.js";
 import { nativeCommandSupervisor } from "./command-supervisor-adapter.js";
 import { LeadPromptJournal } from "./lead-prompt-delivery.js";
 import { CheckoutLocks } from "./checkout-locks.js";
@@ -108,6 +116,7 @@ import {
   loadSettings,
   needsReconnect,
   saveSettings,
+  createSettingsUpdater,
   settingsOverridesFromEnv,
   SettingsSchema,
   type Settings,
@@ -228,6 +237,23 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   if (devTunnel) {
     settings = endpointsBehindLocalForward(settings, devTunnel.url);
   }
+  const commandPermissions = new CommandPermissions({
+    getRules: () => settings.commandPermissionRules,
+    saveRules: async (update) => {
+      await updateSettings((current) => ({
+        ...current,
+        commandPermissionRules: update(current.commandPermissionRules),
+      }));
+    },
+  });
+  const updateSettings = createSettingsUpdater({
+    get: () => settings,
+    set: (next) => {
+      settings = next;
+      commandPermissions.refreshPolicy();
+    },
+    save: saveSettings,
+  });
 
   // A respawned tunnel can land on a different port. Without following it the
   // node keeps dialing the old one, which nothing is listening on any more.
@@ -342,6 +368,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
    */
   let sealedConnection = false;
   let commandExecutionsNegotiated = false;
+  let commandPermissionsNegotiated = false;
   let leadDeliveryNegotiated = false;
   /**
    * Stops the liveness watchdog on whichever socket is current.
@@ -368,6 +395,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   );
   const repositories = new RepositoryParticipation();
   const journal = new CommandJournal(join(configDirectory(), "remote-commands"));
+  if (settings.commandPermissionRules.some((rule) => rule.command === undefined)) {
+    const recovered = recoverCommandPermissionText(
+      settings.commandPermissionRules,
+      journal.all().map((record) => record.descriptor),
+    );
+    if (JSON.stringify(recovered) !== JSON.stringify(settings.commandPermissionRules))
+      await updateSettings((current) => ({
+        ...current,
+        commandPermissionRules: recovered,
+      }));
+  }
   const leadDeliveries = new LeadPromptJournal(
     join(configDirectory(), "lead-deliveries"),
     (receipt, hostId) => {
@@ -604,6 +642,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     connection: () => ({
       sealed: sealedConnection && !!channel,
       negotiated: commandExecutionsNegotiated,
+      permissions: commandPermissionsNegotiated,
       nodeId: credentials.nodeId,
       hostId:
         credentials.authProtocol === MUTUAL_AUTH_PROTOCOL ? credentials.host.hostId : "",
@@ -612,32 +651,17 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       sealedConnection && !!channel && commandExecutionsNegotiated
         ? send(message)
         : false,
-    validateTarget: async (request, target) => {
-      const allowed = await Promise.all(
-        settings.commandExecutionRoots.map((path) => repositories.resolve(path)),
-      );
-      if (!allowed.some((root) => root.repository.key === target.repository.key))
-        throw new Error("This repository is not in this Node owner's enabled root list.");
-      await worktrees.validateCommandTarget(request, target);
-    },
+    validateTarget: (request, target) => worktrees.validateCommandTarget(request, target),
+    permissions: commandPermissions,
     locks: worktrees.locks,
     warn,
   });
   await commands.recoverAll();
   if (commands.unsettled) admission.quarantine(RECOVERED_COMMAND_OWNERSHIP);
-  if (settings.remoteCommandsEnabled) {
-    try {
-      await commands.configure(true);
-      await repositories.activate(
-        settings.commandExecutionRoots,
-        settings.commandIsolationConfirmed,
-      );
-    } catch (error) {
-      warn(`Remote commands unavailable: ${errorMessage(error)}`);
-      await commands
-        .configure(false)
-        .catch((failure: unknown) => admission.quarantine(String(failure)));
-    }
+  try {
+    await commands.configure(true);
+  } catch (error) {
+    warn(`Remote commands unavailable: ${errorMessage(error)}`);
   }
 
   /**
@@ -694,50 +718,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     { operatorEdit = true }: { operatorEdit?: boolean } = {},
   ): Promise<void> {
     const previous = settings;
-    const settled = operatorEdit ? endpointsAfterOperatorEdit(previous, next) : next;
-    const commandPolicyChanged =
-      previous.remoteCommandsEnabled !== settled.remoteCommandsEnabled ||
-      previous.commandIsolationConfirmed !== settled.commandIsolationConfirmed ||
-      JSON.stringify(previous.commandExecutionRoots) !==
-        JSON.stringify(settled.commandExecutionRoots);
-    if (commandPolicyChanged) {
-      const reopen = admission.close("Local command policy is changing.");
-      try {
-        if (settled.remoteCommandsEnabled) {
-          admission.assertIdle();
-          if (
-            router.activeSessionIds.length ||
-            worktrees.hasUnresolvedWork ||
-            commands.unsettled ||
-            leadDeliveries.unsettled
-          )
-            throw new Error(
-              "Drain/reconcile existing Fleet work before enabling command execution.",
-            );
-          await commands.configure(true);
-          await repositories.activate(
-            settled.commandExecutionRoots,
-            settled.commandIsolationConfirmed,
-          );
-        } else {
-          // Persist local revocation before waiting for cancellation, including unknown outcomes.
-          await saveSettings(settled);
-          settings = settled;
-          await commands.configure(false);
-        }
-      } catch (error) {
-        if (settled.remoteCommandsEnabled && !previous.remoteCommandsEnabled)
-          await commands
-            .configure(false)
-            .catch((failure: unknown) => admission.quarantine(String(failure)));
-        if (commands.unsettled) admission.quarantine(String(error));
-        throw error;
-      } finally {
-        reopen();
-      }
-    }
-    settings = settled;
-    await saveSettings(settled);
+    const changes = Object.fromEntries(
+      Object.entries(next).filter(
+        ([key, value]) =>
+          key !== "commandPermissionRules" &&
+          key !== "commandPermissionRevision" &&
+          JSON.stringify(previous[key as keyof Settings]) !== JSON.stringify(value),
+      ),
+    );
+    const settled = await updateSettings(async (current) => {
+      const merged = SettingsSchema.parse({ ...current, ...changes });
+      return operatorEdit ? endpointsAfterOperatorEdit(current, merged) : merged;
+    });
     router.setMaxSessions(settled.maxSessions);
     if (factory instanceof AcpAgentFactory) {
       factory.configure(
@@ -787,14 +779,15 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         "Backup import aborted: sessions could not be safely stopped and quarantined.",
       );
     }
-    credentials = archive.credentials;
-    settings = SettingsSchema.parse({
-      ...archive.settings,
-      remoteCommandsEnabled: false,
-      commandIsolationConfirmed: false,
+    await updateSettings(async () => {
+      const restored = SettingsSchema.parse(archive.settings);
+      restored.commandPermissionRules = await validateCommandPermissionRules(
+        restored.commandPermissionRules,
+      );
+      credentials = archive.credentials;
+      await saveCredentials(credentials);
+      return restored;
     });
-    await saveCredentials(credentials);
-    await saveSettings(settings);
     router.setMaxSessions(settings.maxSessions);
     if (factory instanceof AcpAgentFactory) {
       factory.configure(
@@ -806,7 +799,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     log(
       `Imported node identity ${credentials.nodeId}; reconnecting to ${settings.hostUrl}`,
     );
-    // Old approval namespace is permanently retired; reactivation must be a local edit.
+    // Old preparation and session-grant namespaces are permanently retired.
+    try {
+      await commands.configure(true);
+    } catch (error) {
+      warn(`Remote commands unavailable: ${errorMessage(error)}`);
+    }
     reopen();
     reconnect();
   }
@@ -829,8 +827,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
   /** Writes a change of Host address to both files that remember one. */
   async function persistEndpoints(endpoints: HostEndpoints): Promise<void> {
-    settings = { ...settings, ...endpoints };
-    await saveSettings(settings);
+    await updateSettings((current) => ({ ...current, ...endpoints }));
     if (sameHostUrl(credentials.hostUrl, settings.hostUrl)) return;
     credentials = { ...credentials, hostUrl: settings.hostUrl };
     await saveCredentials(credentials);
@@ -848,8 +845,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   async function applyAnnouncedName(name: string): Promise<void> {
     if (name === settings.nodeName && name === credentials.name) return;
     const previous = settings.nodeName;
-    settings = { ...settings, nodeName: name };
-    await saveSettings(settings);
+    await updateSettings((current) => ({ ...current, nodeName: name }));
     credentials = { ...credentials, name };
     await saveCredentials(credentials);
     if (previous !== name) log(`Host renamed this node "${previous}" -> "${name}"`);
@@ -995,7 +991,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       // process was started with, so what is in memory now has to be on disk
       // before it looks. Without this a node whose address was corrected from
       // the config page comes back on the address it was launched with.
-      await saveSettings(settings);
+      await updateSettings((current) => current);
       // The Host verifies this revision when the supervisor's child reconnects.
       report(
         "restarting",
@@ -1055,6 +1051,16 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     log(`Reached the Host at ${promoted.hostUrl}; dialing it first from now on`);
   }
 
+  const permissionSnapshot = (current: Settings) => ({
+    version: current.commandPermissionRevision,
+    rules: current.commandPermissionRules,
+    entries: commandPermissionEntries(
+      current.commandPermissionRules,
+      credentials.authProtocol === MUTUAL_AUTH_PROTOCOL
+        ? credentials.host.hostId
+        : undefined,
+    ),
+  });
   const configServer = startConfigServer({
     ...(sessionDiscovery ? { sessionDiscovery } : {}),
     getSettings: () => settings,
@@ -1070,6 +1076,47 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         : {}),
     }),
     applySettings,
+    getCommandPermissions: () => permissionSnapshot(settings),
+    updateCommandPermissionEntries: async (expectedVersion, entries) => {
+      const result = await updateSettings(async (current) => {
+        if (current.commandPermissionRevision !== expectedVersion)
+          throw new Error(
+            "Command permissions changed. Reload saved rules before editing them.",
+          );
+        const hostId =
+          credentials.authProtocol === MUTUAL_AUTH_PROTOCOL
+            ? credentials.host.hostId
+            : undefined;
+        const rules = await compileCommandPermissionEntries(
+          current.commandPermissionRules,
+          entries,
+          hostId,
+        ).catch((error: unknown) => {
+          throw Object.assign(new Error(errorMessage(error), { cause: error }), {
+            statusCode: 400,
+          });
+        });
+        return { ...current, commandPermissionRules: rules };
+      });
+      return permissionSnapshot(result);
+    },
+    updateCommandPermissions: async (expectedVersion, rules) => {
+      const result = await updateSettings(async (current) => {
+        if (current.commandPermissionRevision !== expectedVersion)
+          throw new Error("Command permissions changed. Refresh before editing them.");
+        const hostId =
+          credentials.authProtocol === MUTUAL_AUTH_PROTOCOL
+            ? credentials.host.hostId
+            : undefined;
+        const normalized = await validateCommandPermissionRules(
+          rules.map((rule) =>
+            !rule.builtin && !rule.hostId && hostId ? { ...rule, hostId } : rule,
+          ),
+        );
+        return { ...current, commandPermissionRules: normalized };
+      });
+      return permissionSnapshot(result);
+    },
     getCredentials: () => credentials,
     applyBackup,
     log,
@@ -1137,6 +1184,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     channel = undefined;
     sealedConnection = session !== undefined;
     commandExecutionsNegotiated = false;
+    commandPermissionsNegotiated = false;
     leadDeliveryNegotiated = false;
     // Registered before the close handler below so the watchdog is gone before
     // anything decides what to do about the disconnection.
@@ -1145,6 +1193,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         releaseLiveness();
         channel = undefined;
         commandExecutionsNegotiated = false;
+        commandPermissionsNegotiated = false;
         leadDeliveryNegotiated = false;
       }
     });
@@ -1168,7 +1217,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           mockAgent ? "mock" : "real",
           ...(session ? [DURABLE_LEAD_DELIVERY_CAPABILITY] : []),
           // Receipt reconciliation remains available after local opt-out or readiness failure.
-          ...(session ? [COMMAND_EXECUTION_CAPABILITY] : []),
+          ...(session
+            ? [COMMAND_EXECUTION_CAPABILITY, COMMAND_PERMISSIONS_CAPABILITY]
+            : []),
         ],
         ...(session ? { commandExecution: commands.readiness } : {}),
         agents: advertisedAgents,
@@ -1260,6 +1311,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           !!session && !!channel && frame.value.commandExecutions;
         leadDeliveryNegotiated =
           !!session && !!channel && frame.value.durableLeadDelivery;
+        commandPermissionsNegotiated =
+          commandExecutionsNegotiated && frame.value.commandPermissions;
         log(`Authenticated with Host, waiting for commands`);
         await promoteDialUrl();
         if (commandExecutionsNegotiated) commands.inventory();

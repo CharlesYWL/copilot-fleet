@@ -1,7 +1,6 @@
-import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { randomBytes, randomUUID } from "node:crypto";
+import { mkdirSync, rmSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
@@ -10,9 +9,12 @@ import {
   SESSION_RETENTION_CAPABILITY,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   COMMAND_EXECUTION_CAPABILITY,
+  COMMAND_PERMISSIONS_CAPABILITY,
   NodeBackupSchema,
   NODE_BACKUP_KIND,
   BACKUP_VERSION,
+  PreparedCommandSchema,
+  type PreparedCommand,
   type HostToNodeMessage,
   type NodeCommand,
   type NodeClientHello,
@@ -30,6 +32,7 @@ import {
   signWithIdentity,
 } from "@fleet/protocol/node-auth";
 import { settingsFromEnv } from "./settings.js";
+import { CommandPermissions, permissionPath } from "./command-permissions.js";
 import type * as SettingsModule from "./settings.js";
 import type * as AgentCatalogModule from "./agent-catalog.js";
 import type * as InstanceLockModule from "./instance-lock.js";
@@ -61,10 +64,12 @@ class TestSocket extends EventEmitter {
 }
 
 const sockets: TestSocket[] = [];
+const journalRecords: { descriptor: PreparedCommand }[] = [];
 let testConfigDirectory = "";
 let emitEvent: (event: SessionEvent) => void;
 const refreshMcpSessions = vi.fn(async () => {});
 const stopAll = vi.fn(async () => {});
+const configureCommands = vi.fn(async (_enabled: boolean) => {});
 let activeSessionIds = ["session-1"];
 const remoteCommandHandle = vi.fn(async () => {});
 const commandCancelAll = vi.fn(async () => {});
@@ -192,6 +197,7 @@ vi.mock("./managed-worktrees.js", () => ({
 vi.mock("./command-journal.js", () => ({
   CommandJournal: class {
     close = vi.fn();
+    all = vi.fn(() => journalRecords);
   },
 }));
 vi.mock("./lead-prompt-delivery.js", () => ({
@@ -219,7 +225,7 @@ vi.mock("./command-execution-manager.js", () => ({
     };
     unsettled = false;
     recoverAll = vi.fn(async () => {});
-    configure = vi.fn(async () => {});
+    configure = configureCommands;
     handle = remoteCommandHandle;
     inventory = vi.fn();
     flush = vi.fn();
@@ -230,8 +236,10 @@ vi.mock("./command-execution-manager.js", () => ({
 vi.mock("./command-supervisor-adapter.js", () => ({ nativeCommandSupervisor: {} }));
 
 beforeEach(() => {
-  testConfigDirectory = mkdtempSync(join(tmpdir(), "fleet-main-config-"));
+  testConfigDirectory = resolvePath(`.fleet-main-config-${randomUUID()}`);
+  mkdirSync(testConfigDirectory);
   sockets.length = 0;
+  journalRecords.length = 0;
   vi.clearAllMocks();
   activeSessionIds = ["session-1"];
 });
@@ -434,6 +442,8 @@ it.each([
       });
       if (ready.type !== "ready" || !ready.outboxFlush) throw new Error("No outbox");
       expect(ready.capabilities).toContain(COMMAND_EXECUTION_CAPABILITY);
+      expect(ready.capabilities).toContain(COMMAND_PERMISSIONS_CAPABILITY);
+      expect(configureCommands).toHaveBeenCalledWith(true);
       expect(ready.commandExecution).toMatchObject({ enabled: false, supported: false });
       const receive = (message: HostToNodeMessage) =>
         socket.receive(hostChannel.seal(JSON.stringify(message)));
@@ -443,6 +453,7 @@ it.each([
         reconcileAfterOutbox: true,
         acknowledgeOutbox: true,
         commandExecutions: commandsEnabled,
+        commandPermissions: commandsEnabled,
         durableLeadDelivery: deliveryEnabled,
       });
       await receive({
@@ -692,6 +703,212 @@ it("keeps command admission quarantined after updater mutation failure and force
   } finally {
     await runtime.shutdown();
     vi.mocked(updateCheckout).mockReset();
+    for (const listener of process.listeners("exit"))
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+  }
+});
+
+it("recovers and persists legacy script text before exposing the production editor", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const command = "Write-Output preserved; Write-Output script";
+  const input = { command, hostId: credentials.host.hostId, leadSessionId: "lead" };
+  const engine = new CommandPermissions({
+    getRules: () => [],
+    saveRules: async () => {},
+  });
+  const permission = engine.evaluate(input, testConfigDirectory);
+  const at = new Date().toISOString();
+  const identity = {
+    key: "m:v:f",
+    path: testConfigDirectory,
+    machineId: "m",
+    volume: "v",
+    fileId: "f",
+  };
+  journalRecords.push({
+    descriptor: PreparedCommandSchema.parse({
+      ...input,
+      executionId: randomUUID(),
+      attemptId: randomUUID(),
+      nodeId: credentials.nodeId,
+      target: { placementId: "placement" },
+      requestedPath: testConfigDirectory,
+      shell: "windows-powershell-5.1",
+      requestKey: "migration",
+      reason: "fixture",
+      createdAt: at,
+      expiresAt: at,
+      hostTime: at,
+      digest: "a".repeat(64),
+      prepared: {
+        cwd: testConfigDirectory,
+        checkout: identity,
+        repository: identity,
+        shellPath: "powershell.exe",
+        admissionVersion: 1,
+        preparedAt: at,
+        clockUncertaintyMs: 0,
+        hostClockOffsetMs: 0,
+        permission,
+      },
+    }),
+  });
+  const { loadSettings, saveSettings } = await import("./settings.js");
+  vi.mocked(loadSettings).mockResolvedValueOnce({
+    ...settingsFromEnv({}),
+    commandPermissionRevision: 7,
+    commandPermissionRules: [
+      {
+        id: "legacy",
+        commandKey: permission.commandKey!,
+        path: permissionPath(testConfigDirectory),
+        hostId: input.hostId,
+        builtin: false,
+      },
+    ],
+  });
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    expect(configOptions.getCommandPermissions!()).toMatchObject({
+      version: 8,
+      entries: [{ command, path: permissionPath(testConfigDirectory), match: "exact" }],
+    });
+    expect(
+      vi.mocked(saveSettings).mock.calls.at(-1)![0].commandPermissionRules[0],
+    ).toMatchObject({
+      command,
+      match: "exact",
+      commandKey: permission.commandKey,
+    });
+  } finally {
+    await runtime.shutdown();
+    for (const listener of process.listeners("exit"))
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+  }
+});
+
+it("starts command readiness without opt-in and edits rules without stopping existing sessions", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    expect(configureCommands).toHaveBeenCalledWith(true);
+    expect(activeSessionIds).toHaveLength(1);
+    const before = configOptions.getCommandPermissions!();
+    const staleSettings = { ...configOptions.getSettings() };
+    const updated = await configOptions.updateCommandPermissions!(before.version, []);
+    expect(updated).toEqual({ version: before.version + 1, rules: [], entries: [] });
+    const actualConfig =
+      await vi.importActual<typeof ConfigServerModule>("./config-server.js");
+    const route = actualConfig.createConfigRouter(configOptions);
+    const saved = await route(
+      "POST",
+      "/api/config",
+      JSON.stringify({
+        ...staleSettings,
+        nodeName: "Updated name",
+        commandPermissionRules: undefined,
+        commandPermissionRevision: undefined,
+      }),
+    );
+    expect(saved.status).toBe(200);
+    expect(configOptions.getSettings().commandPermissionRules).toEqual([]);
+    await expect(
+      configOptions.updateCommandPermissions!(before.version, before.rules),
+    ).rejects.toThrow("changed");
+    expect((await route("GET", "/api/command-permissions", "")).body).toEqual(updated);
+    const savedRules = await route(
+      "POST",
+      "/api/command-permissions",
+      JSON.stringify({
+        expectedVersion: updated.version,
+        rules: [
+          ...before.rules,
+          {
+            id: "local-git",
+            commandKey: "git status",
+            path: testConfigDirectory,
+            builtin: false,
+          },
+        ],
+      }),
+    );
+    expect(savedRules.status).toBe(200);
+    const persistent = configOptions.getCommandPermissions!();
+    expect(persistent.version).toBe(updated.version + 1);
+    expect(persistent.rules).toContainEqual(
+      expect.objectContaining({
+        id: "local-git",
+        commandKey: expect.stringMatching(/^git status @sha256:[a-f0-9]{64}$/),
+        hostId: credentials.host.hostId,
+      }),
+    );
+    await route("POST", "/api/config", JSON.stringify(staleSettings));
+    expect(configOptions.getCommandPermissions!()).toEqual(persistent);
+    const edit = JSON.stringify({ expectedVersion: persistent.version, rules: [] });
+    const competing = await Promise.all([
+      route("POST", "/api/command-permissions", edit),
+      route("POST", "/api/command-permissions", edit),
+    ]);
+    expect(competing.map((reply) => reply.status)).toEqual([200, 409]);
+    const removed = configOptions.getCommandPermissions!();
+    expect(removed.rules).toEqual([]);
+    const { saveSettings } = await import("./settings.js");
+    vi.mocked(saveSettings).mockRejectedValueOnce(new Error("disk full"));
+    await expect(
+      configOptions.updateCommandPermissions!(removed.version, before.rules),
+    ).rejects.toThrow("disk full");
+    expect(configOptions.getCommandPermissions!()).toEqual(removed);
+    const bulk = await configOptions.updateCommandPermissionEntries!(removed.version, [
+      { command: "git *", path: "*" },
+      {
+        command: "Write-Output one; Write-Output two",
+        path: testConfigDirectory,
+        match: "exact",
+      },
+    ]);
+    expect(bulk.entries).toEqual([
+      { command: "git *", path: "*", match: "pattern" },
+      {
+        command: "Write-Output one; Write-Output two",
+        path: expect.any(String),
+        match: "exact",
+      },
+    ]);
+    expect(bulk.rules.every((rule) => rule.hostId === credentials.host.hostId)).toBe(
+      true,
+    );
+    const invalidPolicy = await route(
+      "POST",
+      "/api/command-permissions",
+      JSON.stringify({
+        expectedVersion: bulk.version,
+        entries: [{ command: "git *; Write-Output unsafe-pattern", path: "*" }],
+      }),
+    );
+    expect(invalidPolicy.status).toBe(400);
+    expect(configOptions.getCommandPermissions!()).toEqual(bulk);
+    await route("POST", "/api/config", JSON.stringify(staleSettings));
+    expect(configOptions.getCommandPermissions!()).toEqual(bulk);
+    await expect(
+      configOptions.updateCommandPermissionEntries!(removed.version, []),
+    ).rejects.toThrow("changed");
+    expect(stopAll).not.toHaveBeenCalled();
+    expect(commandCancelAll).not.toHaveBeenCalled();
+    expect(routerOptions.admission!.reason).toBe("");
+  } finally {
+    await runtime.shutdown();
     for (const listener of process.listeners("exit"))
       if (!exits.includes(listener)) process.removeListener("exit", listener);
   }

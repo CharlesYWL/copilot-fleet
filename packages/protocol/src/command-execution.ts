@@ -3,6 +3,7 @@ import { CheckoutIdentitySchema, ExecutionBindingSchema } from "./managed-worktr
 import { PromptAttachmentsSchema } from "./attachments.js";
 
 export const COMMAND_EXECUTION_CAPABILITY = "remote-command-execution-v1";
+export const COMMAND_PERMISSIONS_CAPABILITY = "command-permissions-v1";
 export const DURABLE_LEAD_DELIVERY_CAPABILITY = "durable-lead-delivery-v1";
 export const COMMAND_ADMISSION_VERSION = 1;
 export const COMMAND_LIMITS = {
@@ -83,6 +84,52 @@ export const CommandPreparationSchema = RunCommandSchema.extend({
 });
 export type CommandPreparation = z.infer<typeof CommandPreparationSchema>;
 
+export const CommandApprovalScopeSchema = z.enum(["once", "session", "always"]);
+export type CommandApprovalScope = z.infer<typeof CommandApprovalScopeSchema>;
+export const EXACT_SCRIPT_PERMISSION_PREFIX = "exact-script:sha256:";
+export function isExactScriptPermissionKey(value: string): boolean {
+  return /^exact-script:sha256:[a-f0-9]{64}$/.test(value);
+}
+export const CommandPermissionMatchModeSchema = z.enum(["command", "exact", "pattern"]);
+export const CommandPermissionEntrySchema = z.union([
+  z
+    .object({
+      command: CommandTextSchema,
+      path,
+      match: CommandPermissionMatchModeSchema.optional(),
+      hostId: id.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      legacyKey: z.string().min(1).max(200),
+      path,
+      hostId: id.optional(),
+    })
+    .strict(),
+]);
+export type CommandPermissionEntry = z.infer<typeof CommandPermissionEntrySchema>;
+export const CommandPermissionRuleSchema = z.object({
+  id: z.string().min(1).max(200),
+  commandKey: z.string().trim().min(1).max(200),
+  command: CommandTextSchema.optional(),
+  match: CommandPermissionMatchModeSchema.optional(),
+  path: z.string().min(1).max(32_768),
+  hostId: id.optional(),
+  builtin: z.boolean().default(false),
+});
+export type CommandPermissionRule = z.infer<typeof CommandPermissionRuleSchema>;
+export const CommandPermissionMatchSchema = z.object({
+  reusable: z.boolean(),
+  commandKey: z.string().min(1).max(200).optional(),
+  path,
+  explanation: detail,
+  policyVersion: z.number().int().nonnegative(),
+  grantedBy: z.enum(["builtin", "session", "always"]).optional(),
+  ruleId: z.string().min(1).max(200).optional(),
+});
+export type CommandPermissionMatch = z.infer<typeof CommandPermissionMatchSchema>;
+
 export const PreparedCommandTargetSchema = z.object({
   cwd: path,
   checkout: CheckoutIdentitySchema,
@@ -92,6 +139,7 @@ export const PreparedCommandTargetSchema = z.object({
   preparedAt: timestamp,
   clockUncertaintyMs: z.number().min(0).max(COMMAND_LIMITS.clockUncertaintyMs),
   hostClockOffsetMs: z.number().finite(),
+  permission: CommandPermissionMatchSchema.optional(),
 });
 export type PreparedCommandTarget = z.infer<typeof PreparedCommandTargetSchema>;
 export const PreparedCommandBodySchema = CommandPreparationSchema.extend({
@@ -242,6 +290,8 @@ export const CommandExecutionSchema = RunCommandSchema.extend({
   expiresAt: timestamp,
   approvedBy: z.string().max(200).optional(),
   approvedAt: timestamp.optional(),
+  approvalScope: CommandApprovalScopeSchema.optional(),
+  automaticApproval: z.boolean().optional(),
   cancelRequested: z.boolean().default(false),
   exitCode: z.number().int().nullable().default(null),
   outcomeKnown: z.boolean().default(false),
@@ -269,7 +319,7 @@ export const CommandExecutionPageSchema = z.object({
 export type CommandExecutionPage = z.infer<typeof CommandExecutionPageSchema>;
 export const CommandDecisionSchema = z
   .object({
-    decision: z.enum(["allow_once", "deny"]),
+    decision: z.enum(["allow_once", "allow_session", "allow_always", "deny"]),
     expectedVersion: z.number().int().nonnegative(),
     digest,
   })
@@ -415,6 +465,13 @@ export const CommandExecutionHostSchemas = [
     approvedBy: id,
     approvedAt: timestamp,
     version: z.number().int().nonnegative(),
+    approvalScope: CommandApprovalScopeSchema.optional(),
+    automaticApproval: z.boolean().optional(),
+  }),
+  z.object({
+    type: z.literal("revoke_command_session_grants"),
+    hostId: id,
+    leadSessionId: id,
   }),
   z.object({
     type: z.literal("cancel_command_execution"),

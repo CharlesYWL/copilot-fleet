@@ -15,6 +15,15 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     root: "ui",
+    // Keep shared schemas in Vite's source/HMR graph, not an independently built dist module.
+    resolve: {
+      alias: [
+        {
+          find: /^@fleet\/protocol$/,
+          replacement: resolve(repoRoot, "packages/protocol/src/index.ts"),
+        },
+      ],
+    },
     build: {
       outDir: "../dist/ui",
       emptyOutDir: true,

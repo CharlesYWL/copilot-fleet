@@ -1,4 +1,9 @@
-import type { NodeBackup, CommandReadiness } from "@fleet/protocol";
+import type {
+  NodeBackup,
+  CommandReadiness,
+  CommandPermissionRule,
+  CommandPermissionEntry,
+} from "@fleet/protocol";
 import type { LogEntry } from "@fleet/protocol/log-buffer";
 import type { Credentials } from "./config.js";
 import type {
@@ -70,6 +75,23 @@ export type ConfigServerOptions = {
   pickFolder?: (start: string) => Promise<PickerResult>;
   inspectPath?: (path: string) => PathCheck;
   sessionDiscovery?: SessionDiscoveryApi;
+  getCommandPermissions?: () => {
+    version: number;
+    rules: CommandPermissionRule[];
+    entries?: CommandPermissionEntry[];
+  };
+  updateCommandPermissions?: (
+    expectedVersion: number,
+    rules: CommandPermissionRule[],
+  ) => Promise<{ version: number; rules: CommandPermissionRule[] }>;
+  updateCommandPermissionEntries?: (
+    expectedVersion: number,
+    entries: CommandPermissionEntry[],
+  ) => Promise<{
+    version: number;
+    rules: CommandPermissionRule[];
+    entries: CommandPermissionEntry[];
+  }>;
 };
 
 export type ConfigReply = { status: number; body: unknown };

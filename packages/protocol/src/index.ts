@@ -1062,6 +1062,7 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("welcome"),
     nodeId: z.string().min(1),
     commandExecutions: z.boolean().default(false),
+    commandPermissions: z.boolean().default(false),
     durableLeadDelivery: z.boolean().default(false),
     /**
      * Confirms this Host deferred reconciliation for the advertised outbox.

@@ -74,6 +74,7 @@ import { TopBar } from "./components/TopBar";
 import { LifecycleNotificationControl } from "./components/LifecycleNotificationControl";
 import { OnboardingTour } from "./components/OnboardingTour";
 import { CommandExecutionsDialog } from "./components/CommandExecutionsDialog";
+import { CommandPermissionPrompts } from "./components/CommandPermissionPrompts";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
@@ -1086,6 +1087,17 @@ export function App() {
                     setView("overview");
                   }
                 : undefined
+          }
+        />
+        <CommandPermissionPrompts
+          executions={snapshot.commandExecutions ?? []}
+          connected={connected}
+          blocked={
+            !!commandPanel ||
+            dialogOpen ||
+            orchestrationDialogOpen ||
+            focusOpen ||
+            !!bulkStopScope
           }
         />
         {commandPanel && (
