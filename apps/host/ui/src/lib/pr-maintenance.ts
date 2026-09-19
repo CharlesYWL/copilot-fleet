@@ -26,6 +26,19 @@ export function getTaskMaintenance(taskId: string) {
   );
 }
 
+export function prepareTaskMaintenance(taskId: string, prUrl?: string) {
+  return api<{ status: "preparation_requested"; taskId: string }>(
+    `/api/runs/${encodeURIComponent(taskId)}/pr-maintenance`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        action: "prepare",
+        ...(prUrl?.trim() ? { prUrl: prUrl.trim() } : {}),
+      }),
+    },
+  );
+}
+
 export function enableTaskMaintenance(taskId: string, registration: PrMaintenanceEnable) {
   return api<PrMaintenanceRegistration>(
     `/api/runs/${encodeURIComponent(taskId)}/pr-maintenance`,

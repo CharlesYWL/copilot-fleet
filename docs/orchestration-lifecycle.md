@@ -118,6 +118,9 @@ timer or direct-to-worker observer. A completed task is not reopened just to mak
 its lead eligible for a reminder.
 
 V1 permits one retained PR registration per task, including paused registrations.
+Task and MCP reads include historical terminal/released jobs. A later PR can reuse
+the same existing worker only after prior ownership is explicitly released or
+verified terminal work is fully settled. History is not erased.
 A known new publication invalidates the pre-push observation for new work and
 readiness. Finding dispositions are scoped to their verified code HEAD; after an
 external commit, unchanged feedback can be revalidated without losing its history.
@@ -148,11 +151,18 @@ head/base repository IDs and full refs, owned worker, baseline, verification,
 publication scope, budgets and current prerequisite evidence. Pause/resume/release
 use `recordId` and `expectedVersion`; stale input is a conflict, not permission to
 overwrite newer state. MCP may propose bounded maintenance but cannot fabricate
-the browser operator's authorization. Unknown helper/credentials/publication
-evidence and unsupported immutable/standalone bindings fail closed.
+the browser operator's authorization. Repair mode requires verified observation
+and publication prerequisites; observation-only mode grants no mutation authority.
+Unsupported immutable/standalone bindings still fail closed.
 
-`fleet_propose_pr_maintenance` lets the owning lead prepare a durable, unapproved
-proposal for an existing eligible worker. It changes neither task state nor
+The default task action sends a preparation request (optional PR URL only) to its
+existing Orchestrator through the existing prompt delivery mechanism. Durable
+deliveries deduplicate while pending; a settled request can be deliberately retried.
+`fleet_prepare_pr_maintenance` validates fresh provider metadata against the URL,
+derives the owned task baseline and sole coding worker, and returns explicit
+choices rather than guessing when ambiguous. `fleet_propose_pr_maintenance`
+retains the advanced exact-scope capability. Both save a durable, unapproved
+proposal for an existing eligible worker. They change neither task state nor
 maintenance authority and dispatches no worker. The operator receives an existing
 task notification and reviews the prefilled authorization dialog. Approval uses
 `authorize_proposal` with the captured proposal ID/version, then revalidates the
@@ -160,6 +170,29 @@ binding through normal operator enablement. A changed proposal requires review
 again; task approval is not maintenance approval. Proposals survive backup and
 restart without acquiring authority. Read them through
 `fleet_get_pr_maintenance(taskId)` or the existing task discovery surfaces.
+The preparer's default mode is observation only, with publication, replies, thread
+resolution, reviewer requests and CI retries disabled. Repair mode needs explicit
+existing-publication evidence; other provider actions must be requested separately.
+The returned mode and action flags mirror the stored proposal. Operator approval
+cannot silently reinterpret read-only scope as repair authority.
+
+The stage rail is a projection of current durable facts, not another scheduler or
+agent-maintained status string. It distinguishes observation/recovery, triage,
+addressing feedback, check/review waiting, readiness, holds and terminal history.
+Completed maintenance rounds count executed, settled batches only; reservations,
+cancelled-before-dispatch batches and provider review iterations do not count.
+
+Failed/partial reads retain the exact sanitized error, bounded helper continuation,
+20-incident history and monotonic incident cursor. One unresolved capability incident
+queues one deduplicated prompt through existing lead delivery. Recovery requires a
+claimed visit and a pre-I/O `alternate_attempt` reservation (stable resolution ID,
+source/method/evidence reference, charged requests), followed by `alternate_observation`.
+Three attempts per incident survive restart; lost/unused reservations stay charged.
+The Host pins identity, bounds freshness and stores the resolution receipt.
+Fresh complete alternative evidence may resolve a helper capability limitation;
+partial evidence remains incomplete. Actual provider access denial, identity drift,
+Stop, design holds and unknown execution/effects are never cleared by alternate reads.
+No new polling service or credential changes are introduced.
 
 | Action | Maintenance effect |
 |---|---|

@@ -70,8 +70,10 @@ az account get-access-token --resource 499b84ac-1321-427f-aa17-267ca6975798
 
 It never invokes `az repos`, installs extensions, logs in, switches subscriptions,
 copies credentials, or creates helper credential files. The existing Azure CLI
-identity must already be suitable for the organization. An unauthenticated Node
-returns `auth_required`; authentication must happen separately and explicitly.
+identity must already be suitable for the organization. A missing local CLI login
+returns `local_auth_unavailable`; an already-authorized independent MCP may read
+through the bounded recovery seam. Actual provider HTTP 401 remains `auth_required`
+and pauses maintenance for operator reconciliation. No fallback changes credentials.
 Token stdout is captured in memory, stderr is never surfaced, and every
 diagnostic is fixed/sanitized. The bearer token is used only in Node HTTPS request
 headers; it is never part of input, URLs, evidence, errors, continuation, or logs.
@@ -173,7 +175,10 @@ Failures distinguish auth, permission, rate limiting, network/timeouts, request
 or deadline exhaustion, invalid input/resume, changed scope, changed/stale
 evidence, overflow, unsupported pagination/policy API, and
 ambiguous effects. Host failures map to `auth`, `permission`, `rate_limit`,
-`network`, `budget`, or `incomplete`. No error embeds raw CLI/API output.
+`network`, `capability`, `budget`, or `incomplete`; local CLI/login limitations map to `capability`,
+not a false provider access denial. The exact sanitized error code/message remain
+in `helperState.error`, together with bounded resume state, for recovery classification.
+No error embeds raw CLI/API output.
 
 ## Evidence and deliberate limitations
 

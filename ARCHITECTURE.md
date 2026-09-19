@@ -309,13 +309,17 @@ talking to.
 ### Opt-in PR maintenance
 
 Maintenance is durable task continuity, not a second scheduler: the existing
-Orchestrator discovers scoped registrations through Fleet MCP, reads GitHub with
+Orchestrator discovers scoped registrations through Fleet MCP, reads the provider with
 the packaged bounded helper on an authorized Node, and dispatches the retained
 eligible worker through the existing follow-up path. Browser task actions supply
 human authorization; MCP cannot mint an operator principal or approve its own
 scope. Node credentials and provider tokens stay on their existing boundary.
 
-Conversational enablement uses `fleet_propose_pr_maintenance` to save one versioned,
+Conversational enablement uses `fleet_prepare_pr_maintenance` to resolve the owned
+task baseline and existing coder from fresh URL-matched provider metadata.
+Ambiguity returns choices, never an invented worker or binding. The task panel
+sends only an optional URL to its existing lead; registration JSON is not a human
+workflow. Preparation (or the advanced `fleet_propose_pr_maintenance`) saves one versioned,
 unapproved proposal per task and publish an existing task notification. The task
 dialog is prefilled, and the authenticated operator approves the stored ID/version.
 Proposal creation never dispatches a worker or reserves PR ownership; activation
@@ -326,6 +330,14 @@ authorization, decisions, observations, batches, per-finding outcomes, remote
 effects and budgets. A terminal PR is not a settled batch. PR, remote head-ref and
 worker ownership remain reserved while work/effects are unsettled; active/paused
 owners are automatic-retention roots. Cleanup admission rechecks those roots.
+
+Helper failures additionally retain bounded incidents and exact sanitized errors.
+Existing lead delivery deduplicates the recovery wake; alternate provider evidence
+requires a pre-I/O reservation tied to the Host turn and a stable resolution receipt.
+Source/method/evidence references and freshness accompany that receipt. Recovery
+does not reset request/attempt budgets or clear access, identity, Stop, design or
+unknown-effect holds. The UI derives its single current stage and settled-round
+count from these records and separates released/terminal PR history.
 
 Shared maintenance admission applies to task completion/reopen, dispatch and
 queued execution, bound-session prompt/resume, and publication. Human holds are

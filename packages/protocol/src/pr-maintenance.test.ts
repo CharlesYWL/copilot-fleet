@@ -4,6 +4,9 @@ import {
   PrMaintenanceIdentitySchema,
   PrMaintenanceOperatorActionSchema,
   PrMaintenanceScopeSchema,
+  PrMaintenanceRegistrationSchema,
+  PrMaintenanceObservationSchema,
+  prMaintenanceProgress,
   parsePrMaintenanceUrl,
   prMaintenanceProviderKey,
   prMaintenanceUrl,
@@ -50,6 +53,250 @@ describe("PR maintenance wire schemas", () => {
       organization: "sample-org",
       headRef: "refs/heads/Fix",
     });
+  });
+
+  describe("maintenance progress from durable facts", () => {
+    const at = "2026-09-18T00:00:00.000Z";
+    const headSha = "a".repeat(40);
+    const source = {
+      id: "thread",
+      revision: "1",
+      groupKey: "finding",
+      evidence: "review thread",
+    };
+    const observation = PrMaintenanceObservationSchema.parse({
+      attemptedAt: at,
+      complete: true,
+      identity,
+      snapshotId: "snapshot",
+      headSha,
+      state: "open",
+      fingerprint: "ready-fingerprint",
+      mergeability: "mergeable",
+      checksComplete: true,
+      reviewsComplete: true,
+      evidence: "Full current-HEAD observation.",
+    });
+    const base = () =>
+      PrMaintenanceRegistrationSchema.parse({
+        schemaVersion: 1,
+        id: "job",
+        version: 1,
+        generation: 1,
+        identity,
+        leadSessionId: "lead",
+        taskId: "task",
+        workerSessionId: "worker",
+        placementId: "placement",
+        checkoutKey: "checkout",
+        bindingGeneration: 0,
+        eligibilityEvidence: "Authenticated grant.",
+        lifecycle: "active",
+        renewedAt: at,
+        nextCheckAt: at,
+        createdAt: at,
+        updatedAt: at,
+        authorization: {
+          id: "authorization",
+          operatorId: "operator",
+          issuedAt: at,
+          headSha,
+          scope: {
+            baseline: "Same contract",
+            verification: "Tests",
+            publicationAuthorized: true,
+          },
+          budgets: {},
+        },
+        counters: {},
+        observation: structuredClone(observation),
+        lastAttempt: structuredClone(observation),
+      });
+
+    it("migrates old observations without requiring or fabricating a draft flag", () => {
+      expect(observation.draft).toBeUndefined();
+      expect(base().incidents).toEqual([]);
+      expect(base().incidentCursor).toBe(0);
+      expect(
+        PrMaintenanceObservationSchema.parse({ ...observation, draft: true }).draft,
+      ).toBe(true);
+    });
+
+    it("provides exactly one truthful current stage with freshness and readiness gates", () => {
+      const record = base();
+      const now = Date.parse(at);
+      expect(prMaintenanceProgress(record, now)).toEqual({
+        stage: "checking",
+        completedIterations: 0,
+      });
+      record.readyFingerprint = observation.fingerprint;
+      expect(prMaintenanceProgress(record, now).stage).toBe("ready");
+      expect(prMaintenanceProgress(record, now + 30 * 60_000 + 1).stage).toBe("checking");
+      expect(prMaintenanceProgress(record, now - 1).stage).toBe("checking");
+      record.observation!.checksComplete = false;
+      expect(prMaintenanceProgress(record, now).stage).toBe("waiting_checks");
+      record.observation!.checksComplete = true;
+      record.observation!.reviewsComplete = false;
+      expect(prMaintenanceProgress(record, now).stage).toBe("waiting_review");
+      record.observation!.sources = [source];
+      expect(prMaintenanceProgress(record, now).stage).toBe("triage");
+      record.observation!.draft = true;
+      expect(prMaintenanceProgress(record, now).stage).toBe("blocked");
+      record.lifecycle = "paused";
+      expect(prMaintenanceProgress(record, now).stage).toBe("paused");
+      record.pauseReason = "authorization_failed";
+      expect(prMaintenanceProgress(record, now).stage).toBe("blocked");
+      record.pauseReason = "task_human_hold";
+      expect(prMaintenanceProgress(record, now).stage).toBe("human_hold");
+      record.pauseReason = "";
+      record.decision = {
+        id: "decision",
+        version: 1,
+        proposal: "Design change?",
+        scope: "API",
+        headSha,
+        state: "pending",
+      };
+      expect(prMaintenanceProgress(record, now).stage).toBe("human_hold");
+      delete record.decision;
+      record.ownershipReleasedAt = at;
+      expect(prMaintenanceProgress(record, now).stage).toBe("released");
+      record.lifecycle = "merged";
+      expect(prMaintenanceProgress(record, now).stage).toBe("merged");
+    });
+
+    it.each(["headSha", "snapshotId", "failure"] as const)(
+      "never displays historical readiness when lastAttempt has inconsistent %s",
+      (field) => {
+        const record = base();
+        record.readyFingerprint = record.observation!.fingerprint;
+        if (field === "failure") record.lastAttempt!.failure = "network";
+        else record.lastAttempt![field] = "b".repeat(40);
+        expect(prMaintenanceProgress(record, Date.parse(at)).stage).toBe("blocked");
+      },
+    );
+
+    it("counts distinct settled execution attempts rather than reservations or provider iterations", () => {
+      const record = base();
+      const batch = {
+        id: "batch",
+        kind: "repair" as const,
+        sources: [source],
+        headSha,
+        prompt: "Bounded repair",
+        scope: "Same contract",
+        reservedMutations: 3,
+        generation: 1,
+        authorizationId: "authorization",
+        state: "succeeded" as const,
+        findings: [],
+        effects: [],
+        stepId: "step",
+        attempt: 2,
+        executionSettled: true,
+        published: false,
+        createdAt: at,
+        updatedAt: at,
+      };
+      record.counters.repairBatches = 20;
+      record.counters.answerBatches = 10;
+      record.batches = [
+        batch,
+        { ...batch, id: "same-attempt" },
+        { ...batch, id: "failed", attempt: 3, state: "failed" },
+        { ...batch, id: "pending-reconciliation", attempt: 4, state: "reconciling" },
+        {
+          ...batch,
+          id: "prepared",
+          stepId: undefined,
+          attempt: undefined,
+          state: "cancelled",
+        },
+        {
+          ...batch,
+          id: "cancelled-before-send",
+          attempt: 5,
+          state: "cancelled",
+          executionNotDispatched: true,
+        },
+        {
+          ...batch,
+          id: "unknown",
+          attempt: 6,
+          executionSettled: false,
+          state: "uncertain",
+        },
+      ];
+      expect(prMaintenanceProgress(record, Date.parse(at))).toEqual({
+        stage: "reconciling",
+        completedIterations: 2,
+      });
+      record.lifecycle = "paused";
+      expect(prMaintenanceProgress(record, Date.parse(at)).stage).toBe("reconciling");
+      record.lifecycle = "active";
+      record.readyFingerprint = record.observation!.fingerprint;
+      record.batches = [{ ...batch, state: "failed", executionSettled: false }];
+      expect(prMaintenanceProgress(record, Date.parse(at))).toEqual({
+        stage: "reconciling",
+        completedIterations: 0,
+      });
+      record.batches = [
+        {
+          ...batch,
+          state: "prepared",
+          stepId: undefined,
+          attempt: undefined,
+          executionSettled: false,
+        },
+      ];
+      expect(prMaintenanceProgress(record, Date.parse(at))).toEqual({
+        stage: "checking",
+        completedIterations: 0,
+      });
+    });
+
+    it("requires bounded provenance and rejects a model-supplied wake or fake fallback success", () => {
+      const attempt = {
+        kind: "alternate_attempt",
+        incidentId: "incident",
+        resolutionId: "attempt",
+        provenance: {
+          source: "github.com",
+          method: "provider API",
+          evidenceRef: "https://github.com/example/repo/pull/1",
+        },
+        requests: 2,
+      };
+      expect(PrMaintenanceCheckpointSchema.safeParse(attempt).success).toBe(true);
+      expect(
+        PrMaintenanceCheckpointSchema.safeParse({ ...attempt, wakeId: "reset" }).success,
+      ).toBe(false);
+      expect(
+        PrMaintenanceCheckpointSchema.safeParse({
+          ...attempt,
+          provenance: { source: "github.com" },
+        }).success,
+      ).toBe(false);
+      expect(
+        PrMaintenanceCheckpointSchema.safeParse({
+          kind: "fallback",
+          error: "failure",
+          observation,
+        }).success,
+      ).toBe(false);
+      expect(
+        PrMaintenanceObservationSchema.safeParse({
+          ...observation,
+          helperState: {
+            error: { code: "auth_required", message: "Provider denied access." },
+          },
+        }).success,
+      ).toBe(false);
+    });
+  });
+
+  it("validates provider keys, repository URLs and identity constraints", () => {
+    const parsed = PrMaintenanceIdentitySchema.parse(ado);
     expect(prMaintenanceProviderKey(parsed)).toBe(
       "azure-devops:dev.azure.com/sample-org",
     );
@@ -136,6 +383,19 @@ describe("PR maintenance wire schemas", () => {
       expect(
         PrMaintenanceIdentitySchema.safeParse({ ...identity, headRef }).success,
       ).toBe(false);
+  });
+
+  it("defaults new scope to read-only while retaining explicit publication grants", () => {
+    const scope = { baseline: "Observe only.", verification: "Read existing evidence." };
+    expect(PrMaintenanceScopeSchema.parse(scope).publicationAuthorized).toBe(false);
+    expect(
+      PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: false })
+        .publicationAuthorized,
+    ).toBe(false);
+    expect(
+      PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: true })
+        .publicationAuthorized,
+    ).toBe(true);
   });
 
   it("cannot turn untrusted checkpoint content into authority or broaden the grant", () => {

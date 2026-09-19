@@ -31,7 +31,9 @@ const messages = Object.freeze({
   invalid_resume:
     "Continuation is invalid or belongs to different input, PR, or generation.",
   auth_required:
-    "Azure CLI authentication is unavailable; authenticate separately on the authorized Node.",
+    "Azure DevOps rejected the authenticated read; operator access reconciliation is required.",
+  local_auth_unavailable:
+    "The local Azure CLI has no usable login; an independently authorized provider tool may inspect without changing credentials.",
   cli_unavailable: "The existing Azure CLI executable could not be used safely.",
   permission_denied:
     "The Node identity cannot read all required PR, policy, or build evidence.",
@@ -300,7 +302,7 @@ export async function getAccessToken({ timeoutMs, spawnProcess = spawn, launcher
       if (done) return;
       const token = Buffer.concat(chunks).toString("utf8").trim();
       if (code !== 0 || !/^[A-Za-z0-9._~-]{16,32768}$/.test(token))
-        finish(fail("auth_required"));
+        finish(fail("local_auth_unavailable"));
       else finish(null, token);
     });
   });
@@ -1347,6 +1349,7 @@ export function toAdoHostObservation(
     helperState: {
       resume: result.resume ?? null,
       previousThreads: value?.threadStates ?? input.previousThreads ?? [],
+      ...(result.error ? { error: result.error } : {}),
     },
     cursor: JSON.stringify(result.progress),
     evidence: result.complete
@@ -1354,8 +1357,11 @@ export function toAdoHostObservation(
       : `Azure DevOps helper v1: ${result.error.code}; ${result.error.message}`,
   };
   if (!result.complete) {
-    observation.failure =
-      result.error.code === "auth_required"
+    observation.failure = ["cli_unavailable", "local_auth_unavailable"].includes(
+      result.error.code,
+    )
+      ? "capability"
+      : result.error.code === "auth_required"
         ? "auth"
         : result.error.code === "permission_denied"
           ? "permission"
@@ -1363,7 +1369,7 @@ export function toAdoHostObservation(
             ? "rate_limit"
             : ["deadline_exhausted", "budget_exhausted"].includes(result.error.code)
               ? "budget"
-              : ["network", "timeout", "cli_unavailable"].includes(result.error.code)
+              : ["network", "timeout"].includes(result.error.code)
                 ? "network"
                 : "incomplete";
     if (result.error.retryAfterSeconds)
@@ -1378,6 +1384,7 @@ export function toAdoHostObservation(
       headSha: value.headSha,
       baseSha: value.baseSha,
       state: value.state,
+      draft: value.isDraft,
       mergeability: value.mergeability,
       checksComplete: value.checksComplete,
       reviewsComplete: value.reviewsComplete,

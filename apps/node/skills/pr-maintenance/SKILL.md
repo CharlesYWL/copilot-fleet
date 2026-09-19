@@ -24,12 +24,15 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    Charge a visit on attempt, including busy/offline/failing records. Persist
    progress after each visit; a noisy PR cannot jump ahead in this pass.
    Use `fleet_get_pr_maintenance` with `takeDue: true` and optional
-   `reserveRequests` (default 8, maximum 40). Its returned `observationAllowance`
+   `reserveRequests` (maximum 40). Its returned `observationAllowance`
    is reserved before I/O against the Host-derived turn ID. A lost response or
    unused request reservation stays charged; do not claim another visit to retry.
-   For Azure DevOps request `reserveRequests: 40` (or the remaining allowance):
-   its complete read/verification pass usually exceeds eight requests. Do not
-   repeatedly use the default eight and expect a fresh verification to finish.
+   The Host defaults to up to 40 requests for ADO observation-only jobs, 39 for
+   repair-enabled ADO jobs (leaving one unit for the existing continuation gate),
+   and eight for GitHub. A recovery visit defaults to one; reserve alternate I/O
+   separately before calling its provider tool. ADO's complete consistency pass
+   usually exceeds eight requests: do not repeatedly override it to eight.
+   Explicitly reserving all 40 is valid, but cannot also admit repair work in that wake.
 3. Honor the existing wake identity's remaining allowance: **5 PR visits,
    40 initiated provider requests, 120 seconds**. Pass the remaining request count
    and absolute deadline to the helper. Reconciliation/retries count too.
@@ -59,12 +62,29 @@ For a conversational request such as "Enable PR maintenance for this PR":
 1. Find the existing owned task and eligible coder with `fleet_list_work` /
    `fleet_get_task`. Read `fleet_get_pr_maintenance` with `taskId` for any existing
    registration or pending proposal. Do not create a replacement worker.
-2. Use the supplied Azure DevOps or GitHub PR URL for bounded, read-only discovery
-   through the packaged provider router and current task
-   evidence. Verify the exact repositories/refs/HEAD, approved baseline,
+2. Discover the Azure DevOps or GitHub PR URL from the task's outputs and existing
+   worker evidence, or use the supplied URL. Ask only for the URL or an ambiguous
+   choice; never ask the human for Fleet IDs, GUIDs, or registration JSON.
+   Use bounded, read-only discovery through the packaged provider router or
+   independently authenticated existing provider MCP/CLI tools. Verify the exact repositories/refs/HEAD, approved baseline,
    verification commands and permitted publication path; report unknowns.
-3. Call `fleet_propose_pr_maintenance` with the advertised registration fields.
-   Include `expectedVersion` when changing an existing proposal. Identical
+3. Call `fleet_prepare_pr_maintenance` with the real PR URL, verified identity and
+   HEAD, actual `observedAt` time (at most five minutes old), `method`, retrievable
+   `evidence`, verification commands and prerequisite evidence. The registry
+   returns `serverTime`: read it immediately before provider I/O to timestamp
+   collection start. Never substitute the PR's last-updated time or relabel old
+   evidence with a fresh time. Omit task/worker
+   IDs only if unambiguous: the tool derives the owned task baseline and its
+   existing coder, otherwise returns choices. It does not create sessions.
+   Preparation defaults to `mode: "observe"`: no repairs, commits, publication,
+   replies, thread resolution, reviewer requests or CI retries. Do not broaden
+   a read-only task. Request `mode: "repair"` only when its existing task authority
+   and publication path are independently verified; supply `publicationEvidence`.
+   Request `replies`, `resolveThreads`, named `reviewers` and `retryChecks`
+   explicitly only within that scope; each defaults off. Inspect the returned
+   `mode` and `proposedActions` and describe them exactly to the operator.
+   `fleet_propose_pr_maintenance` remains available for an explicitly revised
+   advanced scope. Include `expectedVersion` when changing an existing proposal. Identical
    proposals are idempotent; changed scope requires a fresh operator review.
 4. Tell the operator to open the task's **Review PR maintenance proposal** action,
    review its prefilled scope, and select **Authorize maintenance** while signed in.
@@ -87,12 +107,16 @@ legacy `organization.visualstudio.com` URLs to `dev.azure.com`; never reinterpre
 an ADO identity as GitHub. The packaged [ADO contract](ado-contract.md) is runtime
 guidance: a personal `/az-devops-pullrequests` skill is neither required nor authority.
 Its helper uses the Node's existing Azure CLI login without requiring the
-`azure-devops` extension. If credentials/CLI are unavailable, report the prerequisite;
-do not install extensions, sign in, change access, or copy a token.
+`azure-devops` extension. If local credentials/CLI are unavailable, record that
+capability limitation and use only already-authorized alternative tools through
+the recovery checkpoint seam. A provider 401/403 is a separate hard access hold.
+Do not install extensions, sign in, change access, or copy a token.
 
 The grant covers only its agreed local repairs, verification, commits, ordinary
 pushes to the exact PR head ref, appropriate replies/resolutions, and optional
-requests to **named configured external reviewers**. Existing execution approvals
+requests to **named configured external reviewers**. An observation-only grant authorizes none of those mutations;
+observe/checkpoint only and require a new explicit operator grant before repairs.
+Existing execution approvals
 remain effective. Never force-push, automatically rebase/reset, delete user work,
 deploy, change credentials/access, add dependencies/designs, or merge.
 Without a specific reviewer grant, consume external reviews and notify the human
@@ -101,8 +125,10 @@ once: do not choose reviewers or add a blanket review stage.
 Paused registrations keep ownership/retention. After 30 days paused, notify once
 to resume or release; polling does not renew their age and unknown work never
 expires. Portable restore is paused pending authorized reconciliation.
-V1 retains at most one PR registration per task. Release settled maintenance
-before assigning that task to a different PR.
+At most one PR registration is retained per task/worker checkout. Release settled
+maintenance before assigning that task to a different PR. Prior terminal/released
+jobs remain visible as history, not active work. Provider review iterations are
+not maintenance rounds: count only executed, settled maintenance batches.
 
 ## Observe with the packaged read-only helper
 
@@ -144,6 +170,67 @@ Pause after **3 consecutive** or **10 cumulative** failed observations per grant
 success resets only consecutive failures. Allowance exhaustion alone is not an
 observation failure. After **3** scan/reconciliation attempts without new evidence
 or cursor progress, require human attention. Never release unknown work by age.
+
+## Bounded recovery when the helper cannot observe
+
+Helper failure is not a successful observation and not permission to bypass a
+hold. Preserve its exact sanitized error and actual incomplete observation with
+`fleet_checkpoint_pr_maintenance`:
+`checkpoint: {kind: "fallback", error, observation}`. The checkpoint `error` is
+a **string**, not the helper's error object. Map an actual helper result exactly:
+
+```js
+const checkpoint = {
+  kind: "fallback",
+  error: `${result.error.code}: ${result.error.message}`,
+  observation: result.observation,
+};
+```
+
+The original sanitized object is already retained in `observation.helperState.error`.
+After a schema rejection, reuse that original result and timestamp with the corrected
+shape; do not reclaim a visit, rerun the helper, or re-date its evidence.
+This still requires the
+existing claimed visit. Keep the helper's error code, cursor and resume state;
+never store tokens or raw credential-bearing stderr. Ordinary failed observation
+checkpoints also retain a recovery incident. The Host keeps a bounded 20-incident
+history and monotonic cursor, and deduplicates one existing lead wake per unresolved
+capability incident, rather than scheduling a polling loop.
+
+A missing CLI, signed-out **local** CLI or recoverable helper/transport limitation
+may use an already-authorized provider MCP/CLI. A provider 401/403, identity drift,
+Stop, human design hold, unknown execution/effects, or unavailable binding cannot
+be cleared this way. No login, credential transfer, permission escalation or
+replacement worker. If no authorized alternate tool is available, leave an explicit
+blocked checkpoint and ask the operator for the missing prerequisite.
+
+1. On an existing new lead turn, recover the incident and claim its bounded visit.
+   A prior exhausted wake stays exhausted. Preserve all failure and repair budgets.
+   Omit `reserveRequests` to use the recovery default of one (or explicitly use
+   one), leaving remaining capacity for the alternate reservation. This claim
+   does not require running the failed helper again.
+2. Before alternate provider I/O, reserve a stable resolution ID with
+   `checkpoint: {kind: "alternate_attempt", incidentId, resolutionId,
+provenance: {source, method, evidenceRef}, requests}`. `source` identifies the
+   already-authorized tool, `method` its actual read operation, and `evidenceRef`
+   a retrievable source/transcript reference. The allowance is charged before I/O.
+   Use the remaining wake allowance, not a fresh 40-request claim. At most three
+   alternate attempts are allowed per incident across restart/compaction.
+3. Read the provider through that tool, counting requests and pages. Record actual
+   collection start time (the returned reservation's `reservedAt` is a Host clock).
+   Checkpoint `{kind: "alternate_observation", incidentId, resolutionId, observation}`.
+   Preserve exact identity/ref/HEAD pins and evidence freshness. Metadata-only,
+   failed, partial, stale or inconsistent reads are **not** complete snapshots;
+   retain known draft/conflict facts and leave completeness flags false.
+4. Resume from the persisted resolution receipt, never replay an uncertain read
+   or mint a new resolution ID just to reset a cap. An idempotent receipt is not
+   authorization for another provider call. Fresh complete alternate evidence may
+   resolve a capability incident; it never clears a different hold or admits a
+   publication by itself. Ready always requires complete checks **and** reviews.
+
+Re-read the record after every checkpoint. The current stage is projected from
+durable facts, not a model-written progress claim. Draft/conflicts need attention;
+prior success never makes a newer failed/partial attempt current validation.
 
 ## Gate the whole PR, not the number of lines
 
