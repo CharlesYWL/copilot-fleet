@@ -39,21 +39,57 @@ export const PR_MAINTENANCE_WAKE_LIMITS = Object.freeze({
   requests: 40,
   milliseconds: 120_000,
 });
-export const PrMaintenanceIdentitySchema = z
-  .object({
-    host: z
-      .string()
-      .trim()
-      .min(1)
-      .max(253)
-      .transform((value) => value.toLowerCase().replace(/\.$/, ""))
-      .refine(
-        (value) =>
-          value
-            .split(".")
-            .every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)),
-        "Use a GitHub hostname, without a URL or port",
+const hostname = z
+  .string()
+  .trim()
+  .min(1)
+  .max(253)
+  .transform((value) => value.toLowerCase().replace(/\.$/, ""))
+  .refine(
+    (value) =>
+      value
+        .split(".")
+        .every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(label)),
+    "Use a hostname, without a URL or port",
+  );
+const organization = z
+  .string()
+  .regex(/^[a-z\d][a-z\d-]{0,49}$/i)
+  .toLowerCase();
+const guid = z
+  .string()
+  .regex(/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i)
+  .toLowerCase();
+const pathSegment = z
+  .string()
+  .min(1)
+  .max(256)
+  .refine(
+    (value) =>
+      value !== "." &&
+      value !== ".." &&
+      !/[\\/?#]/.test(value) &&
+      [...value].every(
+        (character) => character.charCodeAt(0) > 31 && character.charCodeAt(0) !== 127,
       ),
+    "Use one nonempty project or repository name, not a path",
+  );
+const adoRepository = z
+  .string()
+  .max(512)
+  .refine((value) => {
+    const parts = value.split("/");
+    return (
+      parts.length === 2 && parts.every((part) => pathSegment.safeParse(part).success)
+    );
+  }, "Use the Azure DevOps project/repository display names");
+const githubIdentity = z
+  .object({
+    provider: z.literal("github").optional(),
+    host: hostname.refine(
+      (value) => value !== "dev.azure.com" && !value.endsWith(".visualstudio.com"),
+      "Azure DevOps identities require provider: azure-devops and organization/project IDs",
+    ),
     repositoryId,
     repository,
     prNumber: z.number().int().positive().max(2_147_483_647),
@@ -65,7 +101,153 @@ export const PrMaintenanceIdentitySchema = z
     baseRef: ref,
   })
   .strict();
+const adoIdentity = githubIdentity
+  .extend({
+    provider: z.literal("azure-devops"),
+    host: z.literal("dev.azure.com"),
+    organization,
+    project: pathSegment,
+    projectId: guid,
+    repositoryId: guid,
+    repository: adoRepository,
+    headRepositoryId: guid,
+    headRepository: adoRepository,
+    baseRepositoryId: guid,
+    baseRepository: adoRepository,
+  })
+  .superRefine((value, ctx) => {
+    if (
+      value.repositoryId !== value.baseRepositoryId ||
+      value.repository !== value.baseRepository ||
+      [value.repository, value.headRepository].some(
+        (name) => name.split("/")[0] !== value.project,
+      )
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "Azure DevOps PR/base repository must match; head and base must be in the pinned project",
+      });
+    }
+  });
+export const PrMaintenanceIdentitySchema = z.union([githubIdentity, adoIdentity]);
 export type PrMaintenanceIdentity = z.infer<typeof PrMaintenanceIdentitySchema>;
+
+/** Existing GitHub index keys stay unchanged; ADO IDs are scoped to their organization. */
+export function prMaintenanceProviderKey(identity: PrMaintenanceIdentity): string {
+  return identity.provider === "azure-devops"
+    ? `azure-devops:${identity.host}/${identity.organization}`
+    : identity.host;
+}
+
+export function prMaintenanceProviderLabel(identity: PrMaintenanceIdentity): string {
+  return identity.provider === "azure-devops"
+    ? `Azure DevOps · ${identity.organization} / ${identity.project}`
+    : `GitHub · ${identity.host}`;
+}
+
+export function prMaintenanceUrl(identity: PrMaintenanceIdentity): string {
+  if (identity.provider === "azure-devops") {
+    return `https://dev.azure.com/${encodeURIComponent(identity.organization)}/${encodeURIComponent(identity.project)}/_git/${encodeURIComponent(identity.repository.slice(identity.repository.indexOf("/") + 1))}/pullrequest/${identity.prNumber}`;
+  }
+  return `https://${identity.host}/${identity.repository.split("/").map(encodeURIComponent).join("/")}/pull/${identity.prNumber}`;
+}
+
+export type PrMaintenanceUrl =
+  | {
+      provider: "github";
+      host: string;
+      owner: string;
+      repo: string;
+      number: number;
+      url: string;
+    }
+  | {
+      provider: "azure-devops";
+      host: "dev.azure.com";
+      organization: string;
+      project: string;
+      repo: string;
+      number: number;
+      url: string;
+    };
+
+/** URL discovery is not authorization: GUIDs, refs and HEAD still require provider evidence. */
+export function parsePrMaintenanceUrl(value: string): PrMaintenanceUrl {
+  if (value.length > 4_096 || /[\s\\]/.test(value))
+    throw new Error("Use an encoded PR URL without whitespace or backslashes.");
+  const url = new URL(value);
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.port ||
+    url.search ||
+    url.hash ||
+    value.includes("\\") ||
+    /(?:^|\/)(?:\.|%2e){1,2}(?:\/|$)/i.test(value)
+  )
+    throw new Error(
+      "Use an exact HTTPS PR URL without credentials, query, fragment or port.",
+    );
+  const host = hostname.parse(url.hostname);
+  const parts = url.pathname
+    .replace(/\/$/, "")
+    .split("/")
+    .slice(1)
+    .map((part) => pathSegment.parse(decodeURIComponent(part)));
+  const number = Number(parts.at(-1));
+  if (
+    !/^[1-9]\d*$/.test(parts.at(-1) ?? "") ||
+    !Number.isSafeInteger(number) ||
+    number > 2_147_483_647
+  )
+    throw new Error("Use a positive PR number.");
+  if (host === "dev.azure.com" || host.endsWith(".visualstudio.com")) {
+    const org = organization.parse(
+      host === "dev.azure.com"
+        ? parts.shift()
+        : host.slice(0, -".visualstudio.com".length),
+    );
+    if (host !== "dev.azure.com" && parts[0]?.toLowerCase() === "defaultcollection")
+      parts.shift();
+    if (
+      parts.length !== 5 ||
+      parts[1] !== "_git" ||
+      parts[3]?.toLowerCase() !== "pullrequest"
+    )
+      throw new Error(
+        "Use an Azure DevOps organization/project/_git/repository/pullrequest/ID URL.",
+      );
+    const project = pathSegment.parse(parts[0]);
+    const repo = pathSegment.parse(parts[2]);
+    return {
+      provider: "azure-devops",
+      host: "dev.azure.com",
+      organization: org,
+      project,
+      repo,
+      number,
+      url: `https://dev.azure.com/${org}/${encodeURIComponent(project)}/_git/${encodeURIComponent(repo)}/pullrequest/${number}`,
+    };
+  }
+  if (
+    parts.length !== 4 ||
+    parts[2] !== "pull" ||
+    !parts.slice(0, 2).every((part) => /^[a-z\d_.-]+$/i.test(part))
+  )
+    throw new Error("Use a GitHub owner/repository/pull/ID URL.");
+  const owner = pathSegment.parse(parts[0]).toLowerCase();
+  const repo = pathSegment.parse(parts[1]).toLowerCase();
+  return {
+    provider: "github",
+    host,
+    owner,
+    repo,
+    number,
+    url: `https://${host}/${owner}/${repo}/pull/${number}`,
+  };
+}
 
 export const PrMaintenanceScopeSchema = z
   .object({

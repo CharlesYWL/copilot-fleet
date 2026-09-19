@@ -122,6 +122,26 @@ A known new publication invalidates the pre-push observation for new work and
 readiness. Finding dispositions are scoped to their verified code HEAD; after an
 external commit, unchanged feedback can be revalidated without losing its history.
 
+Azure DevOps and GitHub share this lifecycle. Schema-v1 GitHub identities/backups
+remain readable; ADO adds a provider discriminator, canonical `dev.azure.com`
+organization, project GUID and repository GUIDs. Ownership keys include the ADO
+organization, so equally named projects/PRs in another organization cannot collide.
+Full branch refs remain case-sensitive. Same-project forks are supported when
+their identity can be pinned; unsupported topology requires human handling.
+The packaged `snapshot.mjs` routes canonical/legacy PR URLs without manual JSON
+translation. Azure CLI authentication is Node-local and distinct from Host sign-in;
+no personal skill, automatic login, extension installation or credential transfer.
+Unknown/incomplete policy evaluations and raw positive reviewer votes cannot prove
+ADO readiness. The [ADO contract](../apps/node/skills/pr-maintenance/ado-contract.md)
+describes bounded reads and supported evidence. Ready never completes a PR or sets
+auto-complete. The original diagrams' GitHub labels represent either provider;
+the authorization/repair flow has not changed.
+Readiness always requires both check-policy and review-policy completeness,
+including when some visible checks/reviews already pass. Complete collection
+with unknown policy approval may still support bounded local feedback triage;
+it cannot certify ready. Retrieval, identity or consistency failures cannot
+be treated as complete collection.
+
 The authenticated task action surface is
 `GET/POST /api/runs/:id/pr-maintenance`. Enablement names the exact PR, stable
 head/base repository IDs and full refs, owned worker, baseline, verification,

@@ -989,7 +989,14 @@ describe("packaged maintenance resources", () => {
     const prompt = withMaintenanceResources("wake", [
       { name: "fleet", url: "http://localhost/mcp", headers: [] },
     ]);
-    for (const name of ["SKILL.md", "helper-contract.md", "github-snapshot.mjs"]) {
+    for (const name of [
+      "SKILL.md",
+      "helper-contract.md",
+      "snapshot.mjs",
+      "ado-snapshot.mjs",
+      "ado-contract.md",
+      "github-snapshot.mjs",
+    ]) {
       expect(prompt).toContain(JSON.stringify(join(assets, name)));
       expect(readFileSync(join(assets, name), "utf8").length).toBeGreaterThan(100);
     }

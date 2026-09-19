@@ -39,6 +39,20 @@ const identity = {
   baseRepository: "Example/Main",
   baseRef: "refs/heads/main",
 };
+const adoIdentity = {
+  ...identity,
+  provider: "azure-devops" as const,
+  host: "dev.azure.com" as const,
+  organization: "sample-org",
+  project: "Sample Project",
+  projectId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  repositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+  repository: "Sample Project/Repo",
+  headRepositoryId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+  headRepository: "Sample Project/Fork",
+  baseRepositoryId: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+  baseRepository: "Sample Project/Repo",
+};
 
 afterEach(() => {
   for (const store of stores.splice(0)) store.close();
@@ -206,6 +220,8 @@ function publishedRepair(f: ReturnType<typeof setup>) {
       f,
       observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator"), {
         mergeability: "mergeable",
+        checksComplete: true,
+        reviewsComplete: true,
         checks: [{ key: "unit", state: "passed", headSha: sha, evidence: "ci:A passed" }],
         reviews: [
           {
@@ -237,6 +253,257 @@ function publishedRepair(f: ReturnType<typeof setup>) {
 }
 
 describe("durable PR maintenance registry", () => {
+  it("authorizes and restores ADO proposals and records alongside legacy GitHub without minting authority", () => {
+    const f = setup();
+    const github = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const ado = setup(f.store);
+    ado.input.identity = adoIdentity;
+    const pending = f.store.prMaintenance.propose(ado.lead.id, ado.input);
+    const pendingRestore = storeAt();
+    pendingRestore.replaceHostBackup(f.store.exportHostBackup({ enrollmentToken: "" }));
+    expect(pendingRestore.prMaintenance.getProposal(ado.task.id)).toEqual(pending);
+    expect(pendingRestore.prMaintenance.get(github.id)?.identity).toEqual(
+      github.identity,
+    );
+    expect(pendingRestore.prMaintenance.list().records).toHaveLength(1);
+    const record = f.store.prMaintenance.authorizeProposal(
+      ado.task.id,
+      pending.id,
+      pending.version,
+      "operator",
+    );
+    expect(record.identity).toEqual(adoIdentity);
+    expect(record.authorization.operatorId).toBe("operator");
+    const restored = storeAt();
+    restored.replaceHostBackup(f.store.exportHostBackup({ enrollmentToken: "" }));
+    expect(restored.prMaintenance.get(record.id)).toMatchObject({
+      identity: adoIdentity,
+      lifecycle: "paused",
+      generation: 1,
+    });
+    expect(restored.prMaintenance.list().records).toHaveLength(2);
+  });
+
+  it("scopes ADO PR and head-ref ownership by organization while preserving retained-ref protection", () => {
+    const f = setup();
+    f.input.identity = adoIdentity;
+    f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const duplicate = setup(f.store);
+    duplicate.input.identity = adoIdentity;
+    expect(() =>
+      f.store.prMaintenance.enableFromOperator(duplicate.input, "operator"),
+    ).toThrow(/owns this PR/);
+    duplicate.input.identity = { ...adoIdentity, prNumber: 2 };
+    expect(() =>
+      f.store.prMaintenance.enableFromOperator(duplicate.input, "operator"),
+    ).toThrow(/already reserved/);
+    duplicate.input.identity = { ...adoIdentity, organization: "other-org" };
+    expect(
+      f.store.prMaintenance.enableFromOperator(duplicate.input, "operator").generation,
+    ).toBe(1);
+    const github = setup(f.store);
+    github.input.identity = { ...identity, repositoryId: adoIdentity.repositoryId };
+    expect(
+      f.store.prMaintenance.enableFromOperator(github.input, "operator").generation,
+    ).toBe(1);
+  });
+
+  it("treats explicit GitHub as legacy GitHub and pauses an ADO identity change", () => {
+    const f = setup();
+    let record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    expect(
+      f.store.prMaintenance.enableFromOperator(
+        {
+          ...f.input,
+          identity: { ...f.input.identity, provider: "github" },
+        },
+        "operator",
+      ).id,
+    ).toBe(record.id);
+    record = observe(f, record, { identity: { ...record.identity, provider: "github" } });
+    expect(record.lifecycle).toBe("active");
+    const ado = setup(f.store);
+    ado.input.identity = adoIdentity;
+    const registered = f.store.prMaintenance.enableFromOperator(ado.input, "operator");
+    expect(
+      observe(ado, registered, {
+        identity: { ...adoIdentity, organization: "other-org" },
+      }).pauseReason,
+    ).toBe("remote_identity_changed");
+  });
+
+  it.each(["merged", "closed"] as const)(
+    "settles verified ADO %s without reopening old work",
+    (state) => {
+      const f = setup();
+      f.input.identity = adoIdentity;
+      const record = observe(
+        f,
+        f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+        { state },
+      );
+      expect(record.lifecycle).toBe(state);
+      expect(record.ownershipReleasedAt).toBeDefined();
+    },
+  );
+
+  it("requires complete ADO policy evidence before ready, retaining the existing whole-PR human gate", () => {
+    const f = setup();
+    f.input.identity = adoIdentity;
+    let record = observe(
+      f,
+      f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+      {
+        sources: [],
+        checksComplete: false,
+        reviewsComplete: true,
+        mergeability: "mergeable",
+      },
+    );
+    const ready = {
+      kind: "ready" as const,
+      fingerprint: "fingerprint-1",
+      evidence: "Policy evidence checked.",
+    };
+    expect(() =>
+      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, ready),
+    ).toThrow(/Readiness requires/);
+    record = observe(f, record, {
+      sources: [],
+      checksComplete: true,
+      reviewsComplete: true,
+      mergeability: "mergeable",
+    });
+    record = f.store.prMaintenance.checkpoint(
+      f.lead.id,
+      record.id,
+      record.version,
+      ready,
+    );
+    expect(record.readyFingerprint).toBe("fingerprint-1");
+    record = f.store.prMaintenance.holdForDecision(
+      f.lead.id,
+      record.id,
+      record.version,
+      {
+        id: "design",
+        version: 1,
+        proposal: "Change the API?",
+        headSha: sha,
+        scope: "Contract change",
+      },
+      () => {
+        f.store.advanceRunToReview(f.task.id);
+      },
+    );
+    expect(record.decision?.state).toBe("pending");
+    expect(() =>
+      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, ready),
+    ).toThrow();
+  });
+
+  it("admits bounded ADO feedback repair with unknown policy readiness, never incomplete collection", () => {
+    const f = setup();
+    f.input.identity = adoIdentity;
+    let record = observe(
+      f,
+      f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+      {
+        checksComplete: false,
+        reviewsComplete: false,
+        checks: [
+          {
+            key: "build-policy",
+            state: "unknown",
+            headSha: sha,
+            evidence: "Build approval is not current-HEAD proof.",
+          },
+        ],
+        reviews: [
+          {
+            key: "review-policy",
+            state: "required",
+            headSha: sha,
+            reviewer: "policy",
+            revision: "v1",
+            evidence: "Reviewer votes are not current-HEAD proof.",
+          },
+        ],
+      },
+    );
+    expect(() =>
+      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "ready",
+        fingerprint: "fingerprint-1",
+        evidence: "Policy unknown.",
+      }),
+    ).toThrow(/Readiness requires/);
+    record = prepare(f, record);
+    expect(record.batches[0]).toMatchObject({ state: "prepared", sources: [source] });
+    record = observe(f, record, {
+      complete: false,
+      failure: "incomplete",
+      evidence: "Second-pass feedback changed.",
+    });
+    expect(
+      f.store.prMaintenance.admission({
+        action: "dispatch",
+        taskId: f.task.id,
+        sessionId: f.worker.id,
+        recordId: record.id,
+        generation: record.generation,
+        batchId: record.batches[0]!.id,
+        leadSessionId: f.lead.id,
+      }),
+    ).toMatchObject({ allowed: false, reason: "observation_incomplete" });
+  });
+
+  it.each(["checksComplete", "reviewsComplete"] as const)(
+    "never lets passing nonempty obligations override %s=false for either provider",
+    (flag) => {
+      for (const providerIdentity of [identity, adoIdentity]) {
+        const f = setup();
+        f.input.identity = providerIdentity;
+        const record = observe(
+          f,
+          f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+          {
+            sources: [],
+            mergeability: "mergeable",
+            checksComplete: true,
+            reviewsComplete: true,
+            [flag]: false,
+            checks: [
+              {
+                key: "visible-check",
+                state: "passed",
+                headSha: sha,
+                evidence: "Visible check passed; other requirements unproven.",
+              },
+            ],
+            reviews: [
+              {
+                key: "visible-review",
+                state: "approved",
+                headSha: sha,
+                reviewer: "reviewer",
+                revision: "v1",
+                evidence: "Visible review approved; other requirements unproven.",
+              },
+            ],
+          },
+        );
+        expect(() =>
+          f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+            kind: "ready",
+            fingerprint: "fingerprint-1",
+            evidence: "Partial policy evidence.",
+          }),
+        ).toThrow(/Readiness requires/);
+      }
+    },
+  );
+
   it("preserves pending proposals in backups without restoring authorization", () => {
     const f = setup();
     const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
@@ -304,6 +571,8 @@ describe("durable PR maintenance registry", () => {
       headSha: otherSha,
       fingerprint: "head-B",
       mergeability: "mergeable",
+      checksComplete: true,
+      reviewsComplete: true,
       checks: [
         { key: "unit", state: "passed", headSha: otherSha, evidence: "ci:B passed" },
       ],
@@ -341,6 +610,8 @@ describe("durable PR maintenance registry", () => {
       headSha: externalHead,
       fingerprint: "external-C",
       mergeability: "mergeable",
+      checksComplete: true,
+      reviewsComplete: true,
       checks: [
         { key: "unit", state: "passed", headSha: externalHead, evidence: "ci:C passed" },
       ],
@@ -374,6 +645,8 @@ describe("durable PR maintenance registry", () => {
       headSha: externalHead,
       fingerprint: "head-C",
       mergeability: "mergeable",
+      checksComplete: true,
+      reviewsComplete: true,
       checks: [
         { key: "unit", state: "passed", headSha: externalHead, evidence: "ci:C passed" },
       ],
@@ -1558,6 +1831,8 @@ describe("durable PR maintenance registry", () => {
       {
         sources: [],
         mergeability: "mergeable",
+        checksComplete: true,
+        reviewsComplete: true,
         checks: [{ key: "unit", state: "passed", headSha: sha, evidence: "ci:passed" }],
         reviews: [
           {
@@ -1582,6 +1857,8 @@ describe("durable PR maintenance registry", () => {
     record = observe(f, record, {
       sources: [],
       mergeability: "mergeable",
+      checksComplete: true,
+      reviewsComplete: true,
       checks: [{ key: "unit", state: "passed", headSha: sha, evidence: "ci:passed" }],
       reviews: [
         {

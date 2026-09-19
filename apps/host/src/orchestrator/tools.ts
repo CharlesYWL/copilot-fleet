@@ -7,6 +7,8 @@ import {
   AccessIntentSchema,
   PrMaintenanceCheckpointSchema,
   PrMaintenanceEnableSchema,
+  prMaintenanceProviderLabel,
+  prMaintenanceUrl,
   type PrMaintenanceAdmission,
   checkoutLockKey,
   type WorkspaceMode,
@@ -1870,6 +1872,8 @@ export class FleetTools {
           ...(proposal?.leadSessionId === this.leadSessionId
             ? [
                 proposal.registration.identity.repository,
+                prMaintenanceProviderLabel(proposal.registration.identity),
+                prMaintenanceUrl(proposal.registration.identity),
                 String(proposal.registration.identity.prNumber),
               ]
             : []),
@@ -1998,7 +2002,7 @@ export class FleetTools {
       `  budget: ${steps.length}/${run.policy.maxSessions} sessions, ${run.wakeSeq}/${run.policy.maxWakes} wakes`,
       ...(proposal?.leadSessionId === this.leadSessionId
         ? [
-            `  PR maintenance proposal: ${proposal.id} v${proposal.version} for ${proposal.registration.identity.repository} #${proposal.registration.identity.prNumber} - awaiting operator authorization, not enabled. Read fleet_get_pr_maintenance with taskId: "${run.id}".`,
+            `  PR maintenance proposal: ${proposal.id} v${proposal.version} for ${prMaintenanceProviderLabel(proposal.registration.identity)} ${proposal.registration.identity.repository} #${proposal.registration.identity.prNumber} (${prMaintenanceUrl(proposal.registration.identity)}) - awaiting operator authorization, not enabled. Read fleet_get_pr_maintenance with taskId: "${run.id}".`,
           ]
         : []),
       ...maintenance.records.map(

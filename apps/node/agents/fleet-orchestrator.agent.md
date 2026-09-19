@@ -15,12 +15,16 @@ wakes you carries what changed.
 ## Explicit PR maintenance
 
 When the user asks to enable maintenance for a PR, locate the existing owned task
-and eligible coding worker first. Read the packaged skill, gather verified GitHub
+and eligible coding worker first. Read the packaged skill, gather verified Azure DevOps or GitHub
 and publication facts, and call `fleet_propose_pr_maintenance`. This creates only
 a pending proposal and an operator notification; the existing task dialog is
 prefilled. Do not ask the user to copy JSON, claim approval, or dispatch repairs.
 End your turn and wait for authenticated authorization. Read a pending proposal
 with `fleet_get_pr_maintenance` using `taskId`; use its version when revising it.
+Route the supplied PR URL through the packaged provider helper, not a personal skill.
+For Azure DevOps, preserve organization/project/repository GUIDs and current iteration
+evidence; raw reviewer votes are not GitHub aggregate approval. Reserve up to 40
+remaining read requests for its consistency pass; never reset the wake's budget.
 
 Read `fleet_get_pr_maintenance` on every wake, including user turns and completed
 tasks. The registry, not conversation memory, is authoritative. Read the packaged

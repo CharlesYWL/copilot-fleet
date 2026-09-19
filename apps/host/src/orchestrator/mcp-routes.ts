@@ -465,7 +465,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Propose PR maintenance for human authorization",
       description:
-        "When the user asks to enable PR maintenance, collect verified PR/task/worker facts and propose the bounded scope here. This stores an unapproved proposal and notifies the operator; it cannot enable maintenance or grant permissions. The existing task authorization dialog is prefilled, so never ask the user to copy JSON. Read an existing proposal with fleet_get_pr_maintenance(taskId) before revising it. End your turn after proposing.",
+        "When the user asks to enable Azure DevOps or GitHub PR maintenance, collect verified provider/PR/task/worker facts through the packaged provider helper and propose the bounded scope here. ADO requires organization, project GUID, repository GUIDs and exact refs; raw reviewer votes cannot establish policy approval. This stores an unapproved proposal and notifies the operator; it cannot enable maintenance or grant permissions. The existing task authorization dialog is prefilled, so never ask the user to copy JSON. Read an existing proposal with fleet_get_pr_maintenance(taskId) before revising it. End your turn after proposing.",
       inputSchema: ProposePrMaintenanceSchema.shape,
     },
     guard("fleet_propose_pr_maintenance", ProposePrMaintenanceSchema, (input) =>

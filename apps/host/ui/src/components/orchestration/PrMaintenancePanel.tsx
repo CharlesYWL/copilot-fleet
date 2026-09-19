@@ -15,6 +15,8 @@ import {
 } from "@fluentui/react-components";
 import {
   PrMaintenanceEnableSchema,
+  prMaintenanceProviderLabel,
+  prMaintenanceUrl,
   type FleetSession,
   type PrMaintenanceRegistration,
   type PrMaintenanceProposal,
@@ -168,7 +170,11 @@ export function PrMaintenancePanel({
             sessions.find((entry) => entry.runId === run.id && entry.runRole === "worker")
               ?.id ?? "",
           identity: {
-            host: "github.com",
+            provider: "azure-devops",
+            host: "dev.azure.com",
+            organization: "",
+            project: "",
+            projectId: "",
             repositoryId: "",
             repository: "",
             prNumber: 0,
@@ -204,8 +210,9 @@ export function PrMaintenancePanel({
     <section className={styles.panel} aria-label="PR maintenance">
       <h2>PR maintenance</h2>
       <p>
-        Opt-in local repairs on the retained worker. Design choices need human direction.
-        Ready is not merged; maintenance never merges or force-pushes.
+        Azure DevOps and GitHub PRs: opt-in local repairs on the retained worker. Design
+        choices need human direction. Ready is not merged; maintenance never merges or
+        force-pushes.
       </p>
       {error ? (
         <p role="alert" className={styles.error}>
@@ -223,6 +230,7 @@ export function PrMaintenancePanel({
       {view?.proposal ? (
         <p role="status">
           The Orchestrator proposed maintenance for{" "}
+          {prMaintenanceProviderLabel(view.proposal.registration.identity)} ·{" "}
           {view.proposal.registration.identity.repository} #
           {view.proposal.registration.identity.prNumber}. It is not enabled. Review and
           authorize the proposal below; ordinary task approval does not enable
@@ -248,11 +256,7 @@ export function PrMaintenancePanel({
         return (
           <div key={record.id}>
             <h3>
-              <a
-                href={`https://${identity.host}/${identity.repository}/pull/${identity.prNumber}`}
-                target="_blank"
-                rel="noreferrer"
-              >
+              <a href={prMaintenanceUrl(identity)} target="_blank" rel="noreferrer">
                 {identity.repository} #{identity.prNumber}
               </a>
             </h3>
@@ -330,7 +334,11 @@ export function PrMaintenancePanel({
                 </dd>
                 <dt>Provider</dt>
                 <dd>
-                  {identity.host} · repository ID {identity.repositoryId}
+                  {prMaintenanceProviderLabel(identity)} · repository ID{" "}
+                  {identity.repositoryId}
+                  {identity.provider === "azure-devops"
+                    ? ` · project ID ${identity.projectId}`
+                    : ""}
                 </dd>
                 <dt>Head</dt>
                 <dd>
@@ -480,7 +488,7 @@ export function PrMaintenancePanel({
               ) : (
                 <Field
                   label="Registration proposal"
-                  hint="Paste the Orchestrator's proposal backed by current helper, credential and publication evidence. The task baseline is seeded below; unknown prerequisites cannot enable maintenance."
+                  hint="Prefer asking the Orchestrator to prepare an Azure DevOps or GitHub PR proposal from its URL: the Review action needs no JSON. This advanced input requires current helper, credential and publication evidence; unknown prerequisites cannot enable maintenance."
                 >
                   <Textarea
                     value={proposal}
@@ -497,8 +505,14 @@ export function PrMaintenancePanel({
               {candidate ? (
                 <>
                   <p>
-                    {candidate.identity.host} · {candidate.identity.repository} #
-                    {candidate.identity.prNumber}
+                    {prMaintenanceProviderLabel(candidate.identity)} ·{" "}
+                    <a
+                      href={prMaintenanceUrl(candidate.identity)}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {candidate.identity.repository} #{candidate.identity.prNumber}
+                    </a>
                   </p>
                   <p>
                     Worker: {candidateWorker?.name || candidate.workerSessionId} ·{" "}
@@ -519,6 +533,9 @@ export function PrMaintenancePanel({
                     Stable repository IDs: PR {candidate.identity.repositoryId}; head{" "}
                     {candidate.identity.headRepositoryId}; base{" "}
                     {candidate.identity.baseRepositoryId}. HEAD {candidate.headSha}.
+                    {candidate.identity.provider === "azure-devops"
+                      ? ` Project ID ${candidate.identity.projectId}.`
+                      : ""}
                   </p>
                   <p>Baseline: {candidate.scope.baseline}</p>
                   <p>Verify: {candidate.scope.verification}</p>

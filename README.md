@@ -1822,19 +1822,31 @@ state stay together.
 Task detail includes **PR maintenance** for an existing Orchestrator-owned worker.
 V1 supports one retained PR registration per task; release settled maintenance
 before registering another PR for that task.
-You can ask the Orchestrator to enable maintenance for a PR. It uses
+You can ask the Orchestrator to enable maintenance for an **Azure DevOps or GitHub**
+PR by pasting its URL (including legacy `organization.visualstudio.com` links). It uses
 `fleet_propose_pr_maintenance` to store an unapproved proposal and notify you.
 Open **Review PR maintenance proposal** in the task panel, inspect the prefilled
 scope, and select **Authorize maintenance** while signed in. No JSON copy/paste
 is needed; the agent cannot authorize itself. Checks then use the existing wake
 loop, and a normal chat message can request an immediate first check.
 
-Use **Enable PR maintenance** to review the proposed exact GitHub PR, stable
+Use **Review PR maintenance proposal** to review the proposed exact provider/PR, stable
 repository identities, head/base refs, retained worker and checkout, task/design
 baseline, verification, and helper/credential/publication evidence. Confirmation
 is an authenticated browser action, not an MCP approval or a review comment.
 Unknown prerequisites and unsupported bindings cannot be enabled. Sign-in is
 required for these authorization controls, including on a no-login Host.
+
+Azure DevOps is a first-class provider: the same panel, registry, worker, approvals
+and wake budgets retain organization/project/repository GUIDs and exact refs.
+The Node packages its own provider router and ADO guidance; no personal skill or
+Azure DevOps CLI extension is required. ADO reads need `az` already authenticated
+on that Node; GitHub continues to use authenticated `gh`. Helpers never install,
+log in, persist tokens or mutate a PR. Unavailable credentials are an explicit
+blocker, not an automatic login flow. ADO policy/iteration evidence is evaluated
+separately from reviewer votes; missing, stale or unsupported evidence cannot be
+called ready. See the [ADO helper contract](apps/node/skills/pr-maintenance/ado-contract.md)
+for its supported policy evidence and conservative limits.
 
 Fleet stores registrations, checkpoints, decisions, budgets and unsettled effects
 in its Host database. The existing lead reads them on ordinary wakes and idle
@@ -1843,9 +1855,9 @@ reminders; this is best-effort observation, not a separate observer or an exact
 nonterminal: this release never merges, force-pushes, automatically rebases, or
 starts extra reviewer sessions.
 
-![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read GitHub through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)
+![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read provider evidence through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)
 
-_The normal repair loop reuses the original worker and reconciles outcomes on existing lead wakes._
+_The normal repair loop reuses the original worker and reconciles outcomes on existing lead wakes. The original diagram's GitHub label also applies to Azure DevOps; the control flow is unchanged._
 
 **Pause**, **Resume**, and **Release** operate on the displayed record version;
 stale actions fail and require a fresh review. Design uncertainty pauses the

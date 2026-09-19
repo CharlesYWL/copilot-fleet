@@ -12,7 +12,11 @@ import type {
   RunStep,
   SessionState,
 } from "@fleet/protocol";
-import { terminalCommandExecutionStates } from "@fleet/protocol";
+import {
+  prMaintenanceProviderLabel,
+  prMaintenanceUrl,
+  terminalCommandExecutionStates,
+} from "@fleet/protocol";
 import type {
   FleetStore,
   InsertNotificationResult,
@@ -541,10 +545,10 @@ export class NotificationService {
       subject: {
         type: "run",
         id: record.taskId,
-        label: `PR #${record.identity.prNumber}`,
+        label: `${prMaintenanceProviderLabel(record.identity)} PR #${record.identity.prNumber}`,
       },
       navigation: { type: "run", runId: record.taskId },
-      data: { recordId: record.id, reason },
+      data: { recordId: record.id, reason, prUrl: prMaintenanceUrl(record.identity) },
     });
   }
 
@@ -556,7 +560,7 @@ export class NotificationService {
       kind: "pr_maintenance_attention",
       severity: "info",
       title: "PR maintenance needs your authorization",
-      body: `Review the proposed maintenance for ${identity.repository} #${identity.prNumber}. Nothing is enabled until you authorize its exact scope.`,
+      body: `Review the proposed maintenance for ${prMaintenanceProviderLabel(identity)} ${identity.repository} #${identity.prNumber}. Nothing is enabled until you authorize its exact scope.`,
       subject: {
         type: "run",
         id: taskId,
@@ -567,6 +571,7 @@ export class NotificationService {
         proposalId: proposal.id,
         proposalVersion: proposal.version,
         reason: "authorization",
+        prUrl: prMaintenanceUrl(identity),
       },
     });
   }

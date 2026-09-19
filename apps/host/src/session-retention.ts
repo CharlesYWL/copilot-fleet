@@ -3,6 +3,7 @@ import {
   DEFAULT_SESSION_RETENTION_DAYS,
   SESSION_RETENTION_CAPABILITY,
   SessionRetentionDaysSchema,
+  prMaintenanceProviderLabel,
   sessionRetentionCutoff,
   terminalSessionStates,
   type FleetSession,
@@ -79,7 +80,7 @@ export class SessionRetention {
           severity: "warning",
           title: "Resume or release PR maintenance",
           body:
-            `${record.identity.repository}#${record.identity.prNumber} has been paused for 30 days. ` +
+            `${prMaintenanceProviderLabel(record.identity)} ${record.identity.repository}#${record.identity.prNumber} has been paused for 30 days. ` +
             "Continuity is still retained. Resume with authorization, or release after all accepted work and effects settle.",
           subject: { type: "run", id: record.taskId, label: "PR maintenance" },
           navigation: { type: "run", runId: record.taskId },
