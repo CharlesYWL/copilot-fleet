@@ -259,12 +259,32 @@ export const PrMaintenanceScopeSchema = z
     baseline: text,
     verification: text,
     publicationAuthorized: z.boolean().default(false),
-    replies: z.boolean().default(true),
-    resolveThreads: z.boolean().default(true),
+    replies: z.boolean().optional(),
+    resolveThreads: z.boolean().optional(),
     reviewers: z.array(id).max(20).default([]),
     retryChecks: z.boolean().default(false),
   })
-  .strict();
+  .strict()
+  .transform((scope) => ({
+    ...scope,
+    replies: scope.replies ?? scope.publicationAuthorized,
+    resolveThreads: scope.resolveThreads ?? scope.publicationAuthorized,
+  }))
+  .superRefine((scope, ctx) => {
+    if (
+      !scope.publicationAuthorized &&
+      (scope.replies ||
+        scope.resolveThreads ||
+        scope.reviewers.length ||
+        scope.retryChecks)
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["publicationAuthorized"],
+        message:
+          "Read-only maintenance cannot authorize replies, thread resolution, reviewer requests or CI retries.",
+      });
+  });
 export type PrMaintenanceScope = z.infer<typeof PrMaintenanceScopeSchema>;
 
 export const PrMaintenanceBudgetsSchema = z

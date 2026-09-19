@@ -1005,6 +1005,12 @@ describe("durable PR maintenance registry", () => {
         },
       });
       expect(proposal.registration.scope.publicationAuthorized).toBe(false);
+      expect(proposal.registration.scope).toMatchObject({
+        replies: false,
+        resolveThreads: false,
+        reviewers: [],
+        retryChecks: false,
+      });
       let record = f.store.prMaintenance.authorizeProposal(
         f.task.id,
         proposal.id,
@@ -1117,6 +1123,66 @@ describe("durable PR maintenance registry", () => {
       expect(() => prepare(f, record)).toThrow(/Read-only maintenance/);
     },
   );
+
+  it("cannot disguise a provider mutation as an internal notification under a read-only grant", () => {
+    const f = setup();
+    const record = observe(
+      f,
+      f.store.prMaintenance.enableFromOperator(
+        {
+          ...f.input,
+          scope: {
+            baseline: "Observation only.",
+            verification: "Read evidence.",
+            publicationAuthorized: false,
+          },
+        },
+        "operator",
+      ),
+    );
+    expect(() =>
+      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "action",
+        effect: {
+          key: "notification-shaped-reply",
+          kind: "notification",
+          state: "reserved",
+          headSha: sha,
+          actor: "host",
+          actionIdentity: "Post a comment on the provider",
+        },
+      }),
+    ).toThrow(/Read-only maintenance/);
+    expect(f.store.prMaintenance.get(record.id)?.actions).toEqual([]);
+    expect(f.store.prMaintenance.get(record.id)?.counters.mutationAttempts).toBe(0);
+    expect(() => prepare(f, record)).toThrow(/Read-only maintenance/);
+  });
+
+  it.each([
+    { replies: true },
+    { resolveThreads: true },
+    { reviewers: ["reviewer"] },
+    { retryChecks: true },
+  ])("rejects a read-only proposal or grant with provider flags %j", (flags) => {
+    const f = setup();
+    const input = {
+      ...f.input,
+      scope: {
+        baseline: "Observation only.",
+        verification: "Read evidence.",
+        publicationAuthorized: false,
+        ...flags,
+      },
+    };
+    expect(() => f.store.prMaintenance.propose(f.lead.id, input)).toThrow(
+      /Read-only maintenance/,
+    );
+    expect(() => f.store.prMaintenance.enableFromOperator(input, "operator")).toThrow(
+      /Read-only maintenance/,
+    );
+    expect(f.store.prMaintenance.getProposal(f.task.id)).toBeUndefined();
+    expect(f.store.prMaintenance.list().records).toEqual([]);
+  });
 
   it("authorizes and restores ADO proposals and records alongside legacy GitHub without minting authority", () => {
     const f = setup();

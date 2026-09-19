@@ -387,16 +387,46 @@ describe("PR maintenance wire schemas", () => {
 
   it("defaults new scope to read-only while retaining explicit publication grants", () => {
     const scope = { baseline: "Observe only.", verification: "Read existing evidence." };
-    expect(PrMaintenanceScopeSchema.parse(scope).publicationAuthorized).toBe(false);
+    const readOnly = {
+      publicationAuthorized: false,
+      replies: false,
+      resolveThreads: false,
+      reviewers: [],
+      retryChecks: false,
+    };
+    expect(PrMaintenanceScopeSchema.parse(scope)).toMatchObject(readOnly);
     expect(
-      PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: false })
-        .publicationAuthorized,
-    ).toBe(false);
+      PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: false }),
+    ).toMatchObject(readOnly);
     expect(
-      PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: true })
-        .publicationAuthorized,
-    ).toBe(true);
+      PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: true }),
+    ).toMatchObject({ publicationAuthorized: true, replies: true, resolveThreads: true });
   });
+
+  it.each([
+    { replies: true },
+    { resolveThreads: true },
+    { reviewers: ["reviewer"] },
+    { retryChecks: true },
+  ])(
+    "rejects provider mutation flags %j without an explicit publication grant",
+    (flags) => {
+      const scope = {
+        baseline: "Observe only.",
+        verification: "Read provider evidence.",
+        ...flags,
+      };
+      expect(PrMaintenanceScopeSchema.safeParse(scope).success).toBe(false);
+      expect(
+        PrMaintenanceScopeSchema.safeParse({ ...scope, publicationAuthorized: false })
+          .success,
+      ).toBe(false);
+      expect(
+        PrMaintenanceScopeSchema.safeParse({ ...scope, publicationAuthorized: true })
+          .success,
+      ).toBe(true);
+    },
+  );
 
   it("cannot turn untrusted checkpoint content into authority or broaden the grant", () => {
     expect(
