@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { once } from "node:events";
 import process from "node:process";
@@ -111,6 +111,11 @@ async function localFleet(capable = true) {
     nodeId: () => nodeId,
     locks: new CheckoutLocks(join(root, "locks")),
     quiesce: (id, target) => router.quiesceWorktree(id, target),
+    uploadArtifact: async (result) => ({
+      ...result,
+      state: "available",
+      verifiedAt: new Date().toISOString(),
+    }),
   });
   const factory = {
     async start(id, cwd, sink, options = {}) {
@@ -151,6 +156,11 @@ async function localFleet(capable = true) {
               await writeFile(join(cwd, "same.txt"), `${text}\n`);
               await git.run(cwd, ["commit", "-am", text]);
               active -= 1;
+            } else if (text.startsWith("crash-")) {
+              entered.add(cwd);
+              await writeFile(join(cwd, "same.txt"), `${text}\n`);
+              await writeFile(join(cwd, "unfinished-source.ts"), "export {};\n");
+              throw new Error("Simulated worker crash");
             } else {
               expect(await readFile(join(cwd, "same.txt"), "utf8")).toContain(
                 "implement-",
@@ -312,7 +322,7 @@ async function localFleet(capable = true) {
 
 describe(
   "managed orchestration local HTTP/WebSocket/Git smoke",
-  { timeout: 120_000 },
+  { timeout: 180_000 },
   () => {
     it("quiesces the managed Node slot after automatic integration completes", async () => {
       const fleet = await localFleet();
@@ -490,6 +500,70 @@ describe(
         (await git.run(fleet.source, ["ls-remote", "--heads", "origin"])).stdout,
       ).toContain(a.workspaceBinding.integrationTargetRef.replace("refs/heads/", ""));
       expect(fleet.failures).toEqual([]);
+    });
+
+    it("preserves unfinished tracked and untracked work after a worker crash, then removes the checkout", async () => {
+      const fleet = await localFleet();
+      const run = (await fleet.create("crash recovery", "managed")).body;
+      expect(
+        (
+          await fleet.request(`/api/runs/${run.id}/plan`, "POST", {
+            steps: [
+              {
+                stepKey: "implement",
+                title: "crash-implementation",
+                prompt: "crash-implementation",
+                category: "implement",
+              },
+            ],
+          })
+        ).status,
+      ).toBe(200);
+      expect(
+        (await fleet.request(`/api/runs/${run.id}/approve`, "POST", {})).status,
+      ).toBe(200);
+      await expect.poll(() => fleet.entered.size, { timeout: 30_000 }).toBe(1);
+      await expect
+        .poll(
+          async () => (await fleet.request(`/api/runs/${run.id}`)).body.steps[0]?.state,
+          { timeout: 30_000 },
+        )
+        .toBe("failed");
+      await expect
+        .poll(
+          async () => {
+            const current = (await fleet.request(`/api/runs/${run.id}`)).body.run;
+            return `${current.state}:${current.workspaceBinding.aggregationState}`;
+          },
+          { timeout: 120_000 },
+        )
+        .toBe("failed:completed");
+
+      const store = new FleetStore(join(fleet.root, "host.db"));
+      try {
+        const results = store.listWorkspaceResults(run.id);
+        expect(results).toHaveLength(1);
+        expect(results[0]).toMatchObject({
+          purpose: "recovery",
+          state: "available",
+          checkpointCreated: true,
+          includedFiles: expect.arrayContaining(["same.txt", "unfinished-source.ts"]),
+        });
+        const worktrees = [
+          ...store.listManagedWorktrees(),
+          ...store.listDerivedWorkspaces(),
+        ].filter((entry) => entry.runId === run.id);
+        expect(worktrees.length).toBeGreaterThan(0);
+        expect(worktrees.every((entry) => entry.state === "removed")).toBe(true);
+        for (const tree of worktrees) {
+          await expect(access(tree.path)).rejects.toThrow();
+          if (tree.checkout)
+            expect(fleet.manager.locks.holder(tree.checkout.key)).toBeUndefined();
+        }
+        expect(await readFile(join(fleet.source, "same.txt"), "utf8")).toBe("base\n");
+      } finally {
+        store.close();
+      }
     });
 
     it("keeps explicit managed tasks blocked on old Nodes and persists idempotent mode creation/settings", async () => {

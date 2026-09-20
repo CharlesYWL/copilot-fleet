@@ -214,6 +214,7 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
     );
   const tree = view?.worktree;
   const observation = tree?.observation;
+  const removed = tree?.state === "removed";
   const integration = view?.integrations[view.integrations.length - 1];
   const quarantined =
     binding?.initialization === "quarantined" || tree?.state === "quarantined";
@@ -438,7 +439,9 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
           </p>
           <div className={styles.actions}>
             <Button disabled={busy} onClick={() => void execute("retry-integration")}>
-              Retry integration
+              {binding?.finalizationOutcome && binding.finalizationOutcome !== "completed"
+                ? "Retry finalization"
+                : "Retry integration"}
             </Button>
           </div>
         </>
@@ -523,7 +526,9 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
         </p>
         <p role="status" aria-live="polite">
           {progress ||
-            `Lifecycle: ${tree?.state ?? binding?.initialization ?? "Unknown"}`}
+            (removed
+              ? "Already cleaned"
+              : `Lifecycle: ${tree?.state ?? binding?.initialization ?? "Unknown"}`)}
         </p>
         {!confirmation && error && <p role="alert">{error}</p>}
         {(binding?.error || tree?.error) && (
@@ -561,7 +566,7 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             <dd>
               <code>{tree.baseSha}</code>
             </dd>
-            <dt>HEAD</dt>
+            <dt>{removed ? "Last observed HEAD" : "HEAD"}</dt>
             <dd>
               <code>{observation?.head || "Unknown"}</code>
             </dd>
@@ -598,9 +603,12 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
                 .filter(Boolean)
                 .join("; ") || "Standard checkout"}
             </dd>
-            <dt>Observed</dt>
+            <dt>{removed ? "Historical observation" : "Observed"}</dt>
             <dd>
-              {observation?.observedAt ?? "Never"} (not a current cleanliness guarantee)
+              {observation?.observedAt ?? "Never"}
+              {removed
+                ? " (captured before cleanup)"
+                : " (not a current cleanliness guarantee)"}
             </dd>
             <dt>Retention</dt>
             <dd>
@@ -615,31 +623,33 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             <dd>{integration?.state ?? tree.integrationState}</dd>
           </dl>
         )}
-        <div className={styles.actions}>
-          <Button disabled={busy} onClick={() => void execute("reconcile")}>
-            Reconcile worktree
-          </Button>
-          <Button disabled={blocked} onClick={() => void execute("observe")}>
-            Refresh Git observation
-          </Button>
-          <Button disabled={blocked} onClick={() => void execute("retain")}>
-            Retain worktree
-          </Button>
-          <Button
-            disabled={blocked}
-            onClick={(event) =>
-              confirm(event, {
-                action: "quiesce",
-                title: "Stop checkout sessions?",
-                detail:
-                  "Stop this task’s supervised processes. Conversations and all working files remain intact.",
-                payload: { confirm: "STOP TASK SESSIONS" },
-              })
-            }
-          >
-            Stop checkout sessions
-          </Button>
-        </div>
+        {!removed && (
+          <div className={styles.actions}>
+            <Button disabled={busy} onClick={() => void execute("reconcile")}>
+              Reconcile worktree
+            </Button>
+            <Button disabled={blocked} onClick={() => void execute("observe")}>
+              Refresh Git observation
+            </Button>
+            <Button disabled={blocked} onClick={() => void execute("retain")}>
+              Retain worktree
+            </Button>
+            <Button
+              disabled={blocked}
+              onClick={(event) =>
+                confirm(event, {
+                  action: "quiesce",
+                  title: "Stop checkout sessions?",
+                  detail:
+                    "Stop this task’s supervised processes. Conversations and all working files remain intact.",
+                  payload: { confirm: "STOP TASK SESSIONS" },
+                })
+              }
+            >
+              Stop checkout sessions
+            </Button>
+          </div>
+        )}
         <h3>Advanced recovery: manual integration</h3>
         <p>
           Fleet creates a dedicated detached integration workspace. Use these low-level
@@ -785,42 +795,46 @@ export function ManagedWorktreePanel({ run }: { run: Run }) {
             </div>
           </div>
         )}
-        <h3>Cleanup</h3>
-        <p>
-          Stop, approval and archive retain the checkout. Removal requires fresh verified
-          ownership, no active process or integration, and no staged, unstaged, untracked
-          or ignored data. Cleanup never force-removes, recursively deletes or prunes the
-          repository.
-        </p>
-        <div className={styles.actions}>
-          <Button
-            disabled={blocked || Boolean(ongoingMerge)}
-            onClick={(event) =>
-              confirm(event, {
-                action: "cleanup",
-                title: "Remove this clean worktree?",
-                detail: `${tree!.branchRef} at ${tree!.path}. Git will refuse any dirty or active checkout. The task branch is kept by default.`,
-                payload: {},
-              })
-            }
-          >
-            Remove clean worktree
-          </Button>
-          <Button
-            disabled={busy || !canAbandon || Boolean(ongoingMerge)}
-            onClick={(event) =>
-              confirm(event, {
-                action: "abandon",
-                title: "Abandon Fleet ownership?",
-                detail: `Keep all data and branch ${tree!.branchRef} at ${tree!.path}, but relinquish Fleet lifecycle management. Purging the task afterwards loses its conversation/history references. No files are deleted.`,
-                phrase: `ABANDON ${tree!.branchRef} AT ${tree!.path}; KEEP FILES`,
-                payload: {},
-              })
-            }
-          >
-            Abandon ownership
-          </Button>
-        </div>
+        {!removed && (
+          <>
+            <h3>Cleanup</h3>
+            <p>
+              Stop, approval and archive retain the checkout. Removal requires fresh
+              verified ownership, no active process or integration, and no staged,
+              unstaged, untracked or ignored data. Cleanup never force-removes,
+              recursively deletes or prunes the repository.
+            </p>
+            <div className={styles.actions}>
+              <Button
+                disabled={blocked || Boolean(ongoingMerge)}
+                onClick={(event) =>
+                  confirm(event, {
+                    action: "cleanup",
+                    title: "Remove this clean worktree?",
+                    detail: `${tree!.branchRef} at ${tree!.path}. Git will refuse any dirty or active checkout. The task branch is kept by default.`,
+                    payload: {},
+                  })
+                }
+              >
+                Remove clean worktree
+              </Button>
+              <Button
+                disabled={busy || !canAbandon || Boolean(ongoingMerge)}
+                onClick={(event) =>
+                  confirm(event, {
+                    action: "abandon",
+                    title: "Abandon Fleet ownership?",
+                    detail: `Keep all data and branch ${tree!.branchRef} at ${tree!.path}, but relinquish Fleet lifecycle management. Purging the task afterwards loses its conversation/history references. No files are deleted.`,
+                    phrase: `ABANDON ${tree!.branchRef} AT ${tree!.path}; KEEP FILES`,
+                    payload: {},
+                  })
+                }
+              >
+                Abandon ownership
+              </Button>
+            </div>
+          </>
+        )}
       </details>
       <Dialog
         open={requestChangesOpen}

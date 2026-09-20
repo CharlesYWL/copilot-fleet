@@ -111,6 +111,13 @@ export function archiveRun(
   // scheduler tick can dispatch a dependency after Stop has been accepted.
   // Completed tasks still stop retained workers when explicitly archived.
   stopRunSessions(service, runId);
+  const cancelledRun = store.getRun(runId);
+  if (
+    cancelledRun?.state === "cancelled" &&
+    cancelledRun?.workspaceBinding?.effectiveMode === "managed" &&
+    cancelledRun.workspaceBinding.aggregationState !== "completed"
+  )
+    service.worktrees.beginFinalization(runId, "cancelled", reason);
 
   service.broadcast({ type: "snapshot", data: service.snapshot() });
 }

@@ -10,6 +10,7 @@ import {
   WorktreeObservationSchema,
   WorktreeOperationResultSchema,
   type HostToNodeMessage,
+  type ManagedWorktree,
   type WorktreeOperationRequest,
   type WorktreeOperationResult,
 } from "@fleet/protocol";
@@ -862,6 +863,51 @@ describe("Host managed workspace orchestration", () => {
     expect(kit.store.listNotifications().notifications).toHaveLength(1);
   });
 
+  it("repairs stale Git administration and resumes finalization automatically", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit);
+    kit.frames.splice(0);
+    kit.service.worktrees.advanceAggregation(run.id);
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(0);
+    const quiesce = lastRequest(kit.frames);
+    expect(quiesce.kind).toBe("quiesce");
+    const current = kit.store.getAnyManagedWorkspace(quiesce.worktreeId)!;
+    kit.service.worktrees.handleResult(
+      kit.node.id,
+      WorktreeOperationResultSchema.parse({
+        operationId: quiesce.operationId,
+        worktreeId: quiesce.worktreeId,
+        generation: quiesce.generation,
+        nodeId: quiesce.nodeId,
+        hostInstallationId: quiesce.hostInstallationId,
+        ok: false,
+        retryable: false,
+        code: "registry_moved",
+        error: "Git registration points to a stale missing path.",
+        worktree: { ...current, version: quiesce.expectedVersion + 1 },
+        acknowledgedAt: new Date().toISOString(),
+      }),
+    );
+
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(1);
+    const repair = lastRequest(kit.frames);
+    expect(repair).toMatchObject({
+      kind: "reconcile",
+      actor: "host-finalization-controller",
+    });
+    kit.service.worktrees.handleResult(kit.node.id, operationResult(kit.store, repair));
+
+    await expect.poll(() => kit.frames.length).toBeGreaterThan(2);
+    expect(lastRequest(kit.frames)).toMatchObject({
+      kind: "quiesce",
+      worktreeId: current.id,
+    });
+    expect(kit.store.getRun(run.id)?.workspaceBinding).toMatchObject({
+      aggregationAttempt: 2,
+      aggregationState: "in_progress",
+    });
+  });
+
   it("uses plan-approved recovery for transient Node loss without blocking the task", async () => {
     vi.useFakeTimers();
     const kit = fixture();
@@ -1148,6 +1194,101 @@ describe("Host managed workspace orchestration", () => {
         .filter((entry) => entry.request.actor === "host-integration-controller")
         .map((entry) => entry.request.kind),
     ).toEqual(["quiesce", "integration_preview", "integrate", "retain", "cleanup"]);
+  });
+
+  it.each(["failed", "cancelled"] as const)(
+    "finalizes clean managed workspaces while preserving the %s task outcome",
+    async (outcome) => {
+      const kit = fixture();
+      const run = await readyManaged(kit, false);
+      if (outcome === "cancelled")
+        kit.store.cancelRunWithUnfinishedSteps(run.id, "operator cancelled", true);
+      else kit.store.setRunState(run.id, "running");
+      let seen = kit.frames.length;
+
+      kit.service.worktrees.beginFinalization(run.id, outcome, `${outcome} reason`);
+      for (const kind of ["quiesce", "retain", "cleanup"] as const) {
+        await expect.poll(() => kit.frames.length).toBeGreaterThan(seen);
+        const request = lastRequest(kit.frames);
+        expect(request.kind).toBe(kind);
+        seen = kit.frames.length;
+        kit.service.worktrees.handleResult(
+          kit.node.id,
+          operationResult(kit.store, request, { verifiedClean: true }),
+        );
+      }
+
+      await expect
+        .poll(() => kit.store.getRun(run.id)?.workspaceBinding?.aggregationState)
+        .toBe("completed");
+      expect(kit.store.getRun(run.id)).toMatchObject({
+        state: outcome,
+        failureReason: outcome === "cancelled" ? "operator cancelled" : "failed reason",
+        workspaceBinding: {
+          finalizationOutcome: outcome,
+          aggregationPhase: "done",
+          aggregationSummary: expect.stringContaining("cleaned managed workspaces"),
+        },
+      });
+      expect(kit.store.worktreeForRun(run.id)?.state).toBe("removed");
+      expect(
+        kit.store
+          .listWorktreeOperations()
+          .filter((entry) => entry.request.actor === "host-integration-controller")
+          .map((entry) => entry.request.kind),
+      ).toEqual(["quiesce", "retain", "cleanup"]);
+    },
+  );
+
+  it("keeps a failed writer workspace in authoritative aggregation inspection", async () => {
+    const kit = fixture();
+    const run = await readyManaged(kit);
+    const primary = kit.store.worktreeForRun(run.id)!;
+    const step = kit.store.upsertRunStep(run.id, {
+      stepKey: "failed-writer",
+      title: "failed writer",
+      prompt: "change files",
+      category: "implement",
+      position: 0,
+    });
+    const failedTree = ManagedWorktreeSchema.parse({
+      ...primary,
+      id: "worktree-failed-writer",
+      taskKey: "failed-writer",
+      path: "C:\\trees\\failed-writer",
+      branchRef: "refs/heads/fleet/failed-writer",
+      pinRef: "refs/fleet/pins/failed-writer",
+      checkout: {
+        ...primary.checkout!,
+        key: "failed-writer-checkout",
+        path: "C:\\trees\\failed-writer",
+        fileId: "failed-writer-checkout",
+      },
+      workspaceKind: "step",
+      ownerStepId: step.id,
+      observation: WorktreeObservationSchema.parse({
+        generation: primary.generation,
+        observedAt: new Date().toISOString(),
+        head: primary.baseSha,
+        unstaged: true,
+        dirty: true,
+      }),
+    });
+    kit.store.putDerivedWorkspace(failedTree);
+    kit.store.updateRunStep(step.id, {
+      state: "starting",
+      managedWorktreeId: failedTree.id,
+      workspaceState: "ready",
+    });
+    kit.store.updateRunStep(step.id, { state: "running" });
+    kit.store.updateRunStep(step.id, { state: "failed" });
+    const aggregationWorkspaces = Reflect.get(
+      kit.service.worktrees,
+      "aggregationWorkspaces",
+    ) as (runId: string) => ManagedWorktree[];
+    expect(
+      aggregationWorkspaces.call(kit.service.worktrees, run.id).map((tree) => tree.id),
+    ).toEqual([primary.id, failedTree.id]);
   });
 
   it("reconciles a persisted no-change integration without approval or a remote push", async () => {

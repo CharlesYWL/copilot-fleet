@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import {
+  access,
   chmod,
   mkdir,
   readFile,
@@ -327,6 +328,41 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     await expect(
       readFile(join(created.worktree!.path, "ignored.txt"), "utf8"),
     ).resolves.toBe("generated\n");
+  });
+
+  it("checkpoints meaningful untracked files before managed cleanup", async () => {
+    const uploadArtifact = vi.fn(async (result) => ({
+      ...result,
+      state: "available" as const,
+      verifiedAt: new Date().toISOString(),
+    }));
+    const { source, manager } = await fixture(undefined, { uploadArtifact });
+    const reserved = await manager.execute(
+      WorktreeOperationRequestSchema.parse({
+        ...reserveRequest(source),
+        workspaceKind: "step",
+        ownerStepId: "failed-writer",
+      }),
+    );
+    const created = await operation(manager, reserved.worktree!, "create", {
+      workspaceKind: "step",
+      ownerStepId: "failed-writer",
+    });
+    await writeFile(join(created.worktree!.path, "unfinished-source.ts"), "export {};\n");
+
+    const finalized = await operation(manager, created.worktree!, "finalize", {
+      workspaceKind: "step",
+      ownerStepId: "failed-writer",
+    });
+
+    expect(finalized.ok).toBe(true);
+    expect(finalized.worktree?.resultSha).not.toBe(finalized.worktree?.baseSha);
+    expect(finalized.worktree?.observation?.dirty).toBe(false);
+    expect(finalized.workspaceResult?.state).toBe("available");
+    expect(uploadArtifact).toHaveBeenCalledTimes(1);
+    await expect(
+      git.run(created.worktree!.path, ["show", "--format=", "--name-only", "HEAD"]),
+    ).resolves.toMatchObject({ stdout: expect.stringContaining("unfinished-source.ts") });
   });
 
   it("moves a sealed result between node-local repositories without changing remotes", async () => {
@@ -2002,6 +2038,56 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(abandoned.worktree!.abandonedAt).not.toBe("");
     expect(await readFile(join(tree.path, "same.txt"), "utf8")).toBe("staged\n");
     expect((await operation(manager, tree, "cleanup")).code).toBe("abandoned");
+  });
+
+  it("removes ignored-only output only when trusted cleanup policy explicitly allows it", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    await writeFile(join(tree.path, "ignored.txt"), "generated output\n");
+
+    expect((await operation(manager, tree, "cleanup")).code).toBe("dirty_or_unknown");
+    const cleaned = await operation(manager, tree, "cleanup", {
+      policy: {
+        retentionDays: 7,
+        maxPerRepository: 8,
+        maxPerNode: 32,
+        freeSpaceFloorBytes: 0,
+        byteBudget: 10_737_418_240,
+        cleanupIgnoredOnly: true,
+      },
+    });
+
+    expect(cleaned.ok).toBe(true);
+    expect(cleaned.worktree?.state).toBe("removed");
+    await expect(access(tree.path)).rejects.toThrow();
+  });
+
+  it("repairs a provably stale worktree registration before cleanup", async () => {
+    const { manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    const gitDirectory = (
+      await git.run(tree.path, ["rev-parse", "--absolute-git-dir"])
+    ).stdout.trim();
+    const stalePath = join(tree.path, "moved");
+    await writeFile(join(gitDirectory, "gitdir"), join(stalePath, ".git"));
+    expect(
+      parseWorktreeRegistry(
+        (await git.run(source, ["worktree", "list", "--porcelain", "-z"])).stdout,
+      ).find((entry) => entry.branch === tree.branchRef)?.path,
+    ).toBe(join(stalePath, ".git"));
+
+    const reconciled = await operation(manager, tree, "reconcile");
+
+    expect(reconciled.ok).toBe(true);
+    expect(reconciled.worktree?.state).toBe("retained");
+    expect(
+      parseWorktreeRegistry(
+        (await git.run(source, ["worktree", "list", "--porcelain", "-z"])).stdout,
+      )
+        .find((entry) => entry.branch === tree.branchRef)
+        ?.path.replaceAll("\\", "/"),
+    ).toBe(tree.path.replaceAll("\\", "/"));
+    expect((await operation(manager, reconciled.worktree!, "cleanup")).ok).toBe(true);
   });
 
   it("persists a real merge conflict, reserves the target, and aborts only the matching operation without touching the task", async () => {
