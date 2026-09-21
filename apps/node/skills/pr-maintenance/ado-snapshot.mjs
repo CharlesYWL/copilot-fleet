@@ -4,6 +4,7 @@ import { access } from "node:fs/promises";
 import { get } from "node:https";
 import { resolve, win32 } from "node:path";
 import { pathToFileURL } from "node:url";
+import { z } from "zod";
 import {
   parsePrMaintenanceUrl,
   PrMaintenanceIdentitySchema,
@@ -45,7 +46,9 @@ const messages = Object.freeze({
     "A complete fresh verification does not fit the remaining request allowance.",
   deadline_exhausted: "The remaining observation deadline was exhausted.",
   payload_overflow:
-    "Evidence exceeds the bounded byte or 200-item limit; inspect manually.",
+    "Evidence exceeds a bounded limit; inspect error.limit when present. Use a supported larger evidence byte allowance or manual reconciliation; never truncate obligations.",
+  invalid_observation:
+    "Evidence does not fit the Host observation contract; manual reconciliation is required.",
   malformed_response:
     "Azure DevOps returned missing, partial, or malformed required evidence.",
   unsupported_pagination:
@@ -68,6 +71,19 @@ function fail(code) {
   return Object.assign(new Error(messages[code] ?? messages.network), { code });
 }
 const size = (value) => Buffer.byteLength(JSON.stringify(value));
+class EvidenceOverflow extends Error {
+  constructor(kind, stage, actual, maximum) {
+    super(messages.payload_overflow);
+    this.code = "payload_overflow";
+    this.limit = { kind, stage, actual, maximum };
+  }
+}
+function boundBytes(value, maximum, stage, reserve = 0) {
+  const actual = size(value) + reserve;
+  if (actual > maximum) throw new EvidenceOverflow("bytes", stage, actual, maximum);
+}
+// The fixture API exposes the same continuation twice; CLI/Host persist it only once.
+const wireSize = (result) => size({ ...result, resume: undefined });
 const positive = (value) =>
   Number.isSafeInteger(value) && value > 0 && value <= 2_147_483_647;
 const date = (value) => typeof value === "string" && Number.isFinite(Date.parse(value));
@@ -75,11 +91,12 @@ const lowerGuid = (value) => {
   if (typeof value !== "string" || !GUID.test(value)) throw fail("malformed_response");
   return value.toLowerCase();
 };
-function bounded(value, depth = 0) {
-  if (depth > 32 || (Array.isArray(value) && value.length > MAX_ITEMS))
-    throw fail("payload_overflow");
+function bounded(value, stage, depth = 0) {
+  if (depth > 32) throw new EvidenceOverflow("depth", stage, depth, 32);
+  if (Array.isArray(value) && value.length > MAX_ITEMS)
+    throw new EvidenceOverflow("items", stage, value.length, MAX_ITEMS);
   if (value && typeof value === "object")
-    for (const child of Object.values(value)) bounded(child, depth + 1);
+    for (const child of Object.values(value)) bounded(child, stage, depth + 1);
   return value;
 }
 function required(condition, code = "malformed_response") {
@@ -220,8 +237,8 @@ function validate(input, started) {
     maxBytes: budget.maxBytes ?? 262_144,
     deadline: Math.min(Date.parse(budget.deadlineAt), started + 120_000),
   };
-  required(size(input) <= limits.maxBytes, "payload_overflow");
-  bounded(input);
+  boundBytes(input, limits.maxBytes, "input");
+  bounded(input, "input");
   return { pr, limits };
 }
 
@@ -349,7 +366,8 @@ export function httpsRequest({ url, timeoutMs, maxBytes }, token, requestGet = g
         }
         response.on("data", (chunk) => {
           bytes += chunk.length;
-          if (bytes > maxBytes) return finish(fail("payload_overflow"));
+          if (bytes > maxBytes)
+            return finish(new EvidenceOverflow("bytes", "response", bytes, maxBytes));
           chunks.push(chunk);
         });
         response.on("error", () => finish(fail("network")));
@@ -599,7 +617,7 @@ function normalizePage(pr, scan, job, response) {
     throw fail("malformed_response");
   }
   required(body && typeof body === "object");
-  bounded(body);
+  bounded(body, "response");
   if (job.kind === "metadata") return metadataValue(pr, body);
   if (job.kind === "build") {
     required(body.id === job.buildId);
@@ -1331,7 +1349,7 @@ function snapshot(input, scan, now) {
     policies: result.policies,
     sources: actionableSources.map(({ kind, id, revision }) => ({ kind, id, revision })),
   });
-  bounded(result);
+  bounded(result, "snapshot");
   return result;
 }
 
@@ -1411,6 +1429,7 @@ export function toAdoHostObservation(
       knownSelfEffectIds: value.effects.matched.map((effect) => effect.effectId),
     });
   }
+  bounded(observation, "observation");
   return PrMaintenanceObservationSchema.parse(observation);
 }
 
@@ -1435,6 +1454,44 @@ export async function observe(input, { request, now = Date.now } = {}) {
     elapsedMs: Math.max(0, now() - started),
     progress: progress(),
   });
+  const failure = (error) => {
+    const code = Object.hasOwn(messages, error?.code) ? error.code : "network";
+    return {
+      ...base(),
+      error: {
+        code,
+        message: messages[code],
+        ...(error instanceof EvidenceOverflow ? { limit: error.limit } : {}),
+        ...(code === "rate_limited" && Number.isFinite(error.retryAfterSeconds)
+          ? { retryAfterSeconds: error.retryAfterSeconds }
+          : {}),
+      },
+    };
+  };
+  const attachObservation = (value, observationInput = limits ? input : {}) => ({
+    ...value,
+    observation: toAdoHostObservation(
+      value,
+      observationInput,
+      new Date(started).toISOString(),
+    ),
+  });
+  const withResume = (value) => {
+    if (!scan) return value;
+    const resume = { ...scan, digest: contentHash(scan) };
+    let candidate;
+    try {
+      candidate = attachObservation({ ...value, resume });
+    } catch (error) {
+      if (error instanceof EvidenceOverflow) return failure(error);
+      if (error instanceof z.ZodError) return failure(fail("invalid_observation"));
+      throw error;
+    }
+    if (wireSize(candidate) <= limits.maxBytes) return candidate;
+    return failure(
+      new EvidenceOverflow("bytes", "continuation", wireSize(candidate), limits.maxBytes),
+    );
+  };
   try {
     const validated = validate(input, started);
     const pr = validated.pr;
@@ -1478,7 +1535,7 @@ export async function observe(input, { request, now = Date.now } = {}) {
       const args = { method: "GET", url, timeoutMs, maxBytes: limits.maxBytes };
       const response = await (request ? request(args) : httpsRequest(args, token));
       required(now() <= limits.deadline, "deadline_exhausted");
-      required(size(response) <= limits.maxBytes, "payload_overflow");
+      boundBytes(response, limits.maxBytes, "response");
       return normalizePage(pr, scan, job, response);
     };
     const metadata = await read({ kind: "metadata" });
@@ -1555,8 +1612,8 @@ export async function observe(input, { request, now = Date.now } = {}) {
             next.jobs.push({ kind: "build", buildId });
         }
       }
-      bounded(next);
-      required(size(next) + 4096 <= limits.maxBytes, "payload_overflow");
+      bounded(next, "checkpoint");
+      boundBytes(next, limits.maxBytes, "checkpoint", 4096);
       scan = next;
     }
     scan.phase = "verify";
@@ -1580,46 +1637,40 @@ export async function observe(input, { request, now = Date.now } = {}) {
       snapshot: value,
       progress: { ...progress(), phase: "complete", cursor: null },
     };
-    required(size(result) <= limits.maxBytes, "payload_overflow");
+    boundBytes(result, limits.maxBytes, "snapshot");
   } catch (error) {
-    const code = Object.hasOwn(messages, error?.code) ? error.code : "network";
-    result = { ...base(), error: { code, message: messages[code] } };
-    if (code === "rate_limited" && Number.isFinite(error.retryAfterSeconds))
-      result.error.retryAfterSeconds = error.retryAfterSeconds;
+    result = failure(error);
     if (
       scan &&
-      [
+      ([
         "budget_exhausted",
         "deadline_exhausted",
         "network",
         "timeout",
         "rate_limited",
-      ].includes(code)
+      ].includes(result.error.code) ||
+        (error instanceof EvidenceOverflow && error.limit.kind === "bytes"))
     ) {
-      const resume = { ...scan, digest: contentHash(scan) };
-      if (size({ ...result, resume }) + 4096 <= (limits?.maxBytes ?? MAX_BYTES))
-        result.resume = resume;
+      result = withResume(result);
     }
   } finally {
     token = undefined;
   }
   try {
-    result.observation = toAdoHostObservation(
-      result,
-      limits ? input : {},
-      new Date(started).toISOString(),
+    result = attachObservation(result);
+    const bytes = wireSize(result);
+    if (bytes > (limits?.maxBytes ?? MAX_BYTES))
+      throw new EvidenceOverflow("bytes", "output", bytes, limits?.maxBytes ?? MAX_BYTES);
+  } catch (error) {
+    if (!(error instanceof EvidenceOverflow) && !(error instanceof z.ZodError))
+      throw error;
+    result = failure(
+      error instanceof EvidenceOverflow ? error : fail("invalid_observation"),
     );
-    required(size(result) <= (limits?.maxBytes ?? MAX_BYTES), "payload_overflow");
-  } catch {
-    result = {
-      ...base(),
-      error: { code: "payload_overflow", message: messages.payload_overflow },
-    };
-    result.observation = toAdoHostObservation(
-      result,
-      {},
-      new Date(started).toISOString(),
-    );
+    if (error instanceof EvidenceOverflow && error.limit.kind === "bytes")
+      result = withResume(result);
+    // A non-resumable failure has no collected evidence to interpret as complete.
+    result = result.observation ? result : attachObservation(result, {});
   }
   return result;
 }

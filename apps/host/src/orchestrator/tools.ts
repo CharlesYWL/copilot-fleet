@@ -472,9 +472,20 @@ export const PreparePrMaintenanceSchema = z
     prUrl: z.string().min(1).max(4_096),
     identity: PrMaintenanceIdentitySchema,
     headSha: PrMaintenanceEnableSchema.shape.headSha,
-    observedAt: z.string().datetime(),
+    observedAt: z
+      .string()
+      .datetime()
+      .describe(
+        "Actual start time of the fresh provider metadata read, not PR updatedAt.",
+      ),
     method: z.enum(["packaged_helper", "provider_mcp", "provider_cli"]),
-    evidence: z.string().min(1).max(8_192),
+    evidence: z
+      .string()
+      .min(1)
+      .max(8_192)
+      .describe(
+        "Retrievable exact identity/refs/HEAD evidence. Fresh metadata-only evidence can support an observe proposal; retain incomplete helper receipts separately and do not claim complete observation or readiness.",
+      ),
     verification: z.string().min(1).max(8_192),
     eligibilityEvidence: z.string().min(1).max(8_192),
     mode: z

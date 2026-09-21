@@ -9,7 +9,7 @@ const ref = z
   .string()
   .min(12)
   .max(1_024)
-  .startsWith("refs/heads/")
+  .startsWith("refs/heads/", "Use a complete, case-sensitive refs/heads/... ref")
   .refine(
     (value) =>
       !/[\s~^:?*[\]\\]/.test(value) &&
@@ -23,7 +23,8 @@ const ref = z
       !value.endsWith(".") &&
       value.split("/").every((part) => !part.startsWith(".") && !part.endsWith(".lock")),
     "Use a complete, valid, case-sensitive refs/heads/... ref",
-  );
+  )
+  .describe("Complete case-sensitive branch ref, for example refs/heads/main.");
 const repositoryId = id;
 const repository = z
   .string()
@@ -63,8 +64,12 @@ const organization = z
   .toLowerCase();
 const guid = z
   .string()
-  .regex(/^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i)
-  .toLowerCase();
+  .regex(
+    /^[a-f\d]{8}(?:-[a-f\d]{4}){3}-[a-f\d]{12}$/i,
+    "Use the provider-observed Azure DevOps GUID, not a display name or GitHub ID",
+  )
+  .toLowerCase()
+  .describe("Provider-observed Azure DevOps GUID; normalized to lowercase.");
 const pathSegment = z
   .string()
   .min(1)
@@ -87,7 +92,11 @@ const adoRepository = z
     return (
       parts.length === 2 && parts.every((part) => pathSegment.safeParse(part).success)
     );
-  }, "Use the Azure DevOps project/repository display names");
+  }, "Use Project/Repo display names in the pinned project, not a bare repo name or URL")
+  .describe(
+    "Case-preserved Project/Repo display names, for example MyProject/MyRepo. " +
+      "The Project prefix must exactly equal identity.project; GUIDs belong in the corresponding ID fields.",
+  );
 const githubIdentity = z
   .object({
     provider: z.literal("github").optional(),
@@ -111,7 +120,9 @@ const adoIdentity = githubIdentity
     provider: z.literal("azure-devops"),
     host: z.literal("dev.azure.com"),
     organization,
-    project: pathSegment,
+    project: pathSegment.describe(
+      "Case-preserved provider project display name, not its GUID or Project/Repo path.",
+    ),
     projectId: guid,
     repositoryId: guid,
     repository: adoRepository,
@@ -121,21 +132,36 @@ const adoIdentity = githubIdentity
     baseRepository: adoRepository,
   })
   .superRefine((value, ctx) => {
-    if (
-      value.repositoryId !== value.baseRepositoryId ||
-      value.repository !== value.baseRepository ||
-      [value.repository, value.headRepository].some(
-        (name) => name.split("/")[0] !== value.project,
-      )
-    ) {
+    if (value.repositoryId !== value.baseRepositoryId) {
       ctx.addIssue({
         code: "custom",
-        message:
-          "Azure DevOps PR/base repository must match; head and base must be in the pinned project",
+        path: ["baseRepositoryId"],
+        message: "Azure DevOps PR repositoryId and baseRepositoryId must match",
       });
     }
+    if (value.repository !== value.baseRepository)
+      ctx.addIssue({
+        code: "custom",
+        path: ["baseRepository"],
+        message: "Azure DevOps PR repository and baseRepository display names must match",
+      });
+    for (const field of ["repository", "headRepository", "baseRepository"] as const)
+      if (value[field].split("/")[0] !== value.project)
+        ctx.addIssue({
+          code: "custom",
+          path: [field],
+          message:
+            "The Project prefix must exactly match the pinned project display name",
+        });
   });
-export const PrMaintenanceIdentitySchema = z.union([githubIdentity, adoIdentity]);
+export const PrMaintenanceIdentitySchema = z
+  .discriminatedUnion("provider", [githubIdentity, adoIdentity])
+  .describe(
+    "Use provider: azure-devops with host: dev.azure.com, organization, project display name, " +
+      "projectId and repository GUIDs, Project/Repo display names, prNumber and full refs. " +
+      "GitHub uses owner/repo and opaque node IDs; omitted provider is legacy GitHub only. " +
+      "Pass the helper snapshot.identity unchanged, not its discovery pr object.",
+  );
 export type PrMaintenanceIdentity = z.infer<typeof PrMaintenanceIdentitySchema>;
 
 /** Existing GitHub index keys stay unchanged; ADO IDs are scoped to their organization. */

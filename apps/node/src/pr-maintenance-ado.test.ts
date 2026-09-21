@@ -8,6 +8,9 @@ import { PrMaintenanceObservationSchema } from "@fleet/protocol";
 import { packageRoot } from "./paths.js";
 
 const helper = join(packageRoot(), "skills", "pr-maintenance", "ado-snapshot.mjs");
+const { observe: routeObservation } = await import(
+  pathToFileURL(join(packageRoot(), "skills", "pr-maintenance", "snapshot.mjs")).href
+);
 const {
   observe,
   contentHash,
@@ -236,9 +239,10 @@ async function run(
   data = fixtures(),
   requestInput = input(),
   mutate?: Parameters<typeof transport>[1],
+  observeProvider = observe,
 ) {
   const fixture = transport(data, mutate);
-  const result = await observe(requestInput, { request: fixture.request, now });
+  const result = await observeProvider(requestInput, { request: fixture.request, now });
   expect(PrMaintenanceObservationSchema.safeParse(result.observation).success).toBe(true);
   expect(result.requestsConsumed).toBe(fixture.calls.length);
   return { ...result, calls: fixture.calls };
@@ -1150,6 +1154,214 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     expect(edited.resume).toBeUndefined();
   });
 
+  it("retains a large 35-page discovery continuation within the actual CLI byte allowance", async () => {
+    const data = fixtures();
+    data.threads = Array.from({ length: 27 }, (_, index) => ({
+      ...thread([comment(1, `Finding ${index}: ${"detail ".repeat(450)}`)]),
+      id: index + 1,
+    }));
+    const request = input({
+      pr: { url: "https://dev.azure.com/example/Project/_git/Repo/pullrequest/7" },
+      budget: { ...input().budget, maxBytes: 262_144 },
+    });
+    const first = await run(data, request, undefined, routeObservation);
+    expect(first.error).toMatchObject({ code: "budget_exhausted" });
+    expect(first).toMatchObject({
+      complete: false,
+      requestsConsumed: 36,
+      progress: { phase: "verify", pages: 35, verifiedPages: 0, cursor: null },
+      observation: { complete: false, checksComplete: false, reviewsComplete: false },
+    });
+    expect(first.snapshot).toBeUndefined();
+    expect(first.observation.helperState.resume).toBeDefined();
+    expect(first.resume).toEqual(first.observation.helperState.resume);
+    const { calls: _calls, resume: _resume, ...wire } = first;
+    expect(Buffer.byteLength(JSON.stringify(wire))).toBeLessThanOrEqual(262_144);
+    expect(Buffer.byteLength(JSON.stringify(first.resume))).toBeGreaterThan(131_072);
+    const cli = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `import { main } from ${JSON.stringify(
+          pathToFileURL(
+            join(packageRoot(), "skills", "pr-maintenance", "github-snapshot.mjs"),
+          ).href,
+        )};
+        await main(async input => input.fixture, result => result.observation);`,
+      ],
+      {
+        input: JSON.stringify({ budget: request.budget, fixture: first }),
+        encoding: "utf8",
+        maxBuffer: 1_048_576,
+        timeout: 10_000,
+      },
+    );
+    expect(cli.error).toBeUndefined();
+    expect(cli.status).toBe(2);
+    const emitted = JSON.parse(cli.stdout);
+    expect(emitted.error.code).toBe("budget_exhausted");
+    expect(emitted.resume).toBeUndefined();
+    expect(emitted.observation.helperState.resume).toEqual(first.resume);
+    expect(Buffer.byteLength(cli.stdout)).toBeLessThanOrEqual(262_144);
+    const stillTooSmall = await run(
+      data,
+      input({ ...request, resume: first.resume }),
+      undefined,
+      routeObservation,
+    );
+    expect(stillTooSmall).toMatchObject({
+      complete: false,
+      error: {
+        code: "payload_overflow",
+        limit: { kind: "bytes", stage: "snapshot", maximum: 262_144 },
+      },
+      observation: { complete: false, checksComplete: false, reviewsComplete: false },
+    });
+    expect(stillTooSmall.observation.helperState.resume).toBeDefined();
+    expect(stillTooSmall.error.limit.actual).toBeGreaterThan(262_144);
+    const resumed = await run(
+      data,
+      input({
+        ...request,
+        budget: { ...input().budget, maxBytes: 1_048_576 },
+        resume: JSON.parse(JSON.stringify(stillTooSmall.observation.helperState.resume)),
+      }),
+      undefined,
+      routeObservation,
+    );
+    expect(resumed.complete).toBe(true);
+    expect(resumed.requestsConsumed).toBe(37);
+    expect(resumed.snapshot.actionableSources).toHaveLength(27);
+    expect(resumed.observation.sources).toHaveLength(27);
+    expect(resumed.snapshot.actionableSources.map((source: any) => source.body)).toEqual(
+      data.threads.map((entry) => entry.comments[0].content),
+    );
+    const changed = structuredClone(data);
+    changed.threads[0].comments[0].content = "An edited obligation";
+    const invalidated = await run(
+      changed,
+      input({ ...request, resume: first.resume }),
+      undefined,
+      routeObservation,
+    );
+    expect(invalidated.error.code).toBe("inconsistent_snapshot");
+    expect(invalidated.observation.helperState.resume).toBeNull();
+    expect(invalidated.snapshot).toBeUndefined();
+  });
+
+  it("preserves the pending page on real checkpoint byte overflow for a larger bounded continuation", async () => {
+    const data = fixtures();
+    data.threads = Array.from({ length: 12 }, (_, index) => ({
+      ...thread([comment(1, `Finding ${index}: ${"details ".repeat(800)}`)]),
+      id: index + 1,
+    }));
+    const first = await run(
+      data,
+      input({ budget: { ...input().budget, maxBytes: 131_072 } }),
+    );
+    expect(first.error).toMatchObject({
+      code: "payload_overflow",
+      limit: { kind: "bytes", stage: "checkpoint", maximum: 131_072 },
+    });
+    expect(first.observation.helperState.resume.jobs[0].kind).toBe("comments");
+    expect(first.snapshot).toBeUndefined();
+    const resumed = await run(data, input({ resume: first.resume }));
+    expect(resumed.complete).toBe(true);
+    expect(resumed.requestsConsumed).toBeLessThanOrEqual(40);
+    expect(resumed.snapshot.actionableSources).toHaveLength(12);
+    expect(resumed.observation.sources).toHaveLength(12);
+  });
+
+  it("keeps a bounded continuation when only the final Host observation exceeds the byte allowance", async () => {
+    const data = fixtures();
+    data.threads = [thread([comment(1, "details ".repeat(1_500))])];
+    const full = await run(data);
+    expect(full.complete).toBe(true);
+    const maxBytes = Buffer.byteLength(
+      JSON.stringify({ ...full, observation: undefined, calls: undefined }),
+    );
+    const limited = await run(data, input({ budget: { ...input().budget, maxBytes } }));
+    expect(limited.error).toMatchObject({
+      code: "payload_overflow",
+      limit: { kind: "bytes", stage: "output", maximum: maxBytes },
+    });
+    expect(limited.snapshot).toBeUndefined();
+    expect(limited.observation.complete).toBe(false);
+    expect(limited.observation.helperState.resume).toBeDefined();
+    expect(
+      Buffer.byteLength(
+        JSON.stringify({ ...limited, resume: undefined, calls: undefined }),
+      ),
+    ).toBeLessThanOrEqual(maxBytes);
+    const resumed = await run(data, input({ resume: limited.resume }));
+    expect(resumed.complete).toBe(true);
+    expect(resumed.observation.sources).toHaveLength(1);
+  });
+
+  it("reports item overflow separately and never truncates accumulated comment obligations", async () => {
+    const data = fixtures();
+    data.threads = [1, 2].map((id) => ({
+      ...thread(Array.from({ length: 101 }, (_, index) => comment(index + 1))),
+      id,
+    }));
+    const result = await run(data);
+    expect(result.error).toMatchObject({
+      code: "payload_overflow",
+      limit: { kind: "items", stage: "checkpoint", actual: 202, maximum: 200 },
+    });
+    expect(result.observation).toMatchObject({
+      complete: false,
+      checksComplete: false,
+      reviewsComplete: false,
+      sources: [],
+      helperState: { resume: null },
+    });
+    expect(result.snapshot).toBeUndefined();
+    expect(result.resume).toBeUndefined();
+  });
+
+  it("bounds combined Host sources without treating schema item overflow as a byte allowance problem", async () => {
+    const data = fixtures();
+    data.threads = [
+      thread(Array.from({ length: 200 }, (_, index) => comment(index + 1))),
+    ];
+    data.iterationStatuses = [status(1, "failed")];
+    const result = await run(data);
+    expect(result.error).toMatchObject({
+      code: "payload_overflow",
+      limit: { kind: "items", stage: "observation", actual: 201, maximum: 200 },
+    });
+    expect(result.observation.complete).toBe(false);
+    expect(result.observation.sources).toEqual([]);
+    expect(result.observation.helperState.resume).toBeNull();
+    expect(result.snapshot).toBeUndefined();
+  });
+
+  it("never carries verification credit when a full pass cannot fit the maximum request allowance", async () => {
+    const data = fixtures();
+    data.threads = Array.from({ length: 31 }, (_, index) => ({
+      ...thread(),
+      id: index + 1,
+    }));
+    const first = await run(data);
+    expect(first).toMatchObject({
+      complete: false,
+      requestsConsumed: 40,
+      progress: { phase: "verify", pages: 39, verifiedPages: 0 },
+      error: { code: "budget_exhausted" },
+    });
+    const later = await run(data, input({ resume: first.resume }));
+    expect(later).toMatchObject({
+      complete: false,
+      requestsConsumed: 1,
+      progress: { phase: "verify", pages: 39, verifiedPages: 0 },
+      error: { code: "budget_exhausted" },
+    });
+    expect(later.snapshot).toBeUndefined();
+    expect(later.observation.checksComplete).toBe(false);
+  });
+
   it("revalidates metadata before consuming scoped continuation", async () => {
     const data = fixtures();
     const first = await run(
@@ -1251,13 +1463,21 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
       ...thread(),
       id: index + 1,
     }));
-    expect((await run(data)).error.code).toBe("payload_overflow");
+    expect((await run(data)).error).toMatchObject({
+      code: "payload_overflow",
+      limit: { kind: "items", stage: "response", actual: 201, maximum: 200 },
+    });
     const overflow = await run(fixtures(), input(), () => ({
       status: 200,
       body: "x".repeat(1_048_576),
       headers: {},
     }));
     expect(overflow.error.code).toBe("payload_overflow");
+    expect(overflow.error.limit).toMatchObject({
+      kind: "bytes",
+      stage: "response",
+      maximum: 1_048_576,
+    });
     expect(overflow.requestsConsumed).toBe(1);
     let clock = started;
     const fixture = transport(fixtures());
