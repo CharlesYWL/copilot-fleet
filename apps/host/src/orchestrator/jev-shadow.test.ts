@@ -524,6 +524,32 @@ describe("shadow metrics and replay", () => {
 });
 
 describe("explicit remote consent and SDK transport", () => {
+  it("disables SDK diagnostics even when environment logging is enabled", async () => {
+    vi.stubEnv("TYPESAFE_LOG_LEVEL", "debug");
+    const logs = (["debug", "info", "warn", "error", "log"] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => {}),
+    );
+    const network = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify(response()), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "private provider diagnostic" }), {
+          status: 500,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    vi.stubGlobal("fetch", network);
+    const provider = createJevShadowProvider("test-only");
+    await provider(jevShadowRequest(sample(), "jev-test"));
+    await expect(provider(jevShadowRequest(sample(), "jev-test"))).rejects.toThrow();
+    for (const log of logs) expect(log).not.toHaveBeenCalled();
+  });
+
   it("uses the official SDK with fixed HTTPS origin, no redirects and no retries", async () => {
     vi.stubEnv("TYPESAFE_BASE_URL", "https://untrusted.invalid");
     const network = vi.fn().mockResolvedValue(

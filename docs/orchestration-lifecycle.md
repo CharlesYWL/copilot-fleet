@@ -170,7 +170,9 @@ The integration uses the official `@typesafe-ai/sdk` Choice API. Its contract wa
 checked against [the official SDK v0.6.0](https://github.com/typesafe-ai/typesafe-sdk-js/tree/v0.6.0),
 not inferred from marketing examples. The fixed destination is
 `https://api.typesafe.ai`; SDK base-URL environment overrides and HTTP redirects
-are disabled. Calls are sequential, have a two-second deadline and no retries.
+are disabled. SDK logging is forced off, including when `TYPESAFE_LOG_LEVEL` is set,
+so diagnostics cannot leak request text or corrupt JSON reports. Calls are
+sequential, have a two-second deadline and no retries.
 Network failures and invalid responses produce a Lead fallback rather than
 preventing evaluation of later cases.
 

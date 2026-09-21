@@ -21,6 +21,7 @@ export function createJevShadowProvider(apiKey: string): ShadowProvider {
   const client = new TypeSafeClient({
     apiKey,
     baseURL: "https://api.typesafe.ai",
+    logLevel: "off",
     timeout: 2_000,
     retry: { maxRetries: 0 },
     // An environment override or redirect must not move sensitive state elsewhere.
