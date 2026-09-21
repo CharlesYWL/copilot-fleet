@@ -210,6 +210,133 @@ describe("PR maintenance orchestration", () => {
       },
     });
 
+  it("queues one durable recovery wake across ticks and engine reconstruction without replaying work", () => {
+    const { record, run, worker } = setup(false);
+    world.store.updateRun(run.id, { state: "completed" });
+    const failed = world.store.prMaintenance.checkpoint(
+      world.leadId,
+      record.id,
+      record.version,
+      {
+        kind: "fallback",
+        error: "local gh credential helper is signed out\n",
+        observation: {
+          attemptedAt: new Date().toISOString(),
+          complete: false,
+          failure: "capability",
+          evidence: "Local helper failure, not provider rejection.",
+        },
+      },
+    );
+    vi.spyOn(world.service.commands, "durableLead").mockReturnValue(true);
+    const queue = vi.spyOn(world.service.commands, "queueLeadPrompt");
+    const pump = vi
+      .spyOn(world.service.commands, "pumpLead")
+      .mockImplementation(() => {});
+    const dispatch = vi.spyOn(world.service, "dispatch");
+    new OrchestratorEngine(world.service).tick();
+    expect(queue).toHaveBeenCalledTimes(1);
+    expect(queue.mock.calls[0]![2]).toBe(
+      `pr-maintenance-recovery:${failed.incidents[0]!.id}`,
+    );
+    expect(queue.mock.calls[0]![1]).toContain("alternate_attempt");
+    expect(pump).toHaveBeenCalledWith(world.leadId);
+    expect(world.store.commands.prompts(world.leadId)).toHaveLength(1);
+    const claimed = world.store.prMaintenance.get(record.id)!;
+    expect(claimed.incidents[0]!.wakeQueuedAt).toBeDefined();
+    new OrchestratorEngine(world.service).tick(Date.now() + 60 * 60_000);
+    expect(queue).toHaveBeenCalledTimes(1);
+    expect(
+      dispatch.mock.calls.some(([, command]) => command.sessionId === worker.id),
+    ).toBe(false);
+    expect(world.store.getRun(run.id)!.state).toBe("completed");
+    expect(claimed.authorization).toEqual(failed.authorization);
+    expect(claimed.counters).toEqual(failed.counters);
+    expect(claimed.batches).toEqual([]);
+  });
+
+  it("rolls back the wake claim if durable enqueue fails, then retries the same key once", () => {
+    const { record, run } = setup(false);
+    world.store.updateRun(run.id, { state: "completed" });
+    world.store.prMaintenance.checkpoint(world.leadId, record.id, record.version, {
+      kind: "fallback",
+      error: "helper unavailable",
+      observation: {
+        attemptedAt: new Date().toISOString(),
+        complete: false,
+        failure: "capability",
+        evidence: "Cannot start helper.",
+      },
+    });
+    vi.spyOn(world.service.commands, "durableLead").mockReturnValue(true);
+    const queue = vi
+      .spyOn(world.service.commands, "queueLeadPrompt")
+      .mockImplementationOnce(() => {
+        throw new Error("queue write failed");
+      });
+    vi.spyOn(world.service.commands, "pumpLead").mockImplementation(() => {});
+    expect(() => new OrchestratorEngine(world.service).tick()).toThrow(
+      "queue write failed",
+    );
+    expect(
+      world.store.prMaintenance.get(record.id)!.incidents[0]!.wakeQueuedAt,
+    ).toBeUndefined();
+    expect(world.store.commands.prompts(world.leadId)).toHaveLength(0);
+    new OrchestratorEngine(world.service).tick();
+    expect(queue).toHaveBeenCalledTimes(2);
+    expect(queue.mock.calls[0]![2]).toBe(queue.mock.calls[1]![2]);
+    expect(world.store.commands.prompts(world.leadId)).toHaveLength(1);
+  });
+
+  it.each(["auth", "permission", "stop", "human"] as const)(
+    "never schedules capability recovery through %s",
+    (gate) => {
+      const { record, run } = setup(false);
+      world.store.updateRun(run.id, { state: "completed" });
+      let current = world.store.prMaintenance.checkpoint(
+        world.leadId,
+        record.id,
+        record.version,
+        {
+          kind: "fallback",
+          error: "Failure requiring the appropriate authority.",
+          observation: {
+            attemptedAt: new Date().toISOString(),
+            complete: false,
+            failure: gate === "auth" || gate === "permission" ? gate : "capability",
+            evidence: "Synthetic failure.",
+          },
+        },
+      );
+      if (gate === "stop") world.store.updateRun(run.id, { state: "cancelled" });
+      if (gate === "human")
+        current = world.store.prMaintenance.holdForDecision(
+          world.leadId,
+          current.id,
+          current.version,
+          {
+            id: "design-hold",
+            version: 1,
+            proposal: "Change the approved contract?",
+            scope: "API",
+            headSha,
+          },
+          () => world.store.updateRun(run.id, { state: "awaiting_human" }),
+        );
+      vi.spyOn(world.service.commands, "durableLead").mockReturnValue(true);
+      const queue = vi.spyOn(world.service.commands, "queueLeadPrompt");
+      vi.spyOn(world.service.commands, "pumpLead").mockImplementation(() => {});
+      new OrchestratorEngine(world.service).tick();
+      expect(queue).not.toHaveBeenCalled();
+      expect(
+        world.store.prMaintenance.get(record.id)!.incidents[0]!.wakeQueuedAt,
+      ).toBeUndefined();
+      expect(world.store.prMaintenance.get(record.id)!.authorization).toEqual(
+        current.authorization,
+      );
+    },
+  );
+
   it("exposes the durable registry after conversation context is discarded", () => {
     const { record, worker, run } = setup();
     const replacementFacade = new FleetTools(world.service, world.leadId);

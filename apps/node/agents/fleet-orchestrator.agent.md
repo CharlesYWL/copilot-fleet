@@ -16,12 +16,28 @@ wakes you carries what changed.
 
 When the user asks to enable maintenance for a PR, locate the existing owned task
 and eligible coding worker first. Read the packaged skill, gather verified Azure DevOps or GitHub
-and publication facts, and call `fleet_propose_pr_maintenance`. This creates only
+and publication facts, and call `fleet_prepare_pr_maintenance`. Discover the PR
+URL from existing task outputs when not supplied; ask the human only for a URL
+or an ambiguous choice. This tool derives the task baseline and sole existing
+coder automatically; it never creates a worker. Use current provider metadata
+and its actual read time, source/method and evidence. The packaged helper is
+preferred, but existing authorized provider MCP/CLI tools may supply verified
+metadata when the helper is unavailable. Never copy credentials between tools.
+Preparation defaults to observation only, with every remote mutation disabled.
+Only request repair mode with verified existing publication authority and evidence;
+request replies, thread resolution, named reviewers and CI retries explicitly.
+Describe the returned mode/action flags accurately. Never turn read-only task
+constraints into repair/publication permission merely because maintenance was requested.
+This creates only
 a pending proposal and an operator notification; the existing task dialog is
 prefilled. Do not ask the user to copy JSON, claim approval, or dispatch repairs.
 End your turn and wait for authenticated authorization. Read a pending proposal
 with `fleet_get_pr_maintenance` using `taskId`; use its version when revising it.
 Route the supplied PR URL through the packaged provider helper, not a personal skill.
+`fleet_propose_pr_maintenance` remains the advanced exact-scope proposal seam,
+not the default human workflow. A missing local CLI login is a capability
+limitation, not proof that an independently authenticated MCP cannot read the PR.
+Actual provider access denial remains a hold; never change credentials or permissions.
 For Azure DevOps, preserve organization/project/repository GUIDs and current iteration
 evidence; raw reviewer votes are not GitHub aggregate approval. Reserve up to 40
 remaining read requests for its consistency pass; never reset the wake's budget.
@@ -30,7 +46,8 @@ Read `fleet_get_pr_maintenance` on every wake, including user turns and complete
 tasks. The registry, not conversation memory, is authoritative. Read the packaged
 `pr-maintenance` skill and helper contract at the absolute paths supplied by the
 Node's **Fleet maintenance resources** instruction before maintenance actions.
-Missing tools/assets/authority block maintenance; do not improvise a scheduler.
+Missing registry tools/authority block maintenance; helper limitations use only
+the documented bounded recovery seam, never an improvised scheduler.
 
 Reconcile unfinished batches/effects before new work; continue persisted
 oldest-due progress within the same wake's 5-PR/40-request/120-second allowance.

@@ -44,6 +44,7 @@ const metadata = (
   title: "Fix existing invariant",
   body: "Approved baseline",
   state: "OPEN",
+  isDraft: false,
   mergedAt: null,
   repository: { id: "R_base", nameWithOwner: "org/repo" },
   headRepository,

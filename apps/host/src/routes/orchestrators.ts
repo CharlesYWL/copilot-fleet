@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync, FastifyRequest } from "fastify";
+import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import {
   liveSessionStates,
@@ -10,6 +11,7 @@ import {
   isChatsWorkspace,
   PrMaintenanceEnableSchema,
   PrMaintenanceOperatorActionSchema,
+  parsePrMaintenanceUrl,
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
@@ -55,6 +57,12 @@ const ReviewSchema = z
   .strict();
 
 const MaintenanceActionSchema = z.discriminatedUnion("action", [
+  z
+    .object({
+      action: z.literal("prepare"),
+      prUrl: z.string().trim().min(1).max(4_096).optional(),
+    })
+    .strict(),
   z
     .object({ action: z.literal("enable"), registration: PrMaintenanceEnableSchema })
     .strict(),
@@ -142,7 +150,6 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     do {
       const page = store.prMaintenance.list({
         taskId,
-        retainedOnly: true,
         limit: 100,
         ...(cursor ? { cursor } : {}),
       });
@@ -187,6 +194,88 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           "An authenticated browser operator must authorize maintenance; Node, MCP and no-login principals cannot.",
       });
     const input = MaintenanceActionSchema.parse(request.body);
+    if (input.action === "prepare") {
+      let prUrl: string | undefined;
+      try {
+        prUrl = input.prUrl ? parsePrMaintenanceUrl(input.prUrl).url : undefined;
+      } catch {
+        return reply
+          .code(400)
+          .send({ error: "Use an exact Azure DevOps or GitHub HTTPS PR URL." });
+      }
+      const lead = store.getSession(run.leadSessionId);
+      if (
+        !lead ||
+        lead.runRole !== "lead" ||
+        lead.stopRequested ||
+        lead.cleanupRequested ||
+        !["idle", "running"].includes(lead.state) ||
+        !store.getNode(lead.nodeId)?.online
+      )
+        return reply.code(409).send({
+          error:
+            "Resume the task's existing Orchestrator on its authorized Node before requesting preparation.",
+        });
+      if (maintenanceForTask(id).some((record) => !record.ownershipReleasedAt))
+        return reply.code(409).send({
+          error:
+            "This task retains maintenance. Settle and release it before preparing another PR.",
+        });
+      const prompt = [
+        `<fleet-maintenance-prepare taskId=${JSON.stringify(id)}>`,
+        "Prepare a bounded PR maintenance job for this existing task, not a new task or worker.",
+        prUrl
+          ? `Requested PR URL: ${JSON.stringify(prUrl)}`
+          : "Discover the PR URL from this task's outputs and existing worker evidence. Ask only for the PR URL or an ambiguous choice if needed.",
+        "Read fleet_get_task and fleet_get_pr_maintenance. Verify fresh provider metadata using the packaged helper or an already-authorized provider MCP/CLI.",
+        "Use fleet_prepare_pr_maintenance to fill Fleet context and the approved baseline automatically. Record prerequisite limitations truthfully.",
+        "This request is NOT publication or maintenance authorization. Present the readable proposal for signed-in operator approval, then end your turn. Do not repair, publish, merge, change credentials or create sessions.",
+        "</fleet-maintenance-prepare>",
+      ].join("\n");
+      if (service.commands.durableLead(lead.id)) {
+        store.writeAtomically(() => {
+          const key = `maintenance-prepare:${createHash("sha256")
+            .update(
+              JSON.stringify([
+                id,
+                prUrl ?? "",
+                store.prMaintenance.getProposal(id)?.version ?? 0,
+                maintenanceForTask(id)
+                  .map((record) => record.id)
+                  .sort(),
+              ]),
+            )
+            .digest("hex")}`;
+          const prior = store.commands
+            .prompts(lead.id)
+            .filter((entry) => entry.key.startsWith(`${key}:`));
+          if (
+            !prior.some((entry) =>
+              ["pending", "reserved", "accepted", "rejected_busy", "uncertain"].includes(
+                entry.state,
+              ),
+            )
+          )
+            service.commands.queueLeadPrompt(lead.id, prompt, `${key}:${randomUUID()}`);
+        });
+        service.commands.pumpLead(lead.id);
+      } else {
+        if (lead.state !== "idle")
+          return reply.code(409).send({
+            error: "Wait for this Orchestrator turn to finish, then request preparation.",
+          });
+        const sent = service.dispatch(lead.nodeId, {
+          type: "prompt",
+          sessionId: lead.id,
+          prompt,
+          attachments: [],
+        });
+        if (!sent.sent)
+          return reply.code(503).send({ error: "The Orchestrator Node disconnected." });
+      }
+      service.publishSnapshot();
+      return reply.code(202).send({ status: "preparation_requested", taskId: id });
+    }
     let updated: PrMaintenanceRegistration;
     if (input.action === "enable" || input.action === "authorize_proposal") {
       if (input.action === "enable" && input.registration.taskId !== id)

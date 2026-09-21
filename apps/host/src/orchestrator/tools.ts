@@ -7,7 +7,10 @@ import {
   AccessIntentSchema,
   PrMaintenanceCheckpointSchema,
   PrMaintenanceEnableSchema,
+  PrMaintenanceIdentitySchema,
+  parsePrMaintenanceUrl,
   prMaintenanceProviderLabel,
+  prMaintenanceProgress,
   prMaintenanceUrl,
   type PrMaintenanceAdmission,
   checkoutLockKey,
@@ -435,6 +438,41 @@ export const ProposePrMaintenanceSchema = PrMaintenanceEnableSchema.extend({
     ),
 });
 
+export const PreparePrMaintenanceSchema = z
+  .object({
+    taskId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Owned task; omit only when unambiguous."),
+    workerSessionId: z
+      .string()
+      .min(1)
+      .optional()
+      .describe("Existing task coder; omit to resolve the sole eligible worker."),
+    prUrl: z.string().min(1).max(4_096),
+    identity: PrMaintenanceIdentitySchema,
+    headSha: PrMaintenanceEnableSchema.shape.headSha,
+    observedAt: z.string().datetime(),
+    method: z.enum(["packaged_helper", "provider_mcp", "provider_cli"]),
+    evidence: z.string().min(1).max(8_192),
+    verification: z.string().min(1).max(8_192),
+    eligibilityEvidence: z.string().min(1).max(8_192),
+    mode: z
+      .enum(["observe", "repair"])
+      .default("observe")
+      .describe(
+        "Safe default is read-only observation. Request repair only with verified existing publication authority; human approval is still required.",
+      ),
+    publicationEvidence: z.string().min(1).max(8_192).optional(),
+    replies: z.boolean().default(false),
+    resolveThreads: z.boolean().default(false),
+    reviewers: z.array(z.string().min(1).max(512)).max(20).default([]),
+    retryChecks: z.boolean().default(false),
+    expectedVersion: z.number().int().positive().optional(),
+  })
+  .strict();
+
 export const GetPrMaintenanceSchema = z
   .object({
     recordId: z.string().min(1).optional(),
@@ -443,12 +481,20 @@ export const GetPrMaintenanceSchema = z
       .min(1)
       .optional()
       .describe(
-        "Read an owned task's pending authorization proposal and retained registration.",
+        "Read an owned task's pending authorization proposal, current registration and prior PR jobs.",
       ),
     limit: z.number().int().min(1).max(100).default(20),
     cursor: z.string().min(1).optional(),
     takeDue: z.boolean().default(false),
-    reserveRequests: z.number().int().min(1).max(40).optional(),
+    reserveRequests: z
+      .number()
+      .int()
+      .min(1)
+      .max(40)
+      .optional()
+      .describe(
+        "Override the reserved helper allowance. Defaults: recovery 1 (reserve alternate I/O separately), ADO observe 40, ADO repair 39 (leaves continuation capacity), GitHub 8. Lost/unused reservations stay charged.",
+      ),
   })
   .strict();
 
@@ -833,6 +879,148 @@ export class FleetTools {
     });
   }
 
+  preparePrMaintenance(input: z.infer<typeof PreparePrMaintenanceSchema>): ToolResult {
+    return this.maintenanceResult(() => {
+      if (input.mode === "repair" && !input.publicationEvidence)
+        throw new PrMaintenanceError(
+          "publication_evidence_required",
+          "Repair preparation requires verified existing publication authority. Otherwise prepare observation-only maintenance.",
+        );
+      if (
+        input.mode === "observe" &&
+        (input.replies ||
+          input.resolveThreads ||
+          input.reviewers.length ||
+          input.retryChecks)
+      )
+        throw new PrMaintenanceError(
+          "read_only_scope",
+          "Observation-only maintenance cannot request replies, thread changes, reviewers or CI retries.",
+        );
+      let url;
+      try {
+        url = parsePrMaintenanceUrl(input.prUrl);
+      } catch {
+        throw new PrMaintenanceError(
+          "invalid_pr_url",
+          "Use an exact supported HTTPS PR URL.",
+        );
+      }
+      const identity = input.identity;
+      const matches =
+        url.number === identity.prNumber &&
+        url.host === identity.host &&
+        (url.provider === "azure-devops"
+          ? identity.provider === "azure-devops" &&
+            url.organization === identity.organization &&
+            [identity.project, identity.projectId].some(
+              (value) => value.toLowerCase() === url.project.toLowerCase(),
+            ) &&
+            [identity.repository.split("/")[1], identity.repositoryId].some(
+              (value) => value?.toLowerCase() === url.repo.toLowerCase(),
+            )
+          : identity.provider !== "azure-devops" &&
+            `${url.owner}/${url.repo}` === identity.repository);
+      if (!matches)
+        throw new PrMaintenanceError(
+          "identity_mismatch",
+          "The verified provider identity does not match the requested PR URL.",
+        );
+      const age = Date.now() - Date.parse(input.observedAt);
+      if (age > 5 * 60_000 || age < -30_000)
+        throw new PrMaintenanceError(
+          "stale_evidence",
+          "Read current PR metadata before preparing maintenance (within five minutes).",
+        );
+      const tasks = this.runs().filter((run) => !input.taskId || run.id === input.taskId);
+      if (input.taskId && tasks.length === 0)
+        throw new PrMaintenanceError(
+          "ownership",
+          "That task does not belong to this lead.",
+        );
+      if (tasks.length !== 1)
+        return {
+          status: "needs_task_choice",
+          tasks: tasks.map((run) => ({ taskId: run.id, name: run.name })),
+          instruction:
+            "Choose the existing task from its PR/work evidence; do not create a task or guess.",
+        };
+      const task = tasks[0]!;
+      const workerIds = new Set(
+        this.store
+          .listRunSteps(task.id)
+          .filter((step) => isWritingCategory(step.category))
+          .map((step) => step.sessionId),
+      );
+      const workers = this.store
+        .listSessions()
+        .filter(
+          (session) =>
+            session.runId === task.id &&
+            session.runRole === "worker" &&
+            workerIds.has(session.id) &&
+            (!input.workerSessionId || session.id === input.workerSessionId),
+        );
+      if (workers.length !== 1)
+        return {
+          status: "needs_worker_choice",
+          taskId: task.id,
+          workers: workers.map((worker) => ({
+            workerSessionId: worker.id,
+            name: worker.name,
+          })),
+          instruction:
+            "Resolve the existing coder from task evidence; never create a replacement worker.",
+        };
+      const baseline = [
+        task.objective,
+        ...task.successCriteria.map(
+          (criterion) => `${criterion.scenario} — ${criterion.expectedEvidence}`,
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n");
+      // All binding and readiness checks remain in the shared proposal path.
+      const result = this.proposePrMaintenance(
+        ProposePrMaintenanceSchema.parse({
+          taskId: task.id,
+          workerSessionId: workers[0]!.id,
+          identity,
+          headSha: input.headSha,
+          scope: {
+            baseline,
+            verification: input.verification,
+            publicationAuthorized: input.mode === "repair",
+            replies: input.replies,
+            resolveThreads: input.resolveThreads,
+            reviewers: input.reviewers,
+            retryChecks: input.retryChecks,
+          },
+          eligibilityEvidence: [
+            input.eligibilityEvidence,
+            `Metadata observed ${input.observedAt} via ${input.method}: ${input.evidence}`,
+            input.mode === "repair"
+              ? `Verified publication path: ${input.publicationEvidence}`
+              : "Observation only: no repair, commit, publication or provider mutation is requested.",
+          ].join("\n"),
+          ...(input.expectedVersion ? { expectedVersion: input.expectedVersion } : {}),
+        }),
+      );
+      if (!result.ok) throw new PrMaintenanceError("preparation_refused", result.text);
+      return {
+        ...JSON.parse(result.text),
+        mode: input.mode,
+        proposedActions: {
+          repairAndPublish: input.mode === "repair",
+          replies: input.replies,
+          resolveThreads: input.resolveThreads,
+          reviewers: input.reviewers,
+          retryChecks: input.retryChecks,
+        },
+      };
+    });
+  }
+
   getPrMaintenance(input: z.input<typeof GetPrMaintenanceSchema> = {}): ToolResult {
     const parsed = GetPrMaintenanceSchema.parse(input);
     return this.maintenanceResult(() => {
@@ -849,10 +1037,10 @@ export class FleetTools {
             "That task does not belong to this lead.",
           );
         return {
+          serverTime: new Date().toISOString(),
           ...registry.list({
             leadSessionId: this.leadSessionId,
             taskId: parsed.taskId,
-            retainedOnly: true,
             limit: parsed.limit,
             ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
           }),
@@ -869,7 +1057,7 @@ export class FleetTools {
             "Claim oldest-due work without a record ID.",
           );
         }
-        return record;
+        return { ...record, serverTime: new Date().toISOString() };
       }
       // The caller cannot invent a wake ID to reset the per-turn allowance.
       const wakeId = this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId;
@@ -884,15 +1072,31 @@ export class FleetTools {
         return this.store.writeAtomically(() => {
           const record = registry.takeDue(this.leadSessionId, wakeId);
           const allowance = registry.remainingWake(this.leadSessionId, wakeId);
-          if (!record) return { record: null, allowance };
-          const requests = Math.min(parsed.reserveRequests ?? 8, allowance.requests);
+          if (!record)
+            return { record: null, allowance, serverTime: new Date().toISOString() };
+          const recovery = record.incidents.some(
+            (incident) => incident.kind === "capability" && !incident.resolvedAt,
+          );
+          const defaultRequests = recovery
+            ? 1
+            : record.identity.provider === "azure-devops"
+              ? record.authorization.scope.publicationAuthorized
+                ? 39
+                : 40
+              : 8;
+          const requests = Math.min(
+            parsed.reserveRequests ?? defaultRequests,
+            allowance.requests,
+          );
           registry.chargeWake(this.leadSessionId, wakeId, { requests, milliseconds: 0 });
           return {
+            serverTime: new Date().toISOString(),
             record,
             observationAllowance: { requests, milliseconds: allowance.milliseconds },
             allowance: registry.remainingWake(this.leadSessionId, wakeId),
-            instruction:
-              "Allowance is reserved, including lost responses. Run the bounded helper once, checkpoint its result, and do not reclaim this visit. Paused/terminal records permit reconciliation only.",
+            instruction: recovery
+              ? "Recovery visit claimed; its reservation stays charged. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim, reclaim the visit or reset budgets. Paused/terminal records permit reconciliation only."
+              : "Allowance is reserved, including lost responses. Run the bounded helper once, checkpoint its result, and do not reclaim this visit. ADO defaults leave one request unit for continuation when repair is authorized; claiming all 40 permits observation only in this wake. Paused/terminal records permit reconciliation only.",
           };
         });
       }
@@ -905,6 +1109,7 @@ export class FleetTools {
         ...(parsed.cursor ? { cursor: parsed.cursor } : {}),
       });
       return {
+        serverTime: new Date().toISOString(),
         ...page,
         records: page.records.map((record) => ({
           id: record.id,
@@ -920,6 +1125,16 @@ export class FleetTools {
           decision: record.decision,
           ownershipReleasedAt: record.ownershipReleasedAt,
           counters: record.counters,
+          progress: prMaintenanceProgress(record),
+          recovery: record.incidents
+            .filter((incident) => !incident.resolvedAt)
+            .map((incident) => ({
+              id: incident.id,
+              kind: incident.kind,
+              error: incident.lastError,
+              attempts: incident.attempts.length,
+              wakeQueuedAt: incident.wakeQueuedAt,
+            })),
           pendingBatches: record.batches
             .filter((batch) =>
               ["prepared", "accepted", "reconciling", "uncertain"].includes(batch.state),
@@ -943,6 +1158,7 @@ export class FleetTools {
         }
         if (
           input.checkpoint.kind === "observation" ||
+          input.checkpoint.kind === "fallback" ||
           (input.checkpoint.kind === "action" &&
             input.checkpoint.effect.state === "reserved")
         ) {
@@ -980,6 +1196,7 @@ export class FleetTools {
           input.recordId,
           input.expectedVersion,
           input.checkpoint,
+          this.store.getSessionDispatchAttempt(this.leadSessionId)?.commandId,
         );
       });
       this.service.cancelPausedPrMaintenance();
@@ -1858,7 +2075,26 @@ export class FleetTools {
   }
 
   listWork(input: z.infer<typeof ListWorkSchema> = {}): ToolResult {
-    const words = input.query?.trim().toLowerCase().split(/\s+/) ?? [];
+    const words = input.query?.trim().toLowerCase().split(/\s+/).filter(Boolean) ?? [];
+    const maintenanceByTask = new Map<string, string[]>();
+    if (words.length) {
+      let cursor: string | undefined;
+      do {
+        const page = this.store.prMaintenance.list({
+          leadSessionId: this.leadSessionId,
+          limit: 100,
+          ...(cursor ? { cursor } : {}),
+        });
+        for (const record of page.records) {
+          const labels = maintenanceByTask.get(record.taskId) ?? [];
+          labels.push(
+            `${prMaintenanceProviderLabel(record.identity)} ${record.identity.repository} #${record.identity.prNumber} ${prMaintenanceUrl(record.identity)} ${record.lifecycle} ${record.ownershipReleasedAt ? "released history" : "retained"}`,
+          );
+          maintenanceByTask.set(record.taskId, labels);
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+    }
     const runs = this.runs()
       .reverse()
       .filter((run) => {
@@ -1869,6 +2105,7 @@ export class FleetTools {
           run.id,
           run.name,
           run.objective,
+          ...(maintenanceByTask.get(run.id) ?? []),
           ...(proposal?.leadSessionId === this.leadSessionId
             ? [
                 proposal.registration.identity.repository,
@@ -2007,7 +2244,7 @@ export class FleetTools {
         : []),
       ...maintenance.records.map(
         (record) =>
-          `  PR maintenance: ${record.id} - ${record.lifecycle}${record.pauseReason ? ` (${record.pauseReason})` : ""}; read fleet_get_pr_maintenance before continuation.`,
+          `  Retained PR maintenance: ${prMaintenanceUrl(record.identity)} (${record.id}) - ${record.lifecycle}${record.pauseReason ? ` (${record.pauseReason})` : ""}; read fleet_get_pr_maintenance with taskId "${run.id}" for current facts and prior PR history before continuation.`,
       ),
       ...(steps.length
         ? steps.map((step) => {

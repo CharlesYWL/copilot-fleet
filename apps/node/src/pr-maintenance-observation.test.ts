@@ -48,6 +48,11 @@ const complete = (value: unknown = snapshot()) => ({
 });
 
 describe("GitHub helper to durable Host observation", () => {
+  it("preserves draft state rather than implying a ready PR", () => {
+    expect(
+      toHostObservation(complete({ ...snapshot(), isDraft: true }), {}),
+    ).toMatchObject({ complete: true, draft: true });
+  });
   it.each(["classic", "ruleset"] as const)(
     "blocks behind and unknown base readiness under %s strict policy",
     (policy) => {
@@ -206,6 +211,7 @@ describe("GitHub helper to durable Host observation", () => {
     );
     expect(observation.failure).toBe("budget");
     expect(observation.helperState).toEqual({
+      error: { code: "budget_exhausted", message: "Carry the scan." },
       resume,
       previousThreads: [{ id: "thread", revision: 2, stateHash: "state" }],
     });
@@ -213,6 +219,8 @@ describe("GitHub helper to durable Host observation", () => {
   });
 
   it.each([
+    ["local_auth_unavailable", "capability"],
+    ["gh_unavailable", "capability"],
     ["auth_required", "auth"],
     ["permission_denied", "permission"],
     ["rate_limited", "rate_limit"],
@@ -233,6 +241,7 @@ describe("GitHub helper to durable Host observation", () => {
       failure: expected,
       requestsConsumed: 1,
       retryAfter: "2026-09-18T00:01:00.000Z",
+      helperState: { error: { code, message: "Read refused." } },
     });
   });
 

@@ -22,7 +22,7 @@ const commentFields = `id body updatedAt url ${actor}`;
 const reviewer =
   "requestedReviewer { ... on User { id login } ... on Team { id slug } ... on Mannequin { id login } }";
 const metadataFields = `
-  id number url title body state mergedAt headRefName headRefOid baseRefName baseRefOid
+  id number url title body state isDraft mergedAt headRefName headRefOid baseRefName baseRefOid
   mergeable mergeStateStatus reviewDecision
   repository { id nameWithOwner }
   headRepository { id nameWithOwner }
@@ -321,14 +321,21 @@ export function ghRequest({ host, endpoint, payload, timeoutMs, maxBytes }) {
           reject(error);
         }
       } else {
+        const localAuth = code === 4 && !/HTTP 40[13]/i.test(stderr);
         const auth =
           code === 4 || /(?:HTTP 401|authentication|gh auth login)/i.test(stderr);
         reject(
           fail(
-            auth ? "auth_required" : "request_failed",
-            auth
-              ? "Renew the authorized Node's GitHub login; no credentials were changed."
-              : "GitHub CLI failed without a usable response.",
+            localAuth
+              ? "local_auth_unavailable"
+              : auth
+                ? "auth_required"
+                : "request_failed",
+            localAuth
+              ? "The local GitHub CLI has no usable login; an independently authorized provider tool may inspect without changing credentials."
+              : auth
+                ? "Renew the authorized Node's GitHub login; no credentials were changed."
+                : "GitHub CLI failed without a usable response.",
           ),
         );
       }
@@ -363,6 +370,7 @@ function identity(pr, metadata) {
     !["OPEN", "CLOSED", "MERGED"].includes(metadata.state) ||
     typeof metadata.title !== "string" ||
     typeof metadata.body !== "string" ||
+    typeof metadata.isDraft !== "boolean" ||
     typeof metadata.mergeable !== "string" ||
     !validRef(result.baseRef) ||
     !metadata.baseRefOid
@@ -701,6 +709,7 @@ export function buildSnapshot(input, scan) {
     headSha: metadata.headRefOid,
     baseSha: metadata.baseRefOid,
     state: metadata.mergedAt ? "merged" : metadata.state === "CLOSED" ? "closed" : "open",
+    isDraft: metadata.isDraft,
     title: metadata.title,
     body: metadata.body,
     mergeable: metadata.mergeable,
@@ -721,6 +730,7 @@ export function buildSnapshot(input, scan) {
     actionableFingerprint: contentHash({
       scope,
       state: metadata.state,
+      isDraft: metadata.isDraft,
       design: { title: metadata.title, body: metadata.body },
       mergeable: metadata.mergeable,
       mergeStateStatus: metadata.mergeStateStatus ?? "UNKNOWN",

@@ -24,6 +24,7 @@ import {
   GetPrMaintenanceSchema,
   ListWorkSchema,
   PlanTaskSchema,
+  PreparePrMaintenanceSchema,
   ProposePrMaintenanceSchema,
   ReopenTaskSchema,
   SessionRefSchema,
@@ -461,6 +462,19 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
   );
 
   server.registerTool(
+    "fleet_prepare_pr_maintenance",
+    {
+      title: "Prepare a PR maintenance job",
+      description:
+        "For a natural-language maintenance request, discover the real PR URL and fresh metadata with the helper or already-authorized provider MCP/CLI. Derives the approved task baseline and existing coder; returns choices if ambiguous and stores a readable unapproved proposal. Defaults to observe: no repairs/publication or remote mutations. Repair mode requires verified publicationEvidence; replies, resolveThreads, named reviewers and retryChecks must be requested explicitly and default off. Never broaden read-only task constraints. Metadata must be at most five minutes old and URL-matched. Returns exact mode/proposedActions; describe them accurately. Cannot authorize, create workers, dispatch repairs or change credentials. No human JSON/Fleet IDs.",
+      inputSchema: PreparePrMaintenanceSchema.shape,
+    },
+    guard("fleet_prepare_pr_maintenance", PreparePrMaintenanceSchema, (input) =>
+      tools.preparePrMaintenance(input),
+    ),
+  );
+
+  server.registerTool(
     "fleet_propose_pr_maintenance",
     {
       title: "Propose PR maintenance for human authorization",
@@ -491,7 +505,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Read PR maintenance and claim due work",
       description:
-        "Read this lead's durable registrations on every wake. Use taskId for an owned task's pending authorization proposal and retained registration. List bounded summaries with nextCursor, or read a complete record by recordId. takeDue claims the next persisted oldest-due visit and reserves a bounded helper request allowance for this Host-recorded turn; it does not start a worker. A lost claim stays charged. Reconcile paused or terminal work without repairs.",
+        "Read this lead's durable registrations on every wake. Use taskId for its pending proposal, current job and historical PRs. Responses include serverTime for actual collection-start timestamps, never to re-date old evidence. List bounded summaries with nextCursor, or read a complete record by recordId. takeDue claims the next persisted oldest-due visit and reserves a bounded helper request allowance for this Host-recorded turn; it does not start a worker. A lost claim stays charged. Reconcile paused or terminal work without repairs.",
       inputSchema: GetPrMaintenanceSchema.shape,
     },
     guard("fleet_get_pr_maintenance", GetPrMaintenanceSchema, (input) =>
@@ -504,7 +518,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Checkpoint PR maintenance facts",
       description:
-        "Persist a complete or incomplete observation, exact prepared batch, per-finding/effect settlement, readiness, or reconciliation with an optimistic version. Checkpointing cannot authorize a design change, broaden scope, or transfer ownership. A worker completion is not batch settlement.",
+        "Persist observations, helper fallback errors, prepared batches, settlement or readiness with an optimistic version. For fallback, error is the STRING 'code: message' from result.error.code and result.error.message (not the helper error object), and observation is the unchanged original result.observation with its real timestamp. Correcting a rejected shape does not authorize another helper call. Claim a bounded visit, then reserve alternate_attempt with incidentId, stable resolutionId, source/method/evidenceRef and request budget BEFORE alternate provider I/O. Submit fresh structured alternate_observation with the same resolutionId; partial stays partial. At most 3 attempts/incident; no credential changes or hold bypass. Checkpointing cannot authorize, broaden scope or transfer ownership. A worker completion is not batch settlement.",
       inputSchema: CheckpointPrMaintenanceSchema.shape,
     },
     guard("fleet_checkpoint_pr_maintenance", CheckpointPrMaintenanceSchema, (input) =>

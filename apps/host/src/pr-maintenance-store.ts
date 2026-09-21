@@ -4,7 +4,9 @@ import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { z } from "zod";
 import {
   PR_MAINTENANCE_CADENCE_MS,
+  PR_MAINTENANCE_RECOVERY_LIMITS,
   PR_MAINTENANCE_WAKE_LIMITS,
+  prMaintenanceObservationFresh,
   prMaintenanceProviderKey,
   PrMaintenanceAdmissionSchema,
   PrMaintenanceBackupSchema,
@@ -22,6 +24,7 @@ import {
   type PrMaintenanceCheckpoint,
   type PrMaintenanceEffect,
   type PrMaintenanceIdentity,
+  type PrMaintenanceIncident,
   type PrMaintenanceObservation,
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
@@ -52,6 +55,16 @@ const sameIdentity = (left: PrMaintenanceIdentity, right: PrMaintenanceIdentity)
     { ...left, provider: left.provider ?? "github" },
     { ...right, provider: right.provider ?? "github" },
   );
+const helperError = (observation: PrMaintenanceObservation) => {
+  const state = observation.helperState;
+  if (!state || typeof state !== "object" || Array.isArray(state)) return undefined;
+  const error = state.error;
+  return error && typeof error === "object" && !Array.isArray(error) ? error : undefined;
+};
+const observationError = (observation: PrMaintenanceObservation) => {
+  const message = helperError(observation)?.message;
+  return typeof message === "string" && message ? message : observation.evidence;
+};
 const listSchema = z
   .object({
     leadSessionId: actorSchema.optional(),
@@ -83,9 +96,16 @@ function refuse(code: string, message: string): never {
 }
 export function prMaintenanceUnsettled(record: PrMaintenanceRegistration): boolean {
   return (
+    record.incidents.some(
+      (incident) => incident.kind === "effects" && !incident.resolvedAt,
+    ) ||
     record.batches.some(
-      (batch) => outstanding.has(batch.state) || batch.effects.some(unsettledEffect),
-    ) || record.actions.some(unsettledEffect)
+      (batch) =>
+        outstanding.has(batch.state) ||
+        (batch.stepId && !batch.executionSettled) ||
+        batch.effects.some(unsettledEffect),
+    ) ||
+    record.actions.some(unsettledEffect)
   );
 }
 
@@ -219,14 +239,17 @@ export class PrMaintenanceStore {
           "already_registered",
           "This task already retains maintenance; use its existing registration.",
         );
-      const bindingReason = this.binding({
-        taskId: task.id,
-        workerSessionId: worker.id,
-        leadSessionId,
+      const binding = {
         placementId: worker.placementId,
         checkoutKey:
           worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`,
         bindingGeneration: worker.executionBinding?.generation ?? 0,
+      };
+      const bindingReason = this.binding({
+        taskId: task.id,
+        workerSessionId: worker.id,
+        leadSessionId,
+        ...binding,
       });
       if (bindingReason)
         refuse(bindingReason, "This worker binding cannot be proposed for maintenance.");
@@ -250,7 +273,11 @@ export class PrMaintenanceStore {
           "Settle existing work and task approvals before proposing maintenance.",
         );
       const previous = this.getProposal(task.id, leadSessionId);
-      if (previous && isDeepStrictEqual(previous.registration, registration))
+      if (
+        previous &&
+        isDeepStrictEqual(previous.registration, registration) &&
+        isDeepStrictEqual(previous.binding, binding)
+      )
         return previous;
       if (previous?.version !== expectedVersion)
         refuse(
@@ -274,6 +301,7 @@ export class PrMaintenanceStore {
         version: (previous?.version ?? 0) + 1,
         leadSessionId,
         registration,
+        binding,
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
       });
@@ -304,6 +332,23 @@ export class PrMaintenanceStore {
         refuse(
           "ownership",
           "The task owner changed; its current lead must prepare a new proposal.",
+        );
+      if (!proposal.binding)
+        refuse(
+          "proposal_binding_required",
+          "This legacy proposal has no reviewed checkout binding. Prepare and review a new proposal before authorization.",
+        );
+      const worker = this.store.getSession(proposal.registration.workerSessionId);
+      if (
+        !worker ||
+        worker.placementId !== proposal.binding.placementId ||
+        (worker.executionBinding?.checkoutKey ?? `placement:${worker.placementId}`) !==
+          proposal.binding.checkoutKey ||
+        (worker.executionBinding?.generation ?? 0) !== proposal.binding.bindingGeneration
+      )
+        refuse(
+          "proposal_binding_changed",
+          "The worker placement, checkout or binding generation changed after preparation. Prepare and review a new proposal.",
         );
       return this.enableFromOperator(proposal.registration, actorId);
     });
@@ -624,6 +669,8 @@ export class PrMaintenanceStore {
         renewedAt: now,
         nextCheckAt: now,
         counters: emptyCounters(),
+        incidentCursor: 0,
+        incidents: [],
         decisionHistory: [],
         batches: [],
         findings: [],
@@ -789,6 +836,15 @@ export class PrMaintenanceStore {
             "Terminal registrations cannot resume; settle and enable a new generation.",
           );
         if (action.action !== "direction" || action.resume) {
+          if (
+            record.incidents.some(
+              (incident) => incident.kind === "effects" && !incident.resolvedAt,
+            )
+          )
+            refuse(
+              "unsettled",
+              "Reconcile ambiguous effects with correlated receipts before resuming maintenance.",
+            );
           const reason = this.binding(record);
           if (reason)
             refuse(
@@ -802,6 +858,17 @@ export class PrMaintenanceStore {
           record.nextCheckAt = now;
           record.renewedAt = now;
           delete record.pausedNoticeAt;
+          for (const incident of record.incidents) {
+            if (
+              !incident.resolvedAt &&
+              ["identity", "provider_denial"].includes(incident.kind)
+            ) {
+              incident.resolvedAt = now;
+              incident.resolution = "operator_resume";
+              delete record.lastAttempt;
+              delete record.readyFingerprint;
+            }
+          }
         }
       }
       const saved = this.save(record);
@@ -982,6 +1049,15 @@ export class PrMaintenanceStore {
       if (
         ["dispatch", "execute", "prompt", "resume", "publish"].includes(action.action)
       ) {
+        if (!record.authorization.scope.publicationAuthorized)
+          return denied("publication_not_authorized");
+        if (
+          record.batches.some(
+            (batch) =>
+              batch.stepId && !batch.executionSettled && !outstanding.has(batch.state),
+          )
+        )
+          return denied("execution_uncertain");
         if (task.state === "completed") return denied("task_completed_reopen_required");
         if (action.taskId && action.taskId !== record.taskId)
           return denied("resource_reserved");
@@ -1005,9 +1081,22 @@ export class PrMaintenanceStore {
           batch.state !== "accepted"
         )
           return denied("batch_not_accepted");
-        if (!record.lastAttempt?.complete) return denied("observation_incomplete");
+        if (!record.lastAttempt?.complete || record.lastAttempt.failure)
+          return denied("observation_incomplete");
         if (!record.observation?.complete || batch.headSha !== record.observation.headSha)
           return denied("stale_observation");
+        if (
+          record.lastAttempt.headSha !== record.observation.headSha ||
+          record.lastAttempt.snapshotId !== record.observation.snapshotId
+        )
+          return denied("stale_observation");
+        if (!prMaintenanceObservationFresh(record.observation))
+          return denied("stale_observation");
+        if (record.observation.draft) return denied("draft");
+        if (record.observation.mergeability === "conflicting")
+          return denied("merge_conflict");
+        if (record.incidents.some((incident) => !incident.resolvedAt))
+          return denied("observation_recovery_required");
         if (
           action.action === "dispatch" &&
           !(
@@ -1147,6 +1236,7 @@ export class PrMaintenanceStore {
     id: string,
     expectedVersion: number,
     input: z.input<typeof PrMaintenanceCheckpointSchema>,
+    wakeId?: string,
   ): PrMaintenanceRegistration {
     const checkpoint: PrMaintenanceCheckpoint =
       PrMaintenanceCheckpointSchema.parse(input);
@@ -1154,9 +1244,23 @@ export class PrMaintenanceStore {
       const record = this.required(id, leadSessionId, expectedVersion);
       if (record.ownershipReleasedAt)
         refuse("released", "Released history cannot admit new checkpoints or effects.");
-      if (checkpoint.kind === "observation") {
+      if (checkpoint.kind === "fallback") {
+        const key = this.observationKey(checkpoint.observation, checkpoint.error);
+        if (record.incidents.some((incident) => incident.lastObservationKey === key))
+          return record;
+        this.observe(record, checkpoint.observation, checkpoint.error);
+      } else if (checkpoint.kind === "alternate_attempt") {
+        if (!this.reserveAlternate(record, checkpoint, wakeId)) return record;
+      } else if (checkpoint.kind === "alternate_observation") {
+        if (!this.alternateObservation(record, checkpoint)) return record;
+      } else if (checkpoint.kind === "observation") {
         this.observe(record, checkpoint.observation);
       } else if (checkpoint.kind === "prepare_batch") {
+        if (!record.authorization.scope.publicationAuthorized)
+          refuse(
+            "publication_not_authorized",
+            "Read-only maintenance cannot prepare repair or answer batches; an authenticated operator must explicitly authorize mutations.",
+          );
         const prepared = checkpoint.batch;
         const prior = record.batches.find((batch) => batch.id === prepared.id);
         if (prior) {
@@ -1182,10 +1286,7 @@ export class PrMaintenanceStore {
         });
         if (!admission.allowed)
           refuse(admission.reason!, "Maintenance is held; cannot prepare repairs.");
-        if (
-          record.batches.some((batch) => outstanding.has(batch.state)) ||
-          record.actions.some(unsettledEffect)
-        )
+        if (prMaintenanceUnsettled(record))
           refuse(
             "unsettled",
             "Reconcile the outstanding batch and lead effects before preparing new work.",
@@ -1193,12 +1294,25 @@ export class PrMaintenanceStore {
         if (
           !record.observation?.complete ||
           !record.lastAttempt?.complete ||
+          record.lastAttempt.failure ||
+          record.lastAttempt.headSha !== record.observation.headSha ||
+          record.lastAttempt.snapshotId !== record.observation.snapshotId ||
+          !prMaintenanceObservationFresh(record.observation) ||
           record.observation.state !== "open" ||
           prepared.headSha !== record.observation.headSha
         )
           refuse(
             "observation_incomplete",
             "Prepare requires a complete, consistent current-HEAD observation.",
+          );
+        if (
+          record.observation.draft ||
+          record.observation.mergeability === "conflicting" ||
+          record.incidents.some((incident) => !incident.resolvedAt)
+        )
+          refuse(
+            "observation_blocked",
+            "Drafts, merge conflicts and unresolved observation incidents cannot admit repair or publication.",
           );
         const keys = new Set<string>();
         for (const source of prepared.sources) {
@@ -1271,6 +1385,13 @@ export class PrMaintenanceStore {
           prMaintenanceUnsettled(record) ||
           !record.observation?.complete ||
           !record.lastAttempt?.complete ||
+          record.lastAttempt.failure ||
+          record.lastAttempt.headSha !== record.observation.headSha ||
+          record.lastAttempt.snapshotId !== record.observation.snapshotId ||
+          !prMaintenanceObservationFresh(record.observation) ||
+          record.observation.draft ||
+          record.observation.state !== "open" ||
+          record.incidents.some((incident) => !incident.resolvedAt) ||
           record.observation.fingerprint !== checkpoint.fingerprint ||
           record.observation.mergeability !== "mergeable" ||
           !record.observation.checksComplete ||
@@ -1314,15 +1435,277 @@ export class PrMaintenanceStore {
         if (checkpoint.immediateCheck && record.lifecycle === "active")
           record.nextCheckAt = nowIso();
       }
-      this.releaseTerminal(record);
+      if (
+        checkpoint.kind !== "fallback" &&
+        checkpoint.kind !== "alternate_attempt" &&
+        checkpoint.kind !== "alternate_observation"
+      )
+        this.releaseTerminal(record);
       return this.save(record);
     });
+  }
+
+  private observationKey(observation: PrMaintenanceObservation, error?: string): string {
+    return createHash("sha256")
+      .update(JSON.stringify({ observation, error }))
+      .digest("hex");
+  }
+
+  private incident(
+    record: PrMaintenanceRegistration,
+    observation: PrMaintenanceObservation,
+    error: string,
+    kind: PrMaintenanceIncident["kind"],
+  ): PrMaintenanceIncident {
+    const key = this.observationKey(observation, error);
+    record.lastError = error;
+    let incident = record.incidents.find(
+      (entry) => entry.kind === kind && !entry.resolvedAt,
+    );
+    if (incident) {
+      incident.lastError = error;
+      incident.lastObservationKey = key;
+      incident.updatedAt = nowIso();
+      return incident;
+    }
+    if (record.incidents.length >= PR_MAINTENANCE_RECOVERY_LIMITS.incidents) {
+      const archived = record.incidents.findIndex((entry) => entry.resolvedAt);
+      if (archived < 0)
+        refuse("incident_overflow", "Resolve existing incidents before recording more.");
+      record.incidents.splice(archived, 1);
+    }
+    record.incidentCursor++;
+    const effectKeys =
+      kind === "effects"
+        ? [
+            ...new Set(
+              [...record.actions, ...record.batches.flatMap((batch) => batch.effects)]
+                .filter(
+                  (effect) => effect.kind === "reply" && effect.state !== "not_performed",
+                )
+                .map((effect) => effect.key),
+            ),
+          ]
+        : [];
+    incident = {
+      id: `${record.id}:${record.incidentCursor}`,
+      sequence: record.incidentCursor,
+      kind,
+      error,
+      lastError: error,
+      ...(helperError(observation) ? { helperError: helperError(observation) } : {}),
+      // Missing or oversized correlation remains held, never guessed from other receipts.
+      effectKeys: effectKeys.length <= 200 ? effectKeys : [],
+      observationKey: key,
+      lastObservationKey: key,
+      createdAt: nowIso(),
+      updatedAt: nowIso(),
+      attempts: [],
+    };
+    record.incidents.push(incident);
+    return incident;
+  }
+
+  private recoveryAllowed(record: PrMaintenanceRegistration): boolean {
+    const task = this.store.getRun(record.taskId);
+    const worker = this.store.getSession(record.workerSessionId);
+    const lead = this.store.getSession(record.leadSessionId);
+    return (
+      record.lifecycle === "active" &&
+      !record.ownershipReleasedAt &&
+      record.decision?.state !== "pending" &&
+      !record.incidents.some(
+        (incident) => !incident.resolvedAt && incident.kind !== "capability",
+      ) &&
+      !prMaintenanceUnsettled(record) &&
+      !this.binding(record) &&
+      !!task &&
+      ["running", "awaiting_lead", "completed"].includes(task.state) &&
+      !!worker &&
+      !worker.stopRequested &&
+      !this.store.getSessionTransitionIntent(worker.id) &&
+      !!lead &&
+      !["stopped", "completed", "failed", "offline"].includes(lead.state) &&
+      !lead.stopRequested &&
+      !lead.dismissed &&
+      !lead.cleanupRequested &&
+      !this.store.getSessionTransitionIntent(lead.id)
+    );
+  }
+
+  /** Claimed atomically with the existing durable lead queue, not a new scheduler. */
+  pendingRecoveryWakes(): {
+    recordId: string;
+    leadSessionId: string;
+    incidentId: string;
+  }[] {
+    return this.retained().flatMap((record) =>
+      this.recoveryAllowed(record)
+        ? record.incidents
+            .filter(
+              (incident) =>
+                incident.kind === "capability" &&
+                !incident.resolvedAt &&
+                !incident.wakeQueuedAt &&
+                incident.attempts.length < PR_MAINTENANCE_RECOVERY_LIMITS.attempts,
+            )
+            .map((incident) => ({
+              recordId: record.id,
+              leadSessionId: record.leadSessionId,
+              incidentId: incident.id,
+            }))
+        : [],
+    );
+  }
+
+  markRecoveryWake(recordId: string, incidentId: string, at = nowIso()): boolean {
+    atSchema.parse(at);
+    const record = this.required(recordId);
+    const incident = record.incidents.find((entry) => entry.id === incidentId);
+    if (
+      !incident ||
+      incident.resolvedAt ||
+      incident.wakeQueuedAt ||
+      incident.kind !== "capability" ||
+      !this.recoveryAllowed(record) ||
+      incident.attempts.length >= PR_MAINTENANCE_RECOVERY_LIMITS.attempts
+    )
+      return false;
+    incident.wakeQueuedAt = at;
+    record.nextCheckAt = at;
+    this.save(record);
+    return true;
+  }
+
+  private reserveAlternate(
+    record: PrMaintenanceRegistration,
+    checkpoint: Extract<PrMaintenanceCheckpoint, { kind: "alternate_attempt" }>,
+    wakeId?: string,
+  ): boolean {
+    const incident = record.incidents.find((entry) => entry.id === checkpoint.incidentId);
+    if (!incident)
+      refuse("incident_unknown", "Read the current incident before recovery.");
+    const previous = incident.attempts.find(
+      (entry) => entry.id === checkpoint.resolutionId,
+    );
+    if (previous) {
+      if (
+        !isDeepStrictEqual(previous.provenance, checkpoint.provenance) ||
+        previous.requests !== checkpoint.requests
+      )
+        refuse(
+          "resolution_conflict",
+          "An alternate attempt's provenance and allowance are immutable.",
+        );
+      return false;
+    }
+    if (
+      incident.kind !== "capability" ||
+      incident.resolvedAt ||
+      !this.recoveryAllowed(record)
+    )
+      refuse(
+        "recovery_held",
+        "Recovery cannot clear a hold, authorization denial, Stop or uncertain execution.",
+      );
+    if (incident.attempts.length >= PR_MAINTENANCE_RECOVERY_LIMITS.attempts)
+      refuse(
+        "recovery_exhausted",
+        "Alternate evidence attempts are exhausted; do not repeat them.",
+      );
+    if (!wakeId)
+      refuse("wake_required", "Alternate evidence requires the Host-recorded lead turn.");
+    const wake = this.wake(record.leadSessionId, wakeId);
+    if (!wake.visitedIds.includes(record.id))
+      refuse("visit_required", "Claim this registration in the bounded lead wake first.");
+    this.chargeWake(record.leadSessionId, wakeId, {
+      requests: checkpoint.requests,
+      milliseconds: 0,
+    });
+    incident.attempts.push({
+      id: checkpoint.resolutionId,
+      wakeId,
+      provenance: checkpoint.provenance,
+      requests: checkpoint.requests,
+      reservedAt: nowIso(),
+      state: "reserved",
+    });
+    return true;
+  }
+
+  private alternateObservation(
+    record: PrMaintenanceRegistration,
+    checkpoint: Extract<PrMaintenanceCheckpoint, { kind: "alternate_observation" }>,
+  ): boolean {
+    const incident = record.incidents.find((entry) => entry.id === checkpoint.incidentId);
+    const attempt = incident?.attempts.find(
+      (entry) => entry.id === checkpoint.resolutionId,
+    );
+    if (!incident || !attempt)
+      refuse(
+        "resolution_not_reserved",
+        "Reserve bounded alternate evidence before using any provider tool.",
+      );
+    const observation = checkpoint.observation;
+    const key = this.observationKey(observation);
+    if (attempt.observationKey) {
+      if (attempt.observationKey !== key)
+        refuse("resolution_conflict", "An alternate evidence receipt is immutable.");
+      return false;
+    }
+    attempt.observationKey = key;
+    attempt.attemptedAt = observation.attemptedAt;
+    attempt.complete = observation.complete;
+    attempt.receivedAt = nowIso();
+    const reject = (error: string) => {
+      attempt.state = "rejected";
+      attempt.error = error;
+      return true;
+    };
+    if (
+      !prMaintenanceObservationFresh(observation) ||
+      Date.parse(observation.attemptedAt) < Date.parse(attempt.reservedAt) ||
+      (record.lastAttemptAt && observation.attemptedAt < record.lastAttemptAt)
+    )
+      return reject("stale_or_future_evidence");
+    if (!observation.identity || !sameIdentity(observation.identity, record.identity)) {
+      if (observation.identity) {
+        this.incident(record, observation, observation.evidence, "identity");
+        this.pause(record, "remote_identity_changed");
+      }
+      return reject("identity_mismatch");
+    }
+    if (
+      observation.requestsConsumed > attempt.requests ||
+      observation.elapsedMs > PR_MAINTENANCE_WAKE_LIMITS.milliseconds ||
+      Date.now() - Date.parse(attempt.reservedAt) >
+        PR_MAINTENANCE_WAKE_LIMITS.milliseconds ||
+      this.remainingWake(record.leadSessionId, attempt.wakeId).milliseconds <= 0
+    )
+      return reject("alternate_allowance_exceeded");
+    if (
+      incident.resolvedAt ||
+      incident.kind !== "capability" ||
+      !this.recoveryAllowed(record)
+    )
+      return reject("recovery_held");
+    this.observe(record, observation, undefined, true);
+    attempt.state = incident.resolvedAt ? "resolved" : "incomplete";
+    if (!observation.complete) attempt.error = observationError(observation);
+    return true;
   }
 
   private observe(
     record: PrMaintenanceRegistration,
     observation: PrMaintenanceObservation,
+    error = observationError(observation),
+    alternate = false,
   ): void {
+    if (!prMaintenanceObservationFresh(observation))
+      refuse(
+        "stale_observation",
+        "Observation evidence must be no more than 30 minutes old and cannot be future-dated.",
+      );
     if (record.lastAttemptAt && observation.attemptedAt < record.lastAttemptAt)
       refuse(
         "stale_observation",
@@ -1337,12 +1720,38 @@ export class PrMaintenanceStore {
         observation.retryAfter ? Date.parse(observation.retryAfter) : 0,
       ),
     ).toISOString();
-    if (observation.identity && !sameIdentity(observation.identity, record.identity)) {
+    const code = helperError(observation)?.code;
+    if (
+      code === "scope_changed" ||
+      (observation.identity && !sameIdentity(observation.identity, record.identity))
+    ) {
+      this.incident(record, observation, error, "identity");
       this.pause(record, "remote_identity_changed");
+      return;
+    }
+    if (code === "ambiguous_effect") {
+      this.incident(record, observation, error, "effects");
+      this.pause(record, "execution_or_effect_uncertain");
       return;
     }
     if (!observation.complete) {
       const failure = observation.failure;
+      const providerDenied =
+        failure === "auth" ||
+        failure === "permission" ||
+        [
+          "authentication_required",
+          "auth_required",
+          "authentication",
+          "permission_denied",
+          "permission_required",
+        ].includes(String(code));
+      this.incident(
+        record,
+        observation,
+        error,
+        providerDenied ? "provider_denial" : "capability",
+      );
       if (failure && failure !== "budget" && failure !== "incomplete") {
         record.counters.consecutiveFailures++;
         record.counters.totalFailures++;
@@ -1352,8 +1761,7 @@ export class PrMaintenanceStore {
         (previous?.cursor !== observation.cursor ||
           previous?.revision !== observation.revision);
       record.counters.scanStalls = progress ? 0 : record.counters.scanStalls + 1;
-      if (failure === "auth" || failure === "permission")
-        this.pause(record, "authorization_failed");
+      if (providerDenied) this.pause(record, "authorization_failed");
       else if (
         record.counters.consecutiveFailures >= 3 ||
         record.counters.totalFailures >= 10
@@ -1365,11 +1773,65 @@ export class PrMaintenanceStore {
     }
     record.observation = observation;
     record.lastSuccessAt = observation.attemptedAt;
-    record.counters.consecutiveFailures = 0;
-    record.counters.scanStalls = 0;
-    if (record.readyFingerprint !== observation.fingerprint)
+    if (!alternate) {
+      record.counters.consecutiveFailures = 0;
+      record.counters.scanStalls = 0;
+      const effects = [
+        ...record.actions,
+        ...record.batches.flatMap((batch) => batch.effects),
+      ];
+      if (
+        !record.batches.some((batch) => outstanding.has(batch.state)) &&
+        !effects.some(unsettledEffect)
+      ) {
+        for (const incident of record.incidents) {
+          if (
+            incident.kind === "effects" &&
+            !incident.resolvedAt &&
+            incident.effectKeys.length > 0 &&
+            incident.effectKeys.every(
+              (key) =>
+                observation.knownSelfEffectIds.includes(key) &&
+                effects.some((effect) => effect.key === key && effect.state === "known"),
+            )
+          ) {
+            incident.resolvedAt = nowIso();
+            incident.resolution = "observation";
+          }
+        }
+      }
+    }
+    if (this.recoveryAllowed(record) && prMaintenanceObservationFresh(observation)) {
+      for (const incident of record.incidents) {
+        if (
+          incident.kind === "capability" &&
+          !incident.resolvedAt &&
+          observation.identity &&
+          Date.parse(observation.attemptedAt) >= Date.parse(incident.createdAt)
+        ) {
+          incident.resolvedAt = nowIso();
+          incident.resolution = alternate ? "alternate_observation" : "observation";
+        }
+      }
+    }
+    if (
+      record.readyFingerprint !== observation.fingerprint ||
+      observation.draft ||
+      observation.mergeability !== "mergeable" ||
+      !observation.checksComplete ||
+      !observation.reviewsComplete ||
+      observation.checks.some(
+        (check) => check.state !== "passed" || check.headSha !== observation.headSha,
+      ) ||
+      observation.reviews.some(
+        (review) => review.state !== "approved" || review.headSha !== observation.headSha,
+      )
+    )
       delete record.readyFingerprint;
-    if (observation.state === "merged" || observation.state === "closed") {
+    if (
+      !alternate &&
+      (observation.state === "merged" || observation.state === "closed")
+    ) {
       record.lifecycle = observation.state;
       this.pause(record, "terminal_cancellation_requested", observation.attemptedAt);
       if (record.decision?.state === "pending") {
@@ -1454,6 +1916,8 @@ export class PrMaintenanceStore {
           "execution_unsettled",
           "A worker report or Stop request is not a correlated terminal RunStep receipt with a quiescent worker.",
         );
+      if (["cancelled", "skipped"].includes(step.state) && !step.dispatchedAt)
+        batch.executionNotDispatched = true;
     }
     if (batch.published && !update.published)
       refuse("receipt_conflict", "A verified published repair cannot be erased.");
@@ -1726,6 +2190,11 @@ export class PrMaintenanceStore {
       Object.assign(prior, effect);
       return;
     }
+    if (!record.authorization.scope.publicationAuthorized)
+      refuse(
+        "publication_not_authorized",
+        "Read-only maintenance cannot reserve provider mutations or new effects.",
+      );
     if (effect.state !== "reserved")
       refuse(
         "effect_not_reserved",
@@ -1734,16 +2203,36 @@ export class PrMaintenanceStore {
     if (
       record.lifecycle !== "active" ||
       record.decision?.state === "pending" ||
-      record.actions.some(unsettledEffect)
+      record.actions.some(unsettledEffect) ||
+      record.batches.some(
+        (batch) =>
+          batch.stepId && !batch.executionSettled && !outstanding.has(batch.state),
+      )
     )
       refuse(
         "held",
         "No new lead effect while maintenance is held or a previous result is unknown.",
       );
-    if (!record.lastAttempt?.complete || effect.headSha !== record.observation?.headSha)
+    if (
+      !record.lastAttempt?.complete ||
+      record.lastAttempt.failure ||
+      effect.headSha !== record.observation?.headSha ||
+      record.lastAttempt.headSha !== record.observation.headSha ||
+      record.lastAttempt.snapshotId !== record.observation.snapshotId
+    )
       refuse(
         "stale_observation",
         "Lead actions require a complete current-HEAD observation.",
+      );
+    if (
+      !prMaintenanceObservationFresh(record.observation) ||
+      record.observation?.draft ||
+      record.observation?.mergeability === "conflicting" ||
+      record.incidents.some((incident) => !incident.resolvedAt)
+    )
+      refuse(
+        "observation_blocked",
+        "Fresh non-draft, non-conflicting evidence is required before new effects.",
       );
     const scope = record.authorization.scope;
     if (
@@ -1851,7 +2340,13 @@ export class PrMaintenanceStore {
             (record) =>
               (record.lifecycle === "active" || prMaintenanceUnsettled(record)) &&
               record.counters.reconciliationStalls < 3 &&
-              record.counters.scanStalls < 3,
+              record.counters.scanStalls < 3 &&
+              !record.incidents.some(
+                (incident) =>
+                  !incident.resolvedAt &&
+                  (incident.wakeQueuedAt ||
+                    incident.attempts.length >= PR_MAINTENANCE_RECOVERY_LIMITS.attempts),
+              ),
           )
           .map((record) => record.leadSessionId),
       ),
@@ -1978,7 +2473,18 @@ export class PrMaintenanceStore {
         record.counters.reconciliationStalls < 3;
       if (!scan?.unservedIds.length) {
         const ids = this.retained()
-          .filter((record) => eligible(record) && record.nextCheckAt <= at)
+          .filter(
+            (record) =>
+              eligible(record) &&
+              (record.nextCheckAt <= at ||
+                (this.recoveryAllowed(record) &&
+                  record.incidents.some(
+                    (incident) =>
+                      incident.kind === "capability" &&
+                      !incident.resolvedAt &&
+                      incident.attempts.length < PR_MAINTENANCE_RECOVERY_LIMITS.attempts,
+                  ))),
+          )
           .sort(
             (a, b) =>
               a.nextCheckAt.localeCompare(b.nextCheckAt) || a.id.localeCompare(b.id),

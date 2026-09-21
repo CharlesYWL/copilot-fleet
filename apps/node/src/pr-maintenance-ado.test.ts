@@ -15,6 +15,7 @@ const {
   matchEffects,
   resolveAzLauncher,
   getAccessToken,
+  toAdoHostObservation,
   httpsRequest,
 } = await import(pathToFileURL(helper).href);
 const projectId = "11111111-1111-4111-8111-111111111111";
@@ -385,6 +386,7 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
               : timestamp;
       const result = await run(data);
       expect(result.complete).toBe(true);
+      expect(result.observation.draft).toBe(field === "isDraft");
       expect(
         result.observation.checks.some((check: any) => check.state === "pending"),
       ).toBe(true);
@@ -1354,6 +1356,25 @@ describe("Azure CLI launcher contracts without executing az", () => {
     expect((await resolveAzLauncher({ platform: "linux" })).command).toBe("az");
   });
 
+  it.each(["local_auth_unavailable", "cli_unavailable"])(
+    "records local %s as a capability incident, not provider access denial",
+    (code) => {
+      const error = { code, message: "Sanitized local helper prerequisite failure" };
+      const observation = toAdoHostObservation({
+        complete: false,
+        requestsConsumed: 1,
+        elapsedMs: 10,
+        progress: { phase: "metadata" },
+        error,
+      });
+      expect(observation).toMatchObject({
+        complete: false,
+        failure: "capability",
+        helperState: { error },
+      });
+    },
+  );
+
   it.each([true, false])(
     "keeps fake CLI output private and uses bounded pipes, success=%s",
     async (success) => {
@@ -1379,7 +1400,7 @@ describe("Azure CLI launcher contracts without executing az", () => {
       if (success) expect(await promise).toBe("synthetic_token_no_credentials");
       else
         await expect(promise).rejects.toMatchObject({
-          code: "auth_required",
+          code: "local_auth_unavailable",
           message: expect.not.stringContaining("must_not_appear"),
         });
     },

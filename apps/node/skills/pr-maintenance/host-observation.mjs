@@ -1,6 +1,8 @@
 import { PrMaintenanceObservationSchema } from "@fleet/protocol";
 
 const failureCodes = {
+  local_auth_unavailable: "capability",
+  gh_unavailable: "capability",
   authentication_required: "auth",
   auth_required: "auth",
   authentication: "auth",
@@ -48,6 +50,7 @@ export function toHostObservation(result, input, attemptedAt = new Date().toISOS
     helperState: {
       resume: result.resume ?? null,
       previousThreads: snapshot?.threadStates ?? input.previousThreads ?? [],
+      ...(result.error ? { error: result.error } : {}),
     },
     cursor: JSON.stringify(result.progress),
     evidence: result.complete
@@ -101,6 +104,7 @@ export function toHostObservation(result, input, attemptedAt = new Date().toISOS
   observation.headSha = headSha;
   observation.baseSha = baseSha;
   observation.state = snapshot.state;
+  if (typeof snapshot.isDraft === "boolean") observation.draft = snapshot.isDraft;
   observation.mergeability =
     snapshot.mergeable === "MERGEABLE"
       ? "mergeable"

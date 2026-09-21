@@ -1,9 +1,14 @@
 import Fastify from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PrMaintenanceEnableSchema } from "@fleet/protocol";
+import {
+  PrMaintenanceEnableSchema,
+  prMaintenanceUrl,
+  prMaintenanceProgress,
+} from "@fleet/protocol";
 import { z } from "zod";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
+import { PreparePrMaintenanceSchema } from "../orchestrator/tools.js";
 import { LeadTokens } from "../orchestrator/lead-tokens.js";
 import { mcpRoutes } from "../orchestrator/mcp-routes.js";
 import { orchestratorRoutes } from "./orchestrators.js";
@@ -37,7 +42,7 @@ async function setup(provider: "github" | "azure-devops" = "github") {
   store.transitionSession(worker.id, "starting");
   store.transitionSession(worker.id, "idle");
   const [step] = store.replaceRunSteps(run.id, [
-    { stepKey: "repair", title: "Repair", prompt: "repair" },
+    { stepKey: "repair", title: "Repair", prompt: "repair", category: "implement" },
   ]);
   store.updateRunStep(step!.id, { state: "succeeded", sessionId: worker.id });
   const registration = PrMaintenanceEnableSchema.parse({
@@ -190,6 +195,406 @@ async function setup(provider: "github" | "azure-devops" = "github") {
 }
 
 describe("authenticated PR maintenance controls", () => {
+  it("runs claimed helper failure through the real MCP recovery seam without admitting repairs", async () => {
+    const { store, service, leadId, registration, authorize, mcp } =
+      await setup("azure-devops");
+    await authorize();
+    let record = store.prMaintenance.list().records[0]!;
+    const lead = store.getSession(leadId)!;
+    const wake = () =>
+      service.dispatch(lead.nodeId, {
+        type: "prompt",
+        sessionId: leadId,
+        prompt: "Read-only recovery",
+        attachments: [],
+      });
+    wake();
+    const observation = {
+      attemptedAt: new Date().toISOString(),
+      complete: false,
+      failure: "capability",
+      requestsConsumed: 1,
+      evidence: "Local CLI has no usable login",
+      helperState: {
+        error: {
+          code: "local_auth_unavailable",
+          message: "Local CLI has no usable login",
+        },
+      },
+    };
+    const checkpoint = async (input: unknown) =>
+      mcp("fleet_checkpoint_pr_maintenance", {
+        recordId: record.id,
+        expectedVersion: record.version,
+        checkpoint: input,
+      });
+    expect(
+      (await checkpoint({ kind: "fallback", error: observation.evidence, observation }))
+        .ok,
+    ).toBe(false);
+    expect(
+      (await mcp("fleet_get_pr_maintenance", { takeDue: true, reserveRequests: 40 })).ok,
+    ).toBe(true);
+    const failed = await checkpoint({
+      kind: "fallback",
+      error: observation.evidence,
+      observation,
+    });
+    expect(failed.ok, failed.text).toBe(true);
+    record = JSON.parse(failed.text);
+    const incidentId = record.incidents[0]!.id;
+    const attempt = {
+      kind: "alternate_attempt",
+      incidentId,
+      resolutionId: "mcp-metadata-1",
+      requests: 1,
+      provenance: {
+        source: "existing-provider-mcp",
+        method: "repo_pull_request.get",
+        evidenceRef: "session-local-test-metadata",
+      },
+    };
+    expect((await checkpoint(attempt)).ok).toBe(false);
+    wake();
+    const recoveryVisit = await mcp("fleet_get_pr_maintenance", { takeDue: true });
+    expect(JSON.parse(recoveryVisit.text).record?.id, recoveryVisit.text).toBe(record.id);
+    expect(JSON.parse(recoveryVisit.text).observationAllowance.requests).toBe(1);
+    expect(JSON.parse(recoveryVisit.text).instruction).toContain("alternate_attempt");
+    const reserved = await checkpoint(attempt);
+    expect(reserved.ok, reserved.text).toBe(true);
+    record = JSON.parse(reserved.text);
+    const partial = await checkpoint({
+      kind: "alternate_observation",
+      incidentId,
+      resolutionId: attempt.resolutionId,
+      observation: {
+        attemptedAt: new Date().toISOString(),
+        complete: false,
+        requestsConsumed: 1,
+        identity: registration.identity,
+        headSha: registration.headSha,
+        state: "open",
+        draft: true,
+        mergeability: "conflicting",
+        checksComplete: false,
+        reviewsComplete: false,
+        failure: "incomplete",
+        evidence:
+          "Fresh metadata only: draft and conflicts; policy/thread pages not fully collected.",
+      },
+    });
+    expect(partial.ok, partial.text).toBe(true);
+    record = JSON.parse(partial.text);
+    expect(record.lastAttempt).toMatchObject({ draft: true, complete: false });
+    expect(record.lastError).toBeTruthy();
+    expect(record.readyFingerprint).toBeUndefined();
+    expect(record.batches).toHaveLength(0);
+    expect(prMaintenanceProgress(record).stage).toBe("blocked");
+    expect(record.incidents[0]!.attempts[0]).toMatchObject({
+      id: attempt.resolutionId,
+      state: "incomplete",
+      provenance: attempt.provenance,
+    });
+  });
+
+  it.each([
+    [true, 39],
+    [false, 40],
+  ] as const)(
+    "reserves a usable ADO default without starving continuation, repair=%s",
+    async (publicationAuthorized, requests) => {
+      const { registration, authorize, store, service, leadId, mcp } =
+        await setup("azure-devops");
+      registration.scope.publicationAuthorized = publicationAuthorized;
+      registration.scope.replies = publicationAuthorized;
+      registration.scope.resolveThreads = publicationAuthorized;
+      expect((await authorize()).statusCode).toBe(200);
+      const lead = store.getSession(leadId)!;
+      service.dispatch(lead.nodeId, {
+        type: "prompt",
+        sessionId: lead.id,
+        prompt: "Observe maintained PR",
+        attachments: [],
+      });
+      const claim = await mcp("fleet_get_pr_maintenance", { takeDue: true });
+      expect(claim.ok, claim.text).toBe(true);
+      expect(JSON.parse(claim.text)).toMatchObject({
+        observationAllowance: { requests },
+        allowance: { requests: 40 - requests },
+      });
+    },
+  );
+
+  it("requests preparation with only a URL, without granting authority or creating workers", async () => {
+    const { app, service, store, run, worker } = await setup();
+    const dispatch = vi.spyOn(service, "dispatch");
+    const count = store.listSessions().length;
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: { action: "prepare", prUrl: "https://github.com/owner/repo/pull/17" },
+    });
+    expect(response.statusCode, response.body).toBe(202);
+    expect(dispatch).toHaveBeenCalledWith(
+      worker.nodeId,
+      expect.objectContaining({
+        type: "prompt",
+        prompt: expect.stringContaining("fleet_prepare_pr_maintenance"),
+      }),
+    );
+    expect(store.listSessions()).toHaveLength(count);
+    expect(store.prMaintenance.list().records).toEqual([]);
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(store.getRun(run.id)?.state).toBe("running");
+  });
+
+  it("deduplicates pending durable preparation but permits a deliberate retry after settlement", async () => {
+    const { app, service, store, run } = await setup();
+    vi.spyOn(service.commands, "durableLead").mockReturnValue(true);
+    vi.spyOn(service.commands, "pumpLead").mockImplementation(() => {});
+    const request = () =>
+      app.inject({
+        method: "POST",
+        url: `/api/runs/${run.id}/pr-maintenance`,
+        headers: { "fixture-browser": "yes" },
+        payload: { action: "prepare" },
+      });
+    expect((await request()).statusCode).toBe(202);
+    expect((await request()).statusCode).toBe(202);
+    const [delivery] = store.commands.prompts();
+    expect(store.commands.prompts()).toHaveLength(1);
+    expect(delivery!.delivery.prompt).toContain("Discover the PR URL");
+    store.commands.updatePrompt({ ...delivery!, state: "settled" });
+    expect((await request()).statusCode).toBe(202);
+    expect(store.commands.prompts()).toHaveLength(1);
+    expect(store.commands.prompts()[0]!.delivery.deliveryId).not.toBe(
+      delivery!.delivery.deliveryId,
+    );
+    expect(store.commands.prompt(delivery!.delivery.deliveryId)?.state).toBe("settled");
+  });
+
+  it.each(["github", "azure-devops"] as const)(
+    "automatically binds verified %s metadata to the sole existing task and coder",
+    async (provider) => {
+      const { store, run, registration, mcp, app } = await setup(provider);
+      const result = await mcp("fleet_prepare_pr_maintenance", {
+        prUrl: prMaintenanceUrl(registration.identity),
+        identity: registration.identity,
+        headSha: registration.headSha,
+        observedAt: new Date().toISOString(),
+        method: "provider_mcp",
+        evidence: "Authenticated read-only provider metadata; exact repository/ref pins.",
+        verification: registration.scope.verification,
+        eligibilityEvidence: registration.eligibilityEvidence,
+      });
+      expect(result.ok, result.text).toBe(true);
+      const proposal = store.prMaintenance.getProposal(run.id)!;
+      expect(proposal.registration).toMatchObject({
+        taskId: run.id,
+        workerSessionId: registration.workerSessionId,
+        scope: {
+          baseline: run.objective,
+          publicationAuthorized: false,
+          replies: false,
+          resolveThreads: false,
+          reviewers: [],
+          retryChecks: false,
+        },
+      });
+      expect(store.prMaintenance.list().records).toHaveLength(0);
+      const approval = await app.inject({
+        method: "POST",
+        url: `/api/runs/${run.id}/pr-maintenance`,
+        headers: { "fixture-browser": "yes" },
+        payload: {
+          action: "authorize_proposal",
+          proposalId: proposal.id,
+          expectedVersion: proposal.version,
+        },
+      });
+      expect(approval.statusCode, approval.body).toBe(200);
+      expect(approval.json()).toMatchObject({
+        taskId: run.id,
+        workerSessionId: registration.workerSessionId,
+        authorization: { operatorId: "real-browser-principal" },
+      });
+    },
+  );
+
+  it("never expands a read-only task into publication or feedback mutations when preparation omits permissions", async () => {
+    const { store, run, registration, mcp } = await setup("azure-devops");
+    const objective =
+      "Observe the linked PR only. No repair, publication, review changes or merge.";
+    store.updateRun(run.id, { objective });
+    const input = {
+      taskId: run.id,
+      prUrl: prMaintenanceUrl(registration.identity),
+      identity: registration.identity,
+      headSha: registration.headSha,
+      observedAt: new Date().toISOString(),
+      method: "provider_mcp",
+      evidence: "Fresh PR metadata; draft and conflicts",
+      verification:
+        "Read-only provider metadata; no execution or publication verification.",
+      eligibilityEvidence:
+        "No verified mutable checkout or publication path; observation-only scope.",
+    };
+    const result = await mcp("fleet_prepare_pr_maintenance", input);
+    expect(result.ok, result.text).toBe(true);
+    expect(JSON.parse(result.text)).toMatchObject({
+      mode: "observe",
+      proposedActions: {
+        repairAndPublish: false,
+        replies: false,
+        resolveThreads: false,
+        reviewers: [],
+        retryChecks: false,
+      },
+    });
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    expect(proposal.registration.scope).toMatchObject({
+      baseline: objective,
+      publicationAuthorized: false,
+      replies: false,
+      resolveThreads: false,
+      reviewers: [],
+      retryChecks: false,
+    });
+    expect(store.prMaintenance.list().records).toHaveLength(0);
+    const mutation = await mcp("fleet_prepare_pr_maintenance", {
+      ...input,
+      expectedVersion: proposal.version,
+      replies: true,
+    });
+    expect(mutation.ok, mutation.text).toBe(false);
+    const noPublicationEvidence = await mcp("fleet_prepare_pr_maintenance", {
+      ...input,
+      expectedVersion: proposal.version,
+      mode: "repair",
+    });
+    expect(noPublicationEvidence.ok, noPublicationEvidence.text).toBe(false);
+    expect(store.prMaintenance.getProposal(run.id)?.version).toBe(1);
+  });
+
+  it("proposes only explicitly requested repair actions and still requires operator approval", async () => {
+    const { store, run, registration, mcp } = await setup();
+    const result = await mcp("fleet_prepare_pr_maintenance", {
+      taskId: run.id,
+      prUrl: prMaintenanceUrl(registration.identity),
+      identity: registration.identity,
+      headSha: registration.headSha,
+      observedAt: new Date().toISOString(),
+      method: "packaged_helper",
+      evidence: "Current pinned PR, source/base branches and HEAD verified",
+      verification: registration.scope.verification,
+      eligibilityEvidence: registration.eligibilityEvidence,
+      mode: "repair",
+      publicationEvidence:
+        "Existing task grant permits ordinary pushes to this exact PR source ref.",
+      replies: true,
+    });
+    expect(result.ok, result.text).toBe(true);
+    expect(JSON.parse(result.text)).toMatchObject({
+      mode: "repair",
+      status: "awaiting_operator_authorization",
+      proposedActions: {
+        repairAndPublish: true,
+        replies: true,
+        resolveThreads: false,
+        reviewers: [],
+        retryChecks: false,
+      },
+    });
+    expect(store.prMaintenance.getProposal(run.id)?.registration.scope).toMatchObject({
+      publicationAuthorized: true,
+      replies: true,
+      resolveThreads: false,
+      reviewers: [],
+      retryChecks: false,
+    });
+    expect(store.prMaintenance.list().records).toHaveLength(0);
+  });
+
+  it("refuses stale, mismatched or fabricated preparation authority and asks for ambiguous task choice", async () => {
+    const { store, run, registration, mcp, leadId } = await setup();
+    const input = {
+      prUrl: prMaintenanceUrl(registration.identity),
+      identity: registration.identity,
+      headSha: registration.headSha,
+      observedAt: new Date().toISOString(),
+      method: "provider_cli",
+      evidence: "Current provider metadata",
+      verification: registration.scope.verification,
+      eligibilityEvidence: registration.eligibilityEvidence,
+    };
+    for (const patch of [
+      { observedAt: new Date(Date.now() - 6 * 60_000).toISOString() },
+      { prUrl: "https://github.com/owner/repo/pull/18" },
+      { taskId: "another-lead-task" },
+    ]) {
+      const result = await mcp("fleet_prepare_pr_maintenance", { ...input, ...patch });
+      expect(result.ok, result.text).toBe(false);
+    }
+    expect(
+      PreparePrMaintenanceSchema.safeParse({ ...input, approved: true }).success,
+    ).toBe(false);
+    const second = store.createRun({
+      workspaceId: run.workspaceId,
+      name: "Another task",
+      objective: "Unrelated",
+    });
+    store.updateRun(second.id, { leadSessionId: leadId, state: "running" });
+    const choice = await mcp("fleet_prepare_pr_maintenance", input);
+    expect(choice.ok, choice.text).toBe(true);
+    expect(JSON.parse(choice.text)).toMatchObject({ status: "needs_task_choice" });
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+  });
+
+  it("keeps released PR history visible when the same task starts its next job", async () => {
+    const { app, store, run, registration, authorize, leadId, mcp } = await setup();
+    expect((await authorize()).statusCode).toBe(200);
+    const first = store.prMaintenance.list().records[0]!;
+    store.prMaintenance.operatorAction(
+      first.id,
+      first.version,
+      {
+        action: "release",
+        reason: "Settled, continue with the next PR",
+      },
+      "operator",
+    );
+    store.prMaintenance.enableFromOperator(
+      {
+        ...registration,
+        identity: { ...registration.identity, prNumber: 18 },
+      },
+      "operator",
+    );
+    const response = await app.inject({
+      method: "GET",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+    });
+    expect(response.json().records).toHaveLength(2);
+    const records = JSON.parse(
+      (await mcp("fleet_get_pr_maintenance", { taskId: run.id })).text,
+    ).records;
+    expect(records).toHaveLength(2);
+    expect(
+      records.filter(
+        (record: { ownershipReleasedAt?: string }) => !record.ownershipReleasedAt,
+      ),
+    ).toHaveLength(1);
+    expect(store.prMaintenance.get(first.id, leadId)?.ownershipReleasedAt).toBeTruthy();
+    expect(
+      (await mcp("fleet_list_work", { query: "owner/repo/pull/17" })).text,
+    ).toContain(run.id);
+    expect(
+      (await mcp("fleet_list_work", { query: "owner/repo/pull/18" })).text,
+    ).toContain(run.id);
+  });
+
   it.each(["github", "azure-devops"] as const)(
     "turns a scoped %s MCP request into a durable, idempotent proposal, not authorization or worker execution",
     async (provider) => {

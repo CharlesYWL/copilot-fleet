@@ -1336,26 +1336,38 @@ worker、审查和归档状态留在同一处。
 
 任务详情中的 **PR maintenance** 面向已归属 Orchestrator 的现有 worker。
 V1 每个任务只保留一个 PR 维护注册；为同一任务注册另一个 PR 前，
-需先核实并释放原有维护。
-可以直接提供 **Azure DevOps 或 GitHub** PR URL，向 Orchestrator 请求启用维护，
-也支持旧版 `organization.visualstudio.com` 链接。它通过
-`fleet_propose_pr_maintenance` 保存待授权提案并通知你。在任务面板点击
+需先核实并释放原有维护；已完成或释放的 PR 保留在历史中，不能因任务结束或时间
+流逝而释放未知副作用。向 Orchestrator 请求创建维护任务，或点击任务面板的准备
+操作，它会从现有任务证据发现 **Azure DevOps 或 GitHub** PR。
+唯一可选输入是 PR URL，也支持旧版 `organization.visualstudio.com` 链接。
+`fleet_prepare_pr_maintenance` 自动填入任务基线和原有 coder，核实最新平台
+元数据后保存待授权提案。在任务面板点击
 **Review PR maintenance proposal**，审阅已填好的范围后，以登录身份点击
 **Authorize maintenance**。无需复制 JSON，agent 也不能自行授权。
 之后沿用现有唤醒流程；也可发送普通聊天消息要求立即检查。
+准备操作默认仅观察，所有远程修改权限关闭。修复/发布必须有已核实的原有发布授权，
+回复、解决讨论、指定审查者和 CI 重试需分别显式请求。审批展示准确权限，不会将
+只读任务悄悄扩大为修复权限。
+
+面板区分当前维护与历史 PR，阶段轨道只突出一个真实当前状态，并显示最近/下次
+检查、阻塞原因和可折叠历史。维护轮次只统计实际执行并已结算的批次，不把已预留
+预算或平台审查迭代号算作完成轮次。默认流程不再要求人工填写注册 JSON 或 Fleet ID。
 
 通过 **Review PR maintenance proposal** 审阅准确的平台与 PR、仓库稳定 ID、
 head/base 完整分支引用、worker 与检出绑定、任务/设计基线、验证要求，
 以及 helper、凭据和发布权限的证据。授权来自已登录的浏览器操作，
-不能由 MCP 或 PR 中声称“已批准”的评论代替。前置条件未知或绑定不受
-支持时不能启用；即使 Host 选择免登录，维护授权仍需先登录。
+不能由 MCP 或 PR 中声称“已批准”的评论代替。修复模式需核实发布前置条件，
+仅观察模式不授予任何修改权限；绑定不受支持时不能启用。即使 Host 选择免登录，
+维护授权仍需先登录。
 
 Azure DevOps 复用同一面板、注册表、worker、授权和唤醒预算，并保留组织、
 项目/仓库 GUID 及完整分支引用。Node 自带平台路由 helper 和 ADO 使用指导，
-不依赖个人 skill 或 Azure DevOps CLI 扩展。ADO 读取要求该 Node 的 `az`
+不依赖个人 skill 或 Azure DevOps CLI 扩展。ADO helper 读取要求该 Node 的 `az`
 已登录；GitHub 仍使用已认证的 `gh`。Node 凭据与 Host 登录相互独立；
 helper 不会安装扩展、自动登录、持久保存或复制 token，也不会修改 PR。
-凭据不可用时明确阻塞，不能自行绕过。
+本地 CLI 或登录不可用时记录能力限制；已有独立认证的 MCP/CLI 可通过有界、持久
+恢复检查点提供最新平台证据。平台拒绝访问、Stop、人工设计关卡和未知副作用仍然
+阻塞；不能更改凭据、复制 token 或伪造成功来绕过。
 
 **完整收集的反馈仍可用于已授权的局部修复，但策略证据不足时不能标为就绪。**
 当前实现不会仅凭审查者投票或不透明的策略上下文，将构建/审查策略批准认定为

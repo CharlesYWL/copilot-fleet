@@ -182,6 +182,7 @@ export class OrchestratorEngine {
       }
       this.tickRun(run.id, nowMs);
     }
+    this.wakeMaintenanceRecovery(nowMs);
     this.remindIdleLeads(nowMs);
   }
 
@@ -641,6 +642,52 @@ export class OrchestratorEngine {
   }
 
   /**
+   * Reuses the durable lead queue; the incident claim and queue key survive
+   * restart, lost delivery receipts and conversation compaction together.
+   */
+  private wakeMaintenanceRecovery(nowMs: number): void {
+    for (const pending of this.store.prMaintenance.pendingRecoveryWakes()) {
+      const lead = this.store.getSession(pending.leadSessionId);
+      if (
+        !lead ||
+        lead.runRole !== "lead" ||
+        lead.dismissed ||
+        lead.stopRequested ||
+        lead.cleanupRequested ||
+        terminalSessionStates.has(lead.state) ||
+        this.store.getSessionTransitionIntent(lead.id) ||
+        !this.service.commands.durableLead(lead.id)
+      )
+        continue;
+      const queued = this.store.writeAtomically(() => {
+        if (
+          !this.store.prMaintenance.markRecoveryWake(
+            pending.recordId,
+            pending.incidentId,
+            new Date(nowMs).toISOString(),
+          )
+        )
+          return false;
+        this.service.commands.queueLeadPrompt(
+          lead.id,
+          [
+            `PR maintenance observation recovery: record ${pending.recordId}, incident ${pending.incidentId}.`,
+            "Read fleet_get_pr_maintenance for the exact retained error and receipts. Claim a bounded visit before read-only recovery.",
+            "Use alternate_attempt to reserve an alternate evidence method BEFORE calling it, then alternate_observation with pinned identity, fresh structured evidence and the same resolutionId. At most 3 attempts per incident; the existing 5 visits / 40 requests / 120 seconds per wake still apply.",
+            "Do not repeat a reserved attempt after uncertain delivery. Incomplete evidence stays incomplete. Provider auth/permission denial, identity drift, Stop, human holds and unknown effects are not capability recovery. Do not resume, authorize, release, reset budgets or replay worker dispatch.",
+          ].join("\n"),
+          `pr-maintenance-recovery:${pending.incidentId}`,
+        );
+        return true;
+      });
+      if (queued) {
+        this.promptedThisTick.add(lead.id);
+        this.service.commands.pumpLead(lead.id);
+      }
+    }
+  }
+
+  /**
    * Gives each idle Lead one read-only status check for its own active tasks.
    *
    * This runs after ordinary task briefs and settle wakes, so those prompts win.
@@ -676,7 +723,10 @@ export class OrchestratorEngine {
         !lead ||
         lead.runRole !== "lead" ||
         lead.state !== "idle" ||
-        lead.cleanupRequested
+        lead.cleanupRequested ||
+        lead.stopRequested ||
+        lead.dismissed ||
+        this.store.getSessionTransitionIntent(lead.id)
       ) {
         continue;
       }
@@ -718,11 +768,20 @@ export class OrchestratorEngine {
         retainedOnly: true,
         limit: 5,
       });
+      const recoveries = this.store.prMaintenance
+        .pendingRecoveryWakes()
+        .filter((pending) => pending.leadSessionId === lead.id)
+        .slice(0, 5);
       const prompt = [
         statusCheckEnvelope(tasks),
         ...(maintenance.records.length
           ? [
               `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,
+            ]
+          : []),
+        ...(recoveries.length
+          ? [
+              `Observation recovery incidents: ${recoveries.map((pending) => `${pending.recordId} (${pending.incidentId})`).join(", ")}. Reserve alternate_attempt before read-only alternate evidence, then checkpoint alternate_observation. Existing wake limits and all holds still apply; never repeat a reserved attempt or replay dispatch.`,
             ]
           : []),
       ].join("\n\n");
@@ -739,7 +798,15 @@ export class OrchestratorEngine {
         this.service.commands.pumpLead(lead.id);
         continue;
       }
-      this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+      this.store.writeAtomically(() => {
+        for (const pending of recoveries)
+          this.store.prMaintenance.markRecoveryWake(
+            pending.recordId,
+            pending.incidentId,
+            new Date(nowMs).toISOString(),
+          );
+        this.store.recordOrchestratorPrompt(lead.id, new Date(nowMs).toISOString());
+      });
       this.service.dispatch(lead.nodeId, {
         type: "prompt",
         sessionId: lead.id,

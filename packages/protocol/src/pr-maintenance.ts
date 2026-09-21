@@ -39,6 +39,11 @@ export const PR_MAINTENANCE_WAKE_LIMITS = Object.freeze({
   requests: 40,
   milliseconds: 120_000,
 });
+export const PR_MAINTENANCE_RECOVERY_LIMITS = Object.freeze({
+  incidents: 20,
+  attempts: 3,
+  evidenceAgeMs: PR_MAINTENANCE_CADENCE_MS,
+});
 const hostname = z
   .string()
   .trim()
@@ -253,13 +258,33 @@ export const PrMaintenanceScopeSchema = z
   .object({
     baseline: text,
     verification: text,
-    publicationAuthorized: z.literal(true),
-    replies: z.boolean().default(true),
-    resolveThreads: z.boolean().default(true),
+    publicationAuthorized: z.boolean().default(false),
+    replies: z.boolean().optional(),
+    resolveThreads: z.boolean().optional(),
     reviewers: z.array(id).max(20).default([]),
     retryChecks: z.boolean().default(false),
   })
-  .strict();
+  .strict()
+  .transform((scope) => ({
+    ...scope,
+    replies: scope.replies ?? scope.publicationAuthorized,
+    resolveThreads: scope.resolveThreads ?? scope.publicationAuthorized,
+  }))
+  .superRefine((scope, ctx) => {
+    if (
+      !scope.publicationAuthorized &&
+      (scope.replies ||
+        scope.resolveThreads ||
+        scope.reviewers.length ||
+        scope.retryChecks)
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["publicationAuthorized"],
+        message:
+          "Read-only maintenance cannot authorize replies, thread resolution, reviewer requests or CI retries.",
+      });
+  });
 export type PrMaintenanceScope = z.infer<typeof PrMaintenanceScopeSchema>;
 
 export const PrMaintenanceBudgetsSchema = z
@@ -292,6 +317,14 @@ export const PrMaintenanceProposalSchema = z
     version: z.number().int().positive(),
     leadSessionId: id,
     registration: PrMaintenanceEnableSchema,
+    binding: z
+      .object({
+        placementId: id,
+        checkoutKey: id,
+        bindingGeneration: count,
+      })
+      .strict()
+      .optional(),
     createdAt: time,
     updatedAt: time,
   })
@@ -384,6 +417,7 @@ export const PrMaintenanceObservationSchema = z
     headSha: sha.optional(),
     baseSha: sha.optional(),
     state: z.enum(["open", "merged", "closed"]).optional(),
+    draft: z.boolean().optional(),
     fingerprint: id.optional(),
     mergeability: z.enum(["mergeable", "conflicting", "unknown"]).default("unknown"),
     checks: z
@@ -425,13 +459,27 @@ export const PrMaintenanceObservationSchema = z
     cursor: z.string().max(4_096).optional(),
     revision: id.optional(),
     failure: z
-      .enum(["network", "auth", "permission", "rate_limit", "budget", "incomplete"])
+      .enum([
+        "capability",
+        "network",
+        "auth",
+        "permission",
+        "rate_limit",
+        "budget",
+        "incomplete",
+      ])
       .optional(),
     retryAfter: time.optional(),
     evidence: text,
   })
   .strict()
   .superRefine((value, ctx) => {
+    const helperError =
+      value.helperState &&
+      typeof value.helperState === "object" &&
+      !Array.isArray(value.helperState) &&
+      value.helperState.error !== undefined &&
+      value.helperState.error !== null;
     if (
       value.complete &&
       (!value.identity ||
@@ -439,7 +487,8 @@ export const PrMaintenanceObservationSchema = z
         !value.headSha ||
         !value.state ||
         !value.fingerprint ||
-        value.failure)
+        value.failure ||
+        helperError)
     ) {
       ctx.addIssue({
         code: "custom",
@@ -449,6 +498,51 @@ export const PrMaintenanceObservationSchema = z
     }
   });
 export type PrMaintenanceObservation = z.infer<typeof PrMaintenanceObservationSchema>;
+
+export const PrMaintenanceProvenanceSchema = z
+  .object({ source: id, method: id, evidenceRef: text })
+  .strict();
+export const PrMaintenanceIncidentSchema = z
+  .object({
+    id,
+    sequence: z.number().int().positive(),
+    kind: z.enum(["capability", "provider_denial", "identity", "effects"]),
+    error: text,
+    lastError: text,
+    helperError: z.json().optional(),
+    effectKeys: z.array(id).max(200).default([]),
+    observationKey: id,
+    lastObservationKey: id,
+    createdAt: time,
+    updatedAt: time,
+    wakeQueuedAt: time.optional(),
+    resolvedAt: time.optional(),
+    resolution: z
+      .enum(["observation", "alternate_observation", "operator_resume"])
+      .optional(),
+    attempts: z
+      .array(
+        z
+          .object({
+            id,
+            wakeId: id,
+            provenance: PrMaintenanceProvenanceSchema,
+            requests: z.number().int().min(1).max(40),
+            reservedAt: time,
+            state: z.enum(["reserved", "incomplete", "resolved", "rejected"]),
+            receivedAt: time.optional(),
+            observationKey: id.optional(),
+            attemptedAt: time.optional(),
+            complete: z.boolean().optional(),
+            error: text.optional(),
+          })
+          .strict(),
+      )
+      .max(PR_MAINTENANCE_RECOVERY_LIMITS.attempts)
+      .default([]),
+  })
+  .strict();
+export type PrMaintenanceIncident = z.infer<typeof PrMaintenanceIncidentSchema>;
 
 export const PrMaintenanceBatchStateSchema = z.enum([
   "prepared",
@@ -481,6 +575,7 @@ export const PrMaintenanceBatchSchema = PrMaintenancePreparedBatchSchema.extend(
   stepId: id.optional(),
   attempt: z.number().int().positive().optional(),
   executionSettled: z.boolean().default(false),
+  executionNotDispatched: z.boolean().optional(),
   evidence: text.optional(),
   cancellationRequestedAt: time.optional(),
   reason: text.optional(),
@@ -517,6 +612,33 @@ export const PrMaintenanceCheckpointSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("observation"),
+      observation: PrMaintenanceObservationSchema,
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("fallback"),
+      error: text,
+      observation: PrMaintenanceObservationSchema.refine(
+        (observation) => !observation.complete,
+        "Fallback records failed or incomplete observations, not success",
+      ),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("alternate_attempt"),
+      incidentId: id,
+      resolutionId: id,
+      provenance: PrMaintenanceProvenanceSchema,
+      requests: z.number().int().min(1).max(40),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("alternate_observation"),
+      incidentId: id,
+      resolutionId: id,
       observation: PrMaintenanceObservationSchema,
     })
     .strict(),
@@ -626,6 +748,12 @@ export const PrMaintenanceRegistrationSchema = z
     lastAttempt: PrMaintenanceObservationSchema.optional(),
     lastAttemptAt: time.optional(),
     lastSuccessAt: time.optional(),
+    lastError: text.optional(),
+    incidentCursor: z.number().int().nonnegative().default(0),
+    incidents: z
+      .array(PrMaintenanceIncidentSchema)
+      .max(PR_MAINTENANCE_RECOVERY_LIMITS.incidents)
+      .default([]),
     lastReconciliationEvidence: text.optional(),
     nextCheckAt: time,
     readyFingerprint: id.optional(),
@@ -656,6 +784,148 @@ export const PrMaintenanceRegistrationSchema = z
   })
   .strict();
 export type PrMaintenanceRegistration = z.infer<typeof PrMaintenanceRegistrationSchema>;
+
+export function prMaintenanceObservationFresh(
+  observation: PrMaintenanceObservation | undefined,
+  nowMs = Date.now(),
+): boolean {
+  if (!observation) return false;
+  const age = nowMs - Date.parse(observation.attemptedAt);
+  return age >= 0 && age <= PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs;
+}
+
+export type PrMaintenanceStage =
+  | "released"
+  | "merged"
+  | "closed"
+  | "human_hold"
+  | "reconciling"
+  | "paused"
+  | "recovering"
+  | "blocked"
+  | "addressing_review"
+  | "triage"
+  | "waiting_checks"
+  | "waiting_review"
+  | "ready"
+  | "checking";
+
+/** Current facts, not budget reservations or provider review iteration numbers. */
+export function prMaintenanceProgress(
+  record: PrMaintenanceRegistration,
+  nowMs = Date.now(),
+): { stage: PrMaintenanceStage; completedIterations: number } {
+  const outstanding = new Set(["prepared", "accepted", "reconciling", "uncertain"]);
+  const completedIterations = new Set(
+    record.batches
+      .filter(
+        (batch) =>
+          batch.stepId &&
+          batch.attempt &&
+          batch.executionSettled &&
+          !outstanding.has(batch.state) &&
+          !batch.executionNotDispatched,
+      )
+      .map((batch) => `${batch.stepId}:${batch.attempt}`),
+  ).size;
+  const result = (stage: PrMaintenanceStage) => ({ stage, completedIterations });
+  if (record.lifecycle === "merged" || record.lifecycle === "closed")
+    return result(record.lifecycle);
+  if (record.ownershipReleasedAt) return result("released");
+  if (
+    record.decision?.state === "pending" ||
+    (record.lifecycle === "paused" && record.pauseReason === "task_human_hold")
+  )
+    return result("human_hold");
+  if (
+    record.incidents.some(
+      (incident) => incident.kind === "effects" && !incident.resolvedAt,
+    ) ||
+    record.batches.some(
+      (batch) =>
+        batch.state === "uncertain" ||
+        batch.state === "reconciling" ||
+        (batch.stepId && !batch.executionSettled && !outstanding.has(batch.state)) ||
+        (batch.state === "accepted" && batch.cancellationRequestedAt),
+    ) ||
+    [...record.actions, ...record.batches.flatMap((batch) => batch.effects)].some(
+      (effect) => effect.state === "uncertain" || effect.state === "reserved",
+    )
+  )
+    return result("reconciling");
+  if (record.lifecycle === "paused")
+    return result(
+      ["authorization_failed", "remote_identity_changed"].includes(record.pauseReason)
+        ? "blocked"
+        : "paused",
+    );
+  if (record.lastAttempt?.draft || record.lastAttempt?.mergeability === "conflicting")
+    return result("blocked");
+  const incident = record.incidents.find((entry) => !entry.resolvedAt);
+  if (incident)
+    return result(
+      incident.kind === "capability" &&
+        incident.attempts.length < PR_MAINTENANCE_RECOVERY_LIMITS.attempts
+        ? "recovering"
+        : "blocked",
+    );
+  const observation = record.observation;
+  if (
+    record.lastAttempt?.failure ||
+    (record.lastAttempt && !record.lastAttempt.complete) ||
+    (record.lastAttempt?.complete &&
+      observation?.complete &&
+      (record.lastAttempt.headSha !== observation.headSha ||
+        record.lastAttempt.snapshotId !== observation.snapshotId))
+  )
+    return result("blocked");
+  if (record.batches.some((batch) => batch.state === "accepted"))
+    return result("addressing_review");
+  if (
+    !observation?.complete ||
+    !record.lastAttempt?.complete ||
+    !prMaintenanceObservationFresh(observation, nowMs)
+  )
+    return result("checking");
+  if (observation.draft || observation.mergeability === "conflicting")
+    return result("blocked");
+  if (
+    observation.sources.some(
+      (source) =>
+        !record.findings.some(
+          (finding) =>
+            finding.source.id === source.id &&
+            finding.source.revision === source.revision &&
+            (finding.verifiedHeadSha ?? finding.publishedCommit) ===
+              observation.headSha &&
+            ["addressed", "already_satisfied"].includes(finding.outcome),
+        ),
+    )
+  )
+    return result("triage");
+  if (
+    !observation.checksComplete ||
+    observation.checks.some(
+      (check) => check.state !== "passed" || check.headSha !== observation.headSha,
+    )
+  )
+    return result("waiting_checks");
+  if (
+    !observation.reviewsComplete ||
+    observation.reviews.some(
+      (review) => review.state !== "approved" || review.headSha !== observation.headSha,
+    )
+  )
+    return result("waiting_review");
+  return result(
+    observation.state === "open" &&
+      observation.mergeability === "mergeable" &&
+      !record.batches.some((batch) => outstanding.has(batch.state)) &&
+      record.readyFingerprint === observation.fingerprint
+      ? "ready"
+      : "checking",
+  );
+}
 
 export const PrMaintenanceAdmissionSchema = z
   .object({

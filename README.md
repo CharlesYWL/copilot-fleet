@@ -1821,29 +1821,48 @@ state stay together.
 
 Task detail includes **PR maintenance** for an existing Orchestrator-owned worker.
 V1 supports one retained PR registration per task; release settled maintenance
-before registering another PR for that task.
-You can ask the Orchestrator to enable maintenance for an **Azure DevOps or GitHub**
-PR by pasting its URL (including legacy `organization.visualstudio.com` links). It uses
-`fleet_propose_pr_maintenance` to store an unapproved proposal and notify you.
+before registering another PR for that task. Finished/released PRs remain in its
+history; finishing the task or waiting longer never releases unknown effects.
+Ask the Orchestrator to create a maintenance job, or use the task panel's preparation
+action. It discovers the **Azure DevOps or GitHub** PR from existing task evidence;
+the only optional input is its URL (including legacy `organization.visualstudio.com`
+links). `fleet_prepare_pr_maintenance` fills the approved task baseline and existing
+coder, verifies fresh provider metadata, and stores an unapproved proposal.
+Preparation defaults to **observation only** with all remote mutations off.
+Repair/publication requires an explicit proposal backed by existing publication
+authority; replies, thread resolution, named reviewers and CI retries are requested
+separately. The approval shows the exact proposed actions, never silently expanding
+a read-only task into repair permission.
 Open **Review PR maintenance proposal** in the task panel, inspect the prefilled
 scope, and select **Authorize maintenance** while signed in. No JSON copy/paste
 is needed; the agent cannot authorize itself. Checks then use the existing wake
 loop, and a normal chat message can request an immediate first check.
 
+The panel separates the current job from prior PRs. Its stage rail highlights the
+actual current stage, including attention/hold states, with last/next checks and
+collapsible history. **Maintenance rounds** count executed, settled batches, not
+reserved repair budgets or provider review iteration numbers. No registration JSON
+or manually entered Fleet IDs are part of the default human flow.
+
 Use **Review PR maintenance proposal** to review the proposed exact provider/PR, stable
 repository identities, head/base refs, retained worker and checkout, task/design
 baseline, verification, and helper/credential/publication evidence. Confirmation
 is an authenticated browser action, not an MCP approval or a review comment.
-Unknown prerequisites and unsupported bindings cannot be enabled. Sign-in is
+Repair mode requires verified publication prerequisites; observation-only mode
+grants no mutation authority. Unsupported bindings cannot be enabled. Sign-in is
 required for these authorization controls, including on a no-login Host.
 
 Azure DevOps is a first-class provider: the same panel, registry, worker, approvals
 and wake budgets retain organization/project/repository GUIDs and exact refs.
 The Node packages its own provider router and ADO guidance; no personal skill or
-Azure DevOps CLI extension is required. ADO reads need `az` already authenticated
+Azure DevOps CLI extension is required. ADO helper reads need `az` already authenticated
 on that Node; GitHub continues to use authenticated `gh`. Helpers never install,
 log in, persist tokens or mutate a PR. Unavailable credentials are an explicit
-blocker, not an automatic login flow. ADO policy/iteration evidence is evaluated
+capability limitation, not an automatic login flow. Existing independently
+authenticated provider MCP/CLI tools can provide scoped, fresh alternate evidence
+through a durable bounded recovery checkpoint. Actual provider access denial,
+Stop, design holds and unknown effects are never cleared by this fallback.
+ADO policy/iteration evidence is evaluated
 separately from reviewer votes; missing, stale or unsupported evidence cannot be
 called ready. See the [ADO helper contract](apps/node/skills/pr-maintenance/ado-contract.md)
 for its supported policy evidence and conservative limits.
