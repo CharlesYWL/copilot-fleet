@@ -52,6 +52,17 @@ export const HANDOVER_SHAPE = [
   "- <what no machine could check here — or `nothing`>",
 ].join("\n");
 
+export const WORKER_DELIVERY_CONTRACT = [
+  "The orchestrator delegates, judges and coordinates; it does not edit the repository, commit, create or move branches, push, or publish itself. This restriction does not prohibit authorized writing workers from publishing.",
+  "When the human requests PR creation or updates, an authorized writing worker may commit, create a source branch, push, and create/update the PR within scope and actual checkout/provider permissions. The Host enforces permissions and records results; ordinary worker publication is not exclusively Host-owned.",
+  "Read-only work grants no publication authority. Managed-worktree integration/publication retains its sealed-result and explicit approval gates. Registered PR maintenance still requires authenticated authorization, the retained-worker binding and prepared batch. Never bypass these restrictions or change permissions to obtain publication.",
+  "Publishing a slice PR is separate from completing its parent task. fleet_submit_task is not a prerequisite for authorized worker publication. Record partial results and continue the parent; submit only when all essential whole-task criteria are met with evidence, never mark unmet criteria met to unblock publication.",
+  "Published results must include the PR URL, provider-observed source/head and base identities (repositories, branches and commit SHAs), verification results and limitations. If publication is denied, preserve the patch and report the exact denial instead of claiming publication.",
+].join("\n");
+
+export const DISPATCH_GUIDANCE =
+  "Briefs carry the deliverable, scope, authoritative links/paths, necessary decisions and constraints, and observable acceptance. The worker chooses the investigation, implementation and command sequence using repository conventions. Distinguish historical facts from current observations; include necessary detail without copying giant histories, inventing API/command recipes or imposing a runbook that contradicts the deliverable.";
+
 export function orchestratorBriefing(
   nodeSummary: string,
   options: { hasAgent: boolean } = { hasAgent: false },
@@ -127,6 +138,10 @@ function mechanics(): string[] {
     "`fleet_get_task` reads its objective, criteria, notes, worker context and continuation actions. Use task IDs as `task` in later calls: display names can change or be ambiguous.",
     "`fleet_run_command` requests a finite command on an exact Node/path. A Node-owned permission may allow it automatically; otherwise the Host asks for Once, this orchestrator session, or Always. Recognized simple commands match command/subcommand and canonical cwd without ordinary flags. Compound/dynamic commands can be remembered only as the exact full script; changing any text asks again. Ordinary placement commands may run alongside sessions; coordinate writes, and do not bypass managed worktree or maintenance protections. You cannot approve yourself or edit permissions through MCP. Do not ask for local opt-in setup. Keep the execution ID, end your turn, and await Fleet's completion notification.",
     "",
+    "## Worker delivery and publication",
+    "",
+    WORKER_DELIVERY_CONTRACT,
+    "",
     "## How a task ends",
     "",
     "Four endings, and picking the wrong one is how tasks pile up:",
@@ -148,6 +163,8 @@ function mechanics(): string[] {
     "## What a dispatch has to say",
     "",
     "`fleet_start_work` takes no free-text prompt. It asks for the **deliverable** that must come back, the **scope** to work in, how to **verify** it, and any **context** the worker cannot discover — and the Host writes the brief from those. A dispatch with no way to check it is refused before a machine is spent on it.",
+    "",
+    DISPATCH_GUIDANCE,
     "",
     "`fleet_follow_up` gives an existing worker another turn. Workers stay open and idle after settling, so a normal revisit continues immediately in the same live session. Archiving stops them but keeps their conversations: after `fleet_reopen_task`, use `fleet_follow_up` to resume a prior worker when the role still matches. Deleting the task removes them. Use the session id in the wake or `fleet_list_work` when sending another round of feedback back to the same worker. Use `fleet_start_work` for a genuinely different deliverable or independent judgement; routine inspection and verification belong with implementation, not automatically in separate sessions.",
     "",
@@ -333,7 +350,7 @@ function nextMove(input: {
     "transcript if the summary is not enough to tell.",
     "If the same worker needs another revision, use fleet_follow_up with its session ID rather than starting a new session.",
     input.isLastPhase
-      ? "If the phase is done, call fleet_submit_task to hand the task to the person. If not, dispatch what is missing."
+      ? "Only when all essential whole-task criteria are met with evidence, call fleet_submit_task to hand the task to the person. A published slice alone does not complete the parent; record partial results and dispatch what is missing."
       : "If the phase is done, call fleet_advance_task. If not, dispatch what is missing.",
   ];
 }

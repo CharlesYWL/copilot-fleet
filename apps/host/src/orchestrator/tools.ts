@@ -31,7 +31,11 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { reservedSessionCount } from "../session-policy.js";
-import { HANDOVER_SHAPE } from "./briefing.js";
+import {
+  DISPATCH_GUIDANCE,
+  HANDOVER_SHAPE,
+  WORKER_DELIVERY_CONTRACT,
+} from "./briefing.js";
 import { archiveRun, purgeRun } from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
@@ -105,8 +109,9 @@ export const StartWorkSchema = z.object({
         '"check it works" is not something a worker can do',
     )
     .describe(
-      'The command or observation that will show the deliverable is real — "npm test -- auth", ' +
-        '"curl the endpoint and read the status". Not "check it works".',
+      "The observable acceptance that proves the deliverable. Name a known repository-native " +
+        "check or the required observation; let the worker discover the exact commands. " +
+        'Not "check it works", and do not invent a command recipe.',
     ),
   /**
    * What the worker cannot find out for itself.
@@ -127,8 +132,9 @@ export const StartWorkSchema = z.object({
     .describe(
       "What the worker cannot find out for itself. It cannot see this conversation, the " +
         "person's messages, or any other worker's output, so repeat anything decided elsewhere. " +
-        "No length limit — though it can read the repository itself, so this goes further spent " +
-        "on decisions and constraints than on quoted code.",
+        "Include authoritative links/paths, necessary decisions and constraints, and distinguish " +
+        "historical facts from current observations. No length limit; include needed detail, " +
+        "not giant histories or a prescribed investigation/implementation sequence.",
     ),
   workspace: z
     .string()
@@ -204,6 +210,12 @@ export function composeWorkerPrompt(input: {
     `VERIFY`,
     input.verify,
     ...(input.context ? ["", `CONTEXT`, input.context] : []),
+    "",
+    "FLEET DELIVERY",
+    WORKER_DELIVERY_CONTRACT,
+    DISPATCH_GUIDANCE,
+    "Report completion or blockers in your normal turn response. Fleet records that",
+    "response and wakes the orchestrator automatically; no separate submission or polling is needed.",
     "",
     "Do the verification before you answer, and say what it produced. If you",
     "could not, say that instead — an unchecked claim is worse than an honest",
@@ -404,7 +416,14 @@ export const EscalateSchema = TaskRefSchema.extend({
 });
 
 export const FollowUpSchema = SessionRefSchema.extend({
-  prompt: z.string().min(1).describe("What it should do next."),
+  prompt: z
+    .string()
+    .min(1)
+    .describe(
+      "The next revision's deliverable, scope, necessary changed decisions and observable acceptance. " +
+        "Link authoritative context, distinguish history from current observations, and let the worker " +
+        "choose investigation, implementation and commands. Preserve existing authorization limits.",
+    ),
   maintenance: z
     .object({
       recordId: z.string().min(1),
@@ -1754,8 +1773,8 @@ export class FleetTools {
         "Its criteria and earlier notes still apply. Read fleet_get_task for those and",
         "the retained workers, then use fleet_follow_up on the worker whose role matches.",
         "Do not start a replacement merely because this task was closed.",
-        "Send what this needs, then end your turn. Call fleet_submit_task again once",
-        "it is addressed.",
+        "Send what this needs, then end your turn.",
+        WORKER_DELIVERY_CONTRACT,
       ].join("\n"),
     );
   }

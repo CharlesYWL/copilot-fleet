@@ -306,6 +306,8 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
         "Start one worker agent on a node and return immediately.",
         "This creates a NEW session. For follow-up requests, first find the prior task with fleet_list_work and read fleet_get_task; use fleet_follow_up for the same deliverable.",
         "Say what must come back, where to work, and what will show it is real — the Host writes the worker's brief from those, so a dispatch with no way to check it is refused before a machine is spent on it.",
+        "Include authoritative links/paths, necessary decisions and constraints, and observable acceptance; distinguish history from current observations. Let the worker choose investigation, implementation and commands, not an invented runbook.",
+        "An authorized writing worker may commit, push and create/update a requested PR within actual permissions, without fleet_submit_task first. Read-only, managed publication and authenticated maintenance restrictions still apply.",
         "The Host picks the machine; a review always lands on the same checkout the implementation used, so it can see the changes.",
         "Group related steps under one `task`, and start a separate task for an unrelated request.",
         "You are woken with the result when it finishes — do not poll, and do not wait.",
@@ -353,6 +355,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       description: [
         "The last phase is done and the work is ready to be looked at.",
         "Say how each of the task's success criteria turned out and what shows it — an essential criterion that is not met will be refused here, because the task is not finished.",
+        "Publishing a slice PR is separate from whole-task completion. This tool is not a prerequisite for authorized worker publication and does not create a PR. Keep partial results recorded and the parent open until all essential criteria are met.",
         "The summary is shown to the person as markdown above the approve and send-back buttons, so write it to be scanned — a bold one-line verdict, then short `###` sections with bullets under them. A long unbroken paragraph is refused.",
         "This is the only point at which a person is asked for anything; they approve it or send it back with a note, which arrives as a new turn.",
         "End your turn after calling it.",

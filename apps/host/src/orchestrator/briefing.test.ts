@@ -132,6 +132,33 @@ describe("what the orchestrator is told", () => {
     expect(agentFile).toContain("after reopening");
   });
 
+  it("keeps worker publication and dispatch authority consistent with or without the agent", () => {
+    for (const text of [
+      agentFile,
+      orchestratorBriefing("nodes", { hasAgent: true }),
+      orchestratorBriefing("nodes", { hasAgent: false }),
+    ]) {
+      const normalized = text.replace(/`/g, "").replace(/\s+/g, " ");
+      expect(normalized).toContain(
+        "does not prohibit authorized writing workers from publishing",
+      );
+      expect(normalized).toContain("create a source branch, push, and create/update");
+      expect(normalized).toContain(
+        "fleet_submit_task is not a prerequisite for authorized worker publication",
+      );
+      expect(normalized).toContain("Record partial results and continue the parent");
+      expect(normalized).toContain("never mark unmet criteria met");
+      expect(normalized).toContain("Read-only work grants no publication authority");
+      expect(normalized).toContain("sealed-result and explicit approval gates");
+      expect(normalized).toContain("retained-worker binding and prepared batch");
+      expect(normalized).toContain("provider-observed source/head and base");
+      expect(normalized).toContain("verification results and limitations");
+      expect(normalized).toContain("authoritative links/paths");
+      expect(normalized).toContain("The worker chooses the investigation");
+      expect(normalized).toContain("Distinguish historical facts from current");
+    }
+  });
+
   it("teaches discovery before replacement and distinguishes queued work from failure", () => {
     for (const text of [
       agentFile,

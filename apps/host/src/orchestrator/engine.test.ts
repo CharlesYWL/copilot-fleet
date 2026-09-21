@@ -1,11 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
-import { canTransition } from "@fleet/protocol";
+import { canTransition, RunCriterionSchema, type SessionEvent } from "@fleet/protocol";
 import { FleetService } from "../fleet-service.js";
 import { FleetStore } from "../store.js";
 import { OrchestratorEngine, truncateMiddle } from "./engine.js";
 import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS, runSweepInterval } from "./deadlines.js";
+import { FleetTools } from "./tools.js";
 
 type SentFrame = {
   type: string;
@@ -208,6 +209,134 @@ describe("OrchestratorEngine", () => {
     expect(settled.output).toContain("three problems");
     expect(store.getRun(run.id)?.settleSeq).toBe(1);
   });
+
+  it.each([
+    {
+      outcome: "met" as const,
+      report:
+        "Draft PR https://github.com/example/project/pull/12; source example/project:fix/slice @ " +
+        "a".repeat(40) +
+        "; base example/project:main @ " +
+        "b".repeat(40) +
+        ". Targeted tests passed; remaining series slices are not implemented.",
+    },
+    {
+      outcome: "blocked" as const,
+      report:
+        "Publication blocked: provider denied git push (403). Local patch preserved; no PR created.",
+    },
+  ])(
+    "automatically wakes with a $outcome publication report without completing the parent",
+    ({ outcome, report }) => {
+      const { store, service, engine, commands, placement } = setup();
+      const lead = store.createSession(placement, "orchestrate", false, "", {
+        runRole: "lead",
+      });
+      store.transitionSession(lead.id, "starting");
+      store.transitionSession(lead.id, "idle");
+      const run = store.createRun({
+        workspaceId: placement.workspaceId,
+        name: "Series",
+        objective: "Deliver all slices, publishing each when ready.",
+        policy: { wakePolicy: "on_any_settle" },
+      });
+      store.replaceRunSteps(run.id, [
+        {
+          stepKey: "slice",
+          title: "Publish ready slice",
+          prompt: "Implement and publish the requested slice PR within permissions.",
+          category: "implement",
+        },
+      ]);
+      const criteria = ["slice-pr", "whole-series"].map((id) =>
+        RunCriterionSchema.parse({
+          id,
+          scenario:
+            id === "slice-pr"
+              ? "The ready slice has a provider-observed draft PR"
+              : "All parent-task slices are implemented and verified",
+          expectedEvidence: "Observed deliverable and verification",
+        }),
+      );
+      store.updateRun(run.id, {
+        state: "running",
+        leadSessionId: lead.id,
+        phases: ["Implement"],
+        successCriteria: criteria,
+      });
+      const unsubscribe = service.onSessionEvent((event) =>
+        engine.handleSessionEvent(event),
+      );
+      engine.tickRun(run.id);
+      const step = store.listRunSteps(run.id)[0]!;
+      let sequence = 0;
+      const emit = (type: SessionEvent["type"], payload: Record<string, unknown>) =>
+        service.handleEvent({
+          eventId: `slice-${++sequence}`,
+          sessionId: step.sessionId,
+          sequence,
+          type,
+          payload,
+          createdAt: new Date().toISOString(),
+        });
+      emit("state", { state: "starting" });
+      emit("state", { state: "running" });
+      emit("agent_text", { text: report });
+      emit("turn_complete", { stopReason: "end_turn" });
+      expect(store.getRunStep(step.id)?.state).toBe("running");
+      expect(commands("prompt")).toHaveLength(0);
+
+      emit("state", { state: "idle" });
+      engine.tick();
+      expect(store.getRunStep(step.id)).toMatchObject({
+        state: "succeeded",
+        output: report,
+      });
+      expect(commands("prompt")).toHaveLength(1);
+      expect(commands("prompt")[0]).toMatchObject({
+        sessionId: lead.id,
+        prompt: expect.stringContaining(report),
+      });
+      expect(commands("prompt")[0]?.prompt).toContain("whole-task criteria");
+      expect(store.getRun(run.id)).toMatchObject({
+        state: "awaiting_lead",
+        successCriteria: criteria,
+        settleSeq: 1,
+        wakeSeq: 1,
+      });
+      engine.tick();
+      expect(commands("prompt")).toHaveLength(1);
+
+      const tools = new FleetTools(service, lead.id);
+      const submission = tools.submitTask({
+        task: run.id,
+        summary: "Only the first slice has settled.",
+        criteria: [
+          { id: "slice-pr", outcome, evidence: report },
+          { id: "whole-series", outcome: "unmet", evidence: "Other slices remain." },
+        ],
+      });
+      expect(submission.ok).toBe(false);
+      expect(submission.text).toContain("whole-series");
+      expect(store.getRun(run.id)?.state).toBe("awaiting_lead");
+      expect(store.getRunStep(step.id)?.output).toBe(report);
+      expect(
+        tools.followUp({
+          sessionId: step.sessionId,
+          prompt: "Continue the remaining work, preserving the recorded slice result.",
+        }).ok,
+      ).toBe(true);
+      expect(store.listRunSteps(run.id)).toHaveLength(1);
+      expect(store.getRunStep(step.id)?.sessionId).toBe(step.sessionId);
+      expect(
+        store
+          .listEvents(step.sessionId)
+          .some((event) => event.type === "agent_text" && event.payload.text === report),
+      ).toBe(true);
+      unsubscribe();
+      store.close();
+    },
+  );
 
   it("settles an idle autonomous continuation after the stale grace", () => {
     const { store, engine, planned } = setup();

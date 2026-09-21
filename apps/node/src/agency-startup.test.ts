@@ -163,7 +163,7 @@ beforeEach(() => {
       for (const line of lines) {
         const request = JSON.parse(line) as RpcRequest;
         requests.push(request);
-        if (request.id === undefined) continue;
+        if (request.id === undefined || !request.method) continue;
         if (
           request.method === "session/set_config_option" &&
           request.params.configId === "model"
@@ -324,6 +324,87 @@ afterEach(async () => {
 
 const fleetMcp = [{ name: "fleet", url: "http://127.0.0.1:8787/mcp", headers: [] }];
 const launches = () => processes.filter((entry) => entry.args.includes("--acp"));
+
+describe("Worker publication permissions over ACP", () => {
+  it.each([
+    ["git commit -m fix", "allow_once"],
+    ["git push origin fix/slice", "allow_once"],
+    ["gh pr create --draft", "allow_once"],
+    ["gh pr create --draft", "deny"],
+  ] as const)(
+    "honors the real permission decision for %s: %s",
+    async (title, outcome) => {
+      startupHangs = "session/prompt";
+      const events: SessionEvent[] = [];
+      const agent = await new AcpAgentFactory(60000, "copilot").start(
+        "worker",
+        "C:\\repo",
+        (event) => events.push(event),
+        { yolo: false },
+      );
+      agents.push(agent);
+      const turn = agent.prompt("Publish the requested slice PR within permissions.");
+      await expect
+        .poll(() => requests.some((request) => request.method === "session/prompt"))
+        .toBe(true);
+      const child = launches()[0]!.child as ChildProcessWithoutNullStreams;
+      child.stdout.push(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 10001,
+          method: "session/request_permission",
+          params: {
+            sessionId: "acp-created",
+            toolCall: { toolCallId: "publication", title, kind: "execute" },
+            options: [
+              { optionId: "allow", name: "Allow once", kind: "allow_once" },
+              { optionId: "reject", name: "Deny", kind: "reject_once" },
+            ],
+          },
+        })}\n`,
+      );
+      await expect
+        .poll(() => events.some((event) => event.type === "permission"))
+        .toBe(true);
+      const permission = events.find((event) => event.type === "permission")!;
+      expect(permission.payload.title).toBe(title);
+      expect(requests.find((request) => request.id === 10001)).toBeUndefined();
+      expect(launches()[0]!.args).not.toContain("--allow-all");
+
+      agent.resolvePermission(String(permission.payload.requestId), { outcome });
+      await expect
+        .poll(() => requests.find((request) => request.id === 10001))
+        .toMatchObject({
+          result: {
+            outcome: {
+              outcome: "selected",
+              optionId: outcome === "allow_once" ? "allow" : "reject",
+            },
+          },
+        });
+      expect(
+        events.find((event) => event.type === "permission_result")?.payload,
+      ).toMatchObject({
+        requestId: permission.payload.requestId,
+        outcome,
+      });
+
+      const prompt = requests.find((request) => request.method === "session/prompt")!;
+      child.stdout.push(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: prompt.id,
+          result: { stopReason: "end_turn" },
+        })}\n`,
+      );
+      await turn;
+      expect(events.slice(-2).map((event) => [event.type, event.payload])).toEqual([
+        ["turn_complete", { stopReason: "end_turn" }],
+        ["state", { state: "idle", activity: "Ready for follow-up" }],
+      ]);
+    },
+  );
+});
 
 describe("Agency ACP startup", () => {
   it("overrides the node tier for a session, reports cumulative credits and replayed context, and sends real /compact", async () => {
