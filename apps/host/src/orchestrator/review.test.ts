@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { RunPolicySchema, type Run } from "@fleet/protocol";
-import { maintenanceDirectionPrompt, reopenPrompt, reviewOutcome } from "./review.js";
+import {
+  maintenanceDirectionPrompt,
+  reopenPrompt,
+  reviewOutcome,
+  sendBackPrompt,
+} from "./review.js";
 
 const run = (overrides: Partial<Run> = {}): Run => ({
   id: "r1",
@@ -62,9 +67,8 @@ describe("reviewOutcome", () => {
     expect(outcome.prompt).toContain("The migration is missing.");
     expect(outcome.prompt).toContain("fleet_submit_task");
     expect(outcome.prompt).toContain("dispatch a worker or fixer");
-    expect(outcome.prompt).toContain("Do not edit the repository");
-    expect(outcome.prompt).toContain("push, publish");
-    expect(outcome.prompt).toContain("new sealed result");
+    expect(outcome.prompt).toContain("it does not edit the repository");
+    expect(outcome.prompt).toContain("authorized writing worker may commit");
   });
 
   it("will not send a task back with nothing to act on", () => {
@@ -112,6 +116,43 @@ describe("reopening a finished task", () => {
     // the same situation: act, end the turn, submit again.
     expect(reopenPrompt("Ship it", "not done")).toContain("fleet_submit_task");
     expect(reopenPrompt("Ship it", "not done")).toContain("end your turn");
-    expect(reopenPrompt("Ship it", "not done")).toContain("Do not edit the repository");
+    expect(reopenPrompt("Ship it", "not done")).toContain(
+      "only when the whole task is ready",
+    );
+  });
+});
+
+describe.each([
+  ["send back", sendBackPrompt],
+  ["reopen", reopenPrompt],
+] as const)("%s delivery contract", (_label, promptFor) => {
+  it("delegates requested publication without making submission its prerequisite", () => {
+    const prompt = promptFor("Series", "Publish the ready slice as a draft PR.");
+    expect(prompt).toContain("Publish the ready slice as a draft PR.");
+    expect(prompt).toContain("fleet_follow_up for the retained worker");
+    expect(prompt).toContain("does not prohibit authorized writing workers");
+    expect(prompt).toContain("create a source branch, push, and create/update the PR");
+    expect(prompt).toContain("actual checkout/provider permissions");
+    expect(prompt).toContain("fleet_submit_task is not a prerequisite");
+    expect(prompt).toContain("Record partial results and continue the parent");
+    expect(prompt).toContain("never mark unmet criteria met");
+    expect(prompt).toContain("provider-observed source/head and base identities");
+    expect(prompt).toContain("verification results and limitations");
+    expect(prompt).toContain("report the exact denial");
+    expect(prompt).not.toContain("The Host owns integration");
+    expect(prompt).not.toContain("so Fleet creates");
+  });
+
+  it("preserves restricted modes, worker autonomy and the normal completion wake", () => {
+    const prompt = promptFor("Series", "Continue.");
+    expect(prompt).toContain("Read-only work grants no publication authority");
+    expect(prompt).toContain("sealed-result and explicit approval gates");
+    expect(prompt).toContain("Registered PR maintenance still requires authenticated");
+    expect(prompt).toContain("retained-worker binding and prepared batch");
+    expect(prompt).toContain("The worker chooses the investigation");
+    expect(prompt).toContain("Distinguish historical facts from current observations");
+    expect(prompt).toContain("normal turn response");
+    expect(prompt).toContain("wakes the orchestrator automatically");
+    expect(prompt).toContain("Do not poll");
   });
 });

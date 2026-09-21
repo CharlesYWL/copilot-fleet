@@ -38,7 +38,16 @@ GitHub records without `provider` remain GitHub; explicit `"github"` is also
 accepted. Existing schema-v1 records/backups and `github-snapshot.mjs` inputs
 continue to work. The following detailed GraphQL contract applies **only to GitHub**.
 Provider output always includes the shared schema-validated `observation`;
-checkpoint it unchanged regardless of provider.
+checkpoint it unchanged regardless of provider when a registration and claimed
+visit exist. Before registration, retain it in the existing task/execution
+evidence; see the skill's pre-enrollment recovery guidance.
+
+The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
+helper's `snapshot.identity` unchanged, or construct the same strict provider
+identity from fresh, independently authorized metadata. ADO uses
+`repository/headRepository/baseRepository: "Project/Repo"` (case preserved),
+separate provider GUIDs, full `refs/heads/...` refs, and `prNumber`. Do not pass
+helper-only `url`, `repo`, or `number` fields in proposal `identity`.
 
 ## GitHub compatibility helper
 
@@ -107,6 +116,16 @@ permissions, rate limits, timeout, unavailable CLI/ref, malformed/partial API
 data, unsupported branch-rule API, changed scope, inconsistent snapshot, and
 payload overflow. Diagnostic text is sanitized; raw provider errors/credentials
 are not echoed.
+
+ADO overflow diagnostics include `error.limit: {kind,stage,actual,maximum}`.
+`kind` distinguishes bytes from the fixed 200-item/32-depth ceilings; `stage`
+identifies input, response, checkpoint, snapshot, observation, output or continuation.
+A byte allowance may be raised within 1 MiB, not beyond; this does not reset the
+current wake's request/deadline allowance or remove item limits. A returned
+continuation preserves the pending page and must be passed unchanged on a later
+authorized bounded attempt. A null continuation means there is no resumable
+checkpoint, not that evidence was complete. Use manual evidence when the hard
+limits cannot accommodate the scan; never truncate obligations.
 
 The CLI's `observation` conforms to the shared `PrMaintenanceObservationSchema`.
 Write it through `fleet_checkpoint_pr_maintenance` without hand-translating fields.

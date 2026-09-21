@@ -108,6 +108,40 @@ not evidence that the conversation must be replaced. A confirmed terminal
 worker without a resumable conversation needs replacement with the retained
 task context supplied explicitly.
 
+## Worker delivery and publication
+
+The orchestrator delegates, judges and coordinates rather than mutating the
+repository itself. Its own restriction is not a ban on authorized writing
+workers committing, creating source branches, pushing or creating/updating PRs
+when the human requested that deliverable. Ordinary workers use their actual
+checkout/provider permissions; the Host records their results and mediates
+permission requests, rather than exclusively performing all publication.
+
+Publication of a slice is not whole-task completion. `fleet_submit_task` neither
+creates a PR nor grants worker publication authority, and is not a prerequisite
+for an authorized worker to publish a slice. Keep its output recorded and the
+parent open until every essential success criterion has evidence. Do not mark
+unmet criteria met to obtain publication. Report the PR URL, provider-observed
+source/head and base repositories, refs and commit SHAs, verification results
+and limitations. On denial, keep the patch and report the exact refusal.
+
+This does not grant read-only work publication authority, bypass managed-worktree
+sealed-result/integration/publication approval gates, or replace authenticated
+PR-maintenance authorization and prepared-batch admission. It does not change
+checkout leases, access settings or provider policies.
+
+Briefs specify deliverable, scope, authoritative links/paths, necessary decisions
+and constraints, and observable acceptance. The worker chooses investigation,
+implementation and commands from repository conventions. Necessary detail is
+welcome; distinguish historical facts from current observations and avoid copied
+histories or invented runbooks that contradict the deliverable.
+
+Workers report completion or blockers in their normal response. Node ACP prompt
+completion emits `turn_complete` followed by `idle`; the Host persists those
+events and the existing engine settles the step and wakes its orchestrator.
+A successful turn records the report, not proof that all task criteria are met.
+There is no additional worker submission MCP or polling loop for this contract.
+
 ## PR maintenance lifecycle
 
 Maintenance registration lifecycle (`active`, `paused`, `merged`, `closed`) and

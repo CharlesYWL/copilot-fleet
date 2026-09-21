@@ -1,4 +1,16 @@
 import type { Run } from "@fleet/protocol";
+import { DISPATCH_GUIDANCE, WORKER_DELIVERY_CONTRACT } from "./briefing.js";
+
+const REVIEW_NEXT_STEPS = [
+  "Act through Fleet: use fleet_follow_up for the retained worker's next revision,",
+  "or dispatch a worker or fixer for distinct work, then end your turn.",
+  WORKER_DELIVERY_CONTRACT,
+  DISPATCH_GUIDANCE,
+  "Workers report completion or blockers through their normal turn response;",
+  "Fleet records it and wakes the orchestrator automatically. Do not poll.",
+  "After dispatched work settles, judge the evidence against the whole task.",
+  "Call fleet_submit_task again only when the whole task is ready for human review.",
+].join("\n");
 
 export type ReviewInput = { approved: boolean; note?: string | undefined };
 
@@ -67,12 +79,7 @@ export function sendBackPrompt(task: string, note: string): string {
     note,
     "</fleet-review>",
     "",
-    "Act on this only through Fleet: dispatch a worker or fixer for the requested",
-    "change, then end your turn. Do not edit the repository, commit, create or",
-    "move a branch, push, publish, or claim publication yourself. The Host owns",
-    "integration and publication evidence.",
-    "After dispatched work settles, call fleet_submit_task again so Fleet creates",
-    "a new sealed result, integration preview, and publication approval.",
+    REVIEW_NEXT_STEPS,
   ].join("\n");
 }
 
@@ -92,11 +99,6 @@ export function reopenPrompt(task: string, note: string): string {
     "",
     "This task was finished and has been reopened, so its notes and criteria",
     "describe work you already did. Read them before deciding anything.",
-    "Act on the above only through Fleet: dispatch a worker or fixer, then end your turn.",
-    "Do not edit the repository, commit, create or move a branch,",
-    "push, publish, or claim publication yourself. The Host owns integration",
-    "and publication evidence.",
-    "After dispatched work settles, call fleet_submit_task again so Fleet creates",
-    "a new sealed result, integration preview, and publication approval.",
+    REVIEW_NEXT_STEPS,
   ].join("\n");
 }

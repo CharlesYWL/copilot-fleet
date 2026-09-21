@@ -79,6 +79,25 @@ describe("FleetTools", () => {
     expect(step.prompt).toContain("VERIFY");
   });
 
+  it.each(["implement", "test", "explore", "review-quick", "review-deep"])(
+    "carries conditional delivery authority, not a blanket publication grant, for %s",
+    (category) => {
+      start({ task: "Slice delivery", category });
+      const prompt = store.listRunSteps(tasks()[0]!.id)[0]!.prompt;
+      expect(prompt).toContain("When the human requests PR creation or updates");
+      expect(prompt).toContain("authorized writing worker may commit");
+      expect(prompt).toContain("Read-only work grants no publication authority");
+      expect(prompt).toContain("sealed-result and explicit approval gates");
+      expect(prompt).toContain("retained-worker binding and prepared batch");
+      expect(prompt).toContain("fleet_submit_task is not a prerequisite");
+      expect(prompt).toContain("provider-observed source/head and base identities");
+      expect(prompt).toContain("The worker chooses the investigation");
+      expect(prompt).toContain("normal turn response");
+      expect(prompt).toContain("wakes the orchestrator automatically");
+      expect(prompt).toContain("no separate submission or polling is needed");
+    },
+  );
+
   it("puts a named task in its own run, with its own budget", () => {
     const result = start({ task: "Explore Beta" });
     expect(result.text).toContain("Explore Beta");

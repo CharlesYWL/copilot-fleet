@@ -59,6 +59,40 @@ Same-project forks are supported only when `forkSource.repository.project`
 proves the same project GUID and display name, with the exact source ref.
 Cross-project or incomplete fork identity is not guessed.
 
+### Proposal identity, not discovery input
+
+`fleet_prepare_pr_maintenance.identity` accepts the complete `snapshot.identity`
+unchanged. For independently read fresh metadata, use this same shape (all IDs
+and names must be provider-observed, not inferred from this example):
+
+```json
+{
+  "provider": "azure-devops",
+  "host": "dev.azure.com",
+  "organization": "example",
+  "project": "Project",
+  "projectId": "11111111-1111-4111-8111-111111111111",
+  "repository": "Project/Repo",
+  "repositoryId": "22222222-2222-4222-8222-222222222222",
+  "headRepository": "Project/Repo",
+  "headRepositoryId": "22222222-2222-4222-8222-222222222222",
+  "headRef": "refs/heads/FixCase",
+  "baseRepository": "Project/Repo",
+  "baseRepositoryId": "22222222-2222-4222-8222-222222222222",
+  "baseRef": "refs/heads/main",
+  "prNumber": 7
+}
+```
+
+`project` is the display name, not a GUID. All three repository display names
+include the exact case-preserved project prefix; a bare repo name is invalid.
+The PR/base repository IDs and names must agree; a proven same-project fork may
+have a different head repository. GUIDs/organization normalize to lowercase, not
+project/repository display names or refs. Do not include discovery-only
+`url`, `repo`, or `number` fields. `prUrl`, `headSha`, actual `observedAt`, method
+and evidence are separate proposal fields. Field-specific validation errors
+identify a bad pin; reconcile it against provider evidence instead of guessing.
+
 ## Authentication and limits
 
 The helper invokes only this built-in Azure CLI command:
@@ -97,6 +131,16 @@ links are never followed. Non-success response bodies are not retained.
 accumulated checkpoints, and final CLI output are bounded. Normalized arrays and
 provider arrays have a 200-item ceiling; all text comments together also fit that
 ceiling. Oversize evidence returns incomplete rather than truncating evidence.
+Collection `payload_overflow` carries sanitized `error.limit: {kind,stage,actual,maximum}`:
+`kind` is `bytes`, `items`, or `depth` (maximum depth 32). The stage distinguishes
+input, response, checkpoint, snapshot, observation, output, or continuation.
+Item/depth ceilings cannot be raised. For byte overflow, a later authorized
+attempt can use a larger `maxBytes` up to 1 MiB and the unchanged returned
+continuation, if present. This is not a new request/time budget in the same wake.
+If no continuation fits, retain the receipt and use manual evidence or a later
+explicitly bounded fresh read; never trim comments/checks to manufacture success.
+An entry/authentication failure may only carry code/message; do not assume an
+unknown overflow is a recoverable evidence byte limit.
 
 ## Output and continuation
 
@@ -122,7 +166,7 @@ Exports:
     checks,reviews,checksComplete,reviewsComplete,
     actionableSources,effects,actionableFingerprint
   },
-  error?:{code,message,retryAfterSeconds?}
+  error?:{code,message,retryAfterSeconds?,limit?:{kind,stage,actual,maximum}}
 }
 ```
 
@@ -132,6 +176,16 @@ retain the last successful observation. The raw fixture API also exposes
 `observation.helperState.resume` back as `resume`, and persist
 `observation.helperState.previousThreads`. Write `observation` directly to the
 Host checkpoint; do not translate it using the GitHub-only adapter.
+Byte accounting counts that continuation **once** in the actual serialized output,
+not the raw API alias as well. A genuine snapshot/output byte overflow may also
+retain a last-safe scan; any resumed attempt still repeats full verification.
+If discovery has no registration, retain the incomplete receipt and continuation
+in existing execution/task evidence, not a fabricated recordId checkpoint.
+Fresh exact metadata from an independently authorized provider read may support
+an **observe-only, unapproved proposal** despite incomplete helper collection.
+It cannot establish checks/reviews completeness, triage or readiness, enable
+repair, or clear access/design holds. Approval remains the authenticated operator's
+separate action; registered recovery requires its existing claimed visit.
 
 **Collection completeness is separate from readiness completeness.**
 `complete:true` means exact identity/current refs, all bounded feedback and policy

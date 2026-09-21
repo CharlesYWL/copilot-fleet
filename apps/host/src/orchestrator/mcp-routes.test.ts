@@ -76,6 +76,27 @@ describe("mcp endpoint", () => {
     await app.close();
   });
 
+  it("advertises worker publication independently of whole-task submission", async () => {
+    const response = await list(new LeadTokens(store).mint(lead));
+    const tools = (
+      response.json() as {
+        result: { tools: { name: string; description: string }[] };
+      }
+    ).result.tools;
+    const start = tools.find((tool) => tool.name === "fleet_start_work")!.description;
+    const submit = tools.find((tool) => tool.name === "fleet_submit_task")!.description;
+    expect(start).toContain(
+      "authorized writing worker may commit, push and create/update",
+    );
+    expect(start).toContain("without fleet_submit_task first");
+    expect(start).toContain(
+      "Read-only, managed publication and authenticated maintenance",
+    );
+    expect(start).toContain("Let the worker choose investigation");
+    expect(submit).toContain("does not create a PR");
+    expect(submit).toContain("parent open until all essential criteria are met");
+  });
+
   it("lists the fleet tools to a live orchestrator", async () => {
     const token = new LeadTokens(store).mint(lead);
 

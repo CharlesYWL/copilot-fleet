@@ -477,6 +477,114 @@ describe("authenticated PR maintenance controls", () => {
     expect(store.prMaintenance.getProposal(run.id)?.version).toBe(1);
   });
 
+  it("accepts the reported project-scoped ADO identity through the exposed preparation MCP", async () => {
+    const { store, run, worker, mcp } = await setup("azure-devops");
+    const identity = {
+      provider: "azure-devops",
+      host: "dev.azure.com",
+      organization: "powerbi",
+      project: "Trident",
+      projectId: "3a3467dc-0814-4e9d-8eec-555851655f69",
+      repository: "Trident/TridentWarehouse-UX",
+      repositoryId: "bde35e51-d934-4f33-83ef-618d3498079d",
+      headRepository: "Trident/TridentWarehouse-UX",
+      headRepositoryId: "bde35e51-d934-4f33-83ef-618d3498079d",
+      headRef: "refs/heads/dev/charlesyin/schema-designer-s03-working-state",
+      baseRepository: "Trident/TridentWarehouse-UX",
+      baseRepositoryId: "bde35e51-d934-4f33-83ef-618d3498079d",
+      baseRef: "refs/heads/main",
+      prNumber: 1099182,
+    };
+    const result = await mcp("fleet_prepare_pr_maintenance", {
+      taskId: run.id,
+      workerSessionId: worker.id,
+      prUrl:
+        "https://dev.azure.com/powerbi/Trident/_git/TridentWarehouse-UX/pullrequest/1099182",
+      identity,
+      headSha: "5d4bb3dd33618506ddaa48fec972401205b28f87",
+      observedAt: new Date().toISOString(),
+      method: "provider_mcp",
+      mode: "observe",
+      evidence: "Synthetic metadata fixture; helper discovery was incomplete.",
+      eligibilityEvidence: "No repair authority; only requesting observation.",
+      verification: "Bounded read-only provider evidence; no readiness claim.",
+    });
+    expect(result.ok, result.text).toBe(true);
+    expect(store.prMaintenance.getProposal(run.id)?.registration).toMatchObject({
+      identity,
+      scope: { publicationAuthorized: false, replies: false, resolveThreads: false },
+    });
+    expect(store.prMaintenance.list().records).toHaveLength(0);
+  });
+
+  it("advertises the actual provider-specific identity contract in tools/list", async () => {
+    const { app, leadToken } = await setup("azure-devops");
+    const response = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${leadToken}`,
+        accept: "application/json, text/event-stream",
+      },
+      payload: { jsonrpc: "2.0", id: 1, method: "tools/list" },
+    });
+    const tool = response
+      .json()
+      .result.tools.find(
+        (entry: { name: string }) => entry.name === "fleet_prepare_pr_maintenance",
+      );
+    const identity = tool.inputSchema.properties.identity;
+    expect(tool.description).toContain("Before registration");
+    expect(tool.inputSchema.properties.evidence.description).toContain("metadata-only");
+    expect(identity.description).toContain("snapshot.identity unchanged");
+    const ado = identity.oneOf.find(
+      (entry: any) => entry.properties.provider.const === "azure-devops",
+    );
+    expect(ado.required).toEqual(
+      expect.arrayContaining(["provider", "organization", "projectId", "prNumber"]),
+    );
+    expect(ado.additionalProperties).toBe(false);
+    expect(ado.properties.repository.description).toContain("Project/Repo");
+    expect(ado.properties.project.description).toContain("not its GUID");
+    expect(ado.properties.projectId.description).toContain("Provider");
+    expect(ado.properties.headRef.description).toContain("case-sensitive");
+  });
+
+  it.each([
+    [{ repository: "Repo" }, "identity.repository", "Project/Repo"],
+    [{ headRepository: "Other/Repo" }, "identity.headRepository", "Project prefix"],
+    [
+      { baseRepositoryId: "cccccccc-cccc-cccc-cccc-cccccccccccc" },
+      "identity.baseRepositoryId",
+      "must match",
+    ],
+    [{ baseRepository: "Sample Project/Other" }, "identity.baseRepository", "must match"],
+    [{ projectId: "PRIVATE_VALUE_DO_NOT_ECHO" }, "identity.projectId", "GUID"],
+    [{ headRef: "main" }, "identity.headRef", "refs/heads/"],
+    [{ provider: "PRIVATE_VALUE_DO_NOT_ECHO" }, "identity.provider", "discriminator"],
+  ])(
+    "rejects malformed ADO identity %j with safe field-specific MCP feedback",
+    async (patch, field, message) => {
+      const { mcp, registration, store, run } = await setup("azure-devops");
+      const result = await mcp("fleet_prepare_pr_maintenance", {
+        prUrl: prMaintenanceUrl(registration.identity),
+        identity: { ...registration.identity, ...patch },
+        headSha: registration.headSha,
+        observedAt: new Date().toISOString(),
+        method: "provider_mcp",
+        evidence: "Current fixture provider evidence",
+        verification: registration.scope.verification,
+        eligibilityEvidence: "Observation only; not publication authority.",
+      });
+      expect(result.ok).toBe(false);
+      expect(result.text).toContain(field);
+      expect(result.text).toContain(message);
+      expect(result.text).not.toContain("PRIVATE_VALUE_DO_NOT_ECHO");
+      expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+      expect(store.prMaintenance.list().records).toHaveLength(0);
+    },
+  );
+
   it("proposes only explicitly requested repair actions and still requires operator approval", async () => {
     const { store, run, registration, mcp } = await setup();
     const result = await mcp("fleet_prepare_pr_maintenance", {
