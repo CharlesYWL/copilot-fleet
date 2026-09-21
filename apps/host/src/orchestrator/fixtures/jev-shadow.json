@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "synthetic-routine-review",
+      "risk": "routine",
+      "expected": "preauthorized_review",
+      "leadDecisionMs": 4000,
+      "snapshot": {
+        "run": {
+          "id": "example-run",
+          "workspaceId": "example-workspace",
+          "state": "running",
+          "objective": "Correct the welcome message without changing behavior.",
+          "leadSessionId": "example-lead",
+          "placementId": "example-checkout",
+          "phases": ["Implement and verify", "Independent review"],
+          "phaseIndex": 0,
+          "successCriteria": [
+            {
+              "id": "message",
+              "scenario": "The welcome message uses the requested wording.",
+              "expectedEvidence": "The targeted message test passes."
+            }
+          ],
+          "settleSeq": 1,
+          "wakeSeq": 0
+        },
+        "steps": [
+          {
+            "id": "example-step",
+            "runId": "example-run",
+            "stepKey": "wording",
+            "title": "Correct welcome wording",
+            "prompt": "Correct only the welcome message and run the targeted message test.",
+            "category": "implement",
+            "state": "succeeded",
+            "sessionId": "example-worker",
+            "placementId": "example-checkout",
+            "output": "Updated the welcome text. The targeted message test passed (1 test). No other files changed.",
+            "eventSeqFrom": 4,
+            "attempts": 1,
+            "phaseIndex": 0,
+            "dispatchedAt": "2026-09-21T09:01:00.000Z",
+            "createdAt": "2026-09-21T09:00:00.000Z",
+            "updatedAt": "2026-09-21T09:02:00.000Z"
+          }
+        ],
+        "sessions": [
+          {
+            "id": "example-lead",
+            "workspaceId": "example-workspace",
+            "placementId": "example-checkout",
+            "runRole": "lead",
+            "state": "idle"
+          },
+          {
+            "id": "example-worker",
+            "workspaceId": "example-workspace",
+            "placementId": "example-checkout",
+            "runId": "example-run",
+            "runRole": "worker",
+            "state": "idle",
+            "turnCompleteSequence": 6
+          }
+        ]
+      },
+      "authorization": {
+        "id": "example-approval",
+        "runId": "example-run",
+        "leadSessionId": "example-lead",
+        "sourceStepId": "example-step",
+        "sourceAttempt": 1,
+        "sourceEventSeqFrom": 4,
+        "phaseIndex": 0,
+        "placementId": "example-checkout",
+        "approvedAt": "2026-09-21T09:00:00.000Z",
+        "review": {
+          "category": "review-quick",
+          "title": "Review the welcome wording",
+          "deliverable": "Report unintended changes or missing verification.",
+          "scope": "Read only the welcome message change and its targeted test.",
+          "verify": "Inspect the diff and the recorded targeted test result."
+        }
+      }
+    }
+  ]
+}
