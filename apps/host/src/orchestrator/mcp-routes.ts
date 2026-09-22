@@ -26,6 +26,7 @@ import {
   PlanTaskSchema,
   PreparePrMaintenanceSchema,
   ProposePrMaintenanceSchema,
+  RecordTaskCheckpointSchema,
   ReopenTaskSchema,
   SessionRefSchema,
   SetPrMaintenanceSchema,
@@ -332,6 +333,19 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       inputSchema: PlanTaskSchema.shape,
     },
     guard("fleet_plan_task", PlanTaskSchema, (input) => tools.planTask(input)),
+  );
+
+  server.registerTool(
+    "fleet_record_task_checkpoint",
+    {
+      title: "Record a meaningful task checkpoint",
+      description:
+        "Save a concise factual summary with its full evidence for the task overview and timestamped history. Use for milestones or decisions within a phase, not tool-call narration. The Host records the time and source. This does not advance a phase, authorize work, clear a hold, or finish the task.",
+      inputSchema: RecordTaskCheckpointSchema.shape,
+    },
+    guard("fleet_record_task_checkpoint", RecordTaskCheckpointSchema, (input) =>
+      tools.recordTaskCheckpoint(input),
+    ),
   );
 
   server.registerTool(

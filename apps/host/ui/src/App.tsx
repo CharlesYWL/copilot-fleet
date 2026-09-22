@@ -1271,6 +1271,7 @@ export function App() {
 
               {view === "orchestrator-task" && selectedRunModel && orchestrator && (
                 <OrchestratorTaskDetail
+                  key={selectedRunModel.run.id}
                   model={selectedRunModel}
                   snapshotRevision={snapshotRevision}
                   notes={runNotes[selectedRunModel.run.id] ?? noNotes}

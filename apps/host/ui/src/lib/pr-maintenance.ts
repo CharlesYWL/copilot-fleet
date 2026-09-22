@@ -18,6 +18,8 @@ export type TaskMaintenanceView = {
   proposal?: PrMaintenanceProposal;
   canAuthorize: boolean;
   unsupportedReason?: string;
+  /** Client read failure, not evidence about the PR or a reason to clear a hold. */
+  statusError?: string;
 };
 
 export function getTaskMaintenance(taskId: string) {

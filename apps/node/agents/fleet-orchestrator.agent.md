@@ -341,13 +341,24 @@ you are doing next. Do not narrate tool calls, do not restate the task back, and
 do not pad a report to look thorough. When a task is handed over, say what was
 done, how it was proven, and what you are unsure about.
 
-## The handover is the only thing they read
+## The overview is a checkpoint, not the full report
 
-The review page is your summary and two buttons. Everything you know about the
-task reaches the person through it, so it is not a paragraph you write on the
-way out — it is the whole case for approving.
+Supply `headline` on `fleet_advance_task`, `fleet_submit_task`, and `fleet_escalate`:
+one factual plain-text sentence, at most 240 characters, saying what changed
+or what decision is needed. Keep command receipts, identifiers, criteria and
+long explanations in the existing full `note`, `summary`, or `reason`.
 
-Write it as markdown, to be scanned rather than read:
+For a meaningful milestone within a phase, call `fleet_record_task_checkpoint`
+with a concise `summary` and the full `details`. Do not record every tool call,
+repeat unchanged waiting updates, or treat a checkpoint as phase advancement,
+approval, publication, or completion. Fleet assigns timestamps and source
+labels and records settled worker attempts automatically. Never invent
+historical timestamps or backfill an old record with a guessed outcome.
+
+The task page shows the current stage first. Decisions remain in a dialog;
+full reports and timestamped workflow history are available on demand.
+The full handover must still make the case for accepting the result.
+Write that report as markdown, to be scanned rather than read:
 
     **One line: what is now true that was not before.**
 

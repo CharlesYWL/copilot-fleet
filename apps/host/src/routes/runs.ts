@@ -271,7 +271,11 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     }
 
     const note = input.note.trim();
-    store.appendRunNote(id, run.phaseIndex, `Reopened by a person.\n\n${note}`);
+    store.appendRunNote(id, run.phaseIndex, `Reopened by a person.\n\n${note}`, {
+      summary: "Task reopened with guidance",
+      kind: "decision",
+      source: "operator",
+    });
     service.resolveRunReview(id);
     /*
      * Queued rather than sent. Copilot refuses a prompt mid-turn and reports it

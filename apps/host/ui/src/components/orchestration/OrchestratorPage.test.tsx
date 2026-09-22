@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import {
   RunPolicySchema,
@@ -13,6 +13,12 @@ import { OrchestratorPage } from "./OrchestratorPage";
 import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
 import { runVisual } from "./RunStatusIndicator";
 import { statusDescriptor } from "../../lib/status-visuals";
+import type * as MaintenanceApi from "../../lib/pr-maintenance";
+
+vi.mock("../../lib/pr-maintenance", async (importOriginal) => ({
+  ...(await importOriginal<typeof MaintenanceApi>()),
+  getTaskMaintenance: vi.fn().mockResolvedValue({ records: [], canAuthorize: true }),
+}));
 
 const ISO = "2026-01-01T12:00:00.000Z";
 
@@ -402,6 +408,7 @@ describe("task detail", () => {
      * or done with, and then keeping a record of it is the thing nobody wants.
      */
     detail();
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
 
     expect(screen.getByRole("button", { name: "Archive" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Reopen" })).toBeNull();
@@ -412,6 +419,7 @@ describe("task detail", () => {
     "offers reopening and deleting once a task is %s",
     (state) => {
       detail({ model: models([run({ id: "r1", state })])[0]! });
+      fireEvent.click(screen.getByRole("button", { name: "Task details" }));
 
       expect(screen.getByRole("button", { name: "Reopen" })).toBeTruthy();
       expect(screen.getByRole("button", { name: "Delete" })).toBeTruthy();
@@ -429,14 +437,16 @@ describe("task detail", () => {
       }),
     ])[0]!;
     detail({ model });
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
 
-    expect(screen.getByText("Extract baseline").parentElement?.textContent).toContain(
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("Extract baseline").textContent).toContain(
       "Stopped here",
     );
-    expect(
-      screen.getByText("Implement and validate").parentElement?.textContent,
-    ).toContain("Not reached");
-    expect(screen.getByText("Independent review").parentElement?.textContent).toContain(
+    expect(within(dialog).getByText("Implement and validate").textContent).toContain(
+      "Not reached",
+    );
+    expect(within(dialog).getByText("Independent review").textContent).toContain(
       "Not reached",
     );
   });
@@ -447,6 +457,7 @@ describe("task detail", () => {
     const model = models([run({ id: "r1", state: "completed" })])[0]!;
     const props = detail({ model });
 
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
     fireEvent.click(screen.getByRole("button", { name: "Reopen" }));
     const confirm = screen.getByRole("button", { name: "Reopen task" });
     expect(confirm.hasAttribute("disabled")).toBe(true);
@@ -463,6 +474,7 @@ describe("task detail", () => {
     const model = models([run({ id: "r1", state: "completed" })])[0]!;
     const props = detail({ model });
 
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
     fireEvent.click(screen.getByRole("button", { name: "Delete" }));
     fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
 
@@ -479,9 +491,9 @@ describe("task detail", () => {
     const model = models([run({ id: "r1", phases: [] })])[0]!;
     detail({ model, onOpenLead });
 
-    expect(screen.getByText(/Waiting for the orchestrator to plan this/)).toBeTruthy();
+    expect(screen.getByText(/Waiting for the Orchestrator to plan this/)).toBeTruthy();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open the conversation" }));
+    fireEvent.click(screen.getByRole("button", { name: "Conversation" }));
     expect(onOpenLead).toHaveBeenCalled();
   });
 
@@ -513,6 +525,8 @@ describe("task detail", () => {
     ])[0]!;
     detail({ model });
 
+    expect(screen.queryByText("What done means")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
     expect(screen.getByText("What done means")).toBeTruthy();
     expect(screen.getByText(/Finished when the auth suite is green/)).toBeTruthy();
     expect(screen.getByText(/reusing a token after logout returns 401/)).toBeTruthy();
@@ -524,6 +538,7 @@ describe("task detail", () => {
 
   it("shows no definition of done for a task planned before there was one", () => {
     detail();
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
 
     expect(screen.queryByText("What done means")).toBeNull();
   });
@@ -553,7 +568,9 @@ describe("task detail", () => {
       ],
     });
 
-    const card = screen.getByText("Ready for you").closest("section")!;
+    expect(screen.queryByRole("heading", { name: "How it was proven" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review result" }));
+    const card = screen.getByRole("dialog");
     expect(within(card).getByRole("heading", { name: "How it was proven" })).toBeTruthy();
     expect(within(card).getAllByRole("listitem").length).toBeGreaterThan(0);
     expect(within(card).queryByText(/### How it was proven/)).toBeNull();
@@ -561,7 +578,7 @@ describe("task detail", () => {
 
   it("does not claim a planned task is waiting to be planned", () => {
     detail();
-    expect(screen.queryByText(/Waiting for the orchestrator to plan this/)).toBeNull();
+    expect(screen.queryByText(/Waiting for the Orchestrator to plan this/)).toBeNull();
   });
 
   it("goes back to the task list", () => {
@@ -660,13 +677,16 @@ describe("task detail", () => {
      * resumable context stays with the record.
      */
     const props = detail();
+    fireEvent.click(screen.getByRole("button", { name: "Task details" }));
     fireEvent.click(screen.getByRole("button", { name: "Archive" }));
 
     const dialog = await screen.findByRole("dialog");
-    expect(within(dialog).getByText(/parked outside the active fleet/)).toBeTruthy();
+    expect(
+      within(dialog).getByText(/Any worker still running for this task is stopped/),
+    ).toBeTruthy();
     expect(within(dialog).getByText(/keeps its phases/)).toBeTruthy();
     expect(
-      within(dialog).getByText(/resume one of its worker conversations/),
+      within(dialog).getByText(/resume an existing worker conversation/),
     ).toBeTruthy();
 
     fireEvent.click(within(dialog).getByRole("button", { name: "Archive task" }));
@@ -704,7 +724,7 @@ describe("task detail", () => {
     const model = models([run({ id: "r1", state: "awaiting_human" })])[0]!;
     const props = detail({ model });
 
-    fireEvent.click(screen.getByRole("button", { name: "Send back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Review result" }));
     const dialog = await screen.findByRole("dialog");
     const confirm = within(dialog).getByRole("button", { name: "Send back" });
 
@@ -716,6 +736,12 @@ describe("task detail", () => {
     const model = models([run({ id: "r1", state: "awaiting_human" })])[0]!;
     const props = detail({ model });
 
+    fireEvent.click(screen.getByRole("button", { name: "Review result" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Approve" }).hasAttribute("disabled"),
+      ).toBe(false),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Approve" }));
 
     expect(props.onReview).toHaveBeenCalledWith(true, "");
@@ -736,9 +762,101 @@ describe("task detail", () => {
       ],
     });
 
-    expect(screen.getByText("Blocked — needs your decision")).toBeTruthy();
+    expect(screen.getByText("Your decision is needed")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Review decision" }));
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
+    await waitFor(() =>
+      expect(
+        screen
+          .getByRole("button", { name: "Accept incomplete result" })
+          .hasAttribute("disabled"),
+      ).toBe(false),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Accept incomplete result" }));
     expect(props.onReview).toHaveBeenCalledWith(true, "");
+  });
+
+  it("shows a saved summary first and timestamps full history only on demand", () => {
+    const model = models([run({ state: "awaiting_human" })])[0]!;
+    detail({
+      model,
+      notes: [
+        {
+          id: "checkpoint",
+          runId: "r1",
+          phaseIndex: 0,
+          createdAt: ISO,
+          summary: "Permission expired; the MSIT PR was not created.",
+          kind: "blocked",
+          source: "orchestrator",
+          body: "Original receipt: the execution never started. Preserve the existing worker.",
+        },
+      ],
+    });
+    expect(
+      screen.getByText("Permission expired; the MSIT PR was not created."),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Original receipt:/)).toBeNull();
+    expect(screen.queryByRole("heading", { name: "What done means" })).toBeNull();
+    const history = screen.getByRole("region", { name: "Workflow history" });
+    const toggle = within(history).getByRole("button", { name: /Workflow history/ });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(history.querySelector("time")?.getAttribute("datetime")).toBe(ISO);
+    expect(screen.queryByText(/Original receipt:/)).toBeNull();
+    fireEvent.click(
+      within(history).getByRole("button", { name: "Original report and details" }),
+    );
+    expect(within(history).getByText(/Original receipt:/)).toBeTruthy();
+    fireEvent.click(toggle);
+    expect(screen.queryByText(/Original receipt:/)).toBeNull();
+  });
+
+  it("shows session name, status and node without expanding dispatched work", () => {
+    detail({
+      sessions: [
+        conversation({
+          id: "sess1",
+          name: "Ontology researcher",
+          nodeName: "CharlesDevBox4",
+          runRole: "worker",
+        }),
+      ],
+    });
+    const work = screen.getByRole("region", { name: "Dispatched work" });
+    expect(within(work).getByText("Ontology researcher")).toBeTruthy();
+    expect(within(work).getByText("CharlesDevBox4")).toBeTruthy();
+    expect(
+      within(work)
+        .getByRole("button", { name: /Ontology researcher/ })
+        .getAttribute("aria-expanded"),
+    ).toBe("false");
+    expect(within(work).queryByRole("button", { name: "Open transcript" })).toBeNull();
+  });
+
+  it("sends guidance from the dialog without navigating to the Orchestrator", async () => {
+    const props = detail({ model: models([run({ state: "awaiting_human" })])[0]! });
+    const trigger = screen.getByRole("button", { name: "Review result" });
+    expect(JSON.parse(trigger.getAttribute("data-tabster") ?? "{}")).toHaveProperty(
+      "restorer",
+    );
+    fireEvent.click(trigger);
+    fireEvent.change(screen.getByRole("textbox", { name: "What needs changing?" }), {
+      target: { value: "Keep this change limited to MSIT." },
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Send back" }).hasAttribute("disabled"),
+      ).toBe(false),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send back" }));
+    await waitFor(() =>
+      expect(props.onReview).toHaveBeenCalledWith(
+        false,
+        "Keep this change limited to MSIT.",
+      ),
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(props.onOpenLead).not.toHaveBeenCalled();
   });
 });

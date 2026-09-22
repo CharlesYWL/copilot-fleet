@@ -1,6 +1,5 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
-  shorthands,
   Button,
   Dialog,
   DialogActions,
@@ -9,31 +8,46 @@ import {
   DialogSurface,
   DialogTitle,
   Field,
+  Link,
   Textarea,
-  Text,
   makeStyles,
   mergeClasses,
   tokens,
+  useRestoreFocusTarget,
 } from "@fluentui/react-components";
 import {
   ArrowLeft20Regular,
   ArrowCounterclockwise20Regular,
   Chat20Regular,
   Delete20Regular,
+  Info20Regular,
+  Open16Regular,
 } from "@fluentui/react-icons";
-import type { FleetSession, RunNote } from "@fleet/protocol";
+import {
+  PR_MAINTENANCE_RECOVERY_LIMITS,
+  prMaintenanceUrl,
+  type FleetSession,
+  type RunNote,
+} from "@fleet/protocol";
 import type { RunViewModel } from "../../lib/orchestration-view";
-import { awaitingPlan, currentPhase } from "../../lib/orchestration-view";
+import { currentPhase } from "../../lib/orchestration-view";
+import {
+  blockedReview,
+  currentMaintenance,
+  latestReviewNote,
+  taskOverview,
+} from "../../lib/task-overview";
+import type {
+  MaintenanceReviewReference,
+  TaskMaintenanceView,
+} from "../../lib/pr-maintenance";
 import { semanticColors, statusVisuals, terminal } from "../../theme";
 import { MarkdownBody } from "../MarkdownBody";
 import { RunStatusIndicator } from "./RunStatusIndicator";
 import { WorkerStepTimeline } from "./WorkerStepTimeline";
 import { ManagedWorktreePanel } from "./ManagedWorktreePanel";
 import { PrMaintenancePanel } from "./PrMaintenancePanel";
-import type {
-  MaintenanceReviewReference,
-  TaskMaintenanceView,
-} from "../../lib/pr-maintenance";
+import { TaskWorkflowHistory } from "./TaskWorkflowHistory";
 
 const useStyles = makeStyles({
   page: {
@@ -42,193 +56,207 @@ const useStyles = makeStyles({
     minHeight: 0,
     display: "flex",
     flexDirection: "column",
-    background: tokens.colorNeutralBackground1,
+    backgroundColor: tokens.colorNeutralBackground1,
   },
   head: {
     flexShrink: 0,
-    display: "flex",
-    flexDirection: "column",
-    gap: "10px",
-    padding: "14px 20px",
+    padding: "16px 24px",
     borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
   },
-  crumbRow: { display: "flex", alignItems: "center", gap: "10px", flexWrap: "wrap" },
-  crumb: {
-    color: tokens.colorNeutralForeground3,
-    fontFamily: terminal.font,
-    fontSize: "10px",
-  },
-  titleRow: {
+  crumbRow: {
     display: "flex",
     alignItems: "center",
-    gap: "12px",
+    gap: "8px",
     flexWrap: "wrap",
+    marginBottom: "12px",
   },
-  title: {
-    fontSize: tokens.fontSizeHero700,
-    fontWeight: tokens.fontWeightSemibold,
-    minWidth: 0,
-  },
-  actions: { display: "flex", gap: "8px", flexWrap: "wrap", marginLeft: "auto" },
-  danger: {
-    color: statusVisuals.danger.foreground,
-  },
-  body: { flexGrow: 1, minHeight: 0, overflowY: "auto", padding: "16px 20px 40px" },
-  section: { marginBottom: "22px" },
-  sectionLabel: {
-    display: "block",
-    marginBottom: "8px",
-    color: tokens.colorNeutralForeground3,
-    fontSize: "10px",
-    letterSpacing: "0.08em",
-    textTransform: "uppercase",
-    fontWeight: tokens.fontWeightSemibold,
-  },
-  phases: { display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" },
-  phase: {
-    display: "flex",
-    alignItems: "center",
-    gap: "7px",
-    padding: "6px 10px",
-    borderRadius: tokens.borderRadiusSmall,
-    background: tokens.colorNeutralBackground2,
-    color: tokens.colorNeutralForeground3,
-    fontSize: tokens.fontSizeBase200,
-    minHeight: "32px",
-  },
-  phaseDone: { color: semanticColors.completed },
-  phaseNow: {
-    color: tokens.colorNeutralForeground1,
-    background: tokens.colorNeutralBackground3,
-    boxShadow: `inset 2px 0 ${semanticColors.interaction}`,
-  },
-  phaseState: {
-    color: tokens.colorNeutralForeground4,
-    fontSize: tokens.fontSizeBase100,
-  },
-  pip: { width: "8px", height: "8px", borderRadius: "50%", background: "currentColor" },
-  /*
-   * The contract the orchestrator is held to, shown to the person in the same
-   * words. It cannot hand the task over while an essential one is unmet, so
-   * this is not a summary of intent — it is what will actually be enforced.
-   */
-  stopWhen: {
-    margin: "0 0 10px",
-    color: tokens.colorNeutralForeground2,
-    fontSize: tokens.fontSizeBase300,
-    lineHeight: "1.5",
-  },
-  criteria: { display: "grid", gap: "6px", margin: 0, padding: 0, listStyle: "none" },
-  criterion: {
-    display: "flex",
-    alignItems: "flex-start",
-    gap: "10px",
-    padding: "10px 12px",
-    borderRadius: tokens.borderRadiusMedium,
-    background: tokens.colorNeutralBackground2,
-  },
-  criterionPip: {
-    flexShrink: 0,
-    width: "6px",
-    height: "6px",
-    marginTop: "6px",
-    borderRadius: "50%",
-    background: tokens.colorNeutralForeground4,
-  },
-  criterionText: { display: "flex", flexDirection: "column", gap: "2px", minWidth: 0 },
-  criterionScenario: {
-    color: tokens.colorNeutralForeground1,
-    fontSize: tokens.fontSizeBase200,
-    lineHeight: "1.5",
-  },
-  criterionEvidence: {
-    color: tokens.colorNeutralForeground3,
-    fontSize: tokens.fontSizeBase200,
-    lineHeight: "1.5",
-  },
-  optional: {
-    marginLeft: "6px",
-    color: tokens.colorNeutralForeground4,
-    fontFamily: terminal.font,
-    fontSize: "10px",
-    textTransform: "uppercase",
-    letterSpacing: "0.06em",
-  },
-  notes: { display: "grid", gap: "8px", margin: 0, padding: 0, listStyle: "none" },
-  note: {
-    padding: "10px 12px",
-    borderRadius: tokens.borderRadiusMedium,
-    background: tokens.colorNeutralBackground2,
-    color: tokens.colorNeutralForeground2,
-    fontSize: tokens.fontSizeBase200,
-    lineHeight: "1.55",
-    whiteSpace: "pre-wrap",
-  },
-  /*
-   * The same surface, for text the orchestrator wrote rather than text we did.
-   *
-   * Handover notes are markdown — headings, bullets, evidence — and a paragraph
-   * of `pre-wrap` turns that into the wall of prose this exists to avoid. The
-   * renderer supplies the line breaks, so this must not.
-   */
-  noteSurface: {
-    padding: "12px 14px",
-    borderRadius: tokens.borderRadiusMedium,
-    background: tokens.colorNeutralBackground2,
-    color: tokens.colorNeutralForeground2,
-  },
-  noteMarkdown: {
-    fontSize: "13px",
-    lineHeight: "1.6",
-    color: "inherit",
-  },
-  noteLabel: {
-    display: "block",
-    marginBottom: "4px",
-    color: tokens.colorNeutralForeground4,
-    fontFamily: terminal.font,
-    fontSize: "10px",
-  },
-  review: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "10px",
-    padding: "14px",
-    ...shorthands.border("1px", "solid", statusVisuals.attention.border),
-    borderRadius: tokens.borderRadiusMedium,
-    background: statusVisuals.attention.surface,
-  },
-  reviewButtons: { display: "flex", gap: "8px", flexWrap: "wrap" },
-  /*
-   * A long handover scrolls inside the card rather than pushing Approve and
-   * Send back off the fold. The decision is the point of this page; it should
-   * never be further away than the report that argues for it.
-   */
-  reviewBody: {
-    maxHeight: "min(48vh, 560px)",
-    overflowY: "auto",
-  },
-  /**
-   * Deliberately not the attention colour.
-   *
-   * Amber means a person is needed. This is the machine's turn, not theirs —
-   * borrowing the interrupt colour for it would make every freshly opened task
-   * look like a request.
-   */
-  pending: {
-    display: "flex",
-    flexDirection: "column",
-    gap: "10px",
-    padding: "14px",
-    ...shorthands.border("1px", "solid", tokens.colorNeutralStroke2),
-    borderRadius: tokens.borderRadiusMedium,
-    background: tokens.colorNeutralBackground2,
-  },
-  meta: {
+  crumb: {
     color: tokens.colorNeutralForeground3,
     fontFamily: terminal.font,
     fontSize: "11px",
   },
+  actions: { display: "flex", gap: "4px", flexWrap: "wrap", marginLeft: "auto" },
+  titleRow: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "12px",
+    flexWrap: "wrap",
+  },
+  title: {
+    margin: 0,
+    fontSize: "22px",
+    lineHeight: "1.3",
+    fontWeight: tokens.fontWeightSemibold,
+    letterSpacing: "-0.02em",
+    overflowWrap: "anywhere",
+  },
+  status: {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    fontSize: "11px",
+    color: tokens.colorNeutralForeground3,
+  },
+  body: {
+    flexGrow: 1,
+    minHeight: 0,
+    overflowY: "auto",
+    padding: "24px",
+    backgroundColor: tokens.colorNeutralBackground2,
+  },
+  content: { maxWidth: "1320px", marginInline: "auto", display: "grid", gap: "20px" },
+  overview: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) auto",
+    alignItems: "center",
+    gap: "20px",
+    padding: "24px",
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: "12px",
+    backgroundColor: tokens.colorNeutralBackground1,
+    "@media (max-width: 760px)": { gridTemplateColumns: "minmax(0, 1fr)" },
+  },
+  attention: {
+    borderLeft: `3px solid ${semanticColors.permission}`,
+    paddingLeft: "22px",
+  },
+  eyebrow: {
+    margin: "0 0 8px",
+    fontSize: "10px",
+    fontWeight: tokens.fontWeightSemibold,
+    letterSpacing: "0.06em",
+    textTransform: "uppercase",
+    color: tokens.colorNeutralForeground3,
+  },
+  overviewTitle: {
+    margin: 0,
+    fontSize: "28px",
+    lineHeight: "1.2",
+    fontWeight: tokens.fontWeightSemibold,
+    letterSpacing: "-0.03em",
+    overflowWrap: "anywhere",
+  },
+  overviewSummary: {
+    margin: "10px 0 0",
+    fontSize: "14px",
+    lineHeight: "1.6",
+    maxWidth: "740px",
+    color: tokens.colorNeutralForeground2,
+    overflowWrap: "anywhere",
+  },
+  split: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "20px",
+    alignItems: "flex-start",
+  },
+  unsplit: { display: "grid", gridTemplateColumns: "minmax(0, 1fr)" },
+  maintenanceColumn: { flexGrow: 1.55, flexShrink: 1, flexBasis: "400px", minWidth: 0 },
+  inactiveMaintenance: { order: 2 },
+  work: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: "260px",
+    minWidth: 0,
+    padding: "20px",
+    border: `1px solid ${tokens.colorNeutralStroke2}`,
+    borderRadius: "12px",
+    backgroundColor: tokens.colorNeutralBackground1,
+  },
+  workHead: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: "12px",
+    marginBottom: "16px",
+  },
+  sectionTitle: { margin: 0, fontSize: "14px", fontWeight: tokens.fontWeightSemibold },
+  meta: {
+    color: tokens.colorNeutralForeground3,
+    fontFamily: terminal.font,
+    fontSize: "10px",
+  },
+  detailsSection: { marginBlock: "20px" },
+  detailHeading: {
+    margin: "0 0 10px",
+    fontSize: "14px",
+    fontWeight: tokens.fontWeightSemibold,
+  },
+  phases: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "8px",
+    listStyleType: "none",
+    padding: 0,
+    margin: 0,
+  },
+  phase: {
+    padding: "8px 10px",
+    borderRadius: "6px",
+    backgroundColor: tokens.colorNeutralBackground2,
+    fontSize: "12px",
+  },
+  phaseNow: { borderLeft: `2px solid ${semanticColors.interaction}` },
+  phaseDone: { color: semanticColors.completed },
+  phaseState: {
+    display: "block",
+    color: tokens.colorNeutralForeground3,
+    fontSize: "10px",
+    marginTop: "4px",
+  },
+  criteria: {
+    listStyleType: "none",
+    padding: 0,
+    margin: 0,
+    display: "grid",
+    gap: "10px",
+  },
+  criterion: {
+    padding: "12px",
+    borderRadius: "8px",
+    backgroundColor: tokens.colorNeutralBackground2,
+    fontSize: "12px",
+    lineHeight: "1.6",
+  },
+  evidence: { display: "block", color: tokens.colorNeutralForeground3 },
+  optional: {
+    marginLeft: "6px",
+    color: tokens.colorNeutralForeground3,
+    fontSize: "10px",
+  },
+  report: {
+    marginBlock: "12px",
+    "& summary": { cursor: "pointer", color: tokens.colorNeutralForeground2 },
+    "& summary:focus-visible": {
+      outline: `2px solid ${tokens.colorStrokeFocus2}`,
+      outlineOffset: "3px",
+    },
+  },
+  reportBody: {
+    marginTop: "12px",
+    maxHeight: "min(36vh, 360px)",
+    overflowY: "auto",
+    padding: "12px 16px",
+    borderRadius: "8px",
+    backgroundColor: tokens.colorNeutralBackground2,
+    fontSize: "13px",
+    overflowWrap: "anywhere",
+  },
+  dialogSummary: {
+    margin: "0 0 12px",
+    color: tokens.colorNeutralForeground2,
+    lineHeight: "1.6",
+  },
+  decision: {
+    borderLeft: `3px solid ${semanticColors.permission}`,
+    padding: "8px 12px",
+    whiteSpace: "pre-wrap",
+    maxHeight: "28vh",
+    overflowY: "auto",
+    overflowWrap: "anywhere",
+  },
+  error: { color: statusVisuals.danger.foreground },
 });
 
 export type OrchestratorTaskDetailProps = {
@@ -237,13 +265,6 @@ export type OrchestratorTaskDetailProps = {
   sessions: readonly FleetSession[];
   snapshotRevision?: number;
   onBack: () => void;
-  /**
-   * What Back goes back to, when it is not the board.
-   *
-   * A task reached from a conversation returns to that conversation, and a
-   * button that still reads "All tasks" while doing so is describing a place
-   * the operator is not about to arrive at.
-   */
   backLabel?: string;
   onOpenLead: () => void;
   onOpenWorker: (sessionId: string) => void;
@@ -253,20 +274,22 @@ export type OrchestratorTaskDetailProps = {
     maintenance?: MaintenanceReviewReference,
   ) => Promise<boolean>;
   onArchive: () => Promise<boolean>;
-  /** Puts a finished task back to work, with what is still wanted. */
   onReopen: (note: string) => Promise<boolean>;
-  /** Removes a finished task and the sessions it started. */
   onDelete: () => Promise<boolean>;
   onDismissFailure?: () => void;
 };
 
-/**
- * One task, in full.
- *
- * A page rather than an inspector panel, because this is where a person makes
- * the only decision the orchestrator cannot: whether the work is good. That
- * deserves the whole width, not a 320px column beside a conversation.
- */
+type ReviewContext = {
+  taskId: string;
+  reviewSeq: number;
+  reportId: string | undefined;
+  body: string;
+  summary: string;
+  blocked: boolean;
+  reference: MaintenanceReviewReference | undefined;
+  proposal: string;
+};
+
 export const OrchestratorTaskDetail = ({
   model,
   notes,
@@ -283,22 +306,57 @@ export const OrchestratorTaskDetail = ({
   onDismissFailure,
 }: OrchestratorTaskDetailProps) => {
   const styles = useStyles();
+  const restoreFocusTarget = useRestoreFocusTarget();
+  const { run } = model;
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [reopenOpen, setReopenOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewContext, setReviewContext] = useState<ReviewContext>();
   const [reopenNote, setReopenNote] = useState("");
-  const [sendBackOpen, setSendBackOpen] = useState(false);
-  const [sendBackContext, setSendBackContext] = useState<{
-    taskId: string;
-    reference: MaintenanceReviewReference | undefined;
-    proposal: string;
-  }>();
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
-  const [maintenance, setMaintenance] = useState<TaskMaintenanceView>();
-  const { run } = model;
+  const [actionError, setActionError] = useState("");
+  const [freshnessRevision, setFreshnessRevision] = useState(0);
+  const nowMs = Date.now();
+  const [maintenanceState, setMaintenanceState] = useState<{
+    taskId: string;
+    view: TaskMaintenanceView | undefined;
+  }>();
+  const onMaintenanceChange = useCallback(
+    (view: TaskMaintenanceView | undefined) => {
+      setMaintenanceState({ taskId: run.id, view });
+    },
+    [run.id],
+  );
+  const maintenance =
+    maintenanceState?.taskId === run.id ? maintenanceState.view : undefined;
+
+  const record = currentMaintenance(maintenance?.records ?? []);
+  const observedAt = record?.observation?.attemptedAt;
+  useEffect(() => {
+    if (!observedAt) return;
+    const observed = Date.parse(observedAt);
+    const now = Date.now();
+    const nextBoundary =
+      observed > now
+        ? observed
+        : observed + PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1;
+    const delay = nextBoundary - now;
+    if (!Number.isFinite(delay) || delay <= 0) return;
+    // Evidence can expire without a socket update; re-render at that boundary, not on a poll.
+    const timer = window.setTimeout(
+      () => setFreshnessRevision((value) => value + 1),
+      Math.min(delay, 2_147_483_647),
+    );
+    return () => window.clearTimeout(timer);
+  }, [observedAt, freshnessRevision]);
   const maintenanceHold = maintenance?.records.find(
-    (record) => !record.ownershipReleasedAt && record.decision?.state === "pending",
+    (entry) =>
+      entry.taskId === run.id &&
+      !entry.ownershipReleasedAt &&
+      entry.decision?.state === "pending",
   );
   const maintenanceReference = maintenanceHold?.decision
     ? {
@@ -308,50 +366,68 @@ export const OrchestratorTaskDetail = ({
         decisionVersion: maintenanceHold.decision.version,
       }
     : undefined;
-  const sendBackChanged = Boolean(
-    sendBackContext &&
-    (sendBackContext.taskId !== run.id ||
-      JSON.stringify(sendBackContext.reference) !==
-        JSON.stringify(maintenanceReference) ||
-      sendBackContext.proposal !== (maintenanceHold?.decision?.proposal ?? "")),
+  const report = latestReviewNote(notes);
+  const overview = taskOverview(model, notes, maintenance, nowMs);
+  const finished = ["completed", "cancelled", "failed"].includes(run.state);
+  const needsReview = run.state === "awaiting_human" || Boolean(maintenanceHold);
+  const reviewChanged = Boolean(
+    reviewContext &&
+    (reviewContext.taskId !== run.id ||
+      reviewContext.reviewSeq !== run.reviewSeq ||
+      reviewContext.reportId !== report?.id ||
+      JSON.stringify(reviewContext.reference) !== JSON.stringify(maintenanceReference) ||
+      reviewContext.proposal !== (maintenanceHold?.decision?.proposal ?? "")),
   );
-  const openSendBack = () => {
-    setSendBackContext({
+  const reviewUnavailable = !maintenance || Boolean(maintenance.statusError);
+
+  const openReview = () => {
+    setReviewContext({
       taskId: run.id,
+      reviewSeq: run.reviewSeq,
+      reportId: report?.id,
+      body: report?.body ?? "",
+      summary: overview.summary,
+      blocked: blockedReview(report),
       reference: maintenanceReference,
       proposal: maintenanceHold?.decision?.proposal ?? "",
     });
     setNote("");
-    setSendBackOpen(true);
+    setActionError("");
+    setReviewOpen(true);
   };
-  const finished =
-    run.state === "completed" || run.state === "cancelled" || run.state === "failed";
-  const latestNote = notes[notes.length - 1]?.body ?? "";
-  const blockedReview =
-    run.state === "awaiting_human" &&
-    latestNote.startsWith("**Escalated — this task is not finished.**");
+  const answer = async (approved: boolean) => {
+    if (busy || reviewChanged || reviewUnavailable || !reviewContext || actionError)
+      return;
+    if (reviewContext.reference && (approved || !maintenance?.canAuthorize)) return;
+    setBusy(true);
+    try {
+      const ok = reviewContext.reference
+        ? await onReview(false, note.trim(), reviewContext.reference)
+        : await onReview(approved, note.trim());
+      if (ok) {
+        setReviewOpen(false);
+        setNote("");
+      } else {
+        setActionError(
+          "The decision could not be confirmed. Refresh the task before retrying.",
+        );
+      }
+    } catch (error) {
+      setActionError(
+        error instanceof Error ? error.message : "The decision could not be confirmed.",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
   const phaseState = (index: number) => {
     if (index < run.phaseIndex) return "Complete";
     if (index > run.phaseIndex)
       return finished || run.state === "awaiting_human" ? "Not reached" : "Planned";
-    if (run.state === "completed" && run.phaseIndex >= Math.max(0, run.phases.length - 1))
+    if (run.state === "completed" && run.phaseIndex >= run.phases.length - 1)
       return "Complete";
     if (finished) return "Stopped here";
     return run.state === "awaiting_human" ? "Waiting here" : "Current";
-  };
-
-  const answer = async (approved: boolean, text: string) => {
-    if (!approved && sendBackChanged) return;
-    setBusy(true);
-    const reference = approved ? undefined : sendBackContext?.reference;
-    const ok = reference
-      ? await onReview(approved, text, reference)
-      : await onReview(approved, text);
-    setBusy(false);
-    if (ok) {
-      setSendBackOpen(false);
-      setNote("");
-    }
   };
 
   return (
@@ -366,313 +442,358 @@ export const OrchestratorTaskDetail = ({
           >
             {backLabel}
           </Button>
-          <Text className={styles.crumb}>
-            Orchestrator / {run.name}
-            {currentPhase(run) ? ` / ${currentPhase(run)}` : ""}
-          </Text>
-        </div>
-        <div className={styles.titleRow}>
-          <Text as="h1" className={styles.title}>
-            {run.name}
-          </Text>
-          <RunStatusIndicator
-            model={model}
-            dismissible
-            {...(onDismissFailure ? { onDismissFailure } : {})}
-          />
+          <span className={styles.crumb}>
+            Orchestrator{currentPhase(run) ? ` / ${currentPhase(run)}` : ""}
+          </span>
           <div className={styles.actions}>
-            <Button appearance="subtle" icon={<Chat20Regular />} onClick={onOpenLead}>
+            <Button
+              size="small"
+              appearance="subtle"
+              icon={<Chat20Regular />}
+              onClick={onOpenLead}
+            >
               Conversation
             </Button>
-            {/*
-              What you can do with a task depends on whether it is over.
-
-              A finished one is either wrong — reopen it, and the orchestrator
-              carries on next to the criteria and notes it already has — or done
-              with, and then archiving it would keep a record nobody wants.
-              A live one is neither: archiving stops it and keeps what it found.
-            */}
-            {finished ? (
-              <>
-                <Button
-                  appearance="subtle"
-                  icon={<ArrowCounterclockwise20Regular />}
-                  disabled={Boolean(maintenanceHold)}
-                  onClick={() => setReopenOpen(true)}
-                >
-                  Reopen
-                </Button>
-                <Button
-                  appearance="subtle"
-                  className={styles.danger}
-                  icon={<Delete20Regular />}
-                  onClick={() => setDeleteOpen(true)}
-                >
-                  Delete
-                </Button>
-              </>
-            ) : (
-              <Button
-                appearance="subtle"
-                className={styles.danger}
-                onClick={() => setArchiveOpen(true)}
-              >
-                Archive
-              </Button>
-            )}
+            <Button
+              {...restoreFocusTarget}
+              size="small"
+              appearance="subtle"
+              icon={<Info20Regular />}
+              onClick={() => setDetailsOpen(true)}
+            >
+              Task details
+            </Button>
           </div>
         </div>
-        {run.objective && run.objective !== run.name && (
-          <Text className={styles.meta}>{run.objective}</Text>
-        )}
+        <div className={styles.titleRow}>
+          <h1 className={styles.title}>{run.name}</h1>
+          <span className={styles.status}>
+            Task:
+            <RunStatusIndicator
+              model={model}
+              dismissible
+              {...(onDismissFailure ? { onDismissFailure } : {})}
+            />
+          </span>
+        </div>
       </header>
 
       <div className={styles.body}>
-        <ManagedWorktreePanel run={run} />
-        <PrMaintenancePanel
-          run={run}
-          sessions={sessions}
-          onChange={setMaintenance}
-          snapshotRevision={snapshotRevision}
-        />
-        {(run.state === "awaiting_human" || maintenanceHold) && (
-          <section className={mergeClasses(styles.section, styles.review)}>
-            <Text weight="semibold">
-              {maintenanceHold
-                ? "PR maintenance — needs bounded direction"
-                : blockedReview
-                  ? "Blocked — needs your decision"
-                  : "Ready for you"}
-            </Text>
-            {notes.length > 0 && (
-              <div className={mergeClasses(styles.noteSurface, styles.reviewBody)}>
-                <MarkdownBody
-                  text={notes[notes.length - 1]?.body ?? ""}
-                  className={styles.noteMarkdown}
-                  copyable
-                />
-              </div>
+        <div className={styles.content}>
+          <section
+            className={mergeClasses(
+              styles.overview,
+              overview.attention && styles.attention,
             )}
-            {maintenanceHold ? (
-              <p role="status">
-                Task approval cannot authorize this design change. Send back with
-                instructions for the exact proposal; unresolved defects and criteria
-                remain recorded. Recording direction does not resume a stopped worker or
-                merge the PR.
+            aria-label="Current task stage"
+          >
+            <div>
+              <p className={styles.eyebrow}>
+                {overview.attention
+                  ? "Needs your attention"
+                  : currentPhase(run) || "Current stage"}
               </p>
-            ) : null}
-            <div className={styles.reviewButtons}>
-              {maintenanceHold ? (
-                <Button
-                  appearance="primary"
-                  disabled={busy || !maintenance?.canAuthorize}
-                  onClick={openSendBack}
-                >
-                  Send back with instructions
-                </Button>
-              ) : blockedReview ? (
-                <>
-                  <Button appearance="primary" disabled={busy} onClick={openSendBack}>
-                    Resume with guidance
-                  </Button>
-                  <Button disabled={busy} onClick={() => void answer(true, "")}>
-                    Accept incomplete result
-                  </Button>
-                </>
-              ) : (
-                <>
-                  <Button
-                    appearance="primary"
-                    disabled={busy}
-                    onClick={() => void answer(true, "")}
-                  >
-                    Approve
-                  </Button>
-                  <Button disabled={busy} onClick={openSendBack}>
-                    Send back
-                  </Button>
-                </>
-              )}
+              <h2 className={styles.overviewTitle}>{overview.title}</h2>
+              <p className={styles.overviewSummary}>{overview.summary}</p>
             </div>
-          </section>
-        )}
-
-        {awaitingPlan(model) && (
-          <section className={mergeClasses(styles.section, styles.pending)}>
-            <Text weight="semibold">Waiting for the orchestrator to plan this</Text>
-            <Text className={styles.note}>
-              The task was recorded first and the orchestrator has been asked, in its
-              conversation, to break it into phases. It will pick them up on its next free
-              turn — it takes one at a time. Nothing is lost if it is busy.
-            </Text>
-            <div className={styles.reviewButtons}>
-              <Button appearance="subtle" icon={<Chat20Regular />} onClick={onOpenLead}>
-                Open the conversation
+            {needsReview ? (
+              <Button {...restoreFocusTarget} appearance="primary" onClick={openReview}>
+                {maintenanceHold || blockedReview(report)
+                  ? "Review decision"
+                  : "Review result"}
               </Button>
-            </div>
+            ) : model.attentionSessionId ? (
+              <Button
+                appearance="primary"
+                onClick={() => onOpenWorker(model.attentionSessionId)}
+              >
+                Review permission
+              </Button>
+            ) : model.attention === "workspace-setup" ||
+              model.attention === "integration" ? (
+              <Button
+                {...restoreFocusTarget}
+                appearance="primary"
+                onClick={() => setDetailsOpen(true)}
+              >
+                Review workspace
+              </Button>
+            ) : record ? (
+              <Link
+                href={prMaintenanceUrl(record.identity)}
+                target="_blank"
+                rel="noreferrer"
+              >
+                View PR <Open16Regular aria-hidden />
+              </Link>
+            ) : null}
           </section>
-        )}
 
-        {run.phases.length > 0 && (
-          <section className={styles.section}>
-            <Text className={styles.sectionLabel}>Phases</Text>
-            <div className={styles.phases}>
-              {run.phases.map((phase, index) => (
-                <span
-                  key={phase + String(index)}
-                  className={mergeClasses(
-                    styles.phase,
-                    index < run.phaseIndex && styles.phaseDone,
-                    index === run.phaseIndex && !finished && styles.phaseNow,
-                  )}
-                >
-                  <span className={styles.pip} aria-hidden="true" />
-                  <span>{phase}</span>
-                  <span className={styles.phaseState}>{phaseState(index)}</span>
+          <div
+            className={mergeClasses(styles.split, !record && styles.unsplit)}
+            data-layout="split"
+          >
+            <div
+              className={mergeClasses(
+                styles.maintenanceColumn,
+                !record && styles.inactiveMaintenance,
+              )}
+            >
+              <PrMaintenancePanel
+                key={run.id}
+                run={run}
+                sessions={sessions}
+                onChange={onMaintenanceChange}
+                snapshotRevision={snapshotRevision}
+                compact
+                nowMs={nowMs}
+              />
+            </div>
+            <section className={styles.work} aria-label="Dispatched work">
+              <div className={styles.workHead}>
+                <h2 className={styles.sectionTitle}>Dispatched work</h2>
+                <span className={styles.meta}>
+                  {model.steps.length}{" "}
+                  {model.steps.length === 1 ? "work item" : "work items"}
                 </span>
-              ))}
-            </div>
-          </section>
-        )}
+              </div>
+              <WorkerStepTimeline
+                awaitingPermissionSessionId={model.attentionSessionId}
+                steps={model.steps}
+                phases={run.phases}
+                sessions={sessions}
+                onOpenWorker={onOpenWorker}
+              />
+            </section>
+          </div>
 
-        {run.successCriteria.length > 0 && (
-          <section className={styles.section}>
-            <Text className={styles.sectionLabel}>What done means</Text>
-            {run.stopWhen && (
-              <p className={styles.stopWhen}>Finished when {run.stopWhen}</p>
-            )}
-            <ul className={styles.criteria}>
-              {run.successCriteria.map((criterion) => (
-                <li key={criterion.id} className={styles.criterion}>
-                  <span className={styles.criterionPip} aria-hidden="true" />
-                  <div className={styles.criterionText}>
-                    <span className={styles.criterionScenario}>
-                      {criterion.scenario}
-                      {!criterion.essential && (
-                        <span className={styles.optional}>optional</span>
-                      )}
-                    </span>
-                    <span className={styles.criterionEvidence}>
-                      shown by {criterion.expectedEvidence}
-                    </span>
-                  </div>
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-
-        {notes.length > 0 && (
-          <section className={styles.section}>
-            <Text className={styles.sectionLabel}>What happened</Text>
-            <ul className={styles.notes}>
-              {notes.map((entry) => (
-                <li key={entry.id} className={styles.noteSurface}>
-                  {run.phases[entry.phaseIndex] && (
-                    <span className={styles.noteLabel}>
-                      {run.phases[entry.phaseIndex]}
-                    </span>
-                  )}
-                  <MarkdownBody text={entry.body} className={styles.noteMarkdown} />
-                </li>
-              ))}
-            </ul>
-          </section>
-        )}
-
-        <section className={styles.section}>
-          <Text className={styles.sectionLabel}>Dispatched work</Text>
-          <WorkerStepTimeline
-            awaitingPermissionSessionId={model.attentionSessionId}
-            steps={model.steps}
+          <TaskWorkflowHistory
+            key={run.id}
+            notes={notes}
             phases={run.phases}
             sessions={sessions}
             onOpenWorker={onOpenWorker}
           />
-        </section>
+        </div>
       </div>
 
-      <Dialog open={sendBackOpen} onOpenChange={(_, data) => setSendBackOpen(data.open)}>
+      <Dialog
+        open={reviewOpen}
+        onOpenChange={(_, data) => !busy && setReviewOpen(data.open)}
+      >
         <DialogSurface>
           <DialogBody>
             <DialogTitle>
-              {sendBackContext?.reference
-                ? "Record bounded maintenance direction"
-                : "Send this task back"}
+              {reviewContext?.reference
+                ? "Direct PR maintenance"
+                : reviewContext?.blocked
+                  ? "Review decision"
+                  : "Review task"}
             </DialogTitle>
             <DialogContent>
-              {sendBackContext?.reference ? (
+              {reviewChanged ? (
+                <p role="alert" className={styles.error}>
+                  This decision or task changed. Close this dialog and review the current
+                  version before sending instructions.
+                </p>
+              ) : null}
+              {reviewUnavailable ? (
+                <p role="status">
+                  Current maintenance status is needed before recording a decision.
+                  Refresh maintenance status if it cannot be loaded.
+                </p>
+              ) : null}
+              {actionError ? (
+                <p role="alert" className={styles.error}>
+                  {actionError}
+                </p>
+              ) : null}
+              <p className={styles.dialogSummary}>{reviewContext?.summary}</p>
+              {reviewContext?.reference ? (
                 <>
-                  <p className={styles.meta}>
-                    {sendBackContext.reference.decisionId} v
-                    {sendBackContext.reference.decisionVersion}
+                  <p className={styles.decision}>{reviewContext.proposal}</p>
+                  <p>
+                    Task approval cannot authorize this design change. Your direction
+                    applies only to this exact proposal; it does not resume a stopped
+                    worker, resolve defects, or merge the PR.
                   </p>
-                  <p>{sendBackContext.proposal}</p>
                 </>
               ) : null}
-              {sendBackChanged ? (
-                <p role="alert">
-                  The decision changed or is being refreshed. Close this dialog and review
-                  the current proposal before submitting; this draft will not be
-                  retargeted.
-                </p>
+              {reviewContext?.body ? (
+                <details className={styles.report} open={!report?.summary || undefined}>
+                  <summary>Full report and evidence</summary>
+                  <div className={styles.reportBody}>
+                    <MarkdownBody text={reviewContext.body} copyable />
+                  </div>
+                </details>
               ) : null}
               <Field
                 label="What needs changing?"
                 hint={
-                  sendBackContext?.reference
-                    ? "Name the chosen approach and its limits. This resolves only the displayed decision version, not the defect or task criteria; changed assumptions need a new decision."
-                    : "This goes to the orchestrator as an instruction, and it will dispatch the work it calls for."
+                  reviewContext?.reference
+                    ? "Name the chosen approach and its limits. Changed assumptions need a new decision."
+                    : "Guidance goes to the existing Orchestrator. It is required when sending work back."
                 }
               >
                 <Textarea
                   value={note}
-                  rows={4}
+                  rows={3}
+                  disabled={busy || reviewChanged}
                   onChange={(_, data) => setNote(data.value)}
                 />
               </Field>
             </DialogContent>
             <DialogActions>
-              <Button appearance="secondary" onClick={() => setSendBackOpen(false)}>
+              <Button disabled={busy} onClick={() => setReviewOpen(false)}>
                 Cancel
               </Button>
+              {!reviewContext?.reference ? (
+                <Button
+                  appearance={reviewContext?.blocked ? "secondary" : "primary"}
+                  disabled={
+                    busy || reviewChanged || reviewUnavailable || Boolean(actionError)
+                  }
+                  onClick={() => void answer(true)}
+                >
+                  {reviewContext?.blocked ? "Accept incomplete result" : "Approve"}
+                </Button>
+              ) : null}
               <Button
-                appearance="primary"
-                disabled={busy || sendBackChanged || note.trim().length === 0}
-                onClick={() => void answer(false, note.trim())}
+                appearance={
+                  reviewContext?.blocked || reviewContext?.reference
+                    ? "primary"
+                    : "secondary"
+                }
+                disabled={
+                  busy ||
+                  reviewChanged ||
+                  reviewUnavailable ||
+                  Boolean(actionError) ||
+                  !note.trim() ||
+                  Boolean(reviewContext?.reference && !maintenance?.canAuthorize)
+                }
+                onClick={() => void answer(false)}
               >
-                Send back
+                {reviewContext?.reference ? "Send back with instructions" : "Send back"}
               </Button>
             </DialogActions>
           </DialogBody>
         </DialogSurface>
       </Dialog>
 
-      <Dialog open={archiveOpen} onOpenChange={(_, data) => setArchiveOpen(data.open)}>
+      <Dialog open={detailsOpen} onOpenChange={(_, data) => setDetailsOpen(data.open)}>
+        <DialogSurface>
+          <DialogBody>
+            <DialogTitle>Task details</DialogTitle>
+            <DialogContent>
+              {run.objective ? (
+                <p className={styles.dialogSummary}>{run.objective}</p>
+              ) : null}
+              <ManagedWorktreePanel run={run} />
+              {run.phases.length ? (
+                <section className={styles.detailsSection}>
+                  <h3 className={styles.detailHeading}>Phases</h3>
+                  <ol className={styles.phases}>
+                    {run.phases.map((phase, index) => (
+                      <li
+                        key={`${index}:${phase}`}
+                        className={mergeClasses(
+                          styles.phase,
+                          index < run.phaseIndex && styles.phaseDone,
+                          index === run.phaseIndex && styles.phaseNow,
+                        )}
+                      >
+                        {phase}
+                        <span className={styles.phaseState}>{phaseState(index)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </section>
+              ) : null}
+              {run.successCriteria.length ? (
+                <section className={styles.detailsSection}>
+                  <h3 className={styles.detailHeading}>What done means</h3>
+                  {run.stopWhen ? <p>Finished when {run.stopWhen}</p> : null}
+                  <ul className={styles.criteria}>
+                    {run.successCriteria.map((criterion) => (
+                      <li className={styles.criterion} key={criterion.id}>
+                        {criterion.scenario}
+                        {!criterion.essential ? (
+                          <span className={styles.optional}>optional</span>
+                        ) : null}
+                        <span className={styles.evidence}>
+                          shown by {criterion.expectedEvidence}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </section>
+              ) : null}
+            </DialogContent>
+            <DialogActions>
+              {finished ? (
+                <>
+                  <Button
+                    {...restoreFocusTarget}
+                    appearance="subtle"
+                    icon={<ArrowCounterclockwise20Regular />}
+                    disabled={Boolean(maintenanceHold)}
+                    onClick={() => {
+                      setDetailsOpen(false);
+                      setReopenOpen(true);
+                    }}
+                  >
+                    Reopen
+                  </Button>
+                  <Button
+                    {...restoreFocusTarget}
+                    appearance="subtle"
+                    icon={<Delete20Regular />}
+                    onClick={() => {
+                      setDetailsOpen(false);
+                      setDeleteOpen(true);
+                    }}
+                  >
+                    Delete
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  {...restoreFocusTarget}
+                  appearance="subtle"
+                  onClick={() => {
+                    setDetailsOpen(false);
+                    setArchiveOpen(true);
+                  }}
+                >
+                  Archive
+                </Button>
+              )}
+              <Button onClick={() => setDetailsOpen(false)}>Close</Button>
+            </DialogActions>
+          </DialogBody>
+        </DialogSurface>
+      </Dialog>
+
+      <Dialog
+        open={archiveOpen}
+        onOpenChange={(_, data) => !busy && setArchiveOpen(data.open)}
+      >
         <DialogSurface>
           <DialogBody>
             <DialogTitle>Archive “{run.name}”?</DialogTitle>
-            {/*
-              Says exactly what happens, because the difference between this and
-              deleting is the whole reason it is safe: what the task and its
-              workers learned stays, while the machinery releases its slots.
-            */}
             <DialogContent>
               <p>
-                Any worker still running for this task is stopped, and its sessions are
-                parked outside the active fleet.
+                Any worker still running for this task is stopped. Linked PR maintenance
+                is paused; cancellation and remote effects may still need reconciliation.
               </p>
               <p>
-                Linked PR maintenance is paused. Cancellation and remote effects may still
-                need reconciliation.
-              </p>
-              <p>
-                The task keeps its phases, its steps, its notes and everything they
-                produced. Reopen the task to resume one of its worker conversations.
+                The task keeps its phases, steps, notes and everything they produced.
+                Reopen it to resume an existing worker conversation.
               </p>
             </DialogContent>
             <DialogActions>
-              <Button appearance="secondary" onClick={() => setArchiveOpen(false)}>
+              <Button disabled={busy} onClick={() => setArchiveOpen(false)}>
                 Keep going
               </Button>
               <Button
@@ -680,10 +801,11 @@ export const OrchestratorTaskDetail = ({
                 disabled={busy}
                 onClick={() => {
                   setBusy(true);
-                  void onArchive().then((ok) => {
-                    setBusy(false);
-                    if (ok) setArchiveOpen(false);
-                  });
+                  void onArchive()
+                    .then((ok) => {
+                      if (ok) setArchiveOpen(false);
+                    })
+                    .finally(() => setBusy(false));
                 }}
               >
                 Archive task
@@ -693,19 +815,17 @@ export const OrchestratorTaskDetail = ({
         </DialogSurface>
       </Dialog>
 
-      <Dialog open={reopenOpen} onOpenChange={(_, data) => setReopenOpen(data.open)}>
+      <Dialog
+        open={reopenOpen}
+        onOpenChange={(_, data) => !busy && setReopenOpen(data.open)}
+      >
         <DialogSurface>
           <DialogBody>
             <DialogTitle>Reopen “{run.name}”?</DialogTitle>
             <DialogContent>
-              {/*
-                A reason rather than a confirmation, for the same reason sending
-                a task back needs one: this wakes the orchestrator to act, and
-                "not done" is not something anyone can act on.
-              */}
               <Field
                 label="What is still wanted?"
-                hint="The orchestrator is woken with this. It keeps the task's criteria, notes and steps."
+                hint="The Orchestrator keeps this task's criteria, notes and existing workers."
               >
                 <Textarea
                   value={reopenNote}
@@ -716,21 +836,22 @@ export const OrchestratorTaskDetail = ({
               </Field>
             </DialogContent>
             <DialogActions>
-              <Button appearance="secondary" onClick={() => setReopenOpen(false)}>
+              <Button disabled={busy} onClick={() => setReopenOpen(false)}>
                 Leave it closed
               </Button>
               <Button
                 appearance="primary"
-                disabled={busy || reopenNote.trim().length === 0}
+                disabled={busy || !reopenNote.trim()}
                 onClick={() => {
                   setBusy(true);
-                  void onReopen(reopenNote.trim()).then((ok) => {
-                    setBusy(false);
-                    if (ok) {
-                      setReopenOpen(false);
-                      setReopenNote("");
-                    }
-                  });
+                  void onReopen(reopenNote.trim())
+                    .then((ok) => {
+                      if (ok) {
+                        setReopenOpen(false);
+                        setReopenNote("");
+                      }
+                    })
+                    .finally(() => setBusy(false));
                 }}
               >
                 Reopen task
@@ -740,27 +861,25 @@ export const OrchestratorTaskDetail = ({
         </DialogSurface>
       </Dialog>
 
-      <Dialog open={deleteOpen} onOpenChange={(_, data) => setDeleteOpen(data.open)}>
+      <Dialog
+        open={deleteOpen}
+        onOpenChange={(_, data) => !busy && setDeleteOpen(data.open)}
+      >
         <DialogSurface>
           <DialogBody>
             <DialogTitle>Delete “{run.name}”?</DialogTitle>
             <DialogContent>
-              {/*
-                Named against archiving, since that is the choice being made:
-                one keeps what the work found, this keeps nothing.
-              */}
               <p>
                 The task goes, along with its phases, steps, notes and the sessions it
                 started. Nothing about it is kept.
               </p>
               <p>
-                Archive it instead if the record is worth having. PR maintenance is paused
-                first; retained ownership or unsettled effects block deletion until
-                explicitly released.
+                Archive instead if the record is worth keeping. Retained PR ownership or
+                unsettled effects block deletion until explicitly released.
               </p>
             </DialogContent>
             <DialogActions>
-              <Button appearance="secondary" onClick={() => setDeleteOpen(false)}>
+              <Button disabled={busy} onClick={() => setDeleteOpen(false)}>
                 Keep it
               </Button>
               <Button
@@ -768,10 +887,11 @@ export const OrchestratorTaskDetail = ({
                 disabled={busy}
                 onClick={() => {
                   setBusy(true);
-                  void onDelete().then((ok) => {
-                    setBusy(false);
-                    if (ok) setDeleteOpen(false);
-                  });
+                  void onDelete()
+                    .then((ok) => {
+                      if (ok) setDeleteOpen(false);
+                    })
+                    .finally(() => setBusy(false));
                 }}
               >
                 Delete task

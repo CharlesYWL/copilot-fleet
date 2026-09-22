@@ -7,7 +7,12 @@ import {
 import type { FleetStore } from "../store.js";
 import type { FleetService } from "../fleet-service.js";
 import { fleet } from "./fleet-harness.js";
-import { FleetTools, StartWorkSchema, explainInvalidArgs } from "./tools.js";
+import {
+  FleetTools,
+  RecordTaskCheckpointSchema,
+  StartWorkSchema,
+  explainInvalidArgs,
+} from "./tools.js";
 
 describe("FleetTools", () => {
   let store: FleetStore;
@@ -558,6 +563,63 @@ describe("FleetTools phases", () => {
     expect(task().phases).toEqual(["Answer"]);
   });
 
+  it("records concise factual checkpoints without changing task progress", () => {
+    plan(["Plan", "Implement"]);
+    const before = task();
+    const input = RecordTaskCheckpointSchema.parse({
+      task: before.id,
+      summary: "The existing Flight was updated for MSIT.",
+      details: "Flight revision 32 was read back. The MSIT PR is still not created.",
+      source: "operator",
+      createdAt: "2000-01-01T00:00:00.000Z",
+    });
+    expect(tools().recordTaskCheckpoint(input).ok).toBe(true);
+    expect(tools().recordTaskCheckpoint(input).text).toContain("already recorded");
+    expect(task()).toEqual(before);
+    const notes = store.listRunNotes(before.id);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toMatchObject({
+      summary: input.summary,
+      body: input.details,
+      kind: "progress",
+      source: "orchestrator",
+      sessionId: leadId,
+    });
+    expect(notes[0]?.createdAt).not.toBe("2000-01-01T00:00:00.000Z");
+    expect(
+      RecordTaskCheckpointSchema.safeParse({
+        ...input,
+        summary: "x".repeat(241),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("keeps progress checkpoints from replacing a pending human decision", () => {
+    plan(["Only"]);
+    expect(
+      tools().escalate({
+        task: task().id,
+        headline: "Command approval expired; the MSIT PR was not created.",
+        reason:
+          "The permission expired before execution. A renewed request needs approval.",
+      }).ok,
+    ).toBe(true);
+    expect(
+      tools().recordTaskCheckpoint({
+        task: task().id,
+        summary: "Still working",
+        details: "Do not overwrite the decision.",
+      }).ok,
+    ).toBe(false);
+    expect(store.listRunNotes(task().id)).toHaveLength(1);
+    expect(store.listRunNotes(task().id)[0]).toMatchObject({
+      kind: "blocked",
+      source: "orchestrator",
+      summary: "Command approval expired; the MSIT PR was not created.",
+    });
+    expect(task().state).toBe("awaiting_human");
+  });
+
   it("records which phase a step was dispatched in", () => {
     plan(["Plan", "Implement"]);
     dispatch();
@@ -588,9 +650,12 @@ describe("FleetTools phases", () => {
 
     tools().advanceTask({ task: "Ship it", note: "Settled on the smaller change." });
 
-    expect(store.listRunNotes(task().id).map((note) => note.body)).toEqual([
-      "Settled on the smaller change.",
-    ]);
+    expect(
+      store
+        .listRunNotes(task().id)
+        .filter((note) => note.kind !== "worker")
+        .map((note) => note.body),
+    ).toEqual(["Settled on the smaller change."]);
     expect(task().phaseIndex).toBe(1);
   });
 
@@ -806,6 +871,7 @@ describe("FleetTools success criteria", () => {
       "was worse than the primary so the worker added dedicated keys instead of mutating " +
       "the shared ones, gates are green, and the layout numbers are still unverified by " +
       "machine because jsdom cannot resolve them, so please look at those yourself.";
+    const previousNotes = store.listRunNotes(runId);
 
     const result = tools().submitTask({
       task: "Ship it",
@@ -818,7 +884,7 @@ describe("FleetTools success criteria", () => {
     expect(result.text).toContain("### How it was proven");
     // Nothing moved: the task is still the orchestrator's to hand over.
     expect(state()).not.toBe("awaiting_human");
-    expect(store.listRunNotes(runId)).toHaveLength(0);
+    expect(store.listRunNotes(runId)).toEqual(previousNotes);
   });
 
   it("takes a long handover that is written to be scanned", () => {

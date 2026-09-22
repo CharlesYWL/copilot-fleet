@@ -69,6 +69,83 @@ function notificationInput(
 }
 
 describe("FleetStore", () => {
+  it("preserves settled worker attempts when a step is retried", () => {
+    const { store, workspace, placement } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    const session = store.createSession(placement, "work");
+    const input = { stepKey: "implement", title: "Implement", prompt: "make the change" };
+    const step = store.upsertRunStep(run.id, input);
+    store.updateRunStep(step.id, { state: "running", sessionId: session.id });
+    store.updateRunStep(step.id, { state: "succeeded", output: "First response." });
+    store.updateRunStep(step.id, { state: "succeeded", output: "Later bookkeeping." });
+
+    const first = store.listRunNotes(run.id);
+    expect(first).toHaveLength(1);
+    expect(first[0]).toMatchObject({
+      body: "First response.",
+      summary: "Implement: succeeded (attempt 1)",
+      kind: "worker",
+      source: "system",
+      sessionId: session.id,
+    });
+
+    store.upsertRunStep(run.id, input);
+    expect(store.getRunStep(step.id)?.output).toBe("");
+    store.updateRunStep(step.id, { state: "failed", output: "Second response." });
+    expect(store.listRunNotes(run.id).map((note) => note.body)).toEqual([
+      "First response.",
+      "Second response.",
+    ]);
+    expect(store.listRunNotes(run.id)[0]).toEqual(first[0]);
+    expect(store.listRunNotes(run.id)[1]?.summary).toContain("attempt 2");
+  });
+
+  it("rolls back a settled step and its checkpoint together", () => {
+    const { store, workspace } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    const step = store.upsertRunStep(run.id, {
+      stepKey: "work",
+      title: "Work",
+      prompt: "do the work",
+    });
+    expect(() =>
+      store.writeAtomically(() => {
+        store.updateRunStep(step.id, { state: "succeeded", output: "Reported result" });
+        throw new Error("The surrounding transaction failed");
+      }),
+    ).toThrow("surrounding transaction failed");
+    expect(store.getRunStep(step.id)?.state).toBe("pending");
+    expect(store.listRunNotes(run.id)).toEqual([]);
+  });
+
+  it("migrates legacy notes without inventing a summary or source", () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-note-migration-"));
+    directories.push(directory);
+    const path = join(directory, "host.db");
+    const original = new FleetStore(path);
+    const workspace = original.createWorkspace("repo", "");
+    const run = original.createRun({
+      workspaceId: workspace.id,
+      name: "r",
+      objective: "o",
+    });
+    const note = original.appendRunNote(run.id, 0, "Original full report");
+    original.close();
+    const legacy = new DatabaseSync(path);
+    legacy.exec("ALTER TABLE run_notes DROP COLUMN metadata");
+    legacy.close();
+
+    const migrated = new FleetStore(path);
+    stores.push(migrated);
+    expect(migrated.listRunNotes(run.id)).toEqual([note]);
+    expect(() =>
+      migrated.appendRunNote(run.id, 0, "Details", {
+        summary: "A headline\nthat is not a single line",
+      }),
+    ).toThrow();
+    expect(migrated.listRunNotes(run.id)).toHaveLength(1);
+  });
+
   it("persists cumulative session usage and context defaults through backup without adding replayed credits", () => {
     const { store, placement } = setup();
     const session = store.createSession(placement, "usage");
@@ -2114,7 +2191,12 @@ describe("FleetStore runs", () => {
       prompt: "check",
       phaseIndex: 1,
     });
-    first.appendRunNote(run.id, 0, "wrote the thing");
+    first.appendRunNote(run.id, 0, "wrote the thing", {
+      summary: "Implementation completed",
+      kind: "progress",
+      source: "orchestrator",
+      sessionId: "original-lead",
+    });
     first.appendRunNote(run.id, 1, "looks right");
 
     const backup = first.exportHostBackup({ enrollmentToken: "t" });
@@ -2139,6 +2221,7 @@ describe("FleetStore runs", () => {
       "looks right",
     ]);
     expect(second.listRunSteps(run.id)[0]?.phaseIndex).toBe(1);
+    expect(second.listRunNotes(run.id)).toEqual(backup.runNotes);
     expect(second.getRun(stale.id)).toBeUndefined();
   });
 

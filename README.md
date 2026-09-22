@@ -1798,14 +1798,24 @@ recording the handoff for you to review.
    In progress, Validation, and Done; **List** compares tasks in rows; and
    **Dependency** shows how dispatched worker steps relate. Counts in the header
    show all tasks, running tasks, and tasks that **need you**.
-4. Open a task to see **Phases**, **What done means**, **What happened**, and
-   **Dispatched work**. Worker links open the exact session transcript, so you
-   can inspect output, permission prompts, and files changed on that Node.
-5. When a task is **Ready for you**, read the latest handoff and choose
-   **Approve** or **Send back** with instructions. Approval completes the task;
-   sending it back wakes the lead with your note and keeps the existing phases,
-   criteria, notes, and worker history.
-6. Use lifecycle controls deliberately. **Archive** stops live workers but keeps
+4. Open a task for a short **current-stage overview**, with the **PR maintenance
+   graph** beside **Dispatched work** when maintenance is registered. Narrow
+   layouts stack the panels. Session names, statuses, and Nodes remain visible;
+   worker details and transcript links expand on demand.
+5. **Review decision** or **Review result** opens a dialog, not another chat.
+   Inspect the full handoff there, then **Approve** or **Send back** with
+   instructions. The existing lead receives your guidance without leaving the
+   task page. Maintenance decisions keep their exact proposal/version guards;
+   task approval never authorizes a design change or merges a PR.
+6. **Workflow history** starts collapsed. Its timestamped checkpoints show a
+   saved short summary and source; expand an entry for the original report or
+   worker-attempt response. The Orchestrator can record meaningful progress with
+   `fleet_record_task_checkpoint` and supply `headline` on phase advancement,
+   handover, and escalation. The Host stamps entries when written; opening the
+   page does not invoke a summarizer. Legacy notes keep their original content
+   and timestamps, without guessed summaries or authors.
+7. **Task details** contains the objective, phases, success criteria, workspace
+   controls, and lifecycle actions. **Archive** stops live workers but keeps
    the task record; a finished task can be **Reopen**ed with what is still
    wanted or **Delete**d if nothing should be kept. **Stop orchestrator** stops
    the lead and its tasks; **Resume orchestrator** reopens stopped work when its
@@ -1838,9 +1848,10 @@ scope, and select **Authorize maintenance** while signed in. No JSON copy/paste
 is needed; the agent cannot authorize itself. Checks then use the existing wake
 loop, and a normal chat message can request an immediate first check.
 
-The panel separates the current job from prior PRs. Its stage rail highlights the
-actual current stage, including attention/hold states, with last/next checks and
-collapsible history. **Maintenance rounds** count executed, settled batches, not
+The panel separates the current job from prior PRs. Its graph highlights the
+actual current stage, including attention/hold states; missing or stale evidence
+never appears ready. **Maintenance controls and evidence** contains authorization,
+pause/resume, last/next checks, and prior jobs. **Maintenance rounds** count executed, settled batches, not
 reserved repair budgets or provider review iteration numbers. No registration JSON
 or manually entered Fleet IDs are part of the default human flow.
 

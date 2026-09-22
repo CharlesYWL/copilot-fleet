@@ -2120,6 +2120,7 @@ describe("durable PR maintenance registry", () => {
   it("holds and existing human review creation commit or roll back together", () => {
     const f = setup();
     const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const previousNotes = f.store.listRunNotes(f.task.id);
     const decision = {
       id: "design-1",
       version: 1,
@@ -2140,7 +2141,7 @@ describe("durable PR maintenance registry", () => {
       ),
     ).toThrow("notification unavailable");
     expect(f.store.prMaintenance.get(record.id)).toEqual(record);
-    expect(f.store.listRunNotes(f.task.id)).toEqual([]);
+    expect(f.store.listRunNotes(f.task.id)).toEqual(previousNotes);
     expect(() =>
       f.store.prMaintenance.holdForDecision(
         f.lead.id,

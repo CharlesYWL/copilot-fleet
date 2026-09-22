@@ -476,7 +476,10 @@ describe("inactive session retention", () => {
       sessionId: "",
       output: "Completed work",
     });
-    expect(store.listRunNotes(run.id)[0]?.body).toBe("Keep the result");
+    expect(store.listRunNotes(run.id).map((note) => note.body)).toEqual([
+      "Completed work",
+      "Keep the result",
+    ]);
   });
 
   it("continues a durable pending deletion after restart, even with new cleanup disabled", () => {

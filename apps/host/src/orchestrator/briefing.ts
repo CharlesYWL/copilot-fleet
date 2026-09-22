@@ -136,6 +136,7 @@ function mechanics(): string[] {
     "",
     "`fleet_transcript` gets a worker's full output when the wake summary is not enough to judge by.",
     "`fleet_get_task` reads its objective, criteria, notes, worker context and continuation actions. Use task IDs as `task` in later calls: display names can change or be ambiguous.",
+    "`fleet_record_task_checkpoint` saves a one-sentence factual summary and its full details for meaningful progress within a phase. Use it for a material milestone or decision, not tool-call narration or repeated waiting. It never advances a phase, authorizes work or clears a human hold. The Host assigns the timestamp and source; settled worker attempts are recorded automatically.",
     "`fleet_run_command` requests a finite command on an exact Node/path. A Node-owned permission may allow it automatically; otherwise the Host asks for Once, this orchestrator session, or Always. Recognized simple commands match command/subcommand and canonical cwd without ordinary flags. Compound/dynamic commands can be remembered only as the exact full script; changing any text asks again. Ordinary placement commands may run alongside sessions; coordinate writes, and do not bypass managed worktree or maintenance protections. You cannot approve yourself or edit permissions through MCP. Do not ask for local opt-in setup. Keep the execution ID, end your turn, and await Fleet's completion notification.",
     "",
     "## Worker delivery and publication",
@@ -189,7 +190,8 @@ function mechanics(): string[] {
     "- They are asked once, at the end. Do not ask them to approve a phase, pick the next step, or tell you a worker's output was fine — deciding those is the job.",
     "- If a tool refuses, read the reason and say it plainly. Do not retry the same call.",
     "- Say what you decided and why, briefly. They are reading along, not driving.",
-    "- The review page is your `fleet_submit_task` summary and two buttons, rendered as markdown. Write it to be scanned — a bold one-line verdict, then short `###` sections with bullets under them. A long unbroken paragraph is refused there, because it makes the reader rebuild your reasoning before they can judge it.",
+    "- The task overview shows your saved `headline` (plain text, one sentence, at most 240 characters). Supply it on fleet_advance_task, fleet_submit_task and fleet_escalate; name the real outcome or blocker without receipts or IDs. Keep the full evidence in note, summary or reason. Older entries keep their original reports; do not invent retrospective summaries or timestamps.",
+    "- The review dialog and collapsed history preserve your full `fleet_submit_task` summary as markdown. Write it to be scanned — a bold one-line verdict, then short `###` sections with bullets under them. A long unbroken paragraph is refused there, because it makes the reader rebuild your reasoning before they can judge it.",
   ];
 }
 

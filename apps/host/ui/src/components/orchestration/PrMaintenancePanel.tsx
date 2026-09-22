@@ -15,6 +15,7 @@ import {
   makeStyles,
   mergeClasses,
   tokens,
+  useRestoreFocusTarget,
 } from "@fluentui/react-components";
 import {
   prMaintenanceProgress,
@@ -34,6 +35,8 @@ import {
   prepareTaskMaintenance,
   type TaskMaintenanceView,
 } from "../../lib/pr-maintenance";
+import { currentMaintenance, hasOutstandingWork } from "../../lib/task-overview";
+import { PrMaintenanceGraph } from "./PrMaintenanceGraph";
 
 const useStyles = makeStyles({
   panel: {
@@ -47,6 +50,13 @@ const useStyles = makeStyles({
     "& h3": { fontSize: tokens.fontSizeBase400, marginBlock: tokens.spacingVerticalM },
   },
   muted: { color: tokens.colorNeutralForeground2 },
+  compact: {
+    marginBottom: 0,
+    borderRadius: "12px",
+    backgroundColor: tokens.colorNeutralBackground1,
+    minWidth: 0,
+    "& h2": { fontSize: "14px", margin: "0 0 12px" },
+  },
   actions: {
     display: "flex",
     gap: tokens.spacingHorizontalS,
@@ -93,6 +103,8 @@ const useStyles = makeStyles({
       outlineOffset: "2px",
     },
   },
+  compactDetails: { marginBlock: "8px" },
+  refresh: { marginBlock: "4px 0" },
   historyJob: {
     borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
     marginTop: tokens.spacingVerticalM,
@@ -205,21 +217,6 @@ const loopStages = [
 const readOnlyNotice =
   "No repairs, pushes, replies, thread resolution, reviewer requests or CI retries are authorized.";
 
-function hasOutstandingWork(record: PrMaintenanceRegistration) {
-  return (
-    record.incidents.some(
-      (incident) => incident.kind === "effects" && !incident.resolvedAt,
-    ) ||
-    record.batches.some(
-      (batch) =>
-        ["prepared", "accepted", "reconciling", "uncertain"].includes(batch.state) ||
-        (Boolean(batch.stepId) && !batch.executionSettled) ||
-        batch.effects.some((effect) => ["reserved", "uncertain"].includes(effect.state)),
-    ) ||
-    record.actions.some((action) => ["reserved", "uncertain"].includes(action.state))
-  );
-}
-
 function PrLink({ record }: { record: Pick<PrMaintenanceRegistration, "identity"> }) {
   return (
     <Link href={prMaintenanceUrl(record.identity)} target="_blank" rel="noreferrer">
@@ -233,15 +230,22 @@ export function PrMaintenancePanel({
   sessions,
   onChange,
   snapshotRevision = 0,
+  compact = false,
+  nowMs = Date.now(),
 }: {
   run: Run;
   sessions: readonly FleetSession[];
   onChange: (view: TaskMaintenanceView | undefined) => void;
   snapshotRevision?: number;
+  compact?: boolean;
+  nowMs?: number;
 }) {
   const styles = useStyles();
+  const restoreFocusTarget = useRestoreFocusTarget();
+  const Disclosure = compact ? "details" : "div";
   const [view, setView] = useState<TaskMaintenanceView>();
   const loadedTaskId = useRef<string | undefined>(undefined);
+  const lastView = useRef<TaskMaintenanceView | undefined>(undefined);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -256,6 +260,7 @@ export function PrMaintenancePanel({
   useEffect(() => {
     let active = true;
     if (loadedTaskId.current !== run.id) {
+      lastView.current = undefined;
       setView(undefined);
       setProposal(undefined);
       setRelease(undefined);
@@ -269,15 +274,24 @@ export function PrMaintenancePanel({
       .then((next) => {
         if (!active) return;
         loadedTaskId.current = run.id;
+        lastView.current = next;
         setView(next);
         onChange(next);
         setError("");
       })
       .catch((reason: unknown) => {
-        if (active)
-          setError(
-            reason instanceof Error ? reason.message : "Maintenance status unavailable.",
-          );
+        if (!active) return;
+        const statusError =
+          reason instanceof Error ? reason.message : "Maintenance status unavailable.";
+        const unavailable: TaskMaintenanceView = {
+          ...lastView.current,
+          records: lastView.current?.records ?? [],
+          canAuthorize: false,
+          statusError,
+        };
+        setError(statusError);
+        setView(unavailable);
+        onChange(unavailable);
       });
     return () => {
       active = false;
@@ -317,7 +331,12 @@ export function PrMaintenancePanel({
   );
   const history = records.filter((record) => record !== current);
   const retained = records.some((record) => !record.ownershipReleasedAt);
-  const currentProgress = current ? prMaintenanceProgress(current) : undefined;
+  const observedProgress = current ? prMaintenanceProgress(current, nowMs) : undefined;
+  const currentProgress =
+    observedProgress && view?.statusError
+      ? { ...observedProgress, stage: "checking" as const }
+      : observedProgress;
+  const graphRecord = currentMaintenance(records);
   const displayedScope =
     current?.authorization.scope ?? view?.proposal?.registration.scope;
   const readOnly = displayedScope && !displayedScope.publicationAuthorized;
@@ -396,6 +415,7 @@ export function PrMaintenancePanel({
           </Button>
         ) : null}
         <Button
+          {...restoreFocusTarget}
           disabled={busy || !view?.canAuthorize || outstanding}
           onClick={() => {
             setError("");
@@ -408,6 +428,7 @@ export function PrMaintenancePanel({
         {record.authorization.scope.publicationAuthorized &&
         ["active", "paused"].includes(record.lifecycle) ? (
           <Button
+            {...restoreFocusTarget}
             disabled={busy || !view?.canAuthorize || outstanding || held}
             onClick={() => {
               setError("");
@@ -514,13 +535,11 @@ export function PrMaintenancePanel({
   );
 
   return (
-    <section className={styles.panel} aria-label="PR maintenance">
+    <section
+      className={mergeClasses(styles.panel, compact && styles.compact)}
+      aria-label="PR maintenance"
+    >
       <h2>PR maintenance</h2>
-      <p className={styles.muted}>
-        {readOnly
-          ? "Observe the retained PR without changing code or provider state. Maintenance never merges or force-pushes."
-          : "Bounded repairs on the retained worker. Ready is not merged; maintenance never merges or force-pushes."}
-      </p>
       {error ? (
         <p role="alert" className={styles.error}>
           {error}
@@ -528,245 +547,288 @@ export function PrMaintenancePanel({
       ) : null}
       {message ? <p role="status">{message}</p> : null}
       {!view && !error ? <p role="status">Loading maintenance status…</p> : null}
-      {view?.unsupportedReason ? <p role="status">{view.unsupportedReason}</p> : null}
-      {view && !view.canAuthorize ? (
-        <p>
-          Sign in to authorize maintenance. Node and MCP credentials cannot approve it.
+      {compact && graphRecord ? (
+        <PrMaintenanceGraph
+          record={graphRecord}
+          nowMs={nowMs}
+          unavailable={Boolean(view?.statusError)}
+        />
+      ) : null}
+      {compact && view && !graphRecord && !error ? (
+        <p className={styles.muted}>
+          {view.proposal
+            ? "A proposal is ready for your review; maintenance is not enabled."
+            : "Not enabled for this task."}
         </p>
       ) : null}
-
-      {current && currentProgress ? (
-        <section aria-label="Current maintained PR">
-          <p className={styles.muted}>Current maintained PR</p>
-          <h3>
-            <PrLink record={current} />
-          </h3>
-          {!current.authorization.scope.publicationAuthorized ? (
-            <p>
-              <strong>Read-only observation</strong> — {readOnlyNotice}
-            </p>
-          ) : null}
-          <ol className={styles.rail} aria-label="Maintenance loop stages">
-            {[
-              ...(!loopStages.some((stage) => stage === currentProgress.stage)
-                ? [currentProgress.stage]
-                : []),
-              ...loopStages.filter(
-                (stage) =>
-                  current.authorization.scope.publicationAuthorized ||
-                  stage !== "addressing_review" ||
-                  currentProgress.stage === stage,
-              ),
-            ].map((stage) => (
-              <li
-                key={stage}
-                aria-current={stage === currentProgress.stage ? "step" : undefined}
-                className={mergeClasses(
-                  styles.stage,
-                  stage === currentProgress.stage && styles.currentStage,
-                )}
-              >
-                {stageLabel(stage, current)}
-              </li>
-            ))}
-          </ol>
+      <Disclosure
+        className={mergeClasses(styles.details, compact && styles.compactDetails)}
+      >
+        {compact ? (
+          <summary>
+            {view?.proposal && !current
+              ? "Review maintenance proposal"
+              : graphRecord
+                ? "Maintenance controls and evidence"
+                : "Set up PR maintenance"}
+          </summary>
+        ) : null}
+        <p className={styles.muted}>
+          {readOnly
+            ? "Observe the retained PR without changing code or provider state. Maintenance never merges or force-pushes."
+            : "Bounded repairs on the retained worker. Ready is not merged; maintenance never merges or force-pushes."}
+        </p>
+        {view?.unsupportedReason ? <p role="status">{view.unsupportedReason}</p> : null}
+        {view && !view.canAuthorize ? (
           <p>
-            {currentProgress.completedIterations} completed maintenance rounds · settled
-            worker batches
+            Sign in to authorize maintenance. Node and MCP credentials cannot approve it.
           </p>
-          <dl className={styles.metadata}>
-            <dt>Last action</dt>
-            <dd>
-              {latestBatch
-                ? `${latestBatch.kind === "repair" ? "Repair" : "Answer"} batch ${batchStates[latestBatch.state]} · ${checkTime(latestBatch.updatedAt)}`
-                : "No worker batch yet."}
-            </dd>
-            <dt>Latest check</dt>
-            <dd>
-              {current.lastAttempt ? (
-                <time dateTime={current.lastAttempt.attemptedAt}>
-                  {checkTime(current.lastAttempt.attemptedAt)}
-                </time>
-              ) : (
-                "Not checked yet"
-              )}
-              {current.lastAttempt?.complete && !current.lastAttempt.failure
-                ? " · complete observation"
-                : " · incomplete or unavailable; prior success is not current validation"}
-            </dd>
-            <dt>Next action</dt>
-            <dd>
-              {!current.authorization.scope.publicationAuthorized &&
-              ![
-                "human_hold",
-                "reconciling",
-                "paused",
-                "blocked",
-                "merged",
-                "closed",
-                "released",
-              ].includes(currentProgress.stage)
-                ? "Observe the PR and report findings. Changes require a separately reviewed authorization."
-                : nextActions[currentProgress.stage]}
-            </dd>
-            <dt>Next check</dt>
-            <dd>
-              {["human_hold", "reconciling", "paused", "merged", "closed"].includes(
-                currentProgress.stage,
-              ) ? (
-                "On hold until the current blocker is resolved."
-              ) : (
-                <>
-                  <time dateTime={current.nextCheckAt}>
-                    {checkTime(current.nextCheckAt)}
-                  </time>{" "}
-                  · best-effort lead wake
-                </>
-              )}
-            </dd>
-          </dl>
-          {attention ? (
-            <p className={styles.attention}>
-              <strong>Needs attention: </strong>
-              {attention}
-            </p>
-          ) : null}
-          {current.decision?.state === "pending" ? (
-            <p className={styles.attention}>
-              {current.decision.proposal} Use Send back with instructions below. Approve
-              task and generic Reopen cannot authorize this design change.
-            </p>
-          ) : null}
-          {hasOutstandingWork(current) ? (
-            <p>
-              Work or effects are still pending. Resume, release and renewal stay blocked
-              until reconciled.
-            </p>
-          ) : null}
-          {controls(current)}
-          {details(current)}
-        </section>
-      ) : null}
+        ) : null}
 
-      {!current && view ? (
-        <section aria-label="Prepare PR maintenance">
-          {view.proposal ? (
-            <>
-              <h3>
-                <PrLink record={view.proposal.registration} />
-              </h3>
-              {!view.proposal.registration.scope.publicationAuthorized ? (
+        {current && currentProgress ? (
+          <section aria-label="Current maintained PR">
+            <p className={styles.muted}>Current maintained PR</p>
+            <h3>
+              <PrLink record={current} />
+            </h3>
+            {!current.authorization.scope.publicationAuthorized ? (
+              <p>
+                <strong>Read-only observation</strong> — {readOnlyNotice}
+              </p>
+            ) : null}
+            {!compact ? (
+              <ol className={styles.rail} aria-label="Maintenance loop stages">
+                {[
+                  ...(!loopStages.some((stage) => stage === currentProgress.stage)
+                    ? [currentProgress.stage]
+                    : []),
+                  ...loopStages.filter(
+                    (stage) =>
+                      current.authorization.scope.publicationAuthorized ||
+                      stage !== "addressing_review" ||
+                      currentProgress.stage === stage,
+                  ),
+                ].map((stage) => (
+                  <li
+                    key={stage}
+                    aria-current={stage === currentProgress.stage ? "step" : undefined}
+                    className={mergeClasses(
+                      styles.stage,
+                      stage === currentProgress.stage && styles.currentStage,
+                    )}
+                  >
+                    {stageLabel(stage, current)}
+                  </li>
+                ))}
+              </ol>
+            ) : null}
+            <p>
+              {currentProgress.completedIterations} completed maintenance rounds · settled
+              worker batches
+            </p>
+            <dl className={styles.metadata}>
+              <dt>Last action</dt>
+              <dd>
+                {latestBatch
+                  ? `${latestBatch.kind === "repair" ? "Repair" : "Answer"} batch ${batchStates[latestBatch.state]} · ${checkTime(latestBatch.updatedAt)}`
+                  : "No worker batch yet."}
+              </dd>
+              <dt>Latest check</dt>
+              <dd>
+                {current.lastAttempt ? (
+                  <time dateTime={current.lastAttempt.attemptedAt}>
+                    {checkTime(current.lastAttempt.attemptedAt)}
+                  </time>
+                ) : (
+                  "Not checked yet"
+                )}
+                {current.lastAttempt?.complete && !current.lastAttempt.failure
+                  ? " · complete observation"
+                  : " · incomplete or unavailable; prior success is not current validation"}
+              </dd>
+              <dt>Next action</dt>
+              <dd>
+                {!current.authorization.scope.publicationAuthorized &&
+                ![
+                  "human_hold",
+                  "reconciling",
+                  "paused",
+                  "blocked",
+                  "merged",
+                  "closed",
+                  "released",
+                ].includes(currentProgress.stage)
+                  ? "Observe the PR and report findings. Changes require a separately reviewed authorization."
+                  : nextActions[currentProgress.stage]}
+              </dd>
+              <dt>Next check</dt>
+              <dd>
+                {["human_hold", "reconciling", "paused", "merged", "closed"].includes(
+                  currentProgress.stage,
+                ) ? (
+                  "On hold until the current blocker is resolved."
+                ) : (
+                  <>
+                    <time dateTime={current.nextCheckAt}>
+                      {checkTime(current.nextCheckAt)}
+                    </time>{" "}
+                    · best-effort lead wake
+                  </>
+                )}
+              </dd>
+            </dl>
+            {attention ? (
+              <p className={styles.attention}>
+                <strong>Needs attention: </strong>
+                {attention}
+              </p>
+            ) : null}
+            {current.decision?.state === "pending" ? (
+              <p className={styles.attention}>
+                {current.decision.proposal} Use Send back with instructions below. Approve
+                task and generic Reopen cannot authorize this design change.
+              </p>
+            ) : null}
+            {hasOutstandingWork(current) ? (
+              <p>
+                Work or effects are still pending. Resume, release and renewal stay
+                blocked until reconciled.
+              </p>
+            ) : null}
+            {controls(current)}
+            {details(current)}
+          </section>
+        ) : null}
+
+        {!current && view ? (
+          <section aria-label="Prepare PR maintenance">
+            {view.proposal ? (
+              <>
+                <h3>
+                  <PrLink record={view.proposal.registration} />
+                </h3>
+                {!view.proposal.registration.scope.publicationAuthorized ? (
+                  <p>
+                    <strong>Read-only observation</strong> — {readOnlyNotice}
+                  </p>
+                ) : null}
                 <p>
-                  <strong>Read-only observation</strong> — {readOnlyNotice}
+                  The Orchestrator prepared a proposal. Maintenance is not enabled until
+                  you review and authorize it.
                 </p>
-              ) : null}
-              <p>
-                The Orchestrator prepared a proposal. Maintenance is not enabled until you
-                review and authorize it.
-              </p>
-              <Button
-                appearance="primary"
-                disabled={
-                  busy ||
-                  !view.canAuthorize ||
-                  Boolean(view.unsupportedReason) ||
-                  retained
-                }
-                onClick={() => {
-                  setError("");
-                  setProposal(view.proposal);
-                  setConfirmed(false);
-                }}
-              >
-                Review PR maintenance proposal
-              </Button>
-            </>
-          ) : (
-            <>
-              <p>
-                Ask the Orchestrator to prepare a proposal for this task’s PR. You review
-                its scope before any maintenance is authorized.
-              </p>
-              <Field
-                label="PR URL (optional)"
-                hint="Leave blank to use the task’s PR. Azure DevOps and GitHub are supported."
-                validationState={invalidUrl ? "error" : "none"}
-                validationMessage={
-                  invalidUrl ? "Enter an exact HTTPS pull request URL." : null
-                }
-              >
-                <Input
-                  type="url"
-                  value={prUrl}
-                  disabled={
-                    busy ||
-                    retained ||
-                    !view.canAuthorize ||
-                    Boolean(view.unsupportedReason)
-                  }
-                  onChange={(_, data) => setPrUrl(data.value)}
-                />
-              </Field>
-              <div className={styles.actions}>
                 <Button
+                  {...restoreFocusTarget}
                   appearance="primary"
                   disabled={
                     busy ||
-                    invalidUrl ||
                     !view.canAuthorize ||
                     Boolean(view.unsupportedReason) ||
                     retained
                   }
-                  onClick={() =>
-                    void execute(
-                      () => prepareTaskMaintenance(run.id, prUrl.trim() || undefined),
-                      "Preparation requested. Review the Orchestrator’s proposal when it arrives; maintenance is not enabled.",
-                    )
+                  onClick={() => {
+                    setError("");
+                    setProposal(view.proposal);
+                    setConfirmed(false);
+                  }}
+                >
+                  Review PR maintenance proposal
+                </Button>
+              </>
+            ) : (
+              <>
+                <p>
+                  Ask the Orchestrator to prepare a proposal for this task’s PR. You
+                  review its scope before any maintenance is authorized.
+                </p>
+                <Field
+                  label="PR URL (optional)"
+                  hint="Leave blank to use the task’s PR. Azure DevOps and GitHub are supported."
+                  validationState={invalidUrl ? "error" : "none"}
+                  validationMessage={
+                    invalidUrl ? "Enter an exact HTTPS pull request URL." : null
                   }
                 >
-                  Ask Orchestrator to prepare
-                </Button>
-              </div>
-            </>
-          )}
-          {retained ? (
-            <p>Release the prior retained job in history before preparing another PR.</p>
-          ) : null}
-        </section>
-      ) : null}
+                  <Input
+                    type="url"
+                    value={prUrl}
+                    disabled={
+                      busy ||
+                      retained ||
+                      !view.canAuthorize ||
+                      Boolean(view.unsupportedReason)
+                    }
+                    onChange={(_, data) => setPrUrl(data.value)}
+                  />
+                </Field>
+                <div className={styles.actions}>
+                  <Button
+                    appearance="primary"
+                    disabled={
+                      busy ||
+                      invalidUrl ||
+                      !view.canAuthorize ||
+                      Boolean(view.unsupportedReason) ||
+                      retained
+                    }
+                    onClick={() =>
+                      void execute(
+                        () => prepareTaskMaintenance(run.id, prUrl.trim() || undefined),
+                        "Preparation requested. Review the Orchestrator’s proposal when it arrives; maintenance is not enabled.",
+                      )
+                    }
+                  >
+                    Ask Orchestrator to prepare
+                  </Button>
+                </div>
+              </>
+            )}
+            {retained ? (
+              <p>
+                Release the prior retained job in history before preparing another PR.
+              </p>
+            ) : null}
+          </section>
+        ) : null}
 
-      {history.length ? (
-        <details className={styles.details}>
-          <summary>Prior PR jobs ({history.length})</summary>
-          {history.map((record) => {
-            const progress = prMaintenanceProgress(record);
-            return (
-              <section
-                className={styles.historyJob}
-                key={record.id}
-                aria-label={`Prior PR job: ${record.identity.repository} #${record.identity.prNumber}`}
-              >
-                <h3>
-                  <PrLink record={record} />
-                </h3>
-                <p>
-                  {stageLabel(progress.stage, record)} · {progress.completedIterations}{" "}
-                  completed maintenance rounds
-                </p>
-                {!record.authorization.scope.publicationAuthorized ? (
-                  <p>Read-only observation</p>
-                ) : null}
-                {record.pauseReason ? <p>{record.pauseReason}</p> : null}
-                {controls(record)}
-                {details(record)}
-              </section>
-            );
-          })}
-        </details>
-      ) : null}
-      <div className={styles.actions}>
-        <Button disabled={busy} onClick={() => setRefreshKey((value) => value + 1)}>
-          Refresh maintenance status
+        {history.length ? (
+          <details className={styles.details}>
+            <summary>Prior PR jobs ({history.length})</summary>
+            {history.map((record) => {
+              const progress = prMaintenanceProgress(record);
+              return (
+                <section
+                  className={styles.historyJob}
+                  key={record.id}
+                  aria-label={`Prior PR job: ${record.identity.repository} #${record.identity.prNumber}`}
+                >
+                  <h3>
+                    <PrLink record={record} />
+                  </h3>
+                  <p>
+                    {stageLabel(progress.stage, record)} · {progress.completedIterations}{" "}
+                    completed maintenance rounds
+                  </p>
+                  {!record.authorization.scope.publicationAuthorized ? (
+                    <p>Read-only observation</p>
+                  ) : null}
+                  {record.pauseReason ? <p>{record.pauseReason}</p> : null}
+                  {controls(record)}
+                  {details(record)}
+                </section>
+              );
+            })}
+          </details>
+        ) : null}
+      </Disclosure>
+      <div className={mergeClasses(styles.actions, compact && styles.refresh)}>
+        <Button
+          size={compact ? "small" : "medium"}
+          appearance={compact ? "subtle" : "secondary"}
+          aria-label="Refresh maintenance status"
+          disabled={busy}
+          onClick={() => setRefreshKey((value) => value + 1)}
+        >
+          {compact ? "Refresh status" : "Refresh maintenance status"}
         </Button>
       </div>
 

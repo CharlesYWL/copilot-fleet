@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { FluentProvider } from "@fluentui/react-components";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  PR_MAINTENANCE_RECOVERY_LIMITS,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceObservationSchema,
@@ -22,6 +23,7 @@ import {
 import { PrMaintenancePanel } from "./PrMaintenancePanel";
 import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
 import { buildRunViewModels } from "../../lib/orchestration-view";
+import { taskOverview } from "../../lib/task-overview";
 
 vi.mock("../../lib/pr-maintenance", () => ({
   getTaskMaintenance: vi.fn(),
@@ -210,6 +212,156 @@ beforeEach(() => {
 });
 
 describe("PR maintenance task controls", () => {
+  it("expires displayed readiness at the evidence boundary without a socket update or polling", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(at));
+    let rendered: ReturnType<typeof render> | undefined;
+    try {
+      const record = observed();
+      vi.mocked(getTaskMaintenance).mockResolvedValue({
+        records: [record],
+        canAuthorize: true,
+      });
+      const model = buildRunViewModels({
+        runs: [{ ...task, state: "completed" }],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+      await act(async () => {
+        rendered = render(
+          <FluentProvider theme={fleetDarkTheme}>
+            <OrchestratorTaskDetail
+              model={model}
+              notes={[]}
+              sessions={[]}
+              onBack={vi.fn()}
+              onOpenLead={vi.fn()}
+              onOpenWorker={vi.fn()}
+              onReview={vi.fn()}
+              onArchive={vi.fn()}
+              onReopen={vi.fn()}
+              onDelete={vi.fn()}
+            />
+          </FluentProvider>,
+        );
+      });
+      expect(screen.getByRole("heading", { name: "PR ready to merge" })).toBeTruthy();
+      const reads = vi.mocked(getTaskMaintenance).mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1,
+        );
+      });
+      expect(screen.queryByRole("heading", { name: "PR ready to merge" })).toBeNull();
+      expect(screen.getByRole("heading", { name: "Checking PR status" })).toBeTruthy();
+      expect(vi.mocked(getTaskMaintenance).mock.calls.length).toBe(reads);
+    } finally {
+      rendered?.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["merged", "closed"] as const)(
+    "keeps unsettled %s work in the top-level overview",
+    (lifecycle) => {
+      const record = { ...observed(), lifecycle, batches: [batch("accepted")] };
+      const model = buildRunViewModels({
+        runs: [{ ...task, state: "completed" }],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+      expect(
+        taskOverview(model, [], { records: [record], canAuthorize: true }),
+      ).toMatchObject({
+        title: `PR ${lifecycle}; reconciliation pending`,
+        attention: true,
+      });
+    },
+  );
+  it("shows one current graph stage and folds the detailed maintenance controls", async () => {
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [observed()],
+      canAuthorize: true,
+    });
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} compact />
+      </FluentProvider>,
+    );
+    const graph = await screen.findByRole("group", {
+      name: "PR maintenance progress graph",
+    });
+    expect(graph.querySelectorAll('[aria-current="step"]')).toHaveLength(1);
+    expect(
+      within(graph)
+        .getByRole("button", { name: "Ready: Ready to merge" })
+        .getAttribute("aria-current"),
+    ).toBe("step");
+    expect(
+      screen.getByText("Maintenance controls and evidence").closest("details"),
+    ).toHaveProperty("open", false);
+    fireEvent.click(within(graph).getByRole("button", { name: "Ready: Ready to merge" }));
+    expect(
+      within(screen.getByRole("dialog")).getByText(/Ready is not merged/),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByText("Maintenance controls and evidence"));
+    expect(screen.getByRole("button", { name: "Pause maintenance" })).toBeTruthy();
+  });
+
+  it("does not paint stale evidence as ready and keeps read-only repairs out of the graph", async () => {
+    const record = observed();
+    record.observation.attemptedAt = "2020-01-01T00:00:00.000Z";
+    record.authorization.scope.publicationAuthorized = false;
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: true,
+    });
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} compact />
+      </FluentProvider>,
+    );
+    const graph = await screen.findByRole("group", {
+      name: "PR maintenance progress graph",
+    });
+    expect(
+      within(graph)
+        .getByRole("button", { name: "Reviews & checks: Checking PR" })
+        .getAttribute("aria-current"),
+    ).toBe("step");
+    expect(within(graph).queryByRole("button", { name: /Fix feedback/ })).toBeNull();
+    expect(screen.getByText("Read-only; no repairs authorized")).toBeTruthy();
+  });
+
+  it("invalidates the visible ready state after a failed refresh without dropping a retained record", async () => {
+    const record = observed();
+    const onChange = vi.fn();
+    vi.mocked(getTaskMaintenance)
+      .mockResolvedValueOnce({ records: [record], canAuthorize: true })
+      .mockRejectedValue(new Error("The maintenance read failed"));
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenancePanel run={task} sessions={[worker]} onChange={onChange} compact />
+      </FluentProvider>,
+    );
+    await screen.findByRole("button", { name: "Ready: Ready to merge" });
+    fireEvent.click(screen.getByRole("button", { name: "Refresh maintenance status" }));
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      "The maintenance read failed",
+    );
+    const graph = screen.getByRole("group", { name: "PR maintenance progress graph" });
+    expect(
+      within(graph).queryByRole("button", { name: "Ready: Ready to merge" }),
+    ).toBeNull();
+    expect(onChange).toHaveBeenLastCalledWith({
+      records: [record],
+      canAuthorize: false,
+      statusError: "The maintenance read failed",
+    });
+  });
+
   it("authorizes a read-only proposal without claiming mutation rights even when response flags are true", async () => {
     const pending = proposal();
     Object.assign(pending.registration.scope, {
@@ -590,9 +742,7 @@ describe("PR maintenance task controls", () => {
       </FluentProvider>
     );
     const rendered = render(detail(at));
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Send back with instructions" }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "Review decision" }));
     const dialog = screen.getByRole("dialog");
     fireEvent.change(
       within(dialog).getByRole("textbox", { name: "What needs changing?" }),
@@ -615,7 +765,9 @@ describe("PR maintenance task controls", () => {
     });
     rendered.rerender(detail("2026-09-18T08:00:00.000Z"));
     await screen.findByText(/decision-B v1/);
-    fireEvent.click(within(dialog).getByRole("button", { name: "Send back" }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Send back with instructions" }),
+    );
     expect(review).not.toHaveBeenCalled();
     expect(within(dialog).getByText(first.decision.proposal)).toBeTruthy();
     expect(within(dialog).getByRole("alert").textContent).toMatch(/changed|review/i);
@@ -1016,14 +1168,12 @@ describe("PR maintenance task controls", () => {
         />
       </FluentProvider>,
     );
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Send back with instructions" }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "Review decision" }));
     expect(screen.queryByRole("button", { name: "Approve" })).toBeNull();
     fireEvent.change(screen.getByRole("textbox", { name: "What needs changing?" }), {
       target: { value: "Keep the contract; restore validation only" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Send back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Send back with instructions" }));
     await waitFor(() =>
       expect(review).toHaveBeenCalledWith(
         false,
@@ -1036,6 +1186,8 @@ describe("PR maintenance task controls", () => {
         },
       ),
     );
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    fireEvent.click(screen.getByText("Maintenance controls and evidence"));
     expect(
       (screen.getByRole("button", { name: "Resume maintenance" }) as HTMLButtonElement)
         .disabled,
