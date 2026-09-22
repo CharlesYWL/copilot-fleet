@@ -32,7 +32,7 @@ function fakeSocket() {
  * counting what is free, so an extra node changes the answer for every test in
  * both files; the ones that need somewhere else to send work ask for it.
  */
-export function fleet(): {
+export function fleet(dbPath = ":memory:"): {
   store: FleetStore;
   service: FleetService;
   leadId: string;
@@ -40,7 +40,7 @@ export function fleet(): {
   leadSubject: { sessionId: string; runId: string; nodeId: string };
   addNode: (name: string, options?: { online?: boolean }) => FleetNode;
 } {
-  const store = new FleetStore(":memory:");
+  const store = new FleetStore(dbPath);
   const service = new FleetService(store, silent, "test");
 
   const { node } = store.registerNode({

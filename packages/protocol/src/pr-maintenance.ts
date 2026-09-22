@@ -280,7 +280,8 @@ export function parsePrMaintenanceUrl(value: string): PrMaintenanceUrl {
   };
 }
 
-export const PrMaintenanceScopeSchema = z
+// Stored grants retain their original defaults; parsing history never grants new rights.
+const legacyScopeSchema = z
   .object({
     baseline: text,
     verification: text,
@@ -311,6 +312,20 @@ export const PrMaintenanceScopeSchema = z
           "Read-only maintenance cannot authorize replies, thread resolution, reviewer requests or CI retries.",
       });
   });
+export const PrMaintenanceScopeSchema = z
+  .object({
+    baseline: text,
+    verification: text,
+    publicationAuthorized: z.boolean().refine((value) => value, {
+      message:
+        "Observation-only maintenance is unsupported. Prepare a repair proposal for authenticated authorization.",
+    }),
+    replies: z.boolean().default(false),
+    resolveThreads: z.boolean().default(false),
+    reviewers: z.array(id).max(20).default([]),
+    retryChecks: z.boolean().default(false),
+  })
+  .strict();
 export type PrMaintenanceScope = z.infer<typeof PrMaintenanceScopeSchema>;
 
 export const PrMaintenanceBudgetsSchema = z
@@ -322,12 +337,12 @@ export const PrMaintenanceBudgetsSchema = z
   .strict();
 export type PrMaintenanceBudgets = z.infer<typeof PrMaintenanceBudgetsSchema>;
 
-export const PrMaintenanceEnableSchema = z
+const legacyEnableSchema = z
   .object({
     taskId: id,
     workerSessionId: id,
     identity: PrMaintenanceIdentitySchema,
-    scope: PrMaintenanceScopeSchema,
+    scope: legacyScopeSchema,
     budgets: PrMaintenanceBudgetsSchema.default(() =>
       PrMaintenanceBudgetsSchema.parse({}),
     ),
@@ -335,6 +350,9 @@ export const PrMaintenanceEnableSchema = z
     eligibilityEvidence: text,
   })
   .strict();
+export const PrMaintenanceEnableSchema = legacyEnableSchema.extend({
+  scope: PrMaintenanceScopeSchema,
+});
 export type PrMaintenanceEnable = z.infer<typeof PrMaintenanceEnableSchema>;
 
 export const PrMaintenanceProposalSchema = z
@@ -342,7 +360,15 @@ export const PrMaintenanceProposalSchema = z
     id,
     version: z.number().int().positive(),
     leadSessionId: id,
-    registration: PrMaintenanceEnableSchema,
+    registration: legacyEnableSchema,
+    reauthorization: z
+      .object({
+        recordId: id,
+        version: z.number().int().positive(),
+        generation: z.number().int().positive(),
+      })
+      .strict()
+      .optional(),
     binding: z
       .object({
         placementId: id,
@@ -762,6 +788,17 @@ export const PrMaintenanceManualOwnerSchema = z
   .strict();
 export type PrMaintenanceManualOwner = z.infer<typeof PrMaintenanceManualOwnerSchema>;
 
+const authorizationSchema = z
+  .object({
+    id,
+    operatorId: id,
+    issuedAt: time,
+    headSha: sha,
+    scope: legacyScopeSchema,
+    budgets: PrMaintenanceBudgetsSchema,
+  })
+  .strict();
+
 export const PrMaintenanceRegistrationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -792,16 +829,8 @@ export const PrMaintenanceRegistrationSchema = z
       })
       .strict()
       .optional(),
-    authorization: z
-      .object({
-        id,
-        operatorId: id,
-        issuedAt: time,
-        headSha: sha,
-        scope: PrMaintenanceScopeSchema,
-        budgets: PrMaintenanceBudgetsSchema,
-      })
-      .strict(),
+    authorization: authorizationSchema,
+    authorizationHistory: z.array(authorizationSchema).max(100).default([]),
     decision: PrMaintenanceDecisionSchema.optional(),
     decisionHistory: z.array(PrMaintenanceDecisionSchema).max(100).default([]),
     observation: PrMaintenanceObservationSchema.optional(),
@@ -860,6 +889,7 @@ export type PrMaintenanceStage =
   | "closed"
   | "human_hold"
   | "reconciling"
+  | "authorization_required"
   | "paused"
   | "recovering"
   | "blocked"
@@ -913,6 +943,11 @@ export function prMaintenanceProgress(
     )
   )
     return result("reconciling");
+  if (
+    !record.authorization.scope.publicationAuthorized &&
+    (!record.manualControl || record.manualControl.endedAt)
+  )
+    return result("authorization_required");
   if (record.lifecycle === "paused")
     return result(
       ["authorization_failed", "remote_identity_changed"].includes(record.pauseReason)

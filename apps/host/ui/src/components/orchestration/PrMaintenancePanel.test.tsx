@@ -327,11 +327,11 @@ describe("PR maintenance task controls", () => {
     });
     expect(
       within(graph)
-        .getByRole("button", { name: "Reviews & checks: Checking PR" })
+        .getByRole("button", { name: "PR linked: Repair authorization required" })
         .getAttribute("aria-current"),
     ).toBe("step");
     expect(within(graph).queryByRole("button", { name: /Fix feedback/ })).toBeNull();
-    expect(screen.getByText("Read-only maintenance; no unattended repairs")).toBeTruthy();
+    expect(screen.getByText("Legacy grant; repair authorization required")).toBeTruthy();
   });
 
   it("invalidates the visible ready state after a failed refresh without dropping a retained record", async () => {
@@ -483,7 +483,7 @@ describe("PR maintenance task controls", () => {
     },
   );
 
-  it("authorizes a read-only proposal without claiming mutation rights even when response flags are true", async () => {
+  it("does not authorize a legacy observation proposal and offers repair preparation instead", async () => {
     const pending = proposal();
     Object.assign(pending.registration.scope, {
       publicationAuthorized: false,
@@ -503,43 +503,23 @@ describe("PR maintenance task controls", () => {
         <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} />
       </FluentProvider>,
     );
-    expect(await screen.findByText("Read-only observation")).toBeTruthy();
-    expect(screen.queryByText(/Bounded repairs on the retained worker/)).toBeNull();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Review PR maintenance proposal" }),
-    );
-    const dialog = screen.getByRole("dialog");
-    expect(within(dialog).getByText("Read-only observation")).toBeTruthy();
+    const prepare = await screen.findByRole("button", {
+      name: "Prepare repair authorization",
+    });
     expect(
-      within(dialog).getByText("Observation only; no mutation allowance."),
-    ).toBeTruthy();
-    expect(
-      within(dialog).getByText("Read-only findings only; no provider mutations."),
-    ).toBeTruthy();
-    expect(within(dialog).queryByText(/Push only to|Replies: yes|3 repairs/)).toBeNull();
-    expect(
-      within(dialog).queryByRole("checkbox", {
-        name: /I authorize these bounded repairs/,
-      }),
+      screen.queryByRole("button", { name: "Review PR maintenance proposal" }),
     ).toBeNull();
-    const checkbox = within(dialog).getByRole("checkbox", {
-      name: "I authorize read-only PR observation only. No repairs, pushes, replies, thread resolution, reviewer requests, CI retries, merge or force-push.",
-    });
-    const authorize = within(dialog).getByRole("button", {
-      name: "Authorize read-only observation",
-    });
-    expect((authorize as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.click(checkbox);
-    fireEvent.click(authorize);
+    expect(
+      screen.queryByRole("button", { name: "Authorize read-only observation" }),
+    ).toBeNull();
+    fireEvent.click(prepare);
     await waitFor(() =>
-      expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledWith(task.id, {
-        id: pending.id,
-        version: pending.version,
-      }),
+      expect(prepareTaskMaintenance).toHaveBeenCalledWith(task.id, undefined),
     );
+    expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
   });
 
-  it("keeps a retained read-only job visibly observation-only and hides mutation renewal", async () => {
+  it("shows a retained legacy job as ineligible and offers repair authorization without mutation renewal", async () => {
     const record = observed();
     Object.assign(record.authorization.scope, { publicationAuthorized: false });
     record.observation.sources = [
@@ -557,26 +537,53 @@ describe("PR maintenance task controls", () => {
     show();
     const region = await screen.findByRole("region", { name: "Current maintained PR" });
     expect(
-      within(region).getByText("Read-only observation").closest("details"),
+      within(region).getAllByText("Repair authorization required")[0]!.closest("details"),
     ).toBeNull();
     expect(
-      within(region).getByText(
-        /No repairs, pushes, replies, thread resolution, reviewer requests or CI retries are authorized/,
-      ),
+      within(region).getByText(/Legacy observation-only maintenance is retired/),
     ).toBeTruthy();
     expect(
       within(region).getByText(
-        "Observe the PR and report findings. Changes require a separately reviewed authorization.",
+        /Prepare and review a repair proposal for this exact retained PR and worker/,
       ),
     ).toBeTruthy();
     expect(
       within(region).queryByRole("button", { name: "Renew maintenance budgets" }),
     ).toBeNull();
     expect(within(region).queryByText("Addressing feedback")).toBeNull();
-    expect(screen.queryByText(/Bounded repairs on the retained worker/)).toBeNull();
     expect(
-      within(region).getByText("Read-only observation; no mutation allowance."),
+      within(region).getByText(
+        "Legacy grant; repair authorization required. No mutation allowance.",
+      ),
     ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Prepare repair authorization" }));
+    await waitFor(() =>
+      expect(prepareTaskMaintenance).toHaveBeenCalledWith(
+        task.id,
+        "https://github.com/owner/repo/pull/7",
+      ),
+    );
+  });
+
+  it("does not relabel an ineligible legacy grant as checking when status is unavailable", async () => {
+    const record = observed();
+    record.authorization.scope.publicationAuthorized = false;
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: false,
+      statusError: "Status unavailable",
+    });
+    show();
+    const region = await screen.findByRole("region", { name: "Current maintained PR" });
+    expect(within(region).queryByText("Checking")).toBeNull();
+    expect(
+      within(region).getByText(
+        /Prepare and review a repair proposal for this exact retained PR and worker/,
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Prepare repair authorization" }),
+    ).toHaveProperty("disabled", true);
   });
 
   it.each([undefined, "https://github.com/example/synthetic/pull/42"])(

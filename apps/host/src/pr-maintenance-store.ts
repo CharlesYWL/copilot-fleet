@@ -8,6 +8,7 @@ import {
   PR_MAINTENANCE_WAKE_LIMITS,
   prMaintenanceObservationFresh,
   prMaintenanceProviderKey,
+  isWritingCategory,
   PrMaintenanceAdmissionSchema,
   PrMaintenanceBackupSchema,
   PrMaintenanceCheckpointSchema,
@@ -305,11 +306,13 @@ export class PrMaintenanceStore {
       );
       if (lead.id !== leadSessionId)
         refuse("ownership", "Only the task's owning lead can propose maintenance.");
-      if (this.retained().some((record) => record.taskId === task.id))
+      const retained = this.retained().find((record) => record.taskId === task.id);
+      if (retained?.authorization.scope.publicationAuthorized)
         refuse(
           "already_registered",
           "This task already retains maintenance; use its existing registration.",
         );
+      if (retained) this.assertReauthorization(retained, registration);
       const binding = {
         placementId: worker.placementId,
         checkoutKey:
@@ -347,7 +350,9 @@ export class PrMaintenanceStore {
       if (
         previous &&
         isDeepStrictEqual(previous.registration, registration) &&
-        isDeepStrictEqual(previous.binding, binding)
+        isDeepStrictEqual(previous.binding, binding) &&
+        previous.reauthorization?.recordId === retained?.id &&
+        previous.reauthorization?.version === retained?.version
       )
         return previous;
       if (previous?.version !== expectedVersion)
@@ -372,10 +377,27 @@ export class PrMaintenanceStore {
         version: (previous?.version ?? 0) + 1,
         leadSessionId,
         registration,
+        ...(retained
+          ? {
+              reauthorization: {
+                recordId: retained.id,
+                version: retained.version,
+                generation: retained.generation,
+              },
+            }
+          : {}),
         binding,
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
       });
+      if (previous && !previous.registration.scope.publicationAuthorized)
+        this.store.appendRunNote(task.id, task.phaseIndex, JSON.stringify(previous), {
+          summary:
+            "Superseded legacy observation-only proposal; not repair authorization",
+          kind: "decision",
+          source: "orchestrator",
+          sessionId: leadSessionId,
+        });
       this.db
         .prepare(
           `INSERT INTO pr_maintenance_proposals(task_id,data) VALUES (?,?)
@@ -399,6 +421,7 @@ export class PrMaintenanceStore {
           "version_conflict",
           "The proposal changed or was already handled. Refresh and review it again.",
         );
+      const registration = PrMaintenanceEnableSchema.parse(proposal.registration);
       if (this.store.getRun(taskId)?.leadSessionId !== proposal.leadSessionId)
         refuse(
           "ownership",
@@ -421,8 +444,88 @@ export class PrMaintenanceStore {
           "proposal_binding_changed",
           "The worker placement, checkout or binding generation changed after preparation. Prepare and review a new proposal.",
         );
-      return this.enableFromOperator(proposal.registration, actorId);
+      if (proposal.reauthorization) {
+        const record = this.required(
+          proposal.reauthorization.recordId,
+          proposal.leadSessionId,
+          proposal.reauthorization.version,
+        );
+        if (record.generation !== proposal.reauthorization.generation)
+          refuse("stale_generation", "Prepare a new repair authorization proposal.");
+        this.assertReauthorization(record, registration);
+        const operatorId = actorSchema.parse(actorId);
+        record.authorizationHistory.push(record.authorization);
+        record.authorization = {
+          id: randomUUID(),
+          operatorId,
+          issuedAt: nowIso(),
+          headSha: registration.headSha,
+          scope: registration.scope,
+          budgets: registration.budgets,
+        };
+        // Reauthorization grants scope, not permission to resume old paused/finished work.
+        if (record.lifecycle === "active")
+          this.pause(record, "repair_authorized_requires_explicit_resume");
+        else delete record.readyFingerprint;
+        const saved = this.save(record);
+        this.db
+          .prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?")
+          .run(taskId);
+        return saved;
+      }
+      return this.enableFromOperator(registration, actorId);
     });
+  }
+
+  private assertReauthorization(
+    record: PrMaintenanceRegistration,
+    registration: z.infer<typeof PrMaintenanceEnableSchema>,
+  ): void {
+    if (
+      record.ownershipReleasedAt ||
+      !["active", "paused"].includes(record.lifecycle) ||
+      record.authorization.scope.publicationAuthorized ||
+      record.taskId !== registration.taskId ||
+      record.workerSessionId !== registration.workerSessionId ||
+      !sameIdentity(record.identity, registration.identity)
+    )
+      refuse(
+        "reauthorization_scope",
+        "Repair authorization must retain the exact PR and worker of a nonterminal legacy job.",
+      );
+    if (
+      prMaintenanceUnsettled(record) ||
+      this.hasPendingManualExecution(record.workerSessionId)
+    )
+      refuse(
+        "unsettled",
+        "Settle execution and unknown effects before preparing repair authorization.",
+      );
+    if (record.decision?.state === "pending")
+      refuse(
+        "wait_for_human",
+        "Record direction for the existing decision before repair authorization.",
+      );
+    const reason = this.binding(record);
+    if (reason)
+      refuse(reason, "The retained binding is not eligible for repair authorization.");
+    const { task, worker } = this.ownedWorker(record.taskId, record.workerSessionId);
+    if (
+      !["running", "awaiting_lead", "completed"].includes(task.state) ||
+      worker.stopRequested ||
+      !["idle", "completed", "stopped"].includes(worker.state) ||
+      this.store
+        .listRunSteps(task.id)
+        .some(
+          (step) =>
+            step.sessionId === worker.id &&
+            !["succeeded", "failed", "cancelled", "skipped"].includes(step.state),
+        )
+    )
+      refuse(
+        "proposal_not_ready",
+        "Settle existing work and task approvals before repair authorization.",
+      );
   }
 
   private required(
@@ -632,6 +735,15 @@ export class PrMaintenanceStore {
     this.store.assertRunMutable(task.id);
     this.store.assertSessionMutable(lead.id);
     this.store.assertSessionMutable(worker.id);
+    if (
+      !this.store
+        .listRunSteps(task.id)
+        .some((step) => step.sessionId === worker.id && isWritingCategory(step.category))
+    )
+      refuse(
+        "read_only_task",
+        "Repair maintenance requires the task's existing writing worker; read-only categories cannot be upgraded.",
+      );
     return { task, worker, lead };
   }
 
@@ -737,6 +849,7 @@ export class PrMaintenanceStore {
           scope: parsed.scope,
           budgets: parsed.budgets,
         },
+        authorizationHistory: [],
         lifecycle: "active",
         pauseReason: "",
         renewedAt: now,
@@ -1241,6 +1354,16 @@ export class PrMaintenanceStore {
       if (record.ownershipReleasedAt)
         refuse("released", "Released maintenance needs explicit new enablement.");
       if (
+        !record.authorization.scope.publicationAuthorized &&
+        (action.action === "resume" ||
+          action.action === "renew" ||
+          (action.action === "direction" && action.resume))
+      )
+        refuse(
+          "repair_authorization_required",
+          "Observation-only maintenance is retired. Prepare and authenticate a repair proposal for this retained PR and worker; direction without resume and manual supervisor control remain available.",
+        );
+      if (
         this.hasPendingManualExecution(record.workerSessionId) &&
         action.action !== "pause"
       )
@@ -1281,6 +1404,7 @@ export class PrMaintenanceStore {
             "wait_for_human",
             "Direction for the pending proposal is required before renewal.",
           );
+        record.authorizationHistory.push(record.authorization);
         record.authorization = {
           id: randomUUID(),
           operatorId,
@@ -1406,6 +1530,11 @@ export class PrMaintenanceStore {
       .parse(input);
     return this.store.writeAtomically(() => {
       const record = this.required(parsed.id, leadSessionId, parsed.expectedVersion);
+      if (!record.authorization.scope.publicationAuthorized && parsed.action !== "pause")
+        refuse(
+          "repair_authorization_required",
+          "Legacy observation grants cannot activate maintenance. Prepare a repair proposal for authenticated authorization.",
+        );
       if (
         parsed.action === "enable" &&
         record.lifecycle === "active" &&
@@ -1522,6 +1651,8 @@ export class PrMaintenanceStore {
         return denied("wait_for_human");
       // Stop pauses the registration first. Only an operator action can make it
       // active again, after which the existing Run resume may clear Stop intent.
+      if (!record.authorization.scope.publicationAuthorized)
+        return denied("repair_authorization_required");
       if (action.action === "reopen") continue;
       if (worker.stopRequested || task.state === "cancelled") return denied("stopped");
       if (["awaiting_approval", "blocked", "failed", "aggregating"].includes(task.state))
@@ -1872,6 +2003,7 @@ export class PrMaintenanceStore {
         this.effect(record, checkpoint.effect);
       } else if (checkpoint.kind === "ready") {
         if (
+          !record.authorization.scope.publicationAuthorized ||
           record.lifecycle !== "active" ||
           record.decision?.state === "pending" ||
           prMaintenanceUnsettled(record) ||
@@ -2003,6 +2135,7 @@ export class PrMaintenanceStore {
     const worker = this.store.getSession(record.workerSessionId);
     const lead = this.store.getSession(record.leadSessionId);
     return (
+      record.authorization.scope.publicationAuthorized &&
       record.lifecycle === "active" &&
       !record.ownershipReleasedAt &&
       record.decision?.state !== "pending" &&
@@ -2862,7 +2995,9 @@ export class PrMaintenanceStore {
           .filter(
             (record) =>
               (!record.manualControl || Boolean(record.manualControl.endedAt)) &&
-              (record.lifecycle === "active" || prMaintenanceUnsettled(record)) &&
+              ((record.lifecycle === "active" &&
+                record.authorization.scope.publicationAuthorized) ||
+                prMaintenanceUnsettled(record)) &&
               record.counters.reconciliationStalls < 3 &&
               record.counters.scanStalls < 3 &&
               !record.incidents.some(
@@ -2993,7 +3128,9 @@ export class PrMaintenanceStore {
         !record.ownershipReleasedAt &&
         (!record.manualControl || Boolean(record.manualControl.endedAt)) &&
         record.leadSessionId === leadSessionId &&
-        (record.lifecycle === "active" || prMaintenanceUnsettled(record)) &&
+        ((record.lifecycle === "active" &&
+          record.authorization.scope.publicationAuthorized) ||
+          prMaintenanceUnsettled(record)) &&
         record.counters.scanStalls < 3 &&
         record.counters.reconciliationStalls < 3;
       if (!scan?.unservedIds.length) {

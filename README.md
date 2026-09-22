@@ -1859,9 +1859,22 @@ Use **Review PR maintenance proposal** to review the proposed exact provider/PR,
 repository identities, head/base refs, retained worker and checkout, task/design
 baseline, verification, and helper/credential/publication evidence. Confirmation
 is an authenticated browser action, not an MCP approval or a review comment.
-Repair mode requires verified publication prerequisites; observation-only mode
-grants no mutation authority. Unsupported bindings cannot be enabled. Sign-in is
+Maintenance is repair-only and requires verified existing task/publication
+prerequisites. Omitted mode prepares a repair proposal; explicit observation-only
+requests are rejected, never converted into write permission. Optional replies,
+thread resolutions, reviewer requests and retries default off. Unsupported
+bindings and read-only worker categories cannot be enabled. Sign-in is
 required for these authorization controls, including on a no-login Host.
+
+Legacy observation-only records, proposals and backups remain readable. They
+show **Repair authorization required**, not operational repair maintenance, and
+are excluded from unattended scheduling unless unknown work needs settlement.
+Use **Prepare repair authorization** for a nonterminal retained record: the
+proposal pins its exact PR, worker, binding, generation and record version.
+Authenticated authorization archives the old grant without releasing ownership,
+clearing decisions or replaying work, and leaves the job paused until explicit
+Resume. Old proposals cannot be authorized as-is. Terminal and released history
+is not revived; manual supervisor control remains separate.
 
 Azure DevOps is a first-class provider: the same panel, registry, worker, approvals
 and wake budgets retain organization/project/repository GUIDs and exact refs.
@@ -1896,7 +1909,7 @@ versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
 hold, certify a defect fixed, or approve a redesign.
 
 **Manual supervisor control:** open the retained worker and send an ordinary prompt,
-or use the worker's **Resume** button. This works for observation-only and paused
+or use the worker's **Resume** button. This works for legacy observation-only and paused
 registrations without Release or a separate unattended-publication grant, using the
 Host's existing human access (including its configured no-sign-in mode). Node
 credentials, MCP tokens, request flags, and prompt text do not establish human intent.

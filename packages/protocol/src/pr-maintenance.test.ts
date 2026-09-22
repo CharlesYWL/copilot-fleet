@@ -385,22 +385,23 @@ describe("PR maintenance wire schemas", () => {
       ).toBe(false);
   });
 
-  it("defaults new scope to read-only while retaining explicit publication grants", () => {
+  it("requires explicit repair scope and leaves optional provider actions off", () => {
     const scope = { baseline: "Observe only.", verification: "Read existing evidence." };
-    const readOnly = {
-      publicationAuthorized: false,
+    const repair = {
+      publicationAuthorized: true,
       replies: false,
       resolveThreads: false,
       reviewers: [],
       retryChecks: false,
     };
-    expect(PrMaintenanceScopeSchema.parse(scope)).toMatchObject(readOnly);
+    expect(PrMaintenanceScopeSchema.safeParse(scope).success).toBe(false);
     expect(
-      PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: false }),
-    ).toMatchObject(readOnly);
+      PrMaintenanceScopeSchema.safeParse({ ...scope, publicationAuthorized: false })
+        .success,
+    ).toBe(false);
     expect(
       PrMaintenanceScopeSchema.parse({ ...scope, publicationAuthorized: true }),
-    ).toMatchObject({ publicationAuthorized: true, replies: true, resolveThreads: true });
+    ).toMatchObject(repair);
   });
 
   it.each([

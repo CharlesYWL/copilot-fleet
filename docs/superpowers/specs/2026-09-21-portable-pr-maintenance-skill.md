@@ -767,8 +767,11 @@ independent authenticated approval service.
 
 In Fleet, current browser-operator authorization remains the authority. The
 adapter uses the effective parsed grant, preserving legacy scope/default
-semantics; new preparation still defaults to observe-only with explicitly
-requested mutation permissions. Do not reinterpret a legacy grant while
+semantics. The subsequent Fleet repair-only product decision supersedes its
+observation-only enrollment default: new preparation requires existing repair/publication
+authority and authenticated approval, with optional remote actions explicitly
+requested. The standalone profiles in this proposal are not implemented Fleet
+enrollment modes. Do not reinterpret a legacy grant while
 normalizing it, or infer all reply/reviewer rights merely from a new "repair" label.
 
 JSON-local-observe advertises only provider reads, local checkpoints, and local

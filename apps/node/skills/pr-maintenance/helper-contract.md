@@ -31,8 +31,10 @@ include `provider: "azure-devops"`, `host: "dev.azure.com"`, organization, proje
 display name/GUID, repository GUIDs, display names, PR number and full refs.
 See [ADO reads, policy limits and worker guidance](ado-contract.md). Reads use the
 already authenticated Node-local `az` CLI, not a personal skill, copied token,
-automatic login or extension installation. Request `reserveRequests: 40` (or
-the remaining wake allowance) before an ADO scan, not the default eight.
+automatic login or extension installation. ADO normally reserves 39 requests
+(or the remaining wake allowance), leaving one for repair continuation. Do not
+override this to the GitHub default eight. Explicitly reserving all 40 leaves
+no continuation capacity in that wake.
 
 GitHub records without `provider` remain GitHub; explicit `"github"` is also
 accepted. Existing schema-v1 records/backups and `github-snapshot.mjs` inputs
@@ -41,6 +43,26 @@ Provider output always includes the shared schema-validated `observation`;
 checkpoint it unchanged regardless of provider when a registration and claimed
 visit exist. Before registration, retain it in the existing task/execution
 evidence; see the skill's pre-enrollment recovery guidance.
+
+### Durable evidence handoff
+
+Pass the **whole `result.observation` object** from parsed helper stdout as
+`checkpoint: {kind: "observation", observation: result.observation}` to
+`fleet_checkpoint_pr_maintenance` with the claimed record ID and current version.
+Exit 2 still has an observation: preserve its actual timestamp, usage, sanitized
+error and opaque resume. `fallback.error`, when needed, is a string, not the
+provider error object. A reconciliation note or path/hash is not an observation.
+Do not copy only the displayed summary or rebuild/trim the continuation.
+
+The exposed MCP route accepts the supported large object inline (32 MiB
+transport bound; helper state at most 1 MiB; total durable record at most 2 MiB).
+No filesystem-import capability or arbitrary path read is provided. A synthetic
+291,675-byte helper observation is covered from native CLI stdout through this
+authenticated, claimed MCP checkpoint, exact readback and SQLite restart.
+Read the record back and compare the serialized observation before treating
+the handoff as durable; a rejected request is not saved evidence and does not
+authorize another helper call. Owner/version/claim checks remain in force,
+including for large payloads. Genuine overflow stays incomplete/rejected.
 
 The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
 helper's `snapshot.identity` unchanged, or construct the same strict provider

@@ -12,6 +12,7 @@ import {
   PrMaintenanceEnableSchema,
   PrMaintenanceOperatorActionSchema,
   parsePrMaintenanceUrl,
+  prMaintenanceUrl,
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
@@ -216,7 +217,16 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           error:
             "Resume the task's existing Orchestrator on its authorized Node before requesting preparation.",
         });
-      if (maintenanceForTask(id).some((record) => !record.ownershipReleasedAt))
+      const retained = maintenanceForTask(id).find(
+        (record) => !record.ownershipReleasedAt,
+      );
+      if (
+        retained &&
+        (retained.authorization.scope.publicationAuthorized ||
+          !["active", "paused"].includes(retained.lifecycle) ||
+          prMaintenanceUnsettled(retained) ||
+          retained.decision?.state === "pending")
+      )
         return reply.code(409).send({
           error:
             "This task retains maintenance. Settle and release it before preparing another PR.",
@@ -228,7 +238,12 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           ? `Requested PR URL: ${JSON.stringify(prUrl)}`
           : "Discover the PR URL from this task's outputs and existing worker evidence. Ask only for the PR URL or an ambiguous choice if needed.",
         "Read fleet_get_task and fleet_get_pr_maintenance. Verify fresh provider metadata using the packaged helper or an already-authorized provider MCP/CLI.",
-        "Use fleet_prepare_pr_maintenance to fill Fleet context and the approved baseline automatically. Record prerequisite limitations truthfully.",
+        "Use fleet_prepare_pr_maintenance for repair-only maintenance with verified existing task/publication authority. Optional remote actions default off. Record prerequisite limitations truthfully; missing repair authority blocks enrollment, not an observation-only default.",
+        ...(retained
+          ? [
+              `Prepare repair reauthorization for the exact retained PR ${prMaintenanceUrl(retained.identity)} and worker ${retained.workerSessionId}. Preserve history, decisions and binding; do not release or replace it. Authorization leaves it paused until explicit Resume.`,
+            ]
+          : []),
         "This request is NOT publication or maintenance authorization. Present the readable proposal for signed-in operator approval, then end your turn. Do not repair, publish, merge, change credentials or create sessions.",
         "</fleet-maintenance-prepare>",
       ].join("\n");
