@@ -143,6 +143,7 @@ const stageNode: Record<PrMaintenanceStage, GraphNode> = {
   ready: "ready",
   human_hold: "review",
   reconciling: "review",
+  authorization_required: "linked",
   paused: "review",
   recovering: "review",
   blocked: "review",
@@ -311,7 +312,7 @@ export function PrMaintenanceGraph({
               ? "No new repairs; reconciliation pending"
               : "Maintenance ended; no new repairs"
             : readOnly
-              ? "Read-only maintenance; no unattended repairs"
+              ? "Legacy grant; repair authorization required"
               : "Bounded repairs; never auto-merges"}
         </span>
         <span>Select a stage for details</span>

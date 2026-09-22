@@ -16,6 +16,7 @@ export const maintenanceStageLabels: Record<PrMaintenanceStage, string> = {
   ready: "Ready to merge",
   human_hold: "Decision needed",
   reconciling: "Reconciling effects",
+  authorization_required: "Repair authorization required",
   paused: "Paused",
   recovering: "Recovering access",
   blocked: "Blocked",
@@ -227,6 +228,8 @@ export function taskOverview(
         "Maintenance is waiting for your bounded direction before any further repairs.",
       reconciling:
         "Some work or remote effects are unsettled; do not blindly repeat the action.",
+      authorization_required:
+        "Legacy observation-only maintenance is retired. Prepare and authenticate repair authorization for the retained PR and worker; no writes or automatic resume.",
       paused: "Maintenance is paused; review its controls and reason before resuming.",
       recovering:
         "Fleet is trying a bounded observation fallback, not bypassing permissions.",
@@ -246,7 +249,13 @@ export function taskOverview(
             ? "Checking PR status"
             : `PR: ${maintenanceStageLabels[stage].toLowerCase()}`,
       summary: copy[stage],
-      attention: ["human_hold", "blocked", "reconciling", "paused"].includes(stage),
+      attention: [
+        "human_hold",
+        "blocked",
+        "reconciling",
+        "paused",
+        "authorization_required",
+      ].includes(stage),
     };
   }
   if (run.state === "completed") {

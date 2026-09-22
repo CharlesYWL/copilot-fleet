@@ -1433,9 +1433,10 @@ describe("node reconnect socket ordering", () => {
         stepKey: "work",
         title: "Work",
         prompt: "Original",
+        category: "implement",
       });
       store.updateRunStep(step.id, { state: "succeeded", sessionId: worker.id });
-      const record = store.prMaintenance.enableFromOperator(
+      let record = store.prMaintenance.enableFromOperator(
         {
           taskId: task.id,
           workerSessionId: worker.id,
@@ -1455,12 +1456,16 @@ describe("node reconnect socket ordering", () => {
           scope: {
             baseline: "Preserve design",
             verification: "Fixture tests",
-            publicationAuthorized: false,
+            publicationAuthorized: true,
           },
           eligibilityEvidence: "Fixture retained checkout",
         },
         "original-operator",
       );
+      const backup = store.prMaintenance.exportBackup();
+      backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
+      store.writeAtomically(() => store.prMaintenance.importBackup(backup));
+      record = store.prMaintenance.get(record.id)!;
       const client = await connect({ activeSessionIds: [worker.id], busySessionIds: [] });
       const delivered = nextMessage(client, "command");
       const operationId = randomUUID();

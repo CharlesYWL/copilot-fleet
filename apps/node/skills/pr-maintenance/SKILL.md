@@ -27,8 +27,7 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    `reserveRequests` (maximum 40). Its returned `observationAllowance`
    is reserved before I/O against the Host-derived turn ID. A lost response or
    unused request reservation stays charged; do not claim another visit to retry.
-   The Host defaults to up to 40 requests for ADO observation-only jobs, 39 for
-   repair-enabled ADO jobs (leaving one unit for the existing continuation gate),
+   The Host defaults to 39 requests for ADO jobs (leaving one unit for the existing continuation gate),
    and eight for GitHub. A recovery visit defaults to one; reserve alternate I/O
    separately before calling its provider tool. ADO's complete consistency pass
    usually exceeds eight requests: do not repeatedly override it to eight.
@@ -76,10 +75,11 @@ For a conversational request such as "Enable PR maintenance for this PR":
    evidence with a fresh time. Omit task/worker
    IDs only if unambiguous: the tool derives the owned task baseline and its
    existing coder, otherwise returns choices. It does not create sessions.
-   Preparation defaults to `mode: "observe"`: no repairs, commits, publication,
-   replies, thread resolution, reviewer requests or CI retries. Do not broaden
-   a read-only task. Request `mode: "repair"` only when its existing task authority
-   and publication path are independently verified; supply `publicationEvidence`.
+   Preparation is repair-only (`mode: "repair"` may be omitted). Explicit
+   `mode: "observe"` is unsupported, not permission to write. Verify existing
+   task authority and the publication path and supply `publicationEvidence`;
+   otherwise stop with the missing prerequisite, not a nonrepairing job.
+   Never broaden a read-only task or select a replacement writing worker.
    Request `replies`, `resolveThreads`, named `reviewers` and `retryChecks`
    explicitly only within that scope; each defaults off. Inspect the returned
    `mode` and `proposedActions` and describe them exactly to the operator.
@@ -114,8 +114,13 @@ Do not install extensions, sign in, change access, or copy a token.
 
 The grant covers only its agreed local repairs, verification, commits, ordinary
 pushes to the exact PR head ref, appropriate replies/resolutions, and optional
-requests to **named configured external reviewers**. An observation-only grant authorizes none of those mutations;
-observe/checkpoint only and require a new explicit operator grant before repairs.
+requests to **named configured external reviewers**. Legacy observation-only grants
+remain readable but are ineligible for unattended maintenance and authorize no writes.
+Use **Prepare repair authorization** for the exact retained PR/worker/binding after
+settling unknown work and human decisions. Review the new pinned proposal while
+authenticated; the old grant is archived, not upgraded or deleted. Reauthorization
+leaves maintenance paused until explicit Resume. Terminal/released jobs cannot
+be revived this way; do not release ownership or replace the worker automatically.
 Existing execution approvals
 remain effective. Never force-push, automatically rebase/reset, delete user work,
 deploy, change credentials/access, add dependencies/designs, or merge.
@@ -187,7 +192,8 @@ attempt may pass the unchanged continuation and a larger byte allowance up to
 1 MiB. Item/depth limits and a fresh verification pass too large for 40 operations
 require manual evidence; repeated attempts cannot make them complete.
 If an independently authorized provider MCP/CLI can supply fresh exact metadata,
-it may support `fleet_prepare_pr_maintenance` in **observe** mode while retaining
+it may support a repair proposal only with independently verified existing task
+and publication authority (`publicationEvidence`), while retaining
 the incomplete helper receipt and explicit completeness limitations. Use the
 proposal identity shape in the helper contract, not the discovery `pr` object.
 This remains an unapproved proposal; only authenticated operator approval enables

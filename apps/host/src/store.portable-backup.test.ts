@@ -122,6 +122,7 @@ describe("stable tunnel backup settings", () => {
       stepKey: "repair",
       title: "Repair",
       prompt: "Inspect invariant",
+      category: "implement",
     });
     source.updateRunStep(step.id, { sessionId: worker.id, state: "succeeded" });
     source.transitionSession(worker.id, "starting");

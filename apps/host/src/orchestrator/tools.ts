@@ -506,15 +506,18 @@ export const PreparePrMaintenanceSchema = z
       .min(1)
       .max(8_192)
       .describe(
-        "Retrievable exact identity/refs/HEAD evidence. Fresh metadata-only evidence can support an observe proposal; retain incomplete helper receipts separately and do not claim complete observation or readiness.",
+        "Retrievable exact identity/refs/HEAD evidence. Fresh metadata-only evidence is not complete observation or readiness; repair preparation also requires existing publication authority.",
       ),
     verification: z.string().min(1).max(8_192),
     eligibilityEvidence: z.string().min(1).max(8_192),
     mode: z
-      .enum(["observe", "repair"])
-      .default("observe")
+      .literal("repair", {
+        error:
+          "Observation-only maintenance is unsupported. Prepare a repair proposal for authenticated authorization.",
+      })
+      .default("repair")
       .describe(
-        "Safe default is read-only observation. Request repair only with verified existing publication authority; human approval is still required.",
+        "Repair-only proposal; verified existing task/publication authority and authenticated human approval are required. Observation-only enrollment is unsupported.",
       ),
     publicationEvidence: z.string().min(1).max(8_192).optional(),
     replies: z.boolean().default(false),
@@ -545,7 +548,7 @@ export const GetPrMaintenanceSchema = z
       .max(40)
       .optional()
       .describe(
-        "Override the reserved helper allowance. Defaults: recovery 1 (reserve alternate I/O separately), ADO observe 40, ADO repair 39 (leaves continuation capacity), GitHub 8. Lost/unused reservations stay charged.",
+        "Override the reserved helper allowance. Defaults: recovery 1 (reserve alternate I/O separately), ADO 39 (leaves continuation capacity), GitHub 8. Lost/unused reservations stay charged.",
       ),
   })
   .strict();
@@ -933,21 +936,10 @@ export class FleetTools {
 
   preparePrMaintenance(input: z.infer<typeof PreparePrMaintenanceSchema>): ToolResult {
     return this.maintenanceResult(() => {
-      if (input.mode === "repair" && !input.publicationEvidence)
+      if (!input.publicationEvidence)
         throw new PrMaintenanceError(
           "publication_evidence_required",
-          "Repair preparation requires verified existing publication authority. Otherwise prepare observation-only maintenance.",
-        );
-      if (
-        input.mode === "observe" &&
-        (input.replies ||
-          input.resolveThreads ||
-          input.reviewers.length ||
-          input.retryChecks)
-      )
-        throw new PrMaintenanceError(
-          "read_only_scope",
-          "Observation-only maintenance cannot request replies, thread changes, reviewers or CI retries.",
+          "Repair preparation requires verified existing task and publication authority. Observation-only enrollment is unsupported; no proposal or write grant was created.",
         );
       let url;
       try {
@@ -1042,7 +1034,7 @@ export class FleetTools {
           scope: {
             baseline,
             verification: input.verification,
-            publicationAuthorized: input.mode === "repair",
+            publicationAuthorized: true,
             replies: input.replies,
             resolveThreads: input.resolveThreads,
             reviewers: input.reviewers,
@@ -1051,9 +1043,7 @@ export class FleetTools {
           eligibilityEvidence: [
             input.eligibilityEvidence,
             `Metadata observed ${input.observedAt} via ${input.method}: ${input.evidence}`,
-            input.mode === "repair"
-              ? `Verified publication path: ${input.publicationEvidence}`
-              : "Observation only: no repair, commit, publication or provider mutation is requested.",
+            `Verified publication path: ${input.publicationEvidence}`,
           ].join("\n"),
           ...(input.expectedVersion ? { expectedVersion: input.expectedVersion } : {}),
         }),
@@ -1063,7 +1053,7 @@ export class FleetTools {
         ...JSON.parse(result.text),
         mode: input.mode,
         proposedActions: {
-          repairAndPublish: input.mode === "repair",
+          repairAndPublish: true,
           replies: input.replies,
           resolveThreads: input.resolveThreads,
           reviewers: input.reviewers,
@@ -1132,9 +1122,7 @@ export class FleetTools {
           const defaultRequests = recovery
             ? 1
             : record.identity.provider === "azure-devops"
-              ? record.authorization.scope.publicationAuthorized
-                ? 39
-                : 40
+              ? 39
               : 8;
           const requests = Math.min(
             parsed.reserveRequests ?? defaultRequests,
