@@ -19,7 +19,7 @@ import {
   PrMaintenanceManualOwnerSchema,
   PrMaintenanceOperatorActionSchema,
   PrMaintenanceObservationSchema,
-  PrMaintenanceIdentitySchema,
+  PrMaintenanceHelperSnapshotIdentitySchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceScanSchema,
@@ -3288,6 +3288,7 @@ export class PrMaintenanceStore {
         refuse("receipt_overflow", "Helper output exceeds 1 MiB.");
       if (
         !execution.approvedAt ||
+        !this.store.commands.preparationClock(execution.id)?.acceptedAt ||
         !execution.descriptor ||
         !execution.settledAt ||
         execution.ownership !== "quiescent" ||
@@ -3363,10 +3364,17 @@ export class PrMaintenanceStore {
           requestsConsumed: z.number().int().nonnegative(),
           elapsedMs: z.number().int().nonnegative(),
           observation: z.unknown(),
+          error: z.unknown().optional(),
           snapshot: z
             .object({
               generation: z.number().int().positive(),
-              identity: PrMaintenanceIdentitySchema,
+              identity: PrMaintenanceHelperSnapshotIdentitySchema,
+              headSha: PrMaintenanceObservationSchema.shape.headSha.unwrap(),
+              baseSha: PrMaintenanceObservationSchema.shape.baseSha.unwrap(),
+              state: PrMaintenanceObservationSchema.shape.state.unwrap(),
+              isDraft: z.boolean(),
+              actionableFingerprint:
+                PrMaintenanceObservationSchema.shape.fingerprint.unwrap(),
             })
             .optional(),
         })
@@ -3385,9 +3393,21 @@ export class PrMaintenanceStore {
         result.elapsedMs !== observation.elapsedMs ||
         execution.exitCode !== (observation.complete ? 0 : 2) ||
         (observation.complete && !result.snapshot) ||
+        (observation.complete && result.error !== undefined) ||
+        (!observation.complete && result.snapshot) ||
+        (!observation.complete &&
+          (!observation.failure ||
+            typeof helperError(observation)?.code !== "string" ||
+            !isDeepStrictEqual(result.error, helperError(observation)))) ||
         (result.snapshot &&
           (result.snapshot.generation !== claim.generation ||
-            !sameIdentity(result.snapshot.identity, record.identity))) ||
+            !sameIdentity(result.snapshot.identity, record.identity) ||
+            result.snapshot.headSha !== observation.headSha ||
+            result.snapshot.baseSha !== observation.baseSha ||
+            result.snapshot.state !== observation.state ||
+            result.snapshot.isDraft !== observation.draft ||
+            result.snapshot.actionableFingerprint !== observation.snapshotId ||
+            result.snapshot.actionableFingerprint !== observation.fingerprint)) ||
         (observation.identity && !sameIdentity(observation.identity, record.identity))
       )
         refuse(
@@ -3395,15 +3415,21 @@ export class PrMaintenanceStore {
           "Checkpoint must equal the exact helper observation in this execution's stdout.",
         );
       const attempted = Date.parse(observation.attemptedAt);
+      const finished = attempted + observation.elapsedMs;
+      const deadline = Date.parse(claim.deadlineAt);
+      const settled = Date.parse(execution.settledAt);
+      const late = finished > deadline;
+      // An in-flight failure can finish late; the deadline still forbids new reads.
       if (
         observation.requestsConsumed > claim.requests ||
-        observation.elapsedMs > PR_MAINTENANCE_WAKE_LIMITS.milliseconds ||
+        finished > settled ||
+        finished > Date.now() ||
         attempted < Date.parse(claim.claimedAt) ||
         attempted < Date.parse(execution.createdAt) ||
-        attempted > Date.parse(execution.settledAt) ||
+        attempted > settled ||
         attempted > Date.now() ||
-        ((observation.complete || observation.requestsConsumed > 0) &&
-          attempted + observation.elapsedMs > Date.parse(claim.deadlineAt))
+        (observation.requestsConsumed > 0 && attempted >= deadline) ||
+        (observation.complete && late)
       )
         refuse(
           "receipt_allowance",
@@ -3416,7 +3442,7 @@ export class PrMaintenanceStore {
         return record;
       }
       this.required(recordId, leadSessionId, expectedVersion);
-      this.assertAdmission({ action: "discover", recordId, leadSessionId });
+      const admission = this.admission({ action: "discover", recordId, leadSessionId });
       if (
         record.lastAttemptAt &&
         record.lastAttemptAt >= observation.attemptedAt &&
@@ -3426,7 +3452,12 @@ export class PrMaintenanceStore {
           "stale_observation",
           "Old command evidence cannot overwrite a newer attempt.",
         );
-      if (prMaintenanceObservationFresh(observation)) {
+      if (
+        !late &&
+        admission.allowed &&
+        !prMaintenanceUnsettled(record) &&
+        prMaintenanceObservationFresh(observation)
+      ) {
         this.observe(record, observation);
         this.releaseTerminal(record);
         if (
@@ -3436,7 +3467,7 @@ export class PrMaintenanceStore {
         )
           record.nextCheckAt = nowIso();
       } else {
-        // Retain late evidence without promoting stale feedback to a current snapshot.
+        // Settling exact evidence cannot revive a hold or promote late/stale feedback.
         record.lastAttempt = observation;
         record.lastAttemptAt = observation.attemptedAt;
         delete record.readyFingerprint;

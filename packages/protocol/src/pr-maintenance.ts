@@ -160,9 +160,37 @@ export const PrMaintenanceIdentitySchema = z
     "Use provider: azure-devops with host: dev.azure.com, organization, project display name, " +
       "projectId and repository GUIDs, Project/Repo display names, prNumber and full refs. " +
       "GitHub uses owner/repo and opaque node IDs; omitted provider is legacy GitHub only. " +
-      "Pass the helper snapshot.identity unchanged, not its discovery pr object.",
+      "Pass the helper observation.identity unchanged, not its provider-native snapshot or discovery pr object.",
   );
 export type PrMaintenanceIdentity = z.infer<typeof PrMaintenanceIdentitySchema>;
+
+/** Native GitHub helper v1 identity, normalized only at its observation/receipt boundary. */
+export const PrMaintenanceGithubSnapshotIdentitySchema = githubIdentity
+  .omit({ prNumber: true })
+  .extend({
+    number: githubIdentity.shape.prNumber,
+    prId: id,
+    url: z.string().max(4_096),
+  })
+  .superRefine((value, ctx) => {
+    if (
+      value.url.toLowerCase() !==
+      prMaintenanceUrl({ ...value, prNumber: value.number }).toLowerCase()
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["url"],
+        message: "GitHub snapshot URL must match its exact PR identity.",
+      });
+  })
+  .transform(({ number, prId: _prId, url: _url, ...identity }) =>
+    githubIdentity.parse({ ...identity, prNumber: number }),
+  );
+
+export const PrMaintenanceHelperSnapshotIdentitySchema = z.union([
+  PrMaintenanceGithubSnapshotIdentitySchema,
+  adoIdentity,
+]);
 
 /** Existing GitHub index keys stay unchanged; ADO IDs are scoped to their organization. */
 export function prMaintenanceProviderKey(identity: PrMaintenanceIdentity): string {

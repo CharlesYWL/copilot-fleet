@@ -43,8 +43,20 @@ import { OPERATOR_COOKIE } from "./auth.js";
 import { assertHostArchiveSize, HOST_ARCHIVE_BYTES } from "./backup-limits.js";
 import { parseFleetControl } from "../ui/src/lib/fleet-wake.js";
 
-const { fixtureInput, observeFixture } = await import(
+const {
+  fixtureInput,
+  observeFixture,
+  fixtureTransport: adoTransport,
+} = await import(
   new URL("../../node/src/fixtures/ado-maintenance.mjs", import.meta.url).href
+);
+const githubFixtureUrl = new URL(
+  "../../node/src/fixtures/github-maintenance.mjs",
+  import.meta.url,
+);
+const { identity: githubIdentity } = await import(githubFixtureUrl.href);
+const { observe: observeProvider } = await import(
+  new URL("../../node/skills/pr-maintenance/snapshot.mjs", import.meta.url).href
 );
 
 const stores: FleetStore[] = [];
@@ -2596,9 +2608,13 @@ describe("PR maintenance with durable commands", () => {
     );
   });
 
-  async function observationCommand(path = ":memory:", approve = true) {
+  async function observationCommand(
+    path = ":memory:",
+    approve = true,
+    identity: PrMaintenanceIdentity = fixtureInput(new Date().toISOString()).pr,
+  ) {
     const f = setup(path);
-    const record = enableMaintenance(f, fixtureInput(new Date().toISOString()).pr);
+    const record = enableMaintenance(f, identity);
     const helper = f.store.createPlacement(
       f.store.createWorkspace("Observation helper", "").id,
       f.node.id,
@@ -2737,19 +2753,20 @@ describe("PR maintenance with durable commands", () => {
     };
   }
 
-  function deadlineResult() {
+  function deadlineResult(elapsedMs = 0) {
+    const error = {
+      code: "deadline_exhausted",
+      message: "The remaining observation deadline was exhausted.",
+    };
     const observation: PrMaintenanceObservation = {
       attemptedAt: new Date().toISOString(),
       complete: false,
       requestsConsumed: 0,
-      elapsedMs: 12,
+      elapsedMs,
       helperState: {
         resume: null,
         previousThreads: [],
-        error: {
-          code: "deadline_exhausted",
-          message: "The remaining observation deadline was exhausted.",
-        },
+        error,
       },
       checksComplete: false,
       reviewsComplete: false,
@@ -2768,16 +2785,561 @@ describe("PR maintenance with durable commands", () => {
       complete: false,
       requestsConsumed: 0,
       elapsedMs: observation.elapsedMs,
+      error,
       observation,
     };
   }
+
+  function receiptPath() {
+    const directory = resolve(".test-tmp", randomUUID());
+    mkdirSync(directory, { recursive: true });
+    directories.push(directory);
+    return join(directory, "host.sqlite");
+  }
+
+  function nativeGithubResult(
+    input: {
+      budget: { deadlineAt: string; maxRequests: number; maxBytes: number };
+      [key: string]: unknown;
+    },
+    elapsed = 0,
+  ) {
+    const cliUrl = new URL(
+      "../../node/skills/pr-maintenance/github-snapshot.mjs",
+      import.meta.url,
+    );
+    const routerUrl = new URL(
+      "../../node/skills/pr-maintenance/snapshot.mjs",
+      import.meta.url,
+    );
+    const mapperUrl = new URL(
+      "../../node/skills/pr-maintenance/host-observation.mjs",
+      import.meta.url,
+    );
+    const cli = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `import { main } from ${JSON.stringify(cliUrl.href)};
+       import { observe } from ${JSON.stringify(routerUrl.href)};
+       import { toHostObservation } from ${JSON.stringify(mapperUrl.href)};
+       import { fixtureTransport } from ${JSON.stringify(githubFixtureUrl.href)};
+       let clock = ${Date.parse(input.budget.deadlineAt) - 120_000};
+       const NativeDate = Date;
+       globalThis.Date = class extends NativeDate {
+         constructor(...args) { super(...(args.length ? args : [clock])); }
+         static now() { return clock; }
+       };
+       await main(input => {
+         const fixture = fixtureTransport(new Date().toISOString());
+         return observe(input, { ...fixture, now: () => clock, request: async args => {
+           const response = await fixture.request(args);
+           clock += ${elapsed};
+           return response;
+         } });
+       }, (result, input, attemptedAt) => toHostObservation(result, input, attemptedAt));`,
+      ],
+      {
+        input: JSON.stringify(input),
+        encoding: "utf8",
+        timeout: 10_000,
+        maxBuffer: 1_048_576,
+      },
+    );
+    expect(cli.error).toBeUndefined();
+    return { cli, result: JSON.parse(cli.stdout), stdout: Buffer.from(cli.stdout) };
+  }
+
+  async function checkpointNativeAfterRestart(
+    h: Awaited<ReturnType<typeof observationCommand>>,
+    path: string,
+    result: ReturnType<typeof deadlineResult>,
+    stdout = Buffer.from(JSON.stringify(result)),
+  ) {
+    const serialized = JSON.stringify(result.observation);
+    h.finish(result, {}, stdout);
+    const turn = h.completionTurn();
+    stores.splice(stores.indexOf(h.f.store), 1);
+    h.f.store.close();
+    const store = open(path);
+    const call = await h.connect(store, new FleetService(store, log, "native-restart"));
+    expect(store.getSessionDispatchAttempt(h.f.lead.id)?.commandId).toBe(turn);
+    const read = await call("fleet_get_execution", {
+      executionId: h.execution.id,
+      format: "raw",
+      limitBytes: COMMAND_LIMITS.pageBytes,
+    });
+    expect(read.ok, read.text).toBe(true);
+    const page = CommandExecutionPageSchema.parse(JSON.parse(read.text));
+    expect(page.hasMore).toBe(false);
+    const retrieved = Buffer.concat(
+      page.events.map((event) => Buffer.from(event.data, "base64")),
+    );
+    expect(retrieved).toEqual(stdout);
+    const args = h.checkpoint(JSON.parse(retrieved.toString("utf8")).observation);
+    const stale = await call("fleet_checkpoint_pr_maintenance", {
+      ...args,
+      expectedVersion: h.record.version + 1,
+    });
+    expect(stale.ok).toBe(false);
+    expect(stale.text).toContain("version_conflict");
+    expect(store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+    const saved = await call("fleet_checkpoint_pr_maintenance", args);
+    expect(saved.ok, saved.text).toBe(true);
+    expect(JSON.stringify(store.prMaintenance.get(h.record.id)?.lastAttempt)).toBe(
+      serialized,
+    );
+    const wake = store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId);
+    expect(wake.requests).toBe(39);
+    expect(wake.observationClaims[0]?.receiptHash).toBeTruthy();
+    expect(wake.observationClaims[0]?.deadlineAt).toBe(
+      h.claim.observationAllowance.deadlineAt,
+    );
+    expect(wake.observationClaims[0]).toMatchObject({
+      recordId: h.record.id,
+      generation: h.record.generation,
+      executionId: h.execution.id,
+      attemptId: h.execution.attemptId,
+    });
+    expect(store.prMaintenance.beginWake(h.f.lead.id, turn).visits).toBe(0);
+    const retry = await call("fleet_checkpoint_pr_maintenance", args);
+    expect(retry.ok, retry.text).toBe(true);
+    expect(JSON.parse(retry.text).version).toBe(JSON.parse(saved.text).version);
+    const changed = await call("fleet_checkpoint_pr_maintenance", {
+      ...args,
+      checkpoint: {
+        kind: "observation",
+        observation: {
+          ...result.observation,
+          evidence: "changed native retry",
+        },
+      },
+    });
+    expect(changed.ok).toBe(false);
+    expect(changed.text).toContain("receipt_mismatch");
+    const record = store.prMaintenance.get(h.record.id)!;
+    const dispatch = await call("fleet_checkpoint_pr_maintenance", {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: {
+        kind: "prepare_batch",
+        batch: {
+          id: "receipt-is-not-action-authority",
+          kind: "repair",
+          sources: [
+            {
+              id: "synthetic",
+              revision: "1",
+              groupKey: "synthetic",
+              evidence: "No authority to repair.",
+            },
+          ],
+          headSha: record.authorization.headSha,
+          prompt: "No action on an old allowance.",
+          scope: record.authorization.scope.baseline,
+          reservedMutations: 1,
+        },
+      },
+    });
+    expect(dispatch.ok).toBe(false);
+    expect(dispatch.text).toContain("visit_required");
+    stores.splice(stores.indexOf(store), 1);
+    store.close();
+    const reopened = open(path);
+    expect(JSON.stringify(reopened.prMaintenance.get(h.record.id)?.lastAttempt)).toBe(
+      serialized,
+    );
+    return { store: reopened, args };
+  }
+
+  it.each([
+    { provider: "legacy", complete: true },
+    { provider: "explicit", complete: true },
+    { provider: "legacy", complete: false },
+    { provider: "explicit", complete: false },
+  ])(
+    "preserves F3 native GitHub CLI evidence ($provider, complete=$complete) across completion turns and restart",
+    async ({ provider, complete }) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const path = receiptPath();
+      const h = await observationCommand(path, true, {
+        ...githubIdentity,
+        ...(provider === "explicit" ? { provider: "github" } : {}),
+      });
+      const { cli, result, stdout } = nativeGithubResult({
+        schemaVersion: 1,
+        generation: 1,
+        pr: h.record.identity,
+        budget: {
+          maxRequests: complete ? 39 : 1,
+          maxBytes: 1_048_576,
+          deadlineAt: h.claim.observationAllowance.deadlineAt,
+        },
+      });
+      expect(cli.status, cli.stdout).toBe(complete ? 0 : 2);
+      expect(result).toMatchObject({ complete, requestsConsumed: complete ? 16 : 1 });
+      if (complete) {
+        expect(result.snapshot.identity.number).toBe(7);
+        expect(result.snapshot.identity.prNumber).toBeUndefined();
+        expect(result.observation.identity).toEqual(githubIdentity);
+      } else {
+        expect(result.snapshot).toBeUndefined();
+        expect(result.observation.helperState.resume).toBeTruthy();
+      }
+      const { store } = await checkpointNativeAfterRestart(h, path, result, stdout);
+      expect(store.prMaintenance.get(h.record.id)?.observation?.complete).toBe(
+        complete ? true : undefined,
+      );
+    },
+  );
+
+  it.each([
+    "provider",
+    "repositoryId",
+    "headRepositoryId",
+    "baseRepositoryId",
+    "headRef",
+    "baseRef",
+    "number",
+    "url",
+    "extra",
+    "generation",
+    "headSha",
+    "baseSha",
+    "state",
+    "isDraft",
+    "actionableFingerprint",
+  ])(
+    "rejects F3 native GitHub snapshot %s tampering without altering the exact shared observation",
+    async (field) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const h = await observationCommand(":memory:", true, githubIdentity);
+      const { result } = nativeGithubResult({
+        schemaVersion: 1,
+        generation: 1,
+        pr: h.record.identity,
+        budget: {
+          maxRequests: 39,
+          maxBytes: 1_048_576,
+          deadlineAt: h.claim.observationAllowance.deadlineAt,
+        },
+      });
+      expect(result.complete).toBe(true);
+      const original = JSON.stringify(result.observation);
+      const identityChanges: Record<string, unknown> = {
+        provider: "azure-devops",
+        repositoryId: "R_other",
+        headRepositoryId: "R_other",
+        baseRepositoryId: "R_other",
+        headRef: "refs/heads/Other",
+        baseRef: "refs/heads/Other",
+        number: 8,
+        url: "https://github.com/other/repo/pull/7",
+        extra: "not a known field",
+      };
+      if (field in identityChanges)
+        result.snapshot.identity[field] = identityChanges[field];
+      else
+        result.snapshot[field] = {
+          generation: 2,
+          headSha: "c".repeat(40),
+          baseSha: "c".repeat(40),
+          state: "closed",
+          isDraft: true,
+          actionableFingerprint: "changed-fingerprint",
+        }[field];
+      expect(JSON.stringify(result.observation)).toBe(original);
+      h.finish(result);
+      h.completionTurn();
+      const denied = await h.call(
+        "fleet_checkpoint_pr_maintenance",
+        h.checkpoint(result.observation),
+      );
+      expect(denied.ok, denied.text).toBe(false);
+      expect(denied.text).toMatch(/receipt_(invalid|mismatch)/);
+      expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(h.record);
+    },
+  );
+
+  it.each([
+    "usage",
+    "elapsed",
+    "end-after-settlement",
+    "error",
+    "after-deadline",
+    "before-claim",
+    "identity",
+    "changed-inline",
+    "partial",
+    "unknown",
+  ] as const)("refuses F4 native late failure with %s mismatch", async (mismatch) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const deadline = Date.parse(h.claim.observationAllowance.deadlineAt);
+    vi.setSystemTime(deadline - 50);
+    const fixture = adoTransport(new Date().toISOString());
+    const input = fixtureInput(new Date().toISOString());
+    input.budget.deadlineAt = h.claim.observationAllowance.deadlineAt;
+    const result = await observeProvider(input, {
+      ...fixture,
+      now: () => Date.now(),
+      request: async (args: unknown) => {
+        const response = await fixture.request(args);
+        vi.setSystemTime(deadline + 1);
+        return response;
+      },
+    });
+    const patch: Partial<CommandReceipt> = {};
+    if (mismatch === "usage")
+      result.observation.requestsConsumed = result.requestsConsumed = 40;
+    if (mismatch === "elapsed") result.observation.elapsedMs = result.elapsedMs = 120_002;
+    if (mismatch === "end-after-settlement")
+      result.observation.elapsedMs = result.elapsedMs = 52;
+    if (mismatch === "error")
+      result.error = { code: "other", message: "Changed outer error" };
+    if (mismatch === "after-deadline")
+      result.observation.attemptedAt = new Date(deadline).toISOString();
+    if (mismatch === "before-claim")
+      result.observation.attemptedAt = new Date(
+        Date.parse(h.execution.createdAt) - 1,
+      ).toISOString();
+    if (mismatch === "partial") patch.finalOutputSeq = 2;
+    if (mismatch === "unknown") {
+      patch.state = "reconciliation_required";
+      patch.ownership = "unknown";
+      patch.outcomeKnown = false;
+      patch.exitCode = null;
+      patch.settledAt = undefined;
+    }
+    if (mismatch === "identity") {
+      result.observation.identity = {
+        ...h.record.identity,
+        repositoryId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        baseRepositoryId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      };
+    }
+    h.finish(result, patch);
+    if (mismatch === "changed-inline")
+      result.observation.evidence = "changed after stdout";
+    const denied = await h.call(
+      "fleet_checkpoint_pr_maintenance",
+      h.checkpoint(result.observation),
+    );
+    expect(denied.ok, denied.text).toBe(false);
+    expect(denied.text).toMatch(/receipt_(allowance|mismatch|incomplete)/);
+    expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(h.record);
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+        .observationClaims[0]?.receiptHash,
+    ).toBeUndefined();
+  });
+
+  it("refuses F4 late complete snapshots while retaining the original charged reservation", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    expect(result.complete).toBe(true);
+    result.elapsedMs = result.observation.elapsedMs = 120_001;
+    vi.setSystemTime(Date.now() + 120_001);
+    h.finish(result);
+    h.completionTurn();
+    const denied = await h.call(
+      "fleet_checkpoint_pr_maintenance",
+      h.checkpoint(result.observation),
+    );
+    expect(denied.ok).toBe(false);
+    expect(denied.text).toContain("receipt_allowance");
+    expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(h.record);
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+        .requests,
+    ).toBe(39);
+  });
+
+  it.each(["pause", "release", "design"] as const)(
+    "settles F4 exact evidence under a %s hold without reviving the job or consuming findings",
+    async (hold) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const h = await observationCommand();
+      const result = await observeFixture(fixtureInput(new Date().toISOString()));
+      expect(result).toMatchObject({ complete: true, requestsConsumed: 19 });
+      if (hold === "design") {
+        h.f.store.prMaintenance.holdForDecision(
+          h.f.lead.id,
+          h.record.id,
+          h.record.version,
+          {
+            id: "design",
+            version: 1,
+            proposal: "Operator decision pending",
+            headSha: h.record.authorization.headSha,
+            scope: h.record.authorization.scope.baseline,
+          },
+          () => h.f.store.setRunState(h.record.taskId, "awaiting_human"),
+        );
+      } else {
+        h.f.store.prMaintenance.operatorAction(
+          h.record.id,
+          h.record.version,
+          {
+            action: hold,
+            reason: "Operator hold during collection",
+          },
+          "operator",
+        );
+      }
+      const held = h.f.store.prMaintenance.get(h.record.id)!;
+      h.finish(result);
+      h.completionTurn();
+      const saved = await h.call("fleet_checkpoint_pr_maintenance", {
+        ...h.checkpoint(result.observation),
+        expectedVersion: held.version,
+      });
+      expect(saved.ok, saved.text).toBe(true);
+      expect(h.f.store.prMaintenance.get(held.id)).toEqual({
+        ...held,
+        version: held.version + 1,
+        updatedAt: expect.any(String),
+        lastAttempt: result.observation,
+        lastAttemptAt: result.observation.attemptedAt,
+      });
+      expect(
+        h.f.store.prMaintenance.admission({
+          action: "discover",
+          recordId: held.id,
+          leadSessionId: h.f.lead.id,
+        }).allowed,
+      ).toBe(false);
+    },
+  );
+
+  it("preserves F4 native GitHub in-flight timeout with its true collection start", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const path = receiptPath();
+    const h = await observationCommand(path, true, githubIdentity);
+    const started = Date.now();
+    const { cli, result, stdout } = nativeGithubResult(
+      {
+        schemaVersion: 1,
+        generation: 1,
+        pr: h.record.identity,
+        budget: {
+          maxRequests: 39,
+          maxBytes: 1_048_576,
+          deadlineAt: h.claim.observationAllowance.deadlineAt,
+        },
+      },
+      120_001,
+    );
+    expect(cli.status).toBe(2);
+    expect(result).toMatchObject({
+      complete: false,
+      requestsConsumed: 1,
+      elapsedMs: 120_001,
+      error: { code: "deadline_exhausted" },
+    });
+    expect(result.observation.attemptedAt).toBe(new Date(started).toISOString());
+    vi.setSystemTime(started + result.elapsedMs);
+    await checkpointNativeAfterRestart(h, path, result, stdout);
+  });
+
+  it("preserves F4 native prelaunch-expired ADO receipt with zero operations and 590 observation bytes", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const path = receiptPath();
+    const h = await observationCommand(path);
+    const start = Date.parse(h.claim.observationAllowance.deadlineAt) + 32_000;
+    vi.setSystemTime(start);
+    const fixture = adoTransport(new Date().toISOString());
+    const input = fixtureInput(new Date().toISOString());
+    input.budget.deadlineAt = h.claim.observationAllowance.deadlineAt;
+    let ticks = 0;
+    const result = await observeProvider(input, {
+      ...fixture,
+      now: () => start + (ticks++ === 0 ? 0 : 12),
+    });
+    expect(result).toMatchObject({
+      complete: false,
+      requestsConsumed: 0,
+      elapsedMs: 12,
+      error: { code: "deadline_exhausted" },
+    });
+    expect(fixture.operations).toHaveLength(0);
+    expect(Buffer.byteLength(JSON.stringify(result.observation))).toBe(590);
+    vi.setSystemTime(start + 12);
+    await checkpointNativeAfterRestart(h, path, result);
+  });
+
+  it.each([
+    { remaining: 50, overrun: 1 },
+    { remaining: 15_000, overrun: 1 },
+    { remaining: 120_000, overrun: 1_000 },
+  ])(
+    "preserves F4 native two-operation ADO deadline failure ($remaining + $overrun ms) across completion turns and restart",
+    async ({ remaining, overrun }) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const path = receiptPath();
+      const h = await observationCommand(path);
+      const deadline = Date.parse(h.claim.observationAllowance.deadlineAt);
+      vi.setSystemTime(deadline - remaining);
+      const fixture = adoTransport(new Date().toISOString());
+      const input = fixtureInput(new Date().toISOString());
+      input.budget.deadlineAt = h.claim.observationAllowance.deadlineAt;
+      const result = await observeProvider(input, {
+        ...fixture,
+        now: () => Date.now(),
+        request: async (args: { timeoutMs: number }) => {
+          expect(args.timeoutMs).toBe(Math.min(15_000, remaining));
+          const response = await fixture.request(args);
+          vi.setSystemTime(deadline + overrun);
+          return response;
+        },
+      });
+      expect(result).toMatchObject({
+        complete: false,
+        requestsConsumed: 2,
+        elapsedMs: remaining + overrun,
+        error: { code: "deadline_exhausted" },
+      });
+      expect(fixture.operations).toHaveLength(2);
+      expect(result.observation.attemptedAt).toBe(
+        new Date(deadline - remaining).toISOString(),
+      );
+      const { store } = await checkpointNativeAfterRestart(h, path, result);
+      const record = store.prMaintenance.get(h.record.id)!;
+      expect(record.observation).toBeUndefined();
+      expect(record.readyFingerprint).toBeUndefined();
+      expect(record.findings).toEqual(h.record.findings);
+      expect(record.batches).toEqual(h.record.batches);
+      expect(record.counters).toEqual(h.record.counters);
+      expect(
+        store.prMaintenance.remainingWake(h.f.lead.id, h.first.delivery.deliveryId),
+      ).toEqual({ requests: 1, visits: 4, milliseconds: 0 });
+      const restored = open();
+      restored.replaceHostBackup(store.exportHostBackup({ enrollmentToken: "" }));
+      expect(restored.prMaintenance.get(record.id)?.lastAttempt).toEqual(
+        result.observation,
+      );
+      expect(restored.prMaintenance.get(record.id)?.lifecycle).toBe("paused");
+      expect(() =>
+        restored.prMaintenance.checkpointObservationReceipt(
+          h.f.lead.id,
+          record.id,
+          record.version,
+          h.execution.id,
+          result.observation,
+        ),
+      ).toThrow();
+    },
+  );
 
   it("checkpoints the original observation after the finite command completion starts a different lead turn", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = await observationCommand();
     vi.setSystemTime(Date.parse(h.claim.observationAllowance.deadlineAt) + 32_000);
-    const result = deadlineResult();
+    const result = deadlineResult(12);
     expect(Buffer.byteLength(JSON.stringify(result.observation))).toBe(590);
+    vi.setSystemTime(Date.now() + result.elapsedMs);
     h.finish(result);
     const nextTurn = h.completionTurn();
     const args = h.checkpoint(result.observation);
@@ -3417,12 +3979,30 @@ describe("PR maintenance with durable commands", () => {
       }
     }
     const current = h.f.store.prMaintenance.get(h.record.id)!;
-    const denied = await h.call("fleet_checkpoint_pr_maintenance", {
+    const saved = await h.call("fleet_checkpoint_pr_maintenance", {
       ...h.checkpoint(result.observation),
       expectedVersion: current.version,
     });
-    expect(denied.ok, denied.text).toBe(false);
-    expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(current);
+    if (["paused", "human-design", "released"].includes(drift)) {
+      expect(saved.ok, saved.text).toBe(true);
+      expect(h.f.store.prMaintenance.get(h.record.id)).toEqual({
+        ...current,
+        version: current.version + 1,
+        updatedAt: expect.any(String),
+        lastAttempt: result.observation,
+        lastAttemptAt: result.observation.attemptedAt,
+      });
+      expect(
+        h.f.store.prMaintenance.admission({
+          action: "discover",
+          recordId: current.id,
+          leadSessionId: h.f.lead.id,
+        }).allowed,
+      ).toBe(false);
+    } else {
+      expect(saved.ok, saved.text).toBe(false);
+      expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(current);
+    }
     expect(h.f.store.commands.get(h.execution.id)?.outputComplete).toBe(true);
   });
 

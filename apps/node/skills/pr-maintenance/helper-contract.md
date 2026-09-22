@@ -95,21 +95,42 @@ fails closed. Caller construction delay is not a collector performance failure.
 Never re-date the observation, reset the deadline at launch, or reclaim a visit to
 ingest an old result.
 
+An already-started bounded request may settle after its timeout/deadline (for example,
+ADO token acquisition plus one GET started with 50 ms left and returned after 51 ms).
+Its **incomplete** exit-2 receipt still saves the exact timestamp, elapsed time, usage,
+error and continuation. Nonzero usage requires an attempt begun before the original
+deadline and within the reservation; elapsed time must fit the known command lifetime.
+There is no grace period for collecting more data: a complete snapshot finishing after
+the deadline is refused. A late incomplete receipt is attempt-only and does not consume
+findings, update readiness, refresh the allowance or revive a held job. The CLI records
+collection start before invoking the provider, not at result mapping.
+
 Evidence older than the normal freshness window is retained only as `lastAttempt`,
 not promoted to a current snapshot/readiness. A fresh complete receipt can make the
 job due for action, but preparing/dispatching a repair still requires a **new current
-bounded visit and remaining allowance**. A pause, release, human hold, owner/binding/
-authorization/generation change or portable restore refuses applying old completion
-evidence to the job; its raw command receipt remains readable under existing retention.
+bounded visit and remaining allowance**. Under a pause, release or human hold, an
+otherwise exact same-scope receipt can update only `lastAttempt`, not lifecycle,
+current observation, findings or decisions. Owner/binding/authorization/generation or
+manual-control scope changes still refuse admission. Portable restore revokes the
+local accepted-preparation receipt and cannot acquire active receipt authority; raw
+command evidence and already-saved attempts remain readable under existing retention.
 Unbound historical commands cannot acquire this authority retroactively. Same-turn
 non-command observations retain the original claimed-visit checkpoint contract.
 
 The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
-helper's `snapshot.identity` unchanged, or construct the same strict provider
+helper's `observation.identity` unchanged, or construct the same strict provider
 identity from fresh, independently authorized metadata. ADO uses
 `repository/headRepository/baseRepository: "Project/Repo"` (case preserved),
 separate provider GUIDs, full `refs/heads/...` refs, and `prNumber`. Do not pass
 helper-only `url`, `repo`, or `number` fields in proposal `identity`.
+
+Native GitHub `snapshot.identity` retains `{number,prId,url,...pins}`; native ADO
+uses the shared provider identity. The GitHub observation mapper and Host receipt
+boundary share one strict native-to-shared adapter (`number` to `prNumber`, with exact
+PR URL/pin validation). The service-wide identity schema is unchanged and rejects
+native snapshot fields. Host also matches generation, HEAD/base SHAs, state, draft
+and fingerprint between snapshot and observation. Do not rewrite helper stdout to
+make an incompatible identity appear to pass.
 
 ## GitHub compatibility helper
 

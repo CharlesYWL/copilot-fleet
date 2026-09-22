@@ -16,6 +16,7 @@ const snapshot = () => ({
     repositoryId: "R_Base",
     repository: "org/repo",
     number: 7,
+    prId: "PR_7",
     url: "https://github.com/org/repo/pull/7",
     headRepositoryId: "R_Fork",
     headRepository: "owner/repo",

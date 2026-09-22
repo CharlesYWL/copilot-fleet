@@ -1127,6 +1127,7 @@ export async function main(
   const chunks = [];
   let result;
   let input;
+  let attemptedAt = new Date().toISOString();
   const inputTimer = setTimeout(
     () =>
       process.stdin.destroy(
@@ -1143,8 +1144,9 @@ export async function main(
     }
     clearTimeout(inputTimer);
     input = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    attemptedAt = new Date().toISOString();
     result = await observeProvider(input);
-    const observation = mapObservation(result, input);
+    const observation = mapObservation(result, input, attemptedAt);
     // The opaque resume lives once, inside the durable Host observation.
     delete result.resume;
     result.observation = observation;
@@ -1178,7 +1180,7 @@ export async function main(
           : "Supply bounded version-1 JSON on stdin.",
       },
     };
-    result.observation = mapObservation(result, input ?? {});
+    result.observation = mapObservation(result, input ?? {}, attemptedAt);
   } finally {
     clearTimeout(inputTimer);
   }

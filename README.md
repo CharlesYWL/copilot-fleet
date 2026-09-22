@@ -1932,10 +1932,15 @@ they add no duplicated observation blob or new execution authority. Older wakes
 default to no receipt association, and old unbound commands cannot be attached
 retroactively. Same-database restart preserves associations; portable restore keeps
 evidence but quarantines admission. The original reservation stays charged, including
-zero-operation failures after deadline. Receipt admission does not reset 5-PR/40-request/
+zero-operation and bounded in-flight failures after deadline. Receipt admission does not reset 5-PR/40-request/
 120-second limits or authorize a repair: actions need a current live allowance.
-Stale evidence is attempt-only; pause/release/ownership/grant/binding/generation and
-human-hold fences still apply. Existing output retention and 1 MiB helper/2 MiB record
+Late incomplete, stale or same-scope held/released evidence is attempt-only: it cannot
+promote findings/readiness or revive maintenance. Complete scans finishing beyond
+the original deadline are refused; no timeout grace or new-read permission is added.
+Ownership/grant/binding/generation and human-hold fences still protect actions.
+Native GitHub snapshot identity is strictly adapted to shared observation identity,
+not parsed as if the two formats were identical; both providers' pins and snapshot
+generation/HEAD/base/state/fingerprint must agree. Existing output retention and 1 MiB helper/2 MiB record
 bounds remain; old strict binaries may reject the new optional correlation fields.
 
 ![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read provider evidence through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)

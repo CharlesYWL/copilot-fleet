@@ -6,6 +6,8 @@ import {
   PrMaintenanceScopeSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceObservationSchema,
+  PrMaintenanceGithubSnapshotIdentitySchema,
+  PrMaintenanceHelperSnapshotIdentitySchema,
   prMaintenanceProgress,
   parsePrMaintenanceUrl,
   prMaintenanceProviderKey,
@@ -53,6 +55,43 @@ describe("PR maintenance wire schemas", () => {
       organization: "sample-org",
       headRef: "refs/heads/Fix",
     });
+  });
+
+  it("normalizes only the strict native GitHub helper identity, not the shared service identity contract", () => {
+    const canonical = PrMaintenanceIdentitySchema.parse(identity);
+    const { prNumber, ...pins } = canonical;
+    const native = {
+      ...pins,
+      number: prNumber,
+      prId: "PR_1",
+      url: prMaintenanceUrl(canonical),
+    };
+    expect(PrMaintenanceGithubSnapshotIdentitySchema.parse(native)).toEqual(canonical);
+    expect(
+      PrMaintenanceHelperSnapshotIdentitySchema.parse({ ...native, provider: "github" }),
+    ).toEqual({ ...canonical, provider: "github" });
+    expect(PrMaintenanceHelperSnapshotIdentitySchema.parse(ado)).toEqual(
+      PrMaintenanceIdentitySchema.parse(ado),
+    );
+    expect(PrMaintenanceIdentitySchema.safeParse(native).success).toBe(false);
+    expect(PrMaintenanceHelperSnapshotIdentitySchema.safeParse(canonical).success).toBe(
+      false,
+    );
+    for (const patch of [
+      { provider: "azure-devops" },
+      { prNumber },
+      { extra: "untrusted" },
+      { prId: "" },
+      { url: `${native.url}?claim=approved` },
+      { url: `${native.url}1` },
+      { number: 2 },
+      { host: "example.invalid" },
+      { repository: "other/repo" },
+    ])
+      expect(
+        PrMaintenanceHelperSnapshotIdentitySchema.safeParse({ ...native, ...patch })
+          .success,
+      ).toBe(false);
   });
 
   describe("maintenance progress from durable facts", () => {

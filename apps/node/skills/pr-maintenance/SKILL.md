@@ -162,11 +162,15 @@ output pages, decode the exact stdout JSON and use the current record version.
 The original persisted claim, execution/attempt and approved stdout establish
 receipt provenance across turns and restart; the current turn need not reclaim it.
 Do not claim another visit to save an old result, reset its absolute deadline or
-substitute a reconciliation note. Late zero-operation deadline failures still
-preserve their timestamp/error, with the original reservation charged.
-The Host refuses unbound or mismatched receipts and held/changed job scopes.
+substitute a reconciliation note. Late zero-operation failures and bounded in-flight
+deadline failures preserve their true start, elapsed time, usage and error, with the
+original reservation charged. Complete snapshots finishing beyond the original
+deadline remain invalid. The Host refuses unbound, mismatched or changed-scope receipts.
+Same-scope held/released evidence is attempt-only and cannot revive maintenance.
 Saving evidence is not permission for fresh I/O or repair: actions still need a
 current live visit and allowance. Stale evidence is retained as an attempt only.
+Use `result.observation.identity` for shared proposal inputs; native GitHub
+`snapshot.identity` has a different strict provider shape.
 See the [durable handoff contract](helper-contract.md#durable-evidence-handoff).
 The observation includes request/time usage and bounded `helperState`.
 Pass `lastAttempt.helperState.resume` as the helper's `resume` on continuation.
