@@ -21,6 +21,7 @@ import {
   HostToNodeMessageSchema,
   NodeToHostMessageSchema,
 } from "./index.js";
+import { PrMaintenanceWakeSchema } from "./pr-maintenance.js";
 
 const at = "2026-09-16T14:00:00.000Z";
 const request = {
@@ -62,6 +63,65 @@ const body = {
 };
 
 describe("remote command contracts", () => {
+  it("reads legacy wakes without manufacturing an execution receipt association", () => {
+    const legacy = {
+      leadSessionId: "lead",
+      wakeId: "old-turn",
+      startedAt: at,
+      visits: 1,
+      requests: 39,
+      milliseconds: 0,
+      visitedIds: ["record"],
+    };
+    expect(PrMaintenanceWakeSchema.parse(legacy)).toEqual({
+      ...legacy,
+      observationClaims: [],
+    });
+    const claim = {
+      recordId: "record",
+      generation: 1,
+      recordVersion: 1,
+      scopeKey: "a".repeat(64),
+      claimedAt: at,
+      deadlineAt: at,
+      requests: 39,
+    };
+    expect(
+      PrMaintenanceWakeSchema.safeParse({
+        ...legacy,
+        observationClaims: Array(6).fill(claim),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("binds optional maintenance observation correlation into the approved command digest", () => {
+    const maintenanceObservation = {
+      recordId: "record",
+      generation: 1,
+      wakeId: "original-turn",
+    };
+    expect(
+      RunCommandSchema.parse({ ...request, maintenanceObservation })
+        .maintenanceObservation,
+    ).toEqual(maintenanceObservation);
+    expect(RunCommandSchema.parse(request).maintenanceObservation).toBeUndefined();
+    expect(commandDigestPayload({ ...body, maintenanceObservation })).not.toBe(
+      commandDigestPayload(body),
+    );
+    expect(
+      commandDigestPayload({
+        ...body,
+        maintenanceObservation: { ...maintenanceObservation, generation: 2 },
+      }),
+    ).not.toBe(commandDigestPayload({ ...body, maintenanceObservation }));
+    expect(
+      RunCommandSchema.safeParse({
+        ...request,
+        maintenanceObservation: { ...maintenanceObservation, deadlineAt: at },
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts approval metadata in detail and live updates while an old browser schema reproduces the reported error", () => {
     const execution = CommandExecutionSchema.parse({
       ...request,

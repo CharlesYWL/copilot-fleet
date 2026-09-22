@@ -46,6 +46,27 @@ evidence; see the skill's pre-enrollment recovery guidance.
 
 ### Durable evidence handoff
 
+For a registered job, claim with `fleet_get_pr_maintenance({takeDue:true})`
+(not `recordId` plus `takeDue`). Prepare the helper input and **dispatch immediately**,
+before unrelated work. Use returned `observationAllowance.requests` and
+`observationAllowance.deadlineAt` unchanged, the registered identity/generation,
+and only the current stored continuation. For `fleet_run_command`, also pass
+the exact returned `observationClaim` as `maintenanceObservation`:
+`{recordId,generation,wakeId}`. This binds one execution/attempt to the original
+persisted reservation at command creation, under normal finite-command approvals.
+Do not include the maintained `taskId`, add a deadline to the claim reference,
+or attach a prior execution retroactively.
+
+End the turn after dispatch. On Fleet's automatic completion wake, read the
+current record and **all** `fleet_get_execution` pages for that execution.
+Use `format:"raw"` and concatenate decoded base64 stdout bytes in sequence before
+UTF-8/JSON decoding (an event can split a character). Require known quiescence,
+complete output, no gaps and helper exit 0 or 2. Persist with
+`{recordId,expectedVersion,executionId,checkpoint:{kind:"observation",observation}}`.
+The Host checks the exact observation against persisted, approved execution stdout,
+not caller claims or a file path. This correlation survives a different Host
+lead turn and same-database restart; repeating the same saved receipt is idempotent.
+
 Pass the **whole `result.observation` object** from parsed helper stdout as
 `checkpoint: {kind: "observation", observation: result.observation}` to
 `fleet_checkpoint_pr_maintenance` with the claimed record ID and current version.
@@ -63,6 +84,25 @@ Read the record back and compare the serialized observation before treating
 the handoff as durable; a rejected request is not saved evidence and does not
 authorize another helper call. Owner/version/claim checks remain in force,
 including for large payloads. Genuine overflow stays incomplete/rejected.
+
+The async native fixture crosses command completion, a second accepted Host turn,
+raw execution pagination, checkpointing and SQLite restart with 291,675 observation
+bytes (291,959 CLI stdout bytes). A 590-byte, zero-operation deadline failure follows
+the same path. The original reservation stays charged even when actual usage is
+zero. An expired deadline can admit this evidence, **not** new provider I/O:
+creation/approval after expiry is refused; a dispatched helper delayed past expiry
+fails closed. Caller construction delay is not a collector performance failure.
+Never re-date the observation, reset the deadline at launch, or reclaim a visit to
+ingest an old result.
+
+Evidence older than the normal freshness window is retained only as `lastAttempt`,
+not promoted to a current snapshot/readiness. A fresh complete receipt can make the
+job due for action, but preparing/dispatching a repair still requires a **new current
+bounded visit and remaining allowance**. A pause, release, human hold, owner/binding/
+authorization/generation change or portable restore refuses applying old completion
+evidence to the job; its raw command receipt remains readable under existing retention.
+Unbound historical commands cannot acquire this authority retroactively. Same-turn
+non-command observations retain the original claimed-visit checkpoint contract.
 
 The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
 helper's `snapshot.identity` unchanged, or construct the same strict provider

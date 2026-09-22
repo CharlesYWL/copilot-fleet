@@ -32,6 +32,10 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    separately before calling its provider tool. ADO's complete consistency pass
    usually exceeds eight requests: do not repeatedly override it to eight.
    Explicitly reserving all 40 is valid, but cannot also admit repair work in that wake.
+   For a finite helper command, immediately pass the returned `observationClaim`
+   as `maintenanceObservation` to `fleet_run_command` and use the returned absolute
+   `observationAllowance.deadlineAt`; do not spend the deadline on unrelated work.
+   The command remains subject to normal operator permissions and approvals.
 3. Honor the existing wake identity's remaining allowance: **5 PR visits,
    40 initiated provider requests, 120 seconds**. Pass the remaining request count
    and absolute deadline to the helper. Reconciliation/retries count too.
@@ -152,7 +156,18 @@ visit, persist it unchanged with
 `fleet_checkpoint_pr_maintenance` using
 `{recordId, expectedVersion, checkpoint: {kind: "observation", observation}}`,
 including nonzero exit code 2. Do not invent a successful mapping for partial data.
-The Host refuses observation writes that did not first claim a due visit.
+For a claim-bound finite command, add its **`executionId`** to that checkpoint.
+Fleet's automatic completion wake is a new Host turn: read all raw execution
+output pages, decode the exact stdout JSON and use the current record version.
+The original persisted claim, execution/attempt and approved stdout establish
+receipt provenance across turns and restart; the current turn need not reclaim it.
+Do not claim another visit to save an old result, reset its absolute deadline or
+substitute a reconciliation note. Late zero-operation deadline failures still
+preserve their timestamp/error, with the original reservation charged.
+The Host refuses unbound or mismatched receipts and held/changed job scopes.
+Saving evidence is not permission for fresh I/O or repair: actions still need a
+current live visit and allowance. Stale evidence is retained as an attempt only.
+See the [durable handoff contract](helper-contract.md#durable-evidence-handoff).
 The observation includes request/time usage and bounded `helperState`.
 Pass `lastAttempt.helperState.resume` as the helper's `resume` on continuation.
 Pass the last successful `observation.helperState.previousThreads` as `previousThreads` so an

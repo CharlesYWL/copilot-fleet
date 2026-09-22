@@ -6,6 +6,7 @@ import {
   PR_MAINTENANCE_CADENCE_MS,
   PR_MAINTENANCE_RECOVERY_LIMITS,
   PR_MAINTENANCE_WAKE_LIMITS,
+  COMMAND_LIMITS,
   prMaintenanceObservationFresh,
   prMaintenanceProviderKey,
   isWritingCategory,
@@ -17,6 +18,8 @@ import {
   PrMaintenanceManualCommandSchema,
   PrMaintenanceManualOwnerSchema,
   PrMaintenanceOperatorActionSchema,
+  PrMaintenanceObservationSchema,
+  PrMaintenanceIdentitySchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceScanSchema,
@@ -34,6 +37,7 @@ import {
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
   type PrMaintenanceRegistration,
+  type CommandExecution,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
 import { notificationAttemptKey } from "./notifications/service.js";
@@ -3093,6 +3097,7 @@ export class PrMaintenanceStore {
         requests: 0,
         milliseconds: 0,
         visitedIds: [],
+        observationClaims: [],
       };
       this.db
         .prepare("INSERT INTO pr_maintenance_wakes VALUES (?,?,?)")
@@ -3113,6 +3118,334 @@ export class PrMaintenanceStore {
         "Begin the existing authenticated lead wake before charging maintenance work.",
       );
     return PrMaintenanceWakeSchema.parse(JSON.parse(String(row.data)));
+  }
+
+  private saveWake(wake: z.infer<typeof PrMaintenanceWakeSchema>): void {
+    this.db
+      .prepare(
+        "UPDATE pr_maintenance_wakes SET data=? WHERE lead_session_id=? AND wake_id=?",
+      )
+      .run(
+        JSON.stringify(PrMaintenanceWakeSchema.parse(wake)),
+        wake.leadSessionId,
+        wake.wakeId,
+      );
+  }
+
+  private observationScope(record: PrMaintenanceRegistration): string {
+    return createHash("sha256")
+      .update(
+        JSON.stringify([
+          record.id,
+          record.generation,
+          record.identity,
+          record.authorization.id,
+          record.authorization.headSha,
+          record.renewedAt,
+          record.manualControl?.takenAt,
+          record.leadSessionId,
+          record.taskId,
+          record.workerSessionId,
+          record.placementId,
+          record.checkoutKey,
+          record.bindingGeneration,
+        ]),
+      )
+      .digest("hex");
+  }
+
+  reserveObservation(
+    leadSessionId: string,
+    wakeId: string,
+    recordId: string,
+    requests: number,
+  ) {
+    return this.store.writeAtomically(() => {
+      const record = this.required(recordId, leadSessionId);
+      const before = this.wake(leadSessionId, wakeId);
+      if (
+        !before.visitedIds.includes(recordId) ||
+        before.observationClaims.some((claim) => claim.recordId === recordId)
+      )
+        refuse(
+          "visit_required",
+          "Reserve observation once on the original claimed visit.",
+        );
+      this.chargeWake(leadSessionId, wakeId, { requests, milliseconds: 0 });
+      const wake = this.wake(leadSessionId, wakeId);
+      const claimedAt = nowIso();
+      const deadlineAt = new Date(
+        Math.min(
+          Date.parse(wake.startedAt) + PR_MAINTENANCE_WAKE_LIMITS.milliseconds,
+          Date.parse(claimedAt) +
+            this.remainingWake(leadSessionId, wakeId, claimedAt).milliseconds,
+        ),
+      ).toISOString();
+      wake.observationClaims.push({
+        recordId,
+        generation: record.generation,
+        recordVersion: record.version,
+        scopeKey: this.observationScope(record),
+        claimedAt,
+        deadlineAt,
+        requests,
+      });
+      this.saveWake(wake);
+      return { recordId, generation: record.generation, wakeId, deadlineAt };
+    });
+  }
+
+  private observationExecution(execution: CommandExecution) {
+    const ref = execution.maintenanceObservation;
+    if (!ref)
+      refuse(
+        "receipt_unbound",
+        "The execution was not bound to an observation reservation at creation.",
+      );
+    const record = this.required(ref.recordId, execution.leadSessionId);
+    const wake = this.wake(execution.leadSessionId, ref.wakeId);
+    const claim = wake.observationClaims.find((entry) => entry.recordId === record.id);
+    if (
+      !claim ||
+      claim.generation !== ref.generation ||
+      record.generation !== ref.generation ||
+      claim.scopeKey !== this.observationScope(record) ||
+      this.store.getRun(record.taskId)?.leadSessionId !== execution.leadSessionId ||
+      this.binding(record)
+    )
+      refuse(
+        "receipt_scope_changed",
+        "Observation reservation owner, generation, authorization or binding no longer matches.",
+      );
+    return { ref, record, wake, claim };
+  }
+
+  bindObservationExecution(execution: CommandExecution): void {
+    if (!execution.maintenanceObservation) return;
+    const { ref, record, wake, claim } = this.observationExecution(execution);
+    if (
+      execution.taskId ||
+      claim.executionId ||
+      this.store.getSessionDispatchAttempt(execution.leadSessionId)?.commandId !==
+        ref.wakeId ||
+      claim.recordVersion !== record.version
+    )
+      refuse(
+        "receipt_claim_conflict",
+        "Bind exactly one separate helper execution to the unchanged reservation in its original lead turn.",
+      );
+    claim.executionId = execution.id;
+    claim.attemptId = execution.attemptId;
+    this.saveWake(wake);
+    this.assertObservationExecution(execution);
+  }
+
+  assertObservationExecution(execution: CommandExecution): void {
+    if (!execution.maintenanceObservation) return;
+    const { record, claim } = this.observationExecution(execution);
+    if (claim.executionId !== execution.id || claim.attemptId !== execution.attemptId)
+      refuse(
+        "receipt_claim_conflict",
+        "This execution does not own the observation reservation.",
+      );
+    if (Date.now() >= Date.parse(claim.deadlineAt))
+      refuse(
+        "wake_exhausted",
+        "The original helper deadline expired; do not restart it on command creation or approval.",
+      );
+    this.assertAdmission({
+      action: "discover",
+      recordId: record.id,
+      leadSessionId: execution.leadSessionId,
+    });
+  }
+
+  checkpointObservationReceipt(
+    leadSessionId: string,
+    recordId: string,
+    expectedVersion: number,
+    executionId: string,
+    input: PrMaintenanceObservation,
+  ): PrMaintenanceRegistration {
+    return this.store.writeAtomically(() => {
+      const execution = this.store.commands.get(executionId);
+      if (
+        !execution ||
+        execution.leadSessionId !== leadSessionId ||
+        execution.maintenanceObservation?.recordId !== recordId
+      )
+        refuse(
+          "receipt_owner",
+          "Use the owned execution bound to this exact observation reservation.",
+        );
+      const { record, claim, wake } = this.observationExecution(execution);
+      if (claim.executionId !== execution.id || claim.attemptId !== execution.attemptId)
+        refuse(
+          "receipt_claim_conflict",
+          "Execution/attempt does not match the persisted observation claim.",
+        );
+      if (execution.outputBytes > 1_048_576)
+        refuse("receipt_overflow", "Helper output exceeds 1 MiB.");
+      if (
+        !execution.approvedAt ||
+        !execution.descriptor ||
+        !execution.settledAt ||
+        execution.ownership !== "quiescent" ||
+        !execution.outcomeKnown ||
+        !execution.outputComplete ||
+        execution.gaps.length ||
+        execution.descendantCleanupForced ||
+        !["succeeded", "failed"].includes(execution.state) ||
+        ![0, 2].includes(execution.exitCode ?? -1)
+      )
+        refuse(
+          "receipt_incomplete",
+          "Require an approved, quiescent, known helper exit with complete bounded output and no gaps.",
+        );
+      const chunks: Buffer[] = [];
+      let sequence = 0;
+      let bytes = 0;
+      for (;;) {
+        const page = this.store.commands.page(
+          execution.id,
+          sequence,
+          COMMAND_LIMITS.pageBytes,
+        );
+        for (const event of page.events) {
+          if (event.sequence !== sequence + 1 || event.attemptId !== execution.attemptId)
+            refuse(
+              "receipt_incomplete",
+              "Output must be contiguous and belong to the original attempt.",
+            );
+          sequence = event.sequence;
+          const data = Buffer.from(event.data, "base64");
+          bytes += data.length;
+          if (bytes > 1_048_576)
+            refuse("receipt_overflow", "Helper output exceeds 1 MiB.");
+          if (event.stream === "stdout") chunks.push(data);
+        }
+        if (!page.hasMore) break;
+        if (!page.events.length) refuse("receipt_incomplete", "Output made no progress.");
+      }
+      if (sequence !== execution.finalOutputSeq)
+        refuse(
+          "receipt_incomplete",
+          "Output does not match the terminal receipt watermark.",
+        );
+      let json: unknown;
+      try {
+        json = JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
+        );
+      } catch (error) {
+        if (!(error instanceof SyntaxError) && !(error instanceof TypeError)) throw error;
+        refuse(
+          "receipt_invalid",
+          "Helper stdout must be one complete UTF-8 JSON result.",
+        );
+      }
+      const pending = [{ value: json, depth: 0 }];
+      while (pending.length) {
+        const { value, depth } = pending.pop()!;
+        if (depth > 32 || (Array.isArray(value) && value.length > 200))
+          refuse(
+            "receipt_overflow",
+            "Helper output exceeds the 200-item/32-depth bounds.",
+          );
+        if (value && typeof value === "object")
+          for (const child of Object.values(value))
+            pending.push({ value: child, depth: depth + 1 });
+      }
+      const parsed = z
+        .object({
+          schemaVersion: z.literal(1),
+          complete: z.boolean(),
+          requestsConsumed: z.number().int().nonnegative(),
+          elapsedMs: z.number().int().nonnegative(),
+          observation: z.unknown(),
+          snapshot: z
+            .object({
+              generation: z.number().int().positive(),
+              identity: PrMaintenanceIdentitySchema,
+            })
+            .optional(),
+        })
+        .safeParse(json);
+      if (!parsed.success)
+        refuse(
+          "receipt_invalid",
+          "Helper stdout does not match the version-1 result contract.",
+        );
+      const result = parsed.data;
+      const observation = PrMaintenanceObservationSchema.parse(input);
+      if (
+        !isDeepStrictEqual(result.observation, observation) ||
+        result.complete !== observation.complete ||
+        result.requestsConsumed !== observation.requestsConsumed ||
+        result.elapsedMs !== observation.elapsedMs ||
+        execution.exitCode !== (observation.complete ? 0 : 2) ||
+        (observation.complete && !result.snapshot) ||
+        (result.snapshot &&
+          (result.snapshot.generation !== claim.generation ||
+            !sameIdentity(result.snapshot.identity, record.identity))) ||
+        (observation.identity && !sameIdentity(observation.identity, record.identity))
+      )
+        refuse(
+          "receipt_mismatch",
+          "Checkpoint must equal the exact helper observation in this execution's stdout.",
+        );
+      const attempted = Date.parse(observation.attemptedAt);
+      if (
+        observation.requestsConsumed > claim.requests ||
+        observation.elapsedMs > PR_MAINTENANCE_WAKE_LIMITS.milliseconds ||
+        attempted < Date.parse(claim.claimedAt) ||
+        attempted < Date.parse(execution.createdAt) ||
+        attempted > Date.parse(execution.settledAt) ||
+        attempted > Date.now() ||
+        ((observation.complete || observation.requestsConsumed > 0) &&
+          attempted + observation.elapsedMs > Date.parse(claim.deadlineAt))
+      )
+        refuse(
+          "receipt_allowance",
+          "Receipt usage/timing exceeds its original reservation; deadlines and charges never reset.",
+        );
+      const hash = this.observationKey(observation);
+      if (claim.receiptHash) {
+        if (claim.receiptHash !== hash)
+          refuse("receipt_conflict", "This claim already saved a different result.");
+        return record;
+      }
+      this.required(recordId, leadSessionId, expectedVersion);
+      this.assertAdmission({ action: "discover", recordId, leadSessionId });
+      if (
+        record.lastAttemptAt &&
+        record.lastAttemptAt >= observation.attemptedAt &&
+        !isDeepStrictEqual(record.lastAttempt, observation)
+      )
+        refuse(
+          "stale_observation",
+          "Old command evidence cannot overwrite a newer attempt.",
+        );
+      if (prMaintenanceObservationFresh(observation)) {
+        this.observe(record, observation);
+        this.releaseTerminal(record);
+        if (
+          observation.complete &&
+          record.lifecycle === "active" &&
+          !record.ownershipReleasedAt
+        )
+          record.nextCheckAt = nowIso();
+      } else {
+        // Retain late evidence without promoting stale feedback to a current snapshot.
+        record.lastAttempt = observation;
+        record.lastAttemptAt = observation.attemptedAt;
+        delete record.readyFingerprint;
+      }
+      const saved = this.save(record);
+      claim.receiptHash = hash;
+      this.saveWake(wake);
+      return saved;
+    });
   }
 
   remainingWake(leadSessionId: string, wakeId: string, at = nowIso()) {

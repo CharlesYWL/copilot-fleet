@@ -1059,6 +1059,10 @@ export const PrMaintenanceAdmissionSchema = z
   .strict();
 export type PrMaintenanceAdmission = z.infer<typeof PrMaintenanceAdmissionSchema>;
 
+export const PrMaintenanceObservationClaimRefSchema = z
+  .object({ recordId: id, generation: z.number().int().positive(), wakeId: id })
+  .strict();
+
 export const PrMaintenanceWakeSchema = z
   .object({
     leadSessionId: id,
@@ -1068,6 +1072,25 @@ export const PrMaintenanceWakeSchema = z
     requests: count,
     milliseconds: count,
     visitedIds: z.array(id).max(5),
+    observationClaims: z
+      .array(
+        z
+          .object({
+            recordId: id,
+            generation: z.number().int().positive(),
+            recordVersion: z.number().int().positive(),
+            scopeKey: sha,
+            claimedAt: time,
+            deadlineAt: time,
+            requests: z.number().int().min(1).max(40),
+            executionId: z.string().uuid().optional(),
+            attemptId: z.string().uuid().optional(),
+            receiptHash: sha.optional(),
+          })
+          .strict(),
+      )
+      .max(5)
+      .default([]),
   })
   .strict();
 export const PrMaintenanceScanSchema = z

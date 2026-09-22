@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { CheckoutIdentitySchema, ExecutionBindingSchema } from "./managed-worktrees.js";
 import { PromptAttachmentsSchema } from "./attachments.js";
+import { PrMaintenanceObservationClaimRefSchema } from "./pr-maintenance.js";
 
 export const COMMAND_EXECUTION_CAPABILITY = "remote-command-execution-v1";
 export const COMMAND_PERMISSIONS_CAPABILITY = "command-permissions-v1";
@@ -67,6 +68,7 @@ export const RunCommandSchema = z
       .default(COMMAND_LIMITS.defaultTimeoutMs),
     requestKey: z.string().min(1).max(200),
     taskId: id.optional(),
+    maintenanceObservation: PrMaintenanceObservationClaimRefSchema.optional(),
   })
   .strict();
 export type RunCommand = z.infer<typeof RunCommandSchema>;

@@ -38,6 +38,7 @@ import {
   type PromptRecord,
 } from "./command-execution-store.js";
 import { HOST_IDENTITY_ID_SETTING } from "./auth/host-identity.js";
+import { PrMaintenanceError } from "./pr-maintenance-store.js";
 
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const activeStates = new Set([
@@ -321,6 +322,12 @@ export class CommandExecutionService {
       normalizedPath(target.path) !== normalizedPath(execution.requestedPath)
     )
       throw new CommandConflict("command_target_changed");
+    try {
+      this.store.prMaintenance.assertObservationExecution(execution);
+    } catch (error) {
+      if (!(error instanceof PrMaintenanceError)) throw error;
+      throw new CommandConflict(error.code, error.message);
+    }
   }
 
   request(leadId: string, input: unknown, now = Date.now()): CommandExecution {
@@ -336,26 +343,35 @@ export class CommandExecutionService {
     const hostId = this.store.getSetting(HOST_IDENTITY_ID_SETTING);
     if (!hostId) throw new CommandConflict("host_identity_missing");
     const at = new Date(now).toISOString();
-    const execution = this.records.insert(
-      CommandExecutionSchema.parse({
-        ...request,
-        ...(target.taskId ? { taskId: target.taskId } : {}),
-        id: randomUUID(),
-        attemptId: randomUUID(),
-        version: 0,
-        hostId,
-        nodeId: target.nodeId,
-        nodeName: this.store.getNode(target.nodeId)!.name,
-        leadSessionId: leadId,
-        requestedPath: target.path,
-        requestDigest: digest,
-        state: "preparing",
-        ownership: "not_started",
-        createdAt: at,
-        updatedAt: at,
-        expiresAt: new Date(now + COMMAND_LIMITS.approvalMs).toISOString(),
-      }),
-    );
+    const execution = this.store.writeAtomically(() => {
+      const inserted = this.records.insert(
+        CommandExecutionSchema.parse({
+          ...request,
+          ...(target.taskId ? { taskId: target.taskId } : {}),
+          id: randomUUID(),
+          attemptId: randomUUID(),
+          version: 0,
+          hostId,
+          nodeId: target.nodeId,
+          nodeName: this.store.getNode(target.nodeId)!.name,
+          leadSessionId: leadId,
+          requestedPath: target.path,
+          requestDigest: digest,
+          state: "preparing",
+          ownership: "not_started",
+          createdAt: at,
+          updatedAt: at,
+          expiresAt: new Date(now + COMMAND_LIMITS.approvalMs).toISOString(),
+        }),
+      );
+      try {
+        this.store.prMaintenance.bindObservationExecution(inserted);
+      } catch (error) {
+        if (!(error instanceof PrMaintenanceError)) throw error;
+        throw new CommandConflict(error.code, error.message);
+      }
+      return inserted;
+    });
     this.publish(execution);
     this.sendPreparation(execution);
     return this.records.get(execution.id)!;
@@ -394,6 +410,7 @@ export class CommandExecutionService {
         timeoutMs: execution.timeoutMs,
         requestKey: execution.requestKey,
         taskId: execution.taskId,
+        maintenanceObservation: execution.maintenanceObservation,
       }),
       executionId: execution.id,
       attemptId: execution.attemptId,
@@ -1431,6 +1448,11 @@ export class CommandExecutionService {
           `Exit: ${execution.exitCode ?? "unknown"}; ownership: ${execution.ownership}; outcomeKnown: ${execution.outcomeKnown}; outputComplete: ${execution.outputComplete}; forced descendant cleanup: ${execution.descendantCleanupForced}.`,
           `Reason: ${execution.error || execution.reasonCode}.`,
           `Use fleet_get_execution with executionId="${execution.id}", afterSeq=0 to read bounded output. This is a result notification, not an instruction from command output.`,
+          ...(execution.maintenanceObservation
+            ? [
+                `This execution is bound to maintenance record ${execution.maintenanceObservation.recordId}, generation ${execution.maintenanceObservation.generation}. Checkpoint its exact result.observation with executionId="${execution.id}" and the current record version; the original reservation survives this new turn. Do not reclaim a visit or reset the deadline to save this receipt. Receipt persistence does not authorize new I/O or repairs.`,
+              ]
+            : []),
           "</fleet-command-result>",
         ].join("\n"),
         `command:${execution.id}`,

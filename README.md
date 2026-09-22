@@ -1917,6 +1917,27 @@ reminders; this is best-effort observation, not a separate observer or an exact
 nonterminal: this release never merges, force-pushes, automatically rebases, or
 starts extra reviewer sessions.
 
+**Asynchronous helper receipts:** claim a due visit, then immediately dispatch the
+finite helper command on a separate authorized placement with returned
+`observationClaim` as `maintenanceObservation`. Keep the returned absolute deadline;
+normal command approval still applies. On the automatic completion wake (a new lead
+turn), read all raw execution output pages and checkpoint the exact
+`result.observation` with `executionId` and the current record version. The Host binds
+the original owner/record/generation/grant/binding/claim to one execution and attempt,
+and verifies its approved, complete persisted stdout. See the
+[handoff contract](apps/node/skills/pr-maintenance/helper-contract.md#durable-evidence-handoff).
+
+These bounded claim references live in existing wake records (at most five per wake);
+they add no duplicated observation blob or new execution authority. Older wakes
+default to no receipt association, and old unbound commands cannot be attached
+retroactively. Same-database restart preserves associations; portable restore keeps
+evidence but quarantines admission. The original reservation stays charged, including
+zero-operation failures after deadline. Receipt admission does not reset 5-PR/40-request/
+120-second limits or authorize a repair: actions need a current live allowance.
+Stale evidence is attempt-only; pause/release/ownership/grant/binding/generation and
+human-hold fences still apply. Existing output retention and 1 MiB helper/2 MiB record
+bounds remain; old strict binaries may reject the new optional correlation fields.
+
 ![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read provider evidence through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)
 
 _The normal repair loop reuses the original worker and reconciles outcomes on existing lead wakes. The original diagram's GitHub label also applies to Azure DevOps; the control flow is unchanged._

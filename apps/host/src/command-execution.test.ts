@@ -1,6 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import Fastify, { type FastifyBaseLogger } from "fastify";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -20,6 +22,9 @@ import {
   MAX_ATTACHMENT_BYTES,
   CommandExecutionBackupSchema,
   PromptSchema,
+  type PrMaintenanceIdentity,
+  type PrMaintenanceObservation,
+  CommandExecutionPageSchema,
 } from "@fleet/protocol";
 import type { AuthenticatedChannel } from "@fleet/protocol/node-auth";
 import { FleetStore } from "./store.js";
@@ -37,6 +42,10 @@ import { registerRequestGuard } from "./request-guard.js";
 import { OPERATOR_COOKIE } from "./auth.js";
 import { assertHostArchiveSize, HOST_ARCHIVE_BYTES } from "./backup-limits.js";
 import { parseFleetControl } from "../ui/src/lib/fleet-wake.js";
+
+const { fixtureInput, observeFixture } = await import(
+  new URL("../../node/src/fixtures/ado-maintenance.mjs", import.meta.url).href
+);
 
 const stores: FleetStore[] = [];
 const directories: string[] = [];
@@ -2391,7 +2400,10 @@ describe("durable command output", () => {
 });
 
 describe("PR maintenance with durable commands", () => {
-  function enableMaintenance(f: ReturnType<typeof setup>) {
+  function enableMaintenance(
+    f: ReturnType<typeof setup>,
+    identity?: PrMaintenanceIdentity,
+  ) {
     const run = f.store.createRun({
       workspaceId: f.workspace.id,
       name: "Maintained PR",
@@ -2416,7 +2428,7 @@ describe("PR maintenance with durable commands", () => {
       {
         taskId: run.id,
         workerSessionId: worker.id,
-        identity: {
+        identity: identity ?? {
           host: "github.com",
           repositoryId: "r1",
           repository: "example/repo",
@@ -2582,6 +2594,836 @@ describe("PR maintenance with durable commands", () => {
     expect(f.store.getSessionDispatchAttempt(f.lead.id)?.commandId).toBe(
       next.delivery.deliveryId,
     );
+  });
+
+  async function observationCommand(path = ":memory:", approve = true) {
+    const f = setup(path);
+    const record = enableMaintenance(f, fixtureInput(new Date().toISOString()).pr);
+    const helper = f.store.createPlacement(
+      f.store.createWorkspace("Observation helper", "").id,
+      f.node.id,
+      "C:\\observation-helper",
+    );
+    const token = new LeadTokens(f.store).mint({
+      sessionId: f.lead.id,
+      runId: "",
+      nodeId: f.node.id,
+    });
+    const connect = async (store = f.store, service = f.service) => {
+      const app = Fastify();
+      apps.push(app);
+      await app.register(mcpRoutes, { service, tokens: new LeadTokens(store) });
+      return async (name: string, args: unknown) => {
+        const response = await app.inject({
+          method: "POST",
+          url: "/mcp",
+          headers: {
+            authorization: `Bearer ${token}`,
+            accept: "application/json, text/event-stream",
+          },
+          payload: {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: { name, arguments: args },
+          },
+        });
+        const body = response.json();
+        return {
+          ok: response.statusCode === 200 && !body.error && !body.result?.isError,
+          text: body.error?.message ?? body.result?.content[0]?.text,
+        };
+      };
+    };
+    const call = await connect();
+    const first = f.service.commands.queueLeadPrompt(f.lead.id, "Observe maintained PR.");
+    f.service.commands.pumpLead(f.lead.id);
+    const leadReceipt = (deliveryId: string, state: "accepted" | "settled") =>
+      f.service.commands.handleNodeMessage(f.node.id, {
+        type: "lead_prompt_receipt",
+        receipt: nativeReceipt({
+          deliveryId,
+          sessionId: f.lead.id,
+          state,
+          at: new Date().toISOString(),
+        }),
+      });
+    expect(leadReceipt(first.delivery.deliveryId, "accepted")).toBe(true);
+    const claim = await call("fleet_get_pr_maintenance", {
+      takeDue: true,
+      reserveRequests: 39,
+    });
+    expect(claim.ok, claim.text).toBe(true);
+    const request = {
+      target: { placementId: helper.id },
+      command: "Write-Output synthetic-helper",
+      shell: "windows-powershell-5.1",
+      reason: "Synthetic bounded observation",
+      requestKey: "observation",
+      maintenanceObservation: JSON.parse(claim.text).observationClaim,
+    };
+    const requested = await call("fleet_run_command", request);
+    expect(requested.ok, requested.text).toBe(true);
+    const prepared = f.prepare(
+      f.service.commands.get(JSON.parse(requested.text).executionId)!,
+    );
+    const execution = approve ? f.approve(prepared) : prepared;
+    expect(leadReceipt(first.delivery.deliveryId, "settled")).toBe(true);
+    const finish = (
+      result: {
+        complete: boolean;
+        observation: PrMaintenanceObservation;
+        requestsConsumed: number;
+        elapsedMs: number;
+      },
+      patch: Partial<CommandReceipt> = {},
+      bytes: Buffer = Buffer.from(JSON.stringify(result)),
+    ) => {
+      let sequence = 0;
+      for (let offset = 0; offset < bytes.length; offset += 16_384) {
+        expect(
+          f.service.commands.handleNodeMessage(f.node.id, {
+            type: "command_execution_output",
+            event: {
+              executionId: execution.id,
+              attemptId: execution.attemptId,
+              sequence: ++sequence,
+              stream: "stdout",
+              data: bytes.subarray(offset, offset + 16_384).toString("base64"),
+              at: new Date().toISOString(),
+            },
+          }),
+        ).toBe(true);
+      }
+      expect(
+        f.result(execution, {
+          state: result.complete ? "succeeded" : "failed",
+          exitCode: result.complete ? 0 : 2,
+          finalOutputSeq: sequence,
+          ...patch,
+        }),
+      ).toBe(true);
+      return bytes.length;
+    };
+    const completionTurn = () => {
+      const completion = f.store.commands.reserved(f.lead.id)!;
+      expect(completion.delivery.prompt).toContain(`executionId="${execution.id}"`);
+      expect(completion.delivery.prompt).toContain("Do not reclaim a visit");
+      expect(completion.delivery.deliveryId).not.toBe(first.delivery.deliveryId);
+      expect(leadReceipt(completion.delivery.deliveryId, "accepted")).toBe(true);
+      expect(f.store.getSessionDispatchAttempt(f.lead.id)?.commandId).toBe(
+        completion.delivery.deliveryId,
+      );
+      return completion.delivery.deliveryId;
+    };
+    const checkpoint = (observation: PrMaintenanceObservation) => ({
+      recordId: record.id,
+      expectedVersion: record.version,
+      executionId: execution.id,
+      checkpoint: { kind: "observation", observation },
+    });
+    return {
+      f,
+      record,
+      first,
+      execution,
+      claim: JSON.parse(claim.text),
+      call,
+      connect,
+      request,
+      finish,
+      completionTurn,
+      checkpoint,
+    };
+  }
+
+  function deadlineResult() {
+    const observation: PrMaintenanceObservation = {
+      attemptedAt: new Date().toISOString(),
+      complete: false,
+      requestsConsumed: 0,
+      elapsedMs: 12,
+      helperState: {
+        resume: null,
+        previousThreads: [],
+        error: {
+          code: "deadline_exhausted",
+          message: "The remaining observation deadline was exhausted.",
+        },
+      },
+      checksComplete: false,
+      reviewsComplete: false,
+      mergeability: "unknown",
+      checks: [],
+      reviews: [],
+      sources: [],
+      knownSelfEffectIds: [],
+      cursor: '{"phase":"metadata","pages":0,"verifiedPages":0,"cursor":null}',
+      failure: "budget",
+      evidence:
+        "Azure DevOps helper v1: deadline_exhausted; The remaining observation deadline was exhausted.",
+    };
+    return {
+      schemaVersion: 1 as const,
+      complete: false,
+      requestsConsumed: 0,
+      elapsedMs: observation.elapsedMs,
+      observation,
+    };
+  }
+
+  it("checkpoints the original observation after the finite command completion starts a different lead turn", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    vi.setSystemTime(Date.parse(h.claim.observationAllowance.deadlineAt) + 32_000);
+    const result = deadlineResult();
+    expect(Buffer.byteLength(JSON.stringify(result.observation))).toBe(590);
+    h.finish(result);
+    const nextTurn = h.completionTurn();
+    const args = h.checkpoint(result.observation);
+    const { executionId: _id, ...unbound } = args;
+    const oldPath = await h.call("fleet_checkpoint_pr_maintenance", unbound);
+    expect(oldPath.ok).toBe(false);
+    expect(oldPath.text).toContain("visit_required");
+    const saved = await h.call("fleet_checkpoint_pr_maintenance", args);
+    expect(saved.ok, saved.text).toBe(true);
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(
+      result.observation,
+    );
+    const wake = h.f.store.prMaintenance.beginWake(
+      h.f.lead.id,
+      h.first.delivery.deliveryId,
+    );
+    expect(wake).toMatchObject({ requests: 39, visits: 1 });
+    expect(wake.observationClaims[0]).toMatchObject({
+      executionId: h.execution.id,
+      attemptId: h.execution.attemptId,
+      deadlineAt: h.claim.observationAllowance.deadlineAt,
+    });
+    expect(
+      h.f.store.prMaintenance.remainingWake(h.f.lead.id, h.first.delivery.deliveryId),
+    ).toEqual({ visits: 4, requests: 1, milliseconds: 0 });
+    expect(h.f.store.prMaintenance.beginWake(h.f.lead.id, nextTurn).visits).toBe(0);
+    const retry = await h.call("fleet_checkpoint_pr_maintenance", args);
+    expect(retry.ok, retry.text).toBe(true);
+    expect(JSON.parse(retry.text).version).toBe(JSON.parse(saved.text).version);
+    const changed = await h.call("fleet_checkpoint_pr_maintenance", {
+      ...args,
+      checkpoint: {
+        kind: "observation",
+        observation: {
+          ...result.observation,
+          evidence: "changed retry",
+        },
+      },
+    });
+    expect(changed.ok).toBe(false);
+    expect(changed.text).toContain("receipt_mismatch");
+  });
+
+  it.each(["deadline", "large", "complete"] as const)(
+    "persists an exact %s receipt across automatic completion turns and SQLite restart",
+    async (kind) => {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      const directory = resolve(".test-tmp", randomUUID());
+      mkdirSync(directory, { recursive: true });
+      directories.push(directory);
+      const path = join(directory, "host.sqlite");
+      const h = await observationCommand(path);
+      const input = fixtureInput(new Date().toISOString(), kind === "large" ? 10 : 39);
+      let stdout: Buffer | undefined;
+      let result =
+        kind === "deadline"
+          ? deadlineResult()
+          : await observeFixture(input, kind === "large" ? 3000 : 0);
+      if (kind === "large") {
+        const padding = 291_675 - Buffer.byteLength(JSON.stringify(result.observation));
+        const fixtureUrl = new URL(
+          "../../node/src/fixtures/ado-maintenance.mjs",
+          import.meta.url,
+        );
+        const cliUrl = new URL(
+          "../../node/skills/pr-maintenance/github-snapshot.mjs",
+          import.meta.url,
+        );
+        const cli = spawnSync(
+          process.execPath,
+          [
+            "--input-type=module",
+            "--eval",
+            `import { main } from ${JSON.stringify(cliUrl.href)};
+           import { observeFixture } from ${JSON.stringify(fixtureUrl.href)};
+           await main(input => observeFixture(input, 3000, ${padding}), result => result.observation);`,
+          ],
+          {
+            input: JSON.stringify(input),
+            encoding: "utf8",
+            maxBuffer: 1_048_576,
+            timeout: 10_000,
+          },
+        );
+        expect(cli.error).toBeUndefined();
+        expect(cli.status).toBe(2);
+        result = JSON.parse(cli.stdout);
+        stdout = Buffer.from(cli.stdout);
+        expect(stdout.length).toBe(291_959);
+        expect(Buffer.byteLength(JSON.stringify(result.observation))).toBe(291_675);
+        expect(result.observation.helperState.resume).toBeTruthy();
+        expect(result.requestsConsumed).toBe(10);
+      } else if (kind === "complete") {
+        expect(result.requestsConsumed).toBe(19);
+        expect(result.observation.sources).toHaveLength(80);
+        expect(Buffer.byteLength(JSON.stringify(result.observation))).toBe(34_084);
+      }
+      const serialized = JSON.stringify(result.observation);
+      const bytes = h.finish(result, {}, stdout);
+      expect(bytes).toBeLessThanOrEqual(1_048_576);
+      if (kind === "complete") expect(bytes).toBe(154_748);
+      const nextTurn = h.completionTurn();
+      // Persist completion and its new turn, then reconstruct only Host services.
+      stores.splice(stores.indexOf(h.f.store), 1);
+      h.f.store.close();
+      let store = open(path);
+      let call = await h.connect(store, new FleetService(store, log, "restarted"));
+      expect(store.getSessionDispatchAttempt(h.f.lead.id)?.commandId).toBe(nextTurn);
+      expect(store.commands.get(h.execution.id)?.outputBytes).toBe(bytes);
+      const chunks: Buffer[] = [];
+      let afterSeq = 0;
+      let pages = 0;
+      for (;;) {
+        const read = await call("fleet_get_execution", {
+          executionId: h.execution.id,
+          afterSeq,
+          limitBytes: COMMAND_LIMITS.pageBytes,
+          format: "raw",
+        });
+        expect(read.ok, read.text).toBe(true);
+        const page = CommandExecutionPageSchema.parse(JSON.parse(read.text));
+        for (const event of page.events) chunks.push(Buffer.from(event.data, "base64"));
+        pages++;
+        afterSeq = page.nextSeq;
+        if (!page.hasMore) break;
+      }
+      expect(Buffer.concat(chunks).length).toBe(bytes);
+      const retrieved = JSON.parse(
+        new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
+      );
+      expect(JSON.stringify(retrieved.observation)).toBe(serialized);
+      const args = h.checkpoint(retrieved.observation);
+      if (kind === "large") {
+        expect(pages).toBe(5);
+        expect(Buffer.byteLength(JSON.stringify(args))).toBe(291_850);
+      } else if (kind === "complete") {
+        expect(pages).toBe(3);
+        expect(Buffer.byteLength(JSON.stringify(args))).toBe(34_259);
+      }
+      const saved = await call("fleet_checkpoint_pr_maintenance", args);
+      expect(saved.ok, saved.text).toBe(true);
+      expect(JSON.stringify(JSON.parse(saved.text).lastAttempt)).toBe(serialized);
+      expect(store.prMaintenance.beginWake(h.f.lead.id, nextTurn).visits).toBe(0);
+      expect(
+        store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId).requests,
+      ).toBe(39);
+      stores.splice(stores.indexOf(store), 1);
+      store.close();
+      store = open(path);
+      call = await h.connect(store, new FleetService(store, log, "readback"));
+      const readback = await call("fleet_get_pr_maintenance", { recordId: h.record.id });
+      expect(JSON.stringify(JSON.parse(readback.text).lastAttempt)).toBe(serialized);
+      expect((await call("fleet_checkpoint_pr_maintenance", args)).ok).toBe(true);
+      expect(store.prMaintenance.get(h.record.id)?.version).toBe(
+        JSON.parse(saved.text).version,
+      );
+      expect(store.prMaintenance.get(h.record.id)?.observation?.complete).toBe(
+        kind === "complete" ? true : undefined,
+      );
+    },
+  );
+
+  it("requires a new live action allowance after receipt ingestion and adopts exactly one retained-worker batch", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    expect(result.requestsConsumed).toBe(19);
+    h.finish(result);
+    h.completionTurn();
+    // Completion can be late; only the attempt itself must fit the original deadline.
+    vi.setSystemTime(Date.now() + 130_000);
+    const saved = await h.call(
+      "fleet_checkpoint_pr_maintenance",
+      h.checkpoint(result.observation),
+    );
+    expect(saved.ok, saved.text).toBe(true);
+    const record = h.f.store.prMaintenance.get(h.record.id)!;
+    const batch = {
+      id: "async-repair",
+      kind: "repair",
+      sources: result.observation.sources,
+      headSha: record.authorization.headSha,
+      prompt: "Repair within approved scope.",
+      scope: record.authorization.scope.baseline,
+      reservedMutations: 1,
+    };
+    const args = {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: { kind: "prepare_batch", batch },
+    };
+    const denied = await h.call("fleet_checkpoint_pr_maintenance", args);
+    expect(denied.ok).toBe(false);
+    expect(denied.text).toContain("visit_required");
+    const fresh = await h.call("fleet_get_pr_maintenance", {
+      takeDue: true,
+      reserveRequests: 1,
+    });
+    expect(fresh.ok, fresh.text).toBe(true);
+    expect(JSON.parse(fresh.text).record.id).toBe(record.id);
+    const prepared = await h.call("fleet_checkpoint_pr_maintenance", args);
+    expect(prepared.ok, prepared.text).toBe(true);
+    const followUp = {
+      sessionId: record.workerSessionId,
+      prompt: batch.prompt,
+      maintenance: {
+        recordId: record.id,
+        generation: record.generation,
+        batchId: batch.id,
+      },
+    };
+    const accepted = await h.call("fleet_follow_up", followUp);
+    expect(accepted.ok, accepted.text).toBe(true);
+    expect((await h.call("fleet_follow_up", followUp)).ok).toBe(true);
+    expect(h.f.store.prMaintenance.get(record.id)?.batches).toHaveLength(1);
+    expect(h.f.store.prMaintenance.get(record.id)?.batches[0]?.state).toBe("accepted");
+    expect(
+      h.f.store.listSessions().filter((session) => session.runRole === "worker"),
+    ).toHaveLength(1);
+  });
+
+  it("binds once at creation, rejects forged claims atomically and keeps exact command retries idempotent", async () => {
+    const h = await observationCommand();
+    const before = h.f.store.commands.exportBackup();
+    for (const ref of [
+      h.claim.observationClaim,
+      { ...h.claim.observationClaim, wakeId: randomUUID() },
+      { ...h.claim.observationClaim, generation: 2 },
+      { ...h.claim.observationClaim, recordId: randomUUID() },
+    ]) {
+      const denied = await h.call("fleet_run_command", {
+        ...h.request,
+        requestKey: randomUUID(),
+        maintenanceObservation: ref,
+      });
+      expect(denied.ok, denied.text).toBe(false);
+      expect(h.f.store.commands.exportBackup()).toEqual(before);
+    }
+    const retry = await h.call("fleet_run_command", h.request);
+    expect(retry.ok, retry.text).toBe(true);
+    expect(JSON.parse(retry.text).executionId).toBe(h.execution.id);
+    const changed = await h.call("fleet_run_command", {
+      ...h.request,
+      maintenanceObservation: { ...h.claim.observationClaim, generation: 2 },
+    });
+    expect(changed.ok).toBe(false);
+    expect(h.execution.descriptor?.maintenanceObservation).toEqual(
+      h.claim.observationClaim,
+    );
+  });
+
+  it("does not reset the original deadline at operator approval", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand(":memory:", false);
+    vi.setSystemTime(Date.parse(h.claim.observationAllowance.deadlineAt) + 1);
+    expect(() => h.f.approve(h.execution)).toThrow("original helper deadline expired");
+    expect(
+      h.f.frames.filter((frame) => frame.type === "start_command_execution"),
+    ).toHaveLength(0);
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+        .requests,
+    ).toBe(39);
+  });
+
+  it("retains stale evidence only as an attempt, never as a current repair snapshot", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    h.finish(result);
+    h.completionTurn();
+    vi.setSystemTime(Date.now() + 31 * 60_000);
+    const saved = await h.call(
+      "fleet_checkpoint_pr_maintenance",
+      h.checkpoint(result.observation),
+    );
+    expect(saved.ok, saved.text).toBe(true);
+    const record = h.f.store.prMaintenance.get(h.record.id)!;
+    expect(record.lastAttempt).toEqual(result.observation);
+    expect(record.observation).toBeUndefined();
+    expect(record.readyFingerprint).toBeUndefined();
+    expect(record.batches).toHaveLength(0);
+  });
+
+  it("preserves portable receipt evidence while restore quarantines admission", async () => {
+    const h = await observationCommand();
+    const result = deadlineResult();
+    h.finish(result);
+    h.completionTurn();
+    const restored = open();
+    const backup = h.f.store.exportHostBackup({ enrollmentToken: "" });
+    restored.replaceHostBackup(backup);
+    const record = restored.prMaintenance.get(h.record.id)!;
+    expect(record.lifecycle).toBe("paused");
+    expect(() =>
+      restored.prMaintenance.checkpointObservationReceipt(
+        h.f.lead.id,
+        record.id,
+        record.version,
+        h.execution.id,
+        result.observation,
+      ),
+    ).toThrow();
+    expect(restored.prMaintenance.get(record.id)?.lastAttempt).toBeUndefined();
+    expect(restored.prMaintenance.exportBackup().wakes).toEqual(
+      backup.prMaintenance?.wakes,
+    );
+    const page = restored.commands.page(h.execution.id, 0, COMMAND_LIMITS.pageBytes);
+    expect(
+      JSON.parse(Buffer.from(page.events[0]!.data, "base64").toString()).observation,
+    ).toEqual(result.observation);
+  });
+
+  it.each([
+    "over-budget",
+    "long-elapsed",
+    "before-claim",
+    "future-attempt",
+    "nonzero-after-deadline",
+    "wrong-identity",
+    "outer-usage",
+    "invalid-json",
+    "invalid-schema",
+    "invalid-utf8",
+    "item-overflow",
+    "depth-overflow",
+    "byte-overflow",
+    "unknown-execution",
+    "unsupported-exit",
+    "forced-cleanup",
+    "missing-output",
+    "output-gap",
+  ])("rejects %s command evidence without consuming its receipt", async (scenario) => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand();
+    const result = deadlineResult();
+    const patch: Partial<CommandReceipt> = {};
+    let bytes: Buffer | undefined;
+    let expected = "receipt_allowance";
+    switch (scenario) {
+      case "over-budget":
+        result.requestsConsumed = result.observation.requestsConsumed = 40;
+        break;
+      case "long-elapsed":
+        result.elapsedMs = result.observation.elapsedMs = 120_001;
+        break;
+      case "before-claim":
+        result.observation.attemptedAt = new Date(Date.now() - 1).toISOString();
+        break;
+      case "future-attempt":
+        result.observation.attemptedAt = new Date(Date.now() + 1_000).toISOString();
+        break;
+      case "nonzero-after-deadline":
+        vi.setSystemTime(Date.now() + 130_000);
+        result.observation.attemptedAt = new Date().toISOString();
+        result.requestsConsumed = result.observation.requestsConsumed = 1;
+        break;
+      case "wrong-identity":
+        result.observation.identity = {
+          ...h.record.identity,
+          repositoryId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+          baseRepositoryId: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+        };
+        expected = "receipt_mismatch";
+        break;
+      case "outer-usage":
+        result.requestsConsumed = 1;
+        expected = "receipt_mismatch";
+        break;
+      case "invalid-json":
+        bytes = Buffer.from("{");
+        expected = "receipt_invalid";
+        break;
+      case "invalid-schema":
+        bytes = Buffer.from("{}");
+        expected = "receipt_invalid";
+        break;
+      case "invalid-utf8":
+        bytes = Buffer.from([0xff]);
+        expected = "receipt_invalid";
+        break;
+      case "item-overflow":
+        bytes = Buffer.from(JSON.stringify({ ...result, extra: Array(201).fill(null) }));
+        expected = "receipt_overflow";
+        break;
+      case "depth-overflow": {
+        let extra: unknown = null;
+        for (let depth = 0; depth < 33; depth++) extra = { child: extra };
+        bytes = Buffer.from(JSON.stringify({ ...result, extra }));
+        expected = "receipt_overflow";
+        break;
+      }
+      case "byte-overflow":
+        bytes = Buffer.alloc(1_048_577, 32);
+        expected = "receipt_overflow";
+        break;
+      case "unknown-execution":
+        patch.state = "reconciliation_required";
+        patch.ownership = "unknown";
+        patch.outcomeKnown = false;
+        patch.exitCode = null;
+        patch.settledAt = undefined;
+        expected = "receipt_incomplete";
+        break;
+      case "unsupported-exit":
+        patch.exitCode = 1;
+        expected = "receipt_incomplete";
+        break;
+      case "forced-cleanup":
+        patch.descendantCleanupForced = true;
+        patch.state = "interrupted";
+        expected = "receipt_incomplete";
+        break;
+      case "missing-output":
+        patch.finalOutputSeq = 2;
+        expected = "receipt_incomplete";
+        break;
+      case "output-gap":
+        patch.finalOutputSeq = 2;
+        patch.gaps = [{ from: 2, to: 2 }];
+        expected = "receipt_incomplete";
+        break;
+    }
+    h.finish(result, patch, bytes);
+    const denied = await h.call(
+      "fleet_checkpoint_pr_maintenance",
+      h.checkpoint(result.observation),
+    );
+    expect(denied.ok, denied.text).toBe(false);
+    expect(denied.text).toContain(expected);
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+        .observationClaims[0]?.receiptHash,
+    ).toBeUndefined();
+  });
+
+  it("rejects unknown, inflight, wrong-owner and wrong-record execution claims", async () => {
+    const h = await observationCommand();
+    const result = deadlineResult();
+    const args = h.checkpoint(result.observation);
+    const inflight = await h.call("fleet_checkpoint_pr_maintenance", args);
+    expect(inflight.ok).toBe(false);
+    expect(inflight.text).toContain("receipt_incomplete");
+    expect(h.f.result(h.execution, { attemptId: randomUUID() })).toBe(false);
+    h.finish(result);
+    h.completionTurn();
+    for (const wrong of [
+      { ...args, executionId: randomUUID() },
+      { ...args, recordId: randomUUID() },
+      {
+        ...args,
+        checkpoint: {
+          kind: "reconcile",
+          evidence: "Not observation authority",
+          progress: false,
+        },
+      },
+    ])
+      expect((await h.call("fleet_checkpoint_pr_maintenance", wrong)).ok).toBe(false);
+    expect(() =>
+      h.f.store.prMaintenance.checkpointObservationReceipt(
+        randomUUID(),
+        h.record.id,
+        h.record.version,
+        h.execution.id,
+        result.observation,
+      ),
+    ).toThrow("owned execution");
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+  });
+
+  it("rejects a helper snapshot from another generation despite an unchanged observation", async () => {
+    const h = await observationCommand();
+    const result = await observeFixture(fixtureInput(new Date().toISOString()));
+    result.snapshot.generation++;
+    h.finish(result);
+    h.completionTurn();
+    const denied = await h.call(
+      "fleet_checkpoint_pr_maintenance",
+      h.checkpoint(result.observation),
+    );
+    expect(denied.ok).toBe(false);
+    expect(denied.text).toContain("receipt_mismatch");
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+  });
+
+  it("rolls back observation and claim hash together; stale-version retry can only save the same exact result", async () => {
+    const h = await observationCommand();
+    const result = deadlineResult();
+    h.finish(result);
+    h.completionTurn();
+    const args = h.checkpoint(result.observation);
+    expect(() =>
+      h.f.store.writeAtomically(() => {
+        h.f.store.prMaintenance.checkpointObservationReceipt(
+          h.f.lead.id,
+          h.record.id,
+          h.record.version,
+          h.execution.id,
+          result.observation,
+        );
+        throw new Error("Injected enclosing transaction rollback");
+      }),
+    ).toThrow("Injected enclosing transaction rollback");
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toBeUndefined();
+    expect(
+      h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
+        .observationClaims[0]?.receiptHash,
+    ).toBeUndefined();
+    const reconciled = await h.call("fleet_checkpoint_pr_maintenance", {
+      recordId: h.record.id,
+      expectedVersion: h.record.version,
+      checkpoint: {
+        kind: "reconcile",
+        evidence: "Keep receipt pending.",
+        progress: false,
+      },
+    });
+    expect(reconciled.ok, reconciled.text).toBe(true);
+    const stale = await h.call("fleet_checkpoint_pr_maintenance", args);
+    expect(stale.ok).toBe(false);
+    expect(stale.text).toContain("version_conflict");
+    const saved = await h.call("fleet_checkpoint_pr_maintenance", {
+      ...args,
+      expectedVersion: JSON.parse(reconciled.text).version,
+    });
+    expect(saved.ok, saved.text).toBe(true);
+    expect(h.f.store.prMaintenance.get(h.record.id)?.lastAttempt).toEqual(
+      result.observation,
+    );
+  });
+
+  it.each([
+    "paused",
+    "manual-unknown",
+    "human-design",
+    "released",
+    "binding",
+    "owner",
+    "authorization",
+    "generation",
+    "head",
+  ] as const)("never applies old completion evidence after %s drift", async (drift) => {
+    const directory = resolve(".test-tmp", randomUUID());
+    mkdirSync(directory, { recursive: true });
+    directories.push(directory);
+    const path = join(directory, "host.sqlite");
+    const h = await observationCommand(path);
+    const result = deadlineResult();
+    h.finish(result);
+    h.completionTurn();
+    if (drift === "paused") {
+      h.f.store.prMaintenance.set(h.f.lead.id, {
+        id: h.record.id,
+        expectedVersion: h.record.version,
+        action: "pause",
+      });
+    } else if (drift === "manual-unknown") {
+      h.f.store.prMaintenance.beginManualControl(
+        h.record.workerSessionId,
+        {
+          id: randomUUID(),
+          digest: "synthetic-manual",
+          kind: "prompt",
+          operatorId: "human",
+        },
+        0,
+      );
+      expect(
+        h.f.store.prMaintenance.hasPendingManualExecution(h.record.workerSessionId),
+      ).toBe(true);
+    } else if (drift === "human-design") {
+      h.f.store.prMaintenance.holdForDecision(
+        h.f.lead.id,
+        h.record.id,
+        h.record.version,
+        {
+          id: "design",
+          version: 1,
+          proposal: "Human must decide",
+          headSha: h.record.authorization.headSha,
+          scope: h.record.authorization.scope.baseline,
+        },
+        () => h.f.store.setRunState(h.record.taskId, "awaiting_human"),
+      );
+    } else if (drift === "released") {
+      h.f.store.prMaintenance.operatorAction(
+        h.record.id,
+        h.record.version,
+        {
+          action: "release",
+          reason: "Operator release",
+        },
+        "operator",
+      );
+    } else if (drift === "binding") {
+      const placement = h.f.store.createPlacement(
+        h.f.store.createWorkspace("Changed binding", "").id,
+        h.f.node.id,
+        "C:\\changed-binding",
+      );
+      const db = new DatabaseSync(path);
+      try {
+        db.prepare("UPDATE sessions SET placement_id=? WHERE id=?").run(
+          placement.id,
+          h.record.workerSessionId,
+        );
+      } finally {
+        db.close();
+      }
+    } else if (drift === "owner") {
+      const other = h.f.store.createSession(h.f.placement, "Other lead", false, "lead", {
+        runRole: "lead",
+      });
+      h.f.store.updateRun(h.record.taskId, { leadSessionId: other.id });
+    } else if (drift === "authorization") {
+      h.f.store.prMaintenance.operatorAction(
+        h.record.id,
+        h.record.version,
+        { action: "renew" },
+        "operator",
+      );
+    } else {
+      // Isolated persisted-scope drift; never change a live grant.
+      const record = h.f.store.prMaintenance.get(h.record.id)!;
+      if (drift === "generation") record.generation++;
+      if (drift === "head") record.authorization.headSha = "c".repeat(40);
+      const db = new DatabaseSync(path);
+      try {
+        db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+          JSON.stringify(record),
+          record.id,
+        );
+      } finally {
+        db.close();
+      }
+    }
+    const current = h.f.store.prMaintenance.get(h.record.id)!;
+    const denied = await h.call("fleet_checkpoint_pr_maintenance", {
+      ...h.checkpoint(result.observation),
+      expectedVersion: current.version,
+    });
+    expect(denied.ok, denied.text).toBe(false);
+    expect(h.f.store.prMaintenance.get(h.record.id)).toEqual(current);
+    expect(h.f.store.commands.get(h.execution.id)?.outputComplete).toBe(true);
   });
 
   it("includes maintenance recovery in durable reminders for completed tasks without reopening them", () => {
