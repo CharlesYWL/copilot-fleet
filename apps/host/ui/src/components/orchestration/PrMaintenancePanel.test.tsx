@@ -331,7 +331,7 @@ describe("PR maintenance task controls", () => {
         .getAttribute("aria-current"),
     ).toBe("step");
     expect(within(graph).queryByRole("button", { name: /Fix feedback/ })).toBeNull();
-    expect(screen.getByText("Read-only; no repairs authorized")).toBeTruthy();
+    expect(screen.getByText("Read-only maintenance; no unattended repairs")).toBeTruthy();
   });
 
   it("invalidates the visible ready state after a failed refresh without dropping a retained record", async () => {
@@ -361,6 +361,127 @@ describe("PR maintenance task controls", () => {
       statusError: "The maintenance read failed",
     });
   });
+
+  it("explains normal session manual takeover without publication authorization or Release", async () => {
+    const record = registration();
+    record.authorization.scope.publicationAuthorized = false;
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: false,
+    });
+    show();
+    expect(
+      await screen.findByText(/Send a normal prompt to the retained worker/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/No Release or unattended publication grant is needed/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/pending design decisions still need explicit direction/),
+    ).toBeTruthy();
+  });
+
+  it("shows persistent manual control and unknown delivery without enabling release", async () => {
+    const record = registration();
+    record.pauseReason = "manual_control";
+    record.manualControl = {
+      operatorId: "supervisor",
+      takenAt: at,
+      commands: [
+        {
+          id: "manual",
+          digest: "input",
+          kind: "prompt",
+          operatorId: "supervisor",
+          eventSeqFrom: 0,
+          state: "unknown",
+          createdAt: at,
+        },
+      ],
+    };
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: true,
+    });
+    show();
+    expect(
+      await screen.findByText(
+        /Manual supervisor control — unattended maintenance is paused/,
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText(/Manual delivery has no correlated receipt/)).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: /Release/ }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it.each(["unknown", "accepted", "settled", "rejected"] as const)(
+    "preserves manual %s command gating in the Split page",
+    async (state) => {
+      const record = {
+        ...observed(),
+        lifecycle: "paused" as const,
+        pauseReason: "manual_control",
+      };
+      record.manualControl = {
+        operatorId: "supervisor",
+        takenAt: at,
+        commands: [
+          {
+            id: "manual",
+            digest: "input",
+            kind: "prompt",
+            operatorId: "supervisor",
+            eventSeqFrom: 0,
+            state,
+            createdAt: at,
+          },
+        ],
+      };
+      vi.mocked(getTaskMaintenance).mockResolvedValue({
+        records: [record],
+        canAuthorize: true,
+      });
+      const model = buildRunViewModels({
+        runs: [{ ...task, state: "completed" }],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+      expect(
+        taskOverview(model, [], { records: [record], canAuthorize: true }),
+      ).toMatchObject({
+        title: "Manual supervisor control",
+        attention: state === "unknown",
+      });
+      render(
+        <FluentProvider theme={fleetDarkTheme}>
+          <PrMaintenancePanel run={task} sessions={[worker]} onChange={vi.fn()} compact />
+        </FluentProvider>,
+      );
+      const graph = await screen.findByRole("group", {
+        name: "PR maintenance progress graph",
+      });
+      expect(
+        within(graph)
+          .getByRole("button", { name: "Reviews & checks: Manual control" })
+          .getAttribute("aria-current"),
+      ).toBe("step");
+      expect(
+        within(graph).queryByRole("button", { name: "Ready: Ready to merge" }),
+      ).toBeNull();
+      fireEvent.click(screen.getByText("Maintenance controls and evidence"));
+      const outstanding = state === "unknown" || state === "accepted";
+      for (const action of [
+        "Resume maintenance",
+        "Release maintenance",
+        "Renew maintenance budgets",
+      ]) {
+        expect(
+          (screen.getByRole("button", { name: action }) as HTMLButtonElement).disabled,
+        ).toBe(outstanding);
+      }
+    },
+  );
 
   it("authorizes a read-only proposal without claiming mutation rights even when response flags are true", async () => {
     const pending = proposal();

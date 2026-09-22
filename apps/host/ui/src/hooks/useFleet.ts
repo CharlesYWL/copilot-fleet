@@ -433,12 +433,21 @@ export function useFleet(notify: Notify) {
     [report],
   );
 
+  const sessionCommandKeys = useRef(new Map<string, string>());
   const command = useCallback(
     async (path: string, body?: unknown) => {
+      const sessionTurn = /^\/api\/sessions\/[^/]+\/(?:prompt|resume)$/.test(path);
+      const key = `${path}:${JSON.stringify(body)}`;
+      if (sessionTurn) {
+        const operationId = sessionCommandKeys.current.get(key) ?? crypto.randomUUID();
+        sessionCommandKeys.current.set(key, operationId);
+        body = { operationId, ...(typeof body === "object" && body ? body : {}) };
+      }
       const result = await request(path, {
         method: "POST",
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       });
+      if (result.ok) sessionCommandKeys.current.delete(key);
       return result.ok;
     },
     [request],

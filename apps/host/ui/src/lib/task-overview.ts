@@ -40,6 +40,11 @@ export function currentMaintenance(records: readonly PrMaintenanceRegistration[]
 
 export function hasOutstandingWork(record: PrMaintenanceRegistration) {
   return (
+    Boolean(
+      record.manualControl?.commands.some((command) =>
+        ["unknown", "accepted"].includes(command.state),
+      ),
+    ) ||
     record.incidents.some(
       (incident) => incident.kind === "effects" && !incident.resolvedAt,
     ) ||
@@ -188,6 +193,23 @@ export function taskOverview(
         summary:
           "Previously accepted work or unknown effects still need reconciliation before ownership can be released.",
         attention: true,
+      };
+    }
+    if (record.manualControl && !record.manualControl.endedAt) {
+      const unknown = record.manualControl.commands.some(
+        (command) => command.state === "unknown",
+      );
+      const accepted = record.manualControl.commands.some(
+        (command) => command.state === "accepted",
+      );
+      return {
+        title: "Manual supervisor control",
+        summary: unknown
+          ? "Manual delivery has no correlated receipt yet; do not replay it while unattended maintenance is paused."
+          : accepted
+            ? "The manual command is accepted; wait for its completion receipt while unattended maintenance stays paused."
+            : "Unattended maintenance stays paused; use the retained worker for manual work and explicitly resume maintenance when ready.",
+        attention: unknown,
       };
     }
     const stage = prMaintenanceProgress(record, nowMs).stage;

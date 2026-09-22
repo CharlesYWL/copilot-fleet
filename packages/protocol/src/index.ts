@@ -2336,6 +2336,7 @@ export const UpdateDefaultsSchema = z.object({
 });
 
 export const PromptSchema = z.object({
+  operationId: z.string().uuid().optional(),
   prompt: z.string().min(1).max(100_000),
   attachments: z
     .array(PromptAttachmentSchema)

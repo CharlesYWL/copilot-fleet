@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import {
@@ -31,6 +31,7 @@ import {
   type NodeUpdateStage,
   type Notification,
   type Placement,
+  type PromptAttachment,
   type StartupConfig,
   type Run,
   type RunNoteMetadata,
@@ -55,7 +56,7 @@ import { ManagedWorktreeService } from "./managed-worktree-service.js";
 import { CommandExecutionService } from "./command-execution-service.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
-import { PrMaintenanceError } from "./pr-maintenance-store.js";
+import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
 import {
   NotificationService,
   notificationAttemptKey,
@@ -549,6 +550,7 @@ export class FleetService {
       () => {
         const run = this.store.getRun(input.runId);
         const step = this.store.getRunStep(input.stepId);
+        const session = step && this.store.getSession(step.sessionId);
         if (
           !run ||
           run.state !== "cancelled" ||
@@ -556,7 +558,10 @@ export class FleetService {
           !step ||
           step.runId !== run.id ||
           step.state !== "cancelled" ||
-          !step.stoppedByOrchestrator
+          !step.stoppedByOrchestrator ||
+          !session ||
+          this.store.getSessionDispatchAttempt(step.sessionId)?.attempt !==
+            notificationAttemptKey(session, { step, run })
         ) {
           return undefined;
         }
@@ -914,10 +919,14 @@ export class FleetService {
   resumeSession(
     sessionId: string,
     activity = "Resuming Copilot session",
+    supervisor?: { operatorId: string; operationId?: string | undefined },
   ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
     if (!session) return { ok: false, status: 404, error: "Session not found" };
-    if (session.runRole !== "lead") {
+    const manual =
+      supervisor && this.supervisorCommand(sessionId, "resume_session", supervisor);
+    if (manual && this.isSupervisorRetry(sessionId, manual)) return { ok: true, session };
+    if (session.runRole !== "lead" && !manual) {
       const step = this.store.getRunStepBySession(session.id);
       const reference = step
         ? this.store.prMaintenance.referenceForStep(step.id, step.attempts)
@@ -979,6 +988,7 @@ export class FleetService {
     if (unsupported) return { ok: false, status: 409, error: unsupported };
     try {
       this.worktrees.validateSession(session);
+      if (manual) this.store.prMaintenance.assertManualAvailable(sessionId);
     } catch (error) {
       return {
         ok: false,
@@ -992,6 +1002,9 @@ export class FleetService {
       cause: "resume_requested",
     });
     this.publishSession(resumed);
+    const provenance: [undefined?, SupervisorCommand?] = manual
+      ? [undefined, manual]
+      : [];
     const dispatched = this.dispatch(
       session.nodeId,
       {
@@ -999,7 +1012,9 @@ export class FleetService {
         sessionId,
         localPath: placement.localPath,
         agentSessionId: session.agentSessionId,
-        contextOverflowRecoveryPrompt: contextOverflowRecoveryPrompt(session),
+        contextOverflowRecoveryPrompt: manual
+          ? undefined
+          : contextOverflowRecoveryPrompt(session),
         additionalDirectories: session.additionalDirectories ?? [],
         sequenceOffset: this.store.maxEventSequence(sessionId),
         yolo: session.yolo,
@@ -1009,10 +1024,116 @@ export class FleetService {
         readOnly: session.readOnly,
       },
       { state: "failed", activity: "Node disconnected before session resume" },
+      ...provenance,
     );
     if (!dispatched.sent) return { ok: false, status: 503, error: "Node is offline" };
 
     return { ok: true, session: resumed };
+  }
+
+  private supervisorCommand(
+    sessionId: string,
+    kind: SupervisorCommand["kind"],
+    supervisor: { operatorId: string; operationId?: string | undefined },
+    input?: { prompt: string; attachments: PromptAttachment[] },
+  ): SupervisorCommand | undefined {
+    if (
+      !this.store.prMaintenance.manualRecord(sessionId) &&
+      !this.store.prMaintenance.hasManualHistory(sessionId)
+    )
+      return undefined;
+    const digest = createHash("sha256")
+      .update(
+        JSON.stringify({
+          kind,
+          prompt: input?.prompt,
+          attachments: input?.attachments,
+        }),
+      )
+      .digest("hex");
+    // Keyless requests correlate only while delivery is unsettled. Once settled,
+    // another request is new intent; only an explicit UUID survives that ambiguity.
+    const pending = !supervisor.operationId
+      ? this.store.prMaintenance
+          .pendingManualCommands(sessionId)
+          .find(
+            (command) =>
+              command.digest === digest &&
+              command.operatorId === supervisor.operatorId &&
+              command.kind === kind,
+          )
+      : undefined;
+    return {
+      id: supervisor.operationId
+        ? createHash("sha256")
+            .update(JSON.stringify([sessionId, supervisor.operationId]))
+            .digest("hex")
+        : (pending?.id ?? randomUUID()),
+      digest,
+      kind,
+      operatorId: supervisor.operatorId,
+    };
+  }
+
+  private isSupervisorRetry(sessionId: string, command: SupervisorCommand): boolean {
+    this.store.prMaintenance.assertManualOperationUnambiguous(sessionId, command.id);
+    const previous = this.store.prMaintenance.manualCommand(sessionId, command.id);
+    if (!previous) return false;
+    if (
+      previous.digest !== command.digest ||
+      previous.operatorId !== command.operatorId ||
+      previous.kind !== command.kind
+    )
+      throw new PrMaintenanceError(
+        "manual_request_conflict",
+        "This request key already identifies different manual input.",
+      );
+    if (previous.state === "unknown" || previous.state === "rejected")
+      throw new PrMaintenanceError(
+        "manual_receipt",
+        `Manual delivery is ${previous.state}; the request was not replayed. Reconcile its receipt before a new request.`,
+      );
+    return true;
+  }
+
+  promptSession(
+    sessionId: string,
+    input: {
+      prompt: string;
+      attachments: PromptAttachment[];
+      operationId?: string | undefined;
+    },
+    operatorId?: string,
+  ): { ok: true } | { ok: false; status: number; error: string } {
+    const session = this.store.getSession(sessionId);
+    if (!session) return { ok: false, status: 404, error: "Session not found" };
+    const manual = operatorId
+      ? this.supervisorCommand(
+          sessionId,
+          "prompt",
+          { operatorId, operationId: input.operationId },
+          input,
+        )
+      : undefined;
+    if (manual && this.isSupervisorRetry(sessionId, manual)) return { ok: true };
+    if (session.stopRequested)
+      return { ok: false, status: 409, error: "Session is stopping" };
+    if (session.state !== "idle")
+      return { ok: false, status: 409, error: "Session must be idle" };
+    if (!manual)
+      this.store.prMaintenance.assertAdmission({ sessionId, action: "prompt" });
+    const provenance: [undefined?, SupervisorCommand?] = manual
+      ? [undefined, manual]
+      : [];
+    const dispatched = this.dispatch(
+      session.nodeId,
+      { type: "prompt", sessionId, prompt: input.prompt, attachments: input.attachments },
+      { state: "failed", activity: "Node disconnected before prompt" },
+      ...provenance,
+    );
+    return dispatched.sent
+      ? { ok: true }
+      : { ok: false, status: 503, error: "Node disconnected" };
   }
 
   /**
@@ -1106,6 +1227,7 @@ export class FleetService {
     request: CommandRequest,
     fallback?: DispatchFallback,
     attemptOverride?: string,
+    supervisor?: SupervisorCommand,
   ): DispatchResult {
     const commandSession = this.store.getSession(request.sessionId);
     if (
@@ -1169,17 +1291,20 @@ export class FleetService {
           const reference = step
             ? this.store.prMaintenance.referenceForStep(step.id, step.attempts)
             : undefined;
-          this.store.prMaintenance.assertAdmission({
-            action: "execute",
-            sessionId: session.id,
-            placementId: session.placementId,
-            ...(session.runId ? { taskId: session.runId } : {}),
-            ...(session.executionBinding
-              ? { checkoutKey: session.executionBinding.checkoutKey }
-              : {}),
-            ...(reference ?? {}),
-          });
+          if (supervisor) this.store.prMaintenance.assertManualAvailable(session.id);
+          else
+            this.store.prMaintenance.assertAdmission({
+              action: "execute",
+              sessionId: session.id,
+              placementId: session.placementId,
+              ...(session.runId ? { taskId: session.runId } : {}),
+              ...(session.executionBinding
+                ? { checkoutKey: session.executionBinding.checkoutKey }
+                : {}),
+              ...(reference ?? {}),
+            });
           if (
+            !supervisor &&
             reference &&
             request.type !== "resume_session" &&
             request.prompt !== step?.prompt
@@ -1209,12 +1334,14 @@ export class FleetService {
       ) {
         const session = this.store.getSession(request.sessionId);
         if (!session) return { sent: false };
-        const commandId = randomUUID();
+        const commandId = supervisor?.id ?? randomUUID();
         let binding = session.executionBinding;
         if (binding && request.type !== "prompt") {
           binding = { ...binding, leaseAttempt: commandId };
         }
-        const attempt = attemptOverride ?? this.dispatchAttemptKey(session);
+        const attempt = supervisor
+          ? `manual:${commandId}`
+          : (attemptOverride ?? this.dispatchAttemptKey(session));
         const eventSeqFrom =
           request.type === "resume_session"
             ? request.sequenceOffset
@@ -1222,6 +1349,18 @@ export class FleetService {
         // A new attempt must not inherit a stop/cancel or completion receipt
         // from the old one, and its sequence boundary must be durable before send.
         this.store.writeAtomically(() => {
+          if (supervisor) {
+            if (request.type !== supervisor.kind)
+              throw new PrMaintenanceError(
+                "manual_request_conflict",
+                "Manual command kind changed before delivery.",
+              );
+            this.store.prMaintenance.beginManualControl(
+              session.id,
+              supervisor,
+              eventSeqFrom,
+            );
+          }
           // Resume is an authoritative reattachment, not a new checkout owner.
           // Persist its fencing attempt and dispatch receipt as one transition.
           if (binding && request.type !== "prompt")
@@ -1239,8 +1378,15 @@ export class FleetService {
         });
         // The current fleet preference also applies to adopted conversations,
         // automatic recovery, and orchestration, not just the new-session UI.
+        const manualPrompt =
+          supervisor &&
+          request.type === "prompt" &&
+          this.store.prMaintenance.manualRecord(session.id)
+            ? `${request.prompt}\n\n<fleet-manual-control>\nThe human supervisor has taken manual control of this retained worker. Unattended PR maintenance is paused and must remain paused after this turn. Follow the human's direction; this handoff itself does not authorize unattended publication, certify PR readiness, or approve pending design decisions. Preserve retained scope and receipts; do not restart maintenance.\n</fleet-manual-control>`
+            : undefined;
         const command = {
           ...request,
+          ...(manualPrompt ? { prompt: manualPrompt } : {}),
           ...(session.runRole === "lead" &&
           this.store.prMaintenance.list({
             leadSessionId: session.id,
@@ -1254,7 +1400,7 @@ export class FleetService {
           ...(binding?.worktreeId &&
           (request.type === "start_session" || request.type === "prompt")
             ? {
-                prompt: `${request.prompt}\n\n<fleet-workspace>\nUse only this bound checkout for repository work: ${binding.cwd}\nWorktree ${binding.worktreeId}, generation ${binding.generation}. The catalog placement is the source, not your writable cwd. This may be a per-step or composed DAG workspace; never substitute another predecessor or the source checkout. Do not create/remove worktrees or integrate/push automatically; those are managed operations. This binding is not a filesystem sandbox.\n</fleet-workspace>`,
+                prompt: `${manualPrompt ?? request.prompt}\n\n<fleet-workspace>\nUse only this bound checkout for repository work: ${binding.cwd}\nWorktree ${binding.worktreeId}, generation ${binding.generation}. The catalog placement is the source, not your writable cwd. This may be a per-step or composed DAG workspace; never substitute another predecessor or the source checkout. Do not create/remove worktrees or integrate/push automatically; those are managed operations. This binding is not a filesystem sandbox.\n</fleet-workspace>`,
               }
             : {}),
           ...(binding ? { executionBinding: binding } : {}),
@@ -1278,6 +1424,10 @@ export class FleetService {
           commandId,
         } as NodeCommand;
         this.send(socket, HostToNodeMessageSchema.parse({ type: "command", command }));
+        if (supervisor && session.runId) {
+          this.publishSnapshot();
+          this.publishRunSteps(session.runId, this.store.listRunSteps(session.runId));
+        }
         return { sent: true };
       }
       if (request.type !== "delete_session") {
@@ -1706,6 +1856,35 @@ export class FleetService {
       const kind = session.readOnly ? "read-only" : "writing";
       const held = kind === "read-only" ? reservedReading : reservedWriting;
       if (held >= capacityFor(node, kind)) continue;
+      if (this.store.prMaintenance.hasPendingManualExecution(session.id)) continue;
+      const retained = this.store.prMaintenance.manualRecord(session.id);
+      if (retained?.manualControl && !retained.manualControl.endedAt) {
+        // Reconnect may reattach a settled manual conversation, never replay a
+        // prompt or consume a queued maintenance attempt.
+        const result = this.resumeSession(session.id, "Reconnecting manual session", {
+          operatorId: retained.manualControl.operatorId,
+          operationId: randomUUID(),
+        });
+        if (result.ok) {
+          if (kind === "read-only") reservedReading += 1;
+          else reservedWriting += 1;
+          resumed += 1;
+        }
+        continue;
+      }
+      if (retained) {
+        const step = this.store.getRunStepBySession(session.id);
+        if (
+          !this.store.prMaintenance.admission({
+            action: "resume",
+            sessionId: session.id,
+            ...(step
+              ? this.store.prMaintenance.referenceForStep(step.id, step.attempts)
+              : {}),
+          }).allowed
+        )
+          continue;
+      }
       const placement = this.store.getPlacement(session.placementId);
       if (!placement) continue;
       if (yoloUnsupportedReason(node, session.yolo)) continue;
@@ -1800,6 +1979,7 @@ export class FleetService {
   }
 
   handleEventResult(event: SessionEvent): EventHandlingResult {
+    let manualReceiptChanged = false;
     type WriteResult = {
       outcome: "accepted" | "permanent_rejection";
       reason?: "session_missing" | "identity_conflict";
@@ -1847,6 +2027,29 @@ export class FleetService {
           notifyListeners: false,
         };
       }
+
+      const dispatch = this.store.getSessionDispatchAttempt(session.id);
+      const manual =
+        dispatch &&
+        this.store.prMaintenance.manualCommand(session.id, dispatch.commandId);
+      const manualState =
+        event.type === "state" ? eventPayload(event, "state")?.state : undefined;
+      if (
+        manual &&
+        this.store.getSessionDispatchAttempt(session.id)?.commandId === manual.id &&
+        event.sequence > manual.eventSeqFrom &&
+        ((manual.kind === "prompt" && event.type === "turn_complete") ||
+          (manualState !== undefined &&
+            canTransition(session.state, manualState) &&
+            (!session.dismissed || terminalSessionStates.has(manualState)) &&
+            (terminalSessionStates.has(manualState) ||
+              (manual.kind === "resume_session" && manualState === "idle"))))
+      )
+        manualReceiptChanged = this.store.prMaintenance.recordManualReceipt(
+          session.id,
+          manual.id,
+          "settled",
+        );
 
       if (event.type === "state") {
         const payload = eventPayload(event, "state");
@@ -1952,7 +2155,7 @@ export class FleetService {
           this.store.setSessionTurnCompletion(session.id, {
             eventId: event.eventId,
             sequence: event.sequence,
-            attempt: notificationAttemptKey(session, context),
+            attempt: dispatch?.attempt ?? notificationAttemptKey(session, context),
           });
         }
       } else if (event.type === "permission") {
@@ -2007,6 +2210,7 @@ export class FleetService {
     };
 
     const afterCommit = (result: WriteResult): void => {
+      if (manualReceiptChanged) this.publishSnapshot();
       if (result.skipped > 0) {
         this.log.warn(
           { sessionId: event.sessionId, skipped: result.skipped },

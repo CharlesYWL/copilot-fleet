@@ -183,7 +183,9 @@ export function PrMaintenanceGraph({
     ["merged", "closed"].includes(record.lifecycle) && hasOutstandingWork(record);
   const label = unavailable
     ? "Status unavailable"
-    : `${maintenanceStageLabels[stage]}${unsettled ? " / settling effects" : ""}`;
+    : stage === "paused" && record.manualControl && !record.manualControl.endedAt
+      ? "Manual control"
+      : `${maintenanceStageLabels[stage]}${unsettled ? " / settling effects" : ""}`;
   const nodes: { id: GraphNode; title: string }[] = [
     { id: "linked", title: "PR linked" },
     { id: "review", title: "Reviews & checks" },
@@ -309,7 +311,7 @@ export function PrMaintenanceGraph({
               ? "No new repairs; reconciliation pending"
               : "Maintenance ended; no new repairs"
             : readOnly
-              ? "Read-only; no repairs authorized"
+              ? "Read-only maintenance; no unattended repairs"
               : "Bounded repairs; never auto-merges"}
         </span>
         <span>Select a stage for details</span>
