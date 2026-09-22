@@ -33,6 +33,8 @@ const scope = {
   baseline: "Preserve the approved API and existing null invariant.",
   verification: "Run the existing unit tests.",
   publicationAuthorized: true as const,
+  replies: true,
+  resolveThreads: true,
 };
 const identity = {
   host: "github.com",
@@ -109,6 +111,7 @@ function setup(store = storeAt(), name = randomUUID()) {
     stepKey: "implementation",
     title: "Repair",
     prompt: "Original work",
+    category: "implement",
   });
   store.updateRunStep(step.id, {
     sessionId: worker.id,
@@ -147,6 +150,19 @@ function observe(
       ...overrides,
     },
   });
+}
+
+function restoreLegacy(f: ReturnType<typeof setup>) {
+  const record = f.store.prMaintenance.enableFromOperator(f.input, "legacy-operator");
+  const backup = f.store.prMaintenance.exportBackup();
+  const legacy = backup.registrations.find((entry) => entry.id === record.id)!;
+  Object.assign(legacy.authorization.scope, {
+    publicationAuthorized: false,
+    replies: false,
+    resolveThreads: false,
+  });
+  f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+  return f.store.prMaintenance.get(record.id)!;
 }
 function prepare(
   f: ReturnType<typeof setup>,
@@ -1623,15 +1639,7 @@ describe("durable PR maintenance registry", () => {
     paths.push(path);
     const db = join(path, "host.sqlite");
     const f = setup(storeAt(db));
-    f.input.scope = PrMaintenanceEnableSchema.parse({
-      ...f.input,
-      scope: {
-        baseline: "Preserve design",
-        verification: "Native tests",
-        publicationAuthorized: false,
-      },
-    }).scope;
-    const record = f.store.prMaintenance.enableFromOperator(f.input, "original");
+    const record = restoreLegacy(f);
     const command = {
       id: randomUUID(),
       digest: "exact-input-digest",
@@ -1756,153 +1764,115 @@ describe("durable PR maintenance registry", () => {
     expect(resumed.authorization).toEqual(record.authorization);
   });
   it.each(["omitted", "false"] as const)(
-    "preserves read-only %s authority through proposal, observation and fallback without mutations",
+    "rejects new read-only %s authority instead of silently granting repairs",
     (permission) => {
       const f = setup();
-      const proposal = f.store.prMaintenance.propose(f.lead.id, {
+      const input = {
         ...f.input,
         scope: {
           baseline: "Read-only verification; NO repair or publication.",
           verification: "Inspect provider metadata only.",
           ...(permission === "false" ? { publicationAuthorized: false } : {}),
         },
-      });
-      expect(proposal.registration.scope.publicationAuthorized).toBe(false);
-      expect(proposal.registration.scope).toMatchObject({
-        replies: false,
-        resolveThreads: false,
-        reviewers: [],
-        retryChecks: false,
-      });
-      let record = f.store.prMaintenance.authorizeProposal(
-        f.task.id,
-        proposal.id,
-        proposal.version,
-        "operator",
-      );
-      record = observe(f, record, {
-        sources: [],
-        checksComplete: true,
-        reviewsComplete: true,
-        mergeability: "mergeable",
-      });
-      record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
-        kind: "ready",
-        fingerprint: "fingerprint-1",
-        evidence: "Observed readiness, not authorization to publish.",
-      });
-      expect(prMaintenanceProgress(record).stage).toBe("ready");
-      for (const kind of ["repair", "answer"] as const)
-        expect(() => prepare(f, record, `${kind}-forbidden`, kind)).toThrow(
-          /Read-only maintenance/,
-        );
-      for (const action of [
-        "dispatch",
-        "execute",
-        "prompt",
-        "resume",
-        "publish",
-      ] as const)
-        expect(
-          f.store.prMaintenance.admission({
-            action,
-            recordId: record.id,
-            taskId: f.task.id,
-            sessionId: f.worker.id,
-          }),
-        ).toMatchObject({ allowed: false, reason: "publication_not_authorized" });
-      for (const kind of [
-        "push",
-        "reply",
-        "resolve",
-        "review_request",
-        "ci_retry",
-        "notification",
-      ] as const)
-        expect(() =>
-          f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
-            kind: "action",
-            effect: {
-              key: `${kind}-forbidden`,
-              kind,
-              state: "reserved",
-              headSha: sha,
-              actor: "lead",
-              actionIdentity: `${kind}-forbidden`,
-            },
-          }),
-        ).toThrow(/Read-only maintenance/);
-      record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
-        kind: "fallback",
-        error: "Local read-only helper unavailable.",
-        observation: {
-          attemptedAt: at,
-          complete: false,
-          failure: "capability",
-          evidence: "No provider mutation was attempted.",
-        },
-      });
-      const incidentId = record.incidents[0]!.id;
-      f.store.prMaintenance.beginWake(f.lead.id, "read-only-recovery");
-      expect(f.store.prMaintenance.takeDue(f.lead.id, "read-only-recovery")?.id).toBe(
-        record.id,
-      );
-      record = f.store.prMaintenance.checkpoint(
-        f.lead.id,
-        record.id,
-        record.version,
-        {
-          kind: "alternate_attempt",
-          incidentId,
-          resolutionId: "read-only-evidence",
-          provenance: {
-            source: "github.com",
-            method: "Read-only MCP observation",
-            evidenceRef: "https://github.com/example/main/pull/1",
-          },
-          requests: 1,
-        },
-        "read-only-recovery",
-      );
-      record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
-        kind: "alternate_observation",
-        incidentId,
-        resolutionId: "read-only-evidence",
-        observation: {
-          ...record.observation!,
-          attemptedAt: at,
-          evidence: "Fresh read-only alternate observation.",
-        },
-      });
-      expect(record.incidents[0]!.resolution).toBe("alternate_observation");
-      expect(record.authorization.scope.publicationAuthorized).toBe(false);
-      expect(record.batches).toEqual([]);
-      expect(record.actions).toEqual([]);
-      expect(record.counters).toMatchObject({
-        repairBatches: 0,
-        answerBatches: 0,
-        mutationAttempts: 0,
-      });
-      expect(() => prepare(f, record)).toThrow(/Read-only maintenance/);
+      };
+      expect(() =>
+        f.store.prMaintenance.propose(f.lead.id, PrMaintenanceEnableSchema.parse(input)),
+      ).toThrow();
+      expect(() =>
+        f.store.prMaintenance.enableFromOperator(
+          PrMaintenanceEnableSchema.parse(input),
+          "operator",
+        ),
+      ).toThrow();
+      expect(f.store.prMaintenance.list().records).toEqual([]);
+      expect(f.store.prMaintenance.getProposal(f.task.id)).toBeUndefined();
     },
   );
 
+  it("preserves legacy history without enrollment, scheduling, readiness or writes and requires pinned reauthorization", () => {
+    const f = setup();
+    let record = restoreLegacy(f);
+    const originalAuthorization = record.authorization;
+    expect(prMaintenanceProgress(record).stage).toBe("authorization_required");
+    f.store.prMaintenance.beginWake(f.lead.id, "legacy");
+    expect(f.store.prMaintenance.takeDue(f.lead.id, "legacy")).toBeUndefined();
+    expect(f.store.prMaintenance.wakeEligibleLeadIds()).toEqual([]);
+    for (const action of [
+      { action: "resume" as const },
+      { action: "renew" as const, scope: f.input.scope },
+    ])
+      expect(() =>
+        f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          action,
+          "operator",
+        ),
+      ).toThrow(/repair proposal/);
+    for (const kind of ["repair", "answer"] as const)
+      expect(() => prepare(f, record, `${kind}-forbidden`, kind)).toThrow(
+        /Read-only maintenance/,
+      );
+    for (const action of ["dispatch", "execute", "prompt", "resume", "publish"] as const)
+      expect(
+        f.store.prMaintenance.admission({
+          action,
+          recordId: record.id,
+          taskId: f.task.id,
+          sessionId: f.worker.id,
+        }),
+      ).toMatchObject({ allowed: false });
+    for (const kind of [
+      "push",
+      "reply",
+      "resolve",
+      "review_request",
+      "ci_retry",
+      "notification",
+    ] as const)
+      expect(() =>
+        f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+          kind: "action",
+          effect: {
+            key: `${kind}-forbidden`,
+            kind,
+            state: "reserved",
+            headSha: sha,
+            actor: "lead",
+            actionIdentity: `${kind}-forbidden`,
+          },
+        }),
+      ).toThrow(/Read-only maintenance/);
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    expect(proposal.reauthorization).toEqual({
+      recordId: record.id,
+      version: record.version,
+      generation: record.generation,
+    });
+    record = f.store.prMaintenance.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "new-operator",
+    );
+    expect(record.authorization.scope.publicationAuthorized).toBe(true);
+    expect(record.authorizationHistory).toEqual([originalAuthorization]);
+    expect(record.lifecycle).toBe("paused");
+    expect(record.generation).toBe(1);
+    expect(record.ownershipReleasedAt).toBeUndefined();
+    expect(f.store.prMaintenance.list().records).toHaveLength(1);
+    record = f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      { action: "resume" },
+      "new-operator",
+    );
+    expect(record.lifecycle).toBe("active");
+  });
+
   it("cannot disguise a provider mutation as an internal notification under a read-only grant", () => {
     const f = setup();
-    const record = observe(
-      f,
-      f.store.prMaintenance.enableFromOperator(
-        {
-          ...f.input,
-          scope: {
-            baseline: "Observation only.",
-            verification: "Read evidence.",
-            publicationAuthorized: false,
-          },
-        },
-        "operator",
-      ),
-    );
+    const record = restoreLegacy(f);
     expect(() =>
       f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
         kind: "action",
@@ -1919,6 +1889,167 @@ describe("durable PR maintenance registry", () => {
     expect(f.store.prMaintenance.get(record.id)?.actions).toEqual([]);
     expect(f.store.prMaintenance.get(record.id)?.counters.mutationAttempts).toBe(0);
     expect(() => prepare(f, record)).toThrow(/Read-only maintenance/);
+  });
+
+  it("reads legacy active records and pending proposals losslessly across restart and backup without upgrading authority", () => {
+    const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+    mkdirSync(path, { recursive: true });
+    paths.push(path);
+    const dbPath = join(path, "host.sqlite");
+    const f = setup(storeAt(dbPath));
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    const record = observe(
+      f,
+      f.store.prMaintenance.enableFromOperator(f.input, "legacy-operator"),
+    );
+    const legacy = structuredClone(record);
+    Object.assign(legacy.authorization.scope, {
+      publicationAuthorized: false,
+      replies: false,
+      resolveThreads: false,
+    });
+    Object.assign(proposal.registration.scope, {
+      publicationAuthorized: false,
+      replies: false,
+      resolveThreads: false,
+    });
+    f.store.close();
+    stores.splice(stores.indexOf(f.store), 1);
+    const db = new DatabaseSync(dbPath);
+    db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+      JSON.stringify(legacy),
+      record.id,
+    );
+    db.prepare("INSERT INTO pr_maintenance_proposals(task_id,data) VALUES (?,?)").run(
+      f.task.id,
+      JSON.stringify(proposal),
+    );
+    db.close();
+    const reopened = storeAt(dbPath);
+    expect(reopened.prMaintenance.get(record.id)).toEqual(legacy);
+    expect(reopened.prMaintenance.getProposal(f.task.id)).toEqual(proposal);
+    expect(reopened.prMaintenance.listApprovals()).toEqual([]);
+    expect(prMaintenanceProgress(reopened.prMaintenance.get(record.id)!).stage).toBe(
+      "authorization_required",
+    );
+    expect(reopened.prMaintenance.wakeEligibleLeadIds()).toEqual([]);
+    reopened.prMaintenance.beginWake(f.lead.id, "legacy-active");
+    expect(reopened.prMaintenance.takeDue(f.lead.id, "legacy-active")).toBeUndefined();
+    expect(() =>
+      reopened.prMaintenance.authorizeProposal(
+        f.task.id,
+        proposal.id,
+        proposal.version,
+        "operator",
+      ),
+    ).toThrow(/Observation-only/);
+    expect(() =>
+      reopened.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+        kind: "ready",
+        fingerprint: "fingerprint-1",
+        evidence: "Legacy cannot be ready",
+      }),
+    ).toThrow();
+    const restored = storeAt();
+    restored.replaceHostBackup(reopened.exportHostBackup({ enrollmentToken: "" }));
+    expect(restored.prMaintenance.get(record.id)?.authorization).toEqual(
+      legacy.authorization,
+    );
+    expect(restored.prMaintenance.get(record.id)?.lastAttempt).toEqual(
+      legacy.lastAttempt,
+    );
+    expect(restored.prMaintenance.getProposal(f.task.id)).toEqual(proposal);
+    expect(restored.prMaintenance.listApprovals()).toEqual([]);
+    expect(restored.prMaintenance.get(record.id)?.lifecycle).toBe("paused");
+    expect(restored.prMaintenance.wakeEligibleLeadIds()).toEqual([]);
+    expect(reopened.prMaintenance.get(record.id)).toEqual(legacy);
+    expect(() =>
+      restored.prMaintenance.propose(f.lead.id, f.input, proposal.version),
+    ).toThrow(/Settle existing work/);
+    reopened.prMaintenance.propose(f.lead.id, f.input, proposal.version);
+    const archived = reopened
+      .listRunNotes(f.task.id)
+      .find((note) => note.summary?.startsWith("Superseded legacy"));
+    expect(archived).toBeDefined();
+    expect(JSON.parse(archived!.body)).toEqual(proposal);
+  });
+
+  it.each(["terminal", "decision", "manual", "stale"] as const)(
+    "does not use repair reauthorization to bypass a legacy %s fence",
+    (fence) => {
+      const f = setup();
+      let record = restoreLegacy(f);
+      if (fence === "terminal") {
+        const backup = f.store.prMaintenance.exportBackup();
+        backup.registrations[0]!.lifecycle = "closed";
+        f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+        record = f.store.prMaintenance.get(record.id)!;
+      }
+      if (fence === "decision")
+        record = f.store.prMaintenance.holdForDecision(
+          f.lead.id,
+          record.id,
+          record.version,
+          {
+            id: "legacy-decision",
+            version: 1,
+            proposal: "Change contract?",
+            scope: "Design",
+            headSha: sha,
+          },
+          () => f.store.updateRun(f.task.id, { state: "awaiting_human" }),
+        );
+      if (fence === "manual")
+        f.store.prMaintenance.beginManualControl(
+          f.worker.id,
+          {
+            id: randomUUID(),
+            digest: "legacy-input",
+            kind: "prompt",
+            operatorId: "human",
+          },
+          0,
+        );
+      if (fence === "stale") {
+        const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+        record = f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "pause", reason: "Changed since review" },
+          "human",
+        );
+        expect(() =>
+          f.store.prMaintenance.authorizeProposal(
+            f.task.id,
+            proposal.id,
+            proposal.version,
+            "human",
+          ),
+        ).toThrow(/changed/);
+      } else expect(() => f.store.prMaintenance.propose(f.lead.id, f.input)).toThrow();
+      expect(
+        f.store.prMaintenance.get(record.id)?.authorization.scope.publicationAuthorized,
+      ).toBe(false);
+      expect(f.store.prMaintenance.get(record.id)?.ownershipReleasedAt).toBeUndefined();
+    },
+  );
+
+  it("does not let API or advanced proposals upgrade an original read-only worker category", () => {
+    const f = setup();
+    f.store.upsertRunStep(f.task.id, {
+      stepKey: f.step.stepKey,
+      title: "Review only",
+      prompt: "No writes",
+      category: "review",
+    });
+    f.store.updateRunStep(f.step.id, { sessionId: f.worker.id, state: "succeeded" });
+    expect(() => f.store.prMaintenance.propose(f.lead.id, f.input)).toThrow(
+      /read-only categories/,
+    );
+    expect(() => f.store.prMaintenance.enableFromOperator(f.input, "operator")).toThrow(
+      /read-only categories/,
+    );
+    expect(f.store.prMaintenance.list().records).toEqual([]);
   });
 
   it.each([
@@ -1938,10 +2069,10 @@ describe("durable PR maintenance registry", () => {
       },
     };
     expect(() => f.store.prMaintenance.propose(f.lead.id, input)).toThrow(
-      /Read-only maintenance/,
+      /Observation-only maintenance/,
     );
     expect(() => f.store.prMaintenance.enableFromOperator(input, "operator")).toThrow(
-      /Read-only maintenance/,
+      /Observation-only maintenance/,
     );
     expect(f.store.prMaintenance.getProposal(f.task.id)).toBeUndefined();
     expect(f.store.prMaintenance.list().records).toEqual([]);
@@ -2652,6 +2783,7 @@ describe("durable PR maintenance registry", () => {
       stepKey: "second-worker",
       title: "Second worker",
       prompt: "Independent checkout",
+      category: "implement",
     });
     f.store.updateRunStep(step.id, {
       sessionId: worker.id,

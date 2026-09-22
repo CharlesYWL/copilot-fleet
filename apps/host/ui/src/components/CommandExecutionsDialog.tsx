@@ -506,11 +506,7 @@ export function CommandExecutionsDialog({
                       <dt>Pull request</dt>
                       <dd>{prMaintenanceUrl(selectedProposal.identity)}</dd>
                       <dt>Proposed mode</dt>
-                      <dd>
-                        {selectedProposal.mode === "observe"
-                          ? "Read-only observation"
-                          : "Bounded repairs"}
-                      </dd>
+                      <dd>Bounded repairs</dd>
                       <dt>Requested</dt>
                       <dd>{new Date(selectedProposal.createdAt).toLocaleString()}</dd>
                     </dl>

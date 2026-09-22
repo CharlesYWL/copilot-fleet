@@ -51,10 +51,11 @@ async function setup(
     stepKey: "work",
     title: "Work",
     prompt: "original",
+    category: "implement",
     placementId: placement.id,
   });
   store.updateRunStep(step.id, { state: "succeeded", sessionId: worker.id });
-  const record = store.prMaintenance.enableFromOperator(
+  let record = store.prMaintenance.enableFromOperator(
     {
       taskId: task.id,
       workerSessionId: worker.id,
@@ -73,13 +74,19 @@ async function setup(
       scope: {
         baseline: "Preserve design",
         verification: "Native tests",
-        publicationAuthorized,
+        publicationAuthorized: true,
       },
       headSha,
       eligibilityEvidence: "Fixture existing bound checkout",
     },
     "original-operator",
   );
+  if (!publicationAuthorized) {
+    const backup = store.prMaintenance.exportBackup();
+    backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
+    store.writeAtomically(() => store.prMaintenance.importBackup(backup));
+    record = store.prMaintenance.get(record.id)!;
+  }
   if (mode === "no-auth") store.setSetting(AUTH_MODE_SETTING, NO_AUTH_PRINCIPAL);
   const auth = new FleetAuth({
     store,
@@ -381,7 +388,7 @@ describe("trusted supervisor session handoff", () => {
             taskId: f.task.id,
             workerSessionId: f.worker.id,
             identity: record.identity,
-            scope: record.authorization.scope,
+            scope: { ...record.authorization.scope, publicationAuthorized: true },
             headSha,
             eligibilityEvidence: "Same retained checkout",
           },
@@ -425,7 +432,7 @@ describe("trusted supervisor session handoff", () => {
               taskId: f.task.id,
               workerSessionId: f.worker.id,
               identity: record.identity,
-              scope: record.authorization.scope,
+              scope: { ...record.authorization.scope, publicationAuthorized: true },
               headSha,
               eligibilityEvidence: "Same checkout, but delivery has no receipt yet",
             },

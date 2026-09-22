@@ -120,7 +120,8 @@ unsafe `cmd /c` fallback. Unix launches `az` directly with an argument array.
 CLI dynamic extension installation and telemetry are disabled for that process.
 
 Each wake has at most 40 attempted operations and 120 seconds. Token acquisition
-counts as one operation, including failure; fixture transports skip it. Every
+counts as one operation, including failure; fixture transports can inject
+`acquireToken` to exercise the same charged authentication seam. Every
 initiated HTTP read counts, including failed reads. Each operation is limited to
 15 seconds or the remaining deadline, whichever is shorter. No automatic retries.
 Only generated `https://dev.azure.com/<organization>/<project>/_apis/...` GET
@@ -146,7 +147,7 @@ unknown overflow is a recoverable evidence byte limit.
 
 Exports:
 
-- `observe(input, {request?, now?})`: returns the result below **including**
+- `observe(input, {request?, now?, acquireToken?})`: returns the result below **including**
   `observation`; fixture `request({method:"GET",url,timeoutMs,maxBytes})` returns
   `{status,headers?,body}` with object or JSON-text body. It receives no token.
 - `runCli()`: reads bounded stdin, writes one JSON object, exits 0 for complete
@@ -182,9 +183,10 @@ retain a last-safe scan; any resumed attempt still repeats full verification.
 If discovery has no registration, retain the incomplete receipt and continuation
 in existing execution/task evidence, not a fabricated recordId checkpoint.
 Fresh exact metadata from an independently authorized provider read may support
-an **observe-only, unapproved proposal** despite incomplete helper collection.
-It cannot establish checks/reviews completeness, triage or readiness, enable
-repair, or clear access/design holds. Approval remains the authenticated operator's
+an unapproved **repair proposal** only with verified existing task and publication
+authority. Observation-only enrollment is unsupported. Metadata alone cannot
+establish checks/reviews completeness, triage or readiness, enable repair, or
+clear access/design holds. Approval remains the authenticated operator's
 separate action; registered recovery requires its existing claimed visit.
 
 **Collection completeness is separate from readiness completeness.**
@@ -211,8 +213,8 @@ effects, handled sources, and previous thread states. They contain no executable
 URL or credential. Digests detect corruption, **not malicious forgery**:
 continuations are trusted registry/helper data, never PR text.
 Every resumed wake rereads PR metadata. Previously verified pages receive **no
-verification credit**: a full fresh pass rereads every collected page, every
-thread's complete comments, evaluations, configurations, build, status, iteration,
+verification credit**: a full fresh pass rereads every collected page, the complete
+thread/comment collection, evaluations, configurations, build, status, iteration,
 and branch refs, then rereads PR metadata again. Edits invalidate the scan even if
 PR metadata timestamps do not change. Verification starts only if the complete
 pass fits this wake's remaining request allowance.
@@ -224,6 +226,25 @@ tokens are encoded as query data and scoped to that exact ref/repository.
 Evaluations use documented `$top=100`/`$skip` pages and probe the next page after
 a full page. Endpoints documented as “all” collections have no invented
 pagination: unexpected continuation/link/truncation signals fail closed.
+
+The [REST 7.1 threads list contract](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-request-threads/list?view=azure-devops-rest-7.1)
+retrieves **all** threads; `GitPullRequestCommentThread.comments` contains the initial
+comment and subsequent replies. There is no documented comment-preview or threads
+pagination parameter. Both passes read this unfiltered list (not only active
+threads), validating every comment ID/type/revision/body and thread state. They do
+not issue an additional comments request per thread. Missing arrays, duplicate
+IDs, unexpected continuation, overflow or a changed second pass fail closed.
+The total comments across threads still has the 200-item limit.
+
+A fixture with 40 mixed-state threads and 80 comments takes 19 initiated operations:
+one token acquisition, two metadata reads, and eight collection reads on each
+pass. Builds and documented ref/evaluation pages can increase that count; 39
+operations remain the normal repair allowance and 40/120 seconds the wake bounds.
+New continuations carry `collectionVersion: 2`. Old per-thread continuations are
+preserved as historical evidence but rejected as `invalid_resume`, never given
+verification credit or converted to a write grant. A later authorized fresh
+collection must use its actual remaining budget/deadline; do not repeatedly replay
+an incompatible continuation or reset the allowance.
 
 Failures distinguish auth, permission, rate limiting, network/timeouts, request
 or deadline exhaustion, invalid input/resume, changed scope, changed/stale

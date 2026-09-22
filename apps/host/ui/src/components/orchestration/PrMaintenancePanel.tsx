@@ -119,6 +119,7 @@ const stageLabels: Record<PrMaintenanceStage, string> = {
   closed: "Closed",
   human_hold: "Needs human direction",
   reconciling: "Reconciling unknown effects",
+  authorization_required: "Repair authorization required",
   paused: "Paused",
   recovering: "Recovering access",
   blocked: "Blocked",
@@ -136,6 +137,8 @@ const nextActions: Record<PrMaintenanceStage, string> = {
   closed: "No further repairs. Release ownership after all work settles.",
   human_hold: "Send back with instructions to resolve the design decision.",
   reconciling: "Reconcile pending work and effects before any further changes.",
+  authorization_required:
+    "Prepare and review a repair proposal for this exact retained PR and worker. Legacy observation authority cannot resume maintenance.",
   paused: "Review the pause reason before resuming maintenance.",
   recovering:
     "Try a bounded alternate observation path; no repairs until evidence is complete.",
@@ -222,7 +225,7 @@ const loopStages = [
 ] as const;
 
 const readOnlyNotice =
-  "No repairs, pushes, replies, thread resolution, reviewer requests or CI retries are authorized.";
+  "Legacy observation-only maintenance is retired. History and ownership are retained; authenticated repair authorization is required. No writes are authorized.";
 
 function PrLink({ record }: { record: Pick<PrMaintenanceRegistration, "identity"> }) {
   return (
@@ -338,15 +341,16 @@ export function PrMaintenancePanel({
   );
   const history = records.filter((record) => record !== current);
   const retained = records.some((record) => !record.ownershipReleasedAt);
+  const legacyRetained = current && !current.authorization.scope.publicationAuthorized;
+  const blocksPreparation = retained && !legacyRetained;
   const observedProgress = current ? prMaintenanceProgress(current, nowMs) : undefined;
   const currentProgress =
-    observedProgress && view?.statusError
+    observedProgress &&
+    view?.statusError &&
+    observedProgress.stage !== "authorization_required"
       ? { ...observedProgress, stage: "checking" as const }
       : observedProgress;
   const graphRecord = currentMaintenance(records);
-  const displayedScope =
-    current?.authorization.scope ?? view?.proposal?.registration.scope;
-  const readOnly = displayedScope && !displayedScope.publicationAuthorized;
   const latestBatch = current?.batches.reduce<
     PrMaintenanceRegistration["batches"][number] | undefined
   >(
@@ -391,7 +395,13 @@ export function PrMaintenancePanel({
         ) : null}
         {record.lifecycle === "paused" ? (
           <Button
-            disabled={busy || !view?.canAuthorize || held || outstanding}
+            disabled={
+              busy ||
+              !view?.canAuthorize ||
+              held ||
+              outstanding ||
+              !record.authorization.scope.publicationAuthorized
+            }
             onClick={() =>
               void execute(() =>
                 actOnTaskMaintenance(run.id, record, {
@@ -483,7 +493,7 @@ export function PrMaintenancePanel({
         <dt>Remaining limits</dt>
         <dd>
           {!record.authorization.scope.publicationAuthorized ? (
-            "Read-only observation; no mutation allowance."
+            "Legacy grant; repair authorization required. No mutation allowance."
           ) : (
             <>
               {Math.max(
@@ -569,9 +579,8 @@ export function PrMaintenancePanel({
           </summary>
         ) : null}
         <p className={styles.muted}>
-          {readOnly
-            ? "Observe the retained PR without changing code or provider state. Maintenance never merges or force-pushes."
-            : "Bounded repairs on the retained worker. Ready is not merged; maintenance never merges or force-pushes."}
+          Bounded repairs on the retained worker. Ready is not merged; maintenance never
+          merges or force-pushes.
         </p>
         {view?.unsupportedReason ? <p role="status">{view.unsupportedReason}</p> : null}
         {view && !view.canAuthorize ? (
@@ -600,7 +609,7 @@ export function PrMaintenancePanel({
             </h3>
             {!current.authorization.scope.publicationAuthorized ? (
               <p>
-                <strong>Read-only observation</strong> — {readOnlyNotice}
+                <strong>Repair authorization required</strong> — {readOnlyNotice}
               </p>
             ) : null}
             {!compact ? (
@@ -654,25 +663,17 @@ export function PrMaintenancePanel({
                   : " · incomplete or unavailable; prior success is not current validation"}
               </dd>
               <dt>Next action</dt>
+              <dd>{nextActions[currentProgress.stage]}</dd>
+              <dt>Next check</dt>
               <dd>
-                {!current.authorization.scope.publicationAuthorized &&
-                ![
+                {[
                   "human_hold",
                   "reconciling",
                   "paused",
-                  "blocked",
                   "merged",
                   "closed",
-                  "released",
-                ].includes(currentProgress.stage)
-                  ? "Observe the PR and report findings. Changes require a separately reviewed authorization."
-                  : nextActions[currentProgress.stage]}
-              </dd>
-              <dt>Next check</dt>
-              <dd>
-                {["human_hold", "reconciling", "paused", "merged", "closed"].includes(
-                  currentProgress.stage,
-                ) ? (
+                  "authorization_required",
+                ].includes(currentProgress.stage) ? (
                   "On hold until the current blocker is resolved."
                 ) : (
                   <>
@@ -707,9 +708,16 @@ export function PrMaintenancePanel({
           </section>
         ) : null}
 
-        {!current && view ? (
+        {(!current || legacyRetained) && view ? (
           <section aria-label="Prepare PR maintenance">
-            {view.proposal ? (
+            {view.proposal && !view.proposal.registration.scope.publicationAuthorized ? (
+              <p role="status">
+                This legacy observation proposal cannot be authorized. Its evidence is
+                preserved; ask the Orchestrator to prepare a repair proposal using
+                existing task authority.
+              </p>
+            ) : null}
+            {view.proposal?.registration.scope.publicationAuthorized ? (
               <>
                 <h3>
                   <PrLink record={view.proposal.registration} />
@@ -730,7 +738,7 @@ export function PrMaintenancePanel({
                     busy ||
                     !view.canAuthorize ||
                     Boolean(view.unsupportedReason) ||
-                    retained
+                    blocksPreparation
                   }
                   onClick={() => {
                     setError("");
@@ -760,7 +768,7 @@ export function PrMaintenancePanel({
                     value={prUrl}
                     disabled={
                       busy ||
-                      retained ||
+                      blocksPreparation ||
                       !view.canAuthorize ||
                       Boolean(view.unsupportedReason)
                     }
@@ -775,21 +783,29 @@ export function PrMaintenancePanel({
                       invalidUrl ||
                       !view.canAuthorize ||
                       Boolean(view.unsupportedReason) ||
-                      retained
+                      blocksPreparation
                     }
                     onClick={() =>
                       void execute(
-                        () => prepareTaskMaintenance(run.id, prUrl.trim() || undefined),
+                        () =>
+                          prepareTaskMaintenance(
+                            run.id,
+                            legacyRetained
+                              ? prMaintenanceUrl(current.identity)
+                              : prUrl.trim() || undefined,
+                          ),
                         "Preparation requested. Review the Orchestrator’s proposal when it arrives; maintenance is not enabled.",
                       )
                     }
                   >
-                    Ask Orchestrator to prepare
+                    {legacyRetained || view.proposal
+                      ? "Prepare repair authorization"
+                      : "Ask Orchestrator to prepare"}
                   </Button>
                 </div>
               </>
             )}
-            {retained ? (
+            {blocksPreparation ? (
               <p>
                 Release the prior retained job in history before preparing another PR.
               </p>
@@ -816,7 +832,7 @@ export function PrMaintenancePanel({
                     completed maintenance rounds
                   </p>
                   {!record.authorization.scope.publicationAuthorized ? (
-                    <p>Read-only observation</p>
+                    <p>Legacy observation grant; no repair authorization.</p>
                   ) : null}
                   {record.pauseReason ? <p>{record.pauseReason}</p> : null}
                   {controls(record)}

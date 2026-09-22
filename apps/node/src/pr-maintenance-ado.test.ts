@@ -256,6 +256,45 @@ function withBuild() {
 }
 
 describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
+  it.each([40, 39])(
+    "collects forty mixed multi-comment threads within %i operations including authentication",
+    async (maxRequests) => {
+      const data = fixtures();
+      data.threads = Array.from({ length: 40 }, (_, index) => ({
+        ...thread([comment(1, `Finding ${index}`), comment(2, `Reply ${index}`)]),
+        id: index + 1,
+        status: ["active", "fixed", "closed", "pending"][index % 4],
+      }));
+      const fixture = transport(data);
+      let authentications = 0;
+      const result = await observe(
+        input({ budget: { ...input().budget, maxRequests } }),
+        {
+          request: fixture.request,
+          now,
+          acquireToken: async () => {
+            authentications++;
+            return "synthetic-token-not-a-credential";
+          },
+        },
+      );
+      expect(result, JSON.stringify(result.progress)).toMatchObject({
+        complete: true,
+        requestsConsumed: 19,
+        progress: { pages: 8, verifiedPages: 8 },
+      });
+      expect(authentications).toBe(1);
+      expect(fixture.calls).toHaveLength(18);
+      expect(result.snapshot.threads).toHaveLength(40);
+      expect(result.snapshot.actionableSources).toHaveLength(80);
+      expect(result.observation.sources).toHaveLength(80);
+      expect(fixture.calls.filter((call) => /\/threads\?/.test(call.url))).toHaveLength(
+        2,
+      );
+      expect(fixture.calls.some((call) => /\/comments\?/.test(call.url))).toBe(false);
+    },
+  );
+
   it("pins case-preserved names, lowercase GUIDs and current-iteration/live branch SHAs", async () => {
     const data = fixtures();
     data.metadata.repository.id = repositoryId.toUpperCase();
@@ -285,6 +324,92 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     });
     expect(result.snapshot.iteration.id).toBe(2);
   });
+
+  it.each(["head", "base", "body", "revision", "thread", "new-comment", "deleted"])(
+    "rejects a consolidated second-pass %s mutation without consuming stale sources",
+    async (change) => {
+      const data = fixtures();
+      data.threads = Array.from({ length: 40 }, (_, index) => ({
+        ...thread([comment(), comment(2)]),
+        id: index + 1,
+      }));
+      const result = await run(data, input(), (call, count, response) => {
+        if (count !== 2) return response;
+        const url = new URL(call.url);
+        if (
+          ["head", "base"].includes(change) &&
+          url.pathname.endsWith("/refs") &&
+          url.searchParams.get("filter") ===
+            (change === "head" ? "heads/FixCase" : "heads/main")
+        )
+          response.body.value[0].objectId = merge;
+        if (url.pathname.endsWith("/threads")) {
+          const entry = response.body.value[39];
+          if (change === "body")
+            entry.comments[1].content = "Changed reply, unchanged metadata";
+          if (change === "revision") entry.comments[1].lastContentUpdatedDate = finished;
+          if (change === "thread") entry.status = "fixed";
+          if (change === "new-comment") entry.comments.push(comment(3));
+          if (change === "deleted") entry.comments[1].isDeleted = true;
+        }
+        return response;
+      });
+      expect(result.error.code).toBe("inconsistent_snapshot");
+      expect(result.snapshot).toBeUndefined();
+      expect(result.observation.sources).toEqual([]);
+      expect(result.observation.helperState.resume).toBeNull();
+    },
+  );
+
+  it("rejects old per-thread continuations and expired restart deadlines without provider I/O", async () => {
+    const data = fixtures();
+    const first = await run(
+      data,
+      input({ budget: { ...input().budget, maxRequests: 9 } }),
+    );
+    const legacy = structuredClone(first.resume);
+    delete legacy.collectionVersion;
+    legacy.digest = contentHash({ ...legacy, digest: undefined });
+    expect(await run(data, input({ resume: legacy }))).toMatchObject({
+      complete: false,
+      requestsConsumed: 0,
+      error: { code: "invalid_resume" },
+    });
+    const fixture = transport(data);
+    const expired = await observe(input({ resume: first.resume }), {
+      request: fixture.request,
+      now: () => started + 120_001,
+    });
+    expect(expired).toMatchObject({
+      complete: false,
+      requestsConsumed: 0,
+      error: { code: "deadline_exhausted" },
+    });
+    expect(fixture.calls).toHaveLength(0);
+  });
+
+  it.each(["local_auth_unavailable", "auth_required"])(
+    "counts token acquisition and fails closed for %s",
+    async (code) => {
+      const fixture = transport(fixtures(), () => ({ status: 401 }));
+      const result = await observe(input(), {
+        request: fixture.request,
+        now,
+        acquireToken: async () => {
+          if (code === "local_auth_unavailable")
+            throw Object.assign(new Error("PRIVATE_TOKEN"), { code });
+          return "synthetic-token";
+        },
+      });
+      expect(result).toMatchObject({
+        complete: false,
+        requestsConsumed: code === "auth_required" ? 2 : 1,
+        error: { code },
+      });
+      expect(JSON.stringify(result)).not.toContain("PRIVATE_TOKEN");
+      expect(result.snapshot).toBeUndefined();
+    },
+  );
 
   it.each([
     "https://dev.azure.com/example/Project/_git/Repo/pullrequest/7",
@@ -476,7 +601,7 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     expect(first.complete).toBe(true);
     expect(first.snapshot.actionableSources).toHaveLength(2);
     expect(
-      first.calls.filter((call: Call) => call.url.includes("/threads/12/comments")),
+      first.calls.filter((call: Call) => call.url.includes("/threads?")),
     ).toHaveLength(2);
     const source = first.snapshot.actionableSources[0];
     const handled = {
@@ -586,8 +711,8 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     const data = fixtures();
     data.threads = [thread()];
     const result = await run(data, input(), (call, count, response) => {
-      if (call.url.includes("/threads/12/comments") && count === 2)
-        response.body.value[0].content = "changed without PR timestamp";
+      if (call.url.includes("/threads?") && count === 2)
+        response.body.value[0].comments[0].content = "changed without PR timestamp";
       return response;
     });
     expect(result.error.code).toBe("inconsistent_snapshot");
@@ -1138,13 +1263,13 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     const limited = input({ budget: { ...input().budget, maxRequests: 10 } });
     const first = await run(data, limited);
     expect(first.complete).toBe(false);
-    expect(first.requestsConsumed).toBe(10);
+    expect(first.requestsConsumed).toBe(9);
     expect(first.error.code).toBe("budget_exhausted");
     expect(first.progress.verifiedPages).toBe(0);
     expect(first.observation.helperState.resume).toEqual(first.resume);
     const resumed = await run(data, input({ resume: first.resume }));
     expect(resumed.complete).toBe(true);
-    expect(resumed.requestsConsumed).toBe(11);
+    expect(resumed.requestsConsumed).toBe(10);
     const changed = await run(data, input({ resume: first.resume, generation: 2 }));
     expect(changed.error.code).toBe("invalid_resume");
     expect(changed.requestsConsumed).toBe(0);
@@ -1154,22 +1279,22 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     expect(edited.resume).toBeUndefined();
   });
 
-  it("retains a large 35-page discovery continuation within the actual CLI byte allowance", async () => {
+  it("retains a large consolidated discovery continuation within the actual CLI byte allowance", async () => {
     const data = fixtures();
     data.threads = Array.from({ length: 27 }, (_, index) => ({
-      ...thread([comment(1, `Finding ${index}: ${"detail ".repeat(450)}`)]),
+      ...thread([comment(1, `Finding ${index}: ${"detail ".repeat(800)}`)]),
       id: index + 1,
     }));
     const request = input({
       pr: { url: "https://dev.azure.com/example/Project/_git/Repo/pullrequest/7" },
-      budget: { ...input().budget, maxBytes: 262_144 },
+      budget: { ...input().budget, maxRequests: 10, maxBytes: 262_144 },
     });
     const first = await run(data, request, undefined, routeObservation);
     expect(first.error).toMatchObject({ code: "budget_exhausted" });
     expect(first).toMatchObject({
       complete: false,
-      requestsConsumed: 36,
-      progress: { phase: "verify", pages: 35, verifiedPages: 0, cursor: null },
+      requestsConsumed: 9,
+      progress: { phase: "verify", pages: 8, verifiedPages: 0, cursor: null },
       observation: { complete: false, checksComplete: false, reviewsComplete: false },
     });
     expect(first.snapshot).toBeUndefined();
@@ -1231,7 +1356,7 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
       routeObservation,
     );
     expect(resumed.complete).toBe(true);
-    expect(resumed.requestsConsumed).toBe(37);
+    expect(resumed.requestsConsumed).toBe(10);
     expect(resumed.snapshot.actionableSources).toHaveLength(27);
     expect(resumed.observation.sources).toHaveLength(27);
     expect(resumed.snapshot.actionableSources.map((source: any) => source.body)).toEqual(
@@ -1256,15 +1381,20 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
       ...thread([comment(1, `Finding ${index}: ${"details ".repeat(800)}`)]),
       id: index + 1,
     }));
-    const first = await run(
-      data,
-      input({ budget: { ...input().budget, maxBytes: 131_072 } }),
-    );
+    const maxBytes =
+      Buffer.byteLength(
+        JSON.stringify({
+          status: 200,
+          headers: {},
+          body: { count: data.threads.length, value: data.threads },
+        }),
+      ) + 256;
+    const first = await run(data, input({ budget: { ...input().budget, maxBytes } }));
     expect(first.error).toMatchObject({
       code: "payload_overflow",
-      limit: { kind: "bytes", stage: "checkpoint", maximum: 131_072 },
+      limit: { kind: "bytes", stage: "checkpoint", maximum: maxBytes },
     });
-    expect(first.observation.helperState.resume.jobs[0].kind).toBe("comments");
+    expect(first.observation.helperState.resume.jobs[0].kind).toBe("threads");
     expect(first.snapshot).toBeUndefined();
     const resumed = await run(data, input({ resume: first.resume }));
     expect(resumed.complete).toBe(true);
@@ -1340,10 +1470,18 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
 
   it("never carries verification credit when a full pass cannot fit the maximum request allowance", async () => {
     const data = fixtures();
-    data.threads = Array.from({ length: 31 }, (_, index) => ({
-      ...thread(),
+    data.policies = Array.from({ length: 31 }, (_, index) => ({
+      ...policy(),
       id: index + 1,
     }));
+    data.evaluations = data.policies.map((config, index) => {
+      const buildId = index + 20;
+      data.builds.set(buildId, { ...build(), id: buildId });
+      return {
+        ...evaluation(config, "approved", { buildId }),
+        evaluationId: `${String(index).padStart(8, "0")}-5555-4555-8555-555555555555`,
+      };
+    });
     const first = await run(data);
     expect(first).toMatchObject({
       complete: false,
@@ -1441,7 +1579,9 @@ describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
     expect(result.error.code).toBe("unsupported_pagination");
     const data = fixtures();
     data.threads = [thread([comment(), comment(2)])];
-    data.comments.set(12, [comment()]);
+    delete data.threads[0].comments;
+    expect((await run(data)).error.code).toBe("malformed_response");
+    data.threads = [thread([comment(), comment()])];
     expect((await run(data)).error.code).toBe("inconsistent_snapshot");
   });
 

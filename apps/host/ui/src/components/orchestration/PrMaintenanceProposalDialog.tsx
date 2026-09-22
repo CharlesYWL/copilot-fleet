@@ -75,17 +75,19 @@ export function PrMaintenanceProposalDialog({
   const changed =
     currentProposal?.id !== proposal.id || currentProposal.version !== proposal.version;
   const disabled =
-    busy || !connected || !canAuthorize || !matchesTask || changed || Boolean(error);
+    busy ||
+    !connected ||
+    !canAuthorize ||
+    !matchesTask ||
+    changed ||
+    !candidate.scope.publicationAuthorized ||
+    Boolean(error);
   const readOnly = !candidate.scope.publicationAuthorized;
   return (
     <Dialog open onOpenChange={(_, data) => !busy && !data.open && onClose()}>
       <DialogSurface>
         <DialogBody>
-          <DialogTitle>
-            {readOnly
-              ? "Authorize read-only PR observation"
-              : "Authorize bounded PR maintenance"}
-          </DialogTitle>
+          <DialogTitle>Authorize bounded PR maintenance</DialogTitle>
           <DialogContent>
             {changed && !busy ? (
               <p role="alert">
@@ -122,10 +124,18 @@ export function PrMaintenanceProposalDialog({
               Prepared by the Orchestrator. Only you can authorize it; ask for a revised
               proposal if changes are needed.
             </p>
-            {readOnly ? (
+            {proposal.reauthorization ? (
               <p>
-                <strong>Read-only observation</strong> — No repairs, pushes, replies,
-                thread resolution, reviewer requests or CI retries are authorized.
+                Reauthorizes the exact retained PR and worker without releasing ownership
+                or clearing history. Maintenance stays paused until you explicitly resume
+                it.
+              </p>
+            ) : null}
+            {readOnly ? (
+              <p role="alert">
+                <strong>Unsupported legacy proposal</strong> — Observation-only
+                maintenance is retired. Prepare a repair proposal for authenticated
+                authorization; no writes are authorized by this proposal.
               </p>
             ) : null}
             <dl className={styles.metadata}>
@@ -136,7 +146,7 @@ export function PrMaintenanceProposalDialog({
               <dt>Limits</dt>
               <dd>
                 {readOnly ? (
-                  "Observation only; no mutation allowance."
+                  "Unsupported legacy proposal; prepare repair authorization."
                 ) : (
                   <>
                     {candidate.budgets.repairBatches} repairs ·{" "}
@@ -201,11 +211,7 @@ export function PrMaintenanceProposalDialog({
               checked={confirmed}
               disabled={disabled}
               onChange={(_, data) => onConfirmedChange(data.checked === true)}
-              label={
-                readOnly
-                  ? "I authorize read-only PR observation only. No repairs, pushes, replies, thread resolution, reviewer requests, CI retries, merge or force-push."
-                  : "I authorize these bounded repairs and responses only. No merge, force-push or unapproved design changes."
-              }
+              label="I authorize these bounded repairs and responses only. No merge, force-push or unapproved design changes."
             />
           </DialogContent>
           <DialogActions>
@@ -217,7 +223,7 @@ export function PrMaintenanceProposalDialog({
               disabled={disabled || !confirmed}
               onClick={onAuthorize}
             >
-              {readOnly ? "Authorize read-only observation" : "Authorize maintenance"}
+              Authorize maintenance
             </Button>
           </DialogActions>
         </DialogBody>

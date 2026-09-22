@@ -488,10 +488,6 @@ function endpoint(pr, scan, job) {
     case "threads":
       path = `${pull}/threads`;
       break;
-    case "comments":
-      required(positive(job.threadId), "invalid_resume");
-      path = `${pull}/threads/${job.threadId}/comments`;
-      break;
     case "statuses":
       path = `${pull}/statuses`;
       break;
@@ -591,6 +587,40 @@ function currentIteration(scan) {
   );
   return latest;
 }
+function threadComments(thread) {
+  required(Array.isArray(thread.comments));
+  required(
+    new Set(thread.comments.map((comment) => comment.id)).size === thread.comments.length,
+    "inconsistent_snapshot",
+  );
+  return thread.comments.map((comment) => {
+    required(
+      positive(comment.id) &&
+        Number.isInteger(comment.parentCommentId) &&
+        comment.parentCommentId >= 0 &&
+        date(comment.lastUpdatedDate) &&
+        (comment.lastContentUpdatedDate === undefined ||
+          date(comment.lastContentUpdatedDate)) &&
+        (comment.isDeleted === undefined || typeof comment.isDeleted === "boolean") &&
+        ["text", "system", "codeChange", "unknown"].includes(comment.commentType) &&
+        (comment.isDeleted === true || typeof comment.content === "string"),
+    );
+    return {
+      ...pick(comment, [
+        "id",
+        "parentCommentId",
+        "content",
+        "commentType",
+        "isDeleted",
+        "publishedDate",
+        "lastUpdatedDate",
+        "lastContentUpdatedDate",
+      ]),
+      actor: comment.author?.id ? lowerGuid(comment.author.id) : null,
+      threadId: thread.id,
+    };
+  });
+}
 function normalizePage(pr, scan, job, response) {
   const headers = Object.fromEntries(
     Object.entries(response.headers ?? {}).map(([key, value]) => [
@@ -647,6 +677,7 @@ function normalizePage(pr, scan, job, response) {
       required(
         positive(thread.id) &&
           date(thread.lastUpdatedDate) &&
+          (thread.isDeleted === undefined || typeof thread.isDeleted === "boolean") &&
           Array.isArray(thread.comments),
       );
       return {
@@ -659,33 +690,9 @@ function normalizePage(pr, scan, job, response) {
           "threadContext",
           "pullRequestThreadContext",
         ]),
-        comments: thread.comments,
-      };
-    });
-  }
-  if (job.kind === "comments") {
-    page.values = page.values.map((comment) => {
-      required(
-        positive(comment.id) &&
-          Number.isInteger(comment.parentCommentId) &&
-          comment.parentCommentId >= 0 &&
-          date(comment.lastUpdatedDate) &&
-          ["text", "system", "codeChange", "unknown"].includes(comment.commentType) &&
-          (comment.isDeleted === true || typeof comment.content === "string"),
-      );
-      return {
-        ...pick(comment, [
-          "id",
-          "parentCommentId",
-          "content",
-          "commentType",
-          "isDeleted",
-          "publishedDate",
-          "lastUpdatedDate",
-          "lastContentUpdatedDate",
-        ]),
-        actor: comment.author?.id ? lowerGuid(comment.author.id) : null,
-        threadId: job.threadId,
+        // REST 7.1 returns all threads with initial comments and subsequent replies.
+        // Hash the complete normalized list on both passes, not one read per thread.
+        comments: threadComments(thread),
       };
     });
   }
@@ -1119,21 +1126,7 @@ function snapshot(input, scan, now) {
   };
   const url = `https://dev.azure.com/${identity.organization}/${encodeURIComponent(identity.project)}/_git/${encodeURIComponent(identity.repository.split("/")[1])}/pullrequest/${identity.prNumber}`;
   const threads = (data.threads ?? []).map((thread) => {
-    const comments = (data.comments ?? []).filter(
-      (comment) => comment.threadId === thread.id,
-    );
-    required(
-      thread.comments.length === comments.length &&
-        thread.comments.every((comment) =>
-          comments.some(
-            (entry) =>
-              entry.id === comment.id &&
-              entry.content === comment.content &&
-              entry.lastUpdatedDate === comment.lastUpdatedDate,
-          ),
-        ),
-      "inconsistent_snapshot",
-    );
+    const comments = thread.comments;
     required(
       [
         "unknown",
@@ -1434,7 +1427,7 @@ export function toAdoHostObservation(
 }
 
 /** Fixture transport receives only {method:"GET",url,timeoutMs,maxBytes}; never a credential. */
-export async function observe(input, { request, now = Date.now } = {}) {
+export async function observe(input, { request, now = Date.now, acquireToken } = {}) {
   const started = now();
   let requestsConsumed = 0;
   let scan;
@@ -1507,6 +1500,7 @@ export async function observe(input, { request, now = Date.now } = {}) {
       const candidate = structuredClone(input.resume);
       required(
         candidate.schemaVersion === VERSION &&
+          candidate.collectionVersion === 2 &&
           candidate.scopeKey === scopeKey &&
           ["scan", "verify"].includes(candidate.phase) &&
           Array.isArray(candidate.pages) &&
@@ -1528,8 +1522,9 @@ export async function observe(input, { request, now = Date.now } = {}) {
     };
     const read = async (job) => {
       const url = endpoint(pr, scan, job);
-      if (!request) {
-        if (!token) token = await getAccessToken({ timeoutMs: charge() });
+      if (!request || acquireToken) {
+        if (!token)
+          token = await (acquireToken ?? getAccessToken)({ timeoutMs: charge() });
       }
       const timeoutMs = charge();
       const args = { method: "GET", url, timeoutMs, maxBytes: limits.maxBytes };
@@ -1545,6 +1540,7 @@ export async function observe(input, { request, now = Date.now } = {}) {
     );
     scan ??= {
       schemaVersion: VERSION,
+      collectionVersion: 2,
       scopeKey,
       metadata,
       phase: "scan",
@@ -1574,11 +1570,9 @@ export async function observe(input, { request, now = Date.now } = {}) {
       const keyOf = (entry) =>
         job.kind === "evaluations"
           ? entry.evaluationId
-          : job.kind === "comments"
-            ? `${entry.threadId}:${entry.id}`
-            : ["headRef", "baseRef"].includes(job.kind)
-              ? entry.name
-              : entry.id;
+          : ["headRef", "baseRef"].includes(job.kind)
+            ? entry.name
+            : entry.id;
       const all = [...next.data[job.kind], ...page.values];
       required(new Set(all.map(keyOf)).size === all.length, "inconsistent_snapshot");
       next.data[job.kind] = all;
@@ -1595,8 +1589,9 @@ export async function observe(input, { request, now = Date.now } = {}) {
           iterationId: currentIteration(next).id,
         });
       if (job.kind === "threads")
-        next.jobs.push(
-          ...page.values.map((thread) => ({ kind: "comments", threadId: thread.id })),
+        bounded(
+          next.data.threads.flatMap((thread) => thread.comments),
+          "checkpoint",
         );
       if (job.kind === "evaluations") {
         for (const evaluation of page.values) {

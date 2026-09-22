@@ -1,4 +1,9 @@
 import Fastify from "fastify";
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   PrMaintenanceEnableSchema,
@@ -14,14 +19,26 @@ import { mcpRoutes } from "../orchestrator/mcp-routes.js";
 import { orchestratorRoutes } from "./orchestrators.js";
 import { runRoutes } from "./runs.js";
 import { sessionRoutes } from "./sessions.js";
+import { FleetStore } from "../store.js";
+import { FleetService } from "../fleet-service.js";
+
+const fixtureUrl = new URL(
+  "../../../node/src/fixtures/ado-maintenance.mjs",
+  import.meta.url,
+);
+const cliUrl = new URL(
+  "../../../node/skills/pr-maintenance/github-snapshot.mjs",
+  import.meta.url,
+);
+const { fixtureInput, observeFixture } = await import(fixtureUrl.href);
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const close of cleanup.splice(0)) await close();
 });
 
-async function setup(provider: "github" | "azure-devops" = "github") {
-  const state = fleet();
+async function setup(provider: "github" | "azure-devops" = "github", dbPath?: string) {
+  const state = fleet(dbPath);
   const { store, service, leadId } = state;
   store.transitionSession(leadId, "starting");
   store.transitionSession(leadId, "idle");
@@ -117,10 +134,14 @@ async function setup(provider: "github" | "azure-devops" = "github") {
   const leadToken = tokens.mint(state.leadSubject);
   await app.register(mcpRoutes, { service, tokens });
   await app.ready();
-  cleanup.push(async () => {
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
     await app.close();
     store.close();
-  });
+  };
+  cleanup.push(close);
   const authorize = () =>
     app.inject({
       method: "POST",
@@ -191,10 +212,318 @@ async function setup(provider: "github" | "azure-devops" = "github") {
     hold,
     mcp,
     leadToken,
+    close,
   };
 }
 
 describe("authenticated PR maintenance controls", () => {
+  it("requires authenticated pinned repair reauthorization for a retained legacy grant, then explicit resume", async () => {
+    const { store, run, registration, authorize, mcp, app, worker } =
+      await setup("azure-devops");
+    expect((await authorize()).statusCode).toBe(200);
+    const backup = store.prMaintenance.exportBackup();
+    backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
+    const oldGrant = structuredClone(backup.registrations[0]!.authorization);
+    store.writeAtomically(() => store.prMaintenance.importBackup(backup));
+    const result = await mcp("fleet_prepare_pr_maintenance", {
+      taskId: run.id,
+      workerSessionId: worker.id,
+      prUrl: prMaintenanceUrl(registration.identity),
+      identity: registration.identity,
+      headSha: registration.headSha,
+      observedAt: new Date().toISOString(),
+      method: "provider_mcp",
+      evidence: "Fresh synthetic provider metadata",
+      publicationEvidence:
+        "Existing task permits repair and ordinary push to this exact PR",
+      verification: registration.scope.verification,
+      eligibilityEvidence: registration.eligibilityEvidence,
+    });
+    expect(result.ok, result.text).toBe(true);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    expect(proposal.reauthorization).toBeDefined();
+    const payload = {
+      action: "authorize_proposal",
+      proposalId: proposal.id,
+      expectedVersion: proposal.version,
+    };
+    for (const headers of [{}, { "fixture-node": "yes" }])
+      expect(
+        (
+          await app.inject({
+            method: "POST",
+            url: `/api/runs/${run.id}/pr-maintenance`,
+            headers,
+            payload,
+          })
+        ).statusCode,
+      ).toBe(403);
+    expect(store.prMaintenance.list().records[0]!.authorization).toEqual(oldGrant);
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload,
+    });
+    expect(approved.statusCode, approved.body).toBe(200);
+    const record = approved.json();
+    expect(record).toMatchObject({
+      id: proposal.reauthorization!.recordId,
+      generation: 1,
+      workerSessionId: worker.id,
+      lifecycle: "paused",
+      authorization: {
+        operatorId: "real-browser-principal",
+        scope: {
+          publicationAuthorized: true,
+          replies: false,
+          resolveThreads: false,
+          retryChecks: false,
+          reviewers: [],
+        },
+      },
+      authorizationHistory: [oldGrant],
+    });
+    expect(store.prMaintenance.list().records).toHaveLength(1);
+    expect(
+      (
+        await mcp("fleet_set_pr_maintenance", {
+          recordId: record.id,
+          expectedVersion: record.version,
+          action: "resume",
+        })
+      ).ok,
+    ).toBe(false);
+    const resumed = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: {
+        action: "update",
+        recordId: record.id,
+        expectedVersion: record.version,
+        operation: { action: "resume" },
+      },
+    });
+    expect(resumed.statusCode, resumed.body).toBe(200);
+    expect(resumed.json().lifecycle).toBe("active");
+  });
+
+  it("roundtrips 291675 helper observation bytes through exposed MCP and SQLite restart unchanged", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-maintenance-handoff-"));
+    const dbPath = join(directory, "host.sqlite");
+    const state = await setup("azure-devops", dbPath);
+    const { store, service, leadId, authorize, mcp, close } = state;
+    expect((await authorize()).statusCode).toBe(200);
+    const record = store.prMaintenance.list().records[0]!;
+    const at = new Date().toISOString();
+    const input = fixtureInput(at, 10);
+    const small = await observeFixture(input, 3000);
+    expect(small.error?.code).toBe("budget_exhausted");
+    const targetBytes = 291_675;
+    const padding = targetBytes - Buffer.byteLength(JSON.stringify(small.observation));
+    expect(padding).toBeGreaterThanOrEqual(0);
+    const cli = spawnSync(
+      process.execPath,
+      [
+        "--input-type=module",
+        "--eval",
+        `import { main } from ${JSON.stringify(cliUrl.href)};
+       import { observeFixture } from ${JSON.stringify(fixtureUrl.href)};
+       await main(input => observeFixture(input, 3000, ${padding}), result => result.observation);`,
+      ],
+      {
+        input: JSON.stringify(input),
+        encoding: "utf8",
+        maxBuffer: 1_048_576,
+        timeout: 10_000,
+      },
+    );
+    expect(cli.error).toBeUndefined();
+    expect(cli.status).toBe(2);
+    const helper = JSON.parse(cli.stdout);
+    const observation = helper.observation;
+    const serialized = JSON.stringify(observation);
+    expect(Buffer.byteLength(serialized)).toBe(targetBytes);
+    expect(observation).toMatchObject({
+      complete: false,
+      attemptedAt: at,
+      requestsConsumed: 10,
+      elapsedMs: 0,
+    });
+    expect(helper.resume).toBeUndefined();
+    expect(observation.helperState.resume).toBeTruthy();
+    const args = {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: { kind: "observation", observation },
+    };
+    expect((await mcp("fleet_checkpoint_pr_maintenance", args)).ok).toBe(false);
+    service.dispatch(store.getSession(leadId)!.nodeId, {
+      type: "prompt",
+      sessionId: leadId,
+      prompt: "Fixture evidence collection",
+      attachments: [],
+    });
+    expect((await mcp("fleet_get_pr_maintenance", { takeDue: true })).ok).toBe(true);
+    const rejected = await state.app.inject({
+      method: "POST",
+      url: "/mcp",
+      payload: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "fleet_checkpoint_pr_maintenance", arguments: args },
+      },
+    });
+    expect(rejected.statusCode).toBe(401);
+    const saved = await mcp("fleet_checkpoint_pr_maintenance", args);
+    expect(saved.ok, saved.text).toBe(true);
+    expect(JSON.stringify(JSON.parse(saved.text).lastAttempt)).toBe(serialized);
+    expect((await mcp("fleet_checkpoint_pr_maintenance", args)).ok).toBe(false);
+    const savedVersion = store.prMaintenance.get(record.id)!.version;
+    const overflow = await mcp("fleet_checkpoint_pr_maintenance", {
+      ...args,
+      expectedVersion: savedVersion,
+      checkpoint: {
+        kind: "observation",
+        observation: {
+          ...observation,
+          helperState: { oversized: "x".repeat(1_048_576) },
+        },
+      },
+    });
+    expect(overflow.ok).toBe(false);
+    expect(JSON.stringify(store.prMaintenance.get(record.id)!.lastAttempt)).toBe(
+      serialized,
+    );
+    await close();
+    const reopened = new FleetStore(dbPath);
+    const app = Fastify({ logger: false });
+    const restarted = new FleetService(reopened, app.log, "test");
+    const tokens = new LeadTokens(reopened);
+    await app.register(mcpRoutes, { service: restarted, tokens });
+    cleanup.push(async () => {
+      await app.close();
+      reopened.close();
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const readback = await app.inject({
+      method: "POST",
+      url: "/mcp",
+      headers: {
+        authorization: `Bearer ${tokens.mint(state.leadSubject)}`,
+        accept: "application/json, text/event-stream",
+      },
+      payload: {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "fleet_get_pr_maintenance", arguments: { recordId: record.id } },
+      },
+    });
+    const restored = JSON.parse(readback.json().result.content[0].text);
+    expect(JSON.stringify(restored.lastAttempt)).toBe(serialized);
+    expect(
+      createHash("sha256").update(JSON.stringify(restored.lastAttempt)).digest("hex"),
+    ).toBe(createHash("sha256").update(serialized).digest("hex"));
+    expect(
+      reopened.prMaintenance.remainingWake(
+        leadId,
+        reopened.getSessionDispatchAttempt(leadId)!.commandId,
+      ).requests,
+    ).toBe(1);
+    expect(Buffer.byteLength(cli.stdout)).toBe(291_959);
+    expect(Buffer.byteLength(JSON.stringify(args))).toBe(291_797);
+  });
+
+  it("admits exactly one retained-worker batch from forty-thread complete helper evidence within the existing wake", async () => {
+    const { store, service, leadId, worker, registration, authorize, mcp } =
+      await setup("azure-devops");
+    expect((await authorize()).statusCode).toBe(200);
+    let record = store.prMaintenance.list().records[0]!;
+    service.dispatch(store.getSession(leadId)!.nodeId, {
+      type: "prompt",
+      sessionId: leadId,
+      prompt: "Fixture maintenance wake",
+      attachments: [],
+    });
+    const claim = JSON.parse(
+      (await mcp("fleet_get_pr_maintenance", { takeDue: true })).text,
+    );
+    expect(claim.observationAllowance.requests).toBe(39);
+    const helper = await observeFixture(fixtureInput(new Date().toISOString(), 39));
+    expect(helper).toMatchObject({
+      complete: true,
+      requestsConsumed: 19,
+      progress: { pages: 8, verifiedPages: 8 },
+    });
+    expect(helper.observation).toMatchObject({
+      identity: registration.identity,
+      checksComplete: false,
+      reviewsComplete: false,
+    });
+    expect(helper.observation.sources).toHaveLength(80);
+    const saved = await mcp("fleet_checkpoint_pr_maintenance", {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: { kind: "observation", observation: helper.observation },
+    });
+    expect(saved.ok, saved.text).toBe(true);
+    record = JSON.parse(saved.text);
+    const batch = {
+      id: "synthetic-repair-1",
+      kind: "repair",
+      sources: record.observation!.sources,
+      headSha: registration.headSha,
+      prompt:
+        "Repair synthetic findings within the existing contract; native verification; ordinary push only. No replies or resolutions.",
+      scope: registration.scope.baseline,
+      reservedMutations: 1,
+    };
+    const prepared = await mcp("fleet_checkpoint_pr_maintenance", {
+      recordId: record.id,
+      expectedVersion: record.version,
+      checkpoint: { kind: "prepare_batch", batch },
+    });
+    expect(prepared.ok, prepared.text).toBe(true);
+    const followUp = {
+      sessionId: worker.id,
+      prompt: batch.prompt,
+      maintenance: {
+        recordId: record.id,
+        generation: record.generation,
+        batchId: batch.id,
+      },
+    };
+    expect(
+      (
+        await mcp("fleet_follow_up", {
+          ...followUp,
+          maintenance: { ...followUp.maintenance, generation: 2 },
+        })
+      ).ok,
+    ).toBe(false);
+    const accepted = await mcp("fleet_follow_up", followUp);
+    expect(accepted.ok, accepted.text).toBe(true);
+    expect((await mcp("fleet_follow_up", followUp)).ok).toBe(true);
+    record = store.prMaintenance.get(record.id)!;
+    expect(record.batches).toHaveLength(1);
+    expect(record.batches[0]).toMatchObject({
+      state: "accepted",
+      attempt: 2,
+      authorizationId: record.authorization.id,
+    });
+    expect(record.batches[0]!.stepId).toBeTruthy();
+    expect(
+      store.listSessions().filter((session) => session.runRole === "worker"),
+    ).toHaveLength(1);
+    expect(record.readyFingerprint).toBeUndefined();
+    expect(record.counters.repairBatches).toBe(1);
+    expect(Buffer.byteLength(JSON.stringify(helper.observation))).toBe(34_084);
+    expect(Buffer.byteLength(JSON.stringify(helper))).toBe(154_748);
+  });
+
   it("runs claimed helper failure through the real MCP recovery seam without admitting repairs", async () => {
     const { store, service, leadId, registration, authorize, mcp } =
       await setup("azure-devops");
@@ -299,7 +628,7 @@ describe("authenticated PR maintenance controls", () => {
 
   it.each([
     [true, 39],
-    [false, 40],
+    [false, 0],
   ] as const)(
     "reserves a usable ADO default without starving continuation, repair=%s",
     async (publicationAuthorized, requests) => {
@@ -308,7 +637,14 @@ describe("authenticated PR maintenance controls", () => {
       registration.scope.publicationAuthorized = publicationAuthorized;
       registration.scope.replies = publicationAuthorized;
       registration.scope.resolveThreads = publicationAuthorized;
-      expect((await authorize()).statusCode).toBe(200);
+      const authorization = await authorize();
+      if (!publicationAuthorized) {
+        expect(authorization.statusCode).toBe(400);
+        expect(authorization.body).toContain("Observation-only");
+        expect(store.prMaintenance.list().records).toEqual([]);
+        return;
+      }
+      expect(authorization.statusCode).toBe(200);
       const lead = store.getSession(leadId)!;
       service.dispatch(lead.nodeId, {
         type: "prompt",
@@ -385,6 +721,8 @@ describe("authenticated PR maintenance controls", () => {
         observedAt: new Date().toISOString(),
         method: "provider_mcp",
         evidence: "Authenticated read-only provider metadata; exact repository/ref pins.",
+        publicationEvidence:
+          "Existing writing task authorizes normal pushes to the pinned source ref.",
         verification: registration.scope.verification,
         eligibilityEvidence: registration.eligibilityEvidence,
       });
@@ -395,7 +733,7 @@ describe("authenticated PR maintenance controls", () => {
         workerSessionId: registration.workerSessionId,
         scope: {
           baseline: run.objective,
-          publicationAuthorized: false,
+          publicationAuthorized: true,
           replies: false,
           resolveThreads: false,
           reviewers: [],
@@ -441,67 +779,33 @@ describe("authenticated PR maintenance controls", () => {
         "No verified mutable checkout or publication path; observation-only scope.",
     };
     const result = await mcp("fleet_prepare_pr_maintenance", input);
-    expect(result.ok, result.text).toBe(true);
-    expect(JSON.parse(result.text)).toMatchObject({
-      mode: "observe",
-      proposedActions: {
-        repairAndPublish: false,
-        replies: false,
-        resolveThreads: false,
-        reviewers: [],
-        retryChecks: false,
-      },
-    });
-    const proposal = store.prMaintenance.getProposal(run.id)!;
-    expect(proposal.registration.scope).toMatchObject({
-      baseline: objective,
-      publicationAuthorized: false,
-      replies: false,
-      resolveThreads: false,
-      reviewers: [],
-      retryChecks: false,
-    });
+    expect(result.ok, result.text).toBe(false);
+    expect(result.text).toContain("publication authority");
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
     expect(store.prMaintenance.list().records).toHaveLength(0);
     const mutation = await mcp("fleet_prepare_pr_maintenance", {
       ...input,
-      expectedVersion: proposal.version,
+      mode: "observe",
       replies: true,
     });
     expect(mutation.ok, mutation.text).toBe(false);
     const noPublicationEvidence = await mcp("fleet_prepare_pr_maintenance", {
       ...input,
-      expectedVersion: proposal.version,
       mode: "repair",
     });
     expect(noPublicationEvidence.ok, noPublicationEvidence.text).toBe(false);
-    expect(store.prMaintenance.getProposal(run.id)?.version).toBe(1);
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
   });
 
-  it("accepts the reported project-scoped ADO identity through the exposed preparation MCP", async () => {
-    const { store, run, worker, mcp } = await setup("azure-devops");
-    const identity = {
-      provider: "azure-devops",
-      host: "dev.azure.com",
-      organization: "powerbi",
-      project: "Trident",
-      projectId: "3a3467dc-0814-4e9d-8eec-555851655f69",
-      repository: "Trident/TridentWarehouse-UX",
-      repositoryId: "bde35e51-d934-4f33-83ef-618d3498079d",
-      headRepository: "Trident/TridentWarehouse-UX",
-      headRepositoryId: "bde35e51-d934-4f33-83ef-618d3498079d",
-      headRef: "refs/heads/dev/charlesyin/schema-designer-s03-working-state",
-      baseRepository: "Trident/TridentWarehouse-UX",
-      baseRepositoryId: "bde35e51-d934-4f33-83ef-618d3498079d",
-      baseRef: "refs/heads/main",
-      prNumber: 1099182,
-    };
+  it("rejects explicit legacy observation mode through the exposed preparation MCP", async () => {
+    const { store, run, worker, mcp, registration } = await setup("azure-devops");
+    const identity = registration.identity;
     const result = await mcp("fleet_prepare_pr_maintenance", {
       taskId: run.id,
       workerSessionId: worker.id,
-      prUrl:
-        "https://dev.azure.com/powerbi/Trident/_git/TridentWarehouse-UX/pullrequest/1099182",
+      prUrl: prMaintenanceUrl(identity),
       identity,
-      headSha: "5d4bb3dd33618506ddaa48fec972401205b28f87",
+      headSha: "a".repeat(40),
       observedAt: new Date().toISOString(),
       method: "provider_mcp",
       mode: "observe",
@@ -509,11 +813,9 @@ describe("authenticated PR maintenance controls", () => {
       eligibilityEvidence: "No repair authority; only requesting observation.",
       verification: "Bounded read-only provider evidence; no readiness claim.",
     });
-    expect(result.ok, result.text).toBe(true);
-    expect(store.prMaintenance.getProposal(run.id)?.registration).toMatchObject({
-      identity,
-      scope: { publicationAuthorized: false, replies: false, resolveThreads: false },
-    });
+    expect(result.ok, result.text).toBe(false);
+    expect(result.text).toContain("Observation-only");
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
     expect(store.prMaintenance.list().records).toHaveLength(0);
   });
 
@@ -633,6 +935,8 @@ describe("authenticated PR maintenance controls", () => {
       observedAt: new Date().toISOString(),
       method: "provider_cli",
       evidence: "Current provider metadata",
+      publicationEvidence:
+        "Existing writing task permits normal publication to the pinned source.",
       verification: registration.scope.verification,
       eligibilityEvidence: registration.eligibilityEvidence,
     };

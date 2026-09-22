@@ -119,7 +119,7 @@ describe("useFleet durable notifications", () => {
       version: 1,
       taskId: "task",
       leadSessionId: "lead",
-      mode: "observe",
+      mode: "repair",
       createdAt: ISO,
       identity: {
         host: "github.com",

@@ -31,7 +31,7 @@ const maintenanceApproval = () =>
     version: 2,
     taskId: "task",
     leadSessionId: "lead",
-    mode: "observe",
+    mode: "repair",
     createdAt: at,
     identity: {
       host: "github.com",
@@ -193,7 +193,7 @@ describe("command approval UI", () => {
     expect(
       await screen.findByRole("region", { name: "PR maintenance approval details" }),
     ).toBeTruthy();
-    expect(screen.getByText("Read-only observation")).toBeTruthy();
+    expect(screen.getByText("Bounded repairs")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Review maintenance scope" }));

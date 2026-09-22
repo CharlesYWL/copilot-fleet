@@ -85,6 +85,7 @@ export function PrMaintenanceApprovalReview({
       !confirmed ||
       !connected ||
       !view?.canAuthorize ||
+      !proposal?.registration.scope.publicationAuthorized ||
       view.unsupportedReason ||
       readError ||
       error
