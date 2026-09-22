@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PrMaintenanceEnableSchema,
+  PrMaintenanceManualCommandSchema,
   HostBackupSchema,
   PR_MAINTENANCE_RECOVERY_LIMITS,
   prMaintenanceProgress,
@@ -15,6 +16,7 @@ import { FleetStore } from "./store.js";
 import { FleetService } from "./fleet-service.js";
 import Fastify from "fastify";
 import { prMaintenanceUnsettled } from "./pr-maintenance-store.js";
+import v1Conflicts from "./fixtures/pr-maintenance-v1-conflicts.json" with { type: "json" };
 
 const stores: FleetStore[] = [];
 const paths: string[] = [];
@@ -995,6 +997,409 @@ describe("bounded alternate PR observations", () => {
 });
 
 describe("durable PR maintenance registry", () => {
+  it.each(v1Conflicts.cases)(
+    "opens authentic v1 $conflict/$state conflicts without losing claims or blocking unrelated work",
+    (fixture) => {
+      const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+      mkdirSync(path, { recursive: true });
+      paths.push(path);
+      const dbPath = join(path, "host.sqlite");
+      const f = setup(storeAt(dbPath));
+      let first = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+      first = f.store.prMaintenance.operatorAction(
+        first.id,
+        first.version,
+        {
+          action: "release",
+          reason: "Settled",
+        },
+        "operator",
+      );
+      const second = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+      const backup = f.store.exportHostBackup({ enrollmentToken: "" });
+      // Preserve the captured session/key identity while relocating the surrounding fixture.
+      f.store.replaceHostBackup(
+        HostBackupSchema.parse(
+          JSON.parse(JSON.stringify(backup).replaceAll(f.worker.id, fixture.workerId)),
+        ),
+      );
+      f.store.setSessionDispatchAttempt(fixture.workerId, {
+        commandId: fixture.second.id,
+        eventSeqFrom: fixture.second.eventSeqFrom,
+        attempt: `manual:${fixture.second.id}`,
+      });
+      const legacyRecords = f.store.prMaintenance.exportBackup().registrations;
+      for (const [recordId, command] of [
+        [first.id, fixture.first],
+        [second.id, fixture.second],
+      ] as const) {
+        const record = legacyRecords.find((entry) => entry.id === recordId)!;
+        record.manualControl = {
+          operatorId: command.operatorId,
+          takenAt: command.createdAt,
+          commands: [PrMaintenanceManualCommandSchema.parse(command)],
+        };
+      }
+      f.store.close();
+      stores.splice(stores.indexOf(f.store), 1);
+      const db = new DatabaseSync(dbPath);
+      db.exec(
+        "DROP TABLE pr_maintenance_manual_commands; UPDATE pr_maintenance_schema SET version=1;",
+      );
+      for (const record of legacyRecords)
+        db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+          JSON.stringify(record),
+          record.id,
+        );
+      db.close();
+      const reopened = storeAt(dbPath);
+      expect(reopened.prMaintenance.get(first.id)?.manualControl?.commands).toEqual([
+        fixture.first,
+      ]);
+      expect(reopened.prMaintenance.get(second.id)?.manualControl?.commands).toEqual([
+        fixture.second,
+      ]);
+      const service = new FleetService(reopened, Fastify().log);
+      expect(() =>
+        service.promptSession(
+          fixture.workerId,
+          {
+            prompt: "Explain",
+            attachments: [],
+            operationId: fixture.operationId,
+          },
+          "actor-a",
+        ),
+      ).toThrow(/ambiguous|quarantined/);
+      expect(reopened.getSessionDispatchAttempt(fixture.workerId)?.commandId).toBe(
+        fixture.second.id,
+      );
+      const claims = reopened.prMaintenance.manualConflicts(
+        fixture.workerId,
+        fixture.first.id,
+      );
+      expect(claims).toHaveLength(2);
+      expect(claims).toEqual(expect.arrayContaining([fixture.first, fixture.second]));
+      expect(
+        reopened.prMaintenance.manualCommand(fixture.workerId, fixture.first.id),
+      ).toBeUndefined();
+      expect(
+        reopened.prMaintenance.recordManualReceipt(
+          fixture.workerId,
+          fixture.first.id,
+          "settled",
+        ),
+      ).toBe(false);
+      expect(reopened.prMaintenance.hasPendingManualExecution(fixture.workerId)).toBe(
+        fixture.state === "unknown",
+      );
+      if (fixture.state === "unknown") {
+        expect(() =>
+          reopened.prMaintenance.assertManualAvailable(fixture.workerId),
+        ).toThrow(/receipts|uncertain/);
+        expect(() =>
+          reopened.prMaintenance.assertTaskCleanupAllowed(f.task.id),
+        ).toThrow();
+        expect(() => reopened.deletePlacement(f.placement.id)).toThrow(/retains/);
+        expect(() => reopened.deleteRun(f.task.id)).toThrow(/receipts/);
+      } else
+        expect(() =>
+          reopened.prMaintenance.assertManualAvailable(fixture.workerId),
+        ).not.toThrow();
+      const unrelated = setup(reopened);
+      unrelated.input.identity = {
+        ...unrelated.input.identity,
+        prNumber: 2,
+        headRef: "refs/heads/other",
+      };
+      reopened.prMaintenance.enableFromOperator(unrelated.input, "operator");
+      const ordinary = new FleetService(reopened, Fastify().log);
+      const sent: string[] = [];
+      ordinary.attachNode(unrelated.node.id, {
+        OPEN: 1,
+        readyState: 1,
+        send(raw) {
+          sent.push(String(raw));
+        },
+        close() {},
+      });
+      expect(
+        ordinary.promptSession(
+          unrelated.worker.id,
+          {
+            prompt: "Explain",
+            attachments: [],
+            operationId: fixture.operationId,
+          },
+          "actor-a",
+        ),
+      ).toEqual({ ok: true });
+      const delivered = reopened.getSessionDispatchAttempt(unrelated.worker.id)!;
+      reopened.prMaintenance.recordManualReceipt(
+        unrelated.worker.id,
+        delivered.commandId,
+        "settled",
+      );
+      expect(
+        ordinary.promptSession(
+          unrelated.worker.id,
+          {
+            prompt: "Explain",
+            attachments: [],
+            operationId: fixture.operationId,
+          },
+          "actor-a",
+        ),
+      ).toEqual({ ok: true });
+      expect(sent).toHaveLength(1);
+      expect(() =>
+        ordinary.promptSession(
+          unrelated.worker.id,
+          {
+            prompt: "Different",
+            attachments: [],
+            operationId: fixture.operationId,
+          },
+          "actor-a",
+        ),
+      ).toThrow(/different manual input/);
+      expect(
+        ordinary.promptSession(
+          unrelated.worker.id,
+          {
+            prompt: "New intent",
+            attachments: [],
+            operationId: randomUUID(),
+          },
+          "actor-a",
+        ),
+      ).toEqual({ ok: true });
+      expect(sent).toHaveLength(2);
+
+      const portable = reopened.exportHostBackup({ enrollmentToken: "" });
+      reopened.close();
+      stores.splice(stores.indexOf(reopened), 1);
+      const reopenedAgain = storeAt(dbPath);
+      expect(
+        reopenedAgain.prMaintenance.manualConflicts(fixture.workerId, fixture.first.id),
+      ).toEqual(claims);
+      const versionDb = new DatabaseSync(dbPath);
+      expect(
+        versionDb.prepare("SELECT version FROM pr_maintenance_schema").get()?.version,
+      ).toBe(3);
+      versionDb.close();
+      const restored = storeAt();
+      restored.replaceHostBackup(portable);
+      expect(
+        restored.prMaintenance.manualConflicts(fixture.workerId, fixture.first.id),
+      ).toEqual(claims);
+      expect(restored.prMaintenance.hasPendingManualExecution(fixture.workerId)).toBe(
+        fixture.state === "unknown",
+      );
+      expect(() =>
+        restored.prMaintenance.assertManualOperationUnambiguous(
+          fixture.workerId,
+          fixture.first.id,
+        ),
+      ).toThrow(/quarantined/);
+      const legacyPortable = HostBackupSchema.parse({
+        ...portable,
+        prMaintenance: {
+          ...portable.prMaintenance,
+          registrations: legacyRecords,
+          manualCommands: [],
+          manualConflicts: [],
+          manualOwners: [],
+        },
+      });
+      restored.replaceHostBackup(legacyPortable);
+      expect(
+        restored.prMaintenance.manualConflicts(fixture.workerId, fixture.first.id),
+      ).toEqual(claims);
+      if (fixture.state === "settled") {
+        restored.prMaintenance.beginManualControl(
+          fixture.workerId,
+          {
+            id: "genuine-new-operation",
+            digest: "new",
+            kind: "prompt",
+            operatorId: "actor-a",
+          },
+          10,
+        );
+        expect(restored.prMaintenance.hasPendingManualExecution(fixture.workerId)).toBe(
+          true,
+        );
+      } else {
+        expect(() =>
+          restored.prMaintenance.beginManualControl(
+            fixture.workerId,
+            {
+              id: "genuine-new-operation",
+              digest: "new",
+              kind: "prompt",
+              operatorId: "actor-a",
+            },
+            10,
+          ),
+        ).toThrow(/receipts/);
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "retains orphaned indexed execution ownership across v2 migration and restore (accepted=%s)",
+    (accepted) => {
+      const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+      mkdirSync(path, { recursive: true });
+      paths.push(path);
+      const dbPath = join(path, "host.sqlite");
+      const f = setup(storeAt(dbPath));
+      const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+      f.store.prMaintenance.beginManualControl(
+        f.worker.id,
+        {
+          id: "settled",
+          digest: "settled",
+          kind: "prompt",
+          operatorId: "operator",
+        },
+        0,
+      );
+      f.store.prMaintenance.recordManualReceipt(f.worker.id, "settled", "settled");
+      const settled = f.store.prMaintenance.get(record.id)!;
+      f.store.prMaintenance.operatorAction(
+        record.id,
+        settled.version,
+        {
+          action: "release",
+          reason: "Settled",
+        },
+        "operator",
+      );
+      f.store.prMaintenance.beginManualControl(
+        f.worker.id,
+        {
+          id: "pending",
+          digest: "pending",
+          kind: "prompt",
+          operatorId: "operator",
+        },
+        4,
+      );
+      if (accepted)
+        f.store.prMaintenance.recordManualReceipt(f.worker.id, "pending", "accepted");
+      const staleCleanup = new DatabaseSync(dbPath);
+      staleCleanup
+        .prepare(
+          `INSERT INTO session_cleanup_requests
+         (session_id,command_id,inactive_before,retention_days,requested_at,in_flight)
+         VALUES (?,?,?,?,?,1)`,
+        )
+        .run(f.worker.id, "stale-cleanup", at, 30, at);
+      staleCleanup.close();
+      expect(() => f.store.completeSessionCleanup("stale-cleanup")).toThrow(/continuity/);
+      expect(f.store.getSession(f.worker.id)).toBeDefined();
+      expect(f.store.getRunStep(f.step.id)?.sessionId).toBe(f.worker.id);
+      f.store.failSessionCleanup("stale-cleanup", at);
+      f.store.close();
+      stores.splice(stores.indexOf(f.store), 1);
+      const db = new DatabaseSync(dbPath);
+      // Emulate the reviewed v2 bulk-delete loss, leaving the indexed receipt and
+      // released registration. Attribution must not depend on the deleted session.
+      db.exec(
+        "DROP TABLE pr_maintenance_manual_owners; UPDATE pr_maintenance_schema SET version=2;",
+      );
+      db.prepare("DELETE FROM sessions WHERE id=?").run(f.worker.id);
+      db.close();
+      const reopened = storeAt(dbPath);
+      const assertHeld = (store: FleetStore) => {
+        expect(store.getSession(f.worker.id)).toBeUndefined();
+        expect(store.prMaintenance.hasPendingManualExecution(f.worker.id)).toBe(true);
+        expect(() => store.deleteRun(f.task.id)).toThrow(/receipts/);
+        expect(() => store.replaceRunSteps(f.task.id, [])).toThrow(/receipts/);
+        expect(() => store.assertWorktreePurgeAllowed(f.task.id)).toThrow(/receipts/);
+        expect(() => store.deletePlacement(f.placement.id)).toThrow(/retains.*checkout/);
+        expect(() => store.deleteWorkspace(f.workspace.id)).toThrow(/retains.*checkout/);
+        expect(() => store.deleteNode(f.node.id)).toThrow(/retains.*checkout/);
+        expect(store.getRun(f.task.id)).toBeDefined();
+        expect(store.getPlacement(f.placement.id)).toBeDefined();
+      };
+      assertHeld(reopened);
+      const portable = reopened.exportHostBackup({ enrollmentToken: "" });
+      const restored = storeAt();
+      restored.replaceHostBackup(portable);
+      assertHeld(restored);
+      // Durable ownership survives independently of even the old registration.
+      restored.replaceHostBackup(
+        HostBackupSchema.parse({
+          ...portable,
+          prMaintenance: { ...portable.prMaintenance, registrations: [] },
+        }),
+      );
+      assertHeld(restored);
+      restored.prMaintenance.recordManualReceipt(f.worker.id, "pending", "settled");
+      expect(() =>
+        restored.prMaintenance.assertTaskCleanupAllowed(f.task.id),
+      ).not.toThrow();
+      expect(restored.deleteRun(f.task.id)).toBe(true);
+    },
+  );
+
+  it("retains every conflicting claim when earlier same-input histories were coalesced", () => {
+    const f = setup();
+    const fixture = v1Conflicts.cases[1]!;
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const backup = f.store.prMaintenance.exportBackup();
+    const unknown = {
+      ...fixture.first,
+      state: "unknown" as const,
+      createdAt: "2026-09-22T05:25:43.844Z",
+    };
+    backup.manualCommands = [
+      fixture.first,
+      unknown,
+      { ...fixture.second, state: "settled" },
+    ].map((command) => ({
+      sessionId: f.worker.id,
+      command: PrMaintenanceManualCommandSchema.parse(command),
+    }));
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    expect(
+      f.store.prMaintenance.manualConflicts(f.worker.id, fixture.first.id),
+    ).toHaveLength(3);
+    expect(f.store.prMaintenance.hasPendingManualExecution(f.worker.id)).toBe(true);
+    expect(() =>
+      f.store.prMaintenance.operatorAction(
+        record.id,
+        record.version,
+        {
+          action: "release",
+          reason: "Cannot erase ambiguity",
+        },
+        "operator",
+      ),
+    ).toThrow(/receipt/);
+    expect(f.store.prMaintenance.exportBackup().manualConflicts).toHaveLength(3);
+  });
+
+  it("preserves an explicit quarantine when portable evidence contains only one remaining claim", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const backup = f.store.prMaintenance.exportBackup();
+    const command = PrMaintenanceManualCommandSchema.parse(v1Conflicts.cases[1]!.second);
+    backup.manualConflicts = [{ sessionId: f.worker.id, command }];
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    expect(() =>
+      f.store.prMaintenance.assertManualOperationUnambiguous(f.worker.id, command.id),
+    ).toThrow(/quarantined/);
+    expect(f.store.prMaintenance.hasPendingManualExecution(f.worker.id)).toBe(true);
+    expect(f.store.prMaintenance.get(record.id)).toBeDefined();
+    expect(f.store.prMaintenance.exportBackup().manualConflicts).toEqual(
+      backup.manualConflicts,
+    );
+  });
+
   it("migrates v1 inline receipts into durable bounded history without losing unknown or retry evidence", () => {
     const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
     mkdirSync(path, { recursive: true });

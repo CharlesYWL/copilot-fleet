@@ -5367,9 +5367,9 @@ export class FleetStore {
 
   /** Replaces a run's whole plan. Used by the handwritten-DAG fixture. */
   replaceRunSteps(runId: string, steps: readonly RunStepInput[]): RunStep[] {
-    this.prMaintenance.assertTaskCleanupAllowed(runId);
-    this.assertRunMutable(runId);
     return this.transaction(() => {
+      this.prMaintenance.assertTaskCleanupAllowed(runId);
+      this.assertRunMutable(runId);
       this.statement("DELETE FROM run_steps WHERE run_id=?").run(runId);
       steps.forEach((step, index) => {
         this.upsertRunStep(runId, { ...step, position: index });
@@ -5380,9 +5380,10 @@ export class FleetStore {
 
   /** Deletes a run, its steps, and its notes. Callers stop live sessions first. */
   deleteRun(id: string): boolean {
-    this.prMaintenance.assertTaskCleanupAllowed(id);
+    // Purge refusal must retain the cleanup tombstones it records.
     this.assertWorktreePurgeAllowed(id);
     return this.transaction(() => {
+      this.prMaintenance.assertTaskCleanupAllowed(id);
       if (!this.getRun(id)) return false;
       this.assertRunMutable(id);
       // Notes reference the run, so they have to go first or the foreign key
@@ -5787,6 +5788,7 @@ export class FleetStore {
     id: string,
     label: string,
   ): void {
+    this.prMaintenance.assertResourceCleanupAllowed(column, id);
     const sessions = this.statement(`SELECT id FROM sessions WHERE ${column}=?`).all(id);
     if (
       sessions.some((session) =>
@@ -5859,18 +5861,17 @@ export class FleetStore {
       AND NOT EXISTS (SELECT 1 FROM pr_maintenance m WHERE m.released_at IS NULL
         AND (m.worker_session_id=sessions.id OR m.lead_session_id=sessions.id OR m.task_id=sessions.run_id))`;
     return this.transaction(() => {
-      this.statement(
-        `DELETE FROM notification_preferences WHERE session_id IN
-           (SELECT id FROM sessions WHERE ${disposable})`,
-      ).run(...terminalStateList);
-      this.statement(
-        `DELETE FROM events WHERE session_id IN
-           (SELECT id FROM sessions WHERE ${disposable})`,
-      ).run(...terminalStateList);
-      const result = this.statement(`DELETE FROM sessions WHERE ${disposable}`).run(
-        ...terminalStateList,
-      );
-      return Number(result.changes);
+      const candidates = this.statement(
+        `SELECT id FROM sessions WHERE ${disposable}`,
+      ).all(...terminalStateList);
+      let removed = 0;
+      for (const candidate of candidates) {
+        const id = String(candidate.id);
+        if (this.prMaintenance.hasSessionRetentionBlockers(id)) continue;
+        this.deleteSessionRecords(id);
+        removed++;
+      }
+      return removed;
     });
   }
 
@@ -5878,14 +5879,11 @@ export class FleetStore {
     column: "workspace_id" | "placement_id" | "node_id",
     id: string,
   ): void {
-    this.statement(
-      `DELETE FROM notification_preferences
-       WHERE session_id IN (SELECT id FROM sessions WHERE ${column}=?)`,
-    ).run(id);
-    this.statement(
-      `DELETE FROM events WHERE session_id IN (SELECT id FROM sessions WHERE ${column}=?)`,
-    ).run(id);
-    this.statement(`DELETE FROM sessions WHERE ${column}=?`).run(id);
+    this.prMaintenance.assertResourceCleanupAllowed(column, id);
+    for (const session of this.statement(`SELECT id FROM sessions WHERE ${column}=?`).all(
+      id,
+    ))
+      this.deleteSessionRecords(String(session.id));
   }
 }
 

@@ -1074,6 +1074,7 @@ export class FleetService {
   }
 
   private isSupervisorRetry(sessionId: string, command: SupervisorCommand): boolean {
+    this.store.prMaintenance.assertManualOperationUnambiguous(sessionId, command.id);
     const previous = this.store.prMaintenance.manualCommand(sessionId, command.id);
     if (!previous) return false;
     if (
@@ -1853,7 +1854,7 @@ export class FleetService {
       const kind = session.readOnly ? "read-only" : "writing";
       const held = kind === "read-only" ? reservedReading : reservedWriting;
       if (held >= capacityFor(node, kind)) continue;
-      if (this.store.prMaintenance.pendingManualCommands(session.id).length) continue;
+      if (this.store.prMaintenance.hasPendingManualExecution(session.id)) continue;
       const retained = this.store.prMaintenance.manualRecord(session.id);
       if (retained?.manualControl && !retained.manualControl.endedAt) {
         // Reconnect may reattach a settled manual conversation, never replay a

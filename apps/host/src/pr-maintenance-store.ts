@@ -14,6 +14,7 @@ import {
   PrMaintenanceDecisionInputSchema,
   PrMaintenanceEnableSchema,
   PrMaintenanceManualCommandSchema,
+  PrMaintenanceManualOwnerSchema,
   PrMaintenanceOperatorActionSchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceRegistrationSchema,
@@ -27,6 +28,7 @@ import {
   type PrMaintenanceIdentity,
   type PrMaintenanceIncident,
   type PrMaintenanceManualCommand,
+  type PrMaintenanceManualOwner,
   type PrMaintenanceObservation,
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
@@ -170,16 +172,33 @@ export class PrMaintenanceStore {
       );
       CREATE INDEX IF NOT EXISTS pr_maintenance_manual_pending
         ON pr_maintenance_manual_commands(session_id,state);
+      CREATE TABLE IF NOT EXISTS pr_maintenance_manual_conflicts (
+        session_id TEXT NOT NULL, command_id TEXT NOT NULL, claim_hash TEXT NOT NULL,
+        data TEXT NOT NULL, PRIMARY KEY(session_id,command_id,claim_hash)
+      );
+      CREATE TABLE IF NOT EXISTS pr_maintenance_manual_owners (
+        session_id TEXT NOT NULL, task_id TEXT NOT NULL, placement_id TEXT NOT NULL,
+        node_id TEXT NOT NULL, workspace_id TEXT NOT NULL, checkout_key TEXT NOT NULL,
+        PRIMARY KEY(session_id,task_id,placement_id,node_id,workspace_id,checkout_key)
+      );
+      CREATE INDEX IF NOT EXISTS pr_maintenance_manual_task
+        ON pr_maintenance_manual_owners(task_id,session_id);
+      CREATE INDEX IF NOT EXISTS pr_maintenance_manual_placement
+        ON pr_maintenance_manual_owners(placement_id,session_id);
+      CREATE INDEX IF NOT EXISTS pr_maintenance_manual_node
+        ON pr_maintenance_manual_owners(node_id,session_id);
+      CREATE INDEX IF NOT EXISTS pr_maintenance_manual_workspace
+        ON pr_maintenance_manual_owners(workspace_id,session_id);
     `);
     const version = Number(
       db.prepare("SELECT version FROM pr_maintenance_schema").get()?.version,
     );
-    if (version !== 1 && version !== 2)
+    if (![1, 2, 3].includes(version))
       refuse(
         "schema_version",
         "This Host does not support the maintenance registry schema.",
       );
-    if (version === 1)
+    if (version < 3)
       this.store.writeAtomically(() => {
         const records = db
           .prepare("SELECT data FROM pr_maintenance ORDER BY rowid")
@@ -187,9 +206,19 @@ export class PrMaintenanceStore {
           .map((row) =>
             PrMaintenanceRegistrationSchema.parse(JSON.parse(String(row.data))),
           );
-        for (const record of records)
+        for (const row of db
+          .prepare("SELECT session_id,data FROM pr_maintenance_manual_commands")
+          .all())
+          this.importManualCommand(String(row.session_id), JSON.parse(String(row.data)));
+        for (const record of records) {
+          this.rememberManualOwner(record.workerSessionId, record);
           for (const command of record.manualControl?.commands ?? [])
-            this.saveManualCommand(record.workerSessionId, command);
+            this.importManualCommand(record.workerSessionId, command);
+        }
+        for (const row of db
+          .prepare("SELECT DISTINCT session_id FROM pr_maintenance_manual_commands")
+          .all())
+          this.rememberManualOwner(String(row.session_id));
         for (const record of records) {
           this.archiveManualCommands(record);
           db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
@@ -197,7 +226,7 @@ export class PrMaintenanceStore {
             record.id,
           );
         }
-        db.exec("UPDATE pr_maintenance_schema SET version=2");
+        db.exec("UPDATE pr_maintenance_schema SET version=3");
       });
   }
 
@@ -649,7 +678,7 @@ export class PrMaintenanceStore {
       }
       if (
         !["idle", "completed", "stopped"].includes(worker.state) ||
-        this.pendingManualCommands(worker.id).length > 0 ||
+        this.hasPendingManualExecution(worker.id) ||
         this.store
           .listRunSteps(task.id)
           .some(
@@ -803,7 +832,7 @@ export class PrMaintenanceStore {
   ): PrMaintenanceManualCommand | undefined {
     const row = this.db
       .prepare(
-        "SELECT data FROM pr_maintenance_manual_commands WHERE session_id=? AND command_id=?",
+        "SELECT data FROM pr_maintenance_manual_commands WHERE session_id=? AND command_id=? AND state NOT IN ('ambiguous_pending','ambiguous_settled')",
       )
       .get(sessionId, commandId);
     return row
@@ -821,6 +850,150 @@ export class PrMaintenanceStore {
     );
   }
 
+  manualConflicts(sessionId: string, commandId: string): PrMaintenanceManualCommand[] {
+    return this.db
+      .prepare(
+        `SELECT c.data FROM pr_maintenance_manual_conflicts c
+       JOIN pr_maintenance_manual_commands m ON m.session_id=c.session_id AND m.command_id=c.command_id
+       WHERE c.session_id=? AND c.command_id=? AND m.state IN ('ambiguous_pending','ambiguous_settled') ORDER BY c.claim_hash`,
+      )
+      .all(sessionId, commandId)
+      .map((row) => PrMaintenanceManualCommandSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  assertManualOperationUnambiguous(sessionId: string, commandId: string): void {
+    if (
+      this.db
+        .prepare(
+          "SELECT 1 FROM pr_maintenance_manual_commands WHERE session_id=? AND command_id=? AND state IN ('ambiguous_pending','ambiguous_settled')",
+        )
+        .get(sessionId, commandId)
+    )
+      refuse(
+        "manual_operation_ambiguous",
+        `Manual operation ${commandId} has conflicting historical claims and is quarantined; it cannot be replayed. Inspect manualConflicts in the Host backup.`,
+      );
+  }
+
+  hasPendingManualExecution(sessionId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare(
+          "SELECT 1 FROM pr_maintenance_manual_commands WHERE session_id=? AND state IN ('unknown','accepted','ambiguous_pending') LIMIT 1",
+        )
+        .get(sessionId),
+    );
+  }
+
+  private saveManualOwner(input: PrMaintenanceManualOwner): void {
+    const owner = PrMaintenanceManualOwnerSchema.parse(input);
+    if (
+      ![
+        owner.taskId,
+        owner.placementId,
+        owner.nodeId,
+        owner.workspaceId,
+        owner.checkoutKey,
+      ].some(Boolean)
+    )
+      return;
+    this.db
+      .prepare("INSERT OR IGNORE INTO pr_maintenance_manual_owners VALUES (?,?,?,?,?,?)")
+      .run(
+        owner.sessionId,
+        owner.taskId,
+        owner.placementId,
+        owner.nodeId,
+        owner.workspaceId,
+        owner.checkoutKey,
+      );
+  }
+
+  private rememberManualOwner(
+    sessionId: string,
+    record?: PrMaintenanceRegistration,
+  ): void {
+    const session = this.store.getSession(sessionId);
+    const placement = this.store.getPlacement(
+      record?.placementId ?? session?.placementId ?? "",
+    );
+    this.saveManualOwner({
+      sessionId,
+      taskId: record?.taskId ?? session?.runId ?? "",
+      placementId: record?.placementId ?? session?.placementId ?? "",
+      nodeId: session?.nodeId ?? placement?.nodeId ?? "",
+      workspaceId: session?.workspaceId ?? placement?.workspaceId ?? "",
+      checkoutKey:
+        record?.checkoutKey ??
+        session?.executionBinding?.checkoutKey ??
+        (session ? `placement:${session.placementId}` : ""),
+    });
+    for (const row of this.db
+      .prepare("SELECT DISTINCT run_id FROM run_steps WHERE session_id=?")
+      .all(sessionId)) {
+      if (String(row.run_id) !== (record?.taskId ?? session?.runId))
+        this.saveManualOwner({
+          sessionId,
+          taskId: String(row.run_id),
+          placementId: placement?.id ?? "",
+          nodeId: session?.nodeId ?? placement?.nodeId ?? "",
+          workspaceId: session?.workspaceId ?? placement?.workspaceId ?? "",
+          checkoutKey: record?.checkoutKey ?? "",
+        });
+    }
+  }
+
+  /** Historical ambiguity is evidence to quarantine, not an invalid new request. */
+  private importManualCommand(
+    sessionId: string,
+    input: PrMaintenanceManualCommand,
+  ): void {
+    const command = PrMaintenanceManualCommandSchema.parse(input);
+    const row = this.db
+      .prepare(
+        "SELECT state,data FROM pr_maintenance_manual_commands WHERE session_id=? AND command_id=?",
+      )
+      .get(sessionId, command.id);
+    const ambiguous = row && String(row.state).startsWith("ambiguous_");
+    const previous =
+      row && !ambiguous
+        ? PrMaintenanceManualCommandSchema.parse(JSON.parse(String(row.data)))
+        : undefined;
+    // Preserve source snapshots before coalescing the unambiguous index. If a
+    // later claim conflicts, an earlier uncertain delivery must not disappear.
+    const data = JSON.stringify(command);
+    this.db
+      .prepare("INSERT OR IGNORE INTO pr_maintenance_manual_conflicts VALUES (?,?,?,?)")
+      .run(sessionId, command.id, createHash("sha256").update(data).digest("hex"), data);
+    if (
+      !ambiguous &&
+      (!previous ||
+        (previous.digest === command.digest &&
+          previous.operatorId === command.operatorId &&
+          previous.kind === command.kind))
+    ) {
+      this.saveManualCommand(sessionId, command);
+      return;
+    }
+    this.quarantineManualOperation(sessionId, command.id);
+  }
+
+  private quarantineManualOperation(sessionId: string, commandId: string): void {
+    const pending = Boolean(
+      this.db
+        .prepare(
+          `SELECT 1 FROM pr_maintenance_manual_conflicts WHERE session_id=? AND command_id=?
+       AND json_extract(data,'$.state') IN ('unknown','accepted') LIMIT 1`,
+        )
+        .get(sessionId, commandId),
+    );
+    this.db
+      .prepare(
+        "UPDATE pr_maintenance_manual_commands SET state=?,data='null' WHERE session_id=? AND command_id=?",
+      )
+      .run(pending ? "ambiguous_pending" : "ambiguous_settled", sessionId, commandId);
+  }
+
   pendingManualCommands(sessionId: string): PrMaintenanceManualCommand[] {
     return this.db
       .prepare(
@@ -835,6 +1008,7 @@ export class PrMaintenanceStore {
     input: PrMaintenanceManualCommand,
   ): PrMaintenanceManualCommand {
     let command = PrMaintenanceManualCommandSchema.parse(input);
+    this.assertManualOperationUnambiguous(sessionId, command.id);
     const previous = this.manualCommand(sessionId, command.id);
     if (previous) {
       if (
@@ -869,9 +1043,16 @@ export class PrMaintenanceStore {
 
   private archiveManualCommands(record: PrMaintenanceRegistration): void {
     if (!record.manualControl) return;
-    const commands = record.manualControl.commands.map((command) =>
-      this.saveManualCommand(record.workerSessionId, command),
-    );
+    const commands = record.manualControl.commands.map((command) => {
+      const ambiguous = this.db
+        .prepare(
+          "SELECT 1 FROM pr_maintenance_manual_commands WHERE session_id=? AND command_id=? AND state IN ('ambiguous_pending','ambiguous_settled')",
+        )
+        .get(record.workerSessionId, command.id);
+      return ambiguous
+        ? command
+        : this.saveManualCommand(record.workerSessionId, command);
+    });
     const recent = new Set(
       commands
         .filter((command) => ["settled", "rejected"].includes(command.state))
@@ -903,7 +1084,7 @@ export class PrMaintenanceStore {
   }
 
   assertManualAvailable(sessionId: string): void {
-    if (this.pendingManualCommands(sessionId).length)
+    if (this.hasPendingManualExecution(sessionId))
       refuse(
         "execution_uncertain",
         "Wait for correlated execution and effect receipts before manual control; no work was replayed or stopped.",
@@ -973,6 +1154,7 @@ export class PrMaintenanceStore {
   ): void {
     this.store.writeAtomically(() => {
       this.assertManualAvailable(sessionId);
+      this.assertManualOperationUnambiguous(sessionId, command.id);
       const record = this.manualRecord(sessionId);
       if (this.manualCommand(sessionId, command.id))
         refuse(
@@ -980,6 +1162,7 @@ export class PrMaintenanceStore {
           "This manual request already has a receipt; do not replay it.",
         );
       const now = nowIso();
+      this.rememberManualOwner(sessionId, record);
       const receipt = this.saveManualCommand(sessionId, {
         ...command,
         eventSeqFrom,
@@ -1058,9 +1241,7 @@ export class PrMaintenanceStore {
       if (record.ownershipReleasedAt)
         refuse("released", "Released maintenance needs explicit new enablement.");
       if (
-        record.manualControl?.commands.some((command) =>
-          ["unknown", "accepted"].includes(command.state),
-        ) &&
+        this.hasPendingManualExecution(record.workerSessionId) &&
         action.action !== "pause"
       )
         refuse(
@@ -1415,7 +1596,7 @@ export class PrMaintenanceStore {
     if (
       action.sessionId &&
       ["dispatch", "execute", "prompt", "resume"].includes(action.action) &&
-      this.pendingManualCommands(action.sessionId).length
+      this.hasPendingManualExecution(action.sessionId)
     )
       return { allowed: false, reason: "manual_execution_unsettled" };
     return { allowed: true };
@@ -2612,7 +2793,7 @@ export class PrMaintenanceStore {
   }
 
   hasSessionRetentionBlockers(sessionId: string): boolean {
-    if (this.pendingManualCommands(sessionId).length) return true;
+    if (this.hasPendingManualExecution(sessionId)) return true;
     return Boolean(
       this.db
         .prepare(
@@ -2634,8 +2815,8 @@ export class PrMaintenanceStore {
     if (
       this.db
         .prepare(
-          `SELECT 1 FROM pr_maintenance_manual_commands m JOIN sessions s ON s.id=m.session_id
-       WHERE s.run_id=? AND m.state IN ('unknown','accepted') LIMIT 1`,
+          `SELECT 1 FROM pr_maintenance_manual_owners o JOIN pr_maintenance_manual_commands m ON m.session_id=o.session_id
+       WHERE o.task_id=? AND m.state IN ('unknown','accepted','ambiguous_pending') LIMIT 1`,
         )
         .get(taskId)
     )
@@ -2653,6 +2834,24 @@ export class PrMaintenanceStore {
       refuse(
         "maintenance_retention",
         "Release settled maintenance explicitly before deleting its task or checkout.",
+      );
+  }
+
+  assertResourceCleanupAllowed(
+    column: "workspace_id" | "placement_id" | "node_id",
+    id: string,
+  ): void {
+    if (
+      this.db
+        .prepare(
+          `SELECT 1 FROM pr_maintenance_manual_owners o JOIN pr_maintenance_manual_commands m ON m.session_id=o.session_id
+       WHERE o.${column}=? AND m.state IN ('unknown','accepted','ambiguous_pending') LIMIT 1`,
+        )
+        .get(id)
+    )
+      refuse(
+        "maintenance_retention",
+        "Unsettled manual execution retains its original task and checkout; preserve its receipts.",
       );
   }
 
@@ -2896,12 +3095,36 @@ export class PrMaintenanceStore {
         .map((row) => JSON.parse(String(row.data))),
       manualCommands: this.db
         .prepare(
-          "SELECT session_id,data FROM pr_maintenance_manual_commands ORDER BY session_id,command_id",
+          "SELECT session_id,data FROM pr_maintenance_manual_commands WHERE state NOT IN ('ambiguous_pending','ambiguous_settled') ORDER BY session_id,command_id",
         )
         .all()
         .map((row) => ({
           sessionId: String(row.session_id),
           command: JSON.parse(String(row.data)),
+        })),
+      manualConflicts: this.db
+        .prepare(
+          `SELECT c.session_id,c.data FROM pr_maintenance_manual_conflicts c
+         JOIN pr_maintenance_manual_commands m ON m.session_id=c.session_id AND m.command_id=c.command_id
+         WHERE m.state IN ('ambiguous_pending','ambiguous_settled') ORDER BY c.session_id,c.command_id,c.claim_hash`,
+        )
+        .all()
+        .map((row) => ({
+          sessionId: String(row.session_id),
+          command: JSON.parse(String(row.data)),
+        })),
+      manualOwners: this.db
+        .prepare(
+          "SELECT * FROM pr_maintenance_manual_owners ORDER BY session_id,task_id,placement_id,node_id,workspace_id,checkout_key",
+        )
+        .all()
+        .map((row) => ({
+          sessionId: String(row.session_id),
+          taskId: String(row.task_id),
+          placementId: String(row.placement_id),
+          nodeId: String(row.node_id),
+          workspaceId: String(row.workspace_id),
+          checkoutKey: String(row.checkout_key),
         })),
     });
   }
@@ -2910,13 +3133,23 @@ export class PrMaintenanceStore {
   importBackup(input: PrMaintenanceBackup | undefined): void {
     const backup = input ? PrMaintenanceBackupSchema.parse(input) : undefined;
     this.db.exec(
-      "DELETE FROM pr_maintenance; DELETE FROM pr_maintenance_wakes; DELETE FROM pr_maintenance_scans; DELETE FROM pr_maintenance_proposals; DELETE FROM pr_maintenance_manual_commands;",
+      "DELETE FROM pr_maintenance; DELETE FROM pr_maintenance_wakes; DELETE FROM pr_maintenance_scans; DELETE FROM pr_maintenance_proposals; DELETE FROM pr_maintenance_manual_commands; DELETE FROM pr_maintenance_manual_conflicts; DELETE FROM pr_maintenance_manual_owners;",
     );
-    for (const { sessionId, command } of backup?.manualCommands ?? [])
-      this.saveManualCommand(sessionId, command);
-    for (const record of backup?.registrations ?? [])
+    for (const owner of backup?.manualOwners ?? []) this.saveManualOwner(owner);
+    for (const { sessionId, command } of [
+      ...(backup?.manualCommands ?? []),
+      ...(backup?.manualConflicts ?? []),
+    ]) {
+      this.rememberManualOwner(sessionId);
+      this.importManualCommand(sessionId, command);
+    }
+    for (const record of backup?.registrations ?? []) {
+      this.rememberManualOwner(record.workerSessionId, record);
       for (const command of record.manualControl?.commands ?? [])
-        this.saveManualCommand(record.workerSessionId, command);
+        this.importManualCommand(record.workerSessionId, command);
+    }
+    for (const { sessionId, command } of backup?.manualConflicts ?? [])
+      this.quarantineManualOperation(sessionId, command.id);
     for (const record of backup?.registrations ?? []) {
       if (!record.ownershipReleasedAt) {
         if (record.lifecycle === "active") record.lifecycle = "paused";

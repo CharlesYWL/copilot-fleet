@@ -530,6 +530,91 @@ describe("trusted supervisor session handoff", () => {
     ]);
   });
 
+  it.each([
+    ["store", "unknown"],
+    ["route", "unknown"],
+    ["store", "accepted"],
+    ["route", "accepted"],
+  ] as const)(
+    "retains manual evidence during mixed ended-session cleanup through %s (%s)",
+    async (path, state) => {
+      const f = await setup();
+      await f.command("prompt", { operationId: randomUUID() });
+      f.settle();
+      const record = f.store.prMaintenance.get(f.record.id)!;
+      f.store.prMaintenance.operatorAction(
+        record.id,
+        record.version,
+        {
+          action: "release",
+          reason: "Settled",
+        },
+        "operator",
+      );
+      expect(f.store.getSession(f.worker.id)?.agentSessionId).toBe("");
+      expect((await f.command("prompt", { operationId: randomUUID() })).statusCode).toBe(
+        202,
+      );
+      const dispatch = f.store.getSessionDispatchAttempt(f.worker.id)!;
+      if (state === "accepted")
+        f.store.prMaintenance.recordManualReceipt(
+          f.worker.id,
+          dispatch.commandId,
+          "accepted",
+        );
+      f.event("agent_text", { text: "Unsettled execution evidence" });
+      f.service.disconnectNode(f.worker.nodeId, "Delivery unknown");
+      f.service.attachNode(f.worker.nodeId, f.link);
+      f.store.setNodeOnline(f.worker.nodeId, true, 0);
+      f.service.reconcile(f.worker.nodeId, []);
+      expect(f.store.getSession(f.worker.id)?.state).toBe("failed");
+      const events = f.store.listEvents(f.worker.id);
+      const disposable = f.store.createSession(f.store.listPlacements()[0]!, "Ended");
+      f.store.transitionSession(disposable.id, "failed");
+      expect(() => f.store.deleteSession(f.worker.id)).toThrow(/maintenance/i);
+      const clear = async () => {
+        if (path === "store") return f.store.deleteEndedSessions();
+        const response = await f.app.inject({
+          method: "DELETE",
+          url: "/api/sessions",
+          headers: f.headers,
+        });
+        expect(response.statusCode, response.body).toBe(200);
+        return response.json<{ removed: number }>().removed;
+      };
+      expect(await clear()).toBe(1);
+      expect(f.store.getSession(disposable.id)).toBeUndefined();
+      expect(f.store.getSession(f.worker.id)).toBeDefined();
+      expect(f.store.getSessionDispatchAttempt(f.worker.id)).toEqual(dispatch);
+      expect(f.store.listEvents(f.worker.id)).toEqual(events);
+      expect(f.store.getRunStep(f.step.id)?.sessionId).toBe(f.worker.id);
+      expect(() => f.store.deleteRun(f.task.id)).toThrow(/receipts/);
+      expect(() => f.store.deletePlacement(f.worker.placementId)).toThrow(
+        /retains.*checkout/,
+      );
+      expect(() =>
+        f.store.requestSessionCleanup({
+          sessionId: f.worker.id,
+          nodeId: f.worker.nodeId,
+          commandId: randomUUID(),
+          inactiveBefore: "2099-01-01T00:00:00.000Z",
+          retentionDays: 30,
+          requestedAt: new Date().toISOString(),
+          inFlight: true,
+        }),
+      ).toThrow(/retained/);
+      f.event("turn_complete", {});
+      expect(
+        f.store.prMaintenance.manualCommand(f.worker.id, dispatch.commandId)?.state,
+      ).toBe("settled");
+      expect(await clear()).toBe(1);
+      expect(f.store.getSession(f.worker.id)).toBeUndefined();
+      expect(() =>
+        f.store.prMaintenance.assertTaskCleanupAllowed(f.task.id),
+      ).not.toThrow();
+    },
+  );
+
   it("treats settled keyless Resume after Stop as a new lifecycle intent, not a successful no-op", async () => {
     const f = await setup();
     f.resumable();

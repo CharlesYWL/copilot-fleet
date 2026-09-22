@@ -1919,9 +1919,27 @@ maintenance ownership. Each registration keeps only its 32 most recent terminal
 receipts plus all unsettled receipts; older duplicate-detection evidence is not
 evicted. Settled history and reconnects no longer impose a command-count ceiling or
 require Release. No-sign-in mode still does not authorize unattended maintenance
-renewal, Release, or publication. Registry schema v2 migrates existing inline
-receipts on open; portable backups include the durable index. Compact history
-grows on disk with operations rather than blocking control at an arbitrary count.
+renewal, Release, or publication. Registry schema v3 migrates existing inline
+receipts and durable task/checkout ownership on open; portable backups include
+both. Compact history grows on disk with operations rather than blocking control
+at an arbitrary count.
+
+Older versions could admit conflicting uses of a UUID across Release/re-enablement.
+Migration preserves those historical claims and quarantines the ambiguous key
+instead of preventing Host startup or choosing one claim to replay. A retry receives
+a conflict identifying the key; the portable backup's `manualConflicts` contains
+the original claims for inspection. Fully terminal ambiguity blocks that UUID only;
+unsettled or uncertain claims also hold the affected session, task, and checkout.
+Generic later events cannot resolve those ambiguities, and Release does not bypass
+them. There is no automatic repair or operator reconciliation UI for ambiguous
+historical execution in this change.
+
+Individual, bulk, retention, and catalog/task cleanup preserve unsettled manual
+receipts and their transcript/dispatch evidence, including after maintenance Release.
+Durable ownership keeps task/checkout cleanup blocked even if an older version
+already removed the session. Normal correlated settlement permits cleanup again.
+Large-history migration cost and full-parallel workload performance are not bounded
+by this change; the existing 50 MiB portable-backup limit still applies.
 
 ![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](docs/pr-maintenance-human-gate.png)
 

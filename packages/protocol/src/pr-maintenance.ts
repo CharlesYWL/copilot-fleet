@@ -750,6 +750,18 @@ export const PrMaintenanceManualCommandSchema = z
   .strict();
 export type PrMaintenanceManualCommand = z.infer<typeof PrMaintenanceManualCommandSchema>;
 
+export const PrMaintenanceManualOwnerSchema = z
+  .object({
+    sessionId: id,
+    taskId: z.string().max(512),
+    placementId: z.string().max(512),
+    nodeId: z.string().max(512),
+    workspaceId: z.string().max(512),
+    checkoutKey: z.string().max(512),
+  })
+  .strict();
+export type PrMaintenanceManualOwner = z.infer<typeof PrMaintenanceManualOwnerSchema>;
+
 export const PrMaintenanceRegistrationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -1037,6 +1049,12 @@ export const PrMaintenanceBackupSchema = z
         z.object({ sessionId: id, command: PrMaintenanceManualCommandSchema }).strict(),
       )
       .default([]),
+    manualConflicts: z
+      .array(
+        z.object({ sessionId: id, command: PrMaintenanceManualCommandSchema }).strict(),
+      )
+      .default([]),
+    manualOwners: z.array(PrMaintenanceManualOwnerSchema).default([]),
   })
   .strict();
 export type PrMaintenanceBackup = z.infer<typeof PrMaintenanceBackupSchema>;

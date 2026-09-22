@@ -1,0 +1,150 @@
+{
+  "sourceSha": "d1cc60a7917e17a53bb2fc4331b6744b55183b18",
+  "provenance": "Captured from actual prior-SHA FleetStore, FleetService and PrMaintenanceStore: Prompt UUID K as actor-a, settle, Release, re-enable, reuse K with a different actor/input/kind. Both service requests returned ok. No live state.",
+  "cases": [
+    {
+      "conflict": "actor",
+      "state": "settled",
+      "workerId": "33e7efd5-6442-49e7-86a1-bcf717c33568",
+      "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "first": {
+        "id": "66292f89c2124f7e02f5b5edd87c059d44a22f9411318ab74f2d76ab84a92d5f",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.797Z"
+      },
+      "second": {
+        "id": "66292f89c2124f7e02f5b5edd87c059d44a22f9411318ab74f2d76ab84a92d5f",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-b",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.811Z"
+      }
+    },
+    {
+      "conflict": "actor",
+      "state": "unknown",
+      "workerId": "1a08f4ad-b619-4b54-8f56-e10b1e3eb07f",
+      "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "first": {
+        "id": "e8802530eec3cd228c77a66ae9d68eb31c140d14c738d1ec283a0ba8c8f4c59c",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.843Z"
+      },
+      "second": {
+        "id": "e8802530eec3cd228c77a66ae9d68eb31c140d14c738d1ec283a0ba8c8f4c59c",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-b",
+        "eventSeqFrom": 0,
+        "state": "unknown",
+        "createdAt": "2026-09-22T05:25:43.850Z"
+      }
+    },
+    {
+      "conflict": "input",
+      "state": "settled",
+      "workerId": "6e5ff0bc-3da6-476f-ad3e-a9229971b335",
+      "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "first": {
+        "id": "db1d5187ae60f5242741d601389d964f551fead3a4ca440d3a1c73721e7eeb9a",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.880Z"
+      },
+      "second": {
+        "id": "db1d5187ae60f5242741d601389d964f551fead3a4ca440d3a1c73721e7eeb9a",
+        "digest": "db4dc7fb17c7cf3f3aa4390344bb4ab407af3551e9bda22649eed9eb5a81018d",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.887Z"
+      }
+    },
+    {
+      "conflict": "input",
+      "state": "unknown",
+      "workerId": "4cae561d-3462-4dd1-a51c-86c96bd80b2b",
+      "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "first": {
+        "id": "c44ebeb1ee354c116e8ab73b7b5e8590f7924874b49e2042522929f9fd6f3b3e",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.916Z"
+      },
+      "second": {
+        "id": "c44ebeb1ee354c116e8ab73b7b5e8590f7924874b49e2042522929f9fd6f3b3e",
+        "digest": "db4dc7fb17c7cf3f3aa4390344bb4ab407af3551e9bda22649eed9eb5a81018d",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "unknown",
+        "createdAt": "2026-09-22T05:25:43.923Z"
+      }
+    },
+    {
+      "conflict": "kind",
+      "state": "settled",
+      "workerId": "37780fb8-f17f-4883-b6be-b3daa6a859aa",
+      "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "first": {
+        "id": "478abd695536854f34dc4d11845b508f243ffb982cafbd469a53ac2eb7663055",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.951Z"
+      },
+      "second": {
+        "id": "478abd695536854f34dc4d11845b508f243ffb982cafbd469a53ac2eb7663055",
+        "digest": "0a729d0500a0931da077db8034e93ec5c8918cc8f739c5fc3b75aa4189767020",
+        "kind": "resume_session",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 1,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.966Z"
+      }
+    },
+    {
+      "conflict": "kind",
+      "state": "unknown",
+      "workerId": "0111aa92-e77b-4fa5-86b0-38b1b61a779e",
+      "operationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      "first": {
+        "id": "2aeb34ad4d8724ae2e0d740b66e1e5b55d6d90633800ddfb2dffa297416c80ea",
+        "digest": "89efdf92a5bc9bd40b13fcdc3cfc462c9802a6d10786f52cfae0f23735fdd439",
+        "kind": "prompt",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 0,
+        "state": "settled",
+        "createdAt": "2026-09-22T05:25:43.997Z"
+      },
+      "second": {
+        "id": "2aeb34ad4d8724ae2e0d740b66e1e5b55d6d90633800ddfb2dffa297416c80ea",
+        "digest": "0a729d0500a0931da077db8034e93ec5c8918cc8f739c5fc3b75aa4189767020",
+        "kind": "resume_session",
+        "operatorId": "actor-a",
+        "eventSeqFrom": 1,
+        "state": "unknown",
+        "createdAt": "2026-09-22T05:25:44.006Z"
+      }
+    }
+  ]
+}
