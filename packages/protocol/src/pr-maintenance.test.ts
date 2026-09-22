@@ -201,6 +201,24 @@ describe("PR maintenance wire schemas", () => {
       ).toBe(false);
     });
 
+    it.each([-60_000, 60_000])(
+      "uses the proven Host freshness basis without rewriting Node evidence (%d)",
+      (offset) => {
+        const record = base();
+        const now = Date.parse(at);
+        record.observation!.attemptedAt = new Date(now + offset).toISOString();
+        record.observationHostAt = at;
+        record.readyFingerprint = observation.fingerprint;
+        expect(prMaintenanceProgress(record, now).stage).toBe("ready");
+        expect(prMaintenanceProgress(record, now + 30 * 60_000 + 1).stage).toBe(
+          "checking",
+        );
+        expect(record.observation!.attemptedAt).toBe(
+          new Date(now + offset).toISOString(),
+        );
+      },
+    );
+
     it("provides exactly one truthful current stage with freshness and readiness gates", () => {
       const record = base();
       const now = Date.parse(at);

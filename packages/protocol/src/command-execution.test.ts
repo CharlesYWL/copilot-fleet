@@ -15,6 +15,8 @@ import {
   CommandTextSchema,
   RunCommandSchema,
   commandDigestPayload,
+  CommandObservationClockSchema,
+  commandObservationClock,
 } from "./command-execution.js";
 import {
   BrowserMessageSchema,
@@ -63,6 +65,43 @@ const body = {
 };
 
 describe("remote command contracts", () => {
+  it("keeps F5 observation budgets Host-owned and immutable in the approval digest", () => {
+    const observationBudget = { deadlineAt: at, requests: 39 };
+    expect(RunCommandSchema.safeParse({ ...request, observationBudget }).success).toBe(
+      false,
+    );
+    expect(commandDigestPayload({ ...body, observationBudget })).not.toBe(
+      commandDigestPayload(body),
+    );
+    const descriptor = {
+      ...body,
+      observationBudget,
+      digest: "a".repeat(64),
+      maintenanceObservation: { recordId: "record", generation: 1, wakeId: "turn" },
+      prepared: {
+        ...body.prepared,
+        clockUncertaintyMs: COMMAND_LIMITS.clockUncertaintyMs,
+      },
+    };
+    const context = commandObservationClock(descriptor, at, "10")!;
+    expect(
+      CommandObservationClockSchema.safeParse({ ...context, hostClockOffsetMs: 1 })
+        .success,
+    ).toBe(false);
+    expect(
+      CommandObservationClockSchema.safeParse({ ...context, clockUncertaintyMs: 0 })
+        .success,
+    ).toBe(false);
+    expect(
+      CommandObservationClockSchema.safeParse({
+        ...context,
+        nodeTime: "2026-09-16T14:01:00.000Z",
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandObservationClockSchema.safeParse({ ...context, extra: "PR text" }).success,
+    ).toBe(false);
+  });
   it("reads legacy wakes without manufacturing an execution receipt association", () => {
     const legacy = {
       leadSessionId: "lead",

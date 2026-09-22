@@ -57,6 +57,37 @@ persisted reservation at command creation, under normal finite-command approvals
 Do not include the maintained `taskId`, add a deadline to the claim reference,
 or attach a prior execution retroactively.
 
+**Clock basis:** `deadlineAt` above is the original **Host** instant, not a Node
+wall-clock timestamp. Host adds the persisted deadline/request count to command
+preparation (not caller-editable `fleet_run_command` input); it is included in the
+normal approved descriptor digest. Node injects `FLEET_MAINTENANCE_CLOCK` from that
+descriptor and its original preparation monotonic sample into the finite process.
+Do not set/copy that environment variable, supply an offset in JSON, translate the
+deadline yourself, or use an older helper that ignores the runtime contract.
+Direct provider CLIs and the router share this budget check. Standalone discovery
+without a Fleet reservation still uses an explicitly Node-local deadline; it is
+not an alternate way to collect for a claimed finite-command receipt.
+
+The command proof's offset is **Host send time minus Node receive time**. It is a
+lower-bound mapping, not a synchronized-clock assertion. The local collection
+deadline is `Host deadline - hostClockOffsetMs - 5000 ms uncertainty - 1000 ms drift`,
+using the existing command tolerances. The helper checks wall time against the
+original cross-process monotonic sample and uses the later of wall/monotonic
+progress before every token acquisition/read and completion. It never samples a
+new allowance at approval, launch or helper start. Constant positive/negative
+offsets are supported; inconsistent/discontinuous context fails closed.
+
+Host receipt validation independently uses the persisted accepted preparation
+proof, descriptor digest, original reservation and raw Node settlement receipt.
+No stdout/PR/caller-supplied offset is authoritative. Raw observation timestamps,
+elapsed time and stdout stay unchanged. Host-derived `observationHostAt` and
+`lastAttemptAt` are earliest possible Host attempt times; optional
+`lastAttemptLatestAt` is the latest bound. Freshness uses the earliest bound,
+ordering refuses overlapping older evidence, and readiness/UI expiry uses the
+same basis. These bounded derived fields are not permission for collection.
+Paired updated Host/Node/helper code is required; missing old preparation budget
+or revoked/restored clock proof cannot be retroactively manufactured.
+
 End the turn after dispatch. On Fleet's automatic completion wake, read the
 current record and **all** `fleet_get_execution` pages for that execution.
 Use `format:"raw"` and concatenate decoded base64 stdout bytes in sequence before

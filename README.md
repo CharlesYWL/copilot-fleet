@@ -1927,6 +1927,16 @@ the original owner/record/generation/grant/binding/claim to one execution and at
 and verifies its approved, complete persisted stdout. See the
 [handoff contract](apps/node/skills/pr-maintenance/helper-contract.md#durable-evidence-handoff).
 
+The original Host deadline is also bound into the approved command descriptor.
+Node injects its existing preparation-clock proof into the packaged helper;
+both providers reserve the established uncertainty/drift bounds and check
+monotonic progress before reads. Constant Node clock offsets do not extend the
+120-second window. Raw helper timestamps stay unchanged; bounded Host-derived
+attempt times drive receipt comparisons, freshness, ordering and UI expiry.
+This requires the paired updated Host/Node/helper; callers must not supply
+offsets or reset the deadline at launch. Older missing clock context is not
+silently treated as synchronized or granted retroactive receipt authority.
+
 These bounded claim references live in existing wake records (at most five per wake);
 they add no duplicated observation blob or new execution authority. Older wakes
 default to no receipt association, and old unbound commands cannot be attached

@@ -867,8 +867,10 @@ export const PrMaintenanceRegistrationSchema = z
     decision: PrMaintenanceDecisionSchema.optional(),
     decisionHistory: z.array(PrMaintenanceDecisionSchema).max(100).default([]),
     observation: PrMaintenanceObservationSchema.optional(),
+    observationHostAt: time.optional(),
     lastAttempt: PrMaintenanceObservationSchema.optional(),
     lastAttemptAt: time.optional(),
+    lastAttemptLatestAt: time.optional(),
     lastSuccessAt: time.optional(),
     lastError: text.optional(),
     incidentCursor: z.number().int().nonnegative().default(0),
@@ -910,9 +912,10 @@ export type PrMaintenanceRegistration = z.infer<typeof PrMaintenanceRegistration
 export function prMaintenanceObservationFresh(
   observation: PrMaintenanceObservation | undefined,
   nowMs = Date.now(),
+  hostAttemptedAt = observation?.attemptedAt,
 ): boolean {
-  if (!observation) return false;
-  const age = nowMs - Date.parse(observation.attemptedAt);
+  if (!observation || !hostAttemptedAt) return false;
+  const age = nowMs - Date.parse(hostAttemptedAt);
   return age >= 0 && age <= PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs;
 }
 
@@ -1012,7 +1015,7 @@ export function prMaintenanceProgress(
   if (
     !observation?.complete ||
     !record.lastAttempt?.complete ||
-    !prMaintenanceObservationFresh(observation, nowMs)
+    !prMaintenanceObservationFresh(observation, nowMs, record.observationHostAt)
   )
     return result("checking");
   if (observation.draft || observation.mergeability === "conflicting")

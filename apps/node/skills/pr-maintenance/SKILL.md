@@ -36,6 +36,11 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    as `maintenanceObservation` to `fleet_run_command` and use the returned absolute
    `observationAllowance.deadlineAt`; do not spend the deadline on unrelated work.
    The command remains subject to normal operator permissions and approvals.
+   This deadline is in the Host clock domain. The updated Node runtime injects
+   the approved preparation clock for both native providers; do not translate
+   it, set a clock environment variable, pass offset flags, or reset it at launch.
+   Use the paired updated runtime/helper. Missing or inconsistent proof fails
+   closed; constant Node clock offsets do not create extra collection time.
 3. Honor the existing wake identity's remaining allowance: **5 PR visits,
    40 initiated provider requests, 120 seconds**. Pass the remaining request count
    and absolute deadline to the helper. Reconciliation/retries count too.

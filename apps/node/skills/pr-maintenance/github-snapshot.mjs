@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { toHostObservation } from "./host-observation.mjs";
+import { observationClock } from "./observation-clock.mjs";
 
 export const VERSION = 1;
 const MAX_BYTES = 1024 * 1024;
@@ -743,12 +744,16 @@ export function buildSnapshot(input, scan) {
 }
 
 /** Exported only for deterministic transport fixtures; CLI always uses ghRequest. */
-export async function observe(input, { request = ghRequest, now = Date.now } = {}) {
+export async function observe(
+  input,
+  { request = ghRequest, now = Date.now, monotonic } = {},
+) {
   const started = now();
   let requestsConsumed = 0;
   let scan;
   let discardResume = false;
   let limits;
+  let clock;
   const progress = () => ({
     phase: scan?.phase ?? "metadata",
     pages: scan?.pages.length ?? 0,
@@ -764,6 +769,8 @@ export async function observe(input, { request = ghRequest, now = Date.now } = {
   });
   try {
     limits = validate(input, started);
+    clock = observationClock(input, now, monotonic);
+    limits.deadline = Math.min(clock.deadline, started + 120_000);
     if (size(input) > limits.maxBytes)
       throw fail("payload_overflow", "Input/checkpoint exceeds maxBytes.");
     const scopeKey = contentHash({ generation: input.generation, pr: input.pr });
@@ -798,7 +805,7 @@ export async function observe(input, { request = ghRequest, now = Date.now } = {
           "budget_exhausted",
           "Remaining request allowance exhausted; carry the scan to the next existing wake.",
         );
-      if (now() >= limits.deadline)
+      if (clock.now() >= limits.deadline)
         throw fail(
           "deadline_exhausted",
           "Maintenance deadline reached; carry the scan to the next existing wake.",
@@ -817,15 +824,18 @@ export async function observe(input, { request = ghRequest, now = Date.now } = {
           );
         endpoint = `repos/${encodeURIComponent(input.pr.owner)}/${encodeURIComponent(input.pr.repo)}/rules/branches/${encodeURIComponent(metadata.baseRefName)}?per_page=100${job.cursor ? `&page=${job.cursor}` : ""}`;
       } else payload = queryFor(input.pr, job);
+      const remaining = Math.floor(limits.deadline - clock.now());
+      if (remaining < 1)
+        throw fail("deadline_exhausted", "Maintenance deadline reached.");
       requestsConsumed += 1;
       const response = await request({
         host: input.pr.host.toLowerCase(),
         endpoint,
         payload,
-        timeoutMs: Math.max(1, Math.min(15_000, limits.deadline - now())),
+        timeoutMs: Math.min(15_000, remaining),
         maxBytes: limits.maxBytes,
       });
-      if (now() > limits.deadline)
+      if (clock.now() > limits.deadline)
         throw fail(
           "deadline_exhausted",
           "The read reached the remaining maintenance deadline.",
@@ -1085,6 +1095,11 @@ export async function observe(input, { request = ghRequest, now = Date.now } = {
       throw fail(
         "payload_overflow",
         "Complete evidence exceeds maxBytes; use a larger bounded allowance or manual evidence.",
+      );
+    if (clock.now() > limits.deadline)
+      throw fail(
+        "deadline_exhausted",
+        "Evidence completed after the maintenance deadline.",
       );
     return result;
   } catch (error) {

@@ -11,6 +11,7 @@ import {
   PrMaintenanceObservationSchema,
 } from "@fleet/protocol";
 import { contentHash } from "./github-snapshot.mjs";
+import { observationClock } from "./observation-clock.mjs";
 
 export { contentHash };
 export const VERSION = 1;
@@ -28,6 +29,7 @@ export const POLICY_TYPES = Object.freeze({
   comments: "c6a1889d-b943-4856-b76f-9e46bb6b0df2",
 });
 const messages = Object.freeze({
+  clock_unverified: "Missing, inconsistent or discontinuous approved command clock.",
   invalid_input: "Supply a bounded version-1 Azure DevOps PR observation request.",
   invalid_resume:
     "Continuation is invalid or belongs to different input, PR, or generation.",
@@ -1427,7 +1429,10 @@ export function toAdoHostObservation(
 }
 
 /** Fixture transport receives only {method:"GET",url,timeoutMs,maxBytes}; never a credential. */
-export async function observe(input, { request, now = Date.now, acquireToken } = {}) {
+export async function observe(
+  input,
+  { request, now = Date.now, acquireToken, monotonic } = {},
+) {
   const started = now();
   let requestsConsumed = 0;
   let scan;
@@ -1489,6 +1494,8 @@ export async function observe(input, { request, now = Date.now, acquireToken } =
     const validated = validate(input, started);
     const pr = validated.pr;
     limits = validated.limits;
+    const clock = observationClock(input, now, monotonic);
+    limits.deadline = Math.min(clock.deadline, started + 120_000);
     const scopeKey = contentHash({
       generation: input.generation,
       pr,
@@ -1515,10 +1522,11 @@ export async function observe(input, { request, now = Date.now, acquireToken } =
       scan.verified = 0;
     }
     const charge = () => {
-      required(now() < limits.deadline, "deadline_exhausted");
+      const remaining = Math.floor(limits.deadline - clock.now());
+      required(remaining >= 1, "deadline_exhausted");
       required(requestsConsumed < limits.maxRequests, "budget_exhausted");
       requestsConsumed++;
-      return Math.max(1, Math.min(15_000, limits.deadline - now()));
+      return Math.min(15_000, remaining);
     };
     const read = async (job) => {
       const url = endpoint(pr, scan, job);
@@ -1529,7 +1537,7 @@ export async function observe(input, { request, now = Date.now, acquireToken } =
       const timeoutMs = charge();
       const args = { method: "GET", url, timeoutMs, maxBytes: limits.maxBytes };
       const response = await (request ? request(args) : httpsRequest(args, token));
-      required(now() <= limits.deadline, "deadline_exhausted");
+      required(clock.now() <= limits.deadline, "deadline_exhausted");
       boundBytes(response, limits.maxBytes, "response");
       return normalizePage(pr, scan, job, response);
     };
@@ -1633,6 +1641,7 @@ export async function observe(input, { request, now = Date.now, acquireToken } =
       progress: { ...progress(), phase: "complete", cursor: null },
     };
     boundBytes(result, limits.maxBytes, "snapshot");
+    required(clock.now() <= limits.deadline, "deadline_exhausted");
   } catch (error) {
     result = failure(error);
     if (

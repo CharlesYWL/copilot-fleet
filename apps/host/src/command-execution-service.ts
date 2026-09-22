@@ -424,6 +424,9 @@ export class CommandExecutionService {
         this.records.preparationClock(execution.id)?.hostTime ??
         execution.descriptor?.hostTime ??
         execution.createdAt,
+      observationBudget:
+        execution.descriptor?.observationBudget ??
+        this.store.prMaintenance.observationBudget(execution),
     });
   }
 

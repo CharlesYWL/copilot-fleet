@@ -25,6 +25,7 @@ export const COMMAND_LIMITS = {
   nodeLogBytes: 128 * 1024 * 1024,
   lifecycleReserveBytes: 16 * 1024 * 1024,
   clockUncertaintyMs: 5_000,
+  clockDriftMs: 1_000,
 } as const;
 
 const id = z.string().min(1).max(200);
@@ -73,6 +74,13 @@ export const RunCommandSchema = z
   .strict();
 export type RunCommand = z.infer<typeof RunCommandSchema>;
 
+export const CommandObservationBudgetSchema = z
+  .object({
+    deadlineAt: timestamp,
+    requests: z.number().int().min(0).max(40),
+  })
+  .strict();
+
 export const CommandPreparationSchema = RunCommandSchema.extend({
   executionId: uuid,
   attemptId: uuid,
@@ -83,6 +91,7 @@ export const CommandPreparationSchema = RunCommandSchema.extend({
   createdAt: timestamp,
   expiresAt: timestamp,
   hostTime: timestamp,
+  observationBudget: CommandObservationBudgetSchema.optional(),
 });
 export type CommandPreparation = z.infer<typeof CommandPreparationSchema>;
 
@@ -149,6 +158,57 @@ export const PreparedCommandBodySchema = CommandPreparationSchema.extend({
 });
 export const PreparedCommandSchema = PreparedCommandBodySchema.extend({ digest });
 export type PreparedCommand = z.infer<typeof PreparedCommandSchema>;
+
+// Only Node runtime supplies this environment value, from the approved descriptor.
+export const COMMAND_OBSERVATION_CLOCK_ENV = "FLEET_MAINTENANCE_CLOCK";
+export const CommandObservationClockSchema = z
+  .object({
+    executionId: uuid,
+    attemptId: uuid,
+    digest,
+    claim: PrMaintenanceObservationClaimRefSchema,
+    budget: CommandObservationBudgetSchema,
+    hostTime: timestamp,
+    preparedAt: timestamp,
+    hostClockOffsetMs: z.number().finite(),
+    clockUncertaintyMs: z.literal(COMMAND_LIMITS.clockUncertaintyMs),
+    nodeTime: timestamp,
+    monotonicNs: z.string().regex(/^\d{1,24}$/),
+  })
+  .strict()
+  .superRefine((clock, ctx) => {
+    if (
+      Date.parse(clock.preparedAt) + clock.hostClockOffsetMs !==
+        Date.parse(clock.hostTime) ||
+      clock.nodeTime !== clock.preparedAt
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "Inconsistent approved preparation clock.",
+      });
+  });
+
+export function commandObservationClock(
+  descriptor: PreparedCommand,
+  nodeTime: string,
+  monotonicNs: string,
+) {
+  if (!descriptor.maintenanceObservation && !descriptor.observationBudget)
+    return undefined;
+  return CommandObservationClockSchema.parse({
+    executionId: descriptor.executionId,
+    attemptId: descriptor.attemptId,
+    digest: descriptor.digest,
+    claim: descriptor.maintenanceObservation,
+    budget: descriptor.observationBudget,
+    hostTime: descriptor.hostTime,
+    preparedAt: descriptor.prepared.preparedAt,
+    hostClockOffsetMs: descriptor.prepared.hostClockOffsetMs,
+    clockUncertaintyMs: descriptor.prepared.clockUncertaintyMs,
+    nodeTime,
+    monotonicNs,
+  });
+}
 
 /** Both peers hash this schema-ordered payload; no Node-only crypto enters the browser. */
 export function commandDigestPayload(

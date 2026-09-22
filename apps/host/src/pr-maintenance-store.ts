@@ -7,6 +7,8 @@ import {
   PR_MAINTENANCE_RECOVERY_LIMITS,
   PR_MAINTENANCE_WAKE_LIMITS,
   COMMAND_LIMITS,
+  CommandReceiptSchema,
+  commandDigestPayload,
   prMaintenanceObservationFresh,
   prMaintenanceProviderKey,
   isWritingCategory,
@@ -1769,7 +1771,13 @@ export class PrMaintenanceStore {
           record.lastAttempt.snapshotId !== record.observation.snapshotId
         )
           return denied("stale_observation");
-        if (!prMaintenanceObservationFresh(record.observation))
+        if (
+          !prMaintenanceObservationFresh(
+            record.observation,
+            Date.now(),
+            record.observationHostAt,
+          )
+        )
           return denied("stale_observation");
         if (record.observation.draft) return denied("draft");
         if (record.observation.mergeability === "conflicting")
@@ -1982,7 +1990,11 @@ export class PrMaintenanceStore {
           record.lastAttempt.failure ||
           record.lastAttempt.headSha !== record.observation.headSha ||
           record.lastAttempt.snapshotId !== record.observation.snapshotId ||
-          !prMaintenanceObservationFresh(record.observation) ||
+          !prMaintenanceObservationFresh(
+            record.observation,
+            Date.now(),
+            record.observationHostAt,
+          ) ||
           record.observation.state !== "open" ||
           prepared.headSha !== record.observation.headSha
         )
@@ -2074,7 +2086,11 @@ export class PrMaintenanceStore {
           record.lastAttempt.failure ||
           record.lastAttempt.headSha !== record.observation.headSha ||
           record.lastAttempt.snapshotId !== record.observation.snapshotId ||
-          !prMaintenanceObservationFresh(record.observation) ||
+          !prMaintenanceObservationFresh(
+            record.observation,
+            Date.now(),
+            record.observationHostAt,
+          ) ||
           record.observation.draft ||
           record.observation.state !== "open" ||
           record.incidents.some((incident) => !incident.resolvedAt) ||
@@ -2352,7 +2368,8 @@ export class PrMaintenanceStore {
     if (
       !prMaintenanceObservationFresh(observation) ||
       Date.parse(observation.attemptedAt) < Date.parse(attempt.reservedAt) ||
-      (record.lastAttemptAt && observation.attemptedAt < record.lastAttemptAt)
+      ((record.lastAttemptLatestAt ?? record.lastAttemptAt) &&
+        observation.attemptedAt < (record.lastAttemptLatestAt ?? record.lastAttemptAt)!)
     )
       return reject("stale_or_future_evidence");
     if (!observation.identity || !sameIdentity(observation.identity, record.identity)) {
@@ -2387,24 +2404,35 @@ export class PrMaintenanceStore {
     observation: PrMaintenanceObservation,
     error = observationError(observation),
     alternate = false,
+    hostAttemptedAt = observation.attemptedAt,
+    hostLatestAt = hostAttemptedAt,
   ): void {
-    if (!prMaintenanceObservationFresh(observation))
+    if (!prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt))
       refuse(
         "stale_observation",
         "Observation evidence must be no more than 30 minutes old and cannot be future-dated.",
       );
-    if (record.lastAttemptAt && observation.attemptedAt < record.lastAttemptAt)
+    if (
+      (record.lastAttemptLatestAt ?? record.lastAttemptAt) &&
+      hostAttemptedAt < (record.lastAttemptLatestAt ?? record.lastAttemptAt)!
+    )
       refuse(
         "stale_observation",
         "An older observation cannot overwrite newer successful or incomplete evidence.",
       );
     const previous = record.lastAttempt;
     record.lastAttempt = observation;
-    record.lastAttemptAt = observation.attemptedAt;
+    record.lastAttemptAt = hostAttemptedAt;
+    if (hostLatestAt !== hostAttemptedAt) record.lastAttemptLatestAt = hostLatestAt;
+    else delete record.lastAttemptLatestAt;
     record.nextCheckAt = new Date(
       Math.max(
-        Date.parse(observation.attemptedAt) + PR_MAINTENANCE_CADENCE_MS,
-        observation.retryAfter ? Date.parse(observation.retryAfter) : 0,
+        Date.parse(hostLatestAt) + PR_MAINTENANCE_CADENCE_MS,
+        observation.retryAfter
+          ? Date.parse(observation.retryAfter) +
+              Date.parse(hostAttemptedAt) -
+              Date.parse(observation.attemptedAt)
+          : 0,
       ),
     ).toISOString();
     const code = helperError(observation)?.code;
@@ -2459,7 +2487,10 @@ export class PrMaintenanceStore {
       return;
     }
     record.observation = observation;
-    record.lastSuccessAt = observation.attemptedAt;
+    if (hostAttemptedAt !== observation.attemptedAt)
+      record.observationHostAt = hostAttemptedAt;
+    else delete record.observationHostAt;
+    record.lastSuccessAt = hostAttemptedAt;
     if (!alternate) {
       record.counters.consecutiveFailures = 0;
       record.counters.scanStalls = 0;
@@ -2488,13 +2519,16 @@ export class PrMaintenanceStore {
         }
       }
     }
-    if (this.recoveryAllowed(record) && prMaintenanceObservationFresh(observation)) {
+    if (
+      this.recoveryAllowed(record) &&
+      prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt)
+    ) {
       for (const incident of record.incidents) {
         if (
           incident.kind === "capability" &&
           !incident.resolvedAt &&
           observation.identity &&
-          Date.parse(observation.attemptedAt) >= Date.parse(incident.createdAt)
+          Date.parse(hostAttemptedAt) >= Date.parse(incident.createdAt)
         ) {
           incident.resolvedAt = nowIso();
           incident.resolution = alternate ? "alternate_observation" : "observation";
@@ -2520,13 +2554,13 @@ export class PrMaintenanceStore {
       (observation.state === "merged" || observation.state === "closed")
     ) {
       record.lifecycle = observation.state;
-      this.pause(record, "terminal_cancellation_requested", observation.attemptedAt);
+      this.pause(record, "terminal_cancellation_requested", hostAttemptedAt);
       if (record.decision?.state === "pending") {
         record.decision = {
           ...record.decision,
           state: "withdrawn",
           direction: `Moot after verified PR ${observation.state}; not approved or fixed.`,
-          resolvedAt: observation.attemptedAt,
+          resolvedAt: hostAttemptedAt,
         };
       }
     }
@@ -2912,7 +2946,11 @@ export class PrMaintenanceStore {
         "Lead actions require a complete current-HEAD observation.",
       );
     if (
-      !prMaintenanceObservationFresh(record.observation) ||
+      !prMaintenanceObservationFresh(
+        record.observation,
+        Date.now(),
+        record.observationHostAt,
+      ) ||
       record.observation?.draft ||
       record.observation?.mergeability === "conflicting" ||
       record.incidents.some((incident) => !incident.resolvedAt)
@@ -3260,6 +3298,21 @@ export class PrMaintenanceStore {
     });
   }
 
+  observationBudget(execution: CommandExecution) {
+    const ref = execution.maintenanceObservation;
+    if (!ref) return undefined;
+    const claim = this.wake(execution.leadSessionId, ref.wakeId).observationClaims.find(
+      (entry) =>
+        entry.recordId === ref.recordId &&
+        entry.generation === ref.generation &&
+        entry.executionId === execution.id &&
+        entry.attemptId === execution.attemptId,
+    );
+    if (!claim)
+      refuse("receipt_claim_conflict", "Missing original command observation budget.");
+    return { deadlineAt: claim.deadlineAt, requests: claim.requests };
+  }
+
   checkpointObservationReceipt(
     leadSessionId: string,
     recordId: string,
@@ -3414,20 +3467,64 @@ export class PrMaintenanceStore {
           "receipt_mismatch",
           "Checkpoint must equal the exact helper observation in this execution's stdout.",
         );
-      const attempted = Date.parse(observation.attemptedAt);
+      const proof = this.store.commands.preparationClock(execution.id)!;
+      const descriptor = execution.descriptor;
+      const prepared = descriptor.prepared;
+      const rawReceipt = this.store.commands.attempt(execution.id)?.receipt;
+      const receipt =
+        rawReceipt && CommandReceiptSchema.safeParse(JSON.parse(String(rawReceipt)));
+      if (
+        !receipt ||
+        !receipt.success ||
+        !receipt.data.settledAt ||
+        proof.elapsedMs === null ||
+        proof.elapsedMs < 0 ||
+        proof.elapsedMs > COMMAND_LIMITS.clockUncertaintyMs ||
+        proof.hostTime !== descriptor.hostTime ||
+        prepared.clockUncertaintyMs !== COMMAND_LIMITS.clockUncertaintyMs ||
+        Date.parse(prepared.preparedAt) + prepared.hostClockOffsetMs !==
+          Date.parse(proof.hostTime) ||
+        Date.parse(proof.acceptedAt!) < Date.parse(proof.hostTime) ||
+        Date.parse(proof.acceptedAt!) - Date.parse(proof.hostTime) >
+          COMMAND_LIMITS.clockUncertaintyMs ||
+        Date.parse(execution.approvedAt) < Date.parse(proof.acceptedAt!) ||
+        descriptor.observationBudget?.deadlineAt !== claim.deadlineAt ||
+        descriptor.observationBudget.requests !== claim.requests ||
+        createHash("sha256").update(commandDigestPayload(descriptor)).digest("hex") !==
+          descriptor.digest ||
+        receipt.data.digest !== descriptor.digest ||
+        receipt.data.attemptId !== execution.attemptId
+      )
+        refuse(
+          "receipt_clock",
+          "The original approved command clock proof is missing or inconsistent.",
+        );
+      const rawAttempted = Date.parse(observation.attemptedAt);
+      const rawFinished = rawAttempted + observation.elapsedMs;
+      const attempted = rawAttempted + prepared.hostClockOffsetMs;
       const finished = attempted + observation.elapsedMs;
+      const uncertainty = prepared.clockUncertaintyMs + COMMAND_LIMITS.clockDriftMs;
       const deadline = Date.parse(claim.deadlineAt);
       const settled = Date.parse(execution.settledAt);
-      const late = finished > deadline;
+      const late = finished + uncertainty > deadline;
+      const earliest = Math.max(
+        attempted - COMMAND_LIMITS.clockDriftMs,
+        Date.parse(claim.claimedAt),
+        Date.parse(execution.createdAt),
+        Date.parse(execution.approvedAt),
+      );
+      const latest = Math.min(attempted + uncertainty, settled, Date.now());
       // An in-flight failure can finish late; the deadline still forbids new reads.
       if (
         observation.requestsConsumed > claim.requests ||
-        finished > settled ||
-        finished > Date.now() ||
-        attempted < Date.parse(claim.claimedAt) ||
-        attempted < Date.parse(execution.createdAt) ||
-        attempted > settled ||
-        attempted > Date.now() ||
+        earliest > latest ||
+        rawAttempted < Date.parse(prepared.preparedAt) ||
+        (receipt.data.startedAt && rawAttempted < Date.parse(receipt.data.startedAt)) ||
+        rawFinished > Date.parse(receipt.data.settledAt!) ||
+        finished - COMMAND_LIMITS.clockDriftMs > settled ||
+        finished - COMMAND_LIMITS.clockDriftMs > Date.now() ||
+        attempted + uncertainty < Date.parse(execution.approvedAt) ||
+        Date.now() < Date.parse(proof.acceptedAt!) ||
         (observation.requestsConsumed > 0 && attempted >= deadline) ||
         (observation.complete && late)
       )
@@ -3443,9 +3540,11 @@ export class PrMaintenanceStore {
       }
       this.required(recordId, leadSessionId, expectedVersion);
       const admission = this.admission({ action: "discover", recordId, leadSessionId });
+      const hostAttemptedAt = new Date(earliest).toISOString();
+      const hostLatestAt = new Date(latest).toISOString();
       if (
-        record.lastAttemptAt &&
-        record.lastAttemptAt >= observation.attemptedAt &&
+        (record.lastAttemptLatestAt ?? record.lastAttemptAt) &&
+        (record.lastAttemptLatestAt ?? record.lastAttemptAt)! >= hostAttemptedAt &&
         !isDeepStrictEqual(record.lastAttempt, observation)
       )
         refuse(
@@ -3454,11 +3553,19 @@ export class PrMaintenanceStore {
         );
       if (
         !late &&
+        helperError(observation)?.code !== "clock_unverified" &&
         admission.allowed &&
         !prMaintenanceUnsettled(record) &&
-        prMaintenanceObservationFresh(observation)
+        prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt)
       ) {
-        this.observe(record, observation);
+        this.observe(
+          record,
+          observation,
+          undefined,
+          false,
+          hostAttemptedAt,
+          hostLatestAt,
+        );
         this.releaseTerminal(record);
         if (
           observation.complete &&
@@ -3469,7 +3576,9 @@ export class PrMaintenanceStore {
       } else {
         // Settling exact evidence cannot revive a hold or promote late/stale feedback.
         record.lastAttempt = observation;
-        record.lastAttemptAt = observation.attemptedAt;
+        record.lastAttemptAt = hostAttemptedAt;
+        if (hostLatestAt !== hostAttemptedAt) record.lastAttemptLatestAt = hostLatestAt;
+        else delete record.lastAttemptLatestAt;
         delete record.readyFingerprint;
       }
       const saved = this.save(record);

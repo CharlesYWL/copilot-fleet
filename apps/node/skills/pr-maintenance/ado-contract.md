@@ -124,6 +124,14 @@ counts as one operation, including failure; fixture transports can inject
 `acquireToken` to exercise the same charged authentication seam. Every
 initiated HTTP read counts, including failed reads. Each operation is limited to
 15 seconds or the remaining deadline, whichever is shorter. No automatic retries.
+For a registered finite-command observation, pass the original Host deadline
+unchanged. The approved Node runtime supplies the preparation-clock context;
+the shared helper clock converts that instant conservatively, reserving the
+existing five-second uncertainty and one-second drift bound. Token acquisition,
+every GET and completeness use this same basis, including through the direct
+ADO CLI. Do not provide offsets or copy runtime environment data. Standalone
+discovery uses a Node-local deadline instead and grants no receipt authority.
+See [the shared handoff contract](helper-contract.md#durable-evidence-handoff).
 Only generated `https://dev.azure.com/<organization>/<project>/_apis/...` GET
 URLs are requested. Node HTTPS does not follow redirects, and provider-supplied
 links are never followed. Non-success response bodies are not retained.

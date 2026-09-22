@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMMAND_LIMITS,
   GetCommandExecutionSchema,
+  commandObservationClock,
   PreparedCommandSchema,
   type CommandExecutionNodeMessage,
   type CommandPreparation,
@@ -791,6 +792,46 @@ describe("approved command execution", () => {
       expect(f.supervisor.readiness).toHaveBeenCalledTimes(readinessCalls);
       await f.start(descriptor);
       expect(f.prepare.mock.calls[0]![0].startExpiresAt).toBe(nodeTime + 54000);
+      f.complete(result());
+      await vi.waitFor(() => expect(f.manager.unsettled).toBe(false));
+    },
+  );
+
+  it.each([-60_000, 0, 60_000])(
+    "passes F5 the original approved clock and budget to the supervisor without resetting at launch (%d)",
+    async (offset) => {
+      const hostTime = Date.now();
+      let wall = hostTime + offset;
+      let mono = 0;
+      const f = await fixture({ now: () => wall, monotonic: () => mono });
+      Object.assign(f.request, {
+        hostTime: new Date(hostTime).toISOString(),
+        createdAt: new Date(hostTime).toISOString(),
+        expiresAt: new Date(hostTime + 1_800_000).toISOString(),
+        maintenanceObservation: { recordId: "record", generation: 1, wakeId: "turn" },
+        observationBudget: {
+          deadlineAt: new Date(hostTime + 120_000).toISOString(),
+          requests: 39,
+        },
+      });
+      const descriptor = await f.prepared();
+      wall += 70_000;
+      mono += 70_000;
+      await f.start(descriptor, {
+        approvedAt: new Date(hostTime + 20_000).toISOString(),
+      });
+      const context = f.prepare.mock.calls[0]![0].observationClock!;
+      expect(context).toEqual(
+        commandObservationClock(
+          descriptor,
+          descriptor.prepared.preparedAt,
+          context.monotonicNs,
+        ),
+      );
+      expect(context.nodeTime).toBe(new Date(hostTime + offset).toISOString());
+      expect(context.budget).toEqual(f.request.observationBudget);
+      expect(context.hostClockOffsetMs).toBe(0 - offset);
+      expect(context.digest).toBe(descriptor.digest);
       f.complete(result());
       await vi.waitFor(() => expect(f.manager.unsettled).toBe(false));
     },

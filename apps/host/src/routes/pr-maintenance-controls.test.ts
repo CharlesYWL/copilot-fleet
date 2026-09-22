@@ -1004,7 +1004,7 @@ describe("authenticated PR maintenance controls", () => {
     const identity = tool.inputSchema.properties.identity;
     expect(tool.description).toContain("Before registration");
     expect(tool.inputSchema.properties.evidence.description).toContain("metadata-only");
-    expect(identity.description).toContain("snapshot.identity unchanged");
+    expect(identity.description).toContain("observation.identity unchanged");
     const ado = identity.oneOf.find(
       (entry: any) => entry.properties.provider.const === "azure-devops",
     );
