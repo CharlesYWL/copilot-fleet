@@ -264,6 +264,8 @@ declare module "fastify" {
     fleetNodeId?: string;
     /** Set by the guard for every route that runs as an operator. */
     fleetSession?: ActiveSession;
+    /** Server-established human access, including the existing no-sign-in mode. */
+    fleetHumanActor?: string;
     /**
      * The JSON body exactly as it arrived, kept only so a Node's signature can
      * be checked against the bytes the Host will act on rather than against a
@@ -506,6 +508,8 @@ export function registerRequestGuard(
           return reply.code(403).send({ error: "Missing or invalid CSRF token" });
         }
       }
+      if (!request.headers.authorization && !request.headers[NODE_ID_HEADER])
+        request.fleetHumanActor = NO_AUTH_PRINCIPAL;
       return;
     }
 
@@ -530,6 +534,9 @@ export function registerRequestGuard(
       }
     }
     request.fleetSession = session;
+    if (!request.headers.authorization && !request.headers[NODE_ID_HEADER])
+      request.fleetHumanActor =
+        session.administratorId || `operator:${session.authMethod}`;
   });
 
   app.addHook("preValidation", async (request, reply) => {

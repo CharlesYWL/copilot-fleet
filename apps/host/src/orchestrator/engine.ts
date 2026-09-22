@@ -73,10 +73,11 @@ export class OrchestratorEngine {
         if (session && step) {
           this.turnComplete.set(
             event.sessionId,
-            notificationAttemptKey(session, {
-              step,
-              run: this.store.getRun(step.runId),
-            }),
+            this.store.getSessionDispatchAttempt(session.id)?.attempt ??
+              notificationAttemptKey(session, {
+                step,
+                run: this.store.getRun(step.runId),
+              }),
           );
         }
       }
@@ -122,6 +123,19 @@ export class OrchestratorEngine {
     if (!step) return;
     const session = this.store.getSession(sessionId);
     if (!session) return;
+    const attempt = notificationAttemptKey(session, {
+      step,
+      run: this.store.getRun(step.runId),
+    });
+    const dispatch = this.store.getSessionDispatchAttempt(sessionId);
+    // Event sequence alone cannot distinguish the cancelled turn from a later
+    // supervisor turn. Stop keeps the original dispatch receipt; new work replaces it.
+    if (dispatch?.attempt !== attempt) return;
+    const events = this.store
+      .listEvents(sessionId)
+      .filter(
+        (event) => event.sequence > Math.max(step.eventSeqFrom, dispatch.eventSeqFrom),
+      );
 
     if (session.state === "failed") {
       this.service.reconcileStoppedOrchestrationStep({
@@ -133,29 +147,17 @@ export class OrchestratorEngine {
       return;
     }
 
-    const attempt = notificationAttemptKey(session, {
-      step,
-      run: this.store.getRun(step.runId),
-    });
     const completedTurn =
       this.turnComplete.get(sessionId) === attempt ||
-      this.store
-        .listEvents(sessionId)
-        .some(
-          (event) => event.type === "turn_complete" && event.sequence > step.eventSeqFrom,
-        );
+      this.store.getSessionTurnCompletion(sessionId)?.attempt === attempt ||
+      events.some((event) => event.type === "turn_complete");
     if (
       completedTurn &&
       (session.state === "idle" ||
         session.state === "completed" ||
         session.state === "stopped")
     ) {
-      const output = workerOutput(
-        this.store
-          .listEvents(sessionId)
-          .filter((event) => event.sequence > step.eventSeqFrom),
-        session,
-      );
+      const output = workerOutput(events, session);
       this.service.reconcileStoppedOrchestrationStep({
         runId: step.runId,
         stepId: step.id,
@@ -189,6 +191,12 @@ export class OrchestratorEngine {
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
     if (!run || terminalRunStates.has(run.state)) return;
+    if (
+      this.store.prMaintenance
+        .list({ taskId: runId, retainedOnly: true })
+        .records.some((record) => record.manualControl && !record.manualControl.endedAt)
+    )
+      return;
     const commandFence = this.store.commands.fence(runId);
     if (
       commandFence &&
@@ -534,6 +542,8 @@ export class OrchestratorEngine {
   }
 
   private stopSession(sessionId: string): void {
+    const manual = this.store.prMaintenance.manualRecord(sessionId)?.manualControl;
+    if (manual && !manual.endedAt) return;
     const session = this.store.getSession(sessionId);
     if (
       !session ||
@@ -863,6 +873,10 @@ export class OrchestratorEngine {
   }
 
   private finishRun(run: Run, state: Run["state"], reason: string): boolean {
+    if (
+      !this.store.prMaintenance.admission({ action: "advance", taskId: run.id }).allowed
+    )
+      return false;
     if (run.workspaceBinding?.effectiveMode === "managed") {
       if (state === "completed") {
         if (

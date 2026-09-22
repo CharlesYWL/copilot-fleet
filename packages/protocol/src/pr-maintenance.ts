@@ -737,6 +737,31 @@ export type PrMaintenanceOperatorAction = z.infer<
   typeof PrMaintenanceOperatorActionSchema
 >;
 
+export const PrMaintenanceManualCommandSchema = z
+  .object({
+    id,
+    digest: id,
+    kind: z.enum(["prompt", "resume_session"]),
+    operatorId: id,
+    eventSeqFrom: count,
+    state: z.enum(["unknown", "accepted", "settled", "rejected"]),
+    createdAt: time,
+  })
+  .strict();
+export type PrMaintenanceManualCommand = z.infer<typeof PrMaintenanceManualCommandSchema>;
+
+export const PrMaintenanceManualOwnerSchema = z
+  .object({
+    sessionId: id,
+    taskId: z.string().max(512),
+    placementId: z.string().max(512),
+    nodeId: z.string().max(512),
+    workspaceId: z.string().max(512),
+    checkoutKey: z.string().max(512),
+  })
+  .strict();
+export type PrMaintenanceManualOwner = z.infer<typeof PrMaintenanceManualOwnerSchema>;
+
 export const PrMaintenanceRegistrationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -758,6 +783,15 @@ export const PrMaintenanceRegistrationSchema = z
     pausedNoticeAt: time.optional(),
     ownershipReleasedAt: time.optional(),
     retentionReleasedBy: id.optional(),
+    manualControl: z
+      .object({
+        operatorId: id,
+        takenAt: time,
+        endedAt: time.optional(),
+        commands: z.array(PrMaintenanceManualCommandSchema).max(1_000),
+      })
+      .strict()
+      .optional(),
     authorization: z
       .object({
         id,
@@ -1010,6 +1044,17 @@ export const PrMaintenanceBackupSchema = z
     wakes: z.array(PrMaintenanceWakeSchema).max(100_000),
     scans: z.array(PrMaintenanceScanSchema).max(10_000),
     proposals: z.array(PrMaintenanceProposalSchema).max(10_000).default([]),
+    manualCommands: z
+      .array(
+        z.object({ sessionId: id, command: PrMaintenanceManualCommandSchema }).strict(),
+      )
+      .default([]),
+    manualConflicts: z
+      .array(
+        z.object({ sessionId: id, command: PrMaintenanceManualCommandSchema }).strict(),
+      )
+      .default([]),
+    manualOwners: z.array(PrMaintenanceManualOwnerSchema).default([]),
   })
   .strict();
 export type PrMaintenanceBackup = z.infer<typeof PrMaintenanceBackupSchema>;

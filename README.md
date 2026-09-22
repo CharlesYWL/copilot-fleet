@@ -1884,6 +1884,63 @@ whole PR. Use the task's **Send back with instructions** to record bounded,
 versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
 hold, certify a defect fixed, or approve a redesign.
 
+**Manual supervisor control:** open the retained worker and send an ordinary prompt,
+or use the worker's **Resume** button. This works for observation-only and paused
+registrations without Release or a separate unattended-publication grant, using the
+Host's existing human access (including its configured no-sign-in mode). Node
+credentials, MCP tokens, request flags, and prompt text do not establish human intent.
+Fleet atomically pauses maintenance and cancels only provably never-sent queued work;
+accepted/in-flight work and unknown effects must first produce correlated receipts.
+Busy, stopping, offline, capacity, and checkout restrictions still apply.
+
+After the manual turn, maintenance **stays paused**. Registration, authorization
+scope, pending design decisions, and execution/effect receipts remain intact.
+Manual direction is neither design approval, evidence of readiness, nor permission
+to renew unattended publication. Use explicit maintenance controls to resume the
+loop later. Reconnect may reattach a settled manual conversation, but never replays
+an unknown prompt. A later manual turn cannot complete a cancelled orchestration
+step: late outcomes must still match that step's original dispatch attempt.
+
+For retained sessions and sessions with manual-control history, prompt/resume
+requests accept an `operationId` UUID; the UI reuses it on a failed request retry.
+The same UUID returns its original receipt without redelivery, even after Release,
+re-enablement, or Host restart; changing the actor or input conflicts. Unknown or
+rejected delivery is reported rather than silently replayed. Use a fresh UUID for
+a new intentional operation. This is not a new idempotency guarantee for ordinary
+sessions that have never entered manual control.
+
+Legacy requests without a UUID correlate matching unsettled delivery only. After
+settlement they represent new intent, so Stop followed by keyless Resume really
+resumes the session. Keyless requests cannot distinguish a delayed retry from new
+intent after completion; use explicit UUIDs when that distinction matters.
+
+Compact command receipts live in an indexed durable history independent of
+maintenance ownership. Each registration keeps only its 32 most recent terminal
+receipts plus all unsettled receipts; older duplicate-detection evidence is not
+evicted. Settled history and reconnects no longer impose a command-count ceiling or
+require Release. No-sign-in mode still does not authorize unattended maintenance
+renewal, Release, or publication. Registry schema v3 migrates existing inline
+receipts and durable task/checkout ownership on open; portable backups include
+both. Compact history grows on disk with operations rather than blocking control
+at an arbitrary count.
+
+Older versions could admit conflicting uses of a UUID across Release/re-enablement.
+Migration preserves those historical claims and quarantines the ambiguous key
+instead of preventing Host startup or choosing one claim to replay. A retry receives
+a conflict identifying the key; the portable backup's `manualConflicts` contains
+the original claims for inspection. Fully terminal ambiguity blocks that UUID only;
+unsettled or uncertain claims also hold the affected session, task, and checkout.
+Generic later events cannot resolve those ambiguities, and Release does not bypass
+them. There is no automatic repair or operator reconciliation UI for ambiguous
+historical execution in this change.
+
+Individual, bulk, retention, and catalog/task cleanup preserve unsettled manual
+receipts and their transcript/dispatch evidence, including after maintenance Release.
+Durable ownership keeps task/checkout cleanup blocked even if an older version
+already removed the session. Normal correlated settlement permits cleanup again.
+Large-history migration cost and full-parallel workload performance are not bounded
+by this change; the existing 50 MiB portable-backup limit still applies.
+
 ![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](docs/pr-maintenance-human-gate.png)
 
 _Design choices stay human: record direction, then explicitly resume maintenance._
