@@ -357,6 +357,18 @@ export const PrMaintenanceProposalSchema = z
   .strict();
 export type PrMaintenanceProposal = z.infer<typeof PrMaintenanceProposalSchema>;
 
+/** Pending attention only; authorization still reads the exact stored proposal. */
+export const PrMaintenanceApprovalSchema = z.object({
+  proposalId: id,
+  version: z.number().int().positive(),
+  taskId: id,
+  leadSessionId: id,
+  identity: PrMaintenanceIdentitySchema,
+  mode: z.enum(["observe", "repair"]),
+  createdAt: time,
+});
+export type PrMaintenanceApproval = z.infer<typeof PrMaintenanceApprovalSchema>;
+
 export const PrMaintenanceSourceSchema = z
   .object({
     id,

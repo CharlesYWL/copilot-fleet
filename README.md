@@ -1843,10 +1843,21 @@ Repair/publication requires an explicit proposal backed by existing publication
 authority; replies, thread resolution, named reviewers and CI retries are requested
 separately. The approval shows the exact proposed actions, never silently expanding
 a read-only task into repair permission.
-Open **Review PR maintenance proposal** in the task panel, inspect the prefilled
-scope, and select **Authorize maintenance** while signed in. No JSON copy/paste
-is needed; the agent cannot authorize itself. Checks then use the existing wake
-loop, and a normal chat message can request an immediate first check.
+Pending PR-maintenance proposals now light up the same **Commands** attention
+badge as command permissions. Open **Commands → Waiting approval**, select the
+PR-maintenance request, and choose **Review maintenance scope**. This opens the
+scope-review dialog directly; no task navigation or expanded maintenance section
+is required. The count comes from pending proposals, so reading or dismissing a
+notification does not hide an outstanding approval. Orchestrator-scoped Commands
+shows only that lead's requests.
+
+The task panel's **Review PR maintenance proposal** remains available too. Both
+entry points use the same exact-proposal/version, retained-worker and explicit
+confirmation checks. Select **Authorize maintenance** while signed in; a command
+permission does not authorize PR maintenance, and no JSON copy/paste is needed.
+Changed or already-handled proposals must be reviewed afresh. The agent cannot
+authorize itself. Checks then use the existing wake loop, and a normal chat
+message can request an immediate first check.
 
 The panel separates the current job from prior PRs. Its graph highlights the
 actual current stage, including attention/hold states; missing or stale evidence

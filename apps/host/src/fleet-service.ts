@@ -279,6 +279,7 @@ export class FleetService {
       notificationUnreadCount: this.store.notificationUnreadCount(),
       hostRevision: this.hostRevision,
       commandExecutions: this.commands.list({ limit: 100 }),
+      prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
     };
   }
 

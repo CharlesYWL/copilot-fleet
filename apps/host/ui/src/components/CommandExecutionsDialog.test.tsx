@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CommandExecutionSchema,
   NotificationSchema,
+  PrMaintenanceApprovalSchema,
   type CommandExecution,
   type CommandExecutionPage,
 } from "@fleet/protocol";
@@ -24,6 +25,27 @@ const identity = {
   volume: "volume",
   fileId: "file",
 };
+const maintenanceApproval = () =>
+  PrMaintenanceApprovalSchema.parse({
+    proposalId: "proposal",
+    version: 2,
+    taskId: "task",
+    leadSessionId: "lead",
+    mode: "observe",
+    createdAt: at,
+    identity: {
+      host: "github.com",
+      repositoryId: "123",
+      repository: "owner/repo",
+      prNumber: 17,
+      headRepositoryId: "123",
+      headRepository: "owner/repo",
+      headRef: "refs/heads/fix",
+      baseRepositoryId: "123",
+      baseRepository: "owner/repo",
+      baseRef: "refs/heads/main",
+    },
+  });
 function execution(patch: Partial<CommandExecution> = {}): CommandExecution {
   const request = {
     target: { placementId: "placement" },
@@ -147,6 +169,116 @@ function mount(
 }
 
 describe("command approval UI", () => {
+  it("opens the waiting tab for a maintenance-only approval and routes directly to scope review", async () => {
+    vi.mocked(fetch).mockResolvedValue(json({ executions: [] }));
+    const approval = maintenanceApproval();
+    const review = vi.fn();
+    const rendered = render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <CommandExecutionsDialog
+          executions={[]}
+          output={[]}
+          connected
+          onClose={vi.fn()}
+          maintenanceApprovals={[approval]}
+          onReviewMaintenance={review}
+        />
+      </FluentProvider>,
+    );
+    expect(
+      screen
+        .getByRole("tab", { name: "Waiting approval (1)" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      await screen.findByRole("region", { name: "PR maintenance approval details" }),
+    ).toBeTruthy();
+    expect(screen.getByText("Read-only observation")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review maintenance scope" }));
+    expect(review).toHaveBeenCalledWith(approval);
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === "POST")).toBe(
+      false,
+    );
+    rendered.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <CommandExecutionsDialog
+          executions={[]}
+          output={[]}
+          connected
+          onClose={vi.fn()}
+          maintenanceApprovals={[]}
+          onReviewMaintenance={review}
+        />
+      </FluentProvider>,
+    );
+    expect(screen.getByRole("tab", { name: "Waiting approval (0)" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Review maintenance scope" })).toBeNull();
+  });
+
+  it("keeps command permission actions separate when the waiting list also contains a PR", async () => {
+    const approval = maintenanceApproval();
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <CommandExecutionsDialog
+          executions={[record]}
+          output={[]}
+          connected
+          onClose={vi.fn()}
+          maintenanceApprovals={[approval]}
+          onReviewMaintenance={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+    expect(screen.getByRole("tab", { name: "Waiting approval (2)" })).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: /PR maintenance · waiting approval/ }),
+    );
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Review maintenance scope" })).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: /Windows builder · awaiting approval/ }),
+    );
+    expect(screen.getByRole("button", { name: "Allow once" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Review maintenance scope" })).toBeNull();
+    await act(async () => {});
+  });
+
+  it("filters maintenance approvals to the chosen lead and disables review while disconnected", async () => {
+    const review = vi.fn();
+    const own = maintenanceApproval();
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <CommandExecutionsDialog
+          executions={[]}
+          output={[]}
+          connected={false}
+          leadSessionId="lead"
+          onClose={vi.fn()}
+          maintenanceApprovals={[
+            own,
+            { ...own, proposalId: "other", leadSessionId: "other-lead" },
+          ]}
+          onReviewMaintenance={review}
+        />
+      </FluentProvider>,
+    );
+    await screen.findByText("Windows builder · awaiting approval");
+    expect(screen.getByRole("tab", { name: "Waiting approval (2)" })).toBeTruthy();
+    expect(
+      screen.getAllByRole("button", { name: /PR maintenance · waiting approval/ }),
+    ).toHaveLength(1);
+    fireEvent.click(
+      screen.getByRole("button", { name: /PR maintenance · waiting approval/ }),
+    );
+    expect(
+      screen.getByRole("button", { name: "Review maintenance scope" }),
+    ).toHaveProperty("disabled", true);
+    fireEvent.click(screen.getByRole("button", { name: "Review maintenance scope" }));
+    expect(review).not.toHaveBeenCalled();
+  });
+
   it("separates pending approvals from approved, denied, and completed requests", async () => {
     const others = [
       execution({

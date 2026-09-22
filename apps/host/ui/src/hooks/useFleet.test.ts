@@ -7,7 +7,7 @@ import type {
   SessionEvent,
   Snapshot,
 } from "@fleet/protocol";
-import { RunSchema } from "@fleet/protocol";
+import { PrMaintenanceApprovalSchema, RunSchema } from "@fleet/protocol";
 import { useFleet } from "./useFleet";
 import { csrfToken, forgetCsrfToken } from "../lib/auth";
 
@@ -113,6 +113,64 @@ afterEach(() => {
 });
 
 describe("useFleet durable notifications", () => {
+  it("does not resurrect an authorized maintenance proposal from a delayed REST snapshot", async () => {
+    const approval = PrMaintenanceApprovalSchema.parse({
+      proposalId: "proposal",
+      version: 1,
+      taskId: "task",
+      leadSessionId: "lead",
+      mode: "observe",
+      createdAt: ISO,
+      identity: {
+        host: "github.com",
+        repositoryId: "123",
+        repository: "owner/repo",
+        prNumber: 17,
+        headRepositoryId: "123",
+        headRepository: "owner/repo",
+        headRef: "refs/heads/fix",
+        baseRepositoryId: "123",
+        baseRepository: "owner/repo",
+        baseRef: "refs/heads/main",
+      },
+    });
+    let finish: ((value: Response) => void) | undefined;
+    vi.mocked(fetch).mockImplementation((path) => {
+      if (String(path) === "/api/snapshot")
+        return new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      if (String(path) === "/api/runs")
+        return json({ stepsByRunId: {}, notesByRunId: {} });
+      throw new Error(`Unexpected fetch ${String(path)}`);
+    });
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const socket = MockWebSocket.instances[0]!;
+    act(() =>
+      socket.send({
+        type: "snapshot",
+        data: { ...snapshot(), prMaintenanceApprovals: [approval] },
+      }),
+    );
+    expect(result.current.snapshot.prMaintenanceApprovals).toEqual([approval]);
+    let refreshing!: Promise<void>;
+    act(() => {
+      refreshing = result.current.refresh();
+    });
+    await waitFor(() => expect(finish).toBeDefined());
+    act(() =>
+      socket.send({
+        type: "snapshot",
+        data: { ...snapshot(), prMaintenanceApprovals: [] },
+      }),
+    );
+    await act(async () => {
+      finish!(response({ ...snapshot(), prMaintenanceApprovals: [approval] }));
+      await refreshing;
+    });
+    expect(result.current.snapshot.prMaintenanceApprovals).toEqual([]);
+  });
+
   it("hydrates live checkpoints without refetching or dropping them for an older run message", () => {
     const { result } = renderHook(() => useFleet(vi.fn()));
     const run = RunSchema.parse({

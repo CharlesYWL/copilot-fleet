@@ -3,6 +3,7 @@ import { FluentProvider } from "@fluentui/react-components";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PR_MAINTENANCE_RECOVERY_LIMITS,
+  PrMaintenanceApprovalSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceObservationSchema,
@@ -24,6 +25,7 @@ import { PrMaintenancePanel } from "./PrMaintenancePanel";
 import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
 import { buildRunViewModels } from "../../lib/orchestration-view";
 import { taskOverview } from "../../lib/task-overview";
+import { PrMaintenanceApprovalReview } from "./PrMaintenanceApprovalReview";
 
 vi.mock("../../lib/pr-maintenance", () => ({
   getTaskMaintenance: vi.fn(),
@@ -212,6 +214,191 @@ beforeEach(() => {
 });
 
 describe("PR maintenance task controls", () => {
+  it.each([false, true])(
+    "reviews the same exact stored scope from Commands (repairs=%s)",
+    async (repairs) => {
+      const pending = proposal();
+      pending.registration.scope.publicationAuthorized = repairs;
+      const approval = PrMaintenanceApprovalSchema.parse({
+        proposalId: pending.id,
+        version: pending.version,
+        taskId: task.id,
+        leadSessionId: pending.leadSessionId,
+        identity: pending.registration.identity,
+        mode: repairs ? "repair" : "observe",
+        createdAt: at,
+      });
+      vi.mocked(getTaskMaintenance).mockResolvedValue({
+        records: [],
+        proposal: pending,
+        canAuthorize: true,
+      });
+      vi.mocked(authorizeTaskMaintenanceProposal).mockResolvedValue(registration());
+      const authorized = vi.fn();
+      render(
+        <FluentProvider theme={fleetDarkTheme}>
+          <PrMaintenanceApprovalReview
+            approval={approval}
+            currentApproval={approval}
+            sessions={[worker]}
+            connected
+            snapshotRevision={0}
+            onClose={vi.fn()}
+            onAuthorized={authorized}
+          />
+        </FluentProvider>,
+      );
+      const button = await screen.findByRole("button", {
+        name: repairs ? "Authorize maintenance" : "Authorize read-only observation",
+      });
+      expect(button).toHaveProperty("disabled", true);
+      expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("checkbox"));
+      fireEvent.click(button);
+      await waitFor(() =>
+        expect(authorizeTaskMaintenanceProposal).toHaveBeenCalledExactlyOnceWith(
+          task.id,
+          {
+            id: pending.id,
+            version: pending.version,
+          },
+        ),
+      );
+      expect(authorized).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("never retargets an inbox approval when a newer proposal version arrives", async () => {
+    const pending = proposal();
+    const approval = PrMaintenanceApprovalSchema.parse({
+      proposalId: pending.id,
+      version: pending.version,
+      taskId: task.id,
+      leadSessionId: pending.leadSessionId,
+      identity: pending.registration.identity,
+      mode: "repair",
+      createdAt: at,
+    });
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [],
+      proposal: pending,
+      canAuthorize: true,
+    });
+    const props = {
+      approval,
+      currentApproval: approval,
+      sessions: [worker],
+      connected: true,
+      snapshotRevision: 0,
+      onClose: vi.fn(),
+      onAuthorized: vi.fn(),
+    };
+    const view = render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenanceApprovalReview {...props} />
+      </FluentProvider>,
+    );
+    await screen.findByRole("button", { name: "Authorize maintenance" });
+    fireEvent.click(screen.getByRole("checkbox"));
+    view.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenanceApprovalReview
+          {...props}
+          currentApproval={{ ...approval, version: 2 }}
+          snapshotRevision={1}
+        />
+      </FluentProvider>,
+    );
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      expect.stringContaining("changed or was already handled"),
+    );
+    expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
+    expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { connected: false, canAuthorize: true },
+    { connected: true, canAuthorize: false },
+  ])("keeps inbox approval gated for %j", async ({ connected, canAuthorize }) => {
+    const pending = proposal();
+    const approval = PrMaintenanceApprovalSchema.parse({
+      proposalId: pending.id,
+      version: pending.version,
+      taskId: task.id,
+      leadSessionId: pending.leadSessionId,
+      identity: pending.registration.identity,
+      mode: "repair",
+      createdAt: at,
+    });
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [],
+      proposal: pending,
+      canAuthorize,
+    });
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenanceApprovalReview
+          approval={approval}
+          currentApproval={approval}
+          sessions={[worker]}
+          connected={connected}
+          snapshotRevision={0}
+          onClose={vi.fn()}
+          onAuthorized={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+    expect(
+      await screen.findByRole("button", { name: "Authorize maintenance" }),
+    ).toHaveProperty("disabled", true);
+    expect(screen.getByRole("checkbox")).toHaveProperty("disabled", true);
+    expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
+  });
+
+  it("does not use a previously loaded approval after a failed status refresh", async () => {
+    const pending = proposal();
+    const approval = PrMaintenanceApprovalSchema.parse({
+      proposalId: pending.id,
+      version: pending.version,
+      taskId: task.id,
+      leadSessionId: pending.leadSessionId,
+      identity: pending.registration.identity,
+      mode: "repair",
+      createdAt: at,
+    });
+    vi.mocked(getTaskMaintenance)
+      .mockResolvedValueOnce({ records: [], proposal: pending, canAuthorize: true })
+      .mockRejectedValue(new Error("Maintenance status unavailable"));
+    const props = {
+      approval,
+      currentApproval: approval,
+      sessions: [worker],
+      connected: true,
+      snapshotRevision: 0,
+      onClose: vi.fn(),
+      onAuthorized: vi.fn(),
+    };
+    const view = render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenanceApprovalReview {...props} />
+      </FluentProvider>,
+    );
+    await screen.findByRole("button", { name: "Authorize maintenance" });
+    fireEvent.click(screen.getByRole("checkbox"));
+    view.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <PrMaintenanceApprovalReview {...props} snapshotRevision={1} />
+      </FluentProvider>,
+    );
+    expect(await screen.findByRole("alert")).toHaveProperty(
+      "textContent",
+      "Maintenance status unavailable",
+    );
+    expect(screen.queryByRole("button", { name: "Authorize maintenance" })).toBeNull();
+    expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
+  });
+
   it("expires displayed readiness at the evidence boundary without a socket update or polling", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(at));
