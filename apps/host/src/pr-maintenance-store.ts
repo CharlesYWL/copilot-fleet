@@ -293,6 +293,51 @@ export class PrMaintenanceStore {
     return proposal;
   }
 
+  private consumeProposal(taskId: string, approved = false): void {
+    const proposal = this.getProposal(taskId);
+    if (!proposal) return;
+    this.store.appendRunNote(
+      taskId,
+      this.store.getRun(taskId)!.phaseIndex,
+      JSON.stringify(proposal),
+      {
+        summary: approved
+          ? "Approved PR maintenance proposal; prerequisite evidence retained"
+          : proposal.registration.scope.publicationAuthorized
+            ? "Superseded repair proposal; not repair authorization"
+            : "Superseded legacy observation-only proposal; not repair authorization",
+        kind: "decision",
+        source: approved ? "operator" : "orchestrator",
+        sessionId: proposal.leadSessionId,
+      },
+    );
+    this.db.prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?").run(taskId);
+  }
+
+  private archiveAuthorization(record: PrMaintenanceRegistration) {
+    if (
+      record.authorization.eligibilityEvidence !== undefined &&
+      record.authorization.eligibilityEvidence !== record.eligibilityEvidence
+    )
+      refuse(
+        "eligibility_evidence_conflict",
+        "Record and grant prerequisite evidence disagree; reconcile them without discarding either before changing authorization.",
+      );
+    const previous = {
+      ...record.authorization,
+      // Old observation/initial grants used the record field. Do not assign lost
+      // prerequisites to an already-reauthorized historical repair grant.
+      eligibilityEvidence:
+        record.authorization.eligibilityEvidence ??
+        (!record.authorization.scope.publicationAuthorized ||
+        record.authorizationHistory.length === 0
+          ? record.eligibilityEvidence
+          : undefined),
+    };
+    record.authorizationHistory.push(previous);
+    return previous;
+  }
+
   propose(
     leadSessionId: string,
     input: z.input<typeof PrMaintenanceEnableSchema>,
@@ -390,14 +435,7 @@ export class PrMaintenanceStore {
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
       });
-      if (previous && !previous.registration.scope.publicationAuthorized)
-        this.store.appendRunNote(task.id, task.phaseIndex, JSON.stringify(previous), {
-          summary:
-            "Superseded legacy observation-only proposal; not repair authorization",
-          kind: "decision",
-          source: "orchestrator",
-          sessionId: leadSessionId,
-        });
+      this.consumeProposal(task.id);
       this.db
         .prepare(
           `INSERT INTO pr_maintenance_proposals(task_id,data) VALUES (?,?)
@@ -454,7 +492,8 @@ export class PrMaintenanceStore {
           refuse("stale_generation", "Prepare a new repair authorization proposal.");
         this.assertReauthorization(record, registration);
         const operatorId = actorSchema.parse(actorId);
-        record.authorizationHistory.push(record.authorization);
+        this.archiveAuthorization(record);
+        record.eligibilityEvidence = registration.eligibilityEvidence;
         record.authorization = {
           id: randomUUID(),
           operatorId,
@@ -462,18 +501,18 @@ export class PrMaintenanceStore {
           headSha: registration.headSha,
           scope: registration.scope,
           budgets: registration.budgets,
+          eligibilityEvidence: registration.eligibilityEvidence,
+          sourceProposal: { id: proposal.id, version: proposal.version },
         };
         // Reauthorization grants scope, not permission to resume old paused/finished work.
         if (record.lifecycle === "active")
           this.pause(record, "repair_authorized_requires_explicit_resume");
         else delete record.readyFingerprint;
         const saved = this.save(record);
-        this.db
-          .prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?")
-          .run(taskId);
+        this.consumeProposal(taskId, true);
         return saved;
       }
-      return this.enableFromOperator(registration, actorId);
+      return this.enable(registration, actorId, proposal);
     });
   }
 
@@ -752,6 +791,14 @@ export class PrMaintenanceStore {
     input: z.input<typeof PrMaintenanceEnableSchema>,
     actorId: string,
   ): PrMaintenanceRegistration {
+    return this.enable(input, actorId);
+  }
+
+  private enable(
+    input: z.input<typeof PrMaintenanceEnableSchema>,
+    actorId: string,
+    approvedProposal?: PrMaintenanceProposal,
+  ): PrMaintenanceRegistration {
     const parsed = PrMaintenanceEnableSchema.parse(input);
     const operatorId = actorSchema.parse(actorId);
     return this.store.writeAtomically(() => {
@@ -773,6 +820,8 @@ export class PrMaintenanceStore {
           previous.workerSessionId === parsed.workerSessionId &&
           previous.leadSessionId === lead.id &&
           sameIdentity(previous.identity, parsed.identity) &&
+          previous.authorization.headSha === parsed.headSha &&
+          previous.eligibilityEvidence === parsed.eligibilityEvidence &&
           isDeepStrictEqual(previous.authorization.scope, parsed.scope) &&
           isDeepStrictEqual(previous.authorization.budgets, parsed.budgets)
         )
@@ -848,6 +897,15 @@ export class PrMaintenanceStore {
           headSha: parsed.headSha,
           scope: parsed.scope,
           budgets: parsed.budgets,
+          eligibilityEvidence: parsed.eligibilityEvidence,
+          ...(approvedProposal
+            ? {
+                sourceProposal: {
+                  id: approvedProposal.id,
+                  version: approvedProposal.version,
+                },
+              }
+            : {}),
         },
         authorizationHistory: [],
         lifecycle: "active",
@@ -876,9 +934,7 @@ export class PrMaintenanceStore {
               : undefined);
       if (reason) this.pause(record, reason, now);
       const saved = this.write(record, true);
-      this.db
-        .prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?")
-        .run(task.id);
+      this.consumeProposal(task.id, Boolean(approvedProposal));
       return saved;
     });
   }
@@ -1404,7 +1460,7 @@ export class PrMaintenanceStore {
             "wait_for_human",
             "Direction for the pending proposal is required before renewal.",
           );
-        record.authorizationHistory.push(record.authorization);
+        const previous = this.archiveAuthorization(record);
         record.authorization = {
           id: randomUUID(),
           operatorId,
@@ -1412,6 +1468,8 @@ export class PrMaintenanceStore {
           headSha: record.observation?.headSha ?? record.authorization.headSha,
           scope: action.scope ?? record.authorization.scope,
           budgets: action.budgets ?? record.authorization.budgets,
+          eligibilityEvidence: previous.eligibilityEvidence,
+          sourceProposal: previous.sourceProposal,
         };
         record.counters = emptyCounters();
         record.findingAttempts = [];

@@ -796,6 +796,11 @@ const authorizationSchema = z
     headSha: sha,
     scope: legacyScopeSchema,
     budgets: PrMaintenanceBudgetsSchema,
+    eligibilityEvidence: text.optional(),
+    sourceProposal: z
+      .object({ id, version: z.number().int().positive() })
+      .strict()
+      .optional(),
   })
   .strict();
 

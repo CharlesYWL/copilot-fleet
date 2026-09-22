@@ -122,6 +122,46 @@ describe("PR maintenance wire schemas", () => {
       ).toBe(true);
     });
 
+    it("preserves optional grant-bound prerequisites without manufacturing legacy evidence", () => {
+      const legacy = base();
+      expect(legacy.authorization.eligibilityEvidence).toBeUndefined();
+      expect(legacy.authorization.sourceProposal).toBeUndefined();
+      const record = PrMaintenanceRegistrationSchema.parse({
+        ...legacy,
+        authorization: {
+          ...legacy.authorization,
+          eligibilityEvidence: "Fresh metadata and publication evidence",
+          sourceProposal: { id: "reviewed-proposal", version: 2 },
+        },
+        authorizationHistory: [legacy.authorization],
+      });
+      expect(record.authorization.eligibilityEvidence).toBe(
+        "Fresh metadata and publication evidence",
+      );
+      expect(record.authorization.sourceProposal).toEqual({
+        id: "reviewed-proposal",
+        version: 2,
+      });
+      expect(record.authorizationHistory[0]).toEqual(legacy.authorization);
+      for (const invalid of [
+        { eligibilityEvidence: "x".repeat(8193) },
+        { sourceProposal: { id: "proposal", version: 0 } },
+        { sourceProposal: { id: "proposal", version: 1, operatorId: "forged" } },
+      ])
+        expect(
+          PrMaintenanceRegistrationSchema.safeParse({
+            ...record,
+            authorization: { ...record.authorization, ...invalid },
+          }).success,
+        ).toBe(false);
+      expect(
+        PrMaintenanceRegistrationSchema.safeParse({
+          ...record,
+          authorizationHistory: Array(101).fill(record.authorization),
+        }).success,
+      ).toBe(false);
+    });
+
     it("provides exactly one truthful current stage with freshness and readiness gates", () => {
       const record = base();
       const now = Date.parse(at);

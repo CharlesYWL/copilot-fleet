@@ -1876,6 +1876,25 @@ clearing decisions or replaying work, and leaves the job paused until explicit
 Resume. Old proposals cannot be authorized as-is. Terminal and released history
 is not revived; manual supervisor control remains separate.
 
+Each newly issued grant retains its prerequisite `eligibilityEvidence`; grants
+approved from a proposal also retain its `sourceProposal` ID/version. The containing
+registration binds current and historical grants to its immutable PR identity,
+worker/checkout and generation. Reauthorization updates the current record evidence
+and archives the old grant with its evidence; renewal carries the same prerequisite
+basis without treating it as new provider proof. Every consumed or superseded proposal,
+including one displaced by authenticated direct enable, is archived once verbatim in
+task decision history in the same transaction. Direct enable approves its explicit
+registration, not any displaced proposal. Retries do not duplicate archives; changed
+HEAD or prerequisite evidence is not an idempotent enable request.
+
+These optional grant fields preserve readability of older records/backups without
+fabricating missing evidence. Evidence already lost by an older reauthorization
+cannot be reconstructed: existing record-level text remains historical, not proof of
+that later grant. The existing 8,192-character evidence, 100-entry authorization
+history and 2 MiB record limits still apply; overflow refuses the transaction rather
+than dropping history. Restart and portable restore retain the evidence and archives
+without resuming maintenance.
+
 Azure DevOps is a first-class provider: the same panel, registry, worker, approvals
 and wake budgets retain organization/project/repository GUIDs and exact refs.
 The Node packages its own provider router and ADO guidance; no personal skill or
