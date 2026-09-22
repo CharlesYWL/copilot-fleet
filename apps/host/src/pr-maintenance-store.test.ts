@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -11,6 +12,8 @@ import {
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import { FleetStore } from "./store.js";
+import { FleetService } from "./fleet-service.js";
+import Fastify from "fastify";
 import { prMaintenanceUnsettled } from "./pr-maintenance-store.js";
 
 const stores: FleetStore[] = [];
@@ -992,6 +995,223 @@ describe("bounded alternate PR observations", () => {
 });
 
 describe("durable PR maintenance registry", () => {
+  it("migrates v1 inline receipts into durable bounded history without losing unknown or retry evidence", () => {
+    const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+    mkdirSync(path, { recursive: true });
+    paths.push(path);
+    const dbPath = join(path, "host.sqlite");
+    const f = setup(storeAt(dbPath));
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "original");
+    const operationId = randomUUID();
+    const input = { prompt: "Explain", attachments: [] };
+    const command = {
+      id: createHash("sha256")
+        .update(JSON.stringify([f.worker.id, operationId]))
+        .digest("hex"),
+      digest: createHash("sha256")
+        .update(JSON.stringify({ kind: "prompt", ...input }))
+        .digest("hex"),
+      kind: "prompt" as const,
+      operatorId: "supervisor",
+    };
+    f.store.prMaintenance.beginManualControl(f.worker.id, command, 12);
+    f.store.prMaintenance.recordManualReceipt(f.worker.id, command.id, "settled");
+    f.store.prMaintenance.beginManualControl(
+      f.worker.id,
+      {
+        ...command,
+        id: "unknown-command",
+        digest: "unknown-input",
+      },
+      20,
+    );
+    const legacy = f.store.prMaintenance.get(record.id)!;
+    const [settled, unknown] = legacy.manualControl!.commands;
+    legacy.manualControl!.commands = [
+      settled!,
+      ...Array.from({ length: 998 }, (_, index) => ({
+        ...settled!,
+        id: `historical-${index}`,
+        digest: `input-${index}`,
+        state: index === 0 ? ("rejected" as const) : ("settled" as const),
+      })),
+      unknown!,
+    ];
+    f.store.close();
+    stores.splice(stores.indexOf(f.store), 1);
+    const db = new DatabaseSync(dbPath);
+    db.exec(
+      "DROP TABLE pr_maintenance_manual_commands; UPDATE pr_maintenance_schema SET version=1;",
+    );
+    db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+      JSON.stringify(legacy),
+      record.id,
+    );
+    db.close();
+
+    const reopened = storeAt(dbPath);
+    expect(reopened.prMaintenance.get(record.id)?.manualControl?.commands).toHaveLength(
+      33,
+    );
+    expect(reopened.prMaintenance.exportBackup().manualCommands).toHaveLength(1_000);
+    expect(reopened.prMaintenance.manualCommand(f.worker.id, command.id)).toEqual(
+      settled,
+    );
+    expect(reopened.prMaintenance.manualCommand(f.worker.id, "historical-0")?.state).toBe(
+      "rejected",
+    );
+    expect(reopened.prMaintenance.pendingManualCommands(f.worker.id)).toEqual([unknown]);
+    expect(() => reopened.prMaintenance.assertManualAvailable(f.worker.id)).toThrow(
+      /receipts/,
+    );
+    reopened.prMaintenance.recordManualReceipt(f.worker.id, unknown!.id, "accepted");
+    expect(() => reopened.prMaintenance.assertManualAvailable(f.worker.id)).toThrow(
+      /receipts/,
+    );
+    reopened.prMaintenance.recordManualReceipt(f.worker.id, unknown!.id, "settled");
+    expect(reopened.prMaintenance.get(record.id)?.manualControl?.commands).toHaveLength(
+      32,
+    );
+    const release = reopened.prMaintenance.get(record.id)!;
+    reopened.prMaintenance.operatorAction(
+      record.id,
+      release.version,
+      {
+        action: "release",
+        reason: "Settled",
+      },
+      "operator",
+    );
+    const portable = reopened.exportHostBackup({ enrollmentToken: "" });
+    reopened.close();
+    stores.splice(stores.indexOf(reopened), 1);
+
+    const restarted = storeAt(dbPath);
+    const service = new FleetService(restarted, Fastify().log);
+    expect(
+      service.promptSession(f.worker.id, { ...input, operationId }, "supervisor"),
+    ).toEqual({ ok: true });
+    expect(() =>
+      service.promptSession(
+        f.worker.id,
+        {
+          ...input,
+          operationId,
+          prompt: "Changed",
+        },
+        "supervisor",
+      ),
+    ).toThrow(/different manual input/);
+    expect(() =>
+      service.promptSession(
+        f.worker.id,
+        {
+          ...input,
+          operationId,
+        },
+        "other",
+      ),
+    ).toThrow(/different manual input/);
+    expect(restarted.prMaintenance.exportBackup().manualCommands).toHaveLength(1_000);
+    expect(restarted.prMaintenance.get(record.id)?.manualControl?.commands).toHaveLength(
+      32,
+    );
+    const restored = storeAt();
+    restored.replaceHostBackup(portable);
+    expect(restored.prMaintenance.manualCommand(f.worker.id, command.id)).toEqual(
+      settled,
+    );
+    expect(restored.prMaintenance.manualCommand(f.worker.id, unknown!.id)?.state).toBe(
+      "settled",
+    );
+    expect(restored.prMaintenance.manualCommand(f.worker.id, "historical-0")?.state).toBe(
+      "rejected",
+    );
+  });
+
+  it("imports legacy portable inline history and keeps correlation after subsequent backup and restore", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const command = {
+      id: "pending",
+      digest: "input",
+      kind: "resume_session" as const,
+      operatorId: "operator",
+    };
+    f.store.prMaintenance.beginManualControl(f.worker.id, command, 7);
+    const backup = f.store.exportHostBackup({ enrollmentToken: "" });
+    const legacy = HostBackupSchema.parse({
+      ...backup,
+      prMaintenance: { ...backup.prMaintenance, manualCommands: undefined },
+    });
+    const restored = storeAt();
+    restored.replaceHostBackup(legacy);
+    expect(restored.prMaintenance.manualCommand(f.worker.id, command.id)).toMatchObject({
+      ...command,
+      state: "unknown",
+      eventSeqFrom: 7,
+    });
+    restored.prMaintenance.recordManualReceipt(f.worker.id, command.id, "settled");
+    const again = storeAt();
+    again.replaceHostBackup(restored.exportHostBackup({ enrollmentToken: "" }));
+    expect(again.prMaintenance.manualCommand(f.worker.id, command.id)?.state).toBe(
+      "settled",
+    );
+    expect(again.prMaintenance.get(record.id)?.manualControl?.commands).toHaveLength(1);
+  });
+
+  it("normalizes pre-index Release/re-enable duplicates to the original receipt regardless of backup order", () => {
+    const f = setup();
+    const first = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const command = {
+      id: "same-operation",
+      digest: "input",
+      kind: "prompt" as const,
+      operatorId: "operator",
+    };
+    f.store.prMaintenance.beginManualControl(f.worker.id, command, 4);
+    f.store.prMaintenance.recordManualReceipt(f.worker.id, command.id, "settled");
+    const settled = f.store.prMaintenance.manualCommand(f.worker.id, command.id)!;
+    const current = f.store.prMaintenance.get(first.id)!;
+    f.store.prMaintenance.operatorAction(
+      first.id,
+      current.version,
+      {
+        action: "release",
+        reason: "Settled",
+      },
+      "operator",
+    );
+    const second = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const backup = f.store.prMaintenance.exportBackup();
+    const active = backup.registrations.find((record) => record.id === second.id)!;
+    active.lifecycle = "paused";
+    active.manualControl = {
+      operatorId: "operator",
+      takenAt: at,
+      commands: [{ ...settled, state: "accepted", eventSeqFrom: 20 }],
+    };
+    backup.registrations = [
+      active,
+      backup.registrations.find((record) => record.id === first.id)!,
+    ];
+    backup.manualCommands = [];
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    expect(f.store.prMaintenance.manualCommand(f.worker.id, command.id)).toEqual(settled);
+    expect(f.store.prMaintenance.get(second.id)?.manualControl?.commands).toEqual([
+      settled,
+    ]);
+    expect(() => f.store.prMaintenance.assertManualAvailable(f.worker.id)).not.toThrow();
+    f.store.prMaintenance.beginManualControl(
+      f.worker.id,
+      { ...command, id: "fresh" },
+      21,
+    );
+    expect(f.store.prMaintenance.pendingManualCommands(f.worker.id)).toMatchObject([
+      { id: "fresh" },
+    ]);
+  });
+
   it("persists manual provenance and unknown receipts across database reopen without reviving maintenance", () => {
     const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
     mkdirSync(path, { recursive: true });
@@ -1054,12 +1274,13 @@ describe("durable PR maintenance registry", () => {
       ),
     );
     const before = f.store.getRunStep(f.step.id);
+    const commandId = randomUUID();
     expect(() =>
       f.store.writeAtomically(() => {
         f.store.prMaintenance.beginManualControl(
           f.worker.id,
           {
-            id: randomUUID(),
+            id: commandId,
             digest: "input",
             kind: "prompt",
             operatorId: "supervisor",
@@ -1071,6 +1292,8 @@ describe("durable PR maintenance registry", () => {
     ).toThrow(/dispatch receipt/);
     expect(f.store.prMaintenance.get(record.id)).toEqual(record);
     expect(f.store.getRunStep(f.step.id)).toEqual(before);
+    expect(f.store.prMaintenance.manualCommand(f.worker.id, commandId)).toBeUndefined();
+    expect(f.store.prMaintenance.hasManualHistory(f.worker.id)).toBe(false);
   });
 
   it("does not clear a manual receipt through maintenance renewal or release", () => {

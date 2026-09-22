@@ -737,6 +737,19 @@ export type PrMaintenanceOperatorAction = z.infer<
   typeof PrMaintenanceOperatorActionSchema
 >;
 
+export const PrMaintenanceManualCommandSchema = z
+  .object({
+    id,
+    digest: id,
+    kind: z.enum(["prompt", "resume_session"]),
+    operatorId: id,
+    eventSeqFrom: count,
+    state: z.enum(["unknown", "accepted", "settled", "rejected"]),
+    createdAt: time,
+  })
+  .strict();
+export type PrMaintenanceManualCommand = z.infer<typeof PrMaintenanceManualCommandSchema>;
+
 export const PrMaintenanceRegistrationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -763,21 +776,7 @@ export const PrMaintenanceRegistrationSchema = z
         operatorId: id,
         takenAt: time,
         endedAt: time.optional(),
-        commands: z
-          .array(
-            z
-              .object({
-                id,
-                digest: id,
-                kind: z.enum(["prompt", "resume_session"]),
-                operatorId: id,
-                eventSeqFrom: count,
-                state: z.enum(["unknown", "accepted", "settled", "rejected"]),
-                createdAt: time,
-              })
-              .strict(),
-          )
-          .max(1_000),
+        commands: z.array(PrMaintenanceManualCommandSchema).max(1_000),
       })
       .strict()
       .optional(),
@@ -1033,6 +1032,11 @@ export const PrMaintenanceBackupSchema = z
     wakes: z.array(PrMaintenanceWakeSchema).max(100_000),
     scans: z.array(PrMaintenanceScanSchema).max(10_000),
     proposals: z.array(PrMaintenanceProposalSchema).max(10_000).default([]),
+    manualCommands: z
+      .array(
+        z.object({ sessionId: id, command: PrMaintenanceManualCommandSchema }).strict(),
+      )
+      .default([]),
   })
   .strict();
 export type PrMaintenanceBackup = z.infer<typeof PrMaintenanceBackupSchema>;

@@ -1898,12 +1898,30 @@ scope, pending design decisions, and execution/effect receipts remain intact.
 Manual direction is neither design approval, evidence of readiness, nor permission
 to renew unattended publication. Use explicit maintenance controls to resume the
 loop later. Reconnect may reattach a settled manual conversation, but never replays
-an unknown prompt. Session prompt/resume requests accept an `operationId` UUID;
-the UI reuses it on a failed request retry. Repeating the same key never sends twice.
-Legacy requests without a key deduplicate identical input; send a fresh key for an
-intentional identical new turn. Unknown/rejected delivery is reported rather than
-silently replayed. The retained manual history is bounded at 1,000 commands; once
-full, explicitly release settled maintenance before continuing.
+an unknown prompt. A later manual turn cannot complete a cancelled orchestration
+step: late outcomes must still match that step's original dispatch attempt.
+
+For retained sessions and sessions with manual-control history, prompt/resume
+requests accept an `operationId` UUID; the UI reuses it on a failed request retry.
+The same UUID returns its original receipt without redelivery, even after Release,
+re-enablement, or Host restart; changing the actor or input conflicts. Unknown or
+rejected delivery is reported rather than silently replayed. Use a fresh UUID for
+a new intentional operation. This is not a new idempotency guarantee for ordinary
+sessions that have never entered manual control.
+
+Legacy requests without a UUID correlate matching unsettled delivery only. After
+settlement they represent new intent, so Stop followed by keyless Resume really
+resumes the session. Keyless requests cannot distinguish a delayed retry from new
+intent after completion; use explicit UUIDs when that distinction matters.
+
+Compact command receipts live in an indexed durable history independent of
+maintenance ownership. Each registration keeps only its 32 most recent terminal
+receipts plus all unsettled receipts; older duplicate-detection evidence is not
+evicted. Settled history and reconnects no longer impose a command-count ceiling or
+require Release. No-sign-in mode still does not authorize unattended maintenance
+renewal, Release, or publication. Registry schema v2 migrates existing inline
+receipts on open; portable backups include the durable index. Compact history
+grows on disk with operations rather than blocking control at an arbitrary count.
 
 ![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](docs/pr-maintenance-human-gate.png)
 

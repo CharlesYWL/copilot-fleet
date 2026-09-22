@@ -13,6 +13,7 @@ import {
   PrMaintenanceCheckpointSchema,
   PrMaintenanceDecisionInputSchema,
   PrMaintenanceEnableSchema,
+  PrMaintenanceManualCommandSchema,
   PrMaintenanceOperatorActionSchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceRegistrationSchema,
@@ -25,6 +26,7 @@ import {
   type PrMaintenanceEffect,
   type PrMaintenanceIdentity,
   type PrMaintenanceIncident,
+  type PrMaintenanceManualCommand,
   type PrMaintenanceObservation,
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
@@ -161,14 +163,42 @@ export class PrMaintenanceStore {
         task_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
         data TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS pr_maintenance_manual_commands (
+        session_id TEXT NOT NULL, command_id TEXT NOT NULL,
+        state TEXT NOT NULL, data TEXT NOT NULL,
+        PRIMARY KEY(session_id,command_id)
+      );
+      CREATE INDEX IF NOT EXISTS pr_maintenance_manual_pending
+        ON pr_maintenance_manual_commands(session_id,state);
     `);
-    if (
-      Number(db.prepare("SELECT version FROM pr_maintenance_schema").get()?.version) !== 1
-    )
+    const version = Number(
+      db.prepare("SELECT version FROM pr_maintenance_schema").get()?.version,
+    );
+    if (version !== 1 && version !== 2)
       refuse(
         "schema_version",
         "This Host does not support the maintenance registry schema.",
       );
+    if (version === 1)
+      this.store.writeAtomically(() => {
+        const records = db
+          .prepare("SELECT data FROM pr_maintenance ORDER BY rowid")
+          .all()
+          .map((row) =>
+            PrMaintenanceRegistrationSchema.parse(JSON.parse(String(row.data))),
+          );
+        for (const record of records)
+          for (const command of record.manualControl?.commands ?? [])
+            this.saveManualCommand(record.workerSessionId, command);
+        for (const record of records) {
+          this.archiveManualCommands(record);
+          db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+            JSON.stringify(record),
+            record.id,
+          );
+        }
+        db.exec("UPDATE pr_maintenance_schema SET version=2");
+      });
   }
 
   get(id: string, leadSessionId?: string): PrMaintenanceRegistration | undefined {
@@ -396,6 +426,7 @@ export class PrMaintenanceStore {
         "checkpoint_overflow",
         "The bounded checkpoint is full; settle pending work and archive its history explicitly, without discarding pending findings.",
       );
+    this.archiveManualCommands(record);
     const parsed = PrMaintenanceRegistrationSchema.parse(record);
     if (
       parsed.ownershipReleasedAt &&
@@ -618,6 +649,7 @@ export class PrMaintenanceStore {
       }
       if (
         !["idle", "completed", "stopped"].includes(worker.state) ||
+        this.pendingManualCommands(worker.id).length > 0 ||
         this.store
           .listRunSteps(task.id)
           .some(
@@ -765,6 +797,93 @@ export class PrMaintenanceStore {
     return this.retained().find((record) => record.workerSessionId === sessionId);
   }
 
+  manualCommand(
+    sessionId: string,
+    commandId: string,
+  ): PrMaintenanceManualCommand | undefined {
+    const row = this.db
+      .prepare(
+        "SELECT data FROM pr_maintenance_manual_commands WHERE session_id=? AND command_id=?",
+      )
+      .get(sessionId, commandId);
+    return row
+      ? PrMaintenanceManualCommandSchema.parse(JSON.parse(String(row.data)))
+      : undefined;
+  }
+
+  hasManualHistory(sessionId: string): boolean {
+    return Boolean(
+      this.db
+        .prepare(
+          "SELECT 1 FROM pr_maintenance_manual_commands WHERE session_id=? LIMIT 1",
+        )
+        .get(sessionId),
+    );
+  }
+
+  pendingManualCommands(sessionId: string): PrMaintenanceManualCommand[] {
+    return this.db
+      .prepare(
+        "SELECT data FROM pr_maintenance_manual_commands WHERE session_id=? AND state IN ('unknown','accepted')",
+      )
+      .all(sessionId)
+      .map((row) => PrMaintenanceManualCommandSchema.parse(JSON.parse(String(row.data))));
+  }
+
+  private saveManualCommand(
+    sessionId: string,
+    input: PrMaintenanceManualCommand,
+  ): PrMaintenanceManualCommand {
+    let command = PrMaintenanceManualCommandSchema.parse(input);
+    const previous = this.manualCommand(sessionId, command.id);
+    if (previous) {
+      if (
+        previous.digest !== command.digest ||
+        previous.operatorId !== command.operatorId ||
+        previous.kind !== command.kind
+      )
+        refuse(
+          "manual_request_conflict",
+          "This request key already identifies different manual input.",
+        );
+      // Pre-index backups may repeat an operation in different registrations.
+      // Keep its original sequence boundary and never regress known receipts.
+      const state =
+        ["settled", "rejected"].includes(previous.state) || command.state === "unknown"
+          ? previous.state
+          : command.state;
+      command = {
+        ...(previous.eventSeqFrom <= command.eventSeqFrom ? previous : command),
+        state,
+      };
+      if (isDeepStrictEqual(previous, command)) return previous;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO pr_maintenance_manual_commands VALUES (?,?,?,?)
+       ON CONFLICT(session_id,command_id) DO UPDATE SET state=excluded.state,data=excluded.data`,
+      )
+      .run(sessionId, command.id, command.state, JSON.stringify(command));
+    return command;
+  }
+
+  private archiveManualCommands(record: PrMaintenanceRegistration): void {
+    if (!record.manualControl) return;
+    const commands = record.manualControl.commands.map((command) =>
+      this.saveManualCommand(record.workerSessionId, command),
+    );
+    const recent = new Set(
+      commands
+        .filter((command) => ["settled", "rejected"].includes(command.state))
+        .slice(-32)
+        .map((command) => command.id),
+    );
+    record.manualControl.commands = commands.filter(
+      (command) =>
+        ["unknown", "accepted"].includes(command.state) || recent.has(command.id),
+    );
+  }
+
   private neverDispatched(record: PrMaintenanceRegistration, batch: PrMaintenanceBatch) {
     if (batch.state === "prepared") return true;
     const step = batch.stepId && this.store.getRunStep(batch.stepId);
@@ -784,8 +903,16 @@ export class PrMaintenanceStore {
   }
 
   assertManualAvailable(sessionId: string): void {
+    if (this.pendingManualCommands(sessionId).length)
+      refuse(
+        "execution_uncertain",
+        "Wait for correlated execution and effect receipts before manual control; no work was replayed or stopped.",
+      );
     const record = this.manualRecord(sessionId);
-    if (!record) refuse("worker_reserved", "No retained worker belongs to this session.");
+    if (!record) {
+      this.assertAdmission({ sessionId, action: "prompt" });
+      return;
+    }
     const reason = this.binding(record);
     if (reason)
       refuse(reason, `Manual control cannot change the retained checkout: ${reason}.`);
@@ -836,11 +963,6 @@ export class PrMaintenanceStore {
         "worker_busy",
         "The retained worker still has an unsettled orchestration attempt.",
       );
-    if ((record.manualControl?.commands.length ?? 0) >= 1_000)
-      refuse(
-        "manual_history_full",
-        "Manual receipt history is full; retain receipts and explicitly release settled maintenance before continuing.",
-      );
   }
 
   /** Called only by trusted session routes, in the dispatch receipt transaction. */
@@ -849,45 +971,49 @@ export class PrMaintenanceStore {
     command: SupervisorCommand,
     eventSeqFrom: number,
   ): void {
-    this.assertManualAvailable(sessionId);
-    const record = this.manualRecord(sessionId)!;
-    if (record.manualControl?.commands.some((entry) => entry.id === command.id))
-      refuse(
-        "manual_duplicate",
-        "This manual request already has a receipt; do not replay it.",
-      );
-    const now = nowIso();
-    for (const batch of record.batches) {
-      if (!this.neverDispatched(record, batch) || !batch.stepId) continue;
-      this.store.updateRunStep(batch.stepId, {
-        state: "cancelled",
-        output:
-          "Supervisor took manual control before queued maintenance was dispatched.",
+    this.store.writeAtomically(() => {
+      this.assertManualAvailable(sessionId);
+      const record = this.manualRecord(sessionId);
+      if (this.manualCommand(sessionId, command.id))
+        refuse(
+          "manual_duplicate",
+          "This manual request already has a receipt; do not replay it.",
+        );
+      const now = nowIso();
+      const receipt = this.saveManualCommand(sessionId, {
+        ...command,
+        eventSeqFrom,
+        state: "unknown",
+        createdAt: now,
       });
-      batch.state = "cancelled";
-      batch.executionSettled = true;
-      batch.executionNotDispatched = true;
-      batch.cancellationRequestedAt = now;
-      batch.updatedAt = now;
-      batch.reason = "manual_control";
-      batch.evidence =
-        "Host queue and dispatch receipt prove this attempt was never sent.";
-      this.refund(record, batch, 0, false);
-    }
-    this.pause(record, "manual_control", now);
-    record.manualControl ??= {
-      operatorId: command.operatorId,
-      takenAt: now,
-      commands: [],
-    };
-    delete record.manualControl.endedAt;
-    record.manualControl.commands.push({
-      ...command,
-      eventSeqFrom,
-      state: "unknown",
-      createdAt: now,
+      if (!record) return;
+      for (const batch of record.batches) {
+        if (!this.neverDispatched(record, batch) || !batch.stepId) continue;
+        this.store.updateRunStep(batch.stepId, {
+          state: "cancelled",
+          output:
+            "Supervisor took manual control before queued maintenance was dispatched.",
+        });
+        batch.state = "cancelled";
+        batch.executionSettled = true;
+        batch.executionNotDispatched = true;
+        batch.cancellationRequestedAt = now;
+        batch.updatedAt = now;
+        batch.reason = "manual_control";
+        batch.evidence =
+          "Host queue and dispatch receipt prove this attempt was never sent.";
+        this.refund(record, batch, 0, false);
+      }
+      this.pause(record, "manual_control", now);
+      record.manualControl ??= {
+        operatorId: command.operatorId,
+        takenAt: now,
+        commands: [],
+      };
+      delete record.manualControl.endedAt;
+      record.manualControl.commands.push(receipt);
+      this.save(record);
     });
-    this.save(record);
   }
 
   recordManualReceipt(
@@ -895,20 +1021,26 @@ export class PrMaintenanceStore {
     commandId: string,
     state: "accepted" | "settled" | "rejected",
   ): boolean {
-    const record = this.manualRecord(sessionId);
-    const command = record?.manualControl?.commands.find(
-      (entry) => entry.id === commandId,
-    );
-    if (
-      !record ||
-      !command ||
-      command.state === state ||
-      ["settled", "rejected"].includes(command.state)
-    )
-      return false;
-    command.state = state;
-    this.save(record);
-    return true;
+    return this.store.writeAtomically(() => {
+      const command = this.manualCommand(sessionId, commandId);
+      if (
+        !command ||
+        command.state === state ||
+        ["settled", "rejected"].includes(command.state)
+      )
+        return false;
+      command.state = state;
+      this.saveManualCommand(sessionId, command);
+      const record = this.manualRecord(sessionId);
+      const cached = record?.manualControl?.commands.find(
+        (entry) => entry.id === commandId,
+      );
+      if (record && cached) {
+        cached.state = state;
+        this.save(record);
+      }
+      return true;
+    });
   }
 
   operatorAction(
@@ -1280,6 +1412,12 @@ export class PrMaintenanceStore {
           return denied("worker_unavailable");
       }
     }
+    if (
+      action.sessionId &&
+      ["dispatch", "execute", "prompt", "resume"].includes(action.action) &&
+      this.pendingManualCommands(action.sessionId).length
+    )
+      return { allowed: false, reason: "manual_execution_unsettled" };
     return { allowed: true };
   }
 
@@ -2474,6 +2612,7 @@ export class PrMaintenanceStore {
   }
 
   hasSessionRetentionBlockers(sessionId: string): boolean {
+    if (this.pendingManualCommands(sessionId).length) return true;
     return Boolean(
       this.db
         .prepare(
@@ -2492,6 +2631,18 @@ export class PrMaintenanceStore {
   }
 
   assertTaskCleanupAllowed(taskId: string): void {
+    if (
+      this.db
+        .prepare(
+          `SELECT 1 FROM pr_maintenance_manual_commands m JOIN sessions s ON s.id=m.session_id
+       WHERE s.run_id=? AND m.state IN ('unknown','accepted') LIMIT 1`,
+        )
+        .get(taskId)
+    )
+      refuse(
+        "execution_uncertain",
+        "Settle manual execution receipts before deleting its task or checkout.",
+      );
     if (
       this.db
         .prepare(
@@ -2743,6 +2894,15 @@ export class PrMaintenanceStore {
         .prepare("SELECT data FROM pr_maintenance_proposals ORDER BY task_id")
         .all()
         .map((row) => JSON.parse(String(row.data))),
+      manualCommands: this.db
+        .prepare(
+          "SELECT session_id,data FROM pr_maintenance_manual_commands ORDER BY session_id,command_id",
+        )
+        .all()
+        .map((row) => ({
+          sessionId: String(row.session_id),
+          command: JSON.parse(String(row.data)),
+        })),
     });
   }
 
@@ -2750,8 +2910,13 @@ export class PrMaintenanceStore {
   importBackup(input: PrMaintenanceBackup | undefined): void {
     const backup = input ? PrMaintenanceBackupSchema.parse(input) : undefined;
     this.db.exec(
-      "DELETE FROM pr_maintenance; DELETE FROM pr_maintenance_wakes; DELETE FROM pr_maintenance_scans; DELETE FROM pr_maintenance_proposals;",
+      "DELETE FROM pr_maintenance; DELETE FROM pr_maintenance_wakes; DELETE FROM pr_maintenance_scans; DELETE FROM pr_maintenance_proposals; DELETE FROM pr_maintenance_manual_commands;",
     );
+    for (const { sessionId, command } of backup?.manualCommands ?? [])
+      this.saveManualCommand(sessionId, command);
+    for (const record of backup?.registrations ?? [])
+      for (const command of record.manualControl?.commands ?? [])
+        this.saveManualCommand(record.workerSessionId, command);
     for (const record of backup?.registrations ?? []) {
       if (!record.ownershipReleasedAt) {
         if (record.lifecycle === "active") record.lifecycle = "paused";

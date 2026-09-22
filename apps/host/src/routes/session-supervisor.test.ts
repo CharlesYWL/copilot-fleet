@@ -5,17 +5,21 @@ import { z } from "zod";
 import {
   NODE_ID_HEADER,
   NODE_SECRET_HEADER,
+  ORCHESTRATOR_STOP_REASON,
   type NodeCommand,
   type SessionEvent,
 } from "@fleet/protocol";
+import { CommandRouter } from "../../../node/src/router.js";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
+import { archiveRun } from "../orchestrator/lifecycle.js";
 import { FleetTools } from "../orchestrator/tools.js";
 import { FleetService } from "../fleet-service.js";
 import { FleetAuth, AUTH_MODE_SETTING, NO_AUTH_PRINCIPAL } from "../auth/service.js";
 import { OPERATOR_COOKIE } from "../auth.js";
 import { registerRequestGuard } from "../request-guard.js";
 import { sessionRoutes } from "./sessions.js";
+import { orchestratorRoutes } from "./orchestrators.js";
 
 const cleanup: (() => Promise<void>)[] = [];
 afterEach(async () => {
@@ -124,6 +128,10 @@ async function setup(
       .send({ error: error instanceof Error ? error.message : String(error) });
   });
   await app.register(sessionRoutes, { service });
+  await app.register(orchestratorRoutes, {
+    service,
+    engine: new OrchestratorEngine(service),
+  });
   await app.ready();
   cleanup.push(async () => {
     await app.close();
@@ -240,6 +248,317 @@ async function setup(
 }
 
 describe("trusted supervisor session handoff", () => {
+  it.each(["subscription", "restart", "failure"] as const)(
+    "never settles a stopped repair with a later manual %s event",
+    async (path) => {
+      const f = await setup("password", true);
+      f.event("agent_session", { agentSessionId: "existing-conversation" });
+      f.queue();
+      let engine = new OrchestratorEngine(f.service);
+      let unsubscribe = f.service.onSessionEvent((event) =>
+        engine.handleSessionEvent(event),
+      );
+      archiveRun(f.service, f.task.id, ORCHESTRATOR_STOP_REASON, {
+        stoppedByOrchestrator: true,
+      });
+      f.event("state", { state: "stopped" });
+      let record = f.store.prMaintenance.get(f.record.id)!;
+      record = f.store.prMaintenance.checkpoint(f.leadId, record.id, record.version, {
+        kind: "batch",
+        batchId: "queued",
+        generation: record.generation,
+        state: "cancelled",
+        executionSettled: true,
+        usedMutations: 0,
+        findings: [
+          {
+            source,
+            outcome: "incomplete",
+            stage: "not_attempted",
+            evidence: [],
+            responseRequired: false,
+            responseIds: [],
+            nextAction: "Wait for explicit direction.",
+            progress: false,
+          },
+        ],
+        effects: [],
+        evidence: "Queued attempt stopped; no execution or remote effects.",
+      });
+      const stopped = f.store.getRunStep(f.step.id)!;
+      expect(stopped).toMatchObject({
+        state: "cancelled",
+        stoppedByOrchestrator: true,
+      });
+      expect((await f.command("resume", { operationId: randomUUID() })).statusCode).toBe(
+        202,
+      );
+      f.event("state", { state: "idle" });
+      expect(
+        (await f.command("prompt", { prompt: "Explain only", operationId: randomUUID() }))
+          .statusCode,
+      ).toBe(202);
+      if (path === "restart") unsubscribe();
+      f.event("state", { state: "running" });
+      f.event("agent_text", { text: "Explanation only." });
+      if (path === "failure")
+        f.event("state", { state: "failed", activity: "Manual failure" });
+      else {
+        f.event("turn_complete", {});
+        if (path === "restart") {
+          engine = new OrchestratorEngine(f.service);
+          unsubscribe = f.service.onSessionEvent((event) =>
+            engine.handleSessionEvent(event),
+          );
+        }
+        f.event("state", { state: "idle" });
+      }
+      unsubscribe();
+      expect(f.store.getRunStep(f.step.id)).toEqual(stopped);
+      expect(f.store.getRun(f.task.id)?.state).toBe("cancelled");
+      expect(f.store.prMaintenance.get(record.id)).toMatchObject({
+        lifecycle: "paused",
+        batches: [{ state: "cancelled" }],
+      });
+    },
+  );
+
+  it.each(["released", "re-enabled"] as const)(
+    "keeps UUID receipts across %s maintenance with the actual Node command cache",
+    async (boundary) => {
+      const f = await setup();
+      const prompt = vi.fn(async () => f.settle());
+      const router = new CommandRouter(
+        {
+          async start() {
+            return {
+              prompt,
+              async cancel() {},
+              async stop() {},
+              resolvePermission() {},
+              denyPendingPermissions() {},
+              async setConfigOption() {},
+              busy: false,
+              resync() {},
+            };
+          },
+        },
+        8,
+        () => {},
+        async (path) => path,
+      );
+      expect(
+        await router.route({
+          type: "resume_session",
+          commandId: randomUUID(),
+          sessionId: f.worker.id,
+          localPath: "C:\\fixture",
+          agentSessionId: "conversation",
+          additionalDirectories: [],
+          sequenceOffset: 0,
+          yolo: false,
+          mcpServers: [],
+          agent: "",
+          config: [],
+          readOnly: false,
+        }),
+      ).toMatchObject({ ok: true });
+      const operationId = randomUUID();
+      expect((await f.command("prompt", { operationId })).statusCode).toBe(202);
+      const original = f.sent.at(-1)!;
+      expect(await router.route(original)).toMatchObject({ ok: true });
+      expect(prompt).toHaveBeenCalledTimes(1);
+      let record = f.store.prMaintenance.get(f.record.id)!;
+      f.store.prMaintenance.operatorAction(
+        record.id,
+        record.version,
+        { action: "release", reason: "Settled" },
+        "operator",
+      );
+      if (boundary === "re-enabled")
+        record = f.store.prMaintenance.enableFromOperator(
+          {
+            taskId: f.task.id,
+            workerSessionId: f.worker.id,
+            identity: record.identity,
+            scope: record.authorization.scope,
+            headSha,
+            eligibilityEvidence: "Same retained checkout",
+          },
+          "operator",
+        );
+      expect((await f.command("prompt", { operationId })).statusCode).toBe(202);
+      expect(f.sent).toHaveLength(1);
+      expect(
+        (await f.command("prompt", { operationId, prompt: "Changed input" })).statusCode,
+      ).toBe(409);
+      const other = f.auth.sessions.issue({
+        administratorId: "",
+        authMethod: "recovery",
+      });
+      expect(
+        (
+          await f.command(
+            "prompt",
+            { operationId },
+            {
+              cookie: `${OPERATOR_COOKIE}=${other.token}`,
+              "x-csrf-token": f.auth.sessions.csrfToken(other.tokenHash),
+            },
+          )
+        ).statusCode,
+      ).toBe(409);
+      const freshId = randomUUID();
+      expect((await f.command("prompt", { operationId: freshId })).statusCode).toBe(202);
+      expect(() =>
+        f.service.dispatch(f.worker.nodeId, {
+          type: "prompt",
+          sessionId: f.worker.id,
+          prompt: "Automatic work",
+          attachments: [],
+        }),
+      ).toThrow(boundary === "released" ? /manual_execution_unsettled/ : /paused/);
+      if (boundary === "released")
+        expect(() =>
+          f.store.prMaintenance.enableFromOperator(
+            {
+              taskId: f.task.id,
+              workerSessionId: f.worker.id,
+              identity: record.identity,
+              scope: record.authorization.scope,
+              headSha,
+              eligibilityEvidence: "Same checkout, but delivery has no receipt yet",
+            },
+            "operator",
+          ),
+        ).toThrow(/settle/);
+      const fresh = f.sent.at(-1)!;
+      expect(fresh.commandId).not.toBe(original.commandId);
+      expect(await router.route(fresh)).toMatchObject({ ok: true });
+      expect(await router.route(fresh)).toMatchObject({ ok: true });
+      expect(prompt).toHaveBeenCalledTimes(2);
+      expect((await f.command("prompt", { operationId: freshId })).statusCode).toBe(202);
+      expect(f.sent).toHaveLength(2);
+      expect((await f.command("prompt", { operationId: randomUUID() })).statusCode).toBe(
+        202,
+      );
+      expect(await router.route(f.sent.at(-1)!)).toMatchObject({ ok: true });
+      expect(prompt).toHaveBeenCalledTimes(3);
+      await router.stopAll();
+    },
+  );
+
+  it("keeps no-sign-in control and reconnect working beyond 1000 settled receipts without Release", async () => {
+    const f = await setup("no-auth");
+    f.event("agent_session", { agentSessionId: "existing-conversation" });
+    const operationId = randomUUID();
+    await f.command("prompt", { operationId });
+    f.settle();
+    const backup = f.store.prMaintenance.exportBackup();
+    const manual = backup.registrations[0]!.manualControl!;
+    const first = manual.commands[0]!;
+    manual.commands.push(
+      ...Array.from({ length: 998 }, (_, index) => ({
+        ...first,
+        id: `historic-${index}`,
+        digest: `historic-${index}`,
+      })),
+    );
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    f.service.disconnectNode(f.worker.nodeId, "Fixture reconnect");
+    f.service.attachNode(f.worker.nodeId, f.link);
+    f.store.setNodeOnline(f.worker.nodeId, true, 0);
+    f.service.reconcile(f.worker.nodeId, []);
+    expect(f.sent.at(-1)?.type).toBe("resume_session");
+    f.event("state", { state: "idle" });
+    for (let i = 0; i < 3; i++) {
+      const reply = await f.command("prompt", { operationId: randomUUID() });
+      expect(reply.statusCode, reply.body).toBe(202);
+      f.settle();
+    }
+    const sent = f.sent.length;
+    expect((await f.command("prompt", { operationId })).statusCode).toBe(202);
+    expect(f.sent).toHaveLength(sent);
+    const record = f.store.prMaintenance.get(f.record.id)!;
+    expect(record.manualControl!.commands.length).toBeLessThanOrEqual(32);
+    expect(record.authorization).toEqual(f.record.authorization);
+    const release = await f.app.inject({
+      method: "POST",
+      url: `/api/runs/${f.task.id}/pr-maintenance`,
+      headers: f.headers,
+      payload: {
+        action: "update",
+        recordId: record.id,
+        expectedVersion: record.version,
+        operation: { action: "release", reason: "Not authorized" },
+      },
+    });
+    expect(release.statusCode).toBe(403);
+  });
+
+  it("retains uncertain manual delivery after Release across reconnect and cleanup paths", async () => {
+    const f = await setup();
+    f.event("agent_session", { agentSessionId: "conversation" });
+    await f.command("prompt", { operationId: randomUUID() });
+    f.settle();
+    const record = f.store.prMaintenance.get(f.record.id)!;
+    f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      {
+        action: "release",
+        reason: "Settled",
+      },
+      "operator",
+    );
+    const operationId = randomUUID();
+    expect((await f.command("prompt", { operationId })).statusCode).toBe(202);
+    const dispatch = f.store.getSessionDispatchAttempt(f.worker.id);
+    expect(f.store.prMaintenance.hasSessionRetentionBlockers(f.worker.id)).toBe(true);
+    expect(() => f.store.prMaintenance.assertTaskCleanupAllowed(f.task.id)).toThrow(
+      /receipts/,
+    );
+    f.service.disconnectNode(f.worker.nodeId, "No delivery receipt");
+    f.service.attachNode(f.worker.nodeId, f.link);
+    f.store.setNodeOnline(f.worker.nodeId, true, 0);
+    expect(() => f.service.reconcile(f.worker.nodeId, [])).not.toThrow();
+    expect(f.sent).toHaveLength(2);
+    expect(f.store.getSessionDispatchAttempt(f.worker.id)).toEqual(dispatch);
+    expect((await f.command("prompt", { operationId })).statusCode).toBe(409);
+    expect(f.store.prMaintenance.pendingManualCommands(f.worker.id)).toMatchObject([
+      { id: dispatch!.commandId, state: "unknown" },
+    ]);
+  });
+
+  it("treats settled keyless Resume after Stop as a new lifecycle intent, not a successful no-op", async () => {
+    const f = await setup();
+    f.resumable();
+    expect((await f.command("resume")).statusCode).toBe(202);
+    expect((await f.command("resume")).statusCode).toBe(409);
+    f.event("state", { state: "idle" });
+    expect((await f.command("resume")).statusCode).toBe(409);
+    f.resumable();
+    expect((await f.command("resume")).statusCode).toBe(202);
+    expect(f.store.getSession(f.worker.id)?.state).toBe("starting");
+    expect(f.sent).toHaveLength(2);
+    expect(f.sent[1]!.commandId).not.toBe(f.sent[0]!.commandId);
+    f.event("state", { state: "idle" });
+    for (let i = 0; i < 2; i++) {
+      expect((await f.command("prompt")).statusCode).toBe(202);
+      expect((await f.command("prompt")).statusCode).toBe(409);
+      f.settle();
+    }
+    expect(f.sent).toHaveLength(4);
+    f.service.disconnectNode(f.worker.nodeId, "Keyless conversation reconnect");
+    f.service.attachNode(f.worker.nodeId, f.link);
+    f.store.setNodeOnline(f.worker.nodeId, true, 0);
+    f.service.reconcile(f.worker.nodeId, []);
+    expect(f.sent.at(-1)?.type).toBe("resume_session");
+    f.event("state", { state: "idle" });
+    expect((await f.command("resume")).statusCode).toBe(409);
+    expect(f.sent).toHaveLength(5);
+  });
+
   it.each(["password", "recovery", "microsoft-code", "no-auth"] as const)(
     "admits normal observation-only prompt and paused resume through real %s guards",
     async (mode) => {

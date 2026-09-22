@@ -154,68 +154,78 @@ describe("orchestrator task lifecycle", () => {
     expect(dispatch).toHaveBeenCalledTimes(1);
   });
 
-  it("lets a completed turn win a race with Stop without reopening the run", () => {
-    const { store, service } = fleet();
-    const placement = store.listPlacements()[0]!;
-    const run = store.createRun({
-      workspaceId: placement.workspaceId,
-      name: "Racing completion",
-      objective: "finish while stopping",
-    });
-    const [step] = store.replaceRunSteps(run.id, [
-      { stepKey: "work", title: "Work", prompt: "work" },
-    ]);
-    store.setRunState(run.id, "running");
-    const session = store.createSession(placement, "work", false, "Worker", {
-      runId: run.id,
-      runRole: "worker",
-    });
-    store.transitionSession(session.id, "starting");
-    store.transitionSession(session.id, "running");
-    store.updateRunStep(step!.id, {
-      state: "running",
-      sessionId: session.id,
-      eventSeqFrom: 0,
-    });
-    const engine = new OrchestratorEngine(service);
-    service.onSessionEvent((event) => engine.handleSessionEvent(event));
+  it.each([false, true])(
+    "lets an original completed turn win Stop with restart=%s",
+    (restart) => {
+      const { store, service } = fleet();
+      const placement = store.listPlacements()[0]!;
+      const run = store.createRun({
+        workspaceId: placement.workspaceId,
+        name: "Racing completion",
+        objective: "finish while stopping",
+      });
+      const [step] = store.replaceRunSteps(run.id, [
+        { stepKey: "work", title: "Work", prompt: "work" },
+      ]);
+      store.setRunState(run.id, "running");
+      const session = store.createSession(placement, "work", false, "Worker", {
+        runId: run.id,
+        runRole: "worker",
+      });
+      store.transitionSession(session.id, "starting");
+      store.transitionSession(session.id, "running");
+      store.updateRunStep(step!.id, {
+        state: "running",
+        sessionId: session.id,
+        eventSeqFrom: 0,
+      });
+      service.dispatch(session.nodeId, {
+        type: "prompt",
+        sessionId: session.id,
+        prompt: "work",
+        attachments: [],
+      });
+      let engine = new OrchestratorEngine(service);
+      service.onSessionEvent((event) => engine.handleSessionEvent(event));
 
-    archiveRun(service, run.id, ORCHESTRATOR_STOP_REASON, {
-      stoppedByOrchestrator: true,
-    });
-    service.handleEvent({
-      eventId: "text",
-      sessionId: session.id,
-      sequence: 1,
-      type: "agent_text",
-      payload: { text: "finished output" },
-      createdAt: new Date().toISOString(),
-    });
-    service.handleEvent({
-      eventId: "complete",
-      sessionId: session.id,
-      sequence: 2,
-      type: "turn_complete",
-      payload: {},
-      createdAt: new Date().toISOString(),
-    });
-    service.handleEvent({
-      eventId: "stopped",
-      sessionId: session.id,
-      sequence: 3,
-      type: "state",
-      payload: { state: "stopped", activity: "Stopped after completion" },
-      createdAt: new Date().toISOString(),
-    });
+      archiveRun(service, run.id, ORCHESTRATOR_STOP_REASON, {
+        stoppedByOrchestrator: true,
+      });
+      service.handleEvent({
+        eventId: "text",
+        sessionId: session.id,
+        sequence: 1,
+        type: "agent_text",
+        payload: { text: "finished output" },
+        createdAt: new Date().toISOString(),
+      });
+      service.handleEvent({
+        eventId: "complete",
+        sessionId: session.id,
+        sequence: 2,
+        type: "turn_complete",
+        payload: {},
+        createdAt: new Date().toISOString(),
+      });
+      if (restart) engine = new OrchestratorEngine(service);
+      service.handleEvent({
+        eventId: "stopped",
+        sessionId: session.id,
+        sequence: 3,
+        type: "state",
+        payload: { state: "stopped", activity: "Stopped after completion" },
+        createdAt: new Date().toISOString(),
+      });
 
-    expect(store.getRun(run.id)?.state).toBe("cancelled");
-    expect(store.getRunStep(step!.id)).toMatchObject({
-      state: "succeeded",
-      output: "finished output",
-      stoppedByOrchestrator: false,
-    });
-    expect(store.listNotifications().notifications).toEqual([]);
-  });
+      expect(store.getRun(run.id)?.state).toBe("cancelled");
+      expect(store.getRunStep(step!.id)).toMatchObject({
+        state: "succeeded",
+        output: "finished output",
+        stoppedByOrchestrator: false,
+      });
+      expect(store.listNotifications().notifications).toEqual([]);
+    },
+  );
 
   it("notifies when a stopped step reports a late authoritative failure", () => {
     const { store, service } = fleet();
@@ -239,6 +249,12 @@ describe("orchestrator task lifecycle", () => {
       state: "running",
       sessionId: session.id,
       eventSeqFrom: 0,
+    });
+    service.dispatch(session.nodeId, {
+      type: "prompt",
+      sessionId: session.id,
+      prompt: "work",
+      attachments: [],
     });
     const engine = new OrchestratorEngine(service);
     service.onSessionEvent((event) => engine.handleSessionEvent(event));
