@@ -60,6 +60,35 @@ a stopped session still present on the Node receives Stop again; a session no
 longer present is confirmed `stopped`. Resume resets only steps explicitly
 marked by the orchestration Stop transaction.
 
+### Task overview and checkpoints
+
+The task detail page puts a brief current-stage summary first, then PR
+maintenance and dispatched work in a responsive split layout. Decisions use
+the existing version-guarded dialog flow and do not navigate to the lead's chat.
+Full reports, receipts and worker responses are disclosed in **Workflow history**;
+the objective, phases, criteria and workspace controls live in **Task details**.
+The PR graph uses `prMaintenanceProgress`, including its current-head, freshness,
+human-hold and unknown-effect rules. A failed status refresh invalidates displayed
+readiness without dropping a retained decision or granting new authority.
+
+`RunNote` remains the append-only task journal. Optional `summary`, `kind`,
+`source` and `sessionId` metadata is persisted with each entry and round-trips
+through backups. The Host supplies `createdAt`; old notes are not rewritten,
+retimestamped or assigned a guessed author. Records with equal timestamps retain
+append order. The full report remains separate from the short, single-line,
+240-character summary.
+
+The lead supplies `headline` on advance/submit/escalate, or uses
+`fleet_record_task_checkpoint` for a meaningful in-phase milestone. The latter
+does not advance a phase, dispatch work, authorize an action, resolve a human
+hold or finish a task, and it is refused for closed tasks or pending human reviews.
+Adjacent identical progress checkpoints are not duplicated. Human directions
+are attributed to the operator by their existing authenticated write path.
+Worker-attempt results are snapshotted by Fleet in the same transaction as the
+first terminal step transition, so a retry cannot erase the previous response
+and replaying a settlement does not append it again. Recording a worker result
+does not make that result a whole-task handover or proof of deployment.
+
 ### MCP reconnect recovery
 
 The Node restores retained MCP-equipped sessions without stopping their workers.

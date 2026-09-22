@@ -319,6 +319,11 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
             id,
             run.phaseIndex,
             `Maintenance released by ${actor}: ${input.operation.reason}`,
+            {
+              summary: "PR maintenance ownership released",
+              kind: "decision",
+              source: "operator",
+            },
           );
           if (record.decision?.state === "pending") service.resolveRunReview(id);
         },
@@ -569,6 +574,11 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
             id,
             run!.phaseIndex,
             `Maintenance direction (${reference.decisionId} v${reference.decisionVersion}) by ${actor}:\n\n${outcome.note}`,
+            {
+              summary: "Bounded PR design guidance recorded",
+              kind: "decision",
+              source: "operator",
+            },
           );
           service.resolveRunReview(id);
           store.updateRun(id, {
@@ -596,7 +606,12 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     });
 
     if (outcome.kind === "approve") {
-      if (outcome.note) store.appendRunNote(run!.id, run!.phaseIndex, outcome.note);
+      store.appendRunNote(
+        run!.id,
+        run!.phaseIndex,
+        outcome.note || "The task result was accepted by a person.",
+        { summary: "Task result accepted", kind: "decision", source: "operator" },
+      );
       service.resolveRunReview(run!.id);
       const done =
         run!.workspaceBinding?.effectiveMode === "managed"
@@ -607,7 +622,11 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       return { ok: true, run: done };
     }
 
-    store.appendRunNote(run!.id, run!.phaseIndex, `Sent back: ${outcome.note}`);
+    store.appendRunNote(run!.id, run!.phaseIndex, `Sent back: ${outcome.note}`, {
+      summary: "Guidance sent to the Orchestrator",
+      kind: "decision",
+      source: "operator",
+    });
     service.resolveRunReview(run!.id);
     /*
      * The note is owed rather than sent. Leaving `awaiting_human` is what takes

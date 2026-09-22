@@ -1602,6 +1602,11 @@ export class ManagedWorktreeService {
         runId,
         run.phaseIndex,
         `Changes requested during final publication review.\n\n${note}`,
+        {
+          summary: "Changes requested during publication review",
+          kind: "decision",
+          source: "operator",
+        },
       );
       this.store.setRunWorkspaceBinding(runId, {
         ...binding,

@@ -1,4 +1,4 @@
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BrowserMessage,
@@ -7,6 +7,7 @@ import type {
   SessionEvent,
   Snapshot,
 } from "@fleet/protocol";
+import { RunSchema } from "@fleet/protocol";
 import { useFleet } from "./useFleet";
 import { csrfToken, forgetCsrfToken } from "../lib/auth";
 
@@ -112,6 +113,77 @@ afterEach(() => {
 });
 
 describe("useFleet durable notifications", () => {
+  it("hydrates live checkpoints without refetching or dropping them for an older run message", () => {
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const run = RunSchema.parse({
+      id: "task",
+      workspaceId: "workspace",
+      name: "Task",
+      objective: "Ship",
+      state: "running",
+      createdAt: ISO,
+      updatedAt: ISO,
+    });
+    const note = {
+      id: "checkpoint",
+      runId: run.id,
+      phaseIndex: 0,
+      createdAt: ISO,
+      summary: "PR opened.",
+      body: "Full evidence",
+      kind: "progress" as const,
+      source: "orchestrator" as const,
+    };
+    const socket = MockWebSocket.instances[0]!;
+    const calls = vi.mocked(fetch).mock.calls.length;
+    act(() => socket.send({ type: "run", run, notes: [note] }));
+    expect(result.current.runNotes[run.id]).toEqual([note]);
+    act(() => socket.send({ type: "run", run }));
+    expect(result.current.runNotes[run.id]).toEqual([note]);
+    expect(vi.mocked(fetch).mock.calls.length).toBe(calls);
+  });
+
+  it("does not let a delayed REST response erase a newer live checkpoint", async () => {
+    let finish: ((value: Response) => void) | undefined;
+    vi.mocked(fetch).mockImplementation((path) => {
+      if (String(path) === "/api/snapshot") return json(snapshot());
+      if (String(path) === "/api/runs")
+        return new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      throw new Error(`Unexpected fetch ${String(path)}`);
+    });
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    let refreshing!: Promise<void>;
+    act(() => {
+      refreshing = result.current.refresh();
+    });
+    await waitFor(() => expect(finish).toBeDefined());
+    const run = RunSchema.parse({
+      id: "task",
+      workspaceId: "workspace",
+      name: "Task",
+      objective: "Ship",
+      state: "running",
+      createdAt: ISO,
+      updatedAt: ISO,
+    });
+    const note = {
+      id: "live",
+      runId: run.id,
+      phaseIndex: 0,
+      createdAt: ISO,
+      body: "New live report",
+      summary: "New checkpoint.",
+    };
+    act(() => MockWebSocket.instances[0]!.send({ type: "run", run, notes: [note] }));
+    await act(async () => {
+      finish!(response({ stepsByRunId: {}, notesByRunId: { [run.id]: [] } }));
+      await refreshing;
+    });
+    expect(result.current.runNotes[run.id]).toEqual([note]);
+  });
+
   it("reuses the session prompt/resume operation key on retry, without sending a trust flag", async () => {
     const { result } = renderHook(() => useFleet(vi.fn()));
     const calls: { path: string; body: Record<string, unknown> }[] = [];

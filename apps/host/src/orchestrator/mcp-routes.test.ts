@@ -232,6 +232,35 @@ describe("orchestrator tools over the wire", () => {
       ...over,
     });
 
+  it("advertises and records a bounded checkpoint over MCP with Host-owned attribution", async () => {
+    await plan();
+    const listed = await rpc("tools/list");
+    const advertised = listed.result!.tools!.find(
+      (tool) => tool.name === "fleet_record_task_checkpoint",
+    )!;
+    expect(advertised.inputSchema.properties?.summary?.maxLength).toBe(240);
+    expect(advertised.inputSchema.properties).not.toHaveProperty("source");
+    const result = await call("fleet_record_task_checkpoint", {
+      task: task()!.id,
+      summary: "MSIT Flight updated.",
+      details: "Revision 32 was read back. The PR is not created yet.",
+      source: "operator",
+      createdAt: "2000-01-01T00:00:00.000Z",
+    });
+    expect(result.refused).toBe(false);
+    expect(store.listRunNotes(task()!.id)[0]).toMatchObject({
+      summary: "MSIT Flight updated.",
+      source: "orchestrator",
+      kind: "progress",
+    });
+    expect((await call("fleet_list_work", { query: "MSIT Flight" })).text).toContain(
+      task()!.id,
+    );
+    expect((await call("fleet_get_task", { task: task()!.id })).text).toContain(
+      "MSIT Flight updated.",
+    );
+  });
+
   it("advertises scoped history search and stable task references", async () => {
     const listed = await rpc("tools/list");
     const search = listed.result!.tools!.find((tool) => tool.name === "fleet_list_work")!;

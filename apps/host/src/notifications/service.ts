@@ -8,6 +8,7 @@ import type {
   PrMaintenanceRegistration,
   PrMaintenanceProposal,
   Run,
+  RunNoteMetadata,
   RunRole,
   RunStep,
   SessionState,
@@ -468,9 +469,18 @@ export class NotificationService {
     runId: string;
     note: string;
     reason: ReviewReason;
+    metadata?: RunNoteMetadata | undefined;
   }): Run | undefined {
     const advanced = this.store.advanceRunToReview(input.runId, {
       note: input.note,
+      metadata: input.metadata ?? {
+        kind: input.reason === "completed" ? "review" : "blocked",
+        source: "system",
+        summary:
+          input.reason === "completed"
+            ? "Task ready for review"
+            : "Task needs a decision",
+      },
       notification: (run) => this.reviewNotification(run, input.reason),
     });
     if (!advanced) return undefined;

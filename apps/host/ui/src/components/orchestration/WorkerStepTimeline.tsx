@@ -35,13 +35,24 @@ const useStyles = makeStyles({
     ":hover": { background: tokens.colorNeutralBackground1Hover },
   },
   title: {
-    flexGrow: 1,
     minWidth: 0,
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-    whiteSpace: "nowrap",
+    overflowWrap: "anywhere",
     fontWeight: tokens.fontWeightSemibold,
   },
+  identity: {
+    display: "flex",
+    flexDirection: "column",
+    flexGrow: 1,
+    minWidth: 0,
+    gap: "5px",
+  },
+  node: {
+    color: tokens.colorNeutralForeground3,
+    fontFamily: terminal.font,
+    fontSize: "10px",
+    overflowWrap: "anywhere",
+  },
+  status: { flexShrink: 0, maxWidth: "110px", fontSize: "11px" },
   meta: {
     color: tokens.colorNeutralForeground3,
     fontFamily: terminal.font,
@@ -141,18 +152,29 @@ export const WorkerStepTimeline = ({
               onClick={() => toggle(step.id)}
             >
               <Chevron aria-hidden="true" />
-              <StatusIndicator descriptor={status} variant="icon" />
-              <span className={styles.title}>{step.title}</span>
-              {phases[step.phaseIndex] && (
-                <span className={styles.phaseTag}>{phases[step.phaseIndex]}</span>
-              )}
-              <span className={styles.meta}>
-                {step.category || "step"} · {status.shortLabel}
+              <span className={styles.identity}>
+                <span className={styles.title}>{session?.name || step.title}</span>
+                <span className={styles.node}>
+                  {session
+                    ? session.nodeName
+                    : step.sessionId
+                      ? "Session no longer available"
+                      : "Not dispatched"}
+                </span>
+              </span>
+              <span className={styles.status}>
+                <StatusIndicator descriptor={status} wrap />
               </span>
             </button>
             {expanded && (
               <div className={styles.body}>
+                {session?.name && session.name !== step.title ? (
+                  <Text>{step.title}</Text>
+                ) : null}
                 <div className={styles.facts}>
+                  {phases[step.phaseIndex] ? (
+                    <span className={styles.phaseTag}>{phases[step.phaseIndex]}</span>
+                  ) : null}
                   <Text className={styles.meta}>
                     {session
                       ? `${session.nodeName} · ${session.workspaceName}`

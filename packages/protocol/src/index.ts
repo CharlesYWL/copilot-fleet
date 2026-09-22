@@ -1552,8 +1552,25 @@ export type RunStep = z.infer<typeof RunStepSchema>;
 /** Persisted reason that identifies work cancelled by an orchestration Stop. */
 export const ORCHESTRATOR_STOP_REASON = "Stopped with orchestrator";
 
-/** A line the orchestrator wrote as a phase ended, for the person to read. */
-export const RunNoteSchema = z.object({
+export const RunNoteSummarySchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(240)
+  .regex(/^[^\r\n]+$/, "Use a single line for the checkpoint summary");
+
+export const RunNoteMetadataSchema = z.object({
+  summary: RunNoteSummarySchema.optional(),
+  kind: z
+    .enum(["progress", "review", "blocked", "decision", "worker", "lifecycle"])
+    .optional(),
+  source: z.enum(["orchestrator", "worker", "operator", "system"]).optional(),
+  sessionId: z.string().min(1).optional(),
+});
+export type RunNoteMetadata = z.infer<typeof RunNoteMetadataSchema>;
+
+/** Append-only checkpoints. Older records retain their original body and timestamp. */
+export const RunNoteSchema = RunNoteMetadataSchema.extend({
   id: z.string().min(1),
   runId: z.string().min(1),
   phaseIndex: z.number().int().nonnegative().default(0),
@@ -1814,7 +1831,11 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
    * it, and adding it to the Node wire union would break every Node that has
    * not been updated.
    */
-  z.object({ type: z.literal("run"), run: RunSchema }),
+  z.object({
+    type: z.literal("run"),
+    run: RunSchema,
+    notes: z.array(RunNoteSchema).optional(),
+  }),
   z.object({ type: z.literal("notification_upsert"), notification: NotificationSchema }),
   z.object({
     type: z.literal("notification_unread_count"),

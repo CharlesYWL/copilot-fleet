@@ -34,6 +34,7 @@ import {
   type PromptAttachment,
   type StartupConfig,
   type Run,
+  type RunNoteMetadata,
   type RunRole,
   type RunStep,
   type SecurityBackupPayload,
@@ -425,7 +426,7 @@ export class FleetService {
   }
 
   publishRun(run: Run): void {
-    this.broadcast({ type: "run", run });
+    this.broadcast({ type: "run", run, notes: this.store.listRunNotes(run.id) });
   }
 
   publishNotification(notification: Notification): void {
@@ -466,6 +467,7 @@ export class FleetService {
     runId: string;
     note: string;
     reason: "completed" | "blocked";
+    metadata?: RunNoteMetadata | undefined;
   }): Run | undefined {
     return this.notifications.requestRunReview(input);
   }

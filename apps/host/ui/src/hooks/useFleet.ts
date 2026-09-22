@@ -81,8 +81,10 @@ export function useFleet(notify: Notify) {
    * per run — so they patch by run id instead of forcing a whole snapshot.
    */
   const [runSteps, setRunSteps] = useState<Record<string, RunStep[]>>({});
-  /** What the orchestrator wrote as each phase ended, per task. */
+  /** Durable task checkpoints, including the original reports and worker attempts. */
   const [runNotes, setRunNotes] = useState<Record<string, RunNote[]>>({});
+  const runNoteRevision = useRef(0);
+  const runNoteRevisions = useRef(new Map<string, number>());
   const [connected, setConnected] = useState(false);
   const [nodeUpdates, setNodeUpdates] = useState<NodeUpdateProgress>({});
   const knownNotificationIds = useRef(new Set<string>());
@@ -279,12 +281,23 @@ export function useFleet(notify: Notify) {
        * every run as "0 steps" until the next live broadcast happens to
        * arrive — which for a finished run is never.
        */
+      const notesStartedAt = runNoteRevision.current;
       const runs = await api<{
         stepsByRunId: Record<string, RunStep[]>;
         notesByRunId: Record<string, RunNote[]>;
       }>("/api/runs");
       setRunSteps(runs.stepsByRunId ?? {});
-      setRunNotes(runs.notesByRunId ?? {});
+      if (hydration.ticket === latestHydrationTicket.current) {
+        setRunNotes((current) => {
+          const next = { ...runs.notesByRunId };
+          for (const [runId, revision] of runNoteRevisions.current) {
+            if (revision > notesStartedAt && current[runId]) {
+              next[runId] = current[runId];
+            }
+          }
+          return next;
+        });
+      }
     } catch (reason) {
       finishHydration(hydration.ticket);
       report(reason);
@@ -573,6 +586,11 @@ export function useFleet(notify: Notify) {
         }
         if (message.type === "run") {
           const incoming = message.run;
+          if (message.notes) {
+            runNoteRevisions.current.set(incoming.id, ++runNoteRevision.current);
+            const notes = message.notes;
+            setRunNotes((value) => ({ ...value, [incoming.id]: notes }));
+          }
           setSnapshot((value) => {
             const known = value.runs.some((run) => run.id === incoming.id);
             return {

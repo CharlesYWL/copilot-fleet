@@ -17,6 +17,7 @@ import {
   type WorkspaceMode,
   isChatsWorkspace,
   RunCriterionSchema,
+  RunNoteSummarySchema,
   canTransitionRun,
   isWritingCategory,
   terminalRunStates,
@@ -326,6 +327,9 @@ export const ListWorkSchema = z.object({
 });
 
 export const AdvanceTaskSchema = TaskRefSchema.extend({
+  headline: RunNoteSummarySchema.optional().describe(
+    "One short factual sentence for the task overview and history, at most 240 characters. Keep the full evidence in note.",
+  ),
   /** What this phase established, in a sentence, for the person reading later. */
   note: z
     .string()
@@ -335,7 +339,22 @@ export const AdvanceTaskSchema = TaskRefSchema.extend({
     ),
 });
 
+export const RecordTaskCheckpointSchema = TaskRefSchema.extend({
+  summary: RunNoteSummarySchema.describe(
+    "One short factual sentence about meaningful progress, at most 240 characters. State what actually happened, not what you plan to do.",
+  ),
+  details: z
+    .string()
+    .min(1)
+    .describe(
+      "The original report, decision context or evidence preserved behind the collapsed checkpoint.",
+    ),
+});
+
 export const SubmitTaskSchema = TaskRefSchema.extend({
+  headline: RunNoteSummarySchema.optional().describe(
+    "One short factual sentence for the task overview and history, at most 240 characters. The full report still belongs in summary.",
+  ),
   /** What was done and what the person should look at. */
   summary: z
     .string()
@@ -394,6 +413,9 @@ export const SessionRefSchema = z.object({
  * so the task goes to them with the obstacle named.
  */
 export const EscalateSchema = TaskRefSchema.extend({
+  headline: RunNoteSummarySchema.optional().describe(
+    "One short sentence naming the blocker and decision needed, at most 240 characters. Keep receipts and full context in reason.",
+  ),
   /** What is in the way, concretely enough for a person to act on. */
   reason: z
     .string()
@@ -1463,13 +1485,35 @@ export class FleetTools {
     return ok(planTaskReply(run));
   }
 
-  /**
-   * Moves a task to its next phase.
-   *
-   * The orchestrator's own judgement, not a person's. It has read what the
-   * worker produced and decided the phase is finished; if it has not, the
-   * answer is more work rather than this.
-   */
+  /** Records progress without changing scheduling, authority or the current review. */
+  recordTaskCheckpoint(input: z.infer<typeof RecordTaskCheckpointSchema>): ToolResult {
+    const run = this.requireTask(input.task);
+    if ("ok" in run) return run;
+    if (terminalRunStates.has(run.state) || run.state === "awaiting_human") {
+      return refuse(
+        `"${run.name}" is closed or with a person for review. Do not replace its handover with a progress update.`,
+      );
+    }
+    const previous = this.store.listRunNotes(run.id).at(-1);
+    if (
+      previous?.source === "orchestrator" &&
+      previous.kind === "progress" &&
+      previous.phaseIndex === run.phaseIndex &&
+      previous.summary === input.summary &&
+      previous.body === input.details
+    ) {
+      return ok("That checkpoint is already recorded.");
+    }
+    this.store.appendRunNote(run.id, run.phaseIndex, input.details, {
+      summary: input.summary,
+      kind: "progress",
+      source: "orchestrator",
+      sessionId: this.leadSessionId,
+    });
+    this.service.publishRun(run);
+    return ok("Checkpoint recorded. This does not advance, approve or finish the task.");
+  }
+
   advanceTask(input: z.infer<typeof AdvanceTaskSchema>): ToolResult {
     const run = this.requireTask(input.task);
     if ("ok" in run) return run;
@@ -1505,8 +1549,16 @@ export class FleetTools {
           `Call fleet_submit_task to hand it to the person.`,
       );
     }
-    const moved = this.store.updateRun(run.id, { phaseIndex: next })!;
-    this.store.appendRunNote(run.id, run.phaseIndex, input.note);
+    const moved = this.store.writeAtomically(() => {
+      const advanced = this.store.updateRun(run.id, { phaseIndex: next })!;
+      this.store.appendRunNote(run.id, run.phaseIndex, input.note, {
+        summary: input.headline ?? `${run.phases[run.phaseIndex]} completed`,
+        kind: "progress",
+        source: "orchestrator",
+        sessionId: this.leadSessionId,
+      });
+      return advanced;
+    });
     this.service.publishRun(moved);
     return ok(
       [
@@ -1559,6 +1611,12 @@ export class FleetTools {
       runId: run.id,
       note: [input.summary.trim(), verdict.record].join(""),
       reason: "completed",
+      metadata: {
+        summary: input.headline ?? "Task ready for review",
+        kind: "review",
+        source: "orchestrator",
+        sessionId: this.leadSessionId,
+      },
     });
     if (!submitted) return refuse(`"${run.name}" is already with the person.`);
     return ok(
@@ -1632,6 +1690,12 @@ export class FleetTools {
                 runId: run.id,
                 note: `**PR maintenance needs a design decision.**\n\n${input.reason}\n\nUse Send back with instructions for bounded direction. Approve task does not authorize a design change.`,
                 reason: "blocked",
+                metadata: {
+                  summary: input.headline ?? "PR maintenance needs a design decision",
+                  kind: "blocked",
+                  source: "orchestrator",
+                  sessionId: this.leadSessionId,
+                },
               })
             ) {
               throw new PrMaintenanceError(
@@ -1673,6 +1737,12 @@ export class FleetTools {
       runId: run.id,
       note,
       reason: "blocked",
+      metadata: {
+        summary: input.headline ?? "Task blocked; your decision is needed",
+        kind: "blocked",
+        source: "orchestrator",
+        sessionId: this.leadSessionId,
+      },
     });
     if (!escalated) return refuse(`"${run.name}" is already with the person.`);
     return ok(
@@ -1715,6 +1785,12 @@ export class FleetTools {
       run.id,
       run.phaseIndex,
       [`**Closed without finishing.**`, "", reason].join("\n"),
+      {
+        summary: "Task closed without finishing",
+        kind: "lifecycle",
+        source: "orchestrator",
+        sessionId: this.leadSessionId,
+      },
     );
     const live = this.store
       .listRunSteps(run.id)
@@ -1767,6 +1843,12 @@ export class FleetTools {
       run.id,
       run.phaseIndex,
       [held ? `**Taken back before review.**` : `**Reopened.**`, "", reason].join("\n"),
+      {
+        summary: held ? "Task taken back before review" : "Task reopened",
+        kind: "lifecycle",
+        source: "orchestrator",
+        sessionId: this.leadSessionId,
+      },
     );
     if (held) this.service.resolveRunReview(run.id);
     const reopened = this.store.updateRun(run.id, {
@@ -2152,7 +2234,9 @@ export class FleetTools {
             step.output,
             this.store.getSession(step.sessionId)?.initialPrompt ?? "",
           ]),
-          ...this.store.listRunNotes(run.id).map((note) => note.body),
+          ...this.store
+            .listRunNotes(run.id)
+            .flatMap((note) => [note.summary ?? "", note.body]),
         ]
           .join("\n")
           .toLowerCase();
@@ -2214,7 +2298,8 @@ export class FleetTools {
         truncateMiddle(
           notes
             .map(
-              (note) => `${note.createdAt} [phase ${note.phaseIndex + 1}]\n${note.body}`,
+              (note) =>
+                `${note.createdAt} [phase ${note.phaseIndex + 1}${note.source ? `; ${note.source}` : ""}]\n${note.summary ? `${note.summary}\n` : ""}${note.body}`,
             )
             .join("\n\n"),
           16_000,

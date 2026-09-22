@@ -25,6 +25,7 @@ import {
   type RunState,
   type RunStep,
   type RunNote,
+  type RunNoteMetadata,
   type RunCriterion,
   type RunStepState,
   type SecurityBackupPayload,
@@ -51,6 +52,7 @@ import {
   RunSchema,
   RunStepSchema,
   RunNoteSchema,
+  RunNoteMetadataSchema,
   SecurityBackupPayloadSchema,
   SessionEventSchema,
   SessionSchema,
@@ -215,6 +217,7 @@ export type SessionDispatchAttempt = {
 
 export type AdvanceRunToReviewWrite = {
   note: string;
+  metadata?: RunNoteMetadata | undefined;
   notification: (run: Run) => CreateNotification;
 };
 
@@ -625,7 +628,8 @@ export class FleetStore {
       CREATE TABLE IF NOT EXISTS run_notes (
         id TEXT PRIMARY KEY, run_id TEXT NOT NULL REFERENCES runs(id),
         phase_index INTEGER NOT NULL DEFAULT 0,
-        body TEXT NOT NULL, created_at TEXT NOT NULL
+        body TEXT NOT NULL, created_at TEXT NOT NULL,
+        metadata TEXT NOT NULL DEFAULT '{}'
       );
       CREATE TABLE IF NOT EXISTS notifications (
         id TEXT PRIMARY KEY,
@@ -832,6 +836,7 @@ export class FleetStore {
     this.addColumnIfMissing("runs", "success_criteria", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("runs", "stop_when", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing("runs", "review_seq", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnIfMissing("run_notes", "metadata", "TEXT NOT NULL DEFAULT '{}'");
     this.addColumnIfMissing("run_steps", "phase_index", "INTEGER NOT NULL DEFAULT 0");
     this.addColumnIfMissing(
       "run_steps",
@@ -2434,8 +2439,15 @@ export class FleetStore {
     // After the runs they reference, or the foreign key rejects them.
     for (const note of parsed.runNotes) {
       this.statement(
-        "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
-      ).run(note.id, note.runId, note.phaseIndex, note.body, note.createdAt);
+        "INSERT INTO run_notes (id,run_id,phase_index,body,created_at,metadata) VALUES (?,?,?,?,?,?)",
+      ).run(
+        note.id,
+        note.runId,
+        note.phaseIndex,
+        note.body,
+        note.createdAt,
+        JSON.stringify(RunNoteMetadataSchema.parse(note)),
+      );
     }
     // Filesystem ownership records deliberately have no cascading Run foreign key.
     for (const tree of [
@@ -5151,7 +5163,7 @@ export class FleetStore {
       if (Number(result.changes) === 0) return undefined;
       const run = this.getRun(id)!;
       if (!write) return run;
-      this.appendRunNote(run.id, run.phaseIndex, write.note);
+      this.appendRunNote(run.id, run.phaseIndex, write.note, write.metadata);
       const notification = this.insertPreparedNotification(
         this.prepareNotification(write.notification(run)),
       );
@@ -5288,21 +5300,27 @@ export class FleetStore {
    * there; reconstructing that from a dozen worker transcripts is the thing
    * this exists to save them.
    */
-  appendRunNote(runId: string, phaseIndex: number, body: string): RunNote {
+  appendRunNote(
+    runId: string,
+    phaseIndex: number,
+    body: string,
+    metadata: RunNoteMetadata = {},
+  ): RunNote {
     this.assertRunMutable(runId);
+    const parsed = RunNoteMetadataSchema.parse(metadata);
     const id = randomUUID();
     const createdAt = new Date().toISOString();
     this.statement(
-      "INSERT INTO run_notes (id,run_id,phase_index,body,created_at) VALUES (?,?,?,?,?)",
-    ).run(id, runId, phaseIndex, body, createdAt);
-    return { id, runId, phaseIndex, body, createdAt };
+      "INSERT INTO run_notes (id,run_id,phase_index,body,created_at,metadata) VALUES (?,?,?,?,?,?)",
+    ).run(id, runId, phaseIndex, body, createdAt, JSON.stringify(parsed));
+    return { id, runId, phaseIndex, body, createdAt, ...parsed };
   }
 
   listRunNotes(runId: string): RunNote[] {
     return (
-      this.statement("SELECT * FROM run_notes WHERE run_id=? ORDER BY created_at").all(
-        runId,
-      ) as Row[]
+      this.statement(
+        "SELECT * FROM run_notes WHERE run_id=? ORDER BY created_at,rowid",
+      ).all(runId) as Row[]
     ).map(runNoteFromRow);
   }
 
@@ -5357,12 +5375,32 @@ export class FleetStore {
     const entries = Object.entries(columns).filter(([, value]) => value !== undefined);
     if (entries.length === 0) return this.getRunStep(id);
     const assignments = entries.map(([column]) => `${column}=?`).join(",");
-    this.statement(`UPDATE run_steps SET ${assignments},updated_at=? WHERE id=?`).run(
-      ...entries.map(([, value]) => value as string | number),
-      new Date().toISOString(),
-      id,
-    );
-    return this.getRunStep(id);
+    return this.transaction(() => {
+      this.statement(`UPDATE run_steps SET ${assignments},updated_at=? WHERE id=?`).run(
+        ...entries.map(([, value]) => value as string | number),
+        new Date().toISOString(),
+        id,
+      );
+      const updated = this.getRunStep(id)!;
+      // A retry reuses the step row; retain each settled attempt before its output is reset.
+      if (
+        !terminalRunStepStates.has(current.state) &&
+        terminalRunStepStates.has(updated.state)
+      ) {
+        this.appendRunNote(
+          updated.runId,
+          updated.phaseIndex,
+          updated.output || "No response was recorded for this attempt.",
+          {
+            summary: `${updated.title.replace(/\s+/g, " ").trim().slice(0, 180)}: ${updated.state} (attempt ${updated.attempts})`,
+            kind: "worker",
+            source: "system",
+            ...(updated.sessionId ? { sessionId: updated.sessionId } : {}),
+          },
+        );
+      }
+      return updated;
+    });
   }
 
   /** Replaces a run's whole plan. Used by the handwritten-DAG fixture. */
@@ -6074,6 +6112,7 @@ function assertExecutionBinding(
 
 function runNoteFromRow(row: Row): RunNote {
   return RunNoteSchema.parse({
+    ...RunNoteMetadataSchema.parse(JSON.parse(String(row.metadata ?? "{}"))),
     id: String(row.id),
     runId: String(row.run_id),
     phaseIndex: Number(row.phase_index ?? 0),
