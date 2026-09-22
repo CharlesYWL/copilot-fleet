@@ -185,24 +185,9 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
       }
       const session = store.getSession(id);
       if (!session) return reply.code(404).send({ error: "Session not found" });
-      store.prMaintenance.assertAdmission({ sessionId: id, action: "prompt" });
-      if (session.stopRequested) {
-        return reply.code(409).send({ error: "Session is stopping" });
-      }
-      if (session.state !== "idle") {
-        return reply.code(409).send({ error: "Session must be idle" });
-      }
-      const dispatched = service.dispatch(
-        session.nodeId,
-        {
-          type: "prompt",
-          sessionId: id,
-          prompt: input.prompt,
-          attachments: input.attachments,
-        },
-        { state: "failed", activity: "Node disconnected before prompt" },
-      );
-      if (!dispatched.sent) return reply.code(503).send({ error: "Node disconnected" });
+      const dispatched = service.promptSession(id, input, request.fleetHumanActor);
+      if (!dispatched.ok)
+        return reply.code(dispatched.status).send({ error: dispatched.error });
       /*
        * An orchestrator's conversation takes its name from the first thing a
        * person says to it, so a fleet running several can tell them apart.
@@ -232,8 +217,16 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
 
   app.post("/api/sessions/:id/resume", async (request, reply) => {
     const { id } = request.params as { id: string };
-    store.prMaintenance.assertAdmission({ sessionId: id, action: "resume" });
-    const resumed = service.resumeSession(id);
+    const input = z
+      .object({ operationId: z.string().uuid().optional() })
+      .parse(request.body ?? {});
+    const resumed = service.resumeSession(
+      id,
+      undefined,
+      request.fleetHumanActor
+        ? { operatorId: request.fleetHumanActor, ...input }
+        : undefined,
+    );
     if (!resumed.ok) return reply.code(resumed.status).send({ error: resumed.error });
     return reply.code(202).send({ ok: true });
   });

@@ -992,6 +992,141 @@ describe("bounded alternate PR observations", () => {
 });
 
 describe("durable PR maintenance registry", () => {
+  it("persists manual provenance and unknown receipts across database reopen without reviving maintenance", () => {
+    const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+    mkdirSync(path, { recursive: true });
+    paths.push(path);
+    const db = join(path, "host.sqlite");
+    const f = setup(storeAt(db));
+    f.input.scope = PrMaintenanceEnableSchema.parse({
+      ...f.input,
+      scope: {
+        baseline: "Preserve design",
+        verification: "Native tests",
+        publicationAuthorized: false,
+      },
+    }).scope;
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "original");
+    const command = {
+      id: randomUUID(),
+      digest: "exact-input-digest",
+      kind: "prompt" as const,
+      operatorId: "supervisor",
+    };
+    f.store.writeAtomically(() => {
+      f.store.prMaintenance.beginManualControl(f.worker.id, command, 12);
+      f.store.setSessionDispatchAttempt(f.worker.id, {
+        commandId: command.id,
+        eventSeqFrom: 12,
+        attempt: `manual:${command.id}`,
+      });
+    });
+    const saved = f.store.prMaintenance.get(record.id)!;
+    f.store.close();
+    stores.splice(stores.indexOf(f.store), 1);
+    const reopened = storeAt(db);
+    expect(reopened.prMaintenance.get(record.id)).toEqual(saved);
+    expect(reopened.getSessionDispatchAttempt(f.worker.id)?.commandId).toBe(command.id);
+    expect(
+      reopened.prMaintenance.admission({ sessionId: f.worker.id, action: "execute" })
+        .allowed,
+    ).toBe(false);
+    expect(() => reopened.prMaintenance.assertManualAvailable(f.worker.id)).toThrow(
+      /receipts/,
+    );
+    reopened.prMaintenance.recordManualReceipt(f.worker.id, command.id, "settled");
+    expect(() => reopened.prMaintenance.assertManualAvailable(f.worker.id)).not.toThrow();
+    expect(reopened.prMaintenance.get(record.id)?.lifecycle).toBe("paused");
+    const restored = storeAt();
+    restored.replaceHostBackup(reopened.exportHostBackup({ enrollmentToken: "" }));
+    expect(restored.prMaintenance.get(record.id)?.manualControl).toEqual(
+      reopened.prMaintenance.get(record.id)?.manualControl,
+    );
+  });
+
+  it("rolls back handoff, queued cancellation and provenance with the dispatch receipt transaction", () => {
+    const f = setup();
+    const record = accept(
+      f,
+      prepare(
+        f,
+        observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator")),
+      ),
+    );
+    const before = f.store.getRunStep(f.step.id);
+    expect(() =>
+      f.store.writeAtomically(() => {
+        f.store.prMaintenance.beginManualControl(
+          f.worker.id,
+          {
+            id: randomUUID(),
+            digest: "input",
+            kind: "prompt",
+            operatorId: "supervisor",
+          },
+          0,
+        );
+        throw new Error("dispatch receipt write failed");
+      }),
+    ).toThrow(/dispatch receipt/);
+    expect(f.store.prMaintenance.get(record.id)).toEqual(record);
+    expect(f.store.getRunStep(f.step.id)).toEqual(before);
+  });
+
+  it("does not clear a manual receipt through maintenance renewal or release", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "original");
+    f.store.prMaintenance.beginManualControl(
+      f.worker.id,
+      {
+        id: randomUUID(),
+        digest: "input",
+        kind: "prompt",
+        operatorId: "supervisor",
+      },
+      0,
+    );
+    const saved = f.store.prMaintenance.get(record.id)!;
+    for (const action of [
+      { action: "resume" as const },
+      { action: "release" as const, reason: "Unknown cannot release" },
+      { action: "renew" as const },
+    ])
+      expect(() =>
+        f.store.prMaintenance.operatorAction(
+          record.id,
+          saved.version,
+          action,
+          "operator",
+        ),
+      ).toThrow(/manual command receipt/);
+    expect(f.store.prMaintenance.get(record.id)).toEqual(saved);
+  });
+
+  it("requires explicit maintenance resume after manual completion and retains the deduplication history", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "original");
+    const command = {
+      id: randomUUID(),
+      digest: "input",
+      kind: "prompt" as const,
+      operatorId: "supervisor",
+    };
+    f.store.prMaintenance.beginManualControl(f.worker.id, command, 0);
+    f.store.prMaintenance.recordManualReceipt(f.worker.id, command.id, "settled");
+    const saved = f.store.prMaintenance.get(record.id)!;
+    expect(saved.lifecycle).toBe("paused");
+    const resumed = f.store.prMaintenance.operatorAction(
+      record.id,
+      saved.version,
+      { action: "resume" },
+      "operator",
+    );
+    expect(resumed.lifecycle).toBe("active");
+    expect(resumed.manualControl?.endedAt).toBeDefined();
+    expect(resumed.manualControl?.commands).toEqual(saved.manualControl?.commands);
+    expect(resumed.authorization).toEqual(record.authorization);
+  });
   it.each(["omitted", "false"] as const)(
     "preserves read-only %s authority through proposal, observation and fallback without mutations",
     (permission) => {

@@ -112,6 +112,38 @@ afterEach(() => {
 });
 
 describe("useFleet durable notifications", () => {
+  it("reuses the session prompt/resume operation key on retry, without sending a trust flag", async () => {
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const calls: { path: string; body: Record<string, unknown> }[] = [];
+    vi.mocked(fetch).mockImplementation(async (path, init) => {
+      if (String(path).endsWith("/prompt") || String(path).endsWith("/resume")) {
+        calls.push({ path: String(path), body: JSON.parse(String(init?.body)) });
+        return new Response(JSON.stringify({ error: "Receipt unknown" }), {
+          status: calls.length % 2 ? 409 : 202,
+        });
+      }
+      return response({});
+    });
+    for (const kind of ["prompt", "resume"]) {
+      await act(async () => {
+        await result.current.command(
+          `/api/sessions/worker/${kind}`,
+          kind === "prompt" ? { prompt: "Manual fix" } : undefined,
+        );
+        await result.current.command(
+          `/api/sessions/worker/${kind}`,
+          kind === "prompt" ? { prompt: "Manual fix" } : undefined,
+        );
+      });
+    }
+    expect(calls[0]!.body.operationId).toEqual(calls[1]!.body.operationId);
+    expect(calls[2]!.body.operationId).toEqual(calls[3]!.body.operationId);
+    expect(calls[0]!.body).toEqual({
+      prompt: "Manual fix",
+      operationId: expect.any(String),
+    });
+    expect(calls[2]!.body).toEqual({ operationId: expect.any(String) });
+  });
   it("advances snapshot revisions for registry refresh without requiring a changed task", () => {
     const { result } = renderHook(() => useFleet(vi.fn()));
     const socket = MockWebSocket.instances[0]!;

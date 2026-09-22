@@ -758,6 +758,29 @@ export const PrMaintenanceRegistrationSchema = z
     pausedNoticeAt: time.optional(),
     ownershipReleasedAt: time.optional(),
     retentionReleasedBy: id.optional(),
+    manualControl: z
+      .object({
+        operatorId: id,
+        takenAt: time,
+        endedAt: time.optional(),
+        commands: z
+          .array(
+            z
+              .object({
+                id,
+                digest: id,
+                kind: z.enum(["prompt", "resume_session"]),
+                operatorId: id,
+                eventSeqFrom: count,
+                state: z.enum(["unknown", "accepted", "settled", "rejected"]),
+                createdAt: time,
+              })
+              .strict(),
+          )
+          .max(1_000),
+      })
+      .strict()
+      .optional(),
     authorization: z
       .object({
         id,

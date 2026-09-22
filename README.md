@@ -1884,6 +1884,27 @@ whole PR. Use the task's **Send back with instructions** to record bounded,
 versioned direction. **Approve task** and ordinary **Reopen** cannot clear that
 hold, certify a defect fixed, or approve a redesign.
 
+**Manual supervisor control:** open the retained worker and send an ordinary prompt,
+or use the worker's **Resume** button. This works for observation-only and paused
+registrations without Release or a separate unattended-publication grant, using the
+Host's existing human access (including its configured no-sign-in mode). Node
+credentials, MCP tokens, request flags, and prompt text do not establish human intent.
+Fleet atomically pauses maintenance and cancels only provably never-sent queued work;
+accepted/in-flight work and unknown effects must first produce correlated receipts.
+Busy, stopping, offline, capacity, and checkout restrictions still apply.
+
+After the manual turn, maintenance **stays paused**. Registration, authorization
+scope, pending design decisions, and execution/effect receipts remain intact.
+Manual direction is neither design approval, evidence of readiness, nor permission
+to renew unattended publication. Use explicit maintenance controls to resume the
+loop later. Reconnect may reattach a settled manual conversation, but never replays
+an unknown prompt. Session prompt/resume requests accept an `operationId` UUID;
+the UI reuses it on a failed request retry. Repeating the same key never sends twice.
+Legacy requests without a key deduplicate identical input; send a fresh key for an
+intentional identical new turn. Unknown/rejected delivery is reported rather than
+silently replayed. The retained manual history is bounded at 1,000 commands; once
+full, explicitly release settled maintenance before continuing.
+
 ![PR maintenance human decision gate: local repairs use the retained worker; design changes or uncertainty pause the whole PR until a human records bounded instructions and explicitly resumes maintenance after rechecking authorization and binding.](docs/pr-maintenance-human-gate.png)
 
 _Design choices stay human: record direction, then explicitly resume maintenance._

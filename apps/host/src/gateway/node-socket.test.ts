@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
 import Fastify, { type FastifyBaseLogger, type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
@@ -1410,6 +1410,107 @@ describe("node reconnect socket ordering", () => {
     await app.close();
     store.close();
   });
+
+  it.each([true, false])(
+    "correlates a manual command's real Node receipt (ok=%s) without replay or minting authority",
+    async (ok) => {
+      const placement = store.listPlacements()[0]!;
+      const lead = store.createSession(placement, "Lead", false, "", { runRole: "lead" });
+      const task = store.createRun({
+        workspaceId: placement.workspaceId,
+        name: "Retained",
+        objective: "Preserve design",
+      });
+      store.updateRun(task.id, { state: "running", leadSessionId: lead.id });
+      const worker = store.createSession(placement, "Worker", false, "", {
+        runId: task.id,
+        runRole: "worker",
+      });
+      sessionId = worker.id;
+      store.transitionSession(worker.id, "starting");
+      store.transitionSession(worker.id, "idle");
+      const step = store.upsertRunStep(task.id, {
+        stepKey: "work",
+        title: "Work",
+        prompt: "Original",
+      });
+      store.updateRunStep(step.id, { state: "succeeded", sessionId: worker.id });
+      const record = store.prMaintenance.enableFromOperator(
+        {
+          taskId: task.id,
+          workerSessionId: worker.id,
+          headSha: "a".repeat(40),
+          identity: {
+            host: "github.com",
+            repositoryId: "repo",
+            repository: "owner/repo",
+            prNumber: 1,
+            headRepositoryId: "repo",
+            headRepository: "owner/repo",
+            headRef: "refs/heads/fix",
+            baseRepositoryId: "repo",
+            baseRepository: "owner/repo",
+            baseRef: "refs/heads/main",
+          },
+          scope: {
+            baseline: "Preserve design",
+            verification: "Fixture tests",
+            publicationAuthorized: false,
+          },
+          eligibilityEvidence: "Fixture retained checkout",
+        },
+        "original-operator",
+      );
+      const client = await connect({ activeSessionIds: [worker.id], busySessionIds: [] });
+      const delivered = nextMessage(client, "command");
+      const operationId = randomUUID();
+      const input = { operationId, prompt: "Manual fix", attachments: [] };
+      expect(service.promptSession(worker.id, input, "supervisor")).toEqual({ ok: true });
+      const commandId = (await delivered).command.commandId;
+      expect(commandId).not.toBe(operationId);
+      expect(store.prMaintenance.get(record.id)?.manualControl?.commands[0]?.state).toBe(
+        "unknown",
+      );
+      send(client, { type: "command_result", commandId: "forged", sessionId, ok: true });
+      send(client, {
+        type: "command_result",
+        commandId,
+        sessionId,
+        ok,
+        fatal: false,
+        error: "Fixture refusal",
+      });
+      await waitFor(
+        () =>
+          store.prMaintenance.get(record.id)?.manualControl?.commands[0]?.state ===
+          (ok ? "accepted" : "rejected"),
+      );
+      const dispatch = vi.spyOn(service, "dispatch");
+      if (ok) {
+        expect(service.promptSession(worker.id, input, "supervisor")).toEqual({
+          ok: true,
+        });
+        send(client, event(1, "state", { state: "running" }));
+        send(client, event(2, "turn_complete", {}));
+        send(client, event(3, "state", { state: "idle" }));
+        await waitFor(
+          () =>
+            store.prMaintenance.get(record.id)?.manualControl?.commands[0]?.state ===
+            "settled",
+        );
+      } else {
+        expect(() => service.promptSession(worker.id, input, "supervisor")).toThrow(
+          /rejected/,
+        );
+      }
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(store.prMaintenance.get(record.id)).toMatchObject({
+        lifecycle: "paused",
+        authorization: record.authorization,
+        manualControl: { commands: [{ id: commandId }] },
+      });
+    },
+  );
 
   it("acknowledges a complete durable batch after reconciliation and notifies once", async () => {
     const client = await connect({

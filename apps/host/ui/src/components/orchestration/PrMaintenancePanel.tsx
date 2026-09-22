@@ -137,6 +137,8 @@ const nextActions: Record<PrMaintenanceStage, string> = {
 };
 
 function stageLabel(stage: PrMaintenanceStage, record: PrMaintenanceRegistration) {
+  if (stage === "paused" && record.manualControl && !record.manualControl.endedAt)
+    return "Manual supervisor control";
   if (stage === "blocked") {
     const incident = record.incidents.find((entry) => !entry.resolvedAt);
     if (incident?.kind === "provider_denial") return "Provider access denied";
@@ -151,6 +153,11 @@ function stageLabel(stage: PrMaintenanceStage, record: PrMaintenanceRegistration
 }
 
 function attentionReason(record: PrMaintenanceRegistration, stage: PrMaintenanceStage) {
+  const manual = record.manualControl?.commands.at(-1);
+  if (manual?.state === "unknown")
+    return "Manual delivery has no correlated receipt yet. Do not replay the request.";
+  if (manual?.state === "accepted")
+    return "Manual command accepted; wait for its completion receipt before another turn.";
   if (["merged", "closed"].includes(record.lifecycle) && hasOutstandingWork(record))
     return "The PR is terminal, but work or effects remain unsettled. Ownership is retained until reconciliation completes.";
   if (stage === "reconciling")
@@ -207,6 +214,11 @@ const readOnlyNotice =
 
 function hasOutstandingWork(record: PrMaintenanceRegistration) {
   return (
+    Boolean(
+      record.manualControl?.commands.some((command) =>
+        ["unknown", "accepted"].includes(command.state),
+      ),
+    ) ||
     record.incidents.some(
       (incident) => incident.kind === "effects" && !incident.resolvedAt,
     ) ||
@@ -537,6 +549,18 @@ export function PrMaintenancePanel({
 
       {current && currentProgress ? (
         <section aria-label="Current maintained PR">
+          <p>
+            Send a normal prompt to the retained worker, or use its Resume button, to take
+            manual control. No Release or unattended publication grant is needed.
+            Maintenance stays paused after your turn; pending design decisions still need
+            explicit direction. In-flight or unknown effects must settle first.
+          </p>
+          {current.manualControl && !current.manualControl.endedAt ? (
+            <p role="status">
+              Manual supervisor control — unattended maintenance is paused. This is not PR
+              readiness, publication authorization, or design approval.
+            </p>
+          ) : null}
           <p className={styles.muted}>Current maintained PR</p>
           <h3>
             <PrLink record={current} />

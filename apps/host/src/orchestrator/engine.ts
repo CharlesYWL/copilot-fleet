@@ -189,6 +189,12 @@ export class OrchestratorEngine {
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
     if (!run || terminalRunStates.has(run.state)) return;
+    if (
+      this.store.prMaintenance
+        .list({ taskId: runId, retainedOnly: true })
+        .records.some((record) => record.manualControl && !record.manualControl.endedAt)
+    )
+      return;
     const commandFence = this.store.commands.fence(runId);
     if (
       commandFence &&
@@ -534,6 +540,8 @@ export class OrchestratorEngine {
   }
 
   private stopSession(sessionId: string): void {
+    const manual = this.store.prMaintenance.manualRecord(sessionId)?.manualControl;
+    if (manual && !manual.endedAt) return;
     const session = this.store.getSession(sessionId);
     if (
       !session ||
@@ -863,6 +871,10 @@ export class OrchestratorEngine {
   }
 
   private finishRun(run: Run, state: Run["state"], reason: string): boolean {
+    if (
+      !this.store.prMaintenance.admission({ action: "advance", taskId: run.id }).allowed
+    )
+      return false;
     if (run.workspaceBinding?.effectiveMode === "managed") {
       if (state === "completed") {
         if (

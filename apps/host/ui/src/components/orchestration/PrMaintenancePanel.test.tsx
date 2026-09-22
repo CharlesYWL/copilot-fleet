@@ -210,6 +210,58 @@ beforeEach(() => {
 });
 
 describe("PR maintenance task controls", () => {
+  it("explains normal session manual takeover without publication authorization or Release", async () => {
+    const record = registration();
+    record.authorization.scope.publicationAuthorized = false;
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: false,
+    });
+    show();
+    expect(
+      await screen.findByText(/Send a normal prompt to the retained worker/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/No Release or unattended publication grant is needed/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/pending design decisions still need explicit direction/),
+    ).toBeTruthy();
+  });
+
+  it("shows persistent manual control and unknown delivery without enabling release", async () => {
+    const record = registration();
+    record.pauseReason = "manual_control";
+    record.manualControl = {
+      operatorId: "supervisor",
+      takenAt: at,
+      commands: [
+        {
+          id: "manual",
+          digest: "input",
+          kind: "prompt",
+          operatorId: "supervisor",
+          eventSeqFrom: 0,
+          state: "unknown",
+          createdAt: at,
+        },
+      ],
+    };
+    vi.mocked(getTaskMaintenance).mockResolvedValue({
+      records: [record],
+      canAuthorize: true,
+    });
+    show();
+    expect(
+      await screen.findByText(
+        /Manual supervisor control — unattended maintenance is paused/,
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText(/Manual delivery has no correlated receipt/)).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: /Release/ }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
   it("authorizes a read-only proposal without claiming mutation rights even when response flags are true", async () => {
     const pending = proposal();
     Object.assign(pending.registration.scope, {

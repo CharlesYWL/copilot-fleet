@@ -578,6 +578,16 @@ export function registerNodeGateway(
             service.publishNodeUpdate(nodeId, message.stage, message.detail, message);
             return;
           }
+          if (
+            message.type === "command_result" &&
+            service.store.getSession(message.sessionId)?.nodeId === nodeId &&
+            service.store.prMaintenance.recordManualReceipt(
+              message.sessionId,
+              message.commandId,
+              message.ok ? "accepted" : "rejected",
+            )
+          )
+            service.publishSnapshot();
           if (message.type === "command_result" && !message.ok) {
             app.log.warn(
               {

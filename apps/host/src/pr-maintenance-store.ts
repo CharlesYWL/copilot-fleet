@@ -31,6 +31,7 @@ import {
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
+import { notificationAttemptKey } from "./notifications/service.js";
 
 const outstanding = new Set(["prepared", "accepted", "reconciling", "uncertain"]);
 const unsettledEffect = (effect: PrMaintenanceEffect) =>
@@ -81,6 +82,12 @@ export type PrMaintenanceAdmissionResult = {
   recordId?: string;
   decisionId?: string;
 };
+export type SupervisorCommand = {
+  id: string;
+  digest: string;
+  kind: "prompt" | "resume_session";
+  operatorId: string;
+};
 
 export class PrMaintenanceError extends Error {
   readonly statusCode = 409;
@@ -96,6 +103,11 @@ function refuse(code: string, message: string): never {
 }
 export function prMaintenanceUnsettled(record: PrMaintenanceRegistration): boolean {
   return (
+    Boolean(
+      record.manualControl?.commands.some((command) =>
+        ["unknown", "accepted"].includes(command.state),
+      ),
+    ) ||
     record.incidents.some(
       (incident) => incident.kind === "effects" && !incident.resolvedAt,
     ) ||
@@ -749,6 +761,156 @@ export class PrMaintenanceStore {
     });
   }
 
+  manualRecord(sessionId: string): PrMaintenanceRegistration | undefined {
+    return this.retained().find((record) => record.workerSessionId === sessionId);
+  }
+
+  private neverDispatched(record: PrMaintenanceRegistration, batch: PrMaintenanceBatch) {
+    if (batch.state === "prepared") return true;
+    const step = batch.stepId && this.store.getRunStep(batch.stepId);
+    const worker = this.store.getSession(record.workerSessionId);
+    return Boolean(
+      batch.state === "accepted" &&
+      !batch.effects.length &&
+      step &&
+      worker &&
+      step.sessionId === worker.id &&
+      step.attempts === batch.attempt &&
+      step.state === "pending" &&
+      !step.dispatchedAt &&
+      this.store.getSessionDispatchAttempt(worker.id)?.attempt !==
+        notificationAttemptKey(worker, { step, run: this.store.getRun(record.taskId) }),
+    );
+  }
+
+  assertManualAvailable(sessionId: string): void {
+    const record = this.manualRecord(sessionId);
+    if (!record) refuse("worker_reserved", "No retained worker belongs to this session.");
+    const reason = this.binding(record);
+    if (reason)
+      refuse(reason, `Manual control cannot change the retained checkout: ${reason}.`);
+    if (
+      this.retained().some(
+        (other) => other.id !== record.id && other.checkoutKey === record.checkoutKey,
+      )
+    )
+      refuse(
+        "resource_reserved",
+        "Another retained registration reserves this checkout.",
+      );
+    if (
+      record.manualControl?.commands.some((command) =>
+        ["unknown", "accepted"].includes(command.state),
+      ) ||
+      record.incidents.some(
+        (incident) => incident.kind === "effects" && !incident.resolvedAt,
+      ) ||
+      record.actions.some(unsettledEffect) ||
+      record.batches.some(
+        (batch) =>
+          batch.effects.some(unsettledEffect) ||
+          ((outstanding.has(batch.state) || (batch.stepId && !batch.executionSettled)) &&
+            !this.neverDispatched(record, batch)),
+      )
+    )
+      refuse(
+        "execution_uncertain",
+        "Wait for correlated execution and effect receipts before manual control; no work was replayed or stopped.",
+      );
+    const queuedSteps = new Set(
+      record.batches
+        .filter((batch) => this.neverDispatched(record, batch))
+        .map((batch) => batch.stepId),
+    );
+    if (
+      this.store
+        .listRunSteps(record.taskId)
+        .some(
+          (step) =>
+            step.sessionId === sessionId &&
+            !["succeeded", "failed", "cancelled", "skipped"].includes(step.state) &&
+            !queuedSteps.has(step.id),
+        )
+    )
+      refuse(
+        "worker_busy",
+        "The retained worker still has an unsettled orchestration attempt.",
+      );
+    if ((record.manualControl?.commands.length ?? 0) >= 1_000)
+      refuse(
+        "manual_history_full",
+        "Manual receipt history is full; retain receipts and explicitly release settled maintenance before continuing.",
+      );
+  }
+
+  /** Called only by trusted session routes, in the dispatch receipt transaction. */
+  beginManualControl(
+    sessionId: string,
+    command: SupervisorCommand,
+    eventSeqFrom: number,
+  ): void {
+    this.assertManualAvailable(sessionId);
+    const record = this.manualRecord(sessionId)!;
+    if (record.manualControl?.commands.some((entry) => entry.id === command.id))
+      refuse(
+        "manual_duplicate",
+        "This manual request already has a receipt; do not replay it.",
+      );
+    const now = nowIso();
+    for (const batch of record.batches) {
+      if (!this.neverDispatched(record, batch) || !batch.stepId) continue;
+      this.store.updateRunStep(batch.stepId, {
+        state: "cancelled",
+        output:
+          "Supervisor took manual control before queued maintenance was dispatched.",
+      });
+      batch.state = "cancelled";
+      batch.executionSettled = true;
+      batch.executionNotDispatched = true;
+      batch.cancellationRequestedAt = now;
+      batch.updatedAt = now;
+      batch.reason = "manual_control";
+      batch.evidence =
+        "Host queue and dispatch receipt prove this attempt was never sent.";
+      this.refund(record, batch, 0, false);
+    }
+    this.pause(record, "manual_control", now);
+    record.manualControl ??= {
+      operatorId: command.operatorId,
+      takenAt: now,
+      commands: [],
+    };
+    delete record.manualControl.endedAt;
+    record.manualControl.commands.push({
+      ...command,
+      eventSeqFrom,
+      state: "unknown",
+      createdAt: now,
+    });
+    this.save(record);
+  }
+
+  recordManualReceipt(
+    sessionId: string,
+    commandId: string,
+    state: "accepted" | "settled" | "rejected",
+  ): boolean {
+    const record = this.manualRecord(sessionId);
+    const command = record?.manualControl?.commands.find(
+      (entry) => entry.id === commandId,
+    );
+    if (
+      !record ||
+      !command ||
+      command.state === state ||
+      ["settled", "rejected"].includes(command.state)
+    )
+      return false;
+    command.state = state;
+    this.save(record);
+    return true;
+  }
+
   operatorAction(
     id: string,
     expectedVersion: number,
@@ -763,6 +925,16 @@ export class PrMaintenanceStore {
       const record = this.required(id, undefined, expectedVersion);
       if (record.ownershipReleasedAt)
         refuse("released", "Released maintenance needs explicit new enablement.");
+      if (
+        record.manualControl?.commands.some((command) =>
+          ["unknown", "accepted"].includes(command.state),
+        ) &&
+        action.action !== "pause"
+      )
+        refuse(
+          "execution_uncertain",
+          "Settle the manual command receipt before changing maintenance control.",
+        );
       const now = nowIso();
       if (action.action === "pause") {
         this.pause(record, action.reason, now);
@@ -852,6 +1024,7 @@ export class PrMaintenanceStore {
               "Current worker binding is not eligible; an explicit supported handoff is required.",
             );
           record.lifecycle = "active";
+          if (record.manualControl) record.manualControl.endedAt = now;
           record.pauseReason = "";
           record.counters.scanStalls = 0;
           record.counters.reconciliationStalls = 0;
@@ -2338,6 +2511,7 @@ export class PrMaintenanceStore {
         this.retained()
           .filter(
             (record) =>
+              (!record.manualControl || Boolean(record.manualControl.endedAt)) &&
               (record.lifecycle === "active" || prMaintenanceUnsettled(record)) &&
               record.counters.reconciliationStalls < 3 &&
               record.counters.scanStalls < 3 &&
@@ -2467,6 +2641,7 @@ export class PrMaintenanceStore {
         : undefined;
       const eligible = (record: PrMaintenanceRegistration) =>
         !record.ownershipReleasedAt &&
+        (!record.manualControl || Boolean(record.manualControl.endedAt)) &&
         record.leadSessionId === leadSessionId &&
         (record.lifecycle === "active" || prMaintenanceUnsettled(record)) &&
         record.counters.scanStalls < 3 &&
