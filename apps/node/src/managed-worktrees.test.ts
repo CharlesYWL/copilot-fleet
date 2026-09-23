@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import {
   access,
+  appendFile,
   chmod,
   mkdir,
   readFile,
@@ -60,10 +61,13 @@ async function fixture(
   const source = join(root, "source");
   await mkdir(source, { recursive: true });
   await git.run(source, ["init", "-b", "target"]);
-  await git.run(source, ["config", "user.name", "Fleet Test"]);
-  await git.run(source, ["config", "user.email", "fleet-test@example.invalid"]);
-  await git.run(source, ["config", "commit.gpgSign", "false"]);
-  await git.run(source, ["config", "core.autocrlf", "false"]);
+  // Seed only this fresh fixture's local config; four Git processes add over a
+  // second on Windows without exercising any managed-worktree behavior.
+  await appendFile(
+    join(source, ".git", "config"),
+    "\n[user]\n\tname = Fleet Test\n\temail = fleet-test@example.invalid\n" +
+      "[commit]\n\tgpgSign = false\n[core]\n\tautocrlf = false\n",
+  );
   await writeFile(join(source, "same.txt"), "base\n");
   await writeFile(join(source, ".gitignore"), "ignored.txt\n");
   await git.run(source, ["add", "."]);
@@ -165,6 +169,45 @@ function binding(tree: ManagedWorktree, leaseAttempt: string): ExecutionBinding 
     accessClass: "shell",
     leaseAttempt,
     quarantined: false,
+  };
+}
+
+async function committedStep(
+  manager: ManagedWorktrees,
+  source: string,
+  baseSha: string,
+  stepId: string,
+  position: number,
+  file: string,
+) {
+  const request = WorktreeOperationRequestSchema.parse({
+    ...reserveRequest(source, "dag-run"),
+    operationId: randomUUID(),
+    worktreeId: `worktree-${stepId}`,
+    expectedBaseSha: baseSha,
+    workspaceKind: "step",
+    ownerStepId: stepId,
+  });
+  const reserved = await manager.execute(request);
+  const created = await operation(manager, reserved.worktree!, "create", {
+    workspaceKind: "step",
+    ownerStepId: stepId,
+  });
+  await writeFile(join(created.worktree!.path, file), `${stepId}\n`);
+  await git.run(created.worktree!.path, ["add", file]);
+  await git.run(created.worktree!.path, ["commit", "-m", stepId]);
+  const finalized = await operation(manager, created.worktree!, "finalize", {
+    workspaceKind: "step",
+    ownerStepId: stepId,
+  });
+  expect(finalized.ok).toBe(true);
+  expect(finalized.worktree!.resultSha).toMatch(/^[a-f0-9]{40}$/);
+  return {
+    stepId,
+    stepKey: stepId,
+    position,
+    worktreeId: finalized.worktree!.id,
+    resultSha: finalized.worktree!.resultSha,
   };
 }
 
@@ -296,6 +339,9 @@ async function liveAcpFixture(managed = true) {
   };
 }
 
+// The 120s cases execute 200–250 real Git commands (65–84s on Windows before
+// fixture reductions). Keep ordinary cases at 60s, without mocking policy or
+// revalidation probes or dropping publication safety checks.
 describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
   it("finalizes an unchanged workspace with ignored output without uploading repository history", async () => {
     const uploadArtifact = vi.fn();
@@ -622,40 +668,8 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     const baseSha = (
       await git.run(source, ["rev-parse", "--verify", "HEAD"])
     ).stdout.trim();
-    const makeStep = async (stepId: string, position: number, file: string) => {
-      const runId = "dag-run";
-      const request = WorktreeOperationRequestSchema.parse({
-        ...reserveRequest(source, runId),
-        operationId: randomUUID(),
-        worktreeId: `worktree-${stepId}`,
-        expectedBaseSha: baseSha,
-        workspaceKind: "step",
-        ownerStepId: stepId,
-      });
-      const reserved = await manager.execute(request);
-      const created = await operation(manager, reserved.worktree!, "create", {
-        workspaceKind: "step",
-        ownerStepId: stepId,
-      });
-      await writeFile(join(created.worktree!.path, file), `${stepId}\n`);
-      await git.run(created.worktree!.path, ["add", file]);
-      await git.run(created.worktree!.path, ["commit", "-m", stepId]);
-      const finalized = await operation(manager, created.worktree!, "finalize", {
-        workspaceKind: "step",
-        ownerStepId: stepId,
-      });
-      expect(finalized.ok).toBe(true);
-      expect(finalized.worktree!.resultSha).toMatch(/^[a-f0-9]{40}$/);
-      return {
-        stepId,
-        stepKey: stepId,
-        position,
-        worktreeId: finalized.worktree!.id,
-        resultSha: finalized.worktree!.resultSha,
-      };
-    };
-    const left = await makeStep("left", 0, "left.txt");
-    const right = await makeStep("right", 1, "right.txt");
+    const left = await committedStep(manager, source, baseSha, "left", 0, "left.txt");
+    const right = await committedStep(manager, source, baseSha, "right", 1, "right.txt");
     const composition = {
       baseSha,
       baseRef: "refs/heads/target",
@@ -727,11 +741,52 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         .split(/\s+/)[2],
     ).toBe(right.resultSha);
 
-    const conflictLeft = await makeStep("conflict-left", 2, "same.txt");
-    const conflictRight = await makeStep("conflict-right", 3, "same.txt");
+    await writeFile(join(source, "later.txt"), "later\n");
+    await git.run(source, ["add", "later.txt"]);
+    await git.run(source, ["commit", "-m", "advance source"]);
+    const readyReplay = await operation(manager, composed.worktree!, "compose", {
+      workspaceKind: "derived",
+      ownerStepId: "join",
+      composition,
+    });
+    expect(readyReplay.ok).toBe(true);
+    expect(readyReplay.worktree!.composition).toMatchObject({
+      state: "ready",
+      resultSha: composed.worktree!.composition!.resultSha,
+    });
+  }, 120_000);
+
+  it("retains conflicting committed step results in a derived workspace without resetting or cleaning", async () => {
+    const { source, manager } = await fixture();
+    const baseSha = (
+      await git.run(source, ["rev-parse", "--verify", "HEAD"])
+    ).stdout.trim();
+    const conflictLeft = await committedStep(
+      manager,
+      source,
+      baseSha,
+      "conflict-left",
+      2,
+      "same.txt",
+    );
+    const conflictRight = await committedStep(
+      manager,
+      source,
+      baseSha,
+      "conflict-right",
+      3,
+      "same.txt",
+    );
     const conflicting = {
-      ...composition,
+      baseSha,
+      baseRef: "refs/heads/target",
       predecessors: [conflictLeft, conflictRight],
+      state: "pending" as const,
+      resultSha: "",
+      conflicts: [],
+      error: "",
+      startedAt: "",
+      completedAt: "",
     };
     const conflictReserve = await manager.execute(
       WorktreeOperationRequestSchema.parse({
@@ -769,20 +824,6 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       state: "conflicted",
       conflicts: ["same.txt"],
       error: expect.stringContaining("did not reset or clean"),
-    });
-
-    await writeFile(join(source, "later.txt"), "later\n");
-    await git.run(source, ["add", "later.txt"]);
-    await git.run(source, ["commit", "-m", "advance source"]);
-    const readyReplay = await operation(manager, composed.worktree!, "compose", {
-      workspaceKind: "derived",
-      ownerStepId: "join",
-      composition,
-    });
-    expect(readyReplay.ok).toBe(true);
-    expect(readyReplay.worktree!.composition).toMatchObject({
-      state: "ready",
-      resultSha: composed.worktree!.composition!.resultSha,
     });
   }, 120_000);
 
@@ -2150,7 +2191,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(
       (await git.run(source, ["rev-parse", "--verify", tree.branchRef])).stdout.trim(),
     ).toBe(preview.taskSha);
-  });
+  }, 120_000);
 
   it("rejects stale reviewed SHA and target preview; merges only after explicit confirmation", async () => {
     const { manager, source } = await fixture();
@@ -2206,7 +2247,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     await expect(readFile(join(source, "task.txt"), "utf8")).rejects.toThrow();
     expect(await readFile(join(fresh.target.path, "task.txt"), "utf8")).toBe("task");
     expect((await operation(manager, tree, "cleanup")).ok).toBe(false);
-  });
+  }, 120_000);
 
   it("allows unrelated ignored target output but blocks ignored paths the merge would overwrite", async () => {
     const { manager, source } = await fixture();
@@ -2259,7 +2300,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     await expect(
       readFile(join(collisionFixture.source, "ignored.txt"), "utf8"),
     ).resolves.toBe("local generated output\n");
-  });
+  }, 120_000);
 
   it("disables explicitly allowed hooks during Fleet-controlled integration commits", async () => {
     const { manager, source } = await fixture();
@@ -2485,7 +2526,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
         ])
       ).stdout.trim(),
     ).toContain(published.integration!.resultSha);
-  });
+  }, 120_000);
 
   it("does not run post-commit hooks during controlled integration", async () => {
     const { manager, source } = await fixture();
@@ -2647,7 +2688,7 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
       "target",
     );
     expect((await git.run(source, ["remote"])).stdout.trim()).toBe("");
-  });
+  }, 120_000);
 
   it("fails closed on wrong ownership/generation/path and never recreates a manually missing checkout", async () => {
     const { manager, source } = await fixture();
