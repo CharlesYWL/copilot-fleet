@@ -64,6 +64,7 @@ const useStyles = makeStyles({
   },
   item: {
     width: "100%",
+    flexShrink: 0,
     justifyContent: "flex-start",
     textAlign: "left",
     overflow: "hidden",
