@@ -1418,7 +1418,7 @@ export function App() {
                         )}
                         events={events[activeSession.id] ?? noEvents}
                         onPrompt={(prompt, attachments) =>
-                          void command(`/api/sessions/${activeSession.id}/prompt`, {
+                          command(`/api/sessions/${activeSession.id}/prompt`, {
                             prompt,
                             attachments,
                           })
@@ -1515,7 +1515,7 @@ export function App() {
             open={focusOpen}
             onOpenChange={setFocusOpen}
             onPrompt={(prompt, attachments) =>
-              void command(`/api/sessions/${activeSession.id}/prompt`, {
+              command(`/api/sessions/${activeSession.id}/prompt`, {
                 prompt,
                 attachments,
               })

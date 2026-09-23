@@ -37,7 +37,7 @@ import {
   HANDOVER_SHAPE,
   WORKER_DELIVERY_CONTRACT,
 } from "./briefing.js";
-import { archiveRun, purgeRun } from "./lifecycle.js";
+import { archiveRun, purgeRun, stopSessions } from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
@@ -2681,7 +2681,7 @@ export class FleetTools {
   stopWork(input: z.infer<typeof SessionRefSchema>): ToolResult {
     const owned = this.ownedSession(input.sessionId);
     if (typeof owned === "string") return refuse(owned);
-    this.service.dispatch(owned.nodeId, { type: "stop", sessionId: owned.id });
+    stopSessions(this.service, [owned]);
     return ok("Stopping it.");
   }
 

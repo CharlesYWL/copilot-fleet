@@ -203,6 +203,9 @@ Object supervision, releasing a lease only after verified process-tree terminati
 Uncertain ownership is durably reconciliation-required without suppressing the
 terminal event. Resume can rotate a Host fencing attempt on the same live
 conversation through an atomic lease reattachment, never a second writer.
+Host backups preserve read-only classification and each step's workspace identity,
+state, and result metadata. Restored execution bindings remain quarantined until
+their exact worktree and generation reconcile, for primary and derived workspaces.
 See [Managed worktree isolation](docs/managed-worktree-isolation.md) for the
 two-layer lock model, persisted mode resolution and recovery rules.
 

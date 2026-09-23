@@ -34,6 +34,7 @@ import {
   CommandExecutionSchema,
   CommandOutputEventSchema,
   CommandReadinessSchema,
+  CommandPermissionRuleSchema,
   CommandExecutionBackupSchema,
 } from "./command-execution.js";
 export * from "./command-execution.js";
@@ -2928,6 +2929,8 @@ export const NodeBackupSettingsSchema = z.object({
   copilotCommand: z.string(),
   permissionTimeoutMs: z.number().int().min(1_000).max(3_600_000),
   contextTier: z.enum(["default", "long_context"]).default("long_context"),
+  commandPermissionRules: z.array(CommandPermissionRuleSchema).max(1024).optional(),
+  commandPermissionRevision: z.number().int().nonnegative().optional(),
   knownHostUrls: z.array(z.string()).default([]),
 });
 export type NodeBackupSettings = z.infer<typeof NodeBackupSettingsSchema>;

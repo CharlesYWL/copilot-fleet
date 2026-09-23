@@ -4,6 +4,7 @@ import { FluentProvider } from "@fluentui/react-components";
 import {
   NodeSchema,
   SessionSchema,
+  ExecutionBindingSchema,
   type FleetSession,
   type Placement,
 } from "@fleet/protocol";
@@ -61,6 +62,34 @@ const show = (overrides: Partial<FleetSession> = {}) => {
 };
 
 describe("SessionInfoDialog", () => {
+  it("shows and copies the managed execution directory rather than its source", async () => {
+    const cwd = "Q:\\managed\\task checkout";
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText },
+      configurable: true,
+    });
+    show({
+      executionBinding: ExecutionBindingSchema.parse({
+        worktreeId: "task-worktree",
+        generation: 1,
+        sourcePlacementId: placement.id,
+        cwd,
+        checkoutKey: "task-checkout",
+        leaseAttempt: "attempt",
+      }),
+    });
+    await screen.findByRole("dialog", { name: "Session information" });
+    expect(screen.getByText(cwd, { exact: true })).toBeTruthy();
+    expect(screen.queryByText(placement.localPath, { exact: true })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Copy working directory" }));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(cwd));
+    fireEvent.click(screen.getByRole("button", { name: "Copy resume command" }));
+    await waitFor(() =>
+      expect(writeText).toHaveBeenCalledWith(expect.stringContaining(`'${cwd}'`)),
+    );
+  });
+
   it("shows both IDs and copies a native resume command without launching anything", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {

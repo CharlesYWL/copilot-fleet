@@ -2,12 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
   updateFinished,
-  CommandExecutionSchema,
-  CommandOutputEventSchema,
+  BrowserMessageSchema,
+  decodeFrame,
   type CommandOutputEvent,
   type HostUpdateStatus,
   type MarkAllNotificationsReadResponse,
-  type BrowserMessage,
   type Notification,
   type NodeUpdateStage,
   type RunStep,
@@ -111,6 +110,8 @@ export function useFleet(notify: Notify) {
    * per run — so they patch by run id instead of forcing a whole snapshot.
    */
   const [runSteps, setRunSteps] = useState<Record<string, RunStep[]>>({});
+  const runStepRevision = useRef(0);
+  const runStepRevisions = useRef(new Map<string, number>());
   /** Durable task checkpoints, including the original reports and worker attempts. */
   const [runNotes, setRunNotes] = useState<Record<string, RunNote[]>>({});
   const runNoteRevision = useRef(0);
@@ -339,13 +340,22 @@ export function useFleet(notify: Notify) {
        * every run as "0 steps" until the next live broadcast happens to
        * arrive — which for a finished run is never.
        */
+      const stepsStartedAt = runStepRevision.current;
       const notesStartedAt = runNoteRevision.current;
       const runs = await api<{
         stepsByRunId: Record<string, RunStep[]>;
         notesByRunId: Record<string, RunNote[]>;
       }>("/api/runs");
-      setRunSteps(runs.stepsByRunId ?? {});
       if (hydration.ticket === latestHydrationTicket.current) {
+        setRunSteps((current) => {
+          const next = { ...runs.stepsByRunId };
+          for (const [runId, revision] of runStepRevisions.current) {
+            if (revision > stepsStartedAt && current[runId]) {
+              next[runId] = current[runId];
+            }
+          }
+          return next;
+        });
         setRunNotes((current) => {
           const next = { ...runs.notesByRunId };
           for (const [runId, revision] of runNoteRevisions.current) {
@@ -555,35 +565,26 @@ export function useFleet(notify: Notify) {
         attempt += 1;
       };
       socket.onmessage = ({ data }) => {
-        const message = parseBrowserMessage(String(data));
-        if (!message) {
+        const decoded = decodeFrame(String(data), BrowserMessageSchema);
+        if (!decoded.ok) {
           notifyRef.current("Malformed live update", "error");
-          socket?.close(1007, "Malformed JSON");
+          socket?.close(decoded.code, decoded.reason);
           return;
         }
+        const message = decoded.value;
         if (message.type === "command_execution") {
-          const parsed = CommandExecutionSchema.safeParse(message.execution);
-          if (!parsed.success) {
-            notifyRef.current("Malformed command execution update", "error");
-            socket?.close(1007, "Malformed command execution");
-            return;
-          }
           setSnapshot((value) => ({
             ...value,
             commandExecutions: mergeCommandExecutions(value.commandExecutions ?? [], [
-              parsed.data,
+              message.execution,
             ]).slice(0, 200),
           }));
           return;
         }
         if (message.type === "command_execution_output") {
-          const parsed = CommandOutputEventSchema.safeParse(message.event);
-          if (!parsed.success) {
-            notifyRef.current("Malformed command output", "error");
-            socket?.close(1007, "Malformed command output");
-            return;
-          }
-          pendingCommandOutput = mergeCommandOutput(pendingCommandOutput, [parsed.data]);
+          pendingCommandOutput = mergeCommandOutput(pendingCommandOutput, [
+            message.event,
+          ]);
           if (!commandFlushTimer) {
             commandFlushTimer = setTimeout(() => {
               const batch = pendingCommandOutput;
@@ -696,6 +697,7 @@ export function useFleet(notify: Notify) {
         }
         if (message.type === "run_steps") {
           const { runId, steps } = message;
+          runStepRevisions.current.set(runId, ++runStepRevision.current);
           setRunSteps((value) => ({ ...value, [runId]: steps }));
           return;
         }
@@ -771,14 +773,6 @@ function sortNotifications(notifications: Notification[]): Notification[] {
     (left, right) =>
       right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id),
   );
-}
-
-function parseBrowserMessage(text: string): BrowserMessage | undefined {
-  try {
-    return JSON.parse(text) as BrowserMessage;
-  } catch {
-    return undefined;
-  }
 }
 
 export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {

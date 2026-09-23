@@ -496,6 +496,37 @@ describe("FleetTools", () => {
     },
   );
 
+  it("retains an offline worker Stop until its Node reconnects", () => {
+    addNode("worker");
+    expect(start({ task: "Stop offline", node: "worker" }).ok).toBe(true);
+    const step = store.listRunSteps(tasks()[0]!.id)[0]!;
+    const worker = store.getSession(step.sessionId)!;
+    store.transitionSession(worker.id, "starting");
+    store.transitionSession(worker.id, "running");
+    service.disconnectNode(worker.nodeId, "Disconnected");
+
+    expect(tools().stopWork({ sessionId: worker.id }).ok).toBe(true);
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+
+    const sent: unknown[] = [];
+    service.attachNode(worker.nodeId, {
+      OPEN: 1,
+      readyState: 1,
+      send: (text) => {
+        sent.push(JSON.parse(text));
+      },
+      close() {},
+    });
+    store.setNodeOnline(worker.nodeId, true);
+    service.reconcile(worker.nodeId, [worker.id], [worker.id]);
+
+    expect(sent).toContainEqual({
+      type: "command",
+      command: expect.objectContaining({ type: "stop", sessionId: worker.id }),
+    });
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+  });
+
   it("will not touch a session belonging to somebody else", () => {
     const mine = store.createSession(store.listPlacements()[0]!, "hand-made");
 

@@ -73,15 +73,16 @@ export const NewSessionDialog = ({
   const [placementId, setPlacementId] = useState("");
   const [prompt, setPrompt] = useState("");
   const [name, setName] = useState("");
-  const [yolo, setYolo] = useState(defaultYolo);
+  const [yoloOverride, setYoloOverride] = useState<boolean>();
+  const yolo = yoloOverride ?? defaultYolo;
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     if (!open) return;
     setPrompt("");
     setName("");
-    setYolo(defaultYolo);
-  }, [open, defaultYolo]);
+    setYoloOverride(undefined);
+  }, [open]);
 
   // Node heartbeats hand down a fresh placements array every few seconds, so
   // only correct the selection when it actually stopped being valid.
@@ -159,7 +160,7 @@ export const NewSessionDialog = ({
                 <Switch
                   checked={yolo}
                   label={yolo ? "Allow all tools without asking" : "Ask before each tool"}
-                  onChange={(_event, data) => setYolo(data.checked)}
+                  onChange={(_event, data) => setYoloOverride(data.checked)}
                 />
                 <span className={styles.yoloHint}>
                   Runs Copilot with --allow-all, so it executes commands on{" "}
