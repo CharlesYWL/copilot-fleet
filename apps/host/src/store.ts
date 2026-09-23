@@ -103,7 +103,11 @@ import {
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import { CommandConflict, CommandExecutionStore } from "./command-execution-store.js";
 import { assertHostArchiveSize } from "./backup-limits.js";
-import { PrMaintenanceStore, PrMaintenanceError } from "./pr-maintenance-store.js";
+import {
+  PrMaintenanceStore,
+  PrMaintenanceError,
+  type PrMaintenanceOperationalReview,
+} from "./pr-maintenance-store.js";
 import {
   DEFAULT_NOTIFICATION_LIFECYCLE_ENABLED,
   NOTIFICATION_LIFECYCLE_DEFAULT_SETTING,
@@ -219,6 +223,7 @@ export type AdvanceRunToReviewWrite = {
   note: string;
   metadata?: RunNoteMetadata | undefined;
   notification: (run: Run) => CreateNotification;
+  operationalMaintenance?: PrMaintenanceOperationalReview | undefined;
 };
 
 export type AdvanceRunToReviewResult = {
@@ -5145,13 +5150,24 @@ export class FleetStore {
     id: string,
     write?: AdvanceRunToReviewWrite,
   ): Run | AdvanceRunToReviewResult | undefined {
-    this.assertCommandVerification(id);
+    if (write?.operationalMaintenance && this.transactionDepth > 0)
+      throw new PrMaintenanceError(
+        "review_conflict",
+        "Operational maintenance review must own the outermost transaction.",
+      );
     return this.transaction(() => {
+      this.assertCommandVerification(id);
       const current = this.getRun(id);
+      if (write?.operationalMaintenance)
+        this.prMaintenance.assertOperationalReview(id, write.operationalMaintenance);
       if (
         !current ||
         current.state === "awaiting_human" ||
-        !canTransitionRun(current.state, "awaiting_human")
+        (!canTransitionRun(current.state, "awaiting_human") &&
+          !(
+            write?.operationalMaintenance &&
+            (current.state === "completed" || current.state === "failed")
+          ))
       ) {
         return undefined;
       }
@@ -5164,9 +5180,13 @@ export class FleetStore {
       const run = this.getRun(id)!;
       if (!write) return run;
       this.appendRunNote(run.id, run.phaseIndex, write.note, write.metadata);
-      const notification = this.insertPreparedNotification(
-        this.prepareNotification(write.notification(run)),
-      );
+      const prepared = this.prepareNotification(write.notification(run));
+      if (write.operationalMaintenance && prepared.data.reason !== "blocked")
+        throw new PrMaintenanceError(
+          "review_conflict",
+          "Operational maintenance can only request blocked review.",
+        );
+      const notification = this.insertPreparedNotification(prepared);
       return { run, notification };
     });
   }

@@ -19,6 +19,7 @@ import {
   terminalCommandExecutionStates,
 } from "@fleet/protocol";
 import type {
+  AdvanceRunToReviewWrite,
   FleetStore,
   InsertNotificationResult,
   NotificationListInput,
@@ -470,6 +471,7 @@ export class NotificationService {
     note: string;
     reason: ReviewReason;
     metadata?: RunNoteMetadata | undefined;
+    operationalMaintenance?: AdvanceRunToReviewWrite["operationalMaintenance"];
   }): Run | undefined {
     const advanced = this.store.advanceRunToReview(input.runId, {
       note: input.note,
@@ -482,6 +484,7 @@ export class NotificationService {
             : "Task needs a decision",
       },
       notification: (run) => this.reviewNotification(run, input.reason),
+      operationalMaintenance: input.operationalMaintenance,
     });
     if (!advanced) return undefined;
     this.publisher.runUpsert(advanced.run);

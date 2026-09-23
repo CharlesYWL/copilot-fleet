@@ -34,7 +34,6 @@ import {
   type PromptAttachment,
   type StartupConfig,
   type Run,
-  type RunNoteMetadata,
   type RunRole,
   type RunStep,
   type SecurityBackupPayload,
@@ -464,12 +463,9 @@ export class FleetService {
     return session ? this.notifications.resetPreference(session) : undefined;
   }
 
-  requestRunReview(input: {
-    runId: string;
-    note: string;
-    reason: "completed" | "blocked";
-    metadata?: RunNoteMetadata | undefined;
-  }): Run | undefined {
+  requestRunReview(
+    input: Parameters<NotificationService["requestRunReview"]>[0],
+  ): Run | undefined {
     return this.notifications.requestRunReview(input);
   }
 

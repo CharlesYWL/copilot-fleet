@@ -69,6 +69,21 @@ function notificationInput(
 }
 
 describe("FleetStore", () => {
+  it.each(["completed", "failed", "cancelled"] as const)(
+    "does not admit ordinary review from a %s task",
+    (state) => {
+      const { store, workspace } = setup();
+      const run = store.createRun({
+        workspaceId: workspace.id,
+        name: "r",
+        objective: "o",
+      });
+      store.setRunState(run.id, state);
+      expect(store.advanceRunToReview(run.id)).toBeUndefined();
+      expect(store.getRun(run.id)).toMatchObject({ state, reviewSeq: 0 });
+    },
+  );
+
   it("preserves settled worker attempts when a step is retried", () => {
     const { store, workspace, placement } = setup();
     const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
