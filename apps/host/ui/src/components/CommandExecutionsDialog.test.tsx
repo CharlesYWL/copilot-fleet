@@ -319,6 +319,25 @@ describe("command approval UI", () => {
     await act(async () => {});
   });
 
+  it("keeps stacked history rows from shrinking when the list overflows", async () => {
+    const history = Array.from({ length: 12 }, (_, index) =>
+      execution({
+        id: `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+        state: "failed",
+        command: `failed command ${index}`,
+      }),
+    );
+    mount(history[0]!, true, history.slice(1));
+
+    const list = screen.getByRole("navigation", { name: "Command history" });
+    expect(getComputedStyle(list).overflowY).toBe("auto");
+    expect(within(list).getAllByRole("button")).toHaveLength(12);
+    expect(getComputedStyle(within(list).getAllByRole("button")[0]!).flexShrink).toBe(
+      "0",
+    );
+    await act(async () => {});
+  });
+
   it("opens a completed notification directly in history even with other requests pending", async () => {
     const finished = execution({
       id: "00000000-0000-4000-8000-000000000003",
