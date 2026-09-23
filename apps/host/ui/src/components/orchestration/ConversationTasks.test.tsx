@@ -188,6 +188,39 @@ describe("conversation tasks", () => {
     expect(screen.queryByRole("button", { name: /Beta task/ })).toBeNull();
   });
 
+  it("files a task keeping a PR alive under PR maintenance, not Deciding", () => {
+    show({
+      models: buildRunViewModels({
+        runs: [
+          run({ id: "a", name: "Alpha task", state: "awaiting_lead" }),
+          run({ id: "b", name: "Beta task", state: "awaiting_lead" }),
+        ],
+        stepsByRun: {},
+        sessions: [],
+        maintenance: [
+          {
+            taskId: "a",
+            recordId: "job",
+            stage: "waiting_review",
+            prUrl: "https://github.com/example/repo/pull/1",
+            manualControl: false,
+          },
+        ],
+      }),
+    });
+
+    expect(screen.getByRole("img", { name: "PR · Waiting for review" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("combobox", { name: "Filter tasks by status" }));
+    fireEvent.click(screen.getByRole("option", { name: "PR maintenance" }));
+    expect(screen.getByRole("button", { name: /Alpha task/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Beta task/ })).toBeNull();
+
+    fireEvent.click(screen.getByRole("combobox", { name: "Filter tasks by status" }));
+    fireEvent.click(screen.getByRole("option", { name: "Deciding" }));
+    expect(screen.queryByRole("button", { name: /Alpha task/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Beta task/ })).toBeTruthy();
+  });
+
   it("explains when filters have no matches", () => {
     show();
 

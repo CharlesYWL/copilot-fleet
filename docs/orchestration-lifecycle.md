@@ -180,6 +180,11 @@ Existing lead wakes handle due observation and reconciliation; there is no new
 timer or direct-to-worker observer. A completed task is not reopened just to make
 its lead eligible for a reminder.
 
+The [technical flow diagrams](pr-maintenance-technical-flow.html) show the MCP tools
+and REST actions that start, change and end maintenance, the per-wake observation
+and repair sequences, the registration and batch lifecycles, and the stage
+projection precedence.
+
 V1 permits one retained PR registration per task, including paused registrations.
 Task and MCP reads include historical terminal/released jobs. A later PR can reuse
 the same existing worker only after prior ownership is explicitly released or
@@ -214,9 +219,11 @@ head/base repository IDs and full refs, owned worker, baseline, verification,
 publication scope, budgets and current prerequisite evidence. Pause/resume/release
 use `recordId` and `expectedVersion`; stale input is a conflict, not permission to
 overwrite newer state. MCP may propose bounded maintenance but cannot fabricate
-the browser operator's authorization. Repair mode requires verified observation
-and publication prerequisites; observation-only mode grants no mutation authority.
-Unsupported immutable/standalone bindings still fail closed.
+the browser operator's authorization. Maintenance is repair-only: enablement
+requires verified observation and publication prerequisites. Legacy
+observation-only grants and proposals remain readable but authorize no writes and
+cannot be approved, resumed or renewed; they need a new pinned repair proposal and
+authenticated authorization. Unsupported immutable/standalone bindings still fail closed.
 
 The default task action sends a preparation request (optional PR URL only) to its
 existing Orchestrator through the existing prompt delivery mechanism. Durable
@@ -233,11 +240,13 @@ binding through normal operator enablement. A changed proposal requires review
 again; task approval is not maintenance approval. Proposals survive backup and
 restart without acquiring authority. Read them through
 `fleet_get_pr_maintenance(taskId)` or the existing task discovery surfaces.
-The preparer's default mode is observation only, with publication, replies, thread
-resolution, reviewer requests and CI retries disabled. Repair mode needs explicit
-existing-publication evidence; other provider actions must be requested separately.
-The returned mode and action flags mirror the stored proposal. Operator approval
-cannot silently reinterpret read-only scope as repair authority.
+Preparation is repair-only; there is no observation-only default and an explicit
+observe mode is unsupported. `publicationEvidence` for verified existing task and
+publication authority is required; without it preparation is refused
+(`publication_evidence_required`) and no proposal or write grant is created.
+Replies, thread resolution, named reviewer requests and CI retries default off and
+must be requested separately. The returned mode and action flags mirror the stored
+proposal. Operator approval cannot silently reinterpret read-only scope as repair authority.
 
 The stage rail is a projection of current durable facts, not another scheduler or
 agent-maintained status string. It distinguishes observation/recovery, triage,

@@ -46,6 +46,8 @@ import type { FleetStore } from "./store.js";
 import { notificationAttemptKey } from "./notifications/service.js";
 
 const outstanding = new Set(["prepared", "accepted", "reconciling", "uncertain"]);
+const undispatchedBatch = (batch: PrMaintenanceBatch) =>
+  batch.state === "prepared" && !batch.stepId && batch.effects.length === 0;
 const unsettledEffect = (effect: PrMaintenanceEffect) =>
   effect.state === "reserved" || effect.state === "uncertain";
 const neverSentEffect = (effect: PrMaintenanceEffect) =>
@@ -120,6 +122,13 @@ function refuse(code: string, message: string): never {
 }
 export function prMaintenanceUnsettled(record: PrMaintenanceRegistration): boolean {
   return (
+    record.batches.some((batch) => batch.state === "prepared") ||
+    prMaintenanceInFlight(record)
+  );
+}
+
+function prMaintenanceInFlight(record: PrMaintenanceRegistration): boolean {
+  return (
     Boolean(
       record.manualControl?.commands.some((command) =>
         ["unknown", "accepted"].includes(command.state),
@@ -130,7 +139,7 @@ export function prMaintenanceUnsettled(record: PrMaintenanceRegistration): boole
     ) ||
     record.batches.some(
       (batch) =>
-        outstanding.has(batch.state) ||
+        (outstanding.has(batch.state) && !undispatchedBatch(batch)) ||
         (batch.stepId && !batch.executionSettled) ||
         batch.effects.some(unsettledEffect),
     ) ||
@@ -2401,7 +2410,7 @@ export class PrMaintenanceStore {
       !record.incidents.some(
         (incident) => !incident.resolvedAt && incident.kind !== "capability",
       ) &&
-      !prMaintenanceUnsettled(record) &&
+      !prMaintenanceInFlight(record) &&
       !this.binding(record) &&
       !!task &&
       ["running", "awaiting_lead", "completed"].includes(task.state) &&
@@ -2672,6 +2681,31 @@ export class PrMaintenanceStore {
       record.observationHostAt = hostAttemptedAt;
     else delete record.observationHostAt;
     record.lastSuccessAt = hostAttemptedAt;
+    for (const batch of record.batches) {
+      if (undispatchedBatch(batch) && batch.headSha !== observation.headSha)
+        this.settleBatch(record, {
+          kind: "batch",
+          batchId: batch.id,
+          generation: record.generation,
+          state: "superseded",
+          findings: batch.sources.map((source) => ({
+            source,
+            outcome: "superseded",
+            stage: "not_attempted",
+            evidence: [],
+            responseRequired: true,
+            responseIds: [],
+            nextAction: "Prepare from the fresh observation at the new head.",
+            progress: false,
+          })),
+          effects: [],
+          executionSettled: true,
+          usedMutations: 0,
+          published: false,
+          reason: "head_changed",
+          evidence: "Observed head changed before dispatch; reserved allowance refunded.",
+        });
+    }
     if (!alternate) {
       record.counters.consecutiveFailures = 0;
       record.counters.scanStalls = 0;
@@ -3736,7 +3770,7 @@ export class PrMaintenanceStore {
         !late &&
         helperError(observation)?.code !== "clock_unverified" &&
         admission.allowed &&
-        !prMaintenanceUnsettled(record) &&
+        !prMaintenanceInFlight(record) &&
         prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt)
       ) {
         this.observe(
@@ -3791,7 +3825,11 @@ export class PrMaintenanceStore {
     const usage = z
       .object({
         requests: z.number().int().min(0).max(40),
-        milliseconds: z.number().int().min(0).max(120_000),
+        milliseconds: z
+          .number()
+          .int()
+          .min(0)
+          .max(PR_MAINTENANCE_WAKE_LIMITS.milliseconds),
       })
       .strict()
       .parse(charge);

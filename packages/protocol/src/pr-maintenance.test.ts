@@ -9,6 +9,8 @@ import {
   PrMaintenanceGithubSnapshotIdentitySchema,
   PrMaintenanceHelperSnapshotIdentitySchema,
   prMaintenanceProgress,
+  prMaintenanceTaskStatuses,
+  PrMaintenanceTaskStatusSchema,
   parsePrMaintenanceUrl,
   prMaintenanceProviderKey,
   prMaintenanceUrl,
@@ -262,6 +264,43 @@ describe("PR maintenance wire schemas", () => {
       expect(prMaintenanceProgress(record, now).stage).toBe("released");
       record.lifecycle = "merged";
       expect(prMaintenanceProgress(record, now).stage).toBe("merged");
+    });
+
+    it("summarizes each task's current retained maintenance for task lists", () => {
+      const now = Date.parse(at);
+      const ready = base();
+      ready.readyFingerprint = observation.fingerprint;
+      ready.observationHostAt = at;
+      const older = { ...base(), id: "older", createdAt: "2026-09-17T00:00:00.000Z" };
+      const released = { ...base(), id: "released", taskId: "released-task" };
+      released.ownershipReleasedAt = at;
+      const manual = { ...base(), id: "manual", taskId: "manual-task" };
+      manual.lifecycle = "paused";
+      manual.manualControl = { operatorId: "operator", takenAt: at, commands: [] };
+
+      const statuses = prMaintenanceTaskStatuses([older, ready, released, manual], now);
+
+      expect(statuses).toEqual([
+        {
+          taskId: "task",
+          recordId: "job",
+          stage: "ready",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: false,
+          freshUntil: "2026-09-18T00:30:00.000Z",
+        },
+        {
+          taskId: "manual-task",
+          recordId: "manual",
+          stage: "paused",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: true,
+        },
+      ]);
+      for (const status of statuses)
+        expect(PrMaintenanceTaskStatusSchema.parse(status)).toEqual(status);
+      manual.manualControl.endedAt = at;
+      expect(prMaintenanceTaskStatuses([manual], now)[0]?.manualControl).toBe(false);
     });
 
     it.each(["headSha", "snapshotId", "failure"] as const)(

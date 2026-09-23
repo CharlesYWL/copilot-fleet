@@ -18,6 +18,7 @@ import {
   eventPayload,
   liveSessionStates,
   nodeUpdateState,
+  prMaintenanceTaskStatuses,
   terminalRunStepStates,
   terminalSessionStates,
   type BrowserMessage,
@@ -32,6 +33,7 @@ import {
   type Notification,
   type Placement,
   type PromptAttachment,
+  type PrMaintenanceRegistration,
   type StartupConfig,
   type Run,
   type RunRole,
@@ -279,7 +281,23 @@ export class FleetService {
       hostRevision: this.hostRevision,
       commandExecutions: this.commands.list({ limit: 100 }),
       prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
+      prMaintenanceTasks: prMaintenanceTaskStatuses(this.retainedPrMaintenance()),
     };
+  }
+
+  private retainedPrMaintenance(): PrMaintenanceRegistration[] {
+    const records: PrMaintenanceRegistration[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = this.store.prMaintenance.list({
+        retainedOnly: true,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      records.push(...page.records);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return records;
   }
 
   listNodes(): FleetNode[] {

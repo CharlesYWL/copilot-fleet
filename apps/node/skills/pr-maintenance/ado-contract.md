@@ -119,7 +119,8 @@ installation without that entry point fails `cli_unavailable`; there is no
 unsafe `cmd /c` fallback. Unix launches `az` directly with an argument array.
 CLI dynamic extension installation and telemetry are disabled for that process.
 
-Each wake has at most 40 attempted operations and 120 seconds. Token acquisition
+Each wake has at most 40 attempted operations and 300 seconds (5 minutes).
+Each helper invocation still clamps its own run to 120 seconds. Token acquisition
 counts as one operation, including failure; fixture transports can inject
 `acquireToken` to exercise the same charged authentication seam. Every
 initiated HTTP read counts, including failed reads. Each operation is limited to
@@ -248,7 +249,7 @@ The total comments across threads still has the 200-item limit.
 A fixture with 40 mixed-state threads and 80 comments takes 19 initiated operations:
 one token acquisition, two metadata reads, and eight collection reads on each
 pass. Builds and documented ref/evaluation pages can increase that count; 39
-operations remain the normal repair allowance and 40/120 seconds the wake bounds.
+operations remain the normal repair allowance and 40 operations/300 seconds the wake bounds.
 New continuations carry `collectionVersion: 2`. Old per-thread continuations are
 preserved as historical evidence but rejected as `invalid_resume`, never given
 verification credit or converted to a write grant. A later authorized fresh

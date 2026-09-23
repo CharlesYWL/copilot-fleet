@@ -160,6 +160,53 @@ describe("orchestrator views", () => {
     expect(visual.motion).toBe(shared.motion);
   });
 
+  it.each([
+    ["awaiting_lead", "waiting_review", false, "PR · Waiting for review", "queued"],
+    ["completed", "ready", false, "PR · Ready to merge", "done"],
+    ["awaiting_lead", "blocked", false, "PR · Blocked", "waiting-for-permission"],
+    ["awaiting_lead", "paused", true, "PR · Manual control", "idle"],
+  ] as const)(
+    "shows a %s task's PR maintenance (%s) instead of its parked run state",
+    (state, stage, manualControl, label, visualState) => {
+      const [model] = buildRunViewModels({
+        runs: [run({ state })],
+        stepsByRun: {},
+        sessions: [],
+        maintenance: [
+          {
+            taskId: "r1",
+            recordId: "job",
+            stage,
+            prUrl: "https://github.com/example/repo/pull/1",
+            manualControl,
+          },
+        ],
+      });
+      const visual = runVisual(model!);
+      expect(visual.label).toBe(label);
+      expect(visual.icon).toBe(statusDescriptor(visualState).icon);
+      expect(visual.color).toBe(statusDescriptor(visualState).color);
+    },
+  );
+
+  it("keeps a handed-over task's review badge ahead of its PR maintenance", () => {
+    const [model] = buildRunViewModels({
+      runs: [run({ state: "awaiting_human" })],
+      stepsByRun: {},
+      sessions: [],
+      maintenance: [
+        {
+          taskId: "r1",
+          recordId: "job",
+          stage: "ready",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: false,
+        },
+      ],
+    });
+    expect(runVisual(model!).label).toBe("Needs review");
+  });
+
   it.each(["stage", "list", "dependency"] as const)(
     "opens the same task detail from the %s view",
     (mode) => {

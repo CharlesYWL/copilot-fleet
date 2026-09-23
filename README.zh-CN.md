@@ -1394,7 +1394,8 @@ _常规修复循环复用原 worker，并在现有 lead 唤醒时核实处理结
 
 _设计选择由人决定：先记录指导，再显式恢复维护。_
 
-[可编辑的图表源文件（HTML）](docs/pr-maintenance-flow.html)。
+[可编辑的图表源文件（HTML）](docs/pr-maintenance-flow.html) ·
+[技术流程：MCP 调用、阶段与生命周期（HTML）](docs/pr-maintenance-technical-flow.html)。
 
 Stop、归档或删除会先暂停关联的维护。已接受的工作及结果未知的 push/reply
 会继续保留所有权，并阻止清理，直到完成核实；Stop 不是远端副作用已结束的

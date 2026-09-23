@@ -38,7 +38,7 @@ export const PR_MAINTENANCE_CADENCE_MS = 30 * 60 * 1_000;
 export const PR_MAINTENANCE_WAKE_LIMITS = Object.freeze({
   visits: 5,
   requests: 40,
-  milliseconds: 120_000,
+  milliseconds: 300_000,
 });
 export const PR_MAINTENANCE_RECOVERY_LIMITS = Object.freeze({
   incidents: 20,
@@ -954,22 +954,24 @@ export function prMaintenanceObservationFresh(
   return age >= 0 && age <= PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs;
 }
 
-export type PrMaintenanceStage =
-  | "released"
-  | "merged"
-  | "closed"
-  | "human_hold"
-  | "reconciling"
-  | "authorization_required"
-  | "paused"
-  | "recovering"
-  | "blocked"
-  | "addressing_review"
-  | "triage"
-  | "waiting_checks"
-  | "waiting_review"
-  | "ready"
-  | "checking";
+export const PrMaintenanceStageSchema = z.enum([
+  "released",
+  "merged",
+  "closed",
+  "human_hold",
+  "reconciling",
+  "authorization_required",
+  "paused",
+  "recovering",
+  "blocked",
+  "addressing_review",
+  "triage",
+  "waiting_checks",
+  "waiting_review",
+  "ready",
+  "checking",
+]);
+export type PrMaintenanceStage = z.infer<typeof PrMaintenanceStageSchema>;
 
 /** Current facts, not budget reservations or provider review iteration numbers. */
 export function prMaintenanceProgress(
@@ -1091,6 +1093,82 @@ export function prMaintenanceProgress(
       ? "ready"
       : "checking",
   );
+}
+
+/** The registration a task view should describe: retained active work before history. */
+export function currentPrMaintenance<
+  T extends Pick<
+    PrMaintenanceRegistration,
+    "ownershipReleasedAt" | "lifecycle" | "createdAt"
+  >,
+>(records: readonly T[]): T | undefined {
+  const retained = records.filter((record) => !record.ownershipReleasedAt);
+  const active = retained.filter((record) =>
+    ["active", "paused"].includes(record.lifecycle),
+  );
+  return (active.length ? active : retained.length ? retained : records).reduce<
+    T | undefined
+  >(
+    (latest, record) =>
+      !latest || record.createdAt > latest.createdAt ? record : latest,
+    undefined,
+  );
+}
+
+/**
+ * A task's retained PR maintenance, reduced to what a task list needs.
+ *
+ * The Host computes this for the snapshot so a list can say a task is maintaining
+ * a PR without fetching every full registration. It is a label, not evidence;
+ * task details still read the complete record.
+ */
+export const PrMaintenanceTaskStatusSchema = z.object({
+  taskId: id,
+  recordId: id,
+  stage: PrMaintenanceStageSchema,
+  prUrl: z.string().min(1),
+  manualControl: z.boolean(),
+  /** After this, a stage that relied on the last observation is only "checking". */
+  freshUntil: time.optional(),
+});
+export type PrMaintenanceTaskStatus = z.infer<typeof PrMaintenanceTaskStatusSchema>;
+
+const freshnessDependentStages = new Set<PrMaintenanceStage>([
+  "triage",
+  "waiting_checks",
+  "waiting_review",
+  "ready",
+]);
+
+export function prMaintenanceTaskStatuses(
+  records: readonly PrMaintenanceRegistration[],
+  nowMs = Date.now(),
+): PrMaintenanceTaskStatus[] {
+  const byTask = new Map<string, PrMaintenanceRegistration[]>();
+  for (const record of records)
+    byTask.set(record.taskId, [...(byTask.get(record.taskId) ?? []), record]);
+  return [...byTask.values()].flatMap((taskRecords) => {
+    const record = currentPrMaintenance(taskRecords);
+    if (!record || record.ownershipReleasedAt) return [];
+    const { stage } = prMaintenanceProgress(record, nowMs);
+    const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
+    const freshUntil =
+      observedAt && freshnessDependentStages.has(stage)
+        ? new Date(
+            Date.parse(observedAt) + PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs,
+          ).toISOString()
+        : undefined;
+    return [
+      {
+        taskId: record.taskId,
+        recordId: record.id,
+        stage,
+        prUrl: prMaintenanceUrl(record.identity),
+        manualControl: Boolean(record.manualControl && !record.manualControl.endedAt),
+        ...(freshUntil ? { freshUntil } : {}),
+      },
+    ];
+  });
 }
 
 export const PrMaintenanceAdmissionSchema = z

@@ -1,4 +1,5 @@
 import {
+  currentPrMaintenance,
   prMaintenanceProgress,
   type PrMaintenanceRegistration,
   type PrMaintenanceStage,
@@ -25,19 +26,7 @@ export const maintenanceStageLabels: Record<PrMaintenanceStage, string> = {
   released: "Released",
 };
 
-export function currentMaintenance(records: readonly PrMaintenanceRegistration[]) {
-  const retained = records.filter((record) => !record.ownershipReleasedAt);
-  const active = retained.filter((record) =>
-    ["active", "paused"].includes(record.lifecycle),
-  );
-  return (active.length ? active : retained.length ? retained : records).reduce<
-    PrMaintenanceRegistration | undefined
-  >(
-    (latest, record) =>
-      !latest || record.createdAt > latest.createdAt ? record : latest,
-    undefined,
-  );
-}
+export const currentMaintenance = currentPrMaintenance<PrMaintenanceRegistration>;
 
 export function hasOutstandingWork(record: PrMaintenanceRegistration) {
   return (

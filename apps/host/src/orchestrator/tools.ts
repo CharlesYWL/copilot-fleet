@@ -540,7 +540,12 @@ export const GetPrMaintenanceSchema = z
       ),
     limit: z.number().int().min(1).max(100).default(20),
     cursor: z.string().min(1).optional(),
-    takeDue: z.boolean().default(false),
+    takeDue: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Claim the oldest due PR within this lead turn's shared limit: 5 visits, 40 requests and 5 minutes. Pagination and retries do not reset it.",
+      ),
     reserveRequests: z
       .number()
       .int()
@@ -563,7 +568,7 @@ export const CheckpointPrMaintenanceSchema = z
       .uuid()
       .optional()
       .describe(
-        "For an observation from a claim-bound finite command: verify exact persisted stdout and reconcile its original reservation across lead turns. Not authority for new reads or repairs.",
+        "For an observation from a claim-bound finite command: verify exact persisted stdout and reconcile its original reservation across lead turns. Fresh observations can refresh a prepared, undispatched batch at the same head; in-flight execution/effects still block promotion. An observed head change supersedes undispatched preparation and refunds it. Not authority for new reads or repairs.",
       ),
   })
   .strict();
@@ -1153,7 +1158,7 @@ export class FleetTools {
             allowance: registry.remainingWake(this.leadSessionId, wakeId),
             instruction: recovery
               ? "Recovery visit claimed; its reservation stays charged. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim, reclaim the visit or reset budgets. Paused/terminal records permit reconciliation only."
-              : "Allowance is reserved, including lost responses. Immediately run the helper once with observationAllowance.deadlineAt unchanged. For a finite Fleet command, pass observationClaim as maintenanceObservation at command creation; after completion checkpoint the exact observation with executionId, even in a new lead turn. Do not reclaim a visit to save old evidence. Receipt persistence grants no new I/O or repairs; actions still need a current claimed allowance.",
+              : "Allowance is reserved, including lost responses, within this lead turn's 5-minute window. Immediately run the helper once with observationAllowance.deadlineAt unchanged. For a finite Fleet command, pass observationClaim as maintenanceObservation at command creation; after completion checkpoint the exact observation with executionId, even in a new lead turn. A prepared, undispatched batch does not block fresh observations: keep its exact prompt at the same head; an observed head change supersedes and refunds it so a new batch can be prepared. Do not reclaim a visit to save old evidence. Receipt persistence grants no new I/O or repairs; actions still need a current claimed allowance.",
           };
         });
       }
