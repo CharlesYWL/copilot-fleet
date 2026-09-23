@@ -6,6 +6,8 @@ import {
   PrMaintenanceScopeSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceObservationSchema,
+  PrMaintenanceGithubSnapshotIdentitySchema,
+  PrMaintenanceHelperSnapshotIdentitySchema,
   prMaintenanceProgress,
   parsePrMaintenanceUrl,
   prMaintenanceProviderKey,
@@ -53,6 +55,43 @@ describe("PR maintenance wire schemas", () => {
       organization: "sample-org",
       headRef: "refs/heads/Fix",
     });
+  });
+
+  it("normalizes only the strict native GitHub helper identity, not the shared service identity contract", () => {
+    const canonical = PrMaintenanceIdentitySchema.parse(identity);
+    const { prNumber, ...pins } = canonical;
+    const native = {
+      ...pins,
+      number: prNumber,
+      prId: "PR_1",
+      url: prMaintenanceUrl(canonical),
+    };
+    expect(PrMaintenanceGithubSnapshotIdentitySchema.parse(native)).toEqual(canonical);
+    expect(
+      PrMaintenanceHelperSnapshotIdentitySchema.parse({ ...native, provider: "github" }),
+    ).toEqual({ ...canonical, provider: "github" });
+    expect(PrMaintenanceHelperSnapshotIdentitySchema.parse(ado)).toEqual(
+      PrMaintenanceIdentitySchema.parse(ado),
+    );
+    expect(PrMaintenanceIdentitySchema.safeParse(native).success).toBe(false);
+    expect(PrMaintenanceHelperSnapshotIdentitySchema.safeParse(canonical).success).toBe(
+      false,
+    );
+    for (const patch of [
+      { provider: "azure-devops" },
+      { prNumber },
+      { extra: "untrusted" },
+      { prId: "" },
+      { url: `${native.url}?claim=approved` },
+      { url: `${native.url}1` },
+      { number: 2 },
+      { host: "example.invalid" },
+      { repository: "other/repo" },
+    ])
+      expect(
+        PrMaintenanceHelperSnapshotIdentitySchema.safeParse({ ...native, ...patch })
+          .success,
+      ).toBe(false);
   });
 
   describe("maintenance progress from durable facts", () => {
@@ -121,6 +160,64 @@ describe("PR maintenance wire schemas", () => {
         PrMaintenanceObservationSchema.parse({ ...observation, draft: true }).draft,
       ).toBe(true);
     });
+
+    it("preserves optional grant-bound prerequisites without manufacturing legacy evidence", () => {
+      const legacy = base();
+      expect(legacy.authorization.eligibilityEvidence).toBeUndefined();
+      expect(legacy.authorization.sourceProposal).toBeUndefined();
+      const record = PrMaintenanceRegistrationSchema.parse({
+        ...legacy,
+        authorization: {
+          ...legacy.authorization,
+          eligibilityEvidence: "Fresh metadata and publication evidence",
+          sourceProposal: { id: "reviewed-proposal", version: 2 },
+        },
+        authorizationHistory: [legacy.authorization],
+      });
+      expect(record.authorization.eligibilityEvidence).toBe(
+        "Fresh metadata and publication evidence",
+      );
+      expect(record.authorization.sourceProposal).toEqual({
+        id: "reviewed-proposal",
+        version: 2,
+      });
+      expect(record.authorizationHistory[0]).toEqual(legacy.authorization);
+      for (const invalid of [
+        { eligibilityEvidence: "x".repeat(8193) },
+        { sourceProposal: { id: "proposal", version: 0 } },
+        { sourceProposal: { id: "proposal", version: 1, operatorId: "forged" } },
+      ])
+        expect(
+          PrMaintenanceRegistrationSchema.safeParse({
+            ...record,
+            authorization: { ...record.authorization, ...invalid },
+          }).success,
+        ).toBe(false);
+      expect(
+        PrMaintenanceRegistrationSchema.safeParse({
+          ...record,
+          authorizationHistory: Array(101).fill(record.authorization),
+        }).success,
+      ).toBe(false);
+    });
+
+    it.each([-60_000, 60_000])(
+      "uses the proven Host freshness basis without rewriting Node evidence (%d)",
+      (offset) => {
+        const record = base();
+        const now = Date.parse(at);
+        record.observation!.attemptedAt = new Date(now + offset).toISOString();
+        record.observationHostAt = at;
+        record.readyFingerprint = observation.fingerprint;
+        expect(prMaintenanceProgress(record, now).stage).toBe("ready");
+        expect(prMaintenanceProgress(record, now + 30 * 60_000 + 1).stage).toBe(
+          "checking",
+        );
+        expect(record.observation!.attemptedAt).toBe(
+          new Date(now + offset).toISOString(),
+        );
+      },
+    );
 
     it("provides exactly one truthful current stage with freshness and readiness gates", () => {
       const record = base();

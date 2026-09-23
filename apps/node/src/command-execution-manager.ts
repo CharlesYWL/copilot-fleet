@@ -8,6 +8,7 @@ import {
   CommandPreparationSchema,
   PreparedCommandSchema,
   commandDigestPayload,
+  commandObservationClock,
   terminalCommandExecutionStates,
   type CommandExecutionHostMessage,
   type CommandExecutionNodeMessage,
@@ -29,7 +30,7 @@ import { CommandPermissions } from "./command-permissions.js";
 
 // Atomic sequence events must fit the Host's default 16 KiB output page.
 const OUTPUT_CHUNK_BYTES = Math.min(COMMAND_LIMITS.chunkBytes, 8 * 1024);
-const CLOCK_DRIFT_TOLERANCE_MS = 1000;
+const CLOCK_DRIFT_TOLERANCE_MS = COMMAND_LIMITS.clockDriftMs;
 
 export type CommandProcessResult = {
   exitCode: number | null;
@@ -62,6 +63,7 @@ export type CommandSupervisor = {
     command: string;
     timeoutMs: number;
     startExpiresAt: number;
+    observationClock?: ReturnType<typeof commandObservationClock>;
     onOutput: (stream: "stdout" | "stderr", bytes: Buffer) => void;
   }): Promise<PreparedCommandProcess>;
   recover(
@@ -92,7 +94,10 @@ export class CommandExecutionManager {
   private readonly starting = new Map<string, Promise<void>>();
   private readonly recoveryReads = new Map<string, Promise<void>>();
   private artifactCleanup: Promise<void> | undefined;
-  private readonly clocks = new Map<string, { wall: number; monotonic: number }>();
+  private readonly clocks = new Map<
+    string,
+    { wall: number; monotonic: number; monotonicNs: string }
+  >();
   private readonly liveCursors = new Map<string, number>();
   private supported = false;
   private enabled = false;
@@ -301,6 +306,7 @@ export class CommandExecutionManager {
     // preparedAt is this receive-time clock sample, not metadata-completion time.
     const wall = this.now();
     const monotonic = this.monotonic();
+    const monotonicNs = process.hrtime.bigint().toString();
     const request = CommandPreparationSchema.parse(input);
     try {
       const context = this.connection(true);
@@ -433,7 +439,7 @@ export class CommandExecutionManager {
         },
       };
       journal.save(record);
-      this.clocks.set(request.executionId, { wall, monotonic });
+      this.clocks.set(request.executionId, { wall, monotonic, monotonicNs });
       this.prepared(descriptor);
       if (cancelled) this.sendReceipt(record);
     } catch (error) {
@@ -647,6 +653,11 @@ export class CommandExecutionManager {
         command: descriptor.command,
         timeoutMs: descriptor.timeoutMs,
         startExpiresAt: this.deadline(descriptor),
+        observationClock: commandObservationClock(
+          descriptor,
+          descriptor.prepared.preparedAt,
+          this.clocks.get(descriptor.executionId)!.monotonicNs,
+        ),
         onOutput: (stream, bytes) => this.output(record, stream, bytes),
       });
       running.process = child;

@@ -2329,6 +2329,357 @@ describe("durable PR maintenance registry", () => {
     },
   );
 
+  it.each(["direct", "proposal"] as const)(
+    "preserves proposal and grant evidence through %s enable, renewal, reenrollment and restart",
+    (mode) => {
+      const path = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+      mkdirSync(path, { recursive: true });
+      paths.push(path);
+      const dbPath = join(path, "host.sqlite");
+      const f = setup(storeAt(dbPath));
+      const legacy = f.store.prMaintenance.propose(f.lead.id, {
+        ...f.input,
+        eligibilityEvidence: "pending-legacy-prerequisites",
+      });
+      Object.assign(legacy.registration.scope, {
+        publicationAuthorized: false,
+        replies: false,
+        resolveThreads: false,
+      });
+      const backup = f.store.prMaintenance.exportBackup();
+      backup.proposals = [legacy];
+      f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+      const input = {
+        ...f.input,
+        headSha: otherSha,
+        eligibilityEvidence: "approved-repair-metadata-and-publication",
+      };
+      const proposal =
+        mode === "proposal"
+          ? f.store.prMaintenance.propose(f.lead.id, input, legacy.version)
+          : undefined;
+      let record = proposal
+        ? f.store.prMaintenance.authorizeProposal(
+            f.task.id,
+            proposal.id,
+            proposal.version,
+            "operator",
+          )
+        : f.store.prMaintenance.enableFromOperator(input, "operator");
+      expect(record.authorization.eligibilityEvidence).toBe(input.eligibilityEvidence);
+      expect(record.authorization.sourceProposal).toEqual(
+        proposal ? { id: proposal.id, version: proposal.version } : undefined,
+      );
+      const notes = f.store.listRunNotes(f.task.id);
+      expect(notes.filter((note) => note.body === JSON.stringify(legacy))).toHaveLength(
+        1,
+      );
+      if (proposal)
+        expect(
+          notes.filter((note) => note.body === JSON.stringify(proposal)),
+        ).toHaveLength(1);
+      expect(f.store.prMaintenance.enableFromOperator(input, "operator")).toEqual(record);
+      for (const drift of [
+        { headSha: sha },
+        { eligibilityEvidence: "different-approval" },
+      ])
+        expect(() =>
+          f.store.prMaintenance.enableFromOperator({ ...input, ...drift }, "operator"),
+        ).toThrow(/cannot adopt, rebind or renew/);
+      expect(f.store.listRunNotes(f.task.id)).toEqual(notes);
+      const original = record.authorization;
+      record = f.store.prMaintenance.operatorAction(
+        record.id,
+        record.version,
+        { action: "renew" },
+        "renewing-operator",
+      );
+      expect(record.authorizationHistory).toEqual([original]);
+      expect(record.authorization.eligibilityEvidence).toBe(input.eligibilityEvidence);
+      expect(record.authorization.sourceProposal).toEqual(original.sourceProposal);
+      record = f.store.prMaintenance.operatorAction(
+        record.id,
+        record.version,
+        { action: "release", reason: "Explicit release" },
+        "operator",
+      );
+      const next = f.store.prMaintenance.enableFromOperator(
+        {
+          ...input,
+          eligibilityEvidence: "next-generation-prerequisites",
+        },
+        "next-operator",
+      );
+      expect(next.id).not.toBe(record.id);
+      expect(next.generation).toBe(record.generation + 1);
+      expect(next.authorizationHistory).toEqual([]);
+      expect(next.authorization.sourceProposal).toBeUndefined();
+      const exported = f.store.exportHostBackup({ enrollmentToken: "" });
+      f.store.close();
+      stores.splice(stores.indexOf(f.store), 1);
+      const reopened = storeAt(dbPath);
+      const restored = storeAt();
+      restored.replaceHostBackup(exported);
+      for (const db of [reopened, restored]) {
+        expect(db.prMaintenance.get(record.id)).toEqual(record);
+        expect(db.prMaintenance.get(next.id)).toMatchObject({
+          generation: next.generation,
+          identity: next.identity,
+          eligibilityEvidence: "next-generation-prerequisites",
+          authorization: next.authorization,
+        });
+        expect(db.listRunNotes(f.task.id)).toEqual(notes);
+        expect(JSON.stringify(db.exportHostBackup({ enrollmentToken: "" }))).toContain(
+          "pending-legacy-prerequisites",
+        );
+      }
+      expect(restored.prMaintenance.get(next.id)?.lifecycle).toBe("paused");
+    },
+  );
+
+  it.each(["propose", "enable", "authorize", "reauthorize"] as const)(
+    "rolls back %s evidence consumption atomically and archives once on retry",
+    (path) => {
+      const f = setup();
+      if (path === "reauthorize") restoreLegacy(f);
+      const proposal = f.store.prMaintenance.propose(f.lead.id, {
+        ...f.input,
+        eligibilityEvidence: "atomic-proposal-evidence",
+      });
+      const before = f.store.prMaintenance.exportBackup();
+      const notes = f.store.listRunNotes(f.task.id);
+      const action = () =>
+        path === "propose"
+          ? f.store.prMaintenance.propose(f.lead.id, f.input, proposal.version)
+          : path === "enable"
+            ? f.store.prMaintenance.enableFromOperator(f.input, "operator")
+            : f.store.prMaintenance.authorizeProposal(
+                f.task.id,
+                proposal.id,
+                proposal.version,
+                "operator",
+              );
+      const append = f.store.appendRunNote.bind(f.store);
+      const fault = vi
+        .spyOn(f.store, "appendRunNote")
+        .mockImplementationOnce((...args) => {
+          append(...args);
+          throw new Error("synthetic archive persistence failure");
+        });
+      expect(action).toThrow(/archive persistence failure/);
+      expect(f.store.prMaintenance.exportBackup()).toEqual(before);
+      expect(f.store.listRunNotes(f.task.id)).toEqual(notes);
+      fault.mockRestore();
+      action();
+      expect(
+        f.store
+          .listRunNotes(f.task.id)
+          .filter((note) => note.body === JSON.stringify(proposal)),
+      ).toHaveLength(1);
+      if (path === "propose" || path === "enable") action();
+      else expect(action).toThrow(/already handled/);
+      if (path === "enable")
+        expect(
+          f.store.prMaintenance.list().records[0]!.authorization.sourceProposal,
+        ).toBeUndefined();
+      expect(
+        f.store
+          .listRunNotes(f.task.id)
+          .filter((note) => note.body === JSON.stringify(proposal)),
+      ).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    "owner",
+    "head",
+    "generation",
+    "actor",
+    "manual",
+    "decision",
+    "restore",
+    "evidence",
+  ] as const)(
+    "retains reauthorization evidence without approval after %s drift",
+    (drift) => {
+      const f = setup();
+      const record = restoreLegacy(f);
+      const proposal = f.store.prMaintenance.propose(f.lead.id, {
+        ...f.input,
+        eligibilityEvidence: "unapproved-new-basis",
+      });
+      if (drift === "owner") {
+        const lead = f.store.createSession(f.placement, "New owner", false, "", {
+          runRole: "lead",
+        });
+        f.store.updateRun(f.task.id, { leadSessionId: lead.id });
+      } else if (drift === "head") {
+        observe(f, record, { headSha: otherSha });
+      } else if (drift === "generation") {
+        const backup = f.store.prMaintenance.exportBackup();
+        backup.registrations[0]!.generation++;
+        f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+      } else if (drift === "manual") {
+        f.store.prMaintenance.beginManualControl(
+          f.worker.id,
+          {
+            id: randomUUID(),
+            digest: "unknown-manual",
+            kind: "prompt",
+            operatorId: "human",
+          },
+          0,
+        );
+      } else if (drift === "decision") {
+        f.store.prMaintenance.holdForDecision(
+          f.lead.id,
+          record.id,
+          record.version,
+          {
+            id: "design-hold",
+            version: 1,
+            proposal: "Change contract?",
+            headSha: sha,
+            scope: "Design",
+          },
+          () => f.store.updateRun(f.task.id, { state: "awaiting_human" }),
+        );
+      } else if (drift === "restore") {
+        f.store.replaceHostBackup(f.store.exportHostBackup({ enrollmentToken: "" }));
+      } else if (drift === "evidence") {
+        const backup = f.store.prMaintenance.exportBackup();
+        backup.registrations[0]!.eligibilityEvidence = "conflicting-record-evidence";
+        f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+      }
+      const before = f.store.prMaintenance.exportBackup();
+      const notes = f.store.listRunNotes(f.task.id);
+      expect(() =>
+        f.store.prMaintenance.authorizeProposal(
+          f.task.id,
+          proposal.id,
+          proposal.version,
+          drift === "actor" ? "" : "operator",
+        ),
+      ).toThrow();
+      expect(f.store.prMaintenance.exportBackup()).toEqual(before);
+      expect(f.store.listRunNotes(f.task.id)).toEqual(notes);
+      expect(
+        f.store.prMaintenance.get(record.id)?.authorization.scope.publicationAuthorized,
+      ).toBe(false);
+      expect(f.store.prMaintenance.getProposal(f.task.id)).toEqual(proposal);
+    },
+  );
+
+  it("keeps bounded grant history restorable and refuses count or byte overflow without losing evidence", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(
+      {
+        ...f.input,
+        eligibilityEvidence: "x".repeat(8192),
+      },
+      "operator",
+    );
+    const backup = f.store.prMaintenance.exportBackup();
+    backup.registrations[0]!.authorizationHistory = Array.from(
+      { length: 100 },
+      (_, index) => ({
+        ...record.authorization,
+        id: `history-${index}`,
+      }),
+    );
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    const before = f.store.prMaintenance.get(record.id)!;
+    expect(Buffer.byteLength(JSON.stringify(before))).toBeLessThan(2 * 1024 * 1024);
+    const restored = storeAt();
+    restored.replaceHostBackup(f.store.exportHostBackup({ enrollmentToken: "" }));
+    expect(restored.prMaintenance.get(record.id)?.authorizationHistory).toEqual(
+      before.authorizationHistory,
+    );
+    expect(() =>
+      f.store.prMaintenance.operatorAction(
+        record.id,
+        record.version,
+        { action: "renew" },
+        "operator",
+      ),
+    ).toThrow();
+    const oversized = f.store.prMaintenance.exportBackup();
+    for (const grant of oversized.registrations[0]!.authorizationHistory) {
+      grant.scope.baseline = "y".repeat(8192);
+      grant.scope.verification = "z".repeat(8192);
+    }
+    expect(() =>
+      f.store.writeAtomically(() => f.store.prMaintenance.importBackup(oversized)),
+    ).toThrow(/2 MiB/);
+    expect(f.store.prMaintenance.get(record.id)).toEqual(before);
+  });
+
+  it("refuses reauthorization history overflow without consuming its approved proposal", () => {
+    const f = setup();
+    const record = restoreLegacy(f);
+    const backup = f.store.prMaintenance.exportBackup();
+    backup.registrations[0]!.authorizationHistory = Array.from(
+      { length: 100 },
+      (_, index) => ({
+        ...record.authorization,
+        id: `prior-grant-${index}`,
+      }),
+    );
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    const proposal = f.store.prMaintenance.propose(f.lead.id, {
+      ...f.input,
+      eligibilityEvidence: "overflow-must-preserve-new-proposal",
+    });
+    const before = f.store.prMaintenance.exportBackup();
+    const notes = f.store.listRunNotes(f.task.id);
+    expect(() =>
+      f.store.prMaintenance.authorizeProposal(
+        f.task.id,
+        proposal.id,
+        proposal.version,
+        "operator",
+      ),
+    ).toThrow();
+    expect(f.store.prMaintenance.exportBackup()).toEqual(before);
+    expect(f.store.listRunNotes(f.task.id)).toEqual(notes);
+  });
+
+  it("does not attribute already-lost historical repair prerequisites to a later grant", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const backup = f.store.prMaintenance.exportBackup();
+    const imported = backup.registrations[0]!;
+    delete imported.authorization.eligibilityEvidence;
+    imported.authorizationHistory = [
+      {
+        ...imported.authorization,
+        id: "older-observation-grant",
+        scope: {
+          ...imported.authorization.scope,
+          publicationAuthorized: false,
+          replies: false,
+          resolveThreads: false,
+        },
+      },
+    ];
+    imported.eligibilityEvidence = "historical-text-not-proof-of-later-repair";
+    f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+    const renewed = f.store.prMaintenance.operatorAction(
+      record.id,
+      record.version,
+      { action: "renew" },
+      "operator",
+    );
+    expect(renewed.eligibilityEvidence).toBe(imported.eligibilityEvidence);
+    expect(renewed.authorization.eligibilityEvidence).toBeUndefined();
+    expect(renewed.authorization.sourceProposal).toBeUndefined();
+    expect(
+      renewed.authorizationHistory.every(
+        (grant) => grant.eligibilityEvidence === undefined,
+      ),
+    ).toBe(true);
+  });
+
   it("preserves pending proposals in backups without restoring authorization", () => {
     const f = setup();
     const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);

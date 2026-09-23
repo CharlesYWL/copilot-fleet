@@ -558,6 +558,13 @@ export const CheckpointPrMaintenanceSchema = z
     recordId: z.string().min(1),
     expectedVersion: z.number().int().positive(),
     checkpoint: PrMaintenanceCheckpointSchema,
+    executionId: z
+      .string()
+      .uuid()
+      .optional()
+      .describe(
+        "For an observation from a claim-bound finite command: verify exact persisted stdout and reconcile its original reservation across lead turns. Not authority for new reads or repairs.",
+      ),
   })
   .strict();
 
@@ -1128,15 +1135,25 @@ export class FleetTools {
             parsed.reserveRequests ?? defaultRequests,
             allowance.requests,
           );
-          registry.chargeWake(this.leadSessionId, wakeId, { requests, milliseconds: 0 });
+          const { deadlineAt, ...observationClaim } = registry.reserveObservation(
+            this.leadSessionId,
+            wakeId,
+            record.id,
+            requests,
+          );
           return {
             serverTime: new Date().toISOString(),
             record,
-            observationAllowance: { requests, milliseconds: allowance.milliseconds },
+            observationAllowance: {
+              requests,
+              milliseconds: allowance.milliseconds,
+              deadlineAt,
+            },
+            observationClaim,
             allowance: registry.remainingWake(this.leadSessionId, wakeId),
             instruction: recovery
               ? "Recovery visit claimed; its reservation stays charged. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim, reclaim the visit or reset budgets. Paused/terminal records permit reconciliation only."
-              : "Allowance is reserved, including lost responses. Run the bounded helper once, checkpoint its result, and do not reclaim this visit. ADO defaults leave one request unit for continuation when repair is authorized; claiming all 40 permits observation only in this wake. Paused/terminal records permit reconciliation only.",
+              : "Allowance is reserved, including lost responses. Immediately run the helper once with observationAllowance.deadlineAt unchanged. For a finite Fleet command, pass observationClaim as maintenanceObservation at command creation; after completion checkpoint the exact observation with executionId, even in a new lead turn. Do not reclaim a visit to save old evidence. Receipt persistence grants no new I/O or repairs; actions still need a current claimed allowance.",
           };
         });
       }
@@ -1193,6 +1210,20 @@ export class FleetTools {
     return this.maintenanceResult(() => {
       const record = this.store.writeAtomically(() => {
         const registry = this.store.prMaintenance;
+        if (input.executionId) {
+          if (input.checkpoint.kind !== "observation")
+            throw new PrMaintenanceError(
+              "invalid_receipt",
+              "Execution receipts only admit exact observation evidence.",
+            );
+          return registry.checkpointObservationReceipt(
+            this.leadSessionId,
+            input.recordId,
+            input.expectedVersion,
+            input.executionId,
+            input.checkpoint.observation,
+          );
+        }
         if (input.checkpoint.kind === "prepare_batch") {
           this.requireMaintenanceVisit(input.recordId, true);
         }

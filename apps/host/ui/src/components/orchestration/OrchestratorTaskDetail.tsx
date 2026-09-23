@@ -334,7 +334,7 @@ export const OrchestratorTaskDetail = ({
     maintenanceState?.taskId === run.id ? maintenanceState.view : undefined;
 
   const record = currentMaintenance(maintenance?.records ?? []);
-  const observedAt = record?.observation?.attemptedAt;
+  const observedAt = record?.observationHostAt ?? record?.observation?.attemptedAt;
   useEffect(() => {
     if (!observedAt) return;
     const observed = Date.parse(observedAt);

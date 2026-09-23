@@ -217,6 +217,172 @@ async function setup(provider: "github" | "azure-devops" = "github", dbPath?: st
 }
 
 describe("authenticated PR maintenance controls", () => {
+  it("preserves F1 old and newly approved prerequisite markers in portable evidence", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-authorization-evidence-"));
+    const { store, run, registration, authorize, mcp, app, worker, close } = await setup(
+      "azure-devops",
+      join(directory, "host.sqlite"),
+    );
+    cleanup.push(async () => rmSync(directory, { recursive: true, force: true }));
+    registration.eligibilityEvidence = "F1-original-grant-prerequisite";
+    expect((await authorize()).statusCode).toBe(200);
+    const backup = store.prMaintenance.exportBackup();
+    backup.registrations[0]!.authorization.scope.publicationAuthorized = false;
+    delete backup.registrations[0]!.authorization.eligibilityEvidence;
+    delete backup.registrations[0]!.authorization.sourceProposal;
+    const oldGrant = structuredClone(backup.registrations[0]!.authorization);
+    store.writeAtomically(() => store.prMaintenance.importBackup(backup));
+    const prepared = await mcp("fleet_prepare_pr_maintenance", {
+      taskId: run.id,
+      workerSessionId: worker.id,
+      prUrl: prMaintenanceUrl(registration.identity),
+      identity: registration.identity,
+      headSha: registration.headSha,
+      observedAt: new Date().toISOString(),
+      method: "provider_mcp",
+      evidence: "F1-fresh-provider-metadata",
+      publicationEvidence: "F1-fresh-publication-path",
+      verification: registration.scope.verification,
+      eligibilityEvidence: "F1-fresh-retained-checkout",
+    });
+    expect(prepared.ok, prepared.text).toBe(true);
+    const proposal = store.prMaintenance.getProposal(run.id)!;
+    const payload = {
+      action: "authorize_proposal",
+      proposalId: proposal.id,
+      expectedVersion: proposal.version,
+    };
+    const approved = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload,
+    });
+    expect(approved.statusCode, approved.body).toBe(200);
+    const record = approved.json();
+    store.insertAdministrator({
+      tenantId: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      objectId: "synthetic-evidence-operator",
+      username: "operator@example.com",
+      displayName: "Synthetic operator",
+      addedVia: "claim",
+    });
+    store.setSetting("auth.csrfKey", "synthetic-backup-csrf-key");
+    const exported = store.exportHostBackup({ enrollmentToken: "" });
+    const security = store.exportSecurityBackup();
+    for (const marker of [
+      "F1-original-grant-prerequisite",
+      "F1-fresh-provider-metadata",
+      "F1-fresh-publication-path",
+    ])
+      expect(JSON.stringify(exported)).toContain(marker);
+    expect(record).toMatchObject({
+      id: proposal.reauthorization!.recordId,
+      generation: proposal.reauthorization!.generation,
+      identity: proposal.registration.identity,
+      lifecycle: "paused",
+      eligibilityEvidence: proposal.registration.eligibilityEvidence,
+      authorization: {
+        operatorId: "real-browser-principal",
+        headSha: proposal.registration.headSha,
+        eligibilityEvidence: proposal.registration.eligibilityEvidence,
+        sourceProposal: { id: proposal.id, version: proposal.version },
+      },
+      authorizationHistory: [
+        { ...oldGrant, eligibilityEvidence: "F1-original-grant-prerequisite" },
+      ],
+    });
+    expect(
+      (
+        await app.inject({
+          method: "POST",
+          url: `/api/runs/${run.id}/pr-maintenance`,
+          headers: { "fixture-browser": "yes" },
+          payload,
+        })
+      ).statusCode,
+    ).toBe(409);
+    await close();
+    const reopened = new FleetStore(join(directory, "host.sqlite"));
+    const restored = new FleetStore(":memory:");
+    cleanup.unshift(async () => {
+      reopened.close();
+      restored.close();
+    });
+    const {
+      nodes,
+      kind: _kind,
+      version: _version,
+      enrollmentToken: _token,
+      ...data
+    } = exported;
+    restored.importPortableBackup({
+      data: {
+        ...data,
+        nodes: nodes.map(({ secretHash: _secretHash, ...node }) => node),
+      },
+      security,
+    });
+    for (const db of [reopened, restored]) {
+      const saved = db.prMaintenance.get(record.id)!;
+      expect(saved.authorization).toEqual(record.authorization);
+      expect(saved.authorizationHistory).toEqual(record.authorizationHistory);
+      expect(saved.eligibilityEvidence).toBe(proposal.registration.eligibilityEvidence);
+      expect(saved.identity).toEqual(record.identity);
+      expect(saved.generation).toBe(record.generation);
+      expect(saved.lifecycle).toBe("paused");
+      expect(
+        db.listRunNotes(run.id).filter((note) => note.body === JSON.stringify(proposal)),
+      ).toHaveLength(1);
+    }
+  });
+
+  it("preserves F2 pending legacy proposal markers when authenticated direct enable consumes it", async () => {
+    const { store, run, registration, authorize, app, leadId } = await setup();
+    const pending = store.prMaintenance.propose(leadId, {
+      ...registration,
+      eligibilityEvidence: "F2-unapproved-legacy-proposal",
+    });
+    pending.registration.scope.publicationAuthorized = false;
+    const backup = store.prMaintenance.exportBackup();
+    backup.proposals = [pending];
+    store.writeAtomically(() => store.prMaintenance.importBackup(backup));
+    const refused = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/pr-maintenance`,
+      headers: { "fixture-browser": "yes" },
+      payload: {
+        action: "authorize_proposal",
+        proposalId: pending.id,
+        expectedVersion: pending.version,
+      },
+    });
+    expect(refused.statusCode).toBe(400);
+    expect(store.prMaintenance.getProposal(run.id)).toEqual(pending);
+    registration.eligibilityEvidence = "F2-approved-direct-repair-prerequisite";
+    const approved = await authorize();
+    expect(approved.statusCode, approved.body).toBe(200);
+    const exported = store.exportHostBackup({ enrollmentToken: "" });
+    expect(JSON.stringify(exported)).toContain("F2-unapproved-legacy-proposal");
+    expect(JSON.stringify(exported)).toContain("F2-approved-direct-repair-prerequisite");
+    expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+    expect(
+      store.listRunNotes(run.id).filter((note) => note.body === JSON.stringify(pending)),
+    ).toHaveLength(1);
+    expect((await authorize()).json()).toEqual(approved.json());
+    expect(
+      store.listRunNotes(run.id).filter((note) => note.body === JSON.stringify(pending)),
+    ).toHaveLength(1);
+    const restored = new FleetStore(":memory:");
+    cleanup.push(async () => restored.close());
+    restored.replaceHostBackup(exported);
+    expect(restored.listRunNotes(run.id)).toEqual(store.listRunNotes(run.id));
+    expect(restored.prMaintenance.get(approved.json().id)?.authorization).toEqual(
+      approved.json().authorization,
+    );
+    expect(restored.prMaintenance.get(approved.json().id)?.lifecycle).toBe("paused");
+  });
+
   it("requires authenticated pinned repair reauthorization for a retained legacy grant, then explicit resume", async () => {
     const { store, run, registration, authorize, mcp, app, worker } =
       await setup("azure-devops");
@@ -838,7 +1004,7 @@ describe("authenticated PR maintenance controls", () => {
     const identity = tool.inputSchema.properties.identity;
     expect(tool.description).toContain("Before registration");
     expect(tool.inputSchema.properties.evidence.description).toContain("metadata-only");
-    expect(identity.description).toContain("snapshot.identity unchanged");
+    expect(identity.description).toContain("observation.identity unchanged");
     const ado = identity.oneOf.find(
       (entry: any) => entry.properties.provider.const === "azure-devops",
     );
@@ -1123,6 +1289,15 @@ describe("authenticated PR maintenance controls", () => {
       });
       expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
       expect(service.snapshot().prMaintenanceApprovals).toEqual([]);
+      const archivedProposal = store
+        .listRunNotes(run.id)
+        .find(
+          (note) =>
+            note.summary ===
+            "Approved PR maintenance proposal; prerequisite evidence retained",
+        );
+      expect(archivedProposal).toMatchObject({ source: "operator", kind: "decision" });
+      expect(JSON.parse(archivedProposal!.body)).toEqual(proposal);
       expect(
         store.getNotificationBySourceKey(`pr-maintenance-proposal:${proposal.id}:1`)
           ?.status,

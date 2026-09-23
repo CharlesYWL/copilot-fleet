@@ -46,6 +46,58 @@ evidence; see the skill's pre-enrollment recovery guidance.
 
 ### Durable evidence handoff
 
+For a registered job, claim with `fleet_get_pr_maintenance({takeDue:true})`
+(not `recordId` plus `takeDue`). Prepare the helper input and **dispatch immediately**,
+before unrelated work. Use returned `observationAllowance.requests` and
+`observationAllowance.deadlineAt` unchanged, the registered identity/generation,
+and only the current stored continuation. For `fleet_run_command`, also pass
+the exact returned `observationClaim` as `maintenanceObservation`:
+`{recordId,generation,wakeId}`. This binds one execution/attempt to the original
+persisted reservation at command creation, under normal finite-command approvals.
+Do not include the maintained `taskId`, add a deadline to the claim reference,
+or attach a prior execution retroactively.
+
+**Clock basis:** `deadlineAt` above is the original **Host** instant, not a Node
+wall-clock timestamp. Host adds the persisted deadline/request count to command
+preparation (not caller-editable `fleet_run_command` input); it is included in the
+normal approved descriptor digest. Node injects `FLEET_MAINTENANCE_CLOCK` from that
+descriptor and its original preparation monotonic sample into the finite process.
+Do not set/copy that environment variable, supply an offset in JSON, translate the
+deadline yourself, or use an older helper that ignores the runtime contract.
+Direct provider CLIs and the router share this budget check. Standalone discovery
+without a Fleet reservation still uses an explicitly Node-local deadline; it is
+not an alternate way to collect for a claimed finite-command receipt.
+
+The command proof's offset is **Host send time minus Node receive time**. It is a
+lower-bound mapping, not a synchronized-clock assertion. The local collection
+deadline is `Host deadline - hostClockOffsetMs - 5000 ms uncertainty - 1000 ms drift`,
+using the existing command tolerances. The helper checks wall time against the
+original cross-process monotonic sample and uses the later of wall/monotonic
+progress before every token acquisition/read and completion. It never samples a
+new allowance at approval, launch or helper start. Constant positive/negative
+offsets are supported; inconsistent/discontinuous context fails closed.
+
+Host receipt validation independently uses the persisted accepted preparation
+proof, descriptor digest, original reservation and raw Node settlement receipt.
+No stdout/PR/caller-supplied offset is authoritative. Raw observation timestamps,
+elapsed time and stdout stay unchanged. Host-derived `observationHostAt` and
+`lastAttemptAt` are earliest possible Host attempt times; optional
+`lastAttemptLatestAt` is the latest bound. Freshness uses the earliest bound,
+ordering refuses overlapping older evidence, and readiness/UI expiry uses the
+same basis. These bounded derived fields are not permission for collection.
+Paired updated Host/Node/helper code is required; missing old preparation budget
+or revoked/restored clock proof cannot be retroactively manufactured.
+
+End the turn after dispatch. On Fleet's automatic completion wake, read the
+current record and **all** `fleet_get_execution` pages for that execution.
+Use `format:"raw"` and concatenate decoded base64 stdout bytes in sequence before
+UTF-8/JSON decoding (an event can split a character). Require known quiescence,
+complete output, no gaps and helper exit 0 or 2. Persist with
+`{recordId,expectedVersion,executionId,checkpoint:{kind:"observation",observation}}`.
+The Host checks the exact observation against persisted, approved execution stdout,
+not caller claims or a file path. This correlation survives a different Host
+lead turn and same-database restart; repeating the same saved receipt is idempotent.
+
 Pass the **whole `result.observation` object** from parsed helper stdout as
 `checkpoint: {kind: "observation", observation: result.observation}` to
 `fleet_checkpoint_pr_maintenance` with the claimed record ID and current version.
@@ -64,12 +116,52 @@ the handoff as durable; a rejected request is not saved evidence and does not
 authorize another helper call. Owner/version/claim checks remain in force,
 including for large payloads. Genuine overflow stays incomplete/rejected.
 
+The async native fixture crosses command completion, a second accepted Host turn,
+raw execution pagination, checkpointing and SQLite restart with 291,675 observation
+bytes (291,959 CLI stdout bytes). A 590-byte, zero-operation deadline failure follows
+the same path. The original reservation stays charged even when actual usage is
+zero. An expired deadline can admit this evidence, **not** new provider I/O:
+creation/approval after expiry is refused; a dispatched helper delayed past expiry
+fails closed. Caller construction delay is not a collector performance failure.
+Never re-date the observation, reset the deadline at launch, or reclaim a visit to
+ingest an old result.
+
+An already-started bounded request may settle after its timeout/deadline (for example,
+ADO token acquisition plus one GET started with 50 ms left and returned after 51 ms).
+Its **incomplete** exit-2 receipt still saves the exact timestamp, elapsed time, usage,
+error and continuation. Nonzero usage requires an attempt begun before the original
+deadline and within the reservation; elapsed time must fit the known command lifetime.
+There is no grace period for collecting more data: a complete snapshot finishing after
+the deadline is refused. A late incomplete receipt is attempt-only and does not consume
+findings, update readiness, refresh the allowance or revive a held job. The CLI records
+collection start before invoking the provider, not at result mapping.
+
+Evidence older than the normal freshness window is retained only as `lastAttempt`,
+not promoted to a current snapshot/readiness. A fresh complete receipt can make the
+job due for action, but preparing/dispatching a repair still requires a **new current
+bounded visit and remaining allowance**. Under a pause, release or human hold, an
+otherwise exact same-scope receipt can update only `lastAttempt`, not lifecycle,
+current observation, findings or decisions. Owner/binding/authorization/generation or
+manual-control scope changes still refuse admission. Portable restore revokes the
+local accepted-preparation receipt and cannot acquire active receipt authority; raw
+command evidence and already-saved attempts remain readable under existing retention.
+Unbound historical commands cannot acquire this authority retroactively. Same-turn
+non-command observations retain the original claimed-visit checkpoint contract.
+
 The proposal tool's `identity` is **not** the discovery `pr` object: pass a complete
-helper's `snapshot.identity` unchanged, or construct the same strict provider
+helper's `observation.identity` unchanged, or construct the same strict provider
 identity from fresh, independently authorized metadata. ADO uses
 `repository/headRepository/baseRepository: "Project/Repo"` (case preserved),
 separate provider GUIDs, full `refs/heads/...` refs, and `prNumber`. Do not pass
 helper-only `url`, `repo`, or `number` fields in proposal `identity`.
+
+Native GitHub `snapshot.identity` retains `{number,prId,url,...pins}`; native ADO
+uses the shared provider identity. The GitHub observation mapper and Host receipt
+boundary share one strict native-to-shared adapter (`number` to `prNumber`, with exact
+PR URL/pin validation). The service-wide identity schema is unchanged and rejects
+native snapshot fields. Host also matches generation, HEAD/base SHAs, state, draft
+and fingerprint between snapshot and observation. Do not rewrite helper stdout to
+make an incompatible identity appear to pass.
 
 ## GitHub compatibility helper
 

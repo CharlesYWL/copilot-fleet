@@ -1,4 +1,7 @@
-import { PrMaintenanceObservationSchema } from "@fleet/protocol";
+import {
+  PrMaintenanceObservationSchema,
+  PrMaintenanceGithubSnapshotIdentitySchema,
+} from "@fleet/protocol";
 
 const failureCodes = {
   local_auth_unavailable: "capability",
@@ -87,18 +90,7 @@ export function toHostObservation(result, input, attemptedAt = new Date().toISOS
       evidence: `${identity.url}; an effective branch rule requires evidence this helper does not evaluate. Request human policy reconciliation.`,
     });
   }
-  observation.identity = {
-    host: identity.host,
-    repositoryId: identity.repositoryId,
-    repository: identity.repository,
-    prNumber: identity.number,
-    headRepositoryId: identity.headRepositoryId,
-    headRepository: identity.headRepository,
-    headRef: identity.headRef,
-    baseRepositoryId: identity.baseRepositoryId,
-    baseRepository: identity.baseRepository,
-    baseRef: identity.baseRef,
-  };
+  observation.identity = PrMaintenanceGithubSnapshotIdentitySchema.parse(identity);
   observation.snapshotId = snapshot.actionableFingerprint;
   observation.fingerprint = snapshot.actionableFingerprint;
   observation.headSha = headSha;

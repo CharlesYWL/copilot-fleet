@@ -23,6 +23,7 @@ import {
   type PreparedCommandProcess,
 } from "./command-supervisor.js";
 import { commandSupervisorScript } from "./command-supervisor-native.js";
+import { COMMAND_OBSERVATION_CLOCK_ENV } from "@fleet/protocol";
 
 const windows = describe.skipIf(process.platform !== "win32");
 const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
@@ -251,6 +252,43 @@ afterEach(async () => {
 }, 40_000);
 
 windows("Windows command supervisor: real disposable processes", () => {
+  it.each([false, true])(
+    "injects F5 only this attempt's runtime clock, replacing inherited data (bound=%s)",
+    async (bound) => {
+      const { root, cwd } = await fixture();
+      const value = input(root, cwd, "[Console]::Write($env:FLEET_MAINTENANCE_CLOCK)");
+      const at = new Date().toISOString();
+      if (bound)
+        value.observationClock = {
+          executionId: value.executionId,
+          attemptId: value.attemptId,
+          digest: "a".repeat(64),
+          claim: { recordId: "synthetic", generation: 1, wakeId: "turn" },
+          budget: {
+            deadlineAt: new Date(Date.now() + 120_000).toISOString(),
+            requests: 39,
+          },
+          hostTime: at,
+          preparedAt: at,
+          nodeTime: at,
+          monotonicNs: process.hrtime.bigint().toString(),
+          hostClockOffsetMs: 0,
+          clockUncertaintyMs: 5_000,
+        };
+      await parentFixture(root, value, "normal", {
+        ...process.env,
+        [COMMAND_OBSERVATION_CLOCK_ENV]: "forged-parent-clock",
+      });
+      await waitFor(
+        async () => (await readCommandProcessReceipt(value.directory)).result,
+      );
+      const stdout = await readFile(join(value.directory, "stdout.bin"), "utf8");
+      if (bound) expect(JSON.parse(stdout)).toEqual(value.observationClock);
+      else expect(stdout).toBe("");
+    },
+    40_000,
+  );
+
   beforeAll(async () => {
     const ready = await commandSupervisorReadiness();
     expect(ready.supported, ready.reason).toBe(true);

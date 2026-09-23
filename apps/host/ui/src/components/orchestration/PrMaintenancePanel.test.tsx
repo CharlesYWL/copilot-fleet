@@ -404,54 +404,58 @@ describe("PR maintenance task controls", () => {
     expect(authorizeTaskMaintenanceProposal).not.toHaveBeenCalled();
   });
 
-  it("expires displayed readiness at the evidence boundary without a socket update or polling", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date(at));
-    let rendered: ReturnType<typeof render> | undefined;
-    try {
-      const record = observed();
-      vi.mocked(getTaskMaintenance).mockResolvedValue({
-        records: [record],
-        canAuthorize: true,
-      });
-      const model = buildRunViewModels({
-        runs: [{ ...task, state: "completed" }],
-        stepsByRun: {},
-        sessions: [],
-      })[0]!;
-      await act(async () => {
-        rendered = render(
-          <FluentProvider theme={fleetDarkTheme}>
-            <OrchestratorTaskDetail
-              model={model}
-              notes={[]}
-              sessions={[]}
-              onBack={vi.fn()}
-              onOpenLead={vi.fn()}
-              onOpenWorker={vi.fn()}
-              onReview={vi.fn()}
-              onArchive={vi.fn()}
-              onReopen={vi.fn()}
-              onDelete={vi.fn()}
-            />
-          </FluentProvider>,
-        );
-      });
-      expect(screen.getByRole("heading", { name: "PR ready to merge" })).toBeTruthy();
-      const reads = vi.mocked(getTaskMaintenance).mock.calls.length;
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(
-          PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1,
-        );
-      });
-      expect(screen.queryByRole("heading", { name: "PR ready to merge" })).toBeNull();
-      expect(screen.getByRole("heading", { name: "Checking PR status" })).toBeTruthy();
-      expect(vi.mocked(getTaskMaintenance).mock.calls.length).toBe(reads);
-    } finally {
-      rendered?.unmount();
-      vi.useRealTimers();
-    }
-  });
+  it.each([0, -60_000, 60_000])(
+    "expires displayed readiness at the proven Host boundary without polling (Node offset %d)",
+    async (offset) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date(at));
+      let rendered: ReturnType<typeof render> | undefined;
+      try {
+        const record = { ...observed(), observationHostAt: at };
+        record.observation.attemptedAt = new Date(Date.parse(at) + offset).toISOString();
+        vi.mocked(getTaskMaintenance).mockResolvedValue({
+          records: [record],
+          canAuthorize: true,
+        });
+        const model = buildRunViewModels({
+          runs: [{ ...task, state: "completed" }],
+          stepsByRun: {},
+          sessions: [],
+        })[0]!;
+        await act(async () => {
+          rendered = render(
+            <FluentProvider theme={fleetDarkTheme}>
+              <OrchestratorTaskDetail
+                model={model}
+                notes={[]}
+                sessions={[]}
+                onBack={vi.fn()}
+                onOpenLead={vi.fn()}
+                onOpenWorker={vi.fn()}
+                onReview={vi.fn()}
+                onArchive={vi.fn()}
+                onReopen={vi.fn()}
+                onDelete={vi.fn()}
+              />
+            </FluentProvider>,
+          );
+        });
+        expect(screen.getByRole("heading", { name: "PR ready to merge" })).toBeTruthy();
+        const reads = vi.mocked(getTaskMaintenance).mock.calls.length;
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(
+            PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1,
+          );
+        });
+        expect(screen.queryByRole("heading", { name: "PR ready to merge" })).toBeNull();
+        expect(screen.getByRole("heading", { name: "Checking PR status" })).toBeTruthy();
+        expect(vi.mocked(getTaskMaintenance).mock.calls.length).toBe(reads);
+      } finally {
+        rendered?.unmount();
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it.each(["merged", "closed"] as const)(
     "keeps unsettled %s work in the top-level overview",
