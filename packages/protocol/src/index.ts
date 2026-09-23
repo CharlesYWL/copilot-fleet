@@ -38,7 +38,10 @@ import {
 } from "./command-execution.js";
 export * from "./command-execution.js";
 export * from "./pr-maintenance.js";
-import { PrMaintenanceBackupSchema } from "./pr-maintenance.js";
+import {
+  PrMaintenanceApprovalSchema,
+  PrMaintenanceBackupSchema,
+} from "./pr-maintenance.js";
 
 /** Local startup events consumed by the service CLI, independent of log formatting. */
 export const CONFIG_UI_EVENT_MARKER = "FLEET_CONFIG_UI ";
@@ -1770,6 +1773,7 @@ export const SnapshotSchema = z.object({
    */
   hostRevision: z.string().default(""),
   commandExecutions: z.array(CommandExecutionSchema).optional(),
+  prMaintenanceApprovals: z.array(PrMaintenanceApprovalSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 

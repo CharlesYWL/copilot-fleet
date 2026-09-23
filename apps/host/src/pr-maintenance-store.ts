@@ -27,6 +27,7 @@ import {
   PrMaintenanceScanSchema,
   PrMaintenanceWakeSchema,
   type PrMaintenanceAdmission,
+  type PrMaintenanceApproval,
   type PrMaintenanceBackup,
   type PrMaintenanceBatch,
   type PrMaintenanceCheckpoint,
@@ -297,6 +298,29 @@ export class PrMaintenanceStore {
     if (leadSessionId !== undefined && proposal.leadSessionId !== leadSessionId)
       refuse("ownership", "Maintenance proposal belongs to another lead.");
     return proposal;
+  }
+
+  listApprovals(): PrMaintenanceApproval[] {
+    return this.db
+      .prepare(
+        `SELECT p.data FROM pr_maintenance_proposals p
+         JOIN runs r ON r.id=p.task_id
+         WHERE json_extract(p.data,'$.registration.scope.publicationAuthorized')=1
+         ORDER BY r.created_at,p.task_id`,
+      )
+      .all()
+      .map((row) => PrMaintenanceProposalSchema.parse(JSON.parse(String(row.data))))
+      .map((proposal) => {
+        return {
+          proposalId: proposal.id,
+          version: proposal.version,
+          taskId: proposal.registration.taskId,
+          leadSessionId: proposal.leadSessionId,
+          identity: proposal.registration.identity,
+          mode: "repair" as const,
+          createdAt: proposal.createdAt,
+        };
+      });
   }
 
   private consumeProposal(taskId: string, approved = false): void {

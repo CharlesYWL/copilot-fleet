@@ -25,6 +25,28 @@ const show = (overrides: Partial<Parameters<typeof TopBar>[0]> = {}) =>
   );
 
 describe("TopBar counts", () => {
+  it("pulses the Commands entry for maintenance-only approvals and combines both counts", () => {
+    const open = vi.fn();
+    const first = show({ onOpenCommandExecutions: open, maintenanceApprovalCount: 1 });
+    const button = screen.getByRole("button", {
+      name: "Commands and approvals, 1 awaiting approval",
+    });
+    expect(button.textContent).toBe("Commands1");
+    expect(getComputedStyle(button).animationIterationCount).toBe("infinite");
+    fireEvent.click(button);
+    expect(open).toHaveBeenCalledOnce();
+    first.unmount();
+    show({
+      onOpenCommandExecutions: open,
+      commandApprovalCount: 2,
+      maintenanceApprovalCount: 1,
+    });
+    expect(
+      screen.getByRole("button", { name: "Commands and approvals, 3 awaiting approval" })
+        .textContent,
+    ).toBe("Commands3");
+  });
+
   it("highlights pending commands with a persistent count and a reduced-motion-safe pulse", () => {
     const open = vi.fn();
     const view = show({ onOpenCommandExecutions: open, commandApprovalCount: 3 });

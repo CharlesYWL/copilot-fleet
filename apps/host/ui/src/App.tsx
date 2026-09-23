@@ -16,6 +16,7 @@ import {
   terminalSessionStates,
   type FleetSession,
   type Notification,
+  type PrMaintenanceApproval,
   type Run,
   type RunNote,
   type SessionEvent,
@@ -76,9 +77,11 @@ import { LifecycleNotificationControl } from "./components/LifecycleNotification
 import { OnboardingTour } from "./components/OnboardingTour";
 import { CommandExecutionsDialog } from "./components/CommandExecutionsDialog";
 import { CommandPermissionPrompts } from "./components/CommandPermissionPrompts";
+import { PrMaintenanceApprovalReview } from "./components/orchestration/PrMaintenanceApprovalReview";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
+const noMaintenanceApprovals: PrMaintenanceApproval[] = [];
 
 /**
  * What the main area is showing.
@@ -245,6 +248,7 @@ export function App() {
     dismissAllNotifications,
     dismissNotification,
   } = useFleet(notify);
+  const maintenanceApprovals = snapshot.prMaintenanceApprovals ?? noMaintenanceApprovals;
   const catalog = useCatalogOperations({ request, refresh, notify });
   const [view, setView] = useState<AppView>("session");
   const [orchestratorViewMode, setOrchestratorViewMode] =
@@ -267,6 +271,11 @@ export function App() {
     executionId?: string;
     leadSessionId?: string;
   }>();
+  const [maintenanceApproval, setMaintenanceApproval] = useState<PrMaintenanceApproval>();
+  const handleReviewMaintenance = useCallback((approval: PrMaintenanceApproval) => {
+    setCommandPanel(undefined);
+    setMaintenanceApproval(approval);
+  }, []);
   const [bulkStopScope, setBulkStopScope] = useState<
     { kind: "all" } | { kind: "orchestrator"; sessionId: string }
   >();
@@ -704,6 +713,20 @@ export function App() {
   const handleNotificationNavigate = useCallback(
     (notification: Notification) => {
       void markNotificationRead(notification.id);
+      if (
+        notification.kind === "pr_maintenance_attention" &&
+        notification.data.reason === "authorization"
+      ) {
+        const approval = maintenanceApprovals.find(
+          (item) =>
+            item.proposalId === notification.data.proposalId &&
+            item.version === notification.data.proposalVersion,
+        );
+        if (approval) {
+          handleReviewMaintenance(approval);
+          return;
+        }
+      }
       const target = notificationTarget(
         notification,
         runSteps,
@@ -743,6 +766,8 @@ export function App() {
     },
     [
       handleOpenRun,
+      handleReviewMaintenance,
+      maintenanceApprovals,
       handleSelectSession,
       markNotificationRead,
       orchestratorRuns,
@@ -1090,6 +1115,7 @@ export function App() {
               (execution) => execution.state === "awaiting_approval",
             ).length
           }
+          maintenanceApprovalCount={maintenanceApprovals.length}
           onToggleNav={view === "overview" ? undefined : () => setNavOpen((on) => !on)}
           navOpen={navOpen}
           onToggleNavCollapsed={view === "overview" ? undefined : () => setNavCollapsed()}
@@ -1110,6 +1136,7 @@ export function App() {
           connected={connected}
           blocked={
             !!commandPanel ||
+            !!maintenanceApproval ||
             dialogOpen ||
             orchestrationDialogOpen ||
             focusOpen ||
@@ -1123,9 +1150,30 @@ export function App() {
             connected={connected}
             initialExecutionId={commandPanel.executionId}
             leadSessionId={commandPanel.leadSessionId}
+            maintenanceApprovals={maintenanceApprovals}
+            tasks={snapshot.runs}
+            onReviewMaintenance={handleReviewMaintenance}
             onClose={() => setCommandPanel(undefined)}
           />
         )}
+        {maintenanceApproval ? (
+          <PrMaintenanceApprovalReview
+            key={`${maintenanceApproval.proposalId}:${maintenanceApproval.version}`}
+            approval={maintenanceApproval}
+            currentApproval={maintenanceApprovals.find(
+              (item) => item.proposalId === maintenanceApproval.proposalId,
+            )}
+            sessions={snapshot.sessions}
+            connected={connected}
+            snapshotRevision={snapshotRevision}
+            onClose={() => setMaintenanceApproval(undefined)}
+            onAuthorized={() => {
+              setMaintenanceApproval(undefined);
+              notify("PR maintenance authorized.", "success");
+              void refresh();
+            }}
+          />
+        ) : null}
         <div className={styles.body}>
           {view === "overview" ? (
             <SessionGrid
@@ -1239,6 +1287,9 @@ export function App() {
                     commandExecutionCount={
                       (snapshot.commandExecutions ?? []).filter(
                         (execution) => execution.leadSessionId === orchestrator.id,
+                      ).length +
+                      maintenanceApprovals.filter(
+                        (item) => item.leadSessionId === orchestrator.id,
                       ).length
                     }
                     activeAgentCount={orchestratorAgentCount}

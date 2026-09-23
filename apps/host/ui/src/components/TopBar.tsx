@@ -8,6 +8,7 @@ import {
   mergeClasses,
   shorthands,
   tokens,
+  useRestoreFocusTarget,
 } from "@fluentui/react-components";
 import {
   Code20Regular,
@@ -226,6 +227,7 @@ type TopBarProps = {
   onSignOut: () => void;
   onOpenCommandExecutions?: (() => void) | undefined;
   commandApprovalCount?: number;
+  maintenanceApprovalCount?: number;
   /** Jumps to whatever needs a person, when anything does. */
   onShowAttention?: (() => void) | undefined;
   /** Only meaningful below the width where the tree becomes a drawer. */
@@ -264,6 +266,7 @@ export const TopBar = ({
   onSignOut,
   onOpenCommandExecutions,
   commandApprovalCount = 0,
+  maintenanceApprovalCount = 0,
   onShowAttention,
   onToggleNav,
   navOpen = false,
@@ -271,6 +274,8 @@ export const TopBar = ({
   navCollapsed = false,
 }: TopBarProps) => {
   const styles = useStyles();
+  const restoreFocusTarget = useRestoreFocusTarget();
+  const approvalCount = commandApprovalCount + maintenanceApprovalCount;
   const collapseLabel = navCollapsed ? "Show sidebar" : "Hide sidebar";
   const [operator, setOperator] = useState<{
     username: string;
@@ -374,19 +379,20 @@ export const TopBar = ({
         )}
         {onOpenCommandExecutions && (
           <Button
-            appearance={commandApprovalCount > 0 ? "secondary" : "subtle"}
+            {...restoreFocusTarget}
+            appearance={approvalCount > 0 ? "secondary" : "subtle"}
             size="small"
             className={mergeClasses(
               styles.commandButton,
-              commandApprovalCount > 0 && styles.commandAttention,
+              approvalCount > 0 && styles.commandAttention,
             )}
             icon={<Code20Regular />}
             onClick={onOpenCommandExecutions}
-            aria-label={`Command executions${commandApprovalCount ? `, ${commandApprovalCount} awaiting approval` : ""}`}
+            aria-label={`${maintenanceApprovalCount ? "Commands and approvals" : "Command executions"}${approvalCount ? `, ${approvalCount} awaiting approval` : ""}`}
           >
             <span className={styles.commandLabel}>Commands</span>
-            {commandApprovalCount > 0 && (
-              <span className={styles.commandCount}>{commandApprovalCount}</span>
+            {approvalCount > 0 && (
+              <span className={styles.commandCount}>{approvalCount}</span>
             )}
           </Button>
         )}

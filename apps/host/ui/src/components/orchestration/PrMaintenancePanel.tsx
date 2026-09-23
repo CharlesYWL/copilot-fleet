@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
   Button,
-  Checkbox,
   Dialog,
   DialogActions,
   DialogBody,
@@ -37,6 +36,7 @@ import {
 } from "../../lib/pr-maintenance";
 import { currentMaintenance, hasOutstandingWork } from "../../lib/task-overview";
 import { PrMaintenanceGraph } from "./PrMaintenanceGraph";
+import { PrMaintenanceProposalDialog } from "./PrMaintenanceProposalDialog";
 
 const useStyles = makeStyles({
   panel: {
@@ -361,18 +361,6 @@ export function PrMaintenancePanel({
     current && currentProgress
       ? attentionReason(current, currentProgress.stage)
       : undefined;
-  const candidate = proposal?.registration;
-  const candidateWorker = sessions.find(
-    (entry) => entry.id === candidate?.workerSessionId,
-  );
-  const proposalMatchesTask =
-    candidate?.taskId === run.id &&
-    candidateWorker?.runId === run.id &&
-    candidateWorker.runRole === "worker";
-  const proposalChanged = Boolean(
-    proposal &&
-    (view?.proposal?.id !== proposal.id || view?.proposal?.version !== proposal.version),
-  );
   const changed = (record: PrMaintenanceRegistration) =>
     !records.some((entry) => entry.id === record.id && entry.version === record.version);
   let invalidUrl = false;
@@ -867,175 +855,28 @@ export function PrMaintenancePanel({
         </Button>
       </div>
 
-      <Dialog
-        open={Boolean(proposal)}
-        onOpenChange={(_, data) => !busy && !data.open && setProposal(undefined)}
-      >
-        <DialogSurface>
-          <DialogBody>
-            <DialogTitle>Authorize bounded PR maintenance</DialogTitle>
-            <DialogContent>
-              {proposalChanged ? (
-                <p role="alert">
-                  This proposal changed or was already handled. Close this dialog and
-                  review the current proposal before authorizing.
-                </p>
-              ) : null}
-              {error ? (
-                <p role="alert">
-                  {error} Close this dialog and refresh before authorizing again.
-                </p>
-              ) : null}
-              {candidate ? (
-                <>
-                  <p>
-                    <PrLink record={candidate} />
-                  </p>
-                  <p className={styles.muted}>
-                    Prepared by the Orchestrator. Only you can authorize it; ask for a
-                    revised proposal if changes are needed.
-                  </p>
-                  {proposal?.reauthorization ? (
-                    <p>
-                      Reauthorizes the exact retained PR and worker without releasing
-                      ownership or clearing history. Maintenance stays paused until you
-                      explicitly resume it.
-                    </p>
-                  ) : null}
-                  {!candidate.scope.publicationAuthorized ? (
-                    <p>
-                      <strong>Unsupported legacy proposal</strong> — {readOnlyNotice}
-                    </p>
-                  ) : null}
-                  <dl className={styles.metadata}>
-                    <dt>
-                      {candidate.scope.publicationAuthorized
-                        ? "Scope"
-                        : "Review baseline"}
-                    </dt>
-                    <dd>{candidate.scope.baseline}</dd>
-                    <dt>
-                      {candidate.scope.publicationAuthorized
-                        ? "Verification"
-                        : "Verification reference"}
-                    </dt>
-                    <dd>{candidate.scope.verification}</dd>
-                    <dt>Limits</dt>
-                    <dd>
-                      {!candidate.scope.publicationAuthorized ? (
-                        "Unsupported legacy proposal; prepare repair authorization."
-                      ) : (
-                        <>
-                          {candidate.budgets.repairBatches} repairs ·{" "}
-                          {candidate.budgets.answerBatches} answers ·{" "}
-                          {candidate.budgets.mutationAttempts} mutation attempts
-                        </>
-                      )}
-                    </dd>
-                    <dt>Allowed responses</dt>
-                    <dd>
-                      {!candidate.scope.publicationAuthorized ? (
-                        "Read-only findings only; no provider mutations."
-                      ) : (
-                        <>
-                          Replies: {candidate.scope.replies ? "yes" : "no"} · resolve
-                          evidenced threads:{" "}
-                          {candidate.scope.resolveThreads ? "yes" : "no"} · CI retry:{" "}
-                          {candidate.scope.retryChecks ? "yes" : "no"}
-                        </>
-                      )}
-                    </dd>
-                  </dl>
-                  <details className={styles.details}>
-                    <summary>Technical details</summary>
-                    <p>{prMaintenanceProviderLabel(candidate.identity)}</p>
-                    <p>
-                      Worker: {candidateWorker?.name || "Retained worker"} ·{" "}
-                      {candidate.workerSessionId}
-                    </p>
-                    <p>
-                      Binding: {candidateWorker?.placementId} ·{" "}
-                      {candidateWorker?.executionBinding?.checkoutKey ||
-                        "existing source placement"}{" "}
-                      · Node {candidateWorker?.nodeId}
-                    </p>
-                    <p>
-                      {candidate.scope.publicationAuthorized
-                        ? "Push only to"
-                        : "Observe head"}{" "}
-                      {candidate.identity.headRepository} {candidate.identity.headRef};
-                      base {candidate.identity.baseRepository}{" "}
-                      {candidate.identity.baseRef}.
-                    </p>
-                    <p>
-                      Repository IDs: PR {candidate.identity.repositoryId}; head{" "}
-                      {candidate.identity.headRepositoryId}; base{" "}
-                      {candidate.identity.baseRepositoryId}. HEAD {candidate.headSha}.
-                    </p>
-                    <p>Evidence: {candidate.eligibilityEvidence}</p>
-                    <p>
-                      Reviewers:{" "}
-                      {candidate.scope.publicationAuthorized
-                        ? candidate.scope.reviewers.join(", ") ||
-                          "External reviews only; no review requests"
-                        : "External reviews only; review requests are not authorized"}
-                      .
-                    </p>
-                    <p>
-                      Proposal {proposal?.id} · version {proposal?.version}
-                    </p>
-                  </details>
-                  {!proposalMatchesTask ? (
-                    <p role="alert">
-                      The proposal must name this task and one of its existing workers.
-                    </p>
-                  ) : null}
-                </>
-              ) : null}
-              <Checkbox
-                checked={confirmed}
-                disabled={
-                  !candidate ||
-                  !candidate.scope.publicationAuthorized ||
-                  !proposalMatchesTask ||
-                  proposalChanged ||
-                  busy ||
-                  !view?.canAuthorize
-                }
-                onChange={(_, data) => setConfirmed(data.checked === true)}
-                label="I authorize these bounded repairs and responses only. No merge, force-push or unapproved design changes."
-              />
-            </DialogContent>
-            <DialogActions>
-              <Button disabled={busy} onClick={() => setProposal(undefined)}>
-                Cancel
-              </Button>
-              <Button
-                appearance="primary"
-                disabled={
-                  busy ||
-                  !view?.canAuthorize ||
-                  !proposalMatchesTask ||
-                  !candidate?.scope.publicationAuthorized ||
-                  proposalChanged ||
-                  !confirmed
-                }
-                onClick={() =>
-                  proposal &&
-                  void execute(() =>
-                    authorizeTaskMaintenanceProposal(run.id, {
-                      id: proposal.id,
-                      version: proposal.version,
-                    }),
-                  )
-                }
-              >
-                Authorize maintenance
-              </Button>
-            </DialogActions>
-          </DialogBody>
-        </DialogSurface>
-      </Dialog>
+      {proposal ? (
+        <PrMaintenanceProposalDialog
+          proposal={proposal}
+          currentProposal={view?.proposal}
+          taskId={run.id}
+          sessions={sessions}
+          canAuthorize={view?.canAuthorize ?? false}
+          busy={busy}
+          error={error || view?.unsupportedReason || ""}
+          confirmed={confirmed}
+          onConfirmedChange={setConfirmed}
+          onClose={() => setProposal(undefined)}
+          onAuthorize={() =>
+            void execute(() =>
+              authorizeTaskMaintenanceProposal(run.id, {
+                id: proposal.id,
+                version: proposal.version,
+              }),
+            )
+          }
+        />
+      ) : null}
 
       <Dialog
         open={Boolean(renew)}

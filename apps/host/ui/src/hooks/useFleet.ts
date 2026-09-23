@@ -39,6 +39,7 @@ type NotificationHydrationChange =
       type: "snapshot";
       notifications: Notification[];
       unreadCount: number;
+      prMaintenanceApprovals: Snapshot["prMaintenanceApprovals"];
     };
 
 /**
@@ -157,6 +158,7 @@ export function useFleet(notify: Notify) {
         type: "snapshot",
         notifications: next.notifications,
         unreadCount: next.notificationUnreadCount,
+        prMaintenanceApprovals: next.prMaintenanceApprovals,
       });
       for (const notification of next.notifications) {
         knownNotificationIds.current.add(notification.id);
@@ -203,6 +205,7 @@ export function useFleet(notify: Notify) {
 
       let notifications = next.notifications;
       let unreadCount = next.notificationUnreadCount;
+      let maintenanceApprovals = next.prMaintenanceApprovals;
       let replayedNotificationChange = false;
       let replayedUnreadCount = false;
       for (const change of hydrationChanges.current) {
@@ -210,6 +213,7 @@ export function useFleet(notify: Notify) {
         if (change.type === "snapshot") {
           notifications = change.notifications;
           unreadCount = change.unreadCount;
+          maintenanceApprovals = change.prMaintenanceApprovals;
           replayedNotificationChange = true;
           replayedUnreadCount = true;
           continue;
@@ -243,6 +247,7 @@ export function useFleet(notify: Notify) {
         ...next,
         notifications: sortNotifications(notifications),
         notificationUnreadCount: unreadCount,
+        prMaintenanceApprovals: maintenanceApprovals,
       });
       setSnapshotRevision((value) => value + 1);
       currentUnreadCount.current = unreadCount;

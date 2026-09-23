@@ -13,6 +13,7 @@ import {
   Text,
   makeStyles,
   tokens,
+  useRestoreFocusTarget,
 } from "@fluentui/react-components";
 import {
   COMMAND_LIMITS,
@@ -20,10 +21,13 @@ import {
   CommandExecutionSchema,
   errorMessage,
   terminalCommandExecutionStates,
+  prMaintenanceUrl,
   type CommandExecution,
   type CommandDecision,
   type CommandExecutionPage,
   type CommandOutputEvent,
+  type PrMaintenanceApproval,
+  type Run,
 } from "@fleet/protocol";
 import { api } from "../hooks/useFleet";
 import {
@@ -129,6 +133,9 @@ export type CommandExecutionsDialogProps = {
   initialExecutionId?: string | undefined;
   leadSessionId?: string | undefined;
   onClose: () => void;
+  maintenanceApprovals?: readonly PrMaintenanceApproval[];
+  tasks?: readonly Run[];
+  onReviewMaintenance?: (approval: PrMaintenanceApproval) => void;
 };
 
 export function CommandExecutionsDialog({
@@ -138,10 +145,15 @@ export function CommandExecutionsDialog({
   initialExecutionId,
   leadSessionId,
   onClose,
+  maintenanceApprovals = [],
+  tasks = [],
+  onReviewMaintenance,
 }: CommandExecutionsDialogProps) {
   const styles = useStyles();
+  const restoreFocusTarget = useRestoreFocusTarget();
   const [history, setHistory] = useState<CommandExecution[]>([]);
   const [selectedId, setSelectedId] = useState(initialExecutionId);
+  const [selectedProposalId, setSelectedProposalId] = useState<string>();
   const [group, setGroup] = useState<"waiting" | "history">();
   const [detail, setDetail] = useState<CommandExecutionPage>();
   const [error, setError] = useState("");
@@ -158,6 +170,14 @@ export function CommandExecutionsDialog({
     [history, executions, detail, leadSessionId],
   );
   const waiting = records.filter((item) => item.state === "awaiting_approval").reverse();
+  const proposals = maintenanceApprovals
+    .filter((item) => !leadSessionId || item.leadSessionId === leadSessionId)
+    .sort(
+      (a, b) =>
+        a.createdAt.localeCompare(b.createdAt) ||
+        a.proposalId.localeCompare(b.proposalId),
+    );
+  const approvalCount = waiting.length + proposals.length;
   const reviewed = records.filter((item) => item.state !== "awaiting_approval");
   const initial = records.find((item) => item.id === initialExecutionId);
   const activeGroup =
@@ -166,14 +186,22 @@ export function CommandExecutionsDialog({
       ? initial.state === "awaiting_approval"
         ? "waiting"
         : "history"
-      : waiting.length
+      : approvalCount
         ? "waiting"
         : "history");
   const visible = activeGroup === "waiting" ? waiting : reviewed;
-  const selected = visible.find((item) => item.id === selectedId) ?? visible[0];
-  const currentId =
-    selected?.id ??
-    (records.some((item) => item.id === selectedId) ? undefined : selectedId);
+  const selectedProposal =
+    activeGroup === "waiting"
+      ? (proposals.find((item) => item.proposalId === selectedProposalId) ??
+        (!selectedId && !waiting.length ? proposals[0] : undefined))
+      : undefined;
+  const selected = selectedProposal
+    ? undefined
+    : (visible.find((item) => item.id === selectedId) ?? visible[0]);
+  const currentId = selectedProposal
+    ? undefined
+    : (selected?.id ??
+      (records.some((item) => item.id === selectedId) ? undefined : selectedId));
 
   useEffect(() => {
     const controller = new AbortController();
@@ -251,6 +279,7 @@ export function CommandExecutionsDialog({
       setHistory((prior) => mergeCommandExecutions(prior, [execution]));
       setGroup("waiting");
       setSelectedId(undefined);
+      setSelectedProposalId(undefined);
     } catch (failure) {
       if (isCommandApprovalConflict(failure)) {
         setError(
@@ -335,7 +364,9 @@ export function CommandExecutionsDialog({
     >
       <DialogSurface className={styles.surface}>
         <DialogBody>
-          <DialogTitle>Command executions</DialogTitle>
+          <DialogTitle>
+            {proposals.length ? "Commands and approvals" : "Command executions"}
+          </DialogTitle>
           <DialogContent>
             {error && (
               <p role="alert" className={styles.error}>
@@ -362,10 +393,10 @@ export function CommandExecutionsDialog({
               <Tab
                 id="commands-waiting-tab"
                 value="waiting"
-                className={waiting.length ? styles.pendingTab : undefined}
+                className={approvalCount ? styles.pendingTab : undefined}
                 aria-controls="commands-panel"
               >
-                Waiting approval ({waiting.length})
+                Waiting approval ({approvalCount})
               </Tab>
               <Tab
                 id="commands-history-tab"
@@ -394,13 +425,15 @@ export function CommandExecutionsDialog({
                 }
               >
                 {loading && <Spinner size="small" label="Loading command history" />}
-                {!loading && visible.length === 0 && (
-                  <Text>
-                    {activeGroup === "waiting"
-                      ? "No requests are waiting for approval."
-                      : "No other requests yet. Approved, denied, completed, and preparing requests appear here."}
-                  </Text>
-                )}
+                {!loading &&
+                  visible.length === 0 &&
+                  !(activeGroup === "waiting" && proposals.length) && (
+                    <Text>
+                      {activeGroup === "waiting"
+                        ? "No requests are waiting for approval."
+                        : "No other requests yet. Approved, denied, completed, and preparing requests appear here."}
+                    </Text>
+                  )}
                 {visible.map((item) => (
                   <Button
                     key={item.id}
@@ -409,6 +442,7 @@ export function CommandExecutionsDialog({
                     aria-current={item.id === currentId ? "true" : undefined}
                     onClick={() => {
                       setSelectedId(item.id);
+                      setSelectedProposalId(undefined);
                       setGroup(activeGroup);
                       setError("");
                     }}
@@ -423,9 +457,79 @@ export function CommandExecutionsDialog({
                     </span>
                   </Button>
                 ))}
+                {activeGroup === "waiting"
+                  ? proposals.map((item) => (
+                      <Button
+                        key={`maintenance:${item.proposalId}`}
+                        className={styles.item}
+                        appearance={
+                          selectedProposal?.proposalId === item.proposalId
+                            ? "secondary"
+                            : "subtle"
+                        }
+                        aria-current={
+                          selectedProposal?.proposalId === item.proposalId
+                            ? "true"
+                            : undefined
+                        }
+                        onClick={() => {
+                          setSelectedProposalId(item.proposalId);
+                          setSelectedId(undefined);
+                          setError("");
+                        }}
+                      >
+                        <span className={styles.itemText}>
+                          <span>PR maintenance · waiting approval</span>
+                          <span className={styles.preview}>
+                            {item.identity.repository} #{item.identity.prNumber}
+                          </span>
+                        </span>
+                      </Button>
+                    ))
+                  : null}
               </nav>
-              <section className={styles.detail} aria-label="Command details">
-                {selected ? (
+              <section
+                className={styles.detail}
+                aria-label={
+                  selectedProposal ? "PR maintenance approval details" : "Command details"
+                }
+              >
+                {selectedProposal ? (
+                  <>
+                    <Text weight="semibold">PR maintenance needs your authorization</Text>
+                    <dl className={styles.manifest}>
+                      <dt>Task</dt>
+                      <dd>
+                        {tasks.find((task) => task.id === selectedProposal.taskId)
+                          ?.name ?? selectedProposal.taskId}
+                      </dd>
+                      <dt>Pull request</dt>
+                      <dd>{prMaintenanceUrl(selectedProposal.identity)}</dd>
+                      <dt>Proposed mode</dt>
+                      <dd>Bounded repairs</dd>
+                      <dt>Requested</dt>
+                      <dd>{new Date(selectedProposal.createdAt).toLocaleString()}</dd>
+                    </dl>
+                    <Text>
+                      Nothing is enabled until you review and authorize the exact
+                      maintenance scope.
+                    </Text>
+                    <Text className={styles.muted}>
+                      This is separate from command execution permission. Review the PR,
+                      worker, limits, and allowed actions before deciding.
+                    </Text>
+                    <div>
+                      <Button
+                        {...restoreFocusTarget}
+                        appearance="primary"
+                        disabled={!connected || !onReviewMaintenance}
+                        onClick={() => onReviewMaintenance?.(selectedProposal)}
+                      >
+                        Review maintenance scope
+                      </Button>
+                    </div>
+                  </>
+                ) : selected ? (
                   <>
                     <Text weight="semibold">{selected.state.replaceAll("_", " ")}</Text>
                     <dl className={styles.manifest}>

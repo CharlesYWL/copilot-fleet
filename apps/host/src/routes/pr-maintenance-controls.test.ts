@@ -1214,13 +1214,33 @@ describe("authenticated PR maintenance controls", () => {
         records: [],
       });
       expect((await mcp("fleet_list_work", { query: "17" })).text).toContain(proposal.id);
+      const approvals = service.snapshot().prMaintenanceApprovals;
+      expect(approvals).toEqual([
+        {
+          proposalId: proposal.id,
+          version: 1,
+          taskId: run.id,
+          leadSessionId: proposal.leadSessionId,
+          identity: registration.identity,
+          mode: "repair",
+          createdAt: proposal.createdAt,
+        },
+      ]);
+      expect(approvals?.[0]).not.toHaveProperty("registration");
+      const notice = store.getNotificationBySourceKey(
+        `pr-maintenance-proposal:${proposal.id}:1`,
+      )!;
+      store.markNotificationRead(notice.id);
+      store.dismissNotification(notice.id);
+      expect(service.snapshot().prMaintenanceApprovals).toEqual(approvals);
     },
   );
 
   it.each(["github", "azure-devops"] as const)(
     "authorizes only the exact stored %s proposal through an authenticated operator action",
     async (provider) => {
-      const { app, store, run, registration, mcp, leadToken } = await setup(provider);
+      const { app, store, service, run, registration, mcp, leadToken } =
+        await setup(provider);
       expect((await mcp("fleet_propose_pr_maintenance", registration)).ok).toBe(true);
       const proposal = store.prMaintenance.getProposal(run.id)!;
       const payload = {
@@ -1268,6 +1288,16 @@ describe("authenticated PR maintenance controls", () => {
         },
       });
       expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
+      expect(service.snapshot().prMaintenanceApprovals).toEqual([]);
+      const archivedProposal = store
+        .listRunNotes(run.id)
+        .find(
+          (note) =>
+            note.summary ===
+            "Approved PR maintenance proposal; prerequisite evidence retained",
+        );
+      expect(archivedProposal).toMatchObject({ source: "operator", kind: "decision" });
+      expect(JSON.parse(archivedProposal!.body)).toEqual(proposal);
       expect(
         store.getNotificationBySourceKey(`pr-maintenance-proposal:${proposal.id}:1`)
           ?.status,

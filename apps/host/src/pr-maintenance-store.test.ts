@@ -1928,6 +1928,7 @@ describe("durable PR maintenance registry", () => {
     const reopened = storeAt(dbPath);
     expect(reopened.prMaintenance.get(record.id)).toEqual(legacy);
     expect(reopened.prMaintenance.getProposal(f.task.id)).toEqual(proposal);
+    expect(reopened.prMaintenance.listApprovals()).toEqual([]);
     expect(prMaintenanceProgress(reopened.prMaintenance.get(record.id)!).stage).toBe(
       "authorization_required",
     );
@@ -1958,6 +1959,7 @@ describe("durable PR maintenance registry", () => {
       legacy.lastAttempt,
     );
     expect(restored.prMaintenance.getProposal(f.task.id)).toEqual(proposal);
+    expect(restored.prMaintenance.listApprovals()).toEqual([]);
     expect(restored.prMaintenance.get(record.id)?.lifecycle).toBe("paused");
     expect(restored.prMaintenance.wakeEligibleLeadIds()).toEqual([]);
     expect(reopened.prMaintenance.get(record.id)).toEqual(legacy);
