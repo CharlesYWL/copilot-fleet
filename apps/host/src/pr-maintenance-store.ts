@@ -94,6 +94,11 @@ export type PrMaintenanceAdmissionResult = {
   recordId?: string;
   decisionId?: string;
 };
+export type PrMaintenanceOperationalReview = {
+  recordId: string;
+  leadSessionId: string;
+  expectedVersion: number;
+};
 export type SupervisorCommand = {
   id: string;
   digest: string;
@@ -1637,6 +1642,31 @@ export class PrMaintenanceStore {
       this.pause(record, parsed.reason ?? "Paused by owning lead");
       return this.save(record);
     });
+  }
+
+  /** Review-only admission does not resume work or change any maintenance hold. */
+  assertOperationalReview(taskId: string, input: PrMaintenanceOperationalReview): void {
+    const record = this.required(
+      input.recordId,
+      input.leadSessionId,
+      input.expectedVersion,
+    );
+    const task = this.store.getRun(taskId);
+    if (record.taskId !== taskId || task?.leadSessionId !== input.leadSessionId)
+      refuse("ownership", "The maintenance record must belong to this task and lead.");
+    if (record.ownershipReleasedAt)
+      refuse("released", "Cannot review released maintenance.");
+    if (
+      record.observation?.headSha ||
+      record.decision?.state === "pending" ||
+      task.state === "awaiting_human" ||
+      task.state === "cancelled"
+    )
+      refuse(
+        "review_conflict",
+        "Operational review requires no observed HEAD, pending review or decision, or stopped task.",
+      );
+    this.store.assertRunMutable(taskId);
   }
 
   holdForDecision(

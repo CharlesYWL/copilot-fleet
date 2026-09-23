@@ -19,6 +19,7 @@ import {
   terminalCommandExecutionStates,
 } from "@fleet/protocol";
 import type {
+  AdvanceRunToReviewWrite,
   FleetStore,
   InsertNotificationResult,
   NotificationListInput,
@@ -164,30 +165,27 @@ export class NotificationService {
    * authoritative publication.
    */
   commitAtomically<T>(write: () => T, afterCommit?: (result: T) => void): T {
-    if (this.deferredPublications) {
-      throw new Error("Nested notification transactions are not supported");
-    }
-    const publications: DeferredPublications = {
-      unreadChanged: false,
-      notifications: new Map(),
-    };
-    this.deferredPublications = publications;
-
-    let result: T;
-    try {
-      result = this.store.writeAtomically(write);
-    } catch (error) {
-      this.deferredPublications = undefined;
-      throw error;
-    }
-    this.deferredPublications = undefined;
-
-    try {
-      afterCommit?.(result);
-    } finally {
-      this.publishDeferred(publications);
-    }
-    return result;
+    return this.store.writeAtomically(() => {
+      const parent = this.deferredPublications;
+      const publications: DeferredPublications = {
+        unreadChanged: false,
+        notifications: new Map(),
+      };
+      this.deferredPublications = publications;
+      try {
+        const result = write();
+        this.store.afterCommit(() => {
+          try {
+            afterCommit?.(result);
+          } finally {
+            this.publishDeferred(publications);
+          }
+        });
+        return result;
+      } finally {
+        this.deferredPublications = parent;
+      }
+    });
   }
 
   list(input: NotificationListInput = {}): NotificationPage {
@@ -470,26 +468,32 @@ export class NotificationService {
     note: string;
     reason: ReviewReason;
     metadata?: RunNoteMetadata | undefined;
+    operationalMaintenance?: AdvanceRunToReviewWrite["operationalMaintenance"];
   }): Run | undefined {
-    const advanced = this.store.advanceRunToReview(input.runId, {
-      note: input.note,
-      metadata: input.metadata ?? {
-        kind: input.reason === "completed" ? "review" : "blocked",
-        source: "system",
-        summary:
-          input.reason === "completed"
-            ? "Task ready for review"
-            : "Task needs a decision",
+    return this.commitAtomically(
+      () => {
+        const advanced = this.store.advanceRunToReview(input.runId, {
+          note: input.note,
+          metadata: input.metadata ?? {
+            kind: input.reason === "completed" ? "review" : "blocked",
+            source: "system",
+            summary:
+              input.reason === "completed"
+                ? "Task ready for review"
+                : "Task needs a decision",
+          },
+          notification: (run) => this.reviewNotification(run, input.reason),
+          operationalMaintenance: input.operationalMaintenance,
+        });
+        if (!advanced) return undefined;
+        if (advanced.notification.created)
+          this.publishOrDefer(advanced.notification.notification, true);
+        return advanced.run;
       },
-      notification: (run) => this.reviewNotification(run, input.reason),
-    });
-    if (!advanced) return undefined;
-    this.publisher.runUpsert(advanced.run);
-    if (advanced.notification.created) {
-      this.publisher.notificationUpsert(advanced.notification.notification);
-      this.publisher.notificationUnreadCount(this.store.notificationUnreadCount());
-    }
-    return advanced.run;
+      (run) => {
+        if (run) this.publisher.runUpsert(run);
+      },
+    );
   }
 
   private reviewNotification(run: Run, reason: ReviewReason): CreateNotification {
@@ -787,8 +791,10 @@ export class NotificationService {
   private defer(notification: Notification, unreadChanged = false): void {
     const publications = this.deferredPublications;
     if (!publications) return;
-    publications.notifications.set(notification.id, notification);
-    publications.unreadChanged ||= unreadChanged;
+    this.store.afterCommit(() => {
+      publications.notifications.set(notification.id, notification);
+      publications.unreadChanged ||= unreadChanged;
+    });
   }
 
   private publishDeferred(publications: DeferredPublications): void {

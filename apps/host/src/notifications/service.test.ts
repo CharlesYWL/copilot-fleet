@@ -339,6 +339,71 @@ describe("NotificationService", () => {
     expect(failure.subject.parentLabel).toHaveLength(200);
   });
 
+  it("publishes nested review writes only after the outermost store commit", () => {
+    const { store, service, workspace, published } = setup();
+    const run = store.createRun({ workspaceId: workspace.id, name: "r", objective: "o" });
+    store.setRunState(run.id, "running");
+    const order: string[] = [];
+    store.writeAtomically(() => {
+      service.commitAtomically(
+        () => {
+          const reviewed = service.requestRunReview({
+            runId: run.id,
+            note: "Blocked",
+            reason: "blocked",
+          });
+          expect(reviewed?.reviewSeq).toBe(1);
+          expect(published).toEqual({ runs: [], notifications: [], counts: [] });
+        },
+        () => order.push("committed"),
+      );
+      expect(order).toEqual([]);
+      expect(published).toEqual({ runs: [], notifications: [], counts: [] });
+    });
+    expect(order).toEqual(["committed"]);
+    expect(published.runs).toHaveLength(1);
+    expect(published.notifications).toHaveLength(1);
+    expect(published.counts).toEqual([1]);
+  });
+
+  it("discards rolled-back nested review publications while committing the surviving review", () => {
+    const { store, service, workspace, published } = setup();
+    const discarded = store.createRun({
+      workspaceId: workspace.id,
+      name: "discarded",
+      objective: "o",
+    });
+    const kept = store.createRun({
+      workspaceId: workspace.id,
+      name: "kept",
+      objective: "o",
+    });
+    store.setRunState(discarded.id, "running");
+    store.setRunState(kept.id, "running");
+    service.commitAtomically(() => {
+      expect(() =>
+        store.writeAtomically(() => {
+          service.requestRunReview({
+            runId: discarded.id,
+            note: "Discard",
+            reason: "blocked",
+          });
+          throw new Error("Rollback savepoint");
+        }),
+      ).toThrow("Rollback savepoint");
+      service.requestRunReview({ runId: kept.id, note: "Keep", reason: "blocked" });
+      expect(published).toEqual({ runs: [], notifications: [], counts: [] });
+    });
+    expect(store.getRun(discarded.id)).toMatchObject({ state: "running", reviewSeq: 0 });
+    expect(store.listRunNotes(discarded.id)).toEqual([]);
+    expect(store.getNotificationBySourceKey(`review:${discarded.id}:1`)).toBeUndefined();
+    expect(published.runs.map((run) => run.id)).toEqual([kept.id]);
+    expect(
+      published.notifications.map((notification) => notification.data.runId),
+    ).toEqual([kept.id]);
+    expect(published.counts).toEqual([1]);
+  });
+
   it("publishes and returns the exact rows changed by mark-all", () => {
     const { store, service, published } = setup();
     const notifications = ["first", "second"].map(
