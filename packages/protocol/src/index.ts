@@ -41,6 +41,7 @@ export * from "./pr-maintenance.js";
 import {
   PrMaintenanceApprovalSchema,
   PrMaintenanceBackupSchema,
+  PrMaintenanceTaskStatusSchema,
 } from "./pr-maintenance.js";
 
 /** Local startup events consumed by the service CLI, independent of log formatting. */
@@ -1774,6 +1775,8 @@ export const SnapshotSchema = z.object({
   hostRevision: z.string().default(""),
   commandExecutions: z.array(CommandExecutionSchema).optional(),
   prMaintenanceApprovals: z.array(PrMaintenanceApprovalSchema).optional(),
+  /** Retained PR maintenance per task, so lists do not read it as "deciding". */
+  prMaintenanceTasks: z.array(PrMaintenanceTaskStatusSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
