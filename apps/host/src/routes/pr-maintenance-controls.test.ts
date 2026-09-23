@@ -1289,6 +1289,15 @@ describe("authenticated PR maintenance controls", () => {
       });
       expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
       expect(service.snapshot().prMaintenanceApprovals).toEqual([]);
+      expect(service.snapshot().prMaintenanceTasks).toEqual([
+        {
+          taskId: run.id,
+          recordId: accepted.json().id,
+          stage: expect.any(String),
+          prUrl: prMaintenanceUrl(registration.identity),
+          manualControl: false,
+        },
+      ]);
       const archivedProposal = store
         .listRunNotes(run.id)
         .find(

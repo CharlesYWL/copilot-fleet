@@ -18,7 +18,11 @@ import {
   Search16Regular,
 } from "@fluentui/react-icons";
 import type { RunViewModel } from "../../lib/orchestration-view";
-import { currentPhase, runStateLabel } from "../../lib/orchestration-view";
+import {
+  PR_MAINTENANCE_STATUS_LABEL,
+  currentPhase,
+  taskStatusLabel,
+} from "../../lib/orchestration-view";
 import { statusVisuals, terminal } from "../../theme";
 import { RunCard } from "./RunCard";
 
@@ -27,6 +31,7 @@ const WIDTH_VAR = "--fleet-conversation-tasks-width";
 const STATUS_OPTIONS = [
   "Needs you",
   "Deciding",
+  PR_MAINTENANCE_STATUS_LABEL,
   "Not started",
   "Running",
   "Done",
@@ -228,7 +233,7 @@ export const ConversationTasks = ({
   );
   const visibleModels = useMemo(() => {
     return models.filter((model) => {
-      if (status && runStateLabel(model.run) !== status) return false;
+      if (status && taskStatusLabel(model) !== status) return false;
       if (phase && currentPhase(model.run) !== phase) return false;
       if (!searchQuery) return true;
       return `${model.run.name}\n${model.run.objective}`
