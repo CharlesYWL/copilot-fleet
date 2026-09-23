@@ -541,7 +541,10 @@ export class PrMaintenanceStore {
         };
         // Reauthorization grants scope, not permission to resume old paused/finished work.
         if (record.lifecycle === "active")
-          this.pause(record, "repair_authorized_requires_explicit_resume");
+          this.pause(record, "repair_authorized_requires_explicit_resume", undefined, {
+            actor: "operator",
+            actorId: operatorId,
+          });
         else delete record.readyFingerprint;
         const saved = this.save(record);
         this.consumeProposal(taskId, true);
@@ -626,7 +629,8 @@ export class PrMaintenanceStore {
       record.findings.length > 200 ||
       record.findingAttempts.length > 200 ||
       record.actions.length > 200 ||
-      record.decisionHistory.length > 100
+      record.decisionHistory.length > 100 ||
+      (record.resumeHistory?.length ?? 0) > 100
     )
       refuse(
         "checkpoint_overflow",
@@ -943,6 +947,7 @@ export class PrMaintenanceStore {
             : {}),
         },
         authorizationHistory: [],
+        resumeHistory: [],
         lifecycle: "active",
         pauseReason: "",
         renewedAt: now,
@@ -974,12 +979,21 @@ export class PrMaintenanceStore {
     });
   }
 
-  private pause(record: PrMaintenanceRegistration, reason: string, at = nowIso()): void {
+  private pause(
+    record: PrMaintenanceRegistration,
+    reason: string,
+    at = nowIso(),
+    origin: {
+      actor: "lead" | "operator" | "system";
+      actorId: string;
+    } = { actor: "system", actorId: "host" },
+  ): void {
     if (record.lifecycle === "active") {
       record.lifecycle = "paused";
       record.pausedAt = at;
     }
     record.pauseReason = reason;
+    record.pauseOrigin = { ...origin, at };
     delete record.readyFingerprint;
     for (const batch of record.batches) {
       if (!outstanding.has(batch.state)) continue;
@@ -1391,7 +1405,10 @@ export class PrMaintenanceStore {
           "Host queue and dispatch receipt prove this attempt was never sent.";
         this.refund(record, batch, 0, false);
       }
-      this.pause(record, "manual_control", now);
+      this.pause(record, "manual_control", now, {
+        actor: "operator",
+        actorId: command.operatorId,
+      });
       record.manualControl ??= {
         operatorId: command.operatorId,
         takenAt: now,
@@ -1430,6 +1447,127 @@ export class PrMaintenanceStore {
     });
   }
 
+  private assertResumeSafety(
+    record: PrMaintenanceRegistration,
+    decisionId?: string,
+    decisionVersion?: number,
+  ): void {
+    if (record.ownershipReleasedAt)
+      refuse("released", "Released maintenance needs explicit new enablement.");
+    if (!record.authorization.scope.publicationAuthorized)
+      refuse(
+        "repair_authorization_required",
+        "Observation-only maintenance is retired. Prepare and authenticate a repair proposal for this retained PR and worker.",
+      );
+    if (this.hasPendingManualExecution(record.workerSessionId))
+      refuse(
+        "execution_uncertain",
+        "Settle the manual command receipt before changing maintenance control.",
+      );
+    if (record.decision) {
+      if (record.decision.state === "pending")
+        refuse(
+          "wait_for_human",
+          "Record authenticated direction, not an approval claim, for this decision.",
+        );
+      this.matchDecision(record, decisionId, decisionVersion);
+    }
+    if (record.lifecycle === "merged" || record.lifecycle === "closed")
+      refuse(
+        "terminal",
+        "Terminal registrations cannot resume; settle and enable a new generation.",
+      );
+    if (
+      record.incidents.some(
+        (incident) => incident.kind === "effects" && !incident.resolvedAt,
+      )
+    )
+      refuse(
+        "unsettled",
+        "Reconcile ambiguous effects with correlated receipts before resuming maintenance.",
+      );
+    const reason = this.binding(record);
+    if (reason)
+      refuse(
+        reason,
+        "Current worker binding is not eligible; an explicit supported handoff is required.",
+      );
+  }
+
+  private applyResume(
+    record: PrMaintenanceRegistration,
+    actor: { actor: "lead" | "operator"; actorId: string },
+    at: string,
+  ): void {
+    record.resumeHistory.push({
+      ...actor,
+      resumedAt: at,
+      pauseReason: record.pauseReason,
+      ...(record.pauseOrigin ? { pauseOrigin: record.pauseOrigin } : {}),
+    });
+    record.lifecycle = "active";
+    if (record.manualControl) record.manualControl.endedAt = at;
+    record.pauseReason = "";
+    delete record.pauseOrigin;
+    record.counters.scanStalls = 0;
+    record.counters.reconciliationStalls = 0;
+    record.nextCheckAt = at;
+    record.renewedAt = at;
+    delete record.pausedNoticeAt;
+    for (const incident of record.incidents) {
+      if (
+        !incident.resolvedAt &&
+        ["identity", "provider_denial"].includes(incident.kind)
+      ) {
+        incident.resolvedAt = at;
+        incident.resolution = `${actor.actor}_resume`;
+        delete record.lastAttempt;
+        delete record.readyFingerprint;
+      }
+    }
+  }
+
+  private assertLeadResumeAllowed(
+    record: PrMaintenanceRegistration,
+    leadSessionId: string,
+  ): void {
+    if (record.pausedNoticeAt)
+      refuse(
+        "operator_required",
+        "A long-paused registration requires authenticated operator review.",
+      );
+    if (
+      record.counters.repairBatches >= record.authorization.budgets.repairBatches ||
+      record.counters.answerBatches >= record.authorization.budgets.answerBatches ||
+      record.counters.mutationAttempts >= record.authorization.budgets.mutationAttempts
+    )
+      refuse(
+        "budget_exhausted",
+        "An authenticated operator must renew the exhausted maintenance allowance.",
+      );
+    if (
+      record.incidents.some(
+        (incident) =>
+          !incident.resolvedAt && ["identity", "provider_denial"].includes(incident.kind),
+      )
+    )
+      refuse(
+        "operator_required",
+        "Provider access and identity holds require authenticated operator resume.",
+      );
+    const ownPause =
+      record.pauseOrigin?.actor === "lead" &&
+      record.pauseOrigin.actorId === leadSessionId;
+    const directedHold =
+      ["wait_for_human", "finding_needs_human"].includes(record.pauseReason) &&
+      record.decision?.state === "directed";
+    if (!ownPause && !directedHold)
+      refuse(
+        "operator_required",
+        "The owning lead may resume only its own pause or a directed human-decision hold.",
+      );
+  }
+
   operatorAction(
     id: string,
     expectedVersion: number,
@@ -1464,7 +1602,10 @@ export class PrMaintenanceStore {
         );
       const now = nowIso();
       if (action.action === "pause") {
-        this.pause(record, action.reason, now);
+        this.pause(record, action.reason, now, {
+          actor: "operator",
+          actorId: operatorId,
+        });
       } else if (action.action === "release") {
         if (prMaintenanceUnsettled(record))
           refuse(
@@ -1481,7 +1622,10 @@ export class PrMaintenanceStore {
             resolvedAt: now,
           };
         }
-        this.pause(record, action.reason, now);
+        this.pause(record, action.reason, now, {
+          actor: "operator",
+          actorId: operatorId,
+        });
         record.ownershipReleasedAt = now;
         record.retentionReleasedBy = operatorId;
       } else if (action.action === "renew") {
@@ -1510,7 +1654,14 @@ export class PrMaintenanceStore {
         record.findingAttempts = [];
         record.renewedAt = now;
         delete record.pausedNoticeAt;
-        if (record.lifecycle === "paused") record.pausedAt = now;
+        if (record.lifecycle === "paused") {
+          record.pausedAt = now;
+          record.pauseOrigin = {
+            actor: "operator",
+            actorId: operatorId,
+            at: now,
+          };
+        }
       } else {
         if (action.action === "direction") {
           this.matchDecision(record, action.decisionId, action.decisionVersion);
@@ -1524,54 +1675,10 @@ export class PrMaintenanceStore {
           record.renewedAt = now;
           record.counters.reconciliationStalls = 0;
           record.counters.scanStalls = 0;
-        } else if (record.decision) {
-          if (record.decision.state === "pending")
-            refuse(
-              "wait_for_human",
-              "Record authenticated direction, not an approval claim, for this decision.",
-            );
-          this.matchDecision(record, action.decisionId, action.decisionVersion);
         }
-        if (record.lifecycle === "merged" || record.lifecycle === "closed")
-          refuse(
-            "terminal",
-            "Terminal registrations cannot resume; settle and enable a new generation.",
-          );
         if (action.action !== "direction" || action.resume) {
-          if (
-            record.incidents.some(
-              (incident) => incident.kind === "effects" && !incident.resolvedAt,
-            )
-          )
-            refuse(
-              "unsettled",
-              "Reconcile ambiguous effects with correlated receipts before resuming maintenance.",
-            );
-          const reason = this.binding(record);
-          if (reason)
-            refuse(
-              reason,
-              "Current worker binding is not eligible; an explicit supported handoff is required.",
-            );
-          record.lifecycle = "active";
-          if (record.manualControl) record.manualControl.endedAt = now;
-          record.pauseReason = "";
-          record.counters.scanStalls = 0;
-          record.counters.reconciliationStalls = 0;
-          record.nextCheckAt = now;
-          record.renewedAt = now;
-          delete record.pausedNoticeAt;
-          for (const incident of record.incidents) {
-            if (
-              !incident.resolvedAt &&
-              ["identity", "provider_denial"].includes(incident.kind)
-            ) {
-              incident.resolvedAt = now;
-              incident.resolution = "operator_resume";
-              delete record.lastAttempt;
-              delete record.readyFingerprint;
-            }
-          }
+          this.assertResumeSafety(record, action.decisionId, action.decisionVersion);
+          this.applyResume(record, { actor: "operator", actorId: operatorId }, now);
         }
       }
       const saved = this.save(record);
@@ -1602,7 +1709,7 @@ export class PrMaintenanceStore {
       );
   }
 
-  /** The scoped model surface can pause, but cannot mint or expand an operator grant. */
+  /** The scoped model surface can pause and narrowly resume, but never mint a grant. */
   set(
     leadSessionId: string,
     input: {
@@ -1634,12 +1741,32 @@ export class PrMaintenanceStore {
         !record.ownershipReleasedAt
       )
         return record;
+      if (parsed.action === "resume") {
+        this.assertResumeSafety(record, record.decision?.id, record.decision?.version);
+        this.assertLeadResumeAllowed(record, leadSessionId);
+        this.applyResume(record, { actor: "lead", actorId: leadSessionId }, nowIso());
+        return this.save(record);
+      }
       if (parsed.action !== "pause")
         refuse(
           "operator_required",
-          "Use the authenticated maintenance task action for enablement, direction, resume or release.",
+          "Use the authenticated maintenance task action for enablement, direction or release.",
         );
-      this.pause(record, parsed.reason ?? "Paused by owning lead");
+      if (record.lifecycle === "merged" || record.lifecycle === "closed")
+        refuse("terminal", "Terminal registrations cannot be paused by the lead.");
+      if (
+        record.lifecycle === "paused" &&
+        (record.pauseOrigin?.actor !== "lead" ||
+          record.pauseOrigin.actorId !== leadSessionId)
+      )
+        refuse(
+          "operator_required",
+          "A lead pause cannot replace an operator, system or legacy pause.",
+        );
+      this.pause(record, parsed.reason ?? "Paused by owning lead", undefined, {
+        actor: "lead",
+        actorId: leadSessionId,
+      });
       return this.save(record);
     });
   }
@@ -3876,7 +4003,13 @@ export class PrMaintenanceStore {
       if (!record.ownershipReleasedAt) {
         if (record.lifecycle === "active") record.lifecycle = "paused";
         record.pauseReason = "portable_restore_requires_operator_reconciliation";
-        record.pausedAt ??= nowIso();
+        const pausedAt = nowIso();
+        record.pausedAt ??= pausedAt;
+        record.pauseOrigin = {
+          actor: "system",
+          actorId: "host",
+          at: pausedAt,
+        };
         for (const batch of record.batches) {
           if (batch.state === "accepted") {
             batch.state = "uncertain";

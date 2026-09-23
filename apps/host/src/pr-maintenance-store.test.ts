@@ -15,7 +15,7 @@ import {
 import { FleetStore } from "./store.js";
 import { FleetService } from "./fleet-service.js";
 import Fastify from "fastify";
-import { prMaintenanceUnsettled } from "./pr-maintenance-store.js";
+import { PrMaintenanceError, prMaintenanceUnsettled } from "./pr-maintenance-store.js";
 import v1Conflicts from "./fixtures/pr-maintenance-v1-conflicts.json" with { type: "json" };
 
 const stores: FleetStore[] = [];
@@ -279,6 +279,27 @@ function publishedRepair(f: ReturnType<typeof setup>) {
     ...receipt,
     state: "succeeded",
   });
+}
+
+function expectLeadResumeRefused(
+  f: ReturnType<typeof setup>,
+  record: PrMaintenanceRegistration,
+  code: string,
+  leadSessionId = f.lead.id,
+) {
+  const before = f.store.prMaintenance.get(record.id)!;
+  try {
+    f.store.prMaintenance.set(leadSessionId, {
+      id: record.id,
+      expectedVersion: before.version,
+      action: "resume",
+    });
+    throw new Error("Expected lead resume to be refused.");
+  } catch (error) {
+    expect(error).toBeInstanceOf(PrMaintenanceError);
+    expect((error as PrMaintenanceError).code).toBe(code);
+  }
+  expect(f.store.prMaintenance.get(record.id)).toEqual(before);
 }
 
 describe("bounded alternate PR observations", () => {
@@ -1762,6 +1783,12 @@ describe("durable PR maintenance registry", () => {
     expect(resumed.manualControl?.endedAt).toBeDefined();
     expect(resumed.manualControl?.commands).toEqual(saved.manualControl?.commands);
     expect(resumed.authorization).toEqual(record.authorization);
+    expect(resumed.resumeHistory.at(-1)).toMatchObject({
+      actor: "operator",
+      actorId: "operator",
+      pauseReason: "manual_control",
+      pauseOrigin: { actor: "operator", actorId: "supervisor" },
+    });
   });
   it.each(["omitted", "false"] as const)(
     "rejects new read-only %s authority instead of silently granting repairs",
@@ -3157,6 +3184,288 @@ describe("durable PR maintenance registry", () => {
     );
   });
 
+  it("lets the owning lead pause and resume without changing grant or work budgets", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const paused = f.store.prMaintenance.set(f.lead.id, {
+      id: record.id,
+      expectedVersion: record.version,
+      action: "pause",
+      reason: "Owning lead is checking the current HEAD.",
+    });
+    expect(paused.pauseOrigin).toMatchObject({
+      actor: "lead",
+      actorId: f.lead.id,
+    });
+
+    const resumed = f.store.prMaintenance.set(f.lead.id, {
+      id: paused.id,
+      expectedVersion: paused.version,
+      action: "resume",
+    });
+
+    expect(resumed).toMatchObject({
+      lifecycle: "active",
+      pauseReason: "",
+      authorization: record.authorization,
+      counters: record.counters,
+      findingAttempts: record.findingAttempts,
+    });
+    expect(resumed.pauseOrigin).toBeUndefined();
+    expect(resumed.resumeHistory.at(-1)).toMatchObject({
+      actor: "lead",
+      actorId: f.lead.id,
+      pauseReason: "Owning lead is checking the current HEAD.",
+      pauseOrigin: { actor: "lead", actorId: f.lead.id },
+    });
+  });
+
+  it.each(["wait_for_human", "finding_needs_human"] as const)(
+    "lets the owning lead resume a directed %s hold",
+    (holdReason) => {
+      const f = setup();
+      const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+      const held = f.store.prMaintenance.holdForDecision(
+        f.lead.id,
+        record.id,
+        record.version,
+        {
+          id: "design-direction",
+          version: 1,
+          proposal: "Keep the current API?",
+          scope: "Public API",
+          headSha: sha,
+        },
+        () => f.store.setRunState(f.task.id, "awaiting_human"),
+      );
+      let directed = f.store.prMaintenance.operatorAction(
+        held.id,
+        held.version,
+        {
+          action: "direction",
+          decisionId: "design-direction",
+          decisionVersion: 1,
+          direction: "Keep the current API and restore its invariant.",
+          resume: holdReason === "finding_needs_human",
+        },
+        "operator",
+        () => f.store.setRunState(f.task.id, "running"),
+      );
+      if (holdReason === "finding_needs_human") {
+        f.store.prMaintenance.pauseForTask(f.task.id, holdReason);
+        directed = f.store.prMaintenance.get(record.id)!;
+      }
+      expect(directed).toMatchObject({
+        lifecycle: "paused",
+        pauseReason: holdReason,
+        pauseOrigin: { actor: "system" },
+        decision: { state: "directed" },
+      });
+
+      const resumed = f.store.prMaintenance.set(f.lead.id, {
+        id: directed.id,
+        expectedVersion: directed.version,
+        action: "resume",
+      });
+
+      expect(resumed.lifecycle).toBe("active");
+      expect(resumed.resumeHistory.at(-1)).toMatchObject({
+        actor: "lead",
+        actorId: f.lead.id,
+        pauseReason: holdReason,
+      });
+    },
+  );
+
+  it.each([
+    ["a pending decision", "wait_for_human"],
+    ["an operator pause", "operator_required"],
+    ["a provider access hold", "operator_required"],
+    ["an identity hold", "operator_required"],
+    ["a no-progress hold", "operator_required"],
+    ["exhausted allowance", "budget_exhausted"],
+    ["an operator renewal", "operator_required"],
+    ["a 30-day pause notice", "operator_required"],
+    ["an observation-only grant", "repair_authorization_required"],
+    ["a released record", "released"],
+    ["a terminal record", "terminal"],
+    ["unsettled effects", "unsettled"],
+    ["a pending manual command", "execution_uncertain"],
+    ["an ineligible binding", "sealed_managed_result"],
+    ["a non-owning lead", "ownership"],
+  ] as const)(
+    "refuses lead resume for %s with %s without changing the record",
+    (scenario, code) => {
+      const f = setup();
+      let record =
+        scenario === "an observation-only grant"
+          ? restoreLegacy(f)
+          : f.store.prMaintenance.enableFromOperator(f.input, "operator");
+      let leadSessionId = f.lead.id;
+      if (scenario === "a pending decision") {
+        record = f.store.prMaintenance.holdForDecision(
+          f.lead.id,
+          record.id,
+          record.version,
+          {
+            id: "pending-decision",
+            version: 1,
+            proposal: "Choose the public contract.",
+            scope: "Public API",
+            headSha: sha,
+          },
+          () => f.store.setRunState(f.task.id, "awaiting_human"),
+        );
+      } else if (scenario === "an operator pause") {
+        record = f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "pause", reason: "Operator pause" },
+          "operator",
+        );
+      } else if (scenario === "a provider access hold") {
+        record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+          kind: "observation",
+          observation: {
+            attemptedAt: at,
+            complete: false,
+            failure: "auth",
+            helperState: {
+              error: {
+                code: "auth_required",
+                message: "Provider authentication is required.",
+              },
+            },
+            evidence: "Provider rejected the authenticated request.",
+          },
+        });
+      } else if (scenario === "an identity hold") {
+        record = observe(f, record, {
+          identity: { ...record.identity, headRef: "refs/heads/Other" },
+        });
+      } else if (scenario === "a no-progress hold") {
+        f.store.prMaintenance.pauseForTask(f.task.id, "no_progress");
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "exhausted allowance") {
+        const backup = f.store.prMaintenance.exportBackup();
+        backup.registrations[0]!.authorization.budgets.repairBatches = 1;
+        backup.registrations[0]!.counters.repairBatches = 1;
+        f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "an operator renewal") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        record = f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "renew" },
+          "operator",
+        );
+      } else if (scenario === "a 30-day pause notice") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        const future = new Date(
+          Date.parse(record.renewedAt) + 31 * 24 * 60 * 60 * 1_000,
+        ).toISOString();
+        f.store.prMaintenance.notifyLongPauses(future, () => {});
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "a released record") {
+        record = f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "release", reason: "Release maintenance ownership." },
+          "operator",
+        );
+      } else if (scenario === "a terminal record") {
+        record = accept(f, prepare(f, observe(f, record)));
+        record = observe(f, record, { state: "closed", fingerprint: "closed" });
+      } else if (scenario === "unsettled effects") {
+        record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+          kind: "observation",
+          observation: {
+            attemptedAt: at,
+            complete: false,
+            failure: "incomplete",
+            helperState: {
+              error: {
+                code: "ambiguous_effect",
+                message: "Provider effect could not be correlated.",
+              },
+            },
+            evidence: "Provider effect could not be correlated.",
+          },
+        });
+      } else if (scenario === "a pending manual command") {
+        f.store.prMaintenance.beginManualControl(
+          f.worker.id,
+          {
+            id: randomUUID(),
+            digest: "manual-input",
+            kind: "prompt",
+            operatorId: "operator",
+          },
+          0,
+        );
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "an ineligible binding") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        f.store.updateRunStep(f.step.id, {
+          resultSha: sha,
+          workspaceState: "completed",
+        });
+      } else if (scenario === "a non-owning lead") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        leadSessionId = "different-lead";
+      }
+      expectLeadResumeRefused(f, record, code, leadSessionId);
+    },
+  );
+
+  it("treats a legacy pause without origin as operator-only", () => {
+    const directory = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+    mkdirSync(directory, { recursive: true });
+    paths.push(directory);
+    const dbPath = join(directory, "host.sqlite");
+    const f = setup(storeAt(dbPath));
+    const record = f.store.prMaintenance.operatorAction(
+      f.store.prMaintenance.enableFromOperator(f.input, "operator").id,
+      1,
+      { action: "pause", reason: "Legacy pause" },
+      "operator",
+    );
+    f.store.close();
+    stores.splice(stores.indexOf(f.store), 1);
+    const db = new DatabaseSync(dbPath);
+    const row = db
+      .prepare("SELECT data FROM pr_maintenance WHERE id=?")
+      .get(record.id) as { data: string };
+    const legacy = JSON.parse(row.data);
+    delete legacy.pauseOrigin;
+    db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+      JSON.stringify(legacy),
+      record.id,
+    );
+    db.close();
+    const reopened = storeAt(dbPath);
+    const persisted = reopened.prMaintenance.get(record.id)!;
+    expect(persisted.pauseOrigin).toBeUndefined();
+    expectLeadResumeRefused({ ...f, store: reopened }, persisted, "operator_required");
+  });
+
   it("rejects fabricated approval, mutable identity fields and unbounded checkpoints", () => {
     const f = setup();
     expect(() =>
@@ -3181,7 +3490,7 @@ describe("durable PR maintenance registry", () => {
         expectedVersion: record.version,
         action: "resume",
       }),
-    ).toThrow(/authenticated/i);
+    ).toThrow(/own pause|directed/i);
     record = observe(f, record);
     expect(() =>
       f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {

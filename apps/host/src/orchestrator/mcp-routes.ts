@@ -509,7 +509,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Set owned PR maintenance",
       description:
-        "Pause an owned registration or reconcile already authorized enablement. Enablement, renewal, resume and release require the authenticated task action; this tool cannot mint operator approval or clear a design decision.",
+        "Pause an owned registration, or resume the owning lead's own pause or a human-decision hold after authenticated direction. Before resume, revalidate the PR, HEAD, worker binding and repair authorization. Enablement, renewal, release and answering a decision remain operator-only; this tool cannot mint approval, change scope or reset budgets.",
       inputSchema: SetPrMaintenanceSchema.shape,
     },
     guard("fleet_set_pr_maintenance", SetPrMaintenanceSchema, (input) =>

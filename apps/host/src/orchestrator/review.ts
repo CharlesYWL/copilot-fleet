@@ -60,7 +60,7 @@ export function maintenanceDirectionPrompt(
     "Read fleet_get_pr_maintenance and fleet_get_task before acting.",
     "This is bounded human direction, not proof that a defect is fixed or task criteria are met.",
     "Preserve unresolved findings and history. Revalidate the exact proposal, scope, HEAD,",
-    "worker binding and permissions before requesting maintenance resume.",
+    "worker binding and permissions, then resume maintenance with fleet_set_pr_maintenance.",
     "A substantial redesign returns to normal implementation and needs an accepted baseline.",
     "Do not complete or aggregate the task merely because direction was recorded.",
   ].join("\n");
