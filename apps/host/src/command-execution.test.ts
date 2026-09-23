@@ -9,6 +9,7 @@ import {
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
   COMMAND_LIMITS,
+  PR_MAINTENANCE_WAKE_LIMITS,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   MANAGED_WORKTREES_CAPABILITY,
   ManagedWorktreeSchema,
@@ -2675,6 +2676,14 @@ describe("PR maintenance with durable commands", () => {
         }),
       });
     expect(leadReceipt(first.delivery.deliveryId, "accepted")).toBe(true);
+    // Preserve the receipt tests' two-minute remaining budget within the longer wake.
+    f.store.prMaintenance.beginWake(
+      f.lead.id,
+      first.delivery.deliveryId,
+      new Date(
+        Date.now() - (PR_MAINTENANCE_WAKE_LIMITS.milliseconds - 120_000),
+      ).toISOString(),
+    );
     const claim = await call("fleet_get_pr_maintenance", {
       takeDue: true,
       reserveRequests: 39,

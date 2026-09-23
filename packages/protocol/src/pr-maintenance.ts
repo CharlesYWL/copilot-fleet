@@ -38,7 +38,7 @@ export const PR_MAINTENANCE_CADENCE_MS = 30 * 60 * 1_000;
 export const PR_MAINTENANCE_WAKE_LIMITS = Object.freeze({
   visits: 5,
   requests: 40,
-  milliseconds: 120_000,
+  milliseconds: 300_000,
 });
 export const PR_MAINTENANCE_RECOVERY_LIMITS = Object.freeze({
   incidents: 20,
