@@ -175,7 +175,8 @@ Exports:
     checks,reviews,checksComplete,reviewsComplete,
     actionableSources,effects,actionableFingerprint
   },
-  error?:{code,message,retryAfterSeconds?,limit?:{kind,stage,actual,maximum}}
+  error?:{code,message,retryAfterSeconds?,limit?:{kind,stage,actual,maximum},
+    diagnostic?:{stage,check,path}}
 }
 ```
 
@@ -263,6 +264,20 @@ not a false provider access denial. The exact sanitized error code/message remai
 in `helperState.error`, together with bounded resume state, for recovery classification.
 No error embeds raw CLI/API output.
 
+Every `malformed_response` includes `error.diagnostic: {stage,check,path}`, also
+preserved unchanged in `observation.helperState.error`. `stage` is `response`
+or `snapshot`; `check` is a helper-owned stable identifier, such as
+`status.state`, `evaluation.artifact_id`, `evaluation.fields`, `comment.fields`
+or `list.envelope`. `path` uses only helper-owned schema names and numeric array
+indices/IDs, for example `iterationStatuses[0].state` or
+`evaluations[0].artifactId`. Composite checks identify the containing object.
+Unclassified malformed evidence uses
+`{stage:"response",check:"required_evidence",path:"$"}`. Diagnostics never include
+provider values, arbitrary property names, PR text, identities, URLs, tokens,
+exception messages or validator issue paths. This additive field changes neither
+exit 2 nor the error code/message, failure mapping, receipt or checkpoint shape.
+For `fallback.error`, keep the string `"code: message"`; do not pass the error object.
+
 ## Evidence and deliberate limitations
 
 Active PRs require iteration support. The highest iteration supplies the source
@@ -282,12 +297,22 @@ lifecycle guard. Completed/abandoned PRs are double-read terminal observations;
 terminal settlement does not require a deleted source branch or historical
 policies to remain readable.
 
+The [status state contract](https://learn.microsoft.com/en-us/rest/api/azure/devops/git/pull-request-statuses/list?view=azure-devops-rest-7.1#gitstatusstate)
+defines `notSet` as the default. Native REST may omit `state` for that default.
+After full page verification, only an omitted `state` becomes `notSet` in PR and
+iteration statuses. Current iteration `notSet` remains an **unknown** obligation,
+never success or a repair source. Explicit null, numeric or unrecognized states,
+missing IDs/contexts/dates, and changed second-pass evidence still fail closed.
+
 The hierarchy-aware effective configuration endpoint uses repository and base
 ref filters, including applicable inherited project policies. It is **not** the
 legacy `policy/configurations?scope=...` query. Readiness for an enabled returned
 policy requires a matching evaluation and exact config settings/type/revision.
-Every retrieved evaluation must have the exact
-artifact ID `vstfs:///CodeReview/CodeReviewId/{projectGuid}/{PRid}`. The PR's
+Every retrieved evaluation must identify the exact project GUID and PR number in
+`vstfs:///CodeReview/CodeReviewId/{projectGuid}/{PRid}`. Native REST also returns
+the GUID/PR separator as `%2F` (or `%2f`); only that separator may be encoded.
+Other escaping, double encoding, extra components and different project/PR pins
+are rejected, not broadly URL-decoded. The PR's
 different `vstfs:///Git/PullRequestId/...` artifact is never used for evaluations.
 To contribute readiness proof, terminal evaluation timestamps must be no earlier
 than the current iteration's updated time and no later than observation time.

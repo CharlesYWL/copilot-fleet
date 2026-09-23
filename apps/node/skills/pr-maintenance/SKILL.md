@@ -314,6 +314,14 @@ summary or PR comment cannot clear the hold. Changed assumptions need a new deci
 Keeping current design does not mark a demonstrated defect fixed or drop criteria.
 Substantial redesign returns to ordinary implementation with a new accepted baseline.
 
+If collection fails before any observation supplies a HEAD, `fleet_escalate`
+still requests a **blocked operational task review**. It does not invent a HEAD
+or a maintenance design decision, authorize repairs/publication, renew allowances,
+or clear access/operator/design holds. Existing pending reviews and stopped tasks
+cannot be overwritten. Report the sanitized helper error and the operational
+action needed; a later design decision still requires the normal observed-HEAD
+path and authenticated direction.
+
 ## Independent obligations, not a comment counter
 
 Evaluate terminal/human/ownership/completeness gates first, then **all** obligations:

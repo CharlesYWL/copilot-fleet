@@ -69,7 +69,15 @@ const messages = Object.freeze({
   ambiguous_effect:
     "Comment effects match ambiguously; reconcile receipts before triage.",
 });
-function fail(code) {
+class MalformedEvidence extends Error {
+  constructor(diagnostic = { stage: "response", check: "required_evidence", path: "$" }) {
+    super(messages.malformed_response);
+    this.code = "malformed_response";
+    this.diagnostic = diagnostic;
+  }
+}
+function fail(code, diagnostic) {
+  if (code === "malformed_response") return new MalformedEvidence(diagnostic);
   return Object.assign(new Error(messages[code] ?? messages.network), { code });
 }
 const size = (value) => Buffer.byteLength(JSON.stringify(value));
@@ -101,8 +109,8 @@ function bounded(value, stage, depth = 0) {
     for (const child of Object.values(value)) bounded(child, stage, depth + 1);
   return value;
 }
-function required(condition, code = "malformed_response") {
-  if (!condition) throw fail(code);
+function required(condition, code = "malformed_response", diagnostic) {
+  if (!condition) throw fail(code, diagnostic);
 }
 function pick(value, keys) {
   return Object.fromEntries(
@@ -551,6 +559,8 @@ function listPage(body, headers, job) {
     body &&
       Array.isArray(body.value) &&
       (body.count === undefined || body.count === body.value.length),
+    "malformed_response",
+    { stage: "response", check: "list.envelope", path: job.kind },
   );
   const continuation = headers["x-ms-continuationtoken"];
   let next = null;
@@ -569,6 +579,13 @@ function listPage(body, headers, job) {
   required(
     !headers.link && body.continuationToken === undefined && body.nextLink === undefined,
     "unsupported_pagination",
+  );
+  body.value.forEach((entry, index) =>
+    required(
+      entry && typeof entry === "object" && !Array.isArray(entry),
+      "malformed_response",
+      { stage: "response", check: "list.item", path: `${job.kind}[${index}]` },
+    ),
   );
   return { values: body.value, next };
 }
@@ -589,15 +606,11 @@ function currentIteration(scan) {
   );
   return latest;
 }
-function threadComments(thread) {
+function threadComments(thread, path) {
   required(Array.isArray(thread.comments));
-  required(
-    new Set(thread.comments.map((comment) => comment.id)).size === thread.comments.length,
-    "inconsistent_snapshot",
-  );
-  return thread.comments.map((comment) => {
+  const comments = thread.comments.map((comment, index) => {
     required(
-      positive(comment.id) &&
+      positive(comment?.id) &&
         Number.isInteger(comment.parentCommentId) &&
         comment.parentCommentId >= 0 &&
         date(comment.lastUpdatedDate) &&
@@ -606,6 +619,8 @@ function threadComments(thread) {
         (comment.isDeleted === undefined || typeof comment.isDeleted === "boolean") &&
         ["text", "system", "codeChange", "unknown"].includes(comment.commentType) &&
         (comment.isDeleted === true || typeof comment.content === "string"),
+      "malformed_response",
+      { stage: "response", check: "comment.fields", path: `${path}.comments[${index}]` },
     );
     return {
       ...pick(comment, [
@@ -622,6 +637,11 @@ function threadComments(thread) {
       threadId: thread.id,
     };
   });
+  required(
+    new Set(comments.map((comment) => comment.id)).size === comments.length,
+    "inconsistent_snapshot",
+  );
+  return comments;
 }
 function normalizePage(pr, scan, job, response) {
   const headers = Object.fromEntries(
@@ -646,9 +666,13 @@ function normalizePage(pr, scan, job, response) {
   try {
     body = typeof response.body === "string" ? JSON.parse(response.body) : response.body;
   } catch {
-    throw fail("malformed_response");
+    throw fail("malformed_response", {
+      stage: "response",
+      check: "response.json",
+      path: "$",
+    });
   }
-  required(body && typeof body === "object");
+  required(body && typeof body === "object" && !Array.isArray(body));
   bounded(body, "response");
   if (job.kind === "metadata") return metadataValue(pr, body);
   if (job.kind === "build") {
@@ -675,12 +699,15 @@ function normalizePage(pr, scan, job, response) {
   }
   const page = listPage(body, headers, job);
   if (job.kind === "threads") {
-    page.values = page.values.map((thread) => {
+    page.values = page.values.map((thread, index) => {
+      const path = `threads[${index}]`;
       required(
         positive(thread.id) &&
           date(thread.lastUpdatedDate) &&
           (thread.isDeleted === undefined || typeof thread.isDeleted === "boolean") &&
           Array.isArray(thread.comments),
+        "malformed_response",
+        { stage: "response", check: "thread.fields", path },
       );
       return {
         ...pick(thread, [
@@ -694,7 +721,7 @@ function normalizePage(pr, scan, job, response) {
         ]),
         // REST 7.1 returns all threads with initial comments and subsequent replies.
         // Hash the complete normalized list on both passes, not one read per thread.
-        comments: threadComments(thread),
+        comments: threadComments(thread, path),
       };
     });
   }
@@ -745,7 +772,7 @@ export function matchEffects(sources, effects = []) {
   };
 }
 
-function policyValue(config) {
+function policyValue(config, path = "policies") {
   required(
     positive(config?.id) &&
       positive(config.revision) &&
@@ -755,6 +782,8 @@ function policyValue(config) {
       config.settings &&
       typeof config.settings === "object" &&
       !Array.isArray(config.settings),
+    "malformed_response",
+    { stage: "snapshot", check: "policy.configuration", path },
   );
   return {
     id: config.id,
@@ -869,9 +898,15 @@ function knownPolicySettings(config) {
 function policyEvidence(scan, iteration, headSha, baseSha, now) {
   const { metadata, data } = scan;
   const id = metadata.identity;
-  const configs = data.policies.map(policyValue);
+  const configs = data.policies.map((config, index) =>
+    policyValue(config, `policies[${index}]`),
+  );
   required(new Set(configs.map((config) => config.id)).size === configs.length);
-  const artifact = `vstfs:///CodeReview/CodeReviewId/${id.projectId}/${id.prNumber}`;
+  // Native evaluations encode the GUID/PR delimiter, unlike the request template.
+  const artifacts = ["/", "%2F", "%2f"].map(
+    (separator) =>
+      `vstfs:///CodeReview/CodeReviewId/${id.projectId}${separator}${id.prNumber}`,
+  );
   const checks = [];
   const reviews = [];
   let checksComplete = true;
@@ -881,9 +916,19 @@ function policyEvidence(scan, iteration, headSha, baseSha, now) {
     date(timestamp) &&
     Date.parse(timestamp) >= Date.parse(iteration.updatedDate) &&
     Date.parse(timestamp) <= now;
-  for (const evaluation of data.evaluations) {
-    required(evaluation.artifactId === artifact && GUID.test(evaluation.evaluationId));
-    policyValue(evaluation.configuration);
+  for (const [index, evaluation] of data.evaluations.entries()) {
+    const path = `evaluations[${index}]`;
+    required(artifacts.includes(evaluation.artifactId), "malformed_response", {
+      stage: "snapshot",
+      check: "evaluation.artifact_id",
+      path: `${path}.artifactId`,
+    });
+    required(GUID.test(evaluation.evaluationId), "malformed_response", {
+      stage: "snapshot",
+      check: "evaluation.id",
+      path: `${path}.evaluationId`,
+    });
+    policyValue(evaluation.configuration, `${path}.configuration`);
     required(
       ["queued", "running", "approved", "rejected", "notApplicable", "broken"].includes(
         evaluation.status,
@@ -893,6 +938,8 @@ function policyEvidence(scan, iteration, headSha, baseSha, now) {
           (evaluation.context &&
             typeof evaluation.context === "object" &&
             !Array.isArray(evaluation.context))),
+      "malformed_response",
+      { stage: "snapshot", check: "evaluation.fields", path },
     );
     if (!configs.some((config) => config.id === evaluation.configuration.id)) {
       checksComplete = false;
@@ -969,6 +1016,8 @@ function policyEvidence(scan, iteration, headSha, baseSha, now) {
             typeof build.sourceVersion === "string" &&
             date(build.queueTime) &&
             typeof build.status === "string",
+          "malformed_response",
+          { stage: "snapshot", check: "build.fields", path: `build[${buildId}]` },
         );
         required(lowerGuid(build.project.id) === id.projectId, "scope_changed");
         const repositoryId = build.repository.id.toLowerCase();
@@ -1074,6 +1123,28 @@ function policyEvidence(scan, iteration, headSha, baseSha, now) {
   return { configs, checks, reviews, checksComplete, reviewsComplete };
 }
 
+function statusValue(status, path) {
+  const check = (condition, id, field) =>
+    required(condition, "malformed_response", {
+      stage: "snapshot",
+      check: id,
+      path: `${path}.${field}`,
+    });
+  check(positive(status.id), "status.id", "id");
+  check(typeof status.context?.name === "string", "status.context", "context");
+  check(date(status.updatedDate), "status.updated_date", "updatedDate");
+  // Native REST can omit the default notSet enum; it is never evidence of success.
+  const state = status.state === undefined ? "notSet" : status.state;
+  check(
+    ["notSet", "pending", "succeeded", "failed", "error", "notApplicable"].includes(
+      state,
+    ),
+    "status.state",
+    "state",
+  );
+  return { ...status, state };
+}
+
 function snapshot(input, scan, now) {
   const { metadata, data } = scan;
   const identity = metadata.identity;
@@ -1104,14 +1175,9 @@ function snapshot(input, scan, now) {
     );
     // A source iteration does not advance when only the target branch moves.
     baseSha = liveBase[0].objectId;
-    for (const status of [...data.statuses, ...data.iterationStatuses])
-      required(
-        positive(status.id) &&
-          typeof status.context?.name === "string" &&
-          date(status.updatedDate) &&
-          ["notSet", "pending", "succeeded", "failed", "error", "notApplicable"].includes(
-            status.state,
-          ),
+    for (const kind of ["statuses", "iterationStatuses"])
+      data[kind] = data[kind].map((status, index) =>
+        statusValue(status, `${kind}[${index}]`),
       );
     required(
       data.iterationStatuses.every((status) => status.iterationId === iteration.id),
@@ -1127,7 +1193,7 @@ function snapshot(input, scan, now) {
       metadata.lastMergeTargetCommit?.commitId === baseSha,
   };
   const url = `https://dev.azure.com/${identity.organization}/${encodeURIComponent(identity.project)}/_git/${encodeURIComponent(identity.repository.split("/")[1])}/pullrequest/${identity.prNumber}`;
-  const threads = (data.threads ?? []).map((thread) => {
+  const threads = (data.threads ?? []).map((thread, index) => {
     const comments = thread.comments;
     required(
       [
@@ -1140,10 +1206,18 @@ function snapshot(input, scan, now) {
         "pending",
         undefined,
       ].includes(thread.status),
+      "malformed_response",
+      { stage: "snapshot", check: "thread.status", path: `threads[${index}].status` },
     );
     required(
       thread.status !== undefined ||
         comments.every((comment) => comment.commentType === "system"),
+      "malformed_response",
+      {
+        stage: "snapshot",
+        check: "thread.status_for_comments",
+        path: `threads[${index}].status`,
+      },
     );
     return { ...thread, comments };
   });
@@ -1459,6 +1533,14 @@ export async function observe(
       error: {
         code,
         message: messages[code],
+        ...(code === "malformed_response"
+          ? {
+              diagnostic:
+                error instanceof MalformedEvidence
+                  ? error.diagnostic
+                  : new MalformedEvidence().diagnostic,
+            }
+          : {}),
         ...(error instanceof EvidenceOverflow ? { limit: error.limit } : {}),
         ...(code === "rate_limited" && Number.isFinite(error.retryAfterSeconds)
           ? { retryAfterSeconds: error.retryAfterSeconds }

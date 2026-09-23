@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import Fastify from "fastify";
 import { HostToNodeMessageSchema, PrMaintenanceObservationSchema } from "@fleet/protocol";
 import { fleet } from "./fleet-harness.js";
 import { OrchestratorEngine } from "./engine.js";
 import { FleetTools, GetPrMaintenanceSchema, SetPrMaintenanceSchema } from "./tools.js";
+import { LeadTokens } from "./lead-tokens.js";
+import { MCP_PATH, mcpRoutes } from "./mcp-routes.js";
 
 describe("PR maintenance orchestration", () => {
   let world: ReturnType<typeof fleet>;
@@ -40,7 +43,11 @@ describe("PR maintenance orchestration", () => {
     world.store.close();
   });
 
-  const setup = (claimVisit = true, provider: "github" | "azure-devops" = "github") => {
+  const setup = (
+    claimVisit = true,
+    provider: "github" | "azure-devops" = "github",
+    withObservation = true,
+  ) => {
     const providerIdentity =
       provider === "azure-devops"
         ? {
@@ -97,6 +104,7 @@ describe("PR maintenance orchestration", () => {
       },
       "authenticated-operator",
     );
+    if (!withObservation) return { run, worker, step, record };
     let observed = world.store.prMaintenance.checkpoint(
       world.leadId,
       record.id,
@@ -209,6 +217,177 @@ describe("PR maintenance orchestration", () => {
         decisionId: "decision-1",
       },
     });
+
+  it.each(["running", "completed"] as const)(
+    "fleet_escalate requests blocked review without an observation on a %s maintenance task",
+    async (state) => {
+      const { record, run, worker } = setup(false, "azure-devops", false);
+      world.store.updateRun(run.id, { state });
+      const review = vi.spyOn(world.service, "requestRunReview");
+      const app = Fastify();
+      const tokens = new LeadTokens(world.store);
+      await app.register(mcpRoutes, { service: world.service, tokens });
+      try {
+        const response = await app.inject({
+          method: "POST",
+          url: MCP_PATH,
+          headers: {
+            authorization: `Bearer ${tokens.mint(world.leadSubject)}`,
+            accept: "application/json, text/event-stream",
+            "content-type": "application/json",
+          },
+          payload: {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "tools/call",
+            params: {
+              name: "fleet_escalate",
+              arguments: {
+                task: run.id,
+                reason: "The read-only helper failed before any complete PR observation.",
+              },
+            },
+          },
+        });
+        const result = response.json();
+        expect(result.error).toBeUndefined();
+        expect(result.result.isError, JSON.stringify(result)).not.toBe(true);
+        expect(review).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({ runId: run.id, reason: "blocked" }),
+        );
+        const reviewed = world.store.getRun(run.id)!;
+        expect(reviewed.state).toBe("awaiting_human");
+        expect(
+          world.store.getNotificationBySourceKey(
+            `review:${run.id}:${reviewed.reviewSeq}`,
+          ),
+        ).toMatchObject({ status: "active", data: { reason: "blocked" } });
+        expect(world.store.prMaintenance.get(record.id)).toEqual(record);
+        expect(record.observation).toBeUndefined();
+        expect(record.decision).toBeUndefined();
+        expect(tools.followUp({ sessionId: worker.id, prompt: "Try a repair" }).ok).toBe(
+          false,
+        );
+        expect(
+          tools.reopenTask({ task: run.id, reason: "Try to bypass review" }).ok,
+        ).toBe(false);
+        expect(() =>
+          world.service.worktrees.approvePublication(run.id, "approval", "human"),
+        ).toThrow();
+        expect(world.store.prMaintenance.get(record.id)).toEqual(record);
+      } finally {
+        await app.close();
+      }
+    },
+  );
+
+  it.each(["auth", "permission", "paused"] as const)(
+    "operational escalation preserves the existing %s maintenance hold without a head",
+    (gate) => {
+      const { record, run } = setup(false, "azure-devops", false);
+      const held =
+        gate === "paused"
+          ? world.store.prMaintenance.set(world.leadId, {
+              id: record.id,
+              expectedVersion: record.version,
+              action: "pause",
+              reason: "Operator pause",
+            })
+          : world.store.prMaintenance.checkpoint(
+              world.leadId,
+              record.id,
+              record.version,
+              {
+                kind: "fallback",
+                error: `${gate}: provider rejected read`,
+                observation: {
+                  attemptedAt: new Date().toISOString(),
+                  complete: false,
+                  failure: gate,
+                  evidence: "Synthetic provider access failure.",
+                },
+              },
+            );
+      expect(held.observation?.headSha).toBeUndefined();
+      expect(
+        tools.escalate({
+          task: run.id,
+          reason: "Operator reconciliation is needed before observation can proceed.",
+          maintenance: {
+            recordId: held.id,
+            expectedVersion: held.version,
+            decisionId: "not-a-design-grant",
+          },
+        }).ok,
+      ).toBe(true);
+      expect(world.store.getRun(run.id)!.state).toBe("awaiting_human");
+      expect(world.store.prMaintenance.get(record.id)).toEqual(held);
+      const again = tools.escalate({
+        task: run.id,
+        reason: "Try to overwrite the existing review.",
+      });
+      expect(again.ok).toBe(false);
+      expect(world.store.prMaintenance.get(record.id)).toEqual(held);
+    },
+  );
+
+  it("refuses stale, stopped and pending-decision operational escalation without changing holds", () => {
+    const { record, run } = setup(false, "azure-devops", false);
+    const review = vi.spyOn(world.service, "requestRunReview");
+    expect(
+      tools.escalate({
+        task: run.id,
+        reason: "The helper has no usable observation yet.",
+        maintenance: {
+          recordId: record.id,
+          expectedVersion: record.version + 1,
+          decisionId: "stale",
+        },
+      }).ok,
+    ).toBe(false);
+    world.store.updateRun(run.id, { state: "cancelled" });
+    expect(
+      tools.escalate({ task: run.id, reason: "Try to reopen a stopped task." }).ok,
+    ).toBe(false);
+    expect(world.store.getRun(run.id)!.state).toBe("cancelled");
+    expect(world.store.prMaintenance.get(record.id)).toEqual(record);
+    world.store.updateRun(run.id, { state: "running" });
+    const held = world.store.prMaintenance.holdForDecision(
+      world.leadId,
+      record.id,
+      record.version,
+      {
+        id: "existing",
+        version: 1,
+        proposal: "Existing question",
+        scope: "API",
+        headSha,
+      },
+      () => world.store.updateRun(run.id, { state: "awaiting_human" }),
+    );
+    expect(
+      tools.escalate({
+        task: run.id,
+        reason: "Try to replace a pending design decision.",
+      }).ok,
+    ).toBe(false);
+    expect(world.store.prMaintenance.get(record.id)).toEqual(held);
+    expect(review).not.toHaveBeenCalled();
+  });
+
+  it("rolls back a review-only reopen when operational review cannot be recorded", () => {
+    const { record, run } = setup(false, "azure-devops", false);
+    world.store.updateRun(run.id, { state: "completed" });
+    vi.spyOn(world.service, "requestRunReview").mockReturnValue(undefined);
+    expect(
+      tools.escalate({
+        task: run.id,
+        reason: "The helper cannot collect a complete observation.",
+      }).ok,
+    ).toBe(false);
+    expect(world.store.getRun(run.id)!.state).toBe("completed");
+    expect(world.store.prMaintenance.get(record.id)).toEqual(record);
+  });
 
   it("queues one durable recovery wake across ticks and engine reconstruction without replaying work", () => {
     const { record, run, worker } = setup(false);

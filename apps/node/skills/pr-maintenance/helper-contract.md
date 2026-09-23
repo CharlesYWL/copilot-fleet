@@ -106,6 +106,19 @@ error and opaque resume. `fallback.error`, when needed, is a string, not the
 provider error object. A reconciliation note or path/hash is not an observation.
 Do not copy only the displayed summary or rebuild/trim the continuation.
 
+ADO `malformed_response` errors add a stable sanitized
+`diagnostic: {stage,check,path}` to both `result.error` and
+`observation.helperState.error`. Stage is `response` or `snapshot`, check is a
+helper-owned ID, and path contains only fixed schema names and numeric indices/IDs
+(for example `iterationStatuses[0].state`). Composite checks name the object;
+unclassified failures use `response` / `required_evidence` / `$`. Provider text,
+arbitrary keys/values, exception details and validator issue paths are never
+copied into diagnostics. Exit codes, messages, Host receipts and checkpoint
+schemas are unchanged. When supplying `fallback.error`, use the string
+`"${result.error.code}: ${result.error.message}"`, not the error object.
+See the ADO contract for omitted default status states and encoded artifact
+separators; neither compatibility case weakens completeness or readiness gates.
+
 The exposed MCP route accepts the supported large object inline (32 MiB
 transport bound; helper state at most 1 MiB; total durable record at most 2 MiB).
 No filesystem-import capability or arbitrary path read is provided. A synthetic

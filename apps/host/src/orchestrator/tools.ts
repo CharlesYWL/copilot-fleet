@@ -1681,11 +1681,50 @@ export class FleetTools {
           );
         }
         const headSha = record.observation?.headSha;
-        if (!headSha)
-          throw new PrMaintenanceError(
-            "head_required",
-            "Observe the PR before proposing a design decision.",
-          );
+        if (!headSha) {
+          return this.store.writeAtomically(() => {
+            if (input.maintenance && input.maintenance.expectedVersion !== record.version)
+              throw new PrMaintenanceError(
+                "version_conflict",
+                "Maintenance changed; reread before escalating.",
+              );
+            if (record.ownershipReleasedAt)
+              throw new PrMaintenanceError(
+                "released",
+                "Cannot hold released maintenance.",
+              );
+            if (
+              record.decision?.state === "pending" ||
+              run.state === "awaiting_human" ||
+              run.state === "cancelled"
+            )
+              throw new PrMaintenanceError(
+                "review_conflict",
+                "An existing human review or stopped task cannot be overwritten.",
+              );
+            // Reopen only for review, never for work or a new maintenance grant.
+            if (terminalRunStates.has(run.state))
+              this.store.updateRun(run.id, { state: "running" });
+            if (
+              !this.service.requestRunReview({
+                runId: run.id,
+                note: `**PR maintenance is operationally blocked.**\n\n${input.reason}\n\nNo complete PR observation is available. This review does not authorize repairs, publication or a design change; existing maintenance holds and authorization remain unchanged.`,
+                reason: "blocked",
+                metadata: {
+                  summary: input.headline ?? "PR maintenance observation blocked",
+                  kind: "blocked",
+                  source: "orchestrator",
+                  sessionId: this.leadSessionId,
+                },
+              })
+            )
+              throw new PrMaintenanceError(
+                "review_conflict",
+                "The existing human review cannot be overwritten.",
+              );
+            return record;
+          });
+        }
         const held = this.store.prMaintenance.holdForDecision(
           this.leadSessionId,
           record.id,

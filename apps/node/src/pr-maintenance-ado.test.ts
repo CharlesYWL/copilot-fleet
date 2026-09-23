@@ -256,6 +256,162 @@ function withBuild() {
 }
 
 describe("Azure DevOps read-only snapshot: synthetic transports only", () => {
+  it.each(["%2F", "%2f"])(
+    "accepts native percent-encoded artifact separator %s with exact project and PR pins",
+    async (separator) => {
+      const data = withBuild();
+      data.evaluations[0].artifactId = `vstfs:///CodeReview/CodeReviewId/${projectId}${separator}7`;
+      const result = await run(data);
+      expect(result.complete).toBe(true);
+      expect(result.observation.checksComplete).toBe(false);
+      expect(result.progress).toMatchObject({ pages: 9, verifiedPages: 9 });
+    },
+  );
+
+  it.each([
+    `vstfs:///CodeReview/CodeReviewId/${forkId}%2F7`,
+    `vstfs:///CodeReview/CodeReviewId/${projectId}%2F8`,
+    `vstfs:///CodeReview/CodeReviewId/${projectId}%252F7`,
+    `vstfs:///CodeReview/CodeReviewId/${projectId}%2F7/extra`,
+    `vstfs:///CodeReview/CodeReviewId/${projectId}%2F7#fragment`,
+    `vstfs:%2F%2F%2FCodeReview/CodeReviewId/${projectId}%2F7`,
+    undefined,
+  ])(
+    "rejects nonmatching or over-encoded policy artifact identity: %s",
+    async (artifactId) => {
+      const data = withBuild();
+      data.evaluations[0].artifactId = artifactId;
+      const result = await run(data);
+      expect(result.complete).toBe(false);
+      expect(result.error).toMatchObject({
+        code: "malformed_response",
+        diagnostic: {
+          stage: "snapshot",
+          check: "evaluation.artifact_id",
+          path: "evaluations[0].artifactId",
+        },
+      });
+      expect(result.snapshot).toBeUndefined();
+    },
+  );
+
+  it.each([
+    ["direct", observe],
+    ["router", routeObservation],
+  ])(
+    "collects native omitted-state statuses as unknown through %s",
+    async (_name, collect) => {
+      const data = fixtures();
+      data.statuses = [status()];
+      data.iterationStatuses = [status()];
+      delete data.statuses[0].state;
+      delete data.iterationStatuses[0].state;
+      data.threads = [thread()];
+      const result = await run(data, input(), undefined, collect);
+      expect(result.complete).toBe(true);
+      expect(result.snapshot.statuses[0].state).toBe("notSet");
+      expect(result.observation.checks).toContainEqual(
+        expect.objectContaining({ state: "unknown", headSha: head }),
+      );
+      expect(result.observation.sources.map((source: any) => source.id)).toEqual([
+        "thread_comment:12:1",
+      ]);
+      expect(result.progress).toMatchObject({ pages: 8, verifiedPages: 8 });
+    },
+  );
+
+  it("still detects an omitted-state status changing during verification", async () => {
+    const data = fixtures();
+    data.iterationStatuses = [status()];
+    delete data.iterationStatuses[0].state;
+    const result = await run(data, input(), (call, count, response) => {
+      if (call.url.includes("/iterations/2/statuses?") && count === 2)
+        response.body.value[0].state = "succeeded";
+      return response;
+    });
+    expect(result.error.code).toBe("inconsistent_snapshot");
+    expect(result.snapshot).toBeUndefined();
+  });
+
+  it.each([
+    ["null state", "state", null, "status.state"],
+    ["unknown state", "state", "PRIVATE_PROVIDER_TEXT", "status.state"],
+    ["numeric state", "state", 0, "status.state"],
+    ["missing id", "id", undefined, "status.id"],
+    ["missing context", "context", undefined, "status.context"],
+    ["missing date", "updatedDate", undefined, "status.updated_date"],
+  ])(
+    "rejects partial status evidence with sanitized diagnostics: %s",
+    async (_name, field, value, check) => {
+      const data = fixtures();
+      data.iterationStatuses = [{ ...status(), [field]: value }];
+      data.metadata.title = "PRIVATE_PROVIDER_TEXT";
+      data.threads = [thread([comment(1, "PRIVATE_PROVIDER_TEXT")])];
+      const result = await run(data);
+      expect(result.complete).toBe(false);
+      expect(result.snapshot).toBeUndefined();
+      expect(result.resume).toBeUndefined();
+      expect(result.error).toEqual({
+        code: "malformed_response",
+        message:
+          "Azure DevOps returned missing, partial, or malformed required evidence.",
+        diagnostic: {
+          stage: "snapshot",
+          check,
+          path: `iterationStatuses[0].${field}`,
+        },
+      });
+      expect(result.observation.helperState.error).toEqual(result.error);
+      expect(JSON.stringify(result)).not.toContain("PRIVATE_PROVIDER_TEXT");
+    },
+  );
+
+  it.each(["json", "list", "thread", "comment", "null-comment", "evaluation", "spoofed"])(
+    "does not leak provider text or arbitrary keys in malformed diagnostics: %s",
+    async (kind) => {
+      const data = withBuild();
+      data.metadata.title = "PRIVATE_PROVIDER_TEXT";
+      data.threads = [thread([comment(1, "PRIVATE_PROVIDER_TEXT")])];
+      if (kind === "thread") delete data.threads[0].comments;
+      if (kind === "comment")
+        data.threads[0].comments[0].commentType = "PRIVATE_PROVIDER_TEXT";
+      if (kind === "null-comment") data.threads[0].comments[0] = null;
+      if (kind === "evaluation") data.evaluations[0].status = "PRIVATE_PROVIDER_TEXT";
+      const result = await run(data, input(), (call, _count, response) => {
+        if (!call.url.includes("/threads?")) return response;
+        if (kind === "json") response.body = '{"PRIVATE_PROVIDER_TEXT":';
+        if (kind === "list") response.body = { PRIVATE_PROVIDER_TEXT: [] };
+        if (kind === "spoofed")
+          throw Object.assign(new Error("PRIVATE_PROVIDER_TEXT"), {
+            code: "malformed_response",
+            diagnostic: {
+              stage: "PRIVATE_PROVIDER_TEXT",
+              check: "PRIVATE_PROVIDER_TEXT",
+              path: "PRIVATE_PROVIDER_TEXT",
+            },
+          });
+        return response;
+      });
+      const expected = {
+        json: ["response", "response.json", "$"],
+        list: ["response", "list.envelope", "threads"],
+        thread: ["response", "thread.fields", "threads[0]"],
+        comment: ["response", "comment.fields", "threads[0].comments[0]"],
+        "null-comment": ["response", "comment.fields", "threads[0].comments[0]"],
+        evaluation: ["snapshot", "evaluation.fields", "evaluations[0]"],
+        spoofed: ["response", "required_evidence", "$"],
+      }[kind]!;
+      expect(result.error).toMatchObject({
+        code: "malformed_response",
+        diagnostic: { stage: expected[0], check: expected[1], path: expected[2] },
+      });
+      expect(result.snapshot).toBeUndefined();
+      expect(result.resume).toBeUndefined();
+      expect(result.observation.helperState.error).toEqual(result.error);
+      expect(JSON.stringify(result)).not.toContain("PRIVATE_PROVIDER_TEXT");
+    },
+  );
+
   it.each([40, 39])(
     "collects forty mixed multi-comment threads within %i operations including authentication",
     async (maxRequests) => {
