@@ -23,11 +23,13 @@ coder automatically; it never creates a worker. Use current provider metadata
 and its actual read time, source/method and evidence. The packaged helper is
 preferred, but existing authorized provider MCP/CLI tools may supply verified
 metadata when the helper is unavailable. Never copy credentials between tools.
-Preparation defaults to observation only, with every remote mutation disabled.
-Only request repair mode with verified existing publication authority and evidence;
-request replies, thread resolution, named reviewers and CI retries explicitly.
-Describe the returned mode/action flags accurately. Never turn read-only task
-constraints into repair/publication permission merely because maintenance was requested.
+Preparation is repair-only; observation-only enrollment is unsupported. Supply
+`publicationEvidence` only after verifying existing task and publication authority;
+if that prerequisite is missing, report it and stop rather than enrolling. Replies,
+thread resolution, named reviewers and CI retries default off; request each
+explicitly within the verified scope. Describe the returned mode/action flags
+accurately. Never turn read-only task constraints into repair/publication permission
+merely because maintenance was requested.
 This creates only
 a pending proposal and an operator notification; the existing task dialog is
 prefilled. Do not ask the user to copy JSON, claim approval, or dispatch repairs.

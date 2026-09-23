@@ -2034,7 +2034,8 @@ by this change; the existing 50 MiB portable-backup limit still applies.
 
 _Design choices stay human: record direction, then explicitly resume maintenance._
 
-[Editable diagram source (HTML)](docs/pr-maintenance-flow.html).
+[Editable diagram source (HTML)](docs/pr-maintenance-flow.html) ·
+[Technical flow: MCP calls, stages and lifecycles (HTML)](docs/pr-maintenance-technical-flow.html).
 
 Stop/archive/delete pause linked maintenance. Accepted work and unknown push/reply
 effects retain ownership and block cleanup until reconciled; Stop is not proof
