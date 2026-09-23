@@ -4,6 +4,11 @@ import { mkdir, open, readFile, realpath, rename, rm, stat } from "node:fs/promi
 import { isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import {
+  COMMAND_OBSERVATION_CLOCK_ENV,
+  CommandObservationClockSchema,
+  type commandObservationClock,
+} from "@fleet/protocol";
+import {
   COMMAND_SUPERVISOR_ERROR_LIMIT,
   commandSupervisorScript,
 } from "./command-supervisor-native.js";
@@ -70,6 +75,7 @@ export interface CommandProcessInput {
   command: string;
   timeoutMs: number;
   startExpiresAt: string;
+  observationClock?: ReturnType<typeof commandObservationClock>;
   /** Raw retained bytes. Delivery is best effort; durable .bin files are authoritative. */
   onOutput?: (stream: "stdout" | "stderr", bytes: Buffer) => void;
 }
@@ -485,9 +491,17 @@ async function prepare(
   ];
   checkArguments(shellPath, args);
   const supervisorEnv = {
-    ...process.env,
+    ...Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([key]) => key.toUpperCase() !== COMMAND_OBSERVATION_CLOCK_ENV,
+      ),
+    ),
     TEMP: join(input.directory, "compiler"),
     TMP: join(input.directory, "compiler"),
+    // Never inherit a clock from a parent shell or a different command.
+    [COMMAND_OBSERVATION_CLOCK_ENV]: input.observationClock
+      ? JSON.stringify(CommandObservationClockSchema.parse(input.observationClock))
+      : "",
   };
   // PowerShell's policy gates the fixed compiler bootstrap as well as the user
   // script. The generated executable is private, absolute, and contains no user

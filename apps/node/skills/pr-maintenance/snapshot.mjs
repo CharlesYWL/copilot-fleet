@@ -85,6 +85,7 @@ export async function observe(input, options) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   await main(
     observe,
-    (result, input) => result.observation ?? toHostObservation(result, input),
+    (result, input, attemptedAt) =>
+      result.observation ?? toHostObservation(result, input, attemptedAt),
   );
 }

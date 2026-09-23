@@ -6,6 +6,9 @@ import {
   PR_MAINTENANCE_CADENCE_MS,
   PR_MAINTENANCE_RECOVERY_LIMITS,
   PR_MAINTENANCE_WAKE_LIMITS,
+  COMMAND_LIMITS,
+  CommandReceiptSchema,
+  commandDigestPayload,
   prMaintenanceObservationFresh,
   prMaintenanceProviderKey,
   isWritingCategory,
@@ -17,6 +20,8 @@ import {
   PrMaintenanceManualCommandSchema,
   PrMaintenanceManualOwnerSchema,
   PrMaintenanceOperatorActionSchema,
+  PrMaintenanceObservationSchema,
+  PrMaintenanceHelperSnapshotIdentitySchema,
   PrMaintenanceProposalSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceScanSchema,
@@ -34,6 +39,7 @@ import {
   type PrMaintenanceOperatorAction,
   type PrMaintenanceProposal,
   type PrMaintenanceRegistration,
+  type CommandExecution,
 } from "@fleet/protocol";
 import type { FleetStore } from "./store.js";
 import { notificationAttemptKey } from "./notifications/service.js";
@@ -293,6 +299,51 @@ export class PrMaintenanceStore {
     return proposal;
   }
 
+  private consumeProposal(taskId: string, approved = false): void {
+    const proposal = this.getProposal(taskId);
+    if (!proposal) return;
+    this.store.appendRunNote(
+      taskId,
+      this.store.getRun(taskId)!.phaseIndex,
+      JSON.stringify(proposal),
+      {
+        summary: approved
+          ? "Approved PR maintenance proposal; prerequisite evidence retained"
+          : proposal.registration.scope.publicationAuthorized
+            ? "Superseded repair proposal; not repair authorization"
+            : "Superseded legacy observation-only proposal; not repair authorization",
+        kind: "decision",
+        source: approved ? "operator" : "orchestrator",
+        sessionId: proposal.leadSessionId,
+      },
+    );
+    this.db.prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?").run(taskId);
+  }
+
+  private archiveAuthorization(record: PrMaintenanceRegistration) {
+    if (
+      record.authorization.eligibilityEvidence !== undefined &&
+      record.authorization.eligibilityEvidence !== record.eligibilityEvidence
+    )
+      refuse(
+        "eligibility_evidence_conflict",
+        "Record and grant prerequisite evidence disagree; reconcile them without discarding either before changing authorization.",
+      );
+    const previous = {
+      ...record.authorization,
+      // Old observation/initial grants used the record field. Do not assign lost
+      // prerequisites to an already-reauthorized historical repair grant.
+      eligibilityEvidence:
+        record.authorization.eligibilityEvidence ??
+        (!record.authorization.scope.publicationAuthorized ||
+        record.authorizationHistory.length === 0
+          ? record.eligibilityEvidence
+          : undefined),
+    };
+    record.authorizationHistory.push(previous);
+    return previous;
+  }
+
   propose(
     leadSessionId: string,
     input: z.input<typeof PrMaintenanceEnableSchema>,
@@ -390,14 +441,7 @@ export class PrMaintenanceStore {
         createdAt: previous?.createdAt ?? now,
         updatedAt: now,
       });
-      if (previous && !previous.registration.scope.publicationAuthorized)
-        this.store.appendRunNote(task.id, task.phaseIndex, JSON.stringify(previous), {
-          summary:
-            "Superseded legacy observation-only proposal; not repair authorization",
-          kind: "decision",
-          source: "orchestrator",
-          sessionId: leadSessionId,
-        });
+      this.consumeProposal(task.id);
       this.db
         .prepare(
           `INSERT INTO pr_maintenance_proposals(task_id,data) VALUES (?,?)
@@ -454,7 +498,8 @@ export class PrMaintenanceStore {
           refuse("stale_generation", "Prepare a new repair authorization proposal.");
         this.assertReauthorization(record, registration);
         const operatorId = actorSchema.parse(actorId);
-        record.authorizationHistory.push(record.authorization);
+        this.archiveAuthorization(record);
+        record.eligibilityEvidence = registration.eligibilityEvidence;
         record.authorization = {
           id: randomUUID(),
           operatorId,
@@ -462,18 +507,18 @@ export class PrMaintenanceStore {
           headSha: registration.headSha,
           scope: registration.scope,
           budgets: registration.budgets,
+          eligibilityEvidence: registration.eligibilityEvidence,
+          sourceProposal: { id: proposal.id, version: proposal.version },
         };
         // Reauthorization grants scope, not permission to resume old paused/finished work.
         if (record.lifecycle === "active")
           this.pause(record, "repair_authorized_requires_explicit_resume");
         else delete record.readyFingerprint;
         const saved = this.save(record);
-        this.db
-          .prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?")
-          .run(taskId);
+        this.consumeProposal(taskId, true);
         return saved;
       }
-      return this.enableFromOperator(registration, actorId);
+      return this.enable(registration, actorId, proposal);
     });
   }
 
@@ -752,6 +797,14 @@ export class PrMaintenanceStore {
     input: z.input<typeof PrMaintenanceEnableSchema>,
     actorId: string,
   ): PrMaintenanceRegistration {
+    return this.enable(input, actorId);
+  }
+
+  private enable(
+    input: z.input<typeof PrMaintenanceEnableSchema>,
+    actorId: string,
+    approvedProposal?: PrMaintenanceProposal,
+  ): PrMaintenanceRegistration {
     const parsed = PrMaintenanceEnableSchema.parse(input);
     const operatorId = actorSchema.parse(actorId);
     return this.store.writeAtomically(() => {
@@ -773,6 +826,8 @@ export class PrMaintenanceStore {
           previous.workerSessionId === parsed.workerSessionId &&
           previous.leadSessionId === lead.id &&
           sameIdentity(previous.identity, parsed.identity) &&
+          previous.authorization.headSha === parsed.headSha &&
+          previous.eligibilityEvidence === parsed.eligibilityEvidence &&
           isDeepStrictEqual(previous.authorization.scope, parsed.scope) &&
           isDeepStrictEqual(previous.authorization.budgets, parsed.budgets)
         )
@@ -848,6 +903,15 @@ export class PrMaintenanceStore {
           headSha: parsed.headSha,
           scope: parsed.scope,
           budgets: parsed.budgets,
+          eligibilityEvidence: parsed.eligibilityEvidence,
+          ...(approvedProposal
+            ? {
+                sourceProposal: {
+                  id: approvedProposal.id,
+                  version: approvedProposal.version,
+                },
+              }
+            : {}),
         },
         authorizationHistory: [],
         lifecycle: "active",
@@ -876,9 +940,7 @@ export class PrMaintenanceStore {
               : undefined);
       if (reason) this.pause(record, reason, now);
       const saved = this.write(record, true);
-      this.db
-        .prepare("DELETE FROM pr_maintenance_proposals WHERE task_id=?")
-        .run(task.id);
+      this.consumeProposal(task.id, Boolean(approvedProposal));
       return saved;
     });
   }
@@ -1404,7 +1466,7 @@ export class PrMaintenanceStore {
             "wait_for_human",
             "Direction for the pending proposal is required before renewal.",
           );
-        record.authorizationHistory.push(record.authorization);
+        const previous = this.archiveAuthorization(record);
         record.authorization = {
           id: randomUUID(),
           operatorId,
@@ -1412,6 +1474,8 @@ export class PrMaintenanceStore {
           headSha: record.observation?.headSha ?? record.authorization.headSha,
           scope: action.scope ?? record.authorization.scope,
           budgets: action.budgets ?? record.authorization.budgets,
+          eligibilityEvidence: previous.eligibilityEvidence,
+          sourceProposal: previous.sourceProposal,
         };
         record.counters = emptyCounters();
         record.findingAttempts = [];
@@ -1707,7 +1771,13 @@ export class PrMaintenanceStore {
           record.lastAttempt.snapshotId !== record.observation.snapshotId
         )
           return denied("stale_observation");
-        if (!prMaintenanceObservationFresh(record.observation))
+        if (
+          !prMaintenanceObservationFresh(
+            record.observation,
+            Date.now(),
+            record.observationHostAt,
+          )
+        )
           return denied("stale_observation");
         if (record.observation.draft) return denied("draft");
         if (record.observation.mergeability === "conflicting")
@@ -1920,7 +1990,11 @@ export class PrMaintenanceStore {
           record.lastAttempt.failure ||
           record.lastAttempt.headSha !== record.observation.headSha ||
           record.lastAttempt.snapshotId !== record.observation.snapshotId ||
-          !prMaintenanceObservationFresh(record.observation) ||
+          !prMaintenanceObservationFresh(
+            record.observation,
+            Date.now(),
+            record.observationHostAt,
+          ) ||
           record.observation.state !== "open" ||
           prepared.headSha !== record.observation.headSha
         )
@@ -2012,7 +2086,11 @@ export class PrMaintenanceStore {
           record.lastAttempt.failure ||
           record.lastAttempt.headSha !== record.observation.headSha ||
           record.lastAttempt.snapshotId !== record.observation.snapshotId ||
-          !prMaintenanceObservationFresh(record.observation) ||
+          !prMaintenanceObservationFresh(
+            record.observation,
+            Date.now(),
+            record.observationHostAt,
+          ) ||
           record.observation.draft ||
           record.observation.state !== "open" ||
           record.incidents.some((incident) => !incident.resolvedAt) ||
@@ -2290,7 +2368,8 @@ export class PrMaintenanceStore {
     if (
       !prMaintenanceObservationFresh(observation) ||
       Date.parse(observation.attemptedAt) < Date.parse(attempt.reservedAt) ||
-      (record.lastAttemptAt && observation.attemptedAt < record.lastAttemptAt)
+      ((record.lastAttemptLatestAt ?? record.lastAttemptAt) &&
+        observation.attemptedAt < (record.lastAttemptLatestAt ?? record.lastAttemptAt)!)
     )
       return reject("stale_or_future_evidence");
     if (!observation.identity || !sameIdentity(observation.identity, record.identity)) {
@@ -2325,24 +2404,35 @@ export class PrMaintenanceStore {
     observation: PrMaintenanceObservation,
     error = observationError(observation),
     alternate = false,
+    hostAttemptedAt = observation.attemptedAt,
+    hostLatestAt = hostAttemptedAt,
   ): void {
-    if (!prMaintenanceObservationFresh(observation))
+    if (!prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt))
       refuse(
         "stale_observation",
         "Observation evidence must be no more than 30 minutes old and cannot be future-dated.",
       );
-    if (record.lastAttemptAt && observation.attemptedAt < record.lastAttemptAt)
+    if (
+      (record.lastAttemptLatestAt ?? record.lastAttemptAt) &&
+      hostAttemptedAt < (record.lastAttemptLatestAt ?? record.lastAttemptAt)!
+    )
       refuse(
         "stale_observation",
         "An older observation cannot overwrite newer successful or incomplete evidence.",
       );
     const previous = record.lastAttempt;
     record.lastAttempt = observation;
-    record.lastAttemptAt = observation.attemptedAt;
+    record.lastAttemptAt = hostAttemptedAt;
+    if (hostLatestAt !== hostAttemptedAt) record.lastAttemptLatestAt = hostLatestAt;
+    else delete record.lastAttemptLatestAt;
     record.nextCheckAt = new Date(
       Math.max(
-        Date.parse(observation.attemptedAt) + PR_MAINTENANCE_CADENCE_MS,
-        observation.retryAfter ? Date.parse(observation.retryAfter) : 0,
+        Date.parse(hostLatestAt) + PR_MAINTENANCE_CADENCE_MS,
+        observation.retryAfter
+          ? Date.parse(observation.retryAfter) +
+              Date.parse(hostAttemptedAt) -
+              Date.parse(observation.attemptedAt)
+          : 0,
       ),
     ).toISOString();
     const code = helperError(observation)?.code;
@@ -2397,7 +2487,10 @@ export class PrMaintenanceStore {
       return;
     }
     record.observation = observation;
-    record.lastSuccessAt = observation.attemptedAt;
+    if (hostAttemptedAt !== observation.attemptedAt)
+      record.observationHostAt = hostAttemptedAt;
+    else delete record.observationHostAt;
+    record.lastSuccessAt = hostAttemptedAt;
     if (!alternate) {
       record.counters.consecutiveFailures = 0;
       record.counters.scanStalls = 0;
@@ -2426,13 +2519,16 @@ export class PrMaintenanceStore {
         }
       }
     }
-    if (this.recoveryAllowed(record) && prMaintenanceObservationFresh(observation)) {
+    if (
+      this.recoveryAllowed(record) &&
+      prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt)
+    ) {
       for (const incident of record.incidents) {
         if (
           incident.kind === "capability" &&
           !incident.resolvedAt &&
           observation.identity &&
-          Date.parse(observation.attemptedAt) >= Date.parse(incident.createdAt)
+          Date.parse(hostAttemptedAt) >= Date.parse(incident.createdAt)
         ) {
           incident.resolvedAt = nowIso();
           incident.resolution = alternate ? "alternate_observation" : "observation";
@@ -2458,13 +2554,13 @@ export class PrMaintenanceStore {
       (observation.state === "merged" || observation.state === "closed")
     ) {
       record.lifecycle = observation.state;
-      this.pause(record, "terminal_cancellation_requested", observation.attemptedAt);
+      this.pause(record, "terminal_cancellation_requested", hostAttemptedAt);
       if (record.decision?.state === "pending") {
         record.decision = {
           ...record.decision,
           state: "withdrawn",
           direction: `Moot after verified PR ${observation.state}; not approved or fixed.`,
-          resolvedAt: observation.attemptedAt,
+          resolvedAt: hostAttemptedAt,
         };
       }
     }
@@ -2850,7 +2946,11 @@ export class PrMaintenanceStore {
         "Lead actions require a complete current-HEAD observation.",
       );
     if (
-      !prMaintenanceObservationFresh(record.observation) ||
+      !prMaintenanceObservationFresh(
+        record.observation,
+        Date.now(),
+        record.observationHostAt,
+      ) ||
       record.observation?.draft ||
       record.observation?.mergeability === "conflicting" ||
       record.incidents.some((incident) => !incident.resolvedAt)
@@ -3035,6 +3135,7 @@ export class PrMaintenanceStore {
         requests: 0,
         milliseconds: 0,
         visitedIds: [],
+        observationClaims: [],
       };
       this.db
         .prepare("INSERT INTO pr_maintenance_wakes VALUES (?,?,?)")
@@ -3055,6 +3156,436 @@ export class PrMaintenanceStore {
         "Begin the existing authenticated lead wake before charging maintenance work.",
       );
     return PrMaintenanceWakeSchema.parse(JSON.parse(String(row.data)));
+  }
+
+  private saveWake(wake: z.infer<typeof PrMaintenanceWakeSchema>): void {
+    this.db
+      .prepare(
+        "UPDATE pr_maintenance_wakes SET data=? WHERE lead_session_id=? AND wake_id=?",
+      )
+      .run(
+        JSON.stringify(PrMaintenanceWakeSchema.parse(wake)),
+        wake.leadSessionId,
+        wake.wakeId,
+      );
+  }
+
+  private observationScope(record: PrMaintenanceRegistration): string {
+    return createHash("sha256")
+      .update(
+        JSON.stringify([
+          record.id,
+          record.generation,
+          record.identity,
+          record.authorization.id,
+          record.authorization.headSha,
+          record.renewedAt,
+          record.manualControl?.takenAt,
+          record.leadSessionId,
+          record.taskId,
+          record.workerSessionId,
+          record.placementId,
+          record.checkoutKey,
+          record.bindingGeneration,
+        ]),
+      )
+      .digest("hex");
+  }
+
+  reserveObservation(
+    leadSessionId: string,
+    wakeId: string,
+    recordId: string,
+    requests: number,
+  ) {
+    return this.store.writeAtomically(() => {
+      const record = this.required(recordId, leadSessionId);
+      const before = this.wake(leadSessionId, wakeId);
+      if (
+        !before.visitedIds.includes(recordId) ||
+        before.observationClaims.some((claim) => claim.recordId === recordId)
+      )
+        refuse(
+          "visit_required",
+          "Reserve observation once on the original claimed visit.",
+        );
+      this.chargeWake(leadSessionId, wakeId, { requests, milliseconds: 0 });
+      const wake = this.wake(leadSessionId, wakeId);
+      const claimedAt = nowIso();
+      const deadlineAt = new Date(
+        Math.min(
+          Date.parse(wake.startedAt) + PR_MAINTENANCE_WAKE_LIMITS.milliseconds,
+          Date.parse(claimedAt) +
+            this.remainingWake(leadSessionId, wakeId, claimedAt).milliseconds,
+        ),
+      ).toISOString();
+      wake.observationClaims.push({
+        recordId,
+        generation: record.generation,
+        recordVersion: record.version,
+        scopeKey: this.observationScope(record),
+        claimedAt,
+        deadlineAt,
+        requests,
+      });
+      this.saveWake(wake);
+      return { recordId, generation: record.generation, wakeId, deadlineAt };
+    });
+  }
+
+  private observationExecution(execution: CommandExecution) {
+    const ref = execution.maintenanceObservation;
+    if (!ref)
+      refuse(
+        "receipt_unbound",
+        "The execution was not bound to an observation reservation at creation.",
+      );
+    const record = this.required(ref.recordId, execution.leadSessionId);
+    const wake = this.wake(execution.leadSessionId, ref.wakeId);
+    const claim = wake.observationClaims.find((entry) => entry.recordId === record.id);
+    if (
+      !claim ||
+      claim.generation !== ref.generation ||
+      record.generation !== ref.generation ||
+      claim.scopeKey !== this.observationScope(record) ||
+      this.store.getRun(record.taskId)?.leadSessionId !== execution.leadSessionId ||
+      this.binding(record)
+    )
+      refuse(
+        "receipt_scope_changed",
+        "Observation reservation owner, generation, authorization or binding no longer matches.",
+      );
+    return { ref, record, wake, claim };
+  }
+
+  bindObservationExecution(execution: CommandExecution): void {
+    if (!execution.maintenanceObservation) return;
+    const { ref, record, wake, claim } = this.observationExecution(execution);
+    if (
+      execution.taskId ||
+      claim.executionId ||
+      this.store.getSessionDispatchAttempt(execution.leadSessionId)?.commandId !==
+        ref.wakeId ||
+      claim.recordVersion !== record.version
+    )
+      refuse(
+        "receipt_claim_conflict",
+        "Bind exactly one separate helper execution to the unchanged reservation in its original lead turn.",
+      );
+    claim.executionId = execution.id;
+    claim.attemptId = execution.attemptId;
+    this.saveWake(wake);
+    this.assertObservationExecution(execution);
+  }
+
+  assertObservationExecution(execution: CommandExecution): void {
+    if (!execution.maintenanceObservation) return;
+    const { record, claim } = this.observationExecution(execution);
+    if (claim.executionId !== execution.id || claim.attemptId !== execution.attemptId)
+      refuse(
+        "receipt_claim_conflict",
+        "This execution does not own the observation reservation.",
+      );
+    if (Date.now() >= Date.parse(claim.deadlineAt))
+      refuse(
+        "wake_exhausted",
+        "The original helper deadline expired; do not restart it on command creation or approval.",
+      );
+    this.assertAdmission({
+      action: "discover",
+      recordId: record.id,
+      leadSessionId: execution.leadSessionId,
+    });
+  }
+
+  observationBudget(execution: CommandExecution) {
+    const ref = execution.maintenanceObservation;
+    if (!ref) return undefined;
+    const claim = this.wake(execution.leadSessionId, ref.wakeId).observationClaims.find(
+      (entry) =>
+        entry.recordId === ref.recordId &&
+        entry.generation === ref.generation &&
+        entry.executionId === execution.id &&
+        entry.attemptId === execution.attemptId,
+    );
+    if (!claim)
+      refuse("receipt_claim_conflict", "Missing original command observation budget.");
+    return { deadlineAt: claim.deadlineAt, requests: claim.requests };
+  }
+
+  checkpointObservationReceipt(
+    leadSessionId: string,
+    recordId: string,
+    expectedVersion: number,
+    executionId: string,
+    input: PrMaintenanceObservation,
+  ): PrMaintenanceRegistration {
+    return this.store.writeAtomically(() => {
+      const execution = this.store.commands.get(executionId);
+      if (
+        !execution ||
+        execution.leadSessionId !== leadSessionId ||
+        execution.maintenanceObservation?.recordId !== recordId
+      )
+        refuse(
+          "receipt_owner",
+          "Use the owned execution bound to this exact observation reservation.",
+        );
+      const { record, claim, wake } = this.observationExecution(execution);
+      if (claim.executionId !== execution.id || claim.attemptId !== execution.attemptId)
+        refuse(
+          "receipt_claim_conflict",
+          "Execution/attempt does not match the persisted observation claim.",
+        );
+      if (execution.outputBytes > 1_048_576)
+        refuse("receipt_overflow", "Helper output exceeds 1 MiB.");
+      if (
+        !execution.approvedAt ||
+        !this.store.commands.preparationClock(execution.id)?.acceptedAt ||
+        !execution.descriptor ||
+        !execution.settledAt ||
+        execution.ownership !== "quiescent" ||
+        !execution.outcomeKnown ||
+        !execution.outputComplete ||
+        execution.gaps.length ||
+        execution.descendantCleanupForced ||
+        !["succeeded", "failed"].includes(execution.state) ||
+        ![0, 2].includes(execution.exitCode ?? -1)
+      )
+        refuse(
+          "receipt_incomplete",
+          "Require an approved, quiescent, known helper exit with complete bounded output and no gaps.",
+        );
+      const chunks: Buffer[] = [];
+      let sequence = 0;
+      let bytes = 0;
+      for (;;) {
+        const page = this.store.commands.page(
+          execution.id,
+          sequence,
+          COMMAND_LIMITS.pageBytes,
+        );
+        for (const event of page.events) {
+          if (event.sequence !== sequence + 1 || event.attemptId !== execution.attemptId)
+            refuse(
+              "receipt_incomplete",
+              "Output must be contiguous and belong to the original attempt.",
+            );
+          sequence = event.sequence;
+          const data = Buffer.from(event.data, "base64");
+          bytes += data.length;
+          if (bytes > 1_048_576)
+            refuse("receipt_overflow", "Helper output exceeds 1 MiB.");
+          if (event.stream === "stdout") chunks.push(data);
+        }
+        if (!page.hasMore) break;
+        if (!page.events.length) refuse("receipt_incomplete", "Output made no progress.");
+      }
+      if (sequence !== execution.finalOutputSeq)
+        refuse(
+          "receipt_incomplete",
+          "Output does not match the terminal receipt watermark.",
+        );
+      let json: unknown;
+      try {
+        json = JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
+        );
+      } catch (error) {
+        if (!(error instanceof SyntaxError) && !(error instanceof TypeError)) throw error;
+        refuse(
+          "receipt_invalid",
+          "Helper stdout must be one complete UTF-8 JSON result.",
+        );
+      }
+      const pending = [{ value: json, depth: 0 }];
+      while (pending.length) {
+        const { value, depth } = pending.pop()!;
+        if (depth > 32 || (Array.isArray(value) && value.length > 200))
+          refuse(
+            "receipt_overflow",
+            "Helper output exceeds the 200-item/32-depth bounds.",
+          );
+        if (value && typeof value === "object")
+          for (const child of Object.values(value))
+            pending.push({ value: child, depth: depth + 1 });
+      }
+      const parsed = z
+        .object({
+          schemaVersion: z.literal(1),
+          complete: z.boolean(),
+          requestsConsumed: z.number().int().nonnegative(),
+          elapsedMs: z.number().int().nonnegative(),
+          observation: z.unknown(),
+          error: z.unknown().optional(),
+          snapshot: z
+            .object({
+              generation: z.number().int().positive(),
+              identity: PrMaintenanceHelperSnapshotIdentitySchema,
+              headSha: PrMaintenanceObservationSchema.shape.headSha.unwrap(),
+              baseSha: PrMaintenanceObservationSchema.shape.baseSha.unwrap(),
+              state: PrMaintenanceObservationSchema.shape.state.unwrap(),
+              isDraft: z.boolean(),
+              actionableFingerprint:
+                PrMaintenanceObservationSchema.shape.fingerprint.unwrap(),
+            })
+            .optional(),
+        })
+        .safeParse(json);
+      if (!parsed.success)
+        refuse(
+          "receipt_invalid",
+          "Helper stdout does not match the version-1 result contract.",
+        );
+      const result = parsed.data;
+      const observation = PrMaintenanceObservationSchema.parse(input);
+      if (
+        !isDeepStrictEqual(result.observation, observation) ||
+        result.complete !== observation.complete ||
+        result.requestsConsumed !== observation.requestsConsumed ||
+        result.elapsedMs !== observation.elapsedMs ||
+        execution.exitCode !== (observation.complete ? 0 : 2) ||
+        (observation.complete && !result.snapshot) ||
+        (observation.complete && result.error !== undefined) ||
+        (!observation.complete && result.snapshot) ||
+        (!observation.complete &&
+          (!observation.failure ||
+            typeof helperError(observation)?.code !== "string" ||
+            !isDeepStrictEqual(result.error, helperError(observation)))) ||
+        (result.snapshot &&
+          (result.snapshot.generation !== claim.generation ||
+            !sameIdentity(result.snapshot.identity, record.identity) ||
+            result.snapshot.headSha !== observation.headSha ||
+            result.snapshot.baseSha !== observation.baseSha ||
+            result.snapshot.state !== observation.state ||
+            result.snapshot.isDraft !== observation.draft ||
+            result.snapshot.actionableFingerprint !== observation.snapshotId ||
+            result.snapshot.actionableFingerprint !== observation.fingerprint)) ||
+        (observation.identity && !sameIdentity(observation.identity, record.identity))
+      )
+        refuse(
+          "receipt_mismatch",
+          "Checkpoint must equal the exact helper observation in this execution's stdout.",
+        );
+      const proof = this.store.commands.preparationClock(execution.id)!;
+      const descriptor = execution.descriptor;
+      const prepared = descriptor.prepared;
+      const rawReceipt = this.store.commands.attempt(execution.id)?.receipt;
+      const receipt =
+        rawReceipt && CommandReceiptSchema.safeParse(JSON.parse(String(rawReceipt)));
+      if (
+        !receipt ||
+        !receipt.success ||
+        !receipt.data.settledAt ||
+        proof.elapsedMs === null ||
+        proof.elapsedMs < 0 ||
+        proof.elapsedMs > COMMAND_LIMITS.clockUncertaintyMs ||
+        proof.hostTime !== descriptor.hostTime ||
+        prepared.clockUncertaintyMs !== COMMAND_LIMITS.clockUncertaintyMs ||
+        Date.parse(prepared.preparedAt) + prepared.hostClockOffsetMs !==
+          Date.parse(proof.hostTime) ||
+        Date.parse(proof.acceptedAt!) < Date.parse(proof.hostTime) ||
+        Date.parse(proof.acceptedAt!) - Date.parse(proof.hostTime) >
+          COMMAND_LIMITS.clockUncertaintyMs ||
+        Date.parse(execution.approvedAt) < Date.parse(proof.acceptedAt!) ||
+        descriptor.observationBudget?.deadlineAt !== claim.deadlineAt ||
+        descriptor.observationBudget.requests !== claim.requests ||
+        createHash("sha256").update(commandDigestPayload(descriptor)).digest("hex") !==
+          descriptor.digest ||
+        receipt.data.digest !== descriptor.digest ||
+        receipt.data.attemptId !== execution.attemptId
+      )
+        refuse(
+          "receipt_clock",
+          "The original approved command clock proof is missing or inconsistent.",
+        );
+      const rawAttempted = Date.parse(observation.attemptedAt);
+      const rawFinished = rawAttempted + observation.elapsedMs;
+      const attempted = rawAttempted + prepared.hostClockOffsetMs;
+      const finished = attempted + observation.elapsedMs;
+      const uncertainty = prepared.clockUncertaintyMs + COMMAND_LIMITS.clockDriftMs;
+      const deadline = Date.parse(claim.deadlineAt);
+      const settled = Date.parse(execution.settledAt);
+      const late = finished + uncertainty > deadline;
+      const earliest = Math.max(
+        attempted - COMMAND_LIMITS.clockDriftMs,
+        Date.parse(claim.claimedAt),
+        Date.parse(execution.createdAt),
+        Date.parse(execution.approvedAt),
+      );
+      const latest = Math.min(attempted + uncertainty, settled, Date.now());
+      // An in-flight failure can finish late; the deadline still forbids new reads.
+      if (
+        observation.requestsConsumed > claim.requests ||
+        earliest > latest ||
+        rawAttempted < Date.parse(prepared.preparedAt) ||
+        (receipt.data.startedAt && rawAttempted < Date.parse(receipt.data.startedAt)) ||
+        rawFinished > Date.parse(receipt.data.settledAt!) ||
+        finished - COMMAND_LIMITS.clockDriftMs > settled ||
+        finished - COMMAND_LIMITS.clockDriftMs > Date.now() ||
+        attempted + uncertainty < Date.parse(execution.approvedAt) ||
+        Date.now() < Date.parse(proof.acceptedAt!) ||
+        (observation.requestsConsumed > 0 && attempted >= deadline) ||
+        (observation.complete && late)
+      )
+        refuse(
+          "receipt_allowance",
+          "Receipt usage/timing exceeds its original reservation; deadlines and charges never reset.",
+        );
+      const hash = this.observationKey(observation);
+      if (claim.receiptHash) {
+        if (claim.receiptHash !== hash)
+          refuse("receipt_conflict", "This claim already saved a different result.");
+        return record;
+      }
+      this.required(recordId, leadSessionId, expectedVersion);
+      const admission = this.admission({ action: "discover", recordId, leadSessionId });
+      const hostAttemptedAt = new Date(earliest).toISOString();
+      const hostLatestAt = new Date(latest).toISOString();
+      if (
+        (record.lastAttemptLatestAt ?? record.lastAttemptAt) &&
+        (record.lastAttemptLatestAt ?? record.lastAttemptAt)! >= hostAttemptedAt &&
+        !isDeepStrictEqual(record.lastAttempt, observation)
+      )
+        refuse(
+          "stale_observation",
+          "Old command evidence cannot overwrite a newer attempt.",
+        );
+      if (
+        !late &&
+        helperError(observation)?.code !== "clock_unverified" &&
+        admission.allowed &&
+        !prMaintenanceUnsettled(record) &&
+        prMaintenanceObservationFresh(observation, Date.now(), hostAttemptedAt)
+      ) {
+        this.observe(
+          record,
+          observation,
+          undefined,
+          false,
+          hostAttemptedAt,
+          hostLatestAt,
+        );
+        this.releaseTerminal(record);
+        if (
+          observation.complete &&
+          record.lifecycle === "active" &&
+          !record.ownershipReleasedAt
+        )
+          record.nextCheckAt = nowIso();
+      } else {
+        // Settling exact evidence cannot revive a hold or promote late/stale feedback.
+        record.lastAttempt = observation;
+        record.lastAttemptAt = hostAttemptedAt;
+        if (hostLatestAt !== hostAttemptedAt) record.lastAttemptLatestAt = hostLatestAt;
+        else delete record.lastAttemptLatestAt;
+        delete record.readyFingerprint;
+      }
+      const saved = this.save(record);
+      claim.receiptHash = hash;
+      this.saveWake(wake);
+      return saved;
+    });
   }
 
   remainingWake(leadSessionId: string, wakeId: string, at = nowIso()) {

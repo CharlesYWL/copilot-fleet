@@ -15,12 +15,15 @@ import {
   CommandTextSchema,
   RunCommandSchema,
   commandDigestPayload,
+  CommandObservationClockSchema,
+  commandObservationClock,
 } from "./command-execution.js";
 import {
   BrowserMessageSchema,
   HostToNodeMessageSchema,
   NodeToHostMessageSchema,
 } from "./index.js";
+import { PrMaintenanceWakeSchema } from "./pr-maintenance.js";
 
 const at = "2026-09-16T14:00:00.000Z";
 const request = {
@@ -62,6 +65,102 @@ const body = {
 };
 
 describe("remote command contracts", () => {
+  it("keeps F5 observation budgets Host-owned and immutable in the approval digest", () => {
+    const observationBudget = { deadlineAt: at, requests: 39 };
+    expect(RunCommandSchema.safeParse({ ...request, observationBudget }).success).toBe(
+      false,
+    );
+    expect(commandDigestPayload({ ...body, observationBudget })).not.toBe(
+      commandDigestPayload(body),
+    );
+    const descriptor = {
+      ...body,
+      observationBudget,
+      digest: "a".repeat(64),
+      maintenanceObservation: { recordId: "record", generation: 1, wakeId: "turn" },
+      prepared: {
+        ...body.prepared,
+        clockUncertaintyMs: COMMAND_LIMITS.clockUncertaintyMs,
+      },
+    };
+    const context = commandObservationClock(descriptor, at, "10")!;
+    expect(
+      CommandObservationClockSchema.safeParse({ ...context, hostClockOffsetMs: 1 })
+        .success,
+    ).toBe(false);
+    expect(
+      CommandObservationClockSchema.safeParse({ ...context, clockUncertaintyMs: 0 })
+        .success,
+    ).toBe(false);
+    expect(
+      CommandObservationClockSchema.safeParse({
+        ...context,
+        nodeTime: "2026-09-16T14:01:00.000Z",
+      }).success,
+    ).toBe(false);
+    expect(
+      CommandObservationClockSchema.safeParse({ ...context, extra: "PR text" }).success,
+    ).toBe(false);
+  });
+  it("reads legacy wakes without manufacturing an execution receipt association", () => {
+    const legacy = {
+      leadSessionId: "lead",
+      wakeId: "old-turn",
+      startedAt: at,
+      visits: 1,
+      requests: 39,
+      milliseconds: 0,
+      visitedIds: ["record"],
+    };
+    expect(PrMaintenanceWakeSchema.parse(legacy)).toEqual({
+      ...legacy,
+      observationClaims: [],
+    });
+    const claim = {
+      recordId: "record",
+      generation: 1,
+      recordVersion: 1,
+      scopeKey: "a".repeat(64),
+      claimedAt: at,
+      deadlineAt: at,
+      requests: 39,
+    };
+    expect(
+      PrMaintenanceWakeSchema.safeParse({
+        ...legacy,
+        observationClaims: Array(6).fill(claim),
+      }).success,
+    ).toBe(false);
+  });
+
+  it("binds optional maintenance observation correlation into the approved command digest", () => {
+    const maintenanceObservation = {
+      recordId: "record",
+      generation: 1,
+      wakeId: "original-turn",
+    };
+    expect(
+      RunCommandSchema.parse({ ...request, maintenanceObservation })
+        .maintenanceObservation,
+    ).toEqual(maintenanceObservation);
+    expect(RunCommandSchema.parse(request).maintenanceObservation).toBeUndefined();
+    expect(commandDigestPayload({ ...body, maintenanceObservation })).not.toBe(
+      commandDigestPayload(body),
+    );
+    expect(
+      commandDigestPayload({
+        ...body,
+        maintenanceObservation: { ...maintenanceObservation, generation: 2 },
+      }),
+    ).not.toBe(commandDigestPayload({ ...body, maintenanceObservation }));
+    expect(
+      RunCommandSchema.safeParse({
+        ...request,
+        maintenanceObservation: { ...maintenanceObservation, deadlineAt: at },
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts approval metadata in detail and live updates while an old browser schema reproduces the reported error", () => {
     const execution = CommandExecutionSchema.parse({
       ...request,

@@ -1876,6 +1876,25 @@ clearing decisions or replaying work, and leaves the job paused until explicit
 Resume. Old proposals cannot be authorized as-is. Terminal and released history
 is not revived; manual supervisor control remains separate.
 
+Each newly issued grant retains its prerequisite `eligibilityEvidence`; grants
+approved from a proposal also retain its `sourceProposal` ID/version. The containing
+registration binds current and historical grants to its immutable PR identity,
+worker/checkout and generation. Reauthorization updates the current record evidence
+and archives the old grant with its evidence; renewal carries the same prerequisite
+basis without treating it as new provider proof. Every consumed or superseded proposal,
+including one displaced by authenticated direct enable, is archived once verbatim in
+task decision history in the same transaction. Direct enable approves its explicit
+registration, not any displaced proposal. Retries do not duplicate archives; changed
+HEAD or prerequisite evidence is not an idempotent enable request.
+
+These optional grant fields preserve readability of older records/backups without
+fabricating missing evidence. Evidence already lost by an older reauthorization
+cannot be reconstructed: existing record-level text remains historical, not proof of
+that later grant. The existing 8,192-character evidence, 100-entry authorization
+history and 2 MiB record limits still apply; overflow refuses the transaction rather
+than dropping history. Restart and portable restore retain the evidence and archives
+without resuming maintenance.
+
 Azure DevOps is a first-class provider: the same panel, registry, worker, approvals
 and wake budgets retain organization/project/repository GUIDs and exact refs.
 The Node packages its own provider router and ADO guidance; no personal skill or
@@ -1897,6 +1916,42 @@ reminders; this is best-effort observation, not a separate observer or an exact
 30-minute SLA. Unchanged feedback needs no new worker repair turn. Ready remains
 nonterminal: this release never merges, force-pushes, automatically rebases, or
 starts extra reviewer sessions.
+
+**Asynchronous helper receipts:** claim a due visit, then immediately dispatch the
+finite helper command on a separate authorized placement with returned
+`observationClaim` as `maintenanceObservation`. Keep the returned absolute deadline;
+normal command approval still applies. On the automatic completion wake (a new lead
+turn), read all raw execution output pages and checkpoint the exact
+`result.observation` with `executionId` and the current record version. The Host binds
+the original owner/record/generation/grant/binding/claim to one execution and attempt,
+and verifies its approved, complete persisted stdout. See the
+[handoff contract](apps/node/skills/pr-maintenance/helper-contract.md#durable-evidence-handoff).
+
+The original Host deadline is also bound into the approved command descriptor.
+Node injects its existing preparation-clock proof into the packaged helper;
+both providers reserve the established uncertainty/drift bounds and check
+monotonic progress before reads. Constant Node clock offsets do not extend the
+120-second window. Raw helper timestamps stay unchanged; bounded Host-derived
+attempt times drive receipt comparisons, freshness, ordering and UI expiry.
+This requires the paired updated Host/Node/helper; callers must not supply
+offsets or reset the deadline at launch. Older missing clock context is not
+silently treated as synchronized or granted retroactive receipt authority.
+
+These bounded claim references live in existing wake records (at most five per wake);
+they add no duplicated observation blob or new execution authority. Older wakes
+default to no receipt association, and old unbound commands cannot be attached
+retroactively. Same-database restart preserves associations; portable restore keeps
+evidence but quarantines admission. The original reservation stays charged, including
+zero-operation and bounded in-flight failures after deadline. Receipt admission does not reset 5-PR/40-request/
+120-second limits or authorize a repair: actions need a current live allowance.
+Late incomplete, stale or same-scope held/released evidence is attempt-only: it cannot
+promote findings/readiness or revive maintenance. Complete scans finishing beyond
+the original deadline are refused; no timeout grace or new-read permission is added.
+Ownership/grant/binding/generation and human-hold fences still protect actions.
+Native GitHub snapshot identity is strictly adapted to shared observation identity,
+not parsed as if the two formats were identical; both providers' pins and snapshot
+generation/HEAD/base/state/fingerprint must agree. Existing output retention and 1 MiB helper/2 MiB record
+bounds remain; old strict binaries may reject the new optional correlation fields.
 
 ![PR maintenance repair loop: human authorization is saved in the Host database; existing lead wakes recover the record, read provider evidence through a bounded helper, dispatch local repairs to the original worker, and reconcile the results.](docs/pr-maintenance-repair-loop.png)
 

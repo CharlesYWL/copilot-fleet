@@ -14,6 +14,90 @@ const input = {
 };
 
 describe("packaged PR provider router", () => {
+  it.each([
+    { file: "github-snapshot.mjs", ado: false },
+    { file: "snapshot.mjs", ado: false },
+    { file: "ado-snapshot.mjs", ado: true },
+    { file: "snapshot.mjs", ado: true },
+  ])(
+    "uses F5 runtime clock in the actual $file entrypoint (ADO=$ado) without provider I/O",
+    ({ file, ado }) => {
+      const host = Date.parse("2026-09-23T00:00:00.000Z");
+      const nodeOffset = -60_000;
+      const nodeNow = host + 150_000 + nodeOffset;
+      const path = join(packageRoot(), "skills", "pr-maintenance", file);
+      const context = {
+        executionId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        attemptId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        digest: "a".repeat(64),
+        claim: { recordId: "record", generation: 1, wakeId: "original" },
+        budget: { deadlineAt: new Date(host + 120_000).toISOString(), requests: 39 },
+        hostTime: new Date(host).toISOString(),
+        preparedAt: new Date(host + nodeOffset).toISOString(),
+        nodeTime: new Date(host + nodeOffset).toISOString(),
+        hostClockOffsetMs: -nodeOffset,
+        clockUncertaintyMs: 5_000,
+        monotonicNs: "0",
+      };
+      const cli = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "--eval",
+          `
+      import child from "node:child_process";
+      import https from "node:https";
+      import { syncBuiltinESMExports } from "node:module";
+      child.spawn = https.get = () => { throw new Error("Provider I/O is forbidden in this fixture."); };
+      syncBuiltinESMExports();
+      const NativeDate = Date;
+      globalThis.Date = class extends NativeDate {
+        constructor(...args) { super(...(args.length ? args : [${nodeNow}])); }
+        static now() { return ${nodeNow}; }
+      };
+      process.hrtime.bigint = () => 150000000000n;
+      process.argv[1] = ${JSON.stringify(path)};
+      await import(${JSON.stringify(pathToFileURL(path).href)});
+    `,
+        ],
+        {
+          input: JSON.stringify({
+            schemaVersion: 1,
+            generation: 1,
+            pr: ado
+              ? {
+                  provider: "azure-devops",
+                  host: "dev.azure.com",
+                  organization: "sample-org",
+                  project: "Sample",
+                  repo: "Repo",
+                  number: 17,
+                }
+              : { host: "github.com", owner: "sample", repo: "repo", number: 7 },
+            budget: {
+              maxRequests: 39,
+              maxBytes: 1_048_576,
+              deadlineAt: context.budget.deadlineAt,
+            },
+          }),
+          env: { ...process.env, FLEET_MAINTENANCE_CLOCK: JSON.stringify(context) },
+          encoding: "utf8",
+          timeout: 10_000,
+          maxBuffer: 1_048_576,
+        },
+      );
+      expect(cli.error).toBeUndefined();
+      expect(cli.status, cli.stderr).toBe(2);
+      expect(JSON.parse(cli.stdout)).toMatchObject({
+        complete: false,
+        requestsConsumed: 0,
+        elapsedMs: 0,
+        error: { code: "deadline_exhausted" },
+        observation: { attemptedAt: new Date(nodeNow).toISOString(), complete: false },
+      });
+    },
+  );
+
   it("routes canonical/legacy ADO URLs and retains exact pins", () => {
     expect(
       providerInput({
