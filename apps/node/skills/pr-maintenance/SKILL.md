@@ -322,9 +322,11 @@ cannot be overwritten. Report the sanitized helper error and the operational
 action needed; a later design decision still requires the normal observed-HEAD
 path and authenticated direction. Eligible completed or failed tasks move directly
 into blocked review without reopening work, including when authentication,
-permission, or operator pauses remain in force. The run transition, review note,
-and notification commit together; browser publications wait for the outermost
-transaction to commit and are discarded if it rolls back.
+permission, or operator pauses remain in force. Operational review owns its
+outermost transaction: registration and eligibility checks, the run transition,
+review note, and notification are atomic. Browser publication follows its commit;
+a rollback publishes nothing. Operational review cannot be nested in another
+write transaction.
 
 ## Independent obligations, not a comment counter
 

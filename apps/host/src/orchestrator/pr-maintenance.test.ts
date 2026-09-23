@@ -7,6 +7,7 @@ import { OrchestratorEngine } from "./engine.js";
 import { FleetTools, GetPrMaintenanceSchema, SetPrMaintenanceSchema } from "./tools.js";
 import { LeadTokens } from "./lead-tokens.js";
 import { MCP_PATH, mcpRoutes } from "./mcp-routes.js";
+import { SessionCleanupPendingError } from "../store.js";
 
 describe("PR maintenance orchestration", () => {
   let world: ReturnType<typeof fleet>;
@@ -359,7 +360,8 @@ describe("PR maintenance orchestration", () => {
 
   it("refuses stale, stopped and pending-decision operational escalation without changing holds", () => {
     const { record, run } = setup(false, "azure-devops", false);
-    const review = vi.spyOn(world.service, "requestRunReview");
+    const notes = world.store.listRunNotes(run.id);
+    const broadcast = vi.spyOn(world.service, "broadcast");
     expect(
       tools.escalate({
         task: run.id,
@@ -398,21 +400,36 @@ describe("PR maintenance orchestration", () => {
       }).ok,
     ).toBe(false);
     expect(world.store.prMaintenance.get(record.id)).toEqual(held);
-    expect(review).not.toHaveBeenCalled();
+    expect(world.store.listRunNotes(run.id)).toEqual(notes);
+    expect(world.store.notificationUnreadCount()).toBe(0);
+    expect(broadcast).not.toHaveBeenCalled();
   });
 
-  it("leaves the terminal task unchanged when operational review cannot be recorded", () => {
+  it("requires operational review to own its outermost transaction", () => {
     const { record, run } = setup(false, "azure-devops", false);
     world.store.updateRun(run.id, { state: "completed" });
-    vi.spyOn(world.service, "requestRunReview").mockReturnValue(undefined);
-    expect(
-      tools.escalate({
-        task: run.id,
-        reason: "The helper cannot collect a complete observation.",
-      }).ok,
-    ).toBe(false);
-    expect(world.store.getRun(run.id)!.state).toBe("completed");
+    const before = world.store.getRun(run.id);
+    const notes = world.store.listRunNotes(run.id);
+    const broadcast = vi.spyOn(world.service, "broadcast");
+    world.store.writeAtomically(() => {
+      expect(() =>
+        world.service.requestRunReview({
+          runId: run.id,
+          note: "Nested operational review must not publish before commit.",
+          reason: "blocked",
+          operationalMaintenance: {
+            recordId: record.id,
+            leadSessionId: world.leadId,
+            expectedVersion: record.version,
+          },
+        }),
+      ).toThrow("Operational maintenance review must own the outermost transaction.");
+    });
+    expect(world.store.getRun(run.id)).toEqual(before);
+    expect(world.store.listRunNotes(run.id)).toEqual(notes);
+    expect(world.store.getNotificationBySourceKey(`review:${run.id}:1`)).toBeUndefined();
     expect(world.store.prMaintenance.get(record.id)).toEqual(record);
+    expect(broadcast).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -422,7 +439,9 @@ describe("PR maintenance orchestration", () => {
     "stale",
     "released",
     "pending",
+    "pending-review",
     "cancelled",
+    "nonmutable",
     "completed-review",
   ] as const)(
     "guards the store review-only transition against %s requests",
@@ -451,12 +470,22 @@ describe("PR maintenance orchestration", () => {
         );
       else
         world.store.updateRun(run.id, {
-          state: invalid === "cancelled" ? "cancelled" : "completed",
+          state:
+            invalid === "cancelled"
+              ? "cancelled"
+              : invalid === "pending-review"
+                ? "awaiting_human"
+                : "completed",
+        });
+      if (invalid === "nonmutable")
+        vi.spyOn(world.store, "assertRunMutable").mockImplementation(() => {
+          throw new SessionCleanupPendingError();
         });
       const retained = world.store.prMaintenance.get(record.id)!;
       const before = world.store.getRun(run.id);
       const notes = world.store.listRunNotes(run.id);
       const broadcast = vi.spyOn(world.service, "broadcast");
+      const exec = vi.spyOn(DatabaseSync.prototype, "exec");
       expect(() =>
         world.service.requestRunReview({
           runId: invalid === "wrong-task" ? "another-task" : run.id,
@@ -469,6 +498,10 @@ describe("PR maintenance orchestration", () => {
           },
         }),
       ).toThrow();
+      expect(exec.mock.calls.map(([sql]) => sql)).toEqual([
+        "BEGIN IMMEDIATE",
+        "ROLLBACK",
+      ]);
       expect(world.store.getRun(run.id)).toEqual(before);
       expect(world.store.listRunNotes(run.id)).toEqual(notes);
       expect(
@@ -479,18 +512,29 @@ describe("PR maintenance orchestration", () => {
     },
   );
 
-  it("publishes no operational review when the real outer SQLite COMMIT fails", () => {
+  it("publishes no operational review when its own outermost SQLite COMMIT fails", () => {
     const { record, run } = setup(false, "azure-devops", false);
     world.store.updateRun(run.id, { state: "completed" });
     const before = world.store.getRun(run.id);
     const notes = world.store.listRunNotes(run.id);
     const broadcast = vi.spyOn(world.service, "broadcast");
     const exec = DatabaseSync.prototype.exec;
+    const boundaries: string[] = [];
+    const admissionBoundaries: string[][] = [];
+    const assertOperationalReview =
+      world.store.prMaintenance.assertOperationalReview.bind(world.store.prMaintenance);
+    vi.spyOn(world.store.prMaintenance, "assertOperationalReview").mockImplementation(
+      (...args) => {
+        admissionBoundaries.push([...boundaries]);
+        return assertOperationalReview(...args);
+      },
+    );
     let commits = 0;
     vi.spyOn(DatabaseSync.prototype, "exec").mockImplementation(function (
       this: DatabaseSync,
       sql,
     ) {
+      boundaries.push(sql);
       if (sql === "COMMIT") {
         commits += 1;
         expect(world.store.getRun(run.id)).toMatchObject({
@@ -501,6 +545,8 @@ describe("PR maintenance orchestration", () => {
         expect(
           world.store.getNotificationBySourceKey(`review:${run.id}:1`),
         ).toBeDefined();
+        expect(world.store.prMaintenance.get(record.id)).toEqual(record);
+        expect(broadcast).not.toHaveBeenCalled();
         exec.call(
           this,
           "CREATE TABLE review_commit_failure (run_id TEXT REFERENCES runs(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO review_commit_failure VALUES ('missing-run')",
@@ -515,6 +561,8 @@ describe("PR maintenance orchestration", () => {
       }),
     ).toThrow("FOREIGN KEY constraint failed");
     expect(commits).toBe(1);
+    expect(boundaries).toEqual(["BEGIN IMMEDIATE", "COMMIT", "ROLLBACK"]);
+    expect(admissionBoundaries).toEqual([["BEGIN IMMEDIATE"]]);
     expect(world.store.getRun(run.id)).toEqual(before);
     expect(world.store.listRunNotes(run.id)).toEqual(notes);
     expect(world.store.getNotificationBySourceKey(`review:${run.id}:1`)).toBeUndefined();

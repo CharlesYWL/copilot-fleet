@@ -458,7 +458,6 @@ export class FleetStore {
   readonly prMaintenance: PrMaintenanceStore;
   readonly artifactDirectory: string;
   private transactionDepth = 0;
-  private commitPublications: (() => void)[] = [];
   private restoringBackup = false;
   /**
    * Compiling the same SQL on every call showed up on the hot path: a node
@@ -1068,14 +1067,12 @@ export class FleetStore {
   /** Groups related writes so a crash cannot leave half of them applied. */
   private transaction<T>(work: () => T): T {
     const depth = this.transactionDepth;
-    const publicationStart = this.commitPublications.length;
     const savepoint = `fleet_store_${depth}`;
     if (depth === 0) this.db.exec("BEGIN IMMEDIATE");
     else this.db.exec(`SAVEPOINT ${savepoint}`);
     this.transactionDepth = depth + 1;
-    let result: T;
     try {
-      result = work();
+      const result = work();
       if (
         typeof result === "object" &&
         result !== null &&
@@ -1086,8 +1083,8 @@ export class FleetStore {
       }
       if (depth === 0) this.db.exec("COMMIT");
       else this.db.exec(`RELEASE ${savepoint}`);
+      return result;
     } catch (error) {
-      this.commitPublications.length = publicationStart;
       if (depth === 0) {
         this.db.exec("ROLLBACK");
       } else {
@@ -1098,13 +1095,6 @@ export class FleetStore {
     } finally {
       this.transactionDepth = depth;
     }
-    if (depth === 0) {
-      const publications = this.commitPublications;
-      this.commitPublications = [];
-      // Publication failures cannot roll back an already committed transaction.
-      for (const publish of publications) publish();
-    }
-    return result;
   }
 
   /** Avoids an unnecessary savepoint when a caller already owns the transaction. */
@@ -1115,17 +1105,11 @@ export class FleetStore {
   /**
    * Commits cross-domain store writes as one unit.
    *
-   * @internal Network publication must use afterCommit so nested writes cannot
-   * publish before the outer transaction commits.
+   * @internal Callbacks must only use FleetStore methods. Network publication
+   * belongs after this method returns.
    */
   writeAtomically<T>(work: () => T): T {
     return this.transaction(work);
-  }
-
-  /** Discards publications on rollback, including a rolled-back savepoint. */
-  afterCommit(publish: () => void): void {
-    if (this.transactionDepth > 0) this.commitPublications.push(publish);
-    else publish();
   }
 
   getSetting(key: string): string | undefined {
@@ -5166,8 +5150,13 @@ export class FleetStore {
     id: string,
     write?: AdvanceRunToReviewWrite,
   ): Run | AdvanceRunToReviewResult | undefined {
-    this.assertCommandVerification(id);
+    if (write?.operationalMaintenance && this.transactionDepth > 0)
+      throw new PrMaintenanceError(
+        "review_conflict",
+        "Operational maintenance review must own the outermost transaction.",
+      );
     return this.transaction(() => {
+      this.assertCommandVerification(id);
       const current = this.getRun(id);
       if (write?.operationalMaintenance)
         this.prMaintenance.assertOperationalReview(id, write.operationalMaintenance);

@@ -69,49 +69,6 @@ function notificationInput(
 }
 
 describe("FleetStore", () => {
-  it("keeps publications scoped to successful outer commits and nested savepoints", () => {
-    const { store } = setup();
-    const published: string[] = [];
-    store.afterCommit(() => published.push("outside"));
-    store.writeAtomically(() => {
-      store.afterCommit(() => published.push("outer"));
-      expect(() =>
-        store.writeAtomically(() => {
-          store.afterCommit(() => published.push("discarded"));
-          throw new Error("rollback");
-        }),
-      ).toThrow("rollback");
-      store.writeAtomically(() => store.afterCommit(() => published.push("nested")));
-      expect(published).toEqual(["outside"]);
-    });
-    expect(published).toEqual(["outside", "outer", "nested"]);
-    expect(() =>
-      store.writeAtomically(() => {
-        store.writeAtomically(() => store.afterCommit(() => published.push("lost")));
-        throw new Error("outer rollback");
-      }),
-    ).toThrow("outer rollback");
-    store.writeAtomically(() => store.afterCommit(() => published.push("next")));
-    expect(published).toEqual(["outside", "outer", "nested", "next"]);
-  });
-
-  it("surfaces publication errors without rolling back committed writes or poisoning the next transaction", () => {
-    const { store } = setup();
-    expect(() =>
-      store.writeAtomically(() => {
-        store.setSetting("committed", "yes");
-        store.afterCommit(() => {
-          store.writeAtomically(() => store.setSetting("published", "yes"));
-          throw new Error("publisher failed");
-        });
-      }),
-    ).toThrow("publisher failed");
-    expect(store.getSetting("committed")).toBe("yes");
-    expect(store.getSetting("published")).toBe("yes");
-    store.writeAtomically(() => store.setSetting("next", "yes"));
-    expect(store.getSetting("next")).toBe("yes");
-  });
-
   it.each(["completed", "failed", "cancelled"] as const)(
     "does not admit ordinary review from a %s task",
     (state) => {
