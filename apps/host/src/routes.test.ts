@@ -272,6 +272,7 @@ describe("host routes", () => {
         maxPerNode: 32,
         freeSpaceFloorBytes: 1_073_741_824,
         byteBudget: 10_737_418_240,
+        cleanupIgnoredOnly: false,
       },
     };
     expect(await read()).toEqual({

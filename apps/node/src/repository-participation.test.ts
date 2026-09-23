@@ -134,6 +134,8 @@ describe("shared cross-installation participation", () => {
       sessions.leases[0]!.release();
     }
   });
+  // Even after removing six redundant probes, 13 real Git processes take about
+  // five seconds on Windows. This is not an in-memory participation unit test.
   it("rejects a second installation targeting the shared Git metadata directory or its alias", async () => {
     const f = await repository();
     await new GitRunner().run(f.target.cwd, ["-c", "init.templateDir=", "init"]);
@@ -143,7 +145,6 @@ describe("shared cross-installation participation", () => {
     expect(target.repository.key).toBe(
       (await canonicalPath(f.target.repository.path)).key,
     );
-    await first.activate([f.target.cwd], true);
     const shared = await first.participate([f.target.cwd], "installation-one-session");
     const alias = join(f.directory, "metadata-alias");
     symlinkSync(
@@ -169,24 +170,19 @@ describe("shared cross-installation participation", () => {
         ),
       ).toBe(true);
       await expect(
-        second.acquire(
-          [await second.resolve(f.target.cwd)],
-          "installation-two-command",
-          "exclusive",
-          true,
-        ),
+        second.acquire([target], "installation-two-command", "exclusive", true),
       ).rejects.toThrow("participation");
     } finally {
       for (const lease of shared.leases) lease.release();
     }
     const exclusive = await second.acquire(
-      [await second.resolve(f.target.cwd)],
+      [target],
       "installation-two-command",
       "exclusive",
       true,
     );
     for (const lease of exclusive) lease.release();
-  });
+  }, 15_000);
 
   it("automatically tracks unbound/read-only aliases and excludes commands in both directions", async () => {
     const f = await repository();
