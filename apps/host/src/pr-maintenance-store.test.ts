@@ -4,12 +4,19 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  COMMAND_LIMITS,
+  CommandExecutionSchema,
+  CommandReceiptSchema,
+  PreparedCommandSchema,
+  commandDigestPayload,
+  PrMaintenanceObservationSchema,
   PrMaintenanceEnableSchema,
   PrMaintenanceManualCommandSchema,
   HostBackupSchema,
   PR_MAINTENANCE_RECOVERY_LIMITS,
   prMaintenanceProgress,
   type PrMaintenanceCheckpoint,
+  type PrMaintenanceObservation,
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import { FleetStore } from "./store.js";
@@ -66,6 +73,304 @@ const adoIdentity = {
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(at);
+});
+
+describe("prepared maintenance observation recovery", () => {
+  function receipt(
+    f: ReturnType<typeof setup>,
+    record: PrMaintenanceRegistration,
+    overrides: Partial<PrMaintenanceObservation> = {},
+  ) {
+    const now = new Date().toISOString();
+    const nodeTime = new Date(Date.now() + 10_000).toISOString();
+    const wakeId = randomUUID();
+    f.store.setSessionDispatchAttempt(f.lead.id, {
+      commandId: wakeId,
+      eventSeqFrom: 0,
+      attempt: wakeId,
+    });
+    f.store.prMaintenance.beginWake(f.lead.id, wakeId);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, wakeId)?.id).toBe(record.id);
+    const { deadlineAt, ...maintenanceObservation } =
+      f.store.prMaintenance.reserveObservation(f.lead.id, wakeId, record.id, 8);
+    let execution = CommandExecutionSchema.parse({
+      id: randomUUID(),
+      attemptId: randomUUID(),
+      version: 0,
+      hostId: "test-host",
+      nodeId: f.node.id,
+      nodeName: f.node.name,
+      leadSessionId: f.lead.id,
+      target: { placementId: f.placement.id },
+      requestedPath: f.placement.localPath,
+      command: "node snapshot.mjs",
+      shell: "windows-powershell-5.1",
+      reason: "Fresh complete PR observation",
+      requestKey: randomUUID(),
+      requestDigest: "a".repeat(64),
+      maintenanceObservation,
+      state: "running",
+      ownership: "active",
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: deadlineAt,
+      approvedAt: now,
+    });
+    const physical = {
+      key: "checkout",
+      path: f.placement.localPath,
+      machineId: "test-machine",
+      volume: "test-volume",
+      fileId: "test-file",
+    };
+    const descriptor = PreparedCommandSchema.strip().parse({
+      ...execution,
+      executionId: execution.id,
+      hostTime: now,
+      observationBudget: { deadlineAt, requests: 8 },
+      prepared: {
+        cwd: f.placement.localPath,
+        checkout: physical,
+        repository: physical,
+        shellPath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        admissionVersion: 1,
+        preparedAt: nodeTime,
+        hostClockOffsetMs: -10_000,
+        clockUncertaintyMs: COMMAND_LIMITS.clockUncertaintyMs,
+      },
+      digest: "a".repeat(64),
+    });
+    descriptor.digest = createHash("sha256")
+      .update(commandDigestPayload(descriptor))
+      .digest("hex");
+    execution.descriptor = descriptor;
+    f.store.commands.insert(execution);
+    f.store.prMaintenance.bindObservationExecution(execution);
+    f.store.commands.recordPreparationSend(execution.id, now);
+    f.store.commands.acceptPreparationClock(execution.id, now, now, 0);
+    f.store.commands.markStart(execution);
+    const observation = PrMaintenanceObservationSchema.parse({
+      ...record.observation,
+      attemptedAt: nodeTime,
+      snapshotId: `snapshot-${wakeId}`,
+      fingerprint: `snapshot-${wakeId}`,
+      draft: false,
+      requestsConsumed: 1,
+      elapsedMs: 100,
+      ...overrides,
+    });
+    const { prNumber, ...snapshotIdentity } = record.identity;
+    const output = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 1,
+        complete: true,
+        requestsConsumed: observation.requestsConsumed,
+        elapsedMs: observation.elapsedMs,
+        observation,
+        snapshot: {
+          generation: record.generation,
+          identity: {
+            ...snapshotIdentity,
+            number: prNumber,
+            prId: "PR_MAIN",
+            url: `https://${record.identity.host}/${record.identity.repository}/pull/${prNumber}`,
+          },
+          headSha: observation.headSha,
+          baseSha: observation.baseSha,
+          state: observation.state,
+          isDraft: observation.draft,
+          actionableFingerprint: observation.snapshotId,
+        },
+      }),
+    );
+    execution = f.store.commands.appendOutput(execution, {
+      executionId: execution.id,
+      attemptId: execution.attemptId,
+      sequence: 1,
+      stream: "stdout",
+      data: output.toString("base64"),
+      at: nodeTime,
+    }).execution;
+    vi.setSystemTime(Date.now() + 100);
+    f.store.commands.recordReceipt(
+      execution.id,
+      JSON.stringify(
+        CommandReceiptSchema.parse({
+          executionId: execution.id,
+          attemptId: execution.attemptId,
+          digest: descriptor.digest,
+          state: "succeeded",
+          ownership: "quiescent",
+          exitCode: 0,
+          reason: "completed",
+          outcomeKnown: true,
+          descendantCleanupForced: false,
+          settledAt: new Date(Date.parse(nodeTime) + 100).toISOString(),
+          finalOutputSeq: 1,
+          gaps: [],
+        }),
+      ),
+    );
+    f.store.commands.update(execution.id, execution.version, {
+      state: "succeeded",
+      ownership: "quiescent",
+      exitCode: 0,
+      outcomeKnown: true,
+      outputComplete: true,
+      finalOutputSeq: 1,
+      settledAt: new Date().toISOString(),
+    });
+    const saved = f.store.prMaintenance.checkpointObservationReceipt(
+      f.lead.id,
+      record.id,
+      record.version,
+      execution.id,
+      observation,
+    );
+    return { saved, observation, hostAt: now };
+  }
+
+  function agedPreparation() {
+    const f = setup();
+    const record = prepare(
+      f,
+      observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator")),
+    );
+    vi.setSystemTime(Date.parse(at) + 31 * 60_000);
+    return { f, record };
+  }
+
+  function dispatch(f: ReturnType<typeof setup>, record: PrMaintenanceRegistration) {
+    return f.store.prMaintenance.admission({
+      action: "dispatch",
+      taskId: f.task.id,
+      sessionId: f.worker.id,
+      recordId: record.id,
+      generation: record.generation,
+      batchId: record.batches.at(-1)!.id,
+    });
+  }
+
+  it("promotes a fresh claim-bound receipt for an aged prepared batch, but not accepted work", () => {
+    const { f, record } = agedPreparation();
+    expect(dispatch(f, record).reason).toBe("stale_observation");
+    const fresh = receipt(f, record);
+    expect(fresh.saved.observation).toEqual(fresh.observation);
+    expect(fresh.saved.observationHostAt).toBe(fresh.hostAt);
+    expect(fresh.saved.batches).toEqual(record.batches);
+    expect(dispatch(f, fresh.saved)).toEqual({ allowed: true });
+    const accepted = accept(f, fresh.saved);
+    vi.setSystemTime(Date.now() + 1_000);
+    const late = receipt(f, accepted);
+    expect(late.saved.lastAttempt).toEqual(late.observation);
+    expect(late.saved.observation).toEqual(fresh.observation);
+    expect(late.saved.observationHostAt).toBe(fresh.hostAt);
+    expect(late.saved.batches).toEqual(accepted.batches);
+    expect(dispatch(f, late.saved).allowed).toBe(false);
+  });
+
+  it.each(["receipt", "checkpoint"] as const)(
+    "refreshes prepared work via %s and refunds changed-head preparation without human action",
+    (path) => {
+      const { f, record } = agedPreparation();
+      const refresh = (current: PrMaintenanceRegistration, headSha = sha) =>
+        path === "receipt"
+          ? receipt(f, current, { headSha }).saved
+          : observe(f, current, {
+              attemptedAt: new Date().toISOString(),
+              snapshotId: `snapshot-${Date.now()}`,
+              headSha,
+            });
+      const fresh = refresh(record);
+      expect(fresh.observation?.snapshotId).not.toBe(record.observation?.snapshotId);
+      expect(fresh.batches).toEqual(record.batches);
+      expect(dispatch(f, fresh)).toEqual({ allowed: true });
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      const changed = refresh(fresh, otherSha);
+      expect(changed.observation?.headSha).toBe(otherSha);
+      expect(changed.batches[0]).toMatchObject({
+        state: "superseded",
+        executionSettled: true,
+        usedMutations: 0,
+      });
+      expect(changed.counters.repairBatches).toBe(0);
+      expect(changed.counters.mutationAttempts).toBe(0);
+      expect(dispatch(f, changed).allowed).toBe(false);
+      expect(changed.lifecycle).toBe("active");
+      const replacement = prepare(f, changed, "new-head", "repair", otherSha);
+      expect(dispatch(f, replacement)).toEqual({ allowed: true });
+    },
+  );
+
+  it.each(["draft", "conflict", "incident", "stale"] as const)(
+    "keeps the %s refusal after refreshing an aged prepared batch",
+    (reason) => {
+      const { f, record } = agedPreparation();
+      const fresh = receipt(f, record, {
+        draft: reason === "draft",
+        mergeability: reason === "conflict" ? "conflicting" : "mergeable",
+      });
+      expect(fresh.saved.observation).toEqual(fresh.observation);
+      let current = fresh.saved;
+      if (reason === "incident") {
+        vi.setSystemTime(Date.now() + 10_000);
+        current = observe(f, current, {
+          attemptedAt: new Date().toISOString(),
+          complete: false,
+          failure: "permission",
+        });
+        expect(current.incidents.some((incident) => !incident.resolvedAt)).toBe(true);
+      }
+      if (reason === "stale") vi.setSystemTime(Date.now() + 31 * 60_000);
+      expect(dispatch(f, current)).toMatchObject({
+        allowed: false,
+        reason: {
+          draft: "draft",
+          conflict: "merge_conflict",
+          incident: "paused",
+          stale: "stale_observation",
+        }[reason],
+      });
+    },
+  );
+
+  it("recovers a capability incident while an undispatched batch remains prepared", () => {
+    const { f, record } = agedPreparation();
+    const failed = observe(f, record, {
+      attemptedAt: new Date().toISOString(),
+      complete: false,
+      failure: "network",
+    });
+    vi.setSystemTime(Date.now() + 31 * 60_000);
+    const fresh = receipt(f, failed);
+    expect(fresh.saved.observation).toEqual(fresh.observation);
+    expect(fresh.saved.incidents[0]?.resolution).toBe("observation");
+    expect(fresh.saved.batches).toEqual(record.batches);
+    expect(dispatch(f, fresh.saved)).toEqual({ allowed: true });
+  });
+
+  it("charges the full five-minute wake without changing request or visit limits", () => {
+    const f = setup();
+    f.store.prMaintenance.beginWake(f.lead.id, "five-minute-wake");
+    expect(
+      f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
+        requests: 1,
+        milliseconds: 150_000,
+      }),
+    ).toEqual({ requests: 39, visits: 5, milliseconds: 150_000 });
+    expect(
+      f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
+        requests: 1,
+        milliseconds: 150_000,
+      }),
+    ).toEqual({ requests: 38, visits: 5, milliseconds: 0 });
+    expect(() =>
+      f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
+        requests: 0,
+        milliseconds: 0,
+      }),
+    ).toThrow(/End this maintenance pass/);
+  });
 });
 
 afterEach(() => {
@@ -815,7 +1120,7 @@ describe("bounded alternate PR observations", () => {
     });
     expect(() => reserve(f, record)).toThrow(/End this maintenance pass/);
     expect(f.store.prMaintenance.get(record.id)!.incidents[0]!.attempts).toHaveLength(0);
-    vi.setSystemTime(Date.parse(at) + 120_001);
+    vi.setSystemTime(Date.parse(at) + 300_001);
     expect(() => reserve(f, record, "timed-out", 1)).toThrow(/End this maintenance pass/);
   });
 
@@ -3891,7 +4196,7 @@ describe("durable PR maintenance registry", () => {
       first.store.prMaintenance.takeDue(
         first.lead.id,
         "wake-3",
-        "2099-01-01T00:02:00.000Z",
+        "2099-01-01T00:05:00.000Z",
       ),
     ).toBeUndefined();
     expect(records).toHaveLength(8);

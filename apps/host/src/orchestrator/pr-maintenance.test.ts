@@ -1135,6 +1135,55 @@ describe("PR maintenance orchestration", () => {
     expect(world.store.prMaintenance.wakeEligibleLeadIds()).toContain(world.leadId);
   });
 
+  it("admits prepare and dispatch at 150 seconds, then refuses a new dispatch after 300 seconds", () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const started = Date.now();
+    const { record, worker } = setup();
+    const wakeId = world.store.getSessionDispatchAttempt(world.leadId)!.commandId;
+    const prepared = prepare(record.id);
+    vi.setSystemTime(started + 150_000);
+    const checkpoint = tools.checkpointPrMaintenance({
+      recordId: prepared.id,
+      expectedVersion: prepared.version,
+      checkpoint: {
+        kind: "prepare_batch",
+        batch: {
+          id: "batch-1",
+          kind: "repair",
+          sources: [source],
+          headSha,
+          prompt: prepared.batches[0]!.prompt,
+          scope: prepared.authorization.scope.baseline,
+          reservedMutations: 3,
+        },
+      },
+    });
+    expect(checkpoint.ok, checkpoint.text).toBe(true);
+    expect(world.store.prMaintenance.remainingWake(world.leadId, wakeId)).toMatchObject({
+      requests: 32,
+      visits: 4,
+      milliseconds: 150_000,
+    });
+    const followUp = () =>
+      tools.followUp({
+        sessionId: worker.id,
+        prompt: prepared.batches[0]!.prompt,
+        maintenance: reference(record.id),
+      });
+    // Roll back the accepted attempt so the deadline check exercises the same batch.
+    expect(() =>
+      world.store.writeAtomically(() => {
+        const dispatched = followUp();
+        expect(dispatched.ok, dispatched.text).toBe(true);
+        throw new Error("rollback admitted dispatch");
+      }),
+    ).toThrow("rollback admitted dispatch");
+    vi.setSystemTime(started + 300_001);
+    const expired = followUp();
+    expect(expired.ok).toBe(false);
+    expect(expired.text).toContain("wake_exhausted");
+  });
+
   it.each(["requests", "time"] as const)(
     "blocks prepared work after the %s wake allowance is exhausted",
     (limit) => {
@@ -1149,7 +1198,7 @@ describe("PR maintenance orchestration", () => {
         });
       } else {
         vi.useFakeTimers();
-        vi.setSystemTime(Date.now() + 120_001);
+        vi.setSystemTime(Date.now() + 300_001);
       }
       const result = tools.followUp({
         sessionId: worker.id,

@@ -9,6 +9,8 @@ import type { FleetService } from "../fleet-service.js";
 import { fleet } from "./fleet-harness.js";
 import {
   FleetTools,
+  GetPrMaintenanceSchema,
+  CheckpointPrMaintenanceSchema,
   RecordTaskCheckpointSchema,
   StartWorkSchema,
   explainInvalidArgs,
@@ -29,6 +31,16 @@ describe("FleetTools", () => {
   });
 
   const tools = () => new FleetTools(service, leadId);
+
+  it("describes the five-minute wake and prepared-only observation refresh to the lead", () => {
+    expect(GetPrMaintenanceSchema.shape.takeDue.description).toContain("5 minutes");
+    expect(CheckpointPrMaintenanceSchema.shape.executionId.description).toContain(
+      "prepared",
+    );
+    expect(CheckpointPrMaintenanceSchema.shape.executionId.description).toContain(
+      "in-flight",
+    );
+  });
 
   const start = (input: Record<string, unknown>) =>
     tools().startWork({

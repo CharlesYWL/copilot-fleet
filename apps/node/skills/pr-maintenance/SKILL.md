@@ -42,7 +42,7 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    Use the paired updated runtime/helper. Missing or inconsistent proof fails
    closed; constant Node clock offsets do not create extra collection time.
 3. Honor the existing wake identity's remaining allowance: **5 PR visits,
-   40 initiated provider requests, 120 seconds**. Pass the remaining request count
+   40 initiated provider requests, 300 seconds (5 minutes)**. Pass the remaining request count
    and absolute deadline to the helper. Reconciliation/retries count too.
    MCP pagination, another helper invocation, and compaction do not reset counters.
    Exhaustion means checkpoint and end the pass, not self-message, spin, or
@@ -50,6 +50,7 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    Preparing a batch and dispatching it also require a claimed visit with
    remaining request/time allowance; receipt-only reconciliation stays available
    after exhaustion. Reserve enough for a fresh full verification pass on resumes.
+   Each helper invocation still clamps its own run to 120 seconds.
 4. Reconcile accepted/uncertain work **before** considering a fresh batch. Queued
    means accepted. Read the existing RunStep/attempt and exact prepared prompt
    after a lost dispatch response; never reconstruct a different retry prompt.
@@ -403,6 +404,15 @@ Its concrete shape is `maintenance: {recordId, generation, batchId}`.
 The Host atomically links the accepted attempt. End the lead turn after dispatch.
 Do not dispatch an empty worker turn merely to wait for CI/review or check a PR.
 New feedback while accepted stays pending for later; never overwrite the prompt.
+A merely prepared batch with no accepted step or effects does not block fresh
+complete observations, including claim-bound command receipts. Refresh expired
+observations normally and dispatch the same immutable batch at the same head;
+the retained worker re-reads its assigned PR threads. If a fresh observation
+finds a different head, the Host supersedes the undispatched batch and refunds
+its reservation; prepare a new batch from that observation without human action.
+Drafts, merge conflicts, unresolved incidents and observations older than
+30 minutes still refuse dispatch. Accepted/uncertain execution and unsettled
+effects still prevent late receipts from promoting observations or reviving work.
 
 ## Worker publication and settlement
 
