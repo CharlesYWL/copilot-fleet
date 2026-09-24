@@ -605,11 +605,12 @@ export function registerNodeGateway(
               );
             } else {
               // Refused, not broken. The Node re-announces the session's real
-              // state right behind this, so all that is owed is the reason.
-              service.reportSessionNotice(
-                message.sessionId,
-                message.error ?? "Node refused the command",
-              );
+              // state right behind this, so all that is owed is the reason —
+              // unless what it refused was the launch, which leaves no session
+              // behind to re-announce.
+              const reason = message.error ?? "Node refused the command";
+              service.reportSessionNotice(message.sessionId, reason);
+              service.settleRefusedLaunch(message.sessionId, message.commandId, reason);
             }
           }
           if (

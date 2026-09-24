@@ -393,13 +393,44 @@ describe("orchestrator views", () => {
     expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
   });
 
-  it("still offers Stop when the lead ended before its owned work", () => {
+  it("offers Resume, not Stop, while a stopped lead's tasks keep running", () => {
+    // Stop only ends the lead's conversation, so its tasks outliving it is the
+    // ordinary case. Offering Stop again here would leave no way back in.
+    const onResumeOrchestrator = vi.fn();
     page("stage", vi.fn(), undefined, {
       conversation: conversation({ state: "failed" }),
+      onResumeOrchestrator,
     });
 
-    expect(screen.getByRole("button", { name: "Stop orchestrator" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop orchestrator" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Resume orchestrator" }));
+    expect(onResumeOrchestrator).toHaveBeenCalled();
+  });
+
+  it("allows dismissing a stopped lead while another conversation is still working", () => {
+    // The board lists every conversation's tasks; only this one's decide.
+    page(
+      "stage",
+      vi.fn(),
+      models([
+        run({ id: "mine", state: "completed" }),
+        run({ id: "theirs", leadSessionId: "other-lead", state: "running" }),
+      ]),
+      { conversation: conversation({ state: "stopped" }) },
+    );
+
+    expect(screen.getByRole("button", { name: "Resume orchestrator" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Dismiss orchestrator" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop orchestrator" })).toBeNull();
+  });
+
+  it("describes Stop as ending only the conversation", () => {
+    page("stage");
+
+    expect(
+      screen.getByRole("button", { name: "Stop orchestrator" }).getAttribute("title"),
+    ).toBe("Stop this orchestrator's conversation. Its tasks and agents keep running.");
   });
 
   it("puts what needs a person at the top of its column", () => {

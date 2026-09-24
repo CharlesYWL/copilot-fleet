@@ -899,7 +899,7 @@ export function App() {
     return true;
   };
 
-  /** Ends the orchestrator and everything it started. */
+  /** Stops the orchestrator's own conversation; its tasks keep running. */
   const handleStopOrchestrator = async (sessionId: string) => {
     const stopped = await request(`/api/orchestrators/${sessionId}/stop`, {
       method: "POST",

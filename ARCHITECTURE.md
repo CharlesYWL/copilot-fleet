@@ -107,6 +107,13 @@ Completion delivery has a separate capability on the lead's Node and a persisten
 per-lead prompt reservation across ticks. Competing command completions, ordinary
 Run wakes, and human prompts cannot overwrite an in-flight handoff. Receiver-side
 deduplication records admission and settlement, not exactly-once model consumption.
+Only an `accepted` handoff holds the lead's native conversation. `uncertain` —
+reached when the prompt returns without a current turn_complete, the session
+ends, or the Node restarts mid-turn — means the turn is already over and only its
+consumption is unknown. It stays as evidence and its delivery id is never
+prompted again, but it releases the conversation: nothing ever settles it, and
+when it held the lead a Node restart during a wake left that orchestrator unable
+to resume, be prompted, or receive another handoff.
 The browser receives bounded live output and reads retained bytes by cursor;
 slow consumers recover explicitly instead of growing unbounded queues.
 
@@ -295,6 +302,12 @@ Revocation is therefore the state of the session rather than the presence of a
 row: a call must resolve to a session that still exists, is still a lead, and is
 not terminal. Stopping an orchestrator takes its tools away on the next call.
 
+Stopping it ends that conversation and nothing else. Its tasks keep running —
+steps already dispatched finish and pending ones still dispatch — and each
+settle is owed to the lead as a wake, delivered once Resume brings it back. It
+used to archive every task as well, so stopping a lead that had wedged threw
+its in-flight work away with it.
+
 `session/load` takes its own server list, so an orchestrator resumed without one
 comes back unable to dispatch anything; the same config is supplied on both
 paths.
@@ -457,6 +470,12 @@ non-fatal `command_result`, which tells the operator why while leaving the
 Session alone; failing it would destroy a healthy run over a mistimed message.
 The Node re-announces the Session's true state behind the refusal, so a composer
 opened over a wrong guess closes on its own.
+
+A refused start or resume is the exception: no process started, so nothing will
+ever re-announce it, and the `starting` the Host recorded would stand forever —
+shown as running, with Cancel disabled. When the refused command is the launch
+the Session is still waiting on, the Host settles it `failed` with the Node's
+reason, which keeps it resumable.
 
 ### Turns Copilot starts on its own
 

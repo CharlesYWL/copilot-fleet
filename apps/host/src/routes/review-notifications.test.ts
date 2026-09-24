@@ -1,7 +1,6 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import type { FastifyBaseLogger } from "fastify";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
 import { FleetService } from "../fleet-service.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetStore } from "../store.js";
@@ -117,7 +116,7 @@ describe("review notification lifecycle", () => {
     });
   });
 
-  it("resolves reviews while preserving resumable orchestrator cancellation", async () => {
+  it("keeps a task's review open when only its orchestrator is stopped", async () => {
     const { node } = store.registerNode({
       name: "node",
       os: "linux",
@@ -139,24 +138,25 @@ describe("review notification lifecycle", () => {
       state: "running",
       leadSessionId: lead.id,
     });
-    service.requestRunReview({
+    const handedOver = service.requestRunReview({
       runId: run.id,
       note: "ready",
       reason: "completed",
-    });
+    })!;
 
     const response = await app.inject({
       method: "POST",
       url: `/api/orchestrators/${lead.id}/stop`,
     });
 
+    // The handover is the person's to answer; a send-back waits for Resume.
     expect(response.statusCode).toBe(200);
     expect(store.getRun(run.id)).toMatchObject({
-      state: "cancelled",
-      failureReason: ORCHESTRATOR_STOP_REASON,
+      state: handedOver.state,
+      failureReason: "",
     });
     expect(store.getNotificationBySourceKey(`review:${run.id}:1`)).toMatchObject({
-      status: "resolved",
+      status: "active",
     });
   });
 });

@@ -1324,9 +1324,10 @@ worker 有结果后唤醒自己，并把交付记录留给你审查。
    成功标准、记录和 worker 历史。
 6. 生命周期操作要有意识地使用。**Archive** 会停止仍在运行的 worker，但保留 task 记录；
    已结束的 task 可以用 **Reopen** 说明还想要什么，也可以用 **Delete** 丢弃记录。
-   **Stop orchestrator** 会停止 lead 和它的 tasks；当 session 可恢复时，**Resume
-   orchestrator** 会重开被停止的工作；**Dismiss orchestrator** 只隐藏已停止的 lead，不删除
-   普通 session 历史。
+   **Stop orchestrator** 只停止 lead 自己的对话：它的 tasks 和 agents 会继续运行，完成的结果
+   会在 **Resume orchestrator** 重新接上 lead 后交给它；要结束工作本身请用 **Archive** 或
+   **Stop agents**。**Dismiss orchestrator** 在 lead 的 tasks 已完成或归档后隐藏已停止的
+   lead，不删除普通 session 历史。
 
 如果只是一次不需要 checkout 的问题，请从 **New session** 直接启动 **Chats** session。
 如果是共享的多代理目标，请使用 Orchestrator 的 lead **Conversation** 和 task board，让计划、

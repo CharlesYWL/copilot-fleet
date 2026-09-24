@@ -21,11 +21,7 @@ import { FleetTools } from "../orchestrator/tools.js";
 import { orchestratorBriefing } from "../orchestrator/briefing.js";
 import { maintenanceDirectionPrompt, reviewOutcome } from "../orchestrator/review.js";
 import { PrMaintenanceError, prMaintenanceUnsettled } from "../pr-maintenance-store.js";
-import {
-  archiveRun,
-  reopenOrchestratorStoppedRun,
-  stopSessions,
-} from "../orchestrator/lifecycle.js";
+import { reopenOrchestratorStoppedRun, stopSessions } from "../orchestrator/lifecycle.js";
 
 const CreateOrchestratorSchema = z.object({
   /** Where its workers run. The orchestrator itself only talks. */
@@ -365,17 +361,6 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         runs: store.listRuns().filter((run) => run.leadSessionId === session.id),
       }));
 
-  const stopOwnedRuns = (leadSessionId: string) => {
-    const runs = store
-      .listRuns()
-      .filter((entry) => entry.leadSessionId === leadSessionId);
-    for (const run of runs) {
-      archiveRun(service, run.id, ORCHESTRATOR_STOP_REASON, {
-        stoppedByOrchestrator: true,
-      });
-    }
-  };
-
   const dismissalError = (sessionId: string): string | undefined => {
     const session = store.getSession(sessionId);
     if (!session || session.runRole !== "lead") return "Orchestrator not found";
@@ -401,10 +386,17 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           (worker.stopRequested || !terminalSessionStates.has(worker.state)),
       );
     return ownedRuns.some((run) => !terminalRunStates.has(run.state)) || liveWorker
-      ? "Stop the orchestrator before dismissing it"
+      ? "Archive or finish this orchestrator's tasks before dismissing it"
       : undefined;
   };
 
+  /**
+   * Confirms Stops a person has already asked for on machines that are gone.
+   *
+   * Requests nothing new: a worker is included only when something else — an
+   * archive, a bulk Stop — has already asked it to stop, because a lead's own
+   * Stop no longer reaches its workers.
+   */
   const settleUnavailableStops = (leadSessionId: string): number => {
     const ownedRunIds = new Set(
       store
@@ -776,14 +768,23 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     return reply.code(201).send({ run: store.getRun(run.id) ?? run });
   });
 
-  /** Ends an orchestrator and everything it started. */
+  /**
+   * Stops the orchestrator's own conversation, and nothing it started.
+   *
+   * It used to archive every task the lead owned and stop their workers, so
+   * stopping a lead that had wedged — the obvious first thing to try — threw
+   * away all of its in-flight work as well. The Host already runs tasks without
+   * a live lead: dispatched steps finish, pending ones still dispatch, and what
+   * settles is owed to the lead as a wake that Resume delivers. Ending tasks is
+   * what Archive and Stop agents are for.
+   */
   app.post("/api/orchestrators/:id/stop", async (request, reply) => {
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
     if (!session || session.runRole !== "lead") {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
-    stopOwnedRuns(id);
+    store.prMaintenance.pauseForSession(id, "Orchestrator Stop requested");
     if (terminalSessionStates.has(session.state)) {
       engine.tick();
       return { ok: true, alreadyTerminal: true };
@@ -890,7 +891,12 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .send({ error: "Restore the orchestrator before resuming it" });
     }
     const ownedRuns = store.listRuns().filter((run) => run.leadSessionId === id);
-    const ownedRunIds = new Set(ownedRuns.map((run) => run.id));
+    /*
+     * Only tasks an older Host cancelled when it stopped this lead are reopened.
+     * Stop no longer touches tasks, so their workers carry on while the lead is
+     * away — including the scheduler parking settled ones — and none of that
+     * is a Stop this Resume has to wait out.
+     */
     const resumableRunIds = new Set(
       ownedRuns
         .filter(
@@ -909,15 +915,14 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         : [{ runId, reason: admission.reason, decisionId: admission.decisionId }];
     });
     const heldRunIds = new Set(blockedRuns.map((entry) => entry.runId));
-    const unsettledWorker = store.listSessions().find(
-      (worker) =>
-        ownedRunIds.has(worker.runId) &&
-        (worker.stopRequested ||
-          // Live workers only block reopening runs cancelled by orchestration Stop.
-          (resumableRunIds.has(worker.runId) &&
-            !terminalSessionStates.has(worker.state) &&
-            worker.state !== "idle")),
-    );
+    const unsettledWorker = store
+      .listSessions()
+      .find(
+        (worker) =>
+          resumableRunIds.has(worker.runId) &&
+          (worker.stopRequested ||
+            (!terminalSessionStates.has(worker.state) && worker.state !== "idle")),
+      );
     if (session.stopRequested || unsettledWorker) {
       return reply.code(409).send({
         error: "Wait for every node to acknowledge Stop before resuming",

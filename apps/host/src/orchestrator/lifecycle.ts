@@ -125,6 +125,10 @@ export function archiveRun(
 /**
  * Restores only work that the orchestration stop operation cancelled.
  *
+ * Stop no longer cancels a lead's tasks; this reopens the ones an older Host
+ * cancelled that way, so a conversation stopped before the upgrade resumes
+ * with its work rather than without it.
+ *
  * Successful, failed, skipped, and independently-cancelled steps remain
  * terminal. Pending steps retain their worker session id so the scheduler uses
  * `session/load` and continues the same Copilot context.

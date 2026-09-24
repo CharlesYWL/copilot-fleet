@@ -2522,6 +2522,31 @@ export class FleetService {
   }
 
   /**
+   * Settles a session whose start or resume the Node refused.
+   *
+   * A refusal is non-fatal because whatever session the Node holds is healthy,
+   * and it re-announces that session's state ahead of the refusal. A refused
+   * launch leaves nothing to re-announce: no process started, so nothing on the
+   * Node will ever report on it again. Left in `starting`, the session was drawn
+   * as running with Cancel disabled indefinitely, and Stop then Resume only sent
+   * the same launch into the same refusal. Failing it keeps the conversation
+   * resumable and puts the reason where the operator is already looking.
+   */
+  settleRefusedLaunch(sessionId: string, commandId: string, reason: string): void {
+    const session = this.store.getSession(sessionId);
+    if (
+      session?.state !== "starting" ||
+      this.store.getSessionDispatchAttempt(sessionId)?.commandId !== commandId
+    )
+      return;
+    this.failFromCommandResult(
+      sessionId,
+      commandId,
+      `${session.agentSessionId ? "Resume" : "Start"} refused: ${reason}`,
+    );
+  }
+
+  /**
    * Marks nodes offline rather than failed, so a quick Host restart (tsx watch,
    * deploy bounce) can resurrect agents the Node kept alive.
    */
