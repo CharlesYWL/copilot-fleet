@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DatabaseSync } from "node:sqlite";
 import Fastify from "fastify";
-import { HostToNodeMessageSchema, PrMaintenanceObservationSchema } from "@fleet/protocol";
+import {
+  HostToNodeMessageSchema,
+  ORCHESTRATOR_STOP_REASON,
+  PrMaintenanceObservationSchema,
+  prMaintenanceProgress,
+} from "@fleet/protocol";
 import { fleet } from "./fleet-harness.js";
 import { OrchestratorEngine } from "./engine.js";
 import { FleetTools, GetPrMaintenanceSchema, SetPrMaintenanceSchema } from "./tools.js";
@@ -123,6 +128,8 @@ describe("PR maintenance orchestration", () => {
           state: "open",
           fingerprint: "actionable-1",
           mergeability: "mergeable",
+          checksComplete: true,
+          reviewsComplete: true,
           sources: [source],
           checks: [
             {
@@ -811,6 +818,7 @@ describe("PR maintenance orchestration", () => {
       const { record, worker, step } = setup(true, provider);
       const prepared = prepare(record.id);
       const prompt = prepared.batches[0]!.prompt;
+      const broadcast = vi.spyOn(world.service, "broadcast");
       expect(tools.followUp({ sessionId: worker.id, prompt }).ok).toBe(false);
       const result = tools.followUp({
         sessionId: worker.id,
@@ -820,6 +828,14 @@ describe("PR maintenance orchestration", () => {
       expect(result.ok, result.text).toBe(true);
       const accepted = world.store.prMaintenance.get(record.id)!.batches[0]!;
       expect(accepted).toMatchObject({ state: "accepted", stepId: step.id, attempt: 2 });
+      expect(broadcast).toHaveBeenCalledWith({
+        type: "snapshot",
+        data: expect.objectContaining({
+          prMaintenanceTasks: [
+            expect.objectContaining({ recordId: record.id, stage: "addressing_review" }),
+          ],
+        }),
+      });
       expect(
         world.store.listSessions().filter((session) => session.runRole === "worker"),
       ).toHaveLength(1);
@@ -843,7 +859,12 @@ describe("PR maintenance orchestration", () => {
   it("rolls back step retry when atomic maintenance acceptance fails", () => {
     const { record, worker, step } = setup();
     const prepared = prepare(record.id);
-    vi.spyOn(world.store.prMaintenance, "acceptBatch").mockImplementation(() => {
+    const broadcast = vi.spyOn(world.service, "broadcast");
+    const acceptBatch = world.store.prMaintenance.acceptBatch.bind(
+      world.store.prMaintenance,
+    );
+    vi.spyOn(world.store.prMaintenance, "acceptBatch").mockImplementation((...args) => {
+      acceptBatch(...args);
       throw new Error("simulated database failure");
     });
     expect(() =>
@@ -859,6 +880,7 @@ describe("PR maintenance orchestration", () => {
       prompt: "original brief",
     });
     expect(world.store.prMaintenance.get(record.id)!.batches[0]!.state).toBe("prepared");
+    expect(broadcast).not.toHaveBeenCalled();
   });
 
   it.each(["github", "azure-devops"] as const)(
@@ -959,7 +981,8 @@ describe("PR maintenance orchestration", () => {
         reason: "Operator pause",
       }).ok,
     ).toBe(true);
-    expect(publishSnapshot).toHaveBeenCalled();
+    expect(publishSnapshot).toHaveBeenCalledTimes(2);
+    publishSnapshot.mockClear();
     new OrchestratorEngine(world.service).tickRun(step.runId);
     expect(world.store.getRunStep(step.id)!.state).toBe("cancelled");
     expect(world.store.prMaintenance.get(record.id)!.batches[0]).toMatchObject({
@@ -967,9 +990,104 @@ describe("PR maintenance orchestration", () => {
       executionSettled: true,
     });
     expect(world.store.prMaintenance.hasSessionRetentionBlockers(worker.id)).toBe(true);
+    expect(publishSnapshot).not.toHaveBeenCalled();
   });
 
-  it("does not treat a completed repair turn as verified finding/effect completion", () => {
+  it.each(["github", "azure-devops"] as const)(
+    "publishes %s acceptance, execution reconciliation, finding settlement and guarded readiness",
+    (provider) => {
+      const { record, worker, step } = setup(true, provider);
+      const prepared = prepare(record.id);
+      const stages: string[] = [];
+      vi.spyOn(world.service, "broadcast").mockImplementation((message) => {
+        if (message.type !== "snapshot") return;
+        expect(message.data.prMaintenanceTasks).toEqual(
+          world.service.snapshot().prMaintenanceTasks,
+        );
+        const status = message.data.prMaintenanceTasks?.find(
+          (entry) => entry.recordId === record.id,
+        );
+        expect(status?.stage).toBe(
+          prMaintenanceProgress(world.store.prMaintenance.get(record.id)!).stage,
+        );
+        if (status) stages.push(status.stage);
+      });
+      expect(
+        tools.followUp({
+          sessionId: worker.id,
+          prompt: prepared.batches[0]!.prompt,
+          maintenance: reference(record.id),
+        }).ok,
+      ).toBe(true);
+      expect(stages).toEqual(["addressing_review"]);
+      world.store.updateRunStep(step.id, { state: "running" });
+      completionReceipt(worker.id);
+      world.service.settleOrchestrationStep({
+        runId: step.runId,
+        stepId: step.id,
+        state: "succeeded",
+        output: "Worker says done.",
+      });
+      const batch = world.store.prMaintenance.get(record.id)!.batches[0]!;
+      expect(batch).toMatchObject({
+        state: "reconciling",
+        executionSettled: true,
+        findings: [],
+      });
+      expect(stages).toEqual(["addressing_review", "reconciling"]);
+      expect(() => prepare(record.id)).not.toThrow();
+      expect(tools.followUp({ sessionId: worker.id, prompt: "New repair" }).ok).toBe(
+        false,
+      );
+      const checkpoint = (
+        update: Parameters<FleetTools["checkpointPrMaintenance"]>[0]["checkpoint"],
+      ) =>
+        tools.checkpointPrMaintenance({
+          recordId: record.id,
+          expectedVersion: world.store.prMaintenance.get(record.id)!.version,
+          checkpoint: update,
+        });
+      const ready = {
+        kind: "ready" as const,
+        fingerprint: "actionable-1",
+        evidence: "Complete current-HEAD findings, checks and reviews.",
+      };
+      expect(checkpoint(ready).ok).toBe(false);
+      const settlement = checkpoint({
+        kind: "batch",
+        batchId: batch.id,
+        generation: record.generation,
+        state: "succeeded",
+        executionSettled: true,
+        published: false,
+        usedMutations: 0,
+        effects: [],
+        findings: [
+          {
+            source,
+            outcome: "already_satisfied",
+            stage: "verified",
+            verifiedHeadSha: headSha,
+            evidence: ["Existing repair verified on current HEAD."],
+            responseRequired: false,
+            responseIds: [],
+            progress: true,
+          },
+        ],
+        evidence: "Correlated terminal execution and known effects.",
+      });
+      expect(settlement.ok, settlement.text).toBe(true);
+      expect(stages.at(-1)).toBe("checking");
+      const readiness = checkpoint(ready);
+      expect(readiness.ok, readiness.text).toBe(true);
+      expect(stages).toEqual(["addressing_review", "reconciling", "checking", "ready"]);
+      expect(world.store.prMaintenance.get(record.id)!.observation!.sources).toEqual([
+        source,
+      ]);
+    },
+  );
+
+  it("rolls back execution settlement without publishing an uncommitted maintenance summary", () => {
     const { record, worker, step } = setup();
     const prepared = prepare(record.id);
     expect(
@@ -981,20 +1099,60 @@ describe("PR maintenance orchestration", () => {
     ).toBe(true);
     world.store.updateRunStep(step.id, { state: "running" });
     completionReceipt(worker.id);
-    world.service.settleOrchestrationStep({
+    const before = world.store.prMaintenance.get(record.id);
+    const broadcast = vi.spyOn(world.service, "broadcast");
+    vi.spyOn(world.store, "recordRunSettle").mockImplementation(() => {
+      throw new Error("simulated settlement failure");
+    });
+    expect(() =>
+      world.service.settleOrchestrationStep({
+        runId: step.runId,
+        stepId: step.id,
+        state: "succeeded",
+        output: "Worker turn complete",
+      }),
+    ).toThrow("simulated settlement failure");
+    expect(world.store.prMaintenance.get(record.id)).toEqual(before);
+    expect(world.store.getRunStep(step.id)!.state).toBe("running");
+    expect(broadcast).not.toHaveBeenCalled();
+  });
+
+  it("publishes maintenance reconciliation when a stopped attempt returns a late result", () => {
+    const { record, worker, step } = setup();
+    const prepared = prepare(record.id);
+    expect(
+      tools.followUp({
+        sessionId: worker.id,
+        prompt: prepared.batches[0]!.prompt,
+        maintenance: reference(record.id),
+      }).ok,
+    ).toBe(true);
+    world.store.updateRunStep(step.id, { state: "running" });
+    world.store.cancelRunWithUnfinishedSteps(step.runId, ORCHESTRATOR_STOP_REASON, true);
+    completionReceipt(worker.id);
+    const broadcast = vi.spyOn(world.service, "broadcast");
+    const lateResult = {
       runId: step.runId,
       stepId: step.id,
-      state: "succeeded",
-      output: "Worker says done.",
+      state: "succeeded" as const,
+      output: "Completed before Stop",
+    };
+    expect(world.service.reconcileStoppedOrchestrationStep(lateResult)).toBe(true);
+    expect(broadcast).toHaveBeenCalledWith({
+      type: "snapshot",
+      data: expect.objectContaining({
+        prMaintenanceTasks: [
+          expect.objectContaining({ recordId: record.id, stage: "reconciling" }),
+        ],
+      }),
     });
-    const batch = world.store.prMaintenance.get(record.id)!.batches[0]!;
-    expect(batch).toMatchObject({
+    expect(world.store.prMaintenance.get(record.id)!.batches[0]).toMatchObject({
       state: "reconciling",
       executionSettled: true,
-      findings: [],
     });
-    expect(() => prepare(record.id)).not.toThrow();
-    expect(tools.followUp({ sessionId: worker.id, prompt: "New repair" }).ok).toBe(false);
+    broadcast.mockClear();
+    expect(world.service.reconcileStoppedOrchestrationStep(lateResult)).toBe(false);
+    expect(broadcast).not.toHaveBeenCalled();
   });
 
   it("wakes a lead whose only task is completed without reopening the task", () => {
@@ -1129,6 +1287,7 @@ describe("PR maintenance orchestration", () => {
       executionSettled: false,
     });
     completionReceipt(worker.id);
+    const publishSnapshot = vi.spyOn(world.service, "publishSnapshot");
     world.service.reconcilePrMaintenanceExecution(worker.id);
     const settled = world.store.prMaintenance.get(record.id)!;
     expect(settled.batches[0]).toMatchObject({
@@ -1137,6 +1296,9 @@ describe("PR maintenance orchestration", () => {
     });
     expect(settled.ownershipReleasedAt).toBeUndefined();
     expect(settled.lifecycle).toBe("paused");
+    expect(publishSnapshot).toHaveBeenCalledTimes(1);
+    world.service.reconcilePrMaintenanceExecution(worker.id);
+    expect(publishSnapshot).toHaveBeenCalledTimes(1);
   });
 
   it("accepts an explicitly resumed stopped worker with a retained native conversation", () => {

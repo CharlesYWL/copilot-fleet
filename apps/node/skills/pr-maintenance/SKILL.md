@@ -439,6 +439,18 @@ count complete. `partial`, `failed`, `cancelled`, and `superseded` release the
 outstanding slot only after all accepted execution/effects are known and settled.
 Never infer quiescence from a timeout, “done”, or a requested Stop.
 
+Display status follows these durable facts: **Reviewing feedback** means a current
+source ID/revision has no matching current-HEAD disposition; **Fixing feedback**
+means a batch was accepted for the retained worker, including queued execution,
+not merely prepared or reserved. Holds and uncertain effects still take precedence.
+A known incomplete disposition is not new feedback and is not readiness.
+After execution settles, reconcile findings and effects before final batch
+settlement. **Ready** requires addressed/already-satisfied dispositions for every
+current source ID/revision at the verified HEAD, fresh complete checks/reviews and
+mergeability evidence, no outstanding work or holds, and a successful `ready`
+checkpoint for the current fingerprint. Visible or provider-resolved comments do
+not replace these gates; a changed source revision requires a matching disposition.
+
 Confirmed merge/closure inhibits new repairs/reviews, requests **targeted**
 cancellation and enters settlement-only draining. Retain PR/head-ref/worker
 ownership until accepted work and lead effects settle. Reopening cannot revive

@@ -2653,6 +2653,7 @@ export class FleetTools {
       throw error;
     }
     this.service.publishRunSteps(run.id, this.store.listRunSteps(run.id));
+    if (input.maintenance) this.service.publishSnapshot();
     this.service.tickRun(run.id);
     const retried = this.store.getRunStep(step.id);
     if (!retried) {

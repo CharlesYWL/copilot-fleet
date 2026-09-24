@@ -1057,20 +1057,22 @@ export function prMaintenanceProgress(
     return result("checking");
   if (observation.draft || observation.mergeability === "conflicting")
     return result("blocked");
+  const currentFindings = observation.sources.map((source) =>
+    record.findings.find(
+      (finding) =>
+        finding.source.id === source.id &&
+        finding.source.revision === source.revision &&
+        (finding.verifiedHeadSha ?? finding.publishedCommit) === observation.headSha,
+    ),
+  );
+  if (currentFindings.some((finding) => !finding)) return result("triage");
   if (
-    observation.sources.some(
-      (source) =>
-        !record.findings.some(
-          (finding) =>
-            finding.source.id === source.id &&
-            finding.source.revision === source.revision &&
-            (finding.verifiedHeadSha ?? finding.publishedCommit) ===
-              observation.headSha &&
-            ["addressed", "already_satisfied"].includes(finding.outcome),
-        ),
+    currentFindings.some(
+      (finding) =>
+        finding && !["addressed", "already_satisfied"].includes(finding.outcome),
     )
   )
-    return result("triage");
+    return result("checking");
   if (
     !observation.checksComplete ||
     observation.checks.some(

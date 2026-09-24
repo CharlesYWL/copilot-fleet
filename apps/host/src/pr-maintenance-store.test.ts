@@ -15,6 +15,7 @@ import {
   HostBackupSchema,
   PR_MAINTENANCE_RECOVERY_LIMITS,
   prMaintenanceProgress,
+  prMaintenanceTaskStatuses,
   type PrMaintenanceCheckpoint,
   type PrMaintenanceObservation,
   type PrMaintenanceRegistration,
@@ -3242,6 +3243,7 @@ describe("durable PR maintenance registry", () => {
   it("invalidates HEAD-A readiness after a known repair publication to HEAD B", () => {
     const f = setup();
     let record = publishedRepair(f);
+    expect(prMaintenanceProgress(record).stage).toBe("checking");
     expect(() =>
       f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
         kind: "ready",
@@ -3269,13 +3271,16 @@ describe("durable PR maintenance registry", () => {
         },
       ],
     });
-    expect(
-      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
-        kind: "ready",
-        fingerprint: "head-B",
-        evidence: "Fresh HEAD-B evidence",
-      }).readyFingerprint,
-    ).toBe("head-B");
+    expect(prMaintenanceProgress(record).stage).toBe("checking");
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      kind: "ready",
+      fingerprint: "head-B",
+      evidence: "Fresh HEAD-B evidence",
+    });
+    expect(record.readyFingerprint).toBe("head-B");
+    expect(record.observation!.sources).toEqual([source]);
+    expect(prMaintenanceProgress(record).stage).toBe("ready");
+    expect(prMaintenanceTaskStatuses([record])[0]?.stage).toBe("ready");
   });
 
   it("keeps same-HEAD deduplication but allows unchanged feedback to be revalidated on an external HEAD", () => {
@@ -3377,6 +3382,8 @@ describe("durable PR maintenance registry", () => {
       evidence: "Existing fix verified against current code",
     });
     expect(record.readyFingerprint).toBe("head-C");
+    expect(prMaintenanceProgress(record).stage).toBe("ready");
+    expect(prMaintenanceTaskStatuses([record])[0]?.stage).toBe("ready");
     expect(() => prepare(f, record, "duplicate-C", "answer", externalHead)).toThrow(
       /unchanged/,
     );

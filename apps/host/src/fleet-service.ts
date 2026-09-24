@@ -521,7 +521,7 @@ export class FleetService {
           ...(input.patch ?? {}),
         });
         if (!updatedStep) return undefined;
-        this.recordPrMaintenanceExecution(updatedStep);
+        const maintenanceChanged = this.recordPrMaintenanceExecution(updatedStep);
 
         this.store.recordRunSettle(run.id);
         let updatedRun = this.store.getRun(run.id)!;
@@ -538,12 +538,13 @@ export class FleetService {
         if (updatedStep.state === "failed") {
           this.notifications.createOrchestrationStepFailure(updatedRun, updatedStep);
         }
-        return { run: updatedRun, step: updatedStep };
+        return { run: updatedRun, step: updatedStep, maintenanceChanged };
       },
       (result) => {
         if (!result) return;
         this.publishRun(result.run);
         this.publishRunSteps(result.run.id, this.store.listRunSteps(result.run.id));
+        if (result.maintenanceChanged) this.publishSnapshot();
       },
     );
     return settled !== undefined;
@@ -586,18 +587,19 @@ export class FleetService {
           stoppedByOrchestrator: false,
         });
         if (!updatedStep) return undefined;
-        this.recordPrMaintenanceExecution(updatedStep);
+        const maintenanceChanged = this.recordPrMaintenanceExecution(updatedStep);
         if (updatedStep.sessionId) {
           this.store.clearSessionTurnCompletion(updatedStep.sessionId);
         }
         if (updatedStep.state === "failed") {
           this.notifications.createOrchestrationStepFailure(run, updatedStep);
         }
-        return { run, step: updatedStep };
+        return { run, step: updatedStep, maintenanceChanged };
       },
       (result) => {
         if (!result) return;
         this.publishRunSteps(result.run.id, this.store.listRunSteps(result.run.id));
+        if (result.maintenanceChanged) this.publishSnapshot();
       },
     );
     return settled !== undefined;
@@ -611,15 +613,18 @@ export class FleetService {
   reconcilePrMaintenanceExecution(sessionId: string): void {
     const step = this.store.getRunStepBySession(sessionId);
     if (!step || !terminalRunStepStates.has(step.state)) return;
-    this.store.writeAtomically(() => this.recordPrMaintenanceExecution(step));
+    const changed = this.store.writeAtomically(() =>
+      this.recordPrMaintenanceExecution(step),
+    );
+    if (changed) this.publishSnapshot();
   }
 
-  private recordPrMaintenanceExecution(step: RunStep, neverDispatched = false): void {
+  private recordPrMaintenanceExecution(step: RunStep, neverDispatched = false): boolean {
     const reference = this.store.prMaintenance.referenceForStep(step.id, step.attempts);
-    if (!reference) return;
+    if (!reference) return false;
     const record = this.store.prMaintenance.get(reference.recordId)!;
     const batch = record.batches.find((entry) => entry.id === reference.batchId)!;
-    if (batch.executionSettled) return;
+    if (batch.executionSettled) return false;
     const events = this.store
       .listEvents(step.sessionId)
       .filter((event) => event.sequence > step.eventSeqFrom);
@@ -633,7 +638,7 @@ export class FleetService {
       (receivedState !== undefined &&
         (terminalSessionStates.has(receivedState) ||
           (receivedState === "idle" && completed)));
-    if (!executionSettled && batch.state === "uncertain") return;
+    if (!executionSettled && batch.state === "uncertain") return false;
     const reconciled = this.store.prMaintenance.checkpoint(
       record.leadSessionId,
       record.id,
@@ -663,6 +668,7 @@ export class FleetService {
         evidence: `Execution reconciliation for step ${step.id}, attempt ${step.attempts}; settled=${executionSettled}.`,
       },
     );
+    return true;
   }
 
   /** Stop only the accepted bound attempt; a stop request is not an effect receipt. */
@@ -702,14 +708,15 @@ export class FleetService {
             !step.dispatchedAt &&
             dispatch?.attempt !== currentAttempt
           ) {
-            this.store.writeAtomically(() => {
+            const changed = this.store.writeAtomically(() => {
               const cancelled = this.store.updateRunStep(step.id, {
                 state: "cancelled",
                 output: "PR maintenance paused or terminal before queued execution.",
               })!;
-              this.recordPrMaintenanceExecution(cancelled, true);
+              return this.recordPrMaintenanceExecution(cancelled, true);
             });
             this.publishRunSteps(record.taskId, this.store.listRunSteps(record.taskId));
+            if (changed) this.publishSnapshot();
           } else if (
             this.store.getNode(worker.nodeId)?.online &&
             !["idle", "offline", "completed", "stopped", "failed"].includes(
