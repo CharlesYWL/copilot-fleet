@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -14,6 +14,7 @@ import {
   NODE_BACKUP_KIND,
   BACKUP_VERSION,
   PreparedCommandSchema,
+  WorkspaceResultSchema,
   type PreparedCommand,
   type HostToNodeMessage,
   type NodeCommand,
@@ -40,6 +41,7 @@ import type * as ConfigServerModule from "./config-server.js";
 import type * as UpdaterModule from "./updater.js";
 import type { CopilotSessionDiscoveryOptions } from "./copilot-sessions.js";
 import type { CommandResult, CommandRouterOptions } from "./router.js";
+import type { ManagedWorktreeOptions } from "./managed-worktrees.js";
 
 class TestSocket extends EventEmitter {
   static OPEN = 1;
@@ -84,6 +86,7 @@ const route = vi.fn<(command: NodeCommand) => Promise<CommandResult>>(
   async (command) => ({ commandId: command.commandId, ok: true }),
 );
 let routerOptions: CommandRouterOptions;
+let worktreeOptions: ManagedWorktreeOptions;
 let discoveryOptions: CopilotSessionDiscoveryOptions;
 let configOptions: Parameters<typeof ConfigServerModule.startConfigServer>[0];
 const createDiscovery = vi.fn();
@@ -194,6 +197,9 @@ vi.mock("./managed-worktrees.js", () => ({
   ManagedWorktrees: class {
     quarantine = quarantine;
     shutdown = worktreesShutdown;
+    constructor(options: ManagedWorktreeOptions) {
+      worktreeOptions = options;
+    }
   },
 }));
 vi.mock("./command-journal.js", () => ({
@@ -355,6 +361,153 @@ afterEach(() => {
   vi.unstubAllEnvs();
   vi.restoreAllMocks();
   rmSync(testConfigDirectory, { recursive: true, force: true });
+});
+
+it.each([
+  ["begin", "false"],
+  ["chunk", "false"],
+  ["chunk", "throw"],
+  ["complete", "false"],
+  ["complete", "throw"],
+] as const)("does not leave artifact waiters at %s/%s", async (stage, failure) => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const { loadCredentials } = await import("./config.js");
+  vi.mocked(loadCredentials).mockResolvedValueOnce({
+    hostUrl: credentials.hostUrl,
+    nodeId: credentials.nodeId,
+    name: credentials.name,
+    authProtocol: "legacy-secret",
+    secret: "test-secret",
+  });
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  let finished: Promise<unknown> | undefined;
+  let cleanupAck: HostToNodeMessage | undefined;
+  try {
+    const result = WorkspaceResultSchema.parse({
+      id: randomUUID(),
+      runId: "run-1",
+      ownerStepId: "step-1",
+      repositoryIdentity: "c".repeat(64),
+      baseSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      sourceWorktreeId: "worktree-1",
+      sourceNodeId: credentials.nodeId,
+      sourcePlacementId: "placement-1",
+      sourceGeneration: 1,
+      state: "available",
+      artifactId: "d".repeat(64),
+      artifactSha256: "d".repeat(64),
+      artifactSize: 1,
+      objectFormat: "sha1",
+      createdAt: new Date().toISOString(),
+    });
+    const path = resolvePath(
+      testConfigDirectory,
+      "workspace-result-artifacts",
+      "send-failure.bundle",
+    );
+    const socket = sockets[0]!;
+    if (stage === "begin") {
+      socket.readyState = 3;
+      const timers = vi.getTimerCount();
+      await expect(
+        worktreeOptions.uploadArtifact!({ ...result, state: "sealing" }, path),
+      ).rejects.toThrow("Host is unavailable for artifact upload.");
+      expect(vi.getTimerCount()).toBe(timers);
+      await expect(
+        worktreeOptions.downloadArtifact!(result, path, randomUUID()),
+      ).rejects.toThrow("Host is unavailable for artifact download.");
+      expect(vi.getTimerCount()).toBe(timers);
+      expect(socket.send).not.toHaveBeenCalled();
+      return;
+    }
+
+    mkdirSync(resolvePath(testConfigDirectory, "workspace-result-artifacts"));
+    writeFileSync(path, "x");
+    socket.readyState = TestSocket.OPEN;
+    socket.emit("open");
+    expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({ type: "hello" });
+    await socket.receive({ type: "welcome", nodeId: credentials.nodeId });
+    socket.send.mockClear();
+    const sendError = new Error(`${stage} send failed`);
+    socket.send.mockImplementation((text) => {
+      const frame = JSON.parse(text) as NodeToHostMessage;
+      if (failure === "throw" && frame.type === `artifact_upload_${stage}`)
+        throw sendError;
+    });
+    const transfer = {
+      operationId: result.id,
+      resultId: result.id,
+      artifactId: result.artifactId,
+      ok: true,
+      offset: 0,
+      complete: false,
+      code: "",
+      error: "",
+    };
+    cleanupAck = {
+      type: "artifact_transfer_ack",
+      transfer: { ...transfer, ok: false, error: "Test cleanup" },
+    };
+    const timers = vi.getTimerCount();
+    const resolved = vi.fn();
+    const rejected = vi.fn();
+    finished = worktreeOptions.uploadArtifact!(
+      { ...result, state: "sealing" },
+      path,
+    ).then(resolved, rejected);
+    expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+      type: "artifact_upload_begin",
+    });
+
+    const beginAck = socket.receive({ type: "artifact_transfer_ack", transfer });
+    if (stage === "chunk" && failure === "false") socket.readyState = 3;
+    await beginAck;
+    if (stage === "complete") {
+      await vi.waitFor(
+        () =>
+          expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+            type: "artifact_upload_chunk",
+            transfer: { offset: 0, data: "eA==" },
+          }),
+        { timeout: 1_000, interval: 10 },
+      );
+      const chunkAck = socket.receive({
+        type: "artifact_transfer_ack",
+        transfer: { ...transfer, offset: result.artifactSize },
+      });
+      if (failure === "false") socket.readyState = 3;
+      await chunkAck;
+    }
+
+    await vi.waitFor(() => expect(rejected).toHaveBeenCalledOnce(), {
+      timeout: 1_000,
+      interval: 10,
+    });
+    await finished;
+    expect(resolved).not.toHaveBeenCalled();
+    if (failure === "throw") expect(rejected.mock.lastCall![0]).toBe(sendError);
+    else
+      expect(rejected.mock.lastCall![0]).toMatchObject({
+        message: "Host is unavailable for artifact upload.",
+      });
+    expect(vi.getTimerCount()).toBe(timers);
+  } finally {
+    if (cleanupAck) {
+      await sockets[0]!.receive(cleanupAck);
+      await finished;
+    }
+    await runtime.shutdown();
+    vi.clearAllTimers();
+    for (const listener of process.listeners("exit"))
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+  }
 });
 
 it.each([

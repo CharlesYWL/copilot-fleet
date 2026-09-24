@@ -4,6 +4,18 @@ export type LocalResume =
   | { command: string; shell: string; reason?: never }
   | { command?: never; shell?: never; reason: string };
 
+export function sessionWorkingDirectory(
+  session: FleetSession,
+  placement?: Placement,
+): string | undefined {
+  return (
+    session.executionBinding?.cwd ??
+    (placement?.id === session.placementId && placement.nodeId === session.nodeId
+      ? placement.localPath
+      : undefined)
+  );
+}
+
 export function localResume(
   session: FleetSession,
   node?: FleetNode,
@@ -15,11 +27,8 @@ export function localResume(
   if (session.agentSessionId.startsWith("mock-") || node?.capabilities.includes("mock")) {
     return { reason: "Demo sessions cannot be resumed in Copilot CLI." };
   }
-  if (
-    !placement ||
-    placement.id !== session.placementId ||
-    placement.nodeId !== session.nodeId
-  ) {
+  const cwd = sessionWorkingDirectory(session, placement);
+  if (!cwd) {
     return { reason: "The session's placement is unavailable." };
   }
   if (!node || node.id !== session.nodeId) {
@@ -30,14 +39,14 @@ export function localResume(
     const quote = (value: string) => `'${value.replaceAll("'", "''")}'`;
     return {
       shell: "PowerShell",
-      command: `& {\n  Set-Location -LiteralPath ${quote(placement.localPath)} -ErrorAction Stop\n  copilot --resume=${quote(session.agentSessionId)}\n}`,
+      command: `& {\n  Set-Location -LiteralPath ${quote(cwd)} -ErrorAction Stop\n  copilot --resume=${quote(session.agentSessionId)}\n}`,
     };
   }
   if (node.os === "linux" || node.os === "darwin") {
     const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
     return {
       shell: "Bash / Zsh",
-      command: `cd -- ${quote(placement.localPath)} &&\ncopilot --resume=${quote(session.agentSessionId)}`,
+      command: `cd -- ${quote(cwd)} &&\ncopilot --resume=${quote(session.agentSessionId)}`,
     };
   }
   return { reason: `Local resume instructions are unavailable for ${node.os}.` };

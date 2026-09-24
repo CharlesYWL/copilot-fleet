@@ -1412,6 +1412,19 @@ describe("node reconnect socket ordering", () => {
     store.close();
   });
 
+  it("ignores buffered messages from a superseded connection", async () => {
+    const inventory = { activeSessionIds: [sessionId], busySessionIds: [sessionId] };
+    await connect(inventory);
+    const superseded = service.nodeSocket(nodeId) as WebSocket;
+    await connect(inventory);
+    expect(service.nodeSocket(nodeId)).not.toBe(superseded);
+
+    superseded.emit("message", JSON.stringify(event(1, "state", { state: "failed" })));
+
+    expect(store.getSession(sessionId)?.state).toBe("running");
+    expect(store.listEvents(sessionId)).toEqual([]);
+  });
+
   it.each([true, false])(
     "correlates a manual command's real Node receipt (ok=%s) without replay or minting authority",
     async (ok) => {

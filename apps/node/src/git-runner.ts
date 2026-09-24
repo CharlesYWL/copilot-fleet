@@ -64,7 +64,7 @@ export class GitRunner {
         if (stopping) return;
         failure = new WorktreeConflict("git_incomplete", reason);
         stopping = stopProcessTree(child);
-        void stopping.catch(() => undefined);
+        void stopping.catch(reject);
       };
       const timer = setTimeout(
         () => stop("Git exceeded its deadline; reconcile before retrying."),

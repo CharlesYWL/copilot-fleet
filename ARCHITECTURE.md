@@ -203,6 +203,9 @@ Object supervision, releasing a lease only after verified process-tree terminati
 Uncertain ownership is durably reconciliation-required without suppressing the
 terminal event. Resume can rotate a Host fencing attempt on the same live
 conversation through an atomic lease reattachment, never a second writer.
+Host backups preserve read-only classification and each step's workspace identity,
+state, and result metadata. Restored execution bindings remain quarantined until
+their exact worktree and generation reconcile, for primary and derived workspaces.
 See [Managed worktree isolation](docs/managed-worktree-isolation.md) for the
 two-layer lock model, persisted mode resolution and recovery rules.
 
@@ -753,6 +756,11 @@ when the operator clicks and again in the updater just before the reset, and
 treating a checkout git cannot read as dirty. It refuses while the Node beside
 it is running sessions unless the operator agrees to stop exactly the ones
 listed, and until the restart it refuses to start or resume anything new there.
+
+At the restart-confirmation handoff, the updater stops rewriting its heartbeat
+record, so it cannot overwrite the new Host's final outcome. Browsers likewise
+keep newer live update status and complete snapshots when an older REST response
+arrives.
 
 git is never run through a shell. A tracked branch may legally be called
 `release&x`; joined into a Windows command line, that was a second command.

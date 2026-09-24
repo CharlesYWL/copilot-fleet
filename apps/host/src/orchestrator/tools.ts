@@ -42,6 +42,7 @@ import {
   archiveRun,
   orchestratorLabel,
   purgeRun,
+  stopSessions,
   taskNeedsOrchestrator,
   transferRun,
 } from "./lifecycle.js";
@@ -2903,7 +2904,7 @@ export class FleetTools {
   stopWork(input: z.infer<typeof SessionRefSchema>): ToolResult {
     const owned = this.ownedSession(input.sessionId);
     if (typeof owned === "string") return refuse(owned);
-    this.service.dispatch(owned.nodeId, { type: "stop", sessionId: owned.id });
+    stopSessions(this.service, [owned]);
     return ok("Stopping it.");
   }
 

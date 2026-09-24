@@ -491,8 +491,9 @@ export function startConfigServer(options: ConfigServerOptions): Server {
       return;
     }
 
+    request.setEncoding("utf8");
     let body = "";
-    request.on("data", (chunk: Buffer) => {
+    request.on("data", (chunk: string) => {
       body += chunk;
       // Nothing legitimate approaches this size; stop reading rather than
       // buffering whatever a runaway client decides to send.

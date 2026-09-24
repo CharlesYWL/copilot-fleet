@@ -1891,22 +1891,34 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     },
   );
 
-  it("pins the exact committed base before the source HEAD moves", async () => {
-    const { source, manager } = await fixture();
-    const reserved = await manager.execute(reserveRequest(source));
-    expect(reserved.ok).toBe(true);
-    const base = reserved.worktree!.baseSha;
-    await writeFile(join(source, "same.txt"), "source moved\n");
-    await git.run(source, ["commit", "-am", "source advances"]);
-    const created = await operation(manager, reserved.worktree!, "create");
-    expect(created.ok).toBe(true);
-    expect(
-      (await git.run(created.worktree!.path, ["rev-parse", "HEAD"])).stdout.trim(),
-    ).toBe(base);
-    expect(await readFile(join(created.worktree!.path, "same.txt"), "utf8")).toBe(
-      "base\n",
-    );
-  });
+  it.each(["primary", "step"] as const)(
+    "pins the exact committed base before the source HEAD moves for %s",
+    async (kind) => {
+      const { source, manager } = await fixture();
+      const request = reserveRequest(source);
+      if (kind === "step") {
+        request.workspaceKind = "step";
+        request.ownerStepId = "step-1";
+        request.expectedBaseSha = (
+          await git.run(source, ["rev-parse", "HEAD"])
+        ).stdout.trim();
+        request.integrationBaseRef = "refs/remotes/origin/target";
+      }
+      const reserved = await manager.execute(request);
+      expect(reserved.ok).toBe(true);
+      const base = reserved.worktree!.baseSha;
+      await writeFile(join(source, "same.txt"), "source moved\n");
+      await git.run(source, ["commit", "-am", "source advances"]);
+      const created = await operation(manager, reserved.worktree!, "create");
+      expect(created.ok).toBe(true);
+      expect(
+        (await git.run(created.worktree!.path, ["rev-parse", "HEAD"])).stdout.trim(),
+      ).toBe(base);
+      expect(await readFile(join(created.worktree!.path, "same.txt"), "utf8")).toBe(
+        "base\n",
+      );
+    },
+  );
 
   it("rejects deterministic ref collisions and counts reservations against quota without eviction", async () => {
     const { source, manager } = await fixture();
@@ -2160,6 +2172,13 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(started.error).toBe("");
     expect(started.integration!.state).toBe("conflicted");
     expect(started.integration!.conflicts).toEqual(["same.txt"]);
+    const reconciled = await operation(manager, tree, "reconcile");
+    expect(reconciled.ok).toBe(true);
+    expect(reconciled.integration).toMatchObject({
+      id: started.integration!.id,
+      state: "conflicted",
+      conflicts: ["same.txt"],
+    });
     const target = await canonicalPath(preview.target.path);
     expect(() =>
       manager.locks.acquire(target, { owner: "manual", kind: "worker", attempt: "1" }),
@@ -2191,6 +2210,70 @@ describe("real Git managed task worktrees", { timeout: 60_000 }, () => {
     expect(
       (await git.run(source, ["rev-parse", "--verify", tree.branchRef])).stdout.trim(),
     ).toBe(preview.taskSha);
+  }, 120_000);
+
+  it("refuses detached legacy integration targets outside the managed root", async () => {
+    const { root, manager, source } = await fixture();
+    const tree = await allocate(manager, source);
+    await writeFile(join(tree.path, "same.txt"), "task change\n");
+    await git.run(tree.path, ["commit", "-am", "task"]);
+    const preview = (await operation(manager, tree, "integration_preview")).preview!;
+    const merged = await operation(manager, tree, "integrate", {
+      previewId: preview.id,
+      reviewedTaskSha: preview.taskSha,
+      reviewedDiffIdentity: preview.diffIdentity,
+      confirm: `MERGE ${preview.taskSha} INTO ${preview.targetRef}`,
+      commit: true,
+    });
+    expect(merged.ok).toBe(true);
+    expect(merged.integration!.state).toBe("integrated");
+    const integration = merged.integration!;
+    const legacyPath = join(root, "legacy-target");
+    await git.run(source, [
+      "worktree",
+      "add",
+      "--detach",
+      legacyPath,
+      integration.resultSha,
+    ]);
+    const target = await canonicalPath(legacyPath);
+    expect(
+      (
+        await git.run(target.path, ["symbolic-ref", "-q", "HEAD"], {
+          allowedExitCodes: [1],
+        })
+      ).stdout.trim(),
+    ).toBe("");
+    const legacy = {
+      ...integration,
+      state: "needs_reconciliation" as const,
+      preview: { ...integration.preview, target },
+    };
+    const database = new DatabaseSync(join(root, "state", "managed-worktrees.db"));
+    try {
+      database
+        .prepare("UPDATE integrations SET data=? WHERE id=?")
+        .run(JSON.stringify(legacy), legacy.id);
+      const recover = vi.spyOn(manager.locks, "recoverIntegration");
+      const reconciled = await operation(manager, tree, "reconcile");
+      expect(reconciled).toMatchObject({
+        ok: false,
+        code: "target_not_fleet_owned",
+        error: "The integration workspace escaped Fleet ownership.",
+      });
+      expect(recover).not.toHaveBeenCalled();
+      expect(manager.locks.holder(target.key)).toBeUndefined();
+      expect(
+        database.prepare("SELECT data FROM integrations WHERE id=?").get(legacy.id)!.data,
+      ).toBe(JSON.stringify(legacy));
+      expect((await git.run(target.path, ["rev-parse", "HEAD"])).stdout.trim()).toBe(
+        integration.resultSha,
+      );
+      expect(await readFile(join(target.path, "same.txt"), "utf8")).toBe("task change\n");
+      expect(await readFile(join(source, "same.txt"), "utf8")).toBe("base\n");
+    } finally {
+      database.close();
+    }
   }, 120_000);
 
   it("rejects stale reviewed SHA and target preview; merges only after explicit confirmation", async () => {

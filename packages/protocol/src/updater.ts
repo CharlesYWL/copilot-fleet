@@ -564,23 +564,19 @@ export async function applyUpdate({
       revision: outcome.revision,
       restartRequestedAt: now().toISOString(),
     });
+    // Confirmation belongs to the new Host; a heartbeat must not replace its outcome.
+    if (confirmRestart === "host") clearInterval(heartbeat);
     let failure: string | undefined;
     try {
       failure = await restart(outcome.revision);
     } catch (error) {
       failure = errorMessage(error);
     }
-    if (failure) {
-      // The new Host may already have finished the record from where it
-      // stands — it is serving and its Node is back — and it has the better
-      // view; only a restart still waiting on it is marked failed.
-      const current = readUpdateRecord(statusFile);
-      const settled =
-        confirmRestart === "host" &&
-        current?.updateId === updateId &&
-        updateFinished(current.stage);
-      if (!settled) write({ stage: "failed", detail: failure });
-      else record = current;
+    const current = confirmRestart === "host" ? readUpdateRecord(statusFile) : undefined;
+    if (current?.updateId === updateId && updateFinished(current.stage)) {
+      record = current;
+    } else if (failure) {
+      write({ stage: "failed", detail: failure });
     } else if (confirmRestart === "updater") {
       write({ stage: "up_to_date", detail: `Updated to ${outcome.revision}` });
     }
