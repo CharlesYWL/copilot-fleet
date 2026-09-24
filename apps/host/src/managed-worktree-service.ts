@@ -26,6 +26,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "./fleet-service.js";
 import { stopSessions } from "./orchestrator/lifecycle.js";
+import { owedPrompt } from "./orchestrator/briefing.js";
 import { sendBackPrompt } from "./orchestrator/review.js";
 import { WorkspaceArtifactStore } from "./workspace-artifact-store.js";
 
@@ -1621,7 +1622,7 @@ export class ManagedWorktreeService {
       return this.store.updateRun(runId, {
         state: "running",
         failureReason: "",
-        pendingPrompt: sendBackPrompt(run.name, note),
+        pendingPrompt: owedPrompt(run.pendingPrompt, sendBackPrompt(run.name, note)),
       })!;
     });
     this.publish(runId);

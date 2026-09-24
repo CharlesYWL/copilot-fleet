@@ -5,6 +5,7 @@ import {
   MANAGED_WORKTREES_CAPABILITY,
   WorkspaceModeSchema,
   AccessIntentSchema,
+  contextUsePercent,
   PrMaintenanceCheckpointSchema,
   PrMaintenanceEnableSchema,
   PrMaintenanceIdentitySchema,
@@ -37,7 +38,14 @@ import {
   HANDOVER_SHAPE,
   WORKER_DELIVERY_CONTRACT,
 } from "./briefing.js";
-import { archiveRun, purgeRun, stopSessions } from "./lifecycle.js";
+import {
+  archiveRun,
+  orchestratorLabel,
+  purgeRun,
+  stopSessions,
+  taskNeedsOrchestrator,
+  transferRun,
+} from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
@@ -632,6 +640,44 @@ export const DiscardTaskSchema = TaskRefSchema.extend({
     .min(10)
     .describe(
       "Why this task should not exist. Said to the person reading along, not filed.",
+    ),
+});
+
+/**
+ * Moving a task between orchestrator conversations.
+ *
+ * Not permission-checked by owner: a conversation whose context is full hands
+ * its work on, and a fresh one can be asked to take work over. What makes it
+ * safe is that a task still has exactly one owner afterwards — the one the
+ * engine wakes and PR maintenance's heartbeat runs for.
+ */
+export const TransferTaskSchema = z.object({
+  task: z
+    .string()
+    .min(1)
+    .max(80)
+    .describe(
+      "The task's stable ID, or the exact name of one of your own tasks. Another " +
+        "orchestrator's task can only be named by its ID, from fleet_list_orchestrators.",
+    ),
+  to: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      "The orchestrator conversation to hand the task to: its session ID from " +
+        "fleet_list_orchestrators, or its exact name when that is unique. Omit to take " +
+        "the task over yourself.",
+    ),
+  note: z
+    .string()
+    .max(8_000)
+    .optional()
+    .describe(
+      "What the receiving orchestrator needs that the task record does not say: where the " +
+        "work stands, what you were about to do, what is still uncertain. Kept on the task " +
+        "and delivered with its handoff.",
     ),
 });
 
@@ -1321,7 +1367,26 @@ export class FleetTools {
     return matches[0];
   }
 
+  /** Any task on this Host by its exact ID, whichever orchestrator it is assigned to. */
+  private anyTask(task: string): Run | undefined {
+    const wanted = task.trim();
+    return this.store.getRun(wanted) ?? this.store.getRun(wanted.toLowerCase());
+  }
+
   private missingTask(task: string): ToolResult {
+    const elsewhere = this.anyTask(task);
+    if (elsewhere && elsewhere.leadSessionId !== this.leadSessionId) {
+      const owner = elsewhere.leadSessionId
+        ? this.store.getSession(elsewhere.leadSessionId)
+        : undefined;
+      return refuse(
+        [
+          `Task ${elsewhere.id} is assigned to ${orchestratorLabel(owner, elsewhere.leadSessionId)}, not to this orchestrator (${this.leadSessionId}). Nothing was changed.`,
+          "Its workers, wakes and PR maintenance belong to that orchestrator. Do not recreate its work here.",
+          "Take it over with fleet_transfer_task only when you have been asked to continue that work.",
+        ].join("\n"),
+      );
+    }
     const recent = this.runs().slice(-10).reverse();
     return refuse(
       [
@@ -1950,6 +2015,164 @@ export class FleetTools {
     return ok(
       `Deleted "${name}". It had dispatched nothing, so nothing was lost. ` +
         `Say why in your next message — a task vanishing from the board is otherwise unexplained.`,
+    );
+  }
+
+  /** An orchestrator conversation by session ID, or by a name only it carries. */
+  private orchestrator(ref: string): FleetSession | ToolResult {
+    const wanted = ref.trim().toLowerCase();
+    const leads = this.store
+      .listSessions()
+      .filter((session) => session.runRole === "lead");
+    const byId = leads.find((session) => session.id.toLowerCase() === wanted);
+    if (byId) return byId;
+    const named = leads.filter(
+      (session) => !session.dismissed && session.name.trim().toLowerCase() === wanted,
+    );
+    if (named.length === 1) return named[0]!;
+    return refuse(
+      [
+        named.length
+          ? `The orchestrator name "${ref}" is ambiguous. Nothing was changed.`
+          : `No orchestrator conversation is called "${ref}". Nothing was changed.`,
+        "Use a session ID from fleet_list_orchestrators as to.",
+        ...(named.length
+          ? named.map(
+              (session) =>
+                `  ${session.id}: ${session.state}, started ${session.createdAt}`,
+            )
+          : []),
+      ].join("\n"),
+    );
+  }
+
+  /**
+   * Every orchestrator conversation, and the work each one is responsible for.
+   *
+   * The one place a lead sees past its own scope, and read-only: it is how a
+   * fresh conversation finds the task IDs of work it was asked to take over,
+   * and how a full one finds somewhere to hand its work.
+   */
+  listOrchestrators(): ToolResult {
+    const runs = this.store.listRuns();
+    const leads = this.store
+      .listSessions()
+      .filter((session) => session.runRole === "lead" && !session.dismissed)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const lines = leads.map((lead) => {
+      const owned = runs.filter((run) => run.leadSessionId === lead.id);
+      const assigned = owned
+        .filter((run) => taskNeedsOrchestrator(this.service, run))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const closed = owned.length - assigned.length;
+      const used = contextUsePercent(lead.usage);
+      const context = used === undefined ? "" : `; context ${used}% used`;
+      const state = lead.stopRequested ? `${lead.state}, stopping` : lead.state;
+      const shown = assigned.slice(0, 50);
+      return [
+        `${JSON.stringify(lead.name || "Orchestrator")} (${lead.id})${lead.id === this.leadSessionId ? " — this conversation" : ""}`,
+        `  ${state} on ${lead.nodeName}; started ${lead.createdAt}${context}`,
+        ...(shown.length
+          ? [
+              `  tasks needing it (${assigned.length}):`,
+              ...shown.map((run) => {
+                const maintenance = this.store.prMaintenance.list({
+                  taskId: run.id,
+                  retainedOnly: true,
+                  limit: 1,
+                }).records[0];
+                return `    ${run.id}: ${JSON.stringify(run.name)} - ${run.state}, ${this.phaseLine(run)}${
+                  maintenance
+                    ? `; maintains ${prMaintenanceUrl(maintenance.identity)} (${maintenance.lifecycle})`
+                    : ""
+                }`;
+              }),
+              ...(assigned.length > shown.length
+                ? [`    … and ${assigned.length - shown.length} more`]
+                : []),
+            ]
+          : ["  tasks needing it: none"]),
+        ...(closed > 0 ? [`  closed tasks: ${closed}`] : []),
+      ].join("\n");
+    });
+    return ok(
+      [
+        lines.length
+          ? lines.join("\n\n")
+          : "There are no orchestrator conversations on this Host.",
+        "Each task belongs to exactly one orchestrator: only it is woken for the task and runs its PR-maintenance heartbeat. Move one with fleet_transfer_task.",
+      ].join("\n\n"),
+    );
+  }
+
+  /**
+   * Reassigns a task to another orchestrator conversation, or to this one.
+   *
+   * Handing work on is how a conversation whose context is full gets relief,
+   * and taking it over is how a fresh one continues it. Either way the task
+   * keeps its phases, notes, workers and checkout; the receiving orchestrator
+   * is the only one woken for it afterwards.
+   */
+  transferTask(input: z.infer<typeof TransferTaskSchema>): ToolResult {
+    const own = this.run(input.task);
+    if (own && "ok" in own) return own;
+    const run = own ?? this.anyTask(input.task);
+    if (!run) return this.missingTask(input.task);
+    const target = input.to
+      ? this.orchestrator(input.to)
+      : this.store.getSession(this.leadSessionId);
+    if (!target) return refuse("This orchestrator's session record is missing.");
+    if ("ok" in target) return target;
+    const self = target.id === this.leadSessionId;
+    let result: ReturnType<typeof transferRun>;
+    try {
+      result = transferRun(this.service, run.id, target.id, {
+        source: "orchestrator",
+        actorSessionId: this.leadSessionId,
+        note: input.note,
+        brief: !self,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "statusCode" in error &&
+        Number(error.statusCode) >= 400 &&
+        Number(error.statusCode) < 500
+      ) {
+        const code = "code" in error && typeof error.code === "string" ? error.code : "";
+        return refuse(
+          `${code ? `${code}: ` : ""}${error.message} Nothing was changed for "${run.name}".`,
+        );
+      }
+      throw error;
+    }
+    this.service.tickRun(run.id);
+    if (!result.changed) {
+      return ok(
+        `"${run.name}" (${run.id}) is already assigned to ${self ? "this orchestrator" : orchestratorLabel(target)}. Nothing changed.`,
+      );
+    }
+    if (self) {
+      return ok(
+        [
+          `You now own "${run.name}" (task id: ${run.id}); it was assigned to ${orchestratorLabel(
+            result.from ? this.store.getSession(result.from) : undefined,
+            result.from,
+          )}.`,
+          `You have none of its history in this conversation. Read fleet_get_task with task "${run.id}" before acting, and fleet_get_pr_maintenance with taskId "${run.id}" when it maintains a PR.`,
+          "Continue from where it stands: running steps keep going and wake you when they settle; use fleet_follow_up for retained workers, and do not re-plan, restart or duplicate existing work.",
+        ].join("\n"),
+      );
+    }
+    return ok(
+      [
+        `Transferred "${run.name}" (task id: ${run.id}) to ${orchestratorLabel(target)}. It will be briefed to continue the task when it is free.`,
+        ...(result.from === this.leadSessionId
+          ? [
+              "The task is no longer yours: do not dispatch, follow up, reopen or recreate its work from this conversation.",
+            ]
+          : []),
+      ].join("\n"),
     );
   }
 

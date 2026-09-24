@@ -1924,6 +1924,13 @@ recording the handoff for you to review.
    it. Use **Archive** or **Stop agents** to end the work itself. **Dismiss
    orchestrator** hides a stopped lead once its tasks are finished or archived,
    without deleting ordinary session history.
+8. When a conversation's context is full, start a new conversation and use
+   **Transfer tasks** (in the conversation's task panel or on the board) or
+   **Transfer** (on a task's page) to hand work to it. Each task belongs to
+   exactly one orchestrator, so its workers, pending review and PR-maintenance
+   heartbeat move with it; the receiving lead is briefed to continue from the
+   task's record, and the previous lead no longer sees it. A transfer is refused
+   while a command the previous lead requested for the task has not settled.
 
 For one-off questions that do not need a checkout, start a direct **Chats**
 session from **New session**. For shared multi-agent goals, use Orchestrator's
@@ -2210,6 +2217,19 @@ search first, or return to the owning orchestrator. For a closed task, call
 follow-ups are persisted and scheduled in the same session. Queued, busy,
 stopping or offline does not mean replacement is needed; a repeated pending
 follow-up is not sent twice, and a different prompt cannot overwrite it.
+
+**When a conversation fills up, move its work.** An orchestrator has one context
+window, so a long-lived conversation eventually runs out of room. Start a new
+conversation and hand the work to it: **Transfer tasks** in a conversation's
+task panel or on the board, or **Transfer** on a task's page. Each task belongs
+to exactly one orchestrator — the one woken when its work settles and the one
+that runs its PR-maintenance heartbeat — so the move takes the task's workers,
+pending review and PR maintenance with it, and the receiving conversation is
+briefed to read the task's record and carry on from where it stands. An
+orchestrator can do the same itself: `fleet_list_orchestrators` shows every
+conversation and the work it holds, and `fleet_transfer_task` hands a task on,
+or takes one over. The REST equivalents are `POST /api/runs/<id>/transfer` and
+`POST /api/orchestrators/<id>/transfer`.
 
 ### Chats as a destination
 

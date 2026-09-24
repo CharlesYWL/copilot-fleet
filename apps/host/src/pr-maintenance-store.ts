@@ -1049,6 +1049,78 @@ export class PrMaintenanceStore {
     });
   }
 
+  /**
+   * Moves a task's maintenance to the lead the task now belongs to.
+   *
+   * Maintenance is driven by lead wakes and `takeDue` claims only a lead's own
+   * registrations, so leaving them behind would split one task across two
+   * heartbeats — or, with the previous lead stopped, leave the PR with none.
+   * Released history moves too, because task discovery reads it by lead. The
+   * version bump, and the owner inside every observation scope, invalidate
+   * whatever the previous lead read or reserved before the change.
+   */
+  transferTask(taskId: string, leadSessionId: string): PrMaintenanceRegistration[] {
+    actorSchema.parse(leadSessionId);
+    return this.store.writeAtomically(() => {
+      const moved: PrMaintenanceRegistration[] = [];
+      const versions = new Map<string, { before: number; after: number }>();
+      for (const row of this.db
+        .prepare("SELECT data FROM pr_maintenance WHERE task_id=? ORDER BY id")
+        .all(taskId)) {
+        const record = PrMaintenanceRegistrationSchema.parse(
+          JSON.parse(String(row.data)),
+        );
+        if (record.leadSessionId === leadSessionId) continue;
+        const previous = record.leadSessionId;
+        const before = record.version;
+        record.leadSessionId = leadSessionId;
+        // The previous owner's own pause is the owning lead's pause, not an
+        // operator's or the Host's, so whichever lead owns the task may lift it.
+        if (
+          record.pauseOrigin?.actor === "lead" &&
+          record.pauseOrigin.actorId === previous
+        )
+          record.pauseOrigin = { ...record.pauseOrigin, actorId: leadSessionId };
+        const saved = this.save(record);
+        this.db
+          .prepare("UPDATE pr_maintenance SET lead_session_id=? WHERE id=?")
+          .run(leadSessionId, saved.id);
+        versions.set(saved.id, { before, after: saved.version });
+        moved.push(saved);
+      }
+      const proposal = this.getProposal(taskId);
+      if (proposal && proposal.leadSessionId !== leadSessionId) {
+        /*
+         * A pending proposal is the operator's to judge, and moving the task
+         * does not change what it says. A reauthorization pinned to the record
+         * this transfer just re-versioned follows it; any other change still
+         * makes the proposal stale, as it would have without the transfer.
+         */
+        const pinned = proposal.reauthorization
+          ? versions.get(proposal.reauthorization.recordId)
+          : undefined;
+        const reauthorization =
+          proposal.reauthorization &&
+          pinned &&
+          pinned.before === proposal.reauthorization.version
+            ? { ...proposal.reauthorization, version: pinned.after }
+            : proposal.reauthorization;
+        this.db.prepare("UPDATE pr_maintenance_proposals SET data=? WHERE task_id=?").run(
+          JSON.stringify(
+            PrMaintenanceProposalSchema.parse({
+              ...proposal,
+              leadSessionId,
+              ...(reauthorization ? { reauthorization } : {}),
+              updatedAt: nowIso(),
+            }),
+          ),
+          taskId,
+        );
+      }
+      return moved;
+    });
+  }
+
   manualRecord(sessionId: string): PrMaintenanceRegistration | undefined {
     return this.retained().find((record) => record.workerSessionId === sessionId);
   }

@@ -59,10 +59,13 @@ import { OrchestratorPage } from "./components/orchestration/OrchestratorPage";
 import { OrchestratorTaskDetail } from "./components/orchestration/OrchestratorTaskDetail";
 import { ConversationTasks } from "./components/orchestration/ConversationTasks";
 import { CreateOrchestrationDialog } from "./components/orchestration/CreateOrchestrationDialog";
+import { TransferTasksDialog } from "./components/orchestration/TransferTasksDialog";
 import { readDismissedFailures } from "./components/orchestration/RunStatusIndicator";
+import { sessionLabel } from "./lib/session-label";
 import {
   buildRunViewModels,
   liveSteps,
+  needsOrchestrator,
   summarise,
   tasksAwaitingHuman,
 } from "./lib/orchestration-view";
@@ -279,6 +282,16 @@ export function App() {
   const [bulkStopScope, setBulkStopScope] = useState<
     { kind: "all" } | { kind: "orchestrator"; sessionId: string }
   >();
+  /**
+   * Which tasks the transfer dialog is moving, and from which conversation.
+   *
+   * Named tasks come from one task's page; without them it is everything the
+   * conversation is responsible for, to choose from.
+   */
+  const [transferRequest, setTransferRequest] = useState<{
+    sourceId: string;
+    runIds?: string[];
+  }>();
   const [manageFavoritesOpen, setManageFavoritesOpen] = useState(false);
   const [cleanupOrchestratorsOpen, setCleanupOrchestratorsOpen] = useState(false);
   const [attentionOnly, setAttentionOnly] = useState(false);
@@ -520,8 +533,11 @@ export function App() {
    * dispatches. The first workspace that an online node actually holds is the
    * one picked, since any other choice would produce an orchestrator that can
    * see nowhere to send work.
+   *
+   * `stay` keeps the operator where they are: a conversation started from the
+   * transfer dialog is somewhere to send tasks, not somewhere to go.
    */
-  const handleStartOrchestrator = async () => {
+  const handleStartOrchestrator = async (options: { stay?: boolean } = {}) => {
     const reachable = snapshot.placements.find((placement) =>
       snapshot.nodes.some((node) => node.id === placement.nodeId && node.online),
     );
@@ -537,6 +553,10 @@ export function App() {
       body: JSON.stringify({ workspaceId: reachable.workspaceId }),
     });
     if (!created.ok) return false;
+    if (options.stay) {
+      await refresh();
+      return true;
+    }
     // Opened rather than merely created: starting a conversation and landing on
     // a different one is the kind of thing you only notice after typing into it.
     setOpenConversationId(created.data.session.id);
@@ -691,6 +711,39 @@ export function App() {
   }, [bulkStopScope, runModels, snapshot.sessions]);
   const orchestratorSummary = useMemo(() => summarise(runModels), [runModels]);
   /**
+   * What the transfer dialog offers: the tasks being moved, and where to.
+   *
+   * Only a running conversation can take work — a stopped one would hold it
+   * with nobody awake to act — and never the one it is leaving.
+   */
+  const transferModels = useMemo(() => {
+    if (!transferRequest) return [];
+    return runModels.filter((model) =>
+      transferRequest.runIds
+        ? transferRequest.runIds.includes(model.run.id)
+        : model.run.leadSessionId === transferRequest.sourceId,
+    );
+  }, [transferRequest, runModels]);
+  const transferTargets = useMemo(
+    () =>
+      orchestrators.filter(
+        (session) =>
+          session.id !== transferRequest?.sourceId &&
+          !terminalSessionStates.has(session.state) &&
+          !session.stopRequested &&
+          !session.cleanupRequested,
+      ),
+    [orchestrators, transferRequest],
+  );
+  const assignedTaskCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const model of runModels) {
+      if (!needsOrchestrator(model)) continue;
+      counts[model.run.leadSessionId] = (counts[model.run.leadSessionId] ?? 0) + 1;
+    }
+    return counts;
+  }, [runModels]);
+  /**
    * One number for "waiting on you", counting each thing once.
    *
    * A permission on a worker is already what makes its task need a person, so
@@ -711,6 +764,14 @@ export function App() {
   const selectedRunModel = useMemo(
     () => runModels.find((model) => model.run.id === selectedRunId),
     [runModels, selectedRunId],
+  );
+  /** The conversation the open task is assigned to, which its page names. */
+  const selectedRunOwner = useMemo(
+    () =>
+      allOrchestrators.find(
+        (session) => session.id === selectedRunModel?.run.leadSessionId,
+      ),
+    [allOrchestrators, selectedRunModel],
   );
   const handleNotificationNavigate = useCallback(
     (notification: Notification) => {
@@ -1041,6 +1102,45 @@ export function App() {
   };
 
   /**
+   * Hands tasks to another orchestrator conversation.
+   *
+   * Each task moves on its own on the Host, so some can move while one waits
+   * on a command still settling; the dialog closes once anything moved, and
+   * the rest are reported rather than silently left behind.
+   */
+  const handleTransferTasks = async (input: {
+    runIds: string[];
+    toSessionId: string;
+    note: string;
+  }) => {
+    if (!transferRequest) return false;
+    const moved = await request<{
+      transferred: string[];
+      failed: { runId: string; error: string }[];
+    }>(`/api/orchestrators/${transferRequest.sourceId}/transfer`, {
+      method: "POST",
+      body: JSON.stringify({
+        toSessionId: input.toSessionId,
+        runIds: input.runIds,
+        ...(input.note ? { note: input.note } : {}),
+      }),
+    });
+    if (!moved.ok) return false;
+    const target = orchestrators.find((session) => session.id === input.toSessionId);
+    const destination = target ? sessionLabel(target) : "the other orchestrator";
+    const count = moved.data.transferred.length;
+    const failure = moved.data.failed[0];
+    notify(
+      failure
+        ? `Transferred ${count} of ${input.runIds.length} tasks to ${destination}. ${failure.error}`
+        : `Transferred ${count} ${count === 1 ? "task" : "tasks"} to ${destination}.`,
+      failure ? "warning" : "success",
+    );
+    await refresh();
+    return count > 0;
+  };
+
+  /**
    * Opens a new task on the orchestrator.
    *
    * One call: the Host creates the run bound to the lead and briefs it in the
@@ -1310,6 +1410,9 @@ export function App() {
                     onDismissOrchestrator={() =>
                       void handleDismissOrchestrator(orchestrator.id)
                     }
+                    onTransferTasks={() =>
+                      setTransferRequest({ sourceId: orchestrator.id })
+                    }
                   />
                 ) : (
                   <StartOrchestrator
@@ -1331,6 +1434,15 @@ export function App() {
                   sessions={snapshot.sessions}
                   onBack={handleBackFromTask}
                   backLabel={taskOrigin ? "Conversation" : "All tasks"}
+                  ownerLabel={
+                    selectedRunOwner ? sessionLabel(selectedRunOwner) : undefined
+                  }
+                  onTransfer={() =>
+                    setTransferRequest({
+                      sourceId: selectedRunModel.run.leadSessionId,
+                      runIds: [selectedRunModel.run.id],
+                    })
+                  }
                   onOpenLead={() => {
                     // The conversation that owns this task, not whichever one
                     // happens to be open: on a board that shows every
@@ -1374,6 +1486,19 @@ export function App() {
                 agents={bulkStopAgents}
                 onClose={() => setBulkStopScope(undefined)}
                 onStop={handleStopSelectedAgents}
+              />
+              <TransferTasksDialog
+                open={Boolean(transferRequest)}
+                source={allOrchestrators.find(
+                  (session) => session.id === transferRequest?.sourceId,
+                )}
+                models={transferModels}
+                fixed={Boolean(transferRequest?.runIds)}
+                targets={transferTargets}
+                assignedCounts={assignedTaskCounts}
+                onClose={() => setTransferRequest(undefined)}
+                onTransfer={handleTransferTasks}
+                onStartOrchestrator={() => void handleStartOrchestrator({ stay: true })}
               />
               <ManageFavoritesDialog
                 open={manageFavoritesOpen}
@@ -1481,6 +1606,9 @@ export function App() {
                           setOpenConversationId(activeSession.id);
                           setOrchestrationDialogOpen(true);
                         }}
+                        onTransfer={() =>
+                          setTransferRequest({ sourceId: activeSession.id })
+                        }
                       />
                     )}
                   </>

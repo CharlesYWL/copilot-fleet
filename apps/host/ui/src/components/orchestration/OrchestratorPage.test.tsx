@@ -433,6 +433,38 @@ describe("orchestrator views", () => {
     ).toBe("Stop this orchestrator's conversation. Its tasks and agents keep running.");
   });
 
+  it("offers to transfer this conversation's tasks that still need an owner", () => {
+    const onTransferTasks = vi.fn();
+    page(
+      "stage",
+      vi.fn(),
+      models([
+        run({ id: "mine", state: "running" }),
+        run({ id: "done", state: "completed" }),
+        run({ id: "theirs", leadSessionId: "other-lead", state: "running" }),
+      ]),
+      { conversation: conversation({ state: "stopped" }), onTransferTasks },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Transfer tasks (1)" }));
+
+    expect(onTransferTasks).toHaveBeenCalled();
+  });
+
+  it("offers no transfer to a conversation with nothing left to own", () => {
+    page(
+      "stage",
+      vi.fn(),
+      models([
+        run({ id: "done", state: "completed" }),
+        run({ id: "theirs", leadSessionId: "other-lead" }),
+      ]),
+      { onTransferTasks: vi.fn() },
+    );
+
+    expect(screen.queryByRole("button", { name: /Transfer tasks/ })).toBeNull();
+  });
+
   it("puts what needs a person at the top of its column", () => {
     // Both derive to validation, so this is genuinely about order within one
     // column rather than about which column they land in.
@@ -557,6 +589,24 @@ describe("task detail", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
 
     expect(props.onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the conversation the task is assigned to and offers to move it", () => {
+    const onTransfer = vi.fn();
+    detail({ ownerLabel: "Night shift", onTransfer });
+
+    expect(screen.getByText(/^Night shift/)).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Conversation" }).getAttribute("title"),
+    ).toBe("Open Night shift, the conversation this task is assigned to");
+    fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
+    expect(onTransfer).toHaveBeenCalled();
+  });
+
+  it("offers no transfer where nothing can carry it out", () => {
+    detail();
+
+    expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
   });
 
   it("says a freshly opened task is waiting on the orchestrator, not on you", () => {

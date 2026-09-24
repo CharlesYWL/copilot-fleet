@@ -29,6 +29,7 @@ import {
   canTransition,
   canTransitionRun,
   canTransitionRunStep,
+  contextUsePercent,
   eventPayload,
   isRotatingTunnelUrl,
   normalizeHostUrl,
@@ -76,6 +77,27 @@ describe("protocol validation", () => {
     ]) {
       expect(SessionUsageSchema.safeParse(usage).success).toBe(false);
     }
+  });
+
+  it("reads context use from a /context snapshot first, then the prompt budget", () => {
+    expect(contextUsePercent(undefined)).toBeUndefined();
+    expect(contextUsePercent({ contextTokens: 50_000 })).toBeUndefined();
+    expect(contextUsePercent({ contextTokens: 0, contextWindow: 200_000 })).toBe(0);
+    expect(contextUsePercent({ contextTokens: 50_000, contextWindow: 200_000 })).toBe(25);
+    expect(
+      contextUsePercent({
+        contextTokens: 50_000,
+        contextWindow: 200_000,
+        context: {
+          model: "gpt-5.5",
+          usedTokens: 360_000,
+          tokenLimit: 400_000,
+          percentage: 89.6,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          estimated: true,
+        },
+      }),
+    ).toBe(90);
   });
 
   it.each(["start_session", "resume_session"] as const)(

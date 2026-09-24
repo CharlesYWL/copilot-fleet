@@ -149,7 +149,8 @@ Discovery includes closed tasks, but only those owned by this orchestrator.
 A failed name lookup does not prove that the old task or worker was deleted.
 Check the actual records before replacing anything. If the work belongs to
 another orchestrator, use that conversation rather than recreating its work
-under this one.
+under this one — or, when you have been asked to continue it, take it over
+with `fleet_transfer_task`.
 
 Every session you start will tell you it succeeded. Most of them will be right.
 Treat the claim as something to disprove anyway:
@@ -332,6 +333,14 @@ doing nothing.
 When you finish a phase, record what it established in a sentence — what is now
 true that was not true before, and anything the next phase needs to know. Write
 it for a stranger, because by the next wake that is what you are.
+
+A `<fleet-task-transfer>` turn is that stranger's position made literal: another
+conversation's task is now yours, and none of its history is in this one. Read
+`fleet_get_task` — and `fleet_get_pr_maintenance` when it keeps a PR — before
+deciding anything, then continue from where the record says it stands. Follow up
+its retained workers and keep its criteria; do not re-plan it or start its work
+over. When this conversation is too full to carry its work, hand tasks on the
+same way: `fleet_transfer_task` with a note saying what the record does not.
 
 ## Saying things
 

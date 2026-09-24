@@ -18,10 +18,15 @@ import {
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
-import { orchestratorBriefing } from "../orchestrator/briefing.js";
+import { orchestratorBriefing, owedPrompt } from "../orchestrator/briefing.js";
 import { maintenanceDirectionPrompt, reviewOutcome } from "../orchestrator/review.js";
 import { PrMaintenanceError, prMaintenanceUnsettled } from "../pr-maintenance-store.js";
-import { reopenOrchestratorStoppedRun, stopSessions } from "../orchestrator/lifecycle.js";
+import {
+  reopenOrchestratorStoppedRun,
+  stopSessions,
+  taskNeedsOrchestrator,
+  transferRun,
+} from "../orchestrator/lifecycle.js";
 
 const CreateOrchestratorSchema = z.object({
   /** Where its workers run. The orchestrator itself only talks. */
@@ -85,6 +90,45 @@ function maintenanceOperator(request: FastifyRequest): string | undefined {
   if (request.fleetNodeId || !session || session.expiresAt <= Date.now())
     return undefined;
   return session.administratorId || `operator:${session.authMethod}`;
+}
+
+/** Hands one task to another orchestrator conversation. */
+const TransferTaskSchema = z
+  .object({
+    toSessionId: z.string().min(1),
+    /** Delivered with the receiving orchestrator's brief and kept on the task. */
+    note: z.string().trim().max(8_000).optional(),
+  })
+  .strict();
+
+/** Hands several of one orchestrator's tasks to another. */
+const TransferTasksSchema = z
+  .object({
+    toSessionId: z.string().min(1),
+    /** Omitted means every task that still needs an orchestrator. */
+    runIds: z.array(z.string().min(1)).min(1).max(200).optional(),
+    note: z.string().trim().max(8_000).optional(),
+  })
+  .strict();
+
+/**
+ * A refusal the store or the transfer raised, as the words it carries.
+ *
+ * Every conflict on this path — a checkout command still running, a session
+ * being cleaned up, a maintenance invariant — already explains itself, so the
+ * route only has to pass it on rather than translate it.
+ */
+function transferRefusal(
+  error: unknown,
+): { status: number; code?: string; error: string } | undefined {
+  if (!(error instanceof Error) || !("statusCode" in error)) return undefined;
+  const status = Number(error.statusCode);
+  if (!Number.isInteger(status) || status < 400 || status >= 500) return undefined;
+  return {
+    status,
+    ...("code" in error && typeof error.code === "string" ? { code: error.code } : {}),
+    error: error.message,
+  };
 }
 
 const CreateRunSchema = z.object({
@@ -590,10 +634,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           service.resolveRunReview(id);
           store.updateRun(id, {
             ...(run!.state === "awaiting_human" ? { state: "running" as const } : {}),
-            pendingPrompt: maintenanceDirectionPrompt(
-              run!.name,
-              reference.decisionId,
-              outcome.note,
+            pendingPrompt: owedPrompt(
+              store.getRun(id)?.pendingPrompt ?? "",
+              maintenanceDirectionPrompt(run!.name, reference.decisionId, outcome.note),
             ),
           });
         },
@@ -643,7 +686,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
      */
     const reopened = store.updateRun(run!.id, {
       state: "running",
-      pendingPrompt: outcome.prompt,
+      pendingPrompt: owedPrompt(run!.pendingPrompt, outcome.prompt),
     })!;
     service.publishRun(reopened);
     engine.tick();
@@ -766,6 +809,95 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     service.publishRun(store.getRun(run.id)!);
     engine.tick();
     return reply.code(201).send({ run: store.getRun(run.id) ?? run });
+  });
+
+  /**
+   * Reassigns a task to another orchestrator conversation.
+   *
+   * The way work outlives a conversation: ACP gives an orchestrator one context
+   * window, so a long-lived one fills up, and starting a fresh conversation is
+   * only useful if the work in flight can follow it. The task keeps everything
+   * it has; only who is woken for it, and who runs its PR-maintenance
+   * heartbeat, changes.
+   */
+  app.post("/api/runs/:id/transfer", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = TransferTaskSchema.parse(request.body);
+    try {
+      const result = transferRun(service, id, input.toSessionId, {
+        source: "operator",
+        note: input.note,
+      });
+      engine.tick();
+      return { ok: true, changed: result.changed, from: result.from, run: result.run };
+    } catch (error) {
+      const refusal = transferRefusal(error);
+      if (!refusal) throw error;
+      const { status, ...body } = refusal;
+      return reply.code(status).send(body);
+    }
+  });
+
+  /**
+   * Moves an orchestrator's tasks to another, one task at a time.
+   *
+   * Each task moves on its own: one refused by a command still running on its
+   * checkout should not keep the rest on a conversation that cannot take any
+   * more. Only tasks still assigned here move, so a list read before another
+   * transfer cannot pull a task back from wherever it went since.
+   */
+  app.post("/api/orchestrators/:id/transfer", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = TransferTasksSchema.parse(request.body);
+    const source = store.getSession(id);
+    if (!source || source.runRole !== "lead") {
+      return reply.code(404).send({ error: "Orchestrator not found" });
+    }
+    if (input.toSessionId === id) {
+      return reply
+        .code(409)
+        .send({ error: "Choose a different orchestrator to take these tasks" });
+    }
+    const requested =
+      input.runIds ??
+      store
+        .listRuns()
+        .filter((run) => run.leadSessionId === id && taskNeedsOrchestrator(service, run))
+        .map((run) => run.id);
+    const transferred: string[] = [];
+    const failed: { runId: string; error: string; code?: string }[] = [];
+    for (const runId of new Set(requested)) {
+      const run = store.getRun(runId);
+      if (!run || run.leadSessionId !== id) {
+        failed.push({
+          runId,
+          error: run
+            ? "That task is no longer assigned to this orchestrator."
+            : "Task not found",
+        });
+        continue;
+      }
+      try {
+        transferRun(service, runId, input.toSessionId, {
+          source: "operator",
+          note: input.note,
+        });
+        transferred.push(runId);
+      } catch (error) {
+        const refusal = transferRefusal(error);
+        if (!refusal) throw error;
+        failed.push({
+          runId,
+          error: refusal.error,
+          ...(refusal.code ? { code: refusal.code } : {}),
+        });
+      }
+    }
+    engine.tick();
+    if (transferred.length === 0 && failed.length > 0) {
+      return reply.code(409).send({ error: failed[0]!.error, transferred, failed });
+    }
+    return { ok: true, transferred, failed };
   });
 
   /**

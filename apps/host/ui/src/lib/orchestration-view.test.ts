@@ -11,6 +11,7 @@ import {
   awaitingPlan,
   buildRunViewModels,
   currentPhase,
+  needsOrchestrator,
   PR_MAINTENANCE_STATUS_LABEL,
   runStateLabel,
   stageOf,
@@ -532,5 +533,31 @@ describe("labels", () => {
 
   it("clamps a phase index that has run past the end", () => {
     expect(currentPhase(run({ phases: ["Only"], phaseIndex: 4 }))).toBe("Only");
+  });
+
+  it("counts a task as needing an owner while open or keeping a PR maintained", () => {
+    const models = buildRunViewModels({
+      runs: [
+        run({ id: "open" }),
+        run({ id: "closed", state: "completed" }),
+        run({ id: "maintained", state: "completed" }),
+      ],
+      stepsByRun: {},
+      sessions: [],
+      maintenance: [
+        {
+          taskId: "maintained",
+          recordId: "record-1",
+          stage: "waiting_review",
+          prUrl: "https://github.com/example/repo/pull/7",
+          manualControl: false,
+        },
+      ],
+    });
+    const task = (id: string) => models.find((model) => model.run.id === id)!;
+
+    expect(needsOrchestrator(task("open"))).toBe(true);
+    expect(needsOrchestrator(task("closed"))).toBe(false);
+    expect(needsOrchestrator(task("maintained"))).toBe(true);
   });
 });

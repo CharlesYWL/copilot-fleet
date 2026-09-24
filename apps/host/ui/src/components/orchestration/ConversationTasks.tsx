@@ -13,6 +13,7 @@ import {
 } from "@fluentui/react-components";
 import {
   Add16Regular,
+  ArrowForward16Regular,
   PanelRightContract20Regular,
   PanelRightExpand20Regular,
   Search16Regular,
@@ -183,6 +184,9 @@ const useStyles = makeStyles({
   },
   footer: {
     flexShrink: 0,
+    display: "flex",
+    flexDirection: "column",
+    gap: "6px",
     padding: "8px 12px 12px 4px",
     borderTop: `1px solid ${tokens.colorNeutralStroke2}`,
   },
@@ -198,6 +202,8 @@ export type ConversationTasksProps = {
   onOpenRun: (runId: string) => void;
   onOpenWorker: (sessionId: string) => void;
   onNewRun: () => void;
+  /** Hands this conversation's tasks to another one, when it can take them. */
+  onTransfer?: (() => void) | undefined;
 };
 
 /**
@@ -217,6 +223,7 @@ export const ConversationTasks = ({
   onOpenRun,
   onOpenWorker,
   onNewRun,
+  onTransfer,
 }: ConversationTasksProps) => {
   const styles = useStyles();
   const [search, setSearch] = useState("");
@@ -382,6 +389,18 @@ export const ConversationTasks = ({
             >
               New task
             </Button>
+            {onTransfer && models.length > 0 && (
+              <Button
+                className={styles.newTask}
+                size="small"
+                appearance="subtle"
+                icon={<ArrowForward16Regular />}
+                title="Hand this conversation's tasks to another orchestrator conversation"
+                onClick={onTransfer}
+              >
+                Transfer tasks
+              </Button>
+            )}
           </div>
         </div>
       </div>

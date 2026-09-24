@@ -286,6 +286,39 @@ describe("orchestrator tools over the wire", () => {
     expect(reopen.inputSchema.properties?.task?.description).toContain("stable ID");
   });
 
+  it("hands a task to another orchestrator over the wire", async () => {
+    await plan();
+    const id = task()!.id;
+    const placement = store.listPlacements()[0]!;
+    const next = store.createSession(placement, "orchestrate", true, "Relief", {
+      runRole: "lead",
+    });
+
+    const listed = await rpc("tools/list");
+    const transfer = listed.result!.tools!.find(
+      (tool) => tool.name === "fleet_transfer_task",
+    )!;
+    expect(Object.keys(transfer.inputSchema.properties ?? {})).toEqual(
+      expect.arrayContaining(["task", "to", "note"]),
+    );
+    expect(transfer.description).toContain("exactly one orchestrator");
+    const orchestrators = await call("fleet_list_orchestrators", {});
+    expect(orchestrators.refused).toBe(false);
+    expect(orchestrators.text).toContain(`"Relief" (${next.id})`);
+    expect(orchestrators.text).toContain(id);
+
+    const moved = await call("fleet_transfer_task", {
+      task: id,
+      to: next.id,
+      note: "Implementation is done; review is next.",
+    });
+    expect(moved.refused, moved.text).toBe(false);
+    expect(store.getRun(id)!.leadSessionId).toBe(next.id);
+    expect((await call("fleet_get_task", { task: id })).text).toContain(
+      `assigned to Relief (${next.id})`,
+    );
+  });
+
   it("searches and inspects retained task context over the wire, then reopens by ID", async () => {
     const planned = await plan({ objective: "Address feedback for PR 1066416" });
     const id = task()!.id;

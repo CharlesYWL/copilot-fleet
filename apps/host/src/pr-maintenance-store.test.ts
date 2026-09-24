@@ -4888,3 +4888,118 @@ describe("durable PR maintenance registry", () => {
     ).toThrow(/Reconcile/);
   });
 });
+
+describe("moving maintenance with its task", () => {
+  /** What the task transfer does to the two tables, in its one transaction. */
+  const handOver = (f: ReturnType<typeof setup>) => {
+    const next = f.store.createSession(f.placement, "Next lead", false, "", {
+      runRole: "lead",
+    });
+    f.store.writeAtomically(() => {
+      f.store.updateRun(f.task.id, { leadSessionId: next.id });
+      f.store.prMaintenance.transferTask(f.task.id, next.id);
+    });
+    return next;
+  };
+
+  it("hands the registration, its heartbeat and its history to the new lead", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const next = handOver(f);
+
+    const moved = f.store.prMaintenance.get(record.id)!;
+    expect(moved.leadSessionId).toBe(next.id);
+    expect(moved.version).toBe(record.version + 1);
+    expect(
+      f.store.prMaintenance.list({ leadSessionId: next.id }).records.map(({ id }) => id),
+    ).toEqual([record.id]);
+    expect(f.store.prMaintenance.list({ leadSessionId: f.lead.id }).records).toEqual([]);
+    expect(f.store.prMaintenance.wakeEligibleLeadIds()).toEqual([next.id]);
+    expect(() => f.store.prMaintenance.get(record.id, f.lead.id)).toThrow(/another lead/);
+
+    // Only the new owner's heartbeat claims it now.
+    f.store.prMaintenance.beginWake(f.lead.id, "previous-wake");
+    expect(f.store.prMaintenance.takeDue(f.lead.id, "previous-wake")).toBeUndefined();
+    f.store.prMaintenance.beginWake(next.id, "next-wake");
+    expect(f.store.prMaintenance.takeDue(next.id, "next-wake")?.id).toBe(record.id);
+  });
+
+  it("leaves a task already owned by the lead untouched", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    expect(f.store.prMaintenance.transferTask(f.task.id, f.lead.id)).toEqual([]);
+    expect(f.store.prMaintenance.get(record.id)).toEqual(record);
+  });
+
+  it("lets the new owner lift the previous owner's own pause, and nobody else's", () => {
+    const own = setup();
+    let record = own.store.prMaintenance.enableFromOperator(own.input, "operator");
+    record = own.store.prMaintenance.set(own.lead.id, {
+      id: record.id,
+      expectedVersion: record.version,
+      action: "pause",
+      reason: "Waiting for CI capacity",
+    });
+    const next = handOver(own);
+    expect(own.store.prMaintenance.get(record.id)!.pauseOrigin).toMatchObject({
+      actor: "lead",
+      actorId: next.id,
+    });
+
+    const held = setup();
+    let paused = held.store.prMaintenance.enableFromOperator(held.input, "operator");
+    paused = held.store.prMaintenance.operatorAction(
+      paused.id,
+      paused.version,
+      { action: "pause", reason: "Hold for release freeze" },
+      "operator",
+    );
+    handOver(held);
+    expect(held.store.prMaintenance.get(paused.id)!.pauseOrigin).toMatchObject({
+      actor: "operator",
+      actorId: "operator",
+    });
+  });
+
+  it("keeps a pending proposal authorizable, now owned by the new lead", () => {
+    const f = setup();
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    const next = handOver(f);
+
+    expect(f.store.prMaintenance.getProposal(f.task.id)).toMatchObject({
+      id: proposal.id,
+      version: proposal.version,
+      leadSessionId: next.id,
+    });
+    expect(f.store.prMaintenance.listApprovals()[0]?.leadSessionId).toBe(next.id);
+    const record = f.store.prMaintenance.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "operator",
+    );
+    expect(record.leadSessionId).toBe(next.id);
+  });
+
+  it("keeps a reauthorization pinned to the record the transfer re-versioned", () => {
+    const f = setup();
+    const legacy = restoreLegacy(f);
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    const next = handOver(f);
+
+    const moved = f.store.prMaintenance.get(legacy.id)!;
+    expect(f.store.prMaintenance.getProposal(f.task.id)?.reauthorization).toEqual({
+      recordId: legacy.id,
+      version: moved.version,
+      generation: legacy.generation,
+    });
+    const record = f.store.prMaintenance.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "operator",
+    );
+    expect(record).toMatchObject({ id: legacy.id, leadSessionId: next.id });
+    expect(record.authorization.scope.publicationAuthorized).toBe(true);
+  });
+});

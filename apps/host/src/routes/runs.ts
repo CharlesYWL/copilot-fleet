@@ -11,6 +11,7 @@ import {
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { archiveRun, purgeRun } from "../orchestrator/lifecycle.js";
+import { owedPrompt } from "../orchestrator/briefing.js";
 import { reopenPrompt } from "../orchestrator/review.js";
 
 const CreateRunSchema = z.object({
@@ -291,7 +292,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     const reopened = store.updateRun(id, {
       state: "running",
       failureReason: "",
-      pendingPrompt: reopenPrompt(run.name, note),
+      pendingPrompt: owedPrompt(run.pendingPrompt, reopenPrompt(run.name, note)),
     })!;
     service.publishRun(reopened);
     engine.tick();

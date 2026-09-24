@@ -322,6 +322,41 @@ enrollment uses, which prefers a public tunnel, and an agent on the Host's own
 machine would have been sent out to the internet to reach a port it was already
 talking to.
 
+### Handing tasks to another orchestrator
+
+A task belongs to exactly one orchestrator: its run's `leadSessionId`. The owner
+is what the engine wakes when the task's work settles, what its owed prompts go
+to, whose conversation panel lists it, and what PR maintenance's heartbeat
+claims the task's registrations for. One owner per task is what keeps two
+heartbeats off one PR.
+
+Ownership moves; the work does not. An orchestrator has one context window —
+ACP offers no long-context tier — so a long-lived conversation fills, and
+starting a fresh one only helps if the work in flight can follow it.
+`transferRun` reassigns a task in one transaction: the run, its maintenance
+registrations (a pause the previous lead made itself goes with them) and a
+pending maintenance proposal. Workers, steps, checkout, budget and notes stay
+where they are, and a step already running settles to the new owner.
+
+The new owner has none of the task's history, so it is owed a
+`<fleet-task-transfer>` brief — held on the run like any owed prompt, together
+with anything the previous owner was owed and never sent — telling it to read
+the record and continue rather than re-plan. A closed task moves without one,
+because nothing is delivered to a closed task and an owed prompt there would
+only hold its sessions back from retention. A send-back, reopen or maintenance
+direction that arrives before the brief is read is appended to it, not
+substituted for it.
+
+Who may transfer is deliberately not restricted. The operator moves tasks from a
+task's page, a conversation's task panel or the board, and an orchestrator hands
+work on or takes it over with `fleet_transfer_task`; `fleet_list_orchestrators`
+is the one read that crosses conversation scope. What is refused is an unsafe
+move: to a conversation that is stopped, stopping or dismissed; while a command
+may still be changing the task's checkout; or while a command the previous owner
+requested for the task is unsettled, since its result goes to whoever asked. A
+registration's observation scope includes its owner, so a reservation the
+previous lead held cannot be checkpointed after the move.
+
 ### Opt-in PR maintenance
 
 Maintenance is durable task continuity, not a second scheduler: the existing

@@ -18,6 +18,7 @@ import {
 import {
   ArrowLeft20Regular,
   ArrowCounterclockwise20Regular,
+  ArrowForward20Regular,
   Chat20Regular,
   Delete20Regular,
   Info20Regular,
@@ -266,7 +267,11 @@ export type OrchestratorTaskDetailProps = {
   snapshotRevision?: number;
   onBack: () => void;
   backLabel?: string;
+  /** The conversation the task is assigned to, as the operator knows it. */
+  ownerLabel?: string | undefined;
   onOpenLead: () => void;
+  /** Hands the task to another orchestrator conversation. */
+  onTransfer?: (() => void) | undefined;
   onOpenWorker: (sessionId: string) => void;
   onReview: (
     approved: boolean,
@@ -297,7 +302,9 @@ export const OrchestratorTaskDetail = ({
   snapshotRevision = 0,
   onBack,
   backLabel = "All tasks",
+  ownerLabel,
   onOpenLead,
+  onTransfer,
   onOpenWorker,
   onReview,
   onArchive,
@@ -443,17 +450,35 @@ export const OrchestratorTaskDetail = ({
             {backLabel}
           </Button>
           <span className={styles.crumb}>
-            Orchestrator{currentPhase(run) ? ` / ${currentPhase(run)}` : ""}
+            {ownerLabel || "Orchestrator"}
+            {currentPhase(run) ? ` / ${currentPhase(run)}` : ""}
           </span>
           <div className={styles.actions}>
             <Button
               size="small"
               appearance="subtle"
               icon={<Chat20Regular />}
+              {...(ownerLabel
+                ? {
+                    title: `Open ${ownerLabel}, the conversation this task is assigned to`,
+                  }
+                : {})}
               onClick={onOpenLead}
             >
               Conversation
             </Button>
+            {onTransfer && (
+              <Button
+                {...restoreFocusTarget}
+                size="small"
+                appearance="subtle"
+                icon={<ArrowForward20Regular />}
+                title="Hand this task to another orchestrator conversation"
+                onClick={onTransfer}
+              >
+                Transfer
+              </Button>
+            )}
             <Button
               {...restoreFocusTarget}
               size="small"

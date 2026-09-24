@@ -1403,6 +1403,11 @@ worker 有结果后唤醒自己，并把交付记录留给你审查。
    会在 **Resume orchestrator** 重新接上 lead 后交给它；要结束工作本身请用 **Archive** 或
    **Stop agents**。**Dismiss orchestrator** 在 lead 的 tasks 已完成或归档后隐藏已停止的
    lead，不删除普通 session 历史。
+7. 某个对话的上下文用满时，新开一个对话，再用 **Transfer tasks**（在对话的任务面板或
+   任务板上）或 **Transfer**（在单个 task 页面上）把工作交给它。每个 task 只归属一个
+   orchestrator，所以它的 worker、待审查结果和 PR 维护心跳会一起转过去；接手的 lead
+   会收到简报，按 task 记录从当前进度继续，原来的 lead 则不再看到它。若原 lead 为该
+   task 请求的命令尚未结束，转移会被拒绝。
 
 如果只是一次不需要 checkout 的问题，请从 **New session** 直接启动 **Chats** session。
 如果是共享的多代理目标，请使用 Orchestrator 的 lead **Conversation** 和 task board，让计划、

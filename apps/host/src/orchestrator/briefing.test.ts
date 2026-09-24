@@ -3,7 +3,13 @@ import Fastify from "fastify";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { orchestratorBriefing, statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
+import {
+  orchestratorBriefing,
+  owedPrompt,
+  statusCheckEnvelope,
+  transferEnvelope,
+  wakeEnvelope,
+} from "./briefing.js";
 import { fleet } from "./fleet-harness.js";
 import { LeadTokens } from "./lead-tokens.js";
 import { MCP_PATH, mcpRoutes } from "./mcp-routes.js";
@@ -288,5 +294,52 @@ describe("what the orchestrator is told", () => {
       expect(normalized).toContain("Send back");
       expect(normalized).toContain("named external reviewers");
     }
+  });
+});
+
+describe("the transfer brief", () => {
+  it("points the receiving orchestrator at the record and asks it to continue", () => {
+    const text = transferEnvelope({
+      taskId: "task-1",
+      task: "Ship it",
+      state: "running",
+      phase: "Review (2/2)",
+      from: "Orchestrator (lead-1)",
+      note: "Review is next; the worker already pushed.",
+    });
+
+    expect(text.split("\n")[0]).toBe(
+      '<fleet-task-transfer task="Ship it" taskId="task-1" state="running" phase="Review (2/2)" from="Orchestrator (lead-1)">',
+    );
+    expect(text).toContain("Handoff note:\nReview is next; the worker already pushed.");
+    expect(text).toContain('fleet_get_task with task "task-1"');
+    expect(text).toContain('fleet_get_pr_maintenance with taskId "task-1"');
+    expect(text).toContain("do not re-plan, restart or duplicate work that exists");
+  });
+
+  it("says nothing it was not given", () => {
+    const text = transferEnvelope({
+      taskId: "task-1",
+      task: "Ship it",
+      state: "running",
+    });
+
+    expect(text.split("\n")[0]).toBe(
+      '<fleet-task-transfer task="Ship it" taskId="task-1" state="running">',
+    );
+    expect(text).not.toContain("Handoff note");
+  });
+
+  it("names only tools this Host offers", async () => {
+    const registered = new Set(await registeredTools());
+    const text = transferEnvelope({ taskId: "t", task: "t", state: "running" });
+
+    expect(toolsNamedIn(text).filter((name) => !registered.has(name))).toEqual([]);
+  });
+
+  it("adds to what is owed rather than replacing it", () => {
+    expect(owedPrompt("", "Sent back")).toBe("Sent back");
+    expect(owedPrompt("Brief", "Sent back")).toBe("Brief\n\nSent back");
+    expect(owedPrompt("Brief", "")).toBe("Brief");
   });
 });
