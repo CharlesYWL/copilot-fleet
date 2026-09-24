@@ -43,6 +43,33 @@ Node's reason, instead of leaving it `starting`. A refused launch leaves no
 process to report on it, so `starting` would otherwise never end; `failed` keeps
 the conversation resumable.
 
+## Transferring a task
+
+A task has exactly one owner, its run's `leadSessionId`: the conversation the
+engine wakes, delivers owed prompts to and lists the task under, and the one
+PR maintenance's heartbeat claims the task's registrations for. Transfer
+reassigns that owner and nothing else, in one transaction.
+
+| Existing state | Transfer |
+|---|---|
+| Open task | Moves; the receiving lead is owed a `<fleet-task-transfer>` brief ahead of any prompt already owed |
+| Closed task | Moves without a brief; nothing is delivered to a closed task |
+| Pending, starting or running step, idle retained worker | Unchanged; later settles wake the new owner |
+| Run-prompt or wake queued to the previous lead and not yet sent | Orphaned there and carried into the brief; one already in flight cannot be recalled |
+| PR maintenance registrations, including released history | Move to the new owner with a version bump; a pause the previous lead made itself becomes the new owner's |
+| Pending maintenance proposal | Re-owned and still authorizable; a reauthorization pinned to the moved record follows its new version |
+| Command executing or awaiting observation on the task's checkout | Refused until settled and observed |
+| Unsettled command the previous lead requested for the task | Refused; its result is delivered to whoever requested it |
+| Receiving lead stopped, stopping, dismissed or being deleted | Refused |
+
+The operator transfers from a task's page, a conversation's task panel or the
+board (`POST /api/runs/:id/transfer`, `POST /api/orchestrators/:id/transfer`).
+An orchestrator uses `fleet_transfer_task`, naming another conversation's task
+by the ID `fleet_list_orchestrators` shows; owner permission is deliberately not
+checked. A send-back, reopen or maintenance direction that arrives while the
+brief is still owed is appended to it. Every transfer adds a lifecycle note with
+any handoff note, so the record says where a task has been.
+
 ## Dependency rules
 
 A step is runnable only when every prerequisite is `succeeded`. Failed,

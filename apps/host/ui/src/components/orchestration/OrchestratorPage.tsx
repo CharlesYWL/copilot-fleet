@@ -7,6 +7,7 @@ import {
 } from "@fleet/protocol";
 import type { OrchestratorViewMode } from "../navigation/ContextModeToggle";
 import type { OrchestratorSummary, RunViewModel } from "../../lib/orchestration-view";
+import { needsOrchestrator } from "../../lib/orchestration-view";
 import { OrchestratorHeader } from "./OrchestratorHeader";
 import { OrchestratorStageBoard } from "./OrchestratorStageBoard";
 import { OrchestratorRunList } from "./OrchestratorRunList";
@@ -70,6 +71,8 @@ export type OrchestratorPageProps = {
   onStopOrchestrator: () => void;
   onResumeOrchestrator: () => void;
   onDismissOrchestrator: () => void;
+  /** Hands this conversation's tasks to another one; absent when none can take them. */
+  onTransferTasks?: (() => void) | undefined;
   onOpenCommands?: (() => void) | undefined;
   commandExecutionCount?: number;
 };
@@ -97,6 +100,7 @@ export const OrchestratorPage = ({
   onStopOrchestrator,
   onResumeOrchestrator,
   onDismissOrchestrator,
+  onTransferTasks,
   onOpenCommands,
   commandExecutionCount = 0,
 }: OrchestratorPageProps) => {
@@ -113,6 +117,9 @@ export const OrchestratorPage = ({
     (model) =>
       model.run.leadSessionId === conversation.id &&
       (!terminalRunStates.has(model.run.state) || (model.stoppingSteps ?? 0) > 0),
+  );
+  const unhanded = models.filter(
+    (model) => model.run.leadSessionId === conversation.id && needsOrchestrator(model),
   );
   const resumable = isResumableSession(conversation) && !stopping;
 
@@ -169,6 +176,16 @@ export const OrchestratorPage = ({
         {onOpenCommands && (
           <Button size="small" onClick={onOpenCommands}>
             Commands ({commandExecutionCount})
+          </Button>
+        )}
+        {onTransferTasks && unhanded.length > 0 && (
+          <Button
+            size="small"
+            appearance="subtle"
+            onClick={onTransferTasks}
+            title="Hand this orchestrator's open and PR-maintaining tasks to another conversation, for example when its context is full"
+          >
+            Transfer tasks ({unhanded.length})
           </Button>
         )}
         {activeAgentCount > 0 && (

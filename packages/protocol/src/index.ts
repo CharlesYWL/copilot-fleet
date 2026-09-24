@@ -357,6 +357,21 @@ export const SessionUsageSchema = z.object({
 });
 export type SessionUsage = z.infer<typeof SessionUsageSchema>;
 
+/**
+ * How full a session's context is, as a whole percentage, when it has said.
+ *
+ * A /context snapshot wins over ACP's prompt budget, as it does in the usage
+ * bar: it measures the model's window rather than the last request.
+ */
+export function contextUsePercent(usage: SessionUsage | undefined): number | undefined {
+  const reported = usage?.context?.percentage;
+  if (reported != null && Number.isFinite(reported) && reported >= 0)
+    return Math.round(reported);
+  const used = usage?.contextTokens;
+  const size = usage?.contextWindow;
+  return used != null && size ? Math.round((used / size) * 100) : undefined;
+}
+
 /** What the transcript keeps: enough to show the file, never its bytes. */
 export const AttachmentSummarySchema = z.object({
   name: z.string(),

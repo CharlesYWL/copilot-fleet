@@ -303,4 +303,19 @@ describe("conversation tasks", () => {
 
     expect(onNewRun).toHaveBeenCalled();
   });
+
+  it("offers to hand its tasks to another conversation", () => {
+    const onTransfer = vi.fn();
+    show({ onTransfer });
+
+    fireEvent.click(screen.getByRole("button", { name: "Transfer tasks" }));
+
+    expect(onTransfer).toHaveBeenCalled();
+  });
+
+  it("has nothing to transfer before anything is dispatched", () => {
+    show({ models: [], onTransfer: vi.fn() });
+
+    expect(screen.queryByRole("button", { name: "Transfer tasks" })).toBeNull();
+  });
 });

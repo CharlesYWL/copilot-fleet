@@ -10,6 +10,7 @@ import {
 import { fleet } from "./fleet-harness.js";
 import { OrchestratorEngine } from "./engine.js";
 import { FleetTools, GetPrMaintenanceSchema, SetPrMaintenanceSchema } from "./tools.js";
+import { transferRun } from "./lifecycle.js";
 import { LeadTokens } from "./lead-tokens.js";
 import { MCP_PATH, mcpRoutes } from "./mcp-routes.js";
 import { SessionCleanupPendingError } from "../store.js";
@@ -1460,4 +1461,41 @@ describe("PR maintenance orchestration", () => {
       expect(checkpoint.text).toContain("wake_exhausted");
     },
   );
+
+  it("moves the PR heartbeat with a transferred task", () => {
+    const { run, record } = setup(false, "github", false);
+    const lead = world.store.getSession(world.leadId)!;
+    const next = world.store.createSession(
+      world.store.getPlacement(lead.placementId)!,
+      "orchestrate",
+      true,
+      "Relief",
+      { runRole: "lead" },
+    );
+    world.store.transitionSession(next.id, "starting");
+    world.store.transitionSession(next.id, "idle");
+
+    transferRun(world.service, run.id, next.id, { source: "operator" });
+
+    expect(world.store.prMaintenance.get(record.id)!.leadSessionId).toBe(next.id);
+    expect(world.store.prMaintenance.wakeEligibleLeadIds()).toEqual([next.id]);
+    const previous = tools.getPrMaintenance({ taskId: run.id });
+    expect(previous.ok).toBe(false);
+    expect(previous.text).toContain("ownership");
+    const receiving = new FleetTools(world.service, next.id).getPrMaintenance({
+      taskId: run.id,
+    });
+    expect(receiving.ok, receiving.text).toBe(true);
+    expect(
+      JSON.parse(receiving.text).records.map((entry: { id: string }) => entry.id),
+    ).toEqual([record.id]);
+    // The retained worker is still bound: the new owner can continue it.
+    expect(
+      world.store.prMaintenance.admission({
+        action: "discover",
+        taskId: run.id,
+        leadSessionId: next.id,
+      }).allowed,
+    ).toBe(true);
+  });
 });

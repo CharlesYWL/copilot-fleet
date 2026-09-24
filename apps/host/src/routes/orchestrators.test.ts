@@ -861,3 +861,175 @@ describe("orchestrator lifecycle routes", () => {
     ).toBe(false);
   });
 });
+
+describe("task transfer routes", () => {
+  const apps: ReturnType<typeof Fastify>[] = [];
+
+  afterEach(async () => {
+    await Promise.all(apps.splice(0).map((app) => app.close()));
+  });
+
+  const setup = async () => {
+    const world = fleet();
+    const { store, service, leadId } = world;
+    const idle = (id: string) => {
+      store.transitionSession(id, "starting");
+      store.transitionSession(id, "idle");
+    };
+    idle(leadId);
+    const next = store.createSession(
+      store.listPlacements()[0]!,
+      "orchestrate",
+      true,
+      "Relief",
+      { runRole: "lead" },
+    );
+    idle(next.id);
+    const task = (
+      name: string,
+      state: "running" | "completed" | "awaiting_human" = "running",
+      owner = leadId,
+    ) => {
+      const run = store.createRun({
+        workspaceId: store.getSession(leadId)!.workspaceId,
+        name,
+        objective: `${name}, carefully`,
+      });
+      return store.updateRun(run.id, { leadSessionId: owner, state })!;
+    };
+    const engine = new OrchestratorEngine(service);
+    const app = Fastify({ logger: false });
+    apps.push(app);
+    await app.register(orchestratorRoutes, { service, engine });
+    await app.ready();
+    return { ...world, app, next, task };
+  };
+
+  it("moves one task to another conversation and briefs it there", async () => {
+    const { app, store, service, leadId, next, task } = await setup();
+    const run = task("One");
+    const dispatch = vi.spyOn(service, "dispatch");
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/transfer`,
+      payload: { toSessionId: next.id, note: "Review is next." },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      ok: true,
+      changed: true,
+      from: leadId,
+      run: { id: run.id, leadSessionId: next.id },
+    });
+    expect(store.getRun(run.id)!.leadSessionId).toBe(next.id);
+    expect(dispatch).toHaveBeenCalledWith(
+      next.nodeId,
+      expect.objectContaining({
+        type: "prompt",
+        sessionId: next.id,
+        prompt: expect.stringContaining("Review is next."),
+      }),
+    );
+    expect(
+      (await app.inject({ method: "GET", url: "/api/orchestrators" }))
+        .json()
+        .orchestrators.find(
+          (entry: { session: { id: string } }) => entry.session.id === next.id,
+        )
+        .runs.map((entry: { id: string }) => entry.id),
+    ).toEqual([run.id]);
+  });
+
+  it("explains why a task cannot move", async () => {
+    const { app, store, next, task } = await setup();
+    const run = task("One");
+    store.setSessionControls(next.id, { stopRequested: true });
+
+    const stopped = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/transfer`,
+      payload: { toSessionId: next.id },
+    });
+    const missing = await app.inject({
+      method: "POST",
+      url: "/api/runs/missing/transfer",
+      payload: { toSessionId: next.id },
+    });
+
+    expect(stopped.statusCode).toBe(409);
+    expect(stopped.json()).toMatchObject({ code: "orchestrator_not_live" });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json()).toMatchObject({ code: "task_not_found" });
+  });
+
+  it("moves every task that still needs an orchestrator, and reports the rest", async () => {
+    const { app, store, leadId, next, task } = await setup();
+    const open = task("Open");
+    const closed = task("Closed", "completed");
+    const theirs = task("Theirs", "running", next.id);
+
+    const all = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/transfer`,
+      payload: { toSessionId: next.id },
+    });
+    expect(all.statusCode).toBe(200);
+    expect(all.json()).toEqual({ ok: true, transferred: [open.id], failed: [] });
+    expect(store.getRun(closed.id)!.leadSessionId).toBe(leadId);
+
+    const chosen = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/transfer`,
+      payload: { toSessionId: next.id, runIds: [closed.id, theirs.id] },
+    });
+    expect(chosen.statusCode).toBe(200);
+    expect(chosen.json()).toMatchObject({
+      transferred: [closed.id],
+      failed: [
+        { runId: theirs.id, error: expect.stringContaining("no longer assigned") },
+      ],
+    });
+    expect(store.getRun(closed.id)!.leadSessionId).toBe(next.id);
+
+    const nothing = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/transfer`,
+      payload: { toSessionId: next.id, runIds: [theirs.id] },
+    });
+    expect(nothing.statusCode).toBe(409);
+    expect(nothing.json().error).toContain("no longer assigned");
+
+    const itself = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${leadId}/transfer`,
+      payload: { toSessionId: leadId },
+    });
+    expect(itself.statusCode).toBe(409);
+  });
+
+  it("keeps an unread handoff brief when the person sends the task back", async () => {
+    const { app, store, next, task } = await setup();
+    const run = task("Reviewed", "awaiting_human");
+    // Busy, so the brief is still owed when the review arrives.
+    store.transitionSession(next.id, "running");
+    await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/transfer`,
+      payload: { toSessionId: next.id },
+    });
+    expect(store.getRun(run.id)!.pendingPrompt).toContain("<fleet-task-transfer");
+
+    const review = await app.inject({
+      method: "POST",
+      url: `/api/runs/${run.id}/review`,
+      payload: { approved: false, note: "Add a regression test." },
+    });
+
+    expect(review.statusCode).toBe(200);
+    const owed = store.getRun(run.id)!.pendingPrompt;
+    expect(owed.indexOf("<fleet-task-transfer")).toBe(0);
+    expect(owed).toContain("Add a regression test.");
+  });
+});

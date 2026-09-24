@@ -284,6 +284,17 @@ export function tasksAwaitingHuman(runs: readonly Run[]): Run[] {
   return runs.filter((run) => run.state === "awaiting_human");
 }
 
+/**
+ * Whether a task still needs an orchestrator to own it.
+ *
+ * An open task does, and so does a finished one still keeping a PR maintained:
+ * its heartbeat runs in whichever conversation owns it. What these are is what
+ * a conversation has to hand on before it can be let go.
+ */
+export function needsOrchestrator(model: RunViewModel): boolean {
+  return !terminalRunStates.has(model.run.state) || Boolean(model.maintenance);
+}
+
 /** What the header counts. */
 export type OrchestratorSummary = {
   total: number;
