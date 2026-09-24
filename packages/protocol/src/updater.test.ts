@@ -648,6 +648,43 @@ describe.runIf(process.platform === "win32")("runCommand on Windows", () => {
   });
 });
 describe("applyUpdate confirmation and heartbeat", () => {
+  it.each(["up_to_date", "failed"] as const)(
+    "does not overwrite the Host's %s outcome while its restart command is still running",
+    async (stage) => {
+      vi.useFakeTimers();
+      try {
+        const statusFile = join(temporary(), "self-update.json");
+        const { run } = scriptedRun({
+          ...upstream,
+          "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
+        });
+        let settled!: UpdateRecord;
+        const final = await applyUpdate({
+          statusFile,
+          updateId: "update-confirmed",
+          checkout: { repoRoot: gitCheckout(), buildScript: "build", run },
+          restartCommand: "npm run service -- host+node restart",
+          confirmRestart: "host",
+          restart: async () => {
+            settled = {
+              ...readUpdateRecord(statusFile)!,
+              stage,
+              detail: "Outcome recorded by the serving Host",
+            };
+            writeUpdateRecord(statusFile, settled);
+            await vi.advanceTimersByTimeAsync(60_000);
+            return undefined;
+          },
+        });
+        expect(readUpdateRecord(statusFile)).toEqual(settled);
+        expect(final).toEqual(settled);
+        expect(vi.getTimerCount()).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
+
   it("leaves a launched restart for the new Host to confirm", async () => {
     const statusFile = join(temporary(), "self-update.json");
     const { run } = scriptedRun({

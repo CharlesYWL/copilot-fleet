@@ -409,6 +409,55 @@ describe("useFleet durable notifications", () => {
 
     beforeEach(() => sessionStorage.clear());
 
+    it.each(["host_update", "snapshot"] as const)(
+      "keeps a newer %s outcome when an older REST snapshot arrives",
+      async (type) => {
+        const stale = status("building", "npm run build");
+        const settled = status("up_to_date", "Updated to new222222222", "new222222222");
+        let finish!: (value: Response) => void;
+        vi.mocked(fetch).mockImplementation((path) => {
+          if (String(path) === "/api/snapshot")
+            return new Promise<Response>((resolve) => {
+              finish = resolve;
+            });
+          if (String(path) === "/api/runs")
+            return json({ stepsByRunId: {}, notesByRunId: {} });
+          throw new Error(`Unexpected fetch ${String(path)}`);
+        });
+        const notify = vi.fn();
+        const { result } = renderHook(() => useFleet(notify));
+        const socket = MockWebSocket.instances[0]!;
+        act(() => socket.send({ type: "host_update", status: stale }));
+        let refreshing!: Promise<void>;
+        act(() => {
+          refreshing = result.current.refresh();
+        });
+        await waitFor(() => expect(finish).toBeDefined());
+        act(() =>
+          socket.send(
+            type === "host_update"
+              ? { type, status: settled }
+              : {
+                  type,
+                  data: { ...snapshot(), hostUpdate: settled, hostRevision: "latest" },
+                },
+          ),
+        );
+        await act(async () => {
+          finish(response({ ...snapshot(), hostUpdate: stale }));
+          await refreshing;
+        });
+        expect(result.current.snapshot.hostUpdate).toEqual(settled);
+        if (type === "snapshot")
+          expect(result.current.snapshot.hostRevision).toBe("latest");
+        act(() => socket.send({ type: "host_update", status: settled }));
+        expect(notify).toHaveBeenCalledExactlyOnceWith(
+          "Host updated to new222222222. Reload this page to load the updated interface.",
+          "success",
+        );
+      },
+    );
+
     it("announces the end of one it watched begin, even from the page after a restart", () => {
       const notify = vi.fn();
       const first = renderHook(() => useFleet(notify));

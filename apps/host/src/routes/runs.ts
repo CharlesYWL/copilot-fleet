@@ -166,6 +166,11 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
       return reply.code(409).send({ error: "A run can only be planned before approval" });
     }
     const input = PlanSchema.parse(request.body);
+    if (input.steps.length > run.policy.maxSessions) {
+      return reply.code(400).send({
+        error: "The plan exceeds this run's session budget.",
+      });
+    }
 
     const keys = input.steps.map((step) => step.stepKey);
     const duplicate = keys.find((key, index) => keys.indexOf(key) !== index);

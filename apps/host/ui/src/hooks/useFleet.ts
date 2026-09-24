@@ -32,16 +32,11 @@ export type LiveNotificationUpdate = {
   deliver: boolean;
 };
 
-type NotificationHydrationChange =
+type SnapshotHydrationChange =
   | { revision: number; type: "upsert"; notification: Notification }
   | { revision: number; type: "count"; unreadCount: number }
-  | {
-      revision: number;
-      type: "snapshot";
-      notifications: Notification[];
-      unreadCount: number;
-      prMaintenanceApprovals: Snapshot["prMaintenanceApprovals"];
-    };
+  | { revision: number; type: "host_update"; status: HostUpdateStatus }
+  | { revision: number; type: "snapshot"; data: Snapshot };
 
 /**
  * The outcome of one call, so a caller can tell "succeeded with no body" from
@@ -130,7 +125,7 @@ export function useFleet(notify: Notify) {
   const hydrationTicket = useRef(0);
   const latestHydrationTicket = useRef(0);
   const activeHydrations = useRef(new Map<number, number>());
-  const hydrationChanges = useRef<NotificationHydrationChange[]>([]);
+  const hydrationChanges = useRef<SnapshotHydrationChange[]>([]);
 
   // Kept in a ref so the socket subscription never re-runs when the caller
   // re-creates its notify callback.
@@ -166,9 +161,10 @@ export function useFleet(notify: Notify) {
   const recordHydrationChange = useCallback(
     (
       change:
-        | Omit<Extract<NotificationHydrationChange, { type: "upsert" }>, "revision">
-        | Omit<Extract<NotificationHydrationChange, { type: "count" }>, "revision">
-        | Omit<Extract<NotificationHydrationChange, { type: "snapshot" }>, "revision">,
+        | Omit<Extract<SnapshotHydrationChange, { type: "upsert" }>, "revision">
+        | Omit<Extract<SnapshotHydrationChange, { type: "count" }>, "revision">
+        | Omit<Extract<SnapshotHydrationChange, { type: "host_update" }>, "revision">
+        | Omit<Extract<SnapshotHydrationChange, { type: "snapshot" }>, "revision">,
     ) => {
       const revision = ++notificationRevision.current;
       if (activeHydrations.current.size > 0) {
@@ -208,9 +204,7 @@ export function useFleet(notify: Notify) {
     (next: Snapshot) => {
       const revision = recordHydrationChange({
         type: "snapshot",
-        notifications: next.notifications,
-        unreadCount: next.notificationUnreadCount,
-        prMaintenanceApprovals: next.prMaintenanceApprovals,
+        data: next,
       });
       for (const notification of next.notifications) {
         knownNotificationIds.current.add(notification.id);
@@ -256,19 +250,25 @@ export function useFleet(notify: Notify) {
     (next: Snapshot, request: { ticket: number; revision: number }) => {
       if (latestHydrationTicket.current !== request.ticket) return false;
 
+      let latest = next;
       let notifications = next.notifications;
       let unreadCount = next.notificationUnreadCount;
-      let maintenanceApprovals = next.prMaintenanceApprovals;
+      let hostUpdate = next.hostUpdate;
       let replayedNotificationChange = false;
       let replayedUnreadCount = false;
       for (const change of hydrationChanges.current) {
         if (change.revision <= request.revision) continue;
         if (change.type === "snapshot") {
-          notifications = change.notifications;
-          unreadCount = change.unreadCount;
-          maintenanceApprovals = change.prMaintenanceApprovals;
+          latest = change.data;
+          notifications = latest.notifications;
+          unreadCount = latest.notificationUnreadCount;
+          hostUpdate = latest.hostUpdate;
           replayedNotificationChange = true;
           replayedUnreadCount = true;
+          continue;
+        }
+        if (change.type === "host_update") {
+          hostUpdate = change.status;
           continue;
         }
         if (change.type === "upsert") {
@@ -297,14 +297,14 @@ export function useFleet(notify: Notify) {
       latestUnreadAffectingUpsertRevision.current = revision;
       unreadCountRevision.current = revision;
       setSnapshot({
-        ...next,
+        ...latest,
         notifications: sortNotifications(notifications),
         notificationUnreadCount: unreadCount,
-        prMaintenanceApprovals: maintenanceApprovals,
+        hostUpdate,
       });
       setSnapshotRevision((value) => value + 1);
       currentUnreadCount.current = unreadCount;
-      announceHostUpdate(next.hostUpdate);
+      announceHostUpdate(hostUpdate);
       return true;
     },
     [announceHostUpdate],
@@ -638,6 +638,7 @@ export function useFleet(notify: Notify) {
         }
         if (message.type === "host_update") {
           const { status } = message;
+          recordHydrationChange({ type: "host_update", status });
           setSnapshot((value) => ({ ...value, hostUpdate: status }));
           announceHostUpdate(status);
           return;
@@ -720,6 +721,7 @@ export function useFleet(notify: Notify) {
     announceHostUpdate,
     applyNotification,
     hydrateSocketSnapshot,
+    recordHydrationChange,
     recordNotificationUpsert,
     recordUnreadCount,
     refreshWithStatus,

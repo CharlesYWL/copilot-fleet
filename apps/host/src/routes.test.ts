@@ -661,6 +661,45 @@ describe("run routes", () => {
     expect(body.stepsByRunId[run.id]).toEqual([]);
   });
 
+  it("rejects an over-budget plan without replacing the existing plan", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const created = await inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: {
+        workspaceId,
+        name: "bounded",
+        objective: "One worker only",
+        policy: { maxSessions: 1 },
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const { id } = created.json() as { id: string };
+    const first = { stepKey: "one", title: "One", prompt: "Inspect" };
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/runs/" + id + "/plan",
+          payload: { steps: [first] },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const before = (await inject({ method: "GET", url: "/api/runs/" + id })).json();
+    const rejected = await inject({
+      method: "POST",
+      url: "/api/runs/" + id + "/plan",
+      payload: {
+        steps: [first, { stepKey: "two", title: "Two", prompt: "Inspect again" }],
+      },
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().error).toContain("session budget");
+    expect(
+      (await inject({ method: "GET", url: "/api/runs/" + id })).json().steps,
+    ).toEqual(before.steps);
+  });
+
   it("refuses a plan whose steps depend on each other and names the cycle", async () => {
     const { workspaceId } = await workspaceWithPlacement();
     const run = await createRun(workspaceId);

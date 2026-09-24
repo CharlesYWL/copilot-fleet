@@ -722,6 +722,11 @@ treating a checkout git cannot read as dirty. It refuses while the Node beside
 it is running sessions unless the operator agrees to stop exactly the ones
 listed, and until the restart it refuses to start or resume anything new there.
 
+At the restart-confirmation handoff, the updater stops rewriting its heartbeat
+record, so it cannot overwrite the new Host's final outcome. Browsers likewise
+keep newer live update status and complete snapshots when an older REST response
+arrives.
+
 git is never run through a shell. A tracked branch may legally be called
 `release&x`; joined into a Windows command line, that was a second command.
 

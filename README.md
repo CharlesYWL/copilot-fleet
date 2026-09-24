@@ -1732,6 +1732,9 @@ stage as it happens. The Host drops off while it restarts; the page reconnects
 by itself and reports how the update ended. Reload it afterwards to load the new
 interface.
 
+Once the restarted Host records the outcome, a slow restart command or delayed
+browser snapshot cannot turn it back into an in-progress update.
+
 The steps and the safety property are the Node's, from the same code
 (`@fleet/protocol/updater`): nothing is restarted until the build has
 succeeded, and a checkout already on the newest commit is not restarted at all.

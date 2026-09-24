@@ -187,6 +187,31 @@ describe("auto resume", () => {
     expect(resumeCommands()).toEqual([session.id]);
   });
 
+  it("settles a first launch refused before its starting event", () => {
+    const { store, service, node, placement } = setup();
+    try {
+      store.setNodeOnline(node.id, true);
+      const started = service.createAndStartSession({
+        placement,
+        prompt: "Inspect the repository",
+        yolo: false,
+      });
+      if (!started.ok) throw new Error(started.error);
+      const id = started.session.id;
+      const commandId = store.getSessionDispatchAttempt(id)!.commandId;
+      expect(store.getSession(id)?.state).toBe("queued");
+      service.settleRefusedLaunch(id, "old-command", "Stale refusal");
+      expect(store.getSession(id)?.state).toBe("queued");
+      service.settleRefusedLaunch(id, commandId, "Admission is closed.");
+      expect(store.getSession(id)).toMatchObject({
+        state: "failed",
+        currentActivity: "Start refused: Admission is closed.",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
   it("ignores a refusal that is not the launch the session is waiting on", () => {
     const { service, store, node, orphan, resumeCommandId } = setup();
     const session = orphan("Still starting");
