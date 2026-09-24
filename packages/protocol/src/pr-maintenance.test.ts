@@ -158,6 +158,8 @@ describe("PR maintenance wire schemas", () => {
       expect(observation.draft).toBeUndefined();
       expect(base().incidents).toEqual([]);
       expect(base().incidentCursor).toBe(0);
+      expect(base().pauseOrigin).toBeUndefined();
+      expect(base().resumeHistory).toEqual([]);
       expect(
         PrMaintenanceObservationSchema.parse({ ...observation, draft: true }).draft,
       ).toBe(true);

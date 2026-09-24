@@ -725,13 +725,84 @@ describe("PR maintenance orchestration", () => {
       GetPrMaintenanceSchema.safeParse({ takeDue: true, wakeId: "reset-budget" }).success,
     ).toBe(false);
     const { record } = setup();
-    expect(
-      tools.setPrMaintenance({
-        recordId: record.id,
-        expectedVersion: record.version,
-        action: "resume",
-      }).ok,
-    ).toBe(false);
+    const refused = tools.setPrMaintenance({
+      recordId: record.id,
+      expectedVersion: record.version,
+      action: "resume",
+    });
+    expect(refused.ok).toBe(false);
+    expect(refused.text).toContain("operator_required");
+    expect(world.store.prMaintenance.get(record.id)!.version).toBe(record.version);
+  });
+
+  it("publishes a lead pause and lead resume with distinct audit history", () => {
+    const { record } = setup();
+    const publishSnapshot = vi.spyOn(world.service, "publishSnapshot");
+    const pausedResult = tools.setPrMaintenance({
+      recordId: record.id,
+      expectedVersion: record.version,
+      action: "pause",
+      reason: "Owning lead is revalidating the current HEAD.",
+    });
+    expect(pausedResult.ok, pausedResult.text).toBe(true);
+    const paused = JSON.parse(pausedResult.text);
+    expect(paused.pauseOrigin).toMatchObject({
+      actor: "lead",
+      actorId: world.leadId,
+    });
+
+    const resumedResult = tools.setPrMaintenance({
+      recordId: paused.id,
+      expectedVersion: paused.version,
+      action: "resume",
+    });
+    expect(resumedResult.ok, resumedResult.text).toBe(true);
+    const resumed = JSON.parse(resumedResult.text);
+    expect(resumed.lifecycle).toBe("active");
+    expect(resumed.resumeHistory.at(-1)).toMatchObject({
+      actor: "lead",
+      actorId: world.leadId,
+      pauseReason: "Owning lead is revalidating the current HEAD.",
+    });
+    expect(publishSnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it("resumes a directed maintenance decision without another operator action", () => {
+    const { record, run } = setup();
+    expect(hold(record.id).ok).toBe(true);
+    const held = world.store.prMaintenance.get(record.id)!;
+    const directed = world.store.prMaintenance.operatorAction(
+      held.id,
+      held.version,
+      {
+        action: "direction",
+        decisionId: "decision-1",
+        decisionVersion: 1,
+        direction: "Keep the existing API and restore its invariant.",
+        resume: false,
+      },
+      "authenticated-operator",
+      () => world.store.setRunState(run.id, "running"),
+    );
+
+    const result = tools.setPrMaintenance({
+      recordId: directed.id,
+      expectedVersion: directed.version,
+      action: "resume",
+    });
+
+    expect(result.ok, result.text).toBe(true);
+    expect(JSON.parse(result.text)).toMatchObject({
+      lifecycle: "active",
+      decision: { state: "directed" },
+      resumeHistory: [
+        expect.objectContaining({
+          actor: "lead",
+          actorId: world.leadId,
+          pauseReason: "wait_for_human",
+        }),
+      ],
+    });
   });
 
   it.each(["github", "azure-devops"] as const)(

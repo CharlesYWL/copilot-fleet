@@ -85,6 +85,9 @@ describe("mcp endpoint", () => {
     ).result.tools;
     const start = tools.find((tool) => tool.name === "fleet_start_work")!.description;
     const submit = tools.find((tool) => tool.name === "fleet_submit_task")!.description;
+    const maintenance = tools.find(
+      (tool) => tool.name === "fleet_set_pr_maintenance",
+    )!.description;
     expect(start).toContain(
       "authorized writing worker may commit, push and create/update",
     );
@@ -95,6 +98,12 @@ describe("mcp endpoint", () => {
     expect(start).toContain("Let the worker choose investigation");
     expect(submit).toContain("does not create a PR");
     expect(submit).toContain("parent open until all essential criteria are met");
+    expect(maintenance).toContain("resume the owning lead's own pause");
+    expect(maintenance).toContain("human-decision hold after authenticated direction");
+    expect(maintenance).toContain(
+      "revalidate the PR, HEAD, worker binding and repair authorization",
+    );
+    expect(maintenance).toContain("renewal, release and answering a decision");
   });
 
   it("lists the fleet tools to a live orchestrator", async () => {

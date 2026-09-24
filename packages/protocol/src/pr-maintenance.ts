@@ -610,7 +610,7 @@ export const PrMaintenanceIncidentSchema = z
     wakeQueuedAt: time.optional(),
     resolvedAt: time.optional(),
     resolution: z
-      .enum(["observation", "alternate_observation", "operator_resume"])
+      .enum(["observation", "alternate_observation", "operator_resume", "lead_resume"])
       .optional(),
     attempts: z
       .array(
@@ -844,6 +844,14 @@ const authorizationSchema = z
   })
   .strict();
 
+const pauseOriginSchema = z
+  .object({
+    actor: z.enum(["lead", "operator", "system"]),
+    actorId: id,
+    at: time,
+  })
+  .strict();
+
 export const PrMaintenanceRegistrationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -860,6 +868,7 @@ export const PrMaintenanceRegistrationSchema = z
     eligibilityEvidence: text,
     lifecycle: z.enum(["active", "paused", "merged", "closed"]),
     pauseReason: z.string().max(8_192).default(""),
+    pauseOrigin: pauseOriginSchema.optional(),
     pausedAt: time.optional(),
     renewedAt: time,
     pausedNoticeAt: time.optional(),
@@ -876,6 +885,20 @@ export const PrMaintenanceRegistrationSchema = z
       .optional(),
     authorization: authorizationSchema,
     authorizationHistory: z.array(authorizationSchema).max(100).default([]),
+    resumeHistory: z
+      .array(
+        z
+          .object({
+            actor: z.enum(["lead", "operator"]),
+            actorId: id,
+            resumedAt: time,
+            pauseReason: z.string().max(8_192),
+            pauseOrigin: pauseOriginSchema.optional(),
+          })
+          .strict(),
+      )
+      .max(100)
+      .default([]),
     decision: PrMaintenanceDecisionSchema.optional(),
     decisionHistory: z.array(PrMaintenanceDecisionSchema).max(100).default([]),
     observation: PrMaintenanceObservationSchema.optional(),
