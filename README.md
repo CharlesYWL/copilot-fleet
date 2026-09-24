@@ -52,15 +52,18 @@ working without health telemetry, and health does not change scheduling.
 
 The session header's **Session information** icon opens the same details dialog
 in both the full chat and the focused overview chat. It shows the Node, platform,
-workspace, current placement path, model, status, timestamps, and both the Fleet
+workspace, working directory, model, status, timestamps, and both the Fleet
 and native Copilot session IDs. Copy buttons provide the path, IDs, and a
 shell-quoted local recovery command. Only the native Copilot ID can be passed
 to `copilot --resume`; demo sessions and sessions without that ID have no recovery
 command.
 
+Managed sessions show and copy their bound execution directory, not the source
+checkout. Legacy sessions without a binding use their current placement.
+
 Run local recovery on the original Node as the same OS user, after stopping or
 verifying the old process has exited. The command uses standard Copilot CLI and
-the current placement: if either your launcher/configuration or the placement
+the directory shown above: if either your launcher/configuration or that directory
 has changed, use the corresponding original setup. Local recovery does not
 reattach the CLI to Fleet or restore orchestration tools; use Fleet's **Resume**
 to continue managed work.
@@ -1035,6 +1038,10 @@ The composer takes files: paste a screenshot straight into the box, or use the
 paperclip to pick some. Each one appears as a chip that can be removed until the
 message is sent, and a prompt can carry up to six of them at 10 MB each.
 
+Draft text and attachments stay in the composer until the Host accepts the send.
+A failed request keeps them available for retry; edits made while sending are
+not cleared by the earlier request.
+
 How a file reaches the agent depends on what it is. Images go over as ACP image
 blocks; everything else is embedded as text, so the agent reads the contents
 without needing the file to exist on its own disk — which matters because the
@@ -1063,6 +1070,9 @@ leaves the caret waiting after it; one that does not (`/usage`, `/context`) runs
 straight away. The list is whatever the agent reports for that session, including
 skills and plugins, so a machine with extra skills installed shows them without
 any change here.
+
+Enter used to confirm an input-method composition does not send a prompt or
+select a slash command.
 
 One compact button combines **Model**, **Reasoning Effort**, and **Context window**.
 Its upward-opening menu shows each setting's current value and a submenu of
@@ -1246,6 +1256,10 @@ box replaces this process's identity and reconnects. Placement paths stay whatev
 the Host already stored for that node id; update them if the checkout lives
 somewhere else. Copilot's own session files are not in the archive, so **Resume**
 only works if those files are on the machine that runs the agent.
+
+Node identity archives preserve persistent command-permission rules, including an
+explicitly empty rule list, and their revision. Older archives without those fields
+keep the legacy defaults; temporary session grants are not restored.
 
 Both files contain secrets. Do not commit them.
 
@@ -1717,6 +1731,9 @@ The card shows the commit the Host is on and the restart command, then each
 stage as it happens. The Host drops off while it restarts; the page reconnects
 by itself and reports how the update ended. Reload it afterwards to load the new
 interface.
+
+Once the restarted Host records the outcome, a slow restart command or delayed
+browser snapshot cannot turn it back into an in-progress update.
 
 The steps and the safety property are the Node's, from the same code
 (`@fleet/protocol/updater`): nothing is restarted until the build has

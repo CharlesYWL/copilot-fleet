@@ -2602,7 +2602,8 @@ export class FleetService {
   settleRefusedLaunch(sessionId: string, commandId: string, reason: string): void {
     const session = this.store.getSession(sessionId);
     if (
-      session?.state !== "starting" ||
+      !session ||
+      (session.state !== "queued" && session.state !== "starting") ||
       this.store.getSessionDispatchAttempt(sessionId)?.commandId !== commandId
     )
       return;

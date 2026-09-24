@@ -72,7 +72,7 @@ describe("live command output", () => {
         event: { ...output(1), data: "<script>" },
       }),
     );
-    expect(notify).toHaveBeenCalledWith("Malformed command output", "error");
-    expect(Socket.current.close).toHaveBeenCalledWith(1007, "Malformed command output");
+    expect(notify).toHaveBeenCalledWith("Malformed live update", "error");
+    expect(Socket.current.close).toHaveBeenCalledWith(1008, "Invalid message");
   });
 });

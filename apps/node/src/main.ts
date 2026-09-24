@@ -474,7 +474,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   ): Promise<WorkspaceResult> => {
     const started = Date.now();
     const key = transferKey(result.id, result.artifactId);
-    let pending = waitFor(transferAcks, key);
     if (
       !send({
         type: "artifact_upload_begin",
@@ -487,7 +486,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       })
     )
       throw new Error("Host is unavailable for artifact upload.");
-    let ack = await pending;
+    let ack = await waitFor(transferAcks, key);
     if (!ack.ok) throw new Error(ack.error || ack.code);
     const file = await open(path, "r");
     try {
@@ -498,35 +497,39 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         );
         const buffer = Buffer.alloc(length);
         const { bytesRead } = await file.read(buffer, 0, length, ack.offset);
-        pending = waitFor(transferAcks, key);
-        send({
-          type: "artifact_upload_chunk",
-          transfer: {
-            operationId: result.id,
-            resultId: result.id,
-            artifactId: result.artifactId,
-            offset: ack.offset,
-            data: buffer.subarray(0, bytesRead).toString("base64"),
-          },
-        });
-        ack = await pending;
+        if (
+          !send({
+            type: "artifact_upload_chunk",
+            transfer: {
+              operationId: result.id,
+              resultId: result.id,
+              artifactId: result.artifactId,
+              offset: ack.offset,
+              data: buffer.subarray(0, bytesRead).toString("base64"),
+            },
+          })
+        )
+          throw new Error("Host is unavailable for artifact upload.");
+        ack = await waitFor(transferAcks, key);
         if (!ack.ok) throw new Error(ack.error || ack.code);
       }
     } finally {
       await file.close();
     }
-    pending = waitFor(transferAcks, key);
-    send({
-      type: "artifact_upload_complete",
-      transfer: {
-        operationId: result.id,
-        resultId: result.id,
-        artifactId: result.artifactId,
-        size: result.artifactSize,
-        sha256: result.artifactSha256,
-      },
-    });
-    ack = await pending;
+    if (
+      !send({
+        type: "artifact_upload_complete",
+        transfer: {
+          operationId: result.id,
+          resultId: result.id,
+          artifactId: result.artifactId,
+          size: result.artifactSize,
+          sha256: result.artifactSha256,
+        },
+      })
+    )
+      throw new Error("Host is unavailable for artifact upload.");
+    ack = await waitFor(transferAcks, key);
     if (!ack.ok || !ack.complete) throw new Error(ack.error || ack.code);
     return {
       ...result,
@@ -557,7 +560,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     try {
       while (offset < result.artifactSize) {
         const key = transferKey(operationId, result.artifactId);
-        const pending = waitFor(downloadChunks, key);
         if (
           !send({
             type: "artifact_download_request",
@@ -570,7 +572,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           })
         )
           throw new Error("Host is unavailable for artifact download.");
-        const chunk = await pending;
+        const chunk = await waitFor(downloadChunks, key);
         if (chunk.offset !== offset || chunk.size !== result.artifactSize)
           throw new Error("Artifact download offset or size changed.");
         if (chunk.sha256 !== result.artifactSha256)

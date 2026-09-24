@@ -2313,8 +2313,8 @@ export class FleetStore {
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
-            stop_requested,dismissed,favorite,last_activity_at,usage,operator_username)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            stop_requested,dismissed,favorite,last_activity_at,usage,operator_username,read_only)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -2341,6 +2341,7 @@ export class FleetStore {
         session.lastActivityAt ?? session.updatedAt,
         JSON.stringify(session.usage ?? {}),
         session.operatorUsername ?? "",
+        session.readOnly ? 1 : 0,
       );
       if (session.executionBinding?.worktreeId)
         this.statement("UPDATE sessions SET execution_binding=? WHERE id=?").run(
@@ -2412,8 +2413,9 @@ export class FleetStore {
         `INSERT INTO run_steps
             (id,run_id,step_key,title,prompt,category,depends_on,state,session_id,
              placement_id,output,event_seq_from,stopped_by_orchestrator,attempts,
-             phase_index,dispatched_at,position,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             phase_index,dispatched_at,position,created_at,updated_at,
+             managed_worktree_id,workspace_state,workspace_error,result_sha)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         step.id,
         step.runId,
@@ -2434,6 +2436,10 @@ export class FleetStore {
         step.position,
         step.createdAt,
         step.updatedAt,
+        step.managedWorktreeId ?? "",
+        step.workspaceState ?? "not_required",
+        step.workspaceError ?? "",
+        step.resultSha ?? "",
       );
       if (step.executionBinding?.worktreeId)
         this.statement("UPDATE run_steps SET execution_binding=? WHERE id=?").run(

@@ -274,6 +274,7 @@ export function registerNodeGateway(
       }
 
       const onNodeMessage = (raw: unknown) => {
+        if (service.nodeSocket(nodeId) !== input.link) return;
         const message = input.read(String(raw));
         if (!message) return;
         const ownership = nodeMessageOwnership(nodeId, message, (id) =>

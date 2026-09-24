@@ -2,13 +2,17 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BrowserMessage,
-  FleetSession,
   HostUpdateStatus,
   Notification,
   SessionEvent,
   Snapshot,
 } from "@fleet/protocol";
-import { PrMaintenanceApprovalSchema, RunSchema } from "@fleet/protocol";
+import {
+  PrMaintenanceApprovalSchema,
+  RunSchema,
+  RunStepSchema,
+  SessionSchema,
+} from "@fleet/protocol";
 import { useFleet } from "./useFleet";
 import { csrfToken, forgetCsrfToken } from "../lib/auth";
 
@@ -114,6 +118,110 @@ afterEach(() => {
 });
 
 describe("useFleet durable notifications", () => {
+  it.each([
+    ["not JSON", 1007, "Malformed JSON"],
+    ["null", 1008, "Invalid message"],
+    ["{}", 1008, "Invalid message"],
+    ['{"type":"event","event":null}', 1008, "Invalid message"],
+    ['{"type":"snapshot","data":{"sessions":null}}', 1008, "Invalid message"],
+  ])(
+    "rejects invalid browser frames without changing state: %s",
+    (data, code, reason) => {
+      const notify = vi.fn();
+      const { result } = renderHook(() => useFleet(notify));
+      const socket = MockWebSocket.instances[0]!;
+      const before = result.current.snapshot;
+      expect(() => act(() => socket.onmessage?.({ data } as MessageEvent))).not.toThrow();
+      expect(socket.close).toHaveBeenCalledWith(code, reason);
+      expect(notify).toHaveBeenCalledWith("Malformed live update", "error");
+      expect(result.current.snapshot).toBe(before);
+      expect(result.current.events).toEqual({});
+    },
+  );
+
+  it("keeps live step updates and removals while hydrating the other runs", async () => {
+    const step = RunStepSchema.parse({
+      id: "step",
+      runId: "task",
+      stepKey: "build",
+      title: "Build",
+      prompt: "Build it",
+      state: "running",
+      createdAt: ISO,
+      updatedAt: ISO,
+    });
+    let finish!: (value: Response) => void;
+    vi.mocked(fetch).mockImplementation((path) => {
+      if (String(path) === "/api/snapshot") return json(snapshot());
+      if (String(path) === "/api/runs")
+        return new Promise<Response>((resolve) => {
+          finish = resolve;
+        });
+      throw new Error(`Unexpected fetch ${String(path)}`);
+    });
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    let refreshing!: Promise<void>;
+    act(() => {
+      refreshing = result.current.refresh();
+    });
+    await waitFor(() => expect(finish).toBeDefined());
+    const completed = { ...step, state: "succeeded" as const };
+    act(() => {
+      MockWebSocket.instances[0]!.send({
+        type: "run_steps",
+        runId: "task",
+        steps: [completed],
+      });
+      MockWebSocket.instances[0]!.send({
+        type: "run_steps",
+        runId: "removed",
+        steps: [],
+      });
+    });
+    await act(async () => {
+      finish(
+        response({
+          stepsByRunId: { task: [step], removed: [step], other: [step] },
+          notesByRunId: {},
+        }),
+      );
+      await refreshing;
+    });
+    expect(result.current.runSteps).toEqual({
+      task: [completed],
+      removed: [],
+      other: [step],
+    });
+  });
+
+  it("does not let an older refresh replace the latest run steps", async () => {
+    const pending: ((value: Response) => void)[] = [];
+    vi.mocked(fetch).mockImplementation((path) => {
+      if (String(path) === "/api/snapshot") return json(snapshot());
+      if (String(path) === "/api/runs")
+        return new Promise<Response>((resolve) => pending.push(resolve));
+      throw new Error(`Unexpected fetch ${String(path)}`);
+    });
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    let older!: Promise<void>;
+    let newer!: Promise<void>;
+    act(() => {
+      older = result.current.refresh();
+    });
+    await waitFor(() => expect(pending).toHaveLength(1));
+    act(() => {
+      newer = result.current.refresh();
+    });
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await act(async () => {
+      pending[1]!(response({ stepsByRunId: { current: [] }, notesByRunId: {} }));
+      await newer;
+      pending[0]!(response({ stepsByRunId: { obsolete: [] }, notesByRunId: {} }));
+      await older;
+    });
+    expect(result.current.runSteps).toEqual({ current: [] });
+  });
+
   it("does not resurrect an authorized maintenance proposal from a delayed REST snapshot", async () => {
     const approval = PrMaintenanceApprovalSchema.parse({
       proposalId: "proposal",
@@ -300,6 +408,55 @@ describe("useFleet durable notifications", () => {
     });
 
     beforeEach(() => sessionStorage.clear());
+
+    it.each(["host_update", "snapshot"] as const)(
+      "keeps a newer %s outcome when an older REST snapshot arrives",
+      async (type) => {
+        const stale = status("building", "npm run build");
+        const settled = status("up_to_date", "Updated to new222222222", "new222222222");
+        let finish!: (value: Response) => void;
+        vi.mocked(fetch).mockImplementation((path) => {
+          if (String(path) === "/api/snapshot")
+            return new Promise<Response>((resolve) => {
+              finish = resolve;
+            });
+          if (String(path) === "/api/runs")
+            return json({ stepsByRunId: {}, notesByRunId: {} });
+          throw new Error(`Unexpected fetch ${String(path)}`);
+        });
+        const notify = vi.fn();
+        const { result } = renderHook(() => useFleet(notify));
+        const socket = MockWebSocket.instances[0]!;
+        act(() => socket.send({ type: "host_update", status: stale }));
+        let refreshing!: Promise<void>;
+        act(() => {
+          refreshing = result.current.refresh();
+        });
+        await waitFor(() => expect(finish).toBeDefined());
+        act(() =>
+          socket.send(
+            type === "host_update"
+              ? { type, status: settled }
+              : {
+                  type,
+                  data: { ...snapshot(), hostUpdate: settled, hostRevision: "latest" },
+                },
+          ),
+        );
+        await act(async () => {
+          finish(response({ ...snapshot(), hostUpdate: stale }));
+          await refreshing;
+        });
+        expect(result.current.snapshot.hostUpdate).toEqual(settled);
+        if (type === "snapshot")
+          expect(result.current.snapshot.hostRevision).toBe("latest");
+        act(() => socket.send({ type: "host_update", status: settled }));
+        expect(notify).toHaveBeenCalledExactlyOnceWith(
+          "Host updated to new222222222. Reload this page to load the updated interface.",
+          "success",
+        );
+      },
+    );
 
     it("announces the end of one it watched begin, even from the page after a restart", () => {
       const notify = vi.fn();
@@ -773,12 +930,20 @@ describe("useFleet durable notifications", () => {
     const notify = vi.fn();
     const { result } = renderHook(() => useFleet(notify));
     const socket = MockWebSocket.instances[0]!;
-    const failed = {
+    const failed = SessionSchema.parse({
       id: "s1",
+      workspaceId: "w1",
+      workspaceName: "workspace",
+      placementId: "p1",
+      nodeId: "n1",
       state: "failed",
       nodeName: "node",
       currentActivity: "failed",
-    } as FleetSession;
+      initialPrompt: "Work",
+      lastText: "",
+      createdAt: ISO,
+      updatedAt: ISO,
+    });
     const permission = {
       eventId: "e1",
       sessionId: "s1",

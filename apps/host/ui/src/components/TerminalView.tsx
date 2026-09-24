@@ -542,7 +542,7 @@ type TerminalViewProps = {
   node?: FleetNode | undefined;
   placement?: Placement | undefined;
   events: SessionEvent[];
-  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => void;
+  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => Promise<boolean>;
   onCancel: () => void;
   onStop: () => void;
   onPermission: (
@@ -791,19 +791,23 @@ export const TerminalView = ({
     query.open && canPrompt && !menuDismissed && session.commands.length > 0;
   const activeIndex = Math.min(highlight, Math.max(0, matches.length - 1));
 
-  const submitPrompt = () => {
-    const text = prompt.trim();
+  const submitPrompt = async (
+    text = prompt.trim(),
+    files = toWireAttachments(attachments),
+  ) => {
     // A file with no words is still a message: "look at this" is implied, and
     // refusing to send it would strand the attachment the operator just added.
-    if ((!text && attachments.length === 0) || !canPrompt) return;
-    onPrompt(text || "(see attachment)", toWireAttachments(attachments));
-    onDraftChange(() => EMPTY_DRAFT);
+    if ((!text && files.length === 0) || !canPrompt) return;
+    const accepted = onPrompt(text || "(see attachment)", files);
     setAttachError(undefined);
     setMenuDismissed(false);
     // Sending is a request to watch what happens next, so it re-pins the
     // transcript. Scrolling back to read something older otherwise left the
     // operator staring at old output while the answer arrived below the fold.
     jumpToLatest();
+    if (await accepted) {
+      onDraftChange((current) => (current === draft ? EMPTY_DRAFT : current));
+    }
   };
 
   const addFiles = async (files: readonly File[]) => {
@@ -843,7 +847,7 @@ export const TerminalView = ({
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
-    submitPrompt();
+    void submitPrompt();
   };
 
   const changePrompt = (value: string) => {
@@ -856,21 +860,18 @@ export const TerminalView = ({
 
   const pickCommand = (command: (typeof matches)[number]) => {
     const choice = applyCommand(command);
-    setPrompt(choice.text);
     setMenuDismissed(true);
     setHighlight(0);
     if (choice.submit) {
-      // The state update has not landed yet, so the text is passed rather than
-      // read back off `prompt`.
-      onPrompt(choice.text);
-      onDraftChange(() => EMPTY_DRAFT);
-      jumpToLatest();
+      void submitPrompt(choice.text, []);
       return;
     }
+    setPrompt(choice.text);
     inputRef.current?.focus();
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing) return;
     if (menuOpen && matches.length > 0) {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
@@ -892,7 +893,7 @@ export const TerminalView = ({
     }
     if (event.key !== "Enter" || event.shiftKey) return;
     event.preventDefault();
-    submitPrompt();
+    void submitPrompt();
   };
 
   const handleScroll = () => {
@@ -1236,7 +1237,7 @@ export const TerminalView = ({
               (command) => command.name === "compact",
             )}
             onCompact={() => {
-              onPrompt("/compact");
+              void onPrompt("/compact");
               jumpToLatest();
             }}
           />

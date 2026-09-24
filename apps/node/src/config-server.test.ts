@@ -21,7 +21,7 @@ import {
   type FleetApi,
 } from "./config-server.js";
 import type { Credentials } from "./config.js";
-import { settingsFromEnv } from "./settings.js";
+import { SettingsSchema, settingsFromEnv } from "./settings.js";
 
 const workspace = { id: "ws-1", name: "fleet", description: "" };
 const placement = {
@@ -294,6 +294,46 @@ describe("config listener ports", () => {
     expect(await status(actual, { Origin: `http://127.0.0.1:${actual}` })).toBe(200);
     expect(await status(actual, { Origin: `http://127.0.0.1:${preferred}` })).toBe(403);
     expect(await status(actual, { Host: `127.0.0.1:${preferred}` })).toBe(403);
+  });
+
+  it("preserves UTF-8 split across request chunks when saving config", async () => {
+    const applySettings = vi.fn(async () => {});
+    const server = startConfigServer({ ...baseOptions(), port: 0, applySettings });
+    servers.push(server);
+    await once(server, "listening");
+    const firstChunk = new Promise<void>((done) => {
+      server.once("request", (incoming) => incoming.once("data", () => done()));
+    });
+    const body = Buffer.from(
+      JSON.stringify({ ...settingsFromEnv({}), nodeName: "Node-\u7535\u8111" }),
+    );
+    const split = body.indexOf(Buffer.from("\u7535")) + 1;
+    let call!: ReturnType<typeof request>;
+    const response = new Promise<number>((done, reject) => {
+      call = request(
+        {
+          host: "127.0.0.1",
+          port: portOfServer(server),
+          path: "/api/config",
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        },
+        (reply) => {
+          reply.resume();
+          reply.once("end", () => done(reply.statusCode ?? 0));
+          reply.once("error", reject);
+        },
+      );
+      call.once("error", reject);
+      call.write(body.subarray(0, split));
+    });
+    await firstChunk;
+    call.end(body.subarray(split));
+
+    expect(await response).toBe(200);
+    expect(applySettings).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ nodeName: "Node-\u7535\u8111" }),
+    );
   });
 
   it("reports the bound ephemeral port, not port zero", async () => {
@@ -941,6 +981,52 @@ describe("config router", () => {
     expect(response.status).toBe(200);
     expect(applyBackup).toHaveBeenCalledOnce();
     expect(applyBackup.mock.calls[0]?.[0].credentials.nodeId).toBe("moved");
+  });
+
+  it("round-trips persistent command permissions and preserves legacy defaults", async () => {
+    let settings = SettingsSchema.parse({
+      ...settingsFromEnv({}),
+      commandPermissionRules: [
+        {
+          id: "pinned-git-status",
+          commandKey: `git status @sha256:${"a".repeat(64)}`,
+          command: "git status",
+          match: "command",
+          path: "c:\\work",
+          hostId: "host-1",
+          builtin: false,
+        },
+      ],
+      commandPermissionRevision: 7,
+    });
+    const applyBackup = vi.fn(async (_archive: NodeBackup) => {});
+    const { route } = router({ getSettings: () => settings, applyBackup });
+    for (const rules of [settings.commandPermissionRules, []]) {
+      settings = { ...settings, commandPermissionRules: rules };
+      const exported = await route("GET", "/api/backup", "");
+      expect(exported.status).toBe(200);
+      const imported = await route("POST", "/api/backup", JSON.stringify(exported.body));
+      expect(imported.status).toBe(200);
+      const received = applyBackup.mock.lastCall![0];
+      expect(received.settings).toMatchObject({
+        commandPermissionRules: rules,
+        commandPermissionRevision: 7,
+      });
+      expect(SettingsSchema.parse(received.settings).commandPermissionRules).toEqual(
+        rules,
+      );
+    }
+
+    const legacy = structuredClone(applyBackup.mock.lastCall![0]);
+    delete legacy.settings.commandPermissionRules;
+    delete legacy.settings.commandPermissionRevision;
+    const imported = await route("POST", "/api/backup", JSON.stringify(legacy));
+    expect(imported.status).toBe(200);
+    const restored = SettingsSchema.parse(applyBackup.mock.lastCall![0].settings);
+    expect(restored.commandPermissionRules).toEqual(
+      settingsFromEnv({}).commandPermissionRules,
+    );
+    expect(restored.commandPermissionRevision).toBe(0);
   });
 
   it("refuses a Host archive on the node import endpoint", async () => {

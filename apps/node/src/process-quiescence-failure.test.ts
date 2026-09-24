@@ -1,17 +1,22 @@
 import { ChildProcess } from "node:child_process";
 import type * as ChildProcessModule from "node:child_process";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { stopProcessTree } from "./process-quiescence.js";
+import { GitRunner } from "./git-runner.js";
+import type { CheckoutLease } from "./checkout-locks.js";
 
-const { execFile } = vi.hoisted(() => ({ execFile: vi.fn() }));
+const { execFile, spawn } = vi.hoisted(() => ({ execFile: vi.fn(), spawn: vi.fn() }));
 vi.mock("node:child_process", async (importOriginal) => ({
   ...(await importOriginal<typeof ChildProcessModule>()),
   execFile,
+  spawn,
 }));
 
 beforeEach(() => {
   vi.useFakeTimers();
   execFile.mockReset();
+  spawn.mockReset();
 });
 
 afterEach(() => {
@@ -40,6 +45,47 @@ describe.skipIf(process.platform !== "win32")("unmanaged Windows process cleanup
     expect(child.listeners("close")).toEqual([otherClose]);
     expect(child.listeners("error")).toEqual([otherError]);
     await vi.advanceTimersByTimeAsync(15_000);
+  });
+
+  it("rejects a Git deadline when taskkill fails without claiming quiescence", async () => {
+    const child = Object.assign(runningChild(), {
+      stdin: new PassThrough(),
+      stdout: new PassThrough(),
+      stderr: new PassThrough(),
+    });
+    spawn.mockReturnValue(child);
+    const error = new Error("taskkill failed");
+    execFile.mockImplementation((_file, _args, _options, callback) => callback(error));
+    const lease = {
+      key: "checkout",
+      owner: "operation",
+      revalidate: vi.fn(async () => {}),
+      release: vi.fn(),
+      processPending: vi.fn(),
+      processStarted: vi.fn(),
+      processesQuiesced: vi.fn(),
+      requireReconciliation: vi.fn(),
+      reattach: vi.fn(),
+    } satisfies CheckoutLease;
+    const resolved = vi.fn();
+    const rejected = vi.fn();
+    void new GitRunner()
+      .run(process.cwd(), ["status"], { timeoutMs: 10, lease })
+      .then(resolved, rejected);
+
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(rejected).toHaveBeenCalledExactlyOnceWith(error);
+    expect(resolved).not.toHaveBeenCalled();
+    expect(lease.processPending).toHaveBeenCalledOnce();
+    expect(lease.processStarted).toHaveBeenCalledExactlyOnceWith(child.pid);
+    expect(lease.processesQuiesced).not.toHaveBeenCalled();
+    expect(lease.release).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    child.emit("close", 0, null);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lease.processesQuiesced).not.toHaveBeenCalled();
+    expect(lease.release).not.toHaveBeenCalled();
   });
 
   it.each([null, new Error("late taskkill failure")])(

@@ -772,6 +772,16 @@ describe("canonical actionable inputs and independent obligations", () => {
     const result = matchEffects([item], [effect, { ...effect, effectId: "two" }]);
     expect(result.ambiguous).toHaveLength(1);
     expect(result.remaining).toHaveLength(1);
+    const duplicate = { ...item, id: "another-reply" };
+    const duplicated = matchEffects([item, duplicate], [effect]);
+    expect(duplicated.matched).toEqual([]);
+    expect(duplicated.ambiguous).toHaveLength(2);
+    expect(duplicated.remaining).toEqual([item, duplicate]);
+    expect(duplicated.unobserved).toEqual([effect.effectId]);
+    const pinned = matchEffects([duplicate], [{ ...effect, id: item.id }]);
+    expect(pinned.matched).toEqual([]);
+    expect(pinned.remaining).toEqual([duplicate]);
+    expect(pinned.unobserved).toEqual([effect.effectId]);
   });
 
   it("does not acknowledge known replies or replay verified exact source revisions", () => {
