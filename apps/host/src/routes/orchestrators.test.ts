@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { CONTEXT_TIER_CONFIG_ID, ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { fleet } from "../orchestrator/fleet-harness.js";
+import { archiveRun } from "../orchestrator/lifecycle.js";
 import { orchestratorRoutes } from "./orchestrators.js";
 import { sessionRoutes } from "./sessions.js";
 
@@ -77,6 +78,17 @@ describe("orchestrator lifecycle routes", () => {
     await app.register(orchestratorRoutes, { service, engine });
     await app.register(sessionRoutes, { service });
     await app.ready();
+    /**
+     * What Stop did before it became lead-only: cancel every owned task as
+     * orchestration-stopped, then stop the lead. Databases written by an older
+     * Host still hold tasks in this state, and Resume must still reopen them.
+     */
+    const legacyStop = async () => {
+      archiveRun(service, run.id, ORCHESTRATOR_STOP_REASON, {
+        stoppedByOrchestrator: true,
+      });
+      return app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    };
     return {
       app,
       ...state,
@@ -85,6 +97,7 @@ describe("orchestrator lifecycle routes", () => {
       active: active!,
       descendant: descendant!,
       worker,
+      legacyStop,
     };
   };
 
@@ -157,10 +170,11 @@ describe("orchestrator lifecycle routes", () => {
     expect((await change()).statusCode).toBe(409);
   });
 
-  it("stops atomically, preserves terminal outcomes, and is idempotent", async () => {
+  it("stops only the lead conversation, leaving its tasks and workers running", async () => {
     const { app, store, service, leadId, run, done, active, descendant, worker } =
       await setup();
     const dispatch = vi.spyOn(service, "dispatch");
+    const steps = store.listRunSteps(run.id);
 
     const first = await app.inject({
       method: "POST",
@@ -174,21 +188,19 @@ describe("orchestrator lifecycle routes", () => {
 
     expect(first.statusCode).toBe(202);
     expect(second.statusCode).toBe(200);
-    expect(store.getRun(run.id)).toMatchObject({
-      state: "cancelled",
-      failureReason: ORCHESTRATOR_STOP_REASON,
-    });
+    expect(store.getRun(run.id)).toMatchObject({ state: "running", failureReason: "" });
+    expect(store.listRunSteps(run.id)).toEqual(steps);
     expect(store.getRunStep(done.id)).toMatchObject({
       state: "succeeded",
       output: "preserved",
     });
     expect(store.getRunStep(active.id)).toMatchObject({
-      state: "cancelled",
-      stoppedByOrchestrator: true,
+      state: "running",
+      stoppedByOrchestrator: false,
     });
     expect(store.getRunStep(descendant.id)).toMatchObject({
-      state: "cancelled",
-      stoppedByOrchestrator: true,
+      state: "pending",
+      stoppedByOrchestrator: false,
     });
     expect(store.getSession(leadId)).toMatchObject({
       state: "idle",
@@ -196,11 +208,13 @@ describe("orchestrator lifecycle routes", () => {
     });
     expect(store.getSession(worker.id)).toMatchObject({
       state: "running",
-      stopRequested: true,
+      stopRequested: false,
     });
     expect(
-      dispatch.mock.calls.filter(([, command]) => command.type === "stop"),
-    ).toHaveLength(2);
+      dispatch.mock.calls
+        .filter(([, command]) => command.type === "stop")
+        .map(([, command]) => command.sessionId),
+    ).toEqual([leadId]);
 
     const newTask = await app.inject({
       method: "POST",
@@ -222,6 +236,21 @@ describe("orchestrator lifecycle routes", () => {
     expect(
       dispatch.mock.calls.filter(([, command]) => command.type === "prompt"),
     ).toHaveLength(0);
+
+    // Once the lead is gone its work carries on; the result is owed to it.
+    service.handleEvent({
+      eventId: "lead-stopped-work-continues",
+      sessionId: leadId,
+      sequence: 2,
+      type: "state",
+      payload: { state: "stopped", activity: "Stopped" },
+      createdAt: new Date().toISOString(),
+    });
+    expect(store.getRun(run.id)?.state).toBe("running");
+    expect(store.getSession(worker.id)).toMatchObject({
+      state: "running",
+      stopRequested: false,
+    });
   });
 
   it("creates managed tasks with a remote-main development branch target", async () => {
@@ -273,9 +302,19 @@ describe("orchestrator lifecycle routes", () => {
   });
 
   it("blocks early resume, then continues only stopped unfinished work once", async () => {
-    const { app, store, service, leadId, run, done, active, descendant, worker } =
-      await setup();
-    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    const {
+      app,
+      store,
+      service,
+      leadId,
+      run,
+      done,
+      active,
+      descendant,
+      worker,
+      legacyStop,
+    } = await setup();
+    await legacyStop();
 
     const early = await app.inject({
       method: "POST",
@@ -326,8 +365,8 @@ describe("orchestrator lifecycle routes", () => {
   });
 
   it("resumes while retained child agents are idle", async () => {
-    const { app, store, service, leadId, run, worker } = await setup();
-    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    const { app, store, service, leadId, run, worker, legacyStop } = await setup();
+    await legacyStop();
     service.handleEvent({
       eventId: "lead-stopped-idle-worker",
       sessionId: leadId,
@@ -415,8 +454,8 @@ describe("orchestrator lifecycle routes", () => {
   ] as const)(
     "keeps Stop safeguards for worker state=%s, stopRequested=%s after the lead acknowledges",
     async (workerState, stopRequested) => {
-      const { app, store, service, leadId, run, worker } = await setup();
-      await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+      const { app, store, service, leadId, run, worker, legacyStop } = await setup();
+      await legacyStop();
       service.handleEvent({
         eventId: "lead-stopped-before-worker",
         sessionId: leadId,
@@ -449,26 +488,31 @@ describe("orchestrator lifecycle routes", () => {
     },
   );
 
-  it("does not bypass a pending worker Stop when recovering a failed lead", async () => {
-    const { app, store, service, leadId, run, worker } = await setup();
-    store.transitionSession(leadId, "failed");
-    store.setSessionControls(worker.id, { stopRequested: true });
-    const dispatch = vi.spyOn(service, "dispatch");
+  it.each(["failed", "stopped"] as const)(
+    "resumes a %s lead while one of its workers is still being stopped",
+    async (leadState) => {
+      // The scheduler parks settled workers while the lead is away, and an
+      // operator may stop one; neither is a Stop the lead has to wait out.
+      const { app, store, service, leadId, run, worker } = await setup();
+      store.transitionSession(leadId, leadState);
+      store.setSessionControls(worker.id, { stopRequested: true });
+      const originalRun = store.getRun(run.id);
+      const dispatch = vi.spyOn(service, "dispatch");
 
-    const resumed = await app.inject({
-      method: "POST",
-      url: `/api/orchestrators/${leadId}/resume`,
-    });
+      const resumed = await app.inject({
+        method: "POST",
+        url: `/api/orchestrators/${leadId}/resume`,
+      });
 
-    expect(resumed.statusCode).toBe(409);
-    expect(resumed.json()).toEqual({
-      error: "Wait for every node to acknowledge Stop before resuming",
-    });
-    expect(store.getRun(run.id)?.state).toBe("running");
-    expect(store.getSession(leadId)?.state).toBe("failed");
-    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
-    expect(dispatch).not.toHaveBeenCalled();
-  });
+      expect(resumed.statusCode).toBe(202);
+      expect(store.getRun(run.id)).toEqual(originalRun);
+      expect(store.getSession(leadId)?.state).toBe("starting");
+      expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+      expect(
+        dispatch.mock.calls.map(([, command]) => [command.type, command.sessionId]),
+      ).toEqual([["resume_session", leadId]]);
+    },
+  );
 
   it("bulk stops only agents owned by the selected orchestrator", async () => {
     const { app, store, leadId, worker } = await setup();
@@ -545,7 +589,7 @@ describe("orchestrator lifecycle routes", () => {
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
 
     expect(store.getSession(leadId)?.stopRequested).toBe(true);
-    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+    expect(store.getSession(worker.id)?.stopRequested).toBe(false);
 
     // A restarted Node has no live processes to acknowledge the old commands.
     // Its empty inventory is the authoritative acknowledgement instead.
@@ -556,7 +600,7 @@ describe("orchestrator lifecycle routes", () => {
       stopRequested: false,
     });
     expect(store.getSession(worker.id)).toMatchObject({
-      state: "stopped",
+      state: "running",
       stopRequested: false,
     });
 
@@ -573,6 +617,18 @@ describe("orchestrator lifecycle routes", () => {
     const { app, store, service, leadId, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
     service.disconnectNode(store.getSession(leadId)!.nodeId, "Node unavailable");
+    // Stopped by its own action, not by the lead's: confirming the lead's Stop
+    // also settles a Stop already asked of a worker on the same lost machine.
+    const parked = store.createSession(
+      store.getPlacement(store.getSession(leadId)!.placementId)!,
+      "parked",
+      false,
+      "Parked",
+      { runId: worker.runId, runRole: "worker" },
+    );
+    store.transitionSession(parked.id, "starting");
+    store.transitionSession(parked.id, "offline");
+    store.setSessionControls(parked.id, { stopRequested: true });
 
     const confirmed = await app.inject({
       method: "POST",
@@ -588,8 +644,12 @@ describe("orchestrator lifecycle routes", () => {
       state: "stopped",
       stopRequested: false,
     });
-    expect(store.getSession(worker.id)).toMatchObject({
+    expect(store.getSession(parked.id)).toMatchObject({
       state: "stopped",
+      stopRequested: false,
+    });
+    expect(store.getSession(worker.id)).toMatchObject({
+      state: "offline",
       stopRequested: false,
     });
   });
@@ -598,16 +658,28 @@ describe("orchestrator lifecycle routes", () => {
     const { app, store, service, leadId, run, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
     service.handleEvent({
-      eventId: "worker-stopped",
-      sessionId: worker.id,
+      eventId: "lead-stopped",
+      sessionId: leadId,
       sequence: 2,
       type: "state",
       payload: { state: "stopped", activity: "Stopped" },
       createdAt: new Date().toISOString(),
     });
+
+    const early = await app.inject({
+      method: "DELETE",
+      url: `/api/orchestrators/${leadId}`,
+    });
+    expect(early.statusCode).toBe(409);
+    expect(early.json()).toEqual({
+      error: "Archive or finish this orchestrator's tasks before dismissing it",
+    });
+    expect(store.getSession(leadId)?.dismissed).toBe(false);
+
+    archiveRun(service, run.id, "Archived by an operator");
     service.handleEvent({
-      eventId: "lead-stopped",
-      sessionId: leadId,
+      eventId: "worker-stopped",
+      sessionId: worker.id,
       sequence: 2,
       type: "state",
       payload: { state: "stopped", activity: "Stopped" },
@@ -634,6 +706,7 @@ describe("orchestrator lifecycle routes", () => {
   it("bulk cleans up selected stopped orchestrators without deleting history", async () => {
     const { app, store, service, leadId, run, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    archiveRun(service, run.id, "Archived by an operator");
     service.handleEvent({
       eventId: "worker-stopped-for-cleanup",
       sessionId: worker.id,
@@ -679,8 +752,9 @@ describe("orchestrator lifecycle routes", () => {
   });
 
   it("validates every selected orchestrator before cleaning up any of them", async () => {
-    const { app, store, service, leadId, worker } = await setup();
+    const { app, store, service, leadId, run, worker } = await setup();
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    archiveRun(service, run.id, "Archived by an operator");
     service.handleEvent({
       eventId: "worker-stopped-before-validation",
       sessionId: worker.id,
@@ -709,8 +783,9 @@ describe("orchestrator lifecycle routes", () => {
   });
 
   it("finishes run reopening after a restart interrupted lead resume", async () => {
-    const { app, store, service, leadId, run, worker, addNode } = await setup();
-    await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
+    const { app, store, service, leadId, run, worker, addNode, legacyStop } =
+      await setup();
+    await legacyStop();
     service.handleEvent({
       eventId: "worker-stopped",
       sessionId: worker.id,

@@ -15,6 +15,7 @@ import {
   SESSION_RETENTION_DAY_MS,
   WorktreeConflict,
   OutboxFlushIdSchema,
+  isResumableSession,
   parseEnrollmentGrant,
   type AuthenticatedEnvelope,
   type HostChallenge,
@@ -1569,6 +1570,45 @@ describe("node reconnect socket ordering", () => {
 
     await waitFor(() => store.getSession(sessionId)?.state === "idle");
     expect(store.listNotifications().notifications).toEqual([]);
+  });
+
+  it("settles a resume the Node refused instead of leaving it starting forever", async () => {
+    store.setAutoResume(false);
+    store.appendEvent({
+      eventId: "agent-session",
+      sessionId,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "acp-refused" },
+      createdAt: new Date().toISOString(),
+    });
+    const client = await connect({ activeSessionIds: [], busySessionIds: [] });
+    await waitFor(() => store.getSession(sessionId)?.state === "failed");
+    const delivered = nextMessage(client, "command");
+    expect(service.resumeSession(sessionId).ok).toBe(true);
+    const { command } = await delivered;
+    expect(command.type).toBe("resume_session");
+    expect(store.getSession(sessionId)?.state).toBe("starting");
+
+    const refusal =
+      "A durable native prompt handoff is unresolved; automatic resume/re-prompt is blocked.";
+    send(client, {
+      type: "command_result",
+      commandId: command.commandId,
+      sessionId,
+      ok: false,
+      fatal: false,
+      error: refusal,
+    });
+
+    await waitFor(() => store.getSession(sessionId)?.state === "failed");
+    expect(store.getSession(sessionId)).toMatchObject({
+      currentActivity: `Resume refused: ${refusal}`,
+      agentSessionId: "acp-refused",
+      stopRequested: false,
+    });
+    expect(isResumableSession(store.getSession(sessionId)!)).toBe(true);
+    expect(client.readyState).toBe(WebSocket.OPEN);
   });
 
   it("deletes an expired session only after its owning Node acknowledges over the socket", async () => {

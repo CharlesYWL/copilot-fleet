@@ -1818,9 +1818,11 @@ recording the handoff for you to review.
    controls, and lifecycle actions. **Archive** stops live workers but keeps
    the task record; a finished task can be **Reopen**ed with what is still
    wanted or **Delete**d if nothing should be kept. **Stop orchestrator** stops
-   the lead and its tasks; **Resume orchestrator** reopens stopped work when its
-   sessions are resumable; **Dismiss orchestrator** hides a stopped lead without
-   deleting ordinary session history.
+   only the lead's conversation: its tasks and agents keep running, and what
+   they finish is handed to the lead when **Resume orchestrator** re-attaches
+   it. Use **Archive** or **Stop agents** to end the work itself. **Dismiss
+   orchestrator** hides a stopped lead once its tasks are finished or archived,
+   without deleting ordinary session history.
 
 For one-off questions that do not need a checkout, start a direct **Chats**
 session from **New session**. For shared multi-agent goals, use Orchestrator's

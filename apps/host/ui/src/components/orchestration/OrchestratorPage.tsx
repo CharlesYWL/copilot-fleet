@@ -103,8 +103,16 @@ export const OrchestratorPage = ({
   const styles = useStyles();
   const ended = terminalSessionStates.has(conversation.state);
   const stopping = Boolean(conversation.stopRequested);
+  /*
+   * Only this conversation's tasks, and only to decide whether it can be
+   * dismissed. The board shows every conversation's work, and Stop no longer
+   * ends a lead's tasks, so neither is a reason to keep offering Stop to a lead
+   * that has already stopped instead of the Resume it needs.
+   */
   const hasActiveWork = models.some(
-    (model) => !terminalRunStates.has(model.run.state) || (model.stoppingSteps ?? 0) > 0,
+    (model) =>
+      model.run.leadSessionId === conversation.id &&
+      (!terminalRunStates.has(model.run.state) || (model.stoppingSteps ?? 0) > 0),
   );
   const resumable = isResumableSession(conversation) && !stopping;
 
@@ -173,16 +181,18 @@ export const OrchestratorPage = ({
             Stop agents ({activeAgentCount})
           </Button>
         )}
-        {ended && !stopping && !hasActiveWork ? (
+        {ended && !stopping ? (
           <>
             {resumable && (
               <Button size="small" appearance="primary" onClick={onResumeOrchestrator}>
                 Resume orchestrator
               </Button>
             )}
-            <Button size="small" appearance="secondary" onClick={onDismissOrchestrator}>
-              Dismiss orchestrator
-            </Button>
+            {!hasActiveWork && (
+              <Button size="small" appearance="secondary" onClick={onDismissOrchestrator}>
+                Dismiss orchestrator
+              </Button>
+            )}
           </>
         ) : (
           <Button
@@ -190,6 +200,12 @@ export const OrchestratorPage = ({
             appearance="subtle"
             disabled={stopping && conversation.state !== "offline"}
             onClick={onStopOrchestrator}
+            {...(stopping
+              ? {}
+              : {
+                  title:
+                    "Stop this orchestrator's conversation. Its tasks and agents keep running.",
+                })}
           >
             {stopping
               ? conversation.state === "offline"

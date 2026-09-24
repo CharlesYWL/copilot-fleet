@@ -6,30 +6,42 @@ Orchestration control uses separate persisted facts:
 - The session state records the latest worker state reported by a Node.
 - `stopRequested` records an unacknowledged Stop across disconnects and restarts.
 - `dismissed` controls visibility only.
-- `stoppedByOrchestrator` identifies unfinished steps that Resume may continue.
+- `stoppedByOrchestrator` identifies unfinished steps that an older Host's
+  orchestrator Stop cancelled, which Resume may continue.
 
 ## Operation contract
 
-| Existing state | Stop | Dismiss | Resume |
+Stopping an orchestrator stops its own conversation and nothing it started. The
+Host runs tasks without a live lead: dispatched steps finish, pending steps still
+dispatch, and whatever settles is owed to the lead as a wake that Resume
+delivers. Ending tasks is Archive's job, and Stop agents ends workers. Stop
+pauses PR maintenance owned by the lead, as it always has, because maintenance
+is driven by lead wakes.
+
+| Existing state | Stop orchestrator | Dismiss | Resume orchestrator |
 |---|---|---|---|
-| Pending or dependency-waiting step | Run becomes `cancelled`; step becomes `cancelled` and is marked resumable | No execution change | Marked step returns to `pending`; dependencies are re-evaluated |
-| Starting, queued, or running step | Same persisted cancellation; worker receives Stop and remains in its reported state until acknowledgement | Rejected while the lead is live | Rejected until every Stop is acknowledged |
-| Succeeded step | Preserved | No execution change | Preserved and never dispatched again |
-| Failed step | Preserved | No execution change | Preserved; descendants remain blocked |
-| Skipped or independently cancelled step | Preserved | No execution change | Preserved |
-| Offline worker | Stop intent remains persisted and is reissued if the Node reports the session after reconnect | Rejected until the lead is terminal | Rejected while execution is unknown |
-| Terminal worker | Preserved | No execution change | Reattached only when its step was marked by orchestration Stop |
-| Live lead | Owned runs are cancelled before any stop command is sent; the lead records `stopRequested` | Rejected | Rejected |
-| Terminal lead | Idempotent; any still-live owned run is cancelled | Allowed only after owned work settles; visibility changes and history remains stored | Lead is reattached, then eligible stopped runs reopen |
+| Pending or dependency-waiting step | Unchanged; still dispatched when ready | No execution change | Unchanged |
+| Starting, queued, or running step | Unchanged; its worker keeps running | Rejected while the task is live | Unchanged |
+| Succeeded, failed, skipped, or cancelled step | Preserved | No execution change | Preserved |
+| Offline worker | Unchanged | Rejected while the task is live | Unchanged |
+| Worker with its own pending Stop | Unchanged; "Mark orchestrator stopped" confirms it too when its node is unavailable | Rejected until acknowledged | Does not wait for it |
+| Live lead | The lead records `stopRequested` and receives Stop | Rejected | Rejected |
+| Terminal lead | Idempotent | Allowed once its own tasks are finished or archived and their workers settled; visibility changes and history remains stored | Lead is reattached; owed wakes and held messages are delivered once it is idle |
+| Task cancelled by an older Host's orchestrator Stop | — | Allowed once settled | Unfinished marked steps return to `pending` after their workers are terminal or idle and every Stop is acknowledged |
 
 Dismiss and restore never change run, step, or worker state. A dismissed lead and
 its tasks remain in persistence and continue accepting late terminal events.
 
-An unexpected lead failure, including failure to restore MCP tools, does not
-require stopping its workers before Resume. Resume reattaches the existing lead
+An unexpected lead failure, including failure to restore MCP tools, and an
+explicit Stop are handled the same way: Resume reattaches the existing lead
 conversation while workers in ongoing tasks keep their sessions and progress.
-Outstanding Stop requests still block Resume. Runs cancelled by orchestration
-Stop additionally wait for their workers to be terminal or idle before reopening.
+A lead's own outstanding Stop blocks Resume; its workers' Stops do not, because
+the scheduler parks settled workers while the lead is away.
+
+A Resume or start that the Node refuses settles the session as `failed` with the
+Node's reason, instead of leaving it `starting`. A refused launch leaves no
+process to report on it, so `starting` would otherwise never end; `failed` keeps
+the conversation resumable.
 
 ## Dependency rules
 
@@ -58,7 +70,9 @@ The control fields are additive SQLite columns with safe defaults, so older
 databases remain active and visible. Backups preserve the fields. On reconnect,
 a stopped session still present on the Node receives Stop again; a session no
 longer present is confirmed `stopped`. Resume resets only steps explicitly
-marked by the orchestration Stop transaction.
+marked by an older Host's orchestration Stop transaction; current Hosts no
+longer write that mark, so a database from before the change still resumes the
+work it stopped.
 
 ### Task overview and checkpoints
 
