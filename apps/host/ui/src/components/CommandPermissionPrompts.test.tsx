@@ -140,6 +140,14 @@ describe("Host-triggered command approval", () => {
     ).toBeTruthy();
     expect(screen.getByText("Approve before")).toBeTruthy();
   });
+  it("asks for approval before a bound helper deadline rather than the longer window", () => {
+    const execution = request();
+    const deadlineAt = "2098-12-31T23:00:00.000Z";
+    execution.descriptor!.observationBudget = { deadlineAt, requests: 39 };
+    render(wrap([execution]));
+    expect(screen.getByText(new Date(deadlineAt).toLocaleString())).toBeTruthy();
+    expect(screen.queryByText(new Date(execution.expiresAt).toLocaleString())).toBeNull();
+  });
   it.each(["failed", "awaiting_approval"] as const)(
     "refreshes a conflicting popup to %s without retrying approval",
     async (state) => {

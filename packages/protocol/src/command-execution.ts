@@ -371,6 +371,19 @@ export const CommandExecutionSchema = RunCommandSchema.extend({
   deliveryId: uuid.optional(),
 });
 export type CommandExecution = z.infer<typeof CommandExecutionSchema>;
+
+/**
+ * When an unstarted request stops being approvable: its own window, or the
+ * original PR-maintenance helper deadline bound into its descriptor if sooner.
+ */
+export function commandApprovalExpiresAt(
+  execution: Pick<CommandExecution, "expiresAt" | "descriptor">,
+): string {
+  const helperDeadline = execution.descriptor?.observationBudget?.deadlineAt;
+  return helperDeadline && Date.parse(helperDeadline) < Date.parse(execution.expiresAt)
+    ? helperDeadline
+    : execution.expiresAt;
+}
 export const CommandExecutionPageSchema = z.object({
   execution: CommandExecutionSchema,
   events: z.array(CommandOutputEventSchema).max(512),
