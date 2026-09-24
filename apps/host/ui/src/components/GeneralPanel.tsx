@@ -22,6 +22,7 @@ import {
 } from "@fluentui/react-components";
 import type {
   ContextTier,
+  HostUpdateStatus,
   ManagedWorktreePolicy,
   SessionConfigChoice,
   SessionConfigOption,
@@ -31,6 +32,7 @@ import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
+import { HostUpdateCard } from "./HostUpdateCard";
 
 const useStyles = makeStyles({
   panel: {
@@ -129,12 +131,20 @@ export type GeneralPanelProps = {
   /** Live sessions, read only to learn which models this fleet's Copilot offers. */
   sessions: readonly { configOptions: SessionConfigOption[] }[];
   onStartTour?: (() => void) | undefined;
+  /** The Host's own update; the card is left out when the Host sends none. */
+  hostUpdate?: HostUpdateStatus | undefined;
+  hostRevision?: string | undefined;
 };
 
 const YOLO_WARNING =
   "New sessions will execute commands on their node without approval. You can still turn this off for an individual session when starting it.";
 
-export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
+export const GeneralPanel = ({
+  sessions,
+  onStartTour,
+  hostUpdate,
+  hostRevision = "",
+}: GeneralPanelProps) => {
   const styles = useStyles();
   const active = useSettingsActive();
   const [defaults, setDefaults] = useState<Defaults>();
@@ -537,6 +547,8 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
           </Text>
         )}
       </section>
+
+      {hostUpdate && <HostUpdateCard status={hostUpdate} revision={hostRevision} />}
 
       <section className={styles.card} aria-label="Fleet data archive">
         <div>

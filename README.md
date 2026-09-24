@@ -89,8 +89,9 @@ Start with the walkthrough, then use this map when you need a specific surface.
 - **Connect or maintain machines:** [Windows Node](#windows-node-powershell),
   [Windows login startup](#windows-login-startup),
   [Node command-line flags](#node-command-line-flags),
-  [Node config page](#node-config-page), and
-  [keeping nodes up to date](#keeping-nodes-up-to-date).
+  [Node config page](#node-config-page),
+  [keeping nodes up to date](#keeping-nodes-up-to-date), and
+  [keeping the Host up to date](#keeping-the-host-up-to-date).
 - **Create projects and start everyday sessions:**
   [workspaces and placements](#first-run-walkthrough),
   [Agency mode](#agency-mode),
@@ -208,7 +209,8 @@ For a Host-only development setup, keep `npm run host` running and use
 
 Open the UI → **Settings**:
 
-- **General** — session defaults, the **Take the tour** button, and data export/import.
+- **General** — session defaults, the **Take the tour** button, **Update Host**,
+  and data export/import.
 - **Security** — administrators, invitations, Microsoft sign-in configuration,
   password migration, the Host fingerprint, Node key migration, portable Host
   backup/restore, and this Host's security audit.
@@ -247,6 +249,12 @@ npm start
 
 Or just the Host: `npm run start:host`. Open `http://127.0.0.1:8787` —
 Fastify serves the built UI.
+
+`npm run dev`, `npm run dev:tunnel` and `npm start` run under a small launcher
+(`scripts/launcher.mjs`) so that **Settings → General → Update Host** can restart
+them in place; see [Keeping the Host up to date](#keeping-the-host-up-to-date).
+`npm run dev:bare`, `npm run dev:tunnel:bare` and `npm run start:bare` run the
+same commands without it.
 
 ## First-run walkthrough
 
@@ -1687,6 +1695,79 @@ nssm start copilot-fleet-node
 An update exits 75 in this mode too. PM2 and NSSM restart on any exit, so that
 is already what you want; a unit file that restarts only on failure needs
 `RestartForceExitStatus=75` or `Restart=always`.
+
+## Keeping the Host up to date
+
+**Settings → General → Update Host** does for the Host what **Update** does for
+a node: `git fetch --prune`, `git reset --hard` onto the branch the checkout
+tracks, `npm install --include=dev` and `npm run build` — the whole build, since
+the Node started beside the Host runs from the same checkout — and then restarts
+the Host and that Node **the way they were started**:
+
+| Started with                                  | Restarted with                                                                         |
+| --------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `npm run dev` / `npm run dev:tunnel`          | the same command, in the same terminal, with the same arguments                        |
+| `npm start`                                   | `npm start`, in the same terminal, with the same arguments                             |
+| `npm run service -- host+node install` (etc.) | `npm run service -- host+node restart` (`host restart` if the Node task is not in use) |
+
+The card shows the commit the Host is on and the restart command, then each
+stage as it happens. The Host drops off while it restarts; the page reconnects
+by itself and reports how the update ended. Reload it afterwards to load the new
+interface.
+
+The steps and the safety property are the Node's, from the same code
+(`@fleet/protocol/updater`): nothing is restarted until the build has
+succeeded, and a checkout already on the newest commit is not restarted at all.
+Under `npm start` and the login service a failed build therefore leaves the Host
+and its Node running what they already had. Under `npm run dev` the Host's own
+file watcher still reloads source as soon as the reset rewrites it — that is what
+the watcher is for — so a failed build there can leave the Host on new source
+with old dependencies until you fix the checkout. In addition, the Host will not:
+
+- **Discard uncommitted work.** A Host's checkout is often somebody's working
+  copy too, so uncommitted changes to tracked files refuse the update — checked
+  when you click and again just before the reset, and a checkout git cannot
+  read counts as dirty (untracked files such as `.env` survive a reset and do
+  not count). Local commits that are not on the tracked branch are dropped from
+  it, as on a node; the reflog still has them.
+- **Stop this machine's sessions without asking.** Restarting the Host restarts
+  the Node beside it, so while that Node is running sessions the update is
+  refused with their names, and the card offers to stop exactly those and go
+  ahead; one started in the meantime is named in a fresh refusal. Until the
+  restart, new sessions on this machine are refused rather than started only to
+  be stopped. Sessions on other machines keep running through the Host's restart.
+- **Update beside another update.** Whichever update is resetting and rebuilding
+  a checkout holds `.fleet-update.lock` in it, touching it as it works, so the
+  Host and the Node beside it never run theirs at the same time, even across a
+  restart.
+- **Claim a restart it cannot see.** Starting a command or a scheduled task proves
+  nothing about what runs in it, so success is recorded by the restarted Host
+  itself: once it is listening, on the commit the update built, with this
+  machine's Node back on that commit too. A Host or Node that comes back on
+  anything else, a Node that does not come back within three minutes, or an
+  updater that stops reporting is recorded as a failure.
+
+How it restarts depends on who can survive the restart. Under `npm run dev` the
+file watcher restarts the Host as soon as the reset rewrites its source, so the
+Host never runs the update itself: the launcher in front of `npm run dev`,
+`npm run dev:tunnel` and `npm start` does, and then stops everything it started
+and runs the command again. A login-service Host cannot restart its own task
+from inside it, so it registers a one-off scheduled task for your Windows user,
+`CopilotFleetSelfUpdate-…`, which updates, runs the restart and deletes itself;
+its output is kept in `self-update.log` beside the Host database. Progress in
+both cases is recorded in `self-update.json` there, which is how the restarted
+Host knows how the update went.
+
+Restarting `npm run dev:tunnel` restarts its tunnel with everything else, as
+stopping and starting it by hand would: a Dev Tunnel keeps its address, but a
+quick tunnel (Cloudflare, free ngrok) comes back on a new one. The launcher
+itself is not replaced by an update; changes to it take effect the next time you
+start the command.
+
+A Host started any other way — `npm run host`, `npm run start:host`, a
+`*:bare` script — has nothing waiting to start it again, so **Update Host** is
+disabled and says so. So is a Host that was already running when you pulled this
+feature: restart it once with one of the commands above.
 
 ## Exact proof of concept
 

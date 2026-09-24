@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BrowserMessage,
   FleetSession,
+  HostUpdateStatus,
   Notification,
   SessionEvent,
   Snapshot,
@@ -284,6 +285,77 @@ describe("useFleet durable notifications", () => {
     expect(result.current.snapshotRevision).toBe(2);
     act(() => socket.send({ type: "notification_unread_count", unreadCount: 1 }));
     expect(result.current.snapshotRevision).toBe(2);
+  });
+
+  describe("Host updates", () => {
+    const status = (
+      stage: NonNullable<HostUpdateStatus["update"]>["stage"],
+      detail: string,
+      revision = "",
+    ): HostUpdateStatus => ({
+      launch: "dev",
+      restartCommand: "npm run dev",
+      unavailableReason: "",
+      update: { updateId: "update-1", stage, detail, revision, updatedAt: ISO },
+    });
+
+    beforeEach(() => sessionStorage.clear());
+
+    it("announces the end of one it watched begin, even from the page after a restart", () => {
+      const notify = vi.fn();
+      const first = renderHook(() => useFleet(notify));
+      act(() =>
+        MockWebSocket.instances[0]!.send({
+          type: "host_update",
+          status: status("building", "npm run build"),
+        }),
+      );
+      expect(first.result.current.snapshot.hostUpdate?.update?.stage).toBe("building");
+      expect(notify).not.toHaveBeenCalled();
+      // The Host goes away mid-update, and under Vite the page reloads with it.
+      first.unmount();
+
+      renderHook(() => useFleet(notify));
+      const socket = MockWebSocket.instances.at(-1)!;
+      const finished = {
+        ...snapshot(),
+        hostUpdate: status("up_to_date", "Updated to new222222222", "new222222222"),
+      };
+      act(() => socket.send({ type: "snapshot", data: finished }));
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        "Host updated to new222222222. Reload this page to load the updated interface.",
+        "success",
+      );
+      act(() => socket.send({ type: "snapshot", data: finished }));
+      expect(notify).toHaveBeenCalledTimes(1);
+    });
+
+    it("reports a failure it watched, and says nothing of one it did not", () => {
+      const notify = vi.fn();
+      renderHook(() => useFleet(notify));
+      const socket = MockWebSocket.instances[0]!;
+      act(() =>
+        socket.send({
+          type: "snapshot",
+          data: { ...snapshot(), hostUpdate: status("failed", "npm run build: TS2345") },
+        }),
+      );
+      expect(notify).not.toHaveBeenCalled();
+
+      act(() =>
+        socket.send({ type: "host_update", status: status("installing", "npm install") }),
+      );
+      act(() =>
+        socket.send({
+          type: "host_update",
+          status: status("failed", "npm install --include=dev: EBUSY"),
+        }),
+      );
+      expect(notify).toHaveBeenCalledExactlyOnceWith(
+        "npm install --include=dev: EBUSY",
+        "error",
+      );
+    });
   });
 
   it("reports connection loss once per outage and reports recovery, but not initial connection or unmount", async () => {

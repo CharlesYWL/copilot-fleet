@@ -19,6 +19,10 @@
     "./node-auth": {
       "types": "./dist/node-auth.d.ts",
       "default": "./dist/node-auth.js"
+    },
+    "./updater": {
+      "types": "./dist/updater.d.ts",
+      "default": "./dist/updater.js"
     }
   },
   "scripts": {

@@ -32,7 +32,11 @@ import {
   LeadPromptDeliverySchema,
 } from "@fleet/protocol";
 import { type AuthenticatedChannel } from "@fleet/protocol/node-auth";
-import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
+import {
+  forgetLauncherEnvironment,
+  gitRevision,
+  repoRoot,
+} from "@fleet/protocol/runtime";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
 import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
 import { CliError, USAGE, argvForRestart, parseNodeArgs } from "./cli.js";
@@ -158,6 +162,9 @@ export type NodeRuntime = { shutdown: () => Promise<void> };
  * could be covered by a test.
  */
 export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
+  // Started beside the Host by the launcher, this process inherits a token that
+  // restarts the Host; no agent or command it runs has any business holding it.
+  forgetLauncherEnvironment();
   const flags = parseNodeArgs(argv);
   loadEnv({ path: envFilePath(), quiet: true });
   // One lookup path for both sources; the flags are already the last word.

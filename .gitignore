@@ -11,3 +11,5 @@ dist/
 node_modules/
 data/
 .mwi-test-work/
+# Held by whichever update is resetting and rebuilding this checkout.
+.fleet-update.lock

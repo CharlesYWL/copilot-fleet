@@ -640,9 +640,10 @@ export function eventPayload<T extends SessionEventType>(
  *
  * Named stages rather than free text because the browser renders them and the
  * Host logs them; a message the Node phrased slightly differently on Windows
- * would otherwise be a different thing to everyone reading it.
+ * would otherwise be a different thing to everyone reading it. The Host updates
+ * itself through the same steps, so both report in the same words.
  */
-export const nodeUpdateStages = [
+export const updateStages = [
   "checking",
   "pulling",
   "installing",
@@ -651,8 +652,67 @@ export const nodeUpdateStages = [
   "up_to_date",
   "failed",
 ] as const;
-export const NodeUpdateStageSchema = z.enum(nodeUpdateStages);
-export type NodeUpdateStage = z.infer<typeof NodeUpdateStageSchema>;
+export const UpdateStageSchema = z.enum(updateStages);
+export type UpdateStage = z.infer<typeof UpdateStageSchema>;
+
+/** The same stages, under the name the Node update introduced them with. */
+export const nodeUpdateStages = updateStages;
+export const NodeUpdateStageSchema = UpdateStageSchema;
+export type NodeUpdateStage = UpdateStage;
+
+/** Whether an update in this stage is over, one way or the other. */
+export function updateFinished(stage: UpdateStage): boolean {
+  return stage === "up_to_date" || stage === "failed";
+}
+
+/**
+ * How the Host process was started, which decides how it comes back.
+ *
+ * `dev`, `dev:tunnel` and `start` run under the launcher that `npm run dev`,
+ * `npm run dev:tunnel` and `npm start` put in front of the Host and its Node;
+ * `service` is the Windows login task; `manual` is anything else — `npm run
+ * host` on its own, say — where nothing is waiting to start it again.
+ */
+export const hostLaunchModes = [
+  "dev",
+  "dev:tunnel",
+  "start",
+  "service",
+  "manual",
+] as const;
+export const HostLaunchModeSchema = z.enum(hostLaunchModes);
+export type HostLaunchMode = z.infer<typeof HostLaunchModeSchema>;
+
+/** The Host's own update: the one in flight, or the last one to finish. */
+export const HostUpdateProgressSchema = z.object({
+  updateId: z.string().min(1),
+  stage: UpdateStageSchema,
+  detail: z.string().default(""),
+  /** The commit the update landed on, once it has one. */
+  revision: z.string().default(""),
+  updatedAt: z.string(),
+});
+export type HostUpdateProgress = z.infer<typeof HostUpdateProgressSchema>;
+
+export const HostUpdateStatusSchema = z.object({
+  launch: HostLaunchModeSchema,
+  /** What brings the Host and its Node back after an update, as typed at a prompt. */
+  restartCommand: z.string().default(""),
+  /** Why this Host cannot update itself from the browser; empty when it can. */
+  unavailableReason: z.string().default(""),
+  update: HostUpdateProgressSchema.optional(),
+});
+export type HostUpdateStatus = z.infer<typeof HostUpdateStatusSchema>;
+
+/**
+ * Updating the Host restarts the Node started beside it, so stopping that
+ * Node's sessions is opt-in exactly as it is for a Node update — and covers
+ * only the sessions the operator was shown.
+ */
+export const UpdateHostSchema = z.object({
+  stopSessions: z.boolean().default(false),
+  sessionIds: z.array(z.string().min(1)).max(1_000).default([]),
+});
 
 /**
  * An MCP server a session should be given, in the one transport this needs.
@@ -1773,6 +1833,8 @@ export const SnapshotSchema = z.object({
    * says nothing an operator can act on.
    */
   hostRevision: z.string().default(""),
+  /** Optional so a browser talking to a Host that cannot update itself still parses. */
+  hostUpdate: HostUpdateStatusSchema.optional(),
   commandExecutions: z.array(CommandExecutionSchema).optional(),
   prMaintenanceApprovals: z.array(PrMaintenanceApprovalSchema).optional(),
   /** Retained PR maintenance per task, so lists do not read it as "deciding". */
@@ -1817,6 +1879,14 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     stage: NodeUpdateStageSchema,
     detail: z.string().default(""),
   }),
+  /**
+   * The Host's own update, sent whole whenever it moves.
+   *
+   * Whole rather than as a stage, because a browser that reconnects after the
+   * Host restarted gets the same object in the snapshot and should not have to
+   * reassemble it from the messages it missed while the Host was down.
+   */
+  z.object({ type: z.literal("host_update"), status: HostUpdateStatusSchema }),
   /**
    * Something went wrong with one session without ending it.
    *

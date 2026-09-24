@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { NodeUpdateStage } from "@fleet/protocol";
 import {
+  NODE_BUILD_SCRIPT,
   NODE_ENTRY_POINT,
   RESTART_EXIT_CODE,
   restartHandledBySupervisor,
@@ -51,192 +52,26 @@ const upstream = {
 };
 
 describe("updateCheckout", () => {
-  const stages: NodeUpdateStage[] = [];
-  const report = (stage: NodeUpdateStage) => {
-    stages.push(stage);
-  };
-
-  it("installs and builds before asking for a restart", async () => {
-    stages.length = 0;
+  it("runs the shared update and builds only what a Node runs", async () => {
+    // The steps themselves are covered where they live, in the protocol
+    // package; what is the Node's own is which build it asks for.
     const { run, calls } = scriptedRun({
       ...upstream,
       "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
     });
-    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
-
-    expect(outcome).toEqual({ action: "restart", revision: "new222222222" });
-    // Building before the restart is the whole safety property: a checkout that
-    // does not compile must leave the machine on the code it already had.
-    expect(calls).toEqual([
-      "git rev-parse HEAD",
-      "git fetch --prune",
-      "git rev-parse --abbrev-ref --symbolic-full-name @{u}",
-      "git reset --hard origin/main",
-      "git rev-parse HEAD",
-      "npm install --include=dev",
-      "npm run build:node",
-    ]);
-    expect(stages).toEqual(["checking", "pulling", "pulling", "installing", "building"]);
-  });
-
-  it("does not restart a node that was already current", async () => {
-    stages.length = 0;
-    const { run, calls } = scriptedRun({
-      ...upstream,
-      "git rev-parse HEAD": [ok("same11111111"), ok("same11111111")],
-    });
-    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
-
-    expect(outcome).toEqual({ action: "none", reason: "Already up to date" });
-    // Restarting anyway would drop the connection for no gain — and on "Update
-    // all" it would do that to every machine that was already up to date.
-    expect(calls).not.toContain("npm install --include=dev");
-    expect(calls.some((call) => call.startsWith("npm "))).toBe(false);
-  });
-
-  it("rebuilds an unchanged checkout when the running service is still on an older commit", async () => {
-    const { run, calls } = scriptedRun({
-      ...upstream,
-      "git rev-parse HEAD": [ok("new222222222222"), ok("new222222222222")],
-    });
+    const stages: NodeUpdateStage[] = [];
     const outcome = await updateCheckout({
       repoRoot: gitCheckout(),
-      runningRevision: "old111111111",
-      report,
+      report: (stage) => {
+        stages.push(stage);
+      },
       run,
     });
 
     expect(outcome).toEqual({ action: "restart", revision: "new222222222" });
-    expect(calls.slice(-2)).toEqual(["npm install --include=dev", "npm run build:node"]);
-  });
-
-  it("accepts the abbreviated running revision when both the process and checkout are current", async () => {
-    const { run, calls } = scriptedRun({
-      ...upstream,
-      "git rev-parse HEAD": [ok("same11111111111"), ok("same11111111111")],
-    });
-    expect(
-      await updateCheckout({
-        repoRoot: gitCheckout(),
-        runningRevision: "same11111111",
-        report,
-        run,
-      }),
-    ).toEqual({ action: "none", reason: "Already up to date" });
-    expect(calls.some((call) => call.startsWith("npm "))).toBe(false);
-  });
-
-  it("retries a failed build even though the previous attempt already moved HEAD", async () => {
-    const root = gitCheckout();
-    const { run, calls } = scriptedRun({
-      "git rev-parse --abbrev-ref --symbolic-full-name @{u}": [
-        ok("origin/main"),
-        ok("origin/main"),
-      ],
-      "git rev-parse HEAD": [
-        ok("old111111111111"),
-        ok("new222222222222"),
-        ok("new222222222222"),
-        ok("new222222222222"),
-      ],
-      "npm run build:node": [{ ok: false, output: "tsc not found" }, ok()],
-    });
-    const options = { repoRoot: root, runningRevision: "old111111111", report, run };
-    expect((await updateCheckout(options)).action).toBe("failed");
-    expect(await updateCheckout(options)).toEqual({
-      action: "restart",
-      revision: "new222222222",
-    });
-    expect(calls.filter((call) => call === "npm run build:node")).toHaveLength(2);
-  });
-
-  it("rebuilds rather than claiming success when the running revision is unknown", async () => {
-    const { run } = scriptedRun({
-      ...upstream,
-      "git rev-parse HEAD": [ok("same11111111111"), ok("same11111111111")],
-    });
-    expect(
-      (
-        await updateCheckout({
-          repoRoot: gitCheckout(),
-          runningRevision: "",
-          report,
-          run,
-        })
-      ).action,
-    ).toBe("restart");
-  });
-
-  it("resets onto whichever branch the checkout tracks", async () => {
-    stages.length = 0;
-    const { run, calls } = scriptedRun({
-      "git rev-parse --abbrev-ref --symbolic-full-name @{u}": [ok("upstream/release")],
-      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
-    });
-    await updateCheckout({ repoRoot: gitCheckout(), report, run });
-
-    // Assuming origin/main would drag a machine parked on a release branch onto
-    // a different one, which is a worse outcome than not updating it at all.
-    expect(calls).toContain("git reset --hard upstream/release");
-  });
-
-  it("stops at a fetch that failed, leaving the checkout alone", async () => {
-    stages.length = 0;
-    const { run, calls } = scriptedRun({
-      ...upstream,
-      "git fetch --prune": [{ ok: false, output: "Could not resolve host: github.com" }],
-    });
-    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
-
-    expect(outcome).toEqual({
-      action: "failed",
-      reason: "git fetch: Could not resolve host: github.com",
-    });
-    // Resetting onto a stale remote-tracking ref would report success while
-    // moving the machine nowhere, or backwards.
-    expect(calls).not.toContain("git reset --hard origin/main");
-    expect(calls).not.toContain("npm run build:node");
-  });
-
-  it("stops when the branch has nothing to be reset onto", async () => {
-    stages.length = 0;
-    const { run, calls } = scriptedRun({
-      "git rev-parse --abbrev-ref --symbolic-full-name @{u}": [
-        { ok: false, output: "no upstream configured for branch 'wip'" },
-      ],
-    });
-    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
-
-    expect(outcome).toEqual({
-      action: "failed",
-      reason: "git rev-parse @{u}: no upstream configured for branch 'wip'",
-    });
-    expect(calls).not.toContain("npm run build:node");
-  });
-
-  it("keeps running the old build when the new one does not compile", async () => {
-    stages.length = 0;
-    const { run } = scriptedRun({
-      ...upstream,
-      "git rev-parse HEAD": [ok("old111111111111"), ok("new222222222222")],
-      "npm run build:node": [{ ok: false, output: "TS2345" }],
-    });
-    const outcome = await updateCheckout({ repoRoot: gitCheckout(), report, run });
-
-    expect(outcome).toEqual({
-      action: "failed",
-      reason: "npm run build:node: TS2345",
-    });
-  });
-
-  it("refuses a directory that is not a git checkout", async () => {
-    stages.length = 0;
-    const root = mkdtempSync(join(tmpdir(), "fleet-plain-"));
-    roots.push(root);
-    const { run, calls } = scriptedRun({});
-
-    expect((await updateCheckout({ repoRoot: root, report, run })).action).toBe("failed");
-    expect(calls).toEqual([]);
+    expect(calls.at(-1)).toBe(`npm run ${NODE_BUILD_SCRIPT}`);
+    expect(NODE_BUILD_SCRIPT).toBe("build:node");
+    expect(stages).toEqual(["checking", "pulling", "pulling", "installing", "building"]);
   });
 });
 

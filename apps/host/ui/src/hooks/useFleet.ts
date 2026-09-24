@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
+  updateFinished,
   CommandExecutionSchema,
   CommandOutputEventSchema,
   type CommandOutputEvent,
+  type HostUpdateStatus,
   type MarkAllNotificationsReadResponse,
   type BrowserMessage,
   type Notification,
@@ -66,6 +68,33 @@ export type NodeUpdateProgress = Record<
   { stage: NodeUpdateStage; detail: string }
 >;
 
+/**
+ * The Host update this tab saw start, so its end is announced exactly once.
+ *
+ * Kept in session storage rather than memory because the end usually arrives
+ * after a restart: the socket drops while the Host is replaced, and under
+ * `npm run dev` Vite reloads the page as well, so the first word of how it went
+ * is a snapshot that a fresh page would otherwise have no reason to announce.
+ */
+const WATCHED_HOST_UPDATE = "copilot-fleet.watched-host-update";
+
+function watchedHostUpdate(): string | undefined {
+  try {
+    return sessionStorage.getItem(WATCHED_HOST_UPDATE) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function watchHostUpdate(updateId: string | undefined): void {
+  try {
+    if (updateId) sessionStorage.setItem(WATCHED_HOST_UPDATE, updateId);
+    else sessionStorage.removeItem(WATCHED_HOST_UPDATE);
+  } catch {
+    // Without storage the announcement is lost to a reload, nothing worse.
+  }
+}
+
 export function useFleet(notify: Notify) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [snapshotRevision, setSnapshotRevision] = useState(0);
@@ -109,6 +138,28 @@ export function useFleet(notify: Notify) {
 
   const report = useCallback((reason: unknown) => {
     notifyRef.current(errorMessage(reason), "error");
+  }, []);
+
+  /** Announces the end of a Host update this tab watched begin. */
+  const announceHostUpdate = useCallback((status: HostUpdateStatus | undefined) => {
+    const update = status?.update;
+    if (!update) return;
+    if (!updateFinished(update.stage)) {
+      watchHostUpdate(update.updateId);
+      return;
+    }
+    if (watchedHostUpdate() !== update.updateId) return;
+    watchHostUpdate(undefined);
+    if (update.stage === "failed") {
+      notifyRef.current(update.detail || "The Host update failed", "error");
+      return;
+    }
+    notifyRef.current(
+      update.revision
+        ? `Host ${update.detail.charAt(0).toLowerCase()}${update.detail.slice(1)}. Reload this page to load the updated interface.`
+        : update.detail || "The Host is already up to date",
+      "success",
+    );
   }, []);
 
   const recordHydrationChange = useCallback(
@@ -175,8 +226,9 @@ export function useFleet(notify: Notify) {
         notifications: sortNotifications(next.notifications),
       });
       setSnapshotRevision((value) => value + 1);
+      announceHostUpdate(next.hostUpdate);
     },
-    [recordHydrationChange],
+    [announceHostUpdate, recordHydrationChange],
   );
 
   const beginHydration = useCallback(() => {
@@ -251,9 +303,10 @@ export function useFleet(notify: Notify) {
       });
       setSnapshotRevision((value) => value + 1);
       currentUnreadCount.current = unreadCount;
+      announceHostUpdate(next.hostUpdate);
       return true;
     },
-    [],
+    [announceHostUpdate],
   );
 
   /**
@@ -582,6 +635,12 @@ export function useFleet(notify: Notify) {
             notifyRef.current(detail || "Already up to date", "success");
           return;
         }
+        if (message.type === "host_update") {
+          const { status } = message;
+          setSnapshot((value) => ({ ...value, hostUpdate: status }));
+          announceHostUpdate(status);
+          return;
+        }
         if (message.type === "session_notice") {
           // The session is fine; the command was refused. Saying so is the
           // whole point — a prompt dropped in silence is indistinguishable
@@ -656,6 +715,7 @@ export function useFleet(notify: Notify) {
       socket?.close();
     };
   }, [
+    announceHostUpdate,
     applyNotification,
     hydrateSocketSnapshot,
     recordNotificationUpsert,

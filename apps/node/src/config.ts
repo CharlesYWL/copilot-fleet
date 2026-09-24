@@ -1,8 +1,8 @@
 import { chmod, mkdir, readFile, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { join } from "node:path";
 import { z } from "zod";
 import { MUTUAL_AUTH_PROTOCOL } from "@fleet/protocol";
+import { nodeConfigDirectory } from "@fleet/protocol/runtime";
 
 /**
  * The Host this Node has pinned.
@@ -59,19 +59,7 @@ export type KeyedCredentials = Extract<
 >;
 
 export function configDirectory(): string {
-  if (process.env.FLEET_NODE_CONFIG_DIR !== undefined) {
-    if (!isAbsolute(process.env.FLEET_NODE_CONFIG_DIR)) {
-      throw new Error("FLEET_NODE_CONFIG_DIR must be an absolute directory.");
-    }
-    return process.env.FLEET_NODE_CONFIG_DIR;
-  }
-  if (process.platform === "win32") {
-    return join(
-      process.env.APPDATA ?? join(homedir(), "AppData", "Roaming"),
-      "CopilotFleet",
-    );
-  }
-  return join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "copilot-fleet");
+  return nodeConfigDirectory();
 }
 
 /**
