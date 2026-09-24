@@ -12,6 +12,7 @@ import {
   CommandPreparationSchema,
   GetCommandExecutionSchema,
   RunCommandSchema,
+  commandApprovalExpiresAt,
   commandDigestPayload,
   terminalCommandExecutionStates,
   terminalRunStates,
@@ -515,10 +516,18 @@ export class CommandExecutionService {
         current.descriptor?.digest !== decision.digest
       )
         throw new CommandConflict("approval_conflict");
-      if (now >= Date.parse(current.expiresAt))
+      // Settle a lapsed request instead of refusing it, so it cannot linger as waiting.
+      if (now >= Date.parse(commandApprovalExpiresAt(current)))
         return this.finish(current, "expired", "approval_expired");
       this.lead(current.leadSessionId);
-      this.recheckTarget(current);
+      try {
+        this.recheckTarget(current);
+      } catch (error) {
+        // The helper deadline can lapse between the check above and this recheck.
+        if (Date.now() >= Date.parse(commandApprovalExpiresAt(current)))
+          return this.finish(current, "expired", "approval_expired");
+        throw error;
+      }
       if (decision.decision !== "deny") {
         if (decision.decision !== "allow_once") this.assertReusablePermission(current);
         const clockFailure = this.preparedClockFailure(current);
@@ -940,8 +949,16 @@ export class CommandExecutionService {
       !receipt.outcomeKnown &&
       !receipt.settledAt &&
       (!current.descriptor || current.descriptor.digest === receipt.digest)
-    )
+    ) {
+      // A revocation sent while the Node was offline is lost; repeat it so a request
+      // retired early (for example at a helper deadline) stops holding a Node slot.
+      if (
+        terminalCommandExecutionStates.has(current.state) &&
+        current.ownership === "not_started"
+      )
+        this.sendCancel(current, true);
       return true;
+    }
     if (current.descriptor?.digest !== receipt.digest) return false;
     if (attempt?.start_version == null) {
       if (
@@ -1238,7 +1255,10 @@ export class CommandExecutionService {
           continue;
         }
       }
-      if (!activeStates.has(execution.state) && now >= Date.parse(execution.expiresAt)) {
+      if (
+        !activeStates.has(execution.state) &&
+        now >= Date.parse(commandApprovalExpiresAt(execution))
+      ) {
         this.publish(this.finish(execution, "expired", "authorization_expired"));
         continue;
       }

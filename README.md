@@ -1381,6 +1381,8 @@ within that identity; they are not a claim that every argument is read-only.
 The Commands button highlights pending approvals with an amber pulse and count
 (a steady highlight when reduced motion is enabled). The dialog prioritizes
 **Waiting approval**; **Request history** keeps reviewed and other requests separate.
+A request that expires before anyone decides moves to **Request history** on its
+own, and a decision that arrives after expiry is not applied.
 If an approval conflicts with another update, Fleet refreshes its current state
 without automatically resubmitting your decision. Reload an old browser tab
 after upgrading if it reports unrecognized command fields.
@@ -1458,7 +1460,8 @@ The initial shell is explicitly **Windows PowerShell 5.1**
 a separate starting directory. Git and `npm run` work there; `cd` and variables
 do not persist to later executions. Scripts are limited to 16 KiB of UTF-8 text,
 with a five-minute default and one-hour maximum runtime. An unstarted request
-expires 30 minutes after creation. Only one command runs on a Node at a time.
+expires 30 minutes after creation, or sooner at the original deadline of a
+PR-maintenance helper it is bound to. Only one command runs on a Node at a time.
 Interactive prompts, permanent dev servers, and implicit fallback to another
 shell are not supported.
 
