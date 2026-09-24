@@ -202,6 +202,27 @@ followed by sign-in is the final way to establish logon-trigger operation:
 confirm the Host responds and the same Node reconnects without a terminal.
 No installer command reboots or signs you out.
 
+## Updating the Host from Settings
+
+**Settings → General → Update Host** works for a login-service Host without
+reinstalling anything. The Host cannot restart its own task from inside it —
+everything it starts is in that task's kill-on-close job — so it registers a
+one-off, on-demand task for the same user (`CopilotFleetSelfUpdate-...`,
+InteractiveToken, least privilege, no triggers) and starts it. That task runs
+`scripts/self-update.mjs` outside both Fleet tasks with the Host task's saved
+environment: it fetches, resets, runs `npm install --include=dev` and
+`npm run build`, then `npm run service -- host+node restart` — or `host restart`
+when this checkout has no Node task or the Node task was stopped — and deletes
+itself. A failed build restarts nothing. The task being active is not Fleet
+serving in it, so the restarted Host records the result itself: once it is
+listening on the new commit and this machine's Node has reconnected on it. The
+restart runs noninteractively, so
+expired GitHub CLI credentials fail it (the old processes keep running) rather
+than prompting; renew them and update again. Output goes to `self-update.log`
+and progress to `self-update.json`, both beside the Host database. The Host
+recognises that it was started by this service because its output is the
+manifest's `runtime.log`, so a Host started by hand never restarts the tasks.
+
 ## Historical references
 
 These earlier experiments are retained as history, not the current CLI contract:

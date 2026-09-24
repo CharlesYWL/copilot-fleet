@@ -65,7 +65,8 @@ Fleet 与 Copilot 各自的会话 ID，并提供路径、ID 和带 shell 转义�
 - **选择访问方式与隧道：** [隧道与谁能看到登录页](#隧道与谁能看到登录页)、
   [跟随 Host 迁移到新地址](#跟随-host-迁移到新地址)。
 - **连接和维护机器：** [Windows Node](#windows-上的-nodepowershell)、
-  [节点命令行参数](#节点命令行参数)、[节点配置页](#节点配置页)、[让节点保持最新](#让节点保持最新)。
+  [节点命令行参数](#节点命令行参数)、[节点配置页](#节点配置页)、[让节点保持最新](#让节点保持最新)、
+  [让 Host 保持最新](#让-host-保持最新)。
 - **创建项目并启动日常会话：** [工作区和放置](#首次使用指南)、
   [可复现的最小验证](#可复现的最小验证)、[附加文件与图片](#附加文件与图片)、
   [斜杠命令与会话选择器](#斜杠命令与会话选择器)。
@@ -165,7 +166,7 @@ npm run dev:tunnel
 
 打开界面 → **Settings**：
 
-- **General** —— 会话默认值、**Take the tour** 按钮，以及数据导出/导入。
+- **General** —— 会话默认值、**Take the tour** 按钮、**Update Host**，以及数据导出/导入。
 - **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移、
   可迁移 Host 备份/恢复，以及这台 Host 的安全审计。
 - **Tunnel** —— 管理 Dev Tunnels、Cloudflare、Tailscale Funnel 或 ngrok。
@@ -197,6 +198,11 @@ npm start
 
 或者只跑 Host：`npm run start:host`。打开 `http://127.0.0.1:8787` —— Fastify 会直接托管
 构建好的界面。
+
+`npm run dev`、`npm run dev:tunnel` 和 `npm start` 运行在一个小 launcher
+（`scripts/launcher.mjs`）之下，这样 **Settings → General → Update Host** 才能原地重启
+它们；见[让 Host 保持最新](#让-host-保持最新)。`npm run dev:bare`、
+`npm run dev:tunnel:bare` 和 `npm run start:bare` 运行同样的命令，但不经过它。
 
 ## 首次使用指南
 
@@ -1227,6 +1233,60 @@ nssm start copilot-fleet-node
 
 这种模式下更新同样以 75 退出。PM2 和 NSSM 在任何退出时都会重启，所以这已经是你想要的
 行为；只在失败时重启的 unit 文件需要 `RestartForceExitStatus=75` 或 `Restart=always`。
+
+## 让 Host 保持最新
+
+**Settings → General → Update Host** 为 Host 做的事，和节点上的 **Update** 一样：
+`git fetch --prune`、`git reset --hard` 到检出所跟踪的分支、`npm install --include=dev`、
+`npm run build`（完整构建，因为 Host 旁边启动的 Node 也从同一个检出运行），然后**按原来的
+启动方式**重启 Host 和那个 Node：
+
+| 启动方式                                  | 重启方式                                                                     |
+| ----------------------------------------- | ---------------------------------------------------------------------------- |
+| `npm run dev` / `npm run dev:tunnel`      | 同一条命令、同一个终端、同样的参数                                           |
+| `npm start`                               | `npm start`，同一个终端、同样的参数                                          |
+| `npm run service -- host+node install` 等 | `npm run service -- host+node restart`（Node 任务未启用时为 `host restart`） |
+
+卡片会显示 Host 所在的提交和重启命令，以及每个阶段的进度。Host 重启期间会短暂离线；页面
+会自动重连并报告更新结果。之后刷新页面以加载新的界面。
+
+步骤和安全保证与节点相同，来自同一份代码（`@fleet/protocol/updater`）：构建成功之前不会
+重启任何东西，已经在最新提交上的检出也不会被重启。因此在 `npm start` 和登录服务下，构建
+失败会让 Host 和它的 Node 继续运行原来的代码。在 `npm run dev` 下，reset 改写源码后 Host
+自己的文件监视器仍会照常重新加载 —— 这正是监视器的用途 —— 所以构建失败时 Host 可能停留在
+新源码加旧依赖的状态，直到你修好检出。此外，Host 不会：
+
+- **丢弃未提交的工作。** Host 的检出往往也是某人的工作副本，所以已跟踪文件上有未提交的
+  修改时会拒绝更新 —— 点击时检查一次，reset 之前再检查一次，git 读不了的检出也按“有修改”
+  处理（`.env` 这类未跟踪文件在 reset 后依然保留，不算在内）。不在所跟踪分支上的本地提交
+  会像节点一样从分支上丢弃，reflog 里仍然能找到。
+- **不问一声就停掉这台机器上的会话。** 重启 Host 会重启旁边的 Node，所以当那个 Node 正在
+  运行会话时，更新会被拒绝并列出这些会话，卡片会提供“只停掉这些并继续”的选项；期间新启动
+  的会话会出现在新的拒绝列表里。在重启之前，这台机器上的新会话会被拒绝，而不是启动后又被
+  停掉。其他机器上的会话在 Host 重启期间继续运行。
+- **与另一个更新同时进行。** 正在 reset 和重新构建检出的那个更新会持有检出里的
+  `.fleet-update.lock` 并在工作时持续刷新它，所以 Host 和旁边的 Node 永远不会同时更新同一个
+  检出，重启之后也一样。
+- **声称一次它看不到的重启成功。** 启动一条命令或一个计划任务并不能证明里面运行的东西正常，
+  所以成功由重启后的 Host 自己记录：它开始监听、运行的是更新构建出的提交，并且这台机器的
+  Node 也以该提交回来了。Host 或 Node 以其他提交回来、Node 三分钟内没有回来，或者更新程序
+  停止报告进度，都会被记为失败。
+
+重启由谁来做，取决于谁能在重启中存活。在 `npm run dev` 下，reset 一改写源码，文件监视器
+就会重启 Host，所以 Host 从不亲自执行更新：由 `npm run dev`、`npm run dev:tunnel` 和
+`npm start` 前面的 launcher 执行，然后停掉它启动的所有进程，再把命令重新运行一遍。登录服务
+形式的 Host 无法从任务内部重启自己的任务，所以它会为当前 Windows 用户注册一个一次性的计划
+任务 `CopilotFleetSelfUpdate-…`，由它执行更新和重启，然后删除自己；输出保存在 Host 数据库
+旁边的 `self-update.log`。两种情况下的进度都记录在同目录的 `self-update.json`，重启后的
+Host 正是靠它得知更新结果。
+
+重启 `npm run dev:tunnel` 会连同隧道一起重启，就像手动停止再启动一样：Dev Tunnel 会保持
+原地址，而快速隧道（Cloudflare、免费 ngrok）会换一个新地址。launcher 本身不会被更新替换；
+对它的修改在你下次启动命令时生效。
+
+用其他方式启动的 Host —— `npm run host`、`npm run start:host`、任何 `*:bare` 脚本 —— 没有
+东西会再把它启动起来，所以 **Update Host** 会被禁用并说明原因。在拉取这个功能之前就已经在
+运行的 Host 也是如此：用上面的某条命令重启它一次即可。
 
 ## 可复现的最小验证
 

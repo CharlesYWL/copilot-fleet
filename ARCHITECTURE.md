@@ -672,6 +672,56 @@ tell where the Host had gone. Settings-backed flags are dropped and the current
 settings are written to disk before the Node exits; flags with no home in
 settings, such as the enrollment token and the config port, are passed through.
 
+### Keeping the Host current
+
+The Host updates itself with the same procedure (`@fleet/protocol/updater`:
+fetch, hard reset onto the tracking branch, `npm install --include=dev`, build),
+building everything with `npm run build` because the Node started beside it runs
+from the same checkout. That module is the one place the update strategy lives,
+so replacing commits with released versions later is a change there rather than
+in both services.
+
+Unlike a Node, the Host never runs the steps itself. Under `npm run dev` the file
+watcher restarts the Host the moment the reset rewrites its source, killing the
+update halfway; and as a Windows login service, everything the Host starts sits
+in the task's kill-on-close job, so a process it spawned to run
+`npm run service -- host+node restart` would die at the step that stops the Host
+task. The work therefore belongs to something that survives the restart:
+
+- `npm run dev`, `npm run dev:tunnel` and `npm start` run their commands
+  (`<script>:bare`) under `scripts/launcher.mjs`. The Host asks it over a local
+  socket (endpoint and token in the environment it hands down, which the Node
+  strips before starting agents); the launcher updates, then stops the whole
+  process tree and runs the same command again in the same terminal.
+- A login-service Host registers a one-off scheduled task for the same user
+  (`scripts/self-update.mjs`), which Task Scheduler runs outside both Fleet
+  tasks. It updates, runs `npm run service -- host+node restart` (or `host`
+  when the Node task was stopped on purpose or is not installed), and deletes
+  itself. The Host recognises that it was started by the login service because
+  its standard output is the log file the service manifest names.
+
+Either updater writes every stage to `self-update.json` in the Host's data
+directory, rewriting it every thirty seconds while a long step runs, and takes
+`.fleet-update.lock` in the checkout for as long as git and npm are working in it
+— the same lock a Node's own update takes, created whole and touched as it
+works, so the Host and the Node beside it never update one checkout at once,
+even across a restart. The Host relays the record to browsers while it lasts,
+and the Host that comes back reads it. Neither restart can see its own outcome —
+the launcher only launches a command, and the login CLI only checks that the
+tasks are running — so the restarted Host finishes the record: once it is
+listening, on the commit the update built, and with the Node beside it back on
+that commit (within three minutes) if this Host knows that Node. Any other
+unfinished record whose updater has gone quiet is a failure. As with a Node, a
+build that fails restarts nothing. The Host additionally refuses a checkout with
+uncommitted changes to tracked files — often somebody's working copy — asking
+when the operator clicks and again in the updater just before the reset, and
+treating a checkout git cannot read as dirty. It refuses while the Node beside
+it is running sessions unless the operator agrees to stop exactly the ones
+listed, and until the restart it refuses to start or resume anything new there.
+
+git is never run through a shell. A tracked branch may legally be called
+`release&x`; joined into a Windows command line, that was a second command.
+
 ### Node to Copilot
 
 The official `@agentclientprotocol/sdk` connects to `copilot --acp --stdio` and performs:

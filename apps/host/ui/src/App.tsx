@@ -1496,6 +1496,7 @@ export function App() {
             nodes={snapshot.nodes}
             sessions={snapshot.sessions}
             hostRevision={snapshot.hostRevision}
+            hostUpdate={snapshot.hostUpdate}
             nodeUpdates={nodeUpdates}
             selectedTab={settingsTab}
             onSelectedTabChange={setSettingsTab}

@@ -1,6 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
@@ -9,6 +10,31 @@ import { fileURLToPath } from "node:url";
  * Kept behind its own entry point because the browser bundle imports the
  * protocol root, and nothing in there may touch `process` or `node:fs`.
  */
+
+/**
+ * What the launcher (`scripts/launcher.mjs`) tells the processes it starts.
+ *
+ * `npm run dev`, `npm run dev:tunnel` and `npm start` run the Host and its Node
+ * under a launcher that can restart them after the Host updates itself; these
+ * say where to reach it and prove the request came from inside. The launcher is
+ * plain JavaScript and keeps its own copy of the names, which a test holds equal.
+ */
+export const LAUNCHER_ENDPOINT_ENV = "FLEET_LAUNCHER_ENDPOINT";
+export const LAUNCHER_TOKEN_ENV = "FLEET_LAUNCHER_TOKEN";
+export const LAUNCHER_SCRIPT_ENV = "FLEET_LAUNCHER_SCRIPT";
+
+/**
+ * Removes the launcher's variables from an environment about to be inherited.
+ *
+ * Only the Host has any use for them. Everything else the launcher starts —
+ * the Node, and through it every agent and every command an agent runs — would
+ * otherwise carry a token that restarts the Host.
+ */
+export function forgetLauncherEnvironment(env: NodeJS.ProcessEnv = process.env): void {
+  delete env[LAUNCHER_ENDPOINT_ENV];
+  delete env[LAUNCHER_TOKEN_ENV];
+  delete env[LAUNCHER_SCRIPT_ENV];
+}
 
 /** True while a pid still names a live process this user may signal. */
 export function isProcessAlive(pid: number): boolean {
@@ -83,6 +109,26 @@ export function repoRoot(startDirectory = moduleDirectory()): string {
 /** Absolute path of the repo-root `.env` both services read on startup. */
 export function envFilePath(startDirectory = moduleDirectory()): string {
   return resolve(repoRoot(startDirectory), ".env");
+}
+
+/**
+ * Where a Node keeps its identity and settings on this machine.
+ *
+ * Here rather than in the Node because the Host needs the same answer: updating
+ * the Host restarts the Node started beside it, and the identity in this
+ * directory is how the Host tells which of its Nodes that is.
+ */
+export function nodeConfigDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.FLEET_NODE_CONFIG_DIR !== undefined) {
+    if (!isAbsolute(env.FLEET_NODE_CONFIG_DIR)) {
+      throw new Error("FLEET_NODE_CONFIG_DIR must be an absolute directory.");
+    }
+    return env.FLEET_NODE_CONFIG_DIR;
+  }
+  if (process.platform === "win32") {
+    return join(env.APPDATA ?? join(homedir(), "AppData", "Roaming"), "CopilotFleet");
+  }
+  return join(env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "copilot-fleet");
 }
 
 /**

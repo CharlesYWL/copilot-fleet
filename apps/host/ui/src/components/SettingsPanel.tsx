@@ -1,6 +1,12 @@
 import { useId, useState, type ReactNode } from "react";
 import { Tab, TabList, makeStyles, tokens } from "@fluentui/react-components";
-import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
+import type {
+  FleetNode,
+  FleetSession,
+  HostUpdateStatus,
+  Placement,
+  Workspace,
+} from "@fleet/protocol";
 import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { SettingsActivityContext } from "../hooks/useSettingsActivity";
 import { NodesPanel } from "./NodesPanel";
@@ -55,6 +61,8 @@ type SettingsPanelProps = {
   /** Read only to learn which models this fleet's Copilot offers. */
   sessions: FleetSession[];
   hostRevision: string;
+  /** The Host's own update, absent from a Host that predates it. */
+  hostUpdate?: HostUpdateStatus | undefined;
   nodeUpdates: NodeUpdateProgress;
   active?: boolean;
   selectedTab?: SettingsTab;
@@ -84,7 +92,14 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
   };
 
   const panels: Record<SettingsTab, ReactNode> = {
-    general: <GeneralPanel sessions={props.sessions} onStartTour={props.onStartTour} />,
+    general: (
+      <GeneralPanel
+        sessions={props.sessions}
+        onStartTour={props.onStartTour}
+        hostUpdate={props.hostUpdate}
+        hostRevision={props.hostRevision}
+      />
+    ),
     security: <SecurityPanel />,
     diagnostics: <DiagnosticsPanel />,
     tunnel: <TunnelPanel />,

@@ -12,6 +12,9 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { runCommand, updateCheckout, type CommandResult } from "./updater.js";
 
+/** The fixtures below build the way a Node does. */
+const buildScript = "build:node";
+
 /**
  * The scripted tests prove the decisions; this proves the commands.
  *
@@ -92,6 +95,7 @@ describe("updateCheckout against a real repository", () => {
       const npmCalls: string[] = [];
       const unchanged = await updateCheckout({
         repoRoot: clone,
+        buildScript,
         report: () => {},
         run: gitOnly(npmCalls),
       });
@@ -102,6 +106,7 @@ describe("updateCheckout against a real repository", () => {
 
       const updated = await updateCheckout({
         repoRoot: clone,
+        buildScript,
         report: () => {},
         run: gitOnly(npmCalls),
       });
@@ -140,6 +145,7 @@ describe("updateCheckout against a real repository", () => {
       const npmCalls: string[] = [];
       const outcome = await updateCheckout({
         repoRoot: clone,
+        buildScript,
         report: () => {},
         run: gitOnly(npmCalls),
       });
@@ -173,12 +179,46 @@ describe("updateCheckout against a real repository", () => {
       const npmCalls: string[] = [];
       const outcome = await updateCheckout({
         repoRoot: clone,
+        buildScript,
         report: () => {},
         run: gitOnly(npmCalls),
       });
 
       expect(outcome.action).toBe("failed");
       expect(npmCalls).toEqual([]);
+    },
+    timeout,
+  );
+
+  it(
+    "resets onto a tracked branch whose name a shell would read as two commands",
+    async () => {
+      // `&` is legal in a ref name. Joined into a Windows command line it ends
+      // one command and starts another, so git must never go through a shell.
+      const branch = "release&echo";
+      const origin = makeTemp("fleet-origin4-");
+      git(origin, "init", "--initial-branch=main");
+      git(origin, "config", "user.email", "fleet@example.com");
+      git(origin, "config", "user.name", "Fleet Test");
+      commit(origin, "first.txt", "one");
+      git(origin, "checkout", "-b", branch);
+
+      const clone = makeTemp("fleet-clone4-");
+      execFileSync("git", ["clone", "--branch", branch, origin, clone], {
+        stdio: "ignore",
+      });
+      commit(origin, "second.txt", "two");
+
+      const npmCalls: string[] = [];
+      const outcome = await updateCheckout({
+        repoRoot: clone,
+        buildScript,
+        report: () => {},
+        run: gitOnly(npmCalls),
+      });
+
+      expect(outcome).toEqual({ action: "restart", revision: head(clone, true) });
+      expect(head(clone)).toBe(head(origin));
     },
     timeout,
   );
@@ -215,6 +255,7 @@ it("installs build tools under the login service's production environment", asyn
     expect((await runCommand("npm", ["run", "build:node"], root)).ok).toBe(false);
     const outcome = await updateCheckout({
       repoRoot: root,
+      buildScript,
       runningRevision: "old111111111",
       report: () => {},
       run: (command, args, cwd) => {

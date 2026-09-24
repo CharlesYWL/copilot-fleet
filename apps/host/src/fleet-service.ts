@@ -26,6 +26,7 @@ import {
   type FleetSession,
   type HostBackup,
   type HostPortableBackupData,
+  type HostUpdateStatus,
   type McpHttpServer,
   type NodeCommand,
   type NodeHealth,
@@ -108,6 +109,15 @@ export type DispatchResult = {
   sent: boolean;
   /** The session after the fallback transition, when one was applied. */
   session?: FleetSession;
+};
+
+/** What the service needs from the Host's own update (`self-update.ts`). */
+export type HostUpdateHooks = {
+  status(): HostUpdateStatus;
+  /** Why this Node may not update on its own right now, if it may not. */
+  blocksNodeUpdate(nodeId: string): string | undefined;
+  /** Why a session may not start or resume on this Node right now, if it may not. */
+  blocksNodeWork(nodeId: string): string | undefined;
 };
 
 export type EventHandlingResult =
@@ -216,6 +226,8 @@ export class FleetService {
     | undefined;
   private mcpUrl: (() => string) | undefined;
   private runTicker: ((runId: string) => void) | undefined;
+  /** Late-bound like the orchestration seams: built after the service. */
+  private hostUpdate: HostUpdateHooks | undefined;
   readonly notifications: NotificationService;
   readonly sessionRetention: SessionRetention;
   readonly worktrees: ManagedWorktreeService;
@@ -279,6 +291,7 @@ export class FleetService {
       notifications: this.store.listNotificationHydration(),
       notificationUnreadCount: this.store.notificationUnreadCount(),
       hostRevision: this.hostRevision,
+      ...(this.hostUpdate ? { hostUpdate: this.hostUpdate.status() } : {}),
       commandExecutions: this.commands.list({ limit: 100 }),
       prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
       prMaintenanceTasks: prMaintenanceTaskStatuses(this.retainedPrMaintenance()),
@@ -794,6 +807,8 @@ export class FleetService {
     }
     const node = this.store.getNode(input.placement.nodeId);
     if (!node?.online) return { ok: false, status: 409, error: "Node is offline" };
+    const hostUpdating = this.hostUpdate?.blocksNodeWork(node.id);
+    if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
     const kind = input.readOnly ? "read-only" : "writing";
     if (
       reservedSessionCount(this.store.listSessions(), node.id, kind) >=
@@ -995,6 +1010,8 @@ export class FleetService {
     }
     const node = this.store.getNode(session.nodeId);
     if (!node?.online) return { ok: false, status: 503, error: "Node is offline" };
+    const hostUpdating = this.hostUpdate?.blocksNodeWork(node.id);
+    if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
     const kind = session.readOnly ? "read-only" : "writing";
     if (
       reservedSessionCount(this.store.listSessions(), node.id, kind) >=
@@ -1342,7 +1359,14 @@ export class FleetService {
     }
     const lifecycleIntent =
       request.type === "cancel" || request.type === "stop" ? request.type : undefined;
-    const socket = this.nodeSockets.get(nodeId);
+    // Nothing new starts on the Node beside the Host while the Host is updating:
+    // the restart at the end would stop it without anyone having agreed to that.
+    // Refused the way an unreachable Node is, so every caller already copes.
+    const hostUpdating =
+      request.type === "start_session" || request.type === "resume_session"
+        ? this.hostUpdate?.blocksNodeWork(nodeId)
+        : undefined;
+    const socket = hostUpdating ? undefined : this.nodeSockets.get(nodeId);
     if (socket && socket.readyState === socket.OPEN) {
       if (lifecycleIntent) {
         this.store.writeAtomically(() => {
@@ -1460,6 +1484,7 @@ export class FleetService {
       return { sent: true };
     }
     if (!fallback) return { sent: false };
+    const settledAs = hostUpdating ? { ...fallback, activity: hostUpdating } : fallback;
     const session = this.notifications.commitAtomically(
       () => {
         if (lifecycleIntent) {
@@ -1468,17 +1493,17 @@ export class FleetService {
         }
         const settled = this.transitionSession(
           request.sessionId,
-          fallback.state,
-          fallback.activity,
+          settledAs.state,
+          settledAs.activity,
           { type: "host", cause: "dispatch_fallback" },
         );
-        if (terminalSessionStates.has(fallback.state)) {
+        if (terminalSessionStates.has(settledAs.state)) {
           this.store.clearSessionTurnCompletion(request.sessionId);
         }
         if (lifecycleIntent) {
           this.store.consumeSessionTransitionIntent(request.sessionId);
         }
-        if (terminalSessionStates.has(fallback.state)) {
+        if (terminalSessionStates.has(settledAs.state)) {
           this.resolveSessionPermissionRequests(request.sessionId);
         }
         return settled;
@@ -1612,16 +1637,15 @@ export class FleetService {
         reason: `${node.name} runs a build that predates remote updates; update it by hand once`,
       };
     }
+    // The Node beside the Host shares its checkout; two updates resetting and
+    // rebuilding one directory at once would leave it in neither state.
+    const hostUpdating = this.hostUpdate?.blocksNodeUpdate(nodeId);
+    if (hostUpdating) return { started: false, reason: hostUpdating };
     const socket = this.nodeSockets.get(nodeId);
     if (!socket || socket.readyState !== socket.OPEN) {
       return { started: false, reason: `${node.name} is offline` };
     }
-    const live = this.store
-      .listSessions()
-      .filter(
-        (session) =>
-          session.nodeId === nodeId && !terminalSessionStates.has(session.state),
-      );
+    const live = this.liveSessionsOn(nodeId);
     if (live.length > 0) {
       if (!stopSessions) {
         return {
@@ -1630,20 +1654,7 @@ export class FleetService {
           blockedBy: live,
         };
       }
-      // Stopped before the update rather than left to die with the process, so
-      // each one ends as something an operator asked for and its agent is given
-      // the chance to shut down rather than being killed mid-write.
-      for (const session of live) {
-        this.dispatch(
-          nodeId,
-          { type: "stop", sessionId: session.id },
-          { state: "stopped", activity: "Stopped to update the node" },
-        );
-      }
-      this.log.info(
-        { nodeId, stopped: live.length },
-        "Stopping sessions so the node can update",
-      );
+      this.stopSessionsForUpdate(nodeId, live, "Stopped to update the node");
     }
     const updateId = randomUUID();
     this.send(socket, HostToNodeMessageSchema.parse({ type: "update_node", updateId }));
@@ -1663,6 +1674,55 @@ export class FleetService {
       .listNodes()
       .filter((node) => nodeUpdateState(node, this.hostRevision) === "stale")
       .map((node) => node.id);
+  }
+
+  /** Sessions a restart of this Node would end. */
+  liveSessionsOn(nodeId: string): FleetSession[] {
+    return this.store
+      .listSessions()
+      .filter(
+        (session) =>
+          session.nodeId === nodeId && !terminalSessionStates.has(session.state),
+      );
+  }
+
+  /**
+   * Stops sessions an operator agreed to give up for an update.
+   *
+   * Stopped before the update rather than left to die with the process, so
+   * each one ends as something an operator asked for and its agent is given
+   * the chance to shut down rather than being killed mid-write.
+   */
+  stopSessionsForUpdate(
+    nodeId: string,
+    sessions: readonly FleetSession[],
+    activity: string,
+  ): void {
+    for (const session of sessions) {
+      this.dispatch(
+        nodeId,
+        { type: "stop", sessionId: session.id },
+        { state: "stopped", activity },
+      );
+    }
+    this.log.info(
+      { nodeId, stopped: sessions.length },
+      "Stopping sessions so the node can update",
+    );
+  }
+
+  /** Whether this Node has been told to update and has not said how it went. */
+  nodeUpdateInFlight(nodeId: string): boolean {
+    return this.updatesInFlight.has(nodeId);
+  }
+
+  /** Wires the Host's own update. Called once, from `server.ts`. */
+  attachHostUpdate(hostUpdate: HostUpdateHooks): void {
+    this.hostUpdate = hostUpdate;
+  }
+
+  publishHostUpdate(status: HostUpdateStatus): void {
+    this.broadcast({ type: "host_update", status });
   }
 
   publishNodeUpdate(
