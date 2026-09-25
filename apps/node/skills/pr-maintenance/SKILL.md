@@ -404,6 +404,9 @@ Its concrete shape is `maintenance: {recordId, generation, batchId}`.
 The Host atomically links the accepted attempt. End the lead turn after dispatch.
 Do not dispatch an empty worker turn merely to wait for CI/review or check a PR.
 New feedback while accepted stays pending for later; never overwrite the prompt.
+While the accepted turn is still running, `takeDue` does not offer that PR; its
+completion requests the next check. Routine checks otherwise follow the Host's
+orchestrator heartbeat schedule, so an empty claim is not a reason to poll.
 A merely prepared batch with no accepted step or effects does not block fresh
 complete observations, including claim-bound command receipts. Refresh expired
 observations normally and dispatch the same immutable batch at the same head;

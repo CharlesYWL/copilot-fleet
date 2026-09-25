@@ -219,7 +219,11 @@ batch settlement are independent of the implementation task's state. Discovery
 includes completed-task registrations and terminal/paused work needing settlement.
 Existing lead wakes handle due observation and reconciliation; there is no new
 timer or direct-to-worker observer. A completed task is not reopened just to make
-its lead eligible for a reminder.
+its lead eligible for a reminder. Idle-lead status checks fire on the operator's
+orchestrator heartbeat schedule (cron, Host local time), and a PR's next routine
+check is the first heartbeat at least half an hour after its last observation.
+A PR whose retained worker is still running an accepted batch is not claimed;
+the completed turn requests the next check.
 
 The [technical flow diagrams](pr-maintenance-technical-flow.html) show the MCP tools
 and REST actions that start, change and end maintenance, the per-wake observation

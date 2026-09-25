@@ -1932,6 +1932,16 @@ recording the handoff for you to review.
    task's record, and the previous lead no longer sees it. A transfer is refused
    while a command the previous lead requested for the task has not settled.
 
+While a lead is idle with open tasks or maintained PRs, the Host sends it a
+read-only **status check** at the times named in **Settings → General →
+Orchestrator heartbeat**: standard five-field cron in the Host's local time,
+with several expressions separated by `;`. The default,
+`0 9-18 * * 1-5; 0 */2 * * *`, checks hourly from 09:00 to 18:00 on weekdays and
+every two hours otherwise. A lead that was active in the half hour before a
+heartbeat skips it (half the interval, for schedules faster than hourly), so a
+check never lands on top of the lead's own turn, and the Host catches up with a
+single check rather than a burst after a restart.
+
 For one-off questions that do not need a checkout, start a direct **Chats**
 session from **New session**. For shared multi-agent goals, use Orchestrator's
 lead **Conversation** and task board so the plan, workers, review, and archive
@@ -2031,11 +2041,20 @@ called ready. See the [ADO helper contract](apps/node/skills/pr-maintenance/ado-
 for its supported policy evidence and conservative limits.
 
 Fleet stores registrations, checkpoints, decisions, budgets and unsettled effects
-in its Host database. The existing lead reads them on ordinary wakes and idle
-reminders; this is best-effort observation, not a separate observer or an exact
-30-minute SLA. Unchanged feedback needs no new worker repair turn. Ready remains
-nonterminal: this release never merges, force-pushes, automatically rebases, or
-starts extra reviewer sessions.
+in its Host database. The existing lead reads them on ordinary wakes and heartbeat
+status checks; this is best-effort observation, not a separate observer or an
+exact SLA. A PR's routine check follows the same
+[heartbeat schedule](#orchestrator-quick-guide): after an observation it is next
+due at the first heartbeat at least half an hour later, so by default a PR is read
+about hourly during weekday working hours and every two hours otherwise. (A saved
+command receipt still makes its PR due at once, so the lead can act on that
+evidence.) A PR is not claimed while its retained worker is still running an
+accepted repair batch — repairs often outlast an hour — and the completed turn
+requests the next check. Status labels keep the last observed stage until that
+scheduled check is overdue, while repairs, readiness and new effects still require
+evidence from the last 30 minutes. Unchanged feedback needs no new worker repair
+turn. Ready remains nonterminal: this release never merges, force-pushes,
+automatically rebases, or starts extra reviewer sessions.
 
 **Asynchronous helper receipts:** claim a due visit, then immediately dispatch the
 finite helper command on a separate authorized placement with returned

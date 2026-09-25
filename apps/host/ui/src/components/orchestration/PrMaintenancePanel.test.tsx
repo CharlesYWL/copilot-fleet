@@ -462,6 +462,61 @@ describe("PR maintenance task controls", () => {
     },
   );
 
+  it("holds displayed readiness until the scheduled check is overdue, not for a fixed half hour", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(at));
+    let rendered: ReturnType<typeof render> | undefined;
+    try {
+      // The heartbeat schedules the next look two hours out, as it does at night.
+      const record = {
+        ...observed(),
+        observationHostAt: at,
+        nextCheckAt: new Date(Date.parse(at) + 120 * 60_000).toISOString(),
+      };
+      vi.mocked(getTaskMaintenance).mockResolvedValue({
+        records: [record],
+        canAuthorize: true,
+      });
+      const model = buildRunViewModels({
+        runs: [{ ...task, state: "completed" }],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+      await act(async () => {
+        rendered = render(
+          <FluentProvider theme={fleetDarkTheme}>
+            <OrchestratorTaskDetail
+              model={model}
+              notes={[]}
+              sessions={[]}
+              onBack={vi.fn()}
+              onOpenLead={vi.fn()}
+              onOpenWorker={vi.fn()}
+              onReview={vi.fn()}
+              onArchive={vi.fn()}
+              onReopen={vi.fn()}
+              onDelete={vi.fn()}
+            />
+          </FluentProvider>,
+        );
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1,
+        );
+      });
+      expect(screen.getByRole("heading", { name: "PR ready to merge" })).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120 * 60_000);
+      });
+      expect(screen.queryByRole("heading", { name: "PR ready to merge" })).toBeNull();
+      expect(screen.getByRole("heading", { name: "Checking PR status" })).toBeTruthy();
+    } finally {
+      rendered?.unmount();
+      vi.useRealTimers();
+    }
+  });
+
   it.each(["merged", "closed"] as const)(
     "keeps unsettled %s work in the top-level overview",
     (lifecycle) => {

@@ -10,6 +10,8 @@ import {
   PrMaintenanceFindingSchema,
   PrMaintenanceGithubSnapshotIdentitySchema,
   PrMaintenanceHelperSnapshotIdentitySchema,
+  prMaintenanceEvidenceCurrentUntil,
+  prMaintenanceObservationFresh,
   prMaintenanceProgress,
   prMaintenanceTaskStatuses,
   PrMaintenanceTaskStatusSchema,
@@ -266,6 +268,29 @@ describe("PR maintenance wire schemas", () => {
       expect(prMaintenanceProgress(record, now).stage).toBe("released");
       record.lifecycle = "merged";
       expect(prMaintenanceProgress(record, now).stage).toBe("merged");
+    });
+
+    it("keeps the observed stage through the next routine check, then needs a new look", () => {
+      const record = base();
+      const now = Date.parse(at);
+      record.readyFingerprint = observation.fingerprint;
+      record.observation!.reviewsComplete = false;
+      // The heartbeat schedules the next look two hours out, as it does at night.
+      record.nextCheckAt = new Date(now + 120 * 60_000).toISOString();
+      const until = now + 150 * 60_000;
+      expect(prMaintenanceEvidenceCurrentUntil(record)).toBe(until);
+      expect(prMaintenanceProgress(record, now + 90 * 60_000).stage).toBe(
+        "waiting_review",
+      );
+      expect(prMaintenanceProgress(record, until).stage).toBe("waiting_review");
+      expect(prMaintenanceProgress(record, until + 1).stage).toBe("checking");
+      expect(prMaintenanceTaskStatuses([record], now)[0]?.freshUntil).toBe(
+        new Date(until).toISOString(),
+      );
+      // A label is not permission: acting on the evidence still needs a fresh read.
+      expect(prMaintenanceObservationFresh(record.observation, now + 90 * 60_000)).toBe(
+        false,
+      );
     });
 
     it("summarizes each task's current retained maintenance for task lists", () => {

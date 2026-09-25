@@ -9,6 +9,8 @@ import {
   DialogSurface,
   DialogTitle,
   Dropdown,
+  Field,
+  Input,
   MessageBar,
   MessageBarBody,
   Option,
@@ -20,12 +22,15 @@ import {
   shorthands,
   tokens,
 } from "@fluentui/react-components";
-import type {
-  ContextTier,
-  HostUpdateStatus,
-  ManagedWorktreePolicy,
-  SessionConfigChoice,
-  SessionConfigOption,
+import {
+  DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+  heartbeatScheduleProblem,
+  normalizeHeartbeatSchedule,
+  type ContextTier,
+  type HostUpdateStatus,
+  type ManagedWorktreePolicy,
+  type SessionConfigChoice,
+  type SessionConfigOption,
 } from "@fleet/protocol";
 import { BookOpen20Regular } from "@fluentui/react-icons";
 import { observedChoices } from "../lib/session-config";
@@ -109,6 +114,10 @@ type Defaults = {
   notificationLifecycleEnabled: boolean;
   model: string;
   reasoningEffort: string;
+  /** Absent from a Host that predates the heartbeat schedule. */
+  orchestratorHeartbeatSchedule?: string;
+  orchestratorHeartbeatTimeZone?: string;
+  orchestratorHeartbeatUpcoming?: string[];
 };
 
 /** What to show on a closed dropdown, including for a value no longer offered. */
@@ -480,6 +489,17 @@ export const GeneralPanel = ({
         </div>
       </section>
 
+      <HeartbeatScheduleCard
+        schedule={
+          defaults.orchestratorHeartbeatSchedule ??
+          DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE
+        }
+        timeZone={defaults.orchestratorHeartbeatTimeZone}
+        upcoming={defaults.orchestratorHeartbeatUpcoming ?? []}
+        busy={busy}
+        onSave={(schedule) => void update({ orchestratorHeartbeatSchedule: schedule })}
+      />
+
       <section className={styles.card}>
         <div className={styles.row}>
           <div>
@@ -641,6 +661,99 @@ export const GeneralPanel = ({
     </div>
   );
 };
+
+const heartbeatTime = (value: string) =>
+  new Date(value).toLocaleString(undefined, {
+    weekday: "short",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+
+/**
+ * The cron schedule for orchestrator heartbeats. The draft is checked with the
+ * same parser the Host uses, so an expression it would refuse never leaves the
+ * page; the upcoming times come from the Host, which owns the time zone.
+ */
+function HeartbeatScheduleCard({
+  schedule,
+  timeZone,
+  upcoming,
+  busy,
+  onSave,
+}: {
+  schedule: string;
+  timeZone: string | undefined;
+  upcoming: readonly string[];
+  busy: boolean;
+  onSave: (schedule: string) => void;
+}) {
+  const styles = useStyles();
+  const [draft, setDraft] = useState(schedule);
+  const [shown, setShown] = useState(schedule);
+  // Follow a saved change rather than keep editing a value that is gone.
+  if (shown !== schedule) {
+    setShown(schedule);
+    setDraft(schedule);
+  }
+  const problem = heartbeatScheduleProblem(draft);
+  const changed = normalizeHeartbeatSchedule(draft) !== schedule;
+  const hint = problem
+    ? null
+    : changed
+      ? "Not saved yet."
+      : upcoming.length
+        ? `Next: ${upcoming.map(heartbeatTime).join(" · ")}`
+        : null;
+  return (
+    <section className={styles.card} aria-label="Orchestrator heartbeat">
+      <div>
+        <Text weight="semibold">Orchestrator heartbeat</Text>
+        <br />
+        <Text className={styles.caption}>
+          When an idle orchestrator is reminded to review its open tasks and maintained
+          PRs, and so how often a maintained PR is read. Cron times — minute, hour, day of
+          month, month, weekday — in the Host&apos;s time zone
+          {timeZone ? ` (${timeZone})` : ""}; separate several expressions with “;”. An
+          orchestrator active in the half hour before a heartbeat skips it, and a PR is
+          not read while its worker is still repairing it.
+        </Text>
+      </div>
+      <Field
+        label="Schedule"
+        validationState={problem ? "error" : "none"}
+        validationMessage={problem ?? null}
+        hint={hint}
+      >
+        <Input
+          aria-label="Heartbeat schedule"
+          value={draft}
+          disabled={busy}
+          onChange={(_event, data) => setDraft(data.value)}
+        />
+      </Field>
+      <div className={styles.actions}>
+        <Button
+          appearance="primary"
+          disabled={busy || Boolean(problem) || !changed}
+          onClick={() => onSave(draft)}
+        >
+          Save schedule
+        </Button>
+        <Button
+          appearance="secondary"
+          disabled={busy || draft === DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE}
+          onClick={() => setDraft(DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE)}
+        >
+          Use default
+        </Button>
+      </div>
+      <Text className={styles.caption}>
+        The default, <code>{DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE}</code>, is hourly
+        from 09:00 to 18:00 on weekdays and every two hours otherwise.
+      </Text>
+    </section>
+  );
+}
 
 function ManagedQuotaEditor({
   policy,

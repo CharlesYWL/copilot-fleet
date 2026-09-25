@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { FastifyInstance, InjectOptions } from "fastify";
-import { CHATS_WORKSPACE_ID } from "@fleet/protocol";
+import {
+  CHATS_WORKSPACE_ID,
+  DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+} from "@fleet/protocol";
 import { buildServer } from "./server.js";
 
 const OPERATOR_PASSWORD = "test-password";
@@ -104,6 +107,47 @@ describe("host routes", () => {
         })
       ).statusCode,
     ).toBe(400);
+  });
+
+  it("saves a normalized heartbeat schedule and explains an invalid one", async () => {
+    const initial = (await inject({ method: "GET", url: "/api/defaults" })).json();
+    expect(initial).toMatchObject({
+      orchestratorHeartbeatSchedule: DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+      orchestratorHeartbeatTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
+    expect(initial.orchestratorHeartbeatUpcoming).toHaveLength(3);
+
+    const saved = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { orchestratorHeartbeatSchedule: " 0  8-20 * * * " },
+    });
+    expect(saved.statusCode).toBe(200);
+    const body = saved.json() as {
+      orchestratorHeartbeatSchedule: string;
+      orchestratorHeartbeatUpcoming: string[];
+    };
+    expect(body.orchestratorHeartbeatSchedule).toBe("0 8-20 * * *");
+    for (const at of body.orchestratorHeartbeatUpcoming) {
+      const hour = new Date(at).getHours();
+      expect(hour >= 8 && hour <= 20).toBe(true);
+      expect(new Date(at).getMinutes()).toBe(0);
+    }
+
+    const rejected = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { orchestratorHeartbeatSchedule: "0 25 * * *", yolo: true },
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().error).toBe(
+      'Heartbeat schedule: "25" is not a valid hour (0-23).',
+    );
+    // Nothing in a refused request is applied, including its other fields.
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      orchestratorHeartbeatSchedule: "0 8-20 * * *",
+      yolo: false,
+    });
   });
 
   it("reports health and an empty snapshot", async () => {
@@ -275,8 +319,15 @@ describe("host routes", () => {
         cleanupIgnoredOnly: false,
       },
     };
+    // Hourly through weekday working hours, every two hours otherwise.
+    const heartbeatDefaults = {
+      orchestratorHeartbeatSchedule: DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+      orchestratorHeartbeatTimeZone: expect.any(String),
+      orchestratorHeartbeatUpcoming: expect.any(Array),
+    };
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: false,
       contextTier: "long_context",
       agencyMode: false,
@@ -292,6 +343,7 @@ describe("host routes", () => {
     // not mentioning it.
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: true,
       contextTier: "long_context",
       agencyMode: false,
@@ -309,6 +361,7 @@ describe("host routes", () => {
     });
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: true,
       contextTier: "long_context",
       agencyMode: false,
@@ -336,6 +389,7 @@ describe("host routes", () => {
     });
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: true,
       contextTier: "long_context",
       agencyMode: false,
