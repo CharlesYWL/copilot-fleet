@@ -3,6 +3,7 @@ import { DatabaseSync } from "node:sqlite";
 import Fastify from "fastify";
 import {
   HostToNodeMessageSchema,
+  nextHeartbeat,
   ORCHESTRATOR_STOP_REASON,
   PrMaintenanceObservationSchema,
   prMaintenanceProgress,
@@ -1160,7 +1161,11 @@ describe("PR maintenance orchestration", () => {
     const { record, run } = setup();
     world.store.setRunState(run.id, "completed");
     const sent = vi.spyOn(world.service, "dispatch");
-    const now = Date.parse(world.store.getSession(world.leadId)!.updatedAt) + 30 * 60_000;
+    const lastLook = Math.max(
+      Date.parse(world.store.getSession(world.leadId)!.updatedAt),
+      Date.parse(world.store.lastOrchestratorPromptAt(world.leadId)) || 0,
+    );
+    const now = nextHeartbeat(world.store.getOrchestratorHeartbeatSchedule(), lastLook)!;
     new OrchestratorEngine(world.service).tick(now);
     const prompt = sent.mock.calls.find(([, command]) => command.type === "prompt")?.[1];
     expect(prompt).toMatchObject({ type: "prompt", sessionId: world.leadId });

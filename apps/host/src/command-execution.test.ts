@@ -16,6 +16,7 @@ import {
   commandApprovalExpiresAt,
   commandDigestPayload,
   commandObservationClock,
+  nextHeartbeat,
   type CommandExecution,
   type CommandExecutionHostMessage,
   type CommandPermissionMatch,
@@ -4643,7 +4644,13 @@ describe("PR maintenance with durable commands", () => {
     const record = enableMaintenance(f);
     f.store.setRunState(record.taskId, "completed");
     const engine = new OrchestratorEngine(f.service);
-    vi.setSystemTime(Date.now() + 30 * 60_000);
+    const lastLook = Math.max(
+      Date.parse(f.store.getSession(f.lead.id)!.updatedAt),
+      Date.parse(f.store.lastOrchestratorPromptAt(f.lead.id)) || 0,
+    );
+    vi.setSystemTime(
+      nextHeartbeat(f.store.getOrchestratorHeartbeatSchedule(), lastLook)!,
+    );
     engine.tick();
     const reminders = f.frames.filter((frame) => frame.type === "deliver_lead_prompt");
     expect(reminders).toHaveLength(1);

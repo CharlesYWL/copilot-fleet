@@ -1,11 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
-import { canTransition, RunCriterionSchema, type SessionEvent } from "@fleet/protocol";
+import {
+  canTransition,
+  nextHeartbeat,
+  RunCriterionSchema,
+  type SessionEvent,
+} from "@fleet/protocol";
 import { FleetService } from "../fleet-service.js";
 import { FleetStore } from "../store.js";
 import { OrchestratorEngine, truncateMiddle } from "./engine.js";
-import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS, runSweepInterval } from "./deadlines.js";
+import { runSweepInterval } from "./deadlines.js";
 import { FleetTools } from "./tools.js";
 
 type SentFrame = {
@@ -810,23 +815,72 @@ describe("OrchestratorEngine status checks", () => {
     })!;
   };
 
-  it("checks an idle Lead every 30 minutes, not on every deadline sweep", () => {
+  /** When the heartbeat schedule next reminds a Lead that last looked at `sinceMs`. */
+  const heartbeatAfter = (kit: ReturnType<typeof setup>, sinceMs: number) =>
+    nextHeartbeat(kit.store.getOrchestratorHeartbeatSchedule(), sinceMs)!;
+  const heartbeatFor = (kit: ReturnType<typeof setup>, leadId: string) =>
+    heartbeatAfter(kit, Date.parse(kit.store.getSession(leadId)!.updatedAt));
+
+  it("checks an idle Lead at scheduled heartbeats, not on every deadline sweep", () => {
     const kit = setup();
     const lead = createLead(kit);
     assignTask(kit, lead.id, "Active task");
-    const baseline = Date.parse(kit.store.getSession(lead.id)!.updatedAt);
+    const first = heartbeatFor(kit, lead.id);
 
-    kit.engine.tick(baseline + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS - 1);
+    kit.engine.tick(first - 1);
     expect(kit.commands("prompt")).toHaveLength(0);
 
-    kit.engine.tick(baseline + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS);
+    kit.engine.tick(first);
     expect(kit.commands("prompt")).toHaveLength(1);
 
-    kit.engine.tick(baseline + 2 * ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS - 1);
+    // The default schedule is never more often than hourly.
+    const second = heartbeatAfter(kit, first);
+    expect(second - first).toBeGreaterThanOrEqual(60 * 60_000);
+    kit.engine.tick(second - 1);
     expect(kit.commands("prompt")).toHaveLength(1);
 
-    kit.engine.tick(baseline + 2 * ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS);
+    kit.engine.tick(second);
     expect(kit.commands("prompt")).toHaveLength(2);
+  });
+
+  it("follows the operator's schedule and names its interval in the check", () => {
+    const kit = setup();
+    kit.store.setOrchestratorHeartbeatSchedule("*/30 * * * *");
+    const lead = createLead(kit);
+    assignTask(kit, lead.id, "Active task");
+    const first = heartbeatFor(kit, lead.id);
+    expect(new Date(first).getMinutes() % 30).toBe(0);
+
+    kit.engine.tick(first);
+    expect(kit.commands("prompt")).toHaveLength(1);
+    expect(kit.commands("prompt")[0]?.prompt).toContain(
+      '<fleet-status-check interval="30m">',
+    );
+
+    kit.engine.tick(first + 30 * 60_000 - 1);
+    expect(kit.commands("prompt")).toHaveLength(1);
+    kit.engine.tick(first + 30 * 60_000);
+    expect(kit.commands("prompt")).toHaveLength(2);
+  });
+
+  it("skips a scheduled heartbeat right after the Lead was active", () => {
+    const kit = setup();
+    kit.store.setOrchestratorHeartbeatSchedule("0 * * * *");
+    const lead = createLead(kit);
+    assignTask(kit, lead.id, "Active task");
+    const slot = kit.store
+      .getOrchestratorHeartbeatSchedule()
+      .next(Date.parse(kit.store.getSession(lead.id)!.updatedAt))!;
+    // The Lead finished a turn ten minutes before the hour.
+    kit.store.recordOrchestratorPrompt(
+      lead.id,
+      new Date(slot - 10 * 60_000).toISOString(),
+    );
+
+    kit.engine.tick(slot);
+    expect(kit.commands("prompt")).toHaveLength(0);
+    kit.engine.tick(slot + 60 * 60_000);
+    expect(kit.commands("prompt")).toHaveLength(1);
   });
 
   it("does nothing when every assigned task is done or waiting for review", () => {
@@ -837,10 +891,7 @@ describe("OrchestratorEngine status checks", () => {
     kit.store.updateRun(review.id, { state: "awaiting_human" });
     kit.store.updateRun(done.id, { state: "completed" });
 
-    kit.engine.tick(
-      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
-        ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS,
-    );
+    kit.engine.tick(heartbeatFor(kit, lead.id));
 
     expect(kit.commands("prompt")).toHaveLength(0);
   });
@@ -851,10 +902,7 @@ describe("OrchestratorEngine status checks", () => {
     assignTask(kit, lead.id, "Active task");
     kit.store.transitionSession(lead.id, "running");
 
-    kit.engine.tick(
-      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
-        ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS,
-    );
+    kit.engine.tick(heartbeatFor(kit, lead.id));
 
     expect(kit.commands("prompt")).toHaveLength(0);
   });
@@ -865,11 +913,7 @@ describe("OrchestratorEngine status checks", () => {
     const second = createLead(kit, "second");
     assignTask(kit, first.id, "First lead task");
     assignTask(kit, second.id, "Second lead task");
-    const due =
-      Math.max(
-        Date.parse(kit.store.getSession(first.id)!.updatedAt),
-        Date.parse(kit.store.getSession(second.id)!.updatedAt),
-      ) + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS;
+    const due = Math.max(heartbeatFor(kit, first.id), heartbeatFor(kit, second.id));
 
     kit.engine.tick(due);
 
@@ -887,6 +931,9 @@ describe("OrchestratorEngine status checks", () => {
 
   it("prompts only the Lead and never interrupts a dispatched worker", () => {
     const kit = setup();
+    // Heartbeats well inside the step's one-hour timeout, which would otherwise
+    // stop the worker in the same far-future tick.
+    kit.store.setOrchestratorHeartbeatSchedule("*/30 * * * *");
     const lead = createLead(kit);
     const run = assignTask(kit, lead.id, "Long-running task");
     kit.store.upsertRunStep(run.id, {
@@ -901,10 +948,7 @@ describe("OrchestratorEngine status checks", () => {
     kit.store.transitionSession(worker.id, "running");
     kit.engine.tickRun(run.id);
 
-    kit.engine.tick(
-      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
-        ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS,
-    );
+    kit.engine.tick(heartbeatFor(kit, lead.id));
 
     expect(kit.commands("prompt")).toHaveLength(1);
     expect(kit.commands("prompt")[0]?.sessionId).toBe(lead.id);
@@ -917,9 +961,7 @@ describe("OrchestratorEngine status checks", () => {
     const lead = createLead(kit);
     const run = assignTask(kit, lead.id, "New task");
     kit.store.updateRun(run.id, { pendingPrompt: "read the new task brief" });
-    const due =
-      Date.parse(kit.store.getSession(lead.id)!.updatedAt) +
-      ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS;
+    const due = heartbeatFor(kit, lead.id);
 
     kit.engine.tick(due);
 
@@ -927,12 +969,13 @@ describe("OrchestratorEngine status checks", () => {
       "read the new task brief",
     ]);
 
-    // The brief itself resets the 30-minute clock, even before the Node reports
-    // the Lead as running.
-    kit.engine.tick(due + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS - 1);
+    // The brief itself counts as the Lead's latest look, even before the Node
+    // reports the Lead as running.
+    const next = heartbeatAfter(kit, due);
+    kit.engine.tick(next - 1);
     expect(kit.commands("prompt")).toHaveLength(1);
 
-    kit.engine.tick(due + ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS);
+    kit.engine.tick(next);
     expect(kit.commands("prompt")).toHaveLength(2);
     expect(kit.commands("prompt")[1]?.prompt).toContain("<fleet-status-check");
   });

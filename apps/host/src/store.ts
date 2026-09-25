@@ -99,6 +99,10 @@ import {
   type WorktreeTombstone,
   type PlacementRepositoryCapability,
   type WorkspaceResult,
+  type HeartbeatSchedule,
+  HeartbeatScheduleSchema,
+  heartbeatSchedule,
+  heartbeatScheduleProblem,
 } from "@fleet/protocol";
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import { CommandConflict, CommandExecutionStore } from "./command-execution-store.js";
@@ -2021,6 +2025,22 @@ export class FleetStore {
     this.setSetting("defaults.reasoningEffort", effort);
   }
 
+  /**
+   * When idle orchestrators are reminded of their open work, and so when a
+   * maintained PR is next due for a routine check. A value that no longer
+   * parses reads as the default rather than stopping every heartbeat.
+   */
+  getOrchestratorHeartbeatSchedule(): HeartbeatSchedule {
+    return heartbeatSchedule(this.getSetting("orchestrator.heartbeatSchedule"));
+  }
+
+  setOrchestratorHeartbeatSchedule(schedule: string): void {
+    this.setSetting(
+      "orchestrator.heartbeatSchedule",
+      HeartbeatScheduleSchema.parse(schedule),
+    );
+  }
+
   setTunnelProvider(provider: TunnelProvider): void {
     this.setSetting("tunnel.provider", provider);
   }
@@ -2062,6 +2082,7 @@ export class FleetStore {
         agencyMode: this.getAgencyMode(),
         autoResume: this.getAutoResume(),
         notificationLifecycleEnabled: this.getDefaultNotificationLifecycleEnabled(),
+        orchestratorHeartbeatSchedule: this.getOrchestratorHeartbeatSchedule().source,
       },
       nodes: (this.statement("SELECT * FROM nodes ORDER BY name").all() as Row[]).map(
         (row) => ({
@@ -2261,6 +2282,9 @@ export class FleetStore {
     this.setDefaultNotificationLifecycleEnabled(
       parsed.defaults.notificationLifecycleEnabled,
     );
+    const heartbeat = parsed.defaults.orchestratorHeartbeatSchedule;
+    if (heartbeat !== undefined && !heartbeatScheduleProblem(heartbeat))
+      this.setOrchestratorHeartbeatSchedule(heartbeat);
     this.setSetting("enrollment.token", parsed.enrollmentToken);
     if (parsed.publicUrl) this.setSetting("host.publicUrl", parsed.publicUrl);
     for (const node of parsed.nodes) {

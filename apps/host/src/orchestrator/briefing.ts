@@ -244,7 +244,10 @@ function judgement(): string[] {
   ];
 }
 
-/** A periodic, read-only reminder for one orchestrator conversation. */
+/**
+ * A periodic, read-only reminder for one orchestrator conversation.
+ * `interval` is the heartbeat schedule's gap from this check to the next one.
+ */
 export function statusCheckEnvelope(
   tasks: readonly {
     name: string;
@@ -254,9 +257,10 @@ export function statusCheckEnvelope(
     dispatchedSteps: number;
   }[],
   maintenance: { ids?: readonly string[]; count?: number } = {},
+  interval = "1h",
 ): string {
   const lines = [
-    '<fleet-status-check interval="30m">',
+    `<fleet-status-check interval=${JSON.stringify(interval)}>`,
     "Review only these active tasks assigned to this conversation:",
     ...tasks.map(
       (task) =>

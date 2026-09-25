@@ -7,6 +7,7 @@ import {
   canTransition,
   CHATS_WORKSPACE_ID,
   CHATS_WORKSPACE_NAME,
+  DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
   type SessionEvent,
   type CreateNotification,
 } from "@fleet/protocol";
@@ -1823,6 +1824,25 @@ describe("Chats workspace", () => {
 });
 
 describe("Host backup", () => {
+  it("keeps the default heartbeat when an archive has no schedule or one that no longer parses", () => {
+    const { store } = setup();
+    store.setOrchestratorHeartbeatSchedule("0 8-20 * * *");
+    const backup = store.exportHostBackup({ enrollmentToken: "" });
+    const { orchestratorHeartbeatSchedule: _schedule, ...older } = backup.defaults;
+    for (const defaults of [
+      older,
+      { ...backup.defaults, orchestratorHeartbeatSchedule: "0 25 * * *" },
+    ]) {
+      const restored = new FleetStore(":memory:");
+      stores.push(restored);
+      restored.setOrchestratorHeartbeatSchedule("*/15 * * * *");
+      restored.replaceHostBackup({ ...backup, defaults });
+      expect(restored.getOrchestratorHeartbeatSchedule().source).toBe(
+        DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+      );
+    }
+  });
+
   it("round-trips catalog, transcripts, hashes, and parks live sessions", () => {
     const { store, node, workspace, placement } = setup();
     const { secret } = store.registerNode({
@@ -1837,6 +1857,7 @@ describe("Host backup", () => {
     store.setAutoResume(false);
     store.setAgencyMode(true);
     store.setDefaultNotificationLifecycleEnabled(false);
+    store.setOrchestratorHeartbeatSchedule("0 8-20 * * *");
     store.setTunnelEnabled(true);
     store.setTunnelProvider("tailscale");
     store.reorderWorkspaces([workspace.id]);
@@ -1884,6 +1905,7 @@ describe("Host backup", () => {
     expect(restored.getAutoResume()).toBe(false);
     expect(restored.getAgencyMode()).toBe(true);
     expect(restored.getDefaultNotificationLifecycleEnabled()).toBe(false);
+    expect(restored.getOrchestratorHeartbeatSchedule().source).toBe("0 8-20 * * *");
     expect(restored.getTunnelEnabled()).toBe(true);
     expect(restored.getTunnelProvider()).toBe("tailscale");
     expect(restored.getSetting("enrollment.token")).toBe("move-me");

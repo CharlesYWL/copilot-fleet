@@ -3,15 +3,16 @@ import { isDeepStrictEqual } from "node:util";
 import type { DatabaseSync, SQLInputValue } from "node:sqlite";
 import { z } from "zod";
 import {
-  PR_MAINTENANCE_CADENCE_MS,
   PR_MAINTENANCE_RECOVERY_LIMITS,
   PR_MAINTENANCE_WAKE_LIMITS,
   COMMAND_LIMITS,
   CommandReceiptSchema,
   commandDigestPayload,
+  nextHeartbeat,
   prMaintenanceObservationFresh,
   prMaintenanceProviderKey,
   isWritingCategory,
+  terminalRunStepStates,
   PrMaintenanceAdmissionSchema,
   PrMaintenanceBackupSchema,
   PrMaintenanceCheckpointSchema,
@@ -53,6 +54,8 @@ const unsettledEffect = (effect: PrMaintenanceEffect) =>
 const neverSentEffect = (effect: PrMaintenanceEffect) =>
   effect.state === "not_performed" && effect.usedAttempts === 0;
 const nowIso = () => new Date().toISOString();
+/** Only if the heartbeat schedule has no future time at all. */
+const ROUTINE_CHECK_FALLBACK_MS = 60 * 60_000;
 const emptyCounters = () => ({
   repairBatches: 0,
   answerBatches: 0,
@@ -2689,7 +2692,7 @@ export class PrMaintenanceStore {
     else delete record.lastAttemptLatestAt;
     record.nextCheckAt = new Date(
       Math.max(
-        Date.parse(hostLatestAt) + PR_MAINTENANCE_CADENCE_MS,
+        Date.parse(this.routineCheckAt(hostLatestAt)),
         observation.retryAfter
           ? Date.parse(observation.retryAfter) +
               Date.parse(hostAttemptedAt) -
@@ -3929,6 +3932,37 @@ export class PrMaintenanceStore {
     });
   }
 
+  /**
+   * When a PR last read at `observedAt` is next due for a routine look: the
+   * orchestrator's next heartbeat that is not right on top of that read. PRs
+   * are only read on Lead wakes, so a finer cadence would only ever be spent by
+   * unrelated wakes, re-reading a PR its worker is still busy with.
+   */
+  private routineCheckAt(observedAt: string): string {
+    const observed = Date.parse(observedAt);
+    return new Date(
+      nextHeartbeat(this.store.getOrchestratorHeartbeatSchedule(), observed) ??
+        observed + ROUTINE_CHECK_FALLBACK_MS,
+    ).toISOString();
+  }
+
+  /**
+   * The retained worker is still working an accepted batch. Reading its PR
+   * meanwhile only sees the state the worker is about to change, and repair
+   * turns routinely outlast an hour; the Host requests a check when the turn
+   * completes, and the settled step wakes the Lead to reconcile it.
+   */
+  private repairInProgress(record: PrMaintenanceRegistration): boolean {
+    return record.batches.some((batch) => {
+      if (batch.state !== "accepted" || !batch.stepId || batch.executionSettled)
+        return false;
+      const step = this.store.getRunStep(batch.stepId);
+      return Boolean(
+        step && step.attempts === batch.attempt && !terminalRunStepStates.has(step.state),
+      );
+    });
+  }
+
   takeDue(
     leadSessionId: string,
     wakeId: string,
@@ -3954,7 +3988,8 @@ export class PrMaintenanceStore {
           record.authorization.scope.publicationAuthorized) ||
           prMaintenanceUnsettled(record)) &&
         record.counters.scanStalls < 3 &&
-        record.counters.reconciliationStalls < 3;
+        record.counters.reconciliationStalls < 3 &&
+        !this.repairInProgress(record);
       if (!scan?.unservedIds.length) {
         const ids = this.retained()
           .filter(

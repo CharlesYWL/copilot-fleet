@@ -34,16 +34,20 @@ const repository = z
   .transform((value) => value.toLowerCase());
 
 export const PR_MAINTENANCE_SCHEMA_VERSION = 1;
-export const PR_MAINTENANCE_CADENCE_MS = 30 * 60 * 1_000;
 export const PR_MAINTENANCE_WAKE_LIMITS = Object.freeze({
   visits: 5,
   requests: 40,
   milliseconds: 300_000,
 });
+/**
+ * Routine checks follow the orchestrator heartbeat schedule rather than a
+ * constant here; `evidenceAgeMs` is how old evidence may be and still justify
+ * a repair, readiness or a new effect.
+ */
 export const PR_MAINTENANCE_RECOVERY_LIMITS = Object.freeze({
   incidents: 20,
   attempts: 3,
-  evidenceAgeMs: PR_MAINTENANCE_CADENCE_MS,
+  evidenceAgeMs: 30 * 60 * 1_000,
 });
 const hostname = z
   .string()
@@ -954,6 +958,39 @@ export function prMaintenanceObservationFresh(
   return age >= 0 && age <= PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs;
 }
 
+/**
+ * Until when the last complete observation still describes the PR in status
+ * labels: through the next routine check plus the evidence window to perform
+ * it, since checks follow the heartbeat and are often hours apart. Acting on
+ * that evidence still requires {@link prMaintenanceObservationFresh}.
+ */
+export function prMaintenanceEvidenceCurrentUntil(
+  record: Pick<
+    PrMaintenanceRegistration,
+    "observation" | "observationHostAt" | "nextCheckAt"
+  >,
+): number | undefined {
+  const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
+  if (!observedAt) return undefined;
+  const observed = Date.parse(observedAt);
+  const nextCheck = Date.parse(record.nextCheckAt);
+  return (
+    Math.max(observed, Number.isFinite(nextCheck) ? nextCheck : observed) +
+    PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs
+  );
+}
+
+function evidenceCurrent(record: PrMaintenanceRegistration, nowMs: number): boolean {
+  const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
+  const until = prMaintenanceEvidenceCurrentUntil(record);
+  return (
+    observedAt !== undefined &&
+    until !== undefined &&
+    nowMs >= Date.parse(observedAt) &&
+    nowMs <= until
+  );
+}
+
 export const PrMaintenanceStageSchema = z.enum([
   "released",
   "merged",
@@ -1052,7 +1089,7 @@ export function prMaintenanceProgress(
   if (
     !observation?.complete ||
     !record.lastAttempt?.complete ||
-    !prMaintenanceObservationFresh(observation, nowMs, record.observationHostAt)
+    !evidenceCurrent(record, nowMs)
   )
     return result("checking");
   if (observation.draft || observation.mergeability === "conflicting")
@@ -1153,12 +1190,10 @@ export function prMaintenanceTaskStatuses(
     const record = currentPrMaintenance(taskRecords);
     if (!record || record.ownershipReleasedAt) return [];
     const { stage } = prMaintenanceProgress(record, nowMs);
-    const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
+    const currentUntil = prMaintenanceEvidenceCurrentUntil(record);
     const freshUntil =
-      observedAt && freshnessDependentStages.has(stage)
-        ? new Date(
-            Date.parse(observedAt) + PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs,
-          ).toISOString()
+      currentUntil !== undefined && freshnessDependentStages.has(stage)
+        ? new Date(currentUntil).toISOString()
         : undefined;
     return [
       {

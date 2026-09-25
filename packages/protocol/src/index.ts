@@ -44,6 +44,11 @@ import {
 } from "./session-files.js";
 export * from "./session-files.js";
 export * from "./pr-maintenance.js";
+export * from "./heartbeat-schedule.js";
+import {
+  HEARTBEAT_SCHEDULE_MAX_LENGTH,
+  HeartbeatScheduleSchema,
+} from "./heartbeat-schedule.js";
 import {
   PrMaintenanceApprovalSchema,
   PrMaintenanceBackupSchema,
@@ -2436,6 +2441,8 @@ export const UpdateDefaultsSchema = z.object({
   autoResume: z.boolean().optional(),
   /** Application fallback for lifecycle notifications on top-level agents. */
   notificationLifecycleEnabled: z.boolean().optional(),
+  /** Cron times, in the Host's local time, for idle-orchestrator heartbeats and PR checks. */
+  orchestratorHeartbeatSchedule: HeartbeatScheduleSchema.optional(),
   /**
    * What new sessions start on. Empty means "whatever Copilot picks".
    *
@@ -2716,6 +2723,15 @@ const hostBackupDataShape = {
     agencyMode: z.boolean().default(false),
     autoResume: z.boolean(),
     notificationLifecycleEnabled: z.boolean().default(true),
+    /**
+     * Unchecked here so one stale expression cannot make a whole archive
+     * unimportable; the Host applies it only if it still parses, and an archive
+     * without one leaves the default.
+     */
+    orchestratorHeartbeatSchedule: z
+      .string()
+      .max(HEARTBEAT_SCHEDULE_MAX_LENGTH)
+      .optional(),
   }),
   nodes: z.array(HostBackupNodeSchema),
   workspaces: z.array(HostBackupWorkspaceSchema),

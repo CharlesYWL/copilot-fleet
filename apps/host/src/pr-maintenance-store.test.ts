@@ -14,6 +14,8 @@ import {
   PrMaintenanceManualCommandSchema,
   HostBackupSchema,
   PR_MAINTENANCE_RECOVERY_LIMITS,
+  nextHeartbeat,
+  parseHeartbeatSchedule,
   prMaintenanceProgress,
   prMaintenanceTaskStatuses,
   type PrMaintenanceCheckpoint,
@@ -81,6 +83,8 @@ describe("prepared maintenance observation recovery", () => {
     f: ReturnType<typeof setup>,
     record: PrMaintenanceRegistration,
     overrides: Partial<PrMaintenanceObservation> = {},
+    /** Runs while the claimed helper command is out, before its result lands. */
+    whileRunning?: () => void,
   ) {
     const now = new Date().toISOString();
     const nodeTime = new Date(Date.now() + 10_000).toISOString();
@@ -150,6 +154,7 @@ describe("prepared maintenance observation recovery", () => {
     f.store.commands.recordPreparationSend(execution.id, now);
     f.store.commands.acceptPreparationClock(execution.id, now, now, 0);
     f.store.commands.markStart(execution);
+    whileRunning?.();
     const observation = PrMaintenanceObservationSchema.parse({
       ...record.observation,
       attemptedAt: nodeTime,
@@ -224,7 +229,7 @@ describe("prepared maintenance observation recovery", () => {
     const saved = f.store.prMaintenance.checkpointObservationReceipt(
       f.lead.id,
       record.id,
-      record.version,
+      f.store.prMaintenance.get(record.id)!.version,
       execution.id,
       observation,
     );
@@ -237,7 +242,10 @@ describe("prepared maintenance observation recovery", () => {
       f,
       observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator")),
     );
-    vi.setSystemTime(Date.parse(at) + 31 * 60_000);
+    // Past the evidence window, and at the routine check the heartbeat schedules.
+    vi.setSystemTime(
+      Math.max(Date.parse(at) + 31 * 60_000, Date.parse(record.nextCheckAt)),
+    );
     return { f, record };
   }
 
@@ -260,14 +268,31 @@ describe("prepared maintenance observation recovery", () => {
     expect(fresh.saved.observationHostAt).toBe(fresh.hostAt);
     expect(fresh.saved.batches).toEqual(record.batches);
     expect(dispatch(f, fresh.saved)).toEqual({ allowed: true });
-    const accepted = accept(f, fresh.saved);
     vi.setSystemTime(Date.now() + 1_000);
-    const late = receipt(f, accepted);
+    // A read claimed before the batch was accepted finishes after it.
+    let accepted: PrMaintenanceRegistration | undefined;
+    const late = receipt(f, fresh.saved, {}, () => {
+      accepted = accept(f, fresh.saved);
+    });
     expect(late.saved.lastAttempt).toEqual(late.observation);
     expect(late.saved.observation).toEqual(fresh.observation);
     expect(late.saved.observationHostAt).toBe(fresh.hostAt);
-    expect(late.saved.batches).toEqual(accepted.batches);
+    expect(late.saved.batches).toEqual(accepted!.batches);
     expect(dispatch(f, late.saved).allowed).toBe(false);
+  });
+
+  it("does not claim a PR while its retained worker is still on an accepted batch", () => {
+    const { f, record } = agedPreparation();
+    const fresh = receipt(f, record);
+    accept(f, fresh.saved);
+    const wake = randomUUID();
+    f.store.prMaintenance.beginWake(f.lead.id, wake);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, wake)).toBeUndefined();
+    // Once the repair turn settles, the job is claimable again for reconciliation.
+    f.store.updateRunStep(f.store.prMaintenance.get(record.id)!.batches[0]!.stepId!, {
+      state: "succeeded",
+    });
+    expect(f.store.prMaintenance.takeDue(f.lead.id, wake)?.id).toBe(record.id);
   });
 
   it.each(["receipt", "checkpoint"] as const)(
@@ -348,6 +373,27 @@ describe("prepared maintenance observation recovery", () => {
     expect(fresh.saved.incidents[0]?.resolution).toBe("observation");
     expect(fresh.saved.batches).toEqual(record.batches);
     expect(dispatch(f, fresh.saved)).toEqual({ allowed: true });
+  });
+
+  it("waits for the orchestrator's next heartbeat instead of a fixed half hour", () => {
+    const f = setup();
+    f.store.setOrchestratorHeartbeatSchedule("0 */3 * * *");
+    const record = observe(
+      f,
+      f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+    );
+    const due = nextHeartbeat(parseHeartbeatSchedule("0 */3 * * *"), Date.parse(at))!;
+    expect(record.nextCheckAt).toBe(new Date(due).toISOString());
+    expect(new Date(due).getHours() % 3).toBe(0);
+    expect(due - Date.parse(at)).toBeGreaterThanOrEqual(30 * 60_000);
+    const early = new Date(due - 60_000).toISOString();
+    f.store.prMaintenance.beginWake(f.lead.id, "early", early);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, "early", early)).toBeUndefined();
+    const onTime = new Date(due).toISOString();
+    f.store.prMaintenance.beginWake(f.lead.id, "on-time", onTime);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, "on-time", onTime)?.id).toBe(
+      record.id,
+    );
   });
 
   it("charges the full five-minute wake without changing request or visit limits", () => {

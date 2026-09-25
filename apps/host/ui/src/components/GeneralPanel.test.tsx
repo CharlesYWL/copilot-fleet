@@ -300,6 +300,71 @@ describe("GeneralPanel", () => {
     await waitFor(() => expect((toggle as HTMLInputElement).checked).toBe(false));
   });
 
+  it("checks a heartbeat schedule as it is typed and saves it normalized", async () => {
+    let defaults = {
+      yolo: false,
+      autoResume: true,
+      notificationLifecycleEnabled: true,
+      model: "",
+      reasoningEffort: "",
+      orchestratorHeartbeatSchedule: "0 9-18 * * 1-5; 0 */2 * * *",
+      orchestratorHeartbeatTimeZone: "Asia/Shanghai",
+      orchestratorHeartbeatUpcoming: ["2026-09-25T03:00:00.000Z"],
+    };
+    const fetchMock = vi.fn(async (path: string | URL | Request, init?: RequestInit) => {
+      if (String(path) === "/api/auth/csrf") return response({ csrfToken: "proof" });
+      if (init?.method === "POST") {
+        const patch = JSON.parse(String(init.body)) as {
+          orchestratorHeartbeatSchedule: string;
+        };
+        defaults = {
+          ...defaults,
+          orchestratorHeartbeatSchedule: patch.orchestratorHeartbeatSchedule
+            .trim()
+            .split(/\s+/)
+            .join(" "),
+        };
+      }
+      return response(defaults);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel sessions={[]} />
+      </FluentProvider>,
+    );
+
+    const card = await screen.findByRole("region", { name: "Orchestrator heartbeat" });
+    const input = within(card).getByRole<HTMLInputElement>("textbox", {
+      name: "Heartbeat schedule",
+    });
+    const save = within(card).getByRole<HTMLButtonElement>("button", {
+      name: "Save schedule",
+    });
+    expect(input.value).toBe("0 9-18 * * 1-5; 0 */2 * * *");
+    expect(within(card).getByText(/Asia\/Shanghai/)).toBeTruthy();
+    expect(within(card).getByText(/^Next: /)).toBeTruthy();
+    expect(save.disabled).toBe(true);
+
+    fireEvent.change(input, { target: { value: "0 25 * * *" } });
+    expect(within(card).getByText('"25" is not a valid hour (0-23).')).toBeTruthy();
+    expect(save.disabled).toBe(true);
+
+    fireEvent.change(input, { target: { value: " 0  8-20 * * * " } });
+    expect(within(card).getByText("Not saved yet.")).toBeTruthy();
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    await waitFor(() => expect(input.value).toBe("0 8-20 * * *"));
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ orchestratorHeartbeatSchedule: " 0  8-20 * * * " }),
+      }),
+    );
+    expect(save.disabled).toBe(true);
+  });
+
   it("names the fleet archive as data only and points at the portable one", async () => {
     vi.stubGlobal(
       "fetch",

@@ -2,7 +2,9 @@ import {
   canTransitionRun,
   canTransitionRunStep,
   eventPayload,
+  heartbeatIntervalLabel,
   isWritingCategory,
+  nextHeartbeat,
   ORCHESTRATOR_STOP_REASON,
   terminalRunStates,
   terminalRunStepStates,
@@ -18,7 +20,6 @@ import {
   notificationAttemptKeyForStep,
 } from "../notifications/service.js";
 import { statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
-import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS } from "./deadlines.js";
 import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./schedule.js";
 import { stopSessions } from "./lifecycle.js";
 
@@ -698,13 +699,15 @@ export class OrchestratorEngine {
   }
 
   /**
-   * Gives each idle Lead one read-only status check for its own active tasks.
+   * Gives each idle Lead one read-only status check for its own active tasks,
+   * at the times the operator's heartbeat schedule names.
    *
    * This runs after ordinary task briefs and settle wakes, so those prompts win.
    * It only ever addresses the Lead session; dispatched workers are neither
    * prompted nor stopped by this path.
    */
   private remindIdleLeads(nowMs: number): void {
+    const schedule = this.store.getOrchestratorHeartbeatSchedule();
     const sessions = this.store.listSessions();
     const sessionById = new Map(sessions.map((session) => [session.id, session]));
     const activeByLead = new Map<string, Run[]>();
@@ -750,7 +753,10 @@ export class OrchestratorEngine {
         Number.isFinite(lastAutomatedPrompt) ? lastAutomatedPrompt : 0,
         Number.isFinite(lastActivity) ? lastActivity : Date.parse(lead.createdAt),
       );
-      if (nowMs - baseline < ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS) continue;
+      // Whatever the Lead last did or was sent counts as its latest look.
+      const due = nextHeartbeat(schedule, baseline);
+      if (due === undefined || nowMs < due) continue;
+      const following = schedule.next(due);
 
       const tasks = runs.map((run) => {
         const steps = this.store.listRunSteps(run.id);
@@ -783,7 +789,11 @@ export class OrchestratorEngine {
         .filter((pending) => pending.leadSessionId === lead.id)
         .slice(0, 5);
       const prompt = [
-        statusCheckEnvelope(tasks),
+        statusCheckEnvelope(
+          tasks,
+          {},
+          following === undefined ? undefined : heartbeatIntervalLabel(following - due),
+        ),
         ...(maintenance.records.length
           ? [
               `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,

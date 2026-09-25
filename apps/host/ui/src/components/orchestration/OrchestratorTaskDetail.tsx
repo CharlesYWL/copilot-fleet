@@ -25,7 +25,7 @@ import {
   Open16Regular,
 } from "@fluentui/react-icons";
 import {
-  PR_MAINTENANCE_RECOVERY_LIMITS,
+  prMaintenanceEvidenceCurrentUntil,
   prMaintenanceUrl,
   type FleetSession,
   type RunNote,
@@ -342,14 +342,12 @@ export const OrchestratorTaskDetail = ({
 
   const record = currentMaintenance(maintenance?.records ?? []);
   const observedAt = record?.observationHostAt ?? record?.observation?.attemptedAt;
+  const currentUntil = record ? prMaintenanceEvidenceCurrentUntil(record) : undefined;
   useEffect(() => {
-    if (!observedAt) return;
+    if (!observedAt || currentUntil === undefined) return;
     const observed = Date.parse(observedAt);
     const now = Date.now();
-    const nextBoundary =
-      observed > now
-        ? observed
-        : observed + PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1;
+    const nextBoundary = observed > now ? observed : currentUntil + 1;
     const delay = nextBoundary - now;
     if (!Number.isFinite(delay) || delay <= 0) return;
     // Evidence can expire without a socket update; re-render at that boundary, not on a poll.
@@ -358,7 +356,7 @@ export const OrchestratorTaskDetail = ({
       Math.min(delay, 2_147_483_647),
     );
     return () => window.clearTimeout(timer);
-  }, [observedAt, freshnessRevision]);
+  }, [observedAt, currentUntil, freshnessRevision]);
   const maintenanceHold = maintenance?.records.find(
     (entry) =>
       entry.taskId === run.id &&
