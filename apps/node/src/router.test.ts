@@ -716,6 +716,9 @@ describe("CommandRouter", () => {
     });
     expect(prompts).toBe(0);
     expect(events[0]?.sequence).toBe(8);
+    // What a download may reach while the session is live: cwd first.
+    expect(router.sessionRoots("s1")).toEqual(["/canonical/one", "/canonical/shared"]);
+    expect(router.sessionRoots("unknown")).toEqual([]);
   });
 
   it("omits an unavailable restored workspace root without blocking resume", async () => {

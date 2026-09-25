@@ -2359,8 +2359,13 @@ export class ManagedWorktrees {
     return checkout;
   }
 
+  /** Where an orchestrator is started, without creating it. */
+  coordinatorDirectory(sessionId: string): string {
+    return join(this.options.directory, "coordinators", identityHash(sessionId));
+  }
+
   async coordinatorPath(sessionId: string): Promise<string> {
-    const path = join(this.options.directory, "coordinators", identityHash(sessionId));
+    const path = this.coordinatorDirectory(sessionId);
     await mkdir(path, { recursive: true });
     return (await canonicalPath(path)).path;
   }

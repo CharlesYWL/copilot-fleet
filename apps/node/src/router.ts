@@ -161,6 +161,12 @@ export class CommandRouter {
     return [...this.slots.keys()];
   }
 
+  /** Where a live session is working, working directory first; empty otherwise. */
+  sessionRoots(sessionId: string): string[] {
+    const slot = this.slots.get(sessionId);
+    return slot?.cwd ? [slot.cwd, ...(slot.additionalDirectories ?? [])] : [];
+  }
+
   async route(command: NodeCommand): Promise<CommandResult> {
     const previous = this.handled.get(command.commandId);
     if (previous) return previous;

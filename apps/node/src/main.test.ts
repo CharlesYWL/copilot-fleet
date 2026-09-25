@@ -10,6 +10,7 @@ import {
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
+  SESSION_FILES_CAPABILITY,
   NodeBackupSchema,
   NODE_BACKUP_KIND,
   BACKUP_VERSION,
@@ -174,6 +175,7 @@ vi.mock("./router.js", () => ({
     refreshMcpSessions = refreshMcpSessions;
     setMcpAvailable = setMcpAvailable;
     route = route;
+    sessionRoots = vi.fn((): string[] => []);
     setMaxSessions = vi.fn();
     stopAll = stopAll;
     deliverLeadPrompt = deliverLeadPrompt;
@@ -287,6 +289,7 @@ it.each([false, true])(
         { type: "hello" }
       >;
       expect(hello.capabilities).not.toContain(COMMAND_EXECUTION_CAPABILITY);
+      expect(hello.capabilities).not.toContain(SESSION_FILES_CAPABILITY);
       vi.mocked(updateCheckout).mockResolvedValueOnce({
         action: "failed",
         reason: "Build failed",
@@ -1184,4 +1187,121 @@ it("stops before connecting or loading settings when GitHub authentication fails
   await expect(main([])).rejects.toThrow("GitHub login cancelled");
   expect(loadSettings).not.toHaveBeenCalled();
   expect(sockets).toHaveLength(0);
+});
+
+it("reads session files only for a welcomed sealed Host, and never its own identity", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const workspace = resolvePath(`.fleet-main-files-${randomUUID()}`);
+  mkdirSync(workspace);
+  writeFileSync(resolvePath(workspace, "report.txt"), "report");
+  writeFileSync(resolvePath(testConfigDirectory, "node.json"), "{}");
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    const socket = sockets[0]!;
+    socket.readyState = TestSocket.OPEN;
+    socket.emit("open");
+    const hello = JSON.parse(socket.send.mock.calls[0]![0]) as NodeClientHello;
+    const ephemeral = createEphemeralKeyPair();
+    const transcript = {
+      protocol: MUTUAL_AUTH_PROTOCOL,
+      hostId: credentials.host.hostId,
+      nodeId: credentials.nodeId,
+      connectionId: "connection-files",
+      hostNonce: randomBytes(32).toString("base64"),
+      nodeNonce: hello.nodeNonce,
+      hostPublicKey: hostKeys.publicKey,
+      nodePublicKey: nodeKeys.publicKey,
+      hostEphemeralPublicKey: ephemeral.publicKey,
+      nodeEphemeralPublicKey: hello.nodeEphemeralPublicKey,
+      dialedHostUrl: hello.dialedHostUrl,
+    };
+    const hostChannel = new AuthenticatedChannel({
+      keys: deriveChannelKeys({
+        privateKey: ephemeral.privateKey,
+        peerPublicKey: hello.nodeEphemeralPublicKey,
+        transcript: handshakeTranscript(CHANNEL_KEY_LABEL, transcript),
+      }),
+      binding: transcript,
+      seals: "host-to-node",
+    });
+    await socket.receive({
+      type: "host_challenge",
+      ...transcript,
+      hostFingerprint: hostKeys.fingerprint,
+      signature: signWithIdentity(
+        hostKeys.privateKey,
+        handshakeTranscript(HOST_CHALLENGE_LABEL, transcript),
+      ),
+    });
+    const open = (index: number): NodeToHostMessage => {
+      const opened = hostChannel.open(JSON.parse(socket.send.mock.calls[index]![0]));
+      if (!opened.ok) throw new Error(opened.reason);
+      return JSON.parse(opened.plaintext) as NodeToHostMessage;
+    };
+    const ready = open(2);
+    if (ready.type !== "ready") throw new Error("Expected the sealed inventory");
+    expect(ready.capabilities).toContain(SESSION_FILES_CAPABILITY);
+    const receive = (message: HostToNodeMessage) =>
+      socket.receive(hostChannel.seal(JSON.stringify(message)));
+    const read = async (path: string, roots: string[]) => {
+      const index = socket.send.mock.calls.length;
+      const requestId = randomUUID();
+      await receive({
+        type: "session_file_read",
+        request: {
+          requestId,
+          sessionId: "session-1",
+          path,
+          roots,
+          protectedRoots: [],
+          agentSessionId: "",
+          coordinator: false,
+          offset: 0,
+          length: 1024,
+          version: "",
+        },
+      });
+      const answer = open(index);
+      if (answer.type !== "session_file_data") throw new Error(answer.type);
+      expect(answer.result.requestId).toBe(requestId);
+      return answer.result;
+    };
+
+    expect(await read("report.txt", [workspace])).toMatchObject({
+      ok: false,
+      code: "unavailable",
+    });
+    await receive({
+      type: "welcome",
+      nodeId: credentials.nodeId,
+      reconcileAfterOutbox: false,
+      acknowledgeOutbox: true,
+      commandExecutions: false,
+      commandPermissions: false,
+      durableLeadDelivery: false,
+    });
+    expect(await read("report.txt", [workspace])).toMatchObject({
+      ok: true,
+      name: "report.txt",
+      size: 6,
+      data: Buffer.from("report").toString("base64"),
+    });
+    expect(
+      await read(resolvePath(testConfigDirectory, "node.json"), [
+        resolvePath(testConfigDirectory, ".."),
+      ]),
+    ).toMatchObject({ ok: false, code: "forbidden" });
+  } finally {
+    await runtime.shutdown();
+    rmSync(workspace, { recursive: true, force: true });
+    for (const listener of process.listeners("exit")) {
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  }
 });

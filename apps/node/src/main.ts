@@ -27,6 +27,7 @@ import {
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
+  SESSION_FILES_CAPABILITY,
   COMMAND_LIMITS,
   CommandExecutionHostMessageSchema,
   LeadPromptDeliverySchema,
@@ -89,6 +90,7 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { ManagedWorktrees } from "./managed-worktrees.js";
+import { SessionFileReader } from "./session-files.js";
 import { NodeAdmission } from "./node-admission.js";
 import { UpdateQuarantine } from "./update-quarantine.js";
 import { RepositoryParticipation } from "./repository-participation.js";
@@ -642,6 +644,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       },
     },
   );
+  // Fleet's own configuration directory holds this machine's private key, so
+  // no download reads from it — only an orchestrator's scratch directory
+  // beneath it, which the reader opens by name.
+  const sessionFiles = new SessionFileReader({
+    liveRoots: (sessionId) => router.sessionRoots(sessionId),
+    coordinatorDirectory: (sessionId) => worktrees.coordinatorDirectory(sessionId),
+    protectedRoots: [configDirectory()],
+  });
 
   const commands = new CommandExecutionManager({
     journal,
@@ -1231,6 +1241,8 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           ...(session
             ? [COMMAND_EXECUTION_CAPABILITY, COMMAND_PERMISSIONS_CAPABILITY]
             : []),
+          // File bytes only ever cross a sealed channel.
+          ...(session ? [SESSION_FILES_CAPABILITY] : []),
         ],
         ...(session ? { commandExecution: commands.readiness } : {}),
         agents: advertisedAgents,
@@ -1446,6 +1458,22 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       if (frame.value.type === "repository_probe") {
         const result = await worktrees.probeRepository(frame.value.request);
         send({ type: "repository_probe_result", result });
+        return;
+      }
+      if (frame.value.type === "session_file_read") {
+        const { request } = frame.value;
+        // Answered even when refused, so the Host reports why instead of
+        // waiting out its timeout; the bytes themselves never leave unsealed.
+        const result =
+          welcomed && session && channel
+            ? await sessionFiles.read(request)
+            : {
+                requestId: request.requestId,
+                ok: false as const,
+                code: "unavailable" as const,
+                error: "File downloads need this Node's authenticated connection.",
+              };
+        if (socket === active) send({ type: "session_file_data", result });
         return;
       }
       if (frame.value.type === "artifact_transfer_ack") {

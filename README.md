@@ -99,7 +99,8 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [workspaces and placements](#first-run-walkthrough),
   [Agency mode](#agency-mode),
   [Exact proof of concept](#exact-proof-of-concept),
-  [attachments and images](#attaching-files-and-images), and
+  [attachments and images](#attaching-files-and-images),
+  [downloading files from a session](#downloading-files-from-a-session), and
   [slash commands and session pickers](#slash-commands-and-session-pickers).
 - **Monitor and organize active work:**
   [rows that fold themselves away](#rows-that-fold-themselves-away),
@@ -1060,6 +1061,51 @@ Only the name, type and size are recorded in the transcript. The event log is
 stored on the Host and replayed to every browser watching a session, so keeping
 the bytes there would turn a few pasted screenshots into a liability; the
 attachment chips under a sent message are the trace that remains.
+
+### Downloading files from a session
+
+A session's files live on the machine that ran it, which is often not the one
+your browser is on. The transcript turns the files an agent names into downloads
+from that machine, so a report it wrote downloads the same way whether the Node
+is this computer or one on the other side of a tunnel:
+
+- **Links** to a file — a `file:///` URL, a drive or absolute path, or a path
+  relative to the session's working directory — download instead of navigating
+  away.
+- **Inline code** that is nothing but an absolute path ending in an extension,
+  such as `` `C:\work\report.docx` ``, downloads the same way.
+- **Edit steps** that finished writing a file show a download button at the end
+  of their row.
+- **Download a file** (the arrow in the session header) takes any path, absolute
+  or relative to the session's working directory, for files an agent only
+  mentioned in passing.
+
+A click checks the file first, so a missing or refused file is explained in a
+notification instead of a failed download; the bytes then go to the browser's
+own download manager, with its progress and cancel button.
+
+Nodes only dial out, so the Host cannot fetch from one. It asks over the Node's
+existing authenticated connection and streams the answer to the browser as it
+arrives, 256 KiB at a time with a small window in flight, so a download shares
+the connection with session events rather than queueing in front of them. A file
+that changes mid-download fails instead of arriving spliced from two versions.
+Files up to 512 MB can be relayed, and a Node sends up to three downloads at once.
+
+The Node decides what a download may reach. The file, with links and junctions
+resolved, must be inside the session's working directory, one of its additional
+roots, an orchestrator's scratch directory, or the session's own Copilot state
+folder (`~/.copilot/session-state/<id>`, where agents keep plans and artifacts).
+Fleet's configuration directory, which holds the Node's private key, Copilot's
+own configuration, and the Host's data directory are never read — not even from a
+Chats session, whose working directory is the home folder that contains them. A
+file saved anywhere else, such as a temp folder, cannot be downloaded; ask the
+agent to copy it into the workspace. This is a policy for what the Host relays,
+not a sandbox: the agent runs as the same account as the Node.
+
+Downloads need a Node that uses mutual authentication rather than the legacy
+shared secret, running a build that supports them; the Host says which is
+missing. Files are always served as attachments and never rendered on the Host's
+own origin, where a page an agent wrote would run with your session.
 
 ### Slash commands and session pickers
 
@@ -2333,6 +2379,11 @@ stops a run rather than a prompt each time.
 - A node's own credentials reach only the workspace and placement endpoints its
   config page relays through, and a node can only create or repoint placements
   on itself.
+- Session file downloads cross only a mutually authenticated Node channel. The
+  Node reads only inside the session's own folders, never Fleet's configuration
+  directory, Copilot's configuration or the Host's data directory, and the Host
+  serves every file as an `application/octet-stream` attachment so nothing an
+  agent wrote renders on the operator's origin.
 - New enrollment sends no reusable credential to an unauthenticated Host. A
   one-time grant authorises exactly one Node public key for fifteen minutes;
   the node pins the Host fingerprint before it completes, both ends sign the

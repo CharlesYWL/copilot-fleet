@@ -557,6 +557,7 @@ The Node WebSocket carries:
 - Host commands: start, prompt, cancel, stop, permission response
 - Host address announcements when the Host's public URL changes
 - Self-update instructions, and the progress a Node reports back
+- Session file reads for browser downloads, each answered by one chunk
 - Node command results and ordered Session Events
 
 Commands use unique IDs for deduplication. Events use an event UUID and a monotonically increasing per-Session sequence.
@@ -571,6 +572,32 @@ sequence runs ahead of the next expected one rather than refusing it: the missin
 events are gone with the outage, and a Host that insists on them refuses
 everything after them too, which leaves the Session unable to report its own
 state ever again.
+
+### Session file downloads
+
+A browser download of a file on a session's machine is pulled through the Host,
+because Nodes only dial out. `GET /api/sessions/:id/files/stat` and `/download`
+send `session_file_read` over the Node's sealed channel — never a legacy one, and
+only to Nodes advertising `session-files-v1` — and each `session_file_data`
+answers exactly one read. Reads are stateless: each names the file, offset and
+length again and carries the `version` (device, file id, size and modification
+time) the first read reported, so an abandoned download leaves nothing open on
+the Node and a file that changes mid-download fails instead of arriving spliced.
+The Host keeps two 256 KiB reads in flight per download and at most three
+downloads per Node, answers the browser only once the first chunk is in hand so
+a refusal is still an HTTP error, and fails pending reads when the Node
+disconnects or 30 seconds pass without an answer.
+
+The Host names the session's roots — its working directory (execution binding,
+else placement), additional directories, whether it is an orchestrator, its
+Copilot session id, and the Host's own data directory as protected — and the
+Node decides. It resolves the path through links and junctions, requires it to
+lie inside a root, and refuses its own configuration directory, Copilot's home
+and whatever the Host marked protected, unless the root granting the file sits
+strictly inside them: an orchestrator's scratch directory, the session's own
+`session-state` folder. Responses are `application/octet-stream` attachments
+with no HEAD route, because Fastify would drain the whole file across the Node's
+connection to answer one.
 
 ### Host address changes
 
