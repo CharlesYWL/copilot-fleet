@@ -56,6 +56,7 @@ import { isBroadcastableHostUrl } from "./host-url.js";
 import { SessionRetention } from "./session-retention.js";
 import { ManagedWorktreeService } from "./managed-worktree-service.js";
 import { CommandExecutionService } from "./command-execution-service.js";
+import { SessionFileService } from "./session-files.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
@@ -232,6 +233,7 @@ export class FleetService {
   readonly sessionRetention: SessionRetention;
   readonly worktrees: ManagedWorktreeService;
   readonly commands: CommandExecutionService;
+  readonly files: SessionFileService;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -278,6 +280,7 @@ export class FleetService {
     this.sessionRetention = new SessionRetention(this, log, sessionRetentionDays);
     this.worktrees = new ManagedWorktreeService(this);
     this.commands = new CommandExecutionService(this);
+    this.files = new SessionFileService(this);
     this.commands.reconcileNotifications();
   }
 
@@ -349,6 +352,7 @@ export class FleetService {
   /** Hangs up on a Node the operator deleted; no session bookkeeping follows. */
   evictNode(nodeId: string, code: number, reason: string): void {
     this.commands.nodeDisconnected(nodeId);
+    this.files.nodeDisconnected(nodeId);
     this.nodeHealth.delete(nodeId);
     const socket = this.nodeSockets.get(nodeId);
     if (!socket) return;
@@ -367,6 +371,7 @@ export class FleetService {
     this.nodeHealth.clear();
     for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
       this.commands.nodeDisconnected(nodeId);
+      this.files.nodeDisconnected(nodeId);
       this.sessionRetention.nodeDisconnected(nodeId);
       this.nodeSockets.delete(nodeId);
       socket.close(code, reason);
@@ -2019,6 +2024,7 @@ export class FleetService {
 
   disconnectNode(nodeId: string, activity: string): void {
     this.commands.nodeDisconnected(nodeId);
+    this.files.nodeDisconnected(nodeId);
     this.worktrees.nodeLost(nodeId);
     this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeSockets.delete(nodeId);

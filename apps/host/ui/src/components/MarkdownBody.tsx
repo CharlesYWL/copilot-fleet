@@ -1,14 +1,23 @@
 import {
+  createContext,
   isValidElement,
   memo,
+  useContext,
   type ReactNode,
   type ComponentPropsWithoutRef,
 } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, {
+  defaultUrlTransform,
+  type Components,
+  type ExtraProps,
+  type UrlTransform,
+} from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { makeStyles, mergeClasses, tokens } from "@fluentui/react-components";
+import { inlineFilePath, linkedFilePath } from "../lib/session-files";
 import { terminal } from "../theme";
 import { CopyButton } from "./CopyButton";
+import { FileLink, useSessionFiles } from "./SessionFiles";
 
 const useStyles = makeStyles({
   root: {
@@ -164,6 +173,7 @@ export const MarkdownBody = memo(function MarkdownBody({
   className,
 }: MarkdownBodyProps) {
   const styles = useStyles();
+  const files = useSessionFiles();
   return (
     <div
       className={mergeClasses(
@@ -180,15 +190,67 @@ export const MarkdownBody = memo(function MarkdownBody({
       )}
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        components={{
-          pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
-        }}
+        urlTransform={files ? keepFileLinks : defaultUrlTransform}
+        components={markdownComponents}
       >
         {text}
       </ReactMarkdown>
     </div>
   );
 });
+
+/**
+ * Keeps a link to a file on the session's machine for {@link MarkdownLink},
+ * and sanitises every other URL exactly as the default does — a `javascript:`
+ * link is not a file path, so it still comes out empty.
+ */
+const keepFileLinks: UrlTransform = (url, key) =>
+  key === "href" && linkedFilePath(url) !== undefined ? url : defaultUrlTransform(url);
+
+/** Set inside any link, so code in a link's text is not made a second link. */
+const InsideLink = createContext(false);
+
+function MarkdownLink({
+  node: _node,
+  href,
+  children,
+  ...rest
+}: ComponentPropsWithoutRef<"a"> & ExtraProps) {
+  const files = useSessionFiles();
+  const path = files ? linkedFilePath(href) : undefined;
+  return (
+    <InsideLink.Provider value>
+      {path ? (
+        <FileLink path={path}>{children}</FileLink>
+      ) : (
+        <a href={href} {...rest}>
+          {children}
+        </a>
+      )}
+    </InsideLink.Provider>
+  );
+}
+
+function MarkdownCode({
+  node: _node,
+  children,
+  ...rest
+}: ComponentPropsWithoutRef<"code"> & ExtraProps) {
+  const files = useSessionFiles();
+  const insideLink = useContext(InsideLink);
+  const code = <code {...rest}>{children}</code>;
+  const path =
+    files && !insideLink && typeof children === "string"
+      ? inlineFilePath(children)
+      : undefined;
+  return path ? <FileLink path={path}>{code}</FileLink> : code;
+}
+
+const markdownComponents: Components = {
+  pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
+  a: MarkdownLink,
+  code: MarkdownCode,
+};
 
 const CodeBlock = ({ children }: { children?: ReactNode }) => {
   const styles = useStyles();

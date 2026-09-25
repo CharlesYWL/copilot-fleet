@@ -57,6 +57,7 @@ import { commandExecutionRoutes } from "./routes/command-executions.js";
 import { startNotificationRetentionMonitor } from "./notifications/retention.js";
 import { startSessionRetentionMonitor } from "./session-retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
+import { sessionFileRoutes } from "./routes/session-files.js";
 import { runRoutes } from "./routes/runs.js";
 import { managedWorktreeRoutes } from "./routes/managed-worktrees.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
@@ -423,6 +424,7 @@ export async function buildServer(
   });
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
+  await app.register(sessionFileRoutes, { service });
   await app.register(notificationRoutes, { service });
   await app.register(commandExecutionRoutes, { service, auth });
 

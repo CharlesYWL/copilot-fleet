@@ -1,6 +1,6 @@
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
 import { EntraConfigSchema } from "./auth/entra.js";
@@ -457,6 +457,11 @@ export class FleetStore {
   readonly commands: CommandExecutionStore;
   readonly prMaintenance: PrMaintenanceStore;
   readonly artifactDirectory: string;
+  /**
+   * The directory holding this database, which the Host locks down as a whole
+   * because it holds the Host's private key. Absent for an in-memory store.
+   */
+  readonly dataDirectory: string | undefined;
   private transactionDepth = 0;
   private restoringBackup = false;
   /**
@@ -475,6 +480,7 @@ export class FleetStore {
       path === ":memory:"
         ? join(process.cwd(), ".mwi-test-work", "host-artifacts", randomUUID())
         : join(dirname(path), "workspace-result-artifacts");
+    this.dataDirectory = path === ":memory:" ? undefined : resolve(dirname(path));
     /*
      * The default writes to stderr rather than to a logger, because the store
      * is constructed before anything that has one — and a Host that could not

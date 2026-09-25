@@ -38,6 +38,11 @@ import {
   CommandExecutionBackupSchema,
 } from "./command-execution.js";
 export * from "./command-execution.js";
+import {
+  SessionFileReadRequestSchema,
+  SessionFileReadResultSchema,
+} from "./session-files.js";
+export * from "./session-files.js";
 export * from "./pr-maintenance.js";
 import {
   PrMaintenanceApprovalSchema,
@@ -1046,6 +1051,11 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("managed_worktree_result"),
     result: WorktreeOperationResultSchema,
   }),
+  /** Answers one `session_file_read`, and only ever one. */
+  z.object({
+    type: z.literal("session_file_data"),
+    result: SessionFileReadResultSchema,
+  }),
   NodeHelloSchema,
   NodeReadySchema,
   z.object({
@@ -1139,6 +1149,15 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("managed_worktree"),
     request: WorktreeOperationRequestSchema,
+  }),
+  /**
+   * Read part of a file from the machine that ran a session, for a browser
+   * download. Sent only over a sealed channel to Nodes advertising
+   * `session-files-v1`.
+   */
+  z.object({
+    type: z.literal("session_file_read"),
+    request: SessionFileReadRequestSchema,
   }),
   z.object({
     type: z.literal("welcome"),

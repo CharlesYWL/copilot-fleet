@@ -88,6 +88,7 @@ import {
 } from "../lib/attachments";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { toPromptMarks } from "../lib/prompt-marks";
+import { toolFilePath } from "../lib/session-files";
 import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
@@ -95,6 +96,8 @@ import { PromptRail } from "./PromptRail";
 import { SessionConfigBar } from "./SessionConfigBar";
 import { SessionUsageBar } from "./SessionUsageBar";
 import { SessionAgentBadge } from "./SessionAgentBadge";
+import { SessionFileDialog } from "./SessionFileDialog";
+import { FileDownloadButton, SessionFilesProvider } from "./SessionFiles";
 import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SlashMenu } from "./SlashMenu";
 import { StatusIndicator } from "./StatusIndicator";
@@ -1004,6 +1007,12 @@ export const TerminalView = ({
           placement={placement}
           className={styles.headerAction}
         />
+        <SessionFileDialog
+          key={`files-${session.id}`}
+          session={session}
+          placement={placement}
+          className={styles.headerAction}
+        />
         {notificationPreferenceControl}
         <Button
           className={styles.headerAction}
@@ -1110,9 +1119,16 @@ export const TerminalView = ({
           {blocks.length === 0 ? (
             <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
           ) : (
-            blocks.map((block) => (
-              <TerminalLine block={block} sessionState={session.state} key={block.key} />
-            ))
+            // Paths in the transcript download from the machine that ran it.
+            <SessionFilesProvider sessionId={session.id} nodeName={session.nodeName}>
+              {blocks.map((block) => (
+                <TerminalLine
+                  block={block}
+                  sessionState={session.state}
+                  key={block.key}
+                />
+              ))}
+            </SessionFilesProvider>
           )}
           {session.state === "running" && <div className={styles.working}>working…</div>}
         </div>
@@ -1366,6 +1382,11 @@ const TerminalLine = memo(function TerminalLine({
     ) : (
       (toolKindIcons[block.toolKind ?? ""] ?? kindIcons.tool)
     );
+    // A file the agent finished writing can be taken straight from its row.
+    const written =
+      block.toolKind === "edit" && block.status === "completed"
+        ? toolFilePath(block.detail)
+        : undefined;
     return (
       <div>
         <StepRow
@@ -1375,6 +1396,7 @@ const TerminalLine = memo(function TerminalLine({
           time={time}
           color={failed ? terminal.error : running ? terminal.tool : undefined}
           failed={failed}
+          action={written ? <FileDownloadButton path={written} /> : undefined}
         />
         {block.body && (block.status === "completed" || block.status === "failed") ? (
           <div className={styles.message}>
@@ -1463,6 +1485,8 @@ type StepRowProps = {
   color?: string | undefined;
   /** Says so in words, because colour alone is not a state a reader can read. */
   failed?: boolean;
+  /** A control at the end of the row, such as downloading the file it wrote. */
+  action?: ReactNode;
   onClick?: () => void;
   expanded?: boolean;
 };
@@ -1476,6 +1500,7 @@ const StepRow = ({
   time,
   color,
   failed,
+  action,
   onClick,
   expanded,
 }: StepRowProps) => {
@@ -1499,6 +1524,7 @@ const StepRow = ({
         </span>
       ) : null}
       {failed ? <span className={styles.stepFailed}>failed</span> : null}
+      {action}
     </>
   );
 

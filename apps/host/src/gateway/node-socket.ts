@@ -333,6 +333,16 @@ export function registerNodeGateway(
               );
             return;
           }
+          if (message.type === "session_file_data") {
+            // An unmatched answer is ordinary: a read that timed out still
+            // gets its reply from the Node, just too late to be used.
+            if (!service.files.handleResult(nodeId, message.result))
+              app.log.debug(
+                { nodeId, requestId: message.result.requestId },
+                "Ignored an unexpected session file answer",
+              );
+            return;
+          }
           if (message.type === "artifact_upload_begin") {
             void service.worktrees
               .handleArtifactUploadBegin(nodeId, message.transfer)
