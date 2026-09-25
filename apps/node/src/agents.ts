@@ -12,7 +12,13 @@ import type {
   StartupConfig,
   SessionUsage,
 } from "@fleet/protocol";
-import { CONTEXT_TIER_CONFIG_ID, attachmentSummary, errorMessage } from "@fleet/protocol";
+import {
+  AGENT_NODE_IDENTITY_URL_ENV,
+  AGENT_NODE_ID_ENV,
+  CONTEXT_TIER_CONFIG_ID,
+  attachmentSummary,
+  errorMessage,
+} from "@fleet/protocol";
 import {
   contextConfigOption,
   configValueFor,
@@ -85,6 +91,41 @@ export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
 
 /** Long enough for cold ACP and MCP setup, bounded so startup cannot fail silently. */
 export const ACP_START_TIMEOUT_MS = 180_000;
+
+/** Which Fleet node an agent is running on, as the Node tells it at launch. */
+export type AgentIdentity = {
+  nodeId: string;
+  /** The config page's identity address; absent while nothing listens there. */
+  identityUrl?: string | undefined;
+};
+
+/**
+ * The environment an agent is launched with: this process's own, plus where it
+ * runs.
+ *
+ * Both identity variables are replaced rather than merely added. A Node can be
+ * started from inside an agent — one working on this repository, say — and it
+ * would otherwise hand its own agents the identity of the machine that started
+ * it, including an address that answers for that other node whenever this one's
+ * config page is not up.
+ */
+export function agentEnvironment(
+  base: NodeJS.ProcessEnv,
+  identity: AgentIdentity,
+): NodeJS.ProcessEnv {
+  const {
+    [AGENT_NODE_ID_ENV]: _inheritedNodeId,
+    [AGENT_NODE_IDENTITY_URL_ENV]: _inheritedIdentityUrl,
+    ...inherited
+  } = base;
+  return {
+    ...inherited,
+    [AGENT_NODE_ID_ENV]: identity.nodeId,
+    ...(identity.identityUrl
+      ? { [AGENT_NODE_IDENTITY_URL_ENV]: identity.identityUrl }
+      : {}),
+  };
+}
 
 /**
  * The permissions picker, whose value the Host already knows.
@@ -571,6 +612,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       StartAgentOptions,
       "processStarting" | "processStarted" | "processesQuiesced"
     >,
+    /** The whole environment to launch with; this process's own when absent. */
+    private readonly environment?: NodeJS.ProcessEnv,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
     this.managedProcess =
@@ -636,6 +679,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       shell,
+      ...(this.environment ? { env: this.environment } : {}),
     });
     this.child = child;
     if (child.pid) this.processOwnership?.processStarted?.(child.pid);
@@ -1402,6 +1446,12 @@ export class AcpAgentFactory implements AgentFactory {
     private copilotCommand: string,
     private contextTier: ContextTier = "long_context",
     private readonly startTimeoutMs = ACP_START_TIMEOUT_MS,
+    /**
+     * Where each agent runs, asked as it starts rather than once: the identity
+     * address only exists after the config page is listening, and an imported
+     * backup changes the node id without a restart.
+     */
+    private readonly identity?: () => AgentIdentity,
   ) {}
 
   /** Lets the local config UI retune the agent without a process restart. */
@@ -1467,6 +1517,7 @@ export class AcpAgentFactory implements AgentFactory {
         options.processStarting || options.processStarted || options.processesQuiesced
           ? options
           : undefined,
+        this.identity ? agentEnvironment(process.env, this.identity()) : undefined,
       );
       await withCopilotStartupTimeout(
         wait(agent.start(cwd, options.resumeAgentSessionId)),

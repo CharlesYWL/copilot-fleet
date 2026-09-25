@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, request, Server } from "node:http";
 import { once } from "node:events";
+import { hostname } from "node:os";
 import {
   CONFIG_UI_EVENT_MARKER,
   ConfigUiEventSchema,
@@ -15,6 +16,7 @@ import {
 import { createIdentityKeyPair, verifyNodeHttpProof } from "@fleet/protocol/node-auth";
 import {
   createConfigRouter,
+  nodeIdentityUrl,
   refuseRequest,
   startConfigServer,
   type ConfigServerOptions,
@@ -346,6 +348,29 @@ describe("config listener ports", () => {
     expect(await status(actual)).toBe(200);
   });
 
+  it("hands agents the identity address it is actually listening on", async () => {
+    const server = startConfigServer({ ...baseOptions(), port: 0 });
+    servers.push(server);
+    // Nothing answers yet, and an address that does not answer is worse than none.
+    expect(nodeIdentityUrl(server)).toBeUndefined();
+    await once(server, "listening");
+    const url = nodeIdentityUrl(server);
+    expect(url).toBe(`http://127.0.0.1:${portOfServer(server)}/api/identity`);
+
+    // Asked the way an agent's shell asks: a bare GET with no Origin.
+    const response = await fetch(url!);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      nodeId: "node-1",
+      nodeName: "node",
+      machineName: hostname(),
+      connected: true,
+    });
+
+    await new Promise<void>((done) => server.close(() => done()));
+    expect(nodeIdentityUrl(server)).toBeUndefined();
+  });
+
   it.each([
     { port: 8788, code: "EACCES" },
     { port: 65535, code: "EADDRINUSE" },
@@ -511,6 +536,72 @@ describe("config router", () => {
     const response = await route("GET", "/api/config", "");
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({ status: { nodeId: "node-1" } });
+  });
+
+  describe("identity for the agents on this machine", () => {
+    const credentials = (name: string): Credentials => ({
+      hostUrl: "http://127.0.0.1:8787",
+      nodeId: "node-1",
+      authProtocol: "legacy-secret",
+      secret: "secret",
+      name,
+    });
+
+    it("answers with the name the Host last confirmed, read when asked", async () => {
+      let current = credentials("DESKTOP-7Q2M4VX");
+      const { route } = router({ getCredentials: () => current });
+      const first = await route("GET", "/api/identity", "");
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual({
+        nodeId: "node-1",
+        nodeName: "DESKTOP-7Q2M4VX",
+        machineName: hostname(),
+        connected: true,
+      });
+
+      // A rename on the Host is written to node.json while agents keep running;
+      // the next question has to see it, not what the agent started with.
+      current = credentials("gpu-rig");
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        nodeId: "node-1",
+        nodeName: "gpu-rig",
+      });
+    });
+
+    it("prefers the confirmed name over one still waiting for the Host", async () => {
+      const { route } = router({
+        getCredentials: () => credentials("build-01"),
+        getSettings: () => ({ ...settingsFromEnv({}), nodeName: "build-02" }),
+      });
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        nodeName: "build-01",
+      });
+    });
+
+    it("falls back to the configured name before the node has enrolled", async () => {
+      const { route } = router({
+        getCredentials: () => undefined,
+        getSettings: () => ({ ...settingsFromEnv({}), nodeName: "fresh-box" }),
+      });
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        nodeName: "fresh-box",
+      });
+    });
+
+    it("says when the Host is unreachable, since a rename made there is still on its way", async () => {
+      const { route } = router({
+        getStatus: () => ({
+          nodeId: "node-1",
+          version: "0.1.0",
+          connected: false,
+          activeSessions: 0,
+          mockAgent: false,
+        }),
+      });
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        connected: false,
+      });
+    });
   });
 
   it("rejects settings the schema refuses without calling applySettings", async () => {

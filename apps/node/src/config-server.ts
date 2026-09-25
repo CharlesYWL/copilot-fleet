@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { hostname } from "node:os";
 import { z } from "zod";
 import {
   BACKUP_VERSION,
@@ -21,6 +22,7 @@ import type {
   ConfigRouter,
   ConfigServerOptions,
   FleetApi,
+  NodeIdentity,
 } from "./config-server-types.js";
 import { FleetClient } from "./fleet-client.js";
 import { pickFolder as pickFolderDefault } from "./pick-folder.js";
@@ -33,6 +35,7 @@ export type {
   ConfigServerOptions,
   ConfigStatus,
   FleetApi,
+  NodeIdentity,
   SessionDiscoveryApi,
 } from "./config-server-types.js";
 
@@ -75,6 +78,9 @@ type Handler = (body: string) => Promise<ConfigReply>;
  */
 const HOST = "127.0.0.1";
 const MAX_CONFIG_PORT_ATTEMPTS = 20;
+
+/** Where agents on this machine ask which Fleet node they are running on. */
+export const NODE_IDENTITY_PATH = "/api/identity";
 
 /** Loopback names a browser on this machine can legitimately have used. */
 const LOOPBACK_NAMES = new Set(["127.0.0.1", "localhost", "::1"]);
@@ -160,6 +166,19 @@ export function configServerPort(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isInteger(parsed) && parsed > 0 && parsed < 65_536 ? parsed : 8788;
 }
 
+/**
+ * The full address of {@link NODE_IDENTITY_PATH} on a started config server.
+ *
+ * Read from the listener rather than from settings, because the page moves past
+ * an occupied port, and undefined until it is listening: an address nothing
+ * answers on would send an agent looking for a node that is right here.
+ */
+export function nodeIdentityUrl(server: Server): string | undefined {
+  const address = server.address();
+  if (!server.listening || !address || typeof address === "string") return undefined;
+  return `http://${HOST}:${address.port}${NODE_IDENTITY_PATH}`;
+}
+
 const ok = (body: unknown): ConfigReply => ({ status: 200, body });
 const badRequest = (error: string): ConfigReply => ({ status: 400, body: { error } });
 
@@ -223,9 +242,26 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
   const sessionRoute = createSessionRouteHandler(fleet, discovery);
   const state = (): ConfigReply =>
     ok({ settings: options.getSettings(), status: options.getStatus() });
+  /**
+   * Which Fleet node this is, read at the moment of asking.
+   *
+   * The name is the one the Host last confirmed — node.json's — rather than
+   * settings.json's, because it is what an orchestrator calls this machine. The
+   * two differ only while a rename typed on this page waits for the Host.
+   */
+  const identity = (): NodeIdentity => {
+    const status = options.getStatus();
+    return {
+      nodeId: status.nodeId,
+      nodeName: options.getCredentials()?.name ?? options.getSettings().nodeName,
+      machineName: hostname(),
+      connected: status.connected,
+    };
+  };
 
   const routes = new Map<string, Handler>([
     ["GET /api/config", async () => state()],
+    [`GET ${NODE_IDENTITY_PATH}`, async () => ok(identity())],
     [
       "GET /api/command-permissions",
       async () => {

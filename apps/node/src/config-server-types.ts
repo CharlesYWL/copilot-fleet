@@ -27,6 +27,18 @@ export type ConfigStatus = {
   commandExecution?: CommandReadiness;
 };
 
+/** What `GET /api/identity` tells an agent about the Fleet node it runs on. */
+export type NodeIdentity = {
+  /** Fixed at enrolment; a rename never changes it. */
+  nodeId: string;
+  /** The name the Host last confirmed for this node, which a rename there updates. */
+  nodeName: string;
+  /** The operating system's host name, which a Fleet name need not match. */
+  machineName: string;
+  /** False while the Host is unreachable, when a rename made there has not arrived yet. */
+  connected: boolean;
+};
+
 export type FleetApi = {
   listWorkspaces: () => Promise<WorkspaceLike[]>;
   listOwnPlacements: () => Promise<PlacementLike[]>;
