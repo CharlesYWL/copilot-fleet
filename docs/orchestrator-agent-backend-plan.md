@@ -233,6 +233,73 @@ Future: one phase per new agent kind (investigate its ACP command, yolo,
 usage, `session/load` support; if no loadSession, resume starts fresh with
 `transferEnvelope` from orchestrator/briefing.ts).
 
+## Agent identity and bundle registration (future, not this iteration)
+
+Research notes for when non-Copilot kinds are added. Nothing here is built
+now; the interface should leave room for an `ensureIdentity` hook.
+Details marked "unverified" must be confirmed against a real install.
+
+### What "agent / profile" means per kind
+
+| Kind | Unit | Where it lives | Isolates | Shares |
+| --- | --- | --- | --- | --- |
+| Copilot | custom agent `*.agent.md` | `<cwd>/.github/agents/` (fleet installs per session) | prompt, tool list | memory, auth, config, history |
+| Claude Code | subagent `*.md`; `claude --agent <name>` for main session | `.claude/agents/`, `~/.claude/agents/` | prompt, tools, model, permission mode, preloaded skills | CLAUDE.md hierarchy, settings, auth; full isolation needs separate `CLAUDE_CONFIG_DIR` (auth impact unverified) |
+| Codex | `--profile` / `[profiles.x]` in config.toml | `~/.codex/config.toml` | config overrides only (model, approvals, sandbox, provider) | instructions, skills, sessions; full isolation needs separate `CODEX_HOME` |
+| Hermes | profile (`hermes -p <name>`) | separate HERMES_HOME per profile | config, .env/keys, memory, sessions, skills, cron, gateway | nothing |
+| OpenClaw | agent (`openclaw agents add <id>`); named profiles `~/.openclaw-<p>` | workspace (AGENTS.md, SOUL.md, USER.md) + agentDir (auth, models, sqlite sessions) | workspace, auth, sessions, per-agent skill allowlist | shared `~/.openclaw/skills` root (filtered by allowlist) |
+| Pi | none found | `~/.pi/agent` (settings, skills, AGENTS.md); project `.pi/skills`, `.agents/skills` | n/a | everything; isolation via agent-dir env override (unverified) |
+
+Skills are converging on the `SKILL.md` folder format (Claude, Codex via
+`.agents/skills`, Hermes, OpenClaw, Pi), so one fleet skill bundle can be
+installed into every kind. Instructions differ in file name only
+(`.agent.md`, subagent md, AGENTS.md, SOUL.md, Hermes persona/AGENTS.md).
+
+Current copilot-fleet mechanism (apps/node/src/agent-catalog.ts): built-in
+`apps/node/agents/*.agent.md` plus operator overrides in the Node config
+`agents/` dir (operator wins by name), copied into `<cwd>/.github/agents/`
+before `session/new` and hidden via `.git/info/exclude`, then selected with
+the `_agent` picker. Skills (`apps/node/skills/pr-maintenance`) are only
+referenced by path in the prompt (`withMaintenanceResources`), not installed.
+
+### Proposed registration: Node-side, idempotent
+
+Each Node has its own installs, so registration happens on the Node, not as
+a one-time Host setup step.
+
+1. One fleet bundle shipped in the Node package: orchestrator instructions
+   (single markdown source) + `skills/` in SKILL.md format. Extends the
+   existing `agents/` and `skills/` directories.
+2. Adapter hook `ensureIdentity(bundle, version)`, run at Node start and
+   before an orchestrator starts:
+   - copilot: current behaviour (`.agent.md` into `.github/agents`).
+   - claude: subagent `~/.claude/agents/fleet-orchestrator.md` (converted
+     frontmatter) + `~/.claude/skills/fleet-*`, or a dedicated config dir.
+   - codex: dedicated `CODEX_HOME` under the Node config dir with AGENTS.md +
+     skills. Auth must be logged in there (friction point).
+   - hermes: create profile `fleet-orchestrator` if missing; copy skills as
+     `fleet-*`. Never overwrite memory or agent-learned skills.
+   - openclaw: create agent `fleet-orchestrator` if missing; write
+     AGENTS.md/SOUL.md; allowlist fleet skills.
+   - pi: install skills into its global dir (or a dedicated one once the
+     override is confirmed).
+3. Record bundle version/hash per Node and kind; re-sync on upgrade. Only
+   fleet-owned files (prefix `fleet-`) are touched; never the user's own
+   skills, the agent's memory, or skills the agent created itself.
+4. Report installed identity + bundle version in Node hello, so the
+   Orchestrator settings page can show e.g. "Hermes: profile
+   fleet-orchestrator, bundle v3" per Node.
+5. Auth stays manual per Node (the operator logs each CLI in). Never copy
+   credentials.
+
+### Trade-offs to decide later
+
+- One shared `fleet-orchestrator` identity per Node (learning accumulates;
+  concurrent orchestrators share memory) vs one per orchestrator (isolated,
+  but learning does not accumulate). Recommendation: shared.
+- Learned memory is per Node; an orchestrator placed on another Node does
+  not carry it. Cross-Node memory sync is a separate, later problem.
+
 ## Open questions for reviewer
 
 1. Is keeping one session class with adapter hooks enough, or should the
