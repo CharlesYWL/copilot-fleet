@@ -2283,6 +2283,24 @@ follow-ups are persisted and scheduled in the same session. Queued, busy,
 stopping or offline does not mean replacement is needed; a repeated pending
 follow-up is not sent twice, and a different prompt cannot overwrite it.
 
+**Why a queued follow-up waits, and "Resume now".** Every queued step carries
+the scheduler's own reason — the same pass that decides dispatch records it — in
+the task page, the worker's transcript banner, `fleet_list_work`,
+`fleet_get_task` and the `fleet_follow_up` reply. The states are _queued_
+(ordinary capacity or ordering; Fleet starts it by itself), _blocked_ (another
+live session holds the same checkout, the Node is offline, a Stop, human hold or
+PR-maintenance hold applies), _awaiting approval_, _starting_ (sent, not yet
+acknowledged by the Node) and _running_ (acknowledged). Sessions in different
+checkouts on the same Node never block each other while capacity allows.
+**Resume now** on a queued follow-up runs ordinary scheduling first. Only a
+follow-up held back solely by the Node's reserved scheduling slot becomes a
+one-time approval request, which a signed-in operator answers in a dialog with
+**Approve once** or **Cancel request**; it then resumes the same conversation
+and sends the already-queued follow-up exactly once. An orchestrator may ask with
+`fleet_request_resume` but can never approve. Another writer in the same
+checkout is explained, never overridden. See the
+[orchestration lifecycle](docs/orchestration-lifecycle.md#queued-follow-up-admission-and-resume-now).
+
 **When a conversation fills up, move its work.** An orchestrator has one context
 window, so a long-lived conversation eventually runs out of room. Start a new
 conversation and hand the work to it: **Transfer tasks** in a conversation's

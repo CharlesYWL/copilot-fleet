@@ -28,6 +28,7 @@ import {
   ProposePrMaintenanceSchema,
   RecordTaskCheckpointSchema,
   ReopenTaskSchema,
+  RequestResumeSchema,
   SessionRefSchema,
   SetPrMaintenanceSchema,
   StartWorkSchema,
@@ -590,6 +591,23 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       inputSchema: FollowUpSchema.shape,
     },
     guard("fleet_follow_up", FollowUpSchema, (input) => tools.followUp(input)),
+  );
+
+  server.registerTool(
+    "fleet_request_resume",
+    {
+      title: "Ask to resume a queued worker now",
+      description: [
+        "Ask Fleet to run a retained worker's already-queued follow-up now, for the same session and the same queued prompt; it never sends a new prompt or creates a worker.",
+        "Ordinary scheduling runs first. If only the Node's reserved scheduling slot holds the worker back, this creates an approval request an authenticated operator must answer in Fleet with Approve once or Cancel; you cannot approve it, and nothing you write in chat counts as approval.",
+        "Any other reason — another session in the same checkout, the task's parallel limit, a human hold, PR maintenance, an offline Node — is returned as the answer and is not overridable.",
+        "Call once, report the result, and end your turn. A cancelled or unanswered request is not repeated for the same follow-up.",
+      ].join(" "),
+      inputSchema: RequestResumeSchema.shape,
+    },
+    guard("fleet_request_resume", RequestResumeSchema, (input) =>
+      tools.requestResume(input),
+    ),
   );
 
   server.registerTool(

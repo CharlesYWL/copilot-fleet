@@ -180,6 +180,12 @@ session. Only a confirmed non-resumable conversation warrants replacement work,
 with the lost context repeated explicitly. Busy, stopping, offline or capacity
 blocked is a wait, not a lost conversation. A queued follow-up is already
 accepted and persisted; do not resend it or replace it with a different prompt.
+`fleet_list_work` and `fleet_get_task` report why it is waiting. When the person
+asks for it to run sooner, call `fleet_request_resume` once: only a Node's
+reserved scheduling slot can be spent, and only after an authenticated operator
+approves it in Fleet. You cannot approve it, and chat agreement is not approval.
+Another session in the same checkout is never overridden. Report the answer and
+end your turn.
 Reopen a closed task before following up with its retained worker.
 
 Do not quietly accept a near miss, and do not patch around it yourself — you do

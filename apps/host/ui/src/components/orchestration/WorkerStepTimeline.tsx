@@ -10,6 +10,7 @@ import { terminal } from "../../theme";
 import { stepStatusDescriptor } from "../../lib/run-step-status";
 import { StatusIndicator } from "../StatusIndicator";
 import { relativeTime } from "./OrchestratorRunList";
+import { StepAdmissionLine } from "./StepAdmissionLine";
 
 const useStyles = makeStyles({
   list: { display: "grid", gap: "8px", listStyle: "none", margin: 0, padding: 0 },
@@ -89,6 +90,7 @@ const useStyles = makeStyles({
     fontSize: "10px",
     whiteSpace: "nowrap",
   },
+  admission: { padding: "0 12px 10px 30px" },
 });
 
 export type WorkerStepTimelineProps = {
@@ -97,6 +99,10 @@ export type WorkerStepTimelineProps = {
   sessions: readonly FleetSession[];
   awaitingPermissionSessionId?: string;
   onOpenWorker: (sessionId: string) => void;
+  /** Asks the Host to resume a queued follow-up now; it decides whether that needs approval. */
+  onResumeNow?: ((step: RunStep) => Promise<unknown> | void) | undefined;
+  /** Reopens a pending "Resume now" approval that was put off. */
+  onReviewApproval?: ((requestId: string) => void) | undefined;
 };
 
 /**
@@ -113,6 +119,8 @@ export const WorkerStepTimeline = ({
   sessions,
   awaitingPermissionSessionId,
   onOpenWorker,
+  onResumeNow,
+  onReviewApproval,
 }: WorkerStepTimelineProps) => {
   const styles = useStyles();
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -141,6 +149,7 @@ export const WorkerStepTimeline = ({
           step.state,
           session,
           Boolean(step.sessionId && step.sessionId === awaitingPermissionSessionId),
+          step.admission,
         );
         const Chevron = expanded ? ChevronDown20Regular : ChevronRight20Regular;
         return (
@@ -166,6 +175,15 @@ export const WorkerStepTimeline = ({
                 <StatusIndicator descriptor={status} wrap />
               </span>
             </button>
+            {step.admission && step.admission.state !== "running" && (
+              <div className={styles.admission}>
+                <StepAdmissionLine
+                  step={step}
+                  onResumeNow={onResumeNow}
+                  onReviewApproval={onReviewApproval}
+                />
+              </div>
+            )}
             {expanded && (
               <div className={styles.body}>
                 {session?.name && session.name !== step.title ? (

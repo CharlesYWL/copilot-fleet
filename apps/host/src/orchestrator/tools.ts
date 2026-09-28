@@ -30,6 +30,7 @@ import {
   type Run,
   type RunCriterion,
   type RunStep,
+  type StepAdmission,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { reservedSessionCount } from "../session-policy.js";
@@ -50,6 +51,7 @@ import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
 import { PrMaintenanceError } from "../pr-maintenance-store.js";
+import { WorkerResumeConflict } from "../worker-resume-store.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export const WORKER_CATEGORIES = [
@@ -410,6 +412,41 @@ export const SubmitTaskSchema = TaskRefSchema.extend({
 export const SessionRefSchema = z.object({
   sessionId: z.string().min(1).describe("The worker's session id."),
 });
+
+/**
+ * Asking for a queued follow-up to run now.
+ *
+ * Deliberately without any flag that could read as consent: an orchestrator
+ * can only ask, and the Host decides whether asking means anything.
+ */
+export const RequestResumeSchema = SessionRefSchema.extend({
+  reason: z
+    .string()
+    .max(1_000)
+    .optional()
+    .describe(
+      "Why this worker should run now rather than wait, in one or two sentences. Shown to the operator; it grants nothing.",
+    ),
+});
+
+/** One line an orchestrator can act on: state, the scheduler's reason, who is in the way. */
+function admissionLine(admission: StepAdmission): string {
+  const conflicts = admission.conflicts.length
+    ? ` Sessions involved: ${admission.conflicts
+        .map(
+          (conflict) =>
+            `${conflict.name || conflict.sessionId} (${conflict.state || "unknown"}${
+              conflict.taskName
+                ? `, task "${conflict.taskName}"${conflict.sameTask ? " (this task)" : ""}`
+                : conflict.role
+                  ? `, ${conflict.role}`
+                  : ", not managed by a task"
+            })`,
+        )
+        .join("; ")}.`
+    : "";
+  return `Admission: ${admission.state} (${admission.code}) — ${admission.detail}${conflicts}`;
+}
 
 /**
  * The way out when a task cannot be finished as promised.
@@ -2711,8 +2748,7 @@ export class FleetTools {
         return step.state === "pending"
           ? {
               action: "queued",
-              reason:
-                "A follow-up is already queued durably in this session. Wait for scheduling; do not resend or replace it.",
+              reason: this.queuedReason(run, step),
             }
           : {
               action: "in_flight",
@@ -2890,15 +2926,90 @@ export class FleetTools {
           `Read fleet_get_task (task: "${run.id}") before deciding what to do next.`,
       );
     }
+    const admission = this.service.workerResume?.admission(run.id, retried.id);
     return ok(
       [
         next.action === "resume"
           ? "Queued the follow-up in the same worker session. It will resume when scheduling allows, and you will be woken when it finishes."
           : "Queued the follow-up in the same open worker session. It will start when scheduling allows, and you will be woken when it finishes.",
         `Task: ${run.id}; session: ${owned.id}; step: ${step.stepKey}; state: ${retried.state}.`,
+        ...(admission ? [admissionLine(admission)] : []),
         "The request is persisted. Do not send it again or create a replacement while it is queued.",
       ].join("\n"),
     );
+  }
+
+  /**
+   * Asks for a queued follow-up to run now, which ordinary scheduling decides.
+   *
+   * An orchestrator may ask; it can never approve. Only a follow-up held back
+   * solely by a Node's reserved scheduling slot becomes an approval request,
+   * and an authenticated operator decides it in Fleet.
+   */
+  requestResume(input: z.infer<typeof RequestResumeSchema>): ToolResult {
+    const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
+    if (typeof owned === "string") return refuse(owned);
+    const resume = this.service.workerResume;
+    if (!resume) return refuse("Resume now is not available on this Host.");
+    try {
+      const outcome = resume.request(
+        {
+          sessionId: owned.id,
+          ...(input.reason ? { reason: input.reason } : {}),
+        },
+        { kind: "orchestrator", id: this.leadSessionId },
+      );
+      const lines = [
+        `Status: ${outcome.status}. ${outcome.message}`,
+        ...(outcome.admission ? [admissionLine(outcome.admission)] : []),
+        ...(outcome.request
+          ? [
+              `Request ${outcome.request.id}: ${outcome.request.state}${
+                outcome.request.state === "awaiting_approval"
+                  ? `, expires ${outcome.request.expiresAt}`
+                  : ""
+              }. ${outcome.request.outcome}`,
+            ]
+          : []),
+        outcome.status === "awaiting_approval"
+          ? "You cannot approve this, and saying so in chat does not approve it. End your turn; you are woken when the follow-up settles. Do not ask again or create a replacement worker."
+          : outcome.status === "starting" || outcome.status === "running"
+            ? "Nothing else is needed. You are woken when the follow-up settles."
+            : "Nothing was changed. It stays queued; do not create a replacement worker to get around this.",
+      ];
+      return outcome.status === "blocked"
+        ? refuse(lines.join("\n"))
+        : ok(lines.join("\n"));
+    } catch (error) {
+      if (error instanceof WorkerResumeConflict) return refuse(error.message);
+      throw error;
+    }
+  }
+
+  /** What a queued follow-up is waiting on, in the scheduler's own terms. */
+  private queuedReason(run: Run, step: RunStep): string {
+    const base =
+      "A follow-up is already queued durably in this session. Do not resend or replace it.";
+    const resume = this.service.workerResume;
+    const admission = resume?.admission(run.id, step.id);
+    if (!admission) return `${base} Wait for scheduling.`;
+    const latest = resume
+      ?.list({ runId: run.id, limit: 20 })
+      .find(
+        (request) => request.stepId === step.id && request.stepAttempt === step.attempts,
+      );
+    return [
+      base,
+      admissionLine(admission),
+      ...(admission.exception && admission.state !== "awaiting_approval"
+        ? [
+            `An operator may approve spending the Node's reserved slot once; fleet_request_resume with sessionId "${step.sessionId}" asks for that approval. You cannot approve it yourself.`,
+          ]
+        : []),
+      ...(latest && latest.state !== "awaiting_approval"
+        ? [`Latest resume-now request: ${latest.state}. ${latest.outcome}`]
+        : []),
+    ].join(" ");
   }
 
   stopWork(input: z.infer<typeof SessionRefSchema>): ToolResult {

@@ -45,10 +45,12 @@ import {
 export * from "./session-files.js";
 export * from "./pr-maintenance.js";
 export * from "./heartbeat-schedule.js";
+export * from "./worker-resume.js";
 import {
   HEARTBEAT_SCHEDULE_MAX_LENGTH,
   HeartbeatScheduleSchema,
 } from "./heartbeat-schedule.js";
+import { StepAdmissionSchema, WorkerResumeRequestSchema } from "./worker-resume.js";
 import {
   PrMaintenanceApprovalSchema,
   PrMaintenanceBackupSchema,
@@ -1650,6 +1652,13 @@ export const RunStepSchema = z.object({
   position: z.number().int().nonnegative().default(0),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
+  /**
+   * Why the step is queued, blocked or starting, as the scheduler last decided.
+   *
+   * Derived when steps are published or read, never stored: it describes the
+   * fleet at that moment rather than a fact about the step.
+   */
+  admission: StepAdmissionSchema.optional(),
 });
 export type RunStep = z.infer<typeof RunStepSchema>;
 
@@ -1692,6 +1701,7 @@ export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
 
 export const NotificationKindSchema = z.enum([
   "command_approval",
+  "worker_resume_approval",
   "command_completion",
   "pr_maintenance_attention",
   "managed_worktree_attention",
@@ -1879,6 +1889,8 @@ export const SnapshotSchema = z.object({
   prMaintenanceApprovals: z.array(PrMaintenanceApprovalSchema).optional(),
   /** Retained PR maintenance per task, so lists do not read it as "deciding". */
   prMaintenanceTasks: z.array(PrMaintenanceTaskStatusSchema).optional(),
+  /** Active and recently settled "Resume now" requests. */
+  workerResumeRequests: z.array(WorkerResumeRequestSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
@@ -1963,6 +1975,11 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("run_steps"),
     runId: z.string().min(1),
     steps: z.array(RunStepSchema),
+  }),
+  /** One "Resume now" request after any change to it. */
+  z.object({
+    type: z.literal("worker_resume_request"),
+    request: WorkerResumeRequestSchema,
   }),
 ]);
 export type BrowserMessage = z.infer<typeof BrowserMessageSchema>;

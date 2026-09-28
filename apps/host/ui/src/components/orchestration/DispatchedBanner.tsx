@@ -1,14 +1,20 @@
 import { Button, Text, makeStyles, tokens } from "@fluentui/react-components";
 import type { FleetSession, RunStep } from "@fleet/protocol";
+import { StepAdmissionLine } from "./StepAdmissionLine";
 
 const useStyles = makeStyles({
+  root: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+    padding: "8px 14px",
+    borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
+    background: tokens.colorNeutralBackground3,
+  },
   banner: {
     display: "flex",
     alignItems: "center",
     gap: "10px",
-    padding: "8px 14px",
-    borderBottom: `1px solid ${tokens.colorNeutralStroke2}`,
-    background: tokens.colorNeutralBackground3,
   },
   text: {
     flexGrow: 1,
@@ -27,6 +33,9 @@ export type DispatchedBannerProps = {
   /** The task being returned to, when the operator came from one. */
   runName?: string | undefined;
   onBack: () => void;
+  /** "Resume now" for this worker's queued follow-up; the Host decides what it needs. */
+  onResumeNow?: ((step: RunStep) => Promise<unknown> | void) | undefined;
+  onReviewApproval?: ((requestId: string) => void) | undefined;
 };
 
 /**
@@ -35,27 +44,41 @@ export type DispatchedBannerProps = {
  * Without one the only exit was the Orchestrator row in the sidebar, which
  * reads as navigating somewhere new rather than returning — and landed on the
  * front page rather than the task the operator had been looking at.
+ *
+ * It also says what a queued follow-up for this worker is waiting on, because
+ * this transcript is where an operator looks when a worker seems not to start.
  */
 export const DispatchedBanner = ({
   session,
   step,
   runName,
   onBack,
+  onResumeNow,
+  onReviewApproval,
 }: DispatchedBannerProps) => {
   const styles = useStyles();
   const role = session.runRole === "reviewer" ? "review" : "worker";
   return (
-    <div className={styles.banner}>
-      <Button size="small" appearance="subtle" onClick={onBack}>
-        ← {runName ?? "Orchestrator"}
-      </Button>
-      <Text className={styles.text}>
-        {step
-          ? `${step.title} · ${step.category || role} · ${step.state}`
-          : session.runRole === "lead"
-            ? "The orchestrator's own conversation"
-            : `Dispatched by the orchestrator (${role})`}
-      </Text>
+    <div className={styles.root}>
+      <div className={styles.banner}>
+        <Button size="small" appearance="subtle" onClick={onBack}>
+          ← {runName ?? "Orchestrator"}
+        </Button>
+        <Text className={styles.text}>
+          {step
+            ? `${step.title} · ${step.category || role} · ${step.state}`
+            : session.runRole === "lead"
+              ? "The orchestrator's own conversation"
+              : `Dispatched by the orchestrator (${role})`}
+        </Text>
+      </div>
+      {step?.admission && step.admission.state !== "running" && (
+        <StepAdmissionLine
+          step={step}
+          onResumeNow={onResumeNow}
+          onReviewApproval={onReviewApproval}
+        />
+      )}
     </div>
   );
 };

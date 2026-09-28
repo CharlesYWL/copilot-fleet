@@ -19,7 +19,10 @@ import {
   type PrMaintenanceApproval,
   type Run,
   type RunNote,
+  type RunStep,
   type SessionEvent,
+  type WorkerResumeOutcome,
+  type WorkerResumeRequest,
 } from "@fleet/protocol";
 import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
@@ -81,10 +84,12 @@ import { OnboardingTour } from "./components/OnboardingTour";
 import { CommandExecutionsDialog } from "./components/CommandExecutionsDialog";
 import { CommandPermissionPrompts } from "./components/CommandPermissionPrompts";
 import { PrMaintenanceApprovalReview } from "./components/orchestration/PrMaintenanceApprovalReview";
+import { WorkerResumePrompts } from "./components/orchestration/WorkerResumePrompts";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
 const noMaintenanceApprovals: PrMaintenanceApproval[] = [];
+const noResumeRequests: WorkerResumeRequest[] = [];
 
 /**
  * What the main area is showing.
@@ -252,6 +257,38 @@ export function App() {
     dismissNotification,
   } = useFleet(notify);
   const maintenanceApprovals = snapshot.prMaintenanceApprovals ?? noMaintenanceApprovals;
+  const resumeRequests = snapshot.workerResumeRequests ?? noResumeRequests;
+  /** A "Resume now" approval to show now, even one put off with "Review later". */
+  const [resumeReviewId, setResumeReviewId] = useState<string>();
+  /**
+   * Asks the Host to resume a queued follow-up now.
+   *
+   * The Host runs ordinary scheduling first and answers with what happened; only
+   * a scheduling exception opens the approval dialog. A refusal arrives as an
+   * error toast carrying the Host's reason.
+   */
+  const handleResumeNow = useCallback(
+    async (step: RunStep) => {
+      const result = await request<WorkerResumeOutcome>(
+        `/api/runs/${encodeURIComponent(step.runId)}/steps/${encodeURIComponent(step.id)}/resume-now`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      if (!result.ok) return false;
+      const outcome = result.data;
+      if (outcome.status === "awaiting_approval" && outcome.request)
+        setResumeReviewId(outcome.request.id);
+      notify(
+        outcome.message,
+        outcome.status === "awaiting_approval"
+          ? "warning"
+          : outcome.status === "queued"
+            ? "info"
+            : "success",
+      );
+      return true;
+    },
+    [notify, request],
+  );
   const catalog = useCatalogOperations({ request, refresh, notify });
   const [view, setView] = useState<AppView>("session");
   const [orchestratorViewMode, setOrchestratorViewMode] =
@@ -777,6 +814,11 @@ export function App() {
     (notification: Notification) => {
       void markNotificationRead(notification.id);
       if (
+        notification.kind === "worker_resume_approval" &&
+        typeof notification.data.requestId === "string"
+      )
+        setResumeReviewId(notification.data.requestId);
+      if (
         notification.kind === "pr_maintenance_attention" &&
         notification.data.reason === "authorization"
       ) {
@@ -1245,6 +1287,20 @@ export function App() {
             !!bulkStopScope
           }
         />
+        <WorkerResumePrompts
+          requests={resumeRequests}
+          connected={connected}
+          blocked={
+            !!commandPanel ||
+            !!maintenanceApproval ||
+            dialogOpen ||
+            orchestrationDialogOpen ||
+            focusOpen ||
+            !!bulkStopScope
+          }
+          focusRequestId={resumeReviewId}
+          onFocusHandled={() => setResumeReviewId(undefined)}
+        />
         {commandPanel && (
           <CommandExecutionsDialog
             executions={snapshot.commandExecutions ?? []}
@@ -1460,6 +1516,8 @@ export function App() {
                       runId: selectedRunModel.run.id,
                     })
                   }
+                  onResumeNow={handleResumeNow}
+                  onReviewApproval={setResumeReviewId}
                   onReview={(approved, note, maintenance) =>
                     handleReviewTask(selectedRunModel.run.id, approved, note, maintenance)
                   }
@@ -1531,6 +1589,8 @@ export function App() {
                               : undefined
                           }
                           onBack={handleBackFromSession}
+                          onResumeNow={handleResumeNow}
+                          onReviewApproval={setResumeReviewId}
                         />
                       )}
                       <TerminalView
