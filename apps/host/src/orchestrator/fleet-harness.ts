@@ -35,6 +35,7 @@ function fakeSocket() {
 export function fleet(dbPath = ":memory:"): {
   store: FleetStore;
   service: FleetService;
+  engine: OrchestratorEngine;
   leadId: string;
   /** What a lead token for this world's orchestrator has to claim. */
   leadSubject: { sessionId: string; runId: string; nodeId: string };
@@ -85,6 +86,7 @@ export function fleet(dbPath = ":memory:"): {
     leadTokens: { mint: () => "flt_test" },
     mcpUrl: () => "http://127.0.0.1/mcp",
     tickRun: (runId) => engine.tickRun(runId),
+    resume: engine.resume,
   });
 
   const lead = store.createSession(
@@ -106,6 +108,7 @@ export function fleet(dbPath = ":memory:"): {
   return {
     store,
     service,
+    engine,
     leadId: lead.id,
     leadSubject: { sessionId: lead.id, runId: lead.runId, nodeId: lead.nodeId },
     addNode,

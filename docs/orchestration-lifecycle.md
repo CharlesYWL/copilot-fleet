@@ -178,6 +178,78 @@ not evidence that the conversation must be replaced. A confirmed terminal
 worker without a resumable conversation needs replacement with the retained
 task context supplied explicitly.
 
+## Queued follow-up admission and Resume now
+
+The scheduler records why it leaves each pending step pending, in the same pure
+pass that decides dispatch (`planNextActions` holds), so an explanation cannot
+drift from what the engine did. Holds live in memory and are recomputed every
+tick; a restarted Host reports `scheduling` until its first pass. Steps carry
+the derived `admission` on REST reads and `run_steps` broadcasts, and the
+orchestrator reads the same text in `fleet_list_work`, `fleet_get_task` and the
+`fleet_follow_up` reply.
+
+| State | Meaning | Codes |
+|---|---|---|
+| queued | Ordinary capacity or ordering; Fleet starts it by itself | `session_busy`, `parallel_limit`, `node_headroom`, `node_capacity`, `dependencies`, `workspace_not_ready`, `nodes_unknown`, `no_placement`, `scheduling` |
+| blocked | Something other than capacity must change | `checkout_busy`, `node_offline`, `stop_pending`, `dismissed`, `cleanup_pending`, `task_held`, `maintenance_hold`, `command_fence` |
+| awaiting_approval | A "Resume now" exception waits for a person | `resume_approval` |
+| starting | Sent; the Node has not acknowledged the turn | `resuming`, `dispatched` |
+| running | The Node acknowledged the turn | `running` |
+
+Same-checkout and same-Node concurrency are distinct. `checkout_busy` names the
+live sessions holding the worker's checkout (a Node with managed worktrees
+treats every live non-lead session as holding its checkout; the legacy key is
+the placement). A settled task worker occupying it is parked by the scheduler
+before the handoff, so that wait clears by itself; a session no task manages
+keeps the checkout until whoever uses it stops it. Sessions in different
+checkouts on one Node never block each other while the Node has capacity.
+
+**Resume now** (task page, worker transcript banner, `POST
+/api/runs/:id/steps/:stepId/resume-now`, or `fleet_request_resume`) first runs an
+ordinary scheduling pass. If that starts the worker, nothing else happens. The
+only restriction it can ever turn into an exception is `node_headroom`: the Host
+keeps the last slot of a multi-slot Node free, and a person may approve spending
+it once while the Node's hard limit still has room. Every other reason is
+returned as the answer with no request created.
+
+An exception is a durable, versioned request (`worker_resume_requests`) bound to
+the step attempt, retained session and its Copilot conversation, Node,
+placement and exact checkout, the queued prompt's digest, and the set of
+sessions holding that Node's slots. Its dialog shows all of those, the
+restriction and the risk, with **Approve once** and **Cancel request**; **Review
+later** decides nothing. Only a signed-in browser operator may decide
+(`POST /api/worker-resume-requests/:id/decision` with the displayed version and
+fingerprint); Node, MCP and no-login principals are refused, and an
+orchestrator cannot approve its own request. Chat text, tool arguments, YOLO
+mode and other approvals are never consent.
+
+Approval runs a fresh scheduling pass and recomputes the binding. A changed
+binding — another session on the Node, a new writer in the checkout, an offline
+Node, a replaced follow-up, a human or maintenance hold — makes the request
+`stale` and launches nothing. The approved exception reaches the planner only
+while that binding still holds, applies only where the reserved slot is the one
+remaining obstacle, and is spent in the same transaction as the resume receipt,
+so it launches at most once across repeated clicks, concurrent decisions,
+scheduler races and Host restarts. The existing resume path then restores the
+same conversation and sends the step's already-queued prompt exactly once; the
+request becomes `launched` only when the Node acknowledges that turn, or
+`failed` with the Node's reason. Cancellation and expiry (10 minutes to decide,
+2 minutes to launch after approval) leave the follow-up queued; an orchestrator
+whose request was cancelled or ignored is refused another for the same attempt
+for 30 minutes. Requests, decisions and outcomes are written to the security
+audit log; approvals, cancellations and launch outcomes are also task notes.
+Requests are not carried in backups, and a restore clears them.
+
+A person's own prompt into a worker that has a queued follow-up is stamped with
+that follow-up's attempt; the engine forgets that turn's completion receipt
+when it sends the queued prompt, so the earlier turn cannot settle the queued
+one before the Node acknowledges it.
+
+The manual session **Resume** control applies the scheduler's checkout rule to
+task workers and reviewers: it refuses (`409 checkout_busy`, naming the holder)
+while another live session holds the checkout the worker would write to.
+Sessions no task manages, and orchestrators, keep the control unchanged.
+
 ## Worker delivery and publication
 
 The orchestrator delegates, judges and coordinates rather than mutating the

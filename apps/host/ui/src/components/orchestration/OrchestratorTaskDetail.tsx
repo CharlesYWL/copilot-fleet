@@ -29,6 +29,7 @@ import {
   prMaintenanceUrl,
   type FleetSession,
   type RunNote,
+  type RunStep,
 } from "@fleet/protocol";
 import type { RunViewModel } from "../../lib/orchestration-view";
 import { currentPhase } from "../../lib/orchestration-view";
@@ -273,6 +274,9 @@ export type OrchestratorTaskDetailProps = {
   /** Hands the task to another orchestrator conversation. */
   onTransfer?: (() => void) | undefined;
   onOpenWorker: (sessionId: string) => void;
+  /** "Resume now" for a queued follow-up; the Host decides whether approval is needed. */
+  onResumeNow?: ((step: RunStep) => Promise<unknown> | void) | undefined;
+  onReviewApproval?: ((requestId: string) => void) | undefined;
   onReview: (
     approved: boolean,
     note: string,
@@ -306,6 +310,8 @@ export const OrchestratorTaskDetail = ({
   onOpenLead,
   onTransfer,
   onOpenWorker,
+  onResumeNow,
+  onReviewApproval,
   onReview,
   onArchive,
   onReopen,
@@ -586,6 +592,8 @@ export const OrchestratorTaskDetail = ({
                 phases={run.phases}
                 sessions={sessions}
                 onOpenWorker={onOpenWorker}
+                onResumeNow={onResumeNow}
+                onReviewApproval={onReviewApproval}
               />
             </section>
           </div>

@@ -275,6 +275,17 @@ settled process and waits for the Node's verified terminal receipt. Follow-up
 resumes the same Copilot conversation and immutable task binding, preserving
 committed and uncommitted changes rather than constructing another worktree.
 
+The scheduling pass that leaves a follow-up pending also records why, and that
+reason — never a separate guess — is what the task page, the worker's banner and
+the orchestrator's tools report, distinguishing same-checkout from same-Node
+concurrency. "Resume now" lets ordinary scheduling act first; the one
+restriction it can turn into a one-time exception is a Node's reserved
+scheduling slot, and only through a durable request bound to the exact attempt,
+conversation, Node, checkout, queued prompt and slot holders that a signed-in
+operator approves in a dialog. The planner spends it at most once and only while
+that binding holds; checkout exclusivity, budgets and holds are never
+overridden. See [Queued follow-up admission and Resume now](docs/orchestration-lifecycle.md#queued-follow-up-admission-and-resume-now).
+
 Where a step runs is decided once, in `decidePlacement`, and recorded on the
 step. A Run pins to a checkout when it first writes to one, so later work that
 must see those changes — a reviewer above all — is sent there. That pin says
