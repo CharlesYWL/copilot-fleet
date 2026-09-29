@@ -9,6 +9,7 @@ import { PassThrough } from "node:stream";
 import { CONTEXT_TIER_CONFIG_ID, type SessionEvent } from "@fleet/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ACP_START_TIMEOUT_MS,
   AcpAgentFactory,
   AgentStartupCleanupError,
   type SessionAgent,
@@ -1498,5 +1499,70 @@ describe("Agency ACP startup", () => {
     expect(processes[0]?.child.kill).toHaveBeenCalled();
     expect(launches()).toHaveLength(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("Agent identity environment", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** The options each ACP launch was spawned with, by either spawn path. */
+  const launchOptions = () =>
+    [...vi.mocked(spawn).mock.calls, ...vi.mocked(spawnManagedProcess).mock.calls]
+      .filter(([, args]) => args?.includes("--acp"))
+      .map(([, , options]) => options as childProcess.SpawnOptions | undefined);
+
+  it("tells every agent which node it runs on, asked as that agent starts", async () => {
+    vi.stubEnv("FLEET_TEST_INHERITED", "kept");
+    // Not listening yet when the first agent starts.
+    let identityUrl: string | undefined = undefined;
+    const factory = new AcpAgentFactory(
+      60_000,
+      "copilot",
+      "default",
+      ACP_START_TIMEOUT_MS,
+      () => ({ nodeId: "node-1", identityUrl }),
+    );
+    agents.push(await factory.start("s1", "C:\\repo", () => {}));
+    identityUrl = "http://127.0.0.1:8789/api/identity";
+    agents.push(await factory.start("s2", "C:\\repo", () => {}));
+
+    const [first, second] = launchOptions().map((options) => options?.env);
+    expect(first).toMatchObject({ FLEET_NODE_ID: "node-1" });
+    expect(first).not.toHaveProperty("FLEET_NODE_IDENTITY_URL");
+    expect(second).toMatchObject({
+      FLEET_NODE_ID: "node-1",
+      FLEET_NODE_IDENTITY_URL: identityUrl,
+      // Replacing the environment must not cost the agent anything it had.
+      FLEET_TEST_INHERITED: "kept",
+    });
+  });
+
+  it("reaches an agent launched inside a Windows job too", async () => {
+    Object.defineProperty(process, "platform", { value: "win32" });
+    const factory = new AcpAgentFactory(
+      60_000,
+      "copilot",
+      "default",
+      ACP_START_TIMEOUT_MS,
+      () => ({ nodeId: "node-1", identityUrl: "http://127.0.0.1:8788/api/identity" }),
+    );
+    agents.push(
+      await factory.start("s1", "C:\\repo", () => {}, { mcpServers: fleetMcp }),
+    );
+
+    expect(spawnManagedProcess).toHaveBeenCalledOnce();
+    expect(launchOptions()[0]?.env).toMatchObject({
+      FLEET_NODE_ID: "node-1",
+      FLEET_NODE_IDENTITY_URL: "http://127.0.0.1:8788/api/identity",
+    });
+  });
+
+  it("leaves the environment alone for a factory that was given no identity", async () => {
+    agents.push(
+      await new AcpAgentFactory(60_000, "copilot").start("s1", "C:\\repo", () => {}),
+    );
+    expect(launchOptions()[0]).not.toHaveProperty("env");
   });
 });

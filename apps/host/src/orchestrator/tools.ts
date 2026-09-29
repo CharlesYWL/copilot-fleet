@@ -1,5 +1,8 @@
 import { z } from "zod";
 import {
+  AGENT_IDENTITY_CAPABILITY,
+  AGENT_NODE_IDENTITY_URL_ENV,
+  AGENT_NODE_ID_ENV,
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
   MANAGED_WORKTREES_CAPABILITY,
@@ -25,6 +28,7 @@ import {
   terminalRunStepStates,
   terminalSessionStates,
   type CriterionOutcome,
+  type FleetNode,
   type FleetSession,
   type Placement,
   type Run,
@@ -206,6 +210,8 @@ export function composeWorkerPrompt(input: {
   scope: string;
   verify: string;
   context?: string | undefined;
+  /** The machine the Host placed this step on, when it is known. */
+  runsOn?: WorkerNode | undefined;
 }): string {
   return [
     `TASK: ${input.title}`,
@@ -219,6 +225,7 @@ export function composeWorkerPrompt(input: {
     `VERIFY`,
     input.verify,
     ...(input.context ? ["", `CONTEXT`, input.context] : []),
+    ...(input.runsOn ? ["", "FLEET NODE", workerNodeNote(input.runsOn)] : []),
     "",
     "FLEET DELIVERY",
     WORKER_DELIVERY_CONTRACT,
@@ -230,6 +237,31 @@ export function composeWorkerPrompt(input: {
     "could not, say that instead — an unchecked claim is worse than an honest",
     "gap, because it will be believed.",
   ].join("\n");
+}
+
+type WorkerNode = Pick<FleetNode, "id" | "name" | "capabilities">;
+
+/**
+ * Where the step runs, in terms a worker can check from the machine itself.
+ *
+ * A brief may name the machine it wants, and the only name a worker could see
+ * was the operating system's, which a Fleet name need not match — so a worker
+ * told it was on one node, finding a host name that said otherwise, stopped to
+ * ask instead of working somewhere it could not confirm. The id never changes;
+ * the name can, while the step runs, so the worker is pointed at where to read
+ * the current one rather than left to trust this copy. Older Nodes set neither
+ * variable, and naming them there would hand the worker a contradiction.
+ */
+function workerNodeNote(node: WorkerNode): string {
+  const where =
+    `This step runs on Fleet node "${node.name}" (node id ${node.id}). A Fleet ` +
+    "name is a label an operator can change, so this machine's host name need not match it.";
+  if (!node.capabilities.includes(AGENT_IDENTITY_CAPABILITY)) return where;
+  return (
+    `${where} To confirm from here: ${AGENT_NODE_ID_ENV} in your environment is the ` +
+    `node id, and ${AGENT_NODE_IDENTITY_URL_ENV}, when set, answers a GET with the ` +
+    "node's current name."
+  );
 }
 
 export const PlanTaskSchema = z.object({
@@ -2349,7 +2381,10 @@ export class FleetTools {
     const step = this.store.upsertRunStep(run.id, {
       stepKey,
       title: input.title,
-      prompt: composeWorkerPrompt(input),
+      prompt: composeWorkerPrompt({
+        ...input,
+        runsOn: this.store.getNode(placement.nodeId),
+      }),
       category: input.category,
       // Recorded so the engine dispatches where this reply says it will.
       placementId: placement.id,

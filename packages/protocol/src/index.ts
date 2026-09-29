@@ -1275,6 +1275,34 @@ export const HOST_YOLO_CAPABILITY = "host-yolo";
 export const NODE_NAME_SYNC_CAPABILITY = "node-name-sync";
 
 /**
+ * Set in the environment of every agent a Node starts: that Node's `nodeId`.
+ *
+ * An agent can otherwise see only the machine's host name, which a Fleet name
+ * need not match — so a worker briefed to work on "build-01" had nothing on the
+ * machine to check that against. The id is fixed at enrolment, so a copy taken
+ * when the agent starts is never stale.
+ */
+export const AGENT_NODE_ID_ENV = "FLEET_NODE_ID";
+
+/**
+ * Set beside {@link AGENT_NODE_ID_ENV}: a loopback URL that answers a GET with
+ * the Node's identity, including its current Fleet name.
+ *
+ * An address rather than the name itself, because an operator can rename the
+ * machine from the Host while the agent runs and a variable cannot follow that.
+ * Absent when the Node's config page is not listening.
+ */
+export const AGENT_NODE_IDENTITY_URL_ENV = "FLEET_NODE_IDENTITY_URL";
+
+/**
+ * A Node that sets {@link AGENT_NODE_ID_ENV} and
+ * {@link AGENT_NODE_IDENTITY_URL_ENV} for its agents, so the Host may tell a
+ * worker to check them. Pointing a worker on an older Node at variables that
+ * do not exist would give it a contradiction to stop on instead of an answer.
+ */
+export const AGENT_IDENTITY_CAPABILITY = "agent-identity";
+
+/**
  * A Node that reports which of its sessions are mid-turn, so the Host can
  * restore a reconnecting session to what it is actually doing instead of
  * assuming it is idle and waiting for a prompt.

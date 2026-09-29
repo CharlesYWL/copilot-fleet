@@ -883,8 +883,9 @@ The node name defaults to the machine hostname, and can be changed from either
 end — the Host's Nodes tab or the node's own config page. Renaming keeps the
 machine's identity, so its placements and sessions come with it; the Host owns
 the name, so if both ends changed while the node was offline, the Host's name
-wins and is pushed back down. Pass `--max-sessions 4` if you want a capacity
-other than 10.
+wins and is pushed back down. Agents already running there can read the new
+name without a restart — see [Node config page](#node-config-page). Pass
+`--max-sessions 4` if you want a capacity other than 10.
 
 Enrollment stores the node's private key and the Host's public key at
 `$env:APPDATA\CopilotFleet\node.json`; subsequent starts need no grant, and no
@@ -1419,6 +1420,26 @@ It also edits the node name, session capacity, Copilot executable path, and
 permission timeout. Values are stored in `settings.json` beside the credentials
 and take precedence over the environment variables, so an edit here is not
 undone by a stale `.env` on the next start. Command-line flags outrank both.
+
+Agents use it to learn which node they are on. A Fleet name is a label, so it
+need not match the machine's host name, and an operator can rename the node from
+the Host while its agents run. Every agent a node starts therefore gets two
+variables: `FLEET_NODE_ID`, the node id, which a rename never changes; and
+`FLEET_NODE_IDENTITY_URL`, this page's `/api/identity`, which answers a GET with
+the name as of that moment (absent if the page could not start):
+
+```powershell
+Invoke-RestMethod $env:FLEET_NODE_IDENTITY_URL
+# nodeId      : 0f8e6c2a-5b1d-4c3e-9f7a-2d4b6e8a1c3f
+# nodeName    : build-01
+# machineName : DESKTOP-7Q2M4VX
+# connected   : True
+```
+
+`nodeName` is the name the Host last confirmed. `connected` is false while the
+Host is unreachable, when a rename made there has not arrived yet. A worker the
+orchestrator dispatches is told the node it was placed on, by name and id, and
+pointed at both variables when its node sets them.
 
 The listener binds to loopback only and is deliberately not exposed: anything
 that can repoint a node at a different Host can run commands on that machine.
@@ -2436,7 +2457,9 @@ stops a run rather than a prompt each time.
 - The node's local config page is bound to loopback and additionally refuses
   requests that do not name `127.0.0.1` (or `localhost`) on its own port, come
   from another origin, or write without `content-type: application/json`. It
-  does not defend against another user signed in to the same machine.
+  does not defend against another user signed in to the same machine, or against
+  the node's own agents, which run as its user; the identity address they are
+  given saves them a search, and grants nothing they could not already reach.
 - An internet-exposed Host should still use HTTPS/WSS, and putting one behind
   an authenticated reverse proxy or access policy (for example Cloudflare
   Access) remains a good second layer.
