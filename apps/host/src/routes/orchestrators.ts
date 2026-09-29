@@ -14,7 +14,10 @@ import {
   parsePrMaintenanceUrl,
   prMaintenanceUrl,
   type PrMaintenanceRegistration,
+  supportsAgentKind,
+  type AgentParams,
 } from "@fleet/protocol";
+import { capacityFor, reservedSessionCount } from "../session-policy.js";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
@@ -498,7 +501,27 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       .listPlacements()
       .filter((placement) => placement.workspaceId === input.workspaceId)
       .filter((placement) => store.getNode(placement.nodeId)?.online);
-    const placement = placements[0];
+    const preferred = store.getOrchestratorAgent() ?? { kind: "copilot" as const };
+    const matching = placements.filter((placement) =>
+      supportsAgentKind(store.getNode(placement.nodeId)!, preferred.kind),
+    );
+    const agentParams: AgentParams =
+      matching.length > 0 ? preferred : { kind: "copilot" };
+    const candidates =
+      matching.length > 0
+        ? matching
+        : placements.filter((placement) =>
+            supportsAgentKind(store.getNode(placement.nodeId)!, "copilot"),
+          );
+    const placement =
+      candidates.find((candidate) => {
+        const node = store.getNode(candidate.nodeId)!;
+        return (
+          !service.agentLaunchProblem(node, agentParams) &&
+          reservedSessionCount(store.listSessions(), node.id, "read-only") <
+            capacityFor(node, "read-only")
+        );
+      }) ?? candidates[0];
     if (!placement) {
       return reply.code(409).send({
         error: "No online node holds this workspace, so there is nowhere to run it",
@@ -516,6 +539,12 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
      */
     const started = service.createAndStartSession({
       placement,
+      agentParams,
+      ...(preferred.kind !== agentParams.kind
+        ? {
+            startupNotice: `Preferred agent Hermes is unavailable on the online Nodes holding this workspace. Started with Copilot on ${store.getNode(placement.nodeId)!.name}.`,
+          }
+        : {}),
       /*
        * Which half of the briefing depends on the machine: a Node whose catalog
        * has the orchestrator agent already carries the judgement half, so
@@ -525,7 +554,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       prompt: orchestratorBriefing(new FleetTools(service, "pending").listNodes().text, {
         hasAgent:
           service.agentFor(
-            { runRole: "lead" },
+            { runRole: "lead", agentParams },
             store.getNode(placement.nodeId) ?? { agents: [] },
           ) !== "",
       }),

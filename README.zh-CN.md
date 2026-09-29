@@ -170,6 +170,7 @@ npm run dev:tunnel
 打开界面 → **Settings**：
 
 - **General** —— 会话默认值、**Take the tour** 按钮、**Update Host**，以及数据导出/导入。
+- **Orchestrator** —— 编排器的首选代理、Hermes profile 和心跳计划。
 - **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移、
   可迁移 Host 备份/恢复，以及这台 Host 的安全审计。
 - **Tunnel** —— 管理 Dev Tunnels、Cloudflare、Tailscale Funnel 或 ngrok。
@@ -1415,6 +1416,28 @@ agent session id，会被作为**可恢复**提供出来；而从未走到那一
 某个 Node 上的普通 session，但 Host 会给它一组受限工具，用来规划 task、派发 worker、在
 worker 有结果后唤醒自己，并把交付记录留给你审查。
 
+在 **Settings → Orchestrator → Preferred agent** 选择编排器代理。Auto 固定为 Copilot；
+Node 检测到 Hermes 后会显示 Hermes 选项。选择只影响新编排器，已有会话在停止、恢复和
+重启后保留原代理及 profile，worker 仍使用 Copilot。General 中的模型、推理强度、
+上下文和 Agency 设置只适用于 Copilot。
+
+在运行 Hermes 的每台 Node 上，以运行 Node 的同一 OS 用户手动初始化独立 profile：
+
+```powershell
+hermes profile create fleet-orchestrator --no-alias
+hermes -p fleet-orchestrator acp --setup
+hermes -p fleet-orchestrator acp --check
+```
+
+已有 profile 时跳过创建。setup 交互式配置 provider 和模型；check 仅检查 ACP 依赖，
+不代表模型请求已经成功。Fleet 不自动创建 profile 或复制凭据。记忆、技能和原生历史
+保留在该 Node 的 profile 内，不跨 Node 同步。同一 Node 的同一 profile 同时只能有一个
+活动的 Hermes 编排器，也不要让外部 Hermes 进程同时使用它。
+
+若持有目标 workspace 的在线 Node 均未安装 Hermes，新编排器会回退到 Copilot，并记录
+系统消息；profile 占用、配置或认证错误会明确报错，不会切换代理。已有 Hermes 会话恢复时
+绝不回退。自动原生会话清理仍仅适用于 Copilot，Hermes 历史请在其 profile 中管理。
+
 1. 在侧边栏打开 **Orchestrator**，点击 **Start orchestrator**。只有当在线 Node 持有至少
    一个 workspace 时按钮才可用。lead 会从一个可达 placement 启动，以无人值守方式运行以便
    后续唤醒自己，并被明确要求不要自己写代码。
@@ -1443,7 +1466,7 @@ worker 有结果后唤醒自己，并把交付记录留给你审查。
    会收到简报，按 task 记录从当前进度继续，原来的 lead 则不再看到它。若原 lead 为该
    task 请求的命令尚未结束，转移会被拒绝。
 
-lead 空闲且仍有未完成的 task 或维护中的 PR 时，Host 会按 **Settings → General →
+lead 空闲且仍有未完成的 task 或维护中的 PR 时，Host 会按 **Settings → Orchestrator →
 Orchestrator heartbeat** 中的时间给它发送只读的**状态检查**：标准五段 cron，按 Host
 本地时区计算，多个表达式用 `;` 分隔。默认值 `0 9-18 * * 1-5; 0 */2 * * *` 表示工作日
 09:00–18:00 每小时检查一次，其余时间每两小时一次。心跳前半小时内有过活动的 lead

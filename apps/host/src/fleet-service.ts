@@ -3,6 +3,8 @@ import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import {
   BrowserMessageSchema,
+  agentKindLabels,
+  supportsAgentKind,
   CONTEXT_TIER_CONFIG_ID,
   ContextTierSchema,
   HOST_URL_SYNC_CAPABILITY,
@@ -22,6 +24,7 @@ import {
   terminalRunStepStates,
   terminalSessionStates,
   type BrowserMessage,
+  type AgentParams,
   type FleetNode,
   type FleetSession,
   type HostBackup,
@@ -770,15 +773,47 @@ export class FleetService {
     });
   }
 
+  agentLaunchProblem(
+    node: FleetNode,
+    params: AgentParams,
+    sessionId?: string,
+  ): string | undefined {
+    const session = sessionId ? this.store.getSession(sessionId) : undefined;
+    if (params.kind !== "copilot" && session && session.runRole !== "lead") {
+      return "Only orchestrators can use another agent";
+    }
+    if (!supportsAgentKind(node, params.kind)) {
+      return `${agentKindLabels[params.kind]} is unavailable on ${node.name}. Install the agent and reconnect or upgrade this Node; existing sessions never change backend.`;
+    }
+    if (
+      params.kind === "hermes" &&
+      this.store
+        .listSessions()
+        .some(
+          (session) =>
+            session.id !== sessionId &&
+            session.nodeId === node.id &&
+            session.agentParams?.kind === "hermes" &&
+            session.agentParams.profile === params.profile &&
+            (liveSessionStates.has(session.state) ||
+              session.state === "offline" ||
+              session.stopRequested),
+        )
+    ) {
+      return `Hermes profile "${params.profile}" already belongs to an active orchestrator on ${node.name}. Stop it before starting another, or select a different profile.`;
+    }
+    return undefined;
+  }
+
   /**
    * Creates a session and asks its Node to start it.
    *
-   * Shared by the REST route, the orchestrator, and the MCP facade so all three
-   * enforce the same admission rules — capacity, yolo support, a live node —
-   * rather than each growing its own copy that drifts.
+   * Shared by REST, orchestration and MCP so admission cannot drift by caller.
    */
   createAndStartSession(input: {
     placement: Placement;
+    agentParams?: AgentParams;
+    startupNotice?: string;
     prompt: string;
     yolo: boolean;
     name?: string;
@@ -812,6 +847,16 @@ export class FleetService {
     }
     const node = this.store.getNode(input.placement.nodeId);
     if (!node?.online) return { ok: false, status: 409, error: "Node is offline" };
+    const agentParams = input.agentParams ?? { kind: "copilot" as const };
+    if (agentParams.kind !== "copilot" && input.runRole !== "lead") {
+      return {
+        ok: false,
+        status: 400,
+        error: "Only orchestrators can use another agent",
+      };
+    }
+    const agentProblem = this.agentLaunchProblem(node, agentParams);
+    if (agentProblem) return { ok: false, status: 409, error: agentProblem };
     const hostUpdating = this.hostUpdate?.blocksNodeWork(node.id);
     if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
     const kind = input.readOnly ? "read-only" : "writing";
@@ -851,6 +896,7 @@ export class FleetService {
         runRole: input.runRole ?? "",
         readOnly: input.readOnly ?? false,
         operatorUsername: input.operatorUsername ?? "",
+        agentParams,
       },
     );
     if (binding) {
@@ -876,6 +922,7 @@ export class FleetService {
       node.id,
       {
         type: "start_session",
+        ...(input.startupNotice ? { startupNotice: input.startupNotice } : {}),
         sessionId: session.id,
         localPath: input.placement.localPath,
         sourcePlacementId: input.placement.id,
@@ -916,7 +963,9 @@ export class FleetService {
   }): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const sessions = this.store.listSessions();
     const existing = sessions.find(
-      (session) => session.agentSessionId === input.agentSessionId,
+      (session) =>
+        session.agentSessionId === input.agentSessionId &&
+        (session.agentParams?.kind ?? "copilot") === "copilot",
     );
     if (existing && liveSessionStates.has(existing.state)) {
       return {
@@ -952,7 +1001,7 @@ export class FleetService {
   }
 
   /**
-   * Re-attaches one finished Copilot conversation without prompting it.
+   * Re-attaches one finished conversation without changing its backend or prompting it.
    *
    * Kept beside creation because both paths enforce the same admission rules
    * and assemble the same launch context. The caller may send a prompt
@@ -960,7 +1009,7 @@ export class FleetService {
    */
   resumeSession(
     sessionId: string,
-    activity = "Resuming Copilot session",
+    activity?: string,
     supervisor?: { operatorId: string; operationId?: string | undefined },
   ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
@@ -1015,6 +1064,12 @@ export class FleetService {
     }
     const node = this.store.getNode(session.nodeId);
     if (!node?.online) return { ok: false, status: 503, error: "Node is offline" };
+    const agentProblem = this.agentLaunchProblem(
+      node,
+      session.agentParams ?? { kind: "copilot" },
+      session.id,
+    );
+    if (agentProblem) return { ok: false, status: 409, error: agentProblem };
     const hostUpdating = this.hostUpdate?.blocksNodeWork(node.id);
     if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
     const kind = session.readOnly ? "read-only" : "writing";
@@ -1041,10 +1096,16 @@ export class FleetService {
       };
     }
 
-    const resumed = this.transitionSession(sessionId, "starting", activity, {
-      type: "host",
-      cause: "resume_requested",
-    });
+    const resumed = this.transitionSession(
+      sessionId,
+      "starting",
+      activity ??
+        `Resuming ${agentKindLabels[session.agentParams?.kind ?? "copilot"]} session`,
+      {
+        type: "host",
+        cause: "resume_requested",
+      },
+    );
     this.publishSession(resumed);
     const provenance: [undefined?, SupervisorCommand?] = manual
       ? [undefined, manual]
@@ -1223,10 +1284,14 @@ export class FleetService {
    * keeps that a quiet fact rather than a warning logged on every dispatch.
    */
   agentFor(
-    session: Pick<FleetSession, "runRole">,
+    session: Pick<FleetSession, "runRole" | "agentParams">,
     node: Pick<FleetNode, "agents">,
   ): string {
-    if (session.runRole !== "lead") return "";
+    if (
+      session.runRole !== "lead" ||
+      (session.agentParams?.kind ?? "copilot") !== "copilot"
+    )
+      return "";
     return node.agents.some((agent) => agent.name === ORCHESTRATOR_AGENT)
       ? ORCHESTRATOR_AGENT
       : "";
@@ -1250,7 +1315,10 @@ export class FleetService {
    * has expressed one, and a machine that cannot honour them says so and
    * carries on.
    */
-  startupConfigFor(session: Pick<FleetSession, "runRole">): StartupConfig[] {
+  startupConfigFor(
+    session: Pick<FleetSession, "runRole" | "agentParams">,
+  ): StartupConfig[] {
+    if ((session.agentParams?.kind ?? "copilot") !== "copilot") return [];
     const config: StartupConfig[] = [];
     if (session.runRole === "lead" || session.runRole === "worker") {
       config.push({ id: "mode", value: "agent" });
@@ -1462,6 +1530,12 @@ export class FleetService {
               }
             : {}),
           ...(request.type === "start_session" || request.type === "resume_session"
+            ? {
+                agentParams: session.agentParams ?? { kind: "copilot" },
+              }
+            : {}),
+          ...((request.type === "start_session" || request.type === "resume_session") &&
+          (session.agentParams?.kind ?? "copilot") === "copilot"
             ? {
                 agencyMode: this.store.getAgencyMode(),
                 contextTier:
@@ -1974,6 +2048,17 @@ export class FleetService {
       }
       const placement = this.store.getPlacement(session.placementId);
       if (!placement) continue;
+      const agentProblem = this.agentLaunchProblem(
+        node,
+        session.agentParams ?? { kind: "copilot" },
+        session.id,
+      );
+      if (agentProblem) {
+        this.publishSession(
+          this.store.transitionSession(session.id, session.state, agentProblem),
+        );
+        continue;
+      }
       if (yoloUnsupportedReason(node, session.yolo)) continue;
       try {
         this.worktrees.validateSession(session);

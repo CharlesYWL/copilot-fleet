@@ -1,7 +1,13 @@
 import Fastify from "fastify";
 import { randomUUID } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CONTEXT_TIER_CONFIG_ID, ORCHESTRATOR_STOP_REASON } from "@fleet/protocol";
+import {
+  CONTEXT_TIER_CONFIG_ID,
+  HostToNodeMessageSchema,
+  ORCHESTRATOR_STOP_REASON,
+  type FleetSession,
+  type NodeCommand,
+} from "@fleet/protocol";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { archiveRun } from "../orchestrator/lifecycle.js";
@@ -127,6 +133,134 @@ describe("orchestrator lifecycle routes", () => {
     );
     expect(store.getSession(leadId)!.name).toBe(name);
     expect(store.listEvents(leadId)).toEqual(events);
+  });
+
+  it("selects a Hermes-capable placement and keeps the backend/profile through resume", async () => {
+    const { app, store, service, leadId, addNode } = await setup();
+    const node = addNode("Hermes Node");
+    store.registerNode({
+      ...node,
+      agents: [{ name: "fleet-orchestrator", description: "Copilot persona" }],
+    });
+    store.setNodeIdentity(node.id, {
+      capabilities: ["copilot-acp", "host-yolo", "agent-kinds"],
+      agentKinds: [{ kind: "copilot" }, { kind: "hermes" }],
+    });
+    const params = { kind: "hermes", profile: "fleet-orchestrator" } as const;
+    store.setOrchestratorAgent(params);
+    store.setDefaultModel("copilot-only-model");
+    store.setAgencyMode(true);
+    const sent = vi.spyOn(service, "send");
+    const commands = () =>
+      sent.mock.calls.flatMap(([, frame]) => {
+        const parsed = HostToNodeMessageSchema.safeParse(frame);
+        return parsed.success && parsed.data.type === "command"
+          ? [parsed.data.command]
+          : [];
+      });
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orchestrators",
+      payload: { workspaceId: store.getSession(leadId)!.workspaceId },
+    });
+    expect(response.statusCode).toBe(201);
+    const session = response.json<{ session: FleetSession }>().session;
+    expect(session).toMatchObject({ nodeId: node.id, agentParams: params });
+    const start = commands().find((command) => command.type === "start_session")!;
+    expect(start).toMatchObject({
+      agentParams: params,
+      agent: "",
+      config: [],
+      yolo: true,
+    });
+    expect(start).toMatchObject({
+      prompt: expect.stringContaining("You do not write code yourself"),
+    });
+    expect(start).not.toHaveProperty("agencyMode");
+    expect(start).not.toHaveProperty("contextTier");
+    expect(start).toMatchObject({ mcpServers: [{ name: "fleet" }] });
+
+    const duplicate = await app.inject({
+      method: "POST",
+      url: "/api/orchestrators",
+      payload: { workspaceId: session.workspaceId },
+    });
+    expect(duplicate.statusCode).toBe(409);
+    expect(duplicate.json().error).toMatch(/profile.*already belongs/);
+
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "idle");
+    store.appendEvent({
+      eventId: randomUUID(),
+      sessionId: session.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "hermes-saved" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(session.id, "stopped");
+    store.setOrchestratorAgent({ kind: "copilot" });
+    expect(service.resumeSession(session.id).ok).toBe(true);
+    expect(commands().at(-1)).toMatchObject({
+      type: "resume_session",
+      agentParams: params,
+      agentSessionId: "hermes-saved",
+      agent: "",
+      config: [],
+      mcpServers: [{ name: "fleet" }],
+    });
+    store.transitionSession(session.id, "stopped");
+    store.setNodeIdentity(node.id, {
+      capabilities: ["copilot-acp", "host-yolo"],
+      agentKinds: [],
+    });
+    const before = commands().length;
+    expect(service.resumeSession(session.id)).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("Hermes is unavailable"),
+    });
+    expect(commands()).toHaveLength(before);
+  });
+
+  it("falls back visibly only for a new lead and never changes workers", async () => {
+    const { app, store, service, leadId } = await setup();
+    store.setOrchestratorAgent({ kind: "hermes", profile: "fleet-orchestrator" });
+    const sent = vi.spyOn(service, "send");
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orchestrators",
+      payload: { workspaceId: store.getSession(leadId)!.workspaceId },
+    });
+    expect(response.statusCode).toBe(201);
+    const session = response.json<{ session: FleetSession }>().session;
+    expect(session.agentParams).toEqual({ kind: "copilot" });
+    const commands: NodeCommand[] = sent.mock.calls.flatMap(([, frame]) => {
+      const parsed = HostToNodeMessageSchema.safeParse(frame);
+      return parsed.success && parsed.data.type === "command"
+        ? [parsed.data.command]
+        : [];
+    });
+    expect(commands.at(-1)).toMatchObject({
+      type: "start_session",
+      agentParams: { kind: "copilot" },
+      startupNotice: expect.stringContaining("Started with Copilot"),
+    });
+    const worker = service.createAndStartSession({
+      placement: store.getPlacement(session.placementId)!,
+      prompt: "Work",
+      yolo: false,
+      runRole: "worker",
+    });
+    expect(worker.ok && worker.session.agentParams).toEqual({ kind: "copilot" });
+    expect(
+      service.createAndStartSession({
+        placement: store.getPlacement(session.placementId)!,
+        prompt: "Work",
+        yolo: true,
+        runRole: "worker",
+        agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+      }),
+    ).toMatchObject({ ok: false, status: 400 });
   });
 
   it("gates context changes on an idle session with a context picker", async () => {

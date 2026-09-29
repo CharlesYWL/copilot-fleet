@@ -150,6 +150,51 @@ describe("host routes", () => {
     });
   });
 
+  it("persists typed orchestrator preferences and resets Auto without changing Copilot defaults", async () => {
+    const params = { kind: "hermes", profile: "fleet-orchestrator" };
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: { orchestratorAgent: params },
+        })
+      ).json(),
+    ).toMatchObject({
+      orchestratorAgent: params,
+      contextTier: "long_context",
+      yolo: false,
+    });
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      orchestratorAgent: params,
+    });
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: {
+            orchestratorAgent: { kind: "hermes", profile: "../escape" },
+            yolo: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      orchestratorAgent: params,
+      yolo: false,
+    });
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: { orchestratorAgent: null },
+        })
+      ).json(),
+    ).toMatchObject({ orchestratorAgent: null });
+  });
+
   it("reports health and an empty snapshot", async () => {
     const health = await inject({ method: "GET", url: "/api/health" });
     expect(health.statusCode).toBe(200);
@@ -321,6 +366,7 @@ describe("host routes", () => {
     };
     // Hourly through weekday working hours, every two hours otherwise.
     const heartbeatDefaults = {
+      orchestratorAgent: null,
       orchestratorHeartbeatSchedule: DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
       orchestratorHeartbeatTimeZone: expect.any(String),
       orchestratorHeartbeatUpcoming: expect.any(Array),

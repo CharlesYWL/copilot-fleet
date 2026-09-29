@@ -8,7 +8,7 @@ import {
   tokens,
   type PositioningImperativeRef,
 } from "@fluentui/react-components";
-import type { SessionUsage } from "@fleet/protocol";
+import { agentKindLabels, type AgentKind, type SessionUsage } from "@fleet/protocol";
 
 const useStyles = makeStyles({
   trigger: {
@@ -91,11 +91,13 @@ const number = new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 });
 const exactCredits = new Intl.NumberFormat("en-US", { maximumFractionDigits: 9 });
 
 export function SessionUsageBar({
+  agentKind = "copilot",
   usage,
   canCompact,
   compactAvailable,
   onCompact,
 }: {
+  agentKind?: AgentKind;
   usage: SessionUsage | undefined;
   canCompact: boolean;
   compactAvailable: boolean;
@@ -112,6 +114,7 @@ export function SessionUsageBar({
   const explanationId = useId();
   const credits = usage?.aiCredits;
   const context = usage?.context;
+  const fromAcp = context?.source === "acp";
   const used = usage?.contextTokens;
   const size = usage?.contextWindow;
   const hasUsed = used != null && Number.isFinite(used) && used >= 0;
@@ -123,7 +126,7 @@ export function SessionUsageBar({
   const estimate = context?.estimated ? "~" : "";
   const creditLabel =
     credits == null
-      ? "\u2014"
+      ? "?"
       : credits > 0 && credits < 0.01
         ? "<0.01"
         : number.format(credits);
@@ -263,6 +266,10 @@ export function SessionUsageBar({
       >
         <span className={styles.heading}>Session usage</span>
         <div className={styles.metric}>
+          <span>Agent</span>
+          <strong>{agentKindLabels[agentKind]}</strong>
+        </div>
+        <div className={styles.metric}>
           <span>AI credits</span>
           <strong
             title={
@@ -279,7 +286,7 @@ export function SessionUsageBar({
             <span>Context window</span>
             <strong>
               {percentage === undefined
-                ? "Usage unavailable"
+                ? "? (Usage unavailable)"
                 : `${estimate}${number.format(percentage)}% used`}
             </strong>
           </div>
@@ -290,16 +297,23 @@ export function SessionUsageBar({
                 {number.format(context.usedTokens)} / {estimate}
                 {number.format(context.tokenLimit)} tokens
               </span>
-              <span className={styles.detail}>Model: {context.model}</span>
+              {context.model && (
+                <span className={styles.detail}>Model: {context.model}</span>
+              )}
               <span className={styles.detail}>
-                CLI /context · Updated (local):{" "}
+                {fromAcp ? `${agentKindLabels[agentKind]} ACP` : "CLI /context"} · Updated
+                (local):{" "}
                 <time dateTime={context.updatedAt} title={context.updatedAt}>
                   {new Date(context.updatedAt).toLocaleString()}
                 </time>
               </span>
             </>
           ) : (
-            <span className={styles.detail}>No /context snapshot yet.</span>
+            <span className={styles.detail}>
+              {agentKind === "copilot"
+                ? "No /context snapshot yet."
+                : "No context usage reported yet."}
+            </span>
           )}
         </div>
         <details
@@ -309,22 +323,31 @@ export function SessionUsageBar({
           <summary className={styles.summary}>Reporting details</summary>
           <div className={styles.reportingBody}>
             <span>
-              {context
-                ? context.estimated
-                  ? "Estimated from CLI's rounded /context report. Refreshed after turns."
-                  : "Last /context snapshot. Refreshed after turns."
-                : "The requested context tier does not confirm the actual window."}
+              {fromAcp
+                ? "Estimated context pressure reported by the agent over ACP."
+                : agentKind !== "copilot"
+                  ? "Usage is shown only when the agent reports it. Unreported metrics stay unknown."
+                  : context
+                    ? context.estimated
+                      ? "Estimated from CLI's rounded /context report. Refreshed after turns."
+                      : "Last /context snapshot. Refreshed after turns."
+                    : "The requested context tier does not confirm the actual window."}
             </span>
             {hasUsed || hasSize ? (
               <div className={styles.details}>
-                <span>Last ACP input tokens / input budget</span>
                 <span>
-                  {hasUsed ? number.format(used) : "Unknown"} /{" "}
-                  {hasSize ? number.format(size) : "unknown"} tokens
+                  {agentKind === "copilot"
+                    ? "Last ACP input tokens / input budget"
+                    : "Last ACP context tokens / context window"}
                 </span>
                 <span>
-                  Not the full context window. Reported separately from /context; timing
-                  may differ. ACP timestamp unavailable.
+                  {hasUsed ? number.format(used) : "?"} /{" "}
+                  {hasSize ? number.format(size) : "?"} tokens
+                </span>
+                <span>
+                  {agentKind === "copilot"
+                    ? "Not the full context window. Reported separately from /context; timing may differ. ACP timestamp unavailable."
+                    : "Agent-reported values, not measured or inferred by Fleet."}
                 </span>
               </div>
             ) : null}

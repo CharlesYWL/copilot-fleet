@@ -50,6 +50,7 @@ import {
   Wrench16Regular,
 } from "@fluentui/react-icons";
 import {
+  agentKindLabels,
   SESSION_NAME_MAX_LENGTH,
   isResumableSession,
   terminalSessionStates,
@@ -989,6 +990,11 @@ export const TerminalView = ({
                 YOLO
               </Badge>
             )}
+            {session.runRole === "lead" && (
+              <Badge appearance="outline" size="small">
+                {agentKindLabels[session.agentParams?.kind ?? "copilot"]}
+              </Badge>
+            )}
             <SessionAgentBadge
               options={session.configOptions}
               disabled={!onConfigChange || isEnded}
@@ -1242,11 +1248,16 @@ export const TerminalView = ({
           <SessionConfigBar
             options={session.configOptions}
             session={session}
-            disabled={!onConfigChange || isEnded}
+            disabled={
+              !onConfigChange ||
+              isEnded ||
+              (session.agentParams?.kind === "hermes" && session.state !== "idle")
+            }
             onChange={(configId, value) => onConfigChange?.(configId, value)}
           />
           <span className={styles.toolbarSpacer} />
           <SessionUsageBar
+            agentKind={session.agentParams?.kind ?? "copilot"}
             usage={session.usage}
             canCompact={canPrompt}
             compactAvailable={session.commands.some(

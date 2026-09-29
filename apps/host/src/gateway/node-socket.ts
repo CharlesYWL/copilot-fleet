@@ -209,6 +209,7 @@ export function registerNodeGateway(
         version: inventory.version,
         revision: inventory.revision,
         capabilities: inventory.capabilities,
+        agentKinds: inventory.agentKinds ?? [],
         maxSessions: inventory.maxSessions,
         os: inventory.os,
         arch: inventory.arch,
