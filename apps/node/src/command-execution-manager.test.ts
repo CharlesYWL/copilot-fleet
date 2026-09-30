@@ -1,7 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import * as fsPromises from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   COMMAND_LIMITS,
@@ -51,7 +59,10 @@ async function fixture(
   clock: { now?: () => number; monotonic?: () => number } = {},
   negotiatedPermissions = true,
 ) {
-  const directory = resolve(`.command-manager-test-${randomUUID()}`);
+  // Long-form temp root: 8.3 short names would not match the canonical checkout path.
+  const directory = mkdtempSync(
+    join(realpathSync.native(tmpdir()), "fleet-command-manager-"),
+  );
   directories.push(directory);
   const cwd = join(directory, "checkout");
   mkdirSync(cwd, { recursive: true });
