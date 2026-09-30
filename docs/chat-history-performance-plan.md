@@ -21,6 +21,36 @@ achieve the browser latency targets.
 Raw events remain authoritative. Existing full-history APIs, agent context,
 orchestration semantics, and retention policy are not changed.
 
+### First-slice measurements
+
+Representative synthetic workload on Windows / Node 22.22.3, five warm-up and
+30 measured iterations. The initial runner exercised the baseline raw-history
+path at `b88e238`; the after run used the browser's new transcript path at
+`dc81015`. Both use 112,000 lead events, 5,600 lead blocks, and 312,000 total events.
+
+| Metric | Before | After |
+|---|---:|---:|
+| Browser-history payload, UTF-8 bytes | 28,211,687 | 22,646,384 |
+| Live text merge, P95 | 11.28 ms | 2.83 ms |
+| Twelve-line preview, P95 | 6.30 ms | 0.03 ms |
+| HTTP history response completion, P95 | 1,282.31 ms | 985.54 ms |
+| Concurrent lightweight request, P95 | 1,263.26 ms | 976.21 ms |
+| Text merge plus full block fold, P95 | 59.36 ms | 54.98 ms |
+
+The after run also measured the attempt-suffix alternatives on the same fixture:
+full read then filter was 840.10 ms P95 versus 78.59 ms for the indexed suffix
+reader. Compact permission hydration was 34.07 ms P95; ordinary text no longer
+runs the legacy all-history permission scan.
+
+These are observations, not browser paint results or a guaranteed speedup.
+Unchanged diagnostic operations varied too (the canonical full reader's P95
+was 884.37 ms before and 811.58 ms after), so do not attribute all timing variation
+to this diff. Payload reduction is deterministic; the remaining approximately
+one-second Host delay and full-fold cost show why later phases are still needed.
+Reports are generated under `dist\benchmarks`; use the documented commands to
+produce named before/after JSON reports rather than treating these figures as
+portable pass/fail thresholds.
+
 ## Why data-path fixes come first
 
 The supplied review reports 26 sessions with 312,934 events. Its largest lead
