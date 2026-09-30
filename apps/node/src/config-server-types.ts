@@ -12,7 +12,7 @@ import type {
   StartedSession,
   WorkspaceLike,
 } from "./fleet-client.js";
-import type { PickerResult } from "./pick-folder.js";
+import type { FolderListing } from "./pick-folder.js";
 import type { PathCheck } from "./path-check.js";
 import type { DiscoveredCopilotSession, SessionPreview } from "./copilot-sessions.js";
 import type { Settings } from "./settings.js";
@@ -84,7 +84,7 @@ export type ConfigServerOptions = {
   recentLogs?: () => LogEntry[];
   port?: number;
   fleet?: FleetApi;
-  pickFolder?: (start: string) => Promise<PickerResult>;
+  listFolders?: (path: string) => Promise<FolderListing>;
   inspectPath?: (path: string) => PathCheck;
   sessionDiscovery?: SessionDiscoveryApi;
   getCommandPermissions?: () => {

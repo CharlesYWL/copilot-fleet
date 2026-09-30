@@ -804,6 +804,45 @@ describe("config router", () => {
     });
   });
 
+  it("browses local folders without contacting the Host or opening a desktop dialog", async () => {
+    const listing = {
+      ok: true as const,
+      path: "/tmp",
+      parent: "/",
+      folders: [{ name: "fleet", path: "/tmp/fleet" }],
+      unavailableLinks: 0,
+    };
+    const listFolders = vi.fn(async () => listing);
+    const { route, fleet } = router({ listFolders });
+    expect(await route("POST", "/api/folders", JSON.stringify({ path: "/tmp" }))).toEqual(
+      {
+        status: 200,
+        body: listing,
+      },
+    );
+    expect(listFolders).toHaveBeenCalledWith("/tmp");
+    expect(fleet.listOwnPlacements).not.toHaveBeenCalled();
+    expect(fleet.createOwnPlacement).not.toHaveBeenCalled();
+    expect((await route("POST", "/api/pick-folder", "{}")).status).toBe(410);
+  });
+
+  it("validates folder-list requests and returns actionable filesystem errors", async () => {
+    const listFolders = vi.fn(async () => ({
+      ok: false as const,
+      reason: "Cannot read this folder: access denied",
+    }));
+    const { route } = router({ listFolders });
+    for (const body of ["{", "null", '{"path":123}', '{"path":"\\u0000"}']) {
+      expect((await route("POST", "/api/folders", body)).status).toBe(400);
+    }
+    expect(listFolders).not.toHaveBeenCalled();
+    expect(await route("POST", "/api/folders", "{}")).toEqual({
+      status: 400,
+      body: { error: "Cannot read this folder: access denied" },
+    });
+    expect(listFolders).toHaveBeenCalledWith("");
+  });
+
   it("refuses a placement path this machine cannot open", async () => {
     const { route, fleet } = router();
     const response = await route(

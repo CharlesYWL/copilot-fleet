@@ -344,6 +344,10 @@ of them on one Windows machine, or split Host and Node across machines.
    **Add placement** to choose the workspace, an online Node, and an absolute
    local path that already exists on that Node, such as `C:\code\checkout-service`
    or `/srv/checkout-service`.
+   On the Node's own config page, **Browse** opens an in-page folder chooser.
+   Use **Home**, **Up**, or enter a path to switch drives, then **Choose this folder**.
+   It lists folders on the Node without uploading files or opening a separate desktop
+   dialog, so it also works when the Node runs in the background.
 9. **Start a session.** Choose **New session**, pick **Where to run**, optionally
    set **Session name**, write the **Initial prompt**, and decide whether **YOLO
    mode** should ask before each tool or run with `--allow-all`. Keep YOLO off
