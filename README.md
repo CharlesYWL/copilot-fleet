@@ -1960,12 +1960,23 @@ the selected profile and are not synchronized across Nodes. Only one active
 Hermes orchestrator may use a given profile on a Node; do not use that profile
 in a separate Hermes process at the same time.
 
+An offline orchestrator or pending Stop still reserves its profile. If its Node
+will not reconnect, request **Stop**, verify independently that the old process
+has exited, then select **Mark stopped** on the conversation to release it.
+**Dismiss** only hides a stopped conversation; it never stops a process or
+bypasses the profile reservation. The same profile name on another Node is
+independent.
+
 Fleet prefers an online placement with the chosen agent. If no online Node
 holding the workspace has Hermes installed, a **new** lead falls back to Copilot
 with a transcript notice. An occupied profile, missing profile, authentication
 failure or other startup error is reported instead. An existing Hermes session
 never falls back on resume. Automatic native-session retention remains
 Copilot-only; manage Hermes history in its profile.
+
+If a stored preferred-agent setting is malformed, Fleet logs a warning and uses
+Auto (Copilot) for new orchestrators. Save the preference again under
+**Settings → Orchestrator** to repair it; existing sessions keep their own agent.
 
 1. Open **Orchestrator** in the sidebar and choose **Start orchestrator**. The
    button is enabled only when an online Node holds at least one workspace.

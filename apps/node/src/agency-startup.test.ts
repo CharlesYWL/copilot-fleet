@@ -521,6 +521,26 @@ describe("Hermes ACP startup", () => {
       sessionId: "acp-created",
       modelId: "model-b",
     });
+    const child = hermesLaunch().child as ChildProcessWithoutNullStreams;
+    child.stdout.push(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "acp-created",
+          update: { sessionUpdate: "current_mode_update", currentModeId: "accept_edits" },
+        },
+      })}\n`,
+    );
+    await expect
+      .poll(() => events.filter((event) => event.type === "config").at(-1)?.payload)
+      .toMatchObject({
+        options: [
+          { id: "model", currentValue: "model-b" },
+          { id: "mode", currentValue: "accept_edits" },
+        ],
+      });
+    expect(agent.busy).toBe(false);
     expect(
       requests.some((request) => request.method === "session/set_config_option"),
     ).toBe(false);

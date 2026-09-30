@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance, InjectOptions } from "fastify";
 import {
   CHATS_WORKSPACE_ID,
   DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
 } from "@fleet/protocol";
 import { buildServer } from "./server.js";
+import { FleetStore } from "./store.js";
 
 const OPERATOR_PASSWORD = "test-password";
 
@@ -193,6 +194,25 @@ describe("host routes", () => {
         })
       ).json(),
     ).toMatchObject({ orchestratorAgent: null });
+  });
+
+  it("keeps defaults readable and logs a warning for a corrupted persisted agent preference", async () => {
+    const getSetting = FleetStore.prototype.getSetting;
+    const stored = vi
+      .spyOn(FleetStore.prototype, "getSetting")
+      .mockImplementation(function (this: FleetStore, key) {
+        return key === "orchestrator.agent" ? "{corrupt" : getSetting.call(this, key);
+      });
+    const warn = vi.spyOn(app.log, "warn");
+    try {
+      const response = await inject({ method: "GET", url: "/api/defaults" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ orchestratorAgent: null });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("using Auto (Copilot)"));
+    } finally {
+      stored.mockRestore();
+      warn.mockRestore();
+    }
   });
 
   it("reports health and an empty snapshot", async () => {

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   canTransition,
   CHATS_WORKSPACE_ID,
@@ -70,6 +70,34 @@ function notificationInput(
 }
 
 describe("FleetStore", () => {
+  it.each([
+    "{broken",
+    "null",
+    "42",
+    JSON.stringify({ kind: "future-agent" }),
+    JSON.stringify({ kind: "hermes" }),
+    JSON.stringify({ kind: "hermes", profile: "../personal" }),
+  ])("uses Auto and warns on an invalid stored orchestrator preference: %s", (value) => {
+    const warn = vi.fn();
+    const store = new FleetStore(":memory:", { warn });
+    stores.push(store);
+    expect(store.getOrchestratorAgent()).toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+    store.setSetting("orchestrator.agent", value);
+    expect(store.getOrchestratorAgent()).toBeUndefined();
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining(
+        "Invalid stored orchestrator agent preference; using Auto (Copilot)",
+      ),
+    );
+    expect(store.getSetting("orchestrator.agent")).toBe(value);
+    store.setOrchestratorAgent({ kind: "hermes", profile: "repaired" });
+    expect(store.getOrchestratorAgent()).toEqual({ kind: "hermes", profile: "repaired" });
+    store.setOrchestratorAgent(null);
+    expect(store.getOrchestratorAgent()).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["completed", "failed", "cancelled"] as const)(
     "does not admit ordinary review from a %s task",
     (state) => {

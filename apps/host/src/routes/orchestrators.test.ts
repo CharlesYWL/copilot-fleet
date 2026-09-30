@@ -243,7 +243,7 @@ describe("orchestrator lifecycle routes", () => {
     expect(commands.at(-1)).toMatchObject({
       type: "start_session",
       agentParams: { kind: "copilot" },
-      startupNotice: expect.stringContaining("Started with Copilot"),
+      startupNotice: `Preferred agent Hermes is unavailable on the online Nodes holding this workspace. Started with Copilot on ${session.nodeName}.`,
     });
     const worker = service.createAndStartSession({
       placement: store.getPlacement(session.placementId)!,
@@ -261,6 +261,92 @@ describe("orchestrator lifecycle routes", () => {
         agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
       }),
     ).toMatchObject({ ok: false, status: 400 });
+  });
+
+  it("creates a Copilot orchestrator when a stored preference cannot be parsed", async () => {
+    const { app, store, leadId } = await setup();
+    store.setSetting("orchestrator.agent", "{invalid");
+    const warning = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const response = await app.inject({
+        method: "POST",
+        url: "/api/orchestrators",
+        payload: { workspaceId: store.getSession(leadId)!.workspaceId },
+      });
+      expect(response.statusCode).toBe(201);
+      expect(response.json<{ session: FleetSession }>().session.agentParams).toEqual({
+        kind: "copilot",
+      });
+      expect(warning).toHaveBeenCalledWith(
+        expect.stringContaining("using Auto (Copilot)"),
+      );
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it("releases an offline Hermes profile through confirmed Stop, not by hiding a possibly live process", async () => {
+    const { app, store, service, leadId, addNode } = await setup();
+    const placement = store.getPlacement(store.getSession(leadId)!.placementId)!;
+    store.setNodeIdentity(placement.nodeId, {
+      capabilities: ["copilot-acp", "host-yolo", "agent-kinds"],
+      agentKinds: [{ kind: "copilot" }, { kind: "hermes" }],
+    });
+    const node = store.getNode(placement.nodeId)!;
+    const params = { kind: "hermes", profile: "fleet-orchestrator" } as const;
+    const lead = store.createSession(placement, "Plan", true, "Hermes", {
+      runRole: "lead",
+      agentParams: params,
+      readOnly: true,
+    });
+    store.transitionSession(lead.id, "starting");
+    store.transitionSession(lead.id, "idle");
+    expect(
+      (await app.inject({ method: "DELETE", url: `/api/orchestrators/${lead.id}` }))
+        .statusCode,
+    ).toBe(409);
+    expect(
+      (await app.inject({ method: "POST", url: `/api/orchestrators/${lead.id}/stop` }))
+        .statusCode,
+    ).toBe(202);
+    expect(service.agentLaunchProblem(node, params)).toContain("already belongs");
+    service.disconnectNode(node.id, "Node unavailable");
+    expect(store.getSession(lead.id)).toMatchObject({
+      state: "offline",
+      stopRequested: true,
+    });
+    expect(service.agentLaunchProblem(node, params)).toContain("Mark stopped");
+    expect(
+      (await app.inject({ method: "DELETE", url: `/api/orchestrators/${lead.id}` }))
+        .statusCode,
+    ).toBe(409);
+    const anotherNode = addNode("another-hermes-node");
+    store.setNodeIdentity(anotherNode.id, {
+      capabilities: ["copilot-acp", "host-yolo", "agent-kinds"],
+      agentKinds: [{ kind: "hermes" }],
+    });
+    expect(
+      service.agentLaunchProblem(store.getNode(anotherNode.id)!, params),
+    ).toBeUndefined();
+
+    const confirmed = await app.inject({
+      method: "POST",
+      url: `/api/orchestrators/${lead.id}/stop`,
+    });
+    expect(confirmed.json()).toMatchObject({ confirmedStopped: true });
+    expect(store.getSession(lead.id)).toMatchObject({
+      state: "stopped",
+      stopRequested: false,
+    });
+    expect(service.agentLaunchProblem(node, params)).toBeUndefined();
+    expect(
+      (await app.inject({ method: "DELETE", url: `/api/orchestrators/${lead.id}` }))
+        .statusCode,
+    ).toBe(200);
+    expect(store.getSession(lead.id)?.dismissed).toBe(true);
+    expect(service.agentLaunchProblem(node, params)).toBeUndefined();
+    store.deleteSession(lead.id);
+    expect(service.agentLaunchProblem(node, params)).toBeUndefined();
   });
 
   it("gates context changes on an idle session with a context picker", async () => {

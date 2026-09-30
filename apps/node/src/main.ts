@@ -82,7 +82,12 @@ import {
   type TunnelMode,
 } from "./host-endpoints.js";
 import { envFilePath, packageVersion } from "./paths.js";
-import { catalogSummary, readAgentCatalog, userAgentDirectory } from "./agent-catalog.js";
+import {
+  catalogSummary,
+  readAgentCatalog,
+  userAgentDirectory,
+  type CatalogEntry,
+} from "./agent-catalog.js";
 import {
   AUTH_FAILED_CLOSE_CODE,
   SUPERSEDED_CLOSE_CODE,
@@ -291,15 +296,18 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /**
    * Read fresh on every use rather than cached at startup, so an operator who
    * drops an agent into the config directory does not have to restart the Node
-   * to offer it. A handful of small files is not worth a cache.
+   * to offer it. Only reuse the last successful snapshot when a read fails.
    */
+  let lastAgentCatalog: CatalogEntry[] = [];
   const agentCatalog = async () => {
     try {
-      return await readAgentCatalog();
+      lastAgentCatalog = await readAgentCatalog();
     } catch (error) {
-      warn(`Could not read the agent catalog: ${errorMessage(error)}`);
-      return [];
+      warn(
+        `Could not read the agent catalog; keeping the last known catalog: ${errorMessage(error)}`,
+      );
     }
+    return lastAgentCatalog;
   };
   const catalogAtStartup = await agentCatalog();
   /** What the Host is told this machine can be; refreshed on every dial. */

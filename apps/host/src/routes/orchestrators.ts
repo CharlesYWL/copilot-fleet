@@ -14,6 +14,7 @@ import {
   parsePrMaintenanceUrl,
   prMaintenanceUrl,
   type PrMaintenanceRegistration,
+  agentKindLabels,
   supportsAgentKind,
   type AgentParams,
 } from "@fleet/protocol";
@@ -542,7 +543,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       agentParams,
       ...(preferred.kind !== agentParams.kind
         ? {
-            startupNotice: `Preferred agent Hermes is unavailable on the online Nodes holding this workspace. Started with Copilot on ${store.getNode(placement.nodeId)!.name}.`,
+            startupNotice: `Preferred agent ${agentKindLabels[preferred.kind]} is unavailable on the online Nodes holding this workspace. Started with ${agentKindLabels[agentParams.kind]} on ${store.getNode(placement.nodeId)!.name}.`,
           }
         : {}),
       /*

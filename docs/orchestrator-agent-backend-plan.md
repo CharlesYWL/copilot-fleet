@@ -79,6 +79,9 @@ and is configured.
   complete JSON in `sessions.agent_params`. Legacy rows retain Copilot behavior.
 - Fleet defaults use `orchestratorAgent`; `null` resets Auto. The preference is
   separate from session identity and travels in Host backups.
+  Invalid persisted preferences log a warning and read as Auto until repaired
+  in Settings. The stored value is retained; request validation and each
+  session's actual backend remain strict.
 - `nodes.agent_kinds` stores the latest discovery result and refreshes on hello.
 - Context snapshots can identify `source: "acp"` and omit an unreported model.
   Missing metrics are never replaced with zero, a catalog limit, or another
@@ -123,6 +126,9 @@ The Hermes adapter:
 Discovery reports installation, not profile readiness. Missing installations
 are not cached. The Node refreshes discovery before announcing each connection;
 after changing PATH, restart the Node.
+If a custom-agent catalog read rejects, it logs a warning and retains the last
+successful catalog (empty before the first successful read). A successful empty
+read replaces it, so removed agents do not persist indefinitely.
 
 The router reserves a Hermes profile before awaiting startup. It also counts
 slots awaiting process reconciliation, refuses identity/profile changes on a
@@ -142,6 +148,15 @@ Explicit resume and automatic reconnect use the stored selection, never the
 current default. A missing backend blocks resume with an actionable message.
 Host backup/restore retains both the preference and the independent actual
 selection for every session.
+
+An offline session or pending Stop still holds its Hermes profile because loss
+of connectivity is not proof that its process exited. Request **Stop** first;
+if the Node cannot return, independently verify that the old process has stopped
+and then select **Mark stopped** on that conversation. This existing confirmation
+clears the pending Stop and releases the profile. Dismissal is visibility-only
+and is allowed only after the conversation stops; it must not bypass ownership
+of a possibly running process. The reservation is Node-local, so it does not
+block the same profile name on another Node.
 
 Workers still use the existing Copilot path, including Agency, model/effort
 defaults, context settings and permission behavior.
@@ -206,6 +221,9 @@ Copilot's deletion API. Session downloads retain workspace access, but only
 Copilot IDs grant access to Copilot native state directories.
 Per-worker agent selection, automatic profile creation,
 cross-Node memory synchronization and additional agent kinds are out of scope.
+Successful Hermes preflight caching and per-Node version display remain optional
+follow-ups. For now, a fresh `acp --check` on each launch catches a removed or
+reconfigured profile and repaired dependencies without cache invalidation rules.
 
 Reference: Hermes ACP and profile contracts were checked against the installed
 v0.21.5 CLI and upstream revision

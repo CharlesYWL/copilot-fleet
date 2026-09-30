@@ -151,6 +151,7 @@ export async function buildServer(
   const databasePath =
     options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH);
   const store = new FleetStore(databasePath, {
+    warn: (message) => app.log.warn(message),
     exclusive: options.resetOperatorAuth === true,
     // The Host database holds this Host's private key and its administrator
     // table, so what the filesystem says about it is part of the security

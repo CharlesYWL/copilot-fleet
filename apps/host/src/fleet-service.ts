@@ -800,7 +800,7 @@ export class FleetService {
               session.stopRequested),
         )
     ) {
-      return `Hermes profile "${params.profile}" already belongs to an active orchestrator on ${node.name}. Stop it before starting another, or select a different profile.`;
+      return `Hermes profile "${params.profile}" already belongs to an active orchestrator on ${node.name}. Stop it before starting another, or select a different profile. If its Node is unavailable, verify the old process has stopped, then use Mark stopped on that conversation. Dismissal alone does not stop a process.`;
     }
     return undefined;
   }

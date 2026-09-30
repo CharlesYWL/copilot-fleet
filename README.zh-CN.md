@@ -1434,9 +1434,17 @@ hermes -p fleet-orchestrator acp --check
 保留在该 Node 的 profile 内，不跨 Node 同步。同一 Node 的同一 profile 同时只能有一个
 活动的 Hermes 编排器，也不要让外部 Hermes 进程同时使用它。
 
+离线或等待 Stop 确认的编排器仍占用该 Node 的 profile。若 Node 不再上线，先请求
+**Stop**，独立确认旧进程已退出后，在会话中选择 **Mark stopped** 释放占用。
+**Dismiss** 仅隐藏已停止的会话，不会停止进程或绕过 profile 占用；其他 Node 上的
+同名 profile 不受影响。
+
 若持有目标 workspace 的在线 Node 均未安装 Hermes，新编排器会回退到 Copilot，并记录
 系统消息；profile 占用、配置或认证错误会明确报错，不会切换代理。已有 Hermes 会话恢复时
 绝不回退。自动原生会话清理仍仅适用于 Copilot，Hermes 历史请在其 profile 中管理。
+
+若持久化的首选代理设置损坏，Fleet 会记录警告，并对新编排器使用 Auto（Copilot）。
+在 **Settings → Orchestrator** 中重新保存设置即可修复；已有会话保持自己的代理。
 
 1. 在侧边栏打开 **Orchestrator**，点击 **Start orchestrator**。只有当在线 Node 持有至少
    一个 workspace 时按钮才可用。lead 会从一个可达 placement 启动，以无人值守方式运行以便

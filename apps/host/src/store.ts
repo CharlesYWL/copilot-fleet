@@ -478,11 +478,17 @@ export class FleetStore {
    * connection does.
    */
   private readonly statements = new Map<string, StatementSync>();
+  private readonly warn: (message: string) => void;
 
   constructor(
     path: string,
-    options: { secureFiles?: SecureFiles; exclusive?: boolean } = {},
+    options: {
+      secureFiles?: SecureFiles;
+      exclusive?: boolean;
+      warn?: (message: string) => void;
+    } = {},
   ) {
+    this.warn = options.warn ?? ((message) => process.stderr.write(`${message}\n`));
     this.artifactDirectory =
       path === ":memory:"
         ? join(process.cwd(), ".mwi-test-work", "host-artifacts", randomUUID())
@@ -1980,7 +1986,14 @@ export class FleetStore {
 
   getOrchestratorAgent(): AgentParams | undefined {
     const value = this.getSetting("orchestrator.agent");
-    return value ? AgentParamsSchema.parse(JSON.parse(value)) : undefined;
+    if (!value) return undefined;
+    const json = tryParseJson(value);
+    const parsed = AgentParamsSchema.safeParse(json.ok ? json.value : undefined);
+    if (parsed.success) return parsed.data;
+    this.warn(
+      "Invalid stored orchestrator agent preference; using Auto (Copilot). Select and save the preferred agent in Settings > Orchestrator to repair it.",
+    );
+    return undefined;
   }
 
   setOrchestratorAgent(params: AgentParams | null): void {
