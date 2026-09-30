@@ -11,6 +11,7 @@ import type { NodeUpdateProgress } from "../hooks/useFleet";
 import { SettingsActivityContext } from "../hooks/useSettingsActivity";
 import { NodesPanel } from "./NodesPanel";
 import { GeneralPanel } from "./GeneralPanel";
+import { OrchestratorPanel } from "./OrchestratorPanel";
 import { DiagnosticsPanel } from "./DiagnosticsPanel";
 import { SecurityPanel } from "./SecurityPanel";
 import { TunnelPanel } from "./TunnelPanel";
@@ -43,10 +44,17 @@ const useStyles = makeStyles({
 });
 
 export type SettingsTab =
-  "general" | "security" | "tunnel" | "nodes" | "workspaces" | "diagnostics";
+  | "general"
+  | "orchestrator"
+  | "security"
+  | "tunnel"
+  | "nodes"
+  | "workspaces"
+  | "diagnostics";
 
 const sections: readonly { value: SettingsTab; label: string }[] = [
   { value: "general", label: "General" },
+  { value: "orchestrator", label: "Orchestrator" },
   { value: "security", label: "Security" },
   { value: "tunnel", label: "Tunnel" },
   { value: "nodes", label: "Nodes" },
@@ -92,6 +100,7 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
   };
 
   const panels: Record<SettingsTab, ReactNode> = {
+    orchestrator: <OrchestratorPanel nodes={props.nodes} />,
     general: (
       <GeneralPanel
         sessions={props.sessions}

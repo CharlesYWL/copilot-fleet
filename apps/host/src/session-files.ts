@@ -216,7 +216,10 @@ export class SessionFileService {
         ),
         protectedRoots: store.dataDirectory ? [store.dataDirectory] : [],
         agentSessionId:
-          session.agentSessionId.length <= 128 ? session.agentSessionId : "",
+          (session.agentParams?.kind ?? "copilot") === "copilot" &&
+          session.agentSessionId.length <= 128
+            ? session.agentSessionId
+            : "",
         coordinator: session.runRole === "lead",
       },
     };

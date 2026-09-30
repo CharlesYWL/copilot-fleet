@@ -42,6 +42,24 @@ const placement: Placement = {
 };
 
 describe("localResume", () => {
+  it.each(["win32", "linux"])(
+    "keeps Hermes's profile and native ID in %s recovery commands",
+    (os) => {
+      const result = localResume(
+        {
+          ...session,
+          agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+        },
+        { ...node, os },
+        placement,
+      );
+      expect(result.command).toContain(
+        "hermes -p 'fleet-orchestrator' --resume 'native-id' --no-restore-cwd",
+      );
+      expect(result.command).not.toContain("copilot --resume");
+    },
+  );
+
   it.each(["win32", "linux", "darwin"])(
     "uses the pinned execution directory on %s, even without its source placement",
     (os) => {

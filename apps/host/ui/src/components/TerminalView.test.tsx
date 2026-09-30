@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { ComponentProps } from "react";
 import type { FleetSession, SessionEvent } from "@fleet/protocol";
@@ -86,6 +86,22 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
+  it.each(["idle", "running"] as const)(
+    "identifies Hermes and only enables its model picker when idle: %s",
+    (state) => {
+      show({
+        state,
+        runRole: "lead",
+        agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+      });
+      expect(screen.getByText("Hermes")).toBeTruthy();
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", { name: "Model settings" })
+          .disabled,
+      ).toBe(state !== "idle");
+    },
+  );
+
   it.each([false, true])(
     "only clears a draft after the Host accepts it: %s",
     async (accepted) => {
@@ -263,8 +279,9 @@ describe("TerminalView composer", () => {
     expect(button.disabled).toBe(true);
     fireEvent.click(button);
     expect(onPrompt).not.toHaveBeenCalled();
-    expect(screen.getByText("\u2014")).toBeTruthy();
-    expect(screen.getByText("Usage unavailable")).toBeTruthy();
+    const usage = screen.getByRole("group", { name: "Session usage" });
+    expect(within(usage).getByText("?")).toBeTruthy();
+    expect(within(usage).getByText("? (Usage unavailable)")).toBeTruthy();
   });
 
   it("adds attachment read errors to notifications and keeps the inline error", async () => {

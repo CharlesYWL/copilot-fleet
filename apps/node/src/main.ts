@@ -40,6 +40,7 @@ import {
 } from "@fleet/protocol/runtime";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
 import { ACP_START_TIMEOUT_MS, AcpAgentFactory, MockAgentFactory } from "./agents.js";
+import { detectAgentKinds } from "./agent-kinds/index.js";
 import { CliError, USAGE, argvForRestart, parseNodeArgs } from "./cli.js";
 import {
   configDirectory,
@@ -81,7 +82,12 @@ import {
   type TunnelMode,
 } from "./host-endpoints.js";
 import { envFilePath, packageVersion } from "./paths.js";
-import { catalogSummary, readAgentCatalog, userAgentDirectory } from "./agent-catalog.js";
+import {
+  catalogSummary,
+  readAgentCatalog,
+  userAgentDirectory,
+  type CatalogEntry,
+} from "./agent-catalog.js";
 import {
   AUTH_FAILED_CLOSE_CODE,
   SUPERSEDED_CLOSE_CODE,
@@ -290,19 +296,32 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /**
    * Read fresh on every use rather than cached at startup, so an operator who
    * drops an agent into the config directory does not have to restart the Node
-   * to offer it. A handful of small files is not worth a cache.
+   * to offer it. Only reuse the last successful snapshot when a read fails.
    */
+  let lastAgentCatalog: CatalogEntry[] = [];
   const agentCatalog = async () => {
     try {
-      return await readAgentCatalog();
+      lastAgentCatalog = await readAgentCatalog();
     } catch (error) {
-      warn(`Could not read the agent catalog: ${errorMessage(error)}`);
-      return [];
+      warn(
+        `Could not read the agent catalog; keeping the last known catalog: ${errorMessage(error)}`,
+      );
     }
+    return lastAgentCatalog;
   };
   const catalogAtStartup = await agentCatalog();
   /** What the Host is told this machine can be; refreshed on every dial. */
   let advertisedAgents = catalogSummary(catalogAtStartup);
+  const readAgentKinds = async () => {
+    if (mockAgent) return [{ kind: "copilot" as const }];
+    try {
+      return await detectAgentKinds();
+    } catch (error) {
+      warn(`Could not detect agent backends: ${errorMessage(error)}`);
+      return [{ kind: "copilot" as const }];
+    }
+  };
+  let advertisedAgentKinds = await readAgentKinds();
   log(
     `  agents      ${
       catalogAtStartup.length === 0
@@ -1180,9 +1199,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     log(`Connecting to ${url}`);
     // Re-read before announcing rather than at startup, so an agent dropped in
     // while this node was disconnected is offered as soon as it reconnects.
-    void agentCatalog().then((entries) => {
-      advertisedAgents = catalogSummary(entries);
-    });
+    const refreshedCatalog = Promise.all([agentCatalog(), readAgentKinds()]).then(
+      ([entries, kinds]) => {
+        advertisedAgents = catalogSummary(entries);
+        advertisedAgentKinds = kinds;
+      },
+    );
     // Bounded, because an unanswered dial is the one failure this loop cannot
     // see: a dev tunnel whose relay is gone still accepts the connection, and
     // without a deadline the node waits on it for the operating system's whole
@@ -1254,6 +1276,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         ],
         ...(session ? { commandExecution: commands.readiness } : {}),
         agents: advertisedAgents,
+        agentKinds: advertisedAgentKinds,
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
         name: settings.nodeName,
@@ -1279,7 +1302,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       };
     };
 
-    active.on("open", () => {
+    active.on("open", async () => {
       stopLiveness = watchHostLiveness(active, {
         onDead: (silentMs) => {
           if (socket === active) router.setMcpAvailable(false);
@@ -1295,6 +1318,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         return;
       }
       if (auth.authProtocol !== "legacy-secret") return;
+      await refreshedCatalog;
+      if (socket !== active || shuttingDown || active.readyState !== WebSocket.OPEN)
+        return;
       sendOn(active, {
         type: "hello",
         nodeId: auth.nodeId,
@@ -1327,6 +1353,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         }
         channel = opened.channel;
         active.send(JSON.stringify(opened.proof));
+        await refreshedCatalog;
+        if (socket !== active || shuttingDown || active.readyState !== WebSocket.OPEN)
+          return;
         send({ type: "ready", ...inventory() });
         return;
       }

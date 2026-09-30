@@ -5,7 +5,7 @@
 Copilot Fleet is a self-hosted control plane for supervising GitHub Copilot CLI
 agents on multiple machines. The Host combines a Fastify API, WebSocket hub,
 SQLite database, and React UI. Each Node makes one outbound connection and owns
-an isolated ACP client and Copilot process per live session.
+an isolated ACP client and agent process per live session.
 
 ## What it looks like
 
@@ -410,7 +410,7 @@ Update the Fleet Host and Nodes to a version with this setting before using it.
 
 Each Node looks for `agency` on its own `PATH` and launches
 `agency copilot --acp --stdio` instead of plain `copilot`. This applies to new
-and resumed sessions, including Chats, orchestrators, workers, adopted
+and resumed Copilot sessions, including Chats, Copilot orchestrators, workers, adopted
 conversations, and automatic recovery. Existing running sessions are left alone;
 stop and resume them to switch launchers. Turning the setting off uses standard
 Copilot again on the next launch.
@@ -1131,8 +1131,8 @@ choices. **Mode** remains separate where the operator controls it; a custom agen
 remains beside the session title. Model and effort can change while work is running;
 context changes require an idle session.
 
-New sessions request
-`--context long_context` by default, including Chats, orchestrators, workers, and
+New Copilot sessions request
+`--context long_context` by default, including Chats, Copilot orchestrators, workers, and
 reviewers. Turn **Settings → General → Long context by default** off to use
 `--context default` instead. A session's own selection survives stop/resume and
 automatic recovery. The Host default takes precedence over the node-local context
@@ -1162,7 +1162,7 @@ These local status commands do not ask the model to answer. Values rounded by th
 CLI are marked as estimates, its percentage is retained, and the popover shows the
 report's model and timestamp. Restarting or changing models invalidates old readings.
 
-ACP `usage_update.size` is an **input/prompt budget**, not the full model window:
+Copilot's ACP `usage_update.size` is an **input/prompt budget**, not the full model window:
 for example, 272k input plus a 128k output reserve gives the 400k `/context` window.
 Its used-token count is also an earlier snapshot, often before the response.
 Those readings are labeled separately rather than mixed into the ring's full-window
@@ -1175,6 +1175,11 @@ unavailable, not zero. The latest readings persist across browser/Host reloads,
 resume, and backup/restore. No account-wide quota or budget is shown.
 If request-size recovery replaces the underlying Copilot conversation, the
 usage readout resets to that new conversation rather than retaining old metrics.
+
+Hermes orchestrators instead use their profile's model settings and ACP-reported
+context estimates. The usage popover identifies the agent and reporting source.
+Hermes does not use Copilot's context-tier flags, `/context` parser or billing
+files; unreported credits and other missing metrics display `?`, never zero.
 
 **Compact** in the popover sends the agent's `/compact` command when it is offered and the session
 is idle. It summarizes the live context without clearing the saved transcript or
@@ -1957,6 +1962,47 @@ It is still a normal session on a Node, but the Host gives it scoped tools for
 planning tasks, dispatching workers, waking itself after worker results, and
 recording the handoff for you to review.
 
+**Choose the lead's agent in Settings → Orchestrator → Preferred agent.**
+Auto always means Copilot; Hermes appears when a Node reports it installed.
+The preference applies only to new orchestrators. Existing conversations keep
+their actual agent and profile through stop/resume and restarts, and workers
+continue using Copilot. General's model, effort, context and Agency defaults
+apply to Copilot, not Hermes.
+
+For Hermes, configure a dedicated profile on each Node that will run it, as the
+same OS user that runs the Node:
+
+```powershell
+hermes profile create fleet-orchestrator --no-alias
+hermes -p fleet-orchestrator acp --setup
+hermes -p fleet-orchestrator acp --check
+```
+
+Skip creation if the profile exists. Setup is interactive; `--check` verifies
+ACP dependencies, not a successful model request. Fleet never creates profiles
+or copies credentials. Memory, skills, identity and native history belong to
+the selected profile and are not synchronized across Nodes. Only one active
+Hermes orchestrator may use a given profile on a Node; do not use that profile
+in a separate Hermes process at the same time.
+
+An offline orchestrator or pending Stop still reserves its profile. If its Node
+will not reconnect, request **Stop**, verify independently that the old process
+has exited, then select **Mark stopped** on the conversation to release it.
+**Dismiss** only hides a stopped conversation; it never stops a process or
+bypasses the profile reservation. The same profile name on another Node is
+independent.
+
+Fleet prefers an online placement with the chosen agent. If no online Node
+holding the workspace has Hermes installed, a **new** lead falls back to Copilot
+with a transcript notice. An occupied profile, missing profile, authentication
+failure or other startup error is reported instead. An existing Hermes session
+never falls back on resume. Automatic native-session retention remains
+Copilot-only; manage Hermes history in its profile.
+
+If a stored preferred-agent setting is malformed, Fleet logs a warning and uses
+Auto (Copilot) for new orchestrators. Save the preference again under
+**Settings → Orchestrator** to repair it; existing sessions keep their own agent.
+
 1. Open **Orchestrator** in the sidebar and choose **Start orchestrator**. The
    button is enabled only when an online Node holds at least one workspace.
    The lead starts on one reachable placement, runs unattended so it can wake
@@ -2004,7 +2050,7 @@ recording the handoff for you to review.
    while a command the previous lead requested for the task has not settled.
 
 While a lead is idle with open tasks or maintained PRs, the Host sends it a
-read-only **status check** at the times named in **Settings → General →
+read-only **status check** at the times named in **Settings → Orchestrator →
 Orchestrator heartbeat**: standard five-field cron in the Host's local time,
 with several expressions separated by `;`. The default,
 `0 9-18 * * 1-5; 0 */2 * * *`, checks hourly from 09:00 to 18:00 on weekdays and

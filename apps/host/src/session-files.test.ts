@@ -13,6 +13,7 @@ import {
   NodeToHostMessageSchema,
   SESSION_FILES_CAPABILITY,
   SESSION_FILE_CHUNK_BYTES,
+  type AgentParams,
   type SessionFileReadRequest,
   type SessionFileReadResult,
 } from "@fleet/protocol";
@@ -43,7 +44,12 @@ type Answer = (request: SessionFileReadRequest) => Promise<SessionFileReadResult
  * reader answers it, and the answer comes back sealed.
  */
 async function fixture(
-  options: { capabilities?: string[]; sealed?: boolean; online?: boolean } = {},
+  options: {
+    capabilities?: string[];
+    sealed?: boolean;
+    online?: boolean;
+    agentParams?: AgentParams;
+  } = {},
 ) {
   const root = await mkdtemp(join(tmpdir(), "fleet-session-files-host-"));
   const workspace = join(root, "workspace");
@@ -87,7 +93,9 @@ async function fixture(
   }).node;
   const project = store.createWorkspace("files-fixture", "");
   const placement = store.createPlacement(project.id, node.id, workspace);
-  const session = store.createSession(placement, "Write the report");
+  const session = store.createSession(placement, "Write the report", false, "", {
+    ...(options.agentParams ? { agentParams: options.agentParams, runRole: "lead" } : {}),
+  });
 
   const reader = new SessionFileReader();
   let answer: Answer = (request) => reader.read(request);
@@ -167,6 +175,29 @@ async function fixture(
 }
 
 describe("session file downloads", () => {
+  it.each(["copilot", "hermes"] as const)(
+    "only grants Copilot native state for Copilot sessions: %s",
+    async (kind) => {
+      const { store, session, workspace, get, reads } = await fixture({
+        agentParams:
+          kind === "hermes" ? { kind, profile: "fleet-orchestrator" } : { kind },
+      });
+      const nativeId = randomUUID();
+      store.appendEvent({
+        eventId: randomUUID(),
+        sessionId: session.id,
+        sequence: 1,
+        type: "agent_session",
+        payload: { agentSessionId: nativeId },
+        createdAt: new Date().toISOString(),
+      });
+      await writeFile(join(workspace, "docs", "report.txt"), "report");
+      expect((await get("stat", "docs/report.txt")).statusCode).toBe(200);
+      expect(reads.at(-1)?.agentSessionId).toBe(kind === "copilot" ? nativeId : "");
+      expect(reads.at(-1)?.roots).toEqual([workspace]);
+    },
+  );
+
   it("describes and streams a file from the session's machine, chunk by chunk", async () => {
     const { get, workspace, reads } = await fixture();
     const bytes = randomBytes(SESSION_FILE_CHUNK_BYTES * 2 + 1234);

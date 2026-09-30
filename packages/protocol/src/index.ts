@@ -158,6 +158,46 @@ export const NodeAgentSchema = z.object({
 });
 export type NodeAgent = z.infer<typeof NodeAgentSchema>;
 
+export const AGENT_KINDS_CAPABILITY = "agent-kinds";
+export const DEFAULT_HERMES_PROFILE = "fleet-orchestrator";
+export const AgentKindSchema = z.enum(["copilot", "hermes"]);
+export type AgentKind = z.infer<typeof AgentKindSchema>;
+export const agentKindLabels: Record<AgentKind, string> = {
+  copilot: "Copilot",
+  hermes: "Hermes",
+};
+export const HermesProfileSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, "Use a lowercase profile name, not a path");
+export const AgentParamsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("copilot") }).strict(),
+  z.object({ kind: z.literal("hermes"), profile: HermesProfileSchema }).strict(),
+]);
+export type AgentParams = z.infer<typeof AgentParamsSchema>;
+export const DetectedAgentSchema = z.object({
+  // Newer Nodes may advertise kinds this Host cannot launch yet.
+  kind: z.string().min(1).max(40),
+  version: z.string().max(100).optional(),
+});
+export type DetectedAgent = z.infer<typeof DetectedAgentSchema>;
+
+export function supportsAgentKind(
+  node: {
+    capabilities: readonly string[];
+    agentKinds?: readonly DetectedAgent[] | undefined;
+  },
+  kind: AgentKind,
+): boolean {
+  return (
+    kind === "copilot" ||
+    (node.capabilities.includes(AGENT_KINDS_CAPABILITY) &&
+      (node.agentKinds?.some((agent) => agent.kind === kind) ?? false))
+  );
+}
+
 const resourceBytes = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const capacitySampleShape = {
   sampledAt: z.string().datetime(),
@@ -207,6 +247,7 @@ export const NodeSchema = z.object({
    * none" rather than failing to register.
    */
   agents: z.array(NodeAgentSchema).default([]),
+  agentKinds: z.array(DetectedAgentSchema).optional(),
   maxSessions: z.number().int().positive(),
   activeSessions: z.number().int().nonnegative(),
   lastHeartbeat: z.string().datetime(),
@@ -350,12 +391,14 @@ export type ContextTier = z.infer<typeof ContextTierSchema>;
 export const CONTEXT_TIER_CONFIG_ID = "fleet_context_tier";
 
 export const ContextUsageSchema = z.object({
-  model: z.string().min(1),
+  model: z.string().min(1).optional(),
   usedTokens: z.number().nonnegative(),
   tokenLimit: z.number().positive(),
   percentage: z.number().nonnegative(),
   updatedAt: z.string().datetime(),
   estimated: z.boolean(),
+  /** Absent on older Copilot /context snapshots. */
+  source: z.enum(["copilot-context", "acp"]).optional(),
 });
 export type ContextUsage = z.infer<typeof ContextUsageSchema>;
 
@@ -434,11 +477,13 @@ export const SessionSchema = z.object({
   lastActivityAt: z.string().datetime().optional(),
   /** A durable deletion request is awaiting the owning Node's confirmation. */
   cleanupRequested: z.boolean().optional(),
-  /** Copilot's own ACP session id, needed to resume the conversation. */
+  /** The agent's native ACP session id, interpreted together with agentParams. */
   agentSessionId: z.string().default(""),
+  /** Actual backend and profile; absent on legacy Copilot sessions. Never a preference. */
+  agentParams: AgentParamsSchema.optional(),
   /** Additional workspace roots that ACP must restore with this session. */
   additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).optional(),
-  /** Runs Copilot with --allow-all: no permission prompts for this session. */
+  /** Requests unattended permissions using the backend's YOLO strategy. */
   yolo: z.boolean().default(false),
   /**
    * The slash commands and pickers this session's agent currently offers.
@@ -777,6 +822,8 @@ export type StartupConfig = z.infer<typeof StartupConfigSchema>;
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start_session"),
+    agentParams: AgentParamsSchema.optional(),
+    startupNotice: z.string().max(500).optional(),
     executionBinding: ExecutionBindingSchema.optional(),
     sourcePlacementId: z.string().optional(),
     coordinator: z.boolean().optional(),
@@ -820,6 +867,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("resume_session"),
+    agentParams: AgentParamsSchema.optional(),
     executionBinding: ExecutionBindingSchema.optional(),
     sourcePlacementId: z.string().optional(),
     commandId: z.string().min(1),
@@ -885,6 +933,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("delete_session"),
+    agentParams: AgentParamsSchema.optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     agentSessionId: z.string(),
@@ -954,6 +1003,7 @@ const nodeInventoryShape = {
   capabilities: z.array(z.string()),
   commandExecution: CommandReadinessSchema.optional(),
   agents: z.array(NodeAgentSchema).default([]),
+  agentKinds: z.array(DetectedAgentSchema).optional(),
   maxSessions: z.number().int().positive(),
   homeDir: z.string().default(""),
   /**
@@ -2474,6 +2524,8 @@ export const SetSessionFavoriteSchema = z.object({
 });
 
 export const UpdateDefaultsSchema = z.object({
+  /** Null resets Auto (Copilot). Applies only to newly created orchestrators. */
+  orchestratorAgent: AgentParamsSchema.nullable().optional(),
   operationId: z.string().uuid().optional(),
   expectedRevision: z.number().int().nonnegative().optional(),
   managedWorktreesEnabled: z.boolean().optional(),
@@ -2759,6 +2811,7 @@ const hostBackupDataShape = {
   publicUrl: z.string().url().optional(),
   tunnel: HostBackupTunnelSchema,
   defaults: z.object({
+    orchestratorAgent: AgentParamsSchema.nullable().optional(),
     managedWorktreesEnabled: z.boolean().default(false).optional(),
     managedWorktreePolicy: ManagedWorktreePolicySchema.default(() =>
       ManagedWorktreePolicySchema.parse({}),

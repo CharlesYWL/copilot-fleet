@@ -206,6 +206,9 @@ export const SessionTile = ({
         </div>
         <Text className={styles.subtitle}>
           {session.nodeName} · {session.workspaceName}
+          {session.agentParams?.kind === "hermes" && (
+            <span className={styles.agent}> · Hermes</span>
+          )}
           {agentName && (
             <>
               {" · "}

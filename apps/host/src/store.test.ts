@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   canTransition,
   CHATS_WORKSPACE_ID,
@@ -70,6 +70,34 @@ function notificationInput(
 }
 
 describe("FleetStore", () => {
+  it.each([
+    "{broken",
+    "null",
+    "42",
+    JSON.stringify({ kind: "future-agent" }),
+    JSON.stringify({ kind: "hermes" }),
+    JSON.stringify({ kind: "hermes", profile: "../personal" }),
+  ])("uses Auto and warns on an invalid stored orchestrator preference: %s", (value) => {
+    const warn = vi.fn();
+    const store = new FleetStore(":memory:", { warn });
+    stores.push(store);
+    expect(store.getOrchestratorAgent()).toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+    store.setSetting("orchestrator.agent", value);
+    expect(store.getOrchestratorAgent()).toBeUndefined();
+    expect(warn).toHaveBeenCalledExactlyOnceWith(
+      expect.stringContaining(
+        "Invalid stored orchestrator agent preference; using Auto (Copilot)",
+      ),
+    );
+    expect(store.getSetting("orchestrator.agent")).toBe(value);
+    store.setOrchestratorAgent({ kind: "hermes", profile: "repaired" });
+    expect(store.getOrchestratorAgent()).toEqual({ kind: "hermes", profile: "repaired" });
+    store.setOrchestratorAgent(null);
+    expect(store.getOrchestratorAgent()).toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it.each(["completed", "failed", "cancelled"] as const)(
     "does not admit ordinary review from a %s task",
     (state) => {
@@ -1824,6 +1852,60 @@ describe("Chats workspace", () => {
 });
 
 describe("Host backup", () => {
+  it("does not adopt a Hermes conversation as a Copilot conversation with the same native ID", () => {
+    const { store, placement } = setup();
+    const hermes = store.createSession(placement, "Plan", true, "Hermes", {
+      runRole: "lead",
+      agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+    });
+    store.appendEvent({
+      eventId: "hermes-identity",
+      sessionId: hermes.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "same-native-id" },
+      createdAt: new Date().toISOString(),
+    });
+    const adopted = store.adoptSession(placement, "same-native-id", []);
+    expect(adopted.created).toBe(true);
+    expect(adopted.session.id).not.toBe(hermes.id);
+    expect(adopted.session.agentParams?.kind ?? "copilot").toBe("copilot");
+    expect(store.getSession(hermes.id)?.agentParams).toEqual({
+      kind: "hermes",
+      profile: "fleet-orchestrator",
+    });
+  });
+
+  it("preserves actual backends/profiles independently of the preferred agent", () => {
+    const { store, node, placement } = setup();
+    const params = { kind: "hermes", profile: "fleet-orchestrator" } as const;
+    store.setNodeIdentity(node.id, {
+      capabilities: ["agent-kinds", "copilot-acp"],
+      agentKinds: [{ kind: "copilot" }, { kind: "hermes" }],
+    });
+    const session = store.createSession(placement, "Plan", true, "Hermes", {
+      runRole: "lead",
+      agentParams: params,
+    });
+    store.setOrchestratorAgent({ kind: "hermes", profile: "next-profile" });
+    const backup = store.exportHostBackup({ enrollmentToken: "" });
+    const restored = new FleetStore(":memory:");
+    stores.push(restored);
+    restored.replaceHostBackup(backup);
+    expect(restored.getSession(session.id)?.agentParams).toEqual(params);
+    expect(restored.getOrchestratorAgent()).toEqual({
+      kind: "hermes",
+      profile: "next-profile",
+    });
+    expect(restored.getNode(node.id)?.agentKinds).toEqual([
+      { kind: "copilot" },
+      { kind: "hermes" },
+    ]);
+    restored.setOrchestratorAgent(null);
+    expect(restored.getOrchestratorAgent()).toBeUndefined();
+    expect(restored.getSession(session.id)?.agentParams).toEqual(params);
+  });
+
   it("keeps the default heartbeat when an archive has no schedule or one that no longer parses", () => {
     const { store } = setup();
     store.setOrchestratorHeartbeatSchedule("0 8-20 * * *");

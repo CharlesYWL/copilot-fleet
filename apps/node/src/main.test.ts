@@ -37,6 +37,7 @@ import { settingsFromEnv } from "./settings.js";
 import { CommandPermissions, permissionPath } from "./command-permissions.js";
 import type * as SettingsModule from "./settings.js";
 import type * as AgentCatalogModule from "./agent-catalog.js";
+import { readAgentCatalog } from "./agent-catalog.js";
 import type * as InstanceLockModule from "./instance-lock.js";
 import type * as ConfigServerModule from "./config-server.js";
 import type * as UpdaterModule from "./updater.js";
@@ -57,6 +58,11 @@ class TestSocket extends EventEmitter {
   constructor(_url: URL, _options: unknown) {
     super();
     sockets.push(this);
+  }
+
+  async open(): Promise<void> {
+    this.readyState = TestSocket.OPEN;
+    for (const listener of this.listeners("open")) await listener();
   }
 
   async receive(frame: unknown): Promise<void> {
@@ -87,6 +93,7 @@ const route = vi.fn<(command: NodeCommand) => Promise<CommandResult>>(
   async (command) => ({ commandId: command.commandId, ok: true }),
 );
 let routerOptions: CommandRouterOptions;
+let readRouterCatalog: () => Promise<readonly AgentCatalogModule.CatalogEntry[]>;
 let worktreeOptions: ManagedWorktreeOptions;
 let discoveryOptions: CopilotSessionDiscoveryOptions;
 let configOptions: Parameters<typeof ConfigServerModule.startConfigServer>[0];
@@ -186,12 +193,13 @@ vi.mock("./router.js", () => ({
       onEvent: (event: SessionEvent) => void,
       _validatePath: unknown,
       _hostUrl: unknown,
-      _catalog: unknown,
+      catalog: typeof readRouterCatalog,
       _warn: unknown,
       options: CommandRouterOptions,
     ) {
       emitEvent = onEvent;
       routerOptions = options;
+      readRouterCatalog = catalog;
     }
   },
 }));
@@ -251,8 +259,69 @@ beforeEach(() => {
   sockets.length = 0;
   journalRecords.length = 0;
   vi.clearAllMocks();
+  vi.mocked(readAgentCatalog).mockReset().mockResolvedValue([]);
   activeSessionIds = ["session-1"];
 });
+
+const retainedAgent: AgentCatalogModule.CatalogEntry = {
+  name: "fleet-orchestrator",
+  description: "Orchestrates Fleet tasks",
+  path: "C:\\fixture\\fleet-orchestrator.agent.md",
+  markdown: "Fixture orchestrator",
+};
+
+it.each([false, true])(
+  "sends legacy hello when catalog refresh fails (previous catalog: %s)",
+  async (hasCatalog) => {
+    vi.useFakeTimers();
+    vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+    vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+    vi.stubEnv("FLEET_MOCK_AGENT", "1");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const catalog = vi.mocked(readAgentCatalog);
+    if (hasCatalog) catalog.mockResolvedValueOnce([retainedAgent]);
+    else catalog.mockRejectedValueOnce(new Error("startup read failed"));
+    catalog.mockRejectedValueOnce(new Error("refresh read failed"));
+    const { loadCredentials } = await import("./config.js");
+    vi.mocked(loadCredentials).mockResolvedValueOnce({
+      hostUrl: credentials.hostUrl,
+      nodeId: credentials.nodeId,
+      name: credentials.name,
+      authProtocol: "legacy-secret",
+      secret: "test-secret",
+    });
+    const exits = process.listeners("exit");
+    const { main } = await import("./main.js");
+    const runtime = await main([]);
+    try {
+      const socket = sockets[0]!;
+      await socket.open();
+      expect(JSON.parse(socket.send.mock.calls[0]![0])).toMatchObject({
+        type: "hello",
+        agents: hasCatalog
+          ? [{ name: retainedAgent.name, description: retainedAgent.description }]
+          : [],
+      });
+      expect(configOptions.recentLogs?.()).toContainEqual(
+        expect.objectContaining({
+          level: "warn",
+          message:
+            "Could not read the agent catalog; keeping the last known catalog: refresh read failed",
+        }),
+      );
+      // A successful empty read is authoritative; failure afterwards must not resurrect removed agents.
+      catalog.mockResolvedValueOnce([]);
+      expect(await readRouterCatalog()).toEqual([]);
+      catalog.mockRejectedValueOnce(new Error("another read failed"));
+      expect(await readRouterCatalog()).toEqual([]);
+    } finally {
+      await runtime.shutdown();
+      for (const listener of process.listeners("exit"))
+        if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  },
+);
 
 it.each([false, true])(
   "reports failures and verifies service restart handoff (shutdown failure: %s)",
@@ -282,8 +351,7 @@ it.each([false, true])(
       const { ensureGithubAuth } = await import("./github-auth.js");
       expect(ensureGithubAuth).not.toHaveBeenCalled();
       const socket = sockets[0]!;
-      socket.readyState = TestSocket.OPEN;
-      socket.emit("open");
+      await socket.open();
       const hello = JSON.parse(socket.send.mock.calls[0]![0]) as Extract<
         NodeToHostMessage,
         { type: "hello" }
@@ -433,8 +501,7 @@ it.each([
 
     mkdirSync(resolvePath(testConfigDirectory, "workspace-result-artifacts"));
     writeFileSync(path, "x");
-    socket.readyState = TestSocket.OPEN;
-    socket.emit("open");
+    await socket.open();
     expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({ type: "hello" });
     await socket.receive({ type: "welcome", nodeId: credentials.nodeId });
     socket.send.mockClear();
@@ -526,12 +593,14 @@ it.each([
     vi.stubEnv("FLEET_MOCK_AGENT", "1");
     vi.spyOn(console, "log").mockImplementation(() => {});
     const exits = process.listeners("exit");
+    vi.mocked(readAgentCatalog)
+      .mockResolvedValueOnce([retainedAgent])
+      .mockRejectedValueOnce(new Error("catalog refresh failed"));
     const { main } = await import("./main.js");
     const runtime = await main([]);
     try {
       const socket = sockets[0]!;
-      socket.readyState = TestSocket.OPEN;
-      socket.emit("open");
+      await socket.open();
       const hello = JSON.parse(socket.send.mock.calls[0]![0]) as NodeClientHello;
       expect(hello.type).toBe("client_hello");
 
@@ -589,6 +658,7 @@ it.each([
       const ready = open(2);
       expect(ready).toMatchObject({
         type: "ready",
+        agents: [{ name: retainedAgent.name, description: retainedAgent.description }],
         capabilities: expect.arrayContaining([
           OUTBOX_ACK_CAPABILITY,
           SESSION_RETENTION_CAPABILITY,
@@ -803,8 +873,7 @@ it("refuses self-update before invoking the updater with live sessions or pendin
   const runtime = await main([]);
   try {
     const socket = sockets[0]!;
-    socket.readyState = TestSocket.OPEN;
-    socket.emit("open");
+    await socket.open();
     await socket.receive({ type: "update_node", updateId: "live" });
     expect(updateCheckout).not.toHaveBeenCalled();
     expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
@@ -850,8 +919,7 @@ it("keeps command admission quarantined after updater mutation failure and force
   const runtime = await main([]);
   try {
     const socket = sockets[0]!;
-    socket.readyState = TestSocket.OPEN;
-    socket.emit("open");
+    await socket.open();
     await socket.receive({ type: "update_node", updateId: "mutating-update" });
     expect(updateCheckout).toHaveBeenCalledOnce();
     expect(routerOptions.admission!.reason).toContain("update is incomplete");
@@ -1204,8 +1272,7 @@ it("reads session files only for a welcomed sealed Host, and never its own ident
   const runtime = await main([]);
   try {
     const socket = sockets[0]!;
-    socket.readyState = TestSocket.OPEN;
-    socket.emit("open");
+    await socket.open();
     const hello = JSON.parse(socket.send.mock.calls[0]![0]) as NodeClientHello;
     const ephemeral = createEphemeralKeyPair();
     const transcript = {

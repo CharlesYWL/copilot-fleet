@@ -3,9 +3,9 @@
 ## Core ownership rules
 
 1. **Host owns desired state and history.** It stores Nodes, Workspaces, Placements, Sessions, and ordered Session Events.
-2. **Node owns execution.** Copilot login, child processes, local paths, and ACP connections never leave the Node.
+2. **Node owns execution.** Agent login, profiles, child processes, local paths, and ACP connections never leave the Node.
 3. **Workspace is logical; Placement is physical.** A Workspace can be available on several Nodes, each with a different absolute local path. A Session is assigned to one Placement and therefore one Node.
-4. **One Fleet Session owns one Copilot ACP process.** This makes cancellation, permissions, isolation, and concurrent capacity predictable.
+4. **One Fleet Session owns one ACP agent process.** Copilot remains the worker backend; orchestrators may also use Hermes. This makes cancellation, permissions, isolation, and concurrent capacity predictable.
 5. **Nodes only dial out.** Each Node registers with a Host URL and keeps one authenticated outbound WebSocket. No inbound firewall rule is required on Windows Nodes.
 
 ## Components
@@ -31,15 +31,35 @@ Windows Node App
           | ACP NDJSON over stdio
           v
 copilot --acp --stdio
+or hermes -p <profile> acp (orchestrators only)
 ```
 
 Agency mode is an opt-in Host setting applied at the common command-dispatch
-boundary to every session start and resume. The executing Node resolves Agency
+boundary to every Copilot session start and resume. The executing Node resolves Agency
 on its own PATH and uses `agency copilot --acp --stdio`, preserving the ACP
 transport, permissions, and per-session Fleet MCP injection. Only a missing
 Agency installation falls back to the Node's standard Copilot command, with a
 session-log notice; Agency startup errors are not hidden by a fallback.
 Already-running sessions keep their launcher until stopped and resumed.
+
+Orchestrator backend selection is a separate Host preference. Auto means Copilot.
+The Host prefers a compatible online workspace placement and falls back to
+Copilot, with a transcript notice, only when creating a new lead with no available
+Hermes installation. Each session persists its actual typed `agentParams`,
+including the Hermes profile, through explicit/automatic resume, MCP process
+replacement and Host backup. Profile/authentication errors are not fallback cases.
+Host admission and Node slot reservation allow only one live Hermes lead per
+profile per Node; profile memory is Node-local. A stopped lead never changes
+backend merely because the preference or installed agents changed.
+
+`apps/node/src/agent-kinds` isolates launch, usage and picker differences while
+the shared ACP client retains transport, permissions, sequencing and process
+cleanup. Hermes uses native model/mode ACP methods and auto-approval of offered
+allow options for YOLO leads. It receives the full orchestrator briefing and
+the same scoped HTTP MCP tools. Copilot-specific Agency/context/model defaults,
+credit polling and CAPI rollover are not applied to Hermes. Hermes native
+history is excluded from Copilot's automatic retention/deletion path.
+See [the reviewed backend plan](docs/orchestrator-agent-backend-plan.md).
 
 The execution backend remains ACP. Validate the upstream context-flag fix before
 considering a separately approved migration of the Node-side adapter.

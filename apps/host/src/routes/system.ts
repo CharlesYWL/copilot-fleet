@@ -276,6 +276,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
     model: store.getDefaultModel(),
     reasoningEffort: store.getDefaultReasoningEffort(),
+    orchestratorAgent: store.getOrchestratorAgent() ?? null,
     ...heartbeatDefaults(store),
   }));
 
@@ -322,6 +323,8 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     // Each field is optional so a client that knows about one setting cannot
     // reset the others merely by not mentioning them.
     if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
+    if (input.orchestratorAgent !== undefined)
+      store.setOrchestratorAgent(input.orchestratorAgent);
     if (input.contextTier !== undefined) store.setDefaultContextTier(input.contextTier);
     if (input.managedWorktreesEnabled !== undefined)
       store.setManagedWorktreesEnabled(input.managedWorktreesEnabled);
@@ -353,6 +356,7 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
       model: store.getDefaultModel(),
       reasoningEffort: store.getDefaultReasoningEffort(),
+      orchestratorAgent: store.getOrchestratorAgent() ?? null,
       ...heartbeatDefaults(store),
     };
     if (managedChange)
