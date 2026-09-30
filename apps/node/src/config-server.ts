@@ -25,7 +25,7 @@ import type {
   NodeIdentity,
 } from "./config-server-types.js";
 import { FleetClient } from "./fleet-client.js";
-import { pickFolder as pickFolderDefault } from "./pick-folder.js";
+import { listFolders as listFoldersDefault } from "./pick-folder.js";
 import { inspectPath as inspectPathDefault } from "./path-check.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 
@@ -51,6 +51,16 @@ const PlacementInputSchema = z.object({
   workspaceId: z.string().default(""),
   localPath: z.string().min(1).max(4096),
 });
+
+const FolderInputSchema = z
+  .object({
+    path: z
+      .string()
+      .max(4096)
+      .refine((path) => !path.includes("\0"), "Invalid folder path")
+      .default(""),
+  })
+  .strict();
 
 const CommandPermissionsInputSchema = z.union([
   z
@@ -202,9 +212,8 @@ function pathFrom(body: string): string {
 /**
  * The config endpoints as a table, separate from the HTTP plumbing.
  *
- * Every dependency that reaches off this process — the Host, the folder dialog,
- * the filesystem — arrives as an option, so the endpoints can be exercised
- * without a Host to talk to or a display to open a dialog on.
+ * Every dependency that reaches off this process — the Host and the filesystem —
+ * arrives as an option, so the endpoints can be exercised independently.
  */
 export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
   const fleet: FleetApi =
@@ -231,7 +240,7 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
           : undefined;
       },
     });
-  const pickFolder = options.pickFolder ?? pickFolderDefault;
+  const listFolders = options.listFolders ?? listFoldersDefault;
   const inspectPath = options.inspectPath ?? inspectPathDefault;
   const discovery =
     options.sessionDiscovery ??
@@ -423,9 +432,27 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
     ],
     [
       "POST /api/pick-folder",
-      // The dialog opens on this machine's display, so this only resolves once
-      // whoever is sitting there answers it.
-      async (body) => ok(await pickFolder(pathFrom(body))),
+      async () => ({
+        status: 410,
+        body: { error: "Refresh this page to use the in-page folder chooser." },
+      }),
+    ],
+    [
+      "POST /api/folders",
+      async (body) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest("Invalid folder request");
+        }
+        const input = FolderInputSchema.safeParse(parsed);
+        if (!input.success) {
+          return badRequest(input.error.issues[0]?.message ?? "Invalid folder request");
+        }
+        const result = await listFolders(input.data.path);
+        return result.ok ? ok(result) : badRequest(result.reason);
+      },
     ],
     [
       "POST /api/workspaces",

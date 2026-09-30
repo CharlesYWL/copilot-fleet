@@ -7,11 +7,12 @@ export const el = (tag, { dataset = {}, ...props } = {}, children = []) => {
   return node;
 };
 
-export const post = async (path, body) => {
+export const post = async (path, body, signal) => {
   const response = await fetch(path, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+    ...(signal ? { signal } : {}),
   });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || "Request failed");

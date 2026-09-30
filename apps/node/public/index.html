@@ -366,7 +366,9 @@
                   <button type="button" id="plBrowse">Browse…</button>
                   <button type="button" id="plAdd">Add</button>
                 </div>
-                <div class="hint">Browse opens a folder dialog on this node.</div>
+                <div class="hint">
+                  Browse folders on this node without uploading files.
+                </div>
                 <div class="check" id="plCheck"></div>
               </div>
               <div id="plMsg"></div>
@@ -432,6 +434,45 @@ Loading…</pre>
         </section>
       </main>
     </div>
+
+    <dialog
+      id="folderPicker"
+      aria-labelledby="folderPickerTitle"
+      aria-describedby="folderPickerHint"
+    >
+      <div class="dialog-card">
+        <h2 id="folderPickerTitle">Choose a folder</h2>
+        <p class="sub" id="folderPickerHint">
+          Browse this node's folders. Enter a path to switch drives or network shares.
+        </p>
+        <form id="folderPickerForm">
+          <label for="folderPickerPath" class="label">Folder location</label>
+          <div class="row">
+            <input id="folderPickerPath" maxlength="4096" autocomplete="off" autofocus />
+            <button type="submit">Open</button>
+          </div>
+        </form>
+        <div class="row">
+          <button type="button" id="folderPickerHome">Home</button>
+          <button type="button" id="folderPickerUp" disabled>Up</button>
+        </div>
+        <div id="folderPickerStatus" class="hint" role="status"></div>
+        <div id="folderPickerMsg" role="alert"></div>
+        <div
+          id="folderPickerFolders"
+          class="folder-list"
+          role="group"
+          aria-label="Subfolders"
+          aria-busy="false"
+        ></div>
+        <div class="dialog-actions">
+          <button type="button" class="secondary" id="folderPickerCancel">Cancel</button>
+          <button type="button" id="folderPickerChoose" disabled>
+            Choose this folder
+          </button>
+        </div>
+      </div>
+    </dialog>
 
     <dialog id="newSessionDialog">
       <form method="dialog" class="dialog-card" id="newSessionForm">
