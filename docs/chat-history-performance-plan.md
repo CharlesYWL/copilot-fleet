@@ -51,6 +51,25 @@ Reports are generated under `dist\benchmarks`; use the documented commands to
 produce named before/after JSON reports rather than treating these figures as
 portable pass/fail thresholds.
 
+### Verification status for review
+
+- Lint, formatting, all workspace typechecks, and production builds passed.
+- The focused history/API/permission/benchmark checks passed (105 tests).
+- The integrated run passed `command-execution.test.ts` (244 tests) and
+  `pr-maintenance-store.test.ts` (167 tests), then stalled in
+  `apps/node/src/managed-worktrees.test.ts`. Its verbose retry hit a 60-second
+  timeout and an `EBUSY` cleanup failure.
+- A run excluding those two already-passed suites and the stalled suite completed
+  with 269 passing files, 4,776 passing tests, three skipped tests, and three
+  failures in `scripts/managed-worktrees.integration.test.js` (integration
+  quiescence, concurrent tasks, and crash cleanup; one teardown also timed out).
+- The focused tests overlap the broader runs; their counts are not additive.
+
+The full gate is **not green**, and the PR remains a draft. The native-Git test
+files and their assertions were not changed or disabled. Review the first slice
+with these limitations; do not treat this status as production-release approval
+or evidence that every phase of the plan is complete.
+
 ## Why data-path fixes come first
 
 The supplied review reports 26 sessions with 312,934 events. Its largest lead
