@@ -93,8 +93,9 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [Windows login startup](#windows-login-startup),
   [Node command-line flags](#node-command-line-flags),
   [Node config page](#node-config-page),
-  [keeping nodes up to date](#keeping-nodes-up-to-date), and
-  [keeping the Host up to date](#keeping-the-host-up-to-date).
+  [keeping nodes up to date](#keeping-nodes-up-to-date),
+  [keeping the Host up to date](#keeping-the-host-up-to-date), and
+  [Dev Box MCP onboarding design (proposed)](docs/devbox-fleet-onboarding-design.md).
 - **Create projects and start everyday sessions:**
   [workspaces and placements](#first-run-walkthrough),
   [Agency mode](#agency-mode),
