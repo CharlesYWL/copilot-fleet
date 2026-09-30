@@ -1,10 +1,12 @@
 import * as acp from "@agentclientprotocol/sdk";
 import { z } from "zod";
 import { errorMessage, type AgentParams } from "@fleet/protocol";
+import type { LogLevel } from "@fleet/protocol/log-buffer";
 import { agentOutput, findAgentCommand } from "../copilot-launch.js";
 import type {
   AgentKindAdapter,
   AgentLaunch,
+  AgentLaunchOptions,
   AgentSessionHandle,
   UsageContext,
   UsageReporter,
@@ -44,7 +46,13 @@ export class HermesAgentKind implements AgentKindAdapter {
 
   constructor(private readonly params: Extract<AgentParams, { kind: "hermes" }>) {}
 
-  async prepare(): Promise<AgentLaunch> {
+  stderrLogLevel(text: string): LogLevel {
+    if (/\[(?:ERROR|CRITICAL)\]/i.test(text)) return "error";
+    if (/\[(?:WARN|WARNING)\]/i.test(text)) return "warn";
+    return "info";
+  }
+
+  async prepare(options: AgentLaunchOptions): Promise<AgentLaunch> {
     const profile = this.params.profile;
     const command = await findAgentCommand("hermes");
     if (!command)
@@ -62,7 +70,8 @@ export class HermesAgentKind implements AgentKindAdapter {
       return `${message}${detail && !message.includes(detail) ? `: ${detail}` : ""}. Check this Node's Hermes profile with \`hermes -p ${profile} acp --check\`; configure its provider/model with \`hermes -p ${profile} acp --setup\`.`;
     };
     try {
-      await agentOutput(command, [...args, "--check"]);
+      // Importing the Python ACP stack is startup work, not a short metadata query.
+      await agentOutput(command, [...args, "--check"], options.startTimeoutMs);
     } catch (error) {
       throw new Error(failureMessage(error, ""), { cause: error });
     }

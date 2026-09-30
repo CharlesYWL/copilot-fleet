@@ -1985,6 +1985,27 @@ the selected profile and are not synchronized across Nodes. Only one active
 Hermes orchestrator may use a given profile on a Node; do not use that profile
 in a separate Hermes process at the same time.
 
+Hermes reasoning is configured in its profile; its current ACP interface does
+not expose a reasoning picker or `/reasoning` command. To request high reasoning:
+
+```powershell
+hermes -p fleet-orchestrator config set agent.reasoning_effort high
+```
+
+Stop and resume the idle Hermes orchestrator to load the change. Per-model
+`agent.reasoning_overrides` take precedence, and the model/provider determines
+which reasoning levels are supported. General's reasoning default is Copilot-only.
+
+The Hermes dependency check has the same configurable startup allowance as ACP
+(180 seconds by default), with a separate deadline for the subsequent handshake.
+Cold Python imports can take longer than a short CLI metadata query.
+
+Hermes's runtime and background MCP retry logs go to the **Node config page's
+diagnostics and Node runtime log**, not chat history. An idle orchestrator can
+still produce those diagnostics without starting another turn. Replies, tool
+failures and fatal session errors remain visible in the conversation. Existing
+saved log entries are left intact.
+
 An offline orchestrator or pending Stop still reserves its profile. If its Node
 will not reconnect, request **Stop**, verify independently that the old process
 has exited, then select **Mark stopped** on the conversation to release it.
