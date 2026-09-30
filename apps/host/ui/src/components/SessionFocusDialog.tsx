@@ -8,6 +8,7 @@ import type {
   SessionEvent,
 } from "@fleet/protocol";
 import type { SessionDraft } from "../lib/session-drafts";
+import type { TranscriptActivity } from "../hooks/useFleet";
 import { TerminalView } from "./TerminalView";
 
 const useStyles = makeStyles({
@@ -30,6 +31,8 @@ type SessionFocusDialogProps = {
   node?: FleetNode | undefined;
   placement?: Placement | undefined;
   events: SessionEvent[];
+  activity?: TranscriptActivity | undefined;
+  pendingPermission?: SessionEvent | null | undefined;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onPrompt: (prompt: string, attachments?: PromptAttachment[]) => Promise<boolean>;
@@ -54,6 +57,8 @@ export const SessionFocusDialog = ({
   node,
   placement,
   events,
+  activity,
+  pendingPermission,
   open,
   onOpenChange,
   onPrompt,
@@ -83,6 +88,8 @@ export const SessionFocusDialog = ({
           node={node}
           placement={placement}
           events={events}
+          activity={activity}
+          pendingPermission={pendingPermission}
           onPrompt={onPrompt}
           onCancel={onCancel}
           onStop={onStop}

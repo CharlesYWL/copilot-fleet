@@ -2545,6 +2545,14 @@ npm run build
 npm run verify   # lint, format, types, tests, then production builds
 ```
 
+For repeatable chat-history performance measurements, run
+`npm run benchmark:history`. It uses synthetic histories and an isolated Host,
+reports median/P95 Node-stage and HTTP timings, and writes a JSON report under
+`dist/benchmarks`. See [Chat-history benchmarks](docs/chat-history-benchmarks.md)
+for workload sizes, before/after comparisons, and measurement limitations.
+The [chat-history performance plan](docs/chat-history-performance-plan.md)
+records the first implementation slice and the remaining virtualization and paging work.
+
 ### Local verification and test monitoring
 
 The primary repository is

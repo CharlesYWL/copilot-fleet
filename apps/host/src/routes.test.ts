@@ -303,6 +303,7 @@ describe("host routes", () => {
         payload: { localPath: "/tmp" },
       },
       { method: "GET" as const, url: "/api/sessions/missing/events" },
+      { method: "GET" as const, url: "/api/sessions/missing/transcript" },
       { method: "PATCH" as const, url: "/api/sessions/missing", payload: { name: "x" } },
       { method: "DELETE" as const, url: "/api/sessions/missing" },
     ];

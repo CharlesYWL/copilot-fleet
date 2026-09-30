@@ -403,6 +403,54 @@ describe("TerminalView composer", () => {
 });
 
 describe("TerminalView transcript", () => {
+  it("does not count history hydration as new output and honors the separate permission ledger", () => {
+    const oldRequest = streamEvent("permission", {
+      requestId: "old",
+      title: "Old request",
+    });
+    const renderTranscript = (id: string, live: boolean) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={vi.fn()}>
+          <TerminalView
+            session={session({ state: "running" })}
+            events={[oldRequest]}
+            activity={{
+              eventId: id,
+              sequence: 100,
+              createdAt: oldRequest.createdAt,
+              live,
+            }}
+            pendingPermission={null}
+            onPrompt={vi.fn()}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onPermission={vi.fn()}
+            draft={EMPTY_DRAFT}
+            onDraftChange={vi.fn()}
+          />
+        </NotificationContext.Provider>
+      </FluentProvider>
+    );
+    const view = render(renderTranscript("initial", false));
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    const transcript = screen.getByRole("region", { name: "Chat transcript" });
+    Object.defineProperties(transcript, {
+      scrollHeight: { configurable: true, value: 1200 },
+      clientHeight: { configurable: true, value: 400 },
+    });
+    transcript.scrollTop = 100;
+    fireEvent.scroll(transcript);
+    view.rerender(renderTranscript("history-config", false));
+    expect(
+      screen.getByRole("button", { name: "Jump to latest" }).textContent,
+    ).not.toContain("new");
+    view.rerender(renderTranscript("live-config", true));
+    expect(screen.getByRole("button", { name: "Jump to latest" }).textContent).toContain(
+      "1 new",
+    );
+    expect(transcript.scrollTop).toBe(100);
+  });
+
   it("shows one Output label per consecutive group and keeps errors separate", () => {
     const { container } = show({}, EMPTY_DRAFT, [
       streamEvent("system", { text: "Agency startup" }),

@@ -4,7 +4,7 @@ import type { SessionEvent } from "@fleet/protocol";
  * One session's transcript, combining what a fetch returned with what is
  * already on screen.
  *
- * The socket appends events as they happen while `GET /events` answers with the
+ * The socket appends events as they happen while `GET /transcript` answers with the
  * transcript as it stood when the request left. Replacing the list with that
  * answer drops anything the socket delivered in between, and since a replayed
  * event never arrives twice those lines stay missing until something unrelated
@@ -15,6 +15,17 @@ export function mergeEvents(
   fetched: readonly SessionEvent[],
   known: readonly SessionEvent[],
 ): SessionEvent[] {
+  if (fetched.length === 0) return [...known];
+  const incoming = fetched[0];
+  const last = known[known.length - 1];
+  if (
+    fetched.length === 1 &&
+    incoming &&
+    (!last || incoming.sequence > last.sequence) &&
+    !known.some((event) => event.eventId === incoming.eventId)
+  ) {
+    return [...known, incoming];
+  }
   const fetchedIds = new Set(fetched.map((event) => event.eventId));
   const arrivedMeanwhile = known.filter((event) => !fetchedIds.has(event.eventId));
   return [...fetched, ...arrivedMeanwhile].sort((a, b) => a.sequence - b.sequence);

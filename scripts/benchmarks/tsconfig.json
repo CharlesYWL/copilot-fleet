@@ -1,0 +1,10 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "../..",
+    "module": "ESNext",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["*.ts", "../../apps/host/src/request-guard.ts"]
+}

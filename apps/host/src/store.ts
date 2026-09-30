@@ -32,6 +32,7 @@ import {
   type RunStepState,
   type SecurityBackupPayload,
   type SessionEvent,
+  type SessionTranscript,
   type SessionState,
   type TunnelProvider,
   type Workspace,
@@ -57,6 +58,8 @@ import {
   RunNoteMetadataSchema,
   SecurityBackupPayloadSchema,
   SessionEventSchema,
+  SessionActivitySchema,
+  SessionPermissions,
   SessionSchema,
   TunnelProviderSchema,
   WorkspaceSchema,
@@ -564,6 +567,9 @@ export class FleetStore {
         created_at TEXT NOT NULL, received_at TEXT NOT NULL,
         UNIQUE(session_id, sequence)
       );
+      CREATE INDEX IF NOT EXISTS events_permissions
+        ON events(session_id,sequence)
+        WHERE type IN ('permission','permission_result');
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -5912,6 +5918,54 @@ export class FleetStore {
         sessionId,
       ) as Row[]
     ).map(eventFromRow);
+  }
+
+  listEventsAfter(sessionId: string, sequence: number): SessionEvent[] {
+    return (
+      this.statement(
+        "SELECT * FROM events WHERE session_id=? AND sequence>? ORDER BY sequence",
+      ).all(sessionId, sequence) as Row[]
+    ).map(eventFromRow);
+  }
+
+  listTranscript(sessionId: string): SessionTranscript {
+    const events = (
+      this.statement(
+        `SELECT * FROM events WHERE session_id=?
+         AND type NOT IN ('commands','config','usage','agent_session')
+         ORDER BY sequence`,
+      ).all(sessionId) as Row[]
+    ).map(eventFromRow);
+    // Activity previously included invisible config/commands events, but never usage.
+    const activity = this.statement(
+      `SELECT event_id,sequence,created_at FROM events
+       WHERE session_id=? AND type<>'usage' ORDER BY sequence DESC LIMIT 1`,
+    ).get(sessionId) as Row | undefined;
+    return {
+      events,
+      ...(activity
+        ? {
+            activity: SessionActivitySchema.parse({
+              eventId: String(activity.event_id),
+              sequence: Number(activity.sequence),
+              createdAt: String(activity.created_at),
+            }),
+          }
+        : {}),
+    };
+  }
+
+  listPermissionEvents(): SessionEvent[] {
+    const index = new SessionPermissions();
+    index.apply(
+      (
+        this.statement(
+          `SELECT * FROM events WHERE type IN ('permission','permission_result')
+         ORDER BY session_id,sequence`,
+        ).all() as Row[]
+      ).map(eventFromRow),
+    );
+    return index.latestEvents();
   }
 
   hasEventAfter(

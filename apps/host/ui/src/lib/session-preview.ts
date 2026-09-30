@@ -19,13 +19,20 @@ export function toPreviewLines(
 ): PreviewLine[] {
   const lines: PreviewLine[] = [];
 
-  for (const block of blocks) {
-    for (const [offset, text] of splitLines(blockText(block)).entries()) {
-      lines.push({ key: `${block.key}:${offset}`, kind: block.kind, text });
-    }
+  for (let index = blocks.length - 1; index >= 0 && lines.length < limit; index--) {
+    const block = blocks[index]!;
+    const texts = splitLines(blockText(block));
+    const start = Math.max(0, texts.length - (limit - lines.length));
+    lines.unshift(
+      ...texts.slice(start).map((text, offset) => ({
+        key: `${block.key}:${start + offset}`,
+        kind: block.kind,
+        text,
+      })),
+    );
   }
 
-  if (lines.length > 0) return lines.slice(-limit);
+  if (lines.length > 0) return lines;
 
   // Sessions that streamed before this browser connected have no events yet,
   // but the host keeps the tail of their text on the session record.

@@ -66,6 +66,7 @@ import { sessionLabel } from "../lib/session-label";
 import { sessionStatusDescriptor } from "../lib/session-status";
 import { transcriptNotice } from "../lib/transcript-notice";
 import { useMessageNotification } from "../hooks/useAppNotifications";
+import type { TranscriptActivity } from "../hooks/useFleet";
 import {
   allowOnceOptionId,
   pendingPermission,
@@ -546,6 +547,9 @@ type TerminalViewProps = {
   node?: FleetNode | undefined;
   placement?: Placement | undefined;
   events: SessionEvent[];
+  activity?: TranscriptActivity | undefined;
+  /** Null means the independently hydrated permission ledger has no pending request. */
+  pendingPermission?: SessionEvent | null | undefined;
   onPrompt: (prompt: string, attachments?: PromptAttachment[]) => Promise<boolean>;
   onCancel: () => void;
   onStop: () => void;
@@ -569,6 +573,8 @@ export const TerminalView = ({
   node,
   placement,
   events,
+  activity,
+  pendingPermission: knownPermission,
   onPrompt,
   onCancel,
   onStop,
@@ -612,7 +618,13 @@ export const TerminalView = ({
     }));
 
   const blocks = useMemo(() => toTerminalBlocks(events), [events]);
-  const permission = useMemo(() => pendingPermission(events), [events]);
+  const permission = useMemo(
+    () =>
+      knownPermission === undefined
+        ? pendingPermission(events)
+        : (knownPermission ?? undefined),
+    [events, knownPermission],
+  );
   const status = sessionStatusDescriptor(session, Boolean(permission));
   const promptMarks = useMemo(() => toPromptMarks(blocks), [blocks]);
   const [activePrompt, setActivePrompt] = useState<string>();
@@ -706,14 +718,15 @@ export const TerminalView = ({
    * Counted from events rather than blocks because a block can absorb many
    * events into one line, and "3 new lines" should mean three things arrived.
    */
-  let latestActivityEventId: string | undefined;
-  for (let index = events.length - 1; index >= 0; index--) {
+  let latestActivityEventId = activity?.eventId;
+  for (let index = events.length - 1; !latestActivityEventId && index >= 0; index--) {
     const event = events[index];
     if (event && event.type !== "usage") {
       latestActivityEventId = event.eventId;
       break;
     }
   }
+  const liveActivity = activity?.live ?? true;
   useEffect(() => {
     if (!latestActivityEventId) return;
     setLastEventAt(Date.now());
@@ -721,8 +734,8 @@ export const TerminalView = ({
       setUnseen(0);
       return;
     }
-    setUnseen((count) => count + 1);
-  }, [latestActivityEventId]);
+    if (liveActivity) setUnseen((count) => count + 1);
+  }, [latestActivityEventId, liveActivity]);
 
   // A clock, only while it could change the answer: a silent running session.
   useEffect(() => {

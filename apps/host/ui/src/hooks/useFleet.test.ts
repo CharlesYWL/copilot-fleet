@@ -117,6 +117,169 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe("useFleet transcript loading", () => {
+  const event = (
+    sequence: number,
+    type: SessionEvent["type"] = "agent_text",
+    payload: SessionEvent["payload"] = { text: "Output" },
+  ): SessionEvent => ({
+    eventId: `history-${sequence}`,
+    sessionId: "s1",
+    sequence,
+    type,
+    payload,
+    createdAt: ISO,
+  });
+  const activity = (item: SessionEvent) => ({
+    eventId: item.eventId,
+    sequence: item.sequence,
+    createdAt: item.createdAt,
+  });
+
+  it("shares an in-flight fetch and preserves live events and activity during hydration", async () => {
+    let finish!: (value: Response) => void;
+    vi.mocked(fetch).mockImplementation((path) => {
+      expect(String(path)).toBe("/api/sessions/s1/transcript");
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const first = result.current.loadEvents("s1");
+    const second = result.current.loadEvents("s1");
+    expect(first).toBe(second);
+    const live = event(3);
+    act(() => MockWebSocket.instances[0]!.send({ type: "event", event: live }));
+    const stored = event(1);
+    await act(async () => {
+      finish(response({ events: [stored], activity: activity(stored) }));
+      await first;
+    });
+    expect(result.current.events.s1).toEqual([stored, live]);
+    expect(result.current.activities.s1).toEqual({ ...activity(live), live: true });
+    expect(
+      vi
+        .mocked(fetch)
+        .mock.calls.filter(([path]) => String(path).endsWith("/transcript")),
+    ).toHaveLength(1);
+  });
+
+  it("keeps bookkeeping out of history while preserving non-usage activity", () => {
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const socket = MockWebSocket.instances[0]!;
+    act(() => socket.send({ type: "event", event: event(1) }));
+    const history = result.current.events.s1;
+    for (const [index, type] of (
+      ["commands", "config", "agent_session"] as const
+    ).entries()) {
+      const update = event(index + 2, type, { large: "payload".repeat(100) });
+      act(() => socket.send({ type: "event", event: update }));
+      expect(result.current.events.s1).toBe(history);
+      expect(result.current.activities.s1).toEqual({ ...activity(update), live: true });
+      expect(result.current.activities.s1).not.toHaveProperty("payload");
+    }
+    const lastActivity = result.current.activities.s1;
+    act(() => socket.send({ type: "event", event: event(5, "usage", { aiCredits: 1 }) }));
+    expect(result.current.activities.s1).toBe(lastActivity);
+    expect(result.current.events.s1).toBe(history);
+  });
+
+  it("hydrates permissions independently and ignores an older request after live resolution", async () => {
+    const request = event(1, "permission", { requestId: "request", title: "Run?" });
+    const session = SessionSchema.parse({
+      id: "s1",
+      workspaceId: "w1",
+      workspaceName: "workspace",
+      placementId: "p1",
+      nodeId: "n1",
+      nodeName: "node",
+      state: "idle",
+      initialPrompt: "Work",
+      currentActivity: "",
+      lastText: "",
+      createdAt: ISO,
+      updatedAt: ISO,
+    });
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const socket = MockWebSocket.instances[0]!;
+    act(() =>
+      socket.send({
+        type: "snapshot",
+        data: { ...snapshot(), sessions: [session], permissionEvents: [request] },
+      }),
+    );
+    expect(result.current.pendingPermissions).toEqual([request]);
+    expect(result.current.events).toEqual({});
+    let finish!: (value: Response) => void;
+    vi.mocked(fetch).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const loading = result.current.loadEvents("s1");
+    act(() =>
+      socket.send({
+        type: "event",
+        event: event(2, "permission_result", { requestId: "request", outcome: "deny" }),
+      }),
+    );
+    await act(async () => {
+      finish(response({ events: [request], activity: activity(request) }));
+      await loading;
+    });
+    expect(result.current.pendingPermissions).toEqual([]);
+  });
+
+  it("aborts stale connection requests without letting their completion delete a newer fetch", async () => {
+    const finishes: ((value: Response) => void)[] = [];
+    const signals: (AbortSignal | null | undefined)[] = [];
+    vi.mocked(fetch).mockImplementation((_path, init) => {
+      signals.push(init?.signal);
+      return new Promise((resolve) => {
+        finishes.push(resolve);
+      });
+    });
+    const notify = vi.fn();
+    const { result, unmount } = renderHook(() => useFleet(notify));
+    const first = result.current.loadEvents("s1");
+    act(() => MockWebSocket.instances[0]!.disconnect());
+    expect(signals[0]?.aborted).toBe(true);
+    const next = result.current.loadEvents("s1");
+    expect(next).not.toBe(first);
+    await act(async () => {
+      finishes[0]!(response({ events: [event(1)] }));
+      await first;
+    });
+    expect(result.current.loadEvents("s1")).toBe(next);
+    expect(result.current.events).toEqual({});
+    unmount();
+    expect(signals[1]?.aborted).toBe(true);
+    finishes[1]!(response({ events: [event(2)] }));
+    await next;
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify).toHaveBeenCalledWith(
+      expect.stringContaining("Connection to the Host lost"),
+      "warning",
+    );
+  });
+
+  it("reports real failures and permits a fresh retry", async () => {
+    const notify = vi.fn();
+    const { result } = renderHook(() => useFleet(notify));
+    vi.mocked(fetch).mockRejectedValueOnce(new Error("History unavailable"));
+    await act(async () => {
+      await result.current.loadEvents("s1");
+    });
+    expect(notify).toHaveBeenCalledWith("History unavailable", "error");
+    vi.mocked(fetch).mockResolvedValueOnce(response({ events: [event(1)] }));
+    await act(async () => {
+      await result.current.loadEvents("s1");
+    });
+    expect(result.current.events.s1).toEqual([event(1)]);
+  });
+});
+
 describe("useFleet durable notifications", () => {
   it.each([
     ["not JSON", 1007, "Malformed JSON"],

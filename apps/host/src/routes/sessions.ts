@@ -138,6 +138,14 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     return store.listEvents(id);
   });
 
+  app.get("/api/sessions/:id/transcript", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const session = store.getSession(id);
+    if (!session) return reply.code(404).send({ error: "Session not found" });
+    if (!session.cleanupRequested) store.touchSessionActivity(id);
+    return store.listTranscript(id);
+  });
+
   /**
    * Renames a session. Allowed in every state, including terminal ones: naming
    * a finished run is how it stays findable in the history the UI keeps.

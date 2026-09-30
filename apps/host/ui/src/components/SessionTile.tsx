@@ -131,6 +131,7 @@ const useStyles = makeStyles({
 type SessionTileProps = {
   session: FleetSession;
   events: SessionEvent[];
+  pendingPermission?: SessionEvent | null | undefined;
   /** Passed in so the wall and the tile agree on what is blocked. */
   awaitingPermission?: boolean;
   onOpen: (sessionId: string) => void;
@@ -145,17 +146,24 @@ type SessionTileProps = {
 export const SessionTile = ({
   session,
   events,
+  pendingPermission: knownPermission,
   awaitingPermission,
   onOpen,
   onPermission,
 }: SessionTileProps) => {
   const styles = useStyles();
-  const blocks = useMemo(() => toTerminalBlocks(events), [events]);
+  const blocks = useMemo(() => toTerminalBlocks(events.slice(-200)), [events]);
   const lines = useMemo(
     () => toPreviewLines(blocks, session.lastText),
     [blocks, session.lastText],
   );
-  const permission = useMemo(() => pendingPermission(events), [events]);
+  const permission = useMemo(
+    () =>
+      knownPermission === undefined
+        ? pendingPermission(events)
+        : (knownPermission ?? undefined),
+    [events, knownPermission],
+  );
   const blocked = Boolean(permission) || Boolean(awaitingPermission);
   const descriptor = sessionStatusDescriptor(session, blocked);
   const agentName = customAgentName(session.configOptions);

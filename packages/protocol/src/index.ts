@@ -572,6 +572,26 @@ export const SessionEventSchema = z.object({
 export type SessionEvent = z.infer<typeof SessionEventSchema>;
 export type SessionEventType = SessionEvent["type"];
 
+export { SessionPermissions } from "./session-permissions.js";
+
+export const SessionActivitySchema = SessionEventSchema.pick({
+  eventId: true,
+  sequence: true,
+  createdAt: true,
+});
+export type SessionActivity = z.infer<typeof SessionActivitySchema>;
+
+export const SessionTranscriptSchema = z.object({
+  events: z.array(SessionEventSchema),
+  activity: SessionActivitySchema.optional(),
+});
+export type SessionTranscript = z.infer<typeof SessionTranscriptSchema>;
+
+/** Current picker/usage state travels on the session, not in its transcript. */
+export function isTranscriptEvent(event: Pick<SessionEvent, "type">): boolean {
+  return !["commands", "config", "usage", "agent_session"].includes(event.type);
+}
+
 /** Inventory, picker replay and connectivity notices must not renew retention. */
 export function isSessionActivityEvent(event: SessionEvent): boolean {
   if (event.payload.historyReplay === true) return false;
@@ -1969,6 +1989,8 @@ export const SnapshotSchema = z.object({
   prMaintenanceTasks: z.array(PrMaintenanceTaskStatusSchema).optional(),
   /** Active and recently settled "Resume now" requests. */
   workerResumeRequests: z.array(WorkerResumeRequestSchema).optional(),
+  /** Latest request or resolution per permission, including sessions not opened in this tab. */
+  permissionEvents: z.array(SessionEventSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 

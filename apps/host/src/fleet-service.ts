@@ -317,6 +317,7 @@ export class FleetService {
       prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
       prMaintenanceTasks: prMaintenanceTaskStatuses(this.retainedPrMaintenance()),
       workerResumeRequests: this.store.resumeRequests.list({ limit: 50 }),
+      permissionEvents: this.store.listPermissionEvents(),
     };
   }
 
@@ -667,9 +668,7 @@ export class FleetService {
     const record = this.store.prMaintenance.get(reference.recordId)!;
     const batch = record.batches.find((entry) => entry.id === reference.batchId)!;
     if (batch.executionSettled) return false;
-    const events = this.store
-      .listEvents(step.sessionId)
-      .filter((event) => event.sequence > step.eventSeqFrom);
+    const events = this.store.listEventsAfter(step.sessionId, step.eventSeqFrom);
     const stateReceipt = events.filter((event) => event.type === "state").at(-1);
     const receivedState = stateReceipt
       ? eventPayload(stateReceipt, "state")?.state

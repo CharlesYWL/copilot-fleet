@@ -4,6 +4,8 @@ import {
   updateFinished,
   BrowserMessageSchema,
   decodeFrame,
+  isTranscriptEvent,
+  SessionPermissions,
   type CommandOutputEvent,
   type HostUpdateStatus,
   type MarkAllNotificationsReadResponse,
@@ -12,6 +14,8 @@ import {
   type RunStep,
   type RunNote,
   type SessionEvent,
+  type SessionActivity,
+  type SessionTranscript,
   type Snapshot,
 } from "@fleet/protocol";
 import { announceSignedOut, csrfToken, forgetCsrfToken } from "../lib/auth";
@@ -32,6 +36,8 @@ export type LiveNotificationUpdate = {
   notification: Notification;
   deliver: boolean;
 };
+
+export type TranscriptActivity = SessionActivity & { live: boolean };
 
 type SnapshotHydrationChange =
   | { revision: number; type: "upsert"; notification: Notification }
@@ -97,6 +103,13 @@ export function useFleet(notify: Notify) {
     LiveNotificationUpdate[]
   >([]);
   const [events, setEvents] = useState<Record<string, SessionEvent[]>>({});
+  const [activities, setActivities] = useState<Record<string, TranscriptActivity>>({});
+  const activityRecords = useRef(new Map<string, SessionActivity>());
+  const permissions = useRef(new SessionPermissions());
+  const [pendingPermissions, setPendingPermissions] = useState<SessionEvent[]>([]);
+  const eventRequests = useRef(
+    new Map<string, { controller: AbortController; promise: Promise<void> }>(),
+  );
   const [commandOutput, setCommandOutput] = useState<CommandOutputEvent[]>([]);
   /**
    * Steps per run, kept beside the snapshot rather than inside it.
@@ -136,6 +149,30 @@ export function useFleet(notify: Notify) {
   const report = useCallback((reason: unknown) => {
     notifyRef.current(errorMessage(reason), "error");
   }, []);
+
+  const applyPermissionEvents = useCallback((items: readonly SessionEvent[]) => {
+    if (permissions.current.apply(items))
+      setPendingPermissions(permissions.current.requests());
+  }, []);
+
+  const applyActivity = useCallback(
+    (sessionId: string, activity: SessionActivity | undefined, live: boolean) => {
+      if (!activity) return;
+      const previous = activityRecords.current.get(sessionId);
+      if (previous && previous.sequence >= activity.sequence) return;
+      const next = {
+        eventId: activity.eventId,
+        sequence: activity.sequence,
+        createdAt: activity.createdAt,
+      };
+      activityRecords.current.set(sessionId, next);
+      setActivities((current) => ({
+        ...current,
+        [sessionId]: { ...next, live },
+      }));
+    },
+    [],
+  );
 
   /** Announces the end of a Host update this tab watched begin. */
   const announceHostUpdate = useCallback((status: HostUpdateStatus | undefined) => {
@@ -203,6 +240,9 @@ export function useFleet(notify: Notify) {
 
   const hydrateSocketSnapshot = useCallback(
     (next: Snapshot) => {
+      applyPermissionEvents(next.permissionEvents ?? []);
+      if (permissions.current.prune(new Set(next.sessions.map((session) => session.id))))
+        setPendingPermissions(permissions.current.requests());
       const revision = recordHydrationChange({
         type: "snapshot",
         data: next,
@@ -224,7 +264,7 @@ export function useFleet(notify: Notify) {
       setSnapshotRevision((value) => value + 1);
       announceHostUpdate(next.hostUpdate);
     },
-    [announceHostUpdate, recordHydrationChange],
+    [announceHostUpdate, applyPermissionEvents, recordHydrationChange],
   );
 
   const beginHydration = useCallback(() => {
@@ -297,6 +337,7 @@ export function useFleet(notify: Notify) {
       );
       latestUnreadAffectingUpsertRevision.current = revision;
       unreadCountRevision.current = revision;
+      applyPermissionEvents(latest.permissionEvents ?? []);
       setSnapshot({
         ...latest,
         notifications: sortNotifications(notifications),
@@ -308,7 +349,7 @@ export function useFleet(notify: Notify) {
       announceHostUpdate(hostUpdate);
       return true;
     },
-    [announceHostUpdate],
+    [announceHostUpdate, applyPermissionEvents],
   );
 
   /**
@@ -477,29 +518,35 @@ export function useFleet(notify: Notify) {
     [applyResponseNotification, applyResponseUnreadCount, request],
   );
 
-  // Which fetch is the current one per session. Switching sessions quickly
-  // leaves earlier requests in flight, and the slowest to answer would
-  // otherwise be the one that wins and paint another session's transcript.
-  // The ticket settles races between fetches; mergeEvents settles the race
-  // between a fetch and the socket that kept appending while it travelled.
-  const eventRequests = useRef(new Map<string, number>());
-
   const loadEvents = useCallback(
-    async (sessionId: string) => {
-      const ticket = (eventRequests.current.get(sessionId) ?? 0) + 1;
-      eventRequests.current.set(sessionId, ticket);
-      try {
-        const items = await api<SessionEvent[]>(`/api/sessions/${sessionId}/events`);
-        if (eventRequests.current.get(sessionId) !== ticket) return;
-        setEvents((value) => ({
-          ...value,
-          [sessionId]: mergeEvents(items, value[sessionId] ?? []),
-        }));
-      } catch (reason) {
-        report(reason);
-      }
+    (sessionId: string): Promise<void> => {
+      const pending = eventRequests.current.get(sessionId);
+      if (pending) return pending.promise;
+      const controller = new AbortController();
+      const promise = (async () => {
+        try {
+          const history = await api<SessionTranscript>(
+            `/api/sessions/${sessionId}/transcript`,
+            { signal: controller.signal },
+          );
+          if (controller.signal.aborted) return;
+          applyPermissionEvents(history.events);
+          applyActivity(sessionId, history.activity, false);
+          setEvents((value) => ({
+            ...value,
+            [sessionId]: mergeEvents(history.events, value[sessionId] ?? []),
+          }));
+        } catch (reason) {
+          if (!controller.signal.aborted) report(reason);
+        } finally {
+          if (eventRequests.current.get(sessionId)?.controller === controller)
+            eventRequests.current.delete(sessionId);
+        }
+      })();
+      eventRequests.current.set(sessionId, { controller, promise });
+      return promise;
     },
-    [report],
+    [applyActivity, applyPermissionEvents, report],
   );
 
   const sessionCommandKeys = useRef(new Map<string, string>());
@@ -523,6 +570,7 @@ export function useFleet(notify: Notify) {
   );
 
   useEffect(() => {
+    const pendingEventRequests = eventRequests.current;
     let socket: WebSocket | undefined;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let commandFlushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -551,6 +599,8 @@ export function useFleet(notify: Notify) {
         });
       };
       socket.onclose = () => {
+        for (const request of pendingEventRequests.values()) request.controller.abort();
+        pendingEventRequests.clear();
         setConnected(false);
         if (closed) return;
         if (!connectionLost) {
@@ -714,6 +764,9 @@ export function useFleet(notify: Notify) {
           return;
         }
         const { event } = message;
+        applyPermissionEvents([event]);
+        if (event.type !== "usage") applyActivity(event.sessionId, event, true);
+        if (!isTranscriptEvent(event)) return;
         setEvents((value) => ({
           ...value,
           [event.sessionId]: mergeEvents([event], value[event.sessionId] ?? []),
@@ -724,12 +777,16 @@ export function useFleet(notify: Notify) {
     connect();
     return () => {
       closed = true;
+      for (const request of pendingEventRequests.values()) request.controller.abort();
+      pendingEventRequests.clear();
       if (retryTimer) clearTimeout(retryTimer);
       if (commandFlushTimer) clearTimeout(commandFlushTimer);
       socket?.close();
     };
   }, [
     announceHostUpdate,
+    applyActivity,
+    applyPermissionEvents,
     applyNotification,
     hydrateSocketSnapshot,
     recordHydrationChange,
@@ -743,6 +800,8 @@ export function useFleet(notify: Notify) {
     snapshotRevision,
     liveNotificationUpdates,
     events,
+    activities,
+    pendingPermissions,
     commandOutput,
     runSteps,
     runNotes,

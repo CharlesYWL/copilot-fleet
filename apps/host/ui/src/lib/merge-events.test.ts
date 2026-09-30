@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { SessionEvent } from "@fleet/protocol";
 import { mergeEvents } from "./merge-events";
 
@@ -14,6 +14,25 @@ function event(sequence: number, text: string): SessionEvent {
 }
 
 describe("mergeEvents", () => {
+  it("appends an ordered live event without sorting or mutating history", () => {
+    const known = [event(1, "one"), event(2, "two")];
+    const next = event(3, "three");
+    const sort = vi.spyOn(Array.prototype, "sort");
+    const merged = mergeEvents([next], known);
+    const sorts = sort.mock.calls.length;
+    sort.mockRestore();
+    expect(sorts).toBe(0);
+    expect(merged).toEqual([...known, next]);
+    expect(known).toHaveLength(2);
+    expect(merged[0]).toBe(known[0]);
+  });
+
+  it("still replaces an existing event id even if its incoming sequence is newer", () => {
+    const known = [event(1, "one")];
+    const fetched = { ...event(2, "corrected"), eventId: "e1" };
+    expect(mergeEvents([fetched], known)).toEqual([fetched]);
+  });
+
   it("keeps events the socket delivered while the fetch was in flight", () => {
     const fetched = [event(1, "one"), event(2, "two")];
     const known = [event(1, "one"), event(2, "two"), event(3, "three")];
