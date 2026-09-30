@@ -25,6 +25,50 @@ import {
 
 const REPOSITORY_CAPABILITY_MAX_AGE_MS = 5 * 60_000;
 
+const sessionLabel = (session: FleetSession) =>
+  session.name ? `"${session.name}"` : `session ${session.id.slice(0, 8)}`;
+
+/**
+ * Names who holds a checkout, and whether Fleet will hand it over by itself.
+ *
+ * A settled task worker is parked before another task's worker takes its
+ * checkout, so waiting clears. A session no task manages is a person's, and
+ * nothing here stops it on their behalf.
+ */
+function checkoutBusyDetail(
+  placement: Placement,
+  node: FleetNode,
+  occupants: readonly FleetSession[],
+): string {
+  const managed = occupants.every(
+    (occupant) => occupant.runRole === "worker" || occupant.runRole === "reviewer",
+  );
+  return [
+    `${placement.localPath} on ${node.name} is in use by ${occupants
+      .map((occupant) => `${sessionLabel(occupant)} (${occupant.state})`)
+      .join(", ")}.`,
+    "One live session holds a checkout at a time, because Git state and build output are shared.",
+    managed
+      ? "Fleet parks a settled task worker before handing its checkout over, so this resumes by itself once that session finishes its turn."
+      : "A session that no task manages keeps the checkout until whoever is using it stops it.",
+  ].join(" ");
+}
+
+function sessionBusyDetail(state: FleetSession["state"]): string {
+  switch (state) {
+    case "starting":
+      return "The worker's conversation is being started or restored; its queued follow-up is sent once it is idle.";
+    case "running":
+      return "The worker is running a turn; its queued follow-up is sent once that turn ends and the worker is idle.";
+    case "cancelling":
+      return "The worker is cancelling its current turn; its queued follow-up is sent once it is idle.";
+    case "offline":
+      return "The worker's Node connection is being re-established; its queued follow-up waits for the worker's state.";
+    default:
+      return `The worker is ${state}; its queued follow-up is sent once it is idle.`;
+  }
+}
+
 /**
  * What the engine should do next, decided without touching the database or the
  * network.
@@ -35,8 +79,13 @@ const REPOSITORY_CAPABILITY_MAX_AGE_MS = 5 * 60_000;
  */
 export type ScheduleAction =
   | { type: "start_step"; stepId: string; placementId: string; prompt: string }
-  /** Re-attaches the session a pending retry already belongs to. */
-  | { type: "resume_step"; stepId: string; sessionId: string }
+  /**
+   * Re-attaches the session a pending retry already belongs to.
+   *
+   * `exceptionId` names the operator-approved "Resume now" request this resume
+   * spends, when the ordinary scheduling margin alone would have held it back.
+   */
+  | { type: "resume_step"; stepId: string; sessionId: string; exceptionId?: string }
   /** Starts the retry turn once its resumed session is idle. */
   | { type: "prompt_step"; stepId: string; sessionId: string; prompt: string }
   /** The Node took the command: `starting` becomes `running`. */
@@ -48,6 +97,51 @@ export type ScheduleAction =
   | { type: "deliver_prompt"; runId: string; prompt: string }
   | { type: "wake_lead"; runId: string; prompt: string }
   | { type: "finish_run"; state: RunState; reason: string };
+
+/** Why a pending step was left pending, in the terms the planner used. */
+export type StepHoldCode =
+  | "task_held"
+  | "nodes_unknown"
+  | "dependencies"
+  | "workspace_not_ready"
+  | "stop_pending"
+  | "dismissed"
+  | "node_offline"
+  | "checkout_busy"
+  | "parallel_limit"
+  | "node_headroom"
+  | "node_capacity"
+  | "session_busy"
+  | "no_placement"
+  | "maintenance_hold"
+  | "command_fence"
+  | "cleanup_pending";
+
+export type StepHold = {
+  code: StepHoldCode;
+  detail: string;
+  /** Sessions holding what this step needs, most relevant first. */
+  conflicts?: readonly string[];
+  nodeId?: string;
+  placementId?: string;
+  checkoutKey?: string;
+  /** Slot accounting when capacity is the reason. */
+  capacity?: { kind: SessionKind; reserved: number; limit: number };
+};
+
+/**
+ * An operator-approved, one-shot exception for one queued retry.
+ *
+ * It may only spend the scheduling margin (`node_headroom`), and only for the
+ * exact session and attempt it was approved for. Everything else the planner
+ * checks still applies.
+ */
+export type ScheduleException = {
+  requestId: string;
+  restriction: "node_headroom";
+  sessionId: string;
+  attempt: number;
+};
 
 export type ScheduleInput = {
   workspaceReady?: boolean;
@@ -70,6 +164,15 @@ export type ScheduleInput = {
   /** Collected agent text per step id, so the decision never reads the database. */
   stepOutputs: ReadonlyMap<string, string>;
   nowMs: number;
+  /**
+   * Receives why each pending step was left pending in this pass.
+   *
+   * Filled by the same decisions that dispatch, so an explanation shown to a
+   * person or an orchestrator cannot drift from what the engine did.
+   */
+  holds?: Map<string, StepHold>;
+  /** Operator-approved "Resume now" exceptions, keyed by step id. */
+  exceptions?: ReadonlyMap<string, ScheduleException>;
 };
 
 /**
@@ -97,11 +200,78 @@ export function remainingCapacity(
 
 const isInFlight = (state: RunStepState) => state === "starting" || state === "running";
 
+/**
+ * Whether a live session holds its checkout against another writer.
+ *
+ * On a Node with managed worktrees every live non-lead session holds its
+ * physical checkout, idle or not, because its process can still change it.
+ * Elsewhere only a writing session in a turn does. Shared by the scheduler
+ * and the manual Resume guard so the two cannot disagree.
+ */
+export function holdsCheckout(
+  session: FleetSession,
+  node: FleetNode | undefined,
+): boolean {
+  const strict =
+    Boolean(session.executionBinding?.worktreeId) ||
+    Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY));
+  return (
+    session.runRole !== "lead" &&
+    !terminalSessionStates.has(session.state) &&
+    (strict || (!session.readOnly && session.state !== "idle"))
+  );
+}
+
+/**
+ * The live sessions holding the checkout `target` would write to, if it needs one.
+ *
+ * A read-only session on a Node without managed worktrees takes no lease, the
+ * same exemption the scheduler gives a reviewer beside a writer.
+ */
+export function checkoutOccupants(
+  target: FleetSession,
+  sessions: readonly FleetSession[],
+  nodes: readonly FleetNode[],
+): FleetSession[] {
+  const nodeById = new Map(nodes.map((node) => [node.id, node]));
+  const node = nodeById.get(target.nodeId);
+  const needsLease =
+    Boolean(target.executionBinding?.worktreeId) ||
+    Boolean(node?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY)) ||
+    !target.readOnly;
+  if (!needsLease) return [];
+  const key = checkoutLockKey(target);
+  return sessions.filter(
+    (candidate) =>
+      candidate.id !== target.id &&
+      candidate.nodeId === target.nodeId &&
+      checkoutLockKey(candidate) === key &&
+      holdsCheckout(candidate, nodeById.get(candidate.nodeId)),
+  );
+}
+
 export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   const { run, steps } = input;
+  const hold = (step: RunStep, value: StepHold) => input.holds?.set(step.id, value);
+  const holdEveryPending = (value: StepHold) => {
+    for (const step of steps) if (step.state === "pending") hold(step, value);
+  };
   if (terminalRunStates.has(run.state)) return [];
-  if (run.state === "awaiting_approval") return [];
-  if (run.state === "blocked") return [];
+  if (run.state === "awaiting_approval") {
+    holdEveryPending({
+      code: "task_held",
+      detail:
+        "The task is waiting for its plan to be approved; nothing is dispatched yet.",
+    });
+    return [];
+  }
+  if (run.state === "blocked") {
+    holdEveryPending({
+      code: "task_held",
+      detail: "The task is blocked; nothing is dispatched until it is unblocked.",
+    });
+    return [];
+  }
   /*
    * A task waiting on a person is not waiting on the fleet: nothing new is
    * dispatched and the orchestrator is not woken, because that would be the
@@ -119,7 +289,14 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
    * it owns reads `offline`. Settling on that would mark live work as failed and
    * finish runs that are still going; waiting costs one reconnect.
    */
-  if (input.nodes.length > 0 && input.nodes.every((node) => !node.online)) return [];
+  if (input.nodes.length > 0 && input.nodes.every((node) => !node.online)) {
+    holdEveryPending({
+      code: "nodes_unknown",
+      detail:
+        "No Node has reported since the Host started. Scheduling resumes when one reconnects.",
+    });
+    return [];
+  }
 
   const actions: ScheduleAction[] = [];
   const sessionById = new Map(input.sessions.map((s) => [s.id, s]));
@@ -292,9 +469,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       nodeById.get(session.nodeId)?.capabilities.includes(MANAGED_WORKTREES_CAPABILITY),
     );
   const heldBy = (session: FleetSession) =>
-    session.runRole !== "lead" &&
-    !terminalSessionStates.has(session.state) &&
-    (strictSession(session) || (!session.readOnly && session.state !== "idle"));
+    holdsCheckout(session, nodeById.get(session.nodeId));
   const writingInFlight = new Set(input.sessions.filter(heldBy).map(checkoutLockKey));
   for (const step of [...inFlight, ...activeRetries]) {
     if (
@@ -320,6 +495,25 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
   const parallelBudget = heldByHuman
     ? 0
     : run.policy.maxParallel - inFlight.length - activeRetries.length;
+  const dispatched = new Set<string>();
+  const awaitingPerson: StepHold = {
+    code: "task_held",
+    detail:
+      "The task is waiting for a person's review; nothing new is dispatched until it is approved, sent back or reopened.",
+  };
+  const budgetHold = (): StepHold =>
+    heldByHuman
+      ? awaitingPerson
+      : {
+          code: "parallel_limit",
+          detail: `The task already runs ${inFlight.length + activeRetries.length + started} of its ${run.policy.maxParallel} parallel steps; this starts when one settles.`,
+          conflicts: [...inFlight, ...activeRetries]
+            .map((entry) => entry.sessionId)
+            .filter(Boolean),
+        };
+  const stepKeyOf = (entry: RunStep) =>
+    entry.executionBinding?.checkoutKey ?? executionKey(run, entry.placementId);
+  let budgetExhausted = false;
 
   for (const step of steps) {
     if (effectiveState(step) !== "pending") continue;
@@ -327,11 +521,28 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       Boolean(step.sessionId) &&
       step.workspaceState === "ready" &&
       Boolean(step.executionBinding);
-    if (!workspaceReady && !retryWorkspaceReady) continue;
-    const unmet = step.dependsOn.some((key) => stateByKey.get(key) !== "succeeded");
-    if (unmet) continue;
-    if (run.workspaceBinding?.effectiveMode === "managed" && !step.executionBinding)
+    if (!workspaceReady && !retryWorkspaceReady) {
+      hold(step, {
+        code: "workspace_not_ready",
+        detail: "The task's workspace is still being prepared.",
+      });
       continue;
+    }
+    const unmet = step.dependsOn.filter((key) => stateByKey.get(key) !== "succeeded");
+    if (unmet.length) {
+      hold(step, {
+        code: "dependencies",
+        detail: `Waiting for ${unmet.join(", ")} to succeed first.`,
+      });
+      continue;
+    }
+    if (run.workspaceBinding?.effectiveMode === "managed" && !step.executionBinding) {
+      hold(step, {
+        code: "workspace_not_ready",
+        detail: "This step's isolated workspace is not ready yet.",
+      });
+      continue;
+    }
     const desiredKey =
       step.executionBinding?.checkoutKey ??
       executionKey(run, step.placementId || run.placementId);
@@ -393,31 +604,83 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         });
         continue;
       }
-      if (session.stopRequested || session.dismissed || !node.online) continue;
+      const where = { nodeId: node.id, placementId };
+      if (session.stopRequested) {
+        hold(step, {
+          code: "stop_pending",
+          detail:
+            "A Stop for this worker has not been acknowledged yet; the queued follow-up waits for it.",
+          ...where,
+        });
+        continue;
+      }
+      if (session.dismissed) {
+        hold(step, {
+          code: "dismissed",
+          detail:
+            "The worker session is dismissed; restore it before its queued follow-up can run.",
+          ...where,
+        });
+        continue;
+      }
+      if (!node.online) {
+        hold(step, {
+          code: "node_offline",
+          detail: `${node.name} is offline; the queued follow-up waits for it to reconnect.`,
+          ...where,
+        });
+        continue;
+      }
       const needsLease = requiresCheckoutLease(run, step.category, node);
       const retryKey =
         step.executionBinding?.checkoutKey ?? executionKey(run, placementId);
-      const anotherWriter =
-        needsLease &&
-        input.sessions.some(
-          (candidate) =>
-            candidate.id !== session.id &&
-            checkoutLockKey(candidate) === retryKey &&
-            heldBy(candidate),
-        );
-      if (anotherWriter) continue;
+      const occupants = needsLease
+        ? input.sessions.filter(
+            (candidate) =>
+              candidate.id !== session.id &&
+              checkoutLockKey(candidate) === retryKey &&
+              heldBy(candidate),
+          )
+        : [];
+      if (occupants.length) {
+        hold(step, {
+          code: "checkout_busy",
+          detail: checkoutBusyDetail(placement, node, occupants),
+          conflicts: occupants.map((occupant) => occupant.id),
+          checkoutKey: retryKey,
+          ...where,
+        });
+        continue;
+      }
+      const sameTaskWriters = () =>
+        [...inFlight, ...activeRetries]
+          .filter((entry) => entry.id !== step.id && stepKeyOf(entry) === retryKey)
+          .map((entry) => entry.sessionId)
+          .filter(Boolean);
+      const sameTaskBusy: StepHold = {
+        code: "checkout_busy",
+        detail: `Another step of this task is writing to ${placement.localPath} on ${node.name}; one writer per checkout.`,
+        conflicts: sameTaskWriters(),
+        checkoutKey: retryKey,
+        ...where,
+      };
 
       if (session.state === "idle") {
-        if (started >= parallelBudget) continue;
+        if (started >= parallelBudget) {
+          hold(step, { ...budgetHold(), ...where });
+          continue;
+        }
         if (
           needsLease &&
           writingInFlight.has(retryKey) &&
           !(strictSession(session) && started === 0)
         ) {
+          hold(step, sameTaskBusy);
           continue;
         }
         if (needsLease) writingInFlight.add(retryKey);
         started += 1;
+        dispatched.add(step.id);
         actions.push({
           type: "prompt_step",
           stepId: step.id,
@@ -426,7 +689,14 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         });
         continue;
       }
-      if (!terminalSessionStates.has(session.state)) continue;
+      if (!terminalSessionStates.has(session.state)) {
+        hold(step, {
+          code: "session_busy",
+          detail: sessionBusyDetail(session.state),
+          ...where,
+        });
+        continue;
+      }
       if (step.dispatchedAt) {
         settled.set(step.id, "failed");
         actions.push({
@@ -439,27 +709,71 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         });
         continue;
       }
-      if (started >= parallelBudget) continue;
+      if (started >= parallelBudget) {
+        hold(step, { ...budgetHold(), ...where });
+        continue;
+      }
       if (needsLease && writingInFlight.has(retryKey)) {
+        hold(step, sameTaskBusy);
         continue;
       }
 
       const kind: SessionKind = session.readOnly ? "read-only" : "writing";
-      if (remainingCapacity(node, reservedFor(node.id, kind), kind) <= 0) continue;
+      const reserved = reservedFor(node.id, kind);
+      const limit = capacityFor(node, kind);
+      let exceptionId: string | undefined;
+      if (remainingCapacity(node, reserved, kind) <= 0) {
+        const exception = input.exceptions?.get(step.id);
+        const holders = input.sessions
+          .filter(
+            (candidate) =>
+              candidate.nodeId === node.id &&
+              !terminalSessionStates.has(candidate.state) &&
+              Boolean(candidate.readOnly) === (kind === "read-only"),
+          )
+          .map((candidate) => candidate.id);
+        // The approved exception spends only the reserved margin. A Node that
+        // is at its hard limit refuses the launch whatever was approved.
+        if (
+          reserved < limit &&
+          exception?.restriction === "node_headroom" &&
+          exception.sessionId === session.id &&
+          exception.attempt === step.attempts
+        ) {
+          exceptionId = exception.requestId;
+        } else {
+          hold(step, {
+            code: reserved < limit ? "node_headroom" : "node_capacity",
+            detail:
+              reserved < limit
+                ? `${node.name} is at Fleet's scheduling limit for ${kind} work: ${reserved} of ${limit} slots are held, and Fleet keeps the last slot free on a multi-slot Node.`
+                : `${node.name} is full for ${kind} work: ${reserved} of ${limit} slots are held. The follow-up resumes when one frees.`,
+            conflicts: holders,
+            capacity: { kind, reserved, limit },
+            ...where,
+          });
+          continue;
+        }
+      }
 
-      reservedByNode.set(key(node.id, kind), reservedFor(node.id, kind) + 1);
+      reservedByNode.set(key(node.id, kind), reserved + 1);
       if (needsLease) writingInFlight.add(retryKey);
       started += 1;
+      dispatched.add(step.id);
       actions.push({
         type: "resume_step",
         stepId: step.id,
         sessionId: session.id,
+        ...(exceptionId ? { exceptionId } : {}),
       });
       continue;
     }
 
-    if (started >= parallelBudget) break;
-    const placementId = choosePlacement(step, {
+    if (started >= parallelBudget) {
+      budgetExhausted = true;
+      break;
+    }
+    const chosen = choosePlacement(step, {
       run,
       placements: input.placements,
       nodeById,
@@ -470,7 +784,11 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
         ? { repositoryCapabilities: input.repositoryCapabilities }
         : {}),
     });
-    if (!placementId) continue;
+    if ("reason" in chosen) {
+      hold(step, { code: "no_placement", detail: chosen.reason });
+      continue;
+    }
+    const placementId = chosen.placementId;
 
     const placement = placementById.get(placementId)!;
     const startedKind: SessionKind = isReadOnlyCategory(step.category)
@@ -487,6 +805,7 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
     }
     settled.set(step.id, "starting");
     started += 1;
+    dispatched.add(step.id);
     actions.push({
       type: "start_step",
       stepId: step.id,
@@ -495,6 +814,16 @@ export function planNextActions(input: ScheduleInput): ScheduleAction[] {
       // race the agent's own first turn.
       prompt: step.prompt,
     });
+  }
+  if (budgetExhausted && input.holds) {
+    for (const step of steps) {
+      if (
+        effectiveState(step) === "pending" &&
+        !dispatched.has(step.id) &&
+        !input.holds.has(step.id)
+      )
+        hold(step, budgetHold());
+    }
   }
 
   const remaining = steps.filter(
@@ -853,7 +1182,7 @@ export function decidePlacement(request: PlacementRequest): Placement | string {
 function choosePlacement(
   step: RunStep,
   context: Omit<PlacementRequest, "category" | "workspace">,
-): string | undefined {
+): { placementId: string } | { reason: string } {
   if (
     context.run.workspaceBinding?.effectiveMode === "managed" &&
     step.executionBinding
@@ -862,16 +1191,19 @@ function choosePlacement(
       (placement) => placement.id === step.executionBinding!.sourcePlacementId,
     );
     const node = source ? context.nodeById.get(source.nodeId) : undefined;
-    if (!source || !usable(node, context.run)) return undefined;
+    if (!source || !usable(node, context.run))
+      return {
+        reason: "The step's pinned source checkout or its Node is not available.",
+      };
     const kind: SessionKind = isReadOnlyCategory(step.category) ? "read-only" : "writing";
     if (remainingCapacity(node!, context.reservedFor(node!.id, kind), kind) < 1)
-      return undefined;
+      return { reason: `${node!.name} has no free slot for ${kind} work.` };
     if (
       requiresCheckoutLease(context.run, step.category, node) &&
       context.writingInFlight.has(step.executionBinding.checkoutKey)
     )
-      return undefined;
-    return source.id;
+      return { reason: "Another session is writing to this step's checkout." };
+    return { placementId: source.id };
   }
   /*
    * A step that already names a checkout keeps it. The orchestrator tools
@@ -882,24 +1214,27 @@ function choosePlacement(
    */
   if (step.placementId) {
     const chosen = context.placements.find((p) => p.id === step.placementId);
-    if (!chosen) return undefined;
+    if (!chosen) return { reason: "The step's checkout was removed." };
     const node = context.nodeById.get(chosen.nodeId);
-    if (!usable(node, context.run)) return undefined;
+    if (!usable(node, context.run))
+      return { reason: `${chosen.nodeName} is offline or cannot run this task.` };
     if (
       requiresCheckoutLease(context.run, step.category, node) &&
       context.writingInFlight.has(executionKey(context.run, chosen.id))
     ) {
-      return undefined;
+      return {
+        reason: `Another session is writing to ${chosen.localPath} on ${chosen.nodeName}; one writer per checkout.`,
+      };
     }
     const kind: SessionKind = isReadOnlyCategory(step.category) ? "read-only" : "writing";
     if (remainingCapacity(node!, context.reservedFor(node!.id, kind), kind) < 1) {
-      return undefined;
+      return { reason: `${chosen.nodeName} has no free slot for ${kind} work.` };
     }
-    return chosen.id;
+    return { placementId: chosen.id };
   }
 
   const decided = decidePlacement({ ...context, category: step.category });
-  return typeof decided === "string" ? undefined : decided.id;
+  return typeof decided === "string" ? { reason: decided } : { placementId: decided.id };
 }
 
 function usable(node: FleetNode | undefined, run: Run): boolean {

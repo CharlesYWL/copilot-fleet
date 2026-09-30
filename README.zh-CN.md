@@ -658,7 +658,8 @@ npm run start:node -- --url="https://fleet.example.com" `
 
 节点名默认取机器的主机名，两端都可以改 —— Host 的 Nodes 标签页，或者节点自己的配置页。
 重命名不会改变机器身份，它的放置和会话都会跟着走；名字由 Host 拥有，所以如果节点离线
-期间两端都改过，以 Host 的名字为准并推送回去。想要 10 以外的并发容量就传
+期间两端都改过，以 Host 的名字为准并推送回去。已经在上面运行的代理无需重启就能读到新名字，
+见[节点配置页](#节点配置页)。想要 10 以外的并发容量就传
 `--max-sessions 4`。
 
 注册会把节点的私钥和 Host 的公钥存到
@@ -1040,6 +1041,23 @@ Copilot 则通过它支持的 API 删除自己的数据。
 它还能编辑节点名、会话容量、Copilot 可执行文件路径和权限超时。这些值存放在凭据旁边的
 `settings.json` 里，并且优先级高于环境变量，因此这里的修改不会被下次启动时过期的
 `.env` 覆盖。命令行参数的优先级高于两者。
+
+代理也靠它得知自己在哪个节点上。Fleet 名字只是一个标签，不必和机器的主机名一致，而且操作者
+可以在代理运行期间从 Host 改名。因此节点启动的每个代理都会拿到两个环境变量：
+`FLEET_NODE_ID` 是节点 id，改名永远不会改变它；`FLEET_NODE_IDENTITY_URL` 是本页的
+`/api/identity`，对它发 GET 会返回此刻的名字（配置页没能启动时不设置）：
+
+```powershell
+Invoke-RestMethod $env:FLEET_NODE_IDENTITY_URL
+# nodeId      : 0f8e6c2a-5b1d-4c3e-9f7a-2d4b6e8a1c3f
+# nodeName    : build-01
+# machineName : DESKTOP-7Q2M4VX
+# connected   : True
+```
+
+`nodeName` 是 Host 最近确认的名字。Host 不可达时 `connected` 为 false，此时在 Host 上做的
+改名还没有送达。Orchestrator 派出的 worker 会被告知它被放到了哪个节点（名字和 id），
+如果该节点设置了这两个变量，也会被指向它们。
 
 这个监听只绑定回环地址，并且刻意不对外暴露：任何能把节点重新指向另一个 Host 的东西，
 都能在那台机器上执行命令。要访问远端节点的页面，请通过 SSH 端口转发，而不是把监听放宽。
@@ -1687,7 +1705,9 @@ home directory 里发生的修改会把整个 task 钉在那里，后续步骤�
   被写进去。
 - 节点本地的配置页绑定在回环地址上，并且还会拒绝这些请求：`Host` 不是本机对应端口上的
   `127.0.0.1`（或 `localhost`）、来自其他来源、或写入时没有带
-  `content-type: application/json`。它无法防御登录到同一台机器上的其他用户。
+  `content-type: application/json`。它无法防御登录到同一台机器上的其他用户，也无法防御
+  节点自己的代理 —— 它们以节点的用户身份运行；交给它们的身份地址只是省去查找，并没有授予
+  它们原本够不到的任何东西。
 - 暴露在公网上的 Host 仍应使用 HTTPS/WSS；把它放在带认证的反向代理或访问策略之后
   （例如 Cloudflare Access）依然是一层值得加的防护。
 

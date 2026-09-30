@@ -97,6 +97,194 @@ afterEach(() => {
   document.body.innerHTML = "";
 });
 
+describe("placement folder picker", () => {
+  const listing = (path = "/home/node") => ({
+    ok: true,
+    path,
+    parent: path === "/" ? null : "/",
+    folders: [{ name: "<project & files>", path: "/project" }],
+    unavailableLinks: 0,
+  });
+
+  const loadedPath = (path) =>
+    vi.waitFor(() => {
+      expect($("folderPickerPath").value).toBe(path);
+      expect($("folderPickerChoose").disabled).toBe(false);
+    });
+
+  async function startPickerPage(folderResponse = () => reply(listing())) {
+    vi.mocked(fetch).mockImplementation((path, init) => {
+      if (path === "/api/folders") return folderResponse(JSON.parse(init.body), init);
+      if (path === "/api/fleet") {
+        return reply({
+          workspaces: [{ id: "ws-1", name: "Project" }],
+          placements: [{ id: "pl-1", workspaceId: "ws-1", localPath: "/existing" }],
+        });
+      }
+      return respond(path, init);
+    });
+    await startPage();
+    const dialog = $("folderPicker");
+    if (dialog) {
+      dialog.showModal = () => {
+        dialog.open = true;
+      };
+      dialog.close = () => {
+        dialog.open = false;
+        dialog.dispatchEvent(new Event("close"));
+      };
+    }
+  }
+
+  it("opens immediately while folders load, and Cancel works without waiting", async () => {
+    let signal;
+    await startPickerPage((_body, init) => {
+      signal = init.signal;
+      return new Promise(() => {});
+    });
+    $("plBrowse").click();
+
+    expect($("folderPicker")?.open).toBe(true);
+    expect($("plBrowse").textContent).toBe("Browse…");
+    expect($("folderPickerChoose").disabled).toBe(true);
+    expect($("folderPickerStatus").textContent).toContain("Loading");
+    $("folderPickerCancel").click();
+    expect($("folderPicker").open).toBe(false);
+    expect(signal.aborted).toBe(true);
+    expect($("plPath").value).toBe("");
+    expect(
+      vi.mocked(fetch).mock.calls.some(([path]) => path === "/api/pick-folder"),
+    ).toBe(false);
+  });
+
+  it("navigates folders safely and fills the chosen path without adding a placement", async () => {
+    await startPickerPage(({ path }) => reply(listing(path || "/home/node")));
+    $("plBrowse").click();
+    await vi.waitFor(() => expect($("folderPickerChoose").disabled).toBe(false));
+    expect($("folderPickerFolders").querySelector("project")).toBeNull();
+    expect($("folderPickerFolders").textContent).toContain("<project & files>");
+    $("folderPickerFolders").querySelector("button").click();
+    await loadedPath("/project");
+    $("folderPickerChoose").click();
+
+    expect($("plPath").value).toBe("/project");
+    expect($("plCheck").textContent).toBe("Folder found on this machine");
+    expect($("folderPicker").open).toBe(false);
+    expect(vi.mocked(fetch).mock.calls.some(([path]) => path === "/api/placements")).toBe(
+      false,
+    );
+  });
+
+  it("uses the same chooser for existing placements, with Home, Up and typed paths", async () => {
+    await startPickerPage(({ path }) => reply(listing(path || "/home/node")));
+    document.querySelector('[data-pl-browse="pl-1"]').click();
+    await loadedPath("/existing");
+    $("folderPickerUp").click();
+    await loadedPath("/");
+    expect($("folderPickerUp").disabled).toBe(true);
+    $("folderPickerHome").click();
+    await loadedPath("/home/node");
+    $("folderPickerPath").value = "Q:\\Repos";
+    $("folderPickerForm").dispatchEvent(new Event("submit", { cancelable: true }));
+    await loadedPath("Q:\\Repos");
+    $("folderPickerChoose").click();
+    expect(document.querySelector('[data-pl="pl-1"]').value).toBe("Q:\\Repos");
+    expect($("plPath").value).toBe("");
+  });
+
+  it("shows errors and allows another path without closing the chooser", async () => {
+    let fail = true;
+    await startPickerPage(() =>
+      fail
+        ? Promise.resolve({
+            ok: false,
+            json: async () => ({ error: "Access denied" }),
+          })
+        : reply(listing()),
+    );
+    $("plBrowse").click();
+    await vi.waitFor(() =>
+      expect($("folderPickerMsg").textContent).toContain("Access denied"),
+    );
+    expect($("folderPickerChoose").disabled).toBe(true);
+    fail = false;
+    $("folderPickerHome").click();
+    await vi.waitFor(() => expect($("folderPickerChoose").disabled).toBe(false));
+    expect($("folderPickerMsg").textContent).toBe("");
+  });
+
+  it("times out a stalled listing instead of leaving an indefinite wait", async () => {
+    await startPickerPage((_body, { signal }) => {
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    });
+    $("plBrowse").click();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect($("folderPickerMsg").textContent).toContain("timed out");
+    expect($("folderPickerChoose").disabled).toBe(true);
+    expect($("folderPickerCancel").disabled).toBe(false);
+    $("folderPickerCancel").click();
+    expect($("folderPicker").open).toBe(false);
+  });
+
+  it("ignores a late response from a canceled chooser after it has been reopened", async () => {
+    let finish;
+    let first = true;
+    await startPickerPage(() => {
+      if (!first) return reply(listing("/new"));
+      first = false;
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    $("plBrowse").click();
+    $("folderPickerCancel").click();
+    $("plBrowse").click();
+    await vi.waitFor(() => expect($("folderPickerPath").value).toBe("/new"));
+    finish(await reply(listing("/stale")));
+    await vi.advanceTimersByTimeAsync(0);
+    expect($("folderPickerPath").value).toBe("/new");
+    $("folderPickerChoose").click();
+    expect($("plPath").value).toBe("/new");
+  });
+
+  it("does not overwrite a typed location with an older in-flight listing", async () => {
+    let finish;
+    await startPickerPage(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    $("plBrowse").click();
+    type("folderPickerPath", "Q:\\Repos");
+    finish(await reply(listing("/stale")));
+    await vi.advanceTimersByTimeAsync(0);
+    expect($("folderPickerPath").value).toBe("Q:\\Repos");
+    expect($("folderPickerChoose").disabled).toBe(true);
+    expect($("folderPickerStatus").textContent).toContain("Press Open");
+  });
+
+  it("allows choosing an empty folder and keeps Escape cancellation non-destructive", async () => {
+    await startPickerPage(() =>
+      reply({ ...listing("/empty"), folders: [], unavailableLinks: 1 }),
+    );
+    $("plPath").value = "/original";
+    $("plBrowse").click();
+    await loadedPath("/empty");
+    expect($("folderPickerStatus").textContent).toContain("No subfolders");
+    expect($("folderPickerStatus").textContent).toContain("1 link(s) could not be read");
+    $("folderPicker").dispatchEvent(new Event("cancel", { cancelable: true }));
+    expect($("folderPicker").open).toBe(false);
+    expect($("plPath").value).toBe("/original");
+    $("plBrowse").click();
+    await loadedPath("/empty");
+    $("folderPickerChoose").click();
+    expect($("plPath").value).toBe("/empty");
+  });
+});
+
 describe("node settings form", () => {
   it("keeps permission management separate from the settings save", async () => {
     stored = {

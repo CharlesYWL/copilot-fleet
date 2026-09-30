@@ -1,5 +1,8 @@
 import { z } from "zod";
 import {
+  AGENT_IDENTITY_CAPABILITY,
+  AGENT_NODE_IDENTITY_URL_ENV,
+  AGENT_NODE_ID_ENV,
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
   MANAGED_WORKTREES_CAPABILITY,
@@ -25,11 +28,13 @@ import {
   terminalRunStepStates,
   terminalSessionStates,
   type CriterionOutcome,
+  type FleetNode,
   type FleetSession,
   type Placement,
   type Run,
   type RunCriterion,
   type RunStep,
+  type StepAdmission,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { reservedSessionCount } from "../session-policy.js";
@@ -50,6 +55,7 @@ import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
 import { PrMaintenanceError } from "../pr-maintenance-store.js";
+import { WorkerResumeConflict } from "../worker-resume-store.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export const WORKER_CATEGORIES = [
@@ -206,6 +212,8 @@ export function composeWorkerPrompt(input: {
   scope: string;
   verify: string;
   context?: string | undefined;
+  /** The machine the Host placed this step on, when it is known. */
+  runsOn?: WorkerNode | undefined;
 }): string {
   return [
     `TASK: ${input.title}`,
@@ -219,6 +227,7 @@ export function composeWorkerPrompt(input: {
     `VERIFY`,
     input.verify,
     ...(input.context ? ["", `CONTEXT`, input.context] : []),
+    ...(input.runsOn ? ["", "FLEET NODE", workerNodeNote(input.runsOn)] : []),
     "",
     "FLEET DELIVERY",
     WORKER_DELIVERY_CONTRACT,
@@ -230,6 +239,31 @@ export function composeWorkerPrompt(input: {
     "could not, say that instead — an unchecked claim is worse than an honest",
     "gap, because it will be believed.",
   ].join("\n");
+}
+
+type WorkerNode = Pick<FleetNode, "id" | "name" | "capabilities">;
+
+/**
+ * Where the step runs, in terms a worker can check from the machine itself.
+ *
+ * A brief may name the machine it wants, and the only name a worker could see
+ * was the operating system's, which a Fleet name need not match — so a worker
+ * told it was on one node, finding a host name that said otherwise, stopped to
+ * ask instead of working somewhere it could not confirm. The id never changes;
+ * the name can, while the step runs, so the worker is pointed at where to read
+ * the current one rather than left to trust this copy. Older Nodes set neither
+ * variable, and naming them there would hand the worker a contradiction.
+ */
+function workerNodeNote(node: WorkerNode): string {
+  const where =
+    `This step runs on Fleet node "${node.name}" (node id ${node.id}). A Fleet ` +
+    "name is a label an operator can change, so this machine's host name need not match it.";
+  if (!node.capabilities.includes(AGENT_IDENTITY_CAPABILITY)) return where;
+  return (
+    `${where} To confirm from here: ${AGENT_NODE_ID_ENV} in your environment is the ` +
+    `node id, and ${AGENT_NODE_IDENTITY_URL_ENV}, when set, answers a GET with the ` +
+    "node's current name."
+  );
 }
 
 export const PlanTaskSchema = z.object({
@@ -410,6 +444,41 @@ export const SubmitTaskSchema = TaskRefSchema.extend({
 export const SessionRefSchema = z.object({
   sessionId: z.string().min(1).describe("The worker's session id."),
 });
+
+/**
+ * Asking for a queued follow-up to run now.
+ *
+ * Deliberately without any flag that could read as consent: an orchestrator
+ * can only ask, and the Host decides whether asking means anything.
+ */
+export const RequestResumeSchema = SessionRefSchema.extend({
+  reason: z
+    .string()
+    .max(1_000)
+    .optional()
+    .describe(
+      "Why this worker should run now rather than wait, in one or two sentences. Shown to the operator; it grants nothing.",
+    ),
+});
+
+/** One line an orchestrator can act on: state, the scheduler's reason, who is in the way. */
+function admissionLine(admission: StepAdmission): string {
+  const conflicts = admission.conflicts.length
+    ? ` Sessions involved: ${admission.conflicts
+        .map(
+          (conflict) =>
+            `${conflict.name || conflict.sessionId} (${conflict.state || "unknown"}${
+              conflict.taskName
+                ? `, task "${conflict.taskName}"${conflict.sameTask ? " (this task)" : ""}`
+                : conflict.role
+                  ? `, ${conflict.role}`
+                  : ", not managed by a task"
+            })`,
+        )
+        .join("; ")}.`
+    : "";
+  return `Admission: ${admission.state} (${admission.code}) — ${admission.detail}${conflicts}`;
+}
 
 /**
  * The way out when a task cannot be finished as promised.
@@ -2349,7 +2418,10 @@ export class FleetTools {
     const step = this.store.upsertRunStep(run.id, {
       stepKey,
       title: input.title,
-      prompt: composeWorkerPrompt(input),
+      prompt: composeWorkerPrompt({
+        ...input,
+        runsOn: this.store.getNode(placement.nodeId),
+      }),
       category: input.category,
       // Recorded so the engine dispatches where this reply says it will.
       placementId: placement.id,
@@ -2711,8 +2783,7 @@ export class FleetTools {
         return step.state === "pending"
           ? {
               action: "queued",
-              reason:
-                "A follow-up is already queued durably in this session. Wait for scheduling; do not resend or replace it.",
+              reason: this.queuedReason(run, step),
             }
           : {
               action: "in_flight",
@@ -2890,15 +2961,90 @@ export class FleetTools {
           `Read fleet_get_task (task: "${run.id}") before deciding what to do next.`,
       );
     }
+    const admission = this.service.workerResume?.admission(run.id, retried.id);
     return ok(
       [
         next.action === "resume"
           ? "Queued the follow-up in the same worker session. It will resume when scheduling allows, and you will be woken when it finishes."
           : "Queued the follow-up in the same open worker session. It will start when scheduling allows, and you will be woken when it finishes.",
         `Task: ${run.id}; session: ${owned.id}; step: ${step.stepKey}; state: ${retried.state}.`,
+        ...(admission ? [admissionLine(admission)] : []),
         "The request is persisted. Do not send it again or create a replacement while it is queued.",
       ].join("\n"),
     );
+  }
+
+  /**
+   * Asks for a queued follow-up to run now, which ordinary scheduling decides.
+   *
+   * An orchestrator may ask; it can never approve. Only a follow-up held back
+   * solely by a Node's reserved scheduling slot becomes an approval request,
+   * and an authenticated operator decides it in Fleet.
+   */
+  requestResume(input: z.infer<typeof RequestResumeSchema>): ToolResult {
+    const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
+    if (typeof owned === "string") return refuse(owned);
+    const resume = this.service.workerResume;
+    if (!resume) return refuse("Resume now is not available on this Host.");
+    try {
+      const outcome = resume.request(
+        {
+          sessionId: owned.id,
+          ...(input.reason ? { reason: input.reason } : {}),
+        },
+        { kind: "orchestrator", id: this.leadSessionId },
+      );
+      const lines = [
+        `Status: ${outcome.status}. ${outcome.message}`,
+        ...(outcome.admission ? [admissionLine(outcome.admission)] : []),
+        ...(outcome.request
+          ? [
+              `Request ${outcome.request.id}: ${outcome.request.state}${
+                outcome.request.state === "awaiting_approval"
+                  ? `, expires ${outcome.request.expiresAt}`
+                  : ""
+              }. ${outcome.request.outcome}`,
+            ]
+          : []),
+        outcome.status === "awaiting_approval"
+          ? "You cannot approve this, and saying so in chat does not approve it. End your turn; you are woken when the follow-up settles. Do not ask again or create a replacement worker."
+          : outcome.status === "starting" || outcome.status === "running"
+            ? "Nothing else is needed. You are woken when the follow-up settles."
+            : "Nothing was changed. It stays queued; do not create a replacement worker to get around this.",
+      ];
+      return outcome.status === "blocked"
+        ? refuse(lines.join("\n"))
+        : ok(lines.join("\n"));
+    } catch (error) {
+      if (error instanceof WorkerResumeConflict) return refuse(error.message);
+      throw error;
+    }
+  }
+
+  /** What a queued follow-up is waiting on, in the scheduler's own terms. */
+  private queuedReason(run: Run, step: RunStep): string {
+    const base =
+      "A follow-up is already queued durably in this session. Do not resend or replace it.";
+    const resume = this.service.workerResume;
+    const admission = resume?.admission(run.id, step.id);
+    if (!admission) return `${base} Wait for scheduling.`;
+    const latest = resume
+      ?.list({ runId: run.id, limit: 20 })
+      .find(
+        (request) => request.stepId === step.id && request.stepAttempt === step.attempts,
+      );
+    return [
+      base,
+      admissionLine(admission),
+      ...(admission.exception && admission.state !== "awaiting_approval"
+        ? [
+            `An operator may approve spending the Node's reserved slot once; fleet_request_resume with sessionId "${step.sessionId}" asks for that approval. You cannot approve it yourself.`,
+          ]
+        : []),
+      ...(latest && latest.state !== "awaiting_approval"
+        ? [`Latest resume-now request: ${latest.state}. ${latest.outcome}`]
+        : []),
+    ].join(" ");
   }
 
   stopWork(input: z.infer<typeof SessionRefSchema>): ToolResult {

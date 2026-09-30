@@ -474,7 +474,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       // `run` is the first task, kept so an older UI still finds one.
       run: runs[0],
       runs,
-      steps: runs.flatMap((run) => store.listRunSteps(run.id)),
+      steps: runs.flatMap((run) =>
+        service.withAdmission(run.id, store.listRunSteps(run.id)),
+      ),
       notes: runs.flatMap((run) => store.listRunNotes(run.id)),
     })),
   }));

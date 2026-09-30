@@ -344,6 +344,10 @@ of them on one Windows machine, or split Host and Node across machines.
    **Add placement** to choose the workspace, an online Node, and an absolute
    local path that already exists on that Node, such as `C:\code\checkout-service`
    or `/srv/checkout-service`.
+   On the Node's own config page, **Browse** opens an in-page folder chooser.
+   Use **Home**, **Up**, or enter a path to switch drives, then **Choose this folder**.
+   It lists folders on the Node without uploading files or opening a separate desktop
+   dialog, so it also works when the Node runs in the background.
 9. **Start a session.** Choose **New session**, pick **Where to run**, optionally
    set **Session name**, write the **Initial prompt**, and decide whether **YOLO
    mode** should ask before each tool or run with `--allow-all`. Keep YOLO off
@@ -883,8 +887,9 @@ The node name defaults to the machine hostname, and can be changed from either
 end — the Host's Nodes tab or the node's own config page. Renaming keeps the
 machine's identity, so its placements and sessions come with it; the Host owns
 the name, so if both ends changed while the node was offline, the Host's name
-wins and is pushed back down. Pass `--max-sessions 4` if you want a capacity
-other than 10.
+wins and is pushed back down. Agents already running there can read the new
+name without a restart — see [Node config page](#node-config-page). Pass
+`--max-sessions 4` if you want a capacity other than 10.
 
 Enrollment stores the node's private key and the Host's public key at
 `$env:APPDATA\CopilotFleet\node.json`; subsequent starts need no grant, and no
@@ -1424,6 +1429,26 @@ It also edits the node name, session capacity, Copilot executable path, and
 permission timeout. Values are stored in `settings.json` beside the credentials
 and take precedence over the environment variables, so an edit here is not
 undone by a stale `.env` on the next start. Command-line flags outrank both.
+
+Agents use it to learn which node they are on. A Fleet name is a label, so it
+need not match the machine's host name, and an operator can rename the node from
+the Host while its agents run. Every agent a node starts therefore gets two
+variables: `FLEET_NODE_ID`, the node id, which a rename never changes; and
+`FLEET_NODE_IDENTITY_URL`, this page's `/api/identity`, which answers a GET with
+the name as of that moment (absent if the page could not start):
+
+```powershell
+Invoke-RestMethod $env:FLEET_NODE_IDENTITY_URL
+# nodeId      : 0f8e6c2a-5b1d-4c3e-9f7a-2d4b6e8a1c3f
+# nodeName    : build-01
+# machineName : DESKTOP-7Q2M4VX
+# connected   : True
+```
+
+`nodeName` is the name the Host last confirmed. `connected` is false while the
+Host is unreachable, when a rename made there has not arrived yet. A worker the
+orchestrator dispatches is told the node it was placed on, by name and id, and
+pointed at both variables when its node sets them.
 
 The listener binds to loopback only and is deliberately not exposed: anything
 that can repoint a node at a different Host can run commands on that machine.
@@ -2329,6 +2354,24 @@ follow-ups are persisted and scheduled in the same session. Queued, busy,
 stopping or offline does not mean replacement is needed; a repeated pending
 follow-up is not sent twice, and a different prompt cannot overwrite it.
 
+**Why a queued follow-up waits, and "Resume now".** Every queued step carries
+the scheduler's own reason — the same pass that decides dispatch records it — in
+the task page, the worker's transcript banner, `fleet_list_work`,
+`fleet_get_task` and the `fleet_follow_up` reply. The states are _queued_
+(ordinary capacity or ordering; Fleet starts it by itself), _blocked_ (another
+live session holds the same checkout, the Node is offline, a Stop, human hold or
+PR-maintenance hold applies), _awaiting approval_, _starting_ (sent, not yet
+acknowledged by the Node) and _running_ (acknowledged). Sessions in different
+checkouts on the same Node never block each other while capacity allows.
+**Resume now** on a queued follow-up runs ordinary scheduling first. Only a
+follow-up held back solely by the Node's reserved scheduling slot becomes a
+one-time approval request, which a signed-in operator answers in a dialog with
+**Approve once** or **Cancel request**; it then resumes the same conversation
+and sends the already-queued follow-up exactly once. An orchestrator may ask with
+`fleet_request_resume` but can never approve. Another writer in the same
+checkout is explained, never overridden. See the
+[orchestration lifecycle](docs/orchestration-lifecycle.md#queued-follow-up-admission-and-resume-now).
+
 **When a conversation fills up, move its work.** An orchestrator has one context
 window, so a long-lived conversation eventually runs out of room. Start a new
 conversation and hand the work to it: **Transfer tasks** in a conversation's
@@ -2482,7 +2525,9 @@ stops a run rather than a prompt each time.
 - The node's local config page is bound to loopback and additionally refuses
   requests that do not name `127.0.0.1` (or `localhost`) on its own port, come
   from another origin, or write without `content-type: application/json`. It
-  does not defend against another user signed in to the same machine.
+  does not defend against another user signed in to the same machine, or against
+  the node's own agents, which run as its user; the identity address they are
+  given saves them a search, and grants nothing they could not already reach.
 - An internet-exposed Host should still use HTTPS/WSS, and putting one behind
   an authenticated reverse proxy or access policy (for example Cloudflare
   Access) remains a good second layer.

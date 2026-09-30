@@ -59,6 +59,7 @@ import { startSessionRetentionMonitor } from "./session-retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
 import { sessionFileRoutes } from "./routes/session-files.js";
 import { runRoutes } from "./routes/runs.js";
+import { workerResumeRoutes } from "./routes/worker-resume.js";
 import { managedWorktreeRoutes } from "./routes/managed-worktrees.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
 import { systemRoutes } from "./routes/system.js";
@@ -454,6 +455,7 @@ export async function buildServer(
      */
     mcpUrl: () => new URL(MCP_PATH, enrollmentHostUrl()).toString(),
     tickRun: (runId) => engine.tickRun(runId),
+    resume: engine.resume,
   });
   await app.register(mcpRoutes, {
     service,
@@ -464,6 +466,7 @@ export async function buildServer(
     audit: (entry) => auth.audit(entry),
   });
   await app.register(runRoutes, { service, engine });
+  await app.register(workerResumeRoutes, { engine });
   await app.register(managedWorktreeRoutes, { service });
   await app.register(orchestratorRoutes, { service, engine });
   await app.register(hostUpdateRoutes, { hostUpdate });

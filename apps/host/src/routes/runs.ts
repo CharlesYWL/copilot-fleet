@@ -62,13 +62,16 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
 
   const withSteps = (runId: string) => ({
     run: store.getRun(runId),
-    steps: store.listRunSteps(runId),
+    steps: service.withAdmission(runId, store.listRunSteps(runId)),
   });
 
   app.get("/api/runs", async () => {
     const runs = store.listRuns();
     const stepsByRunId = Object.fromEntries(
-      runs.map((run) => [run.id, store.listRunSteps(run.id)]),
+      runs.map((run) => [
+        run.id,
+        service.withAdmission(run.id, store.listRunSteps(run.id)),
+      ]),
     );
     const notesByRunId = Object.fromEntries(
       runs.map((run) => [run.id, store.listRunNotes(run.id)]),

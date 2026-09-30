@@ -5,6 +5,7 @@ import {
   AcpAgentFactory,
   MockAgentFactory,
   UnpromptedTurn,
+  agentEnvironment,
   configRecoveryRequest,
   contextRolloverPrompt,
   copilotAcpAuthVersionError,
@@ -23,6 +24,44 @@ import {
 
 afterEach(() => {
   vi.useRealTimers();
+});
+
+describe("agentEnvironment", () => {
+  const identityUrl = "http://127.0.0.1:8788/api/identity";
+
+  it("adds where the agent runs to everything this process already has", () => {
+    const base = { PATH: "/usr/bin", GH_TOKEN: "kept" };
+    expect(agentEnvironment(base, { nodeId: "node-1", identityUrl })).toEqual({
+      PATH: "/usr/bin",
+      GH_TOKEN: "kept",
+      FLEET_NODE_ID: "node-1",
+      FLEET_NODE_IDENTITY_URL: identityUrl,
+    });
+    // A copy: the Node's own environment is not where an agent's identity lives.
+    expect(base).toEqual({ PATH: "/usr/bin", GH_TOKEN: "kept" });
+  });
+
+  it("replaces an identity inherited from an agent that started this Node", () => {
+    const inherited = {
+      PATH: "/usr/bin",
+      FLEET_NODE_ID: "outer-node",
+      FLEET_NODE_IDENTITY_URL: "http://127.0.0.1:8788/api/identity",
+    };
+    expect(
+      agentEnvironment(inherited, {
+        nodeId: "inner-node",
+        identityUrl: "http://127.0.0.1:8789/api/identity",
+      }),
+    ).toMatchObject({
+      FLEET_NODE_ID: "inner-node",
+      FLEET_NODE_IDENTITY_URL: "http://127.0.0.1:8789/api/identity",
+    });
+    // With no page of its own up, pointing at the outer one would answer for
+    // the wrong machine; saying nothing is the honest answer.
+    const withoutPage = agentEnvironment(inherited, { nodeId: "inner-node" });
+    expect(withoutPage.FLEET_NODE_ID).toBe("inner-node");
+    expect(withoutPage).not.toHaveProperty("FLEET_NODE_IDENTITY_URL");
+  });
 });
 
 describe("CAPI context rollover", () => {

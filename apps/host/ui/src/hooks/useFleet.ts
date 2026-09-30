@@ -18,6 +18,7 @@ import { announceSignedOut, csrfToken, forgetCsrfToken } from "../lib/auth";
 import { reconnectDelay } from "./reconnect-delay";
 import { mergeEvents } from "../lib/merge-events";
 import { mergeCommandExecutions, mergeCommandOutput } from "../lib/command-output";
+import { mergeResumeRequests } from "../lib/worker-resume";
 
 export type { Snapshot };
 
@@ -700,6 +701,16 @@ export function useFleet(notify: Notify) {
           const { runId, steps } = message;
           runStepRevisions.current.set(runId, ++runStepRevision.current);
           setRunSteps((value) => ({ ...value, [runId]: steps }));
+          return;
+        }
+        if (message.type === "worker_resume_request") {
+          const { request } = message;
+          setSnapshot((value) => ({
+            ...value,
+            workerResumeRequests: mergeResumeRequests(value.workerResumeRequests ?? [], [
+              request,
+            ]),
+          }));
           return;
         }
         const { event } = message;

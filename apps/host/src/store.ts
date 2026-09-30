@@ -114,6 +114,7 @@ import {
   PrMaintenanceError,
   type PrMaintenanceOperationalReview,
 } from "./pr-maintenance-store.js";
+import { WorkerResumeStore } from "./worker-resume-store.js";
 import {
   DEFAULT_NOTIFICATION_LIFECYCLE_ENABLED,
   NOTIFICATION_LIFECYCLE_DEFAULT_SETTING,
@@ -463,6 +464,7 @@ export class FleetStore {
   private readonly db: DatabaseSync;
   readonly commands: CommandExecutionStore;
   readonly prMaintenance: PrMaintenanceStore;
+  readonly resumeRequests: WorkerResumeStore;
   readonly artifactDirectory: string;
   /**
    * The directory holding this database, which the Host locks down as a whole
@@ -942,6 +944,9 @@ export class FleetStore {
     );
     this.commands.quarantine();
     this.prMaintenance = new PrMaintenanceStore(this, this.db);
+    this.resumeRequests = new WorkerResumeStore(this.db, (work) =>
+      this.transactionIfNeeded(work),
+    );
     this.ensureChatsWorkspace();
     this.rebuildSessionStateFromEvents();
   }
@@ -2276,6 +2281,7 @@ export class FleetStore {
       );
     }
     this.prMaintenance.importBackup(undefined);
+    this.resumeRequests.clear();
     this.db.exec(
       "DELETE FROM managed_api_requests; DELETE FROM session_dispatch_attempts; DELETE FROM session_turn_completions; DELETE FROM session_transition_intents; DELETE FROM notification_preferences; DELETE FROM notifications; DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
     );
@@ -4797,7 +4803,7 @@ export class FleetStore {
            WHERE NOT (
              (read_at IS NULL AND status <> 'dismissed')
              OR (status='active' AND kind IN
-               ('permission_request','orchestration_needs_review','command_approval'))
+               ('permission_request','orchestration_needs_review','command_approval','worker_resume_approval'))
            )
            ORDER BY updated_at DESC,id DESC
            LIMIT ?
@@ -4807,7 +4813,7 @@ export class FleetStore {
            WHERE NOT (
              (read_at IS NULL AND status <> 'dismissed')
              OR (status='active' AND kind IN
-               ('permission_request','orchestration_needs_review','command_approval'))
+               ('permission_request','orchestration_needs_review','command_approval','worker_resume_approval'))
            )
            AND (updated_at < ? OR id NOT IN (SELECT id FROM retained))
            ORDER BY updated_at,id

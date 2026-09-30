@@ -39,7 +39,7 @@ import {
   repoRoot,
 } from "@fleet/protocol/runtime";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
-import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
+import { ACP_START_TIMEOUT_MS, AcpAgentFactory, MockAgentFactory } from "./agents.js";
 import { detectAgentKinds } from "./agent-kinds/index.js";
 import { CliError, USAGE, argvForRestart, parseNodeArgs } from "./cli.js";
 import {
@@ -123,7 +123,7 @@ import {
   reconnectFlushLog,
   watchHostLiveness,
 } from "./socket.js";
-import { configServerPort, startConfigServer } from "./config-server.js";
+import { configServerPort, nodeIdentityUrl, startConfigServer } from "./config-server.js";
 import {
   loadSettings,
   needsReconnect,
@@ -372,12 +372,19 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /** Whether this outage has already reported that there is nowhere to rotate. */
   let strandedReported = false;
 
+  /**
+   * Where agents read this node's current Fleet name. Installed once the config
+   * page exists, which is after the factory that hands it to them.
+   */
+  let identityUrl: () => string | undefined = () => undefined;
   const factory = mockAgent
     ? new MockAgentFactory()
     : new AcpAgentFactory(
         settings.permissionTimeoutMs,
         settings.copilotCommand,
         settings.contextTier,
+        ACP_START_TIMEOUT_MS,
+        () => ({ nodeId: credentials.nodeId, identityUrl: identityUrl() }),
       );
   let socket: WebSocket | undefined;
   /**
@@ -1164,6 +1171,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     recentLogs: () => logs.entries(),
     port: configServerPort(env),
   });
+  identityUrl = () => nodeIdentityUrl(configServer);
 
   function connect(): void {
     router.setMcpAvailable(false);

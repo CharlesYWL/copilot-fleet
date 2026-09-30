@@ -63,6 +63,7 @@ import { SessionFileService } from "./session-files.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
+import type { WorkerResumeService } from "./orchestrator/resume-now.js";
 import {
   NotificationService,
   notificationAttemptKey,
@@ -230,6 +231,13 @@ export class FleetService {
     | undefined;
   private mcpUrl: (() => string) | undefined;
   private runTicker: ((runId: string) => void) | undefined;
+  /**
+   * "Resume now" and step admission, owned by the orchestration engine.
+   *
+   * Late-bound like the other orchestration seams; absent in a service built
+   * without an engine, where steps are published without admission.
+   */
+  workerResume: WorkerResumeService | undefined;
   /** Late-bound like the orchestration seams: built after the service. */
   private hostUpdate: HostUpdateHooks | undefined;
   readonly notifications: NotificationService;
@@ -245,15 +253,22 @@ export class FleetService {
     };
     mcpUrl: () => string;
     tickRun: (runId: string) => void;
+    resume?: WorkerResumeService;
   }): void {
     this.leadTokens = input.leadTokens;
     this.mcpUrl = input.mcpUrl;
     this.runTicker = input.tickRun;
+    this.workerResume = input.resume;
   }
 
   /** Advances one run now, used by the tools so a dispatch is not left waiting. */
   tickRun(runId: string): void {
     this.runTicker?.(runId);
+  }
+
+  /** Why nothing new may start on this Node right now, if something prevents it. */
+  nodeWorkBlocked(nodeId: string): string | undefined {
+    return this.hostUpdate?.blocksNodeWork(nodeId);
   }
 
   logManagedPlacementScheduling(details: Record<string, unknown>, message: string): void {
@@ -301,6 +316,7 @@ export class FleetService {
       commandExecutions: this.commands.list({ limit: 100 }),
       prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
       prMaintenanceTasks: prMaintenanceTaskStatuses(this.retainedPrMaintenance()),
+      workerResumeRequests: this.store.resumeRequests.list({ limit: 50 }),
     };
   }
 
@@ -628,7 +644,12 @@ export class FleetService {
 
   /** Steps travel whole: a step that was removed has no row left to describe. */
   publishRunSteps(runId: string, steps: readonly RunStep[]): void {
-    this.broadcast({ type: "run_steps", runId, steps: [...steps] });
+    this.broadcast({ type: "run_steps", runId, steps: this.withAdmission(runId, steps) });
+  }
+
+  /** Steps as browsers and REST readers see them: with what they are waiting on. */
+  withAdmission(runId: string, steps: readonly RunStep[]): RunStep[] {
+    return this.workerResume ? this.workerResume.decorate(runId, steps) : [...steps];
   }
 
   reconcilePrMaintenanceExecution(sessionId: string): void {

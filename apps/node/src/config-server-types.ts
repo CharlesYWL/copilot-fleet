@@ -12,7 +12,7 @@ import type {
   StartedSession,
   WorkspaceLike,
 } from "./fleet-client.js";
-import type { PickerResult } from "./pick-folder.js";
+import type { FolderListing } from "./pick-folder.js";
 import type { PathCheck } from "./path-check.js";
 import type { DiscoveredCopilotSession, SessionPreview } from "./copilot-sessions.js";
 import type { Settings } from "./settings.js";
@@ -25,6 +25,18 @@ export type ConfigStatus = {
   mockAgent: boolean;
   devTunnel?: { id: string; url: string };
   commandExecution?: CommandReadiness;
+};
+
+/** What `GET /api/identity` tells an agent about the Fleet node it runs on. */
+export type NodeIdentity = {
+  /** Fixed at enrolment; a rename never changes it. */
+  nodeId: string;
+  /** The name the Host last confirmed for this node, which a rename there updates. */
+  nodeName: string;
+  /** The operating system's host name, which a Fleet name need not match. */
+  machineName: string;
+  /** False while the Host is unreachable, when a rename made there has not arrived yet. */
+  connected: boolean;
 };
 
 export type FleetApi = {
@@ -72,7 +84,7 @@ export type ConfigServerOptions = {
   recentLogs?: () => LogEntry[];
   port?: number;
   fleet?: FleetApi;
-  pickFolder?: (start: string) => Promise<PickerResult>;
+  listFolders?: (path: string) => Promise<FolderListing>;
   inspectPath?: (path: string) => PathCheck;
   sessionDiscovery?: SessionDiscoveryApi;
   getCommandPermissions?: () => {

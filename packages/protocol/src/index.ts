@@ -45,10 +45,12 @@ import {
 export * from "./session-files.js";
 export * from "./pr-maintenance.js";
 export * from "./heartbeat-schedule.js";
+export * from "./worker-resume.js";
 import {
   HEARTBEAT_SCHEDULE_MAX_LENGTH,
   HeartbeatScheduleSchema,
 } from "./heartbeat-schedule.js";
+import { StepAdmissionSchema, WorkerResumeRequestSchema } from "./worker-resume.js";
 import {
   PrMaintenanceApprovalSchema,
   PrMaintenanceBackupSchema,
@@ -1325,6 +1327,34 @@ export const HOST_YOLO_CAPABILITY = "host-yolo";
 export const NODE_NAME_SYNC_CAPABILITY = "node-name-sync";
 
 /**
+ * Set in the environment of every agent a Node starts: that Node's `nodeId`.
+ *
+ * An agent can otherwise see only the machine's host name, which a Fleet name
+ * need not match — so a worker briefed to work on "build-01" had nothing on the
+ * machine to check that against. The id is fixed at enrolment, so a copy taken
+ * when the agent starts is never stale.
+ */
+export const AGENT_NODE_ID_ENV = "FLEET_NODE_ID";
+
+/**
+ * Set beside {@link AGENT_NODE_ID_ENV}: a loopback URL that answers a GET with
+ * the Node's identity, including its current Fleet name.
+ *
+ * An address rather than the name itself, because an operator can rename the
+ * machine from the Host while the agent runs and a variable cannot follow that.
+ * Absent when the Node's config page is not listening.
+ */
+export const AGENT_NODE_IDENTITY_URL_ENV = "FLEET_NODE_IDENTITY_URL";
+
+/**
+ * A Node that sets {@link AGENT_NODE_ID_ENV} and
+ * {@link AGENT_NODE_IDENTITY_URL_ENV} for its agents, so the Host may tell a
+ * worker to check them. Pointing a worker on an older Node at variables that
+ * do not exist would give it a contradiction to stop on instead of an answer.
+ */
+export const AGENT_IDENTITY_CAPABILITY = "agent-identity";
+
+/**
  * A Node that reports which of its sessions are mid-turn, so the Host can
  * restore a reconnecting session to what it is actually doing instead of
  * assuming it is idle and waiting for a prompt.
@@ -1700,6 +1730,13 @@ export const RunStepSchema = z.object({
   position: z.number().int().nonnegative().default(0),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
+  /**
+   * Why the step is queued, blocked or starting, as the scheduler last decided.
+   *
+   * Derived when steps are published or read, never stored: it describes the
+   * fleet at that moment rather than a fact about the step.
+   */
+  admission: StepAdmissionSchema.optional(),
 });
 export type RunStep = z.infer<typeof RunStepSchema>;
 
@@ -1742,6 +1779,7 @@ export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
 
 export const NotificationKindSchema = z.enum([
   "command_approval",
+  "worker_resume_approval",
   "command_completion",
   "pr_maintenance_attention",
   "managed_worktree_attention",
@@ -1929,6 +1967,8 @@ export const SnapshotSchema = z.object({
   prMaintenanceApprovals: z.array(PrMaintenanceApprovalSchema).optional(),
   /** Retained PR maintenance per task, so lists do not read it as "deciding". */
   prMaintenanceTasks: z.array(PrMaintenanceTaskStatusSchema).optional(),
+  /** Active and recently settled "Resume now" requests. */
+  workerResumeRequests: z.array(WorkerResumeRequestSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
@@ -2013,6 +2053,11 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("run_steps"),
     runId: z.string().min(1),
     steps: z.array(RunStepSchema),
+  }),
+  /** One "Resume now" request after any change to it. */
+  z.object({
+    type: z.literal("worker_resume_request"),
+    request: WorkerResumeRequestSchema,
   }),
 ]);
 export type BrowserMessage = z.infer<typeof BrowserMessageSchema>;

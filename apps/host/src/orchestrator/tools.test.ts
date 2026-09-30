@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  AGENT_IDENTITY_CAPABILITY,
   RunCriterionSchema,
   type CriterionOutcome,
   type RunCriterion,
@@ -94,6 +95,63 @@ describe("FleetTools", () => {
 
     expect(step.prompt).not.toContain("CONTEXT");
     expect(step.prompt).toContain("VERIFY");
+  });
+
+  /**
+   * Where the worker is, in terms it can check.
+   *
+   * A worker told by its brief that it was on one machine, and shown a host name
+   * that said otherwise, stopped to ask instead of doing the work — the Fleet
+   * name is a label the operator chose, and nothing on the machine carried it.
+   */
+  describe("naming the node a worker runs on", () => {
+    const placedNode = () => {
+      const step = store.listRunSteps(tasks()[0]!.id)[0]!;
+      return {
+        prompt: step.prompt,
+        node: store.getNode(store.getPlacement(step.placementId)!.nodeId)!,
+      };
+    };
+
+    it("names the machine the Host placed it on, by id as well as by name", () => {
+      const pinned = addNode("gpu-rig");
+      start({ task: "Explore Beta", node: "gpu-rig" });
+      const { prompt, node } = placedNode();
+
+      expect(node.id).toBe(pinned.id);
+      expect(prompt).toContain(
+        `FLEET NODE\nThis step runs on Fleet node "gpu-rig" (node id ${pinned.id}).`,
+      );
+      expect(prompt).toContain("this machine's host name need not match it");
+      // Before the delivery contract, so the brief's own sections stay first.
+      expect(prompt.indexOf("FLEET NODE")).toBeLessThan(prompt.indexOf("FLEET DELIVERY"));
+    });
+
+    it("points it at the variables its Node sets, when that Node sets them", () => {
+      const box = store.listNodes()[0]!;
+      store.setNodeIdentity(box.id, {
+        capabilities: [...box.capabilities, AGENT_IDENTITY_CAPABILITY],
+      });
+      start({ task: "Explore Beta" });
+      const { prompt } = placedNode();
+
+      expect(prompt).toContain("FLEET_NODE_ID in your environment is the node id");
+      expect(prompt).toContain(
+        "FLEET_NODE_IDENTITY_URL, when set, answers a GET with the node's current name",
+      );
+    });
+
+    it("does not send a worker on an older Node looking for variables it lacks", () => {
+      start({ task: "Explore Beta" });
+      const { prompt, node } = placedNode();
+
+      expect(node.capabilities).not.toContain(AGENT_IDENTITY_CAPABILITY);
+      expect(prompt).toContain(
+        `This step runs on Fleet node "box" (node id ${node.id}).`,
+      );
+      expect(prompt).not.toContain("FLEET_NODE_ID");
+      expect(prompt).not.toContain("FLEET_NODE_IDENTITY_URL");
+    });
   });
 
   it.each(["implement", "test", "explore", "review-quick", "review-deep"])(

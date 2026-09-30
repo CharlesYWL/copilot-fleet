@@ -11,6 +11,7 @@ import {
   remainingCapacity,
   type PlacementRequest,
   type ScheduleInput,
+  type StepHold,
 } from "./schedule.js";
 
 const NOW = Date.parse("2026-01-01T12:00:00.000Z");
@@ -1231,5 +1232,214 @@ describe("naming a machine", () => {
 
   it("leaves the Host's own choice alone when no machine is named", () => {
     expect(ask()).toMatchObject({ id: "p1" });
+  });
+});
+
+describe("why a queued follow-up waits", () => {
+  const managedNode = (id: string, overrides: Partial<FleetNode> = {}) =>
+    node(id, {
+      capabilities: ["copilot-acp", "host-yolo", "managed-worktrees-v1"],
+      ...overrides,
+    });
+  const checkout = (id: string, nodeId: string, localPath: string): Placement => ({
+    ...placement(id, nodeId),
+    localPath,
+  });
+  const retry = (overrides: Partial<RunStep> = {}) =>
+    step("retry", {
+      sessionId: "worker",
+      placementId: "repo",
+      attempts: 6,
+      ...overrides,
+    });
+  const worker = (overrides: Partial<FleetSession> = {}) =>
+    session("worker", {
+      state: "stopped",
+      placementId: "repo",
+      agentSessionId: "copilot-worker",
+      ...overrides,
+    });
+  const planned = (overrides: Partial<ScheduleInput>) => {
+    const holds = new Map<string, StepHold>();
+    const actions = planNextActions(
+      world({
+        nodes: [managedNode("n1", { maxSessions: 10 })],
+        placements: [
+          checkout("repo", "n1", "Q:\\Repos\\TridentWarehouse-UX"),
+          checkout("other", "n1", "Q:\\Repos\\Other"),
+        ],
+        steps: [retry()],
+        ...overrides,
+        holds,
+      }),
+    );
+    return { actions, hold: holds.get("retry") };
+  };
+
+  it("names another task's writer in the same checkout, not the Node", () => {
+    const { actions, hold } = planned({
+      sessions: [
+        worker(),
+        session("occupant", {
+          placementId: "repo",
+          runId: "another-task",
+          name: "Publish and link Ontology MSIT PR",
+        }),
+      ],
+    });
+
+    expect(actions.map((action) => action.type)).not.toContain("resume_step");
+    expect(hold).toMatchObject({
+      code: "checkout_busy",
+      conflicts: ["occupant"],
+      checkoutKey: "repo",
+    });
+    expect(hold?.detail).toContain("Q:\\Repos\\TridentWarehouse-UX");
+    expect(hold?.detail).toContain("resumes by itself");
+  });
+
+  it("does not hold a retained worker back for a session in a different checkout", () => {
+    const { actions, hold } = planned({
+      sessions: [worker(), session("elsewhere", { placementId: "other", runId: "" })],
+    });
+
+    expect(actions).toContainEqual({
+      type: "resume_step",
+      stepId: "retry",
+      sessionId: "worker",
+    });
+    expect(hold).toBeUndefined();
+  });
+
+  it("says a worker still in a turn is waited for, not refused", () => {
+    const { actions, hold } = planned({ sessions: [worker({ state: "running" })] });
+
+    expect(actions.map((action) => action.type)).not.toContain("prompt_step");
+    expect(hold).toMatchObject({ code: "session_busy" });
+  });
+
+  it("names the task's parallel limit and what fills it", () => {
+    const { hold } = planned({
+      run: run({ policy: RunPolicySchema.parse({ maxParallel: 1 }) }),
+      steps: [
+        retry({ sessionId: "worker" }),
+        step("busy", { state: "running", sessionId: "busy", placementId: "other" }),
+      ],
+      sessions: [worker({ state: "idle" }), session("busy", { placementId: "other" })],
+    });
+
+    expect(hold).toMatchObject({ code: "parallel_limit", conflicts: ["busy"] });
+  });
+
+  it("separates Fleet's reserved slot from the Node's hard limit", () => {
+    const headroom = planned({
+      nodes: [managedNode("n1", { maxSessions: 2 })],
+      sessions: [worker(), session("elsewhere", { placementId: "other", runId: "" })],
+    });
+    expect(headroom.actions.map((action) => action.type)).not.toContain("resume_step");
+    expect(headroom.hold).toMatchObject({
+      code: "node_headroom",
+      capacity: { kind: "writing", reserved: 1, limit: 2 },
+      conflicts: ["elsewhere"],
+    });
+
+    const full = planned({
+      nodes: [managedNode("n1", { maxSessions: 1 })],
+      sessions: [worker(), session("elsewhere", { placementId: "other", runId: "" })],
+    });
+    expect(full.hold).toMatchObject({
+      code: "node_capacity",
+      capacity: { kind: "writing", reserved: 1, limit: 1 },
+    });
+  });
+
+  it("spends an approved exception on the reserved slot only", () => {
+    const exceptions = new Map([
+      [
+        "retry",
+        {
+          requestId: "request-1",
+          restriction: "node_headroom" as const,
+          sessionId: "worker",
+          attempt: 6,
+        },
+      ],
+    ]);
+    const approved = planned({
+      nodes: [managedNode("n1", { maxSessions: 2 })],
+      sessions: [worker(), session("elsewhere", { placementId: "other", runId: "" })],
+      exceptions,
+    });
+    expect(approved.actions).toContainEqual({
+      type: "resume_step",
+      stepId: "retry",
+      sessionId: "worker",
+      exceptionId: "request-1",
+    });
+
+    const otherAttempt = planned({
+      nodes: [managedNode("n1", { maxSessions: 2 })],
+      steps: [retry({ attempts: 7 })],
+      sessions: [worker(), session("elsewhere", { placementId: "other", runId: "" })],
+      exceptions,
+    });
+    expect(otherAttempt.actions.map((action) => action.type)).not.toContain(
+      "resume_step",
+    );
+    expect(otherAttempt.hold?.code).toBe("node_headroom");
+
+    const hardLimit = planned({
+      nodes: [managedNode("n1", { maxSessions: 1 })],
+      sessions: [worker(), session("elsewhere", { placementId: "other", runId: "" })],
+      exceptions,
+    });
+    expect(hardLimit.actions.map((action) => action.type)).not.toContain("resume_step");
+    expect(hardLimit.hold?.code).toBe("node_capacity");
+  });
+
+  it.each([
+    [
+      "checkout_busy",
+      {
+        sessions: [
+          worker(),
+          session("occupant", { placementId: "repo", runId: "another-task" }),
+        ],
+      },
+    ],
+    ["stop_pending", { sessions: [worker({ stopRequested: true })] }],
+    [
+      "node_offline",
+      {
+        nodes: [managedNode("n1", { maxSessions: 2, online: false }), node("n2")],
+        sessions: [worker()],
+      },
+    ],
+    [
+      "task_held",
+      {
+        run: run({ state: "awaiting_human" }),
+        sessions: [worker()],
+      },
+    ],
+  ] as const)("never lets an approved exception bypass %s", (code, overrides) => {
+    const { actions, hold } = planned({
+      nodes: [managedNode("n1", { maxSessions: 2 })],
+      ...overrides,
+      exceptions: new Map([
+        [
+          "retry",
+          {
+            requestId: "request-1",
+            restriction: "node_headroom" as const,
+            sessionId: "worker",
+            attempt: 6,
+          },
+        ],
+      ]),
+    });
+
+    expect(actions.map((action) => action.type)).not.toContain("resume_step");
+    expect(hold?.code).toBe(code);
   });
 });
