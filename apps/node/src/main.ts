@@ -385,6 +385,11 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         settings.contextTier,
         ACP_START_TIMEOUT_MS,
         () => ({ nodeId: credentials.nodeId, identityUrl: identityUrl() }),
+        (level, message) => {
+          if (level === "error") errorLog(message);
+          else if (level === "warn") warn(message);
+          else log(message);
+        },
       );
   let socket: WebSocket | undefined;
   /**

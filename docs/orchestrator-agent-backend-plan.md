@@ -116,7 +116,10 @@ The Hermes adapter:
 
 1. Resolves `hermes` from the executing Node's PATH.
 2. Runs `hermes -p <profile> acp --check` as a bounded dependency/profile
-   preflight. This does **not** claim to verify a model request or credentials.
+   preflight using the factory's startup allowance (180 seconds by default),
+   separately from the subsequent ACP handshake deadline. Importing the Python
+   ACP stack can exceed the short metadata-probe limit during cold starts.
+   This does **not** claim to verify a model request or credentials.
 3. Starts `hermes -p <profile> acp` over stdio.
 4. Maps the reported model/mode choices onto Fleet's existing config controls.
    Changes use Hermes's actual ACP methods, not a successful-looking
@@ -128,6 +131,14 @@ The Hermes adapter:
    through its native lazy `tool_search` / `tool_describe` / `tool_call` surface.
 6. Reports ACP context estimates. It does not request `/context`, fabricate AI
    credits, run Copilot config recovery, or apply Copilot CAPI error heuristics.
+
+Hermes sends runtime and background MCP retry logs to stderr even while idle.
+The adapter routes that stream to the Node's existing diagnostics and runtime
+log, not sequenced session events. The Node retains severity and session
+attribution; the shared ACP client keeps a bounded stderr tail for startup and
+unexpected-exit error details. ACP replies, tool failures, permissions and Fleet
+notices still reach the transcript. Copilot's existing stderr behavior is
+unchanged. Historical log events are not deleted or hidden.
 
 Discovery reports installation, not profile readiness. Missing installations
 are not cached. The Node refreshes discovery before announcing each connection;
@@ -206,6 +217,19 @@ A profile includes configuration, `SOUL.md`, skills, memories and native
 session history. `AGENTS.md` normally supplies workspace-specific guidance.
 Fleet supplies its own authoritative orchestrator briefing without overwriting
 the profile's identity files. Memory is not synchronized across Nodes.
+
+Hermes supports reasoning effort through `agent.reasoning_effort` in the profile,
+but the current ACP interface exposes only model and mode choices, not a
+reasoning picker or `/reasoning` command. For example:
+
+```powershell
+hermes -p fleet-orchestrator config set agent.reasoning_effort high
+```
+
+Stop and resume the idle orchestrator to load the changed profile configuration.
+Per-model `agent.reasoning_overrides` take precedence; effective support and
+accepted levels depend on the model/provider. Fleet's General reasoning default
+still applies only to Copilot.
 
 ## Verification and boundaries
 

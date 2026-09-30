@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { packageRoot } from "./paths.js";
 import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
 import * as acp from "@agentclientprotocol/sdk";
+import type { LogLevel } from "@fleet/protocol/log-buffer";
 import type {
   AgentParams,
   McpHttpServer,
@@ -230,6 +231,9 @@ export function resolveConfigValue(
 }
 
 export type EventSink = (event: SessionEvent) => void;
+type AgentDiagnosticSink = (level: LogLevel, message: string) => void;
+const logAgentDiagnostic: AgentDiagnosticSink = (level, message) =>
+  console[level](message);
 
 export type StartAgentOptions = {
   agentParams?: AgentParams;
@@ -543,6 +547,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly startupNotice = "",
     /** The whole environment to launch with; this process's own when absent. */
     private readonly environment?: NodeJS.ProcessEnv,
+    private readonly diagnosticLog: AgentDiagnosticSink = logAgentDiagnostic,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
     this.managedProcess =
@@ -637,7 +642,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       const text = chunk.trim();
       if (!text) return;
       this.stderrTail = `${this.stderrTail}\n${text}`.slice(-4_000);
-      this.emit("system", { text });
+      const level = this.kind.stderrLogLevel?.(text);
+      if (level) {
+        this.diagnosticLog(
+          level,
+          `${this.kind.label} session=${this.fleetSessionId.slice(0, 8)}: ${text}`,
+        );
+      } else {
+        this.emit("system", { text });
+      }
     });
     child.on("error", (error) => {
       this.emit("error", { message: error.message });
@@ -652,9 +665,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       this.denyPendingPermissions();
       this.unprompted.clear();
       if (!this.stopping && !this.hasTerminated) {
+        const activity = `${this.kind.label} exited (${signal ?? code ?? "unknown"})`;
+        if (code !== 0 && this.kind.stderrLogLevel) {
+          this.emit("error", {
+            message: this.launch.failureMessage(new Error(activity), this.stderrTail),
+          });
+        }
         this.emit("state", {
           state: code === 0 ? "completed" : "failed",
-          activity: `${this.kind.label} exited (${signal ?? code ?? "unknown"})`,
+          activity,
         });
       }
     });
@@ -1260,6 +1279,7 @@ export class AcpAgentFactory implements AgentFactory {
      * backup changes the node id without a restart.
      */
     private readonly identity?: () => AgentIdentity,
+    private readonly diagnosticLog: AgentDiagnosticSink = logAgentDiagnostic,
   ) {
     this.copilotKind = new CopilotAgentKind(copilotCommand, startTimeoutMs);
   }
@@ -1306,6 +1326,7 @@ export class AcpAgentFactory implements AgentFactory {
     try {
       const launch = await wait(
         kind.prepare({
+          startTimeoutMs: this.startTimeoutMs,
           yolo: options.yolo ?? false,
           agencyMode: options.agencyMode ?? false,
           contextTier: options.contextTier ?? this.contextTier,
@@ -1333,6 +1354,7 @@ export class AcpAgentFactory implements AgentFactory {
           : undefined,
         options.startupNotice ?? "",
         this.identity ? agentEnvironment(process.env, this.identity()) : undefined,
+        this.diagnosticLog,
       );
       await withAgentStartupTimeout(
         wait(agent.start(cwd, options.resumeAgentSessionId)),

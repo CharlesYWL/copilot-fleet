@@ -1,4 +1,5 @@
 import type * as acp from "@agentclientprotocol/sdk";
+import type { LogLevel } from "@fleet/protocol/log-buffer";
 import type {
   AgentKind,
   ContextTier,
@@ -16,6 +17,7 @@ export type AgentLaunch = {
 
 export type AgentLaunchOptions = {
   signal?: AbortSignal;
+  startTimeoutMs: number;
   yolo: boolean;
   agencyMode: boolean;
   contextTier: ContextTier;
@@ -59,6 +61,8 @@ export interface AgentKindAdapter {
   readonly label: string;
   readonly yolo: "launch-flag" | "auto-approve";
   readonly tracksUnpromptedWork?: boolean;
+  /** When provided, stderr belongs in Node diagnostics rather than the transcript. */
+  stderrLogLevel?(text: string): LogLevel;
   prepare(options: AgentLaunchOptions): Promise<AgentLaunch>;
   usage(context: UsageContext): UsageReporter;
   afterSessionStart?(session: AgentSessionHandle): Promise<void>;

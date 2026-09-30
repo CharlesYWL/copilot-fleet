@@ -1452,6 +1452,22 @@ hermes -p fleet-orchestrator acp --check
 保留在该 Node 的 profile 内，不跨 Node 同步。同一 Node 的同一 profile 同时只能有一个
 活动的 Hermes 编排器，也不要让外部 Hermes 进程同时使用它。
 
+Hermes 支持通过 profile 配置推理强度，但当前 ACP 接口不提供推理选择器或
+`/reasoning` 命令。例如：
+
+```powershell
+hermes -p fleet-orchestrator config set agent.reasoning_effort high
+```
+
+待编排器空闲后停止并恢复，使其读取新配置。模型专属的 `agent.reasoning_overrides`
+优先级更高，具体支持的推理级别取决于模型及 provider；General 中的推理默认值只影响
+Copilot。Hermes 依赖检查使用与 ACP 相同的可配置启动等待时间（默认 180 秒），随后
+ACP 握手单独计时，避免冷启动的 Python 导入被短时元数据查询限制提前终止。
+
+Hermes 的运行日志和后台 MCP 重试日志写入 **Node 配置页的诊断日志及 Node runtime log**，
+不再追加到聊天历史。空闲编排器产生诊断日志不代表开始了新回合；回复、工具失败及致命
+会话错误仍显示在对话中。已有的历史日志条目保持不变。
+
 离线或等待 Stop 确认的编排器仍占用该 Node 的 profile。若 Node 不再上线，先请求
 **Stop**，独立确认旧进程已退出后，在会话中选择 **Mark stopped** 释放占用。
 **Dismiss** 仅隐藏已停止的会话，不会停止进程或绕过 profile 占用；其他 Node 上的
