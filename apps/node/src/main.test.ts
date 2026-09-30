@@ -43,6 +43,7 @@ import type * as ConfigServerModule from "./config-server.js";
 import type * as UpdaterModule from "./updater.js";
 import type { CopilotSessionDiscoveryOptions } from "./copilot-sessions.js";
 import type { CommandResult, CommandRouterOptions } from "./router.js";
+import type { AgentFactory } from "./agents.js";
 import type { ManagedWorktreeOptions } from "./managed-worktrees.js";
 
 class TestSocket extends EventEmitter {
@@ -93,6 +94,7 @@ const route = vi.fn<(command: NodeCommand) => Promise<CommandResult>>(
   async (command) => ({ commandId: command.commandId, ok: true }),
 );
 let routerOptions: CommandRouterOptions;
+let routerFactory: AgentFactory;
 let readRouterCatalog: () => Promise<readonly AgentCatalogModule.CatalogEntry[]>;
 let worktreeOptions: ManagedWorktreeOptions;
 let discoveryOptions: CopilotSessionDiscoveryOptions;
@@ -188,7 +190,7 @@ vi.mock("./router.js", () => ({
     deliverLeadPrompt = deliverLeadPrompt;
     rejectLeadPrompt = rejectLeadPrompt;
     constructor(
-      _factory: unknown,
+      factory: AgentFactory,
       _capacity: number,
       onEvent: (event: SessionEvent) => void,
       _validatePath: unknown,
@@ -199,6 +201,7 @@ vi.mock("./router.js", () => ({
     ) {
       emitEvent = onEvent;
       routerOptions = options;
+      routerFactory = factory;
       readRouterCatalog = catalog;
     }
   },
@@ -1177,6 +1180,38 @@ it("uses current Copilot launch settings for persisted cleanup without starting 
       beforeDelete,
     );
     expect(beforeDelete).toHaveBeenCalledOnce();
+  } finally {
+    await runtime.shutdown();
+    for (const listener of process.listeners("exit")) {
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  }
+});
+
+it("records agent diagnostics in the Node log with severity without sending chat events", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "0");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    const diagnostic = Reflect.get(routerFactory, "diagnosticLog");
+    if (typeof diagnostic !== "function") throw new Error("Missing agent diagnostics");
+    const sent = sockets[0]!.send.mock.calls.length;
+    for (const level of ["info", "warn", "error"] as const) {
+      diagnostic(level, `Hermes session=fixture: ${level} diagnostic`);
+      expect(configOptions.recentLogs?.()).toContainEqual(
+        expect.objectContaining({
+          level,
+          message: `Hermes session=fixture: ${level} diagnostic`,
+        }),
+      );
+    }
+    expect(sockets[0]!.send).toHaveBeenCalledTimes(sent);
   } finally {
     await runtime.shutdown();
     for (const listener of process.listeners("exit")) {

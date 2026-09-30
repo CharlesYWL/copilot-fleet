@@ -73,6 +73,7 @@ let metadataFailure: string | undefined;
 let startupFailure: string | undefined;
 let startupHangs: string | undefined;
 let metadataHangs = false;
+let hermesCheckDelayMs = 0;
 let agencyVersion = "1.0.84";
 let loadUsage: { used: number; size: number } | undefined;
 let advertiseContext = false;
@@ -97,6 +98,7 @@ beforeEach(() => {
   startupFailure = undefined;
   startupHangs = undefined;
   metadataHangs = false;
+  hermesCheckDelayMs = 0;
   agencyVersion = "1.0.84";
   credits.value = undefined;
   credits.bySession.clear();
@@ -144,7 +146,7 @@ beforeEach(() => {
     const agency = argv[0] === "copilot";
     const hermes = argv.includes("acp");
     if (!argv.includes("--acp") && (!hermes || argv.includes("--check"))) {
-      queueMicrotask(() => {
+      const reportMetadata = () => {
         if (metadataHangs) return;
         if ((agency || hermes) && metadataFailure) {
           child.stderr.write(metadataFailure);
@@ -160,7 +162,12 @@ beforeEach(() => {
               : "--allow-all",
         );
         close(0);
-      });
+      };
+      if (hermes && hermesCheckDelayMs > 0) {
+        setTimeout(reportMetadata, hermesCheckDelayMs);
+      } else {
+        queueMicrotask(reportMetadata);
+      }
       return child;
     }
 
@@ -442,6 +449,221 @@ describe("Hermes ACP startup", () => {
       (process) => process.args.includes("acp") && !process.args.includes("--check"),
     )!;
 
+  it.each([false, true])(
+    "keeps Hermes stderr in diagnostics after a turn, not chat history (resumed=%s)",
+    async (resumed) => {
+      advertiseContext = true;
+      const events: SessionEvent[] = [];
+      const diagnostic = vi.fn();
+      const agent = await new AcpAgentFactory(
+        60_000,
+        "copilot",
+        "default",
+        ACP_START_TIMEOUT_MS,
+        undefined,
+        diagnostic,
+      ).start("hermes-log-session", "C:\\repo", (event) => events.push(event), {
+        agentParams: params,
+        ...(resumed ? { resumeAgentSessionId: "saved-hermes" } : {}),
+      });
+      agents.push(agent);
+      await agent.prompt("A synthetic task");
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "agent_text",
+          payload: { text: "Model response" },
+        }),
+      );
+      expect(agent.busy).toBe(false);
+      const savedHistory = [...events];
+      const child = hermesLaunch().child as ChildProcessWithoutNullStreams;
+      for (const [tag, level] of [
+        ["INFO", "info"],
+        ["WARNING", "warn"],
+        ["ERROR", "error"],
+      ] as const) {
+        child.stderr.push(
+          `2026-09-30 13:39:54 [${tag}] tools.mcp_tool: background retry\n`,
+        );
+        expect(diagnostic).toHaveBeenLastCalledWith(
+          level,
+          expect.stringContaining("Hermes session=hermes-l: 2026-09-30 13:39:54"),
+        );
+      }
+      expect(diagnostic).toHaveBeenCalledTimes(3);
+      expect(events).toEqual(savedHistory);
+      expect(agent.busy).toBe(false);
+
+      child.stdout.push(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          method: "session/update",
+          params: {
+            sessionId: resumed ? "saved-hermes" : "acp-created",
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: "failed-tool",
+              title: "Requested MCP tool",
+              status: "failed",
+              rawOutput: { message: "401 Unauthorized" },
+            },
+          },
+        })}\n`,
+      );
+      await expect
+        .poll(() => events.at(-1))
+        .toMatchObject({
+          type: "tool",
+          payload: { status: "failed", error: "401 Unauthorized" },
+        });
+    },
+  );
+
+  it("keeps Hermes startup errors actionable without recording raw stderr chunks", async () => {
+    startupHangs = "initialize";
+    const events: SessionEvent[] = [];
+    const diagnostic = vi.fn();
+    const started = new AcpAgentFactory(
+      60_000,
+      "copilot",
+      "default",
+      ACP_START_TIMEOUT_MS,
+      undefined,
+      diagnostic,
+    ).start("hermes", "C:\\repo", (event) => events.push(event), { agentParams: params });
+    const failure = expect(started).rejects.toThrow(/Provider credentials expired/);
+    await expect
+      .poll(() => requests.some((request) => request.method === "initialize"))
+      .toBe(true);
+    const child = hermesLaunch().child as ChildProcessWithoutNullStreams;
+    child.stderr.push("[ERROR] Provider credentials expired\n");
+    child.stdout.push(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: requests.find((request) => request.method === "initialize")!.id,
+        error: { code: -32000, message: "Authentication required" },
+      })}\n`,
+    );
+    await failure;
+    expect(diagnostic).toHaveBeenCalledWith(
+      "error",
+      expect.stringContaining("Provider credentials expired"),
+    );
+    expect(
+      events.some(
+        (event) =>
+          event.type === "system" &&
+          String(event.payload.text).includes("Provider credentials expired"),
+      ),
+    ).toBe(false);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        payload: {
+          message: expect.stringContaining("hermes -p fleet-orchestrator acp --setup"),
+        },
+      }),
+    );
+  });
+
+  it("reports an unexpected idle Hermes exit with the retained stderr detail", async () => {
+    const events: SessionEvent[] = [];
+    const diagnostic = vi.fn();
+    const agent = await new AcpAgentFactory(
+      60_000,
+      "copilot",
+      "default",
+      ACP_START_TIMEOUT_MS,
+      undefined,
+      diagnostic,
+    ).start("hermes", "C:\\repo", (event) => events.push(event), { agentParams: params });
+    agents.push(agent);
+    await agent.prompt("A synthetic task");
+    const child = hermesLaunch().child as ChildProcessWithoutNullStreams;
+    child.stderr.push("[CRITICAL] Hermes runtime failed\n");
+    Object.defineProperty(child, "exitCode", { value: 1, configurable: true });
+    child.stdout.push(null);
+    child.stderr.push(null);
+    child.emit("exit", 1, null);
+    child.emit("close", 1, null);
+    expect(diagnostic).toHaveBeenCalledWith(
+      "error",
+      expect.stringContaining("Hermes runtime failed"),
+    );
+    expect(events.filter((event) => event.type === "error")).toEqual([
+      expect.objectContaining({
+        payload: { message: expect.stringContaining("Hermes runtime failed") },
+      }),
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      type: "state",
+      payload: { state: "failed", activity: "Hermes exited (1)" },
+    });
+  });
+
+  it("allows a cold Hermes dependency check to finish after 15 seconds", async () => {
+    vi.useFakeTimers();
+    hermesCheckDelayMs = 20_000;
+    let settled = false;
+    const events: SessionEvent[] = [];
+    const started = new AcpAgentFactory(60_000, "copilot")
+      .start("hermes", "C:\\repo", (event) => events.push(event), { agentParams: params })
+      .then(
+        (agent) => {
+          settled = true;
+          agents.push(agent);
+          return agent;
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+
+    await vi.advanceTimersByTimeAsync(15_001);
+    expect(settled).toBe(false);
+    expect(processes[0]?.child.kill).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(await started).not.toBeInstanceOf(Error);
+    expect(events).toContainEqual(expect.objectContaining({ type: "agent_session" }));
+    expect(hermesLaunch().args).toEqual(["-p", "fleet-orchestrator", "acp"]);
+    await agents[0]!.stop();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([ACP_START_TIMEOUT_MS, 1_000])(
+    "bounds a silent Hermes check with the configured startup allowance (%sms)",
+    async (timeoutMs) => {
+      vi.useFakeTimers();
+      metadataHangs = true;
+      let settled = false;
+      const started = new AcpAgentFactory(60_000, "copilot", "default", timeoutMs)
+        .start("hermes", "C:\\repo", () => {}, { agentParams: params })
+        .then(
+          (agent) => {
+            settled = true;
+            agents.push(agent);
+            return undefined;
+          },
+          (error: unknown) => {
+            settled = true;
+            return error;
+          },
+        );
+      await vi.advanceTimersByTimeAsync(timeoutMs - 1);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(settled).toBe(true);
+      expect(await started).toMatchObject({
+        message: expect.stringContaining("acp --check timed out"),
+      });
+      expect(processes[0]?.child.kill).toHaveBeenCalledOnce();
+      expect(processes).toHaveLength(1);
+      expect(requests).toEqual([]);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
   it("rejects Hermes's null response for missing history instead of announcing a phantom resume", async () => {
     missingHermesLoad = true;
     const events: SessionEvent[] = [];
@@ -681,6 +903,38 @@ describe("Hermes ACP startup", () => {
 });
 
 describe("Agency ACP startup", () => {
+  it("preserves Copilot stderr transcript output and explicit startup notices", async () => {
+    const events: SessionEvent[] = [];
+    const diagnostic = vi.fn();
+    const agent = await new AcpAgentFactory(
+      60_000,
+      "copilot",
+      "default",
+      ACP_START_TIMEOUT_MS,
+      undefined,
+      diagnostic,
+    ).start("copilot", "C:\\repo", (event) => events.push(event), {
+      startupNotice: "Preferred agent unavailable; started with Copilot.",
+    });
+    agents.push(agent);
+    (launches()[0]!.child as ChildProcessWithoutNullStreams).stderr.push(
+      "Copilot diagnostic\n",
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "system",
+        payload: { text: "Copilot diagnostic" },
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "system",
+        payload: { text: "Preferred agent unavailable; started with Copilot." },
+      }),
+    );
+    expect(diagnostic).not.toHaveBeenCalled();
+  });
+
   it("overrides the node tier for a session, reports cumulative credits and replayed context, and sends real /compact", async () => {
     credits.value = 27.4014;
     loadUsage = { used: 50000, size: 200000 };
