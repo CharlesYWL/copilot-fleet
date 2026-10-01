@@ -65,6 +65,89 @@ function setup(hostRevision: string | (() => string) = "") {
   return { store, service, enroll };
 }
 
+describe("while the Host updates itself", () => {
+  const updating = "This machine is updating the Host and restarts its Node with it";
+  const hooks = (blocksNodeWork: (nodeId: string) => string | undefined) => ({
+    status: () => ({
+      launch: "dev" as const,
+      restartCommand: "npm run dev",
+      unavailableReason: "",
+    }),
+    blocksNodeUpdate: () => undefined,
+    blocksNodeWork,
+  });
+
+  it("starts and resumes nothing on the Node beside it, and carries on elsewhere", () => {
+    const { store, service, enroll } = setup();
+    try {
+      const local = enroll("workstation", ["copilot-acp"]);
+      const remote = enroll("laptop", ["copilot-acp"]);
+      store.setNodeOnline(local.nodeId, true, 0);
+      store.setNodeOnline(remote.nodeId, true, 0);
+      const workspace = store.createWorkspace("repo", "");
+      const here = store.createPlacement(workspace.id, local.nodeId, "C:\\repo");
+      const there = store.createPlacement(workspace.id, remote.nodeId, "D:\\repo");
+      const earlier = service.adoptAndResumeSession({
+        placement: here,
+        agentSessionId: "conversation",
+        yolo: false,
+      });
+      if (!earlier.ok) throw new Error(earlier.error);
+      store.transitionSession(earlier.session.id, "stopped");
+      const sentBefore = local.sent.length;
+
+      service.attachHostUpdate(
+        hooks((nodeId) => (nodeId === local.nodeId ? updating : undefined)),
+      );
+      // Anything started here now would be stopped by the restart unasked.
+      expect(
+        service.createAndStartSession({ placement: here, prompt: "hi", yolo: false }),
+      ).toEqual({ ok: false, status: 409, error: updating });
+      expect(service.resumeSession(earlier.session.id)).toEqual({
+        ok: false,
+        status: 409,
+        error: updating,
+      });
+      expect(local.sent).toHaveLength(sentBefore);
+      expect(
+        service.createAndStartSession({ placement: there, prompt: "hi", yolo: false }).ok,
+      ).toBe(true);
+    } finally {
+      store.close();
+    }
+  });
+
+  it("turns back a start that reaches the dispatcher anyway, naming why", () => {
+    const { store, service, enroll } = setup();
+    try {
+      const local = enroll("workstation", ["copilot-acp"]);
+      store.setNodeOnline(local.nodeId, true, 0);
+      const workspace = store.createWorkspace("repo", "");
+      const here = store.createPlacement(workspace.id, local.nodeId, "C:\\repo");
+      const earlier = service.adoptAndResumeSession({
+        placement: here,
+        agentSessionId: "conversation",
+        yolo: false,
+      });
+      if (!earlier.ok) throw new Error(earlier.error);
+      store.transitionSession(earlier.session.id, "stopped");
+      const sentBefore = local.sent.length;
+
+      // The update begins between the resume's own check and its dispatch.
+      service.attachHostUpdate(
+        hooks(vi.fn().mockReturnValueOnce(undefined).mockReturnValue(updating)),
+      );
+      expect(service.resumeSession(earlier.session.id).ok).toBe(false);
+      expect(local.sent).toHaveLength(sentBefore);
+      expect(store.getSession(earlier.session.id)).toMatchObject({
+        state: "failed",
+        currentActivity: updating,
+      });
+    } finally {
+      store.close();
+    }
+  });
+});
 describe("session context defaults", () => {
   it.each(["", "lead", "worker", "reviewer"] as const)(
     "starts %s sessions in long context",

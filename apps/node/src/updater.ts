@@ -1,8 +1,20 @@
 import { spawn } from "node:child_process";
 import { existsSync, openSync } from "node:fs";
 import { resolve } from "node:path";
-import type { NodeUpdateStage } from "@fleet/protocol";
 import { isProcessAlive } from "@fleet/protocol/runtime";
+import {
+  updateCheckout as updateSharedCheckout,
+  type UpdateOptions as SharedUpdateOptions,
+  type UpdateOutcome,
+} from "@fleet/protocol/updater";
+
+export {
+  runCommand,
+  type CommandResult,
+  type RunCommand,
+  type UpdateOutcome,
+  type UpdateReport,
+} from "@fleet/protocol/updater";
 
 /**
  * Pulling, rebuilding and restarting the checkout this Node runs from.
@@ -11,6 +23,9 @@ import { isProcessAlive } from "@fleet/protocol/runtime";
  * half-updated fleet is worse than an un-updated one: the Host and its Nodes
  * disagree about the message union and hang up on each other. This exists so a
  * change reaches every machine from one click.
+ *
+ * The update itself is the procedure the Host shares (`@fleet/protocol/updater`);
+ * what is here is how a Node gets back up afterwards.
  */
 
 /** Names the pid of the process being replaced, so the successor can wait. */
@@ -33,160 +48,14 @@ export const RESTART_MODE_ENV = "FLEET_RESTART_MODE";
  */
 export const RESTART_EXIT_CODE = 75;
 
-export type UpdateReport = (stage: NodeUpdateStage, detail: string) => void;
+/** What a Node builds: the protocol it speaks and itself, not the Host. */
+export const NODE_BUILD_SCRIPT = "build:node";
 
-export type CommandResult = { ok: boolean; output: string };
+export type UpdateOptions = Omit<SharedUpdateOptions, "buildScript">;
 
-export type RunCommand = (
-  command: string,
-  args: readonly string[],
-  cwd: string,
-) => Promise<CommandResult>;
-
-/** npm and git are `.cmd` shims on Windows, which `spawn` will not run directly. */
-function platformCommand(command: string): string {
-  return process.platform === "win32" ? `${command}.cmd` : command;
-}
-
-/**
- * Runs one update step without blocking the event loop.
- *
- * `spawnSync` was simpler but stopped this process dead for the length of an
- * `npm install`, which outlasts the Host's heartbeat timeout: the Host decided
- * the Node had died and closed the socket mid-update, so the update it had just
- * asked for reported nothing and looked like a crash.
- */
-export const runCommand: RunCommand = (command, args, cwd) =>
-  new Promise((done) => {
-    const executable = command === "npm" ? platformCommand(command) : command;
-    // `npm.cmd` is a batch file; without a shell Windows refuses to execute it.
-    // The arguments are joined into the command rather than passed alongside it
-    // because Node deprecates the combination (DEP0190) — it cannot know that
-    // every argument here is a literal spelled out in this file, so it warns on
-    // every update. They are, and none of them contains a space.
-    const child =
-      process.platform === "win32"
-        ? spawn([executable, ...args].join(" "), { cwd, shell: true, windowsHide: true })
-        : spawn(executable, [...args], { cwd, windowsHide: true });
-    let output = "";
-    const collect = (chunk: Buffer) => {
-      output += chunk.toString("utf8");
-      // A failing install can print megabytes; only the tail is ever shown.
-      if (output.length > 64_000) output = output.slice(-32_000);
-    };
-    child.stdout?.on("data", collect);
-    child.stderr?.on("data", collect);
-    child.once("error", (error) => done({ ok: false, output: error.message }));
-    child.once("close", (code) => done({ ok: code === 0, output: output.trim() }));
-  });
-
-export type UpdateOptions = {
-  repoRoot: string;
-  /** Captured when the process started, not the HEAD an earlier attempt moved. */
-  runningRevision?: string;
-  report: UpdateReport;
-  run?: RunCommand;
-  beforeMutation?: () => void | Promise<void>;
-  forceRebuild?: boolean;
-};
-
-export type UpdateOutcome =
-  | { action: "restart"; revision: string }
-  | { action: "none"; reason: string }
-  | { action: "failed"; reason: string };
-
-/** Names the branch this checkout tracks, the same one `git pull` would merge. */
-const UPSTREAM_REF = ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"];
-
-/**
- * Brings the checkout up to date, stopping at the first step that fails.
- *
- * The pull is a fetch followed by a hard reset onto the tracking branch rather
- * than `git pull`. `--ff-only` was the safer-looking choice and was the wrong
- * one in practice: nobody is at the keyboard when this runs, so a machine that
- * had picked up a local commit — a debug print committed months ago, a merge
- * someone started on the box — refused every update from then on and stayed
- * behind the rest of the fleet until a human logged in. A Node's checkout is a
- * deployment, not somewhere to keep work: the remote is what it is supposed to
- * be running, so local commits and local edits to tracked files are discarded
- * to get there.
- *
- * Untracked files survive, because `git reset --hard` only deletes the ones
- * standing where a tracked file has to go. That is deliberate — `.env` on that
- * machine is untracked, and cleaning it away would point the Node at a
- * different Host, or at none.
- */
-export function updateCheckout({
-  repoRoot,
-  runningRevision,
-  report,
-  run = runCommand,
-  beforeMutation,
-  forceRebuild = false,
-}: UpdateOptions): Promise<UpdateOutcome> {
-  return (async () => {
-    report("checking", "Inspecting the checkout");
-    if (!existsSync(resolve(repoRoot, ".git"))) {
-      return { action: "failed", reason: `${repoRoot} is not a git checkout` };
-    }
-    const before = await run("git", ["rev-parse", "HEAD"], repoRoot);
-    if (!before.ok) {
-      return { action: "failed", reason: `git rev-parse: ${before.output}` };
-    }
-
-    await beforeMutation?.();
-    report("pulling", "git fetch --prune");
-    const fetched = await run("git", ["fetch", "--prune"], repoRoot);
-    if (!fetched.ok) return { action: "failed", reason: `git fetch: ${fetched.output}` };
-
-    // Asked rather than assumed to be origin/main: a machine parked on a
-    // release branch must be reset onto that branch, not dragged onto another.
-    // git's own message names the branch when there is no upstream at all.
-    const upstream = await run("git", UPSTREAM_REF, repoRoot);
-    if (!upstream.ok) {
-      return { action: "failed", reason: `git rev-parse @{u}: ${upstream.output}` };
-    }
-    const target = upstream.output.trim();
-
-    report("pulling", `git reset --hard ${target}`);
-    const reset = await run("git", ["reset", "--hard", target], repoRoot);
-    if (!reset.ok) {
-      return { action: "failed", reason: `git reset --hard ${target}: ${reset.output}` };
-    }
-
-    const after = await run("git", ["rev-parse", "HEAD"], repoRoot);
-    if (!after.ok) return { action: "failed", reason: `git rev-parse: ${after.output}` };
-    const targetRevision = after.output.trim();
-    const currentRevision = runningRevision?.trim() ?? before.output.trim();
-    if (
-      !forceRebuild &&
-      targetRevision === before.output.trim() &&
-      currentRevision &&
-      targetRevision.startsWith(currentRevision)
-    ) {
-      return { action: "none", reason: "Already up to date" };
-    }
-
-    // TypeScript and the build toolchain are development dependencies. Node
-    // machines commonly set NODE_ENV=production or npm_config_omit=dev, so an
-    // unqualified install can succeed while leaving `tsc` unavailable.
-    report("installing", "npm install --include=dev");
-    const install = await run("npm", ["install", "--include=dev"], repoRoot);
-    if (!install.ok) {
-      return {
-        action: "failed",
-        reason: `npm install --include=dev: ${install.output}`,
-      };
-    }
-
-    report("building", "npm run build:node");
-    const build = await run("npm", ["run", "build:node"], repoRoot);
-    if (!build.ok) {
-      return { action: "failed", reason: `npm run build:node: ${build.output}` };
-    }
-
-    return { action: "restart", revision: targetRevision.slice(0, 12) };
-  })();
+/** The shared update, building what a Node runs. */
+export function updateCheckout(options: UpdateOptions): Promise<UpdateOutcome> {
+  return updateSharedCheckout({ ...options, buildScript: NODE_BUILD_SCRIPT });
 }
 
 /** The entry point `npm run build:node` produces, relative to the checkout. */

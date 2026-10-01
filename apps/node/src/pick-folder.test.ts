@@ -1,66 +1,77 @@
-import { describe, expect, it } from "vitest";
-import { nativePickerCommand, parsePickerResult } from "./pick-folder.js";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, parse, resolve } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { listFolders } from "./pick-folder.js";
 
-describe("nativePickerCommand", () => {
-  it("uses AppleScript on macOS", () => {
-    const command = nativePickerCommand("darwin", "/Users/me");
-    expect(command?.file).toBe("osascript");
-  });
+const temporaryFolders: string[] = [];
+const temporaryFolder = async () => {
+  const path = await mkdtemp(join(tmpdir(), "fleet-picker-"));
+  temporaryFolders.push(path);
+  return path;
+};
 
-  it("uses PowerShell on Windows", () => {
-    const command = nativePickerCommand("win32", "C:\\Users\\me");
-    expect(command?.file).toMatch(/powershell/i);
-  });
-
-  it("reports no picker on a platform without a standard one", () => {
-    // A headless server has no dialog to show. Saying so lets the page keep
-    // its typed-path fallback instead of hanging on a command that cannot run.
-    expect(nativePickerCommand("linux", "/home/me")).toBeUndefined();
-  });
-
-  it("passes the starting folder as an argument, never as script text", () => {
-    // The whole point: a folder named `"; rm -rf ~` must arrive as data. If it
-    // were interpolated into the script source it would be executed instead,
-    // so the script text is what has to stay clean.
-    const hostile = '/tmp/"; do shell script "rm -rf ~"; --';
-    const command = nativePickerCommand("darwin", hostile);
-    const script = command!.args[command!.args.indexOf("-e") + 1]!;
-    expect(script).not.toContain("rm -rf");
-    expect(command!.args).toContain(hostile);
-  });
-
-  it("hands Windows the starting folder out of band, not inside the script", () => {
-    const hostile = 'C:\\tmp"; Remove-Item C:\\ -Recurse; #';
-    const command = nativePickerCommand("win32", hostile);
-    const script = command!.args[command!.args.indexOf("-Command") + 1]!;
-    expect(script).not.toContain("Remove-Item");
-    expect(command!.env?.FLEET_PICKER_START).toBe(hostile);
-  });
+afterEach(async () => {
+  await Promise.all(
+    temporaryFolders.splice(0).map((path) => rm(path, { recursive: true })),
+  );
 });
 
-describe("parsePickerResult", () => {
-  it("reads the chosen folder", () => {
-    expect(parsePickerResult(0, "/Users/me/project\n")).toEqual({
+describe("listFolders", () => {
+  it("lists only immediate folders, sorted, without reading file contents", async () => {
+    const root = await temporaryFolder();
+    await mkdir(join(root, "zebra", "nested"), { recursive: true });
+    await mkdir(join(root, "Alpha & friends"));
+    await writeFile(join(root, "private.txt"), "not returned to the browser");
+
+    expect(await listFolders(` ${root} `)).toEqual({
       ok: true,
-      path: "/Users/me/project",
+      path: root,
+      parent: dirname(root),
+      folders: [
+        { name: "Alpha & friends", path: join(root, "Alpha & friends") },
+        { name: "zebra", path: join(root, "zebra") },
+      ],
+      unavailableLinks: 0,
     });
   });
 
-  it("treats an empty selection as a cancel, not a failure", () => {
-    // Windows reports a dismissed dialog with empty output and a zero exit.
-    // Surfacing that as an error would show a scary message for the ordinary
-    // act of changing your mind.
-    expect(parsePickerResult(0, "  \n")).toEqual({ ok: false, canceled: true });
+  it("opens home for an empty path and stops Up at a filesystem root", async () => {
+    expect(await listFolders("")).toMatchObject({ ok: true, path: resolve(homedir()) });
+    const root = parse(homedir()).root;
+    expect(await listFolders(root)).toMatchObject({ ok: true, path: root, parent: null });
   });
 
-  it("treats the macOS cancel exit code as a cancel", () => {
-    expect(parsePickerResult(1, "")).toEqual({ ok: false, canceled: true });
+  it("supports linked directories and reports broken links without hiding other folders", async () => {
+    const root = await temporaryFolder();
+    const destination = await temporaryFolder();
+    const missing = join(destination, "missing");
+    await mkdir(missing);
+    await symlink(destination, join(root, "linked"), "junction");
+    await symlink(missing, join(root, "broken"), "junction");
+    await rm(missing, { recursive: true });
+
+    expect(await listFolders(root)).toMatchObject({
+      ok: true,
+      folders: [{ name: "linked", path: join(root, "linked") }],
+      unavailableLinks: 1,
+    });
+    expect(await listFolders(join(root, "linked"))).toMatchObject({
+      ok: true,
+      path: join(root, "linked"),
+      parent: root,
+    });
   });
 
-  it("reports a real failure with its exit code", () => {
-    const result = parsePickerResult(127, "");
-    expect(result.ok).toBe(false);
-    if (result.ok || result.canceled) throw new Error("expected a failure");
-    expect(result.reason).toContain("127");
+  it("reports invalid, missing and non-directory paths instead of opening a desktop dialog", async () => {
+    const root = await temporaryFolder();
+    const file = join(root, "file.txt");
+    await writeFile(file, "");
+    for (const path of ["relative", "bad\0path", join(root, "missing"), file]) {
+      expect(await listFolders(path)).toMatchObject({
+        ok: false,
+        reason: expect.any(String),
+      });
+    }
   });
 });

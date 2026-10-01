@@ -1,7 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FastifyInstance, InjectOptions } from "fastify";
-import { CHATS_WORKSPACE_ID } from "@fleet/protocol";
+import {
+  CHATS_WORKSPACE_ID,
+  DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+} from "@fleet/protocol";
 import { buildServer } from "./server.js";
+import { FleetStore } from "./store.js";
 
 const OPERATOR_PASSWORD = "test-password";
 
@@ -104,6 +108,111 @@ describe("host routes", () => {
         })
       ).statusCode,
     ).toBe(400);
+  });
+
+  it("saves a normalized heartbeat schedule and explains an invalid one", async () => {
+    const initial = (await inject({ method: "GET", url: "/api/defaults" })).json();
+    expect(initial).toMatchObject({
+      orchestratorHeartbeatSchedule: DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+      orchestratorHeartbeatTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    });
+    expect(initial.orchestratorHeartbeatUpcoming).toHaveLength(3);
+
+    const saved = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { orchestratorHeartbeatSchedule: " 0  8-20 * * * " },
+    });
+    expect(saved.statusCode).toBe(200);
+    const body = saved.json() as {
+      orchestratorHeartbeatSchedule: string;
+      orchestratorHeartbeatUpcoming: string[];
+    };
+    expect(body.orchestratorHeartbeatSchedule).toBe("0 8-20 * * *");
+    for (const at of body.orchestratorHeartbeatUpcoming) {
+      const hour = new Date(at).getHours();
+      expect(hour >= 8 && hour <= 20).toBe(true);
+      expect(new Date(at).getMinutes()).toBe(0);
+    }
+
+    const rejected = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { orchestratorHeartbeatSchedule: "0 25 * * *", yolo: true },
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().error).toBe(
+      'Heartbeat schedule: "25" is not a valid hour (0-23).',
+    );
+    // Nothing in a refused request is applied, including its other fields.
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      orchestratorHeartbeatSchedule: "0 8-20 * * *",
+      yolo: false,
+    });
+  });
+
+  it("persists typed orchestrator preferences and resets Auto without changing Copilot defaults", async () => {
+    const params = { kind: "hermes", profile: "fleet-orchestrator" };
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: { orchestratorAgent: params },
+        })
+      ).json(),
+    ).toMatchObject({
+      orchestratorAgent: params,
+      contextTier: "long_context",
+      yolo: false,
+    });
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      orchestratorAgent: params,
+    });
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: {
+            orchestratorAgent: { kind: "hermes", profile: "../escape" },
+            yolo: true,
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      orchestratorAgent: params,
+      yolo: false,
+    });
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/defaults",
+          payload: { orchestratorAgent: null },
+        })
+      ).json(),
+    ).toMatchObject({ orchestratorAgent: null });
+  });
+
+  it("keeps defaults readable and logs a warning for a corrupted persisted agent preference", async () => {
+    const getSetting = FleetStore.prototype.getSetting;
+    const stored = vi
+      .spyOn(FleetStore.prototype, "getSetting")
+      .mockImplementation(function (this: FleetStore, key) {
+        return key === "orchestrator.agent" ? "{corrupt" : getSetting.call(this, key);
+      });
+    const warn = vi.spyOn(app.log, "warn");
+    try {
+      const response = await inject({ method: "GET", url: "/api/defaults" });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ orchestratorAgent: null });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("using Auto (Copilot)"));
+    } finally {
+      stored.mockRestore();
+      warn.mockRestore();
+    }
   });
 
   it("reports health and an empty snapshot", async () => {
@@ -275,8 +384,16 @@ describe("host routes", () => {
         cleanupIgnoredOnly: false,
       },
     };
+    // Hourly through weekday working hours, every two hours otherwise.
+    const heartbeatDefaults = {
+      orchestratorAgent: null,
+      orchestratorHeartbeatSchedule: DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
+      orchestratorHeartbeatTimeZone: expect.any(String),
+      orchestratorHeartbeatUpcoming: expect.any(Array),
+    };
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: false,
       contextTier: "long_context",
       agencyMode: false,
@@ -292,6 +409,7 @@ describe("host routes", () => {
     // not mentioning it.
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: true,
       contextTier: "long_context",
       agencyMode: false,
@@ -309,6 +427,7 @@ describe("host routes", () => {
     });
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: true,
       contextTier: "long_context",
       agencyMode: false,
@@ -336,6 +455,7 @@ describe("host routes", () => {
     });
     expect(await read()).toEqual({
       ...managedDefaults,
+      ...heartbeatDefaults,
       yolo: true,
       contextTier: "long_context",
       agencyMode: false,
@@ -659,6 +779,45 @@ describe("run routes", () => {
     const body = listed.json() as { runs: unknown[]; stepsByRunId: Record<string, []> };
     expect(body.runs).toHaveLength(1);
     expect(body.stepsByRunId[run.id]).toEqual([]);
+  });
+
+  it("rejects an over-budget plan without replacing the existing plan", async () => {
+    const { workspaceId } = await workspaceWithPlacement();
+    const created = await inject({
+      method: "POST",
+      url: "/api/runs",
+      payload: {
+        workspaceId,
+        name: "bounded",
+        objective: "One worker only",
+        policy: { maxSessions: 1 },
+      },
+    });
+    expect(created.statusCode).toBe(201);
+    const { id } = created.json() as { id: string };
+    const first = { stepKey: "one", title: "One", prompt: "Inspect" };
+    expect(
+      (
+        await inject({
+          method: "POST",
+          url: "/api/runs/" + id + "/plan",
+          payload: { steps: [first] },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const before = (await inject({ method: "GET", url: "/api/runs/" + id })).json();
+    const rejected = await inject({
+      method: "POST",
+      url: "/api/runs/" + id + "/plan",
+      payload: {
+        steps: [first, { stepKey: "two", title: "Two", prompt: "Inspect again" }],
+      },
+    });
+    expect(rejected.statusCode).toBe(400);
+    expect(rejected.json().error).toContain("session budget");
+    expect(
+      (await inject({ method: "GET", url: "/api/runs/" + id })).json().steps,
+    ).toEqual(before.steps);
   });
 
   it("refuses a plan whose steps depend on each other and names the cycle", async () => {

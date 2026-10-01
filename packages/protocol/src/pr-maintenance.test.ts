@@ -6,9 +6,15 @@ import {
   PrMaintenanceScopeSchema,
   PrMaintenanceRegistrationSchema,
   PrMaintenanceObservationSchema,
+  PrMaintenanceBatchSchema,
+  PrMaintenanceFindingSchema,
   PrMaintenanceGithubSnapshotIdentitySchema,
   PrMaintenanceHelperSnapshotIdentitySchema,
+  prMaintenanceEvidenceCurrentUntil,
+  prMaintenanceObservationFresh,
   prMaintenanceProgress,
+  prMaintenanceTaskStatuses,
+  PrMaintenanceTaskStatusSchema,
   parsePrMaintenanceUrl,
   prMaintenanceProviderKey,
   prMaintenanceUrl,
@@ -156,6 +162,8 @@ describe("PR maintenance wire schemas", () => {
       expect(observation.draft).toBeUndefined();
       expect(base().incidents).toEqual([]);
       expect(base().incidentCursor).toBe(0);
+      expect(base().pauseOrigin).toBeUndefined();
+      expect(base().resumeHistory).toEqual([]);
       expect(
         PrMaintenanceObservationSchema.parse({ ...observation, draft: true }).draft,
       ).toBe(true);
@@ -260,6 +268,171 @@ describe("PR maintenance wire schemas", () => {
       expect(prMaintenanceProgress(record, now).stage).toBe("released");
       record.lifecycle = "merged";
       expect(prMaintenanceProgress(record, now).stage).toBe("merged");
+    });
+
+    it("keeps the observed stage through the next routine check, then needs a new look", () => {
+      const record = base();
+      const now = Date.parse(at);
+      record.readyFingerprint = observation.fingerprint;
+      record.observation!.reviewsComplete = false;
+      // The heartbeat schedules the next look two hours out, as it does at night.
+      record.nextCheckAt = new Date(now + 120 * 60_000).toISOString();
+      const until = now + 150 * 60_000;
+      expect(prMaintenanceEvidenceCurrentUntil(record)).toBe(until);
+      expect(prMaintenanceProgress(record, now + 90 * 60_000).stage).toBe(
+        "waiting_review",
+      );
+      expect(prMaintenanceProgress(record, until).stage).toBe("waiting_review");
+      expect(prMaintenanceProgress(record, until + 1).stage).toBe("checking");
+      expect(prMaintenanceTaskStatuses([record], now)[0]?.freshUntil).toBe(
+        new Date(until).toISOString(),
+      );
+      // A label is not permission: acting on the evidence still needs a fresh read.
+      expect(prMaintenanceObservationFresh(record.observation, now + 90 * 60_000)).toBe(
+        false,
+      );
+    });
+
+    it("summarizes each task's current retained maintenance for task lists", () => {
+      const now = Date.parse(at);
+      const ready = base();
+      ready.readyFingerprint = observation.fingerprint;
+      ready.observationHostAt = at;
+      const older = { ...base(), id: "older", createdAt: "2026-09-17T00:00:00.000Z" };
+      const released = { ...base(), id: "released", taskId: "released-task" };
+      released.ownershipReleasedAt = at;
+      const manual = { ...base(), id: "manual", taskId: "manual-task" };
+      manual.lifecycle = "paused";
+      manual.manualControl = { operatorId: "operator", takenAt: at, commands: [] };
+
+      const statuses = prMaintenanceTaskStatuses([older, ready, released, manual], now);
+
+      expect(statuses).toEqual([
+        {
+          taskId: "task",
+          recordId: "job",
+          stage: "ready",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: false,
+          freshUntil: "2026-09-18T00:30:00.000Z",
+        },
+        {
+          taskId: "manual-task",
+          recordId: "manual",
+          stage: "paused",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: true,
+        },
+      ]);
+      for (const status of statuses)
+        expect(PrMaintenanceTaskStatusSchema.parse(status)).toEqual(status);
+      manual.manualControl.endedAt = at;
+      expect(prMaintenanceTaskStatuses([manual], now)[0]?.manualControl).toBe(false);
+    });
+
+    it.each([
+      ["addressed", "ready"],
+      ["already_satisfied", "ready"],
+      ["incomplete", "checking"],
+      ["failed", "checking"],
+      ["superseded", "checking"],
+      ["needs_human", "checking"],
+    ] as const)(
+      "distinguishes a current %s disposition from unmatched feedback without bypassing readiness",
+      (outcome, stage) => {
+        const record = base();
+        record.observation!.sources = [source];
+        record.findings = [
+          PrMaintenanceFindingSchema.parse({
+            source,
+            outcome,
+            stage: "resolved",
+            verifiedHeadSha: headSha,
+            evidence: ["Current HEAD verification and response receipt"],
+            responseIds: ["response"],
+          }),
+        ];
+        const now = Date.parse(at);
+        expect(prMaintenanceProgress(record, now).stage).toBe("checking");
+        record.readyFingerprint = observation.fingerprint;
+        expect(prMaintenanceProgress(record, now).stage).toBe(stage);
+        expect(prMaintenanceTaskStatuses([record], now)[0]?.stage).toBe(stage);
+      },
+    );
+
+    it.each(["missing", "id", "revision", "head"] as const)(
+      "assesses feedback with a %s current disposition rather than trusting resolved-thread evidence",
+      (mismatch) => {
+        const record = base();
+        record.observation!.sources = [source];
+        record.readyFingerprint = observation.fingerprint;
+        record.findings =
+          mismatch === "missing"
+            ? []
+            : [
+                PrMaintenanceFindingSchema.parse({
+                  source: {
+                    ...source,
+                    ...(mismatch === "id" ? { id: "other-thread" } : {}),
+                    ...(mismatch === "revision" ? { revision: "old" } : {}),
+                  },
+                  outcome: "addressed",
+                  stage: "resolved",
+                  publishedCommit: headSha,
+                  verifiedHeadSha: mismatch === "head" ? "b".repeat(40) : headSha,
+                  evidence: ["Provider thread is resolved"],
+                }),
+              ];
+        expect(prMaintenanceProgress(record, Date.parse(at)).stage).toBe("triage");
+        expect(prMaintenanceTaskStatuses([record], Date.parse(at))[0]?.stage).toBe(
+          "triage",
+        );
+      },
+    );
+
+    it("shows only accepted work as fixing, with holds and reconciliation taking precedence", () => {
+      const record = base();
+      record.observation!.sources = [source];
+      const batch = PrMaintenanceBatchSchema.parse({
+        id: "batch",
+        kind: "repair",
+        sources: [source],
+        headSha,
+        prompt: "Bounded repair",
+        scope: "Same contract",
+        reservedMutations: 3,
+        generation: 1,
+        authorizationId: "authorization",
+        state: "prepared",
+        createdAt: at,
+        updatedAt: at,
+      });
+      record.batches = [batch];
+      const stage = () => prMaintenanceProgress(record, Date.parse(at)).stage;
+      expect(stage()).toBe("triage");
+      Object.assign(batch, { state: "accepted", stepId: "step", attempt: 1 });
+      expect(stage()).toBe("addressing_review");
+      batch.effects = [
+        {
+          key: "reply",
+          kind: "reply",
+          state: "reserved",
+          headSha,
+          actor: "worker",
+          actionIdentity: "reply-to-thread",
+          attempts: 1,
+        },
+      ];
+      expect(stage()).toBe("reconciling");
+      batch.effects = [];
+      batch.cancellationRequestedAt = at;
+      expect(stage()).toBe("reconciling");
+      delete batch.cancellationRequestedAt;
+      record.lifecycle = "paused";
+      record.pauseReason = "task_human_hold";
+      expect(stage()).toBe("human_hold");
+      record.pauseReason = "operator_pause";
+      expect(stage()).toBe("paused");
     });
 
     it.each(["headSha", "snapshotId", "failure"] as const)(

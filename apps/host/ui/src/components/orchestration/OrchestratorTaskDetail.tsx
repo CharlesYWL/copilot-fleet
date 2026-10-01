@@ -18,16 +18,18 @@ import {
 import {
   ArrowLeft20Regular,
   ArrowCounterclockwise20Regular,
+  ArrowForward20Regular,
   Chat20Regular,
   Delete20Regular,
   Info20Regular,
   Open16Regular,
 } from "@fluentui/react-icons";
 import {
-  PR_MAINTENANCE_RECOVERY_LIMITS,
+  prMaintenanceEvidenceCurrentUntil,
   prMaintenanceUrl,
   type FleetSession,
   type RunNote,
+  type RunStep,
 } from "@fleet/protocol";
 import type { RunViewModel } from "../../lib/orchestration-view";
 import { currentPhase } from "../../lib/orchestration-view";
@@ -266,8 +268,15 @@ export type OrchestratorTaskDetailProps = {
   snapshotRevision?: number;
   onBack: () => void;
   backLabel?: string;
+  /** The conversation the task is assigned to, as the operator knows it. */
+  ownerLabel?: string | undefined;
   onOpenLead: () => void;
+  /** Hands the task to another orchestrator conversation. */
+  onTransfer?: (() => void) | undefined;
   onOpenWorker: (sessionId: string) => void;
+  /** "Resume now" for a queued follow-up; the Host decides whether approval is needed. */
+  onResumeNow?: ((step: RunStep) => Promise<unknown> | void) | undefined;
+  onReviewApproval?: ((requestId: string) => void) | undefined;
   onReview: (
     approved: boolean,
     note: string,
@@ -297,8 +306,12 @@ export const OrchestratorTaskDetail = ({
   snapshotRevision = 0,
   onBack,
   backLabel = "All tasks",
+  ownerLabel,
   onOpenLead,
+  onTransfer,
   onOpenWorker,
+  onResumeNow,
+  onReviewApproval,
   onReview,
   onArchive,
   onReopen,
@@ -335,14 +348,12 @@ export const OrchestratorTaskDetail = ({
 
   const record = currentMaintenance(maintenance?.records ?? []);
   const observedAt = record?.observationHostAt ?? record?.observation?.attemptedAt;
+  const currentUntil = record ? prMaintenanceEvidenceCurrentUntil(record) : undefined;
   useEffect(() => {
-    if (!observedAt) return;
+    if (!observedAt || currentUntil === undefined) return;
     const observed = Date.parse(observedAt);
     const now = Date.now();
-    const nextBoundary =
-      observed > now
-        ? observed
-        : observed + PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1;
+    const nextBoundary = observed > now ? observed : currentUntil + 1;
     const delay = nextBoundary - now;
     if (!Number.isFinite(delay) || delay <= 0) return;
     // Evidence can expire without a socket update; re-render at that boundary, not on a poll.
@@ -351,7 +362,7 @@ export const OrchestratorTaskDetail = ({
       Math.min(delay, 2_147_483_647),
     );
     return () => window.clearTimeout(timer);
-  }, [observedAt, freshnessRevision]);
+  }, [observedAt, currentUntil, freshnessRevision]);
   const maintenanceHold = maintenance?.records.find(
     (entry) =>
       entry.taskId === run.id &&
@@ -443,17 +454,35 @@ export const OrchestratorTaskDetail = ({
             {backLabel}
           </Button>
           <span className={styles.crumb}>
-            Orchestrator{currentPhase(run) ? ` / ${currentPhase(run)}` : ""}
+            {ownerLabel || "Orchestrator"}
+            {currentPhase(run) ? ` / ${currentPhase(run)}` : ""}
           </span>
           <div className={styles.actions}>
             <Button
               size="small"
               appearance="subtle"
               icon={<Chat20Regular />}
+              {...(ownerLabel
+                ? {
+                    title: `Open ${ownerLabel}, the conversation this task is assigned to`,
+                  }
+                : {})}
               onClick={onOpenLead}
             >
               Conversation
             </Button>
+            {onTransfer && (
+              <Button
+                {...restoreFocusTarget}
+                size="small"
+                appearance="subtle"
+                icon={<ArrowForward20Regular />}
+                title="Hand this task to another orchestrator conversation"
+                onClick={onTransfer}
+              >
+                Transfer
+              </Button>
+            )}
             <Button
               {...restoreFocusTarget}
               size="small"
@@ -563,6 +592,8 @@ export const OrchestratorTaskDetail = ({
                 phases={run.phases}
                 sessions={sessions}
                 onOpenWorker={onOpenWorker}
+                onResumeNow={onResumeNow}
+                onReviewApproval={onReviewApproval}
               />
             </section>
           </div>

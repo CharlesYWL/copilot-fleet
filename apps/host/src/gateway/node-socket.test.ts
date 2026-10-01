@@ -11,10 +11,12 @@ import {
   MUTUAL_AUTH_PROTOCOL,
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
+  SESSION_FILES_CAPABILITY,
   SESSION_RETENTION_CAPABILITY,
   SESSION_RETENTION_DAY_MS,
   WorktreeConflict,
   OutboxFlushIdSchema,
+  isResumableSession,
   parseEnrollmentGrant,
   type AuthenticatedEnvelope,
   type HostChallenge,
@@ -698,6 +700,102 @@ describe("node gateway mutual authentication", () => {
     expect(nodes.find((node) => node.id === receipt.nodeId)?.online).toBe(true);
     expect(nodes.find((node) => node.id === receipt.nodeId)?.health).toEqual(health);
     socket.close();
+  });
+
+  it("relays a session file download through the sealed channel", async () => {
+    const { keys, receipt } = await enrollNode();
+    const { socket, channel } = await handshake({
+      nodeId: receipt.nodeId,
+      keys,
+      inventory: {
+        capabilities: [...registration.capabilities, SESSION_FILES_CAPABILITY],
+      },
+    });
+    const read = async () => {
+      for (;;) {
+        const opened = channel.open(
+          (await nextFrame(socket)) as unknown as AuthenticatedEnvelope,
+        );
+        if (!opened.ok) throw new Error(opened.reason);
+        const message = JSON.parse(opened.plaintext) as HostToNodeMessage;
+        if (message.type === "session_file_read") return message.request;
+      }
+    };
+    const answer = (
+      result: Extract<NodeToHostMessage, { type: "session_file_data" }>["result"],
+    ) =>
+      socket.send(
+        JSON.stringify(
+          channel.seal(JSON.stringify({ type: "session_file_data", result })),
+        ),
+      );
+    try {
+      // The welcome is sent once the Host has taken the inventory in.
+      channel.open((await nextFrame(socket)) as unknown as AuthenticatedEnvelope);
+      const headers = { cookie: owner.cookie(), "x-csrf-token": await csrfFor(owner) };
+      const snapshot = (
+        await app.inject({ method: "GET", url: "/api/snapshot", headers })
+      ).json() as { placements: { id: string; nodeId: string; localPath: string }[] };
+      const placement = snapshot.placements.find(
+        (entry) => entry.nodeId === receipt.nodeId,
+      );
+      if (!placement) throw new Error("The Node's Chats checkout was not created");
+      const started = await app.inject({
+        method: "POST",
+        url: "/api/sessions",
+        headers,
+        payload: { placementId: placement.id, prompt: "Write the report" },
+      });
+      const session = started.json() as { id: string };
+      expect(started.statusCode, started.body).toBe(202);
+
+      const download = app.inject({
+        method: "GET",
+        url: `/api/sessions/${session.id}/files/download?path=${encodeURIComponent("notes/report.txt")}`,
+        headers: { cookie: owner.cookie() },
+      });
+      const request = await read();
+      expect(request).toMatchObject({
+        sessionId: session.id,
+        path: "notes/report.txt",
+        roots: [placement.localPath],
+        offset: 0,
+        version: "",
+      });
+      answer({
+        requestId: request.requestId,
+        ok: true,
+        path: "/home/alpha/notes/report.txt",
+        name: "report.txt",
+        size: 5,
+        modifiedAt: "2026-09-01T00:00:00.000Z",
+        version: "1:2:5:3",
+        offset: 0,
+        data: Buffer.from("hello").toString("base64"),
+      });
+      const response = await download;
+      expect(response.statusCode).toBe(200);
+      expect(response.headers["content-disposition"]).toContain('filename="report.txt"');
+      expect(response.body).toBe("hello");
+
+      const refused = app.inject({
+        method: "GET",
+        url: `/api/sessions/${session.id}/files/stat?path=secret.txt`,
+        headers: { cookie: owner.cookie() },
+      });
+      const statRequest = await read();
+      expect(statRequest.length).toBe(0);
+      answer({
+        requestId: statRequest.requestId,
+        ok: false,
+        code: "forbidden",
+        error: "That file is outside the folders this session works in.",
+      });
+      expect((await refused).statusCode).toBe(403);
+      expect(socket.readyState).toBe(WebSocket.OPEN);
+    } finally {
+      socket.close();
+    }
   });
 
   it("acknowledges retained outbox events over the mutually authenticated channel", async () => {
@@ -1411,6 +1509,19 @@ describe("node reconnect socket ordering", () => {
     store.close();
   });
 
+  it("ignores buffered messages from a superseded connection", async () => {
+    const inventory = { activeSessionIds: [sessionId], busySessionIds: [sessionId] };
+    await connect(inventory);
+    const superseded = service.nodeSocket(nodeId) as WebSocket;
+    await connect(inventory);
+    expect(service.nodeSocket(nodeId)).not.toBe(superseded);
+
+    superseded.emit("message", JSON.stringify(event(1, "state", { state: "failed" })));
+
+    expect(store.getSession(sessionId)?.state).toBe("running");
+    expect(store.listEvents(sessionId)).toEqual([]);
+  });
+
   it.each([true, false])(
     "correlates a manual command's real Node receipt (ok=%s) without replay or minting authority",
     async (ok) => {
@@ -1569,6 +1680,45 @@ describe("node reconnect socket ordering", () => {
 
     await waitFor(() => store.getSession(sessionId)?.state === "idle");
     expect(store.listNotifications().notifications).toEqual([]);
+  });
+
+  it("settles a resume the Node refused instead of leaving it starting forever", async () => {
+    store.setAutoResume(false);
+    store.appendEvent({
+      eventId: "agent-session",
+      sessionId,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "acp-refused" },
+      createdAt: new Date().toISOString(),
+    });
+    const client = await connect({ activeSessionIds: [], busySessionIds: [] });
+    await waitFor(() => store.getSession(sessionId)?.state === "failed");
+    const delivered = nextMessage(client, "command");
+    expect(service.resumeSession(sessionId).ok).toBe(true);
+    const { command } = await delivered;
+    expect(command.type).toBe("resume_session");
+    expect(store.getSession(sessionId)?.state).toBe("starting");
+
+    const refusal =
+      "A durable native prompt handoff is unresolved; automatic resume/re-prompt is blocked.";
+    send(client, {
+      type: "command_result",
+      commandId: command.commandId,
+      sessionId,
+      ok: false,
+      fatal: false,
+      error: refusal,
+    });
+
+    await waitFor(() => store.getSession(sessionId)?.state === "failed");
+    expect(store.getSession(sessionId)).toMatchObject({
+      currentActivity: `Resume refused: ${refusal}`,
+      agentSessionId: "acp-refused",
+      stopRequested: false,
+    });
+    expect(isResumableSession(store.getSession(sessionId)!)).toBe(true);
+    expect(client.readyState).toBe(WebSocket.OPEN);
   });
 
   it("deletes an expired session only after its owning Node acknowledges over the socket", async () => {

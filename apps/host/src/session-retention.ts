@@ -56,6 +56,7 @@ export class SessionRetention {
       Date.parse(session.lastActivityAt ?? session.updatedAt),
     );
     return (
+      session.agentParams?.kind !== "hermes" &&
       (session.state === "idle" || terminalSessionStates.has(session.state)) &&
       !session.favorite &&
       !session.stopRequested &&
@@ -219,6 +220,7 @@ export class SessionRetention {
         commandId: request.commandId,
         sessionId: request.sessionId,
         agentSessionId: session.agentSessionId,
+        ...(session.agentParams ? { agentParams: session.agentParams } : {}),
         inactiveBefore: request.inactiveBefore,
         retentionDays: request.retentionDays,
       },

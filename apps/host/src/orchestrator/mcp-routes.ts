@@ -28,11 +28,13 @@ import {
   ProposePrMaintenanceSchema,
   RecordTaskCheckpointSchema,
   ReopenTaskSchema,
+  RequestResumeSchema,
   SessionRefSchema,
   SetPrMaintenanceSchema,
   StartWorkSchema,
   SubmitTaskSchema,
   TaskRefSchema,
+  TransferTaskSchema,
   WORKER_CATEGORIES,
   explainInvalidArgs,
   type ToolResult,
@@ -479,6 +481,37 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
   );
 
   server.registerTool(
+    "fleet_list_orchestrators",
+    {
+      title: "List orchestrator conversations",
+      description: [
+        "Every orchestrator conversation on this Host: its state, how full its context is, and the tasks assigned to it that still need an orchestrator (open tasks, and closed ones keeping a PR maintained).",
+        "Use it to find a conversation to hand work to, or the task IDs of another conversation's work you were asked to take over. Read-only.",
+      ].join(" "),
+      inputSchema: {},
+      annotations: { readOnlyHint: true },
+    },
+    async () => reply(tools.listOrchestrators()),
+  );
+
+  server.registerTool(
+    "fleet_transfer_task",
+    {
+      title: "Hand a task to another orchestrator",
+      description: [
+        "Reassign one task, with its workers, pending review and PR maintenance, to another orchestrator conversation — or take one over yourself by omitting `to`.",
+        "A task belongs to exactly one orchestrator: only its owner is woken for it and runs its PR-maintenance heartbeat, and the previous owner stops seeing it.",
+        "Use it when a conversation's context is too full to continue its work, or when the person asks for work to move. Name another orchestrator's task by its ID from fleet_list_orchestrators.",
+        "The receiving orchestrator is briefed to read the task and continue from where it stands; put what the record does not say in `note`. Refused while a command requested for the task has not settled.",
+      ].join(" "),
+      inputSchema: TransferTaskSchema.shape,
+    },
+    guard("fleet_transfer_task", TransferTaskSchema, (input) =>
+      tools.transferTask(input),
+    ),
+  );
+
+  server.registerTool(
     "fleet_prepare_pr_maintenance",
     {
       title: "Prepare a PR maintenance job",
@@ -509,7 +542,7 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
     {
       title: "Set owned PR maintenance",
       description:
-        "Pause an owned registration or reconcile already authorized enablement. Enablement, renewal, resume and release require the authenticated task action; this tool cannot mint operator approval or clear a design decision.",
+        "Pause an owned registration, or resume the owning lead's own pause or a human-decision hold after authenticated direction. Before resume, revalidate the PR, HEAD, worker binding and repair authorization. Enablement, renewal, release and answering a decision remain operator-only; this tool cannot mint approval, change scope or reset budgets.",
       inputSchema: SetPrMaintenanceSchema.shape,
     },
     guard("fleet_set_pr_maintenance", SetPrMaintenanceSchema, (input) =>
@@ -558,6 +591,23 @@ function buildServer(service: FleetService, leadSessionId: string): McpServer {
       inputSchema: FollowUpSchema.shape,
     },
     guard("fleet_follow_up", FollowUpSchema, (input) => tools.followUp(input)),
+  );
+
+  server.registerTool(
+    "fleet_request_resume",
+    {
+      title: "Ask to resume a queued worker now",
+      description: [
+        "Ask Fleet to run a retained worker's already-queued follow-up now, for the same session and the same queued prompt; it never sends a new prompt or creates a worker.",
+        "Ordinary scheduling runs first. If only the Node's reserved scheduling slot holds the worker back, this creates an approval request an authenticated operator must answer in Fleet with Approve once or Cancel; you cannot approve it, and nothing you write in chat counts as approval.",
+        "Any other reason — another session in the same checkout, the task's parallel limit, a human hold, PR maintenance, an offline Node — is returned as the answer and is not overridable.",
+        "Call once, report the result, and end your turn. A cancelled or unanswered request is not repeated for the same follow-up.",
+      ].join(" "),
+      inputSchema: RequestResumeSchema.shape,
+    },
+    guard("fleet_request_resume", RequestResumeSchema, (input) =>
+      tools.requestResume(input),
+    ),
   );
 
   server.registerTool(

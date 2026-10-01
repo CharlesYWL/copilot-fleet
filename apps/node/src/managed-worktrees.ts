@@ -1550,7 +1550,10 @@ export class ManagedWorktrees {
   }
 
   private async assertPinnedSource(tree: ManagedWorktree): Promise<void> {
-    if (tree.sourcePlacementId !== tree.originatingPlacementId) {
+    if (
+      tree.sourcePlacementId !== tree.originatingPlacementId ||
+      tree.baseRef.startsWith("refs/remotes/")
+    ) {
       await this.git.run(tree.repository.path, [
         "rev-parse",
         "--verify",
@@ -2356,8 +2359,13 @@ export class ManagedWorktrees {
     return checkout;
   }
 
+  /** Where an orchestrator is started, without creating it. */
+  coordinatorDirectory(sessionId: string): string {
+    return join(this.options.directory, "coordinators", identityHash(sessionId));
+  }
+
   async coordinatorPath(sessionId: string): Promise<string> {
-    const path = join(this.options.directory, "coordinators", identityHash(sessionId));
+    const path = this.coordinatorDirectory(sessionId);
     await mkdir(path, { recursive: true });
     return (await canonicalPath(path)).path;
   }
@@ -2471,7 +2479,7 @@ export class ManagedWorktrees {
       );
     });
     if (pending) {
-      await assertIdentity(pending.preview.target);
+      await this.validateIntegrationTarget(tree, pending.preview.target);
       this.locks.bindScope(pending.preview.target, tree.commonDirectory);
       this.locks.recoverIntegration(pending.preview.target, pending.id);
       const lease = this.locks.acquire(pending.preview.target, {
@@ -2488,7 +2496,7 @@ export class ManagedWorktrees {
         })
       ).stdout.trim();
       const sameTarget =
-        targetRef === pending.preview.targetRef &&
+        targetRef === "" &&
         (await this.commonDirectory(pending.preview.target.path)).key ===
           tree.commonDirectory.key;
       if (

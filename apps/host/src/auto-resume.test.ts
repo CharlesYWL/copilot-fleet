@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
-import type { FleetSession } from "@fleet/protocol";
+import { isResumableSession, type FleetSession } from "@fleet/protocol";
 import { FleetService } from "./fleet-service.js";
 import { FleetStore } from "./store.js";
 
-type SentFrame = { type: string; command?: { type: string; sessionId: string } };
+type SentFrame = {
+  type: string;
+  command?: { type: string; sessionId: string; commandId: string };
+};
 
 function fakeSocket() {
   const sent: SentFrame[] = [];
@@ -62,7 +65,16 @@ function setup(maxSessions = 4) {
       .filter((frame) => frame.command?.type === "resume_session")
       .map((frame) => frame.command!.sessionId);
 
-  return { store, service, node, placement, orphan, resumeCommands };
+  const resumeCommandId = (sessionId: string) =>
+    wire.sent
+      .filter(
+        (frame) =>
+          frame.command?.type === "resume_session" &&
+          frame.command.sessionId === sessionId,
+      )
+      .at(-1)!.command!.commandId;
+
+  return { store, service, node, placement, orphan, resumeCommands, resumeCommandId };
 }
 
 describe("auto resume", () => {
@@ -149,6 +161,69 @@ describe("auto resume", () => {
     service.reconcile(node.id, []);
 
     expect(resumeCommands()).toEqual([session.id]);
+  });
+
+  it("settles a resume the node refused instead of leaving it starting", () => {
+    // A refusal is non-fatal, but a refused launch leaves no process behind to
+    // report anything. The session sat in `starting` — drawn as running, with
+    // Cancel disabled — until someone restarted the Host.
+    const { service, store, node, orphan, resumeCommands, resumeCommandId } = setup();
+    const session = orphan("Refused");
+
+    service.reconcile(node.id, []);
+    service.settleRefusedLaunch(
+      session.id,
+      resumeCommandId(session.id),
+      "Node self-update is in progress.",
+    );
+
+    const settled = store.getSession(session.id)!;
+    expect(settled).toMatchObject({
+      state: "failed",
+      currentActivity: "Resume refused: Node self-update is in progress.",
+    });
+    expect(isResumableSession(settled)).toBe(true);
+    service.reconcile(node.id, []);
+    expect(resumeCommands()).toEqual([session.id]);
+  });
+
+  it("settles a first launch refused before its starting event", () => {
+    const { store, service, node, placement } = setup();
+    try {
+      store.setNodeOnline(node.id, true);
+      const started = service.createAndStartSession({
+        placement,
+        prompt: "Inspect the repository",
+        yolo: false,
+      });
+      if (!started.ok) throw new Error(started.error);
+      const id = started.session.id;
+      const commandId = store.getSessionDispatchAttempt(id)!.commandId;
+      expect(store.getSession(id)?.state).toBe("queued");
+      service.settleRefusedLaunch(id, "old-command", "Stale refusal");
+      expect(store.getSession(id)?.state).toBe("queued");
+      service.settleRefusedLaunch(id, commandId, "Admission is closed.");
+      expect(store.getSession(id)).toMatchObject({
+        state: "failed",
+        currentActivity: "Start refused: Admission is closed.",
+      });
+    } finally {
+      store.close();
+    }
+  });
+
+  it("ignores a refusal that is not the launch the session is waiting on", () => {
+    const { service, store, node, orphan, resumeCommandId } = setup();
+    const session = orphan("Still starting");
+    service.reconcile(node.id, []);
+    const commandId = resumeCommandId(session.id);
+
+    service.settleRefusedLaunch(session.id, "an-older-command", "Stale refusal");
+    expect(store.getSession(session.id)?.state).toBe("starting");
+
+    store.transitionSession(session.id, "idle", "Resumed; ready for follow-up");
+    service.settleRefusedLaunch(session.id, commandId, "Late refusal");
+    expect(store.getSession(session.id)?.state).toBe("idle");
   });
 
   it("stays out of the way when it is turned off", () => {

@@ -40,7 +40,7 @@ const step = (state: RunStepState) =>
 describe("dispatched work status", () => {
   it.each([
     ["pending", "Queued"],
-    ["starting", "Running"],
+    ["starting", "Starting"],
     ["running", "Running"],
     ["succeeded", "Done"],
     ["failed", "Failed"],
@@ -119,5 +119,111 @@ describe("dispatched work status", () => {
     expect(onOpenWorker).toHaveBeenCalledWith(worker.id);
     rerender(show(false));
     expect(screen.getByRole("img", { name: "Running" })).toBeTruthy();
+  });
+});
+
+describe("queued follow-up admission", () => {
+  const queued = (admission: Record<string, unknown>) =>
+    RunStepSchema.parse({
+      ...step("pending"),
+      attempts: 6,
+      admission: {
+        nodeId: "n1",
+        nodeName: "CharlesDevBox4",
+        localPath: "Q:\\Repos\\TridentWarehouse-UX",
+        resumable: true,
+        ...admission,
+      },
+    });
+
+  it("says a same-checkout writer blocks the follow-up and names it", () => {
+    const blocked = queued({
+      state: "blocked",
+      code: "checkout_busy",
+      detail:
+        'Q:\\Repos\\TridentWarehouse-UX on CharlesDevBox4 is in use by "Publish and link Ontology MSIT PR" (running).',
+      conflicts: [
+        {
+          sessionId: "occupant",
+          name: "Publish and link Ontology MSIT PR",
+          state: "running",
+          runId: "other",
+          taskName: "Roll out Go Extension Ontology to PROD",
+          role: "worker",
+          sameTask: false,
+        },
+      ],
+    });
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <WorkerStepTimeline
+          steps={[blocked]}
+          phases={[]}
+          sessions={[{ ...worker, state: "stopped" }]}
+          onOpenWorker={vi.fn()}
+          onResumeNow={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+
+    expect(screen.getByRole("img", { name: "Blocked" })).toBeTruthy();
+    expect(screen.getByText(/is in use by/)).toBeTruthy();
+    expect(
+      screen.getByText(/Publish and link Ontology MSIT PR \(running\) · task/),
+    ).toBeTruthy();
+    expect(screen.getByText(/queued follow-up · attempt 6/)).toBeTruthy();
+  });
+
+  it("asks the Host to resume a queued follow-up and reopens a pending approval", () => {
+    const onResumeNow = vi.fn();
+    const onReviewApproval = vi.fn();
+    const show = (admission: Record<string, unknown>) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <WorkerStepTimeline
+          steps={[queued(admission)]}
+          phases={[]}
+          sessions={[{ ...worker, state: "stopped" }]}
+          onOpenWorker={vi.fn()}
+          onResumeNow={onResumeNow}
+          onReviewApproval={onReviewApproval}
+        />
+      </FluentProvider>
+    );
+    const { rerender } = render(
+      show({
+        state: "queued",
+        code: "node_headroom",
+        detail: "CharlesDevBox4 is at Fleet's scheduling limit for writing work.",
+        exception: "node_headroom",
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+    expect(onResumeNow).toHaveBeenCalledWith(expect.objectContaining({ id: "step1" }));
+
+    rerender(
+      show({
+        state: "awaiting_approval",
+        code: "resume_approval",
+        detail: "Waiting for an authenticated operator to approve once or cancel.",
+        exception: "node_headroom",
+        requestId: "request-1",
+      }),
+    );
+    expect(screen.getByRole("img", { name: "Awaiting approval" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Resume now" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Review approval" }));
+    expect(onReviewApproval).toHaveBeenCalledWith("request-1");
+
+    rerender(
+      show({
+        state: "starting",
+        code: "resuming",
+        detail:
+          "Resume sent to CharlesDevBox4; waiting for the Node to restore the conversation.",
+      }),
+    );
+    expect(screen.getByRole("img", { name: "Starting" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Resume now" })).toBeNull();
   });
 });

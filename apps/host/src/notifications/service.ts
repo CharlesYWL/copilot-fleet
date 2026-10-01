@@ -12,6 +12,7 @@ import type {
   RunRole,
   RunStep,
   SessionState,
+  WorkerResumeRequest,
 } from "@fleet/protocol";
 import {
   prMaintenanceProviderLabel,
@@ -594,6 +595,50 @@ export class NotificationService {
       `pr-maintenance-proposal:${proposal.id}:${proposal.version}`,
     );
     if (notification) this.resolve(notification.id);
+  }
+
+  /**
+   * One actionable notice per "Resume now" request while it waits for a person.
+   *
+   * Keyed by the request id, so re-publishing the same request never raises a
+   * second notice, and a cancelled or expired request cannot bring one back.
+   * The queued prompt itself never enters notification text.
+   */
+  syncWorkerResumeRequest(request: WorkerResumeRequest): void {
+    const sourceKey = `worker_resume_approval:${request.id}`;
+    if (request.state !== "awaiting_approval") {
+      const existing = this.store.getNotificationBySourceKey(sourceKey);
+      if (existing?.status === "active") this.resolve(existing.id);
+      return;
+    }
+    this.insert({
+      sourceKey,
+      category: "permission",
+      kind: "worker_resume_approval",
+      severity: "warning",
+      title: titledLabel("Resume approval: ", request.sessionName || request.stepTitle),
+      body:
+        request.requestedBy.kind === "orchestrator"
+          ? "An orchestrator asked to resume a queued worker outside ordinary scheduling. Review the Node, checkout and risk, then approve once or cancel."
+          : "A queued worker can resume now only with a one-time scheduling exception. Review the Node, checkout and risk, then approve once or cancel.",
+      subject: {
+        type: "run_step",
+        id: request.stepId,
+        label: boundedLabel(request.stepTitle || "Queued follow-up"),
+        parentId: request.runId,
+        parentLabel: boundedLabel(request.taskName || "Task"),
+      },
+      navigation: { type: "run", runId: request.runId },
+      data: {
+        requestId: request.id,
+        runId: request.runId,
+        stepId: request.stepId,
+        sessionId: request.sessionId,
+        nodeId: request.nodeId,
+        restriction: request.restriction,
+      },
+      createdAt: request.requestedAt,
+    });
   }
 
   createOrchestrationStepFailure(run: Run, step: RunStep): InsertNotificationResult {

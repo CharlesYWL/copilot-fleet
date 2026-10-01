@@ -7,6 +7,7 @@ import {
   findAgencyCommand,
   resolveCopilotLaunch,
 } from "./copilot-launch.js";
+import { detectAgentKinds } from "./agent-kinds/index.js";
 
 const directories: string[] = [];
 afterEach(async () => {
@@ -63,6 +64,22 @@ describe("Copilot launcher selection", () => {
 });
 
 describe("node-local Agency discovery", () => {
+  it("advertises Hermes only when installed and notices later installs without caching absence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "fleet-hermes-discovery-"));
+    directories.push(root);
+    const env = { PATH: root, PATHEXT: ".EXE;.CMD" };
+    expect(await detectAgentKinds(env)).toEqual([{ kind: "copilot" }]);
+    await writeFile(
+      join(root, process.platform === "win32" ? "hermes.exe" : "hermes"),
+      "",
+      { mode: 0o755 },
+    );
+    expect(await detectAgentKinds(env)).toEqual([
+      { kind: "copilot" },
+      { kind: "hermes" },
+    ]);
+  });
+
   it("uses PATH order, accepts spaces, and notices an installation without restarting", async () => {
     const root = await mkdtemp(join(tmpdir(), "fleet-agency-"));
     directories.push(root);

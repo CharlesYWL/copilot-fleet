@@ -121,6 +121,8 @@ refs and `FETCH_HEAD` are not changed. Allocation occurs before the first checko
 step. Source HEAD may move, and the source may be dirty:
 `git worktree add -b fleet/<safe-key> <owned-path> <stored-base-sha>` still uses the
 original committed base. The target must start clean.
+Remote-pinned step bases are checked by the stored commit's availability, not by
+requiring the source checkout's local branch name to equal a remote-tracking ref.
 
 The original Run worktree remains a compatibility/control identity and is not an
 agent execution surface. Every shell-capable step, including a nominally read-only
@@ -296,6 +298,9 @@ execution. A managed session never falls back to the source checkout. On a Host
 restart, correlated outstanding intents replay to the owning capable Node;
 unavailable metadata is reconciled against that Node, not wall-clock assumptions.
 An uncertain merge remains reserved for explicit reconciliation/continue/abort.
+Integration recovery expects the Fleet-owned target to remain detached; the
+future publication branch is not its symbolic HEAD. Managed-root containment,
+physical identity and HEAD/MERGE_HEAD evidence are still required.
 
 Backups carry metadata arrays, not worktree contents, actual lease files or
 process ownership. Restored managed Runs, steps, sessions, worktrees, operations

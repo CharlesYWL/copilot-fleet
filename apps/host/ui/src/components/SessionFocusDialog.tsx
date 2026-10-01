@@ -32,7 +32,7 @@ type SessionFocusDialogProps = {
   events: SessionEvent[];
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => void;
+  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => Promise<boolean>;
   onCancel: () => void;
   onStop: () => void;
   onDismiss: () => void;

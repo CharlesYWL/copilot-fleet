@@ -1,6 +1,6 @@
 {
   "name": "@fleet/protocol",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "exports": {
@@ -19,6 +19,10 @@
     "./node-auth": {
       "types": "./dist/node-auth.d.ts",
       "default": "./dist/node-auth.js"
+    },
+    "./updater": {
+      "types": "./dist/updater.d.ts",
+      "default": "./dist/updater.js"
     }
   },
   "scripts": {

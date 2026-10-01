@@ -11,6 +11,7 @@ import {
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { archiveRun, purgeRun } from "../orchestrator/lifecycle.js";
+import { owedPrompt } from "../orchestrator/briefing.js";
 import { reopenPrompt } from "../orchestrator/review.js";
 
 const CreateRunSchema = z.object({
@@ -61,13 +62,16 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
 
   const withSteps = (runId: string) => ({
     run: store.getRun(runId),
-    steps: store.listRunSteps(runId),
+    steps: service.withAdmission(runId, store.listRunSteps(runId)),
   });
 
   app.get("/api/runs", async () => {
     const runs = store.listRuns();
     const stepsByRunId = Object.fromEntries(
-      runs.map((run) => [run.id, store.listRunSteps(run.id)]),
+      runs.map((run) => [
+        run.id,
+        service.withAdmission(run.id, store.listRunSteps(run.id)),
+      ]),
     );
     const notesByRunId = Object.fromEntries(
       runs.map((run) => [run.id, store.listRunNotes(run.id)]),
@@ -166,6 +170,11 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
       return reply.code(409).send({ error: "A run can only be planned before approval" });
     }
     const input = PlanSchema.parse(request.body);
+    if (input.steps.length > run.policy.maxSessions) {
+      return reply.code(400).send({
+        error: "The plan exceeds this run's session budget.",
+      });
+    }
 
     const keys = input.steps.map((step) => step.stepKey);
     const duplicate = keys.find((key, index) => keys.indexOf(key) !== index);
@@ -286,7 +295,7 @@ export const runRoutes: FastifyPluginAsync<RunRouteOptions> = async (
     const reopened = store.updateRun(id, {
       state: "running",
       failureReason: "",
-      pendingPrompt: reopenPrompt(run.name, note),
+      pendingPrompt: owedPrompt(run.pendingPrompt, reopenPrompt(run.name, note)),
     })!;
     service.publishRun(reopened);
     engine.tick();

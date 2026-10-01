@@ -1,6 +1,7 @@
 import { constants } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
+import { spawn } from "node:child_process";
 
 export type CopilotLaunch = {
   command: string;
@@ -16,6 +17,13 @@ export type CopilotLaunch = {
 export async function findAgencyCommand(
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<string | undefined> {
+  return findAgentCommand("agency", env);
+}
+
+export async function findAgentCommand(
+  name: "agency" | "hermes",
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<string | undefined> {
   const windows = process.platform === "win32";
   const extensions = windows
     ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
@@ -27,7 +35,7 @@ export async function findAgencyCommand(
     const directory = entry.trim().replace(/^"(.*)"$/, "$1");
     if (!directory) continue;
     for (const extension of extensions) {
-      const candidate = join(resolve(directory), `agency${extension}`);
+      const candidate = join(resolve(directory), `${name}${extension}`);
       try {
         if (!(await stat(candidate)).isFile()) continue;
         await access(candidate, windows ? constants.F_OK : constants.X_OK);
@@ -86,4 +94,47 @@ export function copilotSpawnTarget(command: string): {
     command: shell && /\s/.test(command) ? `"${command}"` : command,
     shell,
   };
+}
+
+/** Bounded metadata probes; never invoke an interactive agent command here. */
+export function agentOutput(
+  command: string,
+  args: readonly string[],
+  timeoutMs = 15_000,
+): Promise<string> {
+  return new Promise((done, fail) => {
+    const { command: executable, shell } = copilotSpawnTarget(command);
+    const child = spawn(executable, args, {
+      shell,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    const capture = (chunk: Buffer) => {
+      output = `${output}${chunk.toString("utf8")}`.slice(-64_000);
+    };
+    child.stdout?.on("data", capture);
+    child.stderr?.on("data", capture);
+    const timer = setTimeout(() => {
+      fail(new Error(`${command} ${args.join(" ")} timed out`));
+      child.kill();
+    }, timeoutMs);
+    timer.unref();
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      fail(error);
+    });
+    child.once("close", (code, signal) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        fail(
+          new Error(
+            `${command} ${args.join(" ")} failed (${signal ?? code ?? "unknown"}): ${output.trim()}`,
+          ),
+        );
+      } else {
+        done(output);
+      }
+    });
+  });
 }

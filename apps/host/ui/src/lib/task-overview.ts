@@ -1,4 +1,5 @@
 import {
+  currentPrMaintenance,
   prMaintenanceProgress,
   type PrMaintenanceRegistration,
   type PrMaintenanceStage,
@@ -25,19 +26,7 @@ export const maintenanceStageLabels: Record<PrMaintenanceStage, string> = {
   released: "Released",
 };
 
-export function currentMaintenance(records: readonly PrMaintenanceRegistration[]) {
-  const retained = records.filter((record) => !record.ownershipReleasedAt);
-  const active = retained.filter((record) =>
-    ["active", "paused"].includes(record.lifecycle),
-  );
-  return (active.length ? active : retained.length ? retained : records).reduce<
-    PrMaintenanceRegistration | undefined
-  >(
-    (latest, record) =>
-      !latest || record.createdAt > latest.createdAt ? record : latest,
-    undefined,
-  );
-}
+export const currentMaintenance = currentPrMaintenance<PrMaintenanceRegistration>;
 
 export function hasOutstandingWork(record: PrMaintenanceRegistration) {
   return (
@@ -216,10 +205,11 @@ export function taskOverview(
     const stage = prMaintenanceProgress(record, nowMs).stage;
     const copy: Record<PrMaintenanceStage, string> = {
       checking:
-        "Fleet needs a complete, current observation before claiming review or check results.",
-      triage: "New feedback is being checked against the approved scope.",
+        "Fleet is checking current PR evidence and remaining feedback obligations before claiming readiness.",
+      triage:
+        "Current feedback without a matching current-HEAD disposition is being assessed against the approved scope.",
       addressing_review:
-        "The retained worker is addressing an accepted feedback batch within its authorization.",
+        "An accepted feedback batch is queued or running on the retained worker within its authorization.",
       waiting_checks: "Required checks have not all passed for the current PR head.",
       waiting_review:
         "Required review approval is still outstanding for the current PR head.",

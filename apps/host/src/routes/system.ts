@@ -10,11 +10,13 @@ import {
   backupFormatVersion,
   backupKind,
   errorMessage,
+  upcomingHeartbeats,
 } from "@fleet/protocol";
 import type { LogEntry } from "@fleet/protocol/log-buffer";
 import { z } from "zod";
 import type { LegacyEnrollment } from "../config.js";
 import type { FleetService } from "../fleet-service.js";
+import type { FleetStore } from "../store.js";
 
 /** The switch itself: one boolean, stated rather than toggled. */
 const MutualNodeAuthenticationSchema = z.object({ required: z.boolean() });
@@ -29,6 +31,22 @@ import { HOST_ARCHIVE_BYTES } from "../backup-limits.js";
 
 /** Large enough for a personal fleet's event log; not a license to dump binaries. */
 export const HOST_BACKUP_BODY_LIMIT = HOST_ARCHIVE_BYTES;
+
+/**
+ * The heartbeat schedule as the Host evaluates it. The cron fields are in the
+ * Host's local time, so the zone and the next few instants come from here, not
+ * from whichever browser is looking.
+ */
+function heartbeatDefaults(store: FleetStore, nowMs = Date.now()) {
+  const schedule = store.getOrchestratorHeartbeatSchedule();
+  return {
+    orchestratorHeartbeatSchedule: schedule.source,
+    orchestratorHeartbeatTimeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    orchestratorHeartbeatUpcoming: upcomingHeartbeats(schedule, nowMs, 3).map((at) =>
+      new Date(at).toISOString(),
+    ),
+  };
+}
 
 export type SystemRouteOptions = {
   service: FleetService;
@@ -258,10 +276,22 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
     model: store.getDefaultModel(),
     reasoningEffort: store.getDefaultReasoningEffort(),
+    orchestratorAgent: store.getOrchestratorAgent() ?? null,
+    ...heartbeatDefaults(store),
   }));
 
   app.post("/api/defaults", async (request, reply) => {
-    const input = UpdateDefaultsSchema.parse(request.body);
+    const parsed = UpdateDefaultsSchema.safeParse(request.body);
+    if (!parsed.success) {
+      const schedule = parsed.error.issues.find(
+        (issue) => issue.path[0] === "orchestratorHeartbeatSchedule",
+      );
+      // The one free-text field here: say what is wrong with it in words.
+      if (schedule)
+        return reply.code(400).send({ error: `Heartbeat schedule: ${schedule.message}` });
+      throw parsed.error;
+    }
+    const input = parsed.data;
     const managedChange =
       input.managedWorktreesEnabled !== undefined ||
       input.managedWorktreePolicy !== undefined;
@@ -293,6 +323,8 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     // Each field is optional so a client that knows about one setting cannot
     // reset the others merely by not mentioning them.
     if (input.yolo !== undefined) store.setDefaultYolo(input.yolo);
+    if (input.orchestratorAgent !== undefined)
+      store.setOrchestratorAgent(input.orchestratorAgent);
     if (input.contextTier !== undefined) store.setDefaultContextTier(input.contextTier);
     if (input.managedWorktreesEnabled !== undefined)
       store.setManagedWorktreesEnabled(input.managedWorktreesEnabled);
@@ -306,6 +338,9 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     if (input.model !== undefined) store.setDefaultModel(input.model);
     if (input.reasoningEffort !== undefined) {
       store.setDefaultReasoningEffort(input.reasoningEffort);
+    }
+    if (input.orchestratorHeartbeatSchedule !== undefined) {
+      store.setOrchestratorHeartbeatSchedule(input.orchestratorHeartbeatSchedule);
     }
     if (managedChange)
       store.setSetting("defaults.managedRevision", String(input.expectedRevision! + 1));
@@ -321,6 +356,8 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
       model: store.getDefaultModel(),
       reasoningEffort: store.getDefaultReasoningEffort(),
+      orchestratorAgent: store.getOrchestratorAgent() ?? null,
+      ...heartbeatDefaults(store),
     };
     if (managedChange)
       store.recordManagedApiRequest(

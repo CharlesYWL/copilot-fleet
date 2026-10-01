@@ -9,11 +9,14 @@ import {
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
   COMMAND_LIMITS,
+  PR_MAINTENANCE_WAKE_LIMITS,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   MANAGED_WORKTREES_CAPABILITY,
   ManagedWorktreeSchema,
+  commandApprovalExpiresAt,
   commandDigestPayload,
   commandObservationClock,
+  nextHeartbeat,
   type CommandExecution,
   type CommandExecutionHostMessage,
   type CommandPermissionMatch,
@@ -2675,6 +2678,14 @@ describe("PR maintenance with durable commands", () => {
         }),
       });
     expect(leadReceipt(first.delivery.deliveryId, "accepted")).toBe(true);
+    // Preserve the receipt tests' two-minute remaining budget within the longer wake.
+    f.store.prMaintenance.beginWake(
+      f.lead.id,
+      first.delivery.deliveryId,
+      new Date(
+        Date.now() - (PR_MAINTENANCE_WAKE_LIMITS.milliseconds - 120_000),
+      ).toISOString(),
+    );
     const claim = await call("fleet_get_pr_maintenance", {
       takeDue: true,
       reserveRequests: 39,
@@ -4106,7 +4117,12 @@ describe("PR maintenance with durable commands", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     const h = await observationCommand(":memory:", false);
     vi.setSystemTime(Date.parse(h.claim.observationAllowance.deadlineAt) + 1);
-    expect(() => h.f.approve(h.execution)).toThrow("original helper deadline expired");
+    // A late decision settles the request instead of leaving it waiting forever.
+    expect(h.f.approve(h.execution)).toMatchObject({
+      state: "expired",
+      reasonCode: "approval_expired",
+      ownership: "not_started",
+    });
     expect(
       h.f.frames.filter((frame) => frame.type === "start_command_execution"),
     ).toHaveLength(0);
@@ -4114,6 +4130,110 @@ describe("PR maintenance with durable commands", () => {
       h.f.store.prMaintenance.beginWake(h.f.lead.id, h.first.delivery.deliveryId)
         .requests,
     ).toBe(39);
+  });
+
+  it("expires a waiting helper approval at its original deadline, not the longer window", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand(":memory:", false);
+    const deadlineAt = h.claim.observationAllowance.deadlineAt;
+    const approvalNotice = () =>
+      h.f.service
+        .snapshot()
+        .notifications.some(
+          (entry) => entry.kind === "command_approval" && entry.status === "active",
+        );
+    expect(h.execution.state).toBe("awaiting_approval");
+    expect(Date.parse(h.execution.expiresAt)).toBeGreaterThan(Date.parse(deadlineAt));
+    expect(commandApprovalExpiresAt(h.execution)).toBe(deadlineAt);
+    expect(approvalNotice()).toBe(true);
+    const broadcast = vi.spyOn(h.f.service, "broadcast");
+    h.f.service.commands.tick(Date.parse(deadlineAt) - 1);
+    expect(h.f.service.commands.get(h.execution.id)?.state).toBe("awaiting_approval");
+
+    vi.setSystemTime(Date.parse(deadlineAt));
+    h.f.service.commands.tick();
+    expect(h.f.service.commands.get(h.execution.id)).toMatchObject({
+      state: "expired",
+      reasonCode: "authorization_expired",
+      ownership: "not_started",
+    });
+    // The browser moves it out of Waiting approval on this broadcast alone.
+    expect(broadcast).toHaveBeenCalledWith({
+      type: "command_execution",
+      execution: expect.objectContaining({ id: h.execution.id, state: "expired" }),
+    });
+    expect(approvalNotice()).toBe(false);
+    expect(
+      h.f.frames.some(
+        (frame) =>
+          frame.type === "cancel_command_execution" &&
+          frame.executionId === h.execution.id,
+      ),
+    ).toBe(true);
+    expect(
+      h.f.frames.filter((frame) => frame.type === "start_command_execution"),
+    ).toHaveLength(0);
+  });
+
+  it("settles instead of refusing when the helper deadline lapses mid-decision", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand(":memory:", false);
+    const deadline = Date.parse(h.claim.observationAllowance.deadlineAt);
+    // The decision was admitted just before the deadline; its recheck runs after it.
+    vi.setSystemTime(deadline);
+    expect(
+      h.f.service.commands.decide(
+        h.execution.id,
+        {
+          decision: "allow_once",
+          expectedVersion: h.execution.version,
+          digest: h.execution.descriptor!.digest,
+        },
+        "administrator",
+        deadline - 1,
+      ),
+    ).toMatchObject({ state: "expired", reasonCode: "approval_expired" });
+    expect(
+      h.f.frames.filter((frame) => frame.type === "start_command_execution"),
+    ).toHaveLength(0);
+  });
+
+  it("repeats a revocation lost while the Node was offline when it replays the stale preparation", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const h = await observationCommand(":memory:", false);
+    const cancels = () =>
+      h.f.frames.filter(
+        (frame) =>
+          frame.type === "cancel_command_execution" &&
+          frame.executionId === h.execution.id,
+      ).length;
+    h.f.service.commands.nodeDisconnected(h.f.node.id);
+    vi.setSystemTime(Date.parse(h.claim.observationAllowance.deadlineAt));
+    h.f.service.commands.tick();
+    expect(h.f.service.commands.get(h.execution.id)?.state).toBe("expired");
+    expect(cancels()).toBe(0);
+
+    h.f.connect();
+    // Reconnect replays each unacknowledged journal receipt, still "awaiting approval".
+    expect(
+      h.f.service.commands.handleNodeMessage(h.f.node.id, {
+        type: "command_execution_update",
+        receipt: {
+          executionId: h.execution.id,
+          attemptId: h.execution.attemptId,
+          digest: h.execution.descriptor!.digest,
+          state: "awaiting_approval",
+          ownership: "not_started",
+          exitCode: null,
+          reason: "",
+        },
+      }),
+    ).toBe(true);
+    expect(cancels()).toBe(1);
+    expect(h.f.service.commands.get(h.execution.id)?.state).toBe("expired");
+    expect(
+      h.f.frames.filter((frame) => frame.type === "start_command_execution"),
+    ).toHaveLength(0);
   });
 
   it("retains stale evidence only as an attempt, never as a current repair snapshot", async () => {
@@ -4524,7 +4644,13 @@ describe("PR maintenance with durable commands", () => {
     const record = enableMaintenance(f);
     f.store.setRunState(record.taskId, "completed");
     const engine = new OrchestratorEngine(f.service);
-    vi.setSystemTime(Date.now() + 30 * 60_000);
+    const lastLook = Math.max(
+      Date.parse(f.store.getSession(f.lead.id)!.updatedAt),
+      Date.parse(f.store.lastOrchestratorPromptAt(f.lead.id)) || 0,
+    );
+    vi.setSystemTime(
+      nextHeartbeat(f.store.getOrchestratorHeartbeatSchedule(), lastLook)!,
+    );
     engine.tick();
     const reminders = f.frames.filter((frame) => frame.type === "deliver_lead_prompt");
     expect(reminders).toHaveLength(1);

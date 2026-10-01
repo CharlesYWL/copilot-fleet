@@ -6,13 +6,20 @@ import { packageRoot } from "./paths.js";
 import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
 import * as acp from "@agentclientprotocol/sdk";
 import type {
+  AgentParams,
   McpHttpServer,
   PromptAttachment,
   SessionEvent,
   StartupConfig,
   SessionUsage,
 } from "@fleet/protocol";
-import { CONTEXT_TIER_CONFIG_ID, attachmentSummary, errorMessage } from "@fleet/protocol";
+import {
+  AGENT_NODE_IDENTITY_URL_ENV,
+  AGENT_NODE_ID_ENV,
+  CONTEXT_TIER_CONFIG_ID,
+  attachmentSummary,
+  errorMessage,
+} from "@fleet/protocol";
 import {
   contextConfigOption,
   configValueFor,
@@ -20,13 +27,26 @@ import {
   toSessionConfigOptions,
 } from "./acp-config.js";
 import { toPromptBlocks } from "./prompt-content.js";
-import {
-  copilotSpawnTarget,
-  resolveCopilotLaunch,
-  type CopilotLaunch,
-} from "./copilot-launch.js";
-import { SessionCreditReader } from "./session-credits.js";
-import { parseContextUsage } from "./context-usage.js";
+import { copilotSpawnTarget } from "./copilot-launch.js";
+import { createAgentKind } from "./agent-kinds/index.js";
+import { CopilotAgentKind } from "./agent-kinds/copilot.js";
+import type {
+  AgentKindAdapter,
+  AgentLaunch,
+  AgentSessionHandle,
+  UsageReporter,
+} from "./agent-kinds/types.js";
+export {
+  MIN_COPILOT_ACP_AUTH_VERSION,
+  configRecoveryRequest,
+  contextRolloverPrompt,
+  copilotAcpAuthVersionError,
+  copilotFailureMessage,
+  copilotLaunchArgs,
+  copilotSupportsContextTier,
+  copilotVersionFromOutput,
+  isCapiRequestTooLarge,
+} from "./agent-kinds/copilot.js";
 
 export function withMaintenanceResources(
   text: string,
@@ -75,24 +95,43 @@ export function supportedAdditionalDirectories(
 export type { ContextTier } from "@fleet/protocol";
 import type { ContextTier } from "@fleet/protocol";
 
-/**
- * The first Copilot CLI release whose ACP handshake verifies login.
- *
- * Older builds can accept ACP initialization while signed out, leaving the
- * first prompt waiting forever and the Host with no command failure to show.
- */
-export const MIN_COPILOT_ACP_AUTH_VERSION = "1.0.69";
-
 /** Long enough for cold ACP and MCP setup, bounded so startup cannot fail silently. */
 export const ACP_START_TIMEOUT_MS = 180_000;
 
+/** Which Fleet node an agent is running on, as the Node tells it at launch. */
+export type AgentIdentity = {
+  nodeId: string;
+  /** The config page's identity address; absent while nothing listens there. */
+  identityUrl?: string | undefined;
+};
+
 /**
- * The permissions picker, whose value the Host already knows.
+ * The environment an agent is launched with: this process's own, plus where it
+ * runs.
  *
- * Named here because it is the lever {@link configRecoveryRequest} pulls to get
- * the option list back on a resumed session.
+ * Both identity variables are replaced rather than merely added. A Node can be
+ * started from inside an agent — one working on this repository, say — and it
+ * would otherwise hand its own agents the identity of the machine that started
+ * it, including an address that answers for that other node whenever this one's
+ * config page is not up.
  */
-const ALLOW_ALL_OPTION = "allow_all";
+export function agentEnvironment(
+  base: NodeJS.ProcessEnv,
+  identity: AgentIdentity,
+): NodeJS.ProcessEnv {
+  const {
+    [AGENT_NODE_ID_ENV]: _inheritedNodeId,
+    [AGENT_NODE_IDENTITY_URL_ENV]: _inheritedIdentityUrl,
+    ...inherited
+  } = base;
+  return {
+    ...inherited,
+    [AGENT_NODE_ID_ENV]: identity.nodeId,
+    ...(identity.identityUrl
+      ? { [AGENT_NODE_IDENTITY_URL_ENV]: identity.identityUrl }
+      : {}),
+  };
+}
 
 /**
  * How long work nobody asked for may go quiet before it is called finished.
@@ -116,67 +155,6 @@ export const UNPROMPTED_QUIET_MS = 45_000;
  * benefit of the doubt is bounded rather than open.
  */
 export const UNPROMPTED_TOOL_GRACE_MS = 10 * 60_000;
-const CONTEXT_ROLLOVER_PROMPT_CHARS = 16_000;
-
-export function isCapiRequestTooLarge(error: unknown): boolean {
-  return /request is too large to send through CAPI Responses/i.test(errorMessage(error));
-}
-
-export function contextRolloverPrompt(
-  originalAssignment: string,
-  latestRequest: string,
-  attachments: readonly PromptAttachment[] = [],
-): string {
-  const assignment = originalAssignment.trim().slice(0, 10_000);
-  const latest = latestRequest.trim().slice(-5_000);
-  const attachmentText = attachments
-    .map((attachment) => attachmentSummary(attachment))
-    .map((attachment) => `${attachment.name} (${attachment.bytes} bytes)`)
-    .join(", ")
-    .slice(0, 500);
-  return [
-    "Continue the same Fleet task in this fresh conversation. The previous Copilot conversation exceeded the CAPI request-size limit. Treat the current workspace files and Git state as authoritative; do not restart completed work.",
-    assignment ? `Original assignment:\n${assignment}` : "",
-    latest ? `Latest request:\n${latest}` : "",
-    attachmentText
-      ? `The latest request included attachments that were omitted from rollover to keep the request bounded: ${attachmentText}. Inspect the workspace copies if needed.`
-      : "",
-  ]
-    .filter(Boolean)
-    .join("\n\n")
-    .slice(0, CONTEXT_ROLLOVER_PROMPT_CHARS);
-}
-
-/**
- * What to set, if anything, to get a session's pickers back.
- *
- * `session/new` reports the option list and `session/load` does not, so a
- * resumed session has no idea what its own model or mode is: no notification
- * follows the load, and there is no method to ask. The Host papers over that by
- * keeping the last list it was told, which works until a session has never had
- * one — and one machine in this fleet produces exactly that from a *fresh*
- * session too, on the same Copilot build and the same fleet build as its
- * neighbours that are fine. Whatever the cause there, the result is identical
- * and permanent: every later resume is a load, so the composer stays bare with
- * no control on it to press and nothing to say why.
- *
- * `session/set_config_option` answers with the whole list, so setting one
- * breaks the deadlock. `allow_all` is the only option whose correct value is
- * known without having read that list first: the Host decides it per session
- * and the process was launched moments earlier with the matching `--allow-all`.
- * Re-asserting it therefore changes nothing about the session and makes the
- * pickers agree with what is already true of it.
- */
-export function configRecoveryRequest(
-  options: readonly acp.SessionConfigOption[],
-  yolo: boolean,
-): { configId: string; value: string } | undefined {
-  // Anything already in hand came from the agent itself and is better than
-  // anything that could be asked for here.
-  if (options.length > 0) return undefined;
-  return { configId: ALLOW_ALL_OPTION, value: yolo ? "on" : "off" };
-}
-
 export interface SessionAgent {
   prompt(
     text: string,
@@ -254,12 +232,14 @@ export function resolveConfigValue(
 export type EventSink = (event: SessionEvent) => void;
 
 export type StartAgentOptions = {
+  agentParams?: AgentParams;
+  startupNotice?: string;
   /** Cancels startup and verifies process cleanup before rejecting. */
   signal?: AbortSignal;
   processStarting?: (() => void) | undefined;
   processStarted?: ((pid: number) => void) | undefined;
   processesQuiesced?: (() => void) | undefined;
-  /** Copilot session id to re-attach to via ACP `session/load`. */
+  /** Native session id to load with the same backend and profile. */
   resumeAgentSessionId?: string;
   /** Allow an oversized `session/load` to create and prompt a new conversation. Defaults to true. */
   allowResumeRollover?: boolean;
@@ -269,7 +249,7 @@ export type StartAgentOptions = {
   additionalDirectories?: readonly string[];
   /** First event sequence number to use, so resumed runs keep ordering. */
   sequenceOffset?: number;
-  /** Launch Copilot with --allow-all. The Host owns this decision. */
+  /** Use the backend's unattended permission strategy. The Host owns this decision. */
   yolo?: boolean;
   /** Prefer this Node's Agency installation, falling back only when it is absent. */
   agencyMode?: boolean;
@@ -506,15 +486,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private readonly managedProcess: boolean;
   /** `session/load` replays the whole history; the host already stored it. */
   private replaying = false;
-  private creditReader: SessionCreditReader | undefined;
-  private creditTimer: ReturnType<typeof setInterval> | undefined;
-  private creditRead: Promise<void> | undefined;
-  private creditError: string | undefined;
+  private readonly usageReporter: UsageReporter;
   private usage: SessionUsage = {};
-  private contextCommandAvailable = false;
-  private contextCapture:
-    { text: string; hidden: boolean; truncated: boolean; complete: boolean } | undefined;
-  private contextError: string | undefined;
   /**
    * The agent's own option list, kept as ACP sent it.
    *
@@ -534,7 +507,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     () =>
       this.emit("state", {
         state: "running",
-        activity: "Copilot picked up work on its own",
+        activity: `${this.kind.label} picked up work on its own`,
       }),
     () => {
       // A process that has already ended has emitted the state that settles it,
@@ -550,12 +523,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     private readonly permissionTimeoutMs: number,
     sequenceOffset = 0,
     private readonly yolo = false,
-    private readonly launch: CopilotLaunch = {
-      command: "copilot",
-      args: [],
-      provider: "copilot",
-    },
-    private readonly contextTier: ContextTier | undefined = undefined,
+    private readonly kind: AgentKindAdapter,
+    private readonly launch: AgentLaunch,
     private readonly mcpServerConfigs: readonly McpHttpServer[] = [],
     /** A custom agent to select once the session exists. Empty for workers. */
     private readonly customAgent = "",
@@ -571,11 +540,35 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       StartAgentOptions,
       "processStarting" | "processStarted" | "processesQuiesced"
     >,
+    private readonly startupNotice = "",
+    /** The whole environment to launch with; this process's own when absent. */
+    private readonly environment?: NodeJS.ProcessEnv,
   ) {
     super(fleetSessionId, sink, sequenceOffset);
     this.managedProcess =
       Boolean(processOwnership) ||
       (process.platform === "win32" && mcpServerConfigs.length > 0);
+    this.usageReporter = kind.usage({
+      report: (usage) => this.reportUsage(usage),
+      notice: (text) => this.emit("system", { text }),
+      model: () =>
+        this.configOptions
+          .find((option) => option.id === "model")
+          ?.currentValue?.toString(),
+      stopping: () => this.stopping || this.hasTerminated,
+      aborted: () => this.startupAborted,
+      assertActive: () => this.assertActive(),
+      prompt: async (text, signal) => {
+        this.assertActive();
+        if (!this.connection || !this.agentSessionId)
+          throw new Error("ACP session is not initialized");
+        await this.connection.agent.request(
+          acp.methods.agent.session.prompt,
+          { sessionId: this.agentSessionId, prompt: [{ type: "text", text }] },
+          { cancellationSignal: signal },
+        );
+      },
+    });
   }
 
   /** A startup deadline does not cancel its promise; fence late continuations at cleanup. */
@@ -616,27 +609,27 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (this.announceLifecycle) {
       this.emit("state", {
         state: "starting",
-        activity: resumeAgentSessionId ? "Resuming Copilot ACP" : "Starting Copilot ACP",
+        activity: `${resumeAgentSessionId ? "Resuming" : "Starting"} ${this.kind.label} ACP`,
       });
     }
     this.reportUsage({ context: null });
+    if (this.startupNotice) this.emit("system", { text: this.startupNotice });
     if (this.launch.notice) this.emit("system", { message: this.launch.notice });
-    if (!this.contextTier) {
-      this.emit("system", {
-        text: "This Copilot does not support --context; update it to select a context window.",
-      });
-    }
-    const args = [...this.launch.args, ...copilotLaunchArgs(this.yolo, this.contextTier)];
     const { command, shell } = copilotSpawnTarget(this.launch.command);
     this.assertActive();
     this.processOwnership?.processStarting?.();
     this.assertActive();
-    const child = (this.managedProcess ? spawnManagedProcess : spawn)(command, args, {
-      cwd,
-      stdio: ["pipe", "pipe", "pipe"],
-      windowsHide: true,
-      shell,
-    });
+    const child = (this.managedProcess ? spawnManagedProcess : spawn)(
+      command,
+      this.launch.args,
+      {
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        windowsHide: true,
+        shell,
+        ...(this.environment ? { env: this.environment } : {}),
+      },
+    );
     this.child = child;
     if (child.pid) this.processOwnership?.processStarted?.(child.pid);
     child.stderr.setEncoding("utf8");
@@ -648,17 +641,20 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     });
     child.on("error", (error) => {
       this.emit("error", { message: error.message });
-      this.emit("state", { state: "failed", activity: "Copilot failed to start" });
+      this.emit("state", {
+        state: "failed",
+        activity: `${this.kind.label} failed to start`,
+      });
       this.denyPendingPermissions();
     });
     child.on("exit", (code, signal) => {
-      clearInterval(this.creditTimer);
+      this.usageReporter.close?.();
       this.denyPendingPermissions();
       this.unprompted.clear();
       if (!this.stopping && !this.hasTerminated) {
         this.emit("state", {
           state: code === 0 ? "completed" : "failed",
-          activity: `Copilot exited (${signal ?? code ?? "unknown"})`,
+          activity: `${this.kind.label} exited (${signal ?? code ?? "unknown"})`,
         });
       }
     });
@@ -671,32 +667,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       )
       .onNotification(acp.methods.client.session.update, ({ params }) => {
         if (this.stopping) return;
-        if (
-          this.contextCapture &&
-          params.update.sessionUpdate === "agent_message_chunk" &&
-          params.update.content.type === "text"
-        ) {
-          const capture = this.contextCapture;
-          const text = params.update.content.text;
-          const belongsToReport =
-            !capture.hidden ||
-            (!capture.complete &&
-              (capture.text !== "" ||
-                text.startsWith("Context Usage") ||
-                "Context Usage".startsWith(text) ||
-                text.startsWith("Context information")));
-          if (belongsToReport) {
-            capture.text += text;
-            if (capture.text.length > 32_768) {
-              capture.text = capture.text.slice(0, 32_768);
-              capture.truncated = true;
-            }
-            capture.complete =
-              capture.text.startsWith("Context information is not yet available.") ||
-              /\bBuffer\s+[\d.,]+[kKmM]?\s+\([\d.]+%\)\s*$/.test(capture.text);
-            if (capture.hidden) return;
-          }
-        }
+        if (this.usageReporter.onUpdate(params.update)) return;
         // Commands and pickers describe what the session can do now, not what
         // it did, so they are the one thing a replay must not swallow: a
         // resumed session would otherwise come back with an empty slash menu
@@ -741,13 +712,14 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
             },
           );
           this.assertActive();
-          this.captureConfigOptions(loaded.configOptions);
+          this.captureSessionConfig(loaded);
         } catch (error) {
           this.assertActive();
-          if (!this.allowResumeRollover || !isCapiRequestTooLarge(error)) throw error;
+          const rollover = this.kind.rollover;
+          if (!this.allowResumeRollover || !rollover?.matches(error)) throw error;
           this.replaying = false;
           await this.rollOverConversation(
-            contextRolloverPrompt(this.contextOverflowRecoveryPrompt, ""),
+            rollover.prompt(this.contextOverflowRecoveryPrompt, ""),
           );
           return;
         }
@@ -762,21 +734,15 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       });
       this.assertActive();
       this.agentSessionId = created.sessionId;
-      this.captureConfigOptions(created.configOptions);
+      this.captureSessionConfig(created);
     }
-    // Both paths, because both can arrive without pickers: `session/load` never
-    // reports them, and `session/new` has been seen not to on at least one
-    // machine in this fleet — same Copilot build, same fleet build, same agent
-    // otherwise working, and a composer with nothing on it.
-    await this.recoverConfigOptions();
-    this.assertActive();
-    await this.selectCustomAgent();
+    await this.kind.afterSessionStart?.(this.sessionHandle());
     this.assertActive();
     await this.applyStartupConfig();
     this.assertActive();
     this.captureConfigOptions(this.configOptions);
     this.emit("agent_session", { agentSessionId: this.agentSessionId });
-    await this.trackUsage(this.agentSessionId);
+    await this.usageReporter.start?.(this.agentSessionId);
     this.assertActive();
     if (resumeAgentSessionId) {
       this.emit("state", { state: "idle", activity: "Resumed; ready for follow-up" });
@@ -824,51 +790,29 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
   }
 
-  /**
-   * Puts the session into its custom agent, before anything is asked of it.
-   *
-   * Ordering is the whole point: the first prompt follows immediately, and an
-   * agent selected after it would leave the opening turn — the one that plans
-   * the task — running as an ordinary session.
-   *
-   * The `--agent` launch flag looks like it would do this and does not; in ACP
-   * mode it is accepted and ignored, leaving the picker on its default. This
-   * call is the only route.
-   *
-   * A failure here is reported and survived. The picker is absent on a machine
-   * whose catalog does not have the file, and a session with the wrong prompt
-   * is worth more than no session at all.
-   */
-  private async selectCustomAgent(): Promise<void> {
-    if (!this.customAgent) return;
-    const picker = this.configOptions.find((option) => option.category === "_agent");
-    if (!picker) {
-      this.emit("system", {
-        message: `Copilot offered no agent picker, so "${this.customAgent}" was not applied`,
-      });
-      return;
-    }
-    try {
-      await this.setConfigOption(picker.id, this.customAgent);
-    } catch (error) {
-      this.assertActive();
-      this.emit("system", {
-        message: `Could not select agent "${this.customAgent}": ${errorMessage(error)}`,
-      });
-    }
+  private sessionHandle(): AgentSessionHandle {
+    if (!this.connection || !this.agentSessionId)
+      throw new Error("ACP session is not initialized");
+    return {
+      connection: this.connection,
+      sessionId: this.agentSessionId,
+      options: () => this.configOptions,
+      yolo: this.yolo,
+      customAgent: this.customAgent,
+      setConfigOption: (id, value) => this.setConfigOption(id, value),
+      notice: (message) => this.emit("system", { message }),
+      assertActive: () => this.assertActive(),
+    };
   }
 
-  /** Gets the pickers back when a start — of either kind — brought none. */
-  private async recoverConfigOptions(): Promise<void> {
-    const request = configRecoveryRequest(this.configOptions, this.yolo);
-    if (!request) return;
-    try {
-      await this.setConfigOption(request.configId, request.value);
-    } catch {
-      this.assertActive();
-      // An agent without this option is one that was never going to offer
-      // pickers, and a resumed session is worth more than the pickers on it.
-    }
+  private captureSessionConfig(
+    response: acp.NewSessionResponse | acp.LoadSessionResponse,
+  ): void {
+    this.captureConfigOptions(
+      this.kind.configOptions
+        ? this.kind.configOptions(response)
+        : response.configOptions,
+    );
   }
 
   /**
@@ -897,7 +841,9 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.emit("config", {
       options: [
         ...toSessionConfigOptions(options),
-        ...(this.contextTier ? [contextConfigOption(this.contextTier)] : []),
+        ...(this.launch.contextTier
+          ? [contextConfigOption(this.launch.contextTier)]
+          : []),
       ],
     });
   }
@@ -913,105 +859,6 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.emit("usage", update);
   }
 
-  private async trackUsage(agentSessionId: string, reset = false): Promise<void> {
-    clearInterval(this.creditTimer);
-    await this.creditRead;
-    this.assertActive();
-    this.creditReader = new SessionCreditReader(agentSessionId);
-    if (reset) {
-      this.reportUsage({
-        aiCredits: null,
-        contextTokens: null,
-        contextWindow: null,
-        context: null,
-      });
-    }
-    await this.refreshCredits();
-    if (!this.stopping && !this.hasTerminated) {
-      this.creditTimer = setInterval(() => void this.refreshCredits(), 2_000);
-      this.creditTimer.unref();
-    }
-  }
-
-  private refreshCredits(): Promise<void> {
-    if (this.creditRead) return this.creditRead;
-    if (!this.creditReader) return Promise.resolve();
-    const read = this.creditReader
-      .read()
-      .then((aiCredits) => {
-        if (this.startupAborted) return;
-        this.creditError = undefined;
-        if (aiCredits !== undefined) this.reportUsage({ aiCredits });
-      })
-      .catch((error: unknown) => {
-        if (this.startupAborted) return;
-        const message = `Session AI credit usage is unavailable: ${errorMessage(error)}`;
-        if (this.creditError !== message) this.emit("system", { text: message });
-        this.creditError = message;
-      })
-      .finally(() => {
-        this.creditRead = undefined;
-      });
-    this.creditRead = read;
-    return read;
-  }
-
-  private publishContextCapture(): void {
-    const capture = this.contextCapture;
-    if (!capture) return;
-    try {
-      if (capture.truncated) throw new Error("Copilot's /context report was too large");
-      const context = parseContextUsage(capture.text);
-      const selectedModel = this.configOptions.find(
-        (option) => option.id === "model",
-      )?.currentValue;
-      this.reportUsage({
-        context:
-          context &&
-          selectedModel &&
-          selectedModel !== "auto" &&
-          selectedModel !== context.model
-            ? null
-            : context,
-      });
-      this.contextError = undefined;
-    } catch (error) {
-      this.contextReadFailed(error);
-    }
-  }
-
-  private contextReadFailed(error: unknown): void {
-    this.reportUsage({ context: null });
-    const message = `Context usage is unavailable: ${errorMessage(error)}`;
-    if (message !== this.contextError && !this.stopping)
-      this.emit("system", { text: message });
-    this.contextError = message;
-  }
-
-  /** /context is an advertised local CLI command, not a model prompt. */
-  private async refreshContext(): Promise<void> {
-    if (
-      !this.contextCommandAvailable ||
-      !this.agentSessionId ||
-      !this.connection ||
-      this.stopping
-    )
-      return;
-    this.contextCapture = { text: "", hidden: true, truncated: false, complete: false };
-    try {
-      await this.connection.agent.request(
-        acp.methods.agent.session.prompt,
-        { sessionId: this.agentSessionId, prompt: [{ type: "text", text: "/context" }] },
-        { cancellationSignal: AbortSignal.timeout(5_000) },
-      );
-      this.publishContextCapture();
-    } catch (error) {
-      this.contextReadFailed(error);
-    } finally {
-      this.contextCapture = undefined;
-    }
-  }
-
   async prompt(
     text: string,
     attachments: readonly PromptAttachment[] = [],
@@ -1023,22 +870,11 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     }
     if (this.prompting) throw new Error("A prompt is already active");
     this.prompting = true;
-    const isContextCommand =
-      this.contextCommandAvailable &&
-      text.trim() === "/context" &&
-      attachments.length === 0;
-    if (isContextCommand) {
-      this.contextCapture = {
-        text: "",
-        hidden: false,
-        truncated: false,
-        complete: false,
-      };
-    }
+    this.usageReporter.beforePrompt?.(text, attachments.length > 0);
     // The prompt owns the session's state from here, so whatever was inferred
     // from a turn Copilot started for itself stands down without a word.
     this.unprompted.clear();
-    this.emit("state", { state: "running", activity: "Copilot is working" });
+    this.emit("state", { state: "running", activity: `${this.kind.label} is working` });
     // Only the file's name and size are recorded: the transcript is stored on
     // the Host and replayed to every browser watching, which a few megabytes of
     // base64 per prompt would turn into a liability.
@@ -1059,24 +895,23 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
           ),
         },
       );
-      if (isContextCommand) this.publishContextCapture();
-      else await this.refreshContext();
-      await this.refreshCredits();
+      await this.usageReporter.afterPrompt?.();
       this.emit("turn_complete", { stopReason: response.stopReason });
       this.prompting = false;
       this.emit("state", { state: "idle", activity: "Ready for follow-up" });
     } catch (error) {
       let failure = error;
-      if (isCapiRequestTooLarge(error) && options.allowContextRollover !== false) {
+      const rollover = this.kind.rollover;
+      if (rollover?.matches(error) && options.allowContextRollover !== false) {
         try {
           await this.rollOverConversation(
-            contextRolloverPrompt(this.contextOverflowRecoveryPrompt, text, attachments),
+            rollover.prompt(this.contextOverflowRecoveryPrompt, text, attachments),
           );
           return;
         } catch (recoveryError) {
           failure = new AggregateError(
             [error, recoveryError],
-            "Copilot context rollover failed",
+            `${this.kind.label} context rollover failed`,
             { cause: recoveryError },
           );
         }
@@ -1088,7 +923,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       await this.stop();
       throw failure;
     } finally {
-      this.contextCapture = undefined;
+      this.usageReporter.finishPrompt?.();
       this.prompting = false;
     }
   }
@@ -1096,14 +931,14 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   private async rollOverConversation(prompt: string): Promise<void> {
     this.assertActive();
     if (!this.connection) throw new Error("ACP session is not initialized");
+    if (!this.kind.rollover)
+      throw new Error("This agent does not support context rollover");
     this.denyPendingPermissions();
-    this.contextCapture = undefined;
-    this.contextCommandAvailable = false;
+    this.usageReporter.reset?.();
     this.reportUsage({ context: null });
     this.configOptions = [];
     this.emit("system", {
-      message:
-        "Copilot’s saved conversation exceeded the request-size limit. Fleet started a fresh conversation in the same workspace and continued with a bounded task handoff.",
+      message: this.kind.rollover.notice,
     });
     const created = await this.connection.agent.request(acp.methods.agent.session.new, {
       cwd: this.cwd,
@@ -1111,15 +946,13 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     });
     this.assertActive();
     this.agentSessionId = created.sessionId;
-    this.captureConfigOptions(created.configOptions);
-    await this.recoverConfigOptions();
-    this.assertActive();
-    await this.selectCustomAgent();
+    this.captureSessionConfig(created);
+    await this.kind.afterSessionStart?.(this.sessionHandle());
     this.assertActive();
     await this.applyStartupConfig();
     this.assertActive();
     this.emit("agent_session", { agentSessionId: created.sessionId });
-    await this.trackUsage(created.sessionId, true);
+    await this.usageReporter.start?.(created.sessionId, true);
     this.assertActive();
     this.emit("state", { state: "running", activity: "Continuing in fresh context" });
     const response = await this.connection.agent.request(
@@ -1133,9 +966,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       },
     );
     this.assertActive();
-    await this.refreshContext();
-    this.assertActive();
-    await this.refreshCredits();
+    await this.usageReporter.afterPrompt?.();
     this.assertActive();
     this.emit("turn_complete", { stopReason: response.stopReason });
     this.prompting = false;
@@ -1158,7 +989,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     this.emit(
       "state",
       this.busy
-        ? { state: "running", activity: "Copilot is working" }
+        ? { state: "running", activity: `${this.kind.label} is working` }
         : { state: "idle", activity: "Ready for follow-up" },
     );
   }
@@ -1188,6 +1019,16 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (!this.agentSessionId || !this.connection) {
       throw new Error("ACP session is not initialized");
     }
+    if (this.kind.setConfigOption) {
+      const options = await this.kind.setConfigOption(
+        this.sessionHandle(),
+        configId,
+        value,
+      );
+      this.assertActive();
+      this.captureConfigOptions(options);
+      return;
+    }
     const response = await this.connection.agent.request(
       acp.methods.agent.session.setConfigOption,
       {
@@ -1205,7 +1046,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
   stop(announce = true): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
     this.stopping = true;
-    clearInterval(this.creditTimer);
+    this.usageReporter.close?.();
     this.stopPromise = (async () => {
       this.unprompted.clear();
       this.denyPendingPermissions();
@@ -1218,7 +1059,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
       if (announce && !this.startupAborted) {
         try {
           await Promise.race([
-            this.refreshCredits(),
+            this.usageReporter.flush?.() ?? Promise.resolve(),
             new Promise<void>((resolve) => {
               if (this.startupAborted) resolve();
               else this.abortStartupWait = resolve;
@@ -1240,9 +1081,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
 
   /** Ends an incomplete startup as a failure before its process is torn down. */
   failStartup(error: unknown): Error {
-    const failure = new Error(
-      copilotFailureMessage(error, this.stderrTail, this.launch.provider),
-    );
+    const failure = new Error(this.launch.failureMessage(error, this.stderrTail));
     if (!this.hasTerminated) {
       this.emit("error", { message: failure.message });
       this.emit("state", { state: "failed", activity: failure.message });
@@ -1284,6 +1123,20 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     if (this.stopping) {
       return Promise.resolve({ outcome: { outcome: "cancelled" } });
     }
+    if (this.yolo && this.kind.yolo === "auto-approve") {
+      const option =
+        params.options.find((item) => item.kind === "allow_always") ??
+        params.options.find((item) => item.kind === "allow_once");
+      if (!option)
+        this.emit("system", {
+          text: `${this.kind.label} requested permission without an allow option; the request was cancelled.`,
+        });
+      return Promise.resolve(
+        option
+          ? { outcome: { outcome: "selected", optionId: option.optionId } }
+          : { outcome: { outcome: "cancelled" } },
+      );
+    }
     const requestId = randomUUID();
     this.emit("permission", {
       requestId,
@@ -1309,6 +1162,8 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
     return (
       update.sessionUpdate === "available_commands_update" ||
       update.sessionUpdate === "config_option_update" ||
+      update.sessionUpdate === "current_mode_update" ||
+      update.sessionUpdate === "session_info_update" ||
       update.sessionUpdate === "usage_update"
     );
   }
@@ -1322,23 +1177,29 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
    * started for itself, and the session is running whether or not it was asked.
    */
   private watchUnpromptedWork(update: acp.SessionUpdate): void {
-    if (this.prompting || this.stopping || this.hasTerminated) return;
+    if (
+      !this.kind.tracksUnpromptedWork ||
+      this.prompting ||
+      this.stopping ||
+      this.hasTerminated
+    )
+      return;
     this.unprompted.note(toolProgress(update));
   }
 
   private forwardUpdate(update: acp.SessionUpdate): void {
-    if (update.sessionUpdate === "usage_update") {
-      this.reportUsage({
-        contextTokens: update.used,
-        ...(update.size > 0 ? { contextWindow: update.size } : {}),
-      });
+    if (update.sessionUpdate === "available_commands_update") {
+      this.emit("commands", { commands: toSessionCommands(update.availableCommands) });
       return;
     }
-    if (update.sessionUpdate === "available_commands_update") {
-      this.contextCommandAvailable = update.availableCommands.some(
-        (command) => command.name === "context",
+    if (update.sessionUpdate === "current_mode_update") {
+      this.captureConfigOptions(
+        this.configOptions.map((option) =>
+          option.id === "mode" && option.type === "select"
+            ? { ...option, currentValue: update.currentModeId }
+            : option,
+        ),
       );
-      this.emit("commands", { commands: toSessionCommands(update.availableCommands) });
       return;
     }
     if (update.sessionUpdate === "config_option_update") {
@@ -1385,16 +1246,7 @@ class AcpAgent extends SequencedAgent implements SessionAgent {
 }
 
 export class AcpAgentFactory implements AgentFactory {
-  /**
-   * Whether this Copilot takes `--context`, asked once and remembered.
-   *
-   * A promise rather than a boolean so that sessions starting at the same
-   * moment share one `copilot --help` instead of racing to run their own.
-   * Cleared whenever the command changes, since the answer belongs to the
-   * binary that was asked.
-   */
-  private readonly contextTierSupport = new Map<string, Promise<boolean>>();
-  private readonly copilotValidation = new Map<string, Promise<void>>();
+  private copilotKind: CopilotAgentKind;
 
   /** Values are injected: settings.ts is the only place that reads the env. */
   constructor(
@@ -1402,7 +1254,15 @@ export class AcpAgentFactory implements AgentFactory {
     private copilotCommand: string,
     private contextTier: ContextTier = "long_context",
     private readonly startTimeoutMs = ACP_START_TIMEOUT_MS,
-  ) {}
+    /**
+     * Where each agent runs, asked as it starts rather than once: the identity
+     * address only exists after the config page is listening, and an imported
+     * backup changes the node id without a restart.
+     */
+    private readonly identity?: () => AgentIdentity,
+  ) {
+    this.copilotKind = new CopilotAgentKind(copilotCommand, startTimeoutMs);
+  }
 
   /** Lets the local config UI retune the agent without a process restart. */
   configure(
@@ -1411,8 +1271,7 @@ export class AcpAgentFactory implements AgentFactory {
     contextTier: ContextTier = this.contextTier,
   ): void {
     if (copilotCommand !== this.copilotCommand) {
-      this.contextTierSupport.clear();
-      this.copilotValidation.clear();
+      this.copilotKind = new CopilotAgentKind(copilotCommand, this.startTimeoutMs);
     }
     this.permissionTimeoutMs = permissionTimeoutMs;
     this.copilotCommand = copilotCommand;
@@ -1427,6 +1286,10 @@ export class AcpAgentFactory implements AgentFactory {
   ): Promise<SessionAgent> {
     const signal = options.signal;
     signal?.throwIfAborted();
+    const kind = createAgentKind(
+      options.agentParams ?? { kind: "copilot" },
+      this.copilotKind,
+    );
     let agent: AcpAgent | undefined;
     let onAbort: (() => void) | undefined;
     const aborted =
@@ -1442,12 +1305,13 @@ export class AcpAgentFactory implements AgentFactory {
       aborted ? Promise.race([operation, aborted]) : operation;
     try {
       const launch = await wait(
-        resolveCopilotLaunch(options.agencyMode ?? false, this.copilotCommand),
+        kind.prepare({
+          yolo: options.yolo ?? false,
+          agencyMode: options.agencyMode ?? false,
+          contextTier: options.contextTier ?? this.contextTier,
+          ...(signal ? { signal } : {}),
+        }),
       );
-      signal?.throwIfAborted();
-      await wait(this.validateCopilot(launch));
-      signal?.throwIfAborted();
-      const supportsContext = await wait(this.acceptsContextTier(launch));
       signal?.throwIfAborted();
       agent = new AcpAgent(
         sessionId,
@@ -1455,8 +1319,8 @@ export class AcpAgentFactory implements AgentFactory {
         this.permissionTimeoutMs,
         options.sequenceOffset ?? 0,
         options.yolo ?? false,
+        kind,
         launch,
-        supportsContext ? (options.contextTier ?? this.contextTier) : undefined,
         options.mcpServers ?? [],
         options.agent ?? "",
         options.config ?? [],
@@ -1467,10 +1331,13 @@ export class AcpAgentFactory implements AgentFactory {
         options.processStarting || options.processStarted || options.processesQuiesced
           ? options
           : undefined,
+        options.startupNotice ?? "",
+        this.identity ? agentEnvironment(process.env, this.identity()) : undefined,
       );
-      await withCopilotStartupTimeout(
+      await withAgentStartupTimeout(
         wait(agent.start(cwd, options.resumeAgentSessionId)),
         this.startTimeoutMs,
+        kind.label,
       );
       signal?.throwIfAborted();
       return agent;
@@ -1487,45 +1354,6 @@ export class AcpAgentFactory implements AgentFactory {
     } finally {
       if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
-  }
-
-  private validateCopilot(launch: CopilotLaunch): Promise<void> {
-    const key = JSON.stringify([launch.command, launch.args]);
-    const cached = this.copilotValidation.get(key);
-    if (cached) return cached;
-    const validation = this.metadata(launch, "--version")
-      .then((output) => {
-        const failure = copilotAcpAuthVersionError(output, launch.provider);
-        if (failure) throw new Error(failure);
-      })
-      .catch((error) => {
-        // An operator can update or repair Copilot without restarting the Node.
-        // A failed probe must therefore be retried by the next session.
-        this.copilotValidation.delete(key);
-        throw error;
-      });
-    this.copilotValidation.set(key, validation);
-    return validation;
-  }
-
-  private acceptsContextTier(launch: CopilotLaunch): Promise<boolean> {
-    const key = JSON.stringify([launch.command, launch.args]);
-    const cached = this.contextTierSupport.get(key);
-    if (cached) return cached;
-    const support = copilotSupportsContextTier(launch.command, () =>
-      this.metadata(launch, "--help"),
-    );
-    this.contextTierSupport.set(key, support);
-    return support;
-  }
-
-  private metadata(launch: CopilotLaunch, flag: string): Promise<string> {
-    return copilotOutput(
-      launch.command,
-      [...launch.args, ...(launch.provider === "agency" ? ["--"] : []), flag],
-      // Agency may need to acquire its Copilot binary on the first invocation.
-      launch.provider === "agency" ? this.startTimeoutMs : 15_000,
-    );
   }
 }
 
@@ -1794,124 +1622,20 @@ function toolErrorPayload(update: { rawOutput?: unknown }): { error?: string } {
   return error ? { error } : {};
 }
 
-/**
- * Copilot's --allow-all / --yolo: tools, paths, and URLs all run without
- * prompts. The Host decides this per session, so the node no longer reads the
- * environment and one machine cannot silently diverge from what the UI shows.
- *
- * The context tier is passed for the same reason, and is passed even when it is
- * "default": Copilot keeps a tier of its own in ~/.copilot/settings.json, and
- * omitting the flag would let that file decide, which is exactly the silent
- * per-machine divergence this argument list exists to prevent. Omitted only
- * when the installed Copilot is too old to accept it — see
- * {@link copilotSupportsContextTier}.
- */
-export function copilotLaunchArgs(yolo: boolean, contextTier?: ContextTier): string[] {
-  const args = ["--acp", "--stdio"];
-  if (yolo) args.push("--allow-all");
-  if (contextTier) args.push("--context", contextTier);
-  return args;
-}
-
-/**
- * Whether the installed Copilot understands `--context`.
- *
- * Asked rather than assumed because Copilot is installed per machine and the
- * fleet does not update it: a node can be running the current fleet build
- * against a Copilot from months ago. Commander rejects an unknown option by
- * exiting 1 before it reads a byte of ACP, so passing the flag blindly would
- * not degrade the session — it would stop every session on that machine from
- * starting, with the reason buried in a child process's stderr.
- */
-export async function copilotSupportsContextTier(
-  command: string,
-  help: (command: string) => Promise<string> = copilotHelp,
-): Promise<boolean> {
-  try {
-    return (await help(command)).includes("--context");
-  } catch {
-    // A Copilot that cannot even be asked is one the launch is about to fail
-    // on anyway, and it will fail with its own error rather than this one.
-    return false;
-  }
-}
-
-export function copilotVersionFromOutput(output: string): string | undefined {
-  const match =
-    output.match(/\bGitHub Copilot(?: CLI)?\s+(\d+)\.(\d+)\.(\d+)/i) ??
-    output.match(/\b(\d+)\.(\d+)\.(\d+)(?:[-+][^\s]+)?\b/);
-  return match ? `${match[1]}.${match[2]}.${match[3]}` : undefined;
-}
-
-export function copilotAcpAuthVersionError(
-  output: string,
-  provider: CopilotLaunch["provider"] = "copilot",
-): string | undefined {
-  const version = copilotVersionFromOutput(output);
-  if (!version || compareVersions(version, MIN_COPILOT_ACP_AUTH_VERSION) >= 0) {
-    return undefined;
-  }
-  if (provider === "agency") {
-    return (
-      `Agency's Copilot CLI ${version} is too old for reliable ACP authentication. ` +
-      `Update Agency and its Copilot CLI on this node (minimum ${MIN_COPILOT_ACP_AUTH_VERSION}), ` +
-      "then run `agency copilot` and use `/login` before retrying."
-    );
-  }
-  return (
-    `Copilot CLI ${version} is too old for reliable ACP authentication. ` +
-    `Run \`copilot update\` on this node (minimum ${MIN_COPILOT_ACP_AUTH_VERSION}), ` +
-    "then run `copilot login` and retry."
-  );
-}
-
-function compareVersions(left: string, right: string): number {
-  const a = left.split(".").map(Number);
-  const b = right.split(".").map(Number);
-  for (let index = 0; index < 3; index += 1) {
-    const difference = (a[index] ?? 0) - (b[index] ?? 0);
-    if (difference !== 0) return difference;
-  }
-  return 0;
-}
-
-export function copilotFailureMessage(
-  error: unknown,
-  stderr = "",
-  provider: CopilotLaunch["provider"] = "copilot",
-): string {
-  const primary = errorMessage(error, "Copilot ACP failed to start");
-  const detail = stderr
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .at(-1);
-  const message = detail && !primary.includes(detail) ? `${primary}: ${detail}` : primary;
-  if (
-    /\b(?:not (?:logged|signed) in|login required|authentication (?:required|failed)|unauthenticated|unauthorized)\b/i.test(
-      message,
-    ) &&
-    !message.includes("copilot login")
-  ) {
-    return provider === "agency"
-      ? `${message}. Run \`agency copilot\` on this node and use \`/login\`, then retry.`
-      : `${message}. Run \`copilot login\` on this node, then retry.`;
-  }
-  return message;
-}
-
-export function withCopilotStartupTimeout<T>(
+/** The caller owns cleanup: a startup deadline only bounds the wait. */
+export function withAgentStartupTimeout<T>(
   operation: Promise<T>,
   timeoutMs = ACP_START_TIMEOUT_MS,
+  label = "Copilot",
 ): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       reject(
         new Error(
-          `Copilot ACP did not become ready within ${Math.round(timeoutMs / 1000)}s. ` +
+          `${label} ACP did not become ready within ${Math.round(timeoutMs / 1000)}s. ` +
             "ACP startup or MCP server initialization may be slow or hung; retry, " +
-            "and inspect this node's Copilot and MCP logs if it persists.",
+            `and inspect this node's ${label} and MCP logs if it persists.`,
         ),
       );
     }, timeoutMs);
@@ -1922,53 +1646,7 @@ export function withCopilotStartupTimeout<T>(
   });
 }
 
-/** `copilot --help`, or a rejection if it cannot be run at all. */
-function copilotHelp(command: string): Promise<string> {
-  return copilotOutput(command, ["--help"]);
-}
-
-/** Captures one short Copilot metadata command without leaving a hung child. */
-function copilotOutput(
-  command: string,
-  args: string[],
-  timeoutMs = 15_000,
-): Promise<string> {
-  return new Promise((done, fail) => {
-    const { command: executable, shell } = copilotSpawnTarget(command);
-    const child = spawn(executable, args, {
-      shell,
-      windowsHide: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    const capture = (chunk: Buffer) => {
-      output = `${output}${chunk.toString("utf8")}`.slice(-64_000);
-    };
-    child.stdout?.on("data", capture);
-    child.stderr?.on("data", capture);
-    const timer = setTimeout(() => {
-      fail(new Error(`${command} ${args.join(" ")} timed out`));
-      child.kill();
-    }, timeoutMs);
-    timer.unref();
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      fail(error);
-    });
-    child.once("close", (code, signal) => {
-      clearTimeout(timer);
-      if (code !== 0) {
-        fail(
-          new Error(
-            `${command} ${args.join(" ")} failed (${signal ?? code ?? "unknown"}): ${output.trim()}`,
-          ),
-        );
-      } else {
-        done(output);
-      }
-    });
-  });
-}
+export { withAgentStartupTimeout as withCopilotStartupTimeout };
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

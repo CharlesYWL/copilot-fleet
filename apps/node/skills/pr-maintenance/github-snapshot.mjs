@@ -470,18 +470,27 @@ function source(kind, item, context = {}) {
 }
 
 export function matchEffects(sources, knownEffects = []) {
-  const matched = [];
-  const ambiguous = [];
-  const remaining = [];
-  for (const item of sources) {
-    const candidates = knownEffects.filter(
+  const candidatesBySource = sources.map((item) =>
+    knownEffects.filter(
       (effect) =>
         effect.kind === item.kind &&
         effect.actor === item.actor &&
         effect.contentHash === item.contentHash &&
-        (effect.id === item.id || (effect.marker && item.body?.includes(effect.marker))),
-    );
-    if (candidates.length === 1)
+        (effect.id
+          ? effect.id === item.id
+          : effect.marker && item.body?.includes(effect.marker)),
+    ),
+  );
+  const sourceCounts = new Map();
+  for (const candidates of candidatesBySource)
+    for (const effect of candidates)
+      sourceCounts.set(effect, (sourceCounts.get(effect) ?? 0) + 1);
+  const matched = [];
+  const ambiguous = [];
+  const remaining = [];
+  for (const [index, item] of sources.entries()) {
+    const candidates = candidatesBySource[index];
+    if (candidates.length === 1 && sourceCounts.get(candidates[0]) === 1)
       matched.push({
         effectId: candidates[0].effectId,
         sourceId: item.id,
@@ -489,7 +498,7 @@ export function matchEffects(sources, knownEffects = []) {
       });
     else {
       remaining.push(item);
-      if (candidates.length > 1)
+      if (candidates.length > 0)
         ambiguous.push({
           sourceId: item.id,
           effectIds: candidates.map((effect) => effect.effectId),

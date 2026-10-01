@@ -1,12 +1,14 @@
 import { randomUUID, timingSafeEqual, createHash } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync, type StatementSync } from "node:sqlite";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
 import { EntraConfigSchema } from "./auth/entra.js";
 import { integrationBranchSettings } from "./integration-branch.js";
 import { isDeepStrictEqual } from "node:util";
 import {
+  AgentParamsSchema,
+  type AgentParams,
   type FleetNode,
   type FleetSession,
   type HostBackup,
@@ -99,6 +101,10 @@ import {
   type WorktreeTombstone,
   type PlacementRepositoryCapability,
   type WorkspaceResult,
+  type HeartbeatSchedule,
+  HeartbeatScheduleSchema,
+  heartbeatSchedule,
+  heartbeatScheduleProblem,
 } from "@fleet/protocol";
 import { LEAD_TOKEN_KEY_SETTING } from "./orchestrator/lead-tokens.js";
 import { CommandConflict, CommandExecutionStore } from "./command-execution-store.js";
@@ -108,6 +114,7 @@ import {
   PrMaintenanceError,
   type PrMaintenanceOperationalReview,
 } from "./pr-maintenance-store.js";
+import { WorkerResumeStore } from "./worker-resume-store.js";
 import {
   DEFAULT_NOTIFICATION_LIFECYCLE_ENABLED,
   NOTIFICATION_LIFECYCLE_DEFAULT_SETTING,
@@ -238,6 +245,7 @@ export type AdvanceRunToReviewResult = {
  * touches what was actually reported.
  */
 export type ReportedNodeIdentity = {
+  agentKinds?: FleetNode["agentKinds"];
   version?: string;
   revision?: string;
   capabilities?: string[];
@@ -456,7 +464,13 @@ export class FleetStore {
   private readonly db: DatabaseSync;
   readonly commands: CommandExecutionStore;
   readonly prMaintenance: PrMaintenanceStore;
+  readonly resumeRequests: WorkerResumeStore;
   readonly artifactDirectory: string;
+  /**
+   * The directory holding this database, which the Host locks down as a whole
+   * because it holds the Host's private key. Absent for an in-memory store.
+   */
+  readonly dataDirectory: string | undefined;
   private transactionDepth = 0;
   private restoringBackup = false;
   /**
@@ -466,15 +480,22 @@ export class FleetStore {
    * connection does.
    */
   private readonly statements = new Map<string, StatementSync>();
+  private readonly warn: (message: string) => void;
 
   constructor(
     path: string,
-    options: { secureFiles?: SecureFiles; exclusive?: boolean } = {},
+    options: {
+      secureFiles?: SecureFiles;
+      exclusive?: boolean;
+      warn?: (message: string) => void;
+    } = {},
   ) {
+    this.warn = options.warn ?? ((message) => process.stderr.write(`${message}\n`));
     this.artifactDirectory =
       path === ":memory:"
         ? join(process.cwd(), ".mwi-test-work", "host-artifacts", randomUUID())
         : join(dirname(path), "workspace-result-artifacts");
+    this.dataDirectory = path === ":memory:" ? undefined : resolve(dirname(path));
     /*
      * The default writes to stderr rather than to a logger, because the store
      * is constructed before anything that has one — and a Host that could not
@@ -792,6 +813,8 @@ export class FleetStore {
       "TEXT NOT NULL DEFAULT 'legacy-secret'",
     );
     this.addColumnIfMissing("sessions", "agent_session_id", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("sessions", "agent_params", "TEXT NOT NULL DEFAULT ''");
+    this.addColumnIfMissing("nodes", "agent_kinds", "TEXT NOT NULL DEFAULT '[]'");
     this.addColumnIfMissing("events", "received_at", "TEXT NOT NULL DEFAULT ''");
     this.addColumnIfMissing(
       "sessions",
@@ -921,6 +944,9 @@ export class FleetStore {
     );
     this.commands.quarantine();
     this.prMaintenance = new PrMaintenanceStore(this, this.db);
+    this.resumeRequests = new WorkerResumeStore(this.db, (work) =>
+      this.transactionIfNeeded(work),
+    );
     this.ensureChatsWorkspace();
     this.rebuildSessionStateFromEvents();
   }
@@ -1963,6 +1989,25 @@ export class FleetStore {
     this.setSetting("defaults.agencyMode", enabled ? "1" : "0");
   }
 
+  getOrchestratorAgent(): AgentParams | undefined {
+    const value = this.getSetting("orchestrator.agent");
+    if (!value) return undefined;
+    const json = tryParseJson(value);
+    const parsed = AgentParamsSchema.safeParse(json.ok ? json.value : undefined);
+    if (parsed.success) return parsed.data;
+    this.warn(
+      "Invalid stored orchestrator agent preference; using Auto (Copilot). Select and save the preferred agent in Settings > Orchestrator to repair it.",
+    );
+    return undefined;
+  }
+
+  setOrchestratorAgent(params: AgentParams | null): void {
+    this.setSetting(
+      "orchestrator.agent",
+      params === null ? "" : JSON.stringify(AgentParamsSchema.parse(params)),
+    );
+  }
+
   /**
    * Whether a session a Node lost is re-attached without being asked.
    *
@@ -2015,6 +2060,22 @@ export class FleetStore {
     this.setSetting("defaults.reasoningEffort", effort);
   }
 
+  /**
+   * When idle orchestrators are reminded of their open work, and so when a
+   * maintained PR is next due for a routine check. A value that no longer
+   * parses reads as the default rather than stopping every heartbeat.
+   */
+  getOrchestratorHeartbeatSchedule(): HeartbeatSchedule {
+    return heartbeatSchedule(this.getSetting("orchestrator.heartbeatSchedule"));
+  }
+
+  setOrchestratorHeartbeatSchedule(schedule: string): void {
+    this.setSetting(
+      "orchestrator.heartbeatSchedule",
+      HeartbeatScheduleSchema.parse(schedule),
+    );
+  }
+
   setTunnelProvider(provider: TunnelProvider): void {
     this.setSetting("tunnel.provider", provider);
   }
@@ -2049,6 +2110,7 @@ export class FleetStore {
       ...(input.publicUrl ? { publicUrl: input.publicUrl } : {}),
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
       defaults: {
+        orchestratorAgent: this.getOrchestratorAgent() ?? null,
         managedWorktreesEnabled: this.getManagedWorktreesEnabled(),
         managedWorktreePolicy: this.getManagedWorktreePolicy(),
         yolo: this.getDefaultYolo(),
@@ -2056,6 +2118,7 @@ export class FleetStore {
         agencyMode: this.getAgencyMode(),
         autoResume: this.getAutoResume(),
         notificationLifecycleEnabled: this.getDefaultNotificationLifecycleEnabled(),
+        orchestratorHeartbeatSchedule: this.getOrchestratorHeartbeatSchedule().source,
       },
       nodes: (this.statement("SELECT * FROM nodes ORDER BY name").all() as Row[]).map(
         (row) => ({
@@ -2218,6 +2281,7 @@ export class FleetStore {
       );
     }
     this.prMaintenance.importBackup(undefined);
+    this.resumeRequests.clear();
     this.db.exec(
       "DELETE FROM managed_api_requests; DELETE FROM session_dispatch_attempts; DELETE FROM session_turn_completions; DELETE FROM session_transition_intents; DELETE FROM notification_preferences; DELETE FROM notifications; DELETE FROM run_notes; DELETE FROM run_steps; DELETE FROM runs; DELETE FROM events; DELETE FROM sessions; DELETE FROM placements; DELETE FROM workspaces; DELETE FROM nodes",
     );
@@ -2251,10 +2315,14 @@ export class FleetStore {
       parsed.defaults.managedWorktreePolicy ?? ManagedWorktreePolicySchema.parse({}),
     );
     this.setAgencyMode(parsed.defaults.agencyMode);
+    this.setOrchestratorAgent(parsed.defaults.orchestratorAgent ?? null);
     this.setAutoResume(parsed.defaults.autoResume);
     this.setDefaultNotificationLifecycleEnabled(
       parsed.defaults.notificationLifecycleEnabled,
     );
+    const heartbeat = parsed.defaults.orchestratorHeartbeatSchedule;
+    if (heartbeat !== undefined && !heartbeatScheduleProblem(heartbeat))
+      this.setOrchestratorHeartbeatSchedule(heartbeat);
     this.setSetting("enrollment.token", parsed.enrollmentToken);
     if (parsed.publicUrl) this.setSetting("host.publicUrl", parsed.publicUrl);
     for (const node of parsed.nodes) {
@@ -2282,6 +2350,7 @@ export class FleetStore {
         node.lastHeartbeat,
         node.homeDir,
       );
+      this.setNodeIdentity(node.id, { agentKinds: node.agentKinds ?? [] });
     }
     for (const workspace of parsed.workspaces) {
       this.statement(
@@ -2313,8 +2382,8 @@ export class FleetStore {
             (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,
              last_text,created_at,updated_at,agent_session_id,yolo,name,commands,
             config_options,position,run_id,run_role,additional_directories,
-            stop_requested,dismissed,favorite,last_activity_at,usage,operator_username)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            stop_requested,dismissed,favorite,last_activity_at,usage,operator_username,read_only,agent_params)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         session.id,
         session.workspaceId,
@@ -2341,6 +2410,8 @@ export class FleetStore {
         session.lastActivityAt ?? session.updatedAt,
         JSON.stringify(session.usage ?? {}),
         session.operatorUsername ?? "",
+        session.readOnly ? 1 : 0,
+        session.agentParams ? JSON.stringify(session.agentParams) : "",
       );
       if (session.executionBinding?.worktreeId)
         this.statement("UPDATE sessions SET execution_binding=? WHERE id=?").run(
@@ -2412,8 +2483,9 @@ export class FleetStore {
         `INSERT INTO run_steps
             (id,run_id,step_key,title,prompt,category,depends_on,state,session_id,
              placement_id,output,event_seq_from,stopped_by_orchestrator,attempts,
-             phase_index,dispatched_at,position,created_at,updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             phase_index,dispatched_at,position,created_at,updated_at,
+             managed_worktree_id,workspace_state,workspace_error,result_sha)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       ).run(
         step.id,
         step.runId,
@@ -2434,6 +2506,10 @@ export class FleetStore {
         step.position,
         step.createdAt,
         step.updatedAt,
+        step.managedWorktreeId ?? "",
+        step.workspaceState ?? "not_required",
+        step.workspaceError ?? "",
+        step.resultSha ?? "",
       );
       if (step.executionBinding?.worktreeId)
         this.statement("UPDATE run_steps SET execution_binding=? WHERE id=?").run(
@@ -3295,7 +3371,7 @@ export class FleetStore {
     if (existing) {
       this.statement(
         `UPDATE nodes SET secret_hash=?, os=?, arch=?, version=?, revision=?, capabilities=?,
-           agents=?, max_sessions=?, last_heartbeat=?, home_dir=? WHERE id=?`,
+           agents=?, agent_kinds=?, max_sessions=?, last_heartbeat=?, home_dir=? WHERE id=?`,
       ).run(
         hash(secret),
         input.os,
@@ -3304,6 +3380,7 @@ export class FleetStore {
         input.revision ?? "",
         JSON.stringify(input.capabilities),
         JSON.stringify(input.agents ?? []),
+        JSON.stringify(input.agentKinds ?? []),
         input.maxSessions,
         now,
         input.homeDir ?? "",
@@ -3316,8 +3393,8 @@ export class FleetStore {
     const id = randomUUID();
     this.statement(
       `INSERT INTO nodes
-        (id,name,secret_hash,os,arch,version,revision,capabilities,agents,max_sessions,last_heartbeat,online,home_dir)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)`,
+        (id,name,secret_hash,os,arch,version,revision,capabilities,agents,agent_kinds,max_sessions,last_heartbeat,online,home_dir)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?)`,
     ).run(
       id,
       input.name,
@@ -3328,6 +3405,7 @@ export class FleetStore {
       input.revision ?? "",
       JSON.stringify(input.capabilities),
       JSON.stringify(input.agents ?? []),
+      JSON.stringify(input.agentKinds ?? []),
       input.maxSessions,
       now,
       input.homeDir ?? "",
@@ -3385,6 +3463,10 @@ export class FleetStore {
       values.push(value);
     };
     set("version", identity.version);
+    set(
+      "agent_kinds",
+      identity.agentKinds ? JSON.stringify(identity.agentKinds) : undefined,
+    );
     // Unlike home_dir, an empty revision is a real answer — "this checkout is
     // not a git repository" — and must be able to replace a stale commit, or a
     // machine that moved to a tarball deploy would keep claiming the last
@@ -3453,12 +3535,12 @@ export class FleetStore {
     const row = this.statement(
       `INSERT INTO nodes
          (id,name,secret_hash,public_key,auth_protocol,os,arch,version,revision,
-          capabilities,agents,max_sessions,last_heartbeat,online,home_dir)
-       VALUES (?,?,'',?,?,?,?,?,?,?,?,?,?,0,?)
+          capabilities,agents,agent_kinds,max_sessions,last_heartbeat,online,home_dir)
+       VALUES (?,?,'',?,?,?,?,?,?,?,?,?,?,?,0,?)
        ON CONFLICT(name) DO UPDATE SET
          secret_hash='', public_key=excluded.public_key, auth_protocol=excluded.auth_protocol,
          os=excluded.os, arch=excluded.arch, version=excluded.version, revision=excluded.revision,
-         capabilities=excluded.capabilities, agents=excluded.agents, max_sessions=excluded.max_sessions,
+         capabilities=excluded.capabilities, agents=excluded.agents, agent_kinds=excluded.agent_kinds, max_sessions=excluded.max_sessions,
          last_heartbeat=excluded.last_heartbeat, home_dir=excluded.home_dir
        RETURNING id`,
     ).get(
@@ -3472,6 +3554,7 @@ export class FleetStore {
       input.revision ?? "",
       JSON.stringify(input.capabilities),
       JSON.stringify(input.agents ?? []),
+      JSON.stringify(input.agentKinds ?? []),
       input.maxSessions,
       new Date().toISOString(),
       input.homeDir ?? "",
@@ -3967,6 +4050,7 @@ export class FleetStore {
     yolo = false,
     name = "",
     run: {
+      agentParams?: AgentParams;
       runId?: string;
       runRole?: RunRole;
       readOnly?: boolean;
@@ -3978,8 +4062,8 @@ export class FleetStore {
     const id = randomUUID();
     this.statement(
       `INSERT INTO sessions
-       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at,operator_username)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+       (id,workspace_id,placement_id,node_id,state,initial_prompt,current_activity,last_text,created_at,updated_at,yolo,name,run_id,run_role,read_only,last_activity_at,operator_username,agent_params)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
     ).run(
       id,
       placement.workspaceId,
@@ -3998,6 +4082,7 @@ export class FleetStore {
       run.readOnly ? 1 : 0,
       now,
       run.operatorUsername ?? "",
+      JSON.stringify(AgentParamsSchema.parse(run.agentParams ?? { kind: "copilot" })),
     );
     return this.getSession(id)!;
   }
@@ -4020,7 +4105,9 @@ export class FleetStore {
   ): { session: FleetSession; created: boolean; alreadyLive: boolean } {
     return this.transaction(() => {
       const existingRow = this.sessionQuery(
-        "WHERE s.agent_session_id=? ORDER BY s.created_at DESC LIMIT 1",
+        `WHERE s.agent_session_id=?
+         AND COALESCE(json_extract(NULLIF(s.agent_params,''),'$.kind'),'copilot')='copilot'
+         ORDER BY s.created_at DESC LIMIT 1`,
       ).get(agentSessionId) as Row | undefined;
       if (existingRow) {
         let session = sessionFromRow(existingRow);
@@ -4716,7 +4803,7 @@ export class FleetStore {
            WHERE NOT (
              (read_at IS NULL AND status <> 'dismissed')
              OR (status='active' AND kind IN
-               ('permission_request','orchestration_needs_review','command_approval'))
+               ('permission_request','orchestration_needs_review','command_approval','worker_resume_approval'))
            )
            ORDER BY updated_at DESC,id DESC
            LIMIT ?
@@ -4726,7 +4813,7 @@ export class FleetStore {
            WHERE NOT (
              (read_at IS NULL AND status <> 'dismissed')
              OR (status='active' AND kind IN
-               ('permission_request','orchestration_needs_review','command_approval'))
+               ('permission_request','orchestration_needs_review','command_approval','worker_resume_approval'))
            )
            AND (updated_at < ? OR id NOT IN (SELECT id FROM retained))
            ORDER BY updated_at,id
@@ -5981,6 +6068,7 @@ function nodeFromRow(row: Row): FleetNode {
     revision: String(row.revision ?? ""),
     capabilities: JSON.parse(String(row.capabilities)) as string[],
     agents: parseJsonList(row.agents),
+    agentKinds: parseJsonList(row.agent_kinds),
     maxSessions: Number(row.max_sessions),
     activeSessions: Number(row.active_sessions),
     lastHeartbeat: String(row.last_heartbeat),
@@ -6030,6 +6118,7 @@ function sessionFromRow(row: Row): FleetSession {
     createdAt: String(row.created_at),
     updatedAt: String(row.updated_at),
     agentSessionId: String(row.agent_session_id ?? ""),
+    ...(row.agent_params ? { agentParams: JSON.parse(String(row.agent_params)) } : {}),
     lastActivityAt: String(row.last_activity_at || row.updated_at),
     cleanupRequested: Boolean(row.cleanup_requested),
     additionalDirectories: parseJsonList(row.additional_directories),

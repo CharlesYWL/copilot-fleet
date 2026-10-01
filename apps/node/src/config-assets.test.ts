@@ -30,6 +30,9 @@ describe("config assets", () => {
     expect(html).toContain('id="sessionList"');
     expect(html).toContain('id="resumeSession"');
     expect(html).toContain('id="newSessionDialog"');
+    expect(html).toContain('id="folderPicker"');
+    expect(html).toContain('aria-labelledby="folderPickerTitle"');
+    expect(css).toContain(".folder-list");
     expect(html).toContain('id="commandPermissions"');
     expect(html).toContain('id="commandPermissionForm"');
     expect(css).toContain("@media (max-width: 900px)");

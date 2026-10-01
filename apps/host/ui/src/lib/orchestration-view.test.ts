@@ -11,9 +11,12 @@ import {
   awaitingPlan,
   buildRunViewModels,
   currentPhase,
+  needsOrchestrator,
+  PR_MAINTENANCE_STATUS_LABEL,
   runStateLabel,
   stageOf,
   summarise,
+  taskStatusLabel,
 } from "./orchestration-view";
 
 const ISO = "2026-01-01T12:00:00.000Z";
@@ -161,6 +164,65 @@ describe("stageOf", () => {
 });
 
 describe("buildRunViewModels", () => {
+  it("attaches a task's PR maintenance and ages out stale observations", () => {
+    const status = {
+      taskId: "r1",
+      recordId: "job",
+      stage: "waiting_review" as const,
+      prUrl: "https://github.com/example/repo/pull/1",
+      manualControl: false,
+      freshUntil: later(30),
+    };
+    const input = {
+      runs: [run({ state: "awaiting_lead" }), run({ id: "r2" })],
+      stepsByRun: {},
+      sessions: [],
+      maintenance: [status],
+    };
+
+    const models = build({ ...input, nowMs: Date.parse(later(30)) });
+    const maintained = models.find((model) => model.run.id === "r1");
+    expect(maintained?.maintenance).toEqual(status);
+    expect(models.find((model) => model.run.id === "r2")).not.toHaveProperty(
+      "maintenance",
+    );
+    expect(taskStatusLabel(maintained!)).toBe(PR_MAINTENANCE_STATUS_LABEL);
+
+    const [stale] = build({
+      ...input,
+      runs: [input.runs[0]!],
+      nowMs: Date.parse(later(31)),
+    });
+    expect(stale?.maintenance).toEqual({
+      taskId: "r1",
+      recordId: "job",
+      stage: "checking",
+      prUrl: status.prUrl,
+      manualControl: false,
+    });
+    expect(status.stage).toBe("waiting_review");
+  });
+
+  it("files a maintained task that needs a person under its run state", () => {
+    const [model] = build({
+      runs: [run({ state: "awaiting_human" })],
+      stepsByRun: {},
+      sessions: [],
+      maintenance: [
+        {
+          taskId: "r1",
+          recordId: "job",
+          stage: "checking",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: false,
+        },
+      ],
+    });
+
+    expect(model?.maintenance?.stage).toBe("checking");
+    expect(taskStatusLabel(model!)).toBe("Needs you");
+  });
+
   it("finds attention through the session a permission belongs to", () => {
     /*
      * A permission is an event on a session, and the run it belongs to is
@@ -471,5 +533,31 @@ describe("labels", () => {
 
   it("clamps a phase index that has run past the end", () => {
     expect(currentPhase(run({ phases: ["Only"], phaseIndex: 4 }))).toBe("Only");
+  });
+
+  it("counts a task as needing an owner while open or keeping a PR maintained", () => {
+    const models = buildRunViewModels({
+      runs: [
+        run({ id: "open" }),
+        run({ id: "closed", state: "completed" }),
+        run({ id: "maintained", state: "completed" }),
+      ],
+      stepsByRun: {},
+      sessions: [],
+      maintenance: [
+        {
+          taskId: "maintained",
+          recordId: "record-1",
+          stage: "waiting_review",
+          prUrl: "https://github.com/example/repo/pull/7",
+          manualControl: false,
+        },
+      ],
+    });
+    const task = (id: string) => models.find((model) => model.run.id === id)!;
+
+    expect(needsOrchestrator(task("open"))).toBe(true);
+    expect(needsOrchestrator(task("closed"))).toBe(false);
+    expect(needsOrchestrator(task("maintained"))).toBe(true);
   });
 });

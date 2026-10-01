@@ -160,6 +160,53 @@ describe("orchestrator views", () => {
     expect(visual.motion).toBe(shared.motion);
   });
 
+  it.each([
+    ["awaiting_lead", "waiting_review", false, "PR · Waiting for review", "queued"],
+    ["completed", "ready", false, "PR · Ready to merge", "done"],
+    ["awaiting_lead", "blocked", false, "PR · Blocked", "waiting-for-permission"],
+    ["awaiting_lead", "paused", true, "PR · Manual control", "idle"],
+  ] as const)(
+    "shows a %s task's PR maintenance (%s) instead of its parked run state",
+    (state, stage, manualControl, label, visualState) => {
+      const [model] = buildRunViewModels({
+        runs: [run({ state })],
+        stepsByRun: {},
+        sessions: [],
+        maintenance: [
+          {
+            taskId: "r1",
+            recordId: "job",
+            stage,
+            prUrl: "https://github.com/example/repo/pull/1",
+            manualControl,
+          },
+        ],
+      });
+      const visual = runVisual(model!);
+      expect(visual.label).toBe(label);
+      expect(visual.icon).toBe(statusDescriptor(visualState).icon);
+      expect(visual.color).toBe(statusDescriptor(visualState).color);
+    },
+  );
+
+  it("keeps a handed-over task's review badge ahead of its PR maintenance", () => {
+    const [model] = buildRunViewModels({
+      runs: [run({ state: "awaiting_human" })],
+      stepsByRun: {},
+      sessions: [],
+      maintenance: [
+        {
+          taskId: "r1",
+          recordId: "job",
+          stage: "ready",
+          prUrl: "https://github.com/example/repo/pull/1",
+          manualControl: false,
+        },
+      ],
+    });
+    expect(runVisual(model!).label).toBe("Needs review");
+  });
+
   it.each(["stage", "list", "dependency"] as const)(
     "opens the same task detail from the %s view",
     (mode) => {
@@ -346,13 +393,76 @@ describe("orchestrator views", () => {
     expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
   });
 
-  it("still offers Stop when the lead ended before its owned work", () => {
+  it("offers Resume, not Stop, while a stopped lead's tasks keep running", () => {
+    // Stop only ends the lead's conversation, so its tasks outliving it is the
+    // ordinary case. Offering Stop again here would leave no way back in.
+    const onResumeOrchestrator = vi.fn();
     page("stage", vi.fn(), undefined, {
       conversation: conversation({ state: "failed" }),
+      onResumeOrchestrator,
     });
 
-    expect(screen.getByRole("button", { name: "Stop orchestrator" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop orchestrator" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Dismiss orchestrator" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Resume orchestrator" }));
+    expect(onResumeOrchestrator).toHaveBeenCalled();
+  });
+
+  it("allows dismissing a stopped lead while another conversation is still working", () => {
+    // The board lists every conversation's tasks; only this one's decide.
+    page(
+      "stage",
+      vi.fn(),
+      models([
+        run({ id: "mine", state: "completed" }),
+        run({ id: "theirs", leadSessionId: "other-lead", state: "running" }),
+      ]),
+      { conversation: conversation({ state: "stopped" }) },
+    );
+
+    expect(screen.getByRole("button", { name: "Resume orchestrator" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Dismiss orchestrator" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop orchestrator" })).toBeNull();
+  });
+
+  it("describes Stop as ending only the conversation", () => {
+    page("stage");
+
+    expect(
+      screen.getByRole("button", { name: "Stop orchestrator" }).getAttribute("title"),
+    ).toBe("Stop this orchestrator's conversation. Its tasks and agents keep running.");
+  });
+
+  it("offers to transfer this conversation's tasks that still need an owner", () => {
+    const onTransferTasks = vi.fn();
+    page(
+      "stage",
+      vi.fn(),
+      models([
+        run({ id: "mine", state: "running" }),
+        run({ id: "done", state: "completed" }),
+        run({ id: "theirs", leadSessionId: "other-lead", state: "running" }),
+      ]),
+      { conversation: conversation({ state: "stopped" }), onTransferTasks },
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Transfer tasks (1)" }));
+
+    expect(onTransferTasks).toHaveBeenCalled();
+  });
+
+  it("offers no transfer to a conversation with nothing left to own", () => {
+    page(
+      "stage",
+      vi.fn(),
+      models([
+        run({ id: "done", state: "completed" }),
+        run({ id: "theirs", leadSessionId: "other-lead" }),
+      ]),
+      { onTransferTasks: vi.fn() },
+    );
+
+    expect(screen.queryByRole("button", { name: /Transfer tasks/ })).toBeNull();
   });
 
   it("puts what needs a person at the top of its column", () => {
@@ -479,6 +589,24 @@ describe("task detail", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete task" }));
 
     expect(props.onDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it("names the conversation the task is assigned to and offers to move it", () => {
+    const onTransfer = vi.fn();
+    detail({ ownerLabel: "Night shift", onTransfer });
+
+    expect(screen.getByText(/^Night shift/)).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Conversation" }).getAttribute("title"),
+    ).toBe("Open Night shift, the conversation this task is assigned to");
+    fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
+    expect(onTransfer).toHaveBeenCalled();
+  });
+
+  it("offers no transfer where nothing can carry it out", () => {
+    detail();
+
+    expect(screen.queryByRole("button", { name: "Transfer" })).toBeNull();
   });
 
   it("says a freshly opened task is waiting on the orchestrator, not on you", () => {

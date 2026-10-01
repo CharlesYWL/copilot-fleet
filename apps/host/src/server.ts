@@ -3,11 +3,16 @@ import { randomBytes } from "node:crypto";
 import { existsSync } from "node:fs";
 import { createServer as createPortProbe } from "node:net";
 import { fileURLToPath } from "node:url";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import websocket from "@fastify/websocket";
 import fastifyStatic from "@fastify/static";
 import { errorMessage } from "@fleet/protocol";
+import {
+  forgetLauncherEnvironment,
+  gitRevision,
+  repoRoot,
+} from "@fleet/protocol/runtime";
 import { cachedGitRevision } from "./host-revision.js";
 import { announceClaimCode } from "./claim-announcement.js";
 import { defaultSecureDataDeps, secureHostDataFiles } from "./data-permissions.js";
@@ -52,10 +57,24 @@ import { commandExecutionRoutes } from "./routes/command-executions.js";
 import { startNotificationRetentionMonitor } from "./notifications/retention.js";
 import { startSessionRetentionMonitor } from "./session-retention.js";
 import { sessionRoutes } from "./routes/sessions.js";
+import { sessionFileRoutes } from "./routes/session-files.js";
 import { runRoutes } from "./routes/runs.js";
+import { workerResumeRoutes } from "./routes/worker-resume.js";
 import { managedWorktreeRoutes } from "./routes/managed-worktrees.js";
 import { orchestratorRoutes } from "./routes/orchestrators.js";
 import { systemRoutes } from "./routes/system.js";
+import { hostUpdateRoutes } from "./routes/host-update.js";
+import {
+  HostSelfUpdate,
+  checkoutBusy,
+  defaultLaunchProbe,
+  detectHostLaunch,
+  readLocalNodeId,
+  requestLauncherUpdate,
+  scheduleServiceUpdate,
+  uncommittedChanges,
+  type HostSelfUpdateOptions,
+} from "./self-update.js";
 import { FleetStore } from "./store.js";
 import { TunnelSupervisor } from "./tunnel.js";
 import { recordingLogStream } from "./log-stream.js";
@@ -105,6 +124,24 @@ export async function buildServer(
     useBuiltInEntra?: boolean;
     /** Destructive, console-only startup. Never exposed through an HTTP route. */
     resetOperatorAuth?: boolean;
+    /**
+     * Overrides for the Host's own update, for tests: how it was started, where
+     * it keeps its record, and what it would run.
+     */
+    hostSelfUpdate?: Partial<
+      Pick<
+        HostSelfUpdateOptions,
+        | "launch"
+        | "statusFile"
+        | "localNodeId"
+        | "currentRevision"
+        | "checkoutBusy"
+        | "uncommittedChanges"
+        | "requestLauncher"
+        | "scheduleService"
+        | "pollMs"
+      >
+    >;
   } = {},
 ): Promise<FastifyInstance> {
   const sessionRetentionDays = resolveSessionRetentionDays(
@@ -112,20 +149,20 @@ export async function buildServer(
   );
   const logs = createLogBuffer();
   const app = Fastify({ logger: { stream: recordingLogStream(logs) } });
-  const store = new FleetStore(
-    options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH),
-    {
-      exclusive: options.resetOperatorAuth === true,
-      // The Host database holds this Host's private key and its administrator
-      // table, so what the filesystem says about it is part of the security
-      // boundary rather than a detail of where it happens to live.
-      secureFiles: (databasePath) =>
-        secureHostDataFiles(
-          databasePath,
-          defaultSecureDataDeps((message) => app.log.warn(message)),
-        ),
-    },
-  );
+  const databasePath =
+    options.databasePath ?? resolveDatabasePath(process.env.DATABASE_PATH);
+  const store = new FleetStore(databasePath, {
+    warn: (message) => app.log.warn(message),
+    exclusive: options.resetOperatorAuth === true,
+    // The Host database holds this Host's private key and its administrator
+    // table, so what the filesystem says about it is part of the security
+    // boundary rather than a detail of where it happens to live.
+    secureFiles: (databasePath) =>
+      secureHostDataFiles(
+        databasePath,
+        defaultSecureDataDeps((message) => app.log.warn(message)),
+      ),
+  });
   store.resetConnectivity();
   const enrollment: LegacyEnrollment = {
     token: resolveRuntimeEnrollmentToken(store, options.enrollmentToken),
@@ -225,6 +262,48 @@ export async function buildServer(
     cachedGitRevision(),
     sessionRetentionDays,
   );
+  const checkout = repoRoot();
+  const selfUpdate = options.hostSelfUpdate ?? {};
+  const hostLaunch = selfUpdate.launch ?? detectHostLaunch(defaultLaunchProbe(checkout));
+  // Read once, then kept from everything this Host starts; see the helper.
+  forgetLauncherEnvironment();
+  /** What a login service is running, which is HEAD when it started. */
+  const startupRevision = hostLaunch.mode === "service" ? gitRevision(checkout) : "";
+  const hostUpdate = new HostSelfUpdate({
+    launch: hostLaunch,
+    statusFile:
+      "statusFile" in selfUpdate
+        ? selfUpdate.statusFile
+        : databasePath === ":memory:"
+          ? undefined
+          : join(dirname(databasePath), "self-update.json"),
+    startupRevision: () => startupRevision,
+    currentRevision: selfUpdate.currentRevision ?? (() => gitRevision(checkout)),
+    startedAt: performance.timeOrigin,
+    publish: (status) => service.publishHostUpdate(status),
+    localNodeId: selfUpdate.localNodeId ?? (() => readLocalNodeId()),
+    localNodeState: (nodeId) => {
+      const node = store.getNode(nodeId);
+      return node ? { online: node.online, revision: node.revision } : undefined;
+    },
+    liveSessions: (nodeId) => service.liveSessionsOn(nodeId),
+    nodeUpdateInFlight: (nodeId) => service.nodeUpdateInFlight(nodeId),
+    stopSessions: (nodeId, sessions) =>
+      service.stopSessionsForUpdate(nodeId, sessions, "Stopped to update the Host"),
+    checkoutBusy: selfUpdate.checkoutBusy ?? (() => checkoutBusy(checkout)),
+    uncommittedChanges:
+      selfUpdate.uncommittedChanges ?? (() => uncommittedChanges(checkout)),
+    requestLauncher: selfUpdate.requestLauncher ?? requestLauncherUpdate,
+    scheduleService:
+      selfUpdate.scheduleService ??
+      ((request) => scheduleServiceUpdate(request, { repoRoot: checkout })),
+    log: app.log,
+    ...(selfUpdate.pollMs !== undefined ? { pollMs: selfUpdate.pollMs } : {}),
+  });
+  service.attachHostUpdate(hostUpdate);
+  hostUpdate.start();
+  // Serving is what a restart that only launched this Host is confirmed by.
+  app.addHook("onListen", async () => hostUpdate.ready());
   const leadTokens = new LeadTokens(store);
   /*
    * Minted on the first boot that needs one and kept for the life of the fleet:
@@ -347,6 +426,7 @@ export async function buildServer(
   });
   await app.register(catalogRoutes, { service });
   await app.register(sessionRoutes, { service });
+  await app.register(sessionFileRoutes, { service });
   await app.register(notificationRoutes, { service });
   await app.register(commandExecutionRoutes, { service, auth });
 
@@ -375,6 +455,7 @@ export async function buildServer(
      */
     mcpUrl: () => new URL(MCP_PATH, enrollmentHostUrl()).toString(),
     tickRun: (runId) => engine.tickRun(runId),
+    resume: engine.resume,
   });
   await app.register(mcpRoutes, {
     service,
@@ -385,8 +466,10 @@ export async function buildServer(
     audit: (entry) => auth.audit(entry),
   });
   await app.register(runRoutes, { service, engine });
+  await app.register(workerResumeRoutes, { engine });
   await app.register(managedWorktreeRoutes, { service });
   await app.register(orchestratorRoutes, { service, engine });
+  await app.register(hostUpdateRoutes, { hostUpdate });
 
   registerBrowserGateway(app, { service, auth, registry: browsers });
   registerNodeGateway(app, service, { identity: hostIdentity });
@@ -444,6 +527,7 @@ export async function buildServer(
     clearInterval(runDeadlineTimer);
     clearInterval(hostUrlMonitor);
     clearInterval(sessionTimer);
+    hostUpdate.close();
     await tunnel.stop();
     service.shutdown();
     store.close();

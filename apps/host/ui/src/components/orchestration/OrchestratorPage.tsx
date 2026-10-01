@@ -7,6 +7,7 @@ import {
 } from "@fleet/protocol";
 import type { OrchestratorViewMode } from "../navigation/ContextModeToggle";
 import type { OrchestratorSummary, RunViewModel } from "../../lib/orchestration-view";
+import { needsOrchestrator } from "../../lib/orchestration-view";
 import { OrchestratorHeader } from "./OrchestratorHeader";
 import { OrchestratorStageBoard } from "./OrchestratorStageBoard";
 import { OrchestratorRunList } from "./OrchestratorRunList";
@@ -70,6 +71,8 @@ export type OrchestratorPageProps = {
   onStopOrchestrator: () => void;
   onResumeOrchestrator: () => void;
   onDismissOrchestrator: () => void;
+  /** Hands this conversation's tasks to another one; absent when none can take them. */
+  onTransferTasks?: (() => void) | undefined;
   onOpenCommands?: (() => void) | undefined;
   commandExecutionCount?: number;
 };
@@ -97,14 +100,26 @@ export const OrchestratorPage = ({
   onStopOrchestrator,
   onResumeOrchestrator,
   onDismissOrchestrator,
+  onTransferTasks,
   onOpenCommands,
   commandExecutionCount = 0,
 }: OrchestratorPageProps) => {
   const styles = useStyles();
   const ended = terminalSessionStates.has(conversation.state);
   const stopping = Boolean(conversation.stopRequested);
+  /*
+   * Only this conversation's tasks, and only to decide whether it can be
+   * dismissed. The board shows every conversation's work, and Stop no longer
+   * ends a lead's tasks, so neither is a reason to keep offering Stop to a lead
+   * that has already stopped instead of the Resume it needs.
+   */
   const hasActiveWork = models.some(
-    (model) => !terminalRunStates.has(model.run.state) || (model.stoppingSteps ?? 0) > 0,
+    (model) =>
+      model.run.leadSessionId === conversation.id &&
+      (!terminalRunStates.has(model.run.state) || (model.stoppingSteps ?? 0) > 0),
+  );
+  const unhanded = models.filter(
+    (model) => model.run.leadSessionId === conversation.id && needsOrchestrator(model),
   );
   const resumable = isResumableSession(conversation) && !stopping;
 
@@ -163,6 +178,16 @@ export const OrchestratorPage = ({
             Commands ({commandExecutionCount})
           </Button>
         )}
+        {onTransferTasks && unhanded.length > 0 && (
+          <Button
+            size="small"
+            appearance="subtle"
+            onClick={onTransferTasks}
+            title="Hand this orchestrator's open and PR-maintaining tasks to another conversation, for example when its context is full"
+          >
+            Transfer tasks ({unhanded.length})
+          </Button>
+        )}
         {activeAgentCount > 0 && (
           <Button
             size="small"
@@ -173,16 +198,18 @@ export const OrchestratorPage = ({
             Stop agents ({activeAgentCount})
           </Button>
         )}
-        {ended && !stopping && !hasActiveWork ? (
+        {ended && !stopping ? (
           <>
             {resumable && (
               <Button size="small" appearance="primary" onClick={onResumeOrchestrator}>
                 Resume orchestrator
               </Button>
             )}
-            <Button size="small" appearance="secondary" onClick={onDismissOrchestrator}>
-              Dismiss orchestrator
-            </Button>
+            {!hasActiveWork && (
+              <Button size="small" appearance="secondary" onClick={onDismissOrchestrator}>
+                Dismiss orchestrator
+              </Button>
+            )}
           </>
         ) : (
           <Button
@@ -190,6 +217,12 @@ export const OrchestratorPage = ({
             appearance="subtle"
             disabled={stopping && conversation.state !== "offline"}
             onClick={onStopOrchestrator}
+            {...(stopping
+              ? {}
+              : {
+                  title:
+                    "Stop this orchestrator's conversation. Its tasks and agents keep running.",
+                })}
           >
             {stopping
               ? conversation.state === "offline"

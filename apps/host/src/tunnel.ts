@@ -552,6 +552,7 @@ export class TunnelSupervisor {
 
   constructor(private readonly options: TunnelManagerOptions) {
     this.probe = options.probe ?? new BinaryProbe();
+    for (const spec of providerList) this.manager(spec.id);
   }
 
   private manager(provider: TunnelProvider): TunnelManager {

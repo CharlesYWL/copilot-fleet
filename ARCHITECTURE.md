@@ -3,9 +3,9 @@
 ## Core ownership rules
 
 1. **Host owns desired state and history.** It stores Nodes, Workspaces, Placements, Sessions, and ordered Session Events.
-2. **Node owns execution.** Copilot login, child processes, local paths, and ACP connections never leave the Node.
+2. **Node owns execution.** Agent login, profiles, child processes, local paths, and ACP connections never leave the Node.
 3. **Workspace is logical; Placement is physical.** A Workspace can be available on several Nodes, each with a different absolute local path. A Session is assigned to one Placement and therefore one Node.
-4. **One Fleet Session owns one Copilot ACP process.** This makes cancellation, permissions, isolation, and concurrent capacity predictable.
+4. **One Fleet Session owns one ACP agent process.** Copilot remains the worker backend; orchestrators may also use Hermes. This makes cancellation, permissions, isolation, and concurrent capacity predictable.
 5. **Nodes only dial out.** Each Node registers with a Host URL and keeps one authenticated outbound WebSocket. No inbound firewall rule is required on Windows Nodes.
 
 ## Components
@@ -31,15 +31,35 @@ Windows Node App
           | ACP NDJSON over stdio
           v
 copilot --acp --stdio
+or hermes -p <profile> acp (orchestrators only)
 ```
 
 Agency mode is an opt-in Host setting applied at the common command-dispatch
-boundary to every session start and resume. The executing Node resolves Agency
+boundary to every Copilot session start and resume. The executing Node resolves Agency
 on its own PATH and uses `agency copilot --acp --stdio`, preserving the ACP
 transport, permissions, and per-session Fleet MCP injection. Only a missing
 Agency installation falls back to the Node's standard Copilot command, with a
 session-log notice; Agency startup errors are not hidden by a fallback.
 Already-running sessions keep their launcher until stopped and resumed.
+
+Orchestrator backend selection is a separate Host preference. Auto means Copilot.
+The Host prefers a compatible online workspace placement and falls back to
+Copilot, with a transcript notice, only when creating a new lead with no available
+Hermes installation. Each session persists its actual typed `agentParams`,
+including the Hermes profile, through explicit/automatic resume, MCP process
+replacement and Host backup. Profile/authentication errors are not fallback cases.
+Host admission and Node slot reservation allow only one live Hermes lead per
+profile per Node; profile memory is Node-local. A stopped lead never changes
+backend merely because the preference or installed agents changed.
+
+`apps/node/src/agent-kinds` isolates launch, usage and picker differences while
+the shared ACP client retains transport, permissions, sequencing and process
+cleanup. Hermes uses native model/mode ACP methods and auto-approval of offered
+allow options for YOLO leads. It receives the full orchestrator briefing and
+the same scoped HTTP MCP tools. Copilot-specific Agency/context/model defaults,
+credit polling and CAPI rollover are not applied to Hermes. Hermes native
+history is excluded from Copilot's automatic retention/deletion path.
+See [the reviewed backend plan](docs/orchestrator-agent-backend-plan.md).
 
 The execution backend remains ACP. Validate the upstream context-flag fix before
 considering a separately approved migration of the Node-side adapter.
@@ -107,6 +127,13 @@ Completion delivery has a separate capability on the lead's Node and a persisten
 per-lead prompt reservation across ticks. Competing command completions, ordinary
 Run wakes, and human prompts cannot overwrite an in-flight handoff. Receiver-side
 deduplication records admission and settlement, not exactly-once model consumption.
+Only an `accepted` handoff holds the lead's native conversation. `uncertain` —
+reached when the prompt returns without a current turn_complete, the session
+ends, or the Node restarts mid-turn — means the turn is already over and only its
+consumption is unknown. It stays as evidence and its delivery id is never
+prompted again, but it releases the conversation: nothing ever settles it, and
+when it held the lead a Node restart during a wake left that orchestrator unable
+to resume, be prompted, or receive another handoff.
 The browser receives bounded live output and reads retained bytes by cursor;
 slow consumers recover explicitly instead of growing unbounded queues.
 
@@ -196,6 +223,9 @@ Object supervision, releasing a lease only after verified process-tree terminati
 Uncertain ownership is durably reconciliation-required without suppressing the
 terminal event. Resume can rotate a Host fencing attempt on the same live
 conversation through an atomic lease reattachment, never a second writer.
+Host backups preserve read-only classification and each step's workspace identity,
+state, and result metadata. Restored execution bindings remain quarantined until
+their exact worktree and generation reconcile, for primary and derived workspaces.
 See [Managed worktree isolation](docs/managed-worktree-isolation.md) for the
 two-layer lock model, persisted mode resolution and recovery rules.
 
@@ -265,6 +295,17 @@ settled process and waits for the Node's verified terminal receipt. Follow-up
 resumes the same Copilot conversation and immutable task binding, preserving
 committed and uncommitted changes rather than constructing another worktree.
 
+The scheduling pass that leaves a follow-up pending also records why, and that
+reason — never a separate guess — is what the task page, the worker's banner and
+the orchestrator's tools report, distinguishing same-checkout from same-Node
+concurrency. "Resume now" lets ordinary scheduling act first; the one
+restriction it can turn into a one-time exception is a Node's reserved
+scheduling slot, and only through a durable request bound to the exact attempt,
+conversation, Node, checkout, queued prompt and slot holders that a signed-in
+operator approves in a dialog. The planner spends it at most once and only while
+that binding holds; checkout exclusivity, budgets and holds are never
+overridden. See [Queued follow-up admission and Resume now](docs/orchestration-lifecycle.md#queued-follow-up-admission-and-resume-now).
+
 Where a step runs is decided once, in `decidePlacement`, and recorded on the
 step. A Run pins to a checkout when it first writes to one, so later work that
 must see those changes — a reviewer above all — is sent there. That pin says
@@ -295,6 +336,12 @@ Revocation is therefore the state of the session rather than the presence of a
 row: a call must resolve to a session that still exists, is still a lead, and is
 not terminal. Stopping an orchestrator takes its tools away on the next call.
 
+Stopping it ends that conversation and nothing else. Its tasks keep running —
+steps already dispatched finish and pending ones still dispatch — and each
+settle is owed to the lead as a wake, delivered once Resume brings it back. It
+used to archive every task as well, so stopping a lead that had wedged threw
+its in-flight work away with it.
+
 `session/load` takes its own server list, so an orchestrator resumed without one
 comes back unable to dispatch anything; the same config is supplied on both
 paths.
@@ -305,6 +352,41 @@ connected on it. Left to the Host the address came from the same resolution
 enrollment uses, which prefers a public tunnel, and an agent on the Host's own
 machine would have been sent out to the internet to reach a port it was already
 talking to.
+
+### Handing tasks to another orchestrator
+
+A task belongs to exactly one orchestrator: its run's `leadSessionId`. The owner
+is what the engine wakes when the task's work settles, what its owed prompts go
+to, whose conversation panel lists it, and what PR maintenance's heartbeat
+claims the task's registrations for. One owner per task is what keeps two
+heartbeats off one PR.
+
+Ownership moves; the work does not. An orchestrator has one context window —
+ACP offers no long-context tier — so a long-lived conversation fills, and
+starting a fresh one only helps if the work in flight can follow it.
+`transferRun` reassigns a task in one transaction: the run, its maintenance
+registrations (a pause the previous lead made itself goes with them) and a
+pending maintenance proposal. Workers, steps, checkout, budget and notes stay
+where they are, and a step already running settles to the new owner.
+
+The new owner has none of the task's history, so it is owed a
+`<fleet-task-transfer>` brief — held on the run like any owed prompt, together
+with anything the previous owner was owed and never sent — telling it to read
+the record and continue rather than re-plan. A closed task moves without one,
+because nothing is delivered to a closed task and an owed prompt there would
+only hold its sessions back from retention. A send-back, reopen or maintenance
+direction that arrives before the brief is read is appended to it, not
+substituted for it.
+
+Who may transfer is deliberately not restricted. The operator moves tasks from a
+task's page, a conversation's task panel or the board, and an orchestrator hands
+work on or takes it over with `fleet_transfer_task`; `fleet_list_orchestrators`
+is the one read that crosses conversation scope. What is refused is an unsafe
+move: to a conversation that is stopped, stopping or dismissed; while a command
+may still be changing the task's checkout; or while a command the previous owner
+requested for the task is unsettled, since its result goes to whoever asked. A
+registration's observation scope includes its owner, so a reservation the
+previous lead held cannot be checkpointed after the move.
 
 ### Opt-in PR maintenance
 
@@ -458,6 +540,12 @@ Session alone; failing it would destroy a healthy run over a mistimed message.
 The Node re-announces the Session's true state behind the refusal, so a composer
 opened over a wrong guess closes on its own.
 
+A refused start or resume is the exception: no process started, so nothing will
+ever re-announce it, and the `starting` the Host recorded would stand forever —
+shown as running, with Cancel disabled. When the refused command is the launch
+the Session is still waiting on, the Host settles it `failed` with the Node's
+reason, which keeps it resumable.
+
 ### Turns Copilot starts on its own
 
 Not every Turn begins with a prompt. A backgrounded shell finishing wakes the
@@ -500,6 +588,7 @@ The Node WebSocket carries:
 - Host commands: start, prompt, cancel, stop, permission response
 - Host address announcements when the Host's public URL changes
 - Self-update instructions, and the progress a Node reports back
+- Session file reads for browser downloads, each answered by one chunk
 - Node command results and ordered Session Events
 
 Commands use unique IDs for deduplication. Events use an event UUID and a monotonically increasing per-Session sequence.
@@ -514,6 +603,32 @@ sequence runs ahead of the next expected one rather than refusing it: the missin
 events are gone with the outage, and a Host that insists on them refuses
 everything after them too, which leaves the Session unable to report its own
 state ever again.
+
+### Session file downloads
+
+A browser download of a file on a session's machine is pulled through the Host,
+because Nodes only dial out. `GET /api/sessions/:id/files/stat` and `/download`
+send `session_file_read` over the Node's sealed channel — never a legacy one, and
+only to Nodes advertising `session-files-v1` — and each `session_file_data`
+answers exactly one read. Reads are stateless: each names the file, offset and
+length again and carries the `version` (device, file id, size and modification
+time) the first read reported, so an abandoned download leaves nothing open on
+the Node and a file that changes mid-download fails instead of arriving spliced.
+The Host keeps two 256 KiB reads in flight per download and at most three
+downloads per Node, answers the browser only once the first chunk is in hand so
+a refusal is still an HTTP error, and fails pending reads when the Node
+disconnects or 30 seconds pass without an answer.
+
+The Host names the session's roots — its working directory (execution binding,
+else placement), additional directories, whether it is an orchestrator, its
+Copilot session id, and the Host's own data directory as protected — and the
+Node decides. It resolves the path through links and junctions, requires it to
+lie inside a root, and refuses its own configuration directory, Copilot's home
+and whatever the Host marked protected, unless the root granting the file sits
+strictly inside them: an orchestrator's scratch directory, the session's own
+`session-state` folder. Responses are `application/octet-stream` attachments
+with no HEAD route, because Fastify would drain the whole file across the Node's
+connection to answer one.
 
 ### Host address changes
 
@@ -652,6 +767,61 @@ an address that no longer existed — unreachable, and therefore impossible to
 tell where the Host had gone. Settings-backed flags are dropped and the current
 settings are written to disk before the Node exits; flags with no home in
 settings, such as the enrollment token and the config port, are passed through.
+
+### Keeping the Host current
+
+The Host updates itself with the same procedure (`@fleet/protocol/updater`:
+fetch, hard reset onto the tracking branch, `npm install --include=dev`, build),
+building everything with `npm run build` because the Node started beside it runs
+from the same checkout. That module is the one place the update strategy lives,
+so replacing commits with released versions later is a change there rather than
+in both services.
+
+Unlike a Node, the Host never runs the steps itself. Under `npm run dev` the file
+watcher restarts the Host the moment the reset rewrites its source, killing the
+update halfway; and as a Windows login service, everything the Host starts sits
+in the task's kill-on-close job, so a process it spawned to run
+`npm run service -- host+node restart` would die at the step that stops the Host
+task. The work therefore belongs to something that survives the restart:
+
+- `npm run dev`, `npm run dev:tunnel` and `npm start` run their commands
+  (`<script>:bare`) under `scripts/launcher.mjs`. The Host asks it over a local
+  socket (endpoint and token in the environment it hands down, which the Node
+  strips before starting agents); the launcher updates, then stops the whole
+  process tree and runs the same command again in the same terminal.
+- A login-service Host registers a one-off scheduled task for the same user
+  (`scripts/self-update.mjs`), which Task Scheduler runs outside both Fleet
+  tasks. It updates, runs `npm run service -- host+node restart` (or `host`
+  when the Node task was stopped on purpose or is not installed), and deletes
+  itself. The Host recognises that it was started by the login service because
+  its standard output is the log file the service manifest names.
+
+Either updater writes every stage to `self-update.json` in the Host's data
+directory, rewriting it every thirty seconds while a long step runs, and takes
+`.fleet-update.lock` in the checkout for as long as git and npm are working in it
+— the same lock a Node's own update takes, created whole and touched as it
+works, so the Host and the Node beside it never update one checkout at once,
+even across a restart. The Host relays the record to browsers while it lasts,
+and the Host that comes back reads it. Neither restart can see its own outcome —
+the launcher only launches a command, and the login CLI only checks that the
+tasks are running — so the restarted Host finishes the record: once it is
+listening, on the commit the update built, and with the Node beside it back on
+that commit (within three minutes) if this Host knows that Node. Any other
+unfinished record whose updater has gone quiet is a failure. As with a Node, a
+build that fails restarts nothing. The Host additionally refuses a checkout with
+uncommitted changes to tracked files — often somebody's working copy — asking
+when the operator clicks and again in the updater just before the reset, and
+treating a checkout git cannot read as dirty. It refuses while the Node beside
+it is running sessions unless the operator agrees to stop exactly the ones
+listed, and until the restart it refuses to start or resume anything new there.
+
+At the restart-confirmation handoff, the updater stops rewriting its heartbeat
+record, so it cannot overwrite the new Host's final outcome. Browsers likewise
+keep newer live update status and complete snapshots when an older REST response
+arrives.
+
+git is never run through a shell. A tracked branch may legally be called
+`release&x`; joined into a Windows command line, that was a second command.
 
 ### Node to Copilot
 

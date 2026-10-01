@@ -27,14 +27,20 @@ import {
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
   DURABLE_LEAD_DELIVERY_CAPABILITY,
+  SESSION_FILES_CAPABILITY,
   COMMAND_LIMITS,
   CommandExecutionHostMessageSchema,
   LeadPromptDeliverySchema,
 } from "@fleet/protocol";
 import { type AuthenticatedChannel } from "@fleet/protocol/node-auth";
-import { gitRevision, repoRoot } from "@fleet/protocol/runtime";
+import {
+  forgetLauncherEnvironment,
+  gitRevision,
+  repoRoot,
+} from "@fleet/protocol/runtime";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
-import { AcpAgentFactory, MockAgentFactory } from "./agents.js";
+import { ACP_START_TIMEOUT_MS, AcpAgentFactory, MockAgentFactory } from "./agents.js";
+import { detectAgentKinds } from "./agent-kinds/index.js";
 import { CliError, USAGE, argvForRestart, parseNodeArgs } from "./cli.js";
 import {
   configDirectory,
@@ -76,7 +82,12 @@ import {
   type TunnelMode,
 } from "./host-endpoints.js";
 import { envFilePath, packageVersion } from "./paths.js";
-import { catalogSummary, readAgentCatalog, userAgentDirectory } from "./agent-catalog.js";
+import {
+  catalogSummary,
+  readAgentCatalog,
+  userAgentDirectory,
+  type CatalogEntry,
+} from "./agent-catalog.js";
 import {
   AUTH_FAILED_CLOSE_CODE,
   SUPERSEDED_CLOSE_CODE,
@@ -85,6 +96,7 @@ import {
 } from "./instance-lock.js";
 import { CommandRouter, validateWorkspacePath } from "./router.js";
 import { ManagedWorktrees } from "./managed-worktrees.js";
+import { SessionFileReader } from "./session-files.js";
 import { NodeAdmission } from "./node-admission.js";
 import { UpdateQuarantine } from "./update-quarantine.js";
 import { RepositoryParticipation } from "./repository-participation.js";
@@ -111,7 +123,7 @@ import {
   reconnectFlushLog,
   watchHostLiveness,
 } from "./socket.js";
-import { configServerPort, startConfigServer } from "./config-server.js";
+import { configServerPort, nodeIdentityUrl, startConfigServer } from "./config-server.js";
 import {
   loadSettings,
   needsReconnect,
@@ -158,6 +170,9 @@ export type NodeRuntime = { shutdown: () => Promise<void> };
  * could be covered by a test.
  */
 export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
+  // Started beside the Host by the launcher, this process inherits a token that
+  // restarts the Host; no agent or command it runs has any business holding it.
+  forgetLauncherEnvironment();
   const flags = parseNodeArgs(argv);
   loadEnv({ path: envFilePath(), quiet: true });
   // One lookup path for both sources; the flags are already the last word.
@@ -281,19 +296,32 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /**
    * Read fresh on every use rather than cached at startup, so an operator who
    * drops an agent into the config directory does not have to restart the Node
-   * to offer it. A handful of small files is not worth a cache.
+   * to offer it. Only reuse the last successful snapshot when a read fails.
    */
+  let lastAgentCatalog: CatalogEntry[] = [];
   const agentCatalog = async () => {
     try {
-      return await readAgentCatalog();
+      lastAgentCatalog = await readAgentCatalog();
     } catch (error) {
-      warn(`Could not read the agent catalog: ${errorMessage(error)}`);
-      return [];
+      warn(
+        `Could not read the agent catalog; keeping the last known catalog: ${errorMessage(error)}`,
+      );
     }
+    return lastAgentCatalog;
   };
   const catalogAtStartup = await agentCatalog();
   /** What the Host is told this machine can be; refreshed on every dial. */
   let advertisedAgents = catalogSummary(catalogAtStartup);
+  const readAgentKinds = async () => {
+    if (mockAgent) return [{ kind: "copilot" as const }];
+    try {
+      return await detectAgentKinds();
+    } catch (error) {
+      warn(`Could not detect agent backends: ${errorMessage(error)}`);
+      return [{ kind: "copilot" as const }];
+    }
+  };
+  let advertisedAgentKinds = await readAgentKinds();
   log(
     `  agents      ${
       catalogAtStartup.length === 0
@@ -344,12 +372,19 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   /** Whether this outage has already reported that there is nowhere to rotate. */
   let strandedReported = false;
 
+  /**
+   * Where agents read this node's current Fleet name. Installed once the config
+   * page exists, which is after the factory that hands it to them.
+   */
+  let identityUrl: () => string | undefined = () => undefined;
   const factory = mockAgent
     ? new MockAgentFactory()
     : new AcpAgentFactory(
         settings.permissionTimeoutMs,
         settings.copilotCommand,
         settings.contextTier,
+        ACP_START_TIMEOUT_MS,
+        () => ({ nodeId: credentials.nodeId, identityUrl: identityUrl() }),
       );
   let socket: WebSocket | undefined;
   /**
@@ -467,7 +502,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
   ): Promise<WorkspaceResult> => {
     const started = Date.now();
     const key = transferKey(result.id, result.artifactId);
-    let pending = waitFor(transferAcks, key);
     if (
       !send({
         type: "artifact_upload_begin",
@@ -480,7 +514,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       })
     )
       throw new Error("Host is unavailable for artifact upload.");
-    let ack = await pending;
+    let ack = await waitFor(transferAcks, key);
     if (!ack.ok) throw new Error(ack.error || ack.code);
     const file = await open(path, "r");
     try {
@@ -491,35 +525,39 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         );
         const buffer = Buffer.alloc(length);
         const { bytesRead } = await file.read(buffer, 0, length, ack.offset);
-        pending = waitFor(transferAcks, key);
-        send({
-          type: "artifact_upload_chunk",
-          transfer: {
-            operationId: result.id,
-            resultId: result.id,
-            artifactId: result.artifactId,
-            offset: ack.offset,
-            data: buffer.subarray(0, bytesRead).toString("base64"),
-          },
-        });
-        ack = await pending;
+        if (
+          !send({
+            type: "artifact_upload_chunk",
+            transfer: {
+              operationId: result.id,
+              resultId: result.id,
+              artifactId: result.artifactId,
+              offset: ack.offset,
+              data: buffer.subarray(0, bytesRead).toString("base64"),
+            },
+          })
+        )
+          throw new Error("Host is unavailable for artifact upload.");
+        ack = await waitFor(transferAcks, key);
         if (!ack.ok) throw new Error(ack.error || ack.code);
       }
     } finally {
       await file.close();
     }
-    pending = waitFor(transferAcks, key);
-    send({
-      type: "artifact_upload_complete",
-      transfer: {
-        operationId: result.id,
-        resultId: result.id,
-        artifactId: result.artifactId,
-        size: result.artifactSize,
-        sha256: result.artifactSha256,
-      },
-    });
-    ack = await pending;
+    if (
+      !send({
+        type: "artifact_upload_complete",
+        transfer: {
+          operationId: result.id,
+          resultId: result.id,
+          artifactId: result.artifactId,
+          size: result.artifactSize,
+          sha256: result.artifactSha256,
+        },
+      })
+    )
+      throw new Error("Host is unavailable for artifact upload.");
+    ack = await waitFor(transferAcks, key);
     if (!ack.ok || !ack.complete) throw new Error(ack.error || ack.code);
     return {
       ...result,
@@ -550,7 +588,6 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     try {
       while (offset < result.artifactSize) {
         const key = transferKey(operationId, result.artifactId);
-        const pending = waitFor(downloadChunks, key);
         if (
           !send({
             type: "artifact_download_request",
@@ -563,7 +600,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           })
         )
           throw new Error("Host is unavailable for artifact download.");
-        const chunk = await pending;
+        const chunk = await waitFor(downloadChunks, key);
         if (chunk.offset !== offset || chunk.size !== result.artifactSize)
           throw new Error("Artifact download offset or size changed.");
         if (chunk.sha256 !== result.artifactSha256)
@@ -633,6 +670,14 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       },
     },
   );
+  // Fleet's own configuration directory holds this machine's private key, so
+  // no download reads from it — only an orchestrator's scratch directory
+  // beneath it, which the reader opens by name.
+  const sessionFiles = new SessionFileReader({
+    liveRoots: (sessionId) => router.sessionRoots(sessionId),
+    coordinatorDirectory: (sessionId) => worktrees.coordinatorDirectory(sessionId),
+    protectedRoots: [configDirectory()],
+  });
 
   const commands = new CommandExecutionManager({
     journal,
@@ -1126,6 +1171,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     recentLogs: () => logs.entries(),
     port: configServerPort(env),
   });
+  identityUrl = () => nodeIdentityUrl(configServer);
 
   function connect(): void {
     router.setMcpAvailable(false);
@@ -1153,9 +1199,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
     log(`Connecting to ${url}`);
     // Re-read before announcing rather than at startup, so an agent dropped in
     // while this node was disconnected is offered as soon as it reconnects.
-    void agentCatalog().then((entries) => {
-      advertisedAgents = catalogSummary(entries);
-    });
+    const refreshedCatalog = Promise.all([agentCatalog(), readAgentKinds()]).then(
+      ([entries, kinds]) => {
+        advertisedAgents = catalogSummary(entries);
+        advertisedAgentKinds = kinds;
+      },
+    );
     // Bounded, because an unanswered dial is the one failure this loop cannot
     // see: a dev tunnel whose relay is gone still accepts the connection, and
     // without a deadline the node waits on it for the operating system's whole
@@ -1222,9 +1271,12 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
           ...(session
             ? [COMMAND_EXECUTION_CAPABILITY, COMMAND_PERMISSIONS_CAPABILITY]
             : []),
+          // File bytes only ever cross a sealed channel.
+          ...(session ? [SESSION_FILES_CAPABILITY] : []),
         ],
         ...(session ? { commandExecution: commands.readiness } : {}),
         agents: advertisedAgents,
+        agentKinds: advertisedAgentKinds,
         maxSessions: settings.maxSessions,
         homeDir: homedir(),
         name: settings.nodeName,
@@ -1250,7 +1302,7 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       };
     };
 
-    active.on("open", () => {
+    active.on("open", async () => {
       stopLiveness = watchHostLiveness(active, {
         onDead: (silentMs) => {
           if (socket === active) router.setMcpAvailable(false);
@@ -1266,6 +1318,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         return;
       }
       if (auth.authProtocol !== "legacy-secret") return;
+      await refreshedCatalog;
+      if (socket !== active || shuttingDown || active.readyState !== WebSocket.OPEN)
+        return;
       sendOn(active, {
         type: "hello",
         nodeId: auth.nodeId,
@@ -1298,6 +1353,9 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
         }
         channel = opened.channel;
         active.send(JSON.stringify(opened.proof));
+        await refreshedCatalog;
+        if (socket !== active || shuttingDown || active.readyState !== WebSocket.OPEN)
+          return;
         send({ type: "ready", ...inventory() });
         return;
       }
@@ -1437,6 +1495,22 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
       if (frame.value.type === "repository_probe") {
         const result = await worktrees.probeRepository(frame.value.request);
         send({ type: "repository_probe_result", result });
+        return;
+      }
+      if (frame.value.type === "session_file_read") {
+        const { request } = frame.value;
+        // Answered even when refused, so the Host reports why instead of
+        // waiting out its timeout; the bytes themselves never leave unsealed.
+        const result =
+          welcomed && session && channel
+            ? await sessionFiles.read(request)
+            : {
+                requestId: request.requestId,
+                ok: false as const,
+                code: "unavailable" as const,
+                error: "File downloads need this Node's authenticated connection.",
+              };
+        if (socket === active) send({ type: "session_file_data", result });
         return;
       }
       if (frame.value.type === "artifact_transfer_ack") {

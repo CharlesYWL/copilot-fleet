@@ -147,6 +147,22 @@ function setup(options: { days?: number; path?: string; capabilities?: string[] 
 }
 
 describe("inactive session retention", () => {
+  it("does not expire Hermes history through the Copilot-native retention path", () => {
+    const { service, create } = setup();
+    const lead = create("stopped", "lead");
+    const now = Date.now() + 31 * 86_400_000;
+    expect(service.sessionRetention.shouldExpire(lead, now)).toBe(true);
+    expect(
+      service.sessionRetention.shouldExpire(
+        {
+          ...lead,
+          agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+        },
+        now,
+      ),
+    ).toBe(false);
+  });
+
   it.each(["", "lead", "worker"] as const)(
     "deletes role '%s' only at the inclusive 30-day boundary and after Node confirmation",
     (role) => {

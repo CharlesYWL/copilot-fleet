@@ -20,17 +20,20 @@ import {
   shorthands,
   tokens,
 } from "@fluentui/react-components";
-import type {
-  ContextTier,
-  ManagedWorktreePolicy,
-  SessionConfigChoice,
-  SessionConfigOption,
+import {
+  type AgentParams,
+  type ContextTier,
+  type HostUpdateStatus,
+  type ManagedWorktreePolicy,
+  type SessionConfigChoice,
+  type SessionConfigOption,
 } from "@fleet/protocol";
 import { BookOpen20Regular } from "@fluentui/react-icons";
 import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
+import { HostUpdateCard } from "./HostUpdateCard";
 
 const useStyles = makeStyles({
   panel: {
@@ -127,14 +130,25 @@ const downloadJson = (value: unknown, filename: string) => {
 
 export type GeneralPanelProps = {
   /** Live sessions, read only to learn which models this fleet's Copilot offers. */
-  sessions: readonly { configOptions: SessionConfigOption[] }[];
+  sessions: readonly {
+    configOptions: SessionConfigOption[];
+    agentParams?: AgentParams | undefined;
+  }[];
   onStartTour?: (() => void) | undefined;
+  /** The Host's own update; the card is left out when the Host sends none. */
+  hostUpdate?: HostUpdateStatus | undefined;
+  hostRevision?: string | undefined;
 };
 
 const YOLO_WARNING =
   "New sessions will execute commands on their node without approval. You can still turn this off for an individual session when starting it.";
 
-export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
+export const GeneralPanel = ({
+  sessions,
+  onStartTour,
+  hostUpdate,
+  hostRevision = "",
+}: GeneralPanelProps) => {
   const styles = useStyles();
   const active = useSettingsActive();
   const [defaults, setDefaults] = useState<Defaults>();
@@ -253,8 +267,11 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
     model,
     reasoningEffort,
   } = defaults;
-  const modelChoices = observedChoices(sessions, "model");
-  const effortChoices = observedChoices(sessions, "reasoning_effort");
+  const copilotSessions = sessions.filter(
+    (session) => (session.agentParams?.kind ?? "copilot") === "copilot",
+  );
+  const modelChoices = observedChoices(copilotSessions, "model");
+  const effortChoices = observedChoices(copilotSessions, "reasoning_effort");
 
   return (
     <div className={styles.panel}>
@@ -339,9 +356,9 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
             <Text weight="semibold">Long context by default</Text>
             <br />
             <Text className={styles.caption}>
-              Request --context long_context for new sessions, including Chats,
-              orchestrators, and workers. Extended context can cost more; the window size
-              depends on the model. Each chat can override this setting.
+              Request --context long_context for new Copilot sessions, including Chats,
+              Copilot orchestrators, and workers. Extended context can cost more; the
+              window size depends on the model. Each chat can override this setting.
             </Text>
           </div>
           <Switch
@@ -405,10 +422,10 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
                 </Badge>
               </div>
               <Text className={styles.caption}>
-                Use Agency Copilot for all new and resumed sessions, including Chats,
-                orchestrators, and workers. Each node uses its own Agency configuration
-                and MCP servers. Nodes without Agency on PATH fall back to standard
-                Copilot and report it in the session log.
+                Use Agency Copilot for new and resumed Copilot sessions, including Chats,
+                Copilot orchestrators, and workers. Each node uses its own Agency
+                configuration and MCP servers. Nodes without Agency on PATH fall back to
+                standard Copilot and report it in the session log.
               </Text>
             </div>
             <Switch
@@ -476,9 +493,9 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
             <Text weight="semibold">Model</Text>
             <br />
             <Text className={styles.caption}>
-              What every new session starts on, including orchestrators and the workers
-              they dispatch. Set before the first prompt, so it governs the opening turn.
-              A machine that does not offer the model says so and keeps its own.
+              What new Copilot sessions start on, including Copilot orchestrators and
+              workers. Other orchestrator agents use their own profile settings. A machine
+              that does not offer the model says so and keeps its own.
             </Text>
           </div>
           <Dropdown
@@ -537,6 +554,8 @@ export const GeneralPanel = ({ sessions, onStartTour }: GeneralPanelProps) => {
           </Text>
         )}
       </section>
+
+      {hostUpdate && <HostUpdateCard status={hostUpdate} revision={hostRevision} />}
 
       <section className={styles.card} aria-label="Fleet data archive">
         <div>

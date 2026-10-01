@@ -4,18 +4,28 @@ import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  COMMAND_LIMITS,
+  CommandExecutionSchema,
+  CommandReceiptSchema,
+  PreparedCommandSchema,
+  commandDigestPayload,
+  PrMaintenanceObservationSchema,
   PrMaintenanceEnableSchema,
   PrMaintenanceManualCommandSchema,
   HostBackupSchema,
   PR_MAINTENANCE_RECOVERY_LIMITS,
+  nextHeartbeat,
+  parseHeartbeatSchedule,
   prMaintenanceProgress,
+  prMaintenanceTaskStatuses,
   type PrMaintenanceCheckpoint,
+  type PrMaintenanceObservation,
   type PrMaintenanceRegistration,
 } from "@fleet/protocol";
 import { FleetStore } from "./store.js";
 import { FleetService } from "./fleet-service.js";
 import Fastify from "fastify";
-import { prMaintenanceUnsettled } from "./pr-maintenance-store.js";
+import { PrMaintenanceError, prMaintenanceUnsettled } from "./pr-maintenance-store.js";
 import v1Conflicts from "./fixtures/pr-maintenance-v1-conflicts.json" with { type: "json" };
 
 const stores: FleetStore[] = [];
@@ -66,6 +76,348 @@ const adoIdentity = {
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(at);
+});
+
+describe("prepared maintenance observation recovery", () => {
+  function receipt(
+    f: ReturnType<typeof setup>,
+    record: PrMaintenanceRegistration,
+    overrides: Partial<PrMaintenanceObservation> = {},
+    /** Runs while the claimed helper command is out, before its result lands. */
+    whileRunning?: () => void,
+  ) {
+    const now = new Date().toISOString();
+    const nodeTime = new Date(Date.now() + 10_000).toISOString();
+    const wakeId = randomUUID();
+    f.store.setSessionDispatchAttempt(f.lead.id, {
+      commandId: wakeId,
+      eventSeqFrom: 0,
+      attempt: wakeId,
+    });
+    f.store.prMaintenance.beginWake(f.lead.id, wakeId);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, wakeId)?.id).toBe(record.id);
+    const { deadlineAt, ...maintenanceObservation } =
+      f.store.prMaintenance.reserveObservation(f.lead.id, wakeId, record.id, 8);
+    let execution = CommandExecutionSchema.parse({
+      id: randomUUID(),
+      attemptId: randomUUID(),
+      version: 0,
+      hostId: "test-host",
+      nodeId: f.node.id,
+      nodeName: f.node.name,
+      leadSessionId: f.lead.id,
+      target: { placementId: f.placement.id },
+      requestedPath: f.placement.localPath,
+      command: "node snapshot.mjs",
+      shell: "windows-powershell-5.1",
+      reason: "Fresh complete PR observation",
+      requestKey: randomUUID(),
+      requestDigest: "a".repeat(64),
+      maintenanceObservation,
+      state: "running",
+      ownership: "active",
+      createdAt: now,
+      updatedAt: now,
+      expiresAt: deadlineAt,
+      approvedAt: now,
+    });
+    const physical = {
+      key: "checkout",
+      path: f.placement.localPath,
+      machineId: "test-machine",
+      volume: "test-volume",
+      fileId: "test-file",
+    };
+    const descriptor = PreparedCommandSchema.strip().parse({
+      ...execution,
+      executionId: execution.id,
+      hostTime: now,
+      observationBudget: { deadlineAt, requests: 8 },
+      prepared: {
+        cwd: f.placement.localPath,
+        checkout: physical,
+        repository: physical,
+        shellPath: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        admissionVersion: 1,
+        preparedAt: nodeTime,
+        hostClockOffsetMs: -10_000,
+        clockUncertaintyMs: COMMAND_LIMITS.clockUncertaintyMs,
+      },
+      digest: "a".repeat(64),
+    });
+    descriptor.digest = createHash("sha256")
+      .update(commandDigestPayload(descriptor))
+      .digest("hex");
+    execution.descriptor = descriptor;
+    f.store.commands.insert(execution);
+    f.store.prMaintenance.bindObservationExecution(execution);
+    f.store.commands.recordPreparationSend(execution.id, now);
+    f.store.commands.acceptPreparationClock(execution.id, now, now, 0);
+    f.store.commands.markStart(execution);
+    whileRunning?.();
+    const observation = PrMaintenanceObservationSchema.parse({
+      ...record.observation,
+      attemptedAt: nodeTime,
+      snapshotId: `snapshot-${wakeId}`,
+      fingerprint: `snapshot-${wakeId}`,
+      draft: false,
+      requestsConsumed: 1,
+      elapsedMs: 100,
+      ...overrides,
+    });
+    const { prNumber, ...snapshotIdentity } = record.identity;
+    const output = Buffer.from(
+      JSON.stringify({
+        schemaVersion: 1,
+        complete: true,
+        requestsConsumed: observation.requestsConsumed,
+        elapsedMs: observation.elapsedMs,
+        observation,
+        snapshot: {
+          generation: record.generation,
+          identity: {
+            ...snapshotIdentity,
+            number: prNumber,
+            prId: "PR_MAIN",
+            url: `https://${record.identity.host}/${record.identity.repository}/pull/${prNumber}`,
+          },
+          headSha: observation.headSha,
+          baseSha: observation.baseSha,
+          state: observation.state,
+          isDraft: observation.draft,
+          actionableFingerprint: observation.snapshotId,
+        },
+      }),
+    );
+    execution = f.store.commands.appendOutput(execution, {
+      executionId: execution.id,
+      attemptId: execution.attemptId,
+      sequence: 1,
+      stream: "stdout",
+      data: output.toString("base64"),
+      at: nodeTime,
+    }).execution;
+    vi.setSystemTime(Date.now() + 100);
+    f.store.commands.recordReceipt(
+      execution.id,
+      JSON.stringify(
+        CommandReceiptSchema.parse({
+          executionId: execution.id,
+          attemptId: execution.attemptId,
+          digest: descriptor.digest,
+          state: "succeeded",
+          ownership: "quiescent",
+          exitCode: 0,
+          reason: "completed",
+          outcomeKnown: true,
+          descendantCleanupForced: false,
+          settledAt: new Date(Date.parse(nodeTime) + 100).toISOString(),
+          finalOutputSeq: 1,
+          gaps: [],
+        }),
+      ),
+    );
+    f.store.commands.update(execution.id, execution.version, {
+      state: "succeeded",
+      ownership: "quiescent",
+      exitCode: 0,
+      outcomeKnown: true,
+      outputComplete: true,
+      finalOutputSeq: 1,
+      settledAt: new Date().toISOString(),
+    });
+    const saved = f.store.prMaintenance.checkpointObservationReceipt(
+      f.lead.id,
+      record.id,
+      f.store.prMaintenance.get(record.id)!.version,
+      execution.id,
+      observation,
+    );
+    return { saved, observation, hostAt: now };
+  }
+
+  function agedPreparation() {
+    const f = setup();
+    const record = prepare(
+      f,
+      observe(f, f.store.prMaintenance.enableFromOperator(f.input, "operator")),
+    );
+    // Past the evidence window, and at the routine check the heartbeat schedules.
+    vi.setSystemTime(
+      Math.max(Date.parse(at) + 31 * 60_000, Date.parse(record.nextCheckAt)),
+    );
+    return { f, record };
+  }
+
+  function dispatch(f: ReturnType<typeof setup>, record: PrMaintenanceRegistration) {
+    return f.store.prMaintenance.admission({
+      action: "dispatch",
+      taskId: f.task.id,
+      sessionId: f.worker.id,
+      recordId: record.id,
+      generation: record.generation,
+      batchId: record.batches.at(-1)!.id,
+    });
+  }
+
+  it("promotes a fresh claim-bound receipt for an aged prepared batch, but not accepted work", () => {
+    const { f, record } = agedPreparation();
+    expect(dispatch(f, record).reason).toBe("stale_observation");
+    const fresh = receipt(f, record);
+    expect(fresh.saved.observation).toEqual(fresh.observation);
+    expect(fresh.saved.observationHostAt).toBe(fresh.hostAt);
+    expect(fresh.saved.batches).toEqual(record.batches);
+    expect(dispatch(f, fresh.saved)).toEqual({ allowed: true });
+    vi.setSystemTime(Date.now() + 1_000);
+    // A read claimed before the batch was accepted finishes after it.
+    let accepted: PrMaintenanceRegistration | undefined;
+    const late = receipt(f, fresh.saved, {}, () => {
+      accepted = accept(f, fresh.saved);
+    });
+    expect(late.saved.lastAttempt).toEqual(late.observation);
+    expect(late.saved.observation).toEqual(fresh.observation);
+    expect(late.saved.observationHostAt).toBe(fresh.hostAt);
+    expect(late.saved.batches).toEqual(accepted!.batches);
+    expect(dispatch(f, late.saved).allowed).toBe(false);
+  });
+
+  it("does not claim a PR while its retained worker is still on an accepted batch", () => {
+    const { f, record } = agedPreparation();
+    const fresh = receipt(f, record);
+    accept(f, fresh.saved);
+    const wake = randomUUID();
+    f.store.prMaintenance.beginWake(f.lead.id, wake);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, wake)).toBeUndefined();
+    // Once the repair turn settles, the job is claimable again for reconciliation.
+    f.store.updateRunStep(f.store.prMaintenance.get(record.id)!.batches[0]!.stepId!, {
+      state: "succeeded",
+    });
+    expect(f.store.prMaintenance.takeDue(f.lead.id, wake)?.id).toBe(record.id);
+  });
+
+  it.each(["receipt", "checkpoint"] as const)(
+    "refreshes prepared work via %s and refunds changed-head preparation without human action",
+    (path) => {
+      const { f, record } = agedPreparation();
+      const refresh = (current: PrMaintenanceRegistration, headSha = sha) =>
+        path === "receipt"
+          ? receipt(f, current, { headSha }).saved
+          : observe(f, current, {
+              attemptedAt: new Date().toISOString(),
+              snapshotId: `snapshot-${Date.now()}`,
+              headSha,
+            });
+      const fresh = refresh(record);
+      expect(fresh.observation?.snapshotId).not.toBe(record.observation?.snapshotId);
+      expect(fresh.batches).toEqual(record.batches);
+      expect(dispatch(f, fresh)).toEqual({ allowed: true });
+      vi.setSystemTime(Date.now() + 31 * 60_000);
+      const changed = refresh(fresh, otherSha);
+      expect(changed.observation?.headSha).toBe(otherSha);
+      expect(changed.batches[0]).toMatchObject({
+        state: "superseded",
+        executionSettled: true,
+        usedMutations: 0,
+      });
+      expect(changed.counters.repairBatches).toBe(0);
+      expect(changed.counters.mutationAttempts).toBe(0);
+      expect(dispatch(f, changed).allowed).toBe(false);
+      expect(changed.lifecycle).toBe("active");
+      const replacement = prepare(f, changed, "new-head", "repair", otherSha);
+      expect(dispatch(f, replacement)).toEqual({ allowed: true });
+    },
+  );
+
+  it.each(["draft", "conflict", "incident", "stale"] as const)(
+    "keeps the %s refusal after refreshing an aged prepared batch",
+    (reason) => {
+      const { f, record } = agedPreparation();
+      const fresh = receipt(f, record, {
+        draft: reason === "draft",
+        mergeability: reason === "conflict" ? "conflicting" : "mergeable",
+      });
+      expect(fresh.saved.observation).toEqual(fresh.observation);
+      let current = fresh.saved;
+      if (reason === "incident") {
+        vi.setSystemTime(Date.now() + 10_000);
+        current = observe(f, current, {
+          attemptedAt: new Date().toISOString(),
+          complete: false,
+          failure: "permission",
+        });
+        expect(current.incidents.some((incident) => !incident.resolvedAt)).toBe(true);
+      }
+      if (reason === "stale") vi.setSystemTime(Date.now() + 31 * 60_000);
+      expect(dispatch(f, current)).toMatchObject({
+        allowed: false,
+        reason: {
+          draft: "draft",
+          conflict: "merge_conflict",
+          incident: "paused",
+          stale: "stale_observation",
+        }[reason],
+      });
+    },
+  );
+
+  it("recovers a capability incident while an undispatched batch remains prepared", () => {
+    const { f, record } = agedPreparation();
+    const failed = observe(f, record, {
+      attemptedAt: new Date().toISOString(),
+      complete: false,
+      failure: "network",
+    });
+    vi.setSystemTime(Date.now() + 31 * 60_000);
+    const fresh = receipt(f, failed);
+    expect(fresh.saved.observation).toEqual(fresh.observation);
+    expect(fresh.saved.incidents[0]?.resolution).toBe("observation");
+    expect(fresh.saved.batches).toEqual(record.batches);
+    expect(dispatch(f, fresh.saved)).toEqual({ allowed: true });
+  });
+
+  it("waits for the orchestrator's next heartbeat instead of a fixed half hour", () => {
+    const f = setup();
+    f.store.setOrchestratorHeartbeatSchedule("0 */3 * * *");
+    const record = observe(
+      f,
+      f.store.prMaintenance.enableFromOperator(f.input, "operator"),
+    );
+    const due = nextHeartbeat(parseHeartbeatSchedule("0 */3 * * *"), Date.parse(at))!;
+    expect(record.nextCheckAt).toBe(new Date(due).toISOString());
+    expect(new Date(due).getHours() % 3).toBe(0);
+    expect(due - Date.parse(at)).toBeGreaterThanOrEqual(30 * 60_000);
+    const early = new Date(due - 60_000).toISOString();
+    f.store.prMaintenance.beginWake(f.lead.id, "early", early);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, "early", early)).toBeUndefined();
+    const onTime = new Date(due).toISOString();
+    f.store.prMaintenance.beginWake(f.lead.id, "on-time", onTime);
+    expect(f.store.prMaintenance.takeDue(f.lead.id, "on-time", onTime)?.id).toBe(
+      record.id,
+    );
+  });
+
+  it("charges the full five-minute wake without changing request or visit limits", () => {
+    const f = setup();
+    f.store.prMaintenance.beginWake(f.lead.id, "five-minute-wake");
+    expect(
+      f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
+        requests: 1,
+        milliseconds: 150_000,
+      }),
+    ).toEqual({ requests: 39, visits: 5, milliseconds: 150_000 });
+    expect(
+      f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
+        requests: 1,
+        milliseconds: 150_000,
+      }),
+    ).toEqual({ requests: 38, visits: 5, milliseconds: 0 });
+    expect(() =>
+      f.store.prMaintenance.chargeWake(f.lead.id, "five-minute-wake", {
+        requests: 0,
+        milliseconds: 0,
+      }),
+    ).toThrow(/End this maintenance pass/);
+  });
 });
 
 afterEach(() => {
@@ -279,6 +631,27 @@ function publishedRepair(f: ReturnType<typeof setup>) {
     ...receipt,
     state: "succeeded",
   });
+}
+
+function expectLeadResumeRefused(
+  f: ReturnType<typeof setup>,
+  record: PrMaintenanceRegistration,
+  code: string,
+  leadSessionId = f.lead.id,
+) {
+  const before = f.store.prMaintenance.get(record.id)!;
+  try {
+    f.store.prMaintenance.set(leadSessionId, {
+      id: record.id,
+      expectedVersion: before.version,
+      action: "resume",
+    });
+    throw new Error("Expected lead resume to be refused.");
+  } catch (error) {
+    expect(error).toBeInstanceOf(PrMaintenanceError);
+    expect((error as PrMaintenanceError).code).toBe(code);
+  }
+  expect(f.store.prMaintenance.get(record.id)).toEqual(before);
 }
 
 describe("bounded alternate PR observations", () => {
@@ -815,7 +1188,7 @@ describe("bounded alternate PR observations", () => {
     });
     expect(() => reserve(f, record)).toThrow(/End this maintenance pass/);
     expect(f.store.prMaintenance.get(record.id)!.incidents[0]!.attempts).toHaveLength(0);
-    vi.setSystemTime(Date.parse(at) + 120_001);
+    vi.setSystemTime(Date.parse(at) + 300_001);
     expect(() => reserve(f, record, "timed-out", 1)).toThrow(/End this maintenance pass/);
   });
 
@@ -1762,6 +2135,12 @@ describe("durable PR maintenance registry", () => {
     expect(resumed.manualControl?.endedAt).toBeDefined();
     expect(resumed.manualControl?.commands).toEqual(saved.manualControl?.commands);
     expect(resumed.authorization).toEqual(record.authorization);
+    expect(resumed.resumeHistory.at(-1)).toMatchObject({
+      actor: "operator",
+      actorId: "operator",
+      pauseReason: "manual_control",
+      pauseOrigin: { actor: "operator", actorId: "supervisor" },
+    });
   });
   it.each(["omitted", "false"] as const)(
     "rejects new read-only %s authority instead of silently granting repairs",
@@ -2910,6 +3289,7 @@ describe("durable PR maintenance registry", () => {
   it("invalidates HEAD-A readiness after a known repair publication to HEAD B", () => {
     const f = setup();
     let record = publishedRepair(f);
+    expect(prMaintenanceProgress(record).stage).toBe("checking");
     expect(() =>
       f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
         kind: "ready",
@@ -2937,13 +3317,16 @@ describe("durable PR maintenance registry", () => {
         },
       ],
     });
-    expect(
-      f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
-        kind: "ready",
-        fingerprint: "head-B",
-        evidence: "Fresh HEAD-B evidence",
-      }).readyFingerprint,
-    ).toBe("head-B");
+    expect(prMaintenanceProgress(record).stage).toBe("checking");
+    record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+      kind: "ready",
+      fingerprint: "head-B",
+      evidence: "Fresh HEAD-B evidence",
+    });
+    expect(record.readyFingerprint).toBe("head-B");
+    expect(record.observation!.sources).toEqual([source]);
+    expect(prMaintenanceProgress(record).stage).toBe("ready");
+    expect(prMaintenanceTaskStatuses([record])[0]?.stage).toBe("ready");
   });
 
   it("keeps same-HEAD deduplication but allows unchanged feedback to be revalidated on an external HEAD", () => {
@@ -3045,6 +3428,8 @@ describe("durable PR maintenance registry", () => {
       evidence: "Existing fix verified against current code",
     });
     expect(record.readyFingerprint).toBe("head-C");
+    expect(prMaintenanceProgress(record).stage).toBe("ready");
+    expect(prMaintenanceTaskStatuses([record])[0]?.stage).toBe("ready");
     expect(() => prepare(f, record, "duplicate-C", "answer", externalHead)).toThrow(
       /unchanged/,
     );
@@ -3157,6 +3542,288 @@ describe("durable PR maintenance registry", () => {
     );
   });
 
+  it("lets the owning lead pause and resume without changing grant or work budgets", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const paused = f.store.prMaintenance.set(f.lead.id, {
+      id: record.id,
+      expectedVersion: record.version,
+      action: "pause",
+      reason: "Owning lead is checking the current HEAD.",
+    });
+    expect(paused.pauseOrigin).toMatchObject({
+      actor: "lead",
+      actorId: f.lead.id,
+    });
+
+    const resumed = f.store.prMaintenance.set(f.lead.id, {
+      id: paused.id,
+      expectedVersion: paused.version,
+      action: "resume",
+    });
+
+    expect(resumed).toMatchObject({
+      lifecycle: "active",
+      pauseReason: "",
+      authorization: record.authorization,
+      counters: record.counters,
+      findingAttempts: record.findingAttempts,
+    });
+    expect(resumed.pauseOrigin).toBeUndefined();
+    expect(resumed.resumeHistory.at(-1)).toMatchObject({
+      actor: "lead",
+      actorId: f.lead.id,
+      pauseReason: "Owning lead is checking the current HEAD.",
+      pauseOrigin: { actor: "lead", actorId: f.lead.id },
+    });
+  });
+
+  it.each(["wait_for_human", "finding_needs_human"] as const)(
+    "lets the owning lead resume a directed %s hold",
+    (holdReason) => {
+      const f = setup();
+      const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+      const held = f.store.prMaintenance.holdForDecision(
+        f.lead.id,
+        record.id,
+        record.version,
+        {
+          id: "design-direction",
+          version: 1,
+          proposal: "Keep the current API?",
+          scope: "Public API",
+          headSha: sha,
+        },
+        () => f.store.setRunState(f.task.id, "awaiting_human"),
+      );
+      let directed = f.store.prMaintenance.operatorAction(
+        held.id,
+        held.version,
+        {
+          action: "direction",
+          decisionId: "design-direction",
+          decisionVersion: 1,
+          direction: "Keep the current API and restore its invariant.",
+          resume: holdReason === "finding_needs_human",
+        },
+        "operator",
+        () => f.store.setRunState(f.task.id, "running"),
+      );
+      if (holdReason === "finding_needs_human") {
+        f.store.prMaintenance.pauseForTask(f.task.id, holdReason);
+        directed = f.store.prMaintenance.get(record.id)!;
+      }
+      expect(directed).toMatchObject({
+        lifecycle: "paused",
+        pauseReason: holdReason,
+        pauseOrigin: { actor: "system" },
+        decision: { state: "directed" },
+      });
+
+      const resumed = f.store.prMaintenance.set(f.lead.id, {
+        id: directed.id,
+        expectedVersion: directed.version,
+        action: "resume",
+      });
+
+      expect(resumed.lifecycle).toBe("active");
+      expect(resumed.resumeHistory.at(-1)).toMatchObject({
+        actor: "lead",
+        actorId: f.lead.id,
+        pauseReason: holdReason,
+      });
+    },
+  );
+
+  it.each([
+    ["a pending decision", "wait_for_human"],
+    ["an operator pause", "operator_required"],
+    ["a provider access hold", "operator_required"],
+    ["an identity hold", "operator_required"],
+    ["a no-progress hold", "operator_required"],
+    ["exhausted allowance", "budget_exhausted"],
+    ["an operator renewal", "operator_required"],
+    ["a 30-day pause notice", "operator_required"],
+    ["an observation-only grant", "repair_authorization_required"],
+    ["a released record", "released"],
+    ["a terminal record", "terminal"],
+    ["unsettled effects", "unsettled"],
+    ["a pending manual command", "execution_uncertain"],
+    ["an ineligible binding", "sealed_managed_result"],
+    ["a non-owning lead", "ownership"],
+  ] as const)(
+    "refuses lead resume for %s with %s without changing the record",
+    (scenario, code) => {
+      const f = setup();
+      let record =
+        scenario === "an observation-only grant"
+          ? restoreLegacy(f)
+          : f.store.prMaintenance.enableFromOperator(f.input, "operator");
+      let leadSessionId = f.lead.id;
+      if (scenario === "a pending decision") {
+        record = f.store.prMaintenance.holdForDecision(
+          f.lead.id,
+          record.id,
+          record.version,
+          {
+            id: "pending-decision",
+            version: 1,
+            proposal: "Choose the public contract.",
+            scope: "Public API",
+            headSha: sha,
+          },
+          () => f.store.setRunState(f.task.id, "awaiting_human"),
+        );
+      } else if (scenario === "an operator pause") {
+        record = f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "pause", reason: "Operator pause" },
+          "operator",
+        );
+      } else if (scenario === "a provider access hold") {
+        record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+          kind: "observation",
+          observation: {
+            attemptedAt: at,
+            complete: false,
+            failure: "auth",
+            helperState: {
+              error: {
+                code: "auth_required",
+                message: "Provider authentication is required.",
+              },
+            },
+            evidence: "Provider rejected the authenticated request.",
+          },
+        });
+      } else if (scenario === "an identity hold") {
+        record = observe(f, record, {
+          identity: { ...record.identity, headRef: "refs/heads/Other" },
+        });
+      } else if (scenario === "a no-progress hold") {
+        f.store.prMaintenance.pauseForTask(f.task.id, "no_progress");
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "exhausted allowance") {
+        const backup = f.store.prMaintenance.exportBackup();
+        backup.registrations[0]!.authorization.budgets.repairBatches = 1;
+        backup.registrations[0]!.counters.repairBatches = 1;
+        f.store.writeAtomically(() => f.store.prMaintenance.importBackup(backup));
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "an operator renewal") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        record = f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "renew" },
+          "operator",
+        );
+      } else if (scenario === "a 30-day pause notice") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        const future = new Date(
+          Date.parse(record.renewedAt) + 31 * 24 * 60 * 60 * 1_000,
+        ).toISOString();
+        f.store.prMaintenance.notifyLongPauses(future, () => {});
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "a released record") {
+        record = f.store.prMaintenance.operatorAction(
+          record.id,
+          record.version,
+          { action: "release", reason: "Release maintenance ownership." },
+          "operator",
+        );
+      } else if (scenario === "a terminal record") {
+        record = accept(f, prepare(f, observe(f, record)));
+        record = observe(f, record, { state: "closed", fingerprint: "closed" });
+      } else if (scenario === "unsettled effects") {
+        record = f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
+          kind: "observation",
+          observation: {
+            attemptedAt: at,
+            complete: false,
+            failure: "incomplete",
+            helperState: {
+              error: {
+                code: "ambiguous_effect",
+                message: "Provider effect could not be correlated.",
+              },
+            },
+            evidence: "Provider effect could not be correlated.",
+          },
+        });
+      } else if (scenario === "a pending manual command") {
+        f.store.prMaintenance.beginManualControl(
+          f.worker.id,
+          {
+            id: randomUUID(),
+            digest: "manual-input",
+            kind: "prompt",
+            operatorId: "operator",
+          },
+          0,
+        );
+        record = f.store.prMaintenance.get(record.id)!;
+      } else if (scenario === "an ineligible binding") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        f.store.updateRunStep(f.step.id, {
+          resultSha: sha,
+          workspaceState: "completed",
+        });
+      } else if (scenario === "a non-owning lead") {
+        record = f.store.prMaintenance.set(f.lead.id, {
+          id: record.id,
+          expectedVersion: record.version,
+          action: "pause",
+        });
+        leadSessionId = "different-lead";
+      }
+      expectLeadResumeRefused(f, record, code, leadSessionId);
+    },
+  );
+
+  it("treats a legacy pause without origin as operator-only", () => {
+    const directory = join(process.cwd(), ".pr-maintenance-test-work", randomUUID());
+    mkdirSync(directory, { recursive: true });
+    paths.push(directory);
+    const dbPath = join(directory, "host.sqlite");
+    const f = setup(storeAt(dbPath));
+    const record = f.store.prMaintenance.operatorAction(
+      f.store.prMaintenance.enableFromOperator(f.input, "operator").id,
+      1,
+      { action: "pause", reason: "Legacy pause" },
+      "operator",
+    );
+    f.store.close();
+    stores.splice(stores.indexOf(f.store), 1);
+    const db = new DatabaseSync(dbPath);
+    const row = db
+      .prepare("SELECT data FROM pr_maintenance WHERE id=?")
+      .get(record.id) as { data: string };
+    const legacy = JSON.parse(row.data);
+    delete legacy.pauseOrigin;
+    db.prepare("UPDATE pr_maintenance SET data=? WHERE id=?").run(
+      JSON.stringify(legacy),
+      record.id,
+    );
+    db.close();
+    const reopened = storeAt(dbPath);
+    const persisted = reopened.prMaintenance.get(record.id)!;
+    expect(persisted.pauseOrigin).toBeUndefined();
+    expectLeadResumeRefused({ ...f, store: reopened }, persisted, "operator_required");
+  });
+
   it("rejects fabricated approval, mutable identity fields and unbounded checkpoints", () => {
     const f = setup();
     expect(() =>
@@ -3181,7 +3848,7 @@ describe("durable PR maintenance registry", () => {
         expectedVersion: record.version,
         action: "resume",
       }),
-    ).toThrow(/authenticated/i);
+    ).toThrow(/own pause|directed/i);
     record = observe(f, record);
     expect(() =>
       f.store.prMaintenance.checkpoint(f.lead.id, record.id, record.version, {
@@ -3891,7 +4558,7 @@ describe("durable PR maintenance registry", () => {
       first.store.prMaintenance.takeDue(
         first.lead.id,
         "wake-3",
-        "2099-01-01T00:02:00.000Z",
+        "2099-01-01T00:05:00.000Z",
       ),
     ).toBeUndefined();
     expect(records).toHaveLength(8);
@@ -4265,5 +4932,120 @@ describe("durable PR maintenance registry", () => {
         "operator",
       ),
     ).toThrow(/Reconcile/);
+  });
+});
+
+describe("moving maintenance with its task", () => {
+  /** What the task transfer does to the two tables, in its one transaction. */
+  const handOver = (f: ReturnType<typeof setup>) => {
+    const next = f.store.createSession(f.placement, "Next lead", false, "", {
+      runRole: "lead",
+    });
+    f.store.writeAtomically(() => {
+      f.store.updateRun(f.task.id, { leadSessionId: next.id });
+      f.store.prMaintenance.transferTask(f.task.id, next.id);
+    });
+    return next;
+  };
+
+  it("hands the registration, its heartbeat and its history to the new lead", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    const next = handOver(f);
+
+    const moved = f.store.prMaintenance.get(record.id)!;
+    expect(moved.leadSessionId).toBe(next.id);
+    expect(moved.version).toBe(record.version + 1);
+    expect(
+      f.store.prMaintenance.list({ leadSessionId: next.id }).records.map(({ id }) => id),
+    ).toEqual([record.id]);
+    expect(f.store.prMaintenance.list({ leadSessionId: f.lead.id }).records).toEqual([]);
+    expect(f.store.prMaintenance.wakeEligibleLeadIds()).toEqual([next.id]);
+    expect(() => f.store.prMaintenance.get(record.id, f.lead.id)).toThrow(/another lead/);
+
+    // Only the new owner's heartbeat claims it now.
+    f.store.prMaintenance.beginWake(f.lead.id, "previous-wake");
+    expect(f.store.prMaintenance.takeDue(f.lead.id, "previous-wake")).toBeUndefined();
+    f.store.prMaintenance.beginWake(next.id, "next-wake");
+    expect(f.store.prMaintenance.takeDue(next.id, "next-wake")?.id).toBe(record.id);
+  });
+
+  it("leaves a task already owned by the lead untouched", () => {
+    const f = setup();
+    const record = f.store.prMaintenance.enableFromOperator(f.input, "operator");
+    expect(f.store.prMaintenance.transferTask(f.task.id, f.lead.id)).toEqual([]);
+    expect(f.store.prMaintenance.get(record.id)).toEqual(record);
+  });
+
+  it("lets the new owner lift the previous owner's own pause, and nobody else's", () => {
+    const own = setup();
+    let record = own.store.prMaintenance.enableFromOperator(own.input, "operator");
+    record = own.store.prMaintenance.set(own.lead.id, {
+      id: record.id,
+      expectedVersion: record.version,
+      action: "pause",
+      reason: "Waiting for CI capacity",
+    });
+    const next = handOver(own);
+    expect(own.store.prMaintenance.get(record.id)!.pauseOrigin).toMatchObject({
+      actor: "lead",
+      actorId: next.id,
+    });
+
+    const held = setup();
+    let paused = held.store.prMaintenance.enableFromOperator(held.input, "operator");
+    paused = held.store.prMaintenance.operatorAction(
+      paused.id,
+      paused.version,
+      { action: "pause", reason: "Hold for release freeze" },
+      "operator",
+    );
+    handOver(held);
+    expect(held.store.prMaintenance.get(paused.id)!.pauseOrigin).toMatchObject({
+      actor: "operator",
+      actorId: "operator",
+    });
+  });
+
+  it("keeps a pending proposal authorizable, now owned by the new lead", () => {
+    const f = setup();
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    const next = handOver(f);
+
+    expect(f.store.prMaintenance.getProposal(f.task.id)).toMatchObject({
+      id: proposal.id,
+      version: proposal.version,
+      leadSessionId: next.id,
+    });
+    expect(f.store.prMaintenance.listApprovals()[0]?.leadSessionId).toBe(next.id);
+    const record = f.store.prMaintenance.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "operator",
+    );
+    expect(record.leadSessionId).toBe(next.id);
+  });
+
+  it("keeps a reauthorization pinned to the record the transfer re-versioned", () => {
+    const f = setup();
+    const legacy = restoreLegacy(f);
+    const proposal = f.store.prMaintenance.propose(f.lead.id, f.input);
+    const next = handOver(f);
+
+    const moved = f.store.prMaintenance.get(legacy.id)!;
+    expect(f.store.prMaintenance.getProposal(f.task.id)?.reauthorization).toEqual({
+      recordId: legacy.id,
+      version: moved.version,
+      generation: legacy.generation,
+    });
+    const record = f.store.prMaintenance.authorizeProposal(
+      f.task.id,
+      proposal.id,
+      proposal.version,
+      "operator",
+    );
+    expect(record).toMatchObject({ id: legacy.id, leadSessionId: next.id });
+    expect(record.authorization.scope.publicationAuthorized).toBe(true);
   });
 });

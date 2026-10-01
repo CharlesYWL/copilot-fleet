@@ -50,6 +50,7 @@ import {
   Wrench16Regular,
 } from "@fluentui/react-icons";
 import {
+  agentKindLabels,
   SESSION_NAME_MAX_LENGTH,
   isResumableSession,
   terminalSessionStates,
@@ -88,6 +89,7 @@ import {
 } from "../lib/attachments";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { toPromptMarks } from "../lib/prompt-marks";
+import { toolFilePath } from "../lib/session-files";
 import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
 import { PermissionBanner } from "./PermissionBanner";
@@ -95,6 +97,8 @@ import { PromptRail } from "./PromptRail";
 import { SessionConfigBar } from "./SessionConfigBar";
 import { SessionUsageBar } from "./SessionUsageBar";
 import { SessionAgentBadge } from "./SessionAgentBadge";
+import { SessionFileDialog } from "./SessionFileDialog";
+import { FileDownloadButton, SessionFilesProvider } from "./SessionFiles";
 import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SlashMenu } from "./SlashMenu";
 import { StatusIndicator } from "./StatusIndicator";
@@ -542,7 +546,7 @@ type TerminalViewProps = {
   node?: FleetNode | undefined;
   placement?: Placement | undefined;
   events: SessionEvent[];
-  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => void;
+  onPrompt: (prompt: string, attachments?: PromptAttachment[]) => Promise<boolean>;
   onCancel: () => void;
   onStop: () => void;
   onPermission: (
@@ -791,19 +795,23 @@ export const TerminalView = ({
     query.open && canPrompt && !menuDismissed && session.commands.length > 0;
   const activeIndex = Math.min(highlight, Math.max(0, matches.length - 1));
 
-  const submitPrompt = () => {
-    const text = prompt.trim();
+  const submitPrompt = async (
+    text = prompt.trim(),
+    files = toWireAttachments(attachments),
+  ) => {
     // A file with no words is still a message: "look at this" is implied, and
     // refusing to send it would strand the attachment the operator just added.
-    if ((!text && attachments.length === 0) || !canPrompt) return;
-    onPrompt(text || "(see attachment)", toWireAttachments(attachments));
-    onDraftChange(() => EMPTY_DRAFT);
+    if ((!text && files.length === 0) || !canPrompt) return;
+    const accepted = onPrompt(text || "(see attachment)", files);
     setAttachError(undefined);
     setMenuDismissed(false);
     // Sending is a request to watch what happens next, so it re-pins the
     // transcript. Scrolling back to read something older otherwise left the
     // operator staring at old output while the answer arrived below the fold.
     jumpToLatest();
+    if (await accepted) {
+      onDraftChange((current) => (current === draft ? EMPTY_DRAFT : current));
+    }
   };
 
   const addFiles = async (files: readonly File[]) => {
@@ -843,7 +851,7 @@ export const TerminalView = ({
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
-    submitPrompt();
+    void submitPrompt();
   };
 
   const changePrompt = (value: string) => {
@@ -856,21 +864,18 @@ export const TerminalView = ({
 
   const pickCommand = (command: (typeof matches)[number]) => {
     const choice = applyCommand(command);
-    setPrompt(choice.text);
     setMenuDismissed(true);
     setHighlight(0);
     if (choice.submit) {
-      // The state update has not landed yet, so the text is passed rather than
-      // read back off `prompt`.
-      onPrompt(choice.text);
-      onDraftChange(() => EMPTY_DRAFT);
-      jumpToLatest();
+      void submitPrompt(choice.text, []);
       return;
     }
+    setPrompt(choice.text);
     inputRef.current?.focus();
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing) return;
     if (menuOpen && matches.length > 0) {
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
@@ -892,7 +897,7 @@ export const TerminalView = ({
     }
     if (event.key !== "Enter" || event.shiftKey) return;
     event.preventDefault();
-    submitPrompt();
+    void submitPrompt();
   };
 
   const handleScroll = () => {
@@ -985,6 +990,11 @@ export const TerminalView = ({
                 YOLO
               </Badge>
             )}
+            {session.runRole === "lead" && (
+              <Badge appearance="outline" size="small">
+                {agentKindLabels[session.agentParams?.kind ?? "copilot"]}
+              </Badge>
+            )}
             <SessionAgentBadge
               options={session.configOptions}
               disabled={!onConfigChange || isEnded}
@@ -1000,6 +1010,12 @@ export const TerminalView = ({
           key={session.id}
           session={session}
           node={node}
+          placement={placement}
+          className={styles.headerAction}
+        />
+        <SessionFileDialog
+          key={`files-${session.id}`}
+          session={session}
           placement={placement}
           className={styles.headerAction}
         />
@@ -1109,9 +1125,16 @@ export const TerminalView = ({
           {blocks.length === 0 ? (
             <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
           ) : (
-            blocks.map((block) => (
-              <TerminalLine block={block} sessionState={session.state} key={block.key} />
-            ))
+            // Paths in the transcript download from the machine that ran it.
+            <SessionFilesProvider sessionId={session.id} nodeName={session.nodeName}>
+              {blocks.map((block) => (
+                <TerminalLine
+                  block={block}
+                  sessionState={session.state}
+                  key={block.key}
+                />
+              ))}
+            </SessionFilesProvider>
           )}
           {session.state === "running" && <div className={styles.working}>working…</div>}
         </div>
@@ -1225,18 +1248,23 @@ export const TerminalView = ({
           <SessionConfigBar
             options={session.configOptions}
             session={session}
-            disabled={!onConfigChange || isEnded}
+            disabled={
+              !onConfigChange ||
+              isEnded ||
+              (session.agentParams?.kind === "hermes" && session.state !== "idle")
+            }
             onChange={(configId, value) => onConfigChange?.(configId, value)}
           />
           <span className={styles.toolbarSpacer} />
           <SessionUsageBar
+            agentKind={session.agentParams?.kind ?? "copilot"}
             usage={session.usage}
             canCompact={canPrompt}
             compactAvailable={session.commands.some(
               (command) => command.name === "compact",
             )}
             onCompact={() => {
-              onPrompt("/compact");
+              void onPrompt("/compact");
               jumpToLatest();
             }}
           />
@@ -1365,6 +1393,11 @@ const TerminalLine = memo(function TerminalLine({
     ) : (
       (toolKindIcons[block.toolKind ?? ""] ?? kindIcons.tool)
     );
+    // A file the agent finished writing can be taken straight from its row.
+    const written =
+      block.toolKind === "edit" && block.status === "completed"
+        ? toolFilePath(block.detail)
+        : undefined;
     return (
       <div>
         <StepRow
@@ -1374,6 +1407,7 @@ const TerminalLine = memo(function TerminalLine({
           time={time}
           color={failed ? terminal.error : running ? terminal.tool : undefined}
           failed={failed}
+          action={written ? <FileDownloadButton path={written} /> : undefined}
         />
         {block.body && (block.status === "completed" || block.status === "failed") ? (
           <div className={styles.message}>
@@ -1462,6 +1496,8 @@ type StepRowProps = {
   color?: string | undefined;
   /** Says so in words, because colour alone is not a state a reader can read. */
   failed?: boolean;
+  /** A control at the end of the row, such as downloading the file it wrote. */
+  action?: ReactNode;
   onClick?: () => void;
   expanded?: boolean;
 };
@@ -1475,6 +1511,7 @@ const StepRow = ({
   time,
   color,
   failed,
+  action,
   onClick,
   expanded,
 }: StepRowProps) => {
@@ -1498,6 +1535,7 @@ const StepRow = ({
         </span>
       ) : null}
       {failed ? <span className={styles.stepFailed}>failed</span> : null}
+      {action}
     </>
   );
 

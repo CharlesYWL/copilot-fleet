@@ -134,8 +134,9 @@ raw execution pagination, checkpointing and SQLite restart with 291,675 observat
 bytes (291,959 CLI stdout bytes). A 590-byte, zero-operation deadline failure follows
 the same path. The original reservation stays charged even when actual usage is
 zero. An expired deadline can admit this evidence, **not** new provider I/O:
-creation/approval after expiry is refused; a dispatched helper delayed past expiry
-fails closed. Caller construction delay is not a collector performance failure.
+creation after expiry is refused; a helper still awaiting approval expires at the
+deadline and never starts; a dispatched helper delayed past expiry fails closed.
+Caller construction delay is not a collector performance failure.
 Never re-date the observation, reset the deadline at launch, or reclaim a visit to
 ingest an old result.
 

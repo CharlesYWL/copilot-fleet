@@ -1,10 +1,14 @@
 import { z } from "zod";
 import {
+  AGENT_IDENTITY_CAPABILITY,
+  AGENT_NODE_IDENTITY_URL_ENV,
+  AGENT_NODE_ID_ENV,
   CriterionOutcomeSchema,
   HOST_YOLO_CAPABILITY,
   MANAGED_WORKTREES_CAPABILITY,
   WorkspaceModeSchema,
   AccessIntentSchema,
+  contextUsePercent,
   PrMaintenanceCheckpointSchema,
   PrMaintenanceEnableSchema,
   PrMaintenanceIdentitySchema,
@@ -24,11 +28,13 @@ import {
   terminalRunStepStates,
   terminalSessionStates,
   type CriterionOutcome,
+  type FleetNode,
   type FleetSession,
   type Placement,
   type Run,
   type RunCriterion,
   type RunStep,
+  type StepAdmission,
 } from "@fleet/protocol";
 import type { FleetService } from "../fleet-service.js";
 import { reservedSessionCount } from "../session-policy.js";
@@ -37,11 +43,19 @@ import {
   HANDOVER_SHAPE,
   WORKER_DELIVERY_CONTRACT,
 } from "./briefing.js";
-import { archiveRun, purgeRun } from "./lifecycle.js";
+import {
+  archiveRun,
+  orchestratorLabel,
+  purgeRun,
+  stopSessions,
+  taskNeedsOrchestrator,
+  transferRun,
+} from "./lifecycle.js";
 import { decidePlacement, remainingCapacity } from "./schedule.js";
 import { truncateMiddle, workerOutput } from "./engine.js";
 import { CommandConflict } from "../command-execution-store.js";
 import { PrMaintenanceError } from "../pr-maintenance-store.js";
+import { WorkerResumeConflict } from "../worker-resume-store.js";
 
 /** The kinds of work an orchestrator can ask for, and what each one means. */
 export const WORKER_CATEGORIES = [
@@ -198,6 +212,8 @@ export function composeWorkerPrompt(input: {
   scope: string;
   verify: string;
   context?: string | undefined;
+  /** The machine the Host placed this step on, when it is known. */
+  runsOn?: WorkerNode | undefined;
 }): string {
   return [
     `TASK: ${input.title}`,
@@ -211,6 +227,7 @@ export function composeWorkerPrompt(input: {
     `VERIFY`,
     input.verify,
     ...(input.context ? ["", `CONTEXT`, input.context] : []),
+    ...(input.runsOn ? ["", "FLEET NODE", workerNodeNote(input.runsOn)] : []),
     "",
     "FLEET DELIVERY",
     WORKER_DELIVERY_CONTRACT,
@@ -222,6 +239,31 @@ export function composeWorkerPrompt(input: {
     "could not, say that instead — an unchecked claim is worse than an honest",
     "gap, because it will be believed.",
   ].join("\n");
+}
+
+type WorkerNode = Pick<FleetNode, "id" | "name" | "capabilities">;
+
+/**
+ * Where the step runs, in terms a worker can check from the machine itself.
+ *
+ * A brief may name the machine it wants, and the only name a worker could see
+ * was the operating system's, which a Fleet name need not match — so a worker
+ * told it was on one node, finding a host name that said otherwise, stopped to
+ * ask instead of working somewhere it could not confirm. The id never changes;
+ * the name can, while the step runs, so the worker is pointed at where to read
+ * the current one rather than left to trust this copy. Older Nodes set neither
+ * variable, and naming them there would hand the worker a contradiction.
+ */
+function workerNodeNote(node: WorkerNode): string {
+  const where =
+    `This step runs on Fleet node "${node.name}" (node id ${node.id}). A Fleet ` +
+    "name is a label an operator can change, so this machine's host name need not match it.";
+  if (!node.capabilities.includes(AGENT_IDENTITY_CAPABILITY)) return where;
+  return (
+    `${where} To confirm from here: ${AGENT_NODE_ID_ENV} in your environment is the ` +
+    `node id, and ${AGENT_NODE_IDENTITY_URL_ENV}, when set, answers a GET with the ` +
+    "node's current name."
+  );
 }
 
 export const PlanTaskSchema = z.object({
@@ -404,6 +446,41 @@ export const SessionRefSchema = z.object({
 });
 
 /**
+ * Asking for a queued follow-up to run now.
+ *
+ * Deliberately without any flag that could read as consent: an orchestrator
+ * can only ask, and the Host decides whether asking means anything.
+ */
+export const RequestResumeSchema = SessionRefSchema.extend({
+  reason: z
+    .string()
+    .max(1_000)
+    .optional()
+    .describe(
+      "Why this worker should run now rather than wait, in one or two sentences. Shown to the operator; it grants nothing.",
+    ),
+});
+
+/** One line an orchestrator can act on: state, the scheduler's reason, who is in the way. */
+function admissionLine(admission: StepAdmission): string {
+  const conflicts = admission.conflicts.length
+    ? ` Sessions involved: ${admission.conflicts
+        .map(
+          (conflict) =>
+            `${conflict.name || conflict.sessionId} (${conflict.state || "unknown"}${
+              conflict.taskName
+                ? `, task "${conflict.taskName}"${conflict.sameTask ? " (this task)" : ""}`
+                : conflict.role
+                  ? `, ${conflict.role}`
+                  : ", not managed by a task"
+            })`,
+        )
+        .join("; ")}.`
+    : "";
+  return `Admission: ${admission.state} (${admission.code}) — ${admission.detail}${conflicts}`;
+}
+
+/**
  * The way out when a task cannot be finished as promised.
  *
  * Needed because the criteria gate is deliberately unsympathetic: an essential
@@ -540,7 +617,12 @@ export const GetPrMaintenanceSchema = z
       ),
     limit: z.number().int().min(1).max(100).default(20),
     cursor: z.string().min(1).optional(),
-    takeDue: z.boolean().default(false),
+    takeDue: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Claim the oldest due PR within this lead turn's shared limit: 5 visits, 40 requests and 5 minutes. Pagination and retries do not reset it.",
+      ),
     reserveRequests: z
       .number()
       .int()
@@ -563,7 +645,7 @@ export const CheckpointPrMaintenanceSchema = z
       .uuid()
       .optional()
       .describe(
-        "For an observation from a claim-bound finite command: verify exact persisted stdout and reconcile its original reservation across lead turns. Not authority for new reads or repairs.",
+        "For an observation from a claim-bound finite command: verify exact persisted stdout and reconcile its original reservation across lead turns. Fresh observations can refresh a prepared, undispatched batch at the same head; in-flight execution/effects still block promotion. An observed head change supersedes undispatched preparation and refunds it. Not authority for new reads or repairs.",
       ),
   })
   .strict();
@@ -627,6 +709,44 @@ export const DiscardTaskSchema = TaskRefSchema.extend({
     .min(10)
     .describe(
       "Why this task should not exist. Said to the person reading along, not filed.",
+    ),
+});
+
+/**
+ * Moving a task between orchestrator conversations.
+ *
+ * Not permission-checked by owner: a conversation whose context is full hands
+ * its work on, and a fresh one can be asked to take work over. What makes it
+ * safe is that a task still has exactly one owner afterwards — the one the
+ * engine wakes and PR maintenance's heartbeat runs for.
+ */
+export const TransferTaskSchema = z.object({
+  task: z
+    .string()
+    .min(1)
+    .max(80)
+    .describe(
+      "The task's stable ID, or the exact name of one of your own tasks. Another " +
+        "orchestrator's task can only be named by its ID, from fleet_list_orchestrators.",
+    ),
+  to: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe(
+      "The orchestrator conversation to hand the task to: its session ID from " +
+        "fleet_list_orchestrators, or its exact name when that is unique. Omit to take " +
+        "the task over yourself.",
+    ),
+  note: z
+    .string()
+    .max(8_000)
+    .optional()
+    .describe(
+      "What the receiving orchestrator needs that the task record does not say: where the " +
+        "work stands, what you were about to do, what is still uncertain. Kept on the task " +
+        "and delivered with its handoff.",
     ),
 });
 
@@ -1153,7 +1273,7 @@ export class FleetTools {
             allowance: registry.remainingWake(this.leadSessionId, wakeId),
             instruction: recovery
               ? "Recovery visit claimed; its reservation stays charged. Read the incident, reserve alternate_attempt BEFORE authorized alternate provider I/O, then checkpoint alternate_observation. Do not rerun the failed helper just to satisfy this claim, reclaim the visit or reset budgets. Paused/terminal records permit reconciliation only."
-              : "Allowance is reserved, including lost responses. Immediately run the helper once with observationAllowance.deadlineAt unchanged. For a finite Fleet command, pass observationClaim as maintenanceObservation at command creation; after completion checkpoint the exact observation with executionId, even in a new lead turn. Do not reclaim a visit to save old evidence. Receipt persistence grants no new I/O or repairs; actions still need a current claimed allowance.",
+              : "Allowance is reserved, including lost responses, within this lead turn's 5-minute window. Immediately run the helper once with observationAllowance.deadlineAt unchanged. For a finite Fleet command, pass observationClaim as maintenanceObservation at command creation; after completion checkpoint the exact observation with executionId, even in a new lead turn. A prepared, undispatched batch does not block fresh observations: keep its exact prompt at the same head; an observed head change supersedes and refunds it so a new batch can be prepared. Do not reclaim a visit to save old evidence. Receipt persistence grants no new I/O or repairs; actions still need a current claimed allowance.",
           };
         });
       }
@@ -1316,7 +1436,26 @@ export class FleetTools {
     return matches[0];
   }
 
+  /** Any task on this Host by its exact ID, whichever orchestrator it is assigned to. */
+  private anyTask(task: string): Run | undefined {
+    const wanted = task.trim();
+    return this.store.getRun(wanted) ?? this.store.getRun(wanted.toLowerCase());
+  }
+
   private missingTask(task: string): ToolResult {
+    const elsewhere = this.anyTask(task);
+    if (elsewhere && elsewhere.leadSessionId !== this.leadSessionId) {
+      const owner = elsewhere.leadSessionId
+        ? this.store.getSession(elsewhere.leadSessionId)
+        : undefined;
+      return refuse(
+        [
+          `Task ${elsewhere.id} is assigned to ${orchestratorLabel(owner, elsewhere.leadSessionId)}, not to this orchestrator (${this.leadSessionId}). Nothing was changed.`,
+          "Its workers, wakes and PR maintenance belong to that orchestrator. Do not recreate its work here.",
+          "Take it over with fleet_transfer_task only when you have been asked to continue that work.",
+        ].join("\n"),
+      );
+    }
     const recent = this.runs().slice(-10).reverse();
     return refuse(
       [
@@ -1948,6 +2087,164 @@ export class FleetTools {
     );
   }
 
+  /** An orchestrator conversation by session ID, or by a name only it carries. */
+  private orchestrator(ref: string): FleetSession | ToolResult {
+    const wanted = ref.trim().toLowerCase();
+    const leads = this.store
+      .listSessions()
+      .filter((session) => session.runRole === "lead");
+    const byId = leads.find((session) => session.id.toLowerCase() === wanted);
+    if (byId) return byId;
+    const named = leads.filter(
+      (session) => !session.dismissed && session.name.trim().toLowerCase() === wanted,
+    );
+    if (named.length === 1) return named[0]!;
+    return refuse(
+      [
+        named.length
+          ? `The orchestrator name "${ref}" is ambiguous. Nothing was changed.`
+          : `No orchestrator conversation is called "${ref}". Nothing was changed.`,
+        "Use a session ID from fleet_list_orchestrators as to.",
+        ...(named.length
+          ? named.map(
+              (session) =>
+                `  ${session.id}: ${session.state}, started ${session.createdAt}`,
+            )
+          : []),
+      ].join("\n"),
+    );
+  }
+
+  /**
+   * Every orchestrator conversation, and the work each one is responsible for.
+   *
+   * The one place a lead sees past its own scope, and read-only: it is how a
+   * fresh conversation finds the task IDs of work it was asked to take over,
+   * and how a full one finds somewhere to hand its work.
+   */
+  listOrchestrators(): ToolResult {
+    const runs = this.store.listRuns();
+    const leads = this.store
+      .listSessions()
+      .filter((session) => session.runRole === "lead" && !session.dismissed)
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const lines = leads.map((lead) => {
+      const owned = runs.filter((run) => run.leadSessionId === lead.id);
+      const assigned = owned
+        .filter((run) => taskNeedsOrchestrator(this.service, run))
+        .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+      const closed = owned.length - assigned.length;
+      const used = contextUsePercent(lead.usage);
+      const context = used === undefined ? "" : `; context ${used}% used`;
+      const state = lead.stopRequested ? `${lead.state}, stopping` : lead.state;
+      const shown = assigned.slice(0, 50);
+      return [
+        `${JSON.stringify(lead.name || "Orchestrator")} (${lead.id})${lead.id === this.leadSessionId ? " — this conversation" : ""}`,
+        `  ${state} on ${lead.nodeName}; started ${lead.createdAt}${context}`,
+        ...(shown.length
+          ? [
+              `  tasks needing it (${assigned.length}):`,
+              ...shown.map((run) => {
+                const maintenance = this.store.prMaintenance.list({
+                  taskId: run.id,
+                  retainedOnly: true,
+                  limit: 1,
+                }).records[0];
+                return `    ${run.id}: ${JSON.stringify(run.name)} - ${run.state}, ${this.phaseLine(run)}${
+                  maintenance
+                    ? `; maintains ${prMaintenanceUrl(maintenance.identity)} (${maintenance.lifecycle})`
+                    : ""
+                }`;
+              }),
+              ...(assigned.length > shown.length
+                ? [`    … and ${assigned.length - shown.length} more`]
+                : []),
+            ]
+          : ["  tasks needing it: none"]),
+        ...(closed > 0 ? [`  closed tasks: ${closed}`] : []),
+      ].join("\n");
+    });
+    return ok(
+      [
+        lines.length
+          ? lines.join("\n\n")
+          : "There are no orchestrator conversations on this Host.",
+        "Each task belongs to exactly one orchestrator: only it is woken for the task and runs its PR-maintenance heartbeat. Move one with fleet_transfer_task.",
+      ].join("\n\n"),
+    );
+  }
+
+  /**
+   * Reassigns a task to another orchestrator conversation, or to this one.
+   *
+   * Handing work on is how a conversation whose context is full gets relief,
+   * and taking it over is how a fresh one continues it. Either way the task
+   * keeps its phases, notes, workers and checkout; the receiving orchestrator
+   * is the only one woken for it afterwards.
+   */
+  transferTask(input: z.infer<typeof TransferTaskSchema>): ToolResult {
+    const own = this.run(input.task);
+    if (own && "ok" in own) return own;
+    const run = own ?? this.anyTask(input.task);
+    if (!run) return this.missingTask(input.task);
+    const target = input.to
+      ? this.orchestrator(input.to)
+      : this.store.getSession(this.leadSessionId);
+    if (!target) return refuse("This orchestrator's session record is missing.");
+    if ("ok" in target) return target;
+    const self = target.id === this.leadSessionId;
+    let result: ReturnType<typeof transferRun>;
+    try {
+      result = transferRun(this.service, run.id, target.id, {
+        source: "orchestrator",
+        actorSessionId: this.leadSessionId,
+        note: input.note,
+        brief: !self,
+      });
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "statusCode" in error &&
+        Number(error.statusCode) >= 400 &&
+        Number(error.statusCode) < 500
+      ) {
+        const code = "code" in error && typeof error.code === "string" ? error.code : "";
+        return refuse(
+          `${code ? `${code}: ` : ""}${error.message} Nothing was changed for "${run.name}".`,
+        );
+      }
+      throw error;
+    }
+    this.service.tickRun(run.id);
+    if (!result.changed) {
+      return ok(
+        `"${run.name}" (${run.id}) is already assigned to ${self ? "this orchestrator" : orchestratorLabel(target)}. Nothing changed.`,
+      );
+    }
+    if (self) {
+      return ok(
+        [
+          `You now own "${run.name}" (task id: ${run.id}); it was assigned to ${orchestratorLabel(
+            result.from ? this.store.getSession(result.from) : undefined,
+            result.from,
+          )}.`,
+          `You have none of its history in this conversation. Read fleet_get_task with task "${run.id}" before acting, and fleet_get_pr_maintenance with taskId "${run.id}" when it maintains a PR.`,
+          "Continue from where it stands: running steps keep going and wake you when they settle; use fleet_follow_up for retained workers, and do not re-plan, restart or duplicate existing work.",
+        ].join("\n"),
+      );
+    }
+    return ok(
+      [
+        `Transferred "${run.name}" (task id: ${run.id}) to ${orchestratorLabel(target)}. It will be briefed to continue the task when it is free.`,
+        ...(result.from === this.leadSessionId
+          ? [
+              "The task is no longer yours: do not dispatch, follow up, reopen or recreate its work from this conversation.",
+            ]
+          : []),
+      ].join("\n"),
+    );
+  }
+
   listNodes(): ToolResult {
     const sessions = this.store.listSessions();
     const placements = this.store.listPlacements();
@@ -2121,7 +2418,10 @@ export class FleetTools {
     const step = this.store.upsertRunStep(run.id, {
       stepKey,
       title: input.title,
-      prompt: composeWorkerPrompt(input),
+      prompt: composeWorkerPrompt({
+        ...input,
+        runsOn: this.store.getNode(placement.nodeId),
+      }),
       category: input.category,
       // Recorded so the engine dispatches where this reply says it will.
       placementId: placement.id,
@@ -2483,8 +2783,7 @@ export class FleetTools {
         return step.state === "pending"
           ? {
               action: "queued",
-              reason:
-                "A follow-up is already queued durably in this session. Wait for scheduling; do not resend or replace it.",
+              reason: this.queuedReason(run, step),
             }
           : {
               action: "in_flight",
@@ -2648,6 +2947,7 @@ export class FleetTools {
       throw error;
     }
     this.service.publishRunSteps(run.id, this.store.listRunSteps(run.id));
+    if (input.maintenance) this.service.publishSnapshot();
     this.service.tickRun(run.id);
     const retried = this.store.getRunStep(step.id);
     if (!retried) {
@@ -2661,21 +2961,96 @@ export class FleetTools {
           `Read fleet_get_task (task: "${run.id}") before deciding what to do next.`,
       );
     }
+    const admission = this.service.workerResume?.admission(run.id, retried.id);
     return ok(
       [
         next.action === "resume"
           ? "Queued the follow-up in the same worker session. It will resume when scheduling allows, and you will be woken when it finishes."
           : "Queued the follow-up in the same open worker session. It will start when scheduling allows, and you will be woken when it finishes.",
         `Task: ${run.id}; session: ${owned.id}; step: ${step.stepKey}; state: ${retried.state}.`,
+        ...(admission ? [admissionLine(admission)] : []),
         "The request is persisted. Do not send it again or create a replacement while it is queued.",
       ].join("\n"),
     );
   }
 
+  /**
+   * Asks for a queued follow-up to run now, which ordinary scheduling decides.
+   *
+   * An orchestrator may ask; it can never approve. Only a follow-up held back
+   * solely by a Node's reserved scheduling slot becomes an approval request,
+   * and an authenticated operator decides it in Fleet.
+   */
+  requestResume(input: z.infer<typeof RequestResumeSchema>): ToolResult {
+    const owned = this.ownedSession(input.sessionId, { allowTerminal: true });
+    if (typeof owned === "string") return refuse(owned);
+    const resume = this.service.workerResume;
+    if (!resume) return refuse("Resume now is not available on this Host.");
+    try {
+      const outcome = resume.request(
+        {
+          sessionId: owned.id,
+          ...(input.reason ? { reason: input.reason } : {}),
+        },
+        { kind: "orchestrator", id: this.leadSessionId },
+      );
+      const lines = [
+        `Status: ${outcome.status}. ${outcome.message}`,
+        ...(outcome.admission ? [admissionLine(outcome.admission)] : []),
+        ...(outcome.request
+          ? [
+              `Request ${outcome.request.id}: ${outcome.request.state}${
+                outcome.request.state === "awaiting_approval"
+                  ? `, expires ${outcome.request.expiresAt}`
+                  : ""
+              }. ${outcome.request.outcome}`,
+            ]
+          : []),
+        outcome.status === "awaiting_approval"
+          ? "You cannot approve this, and saying so in chat does not approve it. End your turn; you are woken when the follow-up settles. Do not ask again or create a replacement worker."
+          : outcome.status === "starting" || outcome.status === "running"
+            ? "Nothing else is needed. You are woken when the follow-up settles."
+            : "Nothing was changed. It stays queued; do not create a replacement worker to get around this.",
+      ];
+      return outcome.status === "blocked"
+        ? refuse(lines.join("\n"))
+        : ok(lines.join("\n"));
+    } catch (error) {
+      if (error instanceof WorkerResumeConflict) return refuse(error.message);
+      throw error;
+    }
+  }
+
+  /** What a queued follow-up is waiting on, in the scheduler's own terms. */
+  private queuedReason(run: Run, step: RunStep): string {
+    const base =
+      "A follow-up is already queued durably in this session. Do not resend or replace it.";
+    const resume = this.service.workerResume;
+    const admission = resume?.admission(run.id, step.id);
+    if (!admission) return `${base} Wait for scheduling.`;
+    const latest = resume
+      ?.list({ runId: run.id, limit: 20 })
+      .find(
+        (request) => request.stepId === step.id && request.stepAttempt === step.attempts,
+      );
+    return [
+      base,
+      admissionLine(admission),
+      ...(admission.exception && admission.state !== "awaiting_approval"
+        ? [
+            `An operator may approve spending the Node's reserved slot once; fleet_request_resume with sessionId "${step.sessionId}" asks for that approval. You cannot approve it yourself.`,
+          ]
+        : []),
+      ...(latest && latest.state !== "awaiting_approval"
+        ? [`Latest resume-now request: ${latest.state}. ${latest.outcome}`]
+        : []),
+    ].join(" ");
+  }
+
   stopWork(input: z.infer<typeof SessionRefSchema>): ToolResult {
     const owned = this.ownedSession(input.sessionId);
     if (typeof owned === "string") return refuse(owned);
-    this.service.dispatch(owned.nodeId, { type: "stop", sessionId: owned.id });
+    stopSessions(this.service, [owned]);
     return ok("Stopping it.");
   }
 

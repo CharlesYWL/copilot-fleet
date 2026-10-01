@@ -3,6 +3,8 @@ import type { FastifyBaseLogger } from "fastify";
 import type { WebSocket } from "ws";
 import {
   BrowserMessageSchema,
+  agentKindLabels,
+  supportsAgentKind,
   CONTEXT_TIER_CONFIG_ID,
   ContextTierSchema,
   HOST_URL_SYNC_CAPABILITY,
@@ -18,13 +20,16 @@ import {
   eventPayload,
   liveSessionStates,
   nodeUpdateState,
+  prMaintenanceTaskStatuses,
   terminalRunStepStates,
   terminalSessionStates,
   type BrowserMessage,
+  type AgentParams,
   type FleetNode,
   type FleetSession,
   type HostBackup,
   type HostPortableBackupData,
+  type HostUpdateStatus,
   type McpHttpServer,
   type NodeCommand,
   type NodeHealth,
@@ -32,6 +37,7 @@ import {
   type Notification,
   type Placement,
   type PromptAttachment,
+  type PrMaintenanceRegistration,
   type StartupConfig,
   type Run,
   type RunRole,
@@ -53,9 +59,11 @@ import { isBroadcastableHostUrl } from "./host-url.js";
 import { SessionRetention } from "./session-retention.js";
 import { ManagedWorktreeService } from "./managed-worktree-service.js";
 import { CommandExecutionService } from "./command-execution-service.js";
+import { SessionFileService } from "./session-files.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
+import type { WorkerResumeService } from "./orchestrator/resume-now.js";
 import {
   NotificationService,
   notificationAttemptKey,
@@ -106,6 +114,15 @@ export type DispatchResult = {
   sent: boolean;
   /** The session after the fallback transition, when one was applied. */
   session?: FleetSession;
+};
+
+/** What the service needs from the Host's own update (`self-update.ts`). */
+export type HostUpdateHooks = {
+  status(): HostUpdateStatus;
+  /** Why this Node may not update on its own right now, if it may not. */
+  blocksNodeUpdate(nodeId: string): string | undefined;
+  /** Why a session may not start or resume on this Node right now, if it may not. */
+  blocksNodeWork(nodeId: string): string | undefined;
 };
 
 export type EventHandlingResult =
@@ -214,10 +231,20 @@ export class FleetService {
     | undefined;
   private mcpUrl: (() => string) | undefined;
   private runTicker: ((runId: string) => void) | undefined;
+  /**
+   * "Resume now" and step admission, owned by the orchestration engine.
+   *
+   * Late-bound like the other orchestration seams; absent in a service built
+   * without an engine, where steps are published without admission.
+   */
+  workerResume: WorkerResumeService | undefined;
+  /** Late-bound like the orchestration seams: built after the service. */
+  private hostUpdate: HostUpdateHooks | undefined;
   readonly notifications: NotificationService;
   readonly sessionRetention: SessionRetention;
   readonly worktrees: ManagedWorktreeService;
   readonly commands: CommandExecutionService;
+  readonly files: SessionFileService;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -226,15 +253,22 @@ export class FleetService {
     };
     mcpUrl: () => string;
     tickRun: (runId: string) => void;
+    resume?: WorkerResumeService;
   }): void {
     this.leadTokens = input.leadTokens;
     this.mcpUrl = input.mcpUrl;
     this.runTicker = input.tickRun;
+    this.workerResume = input.resume;
   }
 
   /** Advances one run now, used by the tools so a dispatch is not left waiting. */
   tickRun(runId: string): void {
     this.runTicker?.(runId);
+  }
+
+  /** Why nothing new may start on this Node right now, if something prevents it. */
+  nodeWorkBlocked(nodeId: string): string | undefined {
+    return this.hostUpdate?.blocksNodeWork(nodeId);
   }
 
   logManagedPlacementScheduling(details: Record<string, unknown>, message: string): void {
@@ -264,6 +298,7 @@ export class FleetService {
     this.sessionRetention = new SessionRetention(this, log, sessionRetentionDays);
     this.worktrees = new ManagedWorktreeService(this);
     this.commands = new CommandExecutionService(this);
+    this.files = new SessionFileService(this);
     this.commands.reconcileNotifications();
   }
 
@@ -277,9 +312,27 @@ export class FleetService {
       notifications: this.store.listNotificationHydration(),
       notificationUnreadCount: this.store.notificationUnreadCount(),
       hostRevision: this.hostRevision,
+      ...(this.hostUpdate ? { hostUpdate: this.hostUpdate.status() } : {}),
       commandExecutions: this.commands.list({ limit: 100 }),
       prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
+      prMaintenanceTasks: prMaintenanceTaskStatuses(this.retainedPrMaintenance()),
+      workerResumeRequests: this.store.resumeRequests.list({ limit: 50 }),
     };
+  }
+
+  private retainedPrMaintenance(): PrMaintenanceRegistration[] {
+    const records: PrMaintenanceRegistration[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = this.store.prMaintenance.list({
+        retainedOnly: true,
+        limit: 100,
+        ...(cursor ? { cursor } : {}),
+      });
+      records.push(...page.records);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return records;
   }
 
   listNodes(): FleetNode[] {
@@ -318,6 +371,7 @@ export class FleetService {
   /** Hangs up on a Node the operator deleted; no session bookkeeping follows. */
   evictNode(nodeId: string, code: number, reason: string): void {
     this.commands.nodeDisconnected(nodeId);
+    this.files.nodeDisconnected(nodeId);
     this.nodeHealth.delete(nodeId);
     const socket = this.nodeSockets.get(nodeId);
     if (!socket) return;
@@ -336,6 +390,7 @@ export class FleetService {
     this.nodeHealth.clear();
     for (const [nodeId, socket] of [...this.nodeSockets.entries()]) {
       this.commands.nodeDisconnected(nodeId);
+      this.files.nodeDisconnected(nodeId);
       this.sessionRetention.nodeDisconnected(nodeId);
       this.nodeSockets.delete(nodeId);
       socket.close(code, reason);
@@ -503,7 +558,7 @@ export class FleetService {
           ...(input.patch ?? {}),
         });
         if (!updatedStep) return undefined;
-        this.recordPrMaintenanceExecution(updatedStep);
+        const maintenanceChanged = this.recordPrMaintenanceExecution(updatedStep);
 
         this.store.recordRunSettle(run.id);
         let updatedRun = this.store.getRun(run.id)!;
@@ -520,12 +575,13 @@ export class FleetService {
         if (updatedStep.state === "failed") {
           this.notifications.createOrchestrationStepFailure(updatedRun, updatedStep);
         }
-        return { run: updatedRun, step: updatedStep };
+        return { run: updatedRun, step: updatedStep, maintenanceChanged };
       },
       (result) => {
         if (!result) return;
         this.publishRun(result.run);
         this.publishRunSteps(result.run.id, this.store.listRunSteps(result.run.id));
+        if (result.maintenanceChanged) this.publishSnapshot();
       },
     );
     return settled !== undefined;
@@ -568,18 +624,19 @@ export class FleetService {
           stoppedByOrchestrator: false,
         });
         if (!updatedStep) return undefined;
-        this.recordPrMaintenanceExecution(updatedStep);
+        const maintenanceChanged = this.recordPrMaintenanceExecution(updatedStep);
         if (updatedStep.sessionId) {
           this.store.clearSessionTurnCompletion(updatedStep.sessionId);
         }
         if (updatedStep.state === "failed") {
           this.notifications.createOrchestrationStepFailure(run, updatedStep);
         }
-        return { run, step: updatedStep };
+        return { run, step: updatedStep, maintenanceChanged };
       },
       (result) => {
         if (!result) return;
         this.publishRunSteps(result.run.id, this.store.listRunSteps(result.run.id));
+        if (result.maintenanceChanged) this.publishSnapshot();
       },
     );
     return settled !== undefined;
@@ -587,21 +644,29 @@ export class FleetService {
 
   /** Steps travel whole: a step that was removed has no row left to describe. */
   publishRunSteps(runId: string, steps: readonly RunStep[]): void {
-    this.broadcast({ type: "run_steps", runId, steps: [...steps] });
+    this.broadcast({ type: "run_steps", runId, steps: this.withAdmission(runId, steps) });
+  }
+
+  /** Steps as browsers and REST readers see them: with what they are waiting on. */
+  withAdmission(runId: string, steps: readonly RunStep[]): RunStep[] {
+    return this.workerResume ? this.workerResume.decorate(runId, steps) : [...steps];
   }
 
   reconcilePrMaintenanceExecution(sessionId: string): void {
     const step = this.store.getRunStepBySession(sessionId);
     if (!step || !terminalRunStepStates.has(step.state)) return;
-    this.store.writeAtomically(() => this.recordPrMaintenanceExecution(step));
+    const changed = this.store.writeAtomically(() =>
+      this.recordPrMaintenanceExecution(step),
+    );
+    if (changed) this.publishSnapshot();
   }
 
-  private recordPrMaintenanceExecution(step: RunStep, neverDispatched = false): void {
+  private recordPrMaintenanceExecution(step: RunStep, neverDispatched = false): boolean {
     const reference = this.store.prMaintenance.referenceForStep(step.id, step.attempts);
-    if (!reference) return;
+    if (!reference) return false;
     const record = this.store.prMaintenance.get(reference.recordId)!;
     const batch = record.batches.find((entry) => entry.id === reference.batchId)!;
-    if (batch.executionSettled) return;
+    if (batch.executionSettled) return false;
     const events = this.store
       .listEvents(step.sessionId)
       .filter((event) => event.sequence > step.eventSeqFrom);
@@ -615,7 +680,7 @@ export class FleetService {
       (receivedState !== undefined &&
         (terminalSessionStates.has(receivedState) ||
           (receivedState === "idle" && completed)));
-    if (!executionSettled && batch.state === "uncertain") return;
+    if (!executionSettled && batch.state === "uncertain") return false;
     const reconciled = this.store.prMaintenance.checkpoint(
       record.leadSessionId,
       record.id,
@@ -645,6 +710,7 @@ export class FleetService {
         evidence: `Execution reconciliation for step ${step.id}, attempt ${step.attempts}; settled=${executionSettled}.`,
       },
     );
+    return true;
   }
 
   /** Stop only the accepted bound attempt; a stop request is not an effect receipt. */
@@ -684,14 +750,15 @@ export class FleetService {
             !step.dispatchedAt &&
             dispatch?.attempt !== currentAttempt
           ) {
-            this.store.writeAtomically(() => {
+            const changed = this.store.writeAtomically(() => {
               const cancelled = this.store.updateRunStep(step.id, {
                 state: "cancelled",
                 output: "PR maintenance paused or terminal before queued execution.",
               })!;
-              this.recordPrMaintenanceExecution(cancelled, true);
+              return this.recordPrMaintenanceExecution(cancelled, true);
             });
             this.publishRunSteps(record.taskId, this.store.listRunSteps(record.taskId));
+            if (changed) this.publishSnapshot();
           } else if (
             this.store.getNode(worker.nodeId)?.online &&
             !["idle", "offline", "completed", "stopped", "failed"].includes(
@@ -727,15 +794,47 @@ export class FleetService {
     });
   }
 
+  agentLaunchProblem(
+    node: FleetNode,
+    params: AgentParams,
+    sessionId?: string,
+  ): string | undefined {
+    const session = sessionId ? this.store.getSession(sessionId) : undefined;
+    if (params.kind !== "copilot" && session && session.runRole !== "lead") {
+      return "Only orchestrators can use another agent";
+    }
+    if (!supportsAgentKind(node, params.kind)) {
+      return `${agentKindLabels[params.kind]} is unavailable on ${node.name}. Install the agent and reconnect or upgrade this Node; existing sessions never change backend.`;
+    }
+    if (
+      params.kind === "hermes" &&
+      this.store
+        .listSessions()
+        .some(
+          (session) =>
+            session.id !== sessionId &&
+            session.nodeId === node.id &&
+            session.agentParams?.kind === "hermes" &&
+            session.agentParams.profile === params.profile &&
+            (liveSessionStates.has(session.state) ||
+              session.state === "offline" ||
+              session.stopRequested),
+        )
+    ) {
+      return `Hermes profile "${params.profile}" already belongs to an active orchestrator on ${node.name}. Stop it before starting another, or select a different profile. If its Node is unavailable, verify the old process has stopped, then use Mark stopped on that conversation. Dismissal alone does not stop a process.`;
+    }
+    return undefined;
+  }
+
   /**
    * Creates a session and asks its Node to start it.
    *
-   * Shared by the REST route, the orchestrator, and the MCP facade so all three
-   * enforce the same admission rules — capacity, yolo support, a live node —
-   * rather than each growing its own copy that drifts.
+   * Shared by REST, orchestration and MCP so admission cannot drift by caller.
    */
   createAndStartSession(input: {
     placement: Placement;
+    agentParams?: AgentParams;
+    startupNotice?: string;
     prompt: string;
     yolo: boolean;
     name?: string;
@@ -769,6 +868,18 @@ export class FleetService {
     }
     const node = this.store.getNode(input.placement.nodeId);
     if (!node?.online) return { ok: false, status: 409, error: "Node is offline" };
+    const agentParams = input.agentParams ?? { kind: "copilot" as const };
+    if (agentParams.kind !== "copilot" && input.runRole !== "lead") {
+      return {
+        ok: false,
+        status: 400,
+        error: "Only orchestrators can use another agent",
+      };
+    }
+    const agentProblem = this.agentLaunchProblem(node, agentParams);
+    if (agentProblem) return { ok: false, status: 409, error: agentProblem };
+    const hostUpdating = this.hostUpdate?.blocksNodeWork(node.id);
+    if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
     const kind = input.readOnly ? "read-only" : "writing";
     if (
       reservedSessionCount(this.store.listSessions(), node.id, kind) >=
@@ -806,6 +917,7 @@ export class FleetService {
         runRole: input.runRole ?? "",
         readOnly: input.readOnly ?? false,
         operatorUsername: input.operatorUsername ?? "",
+        agentParams,
       },
     );
     if (binding) {
@@ -831,6 +943,7 @@ export class FleetService {
       node.id,
       {
         type: "start_session",
+        ...(input.startupNotice ? { startupNotice: input.startupNotice } : {}),
         sessionId: session.id,
         localPath: input.placement.localPath,
         sourcePlacementId: input.placement.id,
@@ -871,7 +984,9 @@ export class FleetService {
   }): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const sessions = this.store.listSessions();
     const existing = sessions.find(
-      (session) => session.agentSessionId === input.agentSessionId,
+      (session) =>
+        session.agentSessionId === input.agentSessionId &&
+        (session.agentParams?.kind ?? "copilot") === "copilot",
     );
     if (existing && liveSessionStates.has(existing.state)) {
       return {
@@ -907,7 +1022,7 @@ export class FleetService {
   }
 
   /**
-   * Re-attaches one finished Copilot conversation without prompting it.
+   * Re-attaches one finished conversation without changing its backend or prompting it.
    *
    * Kept beside creation because both paths enforce the same admission rules
    * and assemble the same launch context. The caller may send a prompt
@@ -915,7 +1030,7 @@ export class FleetService {
    */
   resumeSession(
     sessionId: string,
-    activity = "Resuming Copilot session",
+    activity?: string,
     supervisor?: { operatorId: string; operationId?: string | undefined },
   ): { ok: true; session: FleetSession } | { ok: false; status: number; error: string } {
     const session = this.store.getSession(sessionId);
@@ -970,6 +1085,14 @@ export class FleetService {
     }
     const node = this.store.getNode(session.nodeId);
     if (!node?.online) return { ok: false, status: 503, error: "Node is offline" };
+    const agentProblem = this.agentLaunchProblem(
+      node,
+      session.agentParams ?? { kind: "copilot" },
+      session.id,
+    );
+    if (agentProblem) return { ok: false, status: 409, error: agentProblem };
+    const hostUpdating = this.hostUpdate?.blocksNodeWork(node.id);
+    if (hostUpdating) return { ok: false, status: 409, error: hostUpdating };
     const kind = session.readOnly ? "read-only" : "writing";
     if (
       reservedSessionCount(this.store.listSessions(), node.id, kind) >=
@@ -994,10 +1117,16 @@ export class FleetService {
       };
     }
 
-    const resumed = this.transitionSession(sessionId, "starting", activity, {
-      type: "host",
-      cause: "resume_requested",
-    });
+    const resumed = this.transitionSession(
+      sessionId,
+      "starting",
+      activity ??
+        `Resuming ${agentKindLabels[session.agentParams?.kind ?? "copilot"]} session`,
+      {
+        type: "host",
+        cause: "resume_requested",
+      },
+    );
     this.publishSession(resumed);
     const provenance: [undefined?, SupervisorCommand?] = manual
       ? [undefined, manual]
@@ -1176,10 +1305,14 @@ export class FleetService {
    * keeps that a quiet fact rather than a warning logged on every dispatch.
    */
   agentFor(
-    session: Pick<FleetSession, "runRole">,
+    session: Pick<FleetSession, "runRole" | "agentParams">,
     node: Pick<FleetNode, "agents">,
   ): string {
-    if (session.runRole !== "lead") return "";
+    if (
+      session.runRole !== "lead" ||
+      (session.agentParams?.kind ?? "copilot") !== "copilot"
+    )
+      return "";
     return node.agents.some((agent) => agent.name === ORCHESTRATOR_AGENT)
       ? ORCHESTRATOR_AGENT
       : "";
@@ -1203,7 +1336,10 @@ export class FleetService {
    * has expressed one, and a machine that cannot honour them says so and
    * carries on.
    */
-  startupConfigFor(session: Pick<FleetSession, "runRole">): StartupConfig[] {
+  startupConfigFor(
+    session: Pick<FleetSession, "runRole" | "agentParams">,
+  ): StartupConfig[] {
+    if ((session.agentParams?.kind ?? "copilot") !== "copilot") return [];
     const config: StartupConfig[] = [];
     if (session.runRole === "lead" || session.runRole === "worker") {
       config.push({ id: "mode", value: "agent" });
@@ -1317,7 +1453,14 @@ export class FleetService {
     }
     const lifecycleIntent =
       request.type === "cancel" || request.type === "stop" ? request.type : undefined;
-    const socket = this.nodeSockets.get(nodeId);
+    // Nothing new starts on the Node beside the Host while the Host is updating:
+    // the restart at the end would stop it without anyone having agreed to that.
+    // Refused the way an unreachable Node is, so every caller already copes.
+    const hostUpdating =
+      request.type === "start_session" || request.type === "resume_session"
+        ? this.hostUpdate?.blocksNodeWork(nodeId)
+        : undefined;
+    const socket = hostUpdating ? undefined : this.nodeSockets.get(nodeId);
     if (socket && socket.readyState === socket.OPEN) {
       if (lifecycleIntent) {
         this.store.writeAtomically(() => {
@@ -1409,6 +1552,12 @@ export class FleetService {
             : {}),
           ...(request.type === "start_session" || request.type === "resume_session"
             ? {
+                agentParams: session.agentParams ?? { kind: "copilot" },
+              }
+            : {}),
+          ...((request.type === "start_session" || request.type === "resume_session") &&
+          (session.agentParams?.kind ?? "copilot") === "copilot"
+            ? {
                 agencyMode: this.store.getAgencyMode(),
                 contextTier:
                   ContextTierSchema.safeParse(
@@ -1435,6 +1584,7 @@ export class FleetService {
       return { sent: true };
     }
     if (!fallback) return { sent: false };
+    const settledAs = hostUpdating ? { ...fallback, activity: hostUpdating } : fallback;
     const session = this.notifications.commitAtomically(
       () => {
         if (lifecycleIntent) {
@@ -1443,17 +1593,17 @@ export class FleetService {
         }
         const settled = this.transitionSession(
           request.sessionId,
-          fallback.state,
-          fallback.activity,
+          settledAs.state,
+          settledAs.activity,
           { type: "host", cause: "dispatch_fallback" },
         );
-        if (terminalSessionStates.has(fallback.state)) {
+        if (terminalSessionStates.has(settledAs.state)) {
           this.store.clearSessionTurnCompletion(request.sessionId);
         }
         if (lifecycleIntent) {
           this.store.consumeSessionTransitionIntent(request.sessionId);
         }
-        if (terminalSessionStates.has(fallback.state)) {
+        if (terminalSessionStates.has(settledAs.state)) {
           this.resolveSessionPermissionRequests(request.sessionId);
         }
         return settled;
@@ -1587,16 +1737,15 @@ export class FleetService {
         reason: `${node.name} runs a build that predates remote updates; update it by hand once`,
       };
     }
+    // The Node beside the Host shares its checkout; two updates resetting and
+    // rebuilding one directory at once would leave it in neither state.
+    const hostUpdating = this.hostUpdate?.blocksNodeUpdate(nodeId);
+    if (hostUpdating) return { started: false, reason: hostUpdating };
     const socket = this.nodeSockets.get(nodeId);
     if (!socket || socket.readyState !== socket.OPEN) {
       return { started: false, reason: `${node.name} is offline` };
     }
-    const live = this.store
-      .listSessions()
-      .filter(
-        (session) =>
-          session.nodeId === nodeId && !terminalSessionStates.has(session.state),
-      );
+    const live = this.liveSessionsOn(nodeId);
     if (live.length > 0) {
       if (!stopSessions) {
         return {
@@ -1605,20 +1754,7 @@ export class FleetService {
           blockedBy: live,
         };
       }
-      // Stopped before the update rather than left to die with the process, so
-      // each one ends as something an operator asked for and its agent is given
-      // the chance to shut down rather than being killed mid-write.
-      for (const session of live) {
-        this.dispatch(
-          nodeId,
-          { type: "stop", sessionId: session.id },
-          { state: "stopped", activity: "Stopped to update the node" },
-        );
-      }
-      this.log.info(
-        { nodeId, stopped: live.length },
-        "Stopping sessions so the node can update",
-      );
+      this.stopSessionsForUpdate(nodeId, live, "Stopped to update the node");
     }
     const updateId = randomUUID();
     this.send(socket, HostToNodeMessageSchema.parse({ type: "update_node", updateId }));
@@ -1638,6 +1774,55 @@ export class FleetService {
       .listNodes()
       .filter((node) => nodeUpdateState(node, this.hostRevision) === "stale")
       .map((node) => node.id);
+  }
+
+  /** Sessions a restart of this Node would end. */
+  liveSessionsOn(nodeId: string): FleetSession[] {
+    return this.store
+      .listSessions()
+      .filter(
+        (session) =>
+          session.nodeId === nodeId && !terminalSessionStates.has(session.state),
+      );
+  }
+
+  /**
+   * Stops sessions an operator agreed to give up for an update.
+   *
+   * Stopped before the update rather than left to die with the process, so
+   * each one ends as something an operator asked for and its agent is given
+   * the chance to shut down rather than being killed mid-write.
+   */
+  stopSessionsForUpdate(
+    nodeId: string,
+    sessions: readonly FleetSession[],
+    activity: string,
+  ): void {
+    for (const session of sessions) {
+      this.dispatch(
+        nodeId,
+        { type: "stop", sessionId: session.id },
+        { state: "stopped", activity },
+      );
+    }
+    this.log.info(
+      { nodeId, stopped: sessions.length },
+      "Stopping sessions so the node can update",
+    );
+  }
+
+  /** Whether this Node has been told to update and has not said how it went. */
+  nodeUpdateInFlight(nodeId: string): boolean {
+    return this.updatesInFlight.has(nodeId);
+  }
+
+  /** Wires the Host's own update. Called once, from `server.ts`. */
+  attachHostUpdate(hostUpdate: HostUpdateHooks): void {
+    this.hostUpdate = hostUpdate;
+  }
+
+  publishHostUpdate(status: HostUpdateStatus): void {
+    this.broadcast({ type: "host_update", status });
   }
 
   publishNodeUpdate(
@@ -1884,6 +2069,17 @@ export class FleetService {
       }
       const placement = this.store.getPlacement(session.placementId);
       if (!placement) continue;
+      const agentProblem = this.agentLaunchProblem(
+        node,
+        session.agentParams ?? { kind: "copilot" },
+        session.id,
+      );
+      if (agentProblem) {
+        this.publishSession(
+          this.store.transitionSession(session.id, session.state, agentProblem),
+        );
+        continue;
+      }
       if (yoloUnsupportedReason(node, session.yolo)) continue;
       try {
         this.worktrees.validateSession(session);
@@ -1934,6 +2130,7 @@ export class FleetService {
 
   disconnectNode(nodeId: string, activity: string): void {
     this.commands.nodeDisconnected(nodeId);
+    this.files.nodeDisconnected(nodeId);
     this.worktrees.nodeLost(nodeId);
     this.sessionRetention.nodeDisconnected(nodeId);
     this.nodeSockets.delete(nodeId);
@@ -2501,6 +2698,32 @@ export class FleetService {
    */
   reportSessionNotice(sessionId: string, message: string): void {
     this.broadcast({ type: "session_notice", sessionId, message });
+  }
+
+  /**
+   * Settles a session whose start or resume the Node refused.
+   *
+   * A refusal is non-fatal because whatever session the Node holds is healthy,
+   * and it re-announces that session's state ahead of the refusal. A refused
+   * launch leaves nothing to re-announce: no process started, so nothing on the
+   * Node will ever report on it again. Left in `starting`, the session was drawn
+   * as running with Cancel disabled indefinitely, and Stop then Resume only sent
+   * the same launch into the same refusal. Failing it keeps the conversation
+   * resumable and puts the reason where the operator is already looking.
+   */
+  settleRefusedLaunch(sessionId: string, commandId: string, reason: string): void {
+    const session = this.store.getSession(sessionId);
+    if (
+      !session ||
+      (session.state !== "queued" && session.state !== "starting") ||
+      this.store.getSessionDispatchAttempt(sessionId)?.commandId !== commandId
+    )
+      return;
+    this.failFromCommandResult(
+      sessionId,
+      commandId,
+      `${session.agentSessionId ? "Resume" : "Start"} refused: ${reason}`,
+    );
   }
 
   /**

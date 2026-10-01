@@ -50,6 +50,8 @@ describe("reviewOutcome", () => {
     expect(prompt).toContain('decision="decision-1"');
     expect(prompt).toContain("Keep the API");
     expect(prompt).toContain("Preserve unresolved findings");
+    expect(prompt).toContain("then resume maintenance with fleet_set_pr_maintenance");
+    expect(prompt).not.toContain("requesting maintenance resume");
     expect(prompt).not.toContain("Call fleet_submit_task");
   });
 

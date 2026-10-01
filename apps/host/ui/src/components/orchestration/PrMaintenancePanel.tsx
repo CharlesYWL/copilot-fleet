@@ -675,12 +675,14 @@ export function PrMaintenancePanel({
                   "authorization_required",
                 ].includes(currentProgress.stage) ? (
                   "On hold until the current blocker is resolved."
+                ) : currentProgress.stage === "addressing_review" ? (
+                  "After the retained worker finishes its repair turn."
                 ) : (
                   <>
                     <time dateTime={current.nextCheckAt}>
                       {checkTime(current.nextCheckAt)}
                     </time>{" "}
-                    · best-effort lead wake
+                    · orchestrator heartbeat, best effort
                   </>
                 )}
               </dd>

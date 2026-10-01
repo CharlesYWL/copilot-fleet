@@ -13,6 +13,7 @@ import {
 } from "@fluentui/react-components";
 import {
   CommandExecutionSchema,
+  commandApprovalExpiresAt,
   errorMessage,
   type CommandDecision,
   type CommandExecution,
@@ -164,7 +165,7 @@ export function CommandPermissionPrompts({
               <dt>Runtime limit</dt>
               <dd>{Math.round(selected.timeoutMs / 1000)} seconds</dd>
               <dt>Approve before</dt>
-              <dd>{new Date(selected.expiresAt).toLocaleString()}</dd>
+              <dd>{new Date(commandApprovalExpiresAt(selected)).toLocaleString()}</dd>
             </dl>
             <pre className={styles.command} aria-label="Command awaiting approval">
               {visibleCommandText(selected.command)}

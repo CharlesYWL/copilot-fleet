@@ -301,6 +301,7 @@ describe("durable managed workspace store", () => {
     const session = source.createSession(placement, "implement", false, "worker", {
       runId: run.id,
       runRole: "worker",
+      readOnly: true,
     });
     const binding = ExecutionBindingSchema.parse({
       worktreeId: tree.id,
@@ -317,7 +318,15 @@ describe("durable managed workspace store", () => {
       prompt: "task",
       placementId: placement.id,
     });
-    source.updateRunStep(step.id, { executionBinding: binding, sessionId: session.id });
+    source.updateRunStep(step.id, {
+      executionBinding: binding,
+      sessionId: session.id,
+      state: "succeeded",
+      managedWorktreeId: tree.id,
+      workspaceState: "completed",
+      workspaceError: "Retained workspace diagnostic",
+      resultSha: tree.baseSha,
+    });
     source.putWorktreeOperation({
       request: WorktreeOperationRequestSchema.parse({
         operationId: randomUUID(),
@@ -341,8 +350,17 @@ describe("durable managed workspace store", () => {
     target.replaceHostBackup(backup);
     expect(target.getRun(run.id)!.workspaceBinding!.initialization).toBe("quarantined");
     expect(target.getManagedWorktree(tree.id)!.state).toBe("quarantined");
-    expect(target.getSession(session.id)!.executionBinding!.quarantined).toBe(true);
-    expect(target.getRunStep(step.id)!.executionBinding!.quarantined).toBe(true);
+    expect(target.getSession(session.id)).toMatchObject({
+      readOnly: true,
+      executionBinding: { quarantined: true },
+    });
+    expect(target.getRunStep(step.id)).toMatchObject({
+      managedWorktreeId: tree.id,
+      workspaceState: "completed",
+      workspaceError: "Retained workspace diagnostic",
+      resultSha: tree.baseSha,
+      executionBinding: { quarantined: true },
+    });
     expect(target.listWorktreeOperations()[0]!.state).toBe("quarantined");
     expect(() => target.deleteRun(run.id)).toThrow();
     expect(JSON.stringify(backup)).not.toContain("nodeIncarnation");

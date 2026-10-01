@@ -111,6 +111,22 @@ afterEach(() => {
 });
 
 describe("settings navigation", () => {
+  it("puts heartbeat and agent settings in their own retained Orchestrator tab", async () => {
+    show();
+    await openSettings();
+    expect(screen.queryByRole("textbox", { name: "Heartbeat schedule" })).toBeNull();
+    await selectTab("Orchestrator");
+    const schedule = screen.getByRole<HTMLInputElement>("textbox", {
+      name: "Heartbeat schedule",
+    });
+    expect(screen.getByRole("combobox", { name: "Preferred agent" })).toBeTruthy();
+    fireEvent.change(schedule, { target: { value: "*/15 * * * *" } });
+    await selectTab("General");
+    await selectTab("Orchestrator");
+    expect(screen.getByRole("textbox", { name: "Heartbeat schedule" })).toBe(schedule);
+    expect(schedule.value).toBe("*/15 * * * *");
+  });
+
   it("loads sections lazily and keeps their content without reloading or replaying warnings", async () => {
     show();
     const initialAuthReads = readCount("/api/auth/status");

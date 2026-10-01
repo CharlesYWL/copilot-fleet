@@ -183,8 +183,11 @@ describe("real Node process-death recovery", { timeout: 90_000 }, () => {
       ).stdout.trim(),
     ).toBe("same.txt");
     const restored = await fleet.act("reconcile");
-    expect(restored.integration.state).toBe("needs_reconciliation");
-    expect(restored.worktree.state).toBe("needs_reconciliation");
+    expect(restored.integration.state).toBe("conflicted");
+    expect(restored.worktree).toMatchObject({
+      state: "retained",
+      integrationState: "conflicted",
+    });
     expect(
       (
         await git.run(preview.target.path, ["diff", "--name-only", "--diff-filter=U"])
@@ -214,8 +217,16 @@ describe("real Node process-death recovery", { timeout: 90_000 }, () => {
     ).stdout.trim();
     const restored = await fleet.act("reconcile");
     expect(restored.error).toBe("");
-    expect(restored.integration.state).toBe("needs_reconciliation");
-    expect(restored.worktree.state).toBe("needs_reconciliation");
+    expect(restored.integration).toMatchObject({
+      state: "integrated",
+      resultSha: head,
+      validationState: "passed",
+      publishState: "not_started",
+    });
+    expect(restored.worktree).toMatchObject({
+      state: "retained",
+      integrationState: "integrated",
+    });
     expect(
       (await git.run(preview.target.path, ["rev-parse", "HEAD"])).stdout.trim(),
     ).toBe(head);

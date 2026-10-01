@@ -1,5 +1,6 @@
 import { Button, makeStyles, mergeClasses } from "@fluentui/react-components";
 import { Dismiss12Regular } from "@fluentui/react-icons";
+import type { PrMaintenanceStage, PrMaintenanceTaskStatus } from "@fleet/protocol";
 import { useState } from "react";
 import type { RunViewModel } from "../../lib/orchestration-view";
 import {
@@ -7,7 +8,12 @@ import {
   isOrchestratorStoppedRun,
   runStateLabel,
 } from "../../lib/orchestration-view";
-import { statusDescriptor, type StatusDescriptor } from "../../lib/status-visuals";
+import {
+  statusDescriptor,
+  type StatusDescriptor,
+  type StatusState,
+} from "../../lib/status-visuals";
+import { maintenanceStageLabels } from "../../lib/task-overview";
 import { StatusIndicator } from "../StatusIndicator";
 
 export const FAILED_STEP_DISMISS_PREFIX = "fleet.ui.run.failed-step.";
@@ -55,6 +61,29 @@ const rememberDismissedFailures = (runId: string, tokens: readonly string[]) => 
   }
 };
 
+/** Amber where maintenance waits on a person, as the task overview says. */
+const maintenanceVisualState: Record<PrMaintenanceStage, StatusState> = {
+  checking: "queued",
+  triage: "queued",
+  addressing_review: "queued",
+  waiting_checks: "queued",
+  waiting_review: "queued",
+  recovering: "resumable",
+  ready: "done",
+  merged: "done",
+  closed: "stopped",
+  released: "stopped",
+  human_hold: "waiting-for-permission",
+  reconciling: "waiting-for-permission",
+  authorization_required: "waiting-for-permission",
+  paused: "waiting-for-permission",
+  blocked: "waiting-for-permission",
+};
+
+export function maintenanceStatusLabel(status: PrMaintenanceTaskStatus): string {
+  return `PR · ${status.manualControl ? "Manual control" : maintenanceStageLabels[status.stage]}`;
+}
+
 /**
  * What a task's state looks like, in words first.
  *
@@ -93,7 +122,24 @@ export function runVisual(model: RunViewModel): StatusDescriptor {
     return { ...statusDescriptor("offline"), label: "Node offline" };
   }
   if (model.liveSteps > 0) {
-    return statusDescriptor("running");
+    return model.maintenance
+      ? {
+          ...statusDescriptor("running"),
+          label: maintenanceStatusLabel(model.maintenance),
+        }
+      : statusDescriptor("running");
+  }
+  // Before the terminal states, as in the task overview: retained maintenance
+  // keeps working on the PR whatever the run row says.
+  if (model.maintenance) {
+    return {
+      ...statusDescriptor(
+        model.maintenance.manualControl
+          ? "idle"
+          : maintenanceVisualState[model.maintenance.stage],
+      ),
+      label: maintenanceStatusLabel(model.maintenance),
+    };
   }
   if (model.run.state === "completed") {
     return statusDescriptor("done");

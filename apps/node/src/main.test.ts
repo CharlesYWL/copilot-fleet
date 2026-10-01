@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -10,10 +10,12 @@ import {
   DURABLE_LEAD_DELIVERY_CAPABILITY,
   COMMAND_EXECUTION_CAPABILITY,
   COMMAND_PERMISSIONS_CAPABILITY,
+  SESSION_FILES_CAPABILITY,
   NodeBackupSchema,
   NODE_BACKUP_KIND,
   BACKUP_VERSION,
   PreparedCommandSchema,
+  WorkspaceResultSchema,
   type PreparedCommand,
   type HostToNodeMessage,
   type NodeCommand,
@@ -35,11 +37,13 @@ import { settingsFromEnv } from "./settings.js";
 import { CommandPermissions, permissionPath } from "./command-permissions.js";
 import type * as SettingsModule from "./settings.js";
 import type * as AgentCatalogModule from "./agent-catalog.js";
+import { readAgentCatalog } from "./agent-catalog.js";
 import type * as InstanceLockModule from "./instance-lock.js";
 import type * as ConfigServerModule from "./config-server.js";
 import type * as UpdaterModule from "./updater.js";
 import type { CopilotSessionDiscoveryOptions } from "./copilot-sessions.js";
 import type { CommandResult, CommandRouterOptions } from "./router.js";
+import type { ManagedWorktreeOptions } from "./managed-worktrees.js";
 
 class TestSocket extends EventEmitter {
   static OPEN = 1;
@@ -54,6 +58,11 @@ class TestSocket extends EventEmitter {
   constructor(_url: URL, _options: unknown) {
     super();
     sockets.push(this);
+  }
+
+  async open(): Promise<void> {
+    this.readyState = TestSocket.OPEN;
+    for (const listener of this.listeners("open")) await listener();
   }
 
   async receive(frame: unknown): Promise<void> {
@@ -84,6 +93,8 @@ const route = vi.fn<(command: NodeCommand) => Promise<CommandResult>>(
   async (command) => ({ commandId: command.commandId, ok: true }),
 );
 let routerOptions: CommandRouterOptions;
+let readRouterCatalog: () => Promise<readonly AgentCatalogModule.CatalogEntry[]>;
+let worktreeOptions: ManagedWorktreeOptions;
 let discoveryOptions: CopilotSessionDiscoveryOptions;
 let configOptions: Parameters<typeof ConfigServerModule.startConfigServer>[0];
 const createDiscovery = vi.fn();
@@ -171,6 +182,7 @@ vi.mock("./router.js", () => ({
     refreshMcpSessions = refreshMcpSessions;
     setMcpAvailable = setMcpAvailable;
     route = route;
+    sessionRoots = vi.fn((): string[] => []);
     setMaxSessions = vi.fn();
     stopAll = stopAll;
     deliverLeadPrompt = deliverLeadPrompt;
@@ -181,12 +193,13 @@ vi.mock("./router.js", () => ({
       onEvent: (event: SessionEvent) => void,
       _validatePath: unknown,
       _hostUrl: unknown,
-      _catalog: unknown,
+      catalog: typeof readRouterCatalog,
       _warn: unknown,
       options: CommandRouterOptions,
     ) {
       emitEvent = onEvent;
       routerOptions = options;
+      readRouterCatalog = catalog;
     }
   },
 }));
@@ -194,6 +207,9 @@ vi.mock("./managed-worktrees.js", () => ({
   ManagedWorktrees: class {
     quarantine = quarantine;
     shutdown = worktreesShutdown;
+    constructor(options: ManagedWorktreeOptions) {
+      worktreeOptions = options;
+    }
   },
 }));
 vi.mock("./command-journal.js", () => ({
@@ -243,8 +259,69 @@ beforeEach(() => {
   sockets.length = 0;
   journalRecords.length = 0;
   vi.clearAllMocks();
+  vi.mocked(readAgentCatalog).mockReset().mockResolvedValue([]);
   activeSessionIds = ["session-1"];
 });
+
+const retainedAgent: AgentCatalogModule.CatalogEntry = {
+  name: "fleet-orchestrator",
+  description: "Orchestrates Fleet tasks",
+  path: "C:\\fixture\\fleet-orchestrator.agent.md",
+  markdown: "Fixture orchestrator",
+};
+
+it.each([false, true])(
+  "sends legacy hello when catalog refresh fails (previous catalog: %s)",
+  async (hasCatalog) => {
+    vi.useFakeTimers();
+    vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+    vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+    vi.stubEnv("FLEET_MOCK_AGENT", "1");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const catalog = vi.mocked(readAgentCatalog);
+    if (hasCatalog) catalog.mockResolvedValueOnce([retainedAgent]);
+    else catalog.mockRejectedValueOnce(new Error("startup read failed"));
+    catalog.mockRejectedValueOnce(new Error("refresh read failed"));
+    const { loadCredentials } = await import("./config.js");
+    vi.mocked(loadCredentials).mockResolvedValueOnce({
+      hostUrl: credentials.hostUrl,
+      nodeId: credentials.nodeId,
+      name: credentials.name,
+      authProtocol: "legacy-secret",
+      secret: "test-secret",
+    });
+    const exits = process.listeners("exit");
+    const { main } = await import("./main.js");
+    const runtime = await main([]);
+    try {
+      const socket = sockets[0]!;
+      await socket.open();
+      expect(JSON.parse(socket.send.mock.calls[0]![0])).toMatchObject({
+        type: "hello",
+        agents: hasCatalog
+          ? [{ name: retainedAgent.name, description: retainedAgent.description }]
+          : [],
+      });
+      expect(configOptions.recentLogs?.()).toContainEqual(
+        expect.objectContaining({
+          level: "warn",
+          message:
+            "Could not read the agent catalog; keeping the last known catalog: refresh read failed",
+        }),
+      );
+      // A successful empty read is authoritative; failure afterwards must not resurrect removed agents.
+      catalog.mockResolvedValueOnce([]);
+      expect(await readRouterCatalog()).toEqual([]);
+      catalog.mockRejectedValueOnce(new Error("another read failed"));
+      expect(await readRouterCatalog()).toEqual([]);
+    } finally {
+      await runtime.shutdown();
+      for (const listener of process.listeners("exit"))
+        if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  },
+);
 
 it.each([false, true])(
   "reports failures and verifies service restart handoff (shutdown failure: %s)",
@@ -274,13 +351,13 @@ it.each([false, true])(
       const { ensureGithubAuth } = await import("./github-auth.js");
       expect(ensureGithubAuth).not.toHaveBeenCalled();
       const socket = sockets[0]!;
-      socket.readyState = TestSocket.OPEN;
-      socket.emit("open");
+      await socket.open();
       const hello = JSON.parse(socket.send.mock.calls[0]![0]) as Extract<
         NodeToHostMessage,
         { type: "hello" }
       >;
       expect(hello.capabilities).not.toContain(COMMAND_EXECUTION_CAPABILITY);
+      expect(hello.capabilities).not.toContain(SESSION_FILES_CAPABILITY);
       vi.mocked(updateCheckout).mockResolvedValueOnce({
         action: "failed",
         reason: "Build failed",
@@ -358,6 +435,152 @@ afterEach(() => {
 });
 
 it.each([
+  ["begin", "false"],
+  ["chunk", "false"],
+  ["chunk", "throw"],
+  ["complete", "false"],
+  ["complete", "throw"],
+] as const)("does not leave artifact waiters at %s/%s", async (stage, failure) => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const { loadCredentials } = await import("./config.js");
+  vi.mocked(loadCredentials).mockResolvedValueOnce({
+    hostUrl: credentials.hostUrl,
+    nodeId: credentials.nodeId,
+    name: credentials.name,
+    authProtocol: "legacy-secret",
+    secret: "test-secret",
+  });
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  let finished: Promise<unknown> | undefined;
+  let cleanupAck: HostToNodeMessage | undefined;
+  try {
+    const result = WorkspaceResultSchema.parse({
+      id: randomUUID(),
+      runId: "run-1",
+      ownerStepId: "step-1",
+      repositoryIdentity: "c".repeat(64),
+      baseSha: "a".repeat(40),
+      headSha: "b".repeat(40),
+      sourceWorktreeId: "worktree-1",
+      sourceNodeId: credentials.nodeId,
+      sourcePlacementId: "placement-1",
+      sourceGeneration: 1,
+      state: "available",
+      artifactId: "d".repeat(64),
+      artifactSha256: "d".repeat(64),
+      artifactSize: 1,
+      objectFormat: "sha1",
+      createdAt: new Date().toISOString(),
+    });
+    const path = resolvePath(
+      testConfigDirectory,
+      "workspace-result-artifacts",
+      "send-failure.bundle",
+    );
+    const socket = sockets[0]!;
+    if (stage === "begin") {
+      socket.readyState = 3;
+      const timers = vi.getTimerCount();
+      await expect(
+        worktreeOptions.uploadArtifact!({ ...result, state: "sealing" }, path),
+      ).rejects.toThrow("Host is unavailable for artifact upload.");
+      expect(vi.getTimerCount()).toBe(timers);
+      await expect(
+        worktreeOptions.downloadArtifact!(result, path, randomUUID()),
+      ).rejects.toThrow("Host is unavailable for artifact download.");
+      expect(vi.getTimerCount()).toBe(timers);
+      expect(socket.send).not.toHaveBeenCalled();
+      return;
+    }
+
+    mkdirSync(resolvePath(testConfigDirectory, "workspace-result-artifacts"));
+    writeFileSync(path, "x");
+    await socket.open();
+    expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({ type: "hello" });
+    await socket.receive({ type: "welcome", nodeId: credentials.nodeId });
+    socket.send.mockClear();
+    const sendError = new Error(`${stage} send failed`);
+    socket.send.mockImplementation((text) => {
+      const frame = JSON.parse(text) as NodeToHostMessage;
+      if (failure === "throw" && frame.type === `artifact_upload_${stage}`)
+        throw sendError;
+    });
+    const transfer = {
+      operationId: result.id,
+      resultId: result.id,
+      artifactId: result.artifactId,
+      ok: true,
+      offset: 0,
+      complete: false,
+      code: "",
+      error: "",
+    };
+    cleanupAck = {
+      type: "artifact_transfer_ack",
+      transfer: { ...transfer, ok: false, error: "Test cleanup" },
+    };
+    const timers = vi.getTimerCount();
+    const resolved = vi.fn();
+    const rejected = vi.fn();
+    finished = worktreeOptions.uploadArtifact!(
+      { ...result, state: "sealing" },
+      path,
+    ).then(resolved, rejected);
+    expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+      type: "artifact_upload_begin",
+    });
+
+    const beginAck = socket.receive({ type: "artifact_transfer_ack", transfer });
+    if (stage === "chunk" && failure === "false") socket.readyState = 3;
+    await beginAck;
+    if (stage === "complete") {
+      await vi.waitFor(
+        () =>
+          expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
+            type: "artifact_upload_chunk",
+            transfer: { offset: 0, data: "eA==" },
+          }),
+        { timeout: 1_000, interval: 10 },
+      );
+      const chunkAck = socket.receive({
+        type: "artifact_transfer_ack",
+        transfer: { ...transfer, offset: result.artifactSize },
+      });
+      if (failure === "false") socket.readyState = 3;
+      await chunkAck;
+    }
+
+    await vi.waitFor(() => expect(rejected).toHaveBeenCalledOnce(), {
+      timeout: 1_000,
+      interval: 10,
+    });
+    await finished;
+    expect(resolved).not.toHaveBeenCalled();
+    if (failure === "throw") expect(rejected.mock.lastCall![0]).toBe(sendError);
+    else
+      expect(rejected.mock.lastCall![0]).toMatchObject({
+        message: "Host is unavailable for artifact upload.",
+      });
+    expect(vi.getTimerCount()).toBe(timers);
+  } finally {
+    if (cleanupAck) {
+      await sockets[0]!.receive(cleanupAck);
+      await finished;
+    }
+    await runtime.shutdown();
+    vi.clearAllTimers();
+    for (const listener of process.listeners("exit"))
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+  }
+});
+
+it.each([
   [false, false],
   [true, false],
   [false, true],
@@ -370,12 +593,14 @@ it.each([
     vi.stubEnv("FLEET_MOCK_AGENT", "1");
     vi.spyOn(console, "log").mockImplementation(() => {});
     const exits = process.listeners("exit");
+    vi.mocked(readAgentCatalog)
+      .mockResolvedValueOnce([retainedAgent])
+      .mockRejectedValueOnce(new Error("catalog refresh failed"));
     const { main } = await import("./main.js");
     const runtime = await main([]);
     try {
       const socket = sockets[0]!;
-      socket.readyState = TestSocket.OPEN;
-      socket.emit("open");
+      await socket.open();
       const hello = JSON.parse(socket.send.mock.calls[0]![0]) as NodeClientHello;
       expect(hello.type).toBe("client_hello");
 
@@ -433,6 +658,7 @@ it.each([
       const ready = open(2);
       expect(ready).toMatchObject({
         type: "ready",
+        agents: [{ name: retainedAgent.name, description: retainedAgent.description }],
         capabilities: expect.arrayContaining([
           OUTBOX_ACK_CAPABILITY,
           SESSION_RETENTION_CAPABILITY,
@@ -647,8 +873,7 @@ it("refuses self-update before invoking the updater with live sessions or pendin
   const runtime = await main([]);
   try {
     const socket = sockets[0]!;
-    socket.readyState = TestSocket.OPEN;
-    socket.emit("open");
+    await socket.open();
     await socket.receive({ type: "update_node", updateId: "live" });
     expect(updateCheckout).not.toHaveBeenCalled();
     expect(JSON.parse(socket.send.mock.lastCall![0])).toMatchObject({
@@ -694,8 +919,7 @@ it("keeps command admission quarantined after updater mutation failure and force
   const runtime = await main([]);
   try {
     const socket = sockets[0]!;
-    socket.readyState = TestSocket.OPEN;
-    socket.emit("open");
+    await socket.open();
     await socket.receive({ type: "update_node", updateId: "mutating-update" });
     expect(updateCheckout).toHaveBeenCalledOnce();
     expect(routerOptions.admission!.reason).toContain("update is incomplete");
@@ -1031,4 +1255,120 @@ it("stops before connecting or loading settings when GitHub authentication fails
   await expect(main([])).rejects.toThrow("GitHub login cancelled");
   expect(loadSettings).not.toHaveBeenCalled();
   expect(sockets).toHaveLength(0);
+});
+
+it("reads session files only for a welcomed sealed Host, and never its own identity", async () => {
+  vi.useFakeTimers();
+  vi.stubEnv("FLEET_DEVTUNNEL_ID", "");
+  vi.stubEnv("FLEET_UPDATE_PARENT_PID", "");
+  vi.stubEnv("FLEET_MOCK_AGENT", "1");
+  vi.spyOn(console, "log").mockImplementation(() => {});
+  const workspace = resolvePath(`.fleet-main-files-${randomUUID()}`);
+  mkdirSync(workspace);
+  writeFileSync(resolvePath(workspace, "report.txt"), "report");
+  writeFileSync(resolvePath(testConfigDirectory, "node.json"), "{}");
+  const exits = process.listeners("exit");
+  const { main } = await import("./main.js");
+  const runtime = await main([]);
+  try {
+    const socket = sockets[0]!;
+    await socket.open();
+    const hello = JSON.parse(socket.send.mock.calls[0]![0]) as NodeClientHello;
+    const ephemeral = createEphemeralKeyPair();
+    const transcript = {
+      protocol: MUTUAL_AUTH_PROTOCOL,
+      hostId: credentials.host.hostId,
+      nodeId: credentials.nodeId,
+      connectionId: "connection-files",
+      hostNonce: randomBytes(32).toString("base64"),
+      nodeNonce: hello.nodeNonce,
+      hostPublicKey: hostKeys.publicKey,
+      nodePublicKey: nodeKeys.publicKey,
+      hostEphemeralPublicKey: ephemeral.publicKey,
+      nodeEphemeralPublicKey: hello.nodeEphemeralPublicKey,
+      dialedHostUrl: hello.dialedHostUrl,
+    };
+    const hostChannel = new AuthenticatedChannel({
+      keys: deriveChannelKeys({
+        privateKey: ephemeral.privateKey,
+        peerPublicKey: hello.nodeEphemeralPublicKey,
+        transcript: handshakeTranscript(CHANNEL_KEY_LABEL, transcript),
+      }),
+      binding: transcript,
+      seals: "host-to-node",
+    });
+    await socket.receive({
+      type: "host_challenge",
+      ...transcript,
+      hostFingerprint: hostKeys.fingerprint,
+      signature: signWithIdentity(
+        hostKeys.privateKey,
+        handshakeTranscript(HOST_CHALLENGE_LABEL, transcript),
+      ),
+    });
+    const open = (index: number): NodeToHostMessage => {
+      const opened = hostChannel.open(JSON.parse(socket.send.mock.calls[index]![0]));
+      if (!opened.ok) throw new Error(opened.reason);
+      return JSON.parse(opened.plaintext) as NodeToHostMessage;
+    };
+    const ready = open(2);
+    if (ready.type !== "ready") throw new Error("Expected the sealed inventory");
+    expect(ready.capabilities).toContain(SESSION_FILES_CAPABILITY);
+    const receive = (message: HostToNodeMessage) =>
+      socket.receive(hostChannel.seal(JSON.stringify(message)));
+    const read = async (path: string, roots: string[]) => {
+      const index = socket.send.mock.calls.length;
+      const requestId = randomUUID();
+      await receive({
+        type: "session_file_read",
+        request: {
+          requestId,
+          sessionId: "session-1",
+          path,
+          roots,
+          protectedRoots: [],
+          agentSessionId: "",
+          coordinator: false,
+          offset: 0,
+          length: 1024,
+          version: "",
+        },
+      });
+      const answer = open(index);
+      if (answer.type !== "session_file_data") throw new Error(answer.type);
+      expect(answer.result.requestId).toBe(requestId);
+      return answer.result;
+    };
+
+    expect(await read("report.txt", [workspace])).toMatchObject({
+      ok: false,
+      code: "unavailable",
+    });
+    await receive({
+      type: "welcome",
+      nodeId: credentials.nodeId,
+      reconcileAfterOutbox: false,
+      acknowledgeOutbox: true,
+      commandExecutions: false,
+      commandPermissions: false,
+      durableLeadDelivery: false,
+    });
+    expect(await read("report.txt", [workspace])).toMatchObject({
+      ok: true,
+      name: "report.txt",
+      size: 6,
+      data: Buffer.from("report").toString("base64"),
+    });
+    expect(
+      await read(resolvePath(testConfigDirectory, "node.json"), [
+        resolvePath(testConfigDirectory, ".."),
+      ]),
+    ).toMatchObject({ ok: false, code: "forbidden" });
+  } finally {
+    await runtime.shutdown();
+    rmSync(workspace, { recursive: true, force: true });
+    for (const listener of process.listeners("exit")) {
+      if (!exits.includes(listener)) process.removeListener("exit", listener);
+    }
+  }
 });

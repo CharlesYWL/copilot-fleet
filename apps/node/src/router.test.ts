@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CONTEXT_TIER_CONFIG_ID,
+  NodeCommandSchema,
   type NodeCommand,
   type SessionEvent,
 } from "@fleet/protocol";
@@ -45,6 +46,102 @@ const START_DEFAULTS: Pick<
 > = { yolo: false, mcpServers: [], agent: "", readOnly: false, config: [] };
 
 describe("CommandRouter", () => {
+  it("never forwards Hermes native IDs to Copilot deletion", async () => {
+    const deleteInactiveSession = vi.fn();
+    const router = new CommandRouter(
+      new MockAgentFactory(),
+      2,
+      () => {},
+      async (path) => path,
+      undefined,
+      undefined,
+      undefined,
+      { deleteInactiveSession },
+    );
+    const result = await router.route(
+      NodeCommandSchema.parse({
+        type: "delete_session",
+        commandId: "delete-hermes",
+        sessionId: "hermes",
+        agentSessionId: "native-hermes",
+        agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+        inactiveBefore: "2026-01-01T00:00:00.000Z",
+        retentionDays: 30,
+      }),
+    );
+    expect(result).toMatchObject({
+      ok: false,
+      fatal: false,
+      error: expect.stringContaining("unsupported_delete"),
+    });
+    expect(deleteInactiveSession).not.toHaveBeenCalled();
+  });
+
+  it("reserves a Hermes profile before startup awaits and releases it only after stopping", async () => {
+    let finish!: () => void;
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    const start = vi.fn<AgentFactory["start"]>(async (id, _cwd, sink) => {
+      await pending;
+      return inertAgent(id, sink);
+    });
+    const router = new CommandRouter(
+      { start },
+      3,
+      () => {},
+      async (path) => path,
+    );
+    const command = NodeCommandSchema.parse({
+      type: "start_session",
+      commandId: "h1",
+      sessionId: "h1",
+      localPath: "C:\\repo",
+      prompt: "Plan",
+      agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+      yolo: true,
+      readOnly: true,
+    });
+    const first = router.route(command);
+    try {
+      expect(
+        await router.route({ ...command, commandId: "h2", sessionId: "h2" }),
+      ).toMatchObject({
+        ok: false,
+        fatal: false,
+        error: expect.stringContaining("already in use"),
+      });
+    } finally {
+      finish();
+    }
+    expect((await first).ok).toBe(true);
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(start.mock.calls[0]?.[3]).toMatchObject({
+      agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+    });
+    expect(
+      await router.route(
+        NodeCommandSchema.parse({
+          type: "resume_session",
+          commandId: "change",
+          sessionId: "h1",
+          localPath: "C:\\repo",
+          agentSessionId: "saved",
+          agentParams: { kind: "hermes", profile: "different" },
+        }),
+      ),
+    ).toMatchObject({
+      ok: false,
+      fatal: false,
+      error: expect.stringContaining("cannot change"),
+    });
+    await router.route({ type: "stop", commandId: "stop", sessionId: "h1" });
+    expect(
+      (await router.route({ ...command, commandId: "h3", sessionId: "h3" })).ok,
+    ).toBe(true);
+    await router.stopAll();
+  });
+
   it("stops idle and busy sessions through the existing shutdown path", async () => {
     const stops = new Map<string, ReturnType<typeof vi.fn>>();
     const router = new CommandRouter(
@@ -716,6 +813,9 @@ describe("CommandRouter", () => {
     });
     expect(prompts).toBe(0);
     expect(events[0]?.sequence).toBe(8);
+    // What a download may reach while the session is live: cwd first.
+    expect(router.sessionRoots("s1")).toEqual(["/canonical/one", "/canonical/shared"]);
+    expect(router.sessionRoots("unknown")).toEqual([]);
   });
 
   it("omits an unavailable restored workspace root without blocking resume", async () => {

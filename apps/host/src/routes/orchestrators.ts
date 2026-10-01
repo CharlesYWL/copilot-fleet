@@ -14,17 +14,22 @@ import {
   parsePrMaintenanceUrl,
   prMaintenanceUrl,
   type PrMaintenanceRegistration,
+  agentKindLabels,
+  supportsAgentKind,
+  type AgentParams,
 } from "@fleet/protocol";
+import { capacityFor, reservedSessionCount } from "../session-policy.js";
 import type { FleetService } from "../fleet-service.js";
 import type { OrchestratorEngine } from "../orchestrator/engine.js";
 import { FleetTools } from "../orchestrator/tools.js";
-import { orchestratorBriefing } from "../orchestrator/briefing.js";
+import { orchestratorBriefing, owedPrompt } from "../orchestrator/briefing.js";
 import { maintenanceDirectionPrompt, reviewOutcome } from "../orchestrator/review.js";
 import { PrMaintenanceError, prMaintenanceUnsettled } from "../pr-maintenance-store.js";
 import {
-  archiveRun,
   reopenOrchestratorStoppedRun,
   stopSessions,
+  taskNeedsOrchestrator,
+  transferRun,
 } from "../orchestrator/lifecycle.js";
 
 const CreateOrchestratorSchema = z.object({
@@ -89,6 +94,45 @@ function maintenanceOperator(request: FastifyRequest): string | undefined {
   if (request.fleetNodeId || !session || session.expiresAt <= Date.now())
     return undefined;
   return session.administratorId || `operator:${session.authMethod}`;
+}
+
+/** Hands one task to another orchestrator conversation. */
+const TransferTaskSchema = z
+  .object({
+    toSessionId: z.string().min(1),
+    /** Delivered with the receiving orchestrator's brief and kept on the task. */
+    note: z.string().trim().max(8_000).optional(),
+  })
+  .strict();
+
+/** Hands several of one orchestrator's tasks to another. */
+const TransferTasksSchema = z
+  .object({
+    toSessionId: z.string().min(1),
+    /** Omitted means every task that still needs an orchestrator. */
+    runIds: z.array(z.string().min(1)).min(1).max(200).optional(),
+    note: z.string().trim().max(8_000).optional(),
+  })
+  .strict();
+
+/**
+ * A refusal the store or the transfer raised, as the words it carries.
+ *
+ * Every conflict on this path — a checkout command still running, a session
+ * being cleaned up, a maintenance invariant — already explains itself, so the
+ * route only has to pass it on rather than translate it.
+ */
+function transferRefusal(
+  error: unknown,
+): { status: number; code?: string; error: string } | undefined {
+  if (!(error instanceof Error) || !("statusCode" in error)) return undefined;
+  const status = Number(error.statusCode);
+  if (!Number.isInteger(status) || status < 400 || status >= 500) return undefined;
+  return {
+    status,
+    ...("code" in error && typeof error.code === "string" ? { code: error.code } : {}),
+    error: error.message,
+  };
 }
 
 const CreateRunSchema = z.object({
@@ -365,17 +409,6 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         runs: store.listRuns().filter((run) => run.leadSessionId === session.id),
       }));
 
-  const stopOwnedRuns = (leadSessionId: string) => {
-    const runs = store
-      .listRuns()
-      .filter((entry) => entry.leadSessionId === leadSessionId);
-    for (const run of runs) {
-      archiveRun(service, run.id, ORCHESTRATOR_STOP_REASON, {
-        stoppedByOrchestrator: true,
-      });
-    }
-  };
-
   const dismissalError = (sessionId: string): string | undefined => {
     const session = store.getSession(sessionId);
     if (!session || session.runRole !== "lead") return "Orchestrator not found";
@@ -401,10 +434,17 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           (worker.stopRequested || !terminalSessionStates.has(worker.state)),
       );
     return ownedRuns.some((run) => !terminalRunStates.has(run.state)) || liveWorker
-      ? "Stop the orchestrator before dismissing it"
+      ? "Archive or finish this orchestrator's tasks before dismissing it"
       : undefined;
   };
 
+  /**
+   * Confirms Stops a person has already asked for on machines that are gone.
+   *
+   * Requests nothing new: a worker is included only when something else — an
+   * archive, a bulk Stop — has already asked it to stop, because a lead's own
+   * Stop no longer reaches its workers.
+   */
   const settleUnavailableStops = (leadSessionId: string): number => {
     const ownedRunIds = new Set(
       store
@@ -434,7 +474,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       // `run` is the first task, kept so an older UI still finds one.
       run: runs[0],
       runs,
-      steps: runs.flatMap((run) => store.listRunSteps(run.id)),
+      steps: runs.flatMap((run) =>
+        service.withAdmission(run.id, store.listRunSteps(run.id)),
+      ),
       notes: runs.flatMap((run) => store.listRunNotes(run.id)),
     })),
   }));
@@ -462,7 +504,27 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       .listPlacements()
       .filter((placement) => placement.workspaceId === input.workspaceId)
       .filter((placement) => store.getNode(placement.nodeId)?.online);
-    const placement = placements[0];
+    const preferred = store.getOrchestratorAgent() ?? { kind: "copilot" as const };
+    const matching = placements.filter((placement) =>
+      supportsAgentKind(store.getNode(placement.nodeId)!, preferred.kind),
+    );
+    const agentParams: AgentParams =
+      matching.length > 0 ? preferred : { kind: "copilot" };
+    const candidates =
+      matching.length > 0
+        ? matching
+        : placements.filter((placement) =>
+            supportsAgentKind(store.getNode(placement.nodeId)!, "copilot"),
+          );
+    const placement =
+      candidates.find((candidate) => {
+        const node = store.getNode(candidate.nodeId)!;
+        return (
+          !service.agentLaunchProblem(node, agentParams) &&
+          reservedSessionCount(store.listSessions(), node.id, "read-only") <
+            capacityFor(node, "read-only")
+        );
+      }) ?? candidates[0];
     if (!placement) {
       return reply.code(409).send({
         error: "No online node holds this workspace, so there is nowhere to run it",
@@ -480,6 +542,12 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
      */
     const started = service.createAndStartSession({
       placement,
+      agentParams,
+      ...(preferred.kind !== agentParams.kind
+        ? {
+            startupNotice: `Preferred agent ${agentKindLabels[preferred.kind]} is unavailable on the online Nodes holding this workspace. Started with ${agentKindLabels[agentParams.kind]} on ${store.getNode(placement.nodeId)!.name}.`,
+          }
+        : {}),
       /*
        * Which half of the briefing depends on the machine: a Node whose catalog
        * has the orchestrator agent already carries the judgement half, so
@@ -489,7 +557,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
       prompt: orchestratorBriefing(new FleetTools(service, "pending").listNodes().text, {
         hasAgent:
           service.agentFor(
-            { runRole: "lead" },
+            { runRole: "lead", agentParams },
             store.getNode(placement.nodeId) ?? { agents: [] },
           ) !== "",
       }),
@@ -598,10 +666,9 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
           service.resolveRunReview(id);
           store.updateRun(id, {
             ...(run!.state === "awaiting_human" ? { state: "running" as const } : {}),
-            pendingPrompt: maintenanceDirectionPrompt(
-              run!.name,
-              reference.decisionId,
-              outcome.note,
+            pendingPrompt: owedPrompt(
+              store.getRun(id)?.pendingPrompt ?? "",
+              maintenanceDirectionPrompt(run!.name, reference.decisionId, outcome.note),
             ),
           });
         },
@@ -651,7 +718,7 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
      */
     const reopened = store.updateRun(run!.id, {
       state: "running",
-      pendingPrompt: outcome.prompt,
+      pendingPrompt: owedPrompt(run!.pendingPrompt, outcome.prompt),
     })!;
     service.publishRun(reopened);
     engine.tick();
@@ -776,14 +843,112 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
     return reply.code(201).send({ run: store.getRun(run.id) ?? run });
   });
 
-  /** Ends an orchestrator and everything it started. */
+  /**
+   * Reassigns a task to another orchestrator conversation.
+   *
+   * The way work outlives a conversation: ACP gives an orchestrator one context
+   * window, so a long-lived one fills up, and starting a fresh conversation is
+   * only useful if the work in flight can follow it. The task keeps everything
+   * it has; only who is woken for it, and who runs its PR-maintenance
+   * heartbeat, changes.
+   */
+  app.post("/api/runs/:id/transfer", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = TransferTaskSchema.parse(request.body);
+    try {
+      const result = transferRun(service, id, input.toSessionId, {
+        source: "operator",
+        note: input.note,
+      });
+      engine.tick();
+      return { ok: true, changed: result.changed, from: result.from, run: result.run };
+    } catch (error) {
+      const refusal = transferRefusal(error);
+      if (!refusal) throw error;
+      const { status, ...body } = refusal;
+      return reply.code(status).send(body);
+    }
+  });
+
+  /**
+   * Moves an orchestrator's tasks to another, one task at a time.
+   *
+   * Each task moves on its own: one refused by a command still running on its
+   * checkout should not keep the rest on a conversation that cannot take any
+   * more. Only tasks still assigned here move, so a list read before another
+   * transfer cannot pull a task back from wherever it went since.
+   */
+  app.post("/api/orchestrators/:id/transfer", async (request, reply) => {
+    const { id } = request.params as { id: string };
+    const input = TransferTasksSchema.parse(request.body);
+    const source = store.getSession(id);
+    if (!source || source.runRole !== "lead") {
+      return reply.code(404).send({ error: "Orchestrator not found" });
+    }
+    if (input.toSessionId === id) {
+      return reply
+        .code(409)
+        .send({ error: "Choose a different orchestrator to take these tasks" });
+    }
+    const requested =
+      input.runIds ??
+      store
+        .listRuns()
+        .filter((run) => run.leadSessionId === id && taskNeedsOrchestrator(service, run))
+        .map((run) => run.id);
+    const transferred: string[] = [];
+    const failed: { runId: string; error: string; code?: string }[] = [];
+    for (const runId of new Set(requested)) {
+      const run = store.getRun(runId);
+      if (!run || run.leadSessionId !== id) {
+        failed.push({
+          runId,
+          error: run
+            ? "That task is no longer assigned to this orchestrator."
+            : "Task not found",
+        });
+        continue;
+      }
+      try {
+        transferRun(service, runId, input.toSessionId, {
+          source: "operator",
+          note: input.note,
+        });
+        transferred.push(runId);
+      } catch (error) {
+        const refusal = transferRefusal(error);
+        if (!refusal) throw error;
+        failed.push({
+          runId,
+          error: refusal.error,
+          ...(refusal.code ? { code: refusal.code } : {}),
+        });
+      }
+    }
+    engine.tick();
+    if (transferred.length === 0 && failed.length > 0) {
+      return reply.code(409).send({ error: failed[0]!.error, transferred, failed });
+    }
+    return { ok: true, transferred, failed };
+  });
+
+  /**
+   * Stops the orchestrator's own conversation, and nothing it started.
+   *
+   * It used to archive every task the lead owned and stop their workers, so
+   * stopping a lead that had wedged — the obvious first thing to try — threw
+   * away all of its in-flight work as well. The Host already runs tasks without
+   * a live lead: dispatched steps finish, pending ones still dispatch, and what
+   * settles is owed to the lead as a wake that Resume delivers. Ending tasks is
+   * what Archive and Stop agents are for.
+   */
   app.post("/api/orchestrators/:id/stop", async (request, reply) => {
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
     if (!session || session.runRole !== "lead") {
       return reply.code(404).send({ error: "Orchestrator not found" });
     }
-    stopOwnedRuns(id);
+    store.prMaintenance.pauseForSession(id, "Orchestrator Stop requested");
     if (terminalSessionStates.has(session.state)) {
       engine.tick();
       return { ok: true, alreadyTerminal: true };
@@ -890,7 +1055,12 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         .send({ error: "Restore the orchestrator before resuming it" });
     }
     const ownedRuns = store.listRuns().filter((run) => run.leadSessionId === id);
-    const ownedRunIds = new Set(ownedRuns.map((run) => run.id));
+    /*
+     * Only tasks an older Host cancelled when it stopped this lead are reopened.
+     * Stop no longer touches tasks, so their workers carry on while the lead is
+     * away — including the scheduler parking settled ones — and none of that
+     * is a Stop this Resume has to wait out.
+     */
     const resumableRunIds = new Set(
       ownedRuns
         .filter(
@@ -909,15 +1079,14 @@ export const orchestratorRoutes: FastifyPluginAsync<OrchestratorRouteOptions> = 
         : [{ runId, reason: admission.reason, decisionId: admission.decisionId }];
     });
     const heldRunIds = new Set(blockedRuns.map((entry) => entry.runId));
-    const unsettledWorker = store.listSessions().find(
-      (worker) =>
-        ownedRunIds.has(worker.runId) &&
-        (worker.stopRequested ||
-          // Live workers only block reopening runs cancelled by orchestration Stop.
-          (resumableRunIds.has(worker.runId) &&
-            !terminalSessionStates.has(worker.state) &&
-            worker.state !== "idle")),
-    );
+    const unsettledWorker = store
+      .listSessions()
+      .find(
+        (worker) =>
+          resumableRunIds.has(worker.runId) &&
+          (worker.stopRequested ||
+            (!terminalSessionStates.has(worker.state) && worker.state !== "idle")),
+      );
     if (session.stopRequested || unsettledWorker) {
       return reply.code(409).send({
         error: "Wait for every node to acknowledge Stop before resuming",

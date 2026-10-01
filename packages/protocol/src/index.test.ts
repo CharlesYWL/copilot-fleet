@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  AgentParamsSchema,
+  supportsAgentKind,
   BrowserMessageSchema,
   HOST_BACKUP_KIND,
   HOST_YOLO_CAPABILITY,
@@ -11,6 +13,8 @@ import {
   NODE_BACKUP_KIND,
   NodeBackupSchema,
   NodeCommandSchema,
+  NodeHelloSchema,
+  NodeRegistrationPayloadSchema,
   NodeToHostMessageSchema,
   OUTBOX_ACK_CAPABILITY,
   OutboxFlushIdSchema,
@@ -29,6 +33,7 @@ import {
   canTransition,
   canTransitionRun,
   canTransitionRunStep,
+  contextUsePercent,
   eventPayload,
   isRotatingTunnelUrl,
   normalizeHostUrl,
@@ -39,6 +44,85 @@ import {
 } from "./index.js";
 
 describe("protocol validation", () => {
+  it("validates backend-specific parameters without repurposing the custom-agent name", () => {
+    const params = { kind: "hermes", profile: "fleet-orchestrator" };
+    expect(AgentParamsSchema.parse(params)).toEqual(params);
+    for (const invalid of [
+      { kind: "other" },
+      { kind: "copilot", profile: "default" },
+      { kind: "hermes" },
+      { kind: "hermes", profile: "../personal" },
+      { kind: "hermes", profile: "--version" },
+      { kind: "hermes", profile: "fleet;evil" },
+    ])
+      expect(AgentParamsSchema.safeParse(invalid).success).toBe(false);
+    for (const type of ["start_session", "resume_session"] as const) {
+      const command = {
+        type,
+        commandId: "c",
+        sessionId: "s",
+        localPath: "C:\\repo",
+        prompt: "work",
+        agentSessionId: "native",
+        agent: "custom-persona",
+      };
+      expect(NodeCommandSchema.parse(command)).not.toHaveProperty("agentParams");
+      expect(NodeCommandSchema.parse({ ...command, agentParams: params })).toMatchObject({
+        agent: "custom-persona",
+        agentParams: params,
+      });
+    }
+    expect(UpdateDefaultsSchema.parse({ orchestratorAgent: null })).toEqual({
+      orchestratorAgent: null,
+    });
+    expect(UpdateDefaultsSchema.parse({})).not.toHaveProperty("orchestratorAgent");
+  });
+
+  it("treats legacy Nodes as Copilot-only and honors modern backend discovery", () => {
+    expect(supportsAgentKind({ capabilities: [] }, "copilot")).toBe(true);
+    expect(supportsAgentKind({ capabilities: [] }, "hermes")).toBe(false);
+    expect(supportsAgentKind({ capabilities: ["agent-kinds"] }, "hermes")).toBe(false);
+    expect(
+      supportsAgentKind(
+        {
+          capabilities: ["agent-kinds"],
+          agentKinds: [{ kind: "hermes" }],
+        },
+        "hermes",
+      ),
+    ).toBe(true);
+  });
+
+  it("accepts future kinds in discovery without accepting unsupported launch parameters", () => {
+    const hello = NodeHelloSchema.parse({
+      type: "hello",
+      nodeId: "n",
+      secret: "test-only",
+      os: "linux",
+      arch: "x64",
+      version: "test",
+      capabilities: ["agent-kinds"],
+      maxSessions: 2,
+      agentKinds: [{ kind: "hermes" }, { kind: "future-agent" }],
+    });
+    expect(supportsAgentKind(hello, "hermes")).toBe(true);
+    expect(AgentParamsSchema.safeParse({ kind: "future-agent" }).success).toBe(false);
+  });
+
+  it("keeps backend discovery out of the enrollment payload signed with older Hosts", () => {
+    const registration = NodeRegistrationPayloadSchema.parse({
+      name: "Node",
+      os: "linux",
+      arch: "x64",
+      version: "test",
+      capabilities: ["copilot-acp", "agent-kinds"],
+      maxSessions: 2,
+      agentKinds: [{ kind: "copilot" }, { kind: "hermes" }],
+    });
+    expect(registration).not.toHaveProperty("agentKinds");
+    expect(registration.capabilities).toContain("agent-kinds");
+  });
+
   it.each(["start_session", "resume_session"] as const)(
     "validates context tiers for %s",
     (type) => {
@@ -76,6 +160,27 @@ describe("protocol validation", () => {
     ]) {
       expect(SessionUsageSchema.safeParse(usage).success).toBe(false);
     }
+  });
+
+  it("reads context use from a /context snapshot first, then the prompt budget", () => {
+    expect(contextUsePercent(undefined)).toBeUndefined();
+    expect(contextUsePercent({ contextTokens: 50_000 })).toBeUndefined();
+    expect(contextUsePercent({ contextTokens: 0, contextWindow: 200_000 })).toBe(0);
+    expect(contextUsePercent({ contextTokens: 50_000, contextWindow: 200_000 })).toBe(25);
+    expect(
+      contextUsePercent({
+        contextTokens: 50_000,
+        contextWindow: 200_000,
+        context: {
+          model: "gpt-5.5",
+          usedTokens: 360_000,
+          tokenLimit: 400_000,
+          percentage: 89.6,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+          estimated: true,
+        },
+      }),
+    ).toBe(90);
   });
 
   it.each(["start_session", "resume_session"] as const)(

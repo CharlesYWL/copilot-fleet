@@ -2,7 +2,9 @@ import {
   canTransitionRun,
   canTransitionRunStep,
   eventPayload,
+  heartbeatIntervalLabel,
   isWritingCategory,
+  nextHeartbeat,
   ORCHESTRATOR_STOP_REASON,
   terminalRunStates,
   terminalRunStepStates,
@@ -18,9 +20,14 @@ import {
   notificationAttemptKeyForStep,
 } from "../notifications/service.js";
 import { statusCheckEnvelope, wakeEnvelope } from "./briefing.js";
-import { ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS } from "./deadlines.js";
-import { isReadOnlyCategory, planNextActions, type ScheduleAction } from "./schedule.js";
+import {
+  isReadOnlyCategory,
+  planNextActions,
+  type ScheduleAction,
+  type StepHold,
+} from "./schedule.js";
 import { stopSessions } from "./lifecycle.js";
+import { WorkerResumeService } from "./resume-now.js";
 
 /**
  * Turns the scheduler's decisions into writes and commands.
@@ -45,8 +52,23 @@ export class OrchestratorEngine {
    * second is refused and silently lost.
    */
   private readonly promptedThisTick = new Set<string>();
+  /**
+   * Why each run's pending steps were left pending on its latest pass.
+   *
+   * Kept in memory rather than stored: it is a reading of the fleet, recomputed
+   * on every tick, and a restarted Host has nothing true to say until the first
+   * pass after its Nodes report in.
+   */
+  private readonly holdsByRun = new Map<string, Map<string, StepHold>>();
+  /** "Resume now" requests and step admission, decided from the same holds. */
+  readonly resume: WorkerResumeService;
 
-  constructor(private readonly service: FleetService) {}
+  constructor(private readonly service: FleetService) {
+    this.resume = new WorkerResumeService(service, {
+      holds: (runId) => this.holdsByRun.get(runId),
+      tickRun: (runId) => this.tickRun(runId),
+    });
+  }
 
   private get store() {
     return this.service.store;
@@ -173,8 +195,12 @@ export class OrchestratorEngine {
     this.service.cancelPausedPrMaintenance(new Date(nowMs).toISOString());
     this.service.worktrees.sweep(nowMs);
     this.promptedThisTick.clear();
-    for (const run of this.store.listRuns()) {
+    const runs = this.store.listRuns();
+    for (const runId of this.holdsByRun.keys())
+      if (!runs.some((run) => run.id === runId)) this.holdsByRun.delete(runId);
+    for (const run of runs) {
       if (terminalRunStates.has(run.state)) {
+        this.holdsByRun.delete(run.id);
         if (
           run.workspaceBinding?.effectiveMode === "managed" &&
           run.workspaceBinding.aggregationState === "in_progress"
@@ -184,25 +210,41 @@ export class OrchestratorEngine {
       }
       this.tickRun(run.id, nowMs);
     }
+    // Requests of runs that just closed, and expiry, are settled on every sweep.
+    this.resume.reconcile(nowMs);
     this.wakeMaintenanceRecovery(nowMs);
     this.remindIdleLeads(nowMs);
   }
 
   tickRun(runId: string, nowMs = Date.now()): void {
     const run = this.store.getRun(runId);
-    if (!run || terminalRunStates.has(run.state)) return;
-    if (
-      this.store.prMaintenance
-        .list({ taskId: runId, retainedOnly: true })
-        .records.some((record) => record.manualControl && !record.manualControl.endedAt)
-    )
+    if (!run || terminalRunStates.has(run.state)) {
+      this.holdsByRun.delete(runId);
       return;
+    }
+    const manual = this.store.prMaintenance
+      .list({ taskId: runId, retainedOnly: true })
+      .records.find((record) => record.manualControl && !record.manualControl.endedAt);
+    if (manual) {
+      this.holdEveryPending(run.id, {
+        code: "maintenance_hold",
+        detail:
+          "A person has taken manual control of this task's PR-maintenance worker; scheduling waits until that control ends.",
+      });
+      return;
+    }
     const commandFence = this.store.commands.fence(runId);
     if (
       commandFence &&
       ["executing", "observation_required"].includes(commandFence.state)
-    )
+    ) {
+      this.holdEveryPending(run.id, {
+        code: "command_fence",
+        detail:
+          "A command requested for this task is still settling on its checkout; scheduling resumes once it is observed.",
+      });
       return;
+    }
     if (run.state === "aggregating") {
       if (
         !this.store.prMaintenance.admission({ action: "aggregate", taskId: run.id })
@@ -258,10 +300,11 @@ export class OrchestratorEngine {
         completedTurns.add(session.id);
       }
     }
-    const mayContinue = this.store.prMaintenance.admission({
+    const maintenance = this.store.prMaintenance.admission({
       action: "discover",
       taskId: run.id,
-    }).allowed;
+    });
+    const mayContinue = maintenance.allowed;
     const workspaceReady =
       mayContinue && (steps.length ? this.service.worktrees.ensureReady(run) : true);
     if (workspaceReady && run.workspaceBinding?.effectiveMode === "managed") {
@@ -269,6 +312,7 @@ export class OrchestratorEngine {
         if (step.state === "pending") this.service.worktrees.ensureStepReady(run, step);
       steps = this.store.listRunSteps(runId);
     }
+    const holds = new Map<string, StepHold>();
     const actions = planNextActions({
       run,
       steps,
@@ -287,22 +331,64 @@ export class OrchestratorEngine {
           .filter((step) => terminalRunStepStates.has(step.state))
           .map((step) => step.sessionId),
       ),
+      holds,
+      exceptions: this.resume.exceptionsFor(run, nowMs),
     });
-    if (actions.length === 0) return;
+    if (!mayContinue) {
+      // The planner only sees an unready workspace; the reason is maintenance.
+      for (const [stepId, hold] of holds)
+        if (hold.code === "workspace_not_ready")
+          holds.set(stepId, {
+            code: "maintenance_hold",
+            detail: `PR maintenance holds this task (${maintenance.reason}); nothing new is dispatched until it is resolved.`,
+          });
+    }
 
     let touched = false;
-    for (const action of actions) touched = this.execute(run, action, nowMs) || touched;
+    for (const action of actions)
+      touched = this.execute(run, action, nowMs, holds) || touched;
+    this.resume.reconcile(nowMs, run.id);
+    const holdsChanged = this.recordHolds(run.id, holds);
     if (touched) this.publish(runId);
+    else if (holdsChanged)
+      this.service.publishRunSteps(runId, this.store.listRunSteps(runId));
   }
 
-  private execute(run: Run, action: ScheduleAction, nowMs: number): boolean {
+  /** Every pending step shares one reason when a whole-task gate stops the pass. */
+  private holdEveryPending(runId: string, hold: StepHold): void {
+    const holds = new Map<string, StepHold>();
+    for (const step of this.store.listRunSteps(runId))
+      if (step.state === "pending") holds.set(step.id, hold);
+    if (this.recordHolds(runId, holds))
+      this.service.publishRunSteps(runId, this.store.listRunSteps(runId));
+  }
+
+  /** Keeps the latest reasons, reporting whether browsers need to hear about them. */
+  private recordHolds(runId: string, holds: Map<string, StepHold>): boolean {
+    const before = this.holdsByRun.get(runId);
+    this.holdsByRun.set(runId, holds);
+    const serialize = (entries: ReadonlyMap<string, StepHold> | undefined) =>
+      JSON.stringify(
+        [...(entries ?? new Map<string, StepHold>()).entries()].sort(([a], [b]) =>
+          a.localeCompare(b),
+        ),
+      );
+    return serialize(before) !== serialize(holds);
+  }
+
+  private execute(
+    run: Run,
+    action: ScheduleAction,
+    nowMs: number,
+    holds: Map<string, StepHold> = new Map(),
+  ): boolean {
     switch (action.type) {
       case "start_step":
-        return this.startStep(run, action);
+        return this.startStep(run, action, holds);
       case "resume_step":
-        return this.resumeStep(run, action);
+        return this.resumeStep(run, action, holds, nowMs);
       case "prompt_step":
-        return this.promptStep(run, action);
+        return this.promptStep(run, action, holds);
       case "advance_step":
         return Boolean(this.store.updateRunStep(action.stepId, { state: "running" }));
       case "settle_step":
@@ -338,21 +424,26 @@ export class OrchestratorEngine {
   private startStep(
     run: Run,
     action: Extract<ScheduleAction, { type: "start_step" }>,
+    holds: Map<string, StepHold>,
   ): boolean {
     const placement = this.store.getPlacement(action.placementId);
     const step = this.store.getRunStep(action.stepId);
     if (!placement || !step) return false;
-    if (
-      !this.store.prMaintenance.admission({
-        action: "execute",
-        taskId: run.id,
-        placementId: placement.id,
-        ...(step.executionBinding
-          ? { checkoutKey: step.executionBinding.checkoutKey }
-          : {}),
-      }).allowed
-    )
+    const maintenance = this.store.prMaintenance.admission({
+      action: "execute",
+      taskId: run.id,
+      placementId: placement.id,
+      ...(step.executionBinding
+        ? { checkoutKey: step.executionBinding.checkoutKey }
+        : {}),
+    });
+    if (!maintenance.allowed) {
+      holds.set(step.id, {
+        code: "maintenance_hold",
+        detail: `PR maintenance holds this checkout (${maintenance.reason}).`,
+      });
       return false;
+    }
     if (!canTransitionRunStep(step.state, "starting")) return false;
 
     const starting = this.store.updateRunStep(step.id, {
@@ -384,6 +475,12 @@ export class OrchestratorEngine {
       // Nothing is running, so the step goes back in the queue rather than
       // being blamed for a failure that happened before it started.
       this.store.updateRunStep(step.id, { state: "pending", dispatchedAt: "" });
+      holds.set(step.id, {
+        code: "no_placement",
+        detail: `The Host could not start it on ${placement.nodeName}: ${result.error}`,
+        nodeId: placement.nodeId,
+        placementId: placement.id,
+      });
       return true;
     }
 
@@ -414,35 +511,67 @@ export class OrchestratorEngine {
     return true;
   }
 
-  /** Re-attaches a settled worker; its persisted retry prompt is sent once idle. */
+  /**
+   * Re-attaches a settled worker; its persisted retry prompt is sent once idle.
+   *
+   * An approved "Resume now" exception is spent in the same transaction that
+   * writes the dispatch receipt, so it can be spent once and only for a resume
+   * that is actually sent.
+   */
   private resumeStep(
     run: Run,
     action: Extract<ScheduleAction, { type: "resume_step" }>,
+    holds: Map<string, StepHold>,
+    nowMs: number,
   ): boolean {
     const step = this.store.getRunStep(action.stepId);
     const session = this.store.getSession(action.sessionId);
-    if (!step || step.state !== "pending" || !session || session.cleanupRequested) {
+    if (!step || step.state !== "pending" || !session) return false;
+    if (session.cleanupRequested) {
+      holds.set(step.id, {
+        code: "cleanup_pending",
+        detail:
+          "The worker session is being deleted; its queued follow-up cannot resume.",
+      });
       return false;
     }
-    if (
-      !this.store.prMaintenance.admission({
-        action: "execute",
-        taskId: run.id,
-        sessionId: session.id,
-        placementId: session.placementId,
-        ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
-      }).allowed
-    )
+    const maintenance = this.store.prMaintenance.admission({
+      action: "execute",
+      taskId: run.id,
+      sessionId: session.id,
+      placementId: session.placementId,
+      ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
+    });
+    if (!maintenance.allowed) {
+      holds.set(step.id, {
+        code: "maintenance_hold",
+        detail: `PR maintenance holds this worker (${maintenance.reason}).`,
+      });
       return false;
+    }
     if (!terminalSessionStates.has(session.state)) return false;
-    this.store.updateRunStep(step.id, { dispatchedAt: new Date().toISOString() });
-    this.store.commands.recordStepEvidence(run.id, step.id);
+    const claimed = this.store.writeAtomically(() => {
+      const request = action.exceptionId
+        ? this.resume.claimLaunch(action.exceptionId, step, nowMs)
+        : undefined;
+      if (action.exceptionId && !request) return undefined;
+      this.store.updateRunStep(step.id, { dispatchedAt: new Date().toISOString() });
+      this.store.commands.recordStepEvidence(run.id, step.id);
+      return { request };
+    });
+    if (!claimed) return false;
+    if (claimed.request) this.resume.announce(claimed.request);
+    // Whatever completed before this resume belongs to an earlier turn.
+    this.turnComplete.delete(session.id);
     const resumed = this.service.resumeSession(
       session.id,
-      "Resuming for orchestrator follow-up",
+      action.exceptionId
+        ? "Resuming for an approved orchestrator follow-up"
+        : "Resuming for orchestrator follow-up",
     );
     if (resumed.ok) return true;
 
+    if (action.exceptionId) this.resume.failLaunch(action.exceptionId, resumed.error);
     return this.failStep(
       run,
       step,
@@ -455,22 +584,33 @@ export class OrchestratorEngine {
   private promptStep(
     run: Run,
     action: Extract<ScheduleAction, { type: "prompt_step" }>,
+    holds: Map<string, StepHold>,
   ): boolean {
     const step = this.store.getRunStep(action.stepId);
     const session = this.store.getSession(action.sessionId);
     if (!step || step.state !== "pending" || session?.state !== "idle") return false;
-    if (session.stopRequested || session.dismissed || session.cleanupRequested)
+    if (session.stopRequested || session.dismissed || session.cleanupRequested) {
+      if (session.cleanupRequested)
+        holds.set(step.id, {
+          code: "cleanup_pending",
+          detail: "The worker session is being deleted; its queued follow-up cannot run.",
+        });
       return false;
-    if (
-      !this.store.prMaintenance.admission({
-        action: "execute",
-        taskId: run.id,
-        sessionId: session.id,
-        placementId: session.placementId,
-        ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
-      }).allowed
-    )
+    }
+    const maintenance = this.store.prMaintenance.admission({
+      action: "execute",
+      taskId: run.id,
+      sessionId: session.id,
+      placementId: session.placementId,
+      ...(this.store.prMaintenance.referenceForStep(step.id, step.attempts) ?? {}),
+    });
+    if (!maintenance.allowed) {
+      holds.set(step.id, {
+        code: "maintenance_hold",
+        detail: `PR maintenance holds this worker (${maintenance.reason}).`,
+      });
       return false;
+    }
 
     this.store.updateRunStep(step.id, {
       state: "starting",
@@ -478,6 +618,12 @@ export class OrchestratorEngine {
       dispatchedAt: new Date().toISOString(),
     });
     this.store.commands.recordStepEvidence(run.id, step.id);
+    /*
+     * A completion receipt remembered from an earlier turn — a person's own
+     * prompt into this worker carries the same attempt key — must not be read
+     * as this prompt's completion before the Node has even acknowledged it.
+     */
+    this.turnComplete.delete(session.id);
     const sent = this.service.dispatch(session.nodeId, {
       type: "prompt",
       sessionId: session.id,
@@ -698,13 +844,15 @@ export class OrchestratorEngine {
   }
 
   /**
-   * Gives each idle Lead one read-only status check for its own active tasks.
+   * Gives each idle Lead one read-only status check for its own active tasks,
+   * at the times the operator's heartbeat schedule names.
    *
    * This runs after ordinary task briefs and settle wakes, so those prompts win.
    * It only ever addresses the Lead session; dispatched workers are neither
    * prompted nor stopped by this path.
    */
   private remindIdleLeads(nowMs: number): void {
+    const schedule = this.store.getOrchestratorHeartbeatSchedule();
     const sessions = this.store.listSessions();
     const sessionById = new Map(sessions.map((session) => [session.id, session]));
     const activeByLead = new Map<string, Run[]>();
@@ -750,7 +898,10 @@ export class OrchestratorEngine {
         Number.isFinite(lastAutomatedPrompt) ? lastAutomatedPrompt : 0,
         Number.isFinite(lastActivity) ? lastActivity : Date.parse(lead.createdAt),
       );
-      if (nowMs - baseline < ORCHESTRATOR_STATUS_CHECK_INTERVAL_MS) continue;
+      // Whatever the Lead last did or was sent counts as its latest look.
+      const due = nextHeartbeat(schedule, baseline);
+      if (due === undefined || nowMs < due) continue;
+      const following = schedule.next(due);
 
       const tasks = runs.map((run) => {
         const steps = this.store.listRunSteps(run.id);
@@ -783,7 +934,11 @@ export class OrchestratorEngine {
         .filter((pending) => pending.leadSessionId === lead.id)
         .slice(0, 5);
       const prompt = [
-        statusCheckEnvelope(tasks),
+        statusCheckEnvelope(
+          tasks,
+          {},
+          following === undefined ? undefined : heartbeatIntervalLabel(following - due),
+        ),
         ...(maintenance.records.length
           ? [
               `PR maintenance records: ${maintenance.records.map((record) => record.id).join(", ")}${maintenance.nextCursor ? " (more in registry)" : ""}. Read fleet_get_pr_maintenance; reconcile unfinished work before claiming due PRs. This reminder does not reopen a task.`,

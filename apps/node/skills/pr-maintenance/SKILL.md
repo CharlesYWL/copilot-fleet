@@ -42,7 +42,7 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    Use the paired updated runtime/helper. Missing or inconsistent proof fails
    closed; constant Node clock offsets do not create extra collection time.
 3. Honor the existing wake identity's remaining allowance: **5 PR visits,
-   40 initiated provider requests, 120 seconds**. Pass the remaining request count
+   40 initiated provider requests, 300 seconds (5 minutes)**. Pass the remaining request count
    and absolute deadline to the helper. Reconciliation/retries count too.
    MCP pagination, another helper invocation, and compaction do not reset counters.
    Exhaustion means checkpoint and end the pass, not self-message, spin, or
@@ -50,6 +50,7 @@ Never merge, enable auto-merge/auto-complete, or create a paid/internal review-a
    Preparing a batch and dispatching it also require a claimed visit with
    remaining request/time allowance; receipt-only reconciliation stays available
    after exhaustion. Reserve enough for a fresh full verification pass on resumes.
+   Each helper invocation still clamps its own run to 120 seconds.
 4. Reconcile accepted/uncertain work **before** considering a fresh batch. Queued
    means accepted. Read the existing RunStep/attempt and exact prepared prompt
    after a lost dispatch response; never reconstruct a different retry prompt.
@@ -403,6 +404,18 @@ Its concrete shape is `maintenance: {recordId, generation, batchId}`.
 The Host atomically links the accepted attempt. End the lead turn after dispatch.
 Do not dispatch an empty worker turn merely to wait for CI/review or check a PR.
 New feedback while accepted stays pending for later; never overwrite the prompt.
+While the accepted turn is still running, `takeDue` does not offer that PR; its
+completion requests the next check. Routine checks otherwise follow the Host's
+orchestrator heartbeat schedule, so an empty claim is not a reason to poll.
+A merely prepared batch with no accepted step or effects does not block fresh
+complete observations, including claim-bound command receipts. Refresh expired
+observations normally and dispatch the same immutable batch at the same head;
+the retained worker re-reads its assigned PR threads. If a fresh observation
+finds a different head, the Host supersedes the undispatched batch and refunds
+its reservation; prepare a new batch from that observation without human action.
+Drafts, merge conflicts, unresolved incidents and observations older than
+30 minutes still refuse dispatch. Accepted/uncertain execution and unsettled
+effects still prevent late receipts from promoting observations or reviving work.
 
 ## Worker publication and settlement
 
@@ -428,6 +441,18 @@ or effects stay outstanding. Only evidenced addressed/already-satisfied findings
 count complete. `partial`, `failed`, `cancelled`, and `superseded` release the
 outstanding slot only after all accepted execution/effects are known and settled.
 Never infer quiescence from a timeout, “done”, or a requested Stop.
+
+Display status follows these durable facts: **Reviewing feedback** means a current
+source ID/revision has no matching current-HEAD disposition; **Fixing feedback**
+means a batch was accepted for the retained worker, including queued execution,
+not merely prepared or reserved. Holds and uncertain effects still take precedence.
+A known incomplete disposition is not new feedback and is not readiness.
+After execution settles, reconcile findings and effects before final batch
+settlement. **Ready** requires addressed/already-satisfied dispositions for every
+current source ID/revision at the verified HEAD, fresh complete checks/reviews and
+mergeability evidence, no outstanding work or holds, and a successful `ready`
+checkpoint for the current fingerprint. Visible or provider-resolved comments do
+not replace these gates; a changed source revision requires a matching disposition.
 
 Confirmed merge/closure inhibits new repairs/reviews, requests **targeted**
 cancellation and enters settlement-only draining. Retain PR/head-ref/worker

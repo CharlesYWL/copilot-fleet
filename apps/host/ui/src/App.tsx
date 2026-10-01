@@ -19,7 +19,10 @@ import {
   type PrMaintenanceApproval,
   type Run,
   type RunNote,
+  type RunStep,
   type SessionEvent,
+  type WorkerResumeOutcome,
+  type WorkerResumeRequest,
 } from "@fleet/protocol";
 import { api, useFleet, type Notify } from "./hooks/useFleet";
 import { CatalogProvider, useCatalogOperations } from "./hooks/useCatalog";
@@ -59,10 +62,13 @@ import { OrchestratorPage } from "./components/orchestration/OrchestratorPage";
 import { OrchestratorTaskDetail } from "./components/orchestration/OrchestratorTaskDetail";
 import { ConversationTasks } from "./components/orchestration/ConversationTasks";
 import { CreateOrchestrationDialog } from "./components/orchestration/CreateOrchestrationDialog";
+import { TransferTasksDialog } from "./components/orchestration/TransferTasksDialog";
 import { readDismissedFailures } from "./components/orchestration/RunStatusIndicator";
+import { sessionLabel } from "./lib/session-label";
 import {
   buildRunViewModels,
   liveSteps,
+  needsOrchestrator,
   summarise,
   tasksAwaitingHuman,
 } from "./lib/orchestration-view";
@@ -78,10 +84,12 @@ import { OnboardingTour } from "./components/OnboardingTour";
 import { CommandExecutionsDialog } from "./components/CommandExecutionsDialog";
 import { CommandPermissionPrompts } from "./components/CommandPermissionPrompts";
 import { PrMaintenanceApprovalReview } from "./components/orchestration/PrMaintenanceApprovalReview";
+import { WorkerResumePrompts } from "./components/orchestration/WorkerResumePrompts";
 
 const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
 const noMaintenanceApprovals: PrMaintenanceApproval[] = [];
+const noResumeRequests: WorkerResumeRequest[] = [];
 
 /**
  * What the main area is showing.
@@ -249,6 +257,38 @@ export function App() {
     dismissNotification,
   } = useFleet(notify);
   const maintenanceApprovals = snapshot.prMaintenanceApprovals ?? noMaintenanceApprovals;
+  const resumeRequests = snapshot.workerResumeRequests ?? noResumeRequests;
+  /** A "Resume now" approval to show now, even one put off with "Review later". */
+  const [resumeReviewId, setResumeReviewId] = useState<string>();
+  /**
+   * Asks the Host to resume a queued follow-up now.
+   *
+   * The Host runs ordinary scheduling first and answers with what happened; only
+   * a scheduling exception opens the approval dialog. A refusal arrives as an
+   * error toast carrying the Host's reason.
+   */
+  const handleResumeNow = useCallback(
+    async (step: RunStep) => {
+      const result = await request<WorkerResumeOutcome>(
+        `/api/runs/${encodeURIComponent(step.runId)}/steps/${encodeURIComponent(step.id)}/resume-now`,
+        { method: "POST", body: JSON.stringify({}) },
+      );
+      if (!result.ok) return false;
+      const outcome = result.data;
+      if (outcome.status === "awaiting_approval" && outcome.request)
+        setResumeReviewId(outcome.request.id);
+      notify(
+        outcome.message,
+        outcome.status === "awaiting_approval"
+          ? "warning"
+          : outcome.status === "queued"
+            ? "info"
+            : "success",
+      );
+      return true;
+    },
+    [notify, request],
+  );
   const catalog = useCatalogOperations({ request, refresh, notify });
   const [view, setView] = useState<AppView>("session");
   const [orchestratorViewMode, setOrchestratorViewMode] =
@@ -279,6 +319,16 @@ export function App() {
   const [bulkStopScope, setBulkStopScope] = useState<
     { kind: "all" } | { kind: "orchestrator"; sessionId: string }
   >();
+  /**
+   * Which tasks the transfer dialog is moving, and from which conversation.
+   *
+   * Named tasks come from one task's page; without them it is everything the
+   * conversation is responsible for, to choose from.
+   */
+  const [transferRequest, setTransferRequest] = useState<{
+    sourceId: string;
+    runIds?: string[];
+  }>();
   const [manageFavoritesOpen, setManageFavoritesOpen] = useState(false);
   const [cleanupOrchestratorsOpen, setCleanupOrchestratorsOpen] = useState(false);
   const [attentionOnly, setAttentionOnly] = useState(false);
@@ -520,8 +570,11 @@ export function App() {
    * dispatches. The first workspace that an online node actually holds is the
    * one picked, since any other choice would produce an orchestrator that can
    * see nowhere to send work.
+   *
+   * `stay` keeps the operator where they are: a conversation started from the
+   * transfer dialog is somewhere to send tasks, not somewhere to go.
    */
-  const handleStartOrchestrator = async () => {
+  const handleStartOrchestrator = async (options: { stay?: boolean } = {}) => {
     const reachable = snapshot.placements.find((placement) =>
       snapshot.nodes.some((node) => node.id === placement.nodeId && node.online),
     );
@@ -537,6 +590,10 @@ export function App() {
       body: JSON.stringify({ workspaceId: reachable.workspaceId }),
     });
     if (!created.ok) return false;
+    if (options.stay) {
+      await refresh();
+      return true;
+    }
     // Opened rather than merely created: starting a conversation and landing on
     // a different one is the kind of thing you only notice after typing into it.
     setOpenConversationId(created.data.session.id);
@@ -648,12 +705,14 @@ export function App() {
         placements: snapshot.placements,
         waitingPermissions,
         acknowledgedFailedSteps,
+        maintenance: snapshot.prMaintenanceTasks ?? [],
       }),
     [
       orchestratorRuns,
       runSteps,
       snapshot.sessions,
       snapshot.placements,
+      snapshot.prMaintenanceTasks,
       waitingPermissions,
       acknowledgedFailedSteps,
     ],
@@ -689,6 +748,39 @@ export function App() {
   }, [bulkStopScope, runModels, snapshot.sessions]);
   const orchestratorSummary = useMemo(() => summarise(runModels), [runModels]);
   /**
+   * What the transfer dialog offers: the tasks being moved, and where to.
+   *
+   * Only a running conversation can take work — a stopped one would hold it
+   * with nobody awake to act — and never the one it is leaving.
+   */
+  const transferModels = useMemo(() => {
+    if (!transferRequest) return [];
+    return runModels.filter((model) =>
+      transferRequest.runIds
+        ? transferRequest.runIds.includes(model.run.id)
+        : model.run.leadSessionId === transferRequest.sourceId,
+    );
+  }, [transferRequest, runModels]);
+  const transferTargets = useMemo(
+    () =>
+      orchestrators.filter(
+        (session) =>
+          session.id !== transferRequest?.sourceId &&
+          !terminalSessionStates.has(session.state) &&
+          !session.stopRequested &&
+          !session.cleanupRequested,
+      ),
+    [orchestrators, transferRequest],
+  );
+  const assignedTaskCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    for (const model of runModels) {
+      if (!needsOrchestrator(model)) continue;
+      counts[model.run.leadSessionId] = (counts[model.run.leadSessionId] ?? 0) + 1;
+    }
+    return counts;
+  }, [runModels]);
+  /**
    * One number for "waiting on you", counting each thing once.
    *
    * A permission on a worker is already what makes its task need a person, so
@@ -710,9 +802,22 @@ export function App() {
     () => runModels.find((model) => model.run.id === selectedRunId),
     [runModels, selectedRunId],
   );
+  /** The conversation the open task is assigned to, which its page names. */
+  const selectedRunOwner = useMemo(
+    () =>
+      allOrchestrators.find(
+        (session) => session.id === selectedRunModel?.run.leadSessionId,
+      ),
+    [allOrchestrators, selectedRunModel],
+  );
   const handleNotificationNavigate = useCallback(
     (notification: Notification) => {
       void markNotificationRead(notification.id);
+      if (
+        notification.kind === "worker_resume_approval" &&
+        typeof notification.data.requestId === "string"
+      )
+        setResumeReviewId(notification.data.requestId);
       if (
         notification.kind === "pr_maintenance_attention" &&
         notification.data.reason === "authorization"
@@ -897,7 +1002,7 @@ export function App() {
     return true;
   };
 
-  /** Ends the orchestrator and everything it started. */
+  /** Stops the orchestrator's own conversation; its tasks keep running. */
   const handleStopOrchestrator = async (sessionId: string) => {
     const stopped = await request(`/api/orchestrators/${sessionId}/stop`, {
       method: "POST",
@@ -1039,6 +1144,45 @@ export function App() {
   };
 
   /**
+   * Hands tasks to another orchestrator conversation.
+   *
+   * Each task moves on its own on the Host, so some can move while one waits
+   * on a command still settling; the dialog closes once anything moved, and
+   * the rest are reported rather than silently left behind.
+   */
+  const handleTransferTasks = async (input: {
+    runIds: string[];
+    toSessionId: string;
+    note: string;
+  }) => {
+    if (!transferRequest) return false;
+    const moved = await request<{
+      transferred: string[];
+      failed: { runId: string; error: string }[];
+    }>(`/api/orchestrators/${transferRequest.sourceId}/transfer`, {
+      method: "POST",
+      body: JSON.stringify({
+        toSessionId: input.toSessionId,
+        runIds: input.runIds,
+        ...(input.note ? { note: input.note } : {}),
+      }),
+    });
+    if (!moved.ok) return false;
+    const target = orchestrators.find((session) => session.id === input.toSessionId);
+    const destination = target ? sessionLabel(target) : "the other orchestrator";
+    const count = moved.data.transferred.length;
+    const failure = moved.data.failed[0];
+    notify(
+      failure
+        ? `Transferred ${count} of ${input.runIds.length} tasks to ${destination}. ${failure.error}`
+        : `Transferred ${count} ${count === 1 ? "task" : "tasks"} to ${destination}.`,
+      failure ? "warning" : "success",
+    );
+    await refresh();
+    return count > 0;
+  };
+
+  /**
    * Opens a new task on the orchestrator.
    *
    * One call: the Host creates the run bound to the lead and briefs it in the
@@ -1142,6 +1286,20 @@ export function App() {
             focusOpen ||
             !!bulkStopScope
           }
+        />
+        <WorkerResumePrompts
+          requests={resumeRequests}
+          connected={connected}
+          blocked={
+            !!commandPanel ||
+            !!maintenanceApproval ||
+            dialogOpen ||
+            orchestrationDialogOpen ||
+            focusOpen ||
+            !!bulkStopScope
+          }
+          focusRequestId={resumeReviewId}
+          onFocusHandled={() => setResumeReviewId(undefined)}
         />
         {commandPanel && (
           <CommandExecutionsDialog
@@ -1308,6 +1466,9 @@ export function App() {
                     onDismissOrchestrator={() =>
                       void handleDismissOrchestrator(orchestrator.id)
                     }
+                    onTransferTasks={() =>
+                      setTransferRequest({ sourceId: orchestrator.id })
+                    }
                   />
                 ) : (
                   <StartOrchestrator
@@ -1329,6 +1490,15 @@ export function App() {
                   sessions={snapshot.sessions}
                   onBack={handleBackFromTask}
                   backLabel={taskOrigin ? "Conversation" : "All tasks"}
+                  ownerLabel={
+                    selectedRunOwner ? sessionLabel(selectedRunOwner) : undefined
+                  }
+                  onTransfer={() =>
+                    setTransferRequest({
+                      sourceId: selectedRunModel.run.leadSessionId,
+                      runIds: [selectedRunModel.run.id],
+                    })
+                  }
                   onOpenLead={() => {
                     // The conversation that owns this task, not whichever one
                     // happens to be open: on a board that shows every
@@ -1346,6 +1516,8 @@ export function App() {
                       runId: selectedRunModel.run.id,
                     })
                   }
+                  onResumeNow={handleResumeNow}
+                  onReviewApproval={setResumeReviewId}
                   onReview={(approved, note, maintenance) =>
                     handleReviewTask(selectedRunModel.run.id, approved, note, maintenance)
                   }
@@ -1372,6 +1544,19 @@ export function App() {
                 agents={bulkStopAgents}
                 onClose={() => setBulkStopScope(undefined)}
                 onStop={handleStopSelectedAgents}
+              />
+              <TransferTasksDialog
+                open={Boolean(transferRequest)}
+                source={allOrchestrators.find(
+                  (session) => session.id === transferRequest?.sourceId,
+                )}
+                models={transferModels}
+                fixed={Boolean(transferRequest?.runIds)}
+                targets={transferTargets}
+                assignedCounts={assignedTaskCounts}
+                onClose={() => setTransferRequest(undefined)}
+                onTransfer={handleTransferTasks}
+                onStartOrchestrator={() => void handleStartOrchestrator({ stay: true })}
               />
               <ManageFavoritesDialog
                 open={manageFavoritesOpen}
@@ -1404,6 +1589,8 @@ export function App() {
                               : undefined
                           }
                           onBack={handleBackFromSession}
+                          onResumeNow={handleResumeNow}
+                          onReviewApproval={setResumeReviewId}
                         />
                       )}
                       <TerminalView
@@ -1416,7 +1603,7 @@ export function App() {
                         )}
                         events={events[activeSession.id] ?? noEvents}
                         onPrompt={(prompt, attachments) =>
-                          void command(`/api/sessions/${activeSession.id}/prompt`, {
+                          command(`/api/sessions/${activeSession.id}/prompt`, {
                             prompt,
                             attachments,
                           })
@@ -1479,6 +1666,9 @@ export function App() {
                           setOpenConversationId(activeSession.id);
                           setOrchestrationDialogOpen(true);
                         }}
+                        onTransfer={() =>
+                          setTransferRequest({ sourceId: activeSession.id })
+                        }
                       />
                     )}
                   </>
@@ -1494,6 +1684,7 @@ export function App() {
             nodes={snapshot.nodes}
             sessions={snapshot.sessions}
             hostRevision={snapshot.hostRevision}
+            hostUpdate={snapshot.hostUpdate}
             nodeUpdates={nodeUpdates}
             selectedTab={settingsTab}
             onSelectedTabChange={setSettingsTab}
@@ -1512,7 +1703,7 @@ export function App() {
             open={focusOpen}
             onOpenChange={setFocusOpen}
             onPrompt={(prompt, attachments) =>
-              void command(`/api/sessions/${activeSession.id}/prompt`, {
+              command(`/api/sessions/${activeSession.id}/prompt`, {
                 prompt,
                 attachments,
               })

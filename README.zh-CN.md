@@ -40,13 +40,16 @@ Copilot Fleet 是一个自托管的控制平面，用于在多台机器上运行
 连接，只是不提供健康数据；这些指标不会改变任务调度。
 
 完整聊天和监控墙中的聚焦聊天，都可以通过标题栏的 **Session information** 图标打开
-详情弹窗。弹窗显示节点、平台、工作区、当前 placement 路径、模型、状态、时间，以及
+详情弹窗。弹窗显示节点、平台、工作区、工作目录、模型、状态、时间，以及
 Fleet 与 Copilot 各自的会话 ID，并提供路径、ID 和带 shell 转义的本地恢复命令复制按钮。
 `copilot --resume` 必须使用原生 Copilot 会话 ID；演示会话和尚未获取该 ID 的会话不会
 生成恢复命令。
 
+受管会话显示和复制其绑定的执行目录，而不是源 checkout；没有绑定的旧会话使用当前
+placement 路径。
+
 本地恢复应在原 Node 上，以运行 Node 的同一操作系统用户执行，并先停止旧进程或确认
-它已经退出。命令使用标准 Copilot CLI 和当前 placement；如果启动器、配置或路径已经
+它已经退出。命令使用标准 Copilot CLI 和上方显示的目录；如果启动器、配置或路径已经
 变化，请使用对应的原始环境。本地恢复不会重新接入 Fleet，也不会恢复编排工具；
 需要继续受管任务时，应使用 Fleet 的 **Resume**。
 
@@ -65,10 +68,11 @@ Fleet 与 Copilot 各自的会话 ID，并提供路径、ID 和带 shell 转义�
 - **选择访问方式与隧道：** [隧道与谁能看到登录页](#隧道与谁能看到登录页)、
   [跟随 Host 迁移到新地址](#跟随-host-迁移到新地址)。
 - **连接和维护机器：** [Windows Node](#windows-上的-nodepowershell)、
-  [节点命令行参数](#节点命令行参数)、[节点配置页](#节点配置页)、[让节点保持最新](#让节点保持最新)。
+  [节点命令行参数](#节点命令行参数)、[节点配置页](#节点配置页)、[让节点保持最新](#让节点保持最新)、
+  [让 Host 保持最新](#让-host-保持最新)。
 - **创建项目并启动日常会话：** [工作区和放置](#首次使用指南)、
   [可复现的最小验证](#可复现的最小验证)、[附加文件与图片](#附加文件与图片)、
-  [斜杠命令与会话选择器](#斜杠命令与会话选择器)。
+  [从会话下载文件](#从会话下载文件)、[斜杠命令与会话选择器](#斜杠命令与会话选择器)。
 - **监控和整理活跃工作：** [自动收起的分支](#空闲分支会自动收起)、
   [拖拽排序和归类](#用拖拽排序和归类)、[提示音和通知](#提示音)。
 - **协调多代理任务：** [Orchestrator 快速指南](#orchestrator-快速指南)、
@@ -96,10 +100,10 @@ Fleet 与 Copilot 各自的会话 ID，并提供路径、ID 和带 shell 转义�
 Host 可以运行在 Windows、macOS 或 Linux 上。Node 可以和 Host 是同一台机器，也可以在别的
 机器上；真正拥有工作目录和 Copilot 登录态的是 Node。
 
-请用有权限的账号克隆当前私有仓库：
+克隆公开仓库：
 
 ```bash
-git clone https://github.com/charlesyin_microsoft/copilot-fleet.git
+git clone https://github.com/CharlesYWL/copilot-fleet.git
 cd copilot-fleet
 npm install
 ```
@@ -165,7 +169,8 @@ npm run dev:tunnel
 
 打开界面 → **Settings**：
 
-- **General** —— 会话默认值、**Take the tour** 按钮，以及数据导出/导入。
+- **General** —— 会话默认值、**Take the tour** 按钮、**Update Host**，以及数据导出/导入。
+- **Orchestrator** —— 编排器的首选代理、Hermes profile 和心跳计划。
 - **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移、
   可迁移 Host 备份/恢复，以及这台 Host 的安全审计。
 - **Tunnel** —— 管理 Dev Tunnels、Cloudflare、Tailscale Funnel 或 ngrok。
@@ -197,6 +202,11 @@ npm start
 
 或者只跑 Host：`npm run start:host`。打开 `http://127.0.0.1:8787` —— Fastify 会直接托管
 构建好的界面。
+
+`npm run dev`、`npm run dev:tunnel` 和 `npm start` 运行在一个小 launcher
+（`scripts/launcher.mjs`）之下，这样 **Settings → General → Update Host** 才能原地重启
+它们；见[让 Host 保持最新](#让-host-保持最新)。`npm run dev:bare`、
+`npm run dev:tunnel:bare` 和 `npm run start:bare` 运行同样的命令，但不经过它。
 
 ## 首次使用指南
 
@@ -648,7 +658,8 @@ npm run start:node -- --url="https://fleet.example.com" `
 
 节点名默认取机器的主机名，两端都可以改 —— Host 的 Nodes 标签页，或者节点自己的配置页。
 重命名不会改变机器身份，它的放置和会话都会跟着走；名字由 Host 拥有，所以如果节点离线
-期间两端都改过，以 Host 的名字为准并推送回去。想要 10 以外的并发容量就传
+期间两端都改过，以 Host 的名字为准并推送回去。已经在上面运行的代理无需重启就能读到新名字，
+见[节点配置页](#节点配置页)。想要 10 以外的并发容量就传
 `--max-sessions 4`。
 
 注册会把节点的私钥和 Host 的公钥存到
@@ -768,6 +779,9 @@ Fleet 自动生成的控制消息（包括 worker 唤醒摘要和任务审查反
 输入框接受文件：直接把截图粘贴进去，或者用回形针挑选。每个文件会显示为一个小标签，在
 消息发送前都可以移除；一条提示词最多带 6 个文件，每个 10 MB。
 
+草稿和附件会保留到 Host 接受发送请求。请求失败时可以直接重试；等待期间的新编辑不会被
+较早请求的成功响应清空。
+
 文件如何抵达代理取决于它是什么。图片作为 ACP image block 传过去；其他内容以文本方式
 内嵌，这样代理不需要文件真的存在于自己的磁盘上就能读到内容 —— 这一点很重要，因为跑
 代理的机器通常并不是文件来源的那台机器。既不是图片也不是文本的二进制（比如 zip）只会
@@ -782,12 +796,48 @@ Fleet 自动生成的控制消息（包括 worker 唤醒摘要和任务审查反
 会话的浏览器，把字节留在那里会让几张粘贴的截图变成一项负担；已发送消息下方的附件标签
 就是留下来的痕迹。
 
+### 从会话下载文件
+
+会话产生的文件留在运行它的那台机器上，而那通常不是你浏览器所在的机器。对话记录会把代理
+提到的文件变成从那台机器下载的链接，所以无论 Node 就是这台电脑，还是在隧道另一端，代理
+写出的报告都能用同样的方式下载：
+
+- **链接**：指向文件的链接——`file:///` URL、盘符路径或绝对路径，或者相对于会话工作目录
+  的路径——点击后会下载，而不是跳离页面。
+- **行内代码**：内容只是一个以扩展名结尾的绝对路径（例如 `` `C:\work\report.docx` ``）
+  时，也会变成下载链接。
+- **编辑步骤**：写完文件的编辑步骤会在该行末尾显示一个下载按钮。
+- **Download a file**（会话标题栏里的箭头图标）可以输入任意路径，绝对路径或相对于会话
+  工作目录的路径都行，用于代理只是顺带提到的文件。
+
+点击时会先检查文件，所以文件不存在或被拒绝时，会以通知说明原因，而不是留下一个失败的
+下载；之后字节交给浏览器自己的下载管理器，带进度显示和取消按钮。
+
+Node 只会主动向外连接，Host 无法直接从它那里拉取。Host 通过 Node 现有的已认证连接发起
+请求，并在数据到达时边收边转发给浏览器：每块 256 KiB，同时只保留少量请求在途，因此下载
+与会话事件共享这条连接，而不会排在它们前面。下载过程中文件发生变化会直接失败，而不是拼出
+一个混合了两个版本的文件。单个文件最大 512 MB，每个 Node 同时最多发送三个下载。
+
+下载能读到什么由 Node 决定。文件（解析完链接和 junction 之后）必须位于会话的工作目录、
+它的附加根目录、Orchestrator 的临时目录，或者会话自己的 Copilot 状态目录
+（`~/.copilot/session-state/<id>`，代理在这里保存计划和产物）之内。Fleet 自己的配置目录
+（其中有 Node 的私钥）、Copilot 自己的配置，以及 Host 的数据目录永远不会被读取——即使是
+工作目录就是包含它们的主目录的 Chats 会话也不行。保存在其他位置（比如临时目录）的文件无法
+下载；请让代理把它复制到工作区里。这是 Host 转发内容的策略，而不是沙箱：代理与 Node 以
+同一个账户运行。
+
+下载需要 Node 使用双向认证（而不是旧的共享密钥），并且运行支持该功能的版本；缺哪一项
+Host 都会直接说明。文件总是以附件形式提供，绝不会在 Host 自己的源上渲染——否则代理写出
+的页面会带着你的会话运行。
+
 ### 斜杠命令与会话选择器
 
 输入框提供 Copilot 自己的斜杠命令：输入 `/` 会出现一个列表，随输入过滤。方向键移动
 选择，Enter 或 Tab 选中，Escape 关闭菜单。需要参数的命令（`/review`、`/research`）会把
 光标停在后面；不需要参数的（`/usage`、`/context`）直接执行。列表就是该会话的代理所上报
 的内容，包括 skills 和 plugins，所以装了额外 skills 的机器无需这里改动就会显示出来。
+
+用 Enter 确认输入法组合文字时，不会发送提示词或选中斜杠命令。
 
 输入框用一个紧凑按钮合并 **Model**、**Reasoning Effort** 和 **Context window**。向上打开的
 菜单显示各项当前值，并通过子菜单选择；可由用户控制的 **Mode** 仍单独显示，自定义代理仍在
@@ -911,6 +961,9 @@ Host（请换成实际 API 端口）。直连时不要传 `--devtunnel`，并清
 放置路径仍然沿用 Host 为该节点 id 存储的值；如果检出在别的位置，需要更新它们。Copilot
 自己的会话文件不在归档里，所以 **Resume** 只在跑代理的那台机器上有那些文件时才有效。
 
+Node 身份归档保留持久命令权限规则（包括显式清空的规则列表）及其版本号。没有这些字段的
+旧归档仍使用原有默认值；临时会话授权不会恢复。
+
 这两个文件都含有机密。不要提交到代码库。
 
 ### 重启之后恢复会话
@@ -989,6 +1042,23 @@ Copilot 则通过它支持的 API 删除自己的数据。
 `settings.json` 里，并且优先级高于环境变量，因此这里的修改不会被下次启动时过期的
 `.env` 覆盖。命令行参数的优先级高于两者。
 
+代理也靠它得知自己在哪个节点上。Fleet 名字只是一个标签，不必和机器的主机名一致，而且操作者
+可以在代理运行期间从 Host 改名。因此节点启动的每个代理都会拿到两个环境变量：
+`FLEET_NODE_ID` 是节点 id，改名永远不会改变它；`FLEET_NODE_IDENTITY_URL` 是本页的
+`/api/identity`，对它发 GET 会返回此刻的名字（配置页没能启动时不设置）：
+
+```powershell
+Invoke-RestMethod $env:FLEET_NODE_IDENTITY_URL
+# nodeId      : 0f8e6c2a-5b1d-4c3e-9f7a-2d4b6e8a1c3f
+# nodeName    : build-01
+# machineName : DESKTOP-7Q2M4VX
+# connected   : True
+```
+
+`nodeName` 是 Host 最近确认的名字。Host 不可达时 `connected` 为 false，此时在 Host 上做的
+改名还没有送达。Orchestrator 派出的 worker 会被告知它被放到了哪个节点（名字和 id），
+如果该节点设置了这两个变量，也会被指向它们。
+
 这个监听只绑定回环地址，并且刻意不对外暴露：任何能把节点重新指向另一个 Host 的东西，
 都能在那台机器上执行命令。要访问远端节点的页面，请通过 SSH 端口转发，而不是把监听放宽。
 
@@ -1012,6 +1082,7 @@ Orchestrator 可以用 `fleet_run_command` 请求在节点执行有限时长的 
 外部命令的规则还绑定实际可执行文件；更新或替换该文件后需要重新批准。
 有待批准请求时，Commands 按钮显示琥珀色脉冲和数量；启用减少动态效果时保留静态高亮。
 弹窗将 **Waiting approval** 与 **Request history** 分开，优先显示待批准请求。
+无人决定就已过期的请求会自动移入 **Request history**；过期后才到达的决定不会生效。
 审批冲突后会刷新当前状态，不会自动重提决定。升级后若旧浏览器页报告无法识别的命令字段，请重新加载页面。
 可可靠解析的其他工具（如 `dotnet build`、`cargo test`、`where.exe git`）也支持记住权限；
 未识别的 flags 和操作数会保留在显示的规则中，不会被静默忽略。
@@ -1059,7 +1130,8 @@ Host 和 Node 都需要支持新权限协议；审批仍要求已登录管理员
 
 首个版本明确使用 **Windows PowerShell 5.1**（`windows-powershell-5.1`），每次使用新的
 非交互 Shell。`cd` 和变量不会保留到下一次执行。脚本上限为 16 KiB UTF-8 文本，默认运行
-五分钟、最多一小时；未开始的请求自创建起 30 分钟后过期。每个节点同时只执行一个命令，
+五分钟、最多一小时；未开始的请求自创建起 30 分钟后过期，绑定 PR 维护 helper 的请求
+若其原始截止时间更早，则在该时间过期。每个节点同时只执行一个命令，
 不支持交互输入或永久运行的开发服务，也不会静默替换 Shell。
 
 请求和输出复用已认证、加密的 Host–Node 连接。托管 Orchestrator 的节点也必须支持持久
@@ -1226,6 +1298,62 @@ nssm start copilot-fleet-node
 这种模式下更新同样以 75 退出。PM2 和 NSSM 在任何退出时都会重启，所以这已经是你想要的
 行为；只在失败时重启的 unit 文件需要 `RestartForceExitStatus=75` 或 `Restart=always`。
 
+## 让 Host 保持最新
+
+**Settings → General → Update Host** 为 Host 做的事，和节点上的 **Update** 一样：
+`git fetch --prune`、`git reset --hard` 到检出所跟踪的分支、`npm install --include=dev`、
+`npm run build`（完整构建，因为 Host 旁边启动的 Node 也从同一个检出运行），然后**按原来的
+启动方式**重启 Host 和那个 Node：
+
+| 启动方式                                  | 重启方式                                                                     |
+| ----------------------------------------- | ---------------------------------------------------------------------------- |
+| `npm run dev` / `npm run dev:tunnel`      | 同一条命令、同一个终端、同样的参数                                           |
+| `npm start`                               | `npm start`，同一个终端、同样的参数                                          |
+| `npm run service -- host+node install` 等 | `npm run service -- host+node restart`（Node 任务未启用时为 `host restart`） |
+
+卡片会显示 Host 所在的提交和重启命令，以及每个阶段的进度。Host 重启期间会短暂离线；页面
+会自动重连并报告更新结果。之后刷新页面以加载新的界面。
+
+重启后的 Host 记录结果后，较慢的重启命令或迟到的浏览器快照不会将它改回“更新中”。
+
+步骤和安全保证与节点相同，来自同一份代码（`@fleet/protocol/updater`）：构建成功之前不会
+重启任何东西，已经在最新提交上的检出也不会被重启。因此在 `npm start` 和登录服务下，构建
+失败会让 Host 和它的 Node 继续运行原来的代码。在 `npm run dev` 下，reset 改写源码后 Host
+自己的文件监视器仍会照常重新加载 —— 这正是监视器的用途 —— 所以构建失败时 Host 可能停留在
+新源码加旧依赖的状态，直到你修好检出。此外，Host 不会：
+
+- **丢弃未提交的工作。** Host 的检出往往也是某人的工作副本，所以已跟踪文件上有未提交的
+  修改时会拒绝更新 —— 点击时检查一次，reset 之前再检查一次，git 读不了的检出也按“有修改”
+  处理（`.env` 这类未跟踪文件在 reset 后依然保留，不算在内）。不在所跟踪分支上的本地提交
+  会像节点一样从分支上丢弃，reflog 里仍然能找到。
+- **不问一声就停掉这台机器上的会话。** 重启 Host 会重启旁边的 Node，所以当那个 Node 正在
+  运行会话时，更新会被拒绝并列出这些会话，卡片会提供“只停掉这些并继续”的选项；期间新启动
+  的会话会出现在新的拒绝列表里。在重启之前，这台机器上的新会话会被拒绝，而不是启动后又被
+  停掉。其他机器上的会话在 Host 重启期间继续运行。
+- **与另一个更新同时进行。** 正在 reset 和重新构建检出的那个更新会持有检出里的
+  `.fleet-update.lock` 并在工作时持续刷新它，所以 Host 和旁边的 Node 永远不会同时更新同一个
+  检出，重启之后也一样。
+- **声称一次它看不到的重启成功。** 启动一条命令或一个计划任务并不能证明里面运行的东西正常，
+  所以成功由重启后的 Host 自己记录：它开始监听、运行的是更新构建出的提交，并且这台机器的
+  Node 也以该提交回来了。Host 或 Node 以其他提交回来、Node 三分钟内没有回来，或者更新程序
+  停止报告进度，都会被记为失败。
+
+重启由谁来做，取决于谁能在重启中存活。在 `npm run dev` 下，reset 一改写源码，文件监视器
+就会重启 Host，所以 Host 从不亲自执行更新：由 `npm run dev`、`npm run dev:tunnel` 和
+`npm start` 前面的 launcher 执行，然后停掉它启动的所有进程，再把命令重新运行一遍。登录服务
+形式的 Host 无法从任务内部重启自己的任务，所以它会为当前 Windows 用户注册一个一次性的计划
+任务 `CopilotFleetSelfUpdate-…`，由它执行更新和重启，然后删除自己；输出保存在 Host 数据库
+旁边的 `self-update.log`。两种情况下的进度都记录在同目录的 `self-update.json`，重启后的
+Host 正是靠它得知更新结果。
+
+重启 `npm run dev:tunnel` 会连同隧道一起重启，就像手动停止再启动一样：Dev Tunnel 会保持
+原地址，而快速隧道（Cloudflare、免费 ngrok）会换一个新地址。launcher 本身不会被更新替换；
+对它的修改在你下次启动命令时生效。
+
+用其他方式启动的 Host —— `npm run host`、`npm run start:host`、任何 `*:bare` 脚本 —— 没有
+东西会再把它启动起来，所以 **Update Host** 会被禁用并说明原因。在拉取这个功能之前就已经在
+运行的 Host 也是如此：用上面的某条命令重启它一次即可。
+
 ## 可复现的最小验证
 
 在终端 1 运行 Host：
@@ -1306,6 +1434,36 @@ agent session id，会被作为**可恢复**提供出来；而从未走到那一
 某个 Node 上的普通 session，但 Host 会给它一组受限工具，用来规划 task、派发 worker、在
 worker 有结果后唤醒自己，并把交付记录留给你审查。
 
+在 **Settings → Orchestrator → Preferred agent** 选择编排器代理。Auto 固定为 Copilot；
+Node 检测到 Hermes 后会显示 Hermes 选项。选择只影响新编排器，已有会话在停止、恢复和
+重启后保留原代理及 profile，worker 仍使用 Copilot。General 中的模型、推理强度、
+上下文和 Agency 设置只适用于 Copilot。
+
+在运行 Hermes 的每台 Node 上，以运行 Node 的同一 OS 用户手动初始化独立 profile：
+
+```powershell
+hermes profile create fleet-orchestrator --no-alias
+hermes -p fleet-orchestrator acp --setup
+hermes -p fleet-orchestrator acp --check
+```
+
+已有 profile 时跳过创建。setup 交互式配置 provider 和模型；check 仅检查 ACP 依赖，
+不代表模型请求已经成功。Fleet 不自动创建 profile 或复制凭据。记忆、技能和原生历史
+保留在该 Node 的 profile 内，不跨 Node 同步。同一 Node 的同一 profile 同时只能有一个
+活动的 Hermes 编排器，也不要让外部 Hermes 进程同时使用它。
+
+离线或等待 Stop 确认的编排器仍占用该 Node 的 profile。若 Node 不再上线，先请求
+**Stop**，独立确认旧进程已退出后，在会话中选择 **Mark stopped** 释放占用。
+**Dismiss** 仅隐藏已停止的会话，不会停止进程或绕过 profile 占用；其他 Node 上的
+同名 profile 不受影响。
+
+若持有目标 workspace 的在线 Node 均未安装 Hermes，新编排器会回退到 Copilot，并记录
+系统消息；profile 占用、配置或认证错误会明确报错，不会切换代理。已有 Hermes 会话恢复时
+绝不回退。自动原生会话清理仍仅适用于 Copilot，Hermes 历史请在其 profile 中管理。
+
+若持久化的首选代理设置损坏，Fleet 会记录警告，并对新编排器使用 Auto（Copilot）。
+在 **Settings → Orchestrator** 中重新保存设置即可修复；已有会话保持自己的代理。
+
 1. 在侧边栏打开 **Orchestrator**，点击 **Start orchestrator**。只有当在线 Node 持有至少
    一个 workspace 时按钮才可用。lead 会从一个可达 placement 启动，以无人值守方式运行以便
    后续唤醒自己，并被明确要求不要自己写代码。
@@ -1324,9 +1482,22 @@ worker 有结果后唤醒自己，并把交付记录留给你审查。
    成功标准、记录和 worker 历史。
 6. 生命周期操作要有意识地使用。**Archive** 会停止仍在运行的 worker，但保留 task 记录；
    已结束的 task 可以用 **Reopen** 说明还想要什么，也可以用 **Delete** 丢弃记录。
-   **Stop orchestrator** 会停止 lead 和它的 tasks；当 session 可恢复时，**Resume
-   orchestrator** 会重开被停止的工作；**Dismiss orchestrator** 只隐藏已停止的 lead，不删除
-   普通 session 历史。
+   **Stop orchestrator** 只停止 lead 自己的对话：它的 tasks 和 agents 会继续运行，完成的结果
+   会在 **Resume orchestrator** 重新接上 lead 后交给它；要结束工作本身请用 **Archive** 或
+   **Stop agents**。**Dismiss orchestrator** 在 lead 的 tasks 已完成或归档后隐藏已停止的
+   lead，不删除普通 session 历史。
+7. 某个对话的上下文用满时，新开一个对话，再用 **Transfer tasks**（在对话的任务面板或
+   任务板上）或 **Transfer**（在单个 task 页面上）把工作交给它。每个 task 只归属一个
+   orchestrator，所以它的 worker、待审查结果和 PR 维护心跳会一起转过去；接手的 lead
+   会收到简报，按 task 记录从当前进度继续，原来的 lead 则不再看到它。若原 lead 为该
+   task 请求的命令尚未结束，转移会被拒绝。
+
+lead 空闲且仍有未完成的 task 或维护中的 PR 时，Host 会按 **Settings → Orchestrator →
+Orchestrator heartbeat** 中的时间给它发送只读的**状态检查**：标准五段 cron，按 Host
+本地时区计算，多个表达式用 `;` 分隔。默认值 `0 9-18 * * 1-5; 0 */2 * * *` 表示工作日
+09:00–18:00 每小时检查一次，其余时间每两小时一次。心跳前半小时内有过活动的 lead
+会跳过这一次（比每小时更密的计划则按间隔的一半计算），检查不会紧跟在 lead 自己的
+回合之后；Host 重启后只补发一次检查，不会连发。
 
 如果只是一次不需要 checkout 的问题，请从 **New session** 直接启动 **Chats** session。
 如果是共享的多代理目标，请使用 Orchestrator 的 lead **Conversation** 和 task board，让计划、
@@ -1377,8 +1548,14 @@ helper 不会安装扩展、自动登录、持久保存或复制 token，也不�
 中的受支持证据及保守限制。就绪不会触发合并或 auto-complete。
 
 Host 数据库保存注册、检查点、决策、预算及尚未确认的副作用。现有 lead
-在普通唤醒和空闲提醒中读取这些状态；没有新增观察进程或定时器，
-也不保证严格每 30 分钟检查。未变化的反馈不启动新的修复轮次。
+在普通唤醒和心跳状态检查中读取这些状态；没有新增观察进程或定时器，
+也不保证严格按时检查。PR 的例行检查沿用同一心跳计划：一次观察之后，下一次
+在至少半小时后的第一个心跳到期，默认工作日工作时间约每小时读取一次 PR，其余
+时间约每两小时一次（已保存的命令回执仍会让该 PR 立即到期，以便 lead 根据这份
+证据采取行动）。保留的 worker 仍在执行已接受的修复批次时不会认领该 PR
+（修复常常超过一小时），该回合结束后会请求下一次检查。状态标签会保留最近一次
+观察到的阶段，直到计划的检查逾期；修复、就绪和新的副作用仍要求最近 30 分钟内的
+证据。未变化的反馈不启动新的修复轮次。
 就绪不等于已合并：本版本不会自动合并、强推、rebase 或新建审查 agent。
 
 ![PR 维护修复循环：人工授权保存在 Host 数据库中；现有 lead 被唤醒后恢复记录，通过受限 helper 读取 PR 平台证据，将局部修复派回原 worker，并核实处理结果。](docs/pr-maintenance-repair-loop.png)
@@ -1394,7 +1571,8 @@ _常规修复循环复用原 worker，并在现有 lead 唤醒时核实处理结
 
 _设计选择由人决定：先记录指导，再显式恢复维护。_
 
-[可编辑的图表源文件（HTML）](docs/pr-maintenance-flow.html)。
+[可编辑的图表源文件（HTML）](docs/pr-maintenance-flow.html) ·
+[技术流程：MCP 调用、阶段与生命周期（HTML）](docs/pr-maintenance-technical-flow.html)。
 
 Stop、归档或删除会先暂停关联的维护。已接受的工作及结果未知的 push/reply
 会继续保留所有权，并阻止清理，直到完成核实；Stop 不是远端副作用已结束的
@@ -1505,6 +1683,9 @@ home directory 里发生的修改会把整个 task 钉在那里，后续步骤�
   拒绝。
 - 节点自己的凭据只能触及它的配置页需要中转的工作区与放置接口，并且一个节点只能为
   自己创建或改写放置。
+- 会话文件下载只经过双向认证的 Node 连接。Node 只读取会话自己的目录，绝不读取 Fleet
+  的配置目录、Copilot 的配置或 Host 的数据目录；Host 总是以 `application/octet-stream`
+  附件的形式提供文件，代理写出的任何内容都不会在操作者的源上渲染。
 - 新的注册流程不会向未经认证的 Host 发送任何可重复使用的凭据。一次性授权只对一个节点公钥
   有效、15 分钟过期；节点在完成之前先钉住 Host 指纹，两端都对整个握手签名，连接再派生出
   按方向分开的 AES-256-GCM 密钥和递增序号 —— 中继可以转发流量，但读不了、伪造不了、也
@@ -1524,7 +1705,9 @@ home directory 里发生的修改会把整个 task 钉在那里，后续步骤�
   被写进去。
 - 节点本地的配置页绑定在回环地址上，并且还会拒绝这些请求：`Host` 不是本机对应端口上的
   `127.0.0.1`（或 `localhost`）、来自其他来源、或写入时没有带
-  `content-type: application/json`。它无法防御登录到同一台机器上的其他用户。
+  `content-type: application/json`。它无法防御登录到同一台机器上的其他用户，也无法防御
+  节点自己的代理 —— 它们以节点的用户身份运行；交给它们的身份地址只是省去查找，并没有授予
+  它们原本够不到的任何东西。
 - 暴露在公网上的 Host 仍应使用 HTTPS/WSS；把它放在带认证的反向代理或访问策略之后
   （例如 Cloudflare Access）依然是一层值得加的防护。
 
@@ -1543,10 +1726,9 @@ npm run verify   # 依次检查 lint、格式、类型、测试以及生产构�
 
 ### 本地验证与测试监控
 
-主仓库是
-[`charlesyin_microsoft/copilot-fleet`](https://github.com/charlesyin_microsoft/copilot-fleet)，
-属于私有仓库，需要使用公司 GitHub 账号访问。托管用户账号直接拥有的仓库不提供
-GitHub 托管的 Actions runner，因此这里已移除 GitHub Actions 工作流。
+公开仓库是
+[`CharlesYWL/copilot-fleet`](https://github.com/CharlesYWL/copilot-fleet)。
+此快照使用本地验证，不包含 GitHub Actions 工作流。
 
 **推送前运行 `npm run verify`**。它保留原 CI 工作流的全部验证步骤，失败时返回非零
 退出码，包括 `lint` 没有覆盖的格式检查（`prettier --check`）。
@@ -1564,7 +1746,6 @@ npm run test:watch -- --project=services apps/host/src/auth/public-signin.test.t
 这些报告仅保存在本地，并被 Git 忽略。
 
 这些命令提供本地监控，不会自动检查远程 push/PR，也不是 Linux runner。若需要托管
-CI，应另行配置经批准的 Azure DevOps pipeline，或将仓库放入支持相应 runner 的
-Microsoft GitHub organization。这里没有创建外部流水线。
+CI，应另行配置具有合适 runner 的 CI 系统。这里没有创建外部流水线。
 
 启动过程无需种子数据。SQLite 会在首次启动时创建 schema 和空数据文件。

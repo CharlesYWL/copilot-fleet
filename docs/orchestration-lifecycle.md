@@ -6,30 +6,69 @@ Orchestration control uses separate persisted facts:
 - The session state records the latest worker state reported by a Node.
 - `stopRequested` records an unacknowledged Stop across disconnects and restarts.
 - `dismissed` controls visibility only.
-- `stoppedByOrchestrator` identifies unfinished steps that Resume may continue.
+- `stoppedByOrchestrator` identifies unfinished steps that an older Host's
+  orchestrator Stop cancelled, which Resume may continue.
 
 ## Operation contract
 
-| Existing state | Stop | Dismiss | Resume |
+Stopping an orchestrator stops its own conversation and nothing it started. The
+Host runs tasks without a live lead: dispatched steps finish, pending steps still
+dispatch, and whatever settles is owed to the lead as a wake that Resume
+delivers. Ending tasks is Archive's job, and Stop agents ends workers. Stop
+pauses PR maintenance owned by the lead, as it always has, because maintenance
+is driven by lead wakes.
+
+| Existing state | Stop orchestrator | Dismiss | Resume orchestrator |
 |---|---|---|---|
-| Pending or dependency-waiting step | Run becomes `cancelled`; step becomes `cancelled` and is marked resumable | No execution change | Marked step returns to `pending`; dependencies are re-evaluated |
-| Starting, queued, or running step | Same persisted cancellation; worker receives Stop and remains in its reported state until acknowledgement | Rejected while the lead is live | Rejected until every Stop is acknowledged |
-| Succeeded step | Preserved | No execution change | Preserved and never dispatched again |
-| Failed step | Preserved | No execution change | Preserved; descendants remain blocked |
-| Skipped or independently cancelled step | Preserved | No execution change | Preserved |
-| Offline worker | Stop intent remains persisted and is reissued if the Node reports the session after reconnect | Rejected until the lead is terminal | Rejected while execution is unknown |
-| Terminal worker | Preserved | No execution change | Reattached only when its step was marked by orchestration Stop |
-| Live lead | Owned runs are cancelled before any stop command is sent; the lead records `stopRequested` | Rejected | Rejected |
-| Terminal lead | Idempotent; any still-live owned run is cancelled | Allowed only after owned work settles; visibility changes and history remains stored | Lead is reattached, then eligible stopped runs reopen |
+| Pending or dependency-waiting step | Unchanged; still dispatched when ready | No execution change | Unchanged |
+| Starting, queued, or running step | Unchanged; its worker keeps running | Rejected while the task is live | Unchanged |
+| Succeeded, failed, skipped, or cancelled step | Preserved | No execution change | Preserved |
+| Offline worker | Unchanged | Rejected while the task is live | Unchanged |
+| Worker with its own pending Stop | Unchanged; "Mark orchestrator stopped" confirms it too when its node is unavailable | Rejected until acknowledged | Does not wait for it |
+| Live lead | The lead records `stopRequested` and receives Stop | Rejected | Rejected |
+| Terminal lead | Idempotent | Allowed once its own tasks are finished or archived and their workers settled; visibility changes and history remains stored | Lead is reattached; owed wakes and held messages are delivered once it is idle |
+| Task cancelled by an older Host's orchestrator Stop | — | Allowed once settled | Unfinished marked steps return to `pending` after their workers are terminal or idle and every Stop is acknowledged |
 
 Dismiss and restore never change run, step, or worker state. A dismissed lead and
 its tasks remain in persistence and continue accepting late terminal events.
 
-An unexpected lead failure, including failure to restore MCP tools, does not
-require stopping its workers before Resume. Resume reattaches the existing lead
+An unexpected lead failure, including failure to restore MCP tools, and an
+explicit Stop are handled the same way: Resume reattaches the existing lead
 conversation while workers in ongoing tasks keep their sessions and progress.
-Outstanding Stop requests still block Resume. Runs cancelled by orchestration
-Stop additionally wait for their workers to be terminal or idle before reopening.
+A lead's own outstanding Stop blocks Resume; its workers' Stops do not, because
+the scheduler parks settled workers while the lead is away.
+
+A Resume or start that the Node refuses settles the session as `failed` with the
+Node's reason, instead of leaving it `starting`. A refused launch leaves no
+process to report on it, so `starting` would otherwise never end; `failed` keeps
+the conversation resumable.
+
+## Transferring a task
+
+A task has exactly one owner, its run's `leadSessionId`: the conversation the
+engine wakes, delivers owed prompts to and lists the task under, and the one
+PR maintenance's heartbeat claims the task's registrations for. Transfer
+reassigns that owner and nothing else, in one transaction.
+
+| Existing state | Transfer |
+|---|---|
+| Open task | Moves; the receiving lead is owed a `<fleet-task-transfer>` brief ahead of any prompt already owed |
+| Closed task | Moves without a brief; nothing is delivered to a closed task |
+| Pending, starting or running step, idle retained worker | Unchanged; later settles wake the new owner |
+| Run-prompt or wake queued to the previous lead and not yet sent | Orphaned there and carried into the brief; one already in flight cannot be recalled |
+| PR maintenance registrations, including released history | Move to the new owner with a version bump; a pause the previous lead made itself becomes the new owner's |
+| Pending maintenance proposal | Re-owned and still authorizable; a reauthorization pinned to the moved record follows its new version |
+| Command executing or awaiting observation on the task's checkout | Refused until settled and observed |
+| Unsettled command the previous lead requested for the task | Refused; its result is delivered to whoever requested it |
+| Receiving lead stopped, stopping, dismissed or being deleted | Refused |
+
+The operator transfers from a task's page, a conversation's task panel or the
+board (`POST /api/runs/:id/transfer`, `POST /api/orchestrators/:id/transfer`).
+An orchestrator uses `fleet_transfer_task`, naming another conversation's task
+by the ID `fleet_list_orchestrators` shows; owner permission is deliberately not
+checked. A send-back, reopen or maintenance direction that arrives while the
+brief is still owed is appended to it. Every transfer adds a lifecycle note with
+any handoff note, so the record says where a task has been.
 
 ## Dependency rules
 
@@ -58,7 +97,9 @@ The control fields are additive SQLite columns with safe defaults, so older
 databases remain active and visible. Backups preserve the fields. On reconnect,
 a stopped session still present on the Node receives Stop again; a session no
 longer present is confirmed `stopped`. Resume resets only steps explicitly
-marked by the orchestration Stop transaction.
+marked by an older Host's orchestration Stop transaction; current Hosts no
+longer write that mark, so a database from before the change still resumes the
+work it stopped.
 
 ### Task overview and checkpoints
 
@@ -137,6 +178,78 @@ not evidence that the conversation must be replaced. A confirmed terminal
 worker without a resumable conversation needs replacement with the retained
 task context supplied explicitly.
 
+## Queued follow-up admission and Resume now
+
+The scheduler records why it leaves each pending step pending, in the same pure
+pass that decides dispatch (`planNextActions` holds), so an explanation cannot
+drift from what the engine did. Holds live in memory and are recomputed every
+tick; a restarted Host reports `scheduling` until its first pass. Steps carry
+the derived `admission` on REST reads and `run_steps` broadcasts, and the
+orchestrator reads the same text in `fleet_list_work`, `fleet_get_task` and the
+`fleet_follow_up` reply.
+
+| State | Meaning | Codes |
+|---|---|---|
+| queued | Ordinary capacity or ordering; Fleet starts it by itself | `session_busy`, `parallel_limit`, `node_headroom`, `node_capacity`, `dependencies`, `workspace_not_ready`, `nodes_unknown`, `no_placement`, `scheduling` |
+| blocked | Something other than capacity must change | `checkout_busy`, `node_offline`, `stop_pending`, `dismissed`, `cleanup_pending`, `task_held`, `maintenance_hold`, `command_fence` |
+| awaiting_approval | A "Resume now" exception waits for a person | `resume_approval` |
+| starting | Sent; the Node has not acknowledged the turn | `resuming`, `dispatched` |
+| running | The Node acknowledged the turn | `running` |
+
+Same-checkout and same-Node concurrency are distinct. `checkout_busy` names the
+live sessions holding the worker's checkout (a Node with managed worktrees
+treats every live non-lead session as holding its checkout; the legacy key is
+the placement). A settled task worker occupying it is parked by the scheduler
+before the handoff, so that wait clears by itself; a session no task manages
+keeps the checkout until whoever uses it stops it. Sessions in different
+checkouts on one Node never block each other while the Node has capacity.
+
+**Resume now** (task page, worker transcript banner, `POST
+/api/runs/:id/steps/:stepId/resume-now`, or `fleet_request_resume`) first runs an
+ordinary scheduling pass. If that starts the worker, nothing else happens. The
+only restriction it can ever turn into an exception is `node_headroom`: the Host
+keeps the last slot of a multi-slot Node free, and a person may approve spending
+it once while the Node's hard limit still has room. Every other reason is
+returned as the answer with no request created.
+
+An exception is a durable, versioned request (`worker_resume_requests`) bound to
+the step attempt, retained session and its Copilot conversation, Node,
+placement and exact checkout, the queued prompt's digest, and the set of
+sessions holding that Node's slots. Its dialog shows all of those, the
+restriction and the risk, with **Approve once** and **Cancel request**; **Review
+later** decides nothing. Only a signed-in browser operator may decide
+(`POST /api/worker-resume-requests/:id/decision` with the displayed version and
+fingerprint); Node, MCP and no-login principals are refused, and an
+orchestrator cannot approve its own request. Chat text, tool arguments, YOLO
+mode and other approvals are never consent.
+
+Approval runs a fresh scheduling pass and recomputes the binding. A changed
+binding — another session on the Node, a new writer in the checkout, an offline
+Node, a replaced follow-up, a human or maintenance hold — makes the request
+`stale` and launches nothing. The approved exception reaches the planner only
+while that binding still holds, applies only where the reserved slot is the one
+remaining obstacle, and is spent in the same transaction as the resume receipt,
+so it launches at most once across repeated clicks, concurrent decisions,
+scheduler races and Host restarts. The existing resume path then restores the
+same conversation and sends the step's already-queued prompt exactly once; the
+request becomes `launched` only when the Node acknowledges that turn, or
+`failed` with the Node's reason. Cancellation and expiry (10 minutes to decide,
+2 minutes to launch after approval) leave the follow-up queued; an orchestrator
+whose request was cancelled or ignored is refused another for the same attempt
+for 30 minutes. Requests, decisions and outcomes are written to the security
+audit log; approvals, cancellations and launch outcomes are also task notes.
+Requests are not carried in backups, and a restore clears them.
+
+A person's own prompt into a worker that has a queued follow-up is stamped with
+that follow-up's attempt; the engine forgets that turn's completion receipt
+when it sends the queued prompt, so the earlier turn cannot settle the queued
+one before the Node acknowledges it.
+
+The manual session **Resume** control applies the scheduler's checkout rule to
+task workers and reviewers: it refuses (`409 checkout_busy`, naming the holder)
+while another live session holds the checkout the worker would write to.
+Sessions no task manages, and orchestrators, keep the control unchanged.
+
 ## Worker delivery and publication
 
 The orchestrator delegates, judges and coordinates rather than mutating the
@@ -178,7 +291,16 @@ batch settlement are independent of the implementation task's state. Discovery
 includes completed-task registrations and terminal/paused work needing settlement.
 Existing lead wakes handle due observation and reconciliation; there is no new
 timer or direct-to-worker observer. A completed task is not reopened just to make
-its lead eligible for a reminder.
+its lead eligible for a reminder. Idle-lead status checks fire on the operator's
+orchestrator heartbeat schedule (cron, Host local time), and a PR's next routine
+check is the first heartbeat at least half an hour after its last observation.
+A PR whose retained worker is still running an accepted batch is not claimed;
+the completed turn requests the next check.
+
+The [technical flow diagrams](pr-maintenance-technical-flow.html) show the MCP tools
+and REST actions that start, change and end maintenance, the per-wake observation
+and repair sequences, the registration and batch lifecycles, and the stage
+projection precedence.
 
 V1 permits one retained PR registration per task, including paused registrations.
 Task and MCP reads include historical terminal/released jobs. A later PR can reuse
@@ -214,9 +336,11 @@ head/base repository IDs and full refs, owned worker, baseline, verification,
 publication scope, budgets and current prerequisite evidence. Pause/resume/release
 use `recordId` and `expectedVersion`; stale input is a conflict, not permission to
 overwrite newer state. MCP may propose bounded maintenance but cannot fabricate
-the browser operator's authorization. Repair mode requires verified observation
-and publication prerequisites; observation-only mode grants no mutation authority.
-Unsupported immutable/standalone bindings still fail closed.
+the browser operator's authorization. Maintenance is repair-only: enablement
+requires verified observation and publication prerequisites. Legacy
+observation-only grants and proposals remain readable but authorize no writes and
+cannot be approved, resumed or renewed; they need a new pinned repair proposal and
+authenticated authorization. Unsupported immutable/standalone bindings still fail closed.
 
 The default task action sends a preparation request (optional PR URL only) to its
 existing Orchestrator through the existing prompt delivery mechanism. Durable
@@ -233,11 +357,13 @@ binding through normal operator enablement. A changed proposal requires review
 again; task approval is not maintenance approval. Proposals survive backup and
 restart without acquiring authority. Read them through
 `fleet_get_pr_maintenance(taskId)` or the existing task discovery surfaces.
-The preparer's default mode is observation only, with publication, replies, thread
-resolution, reviewer requests and CI retries disabled. Repair mode needs explicit
-existing-publication evidence; other provider actions must be requested separately.
-The returned mode and action flags mirror the stored proposal. Operator approval
-cannot silently reinterpret read-only scope as repair authority.
+Preparation is repair-only; there is no observation-only default and an explicit
+observe mode is unsupported. `publicationEvidence` for verified existing task and
+publication authority is required; without it preparation is refused
+(`publication_evidence_required`) and no proposal or write grant is created.
+Replies, thread resolution, named reviewer requests and CI retries default off and
+must be requested separately. The returned mode and action flags mirror the stored
+proposal. Operator approval cannot silently reinterpret read-only scope as repair authority.
 
 The stage rail is a projection of current durable facts, not another scheduler or
 agent-maintained status string. It distinguishes observation/recovery, triage,

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { ComponentProps } from "react";
 import type { SessionUsage } from "@fleet/protocol";
@@ -96,7 +96,7 @@ describe("SessionUsageBar", () => {
       expect(ring().querySelector("circle[pathLength]")).toBeNull();
       expect(ring().textContent).toBe("?");
       fireEvent.click(ring());
-      expect(screen.getByText("Usage unavailable")).toBeTruthy();
+      expect(screen.getByText("? (Usage unavailable)")).toBeTruthy();
     },
   );
 
@@ -188,19 +188,42 @@ describe("SessionUsageBar", () => {
   });
 
   it.each([
-    { aiCredits: undefined, label: "—" },
+    { aiCredits: undefined, label: "?" },
     { aiCredits: 0, label: "0" },
     { aiCredits: 0.00014, label: "<0.01" },
   ])("distinguishes missing, zero and small credits ($label)", ({ aiCredits, label }) => {
     show({ usage: aiCredits === undefined ? {} : { aiCredits } });
     fireEvent.click(ring());
-    expect(screen.getByText(label)).toBeTruthy();
+    expect(within(panel()).getByText(label)).toBeTruthy();
+  });
+
+  it("labels Hermes ACP estimates without inventing credits or a Copilot context report", () => {
+    show({
+      agentKind: "hermes",
+      usage: {
+        context: {
+          usedTokens: 8_000,
+          tokenLimit: 32_000,
+          percentage: 25,
+          updatedAt: "2026-09-28T00:00:00.000Z",
+          estimated: true,
+          source: "acp",
+        },
+      },
+    });
+    expect(ring().getAttribute("aria-label")).toContain("approximately 25%");
+    fireEvent.click(ring());
+    expect(within(panel()).getByText("Hermes")).toBeTruthy();
+    expect(within(panel()).getByText("?")).toBeTruthy();
+    expect(screen.getByText(/Hermes ACP · Updated/)).toBeTruthy();
+    expect(screen.getByText("~8,000 / ~32,000 tokens")).toBeTruthy();
+    expect(screen.queryByText(/CLI \/context|Model:|input budget/)).toBeNull();
   });
 
   it("keeps partial ACP details explicitly separate from unknown full-window usage", () => {
     show({ usage: { contextTokens: 12345 } });
     fireEvent.click(ring());
-    expect(screen.getByText("12,345 / unknown tokens")).toBeTruthy();
+    expect(screen.getByText("12,345 / ? tokens")).toBeTruthy();
     expect(screen.getByText("Last ACP input tokens / input budget")).toBeTruthy();
     expect(screen.getByText(/No \/context snapshot yet/)).toBeTruthy();
     expect(screen.queryByText(/1M|1,000,000/)).toBeNull();

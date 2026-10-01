@@ -19,6 +19,7 @@ import {
   COMMAND_LIMITS,
   CommandExecutionPageSchema,
   CommandExecutionSchema,
+  commandApprovalExpiresAt,
   errorMessage,
   terminalCommandExecutionStates,
   prMaintenanceUrl,
@@ -278,6 +279,10 @@ export function CommandExecutionsDialog({
       );
       const execution = CommandExecutionSchema.parse(result.execution);
       setHistory((prior) => mergeCommandExecutions(prior, [execution]));
+      if (execution.state === "expired")
+        setError(
+          "That request had already expired, so your decision was not applied and nothing ran. It moved to Request history.",
+        );
       setGroup("waiting");
       setSelectedId(undefined);
       setSelectedProposalId(undefined);
@@ -563,7 +568,9 @@ export function CommandExecutionsDialog({
                       <dt>Runtime limit</dt>
                       <dd>{Math.round(selected.timeoutMs / 1000)} seconds</dd>
                       <dt>Start approval expires</dt>
-                      <dd>{new Date(selected.expiresAt).toLocaleString()}</dd>
+                      <dd>
+                        {new Date(commandApprovalExpiresAt(selected)).toLocaleString()}
+                      </dd>
                       {selected.approvedBy && (
                         <>
                           <dt>Approved by</dt>

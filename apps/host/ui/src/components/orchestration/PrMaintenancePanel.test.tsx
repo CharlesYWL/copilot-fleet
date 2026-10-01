@@ -8,9 +8,13 @@ import {
   PrMaintenanceProposalSchema,
   PrMaintenanceObservationSchema,
   PrMaintenanceBatchSchema,
+  PrMaintenanceFindingSchema,
   PrMaintenanceIncidentSchema,
+  prMaintenanceTaskStatuses,
   RunPolicySchema,
+  RunStepSchema,
   type FleetSession,
+  type PrMaintenanceRegistration,
   type Run,
 } from "@fleet/protocol";
 import { fleetDarkTheme } from "../../theme";
@@ -26,6 +30,7 @@ import { OrchestratorTaskDetail } from "./OrchestratorTaskDetail";
 import { buildRunViewModels } from "../../lib/orchestration-view";
 import { taskOverview } from "../../lib/task-overview";
 import { PrMaintenanceApprovalReview } from "./PrMaintenanceApprovalReview";
+import { ConversationTasks } from "./ConversationTasks";
 
 vi.mock("../../lib/pr-maintenance", () => ({
   getTaskMaintenance: vi.fn(),
@@ -456,6 +461,61 @@ describe("PR maintenance task controls", () => {
       }
     },
   );
+
+  it("holds displayed readiness until the scheduled check is overdue, not for a fixed half hour", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(at));
+    let rendered: ReturnType<typeof render> | undefined;
+    try {
+      // The heartbeat schedules the next look two hours out, as it does at night.
+      const record = {
+        ...observed(),
+        observationHostAt: at,
+        nextCheckAt: new Date(Date.parse(at) + 120 * 60_000).toISOString(),
+      };
+      vi.mocked(getTaskMaintenance).mockResolvedValue({
+        records: [record],
+        canAuthorize: true,
+      });
+      const model = buildRunViewModels({
+        runs: [{ ...task, state: "completed" }],
+        stepsByRun: {},
+        sessions: [],
+      })[0]!;
+      await act(async () => {
+        rendered = render(
+          <FluentProvider theme={fleetDarkTheme}>
+            <OrchestratorTaskDetail
+              model={model}
+              notes={[]}
+              sessions={[]}
+              onBack={vi.fn()}
+              onOpenLead={vi.fn()}
+              onOpenWorker={vi.fn()}
+              onReview={vi.fn()}
+              onArchive={vi.fn()}
+              onReopen={vi.fn()}
+              onDelete={vi.fn()}
+            />
+          </FluentProvider>,
+        );
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(
+          PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs + 1,
+        );
+      });
+      expect(screen.getByRole("heading", { name: "PR ready to merge" })).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120 * 60_000);
+      });
+      expect(screen.queryByRole("heading", { name: "PR ready to merge" })).toBeNull();
+      expect(screen.getByRole("heading", { name: "Checking PR status" })).toBeTruthy();
+    } finally {
+      rendered?.unmount();
+      vi.useRealTimers();
+    }
+  });
 
   it.each(["merged", "closed"] as const)(
     "keeps unsettled %s work in the top-level overview",
@@ -1143,6 +1203,125 @@ describe("PR maintenance task controls", () => {
       ).disabled,
     ).toBe(true);
   });
+
+  it.each(["addressed", "already_satisfied"] as const)(
+    "refreshes detail and card together from feedback assessment through %s readiness",
+    async (outcome) => {
+      const record: PrMaintenanceRegistration = observed();
+      const repair = batch("accepted");
+      const source = repair.sources[0]!;
+      record.observation!.sources = [source];
+      delete record.readyFingerprint;
+      const work = RunStepSchema.parse({
+        id: repair.stepId,
+        runId: task.id,
+        stepKey: "repair",
+        title: "Repair feedback",
+        prompt: repair.prompt,
+        sessionId: worker.id,
+        placementId: worker.placementId,
+        state: "pending",
+        createdAt: at,
+        updatedAt: at,
+      });
+      const view = () => {
+        vi.mocked(getTaskMaintenance).mockResolvedValue({
+          records: [structuredClone(record)],
+          canAuthorize: true,
+        });
+        const models = buildRunViewModels({
+          runs: [{ ...task, state: "running" }],
+          stepsByRun: { [task.id]: [work] },
+          sessions: [worker],
+          maintenance: prMaintenanceTaskStatuses([record]),
+        });
+        return (
+          <FluentProvider theme={fleetDarkTheme}>
+            <ConversationTasks
+              models={models}
+              open
+              onToggle={vi.fn()}
+              onOpenRun={vi.fn()}
+              onOpenWorker={vi.fn()}
+              onNewRun={vi.fn()}
+            />
+            <OrchestratorTaskDetail
+              model={models[0]!}
+              snapshotRevision={record.version}
+              notes={[]}
+              sessions={[worker]}
+              onBack={vi.fn()}
+              onOpenLead={vi.fn()}
+              onOpenWorker={vi.fn()}
+              onReview={vi.fn()}
+              onArchive={vi.fn()}
+              onReopen={vi.fn()}
+              onDelete={vi.fn()}
+            />
+          </FluentProvider>
+        );
+      };
+      const rendered = render(view());
+      const expectStatus = async (title: string, label: string) => {
+        const detail = screen.getByRole("region", { name: "Current task stage" });
+        await within(detail).findByRole("heading", { name: title });
+        const cards = screen.getByRole("complementary", { name: "Conversation tasks" });
+        expect(within(cards).getByRole("img", { name: `PR · ${label}` })).toBeTruthy();
+      };
+      const refresh = () => {
+        record.version++;
+        rendered.rerender(view());
+      };
+      await expectStatus("PR: reviewing feedback", "Reviewing feedback");
+      record.batches = [
+        {
+          ...repair,
+          state: "prepared",
+          stepId: undefined,
+          attempt: undefined,
+        },
+      ];
+      refresh();
+      await expectStatus("PR: reviewing feedback", "Reviewing feedback");
+      record.batches = [repair];
+      refresh();
+      await expectStatus("PR: fixing feedback", "Fixing feedback");
+      work.state = "running";
+      refresh();
+      await expectStatus("PR: fixing feedback", "Fixing feedback");
+      work.state = "succeeded";
+      repair.state = "reconciling";
+      repair.executionSettled = true;
+      refresh();
+      await expectStatus("PR: reconciling effects", "Reconciling effects");
+      const finding = PrMaintenanceFindingSchema.parse({
+        source,
+        outcome: "incomplete",
+        stage: "published",
+        publishedCommit: record.observation!.headSha,
+        verifiedHeadSha: record.observation!.headSha,
+        evidence: ["Current HEAD verified; required reply still pending"],
+        nextAction: "Reconcile required response",
+      });
+      repair.state = "partial";
+      repair.findings = [finding];
+      record.findings = [finding];
+      refresh();
+      await expectStatus("Checking PR status", "Checking PR");
+      finding.outcome = outcome;
+      finding.stage = "resolved";
+      finding.responseIds = ["response"];
+      refresh();
+      await expectStatus("Checking PR status", "Checking PR");
+      record.readyFingerprint = record.observation!.fingerprint;
+      refresh();
+      await expectStatus("PR ready to merge", "Ready to merge");
+      expect(record.observation!.sources).toEqual([source]);
+      record.observation!.sources = [{ ...source, revision: "new-revision" }];
+      refresh();
+      await expectStatus("PR: reviewing feedback", "Reviewing feedback");
+    },
+  );
 
   it.each([
     ["ready", "Ready · not merged"],

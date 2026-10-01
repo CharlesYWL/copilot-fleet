@@ -13,12 +13,13 @@ import {
 } from "@fluentui/react-components";
 import { Info20Regular } from "@fluentui/react-icons";
 import {
+  agentKindLabels,
   terminalSessionStates,
   type FleetNode,
   type FleetSession,
   type Placement,
 } from "@fleet/protocol";
-import { localResume } from "../lib/session-info";
+import { localResume, sessionWorkingDirectory } from "../lib/session-info";
 import { sessionLabel } from "../lib/session-label";
 import { sessionStatusLabel } from "../lib/session-status";
 import { statusVisuals, terminal } from "../theme";
@@ -109,10 +110,8 @@ export function SessionInfoDialog({
 }: SessionInfoDialogProps) {
   const styles = useStyles();
   const resume = localResume(session, node, placement);
-  const currentPlacement =
-    placement?.id === session.placementId && placement.nodeId === session.nodeId
-      ? placement
-      : undefined;
+  const agentLabel = agentKindLabels[session.agentParams?.kind ?? "copilot"];
+  const directory = sessionWorkingDirectory(session, placement);
   const model = session.configOptions.find((option) => option.category === "model");
   const modelName =
     model?.choices.find((choice) => choice.value === model.currentValue)?.name ??
@@ -141,6 +140,15 @@ export function SessionInfoDialog({
             </div>
             <dl className={styles.details}>
               <div>
+                <dt className={styles.label}>Agent backend</dt>
+                <dd className={styles.value}>
+                  {agentLabel}
+                  {session.agentParams?.kind === "hermes"
+                    ? ` (${session.agentParams.profile})`
+                    : ""}
+                </dd>
+              </div>
+              <div>
                 <dt className={styles.label}>Node</dt>
                 <dd className={styles.value}>
                   {session.nodeName}
@@ -166,21 +174,16 @@ export function SessionInfoDialog({
                 </dd>
               </div>
               <div className={styles.wide}>
-                <dt className={styles.label}>Working directory (current placement)</dt>
+                <dt className={styles.label}>Working directory</dt>
                 <dd className={styles.value}>
-                  <span className={styles.mono}>
-                    {currentPlacement?.localPath || "Unavailable"}
-                  </span>
-                  {currentPlacement && (
-                    <CopyButton
-                      text={currentPlacement.localPath}
-                      label="Copy working directory"
-                    />
+                  <span className={styles.mono}>{directory || "Unavailable"}</span>
+                  {directory && (
+                    <CopyButton text={directory} label="Copy working directory" />
                   )}
                 </dd>
               </div>
               <div className={styles.wide}>
-                <dt className={styles.label}>Copilot session ID</dt>
+                <dt className={styles.label}>{agentLabel} session ID</dt>
                 <dd className={styles.value}>
                   <span className={styles.mono}>
                     {session.agentSessionId || "Not reported yet"}
@@ -188,7 +191,7 @@ export function SessionInfoDialog({
                   {session.agentSessionId && (
                     <CopyButton
                       text={session.agentSessionId}
-                      label="Copy Copilot session ID"
+                      label={`Copy ${agentLabel} session ID`}
                     />
                   )}
                 </dd>
@@ -253,10 +256,9 @@ export function SessionInfoDialog({
                   )}
                   <pre className={styles.code}>{resume.command}</pre>
                   <p className={styles.instructions}>
-                    Uses standard Copilot CLI and the current placement. If the placement
-                    moved, use the original directory. If you use Agency or a custom
-                    launcher, use its equivalent resume command and the same Copilot
-                    configuration.
+                    {session.agentParams?.kind === "hermes"
+                      ? "Uses Hermes with this session's saved profile. Stop any other process using that profile before local recovery. Keep the same OS user and original working directory."
+                      : "Uses standard Copilot CLI and the bound execution directory when available, otherwise the current placement. If the directory moved, use the original directory. If you use Agency or a custom launcher, use its equivalent resume command and the same Copilot configuration."}
                   </p>
                   <p className={styles.instructions}>
                     Local recovery does not reconnect this terminal to Fleet

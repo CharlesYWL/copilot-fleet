@@ -9,6 +9,7 @@ import {
   WorktreeIntegrationSchema,
   WorktreeObservationSchema,
   WorktreeOperationResultSchema,
+  WorktreeOperationRequestSchema,
   type HostToNodeMessage,
   type ManagedWorktree,
   type WorktreeOperationRequest,
@@ -568,6 +569,104 @@ describe("Host managed workspace orchestration", () => {
         cwd: binding.cwd,
       });
   });
+
+  it.each(["step", "derived"] as const)(
+    "reconciliation clears only the matching %s session quarantine",
+    async (workspaceKind) => {
+      const kit = fixture();
+      const run = await readyManaged(kit, false);
+      const primary = kit.store.worktreeForRun(run.id)!;
+      const step = kit.store.upsertRunStep(run.id, {
+        stepKey: "worker",
+        title: "worker",
+        prompt: "work",
+        category: "explore",
+      });
+      const taskKey = createHash("sha256")
+        .update(
+          [
+            primary.hostInstallationId,
+            run.id,
+            workspaceKind,
+            step.id,
+            primary.generation,
+          ].join(":"),
+        )
+        .digest("hex")
+        .slice(0, 32);
+      const cwd = "C:\\trees\\" + taskKey;
+      const tree = ManagedWorktreeSchema.parse({
+        ...primary,
+        id: "worktree-reconciled",
+        taskKey,
+        path: cwd,
+        branchRef: "refs/heads/fleet/" + taskKey,
+        pinRef: "refs/fleet/pins/" + taskKey,
+        checkout: {
+          ...primary.checkout!,
+          key: "derived-checkout",
+          fileId: "derived-checkout",
+          path: cwd,
+        },
+        workspaceKind,
+        ownerStepId: step.id,
+        state: "quarantined",
+      });
+      kit.store.putDerivedWorkspace(tree);
+      const binding = {
+        worktreeId: tree.id,
+        generation: tree.generation,
+        sourcePlacementId: tree.sourcePlacementId,
+        cwd,
+        checkoutKey: tree.checkout!.key,
+        accessClass: "shell" as const,
+        leaseAttempt: "reconcile-attempt",
+        quarantined: true,
+      };
+      const sessions = [
+        binding,
+        { ...binding, worktreeId: "another-worktree" },
+        { ...binding, generation: tree.generation + 1 },
+      ].map((executionBinding) => {
+        const session = kit.store.createSession(kit.placement, "work", false, "", {
+          runId: run.id,
+          runRole: "worker",
+        });
+        kit.store.setSessionExecutionBinding(session.id, executionBinding);
+        return session;
+      });
+      kit.store.updateRunStep(step.id, {
+        sessionId: sessions[0]!.id,
+        executionBinding: binding,
+        managedWorktreeId: tree.id,
+      });
+      const request = WorktreeOperationRequestSchema.parse({
+        ...lastRequest(kit.frames),
+        operationId: randomUUID(),
+        kind: "reconcile",
+        worktreeId: tree.id,
+        workspaceKind,
+        ownerStepId: step.id,
+        expectedVersion: tree.version,
+        expectedPath: tree.path,
+        expectedBranchRef: tree.branchRef,
+      });
+      kit.store.putWorktreeOperation({
+        request,
+        state: "intent",
+        createdAt: new Date().toISOString(),
+      });
+      const result = operationResult(kit.store, request);
+      result.worktree!.state = "ready";
+
+      expect(kit.service.worktrees.handleResult(kit.node.id, result)).toBe(true);
+      expect(
+        sessions.map(
+          (session) => kit.store.getSession(session.id)!.executionBinding!.quarantined,
+        ),
+      ).toEqual([false, true, true]);
+    },
+  );
 
   it("quarantines restores and never automatically replays or launches their managed metadata", async () => {
     const { create, frames, node, service, store } = fixture();

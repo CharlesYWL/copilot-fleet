@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import { hostname } from "node:os";
 import { z } from "zod";
 import {
   BACKUP_VERSION,
@@ -21,9 +22,10 @@ import type {
   ConfigRouter,
   ConfigServerOptions,
   FleetApi,
+  NodeIdentity,
 } from "./config-server-types.js";
 import { FleetClient } from "./fleet-client.js";
-import { pickFolder as pickFolderDefault } from "./pick-folder.js";
+import { listFolders as listFoldersDefault } from "./pick-folder.js";
 import { inspectPath as inspectPathDefault } from "./path-check.js";
 import { CopilotSessionDiscovery } from "./copilot-sessions.js";
 
@@ -33,6 +35,7 @@ export type {
   ConfigServerOptions,
   ConfigStatus,
   FleetApi,
+  NodeIdentity,
   SessionDiscoveryApi,
 } from "./config-server-types.js";
 
@@ -48,6 +51,16 @@ const PlacementInputSchema = z.object({
   workspaceId: z.string().default(""),
   localPath: z.string().min(1).max(4096),
 });
+
+const FolderInputSchema = z
+  .object({
+    path: z
+      .string()
+      .max(4096)
+      .refine((path) => !path.includes("\0"), "Invalid folder path")
+      .default(""),
+  })
+  .strict();
 
 const CommandPermissionsInputSchema = z.union([
   z
@@ -75,6 +88,9 @@ type Handler = (body: string) => Promise<ConfigReply>;
  */
 const HOST = "127.0.0.1";
 const MAX_CONFIG_PORT_ATTEMPTS = 20;
+
+/** Where agents on this machine ask which Fleet node they are running on. */
+export const NODE_IDENTITY_PATH = "/api/identity";
 
 /** Loopback names a browser on this machine can legitimately have used. */
 const LOOPBACK_NAMES = new Set(["127.0.0.1", "localhost", "::1"]);
@@ -160,6 +176,19 @@ export function configServerPort(env: NodeJS.ProcessEnv = process.env): number {
   return Number.isInteger(parsed) && parsed > 0 && parsed < 65_536 ? parsed : 8788;
 }
 
+/**
+ * The full address of {@link NODE_IDENTITY_PATH} on a started config server.
+ *
+ * Read from the listener rather than from settings, because the page moves past
+ * an occupied port, and undefined until it is listening: an address nothing
+ * answers on would send an agent looking for a node that is right here.
+ */
+export function nodeIdentityUrl(server: Server): string | undefined {
+  const address = server.address();
+  if (!server.listening || !address || typeof address === "string") return undefined;
+  return `http://${HOST}:${address.port}${NODE_IDENTITY_PATH}`;
+}
+
 const ok = (body: unknown): ConfigReply => ({ status: 200, body });
 const badRequest = (error: string): ConfigReply => ({ status: 400, body: { error } });
 
@@ -183,9 +212,8 @@ function pathFrom(body: string): string {
 /**
  * The config endpoints as a table, separate from the HTTP plumbing.
  *
- * Every dependency that reaches off this process — the Host, the folder dialog,
- * the filesystem — arrives as an option, so the endpoints can be exercised
- * without a Host to talk to or a display to open a dialog on.
+ * Every dependency that reaches off this process — the Host and the filesystem —
+ * arrives as an option, so the endpoints can be exercised independently.
  */
 export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
   const fleet: FleetApi =
@@ -212,7 +240,7 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
           : undefined;
       },
     });
-  const pickFolder = options.pickFolder ?? pickFolderDefault;
+  const listFolders = options.listFolders ?? listFoldersDefault;
   const inspectPath = options.inspectPath ?? inspectPathDefault;
   const discovery =
     options.sessionDiscovery ??
@@ -223,9 +251,26 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
   const sessionRoute = createSessionRouteHandler(fleet, discovery);
   const state = (): ConfigReply =>
     ok({ settings: options.getSettings(), status: options.getStatus() });
+  /**
+   * Which Fleet node this is, read at the moment of asking.
+   *
+   * The name is the one the Host last confirmed — node.json's — rather than
+   * settings.json's, because it is what an orchestrator calls this machine. The
+   * two differ only while a rename typed on this page waits for the Host.
+   */
+  const identity = (): NodeIdentity => {
+    const status = options.getStatus();
+    return {
+      nodeId: status.nodeId,
+      nodeName: options.getCredentials()?.name ?? options.getSettings().nodeName,
+      machineName: hostname(),
+      connected: status.connected,
+    };
+  };
 
   const routes = new Map<string, Handler>([
     ["GET /api/config", async () => state()],
+    [`GET ${NODE_IDENTITY_PATH}`, async () => ok(identity())],
     [
       "GET /api/command-permissions",
       async () => {
@@ -387,9 +432,27 @@ export function createConfigRouter(options: ConfigServerOptions): ConfigRouter {
     ],
     [
       "POST /api/pick-folder",
-      // The dialog opens on this machine's display, so this only resolves once
-      // whoever is sitting there answers it.
-      async (body) => ok(await pickFolder(pathFrom(body))),
+      async () => ({
+        status: 410,
+        body: { error: "Refresh this page to use the in-page folder chooser." },
+      }),
+    ],
+    [
+      "POST /api/folders",
+      async (body) => {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return badRequest("Invalid folder request");
+        }
+        const input = FolderInputSchema.safeParse(parsed);
+        if (!input.success) {
+          return badRequest(input.error.issues[0]?.message ?? "Invalid folder request");
+        }
+        const result = await listFolders(input.data.path);
+        return result.ok ? ok(result) : badRequest(result.reason);
+      },
     ],
     [
       "POST /api/workspaces",
@@ -491,8 +554,9 @@ export function startConfigServer(options: ConfigServerOptions): Server {
       return;
     }
 
+    request.setEncoding("utf8");
     let body = "";
-    request.on("data", (chunk: Buffer) => {
+    request.on("data", (chunk: string) => {
       body += chunk;
       // Nothing legitimate approaches this size; stop reading rather than
       // buffering whatever a runaway client decides to send.

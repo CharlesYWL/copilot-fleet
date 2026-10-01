@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  ORCHESTRATOR_STOP_REASON,
   PrMaintenanceEnableSchema,
   prMaintenanceUrl,
   prMaintenanceProgress,
@@ -13,6 +14,7 @@ import {
 import { z } from "zod";
 import { fleet } from "../orchestrator/fleet-harness.js";
 import { OrchestratorEngine } from "../orchestrator/engine.js";
+import { archiveRun } from "../orchestrator/lifecycle.js";
 import { PreparePrMaintenanceSchema } from "../orchestrator/tools.js";
 import { LeadTokens } from "../orchestrator/lead-tokens.js";
 import { mcpRoutes } from "../orchestrator/mcp-routes.js";
@@ -1289,6 +1291,15 @@ describe("authenticated PR maintenance controls", () => {
       });
       expect(store.prMaintenance.getProposal(run.id)).toBeUndefined();
       expect(service.snapshot().prMaintenanceApprovals).toEqual([]);
+      expect(service.snapshot().prMaintenanceTasks).toEqual([
+        {
+          taskId: run.id,
+          recordId: accepted.json().id,
+          stage: expect.any(String),
+          prUrl: prMaintenanceUrl(registration.identity),
+          manualControl: false,
+        },
+      ]);
       const archivedProposal = store
         .listRunNotes(run.id)
         .find(
@@ -1651,7 +1662,7 @@ describe("authenticated PR maintenance controls", () => {
   });
 
   it("resumes unrelated tasks with an active worker without reopening the maintenance-held task", async () => {
-    const { app, run, worker, leadId, store, hold } = await setup();
+    const { app, run, worker, leadId, store, service, hold } = await setup();
     const held = hold();
     const unrelated = store.createRun({
       workspaceId: run.workspaceId,
@@ -1667,6 +1678,10 @@ describe("authenticated PR maintenance controls", () => {
       payload: { agentSessionId: "retained-native-lead" },
       createdAt: new Date().toISOString(),
     });
+    // Tasks an older Host cancelled when it stopped this lead: Stop no longer
+    // cancels anything, but Resume still reopens what it left in this state.
+    for (const id of [run.id, unrelated.id])
+      archiveRun(service, id, ORCHESTRATOR_STOP_REASON, { stoppedByOrchestrator: true });
     await app.inject({ method: "POST", url: `/api/orchestrators/${leadId}/stop` });
     for (const id of [worker.id, leadId]) {
       store.transitionSession(id, "stopped");

@@ -5,7 +5,7 @@
 Copilot Fleet is a self-hosted control plane for supervising GitHub Copilot CLI
 agents on multiple machines. The Host combines a Fastify API, WebSocket hub,
 SQLite database, and React UI. Each Node makes one outbound connection and owns
-an isolated ACP client and Copilot process per live session.
+an isolated ACP client and agent process per live session.
 
 ## What it looks like
 
@@ -52,15 +52,18 @@ working without health telemetry, and health does not change scheduling.
 
 The session header's **Session information** icon opens the same details dialog
 in both the full chat and the focused overview chat. It shows the Node, platform,
-workspace, current placement path, model, status, timestamps, and both the Fleet
+workspace, working directory, model, status, timestamps, and both the Fleet
 and native Copilot session IDs. Copy buttons provide the path, IDs, and a
 shell-quoted local recovery command. Only the native Copilot ID can be passed
 to `copilot --resume`; demo sessions and sessions without that ID have no recovery
 command.
 
+Managed sessions show and copy their bound execution directory, not the source
+checkout. Legacy sessions without a binding use their current placement.
+
 Run local recovery on the original Node as the same OS user, after stopping or
 verifying the old process has exited. The command uses standard Copilot CLI and
-the current placement: if either your launcher/configuration or the placement
+the directory shown above: if either your launcher/configuration or that directory
 has changed, use the corresponding original setup. Local recovery does not
 reattach the CLI to Fleet or restore orchestration tools; use Fleet's **Resume**
 to continue managed work.
@@ -90,13 +93,15 @@ Start with the walkthrough, then use this map when you need a specific surface.
   [Windows login startup](#windows-login-startup),
   [Node command-line flags](#node-command-line-flags),
   [Node config page](#node-config-page),
-  [keeping nodes up to date](#keeping-nodes-up-to-date), and
+  [keeping nodes up to date](#keeping-nodes-up-to-date),
+  [keeping the Host up to date](#keeping-the-host-up-to-date), and
   [Dev Box MCP onboarding design (proposed)](docs/devbox-fleet-onboarding-design.md).
 - **Create projects and start everyday sessions:**
   [workspaces and placements](#first-run-walkthrough),
   [Agency mode](#agency-mode),
   [Exact proof of concept](#exact-proof-of-concept),
-  [attachments and images](#attaching-files-and-images), and
+  [attachments and images](#attaching-files-and-images),
+  [downloading files from a session](#downloading-files-from-a-session), and
   [slash commands and session pickers](#slash-commands-and-session-pickers).
 - **Monitor and organize active work:**
   [rows that fold themselves away](#rows-that-fold-themselves-away),
@@ -135,10 +140,10 @@ The Host can run on Windows, macOS, or Linux. A Node may be the same machine as
 the Host or a separate machine; the Node is the side that owns working
 directories and Copilot authentication.
 
-Clone the intended private repository with an account that can read it:
+Clone the public repository:
 
 ```bash
-git clone https://github.com/charlesyin_microsoft/copilot-fleet.git
+git clone https://github.com/CharlesYWL/copilot-fleet.git
 cd copilot-fleet
 npm install
 ```
@@ -209,7 +214,8 @@ For a Host-only development setup, keep `npm run host` running and use
 
 Open the UI → **Settings**:
 
-- **General** — session defaults, the **Take the tour** button, and data export/import.
+- **General** — session defaults, the **Take the tour** button, **Update Host**,
+  and data export/import.
 - **Security** — administrators, invitations, Microsoft sign-in configuration,
   password migration, the Host fingerprint, Node key migration, portable Host
   backup/restore, and this Host's security audit.
@@ -248,6 +254,12 @@ npm start
 
 Or just the Host: `npm run start:host`. Open `http://127.0.0.1:8787` —
 Fastify serves the built UI.
+
+`npm run dev`, `npm run dev:tunnel` and `npm start` run under a small launcher
+(`scripts/launcher.mjs`) so that **Settings → General → Update Host** can restart
+them in place; see [Keeping the Host up to date](#keeping-the-host-up-to-date).
+`npm run dev:bare`, `npm run dev:tunnel:bare` and `npm run start:bare` run the
+same commands without it.
 
 ## First-run walkthrough
 
@@ -333,6 +345,10 @@ of them on one Windows machine, or split Host and Node across machines.
    **Add placement** to choose the workspace, an online Node, and an absolute
    local path that already exists on that Node, such as `C:\code\checkout-service`
    or `/srv/checkout-service`.
+   On the Node's own config page, **Browse** opens an in-page folder chooser.
+   Use **Home**, **Up**, or enter a path to switch drives, then **Choose this folder**.
+   It lists folders on the Node without uploading files or opening a separate desktop
+   dialog, so it also works when the Node runs in the background.
 9. **Start a session.** Choose **New session**, pick **Where to run**, optionally
    set **Session name**, write the **Initial prompt**, and decide whether **YOLO
    mode** should ask before each tool or run with `--allow-all`. Keep YOLO off
@@ -395,7 +411,7 @@ Update the Fleet Host and Nodes to a version with this setting before using it.
 
 Each Node looks for `agency` on its own `PATH` and launches
 `agency copilot --acp --stdio` instead of plain `copilot`. This applies to new
-and resumed sessions, including Chats, orchestrators, workers, adopted
+and resumed Copilot sessions, including Chats, Copilot orchestrators, workers, adopted
 conversations, and automatic recovery. Existing running sessions are left alone;
 stop and resume them to switch launchers. Turning the setting off uses standard
 Copilot again on the next launch.
@@ -872,8 +888,9 @@ The node name defaults to the machine hostname, and can be changed from either
 end — the Host's Nodes tab or the node's own config page. Renaming keeps the
 machine's identity, so its placements and sessions come with it; the Host owns
 the name, so if both ends changed while the node was offline, the Host's name
-wins and is pushed back down. Pass `--max-sessions 4` if you want a capacity
-other than 10.
+wins and is pushed back down. Agents already running there can read the new
+name without a restart — see [Node config page](#node-config-page). Pass
+`--max-sessions 4` if you want a capacity other than 10.
 
 Enrollment stores the node's private key and the Host's public key at
 `$env:APPDATA\CopilotFleet\node.json`; subsequent starts need no grant, and no
@@ -1028,6 +1045,10 @@ The composer takes files: paste a screenshot straight into the box, or use the
 paperclip to pick some. Each one appears as a chip that can be removed until the
 message is sent, and a prompt can carry up to six of them at 10 MB each.
 
+Draft text and attachments stay in the composer until the Host accepts the send.
+A failed request keeps them available for retry; edits made while sending are
+not cleared by the earlier request.
+
 How a file reaches the agent depends on what it is. Images go over as ACP image
 blocks; everything else is embedded as text, so the agent reads the contents
 without needing the file to exist on its own disk — which matters because the
@@ -1047,6 +1068,51 @@ stored on the Host and replayed to every browser watching a session, so keeping
 the bytes there would turn a few pasted screenshots into a liability; the
 attachment chips under a sent message are the trace that remains.
 
+### Downloading files from a session
+
+A session's files live on the machine that ran it, which is often not the one
+your browser is on. The transcript turns the files an agent names into downloads
+from that machine, so a report it wrote downloads the same way whether the Node
+is this computer or one on the other side of a tunnel:
+
+- **Links** to a file — a `file:///` URL, a drive or absolute path, or a path
+  relative to the session's working directory — download instead of navigating
+  away.
+- **Inline code** that is nothing but an absolute path ending in an extension,
+  such as `` `C:\work\report.docx` ``, downloads the same way.
+- **Edit steps** that finished writing a file show a download button at the end
+  of their row.
+- **Download a file** (the arrow in the session header) takes any path, absolute
+  or relative to the session's working directory, for files an agent only
+  mentioned in passing.
+
+A click checks the file first, so a missing or refused file is explained in a
+notification instead of a failed download; the bytes then go to the browser's
+own download manager, with its progress and cancel button.
+
+Nodes only dial out, so the Host cannot fetch from one. It asks over the Node's
+existing authenticated connection and streams the answer to the browser as it
+arrives, 256 KiB at a time with a small window in flight, so a download shares
+the connection with session events rather than queueing in front of them. A file
+that changes mid-download fails instead of arriving spliced from two versions.
+Files up to 512 MB can be relayed, and a Node sends up to three downloads at once.
+
+The Node decides what a download may reach. The file, with links and junctions
+resolved, must be inside the session's working directory, one of its additional
+roots, an orchestrator's scratch directory, or the session's own Copilot state
+folder (`~/.copilot/session-state/<id>`, where agents keep plans and artifacts).
+Fleet's configuration directory, which holds the Node's private key, Copilot's
+own configuration, and the Host's data directory are never read — not even from a
+Chats session, whose working directory is the home folder that contains them. A
+file saved anywhere else, such as a temp folder, cannot be downloaded; ask the
+agent to copy it into the workspace. This is a policy for what the Host relays,
+not a sandbox: the agent runs as the same account as the Node.
+
+Downloads need a Node that uses mutual authentication rather than the legacy
+shared secret, running a build that supports them; the Host says which is
+missing. Files are always served as attachments and never rendered on the Host's
+own origin, where a page an agent wrote would run with your session.
+
 ### Slash commands and session pickers
 
 The composer offers Copilot's own slash commands: type `/` and a list appears,
@@ -1057,14 +1123,17 @@ straight away. The list is whatever the agent reports for that session, includin
 skills and plugins, so a machine with extra skills installed shows them without
 any change here.
 
+Enter used to confirm an input-method composition does not send a prompt or
+select a slash command.
+
 One compact button combines **Model**, **Reasoning Effort**, and **Context window**.
 Its upward-opening menu shows each setting's current value and a submenu of
 choices. **Mode** remains separate where the operator controls it; a custom agent
 remains beside the session title. Model and effort can change while work is running;
 context changes require an idle session.
 
-New sessions request
-`--context long_context` by default, including Chats, orchestrators, workers, and
+New Copilot sessions request
+`--context long_context` by default, including Chats, Copilot orchestrators, workers, and
 reviewers. Turn **Settings → General → Long context by default** off to use
 `--context default` instead. A session's own selection survives stop/resume and
 automatic recovery. The Host default takes precedence over the node-local context
@@ -1094,7 +1163,7 @@ These local status commands do not ask the model to answer. Values rounded by th
 CLI are marked as estimates, its percentage is retained, and the popover shows the
 report's model and timestamp. Restarting or changing models invalidates old readings.
 
-ACP `usage_update.size` is an **input/prompt budget**, not the full model window:
+Copilot's ACP `usage_update.size` is an **input/prompt budget**, not the full model window:
 for example, 272k input plus a 128k output reserve gives the 400k `/context` window.
 Its used-token count is also an earlier snapshot, often before the response.
 Those readings are labeled separately rather than mixed into the ring's full-window
@@ -1107,6 +1176,11 @@ unavailable, not zero. The latest readings persist across browser/Host reloads,
 resume, and backup/restore. No account-wide quota or budget is shown.
 If request-size recovery replaces the underlying Copilot conversation, the
 usage readout resets to that new conversation rather than retaining old metrics.
+
+Hermes orchestrators instead use their profile's model settings and ACP-reported
+context estimates. The usage popover identifies the agent and reporting source.
+Hermes does not use Copilot's context-tier flags, `/context` parser or billing
+files; unreported credits and other missing metrics display `?`, never zero.
 
 **Compact** in the popover sends the agent's `/compact` command when it is offered and the session
 is idle. It summarizes the live context without clearing the saved transcript or
@@ -1240,6 +1314,10 @@ the Host already stored for that node id; update them if the checkout lives
 somewhere else. Copilot's own session files are not in the archive, so **Resume**
 only works if those files are on the machine that runs the agent.
 
+Node identity archives preserve persistent command-permission rules, including an
+explicitly empty rule list, and their revision. Older archives without those fields
+keep the legacy defaults; temporary session grants are not restored.
+
 Both files contain secrets. Do not commit them.
 
 ### Recovering sessions after a restart
@@ -1353,6 +1431,26 @@ permission timeout. Values are stored in `settings.json` beside the credentials
 and take precedence over the environment variables, so an edit here is not
 undone by a stale `.env` on the next start. Command-line flags outrank both.
 
+Agents use it to learn which node they are on. A Fleet name is a label, so it
+need not match the machine's host name, and an operator can rename the node from
+the Host while its agents run. Every agent a node starts therefore gets two
+variables: `FLEET_NODE_ID`, the node id, which a rename never changes; and
+`FLEET_NODE_IDENTITY_URL`, this page's `/api/identity`, which answers a GET with
+the name as of that moment (absent if the page could not start):
+
+```powershell
+Invoke-RestMethod $env:FLEET_NODE_IDENTITY_URL
+# nodeId      : 0f8e6c2a-5b1d-4c3e-9f7a-2d4b6e8a1c3f
+# nodeName    : build-01
+# machineName : DESKTOP-7Q2M4VX
+# connected   : True
+```
+
+`nodeName` is the name the Host last confirmed. `connected` is false while the
+Host is unreachable, when a rename made there has not arrived yet. A worker the
+orchestrator dispatches is told the node it was placed on, by name and id, and
+pointed at both variables when its node sets them.
+
 The listener binds to loopback only and is deliberately not exposed: anything
 that can repoint a node at a different Host can run commands on that machine.
 Reach a remote node's page over SSH port forwarding rather than binding wider.
@@ -1382,6 +1480,8 @@ within that identity; they are not a claim that every argument is read-only.
 The Commands button highlights pending approvals with an amber pulse and count
 (a steady highlight when reduced motion is enabled). The dialog prioritizes
 **Waiting approval**; **Request history** keeps reviewed and other requests separate.
+A request that expires before anyone decides moves to **Request history** on its
+own, and a decision that arrives after expiry is not applied.
 If an approval conflicts with another update, Fleet refreshes its current state
 without automatically resubmitting your decision. Reload an old browser tab
 after upgrading if it reports unrecognized command fields.
@@ -1459,7 +1559,8 @@ The initial shell is explicitly **Windows PowerShell 5.1**
 a separate starting directory. Git and `npm run` work there; `cd` and variables
 do not persist to later executions. Scripts are limited to 16 KiB of UTF-8 text,
 with a five-minute default and one-hour maximum runtime. An unstarted request
-expires 30 minutes after creation. Only one command runs on a Node at a time.
+expires 30 minutes after creation, or sooner at the original deadline of a
+PR-maintenance helper it is bound to. Only one command runs on a Node at a time.
 Interactive prompts, permanent dev servers, and implicit fallback to another
 shell are not supported.
 
@@ -1689,6 +1790,82 @@ An update exits 75 in this mode too. PM2 and NSSM restart on any exit, so that
 is already what you want; a unit file that restarts only on failure needs
 `RestartForceExitStatus=75` or `Restart=always`.
 
+## Keeping the Host up to date
+
+**Settings → General → Update Host** does for the Host what **Update** does for
+a node: `git fetch --prune`, `git reset --hard` onto the branch the checkout
+tracks, `npm install --include=dev` and `npm run build` — the whole build, since
+the Node started beside the Host runs from the same checkout — and then restarts
+the Host and that Node **the way they were started**:
+
+| Started with                                  | Restarted with                                                                         |
+| --------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `npm run dev` / `npm run dev:tunnel`          | the same command, in the same terminal, with the same arguments                        |
+| `npm start`                                   | `npm start`, in the same terminal, with the same arguments                             |
+| `npm run service -- host+node install` (etc.) | `npm run service -- host+node restart` (`host restart` if the Node task is not in use) |
+
+The card shows the commit the Host is on and the restart command, then each
+stage as it happens. The Host drops off while it restarts; the page reconnects
+by itself and reports how the update ended. Reload it afterwards to load the new
+interface.
+
+Once the restarted Host records the outcome, a slow restart command or delayed
+browser snapshot cannot turn it back into an in-progress update.
+
+The steps and the safety property are the Node's, from the same code
+(`@fleet/protocol/updater`): nothing is restarted until the build has
+succeeded, and a checkout already on the newest commit is not restarted at all.
+Under `npm start` and the login service a failed build therefore leaves the Host
+and its Node running what they already had. Under `npm run dev` the Host's own
+file watcher still reloads source as soon as the reset rewrites it — that is what
+the watcher is for — so a failed build there can leave the Host on new source
+with old dependencies until you fix the checkout. In addition, the Host will not:
+
+- **Discard uncommitted work.** A Host's checkout is often somebody's working
+  copy too, so uncommitted changes to tracked files refuse the update — checked
+  when you click and again just before the reset, and a checkout git cannot
+  read counts as dirty (untracked files such as `.env` survive a reset and do
+  not count). Local commits that are not on the tracked branch are dropped from
+  it, as on a node; the reflog still has them.
+- **Stop this machine's sessions without asking.** Restarting the Host restarts
+  the Node beside it, so while that Node is running sessions the update is
+  refused with their names, and the card offers to stop exactly those and go
+  ahead; one started in the meantime is named in a fresh refusal. Until the
+  restart, new sessions on this machine are refused rather than started only to
+  be stopped. Sessions on other machines keep running through the Host's restart.
+- **Update beside another update.** Whichever update is resetting and rebuilding
+  a checkout holds `.fleet-update.lock` in it, touching it as it works, so the
+  Host and the Node beside it never run theirs at the same time, even across a
+  restart.
+- **Claim a restart it cannot see.** Starting a command or a scheduled task proves
+  nothing about what runs in it, so success is recorded by the restarted Host
+  itself: once it is listening, on the commit the update built, with this
+  machine's Node back on that commit too. A Host or Node that comes back on
+  anything else, a Node that does not come back within three minutes, or an
+  updater that stops reporting is recorded as a failure.
+
+How it restarts depends on who can survive the restart. Under `npm run dev` the
+file watcher restarts the Host as soon as the reset rewrites its source, so the
+Host never runs the update itself: the launcher in front of `npm run dev`,
+`npm run dev:tunnel` and `npm start` does, and then stops everything it started
+and runs the command again. A login-service Host cannot restart its own task
+from inside it, so it registers a one-off scheduled task for your Windows user,
+`CopilotFleetSelfUpdate-…`, which updates, runs the restart and deletes itself;
+its output is kept in `self-update.log` beside the Host database. Progress in
+both cases is recorded in `self-update.json` there, which is how the restarted
+Host knows how the update went.
+
+Restarting `npm run dev:tunnel` restarts its tunnel with everything else, as
+stopping and starting it by hand would: a Dev Tunnel keeps its address, but a
+quick tunnel (Cloudflare, free ngrok) comes back on a new one. The launcher
+itself is not replaced by an update; changes to it take effect the next time you
+start the command.
+
+A Host started any other way — `npm run host`, `npm run start:host`, a
+`*:bare` script — has nothing waiting to start it again, so **Update Host** is
+disabled and says so. So is a Host that was already running when you pulled this
+feature: restart it once with one of the commands above.
+
 ## Exact proof of concept
 
 Run the Host in terminal 1:
@@ -1786,6 +1963,47 @@ It is still a normal session on a Node, but the Host gives it scoped tools for
 planning tasks, dispatching workers, waking itself after worker results, and
 recording the handoff for you to review.
 
+**Choose the lead's agent in Settings → Orchestrator → Preferred agent.**
+Auto always means Copilot; Hermes appears when a Node reports it installed.
+The preference applies only to new orchestrators. Existing conversations keep
+their actual agent and profile through stop/resume and restarts, and workers
+continue using Copilot. General's model, effort, context and Agency defaults
+apply to Copilot, not Hermes.
+
+For Hermes, configure a dedicated profile on each Node that will run it, as the
+same OS user that runs the Node:
+
+```powershell
+hermes profile create fleet-orchestrator --no-alias
+hermes -p fleet-orchestrator acp --setup
+hermes -p fleet-orchestrator acp --check
+```
+
+Skip creation if the profile exists. Setup is interactive; `--check` verifies
+ACP dependencies, not a successful model request. Fleet never creates profiles
+or copies credentials. Memory, skills, identity and native history belong to
+the selected profile and are not synchronized across Nodes. Only one active
+Hermes orchestrator may use a given profile on a Node; do not use that profile
+in a separate Hermes process at the same time.
+
+An offline orchestrator or pending Stop still reserves its profile. If its Node
+will not reconnect, request **Stop**, verify independently that the old process
+has exited, then select **Mark stopped** on the conversation to release it.
+**Dismiss** only hides a stopped conversation; it never stops a process or
+bypasses the profile reservation. The same profile name on another Node is
+independent.
+
+Fleet prefers an online placement with the chosen agent. If no online Node
+holding the workspace has Hermes installed, a **new** lead falls back to Copilot
+with a transcript notice. An occupied profile, missing profile, authentication
+failure or other startup error is reported instead. An existing Hermes session
+never falls back on resume. Automatic native-session retention remains
+Copilot-only; manage Hermes history in its profile.
+
+If a stored preferred-agent setting is malformed, Fleet logs a warning and uses
+Auto (Copilot) for new orchestrators. Save the preference again under
+**Settings → Orchestrator** to repair it; existing sessions keep their own agent.
+
 1. Open **Orchestrator** in the sidebar and choose **Start orchestrator**. The
    button is enabled only when an online Node holds at least one workspace.
    The lead starts on one reachable placement, runs unattended so it can wake
@@ -1819,9 +2037,28 @@ recording the handoff for you to review.
    controls, and lifecycle actions. **Archive** stops live workers but keeps
    the task record; a finished task can be **Reopen**ed with what is still
    wanted or **Delete**d if nothing should be kept. **Stop orchestrator** stops
-   the lead and its tasks; **Resume orchestrator** reopens stopped work when its
-   sessions are resumable; **Dismiss orchestrator** hides a stopped lead without
-   deleting ordinary session history.
+   only the lead's conversation: its tasks and agents keep running, and what
+   they finish is handed to the lead when **Resume orchestrator** re-attaches
+   it. Use **Archive** or **Stop agents** to end the work itself. **Dismiss
+   orchestrator** hides a stopped lead once its tasks are finished or archived,
+   without deleting ordinary session history.
+8. When a conversation's context is full, start a new conversation and use
+   **Transfer tasks** (in the conversation's task panel or on the board) or
+   **Transfer** (on a task's page) to hand work to it. Each task belongs to
+   exactly one orchestrator, so its workers, pending review and PR-maintenance
+   heartbeat move with it; the receiving lead is briefed to continue from the
+   task's record, and the previous lead no longer sees it. A transfer is refused
+   while a command the previous lead requested for the task has not settled.
+
+While a lead is idle with open tasks or maintained PRs, the Host sends it a
+read-only **status check** at the times named in **Settings → Orchestrator →
+Orchestrator heartbeat**: standard five-field cron in the Host's local time,
+with several expressions separated by `;`. The default,
+`0 9-18 * * 1-5; 0 */2 * * *`, checks hourly from 09:00 to 18:00 on weekdays and
+every two hours otherwise. A lead that was active in the half hour before a
+heartbeat skips it (half the interval, for schedules faster than hourly), so a
+check never lands on top of the lead's own turn, and the Host catches up with a
+single check rather than a burst after a restart.
 
 For one-off questions that do not need a checkout, start a direct **Chats**
 session from **New session**. For shared multi-agent goals, use Orchestrator's
@@ -1922,11 +2159,20 @@ called ready. See the [ADO helper contract](apps/node/skills/pr-maintenance/ado-
 for its supported policy evidence and conservative limits.
 
 Fleet stores registrations, checkpoints, decisions, budgets and unsettled effects
-in its Host database. The existing lead reads them on ordinary wakes and idle
-reminders; this is best-effort observation, not a separate observer or an exact
-30-minute SLA. Unchanged feedback needs no new worker repair turn. Ready remains
-nonterminal: this release never merges, force-pushes, automatically rebases, or
-starts extra reviewer sessions.
+in its Host database. The existing lead reads them on ordinary wakes and heartbeat
+status checks; this is best-effort observation, not a separate observer or an
+exact SLA. A PR's routine check follows the same
+[heartbeat schedule](#orchestrator-quick-guide): after an observation it is next
+due at the first heartbeat at least half an hour later, so by default a PR is read
+about hourly during weekday working hours and every two hours otherwise. (A saved
+command receipt still makes its PR due at once, so the lead can act on that
+evidence.) A PR is not claimed while its retained worker is still running an
+accepted repair batch — repairs often outlast an hour — and the completed turn
+requests the next check. Status labels keep the last observed stage until that
+scheduled check is overdue, while repairs, readiness and new effects still require
+evidence from the last 30 minutes. Unchanged feedback needs no new worker repair
+turn. Ready remains nonterminal: this release never merges, force-pushes,
+automatically rebases, or starts extra reviewer sessions.
 
 **Asynchronous helper receipts:** claim a due visit, then immediately dispatch the
 finite helper command on a separate authorized placement with returned
@@ -2035,7 +2281,8 @@ by this change; the existing 50 MiB portable-backup limit still applies.
 
 _Design choices stay human: record direction, then explicitly resume maintenance._
 
-[Editable diagram source (HTML)](docs/pr-maintenance-flow.html).
+[Editable diagram source (HTML)](docs/pr-maintenance-flow.html) ·
+[Technical flow: MCP calls, stages and lifecycles (HTML)](docs/pr-maintenance-technical-flow.html).
 
 Stop/archive/delete pause linked maintenance. Accepted work and unknown push/reply
 effects retain ownership and block cleanup until reconciled; Stop is not proof
@@ -2107,6 +2354,37 @@ search first, or return to the owning orchestrator. For a closed task, call
 follow-ups are persisted and scheduled in the same session. Queued, busy,
 stopping or offline does not mean replacement is needed; a repeated pending
 follow-up is not sent twice, and a different prompt cannot overwrite it.
+
+**Why a queued follow-up waits, and "Resume now".** Every queued step carries
+the scheduler's own reason — the same pass that decides dispatch records it — in
+the task page, the worker's transcript banner, `fleet_list_work`,
+`fleet_get_task` and the `fleet_follow_up` reply. The states are _queued_
+(ordinary capacity or ordering; Fleet starts it by itself), _blocked_ (another
+live session holds the same checkout, the Node is offline, a Stop, human hold or
+PR-maintenance hold applies), _awaiting approval_, _starting_ (sent, not yet
+acknowledged by the Node) and _running_ (acknowledged). Sessions in different
+checkouts on the same Node never block each other while capacity allows.
+**Resume now** on a queued follow-up runs ordinary scheduling first. Only a
+follow-up held back solely by the Node's reserved scheduling slot becomes a
+one-time approval request, which a signed-in operator answers in a dialog with
+**Approve once** or **Cancel request**; it then resumes the same conversation
+and sends the already-queued follow-up exactly once. An orchestrator may ask with
+`fleet_request_resume` but can never approve. Another writer in the same
+checkout is explained, never overridden. See the
+[orchestration lifecycle](docs/orchestration-lifecycle.md#queued-follow-up-admission-and-resume-now).
+
+**When a conversation fills up, move its work.** An orchestrator has one context
+window, so a long-lived conversation eventually runs out of room. Start a new
+conversation and hand the work to it: **Transfer tasks** in a conversation's
+task panel or on the board, or **Transfer** on a task's page. Each task belongs
+to exactly one orchestrator — the one woken when its work settles and the one
+that runs its PR-maintenance heartbeat — so the move takes the task's workers,
+pending review and PR maintenance with it, and the receiving conversation is
+briefed to read the task's record and carry on from where it stands. An
+orchestrator can do the same itself: `fleet_list_orchestrators` shows every
+conversation and the work it holds, and `fleet_transfer_task` hands a task on,
+or takes one over. The REST equivalents are `POST /api/runs/<id>/transfer` and
+`POST /api/orchestrators/<id>/transfer`.
 
 ### Chats as a destination
 
@@ -2210,6 +2488,11 @@ stops a run rather than a prompt each time.
 - A node's own credentials reach only the workspace and placement endpoints its
   config page relays through, and a node can only create or repoint placements
   on itself.
+- Session file downloads cross only a mutually authenticated Node channel. The
+  Node reads only inside the session's own folders, never Fleet's configuration
+  directory, Copilot's configuration or the Host's data directory, and the Host
+  serves every file as an `application/octet-stream` attachment so nothing an
+  agent wrote renders on the operator's origin.
 - New enrollment sends no reusable credential to an unauthenticated Host. A
   one-time grant authorises exactly one Node public key for fifteen minutes;
   the node pins the Host fingerprint before it completes, both ends sign the
@@ -2243,7 +2526,9 @@ stops a run rather than a prompt each time.
 - The node's local config page is bound to loopback and additionally refuses
   requests that do not name `127.0.0.1` (or `localhost`) on its own port, come
   from another origin, or write without `content-type: application/json`. It
-  does not defend against another user signed in to the same machine.
+  does not defend against another user signed in to the same machine, or against
+  the node's own agents, which run as its user; the identity address they are
+  given saves them a search, and grants nothing they could not already reach.
 - An internet-exposed Host should still use HTTPS/WSS, and putting one behind
   an authenticated reverse proxy or access policy (for example Cloudflare
   Access) remains a good second layer.
@@ -2263,11 +2548,9 @@ npm run verify   # lint, format, types, tests, then production builds
 
 ### Local verification and test monitoring
 
-The primary repository is
-[`charlesyin_microsoft/copilot-fleet`](https://github.com/charlesyin_microsoft/copilot-fleet).
-It is private; open it with the corporate GitHub account. Its user-owned
-managed-account hosting does not provide GitHub-hosted Actions runners, so this
-repository no longer includes a GitHub Actions workflow.
+The public repository is
+[`CharlesYWL/copilot-fleet`](https://github.com/CharlesYWL/copilot-fleet).
+This snapshot uses local verification and does not include a GitHub Actions workflow.
 
 Run **`npm run verify` before pushing**. It retains every validation step from
 the former CI workflow and stops with a nonzero exit code on failure. This
@@ -2287,9 +2570,8 @@ For a browser-readable coverage report, run **`npm run test:coverage`** and open
 `coverage/index.html`. Coverage output is local and ignored by Git.
 
 These commands provide local monitoring, not automatic remote push/PR checks or
-a Linux runner. A hosted equivalent requires a separately configured CI system,
-such as an approved Azure DevOps pipeline, or an organization-owned Microsoft
-GitHub repository with suitable runners. No external pipeline is provisioned here.
+a Linux runner. A hosted equivalent requires a separately configured CI system
+with suitable runners. No external pipeline is provisioned here.
 
 Startup is seed-free. SQLite creates its schema and empty data file on first
 launch.

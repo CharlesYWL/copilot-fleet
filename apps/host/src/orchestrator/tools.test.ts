@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  AGENT_IDENTITY_CAPABILITY,
   RunCriterionSchema,
   type CriterionOutcome,
   type RunCriterion,
@@ -9,6 +10,8 @@ import type { FleetService } from "../fleet-service.js";
 import { fleet } from "./fleet-harness.js";
 import {
   FleetTools,
+  GetPrMaintenanceSchema,
+  CheckpointPrMaintenanceSchema,
   RecordTaskCheckpointSchema,
   StartWorkSchema,
   explainInvalidArgs,
@@ -29,6 +32,16 @@ describe("FleetTools", () => {
   });
 
   const tools = () => new FleetTools(service, leadId);
+
+  it("describes the five-minute wake and prepared-only observation refresh to the lead", () => {
+    expect(GetPrMaintenanceSchema.shape.takeDue.description).toContain("5 minutes");
+    expect(CheckpointPrMaintenanceSchema.shape.executionId.description).toContain(
+      "prepared",
+    );
+    expect(CheckpointPrMaintenanceSchema.shape.executionId.description).toContain(
+      "in-flight",
+    );
+  });
 
   const start = (input: Record<string, unknown>) =>
     tools().startWork({
@@ -82,6 +95,63 @@ describe("FleetTools", () => {
 
     expect(step.prompt).not.toContain("CONTEXT");
     expect(step.prompt).toContain("VERIFY");
+  });
+
+  /**
+   * Where the worker is, in terms it can check.
+   *
+   * A worker told by its brief that it was on one machine, and shown a host name
+   * that said otherwise, stopped to ask instead of doing the work — the Fleet
+   * name is a label the operator chose, and nothing on the machine carried it.
+   */
+  describe("naming the node a worker runs on", () => {
+    const placedNode = () => {
+      const step = store.listRunSteps(tasks()[0]!.id)[0]!;
+      return {
+        prompt: step.prompt,
+        node: store.getNode(store.getPlacement(step.placementId)!.nodeId)!,
+      };
+    };
+
+    it("names the machine the Host placed it on, by id as well as by name", () => {
+      const pinned = addNode("gpu-rig");
+      start({ task: "Explore Beta", node: "gpu-rig" });
+      const { prompt, node } = placedNode();
+
+      expect(node.id).toBe(pinned.id);
+      expect(prompt).toContain(
+        `FLEET NODE\nThis step runs on Fleet node "gpu-rig" (node id ${pinned.id}).`,
+      );
+      expect(prompt).toContain("this machine's host name need not match it");
+      // Before the delivery contract, so the brief's own sections stay first.
+      expect(prompt.indexOf("FLEET NODE")).toBeLessThan(prompt.indexOf("FLEET DELIVERY"));
+    });
+
+    it("points it at the variables its Node sets, when that Node sets them", () => {
+      const box = store.listNodes()[0]!;
+      store.setNodeIdentity(box.id, {
+        capabilities: [...box.capabilities, AGENT_IDENTITY_CAPABILITY],
+      });
+      start({ task: "Explore Beta" });
+      const { prompt } = placedNode();
+
+      expect(prompt).toContain("FLEET_NODE_ID in your environment is the node id");
+      expect(prompt).toContain(
+        "FLEET_NODE_IDENTITY_URL, when set, answers a GET with the node's current name",
+      );
+    });
+
+    it("does not send a worker on an older Node looking for variables it lacks", () => {
+      start({ task: "Explore Beta" });
+      const { prompt, node } = placedNode();
+
+      expect(node.capabilities).not.toContain(AGENT_IDENTITY_CAPABILITY);
+      expect(prompt).toContain(
+        `This step runs on Fleet node "box" (node id ${node.id}).`,
+      );
+      expect(prompt).not.toContain("FLEET_NODE_ID");
+      expect(prompt).not.toContain("FLEET_NODE_IDENTITY_URL");
+    });
   });
 
   it.each(["implement", "test", "explore", "review-quick", "review-deep"])(
@@ -483,6 +553,37 @@ describe("FleetTools", () => {
       if (text) expect(result.text).toContain(text);
     },
   );
+
+  it("retains an offline worker Stop until its Node reconnects", () => {
+    addNode("worker");
+    expect(start({ task: "Stop offline", node: "worker" }).ok).toBe(true);
+    const step = store.listRunSteps(tasks()[0]!.id)[0]!;
+    const worker = store.getSession(step.sessionId)!;
+    store.transitionSession(worker.id, "starting");
+    store.transitionSession(worker.id, "running");
+    service.disconnectNode(worker.nodeId, "Disconnected");
+
+    expect(tools().stopWork({ sessionId: worker.id }).ok).toBe(true);
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+
+    const sent: unknown[] = [];
+    service.attachNode(worker.nodeId, {
+      OPEN: 1,
+      readyState: 1,
+      send: (text) => {
+        sent.push(JSON.parse(text));
+      },
+      close() {},
+    });
+    store.setNodeOnline(worker.nodeId, true);
+    service.reconcile(worker.nodeId, [worker.id], [worker.id]);
+
+    expect(sent).toContainEqual({
+      type: "command",
+      command: expect.objectContaining({ type: "stop", sessionId: worker.id }),
+    });
+    expect(store.getSession(worker.id)?.stopRequested).toBe(true);
+  });
 
   it("will not touch a session belonging to somebody else", () => {
     const mine = store.createSession(store.listPlacements()[0]!, "hand-made");

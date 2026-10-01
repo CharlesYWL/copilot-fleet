@@ -506,6 +506,14 @@ describe("TunnelSupervisor", () => {
       probe: fakeProbe(),
     });
 
+  it("discovers an external tunnel before its first information request", () => {
+    const url = "https://audit.trycloudflare.com";
+    const managed = supervisor({ provider: "cloudflare", url });
+    expect(managed.allTunnelUrls()).toEqual([url]);
+    expect(managed.allTunnelEndpoints()).toContainEqual({ provider: "cloudflare", url });
+    expect(managed.activeTunnelUrl()).toBe(url);
+  });
+
   it("offers every provider so one that never ran can still be switched on", async () => {
     const info = await supervisor().info("http://127.0.0.1:8787");
     expect(info.tunnels.map((entry) => entry.provider)).toEqual(

@@ -132,27 +132,118 @@ export const initFleetWorkspaces = () => {
     return result.ok;
   };
 
-  const openPicker = async (targetInput, button, check) => {
-    const label = button.textContent;
-    button.disabled = true;
-    button.textContent = "Waiting…";
+  const folderPicker = $("folderPicker");
+  let pickerTarget;
+  let folderListing;
+  let folderRequest;
+
+  const resetPicker = () => {
+    folderRequest?.abort();
+    folderRequest = undefined;
+    folderListing = undefined;
+    $("folderPickerChoose").disabled = true;
+    $("folderPickerUp").disabled = true;
+    $("folderPickerFolders").replaceChildren();
+    $("folderPickerFolders").ariaBusy = "false";
+    note("folderPickerMsg", "", true);
+  };
+
+  const browseFolders = async (path) => {
+    resetPicker();
+    const request = new AbortController();
+    folderRequest = request;
+    $("folderPickerPath").value = path;
+    $("folderPickerStatus").textContent = "Loading folders…";
+    $("folderPickerFolders").ariaBusy = "true";
+    const timeout = setTimeout(
+      () =>
+        request.abort(
+          new Error("Reading folders timed out. Try another path or enter it manually."),
+        ),
+      10_000,
+    );
     try {
-      const result = await post("/api/pick-folder", {
-        path: targetInput.value.trim(),
-      });
-      if (result.ok) {
-        targetInput.value = result.path;
-        await checkPath(result.path, check);
-      } else if (!result.canceled) {
-        note("plMsg", result.reason, false);
-      }
+      const result = await post("/api/folders", { path }, request.signal);
+      if (folderRequest !== request || !folderPicker.open) return;
+      if (request.signal.aborted) throw request.signal.reason;
+      folderListing = result;
+      $("folderPickerPath").value = result.path;
+      $("folderPickerChoose").disabled = false;
+      $("folderPickerUp").disabled = result.parent === null;
+      $("folderPickerFolders").replaceChildren(
+        ...result.folders.map((folder) =>
+          el("button", {
+            type: "button",
+            className: "folder-entry secondary",
+            textContent: folder.name,
+            title: folder.path,
+            ariaLabel: `Open ${folder.name}`,
+            onclick: () => void browseFolders(folder.path),
+          }),
+        ),
+      );
+      $("folderPickerStatus").textContent =
+        (result.folders.length
+          ? "Choose this folder or open a subfolder."
+          : "No subfolders. You can choose this folder.") +
+        (result.unavailableLinks
+          ? ` ${result.unavailableLinks} link(s) could not be read.`
+          : "");
     } catch (error) {
-      note("plMsg", error.message, false);
+      if (folderRequest !== request || !folderPicker.open) return;
+      $("folderPickerStatus").textContent = "";
+      note("folderPickerMsg", error.message, false);
     } finally {
-      button.disabled = false;
-      button.textContent = label;
+      clearTimeout(timeout);
+      if (folderRequest === request) {
+        folderRequest = undefined;
+        $("folderPickerFolders").ariaBusy = "false";
+      }
     }
   };
+
+  const openPicker = (targetInput, check) => {
+    pickerTarget = { input: targetInput, check };
+    folderPicker.showModal();
+    void browseFolders(targetInput.value.trim());
+  };
+
+  const closePicker = () => {
+    resetPicker();
+    pickerTarget = undefined;
+    folderPicker.close();
+  };
+
+  $("folderPickerCancel").addEventListener("click", closePicker);
+  folderPicker.addEventListener("cancel", (event) => {
+    event.preventDefault();
+    closePicker();
+  });
+  folderPicker.addEventListener("close", () => {
+    if (!folderPicker.open) {
+      resetPicker();
+      pickerTarget = undefined;
+    }
+  });
+  $("folderPickerForm").addEventListener("submit", (event) => {
+    event.preventDefault();
+    void browseFolders($("folderPickerPath").value.trim());
+  });
+  $("folderPickerPath").addEventListener("input", () => {
+    resetPicker();
+    $("folderPickerStatus").textContent = "Press Open to browse this path.";
+  });
+  $("folderPickerHome").addEventListener("click", () => void browseFolders(""));
+  $("folderPickerUp").addEventListener("click", () => {
+    if (folderListing?.parent) void browseFolders(folderListing.parent);
+  });
+  $("folderPickerChoose").addEventListener("click", () => {
+    if (!folderListing || !pickerTarget) return;
+    pickerTarget.input.value = folderListing.path;
+    pickerTarget.check.className = "check ok";
+    pickerTarget.check.textContent = "Folder found on this machine";
+    closePicker();
+  });
 
   $("wsAdd").addEventListener("click", async () => {
     const name = $("wsName").value.trim();
@@ -228,16 +319,15 @@ export const initFleetWorkspaces = () => {
     }
   });
 
-  $("plBrowse").addEventListener("click", (event) => {
-    void openPicker($("plPath"), event.target, $("plCheck"));
+  $("plBrowse").addEventListener("click", () => {
+    openPicker($("plPath"), $("plCheck"));
   });
 
   $("placements").addEventListener("click", (event) => {
     const id = event.target.dataset ? event.target.dataset.plBrowse : undefined;
     if (!id) return;
-    void openPicker(
+    openPicker(
       document.querySelector('[data-pl="' + id + '"]'),
-      event.target,
       document.querySelector('[data-check="' + id + '"]'),
     );
   });

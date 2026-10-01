@@ -34,13 +34,27 @@ import {
   CommandExecutionSchema,
   CommandOutputEventSchema,
   CommandReadinessSchema,
+  CommandPermissionRuleSchema,
   CommandExecutionBackupSchema,
 } from "./command-execution.js";
 export * from "./command-execution.js";
+import {
+  SessionFileReadRequestSchema,
+  SessionFileReadResultSchema,
+} from "./session-files.js";
+export * from "./session-files.js";
 export * from "./pr-maintenance.js";
+export * from "./heartbeat-schedule.js";
+export * from "./worker-resume.js";
+import {
+  HEARTBEAT_SCHEDULE_MAX_LENGTH,
+  HeartbeatScheduleSchema,
+} from "./heartbeat-schedule.js";
+import { StepAdmissionSchema, WorkerResumeRequestSchema } from "./worker-resume.js";
 import {
   PrMaintenanceApprovalSchema,
   PrMaintenanceBackupSchema,
+  PrMaintenanceTaskStatusSchema,
 } from "./pr-maintenance.js";
 
 /** Local startup events consumed by the service CLI, independent of log formatting. */
@@ -144,6 +158,46 @@ export const NodeAgentSchema = z.object({
 });
 export type NodeAgent = z.infer<typeof NodeAgentSchema>;
 
+export const AGENT_KINDS_CAPABILITY = "agent-kinds";
+export const DEFAULT_HERMES_PROFILE = "fleet-orchestrator";
+export const AgentKindSchema = z.enum(["copilot", "hermes"]);
+export type AgentKind = z.infer<typeof AgentKindSchema>;
+export const agentKindLabels: Record<AgentKind, string> = {
+  copilot: "Copilot",
+  hermes: "Hermes",
+};
+export const HermesProfileSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9_-]*$/, "Use a lowercase profile name, not a path");
+export const AgentParamsSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("copilot") }).strict(),
+  z.object({ kind: z.literal("hermes"), profile: HermesProfileSchema }).strict(),
+]);
+export type AgentParams = z.infer<typeof AgentParamsSchema>;
+export const DetectedAgentSchema = z.object({
+  // Newer Nodes may advertise kinds this Host cannot launch yet.
+  kind: z.string().min(1).max(40),
+  version: z.string().max(100).optional(),
+});
+export type DetectedAgent = z.infer<typeof DetectedAgentSchema>;
+
+export function supportsAgentKind(
+  node: {
+    capabilities: readonly string[];
+    agentKinds?: readonly DetectedAgent[] | undefined;
+  },
+  kind: AgentKind,
+): boolean {
+  return (
+    kind === "copilot" ||
+    (node.capabilities.includes(AGENT_KINDS_CAPABILITY) &&
+      (node.agentKinds?.some((agent) => agent.kind === kind) ?? false))
+  );
+}
+
 const resourceBytes = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const capacitySampleShape = {
   sampledAt: z.string().datetime(),
@@ -193,6 +247,7 @@ export const NodeSchema = z.object({
    * none" rather than failing to register.
    */
   agents: z.array(NodeAgentSchema).default([]),
+  agentKinds: z.array(DetectedAgentSchema).optional(),
   maxSessions: z.number().int().positive(),
   activeSessions: z.number().int().nonnegative(),
   lastHeartbeat: z.string().datetime(),
@@ -336,12 +391,14 @@ export type ContextTier = z.infer<typeof ContextTierSchema>;
 export const CONTEXT_TIER_CONFIG_ID = "fleet_context_tier";
 
 export const ContextUsageSchema = z.object({
-  model: z.string().min(1),
+  model: z.string().min(1).optional(),
   usedTokens: z.number().nonnegative(),
   tokenLimit: z.number().positive(),
   percentage: z.number().nonnegative(),
   updatedAt: z.string().datetime(),
   estimated: z.boolean(),
+  /** Absent on older Copilot /context snapshots. */
+  source: z.enum(["copilot-context", "acp"]).optional(),
 });
 export type ContextUsage = z.infer<typeof ContextUsageSchema>;
 
@@ -355,6 +412,21 @@ export const SessionUsageSchema = z.object({
   context: ContextUsageSchema.nullable().optional(),
 });
 export type SessionUsage = z.infer<typeof SessionUsageSchema>;
+
+/**
+ * How full a session's context is, as a whole percentage, when it has said.
+ *
+ * A /context snapshot wins over ACP's prompt budget, as it does in the usage
+ * bar: it measures the model's window rather than the last request.
+ */
+export function contextUsePercent(usage: SessionUsage | undefined): number | undefined {
+  const reported = usage?.context?.percentage;
+  if (reported != null && Number.isFinite(reported) && reported >= 0)
+    return Math.round(reported);
+  const used = usage?.contextTokens;
+  const size = usage?.contextWindow;
+  return used != null && size ? Math.round((used / size) * 100) : undefined;
+}
 
 /** What the transcript keeps: enough to show the file, never its bytes. */
 export const AttachmentSummarySchema = z.object({
@@ -405,11 +477,13 @@ export const SessionSchema = z.object({
   lastActivityAt: z.string().datetime().optional(),
   /** A durable deletion request is awaiting the owning Node's confirmation. */
   cleanupRequested: z.boolean().optional(),
-  /** Copilot's own ACP session id, needed to resume the conversation. */
+  /** The agent's native ACP session id, interpreted together with agentParams. */
   agentSessionId: z.string().default(""),
+  /** Actual backend and profile; absent on legacy Copilot sessions. Never a preference. */
+  agentParams: AgentParamsSchema.optional(),
   /** Additional workspace roots that ACP must restore with this session. */
   additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).optional(),
-  /** Runs Copilot with --allow-all: no permission prompts for this session. */
+  /** Requests unattended permissions using the backend's YOLO strategy. */
   yolo: z.boolean().default(false),
   /**
    * The slash commands and pickers this session's agent currently offers.
@@ -639,9 +713,10 @@ export function eventPayload<T extends SessionEventType>(
  *
  * Named stages rather than free text because the browser renders them and the
  * Host logs them; a message the Node phrased slightly differently on Windows
- * would otherwise be a different thing to everyone reading it.
+ * would otherwise be a different thing to everyone reading it. The Host updates
+ * itself through the same steps, so both report in the same words.
  */
-export const nodeUpdateStages = [
+export const updateStages = [
   "checking",
   "pulling",
   "installing",
@@ -650,8 +725,67 @@ export const nodeUpdateStages = [
   "up_to_date",
   "failed",
 ] as const;
-export const NodeUpdateStageSchema = z.enum(nodeUpdateStages);
-export type NodeUpdateStage = z.infer<typeof NodeUpdateStageSchema>;
+export const UpdateStageSchema = z.enum(updateStages);
+export type UpdateStage = z.infer<typeof UpdateStageSchema>;
+
+/** The same stages, under the name the Node update introduced them with. */
+export const nodeUpdateStages = updateStages;
+export const NodeUpdateStageSchema = UpdateStageSchema;
+export type NodeUpdateStage = UpdateStage;
+
+/** Whether an update in this stage is over, one way or the other. */
+export function updateFinished(stage: UpdateStage): boolean {
+  return stage === "up_to_date" || stage === "failed";
+}
+
+/**
+ * How the Host process was started, which decides how it comes back.
+ *
+ * `dev`, `dev:tunnel` and `start` run under the launcher that `npm run dev`,
+ * `npm run dev:tunnel` and `npm start` put in front of the Host and its Node;
+ * `service` is the Windows login task; `manual` is anything else — `npm run
+ * host` on its own, say — where nothing is waiting to start it again.
+ */
+export const hostLaunchModes = [
+  "dev",
+  "dev:tunnel",
+  "start",
+  "service",
+  "manual",
+] as const;
+export const HostLaunchModeSchema = z.enum(hostLaunchModes);
+export type HostLaunchMode = z.infer<typeof HostLaunchModeSchema>;
+
+/** The Host's own update: the one in flight, or the last one to finish. */
+export const HostUpdateProgressSchema = z.object({
+  updateId: z.string().min(1),
+  stage: UpdateStageSchema,
+  detail: z.string().default(""),
+  /** The commit the update landed on, once it has one. */
+  revision: z.string().default(""),
+  updatedAt: z.string(),
+});
+export type HostUpdateProgress = z.infer<typeof HostUpdateProgressSchema>;
+
+export const HostUpdateStatusSchema = z.object({
+  launch: HostLaunchModeSchema,
+  /** What brings the Host and its Node back after an update, as typed at a prompt. */
+  restartCommand: z.string().default(""),
+  /** Why this Host cannot update itself from the browser; empty when it can. */
+  unavailableReason: z.string().default(""),
+  update: HostUpdateProgressSchema.optional(),
+});
+export type HostUpdateStatus = z.infer<typeof HostUpdateStatusSchema>;
+
+/**
+ * Updating the Host restarts the Node started beside it, so stopping that
+ * Node's sessions is opt-in exactly as it is for a Node update — and covers
+ * only the sessions the operator was shown.
+ */
+export const UpdateHostSchema = z.object({
+  stopSessions: z.boolean().default(false),
+  sessionIds: z.array(z.string().min(1)).max(1_000).default([]),
+});
 
 /**
  * An MCP server a session should be given, in the one transport this needs.
@@ -688,6 +822,8 @@ export type StartupConfig = z.infer<typeof StartupConfigSchema>;
 export const NodeCommandSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("start_session"),
+    agentParams: AgentParamsSchema.optional(),
+    startupNotice: z.string().max(500).optional(),
     executionBinding: ExecutionBindingSchema.optional(),
     sourcePlacementId: z.string().optional(),
     coordinator: z.boolean().optional(),
@@ -731,6 +867,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("resume_session"),
+    agentParams: AgentParamsSchema.optional(),
     executionBinding: ExecutionBindingSchema.optional(),
     sourcePlacementId: z.string().optional(),
     commandId: z.string().min(1),
@@ -796,6 +933,7 @@ export const NodeCommandSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("delete_session"),
+    agentParams: AgentParamsSchema.optional(),
     commandId: z.string().min(1),
     sessionId: z.string().min(1),
     agentSessionId: z.string(),
@@ -865,6 +1003,7 @@ const nodeInventoryShape = {
   capabilities: z.array(z.string()),
   commandExecution: CommandReadinessSchema.optional(),
   agents: z.array(NodeAgentSchema).default([]),
+  agentKinds: z.array(DetectedAgentSchema).optional(),
   maxSessions: z.number().int().positive(),
   homeDir: z.string().default(""),
   /**
@@ -969,6 +1108,11 @@ export const NodeToHostMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("managed_worktree_result"),
     result: WorktreeOperationResultSchema,
   }),
+  /** Answers one `session_file_read`, and only ever one. */
+  z.object({
+    type: z.literal("session_file_data"),
+    result: SessionFileReadResultSchema,
+  }),
   NodeHelloSchema,
   NodeReadySchema,
   z.object({
@@ -1062,6 +1206,15 @@ export const HostToNodeMessageSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("managed_worktree"),
     request: WorktreeOperationRequestSchema,
+  }),
+  /**
+   * Read part of a file from the machine that ran a session, for a browser
+   * download. Sent only over a sealed channel to Nodes advertising
+   * `session-files-v1`.
+   */
+  z.object({
+    type: z.literal("session_file_read"),
+    request: SessionFileReadRequestSchema,
   }),
   z.object({
     type: z.literal("welcome"),
@@ -1172,6 +1325,34 @@ export const HOST_YOLO_CAPABILITY = "host-yolo";
  * identity: it proposes renames over `hello` and accepts `node_name` back.
  */
 export const NODE_NAME_SYNC_CAPABILITY = "node-name-sync";
+
+/**
+ * Set in the environment of every agent a Node starts: that Node's `nodeId`.
+ *
+ * An agent can otherwise see only the machine's host name, which a Fleet name
+ * need not match — so a worker briefed to work on "build-01" had nothing on the
+ * machine to check that against. The id is fixed at enrolment, so a copy taken
+ * when the agent starts is never stale.
+ */
+export const AGENT_NODE_ID_ENV = "FLEET_NODE_ID";
+
+/**
+ * Set beside {@link AGENT_NODE_ID_ENV}: a loopback URL that answers a GET with
+ * the Node's identity, including its current Fleet name.
+ *
+ * An address rather than the name itself, because an operator can rename the
+ * machine from the Host while the agent runs and a variable cannot follow that.
+ * Absent when the Node's config page is not listening.
+ */
+export const AGENT_NODE_IDENTITY_URL_ENV = "FLEET_NODE_IDENTITY_URL";
+
+/**
+ * A Node that sets {@link AGENT_NODE_ID_ENV} and
+ * {@link AGENT_NODE_IDENTITY_URL_ENV} for its agents, so the Host may tell a
+ * worker to check them. Pointing a worker on an older Node at variables that
+ * do not exist would give it a contradiction to stop on instead of an answer.
+ */
+export const AGENT_IDENTITY_CAPABILITY = "agent-identity";
 
 /**
  * A Node that reports which of its sessions are mid-turn, so the Host can
@@ -1549,6 +1730,13 @@ export const RunStepSchema = z.object({
   position: z.number().int().nonnegative().default(0),
   createdAt: z.string().datetime(),
   updatedAt: z.string().datetime(),
+  /**
+   * Why the step is queued, blocked or starting, as the scheduler last decided.
+   *
+   * Derived when steps are published or read, never stored: it describes the
+   * fleet at that moment rather than a fact about the step.
+   */
+  admission: StepAdmissionSchema.optional(),
 });
 export type RunStep = z.infer<typeof RunStepSchema>;
 
@@ -1591,6 +1779,7 @@ export type NotificationCategory = z.infer<typeof NotificationCategorySchema>;
 
 export const NotificationKindSchema = z.enum([
   "command_approval",
+  "worker_resume_approval",
   "command_completion",
   "pr_maintenance_attention",
   "managed_worktree_attention",
@@ -1772,8 +1961,14 @@ export const SnapshotSchema = z.object({
    * says nothing an operator can act on.
    */
   hostRevision: z.string().default(""),
+  /** Optional so a browser talking to a Host that cannot update itself still parses. */
+  hostUpdate: HostUpdateStatusSchema.optional(),
   commandExecutions: z.array(CommandExecutionSchema).optional(),
   prMaintenanceApprovals: z.array(PrMaintenanceApprovalSchema).optional(),
+  /** Retained PR maintenance per task, so lists do not read it as "deciding". */
+  prMaintenanceTasks: z.array(PrMaintenanceTaskStatusSchema).optional(),
+  /** Active and recently settled "Resume now" requests. */
+  workerResumeRequests: z.array(WorkerResumeRequestSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
@@ -1815,6 +2010,14 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     detail: z.string().default(""),
   }),
   /**
+   * The Host's own update, sent whole whenever it moves.
+   *
+   * Whole rather than as a stage, because a browser that reconnects after the
+   * Host restarted gets the same object in the snapshot and should not have to
+   * reassemble it from the messages it missed while the Host was down.
+   */
+  z.object({ type: z.literal("host_update"), status: HostUpdateStatusSchema }),
+  /**
    * Something went wrong with one session without ending it.
    *
    * A prompt refused because the session is already mid-turn is the case this
@@ -1850,6 +2053,11 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
     type: z.literal("run_steps"),
     runId: z.string().min(1),
     steps: z.array(RunStepSchema),
+  }),
+  /** One "Resume now" request after any change to it. */
+  z.object({
+    type: z.literal("worker_resume_request"),
+    request: WorkerResumeRequestSchema,
   }),
 ]);
 export type BrowserMessage = z.infer<typeof BrowserMessageSchema>;
@@ -2316,6 +2524,8 @@ export const SetSessionFavoriteSchema = z.object({
 });
 
 export const UpdateDefaultsSchema = z.object({
+  /** Null resets Auto (Copilot). Applies only to newly created orchestrators. */
+  orchestratorAgent: AgentParamsSchema.nullable().optional(),
   operationId: z.string().uuid().optional(),
   expectedRevision: z.number().int().nonnegative().optional(),
   managedWorktreesEnabled: z.boolean().optional(),
@@ -2328,6 +2538,8 @@ export const UpdateDefaultsSchema = z.object({
   autoResume: z.boolean().optional(),
   /** Application fallback for lifecycle notifications on top-level agents. */
   notificationLifecycleEnabled: z.boolean().optional(),
+  /** Cron times, in the Host's local time, for idle-orchestrator heartbeats and PR checks. */
+  orchestratorHeartbeatSchedule: HeartbeatScheduleSchema.optional(),
   /**
    * What new sessions start on. Empty means "whatever Copilot picks".
    *
@@ -2599,6 +2811,7 @@ const hostBackupDataShape = {
   publicUrl: z.string().url().optional(),
   tunnel: HostBackupTunnelSchema,
   defaults: z.object({
+    orchestratorAgent: AgentParamsSchema.nullable().optional(),
     managedWorktreesEnabled: z.boolean().default(false).optional(),
     managedWorktreePolicy: ManagedWorktreePolicySchema.default(() =>
       ManagedWorktreePolicySchema.parse({}),
@@ -2608,6 +2821,15 @@ const hostBackupDataShape = {
     agencyMode: z.boolean().default(false),
     autoResume: z.boolean(),
     notificationLifecycleEnabled: z.boolean().default(true),
+    /**
+     * Unchecked here so one stale expression cannot make a whole archive
+     * unimportable; the Host applies it only if it still parses, and an archive
+     * without one leaves the default.
+     */
+    orchestratorHeartbeatSchedule: z
+      .string()
+      .max(HEARTBEAT_SCHEDULE_MAX_LENGTH)
+      .optional(),
   }),
   nodes: z.array(HostBackupNodeSchema),
   workspaces: z.array(HostBackupWorkspaceSchema),
@@ -2855,6 +3077,8 @@ export const NodeBackupSettingsSchema = z.object({
   copilotCommand: z.string(),
   permissionTimeoutMs: z.number().int().min(1_000).max(3_600_000),
   contextTier: z.enum(["default", "long_context"]).default("long_context"),
+  commandPermissionRules: z.array(CommandPermissionRuleSchema).max(1024).optional(),
+  commandPermissionRevision: z.number().int().nonnegative().optional(),
   knownHostUrls: z.array(z.string()).default([]),
 });
 export type NodeBackupSettings = z.infer<typeof NodeBackupSettingsSchema>;

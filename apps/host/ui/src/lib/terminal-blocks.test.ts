@@ -302,17 +302,21 @@ describe("toTerminalBlocks", () => {
       detail: "Fix the banner · C:\\repo",
     },
     {
-      prompt: statusCheckEnvelope([
-        {
-          name: "Fix the banner",
-          state: "running",
-          phase: "phase 1/1: Verify",
-          openSteps: 1,
-          dispatchedSteps: 1,
-        },
-      ]),
+      prompt: statusCheckEnvelope(
+        [
+          {
+            name: "Fix the banner",
+            state: "running",
+            phase: "phase 1/1: Verify",
+            openSteps: 1,
+            dispatchedSteps: 1,
+          },
+        ],
+        {},
+        "2h",
+      ),
       title: "Status check",
-      detail: "30m interval",
+      detail: "2h interval",
     },
   ])(
     "folds $title with the full payload, timestamp and key intact",

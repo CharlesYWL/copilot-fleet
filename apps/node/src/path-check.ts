@@ -6,10 +6,8 @@ export type PathCheck = { ok: true; kind: "directory" } | { ok: false; reason: s
 /**
  * Checks a placement path against this machine's filesystem.
  *
- * The browser cannot offer a real folder picker — a sandboxed page never learns
- * an absolute path — so the node validates what was typed instead. This turns a
- * typo into an answer here, rather than into a session that starts and then
- * fails somewhere less obvious.
+ * Whether typed or selected in the config page, a path must still name a local
+ * directory when the placement is saved.
  */
 export function inspectPath(input: string): PathCheck {
   const path = input.trim();

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { NodeSchema, SessionSchema, type Placement } from "@fleet/protocol";
+import {
+  ExecutionBindingSchema,
+  NodeSchema,
+  SessionSchema,
+  type Placement,
+} from "@fleet/protocol";
 import { localResume } from "./session-info";
 
 const session = SessionSchema.parse({
@@ -37,6 +42,48 @@ const placement: Placement = {
 };
 
 describe("localResume", () => {
+  it.each(["win32", "linux"])(
+    "keeps Hermes's profile and native ID in %s recovery commands",
+    (os) => {
+      const result = localResume(
+        {
+          ...session,
+          agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+        },
+        { ...node, os },
+        placement,
+      );
+      expect(result.command).toContain(
+        "hermes -p 'fleet-orchestrator' --resume 'native-id' --no-restore-cwd",
+      );
+      expect(result.command).not.toContain("copilot --resume");
+    },
+  );
+
+  it.each(["win32", "linux", "darwin"])(
+    "uses the pinned execution directory on %s, even without its source placement",
+    (os) => {
+      const cwd =
+        os === "win32" ? "Q:\\managed\\task checkout" : "/managed/task checkout";
+      const bound = {
+        ...session,
+        executionBinding: ExecutionBindingSchema.parse({
+          worktreeId: "task-worktree",
+          generation: 1,
+          sourcePlacementId: placement.id,
+          cwd,
+          checkoutKey: "task-checkout",
+          leaseAttempt: "attempt",
+        }),
+      };
+      for (const source of [placement, undefined]) {
+        const result = localResume(bound, { ...node, os }, source);
+        expect(result.command).toContain(`'${cwd}'`);
+        expect(result.command).not.toContain(placement.localPath);
+      }
+    },
+  );
+
   it("quotes Windows paths and native IDs, and stops if the directory cannot be entered", () => {
     const result = localResume(
       { ...session, agentSessionId: "native'id; Write-Error 'oops" },

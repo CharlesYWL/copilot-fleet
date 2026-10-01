@@ -21,6 +21,7 @@ import {
 import type { FleetService } from "../fleet-service.js";
 import { conversationTitle, isUnnamed } from "../orchestrator/conversation-title.js";
 import { stopSessions } from "../orchestrator/lifecycle.js";
+import { checkoutOccupants } from "../orchestrator/schedule.js";
 import { configUnsupportedReason } from "../session-policy.js";
 
 export type SessionRouteOptions = { service: FleetService };
@@ -220,6 +221,30 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     const input = z
       .object({ operationId: z.string().uuid().optional() })
       .parse(request.body ?? {});
+    /*
+     * A task worker is the scheduler's to place, and it never puts two writers
+     * in one checkout. A person resuming one by hand is held to the same rule;
+     * "Resume now" on its task waits for the checkout and says who holds it.
+     */
+    const target = store.getSession(id);
+    if (target && (target.runRole === "worker" || target.runRole === "reviewer")) {
+      const occupants = checkoutOccupants(
+        target,
+        store.listSessions(),
+        store.listNodes(),
+      );
+      if (occupants.length) {
+        const where = store.getPlacement(target.placementId)?.localPath ?? "its checkout";
+        return reply.code(409).send({
+          code: "checkout_busy",
+          error: `${where} on ${target.nodeName} is in use by ${occupants
+            .map((occupant) => `"${occupant.name || occupant.id}" (${occupant.state})`)
+            .join(
+              ", ",
+            )}. Two sessions cannot write to one checkout; use Resume now on the task, which waits for it.`,
+        });
+      }
+    }
     const resumed = service.resumeSession(
       id,
       undefined,

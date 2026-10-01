@@ -12,6 +12,20 @@ import { privateJournalDirectory } from "./command-journal.js";
 
 const MAX_SERIALIZED_DELIVERY_BYTES = 16 * 1024 * 1024;
 
+/**
+ * Whether a handoff may still be inside a native turn on this Node.
+ *
+ * Only `accepted` can be. Every path to `uncertain` — the prompt returning or
+ * failing without a current turn_complete, the session ending, the Node
+ * restarting — happens after the native turn that received it is over, so what
+ * remains unknown is whether the model consumed it, not whether it is running.
+ * An uncertain record stays as evidence and still deduplicates its delivery id,
+ * which is what keeps it from ever being re-prompted. Counting it as a live
+ * reservation as well wedged the lead for good: nothing ever settles it, so
+ * every resume, prompt and later handoff for that conversation was refused.
+ */
+const inFlight = (record: DeliveryRecord) => record.receipt.state === "accepted";
+
 type DeliveryRecord = {
   hostId: string;
   nativeSessionId: string;
@@ -85,9 +99,7 @@ export class LeadPromptJournal {
   }
 
   get unsettled(): boolean {
-    return this.all().some((record) =>
-      ["accepted", "uncertain"].includes(record.receipt.state),
-    );
+    return this.all().some(inFlight);
   }
 
   private save(record: DeliveryRecord): void {
@@ -115,7 +127,7 @@ export class LeadPromptJournal {
       (record) =>
         (record.receipt.sessionId === sessionId ||
           (nativeSessionId && record.nativeSessionId === nativeSessionId)) &&
-        ["accepted", "uncertain"].includes(record.receipt.state),
+        inFlight(record),
     );
   }
 

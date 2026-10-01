@@ -125,6 +125,8 @@ function mechanics(): string[] {
     "",
     "For follow-up requests, discover before dispatching: call `fleet_list_work` with a short query such as the PR number, then `fleet_get_task` with the returned stable task ID. Discovery includes closed tasks but only those owned by this orchestrator. An exact-name lookup miss does not prove that a task or conversation was deleted; it may have another name or belong to another orchestrator. Never create replacement work solely because a remembered title was not found.",
     "",
+    "Each task belongs to exactly one orchestrator conversation: only its owner is woken for it and runs its PR-maintenance heartbeat. `fleet_list_orchestrators` shows every conversation and the work it holds. `fleet_transfer_task` hands one of your tasks to another conversation, or takes one over when you omit `to` — when the person asks, or when this conversation is too full to carry the work; the task keeps its workers, notes and maintenance. A `<fleet-task-transfer>` turn means a task was handed to you: read `fleet_get_task` before acting and continue from where it stands, never restart it.",
+    "",
     "A request from the human becomes a **task**. `fleet_plan_task` opens one: you name the phases it will go through and the success criteria that decide when it is done. Choose the fewest phases and workers justified by complexity, uncertainty and risk, not a fixed inspect -> implement -> review pipeline. Only name a phase you will actually dispatch work for.",
     "",
     "From then on the task is yours to move, not the human's:",
@@ -242,7 +244,10 @@ function judgement(): string[] {
   ];
 }
 
-/** A periodic, read-only reminder for one orchestrator conversation. */
+/**
+ * A periodic, read-only reminder for one orchestrator conversation.
+ * `interval` is the heartbeat schedule's gap from this check to the next one.
+ */
 export function statusCheckEnvelope(
   tasks: readonly {
     name: string;
@@ -252,9 +257,10 @@ export function statusCheckEnvelope(
     dispatchedSteps: number;
   }[],
   maintenance: { ids?: readonly string[]; count?: number } = {},
+  interval = "1h",
 ): string {
   const lines = [
-    '<fleet-status-check interval="30m">',
+    `<fleet-status-check interval=${JSON.stringify(interval)}>`,
     "Review only these active tasks assigned to this conversation:",
     ...tasks.map(
       (task) =>
@@ -325,6 +331,46 @@ export function wakeEnvelope(input: {
   );
   lines.push(...nextMove(input));
   return lines.join("\n");
+}
+
+/**
+ * The turn a task arrives as when another orchestrator's work is handed over.
+ *
+ * The receiving conversation has none of the task's history, and the one
+ * mistake worth preventing is starting it over: a new worker reconstructing
+ * what a retained one already knows, or a second PR for work that has one.
+ * So it points at the record first — the notes, workers and maintenance the
+ * previous orchestrator left — and asks for continuation, not a plan.
+ */
+export function transferEnvelope(input: {
+  taskId: string;
+  task: string;
+  state: string;
+  phase?: string;
+  from?: string;
+  note?: string;
+}): string {
+  const lines = [
+    `<fleet-task-transfer task=${JSON.stringify(input.task)} taskId=${JSON.stringify(input.taskId)} state=${JSON.stringify(input.state)}${input.phase ? ` phase=${JSON.stringify(input.phase)}` : ""}${input.from ? ` from=${JSON.stringify(input.from)}` : ""}>`,
+    "This task was transferred to you from another orchestrator conversation. You own it now: its phases, criteria, notes, retained workers, pending review and PR maintenance. The previous orchestrator no longer sees it.",
+    ...(input.note ? ["Handoff note:", input.note] : []),
+    "</fleet-task-transfer>",
+    "",
+    `You have none of its history in this conversation. Read fleet_get_task with task "${input.taskId}" before acting, and fleet_get_pr_maintenance with taskId "${input.taskId}" when it maintains a PR.`,
+    "Continue from where it stands: steps already running keep going and you are woken when they settle; use fleet_follow_up for retained workers, and do not re-plan, restart or duplicate work that exists. If nothing needs deciding now, say what you are waiting for and end your turn.",
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * Adds a message to whatever the run already owes its orchestrator.
+ *
+ * A run holds one owed prompt, and a handover brief that has not been read yet
+ * is still owed when a person sends the task back: replacing it would hand the
+ * new owner a review note for a task it has never seen.
+ */
+export function owedPrompt(current: string, next: string): string {
+  return [current, next].filter((part) => part.trim()).join("\n\n");
 }
 
 /**

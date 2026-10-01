@@ -660,6 +660,22 @@ dialog::backdrop {
   justify-content: flex-end;
 }
 
+.folder-list {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  min-height: 160px;
+  max-height: 40vh;
+  overflow: auto;
+  margin: 14px 0;
+}
+
+.folder-entry {
+  width: 100%;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
 .command-permissions .section-heading {
   margin-top: 0;
   flex-wrap: wrap;

@@ -34,16 +34,20 @@ const repository = z
   .transform((value) => value.toLowerCase());
 
 export const PR_MAINTENANCE_SCHEMA_VERSION = 1;
-export const PR_MAINTENANCE_CADENCE_MS = 30 * 60 * 1_000;
 export const PR_MAINTENANCE_WAKE_LIMITS = Object.freeze({
   visits: 5,
   requests: 40,
-  milliseconds: 120_000,
+  milliseconds: 300_000,
 });
+/**
+ * Routine checks follow the orchestrator heartbeat schedule rather than a
+ * constant here; `evidenceAgeMs` is how old evidence may be and still justify
+ * a repair, readiness or a new effect.
+ */
 export const PR_MAINTENANCE_RECOVERY_LIMITS = Object.freeze({
   incidents: 20,
   attempts: 3,
-  evidenceAgeMs: PR_MAINTENANCE_CADENCE_MS,
+  evidenceAgeMs: 30 * 60 * 1_000,
 });
 const hostname = z
   .string()
@@ -610,7 +614,7 @@ export const PrMaintenanceIncidentSchema = z
     wakeQueuedAt: time.optional(),
     resolvedAt: time.optional(),
     resolution: z
-      .enum(["observation", "alternate_observation", "operator_resume"])
+      .enum(["observation", "alternate_observation", "operator_resume", "lead_resume"])
       .optional(),
     attempts: z
       .array(
@@ -844,6 +848,14 @@ const authorizationSchema = z
   })
   .strict();
 
+const pauseOriginSchema = z
+  .object({
+    actor: z.enum(["lead", "operator", "system"]),
+    actorId: id,
+    at: time,
+  })
+  .strict();
+
 export const PrMaintenanceRegistrationSchema = z
   .object({
     schemaVersion: z.literal(1),
@@ -860,6 +872,7 @@ export const PrMaintenanceRegistrationSchema = z
     eligibilityEvidence: text,
     lifecycle: z.enum(["active", "paused", "merged", "closed"]),
     pauseReason: z.string().max(8_192).default(""),
+    pauseOrigin: pauseOriginSchema.optional(),
     pausedAt: time.optional(),
     renewedAt: time,
     pausedNoticeAt: time.optional(),
@@ -876,6 +889,20 @@ export const PrMaintenanceRegistrationSchema = z
       .optional(),
     authorization: authorizationSchema,
     authorizationHistory: z.array(authorizationSchema).max(100).default([]),
+    resumeHistory: z
+      .array(
+        z
+          .object({
+            actor: z.enum(["lead", "operator"]),
+            actorId: id,
+            resumedAt: time,
+            pauseReason: z.string().max(8_192),
+            pauseOrigin: pauseOriginSchema.optional(),
+          })
+          .strict(),
+      )
+      .max(100)
+      .default([]),
     decision: PrMaintenanceDecisionSchema.optional(),
     decisionHistory: z.array(PrMaintenanceDecisionSchema).max(100).default([]),
     observation: PrMaintenanceObservationSchema.optional(),
@@ -931,22 +958,57 @@ export function prMaintenanceObservationFresh(
   return age >= 0 && age <= PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs;
 }
 
-export type PrMaintenanceStage =
-  | "released"
-  | "merged"
-  | "closed"
-  | "human_hold"
-  | "reconciling"
-  | "authorization_required"
-  | "paused"
-  | "recovering"
-  | "blocked"
-  | "addressing_review"
-  | "triage"
-  | "waiting_checks"
-  | "waiting_review"
-  | "ready"
-  | "checking";
+/**
+ * Until when the last complete observation still describes the PR in status
+ * labels: through the next routine check plus the evidence window to perform
+ * it, since checks follow the heartbeat and are often hours apart. Acting on
+ * that evidence still requires {@link prMaintenanceObservationFresh}.
+ */
+export function prMaintenanceEvidenceCurrentUntil(
+  record: Pick<
+    PrMaintenanceRegistration,
+    "observation" | "observationHostAt" | "nextCheckAt"
+  >,
+): number | undefined {
+  const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
+  if (!observedAt) return undefined;
+  const observed = Date.parse(observedAt);
+  const nextCheck = Date.parse(record.nextCheckAt);
+  return (
+    Math.max(observed, Number.isFinite(nextCheck) ? nextCheck : observed) +
+    PR_MAINTENANCE_RECOVERY_LIMITS.evidenceAgeMs
+  );
+}
+
+function evidenceCurrent(record: PrMaintenanceRegistration, nowMs: number): boolean {
+  const observedAt = record.observationHostAt ?? record.observation?.attemptedAt;
+  const until = prMaintenanceEvidenceCurrentUntil(record);
+  return (
+    observedAt !== undefined &&
+    until !== undefined &&
+    nowMs >= Date.parse(observedAt) &&
+    nowMs <= until
+  );
+}
+
+export const PrMaintenanceStageSchema = z.enum([
+  "released",
+  "merged",
+  "closed",
+  "human_hold",
+  "reconciling",
+  "authorization_required",
+  "paused",
+  "recovering",
+  "blocked",
+  "addressing_review",
+  "triage",
+  "waiting_checks",
+  "waiting_review",
+  "ready",
+  "checking",
+]);
+export type PrMaintenanceStage = z.infer<typeof PrMaintenanceStageSchema>;
 
 /** Current facts, not budget reservations or provider review iteration numbers. */
 export function prMaintenanceProgress(
@@ -1027,25 +1089,27 @@ export function prMaintenanceProgress(
   if (
     !observation?.complete ||
     !record.lastAttempt?.complete ||
-    !prMaintenanceObservationFresh(observation, nowMs, record.observationHostAt)
+    !evidenceCurrent(record, nowMs)
   )
     return result("checking");
   if (observation.draft || observation.mergeability === "conflicting")
     return result("blocked");
+  const currentFindings = observation.sources.map((source) =>
+    record.findings.find(
+      (finding) =>
+        finding.source.id === source.id &&
+        finding.source.revision === source.revision &&
+        (finding.verifiedHeadSha ?? finding.publishedCommit) === observation.headSha,
+    ),
+  );
+  if (currentFindings.some((finding) => !finding)) return result("triage");
   if (
-    observation.sources.some(
-      (source) =>
-        !record.findings.some(
-          (finding) =>
-            finding.source.id === source.id &&
-            finding.source.revision === source.revision &&
-            (finding.verifiedHeadSha ?? finding.publishedCommit) ===
-              observation.headSha &&
-            ["addressed", "already_satisfied"].includes(finding.outcome),
-        ),
+    currentFindings.some(
+      (finding) =>
+        finding && !["addressed", "already_satisfied"].includes(finding.outcome),
     )
   )
-    return result("triage");
+    return result("checking");
   if (
     !observation.checksComplete ||
     observation.checks.some(
@@ -1068,6 +1132,80 @@ export function prMaintenanceProgress(
       ? "ready"
       : "checking",
   );
+}
+
+/** The registration a task view should describe: retained active work before history. */
+export function currentPrMaintenance<
+  T extends Pick<
+    PrMaintenanceRegistration,
+    "ownershipReleasedAt" | "lifecycle" | "createdAt"
+  >,
+>(records: readonly T[]): T | undefined {
+  const retained = records.filter((record) => !record.ownershipReleasedAt);
+  const active = retained.filter((record) =>
+    ["active", "paused"].includes(record.lifecycle),
+  );
+  return (active.length ? active : retained.length ? retained : records).reduce<
+    T | undefined
+  >(
+    (latest, record) =>
+      !latest || record.createdAt > latest.createdAt ? record : latest,
+    undefined,
+  );
+}
+
+/**
+ * A task's retained PR maintenance, reduced to what a task list needs.
+ *
+ * The Host computes this for the snapshot so a list can say a task is maintaining
+ * a PR without fetching every full registration. It is a label, not evidence;
+ * task details still read the complete record.
+ */
+export const PrMaintenanceTaskStatusSchema = z.object({
+  taskId: id,
+  recordId: id,
+  stage: PrMaintenanceStageSchema,
+  prUrl: z.string().min(1),
+  manualControl: z.boolean(),
+  /** After this, a stage that relied on the last observation is only "checking". */
+  freshUntil: time.optional(),
+});
+export type PrMaintenanceTaskStatus = z.infer<typeof PrMaintenanceTaskStatusSchema>;
+
+const freshnessDependentStages = new Set<PrMaintenanceStage>([
+  "triage",
+  "waiting_checks",
+  "waiting_review",
+  "ready",
+]);
+
+export function prMaintenanceTaskStatuses(
+  records: readonly PrMaintenanceRegistration[],
+  nowMs = Date.now(),
+): PrMaintenanceTaskStatus[] {
+  const byTask = new Map<string, PrMaintenanceRegistration[]>();
+  for (const record of records)
+    byTask.set(record.taskId, [...(byTask.get(record.taskId) ?? []), record]);
+  return [...byTask.values()].flatMap((taskRecords) => {
+    const record = currentPrMaintenance(taskRecords);
+    if (!record || record.ownershipReleasedAt) return [];
+    const { stage } = prMaintenanceProgress(record, nowMs);
+    const currentUntil = prMaintenanceEvidenceCurrentUntil(record);
+    const freshUntil =
+      currentUntil !== undefined && freshnessDependentStages.has(stage)
+        ? new Date(currentUntil).toISOString()
+        : undefined;
+    return [
+      {
+        taskId: record.taskId,
+        recordId: record.id,
+        stage,
+        prUrl: prMaintenanceUrl(record.identity),
+        manualControl: Boolean(record.manualControl && !record.manualControl.endedAt),
+        ...(freshUntil ? { freshUntil } : {}),
+      },
+    ];
+  });
 }
 
 export const PrMaintenanceAdmissionSchema = z

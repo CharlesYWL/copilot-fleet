@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createServer, request, Server } from "node:http";
 import { once } from "node:events";
+import { hostname } from "node:os";
 import {
   CONFIG_UI_EVENT_MARKER,
   ConfigUiEventSchema,
@@ -15,13 +16,14 @@ import {
 import { createIdentityKeyPair, verifyNodeHttpProof } from "@fleet/protocol/node-auth";
 import {
   createConfigRouter,
+  nodeIdentityUrl,
   refuseRequest,
   startConfigServer,
   type ConfigServerOptions,
   type FleetApi,
 } from "./config-server.js";
 import type { Credentials } from "./config.js";
-import { settingsFromEnv } from "./settings.js";
+import { SettingsSchema, settingsFromEnv } from "./settings.js";
 
 const workspace = { id: "ws-1", name: "fleet", description: "" };
 const placement = {
@@ -296,6 +298,46 @@ describe("config listener ports", () => {
     expect(await status(actual, { Host: `127.0.0.1:${preferred}` })).toBe(403);
   });
 
+  it("preserves UTF-8 split across request chunks when saving config", async () => {
+    const applySettings = vi.fn(async () => {});
+    const server = startConfigServer({ ...baseOptions(), port: 0, applySettings });
+    servers.push(server);
+    await once(server, "listening");
+    const firstChunk = new Promise<void>((done) => {
+      server.once("request", (incoming) => incoming.once("data", () => done()));
+    });
+    const body = Buffer.from(
+      JSON.stringify({ ...settingsFromEnv({}), nodeName: "Node-\u7535\u8111" }),
+    );
+    const split = body.indexOf(Buffer.from("\u7535")) + 1;
+    let call!: ReturnType<typeof request>;
+    const response = new Promise<number>((done, reject) => {
+      call = request(
+        {
+          host: "127.0.0.1",
+          port: portOfServer(server),
+          path: "/api/config",
+          method: "POST",
+          headers: { "content-type": "application/json" },
+        },
+        (reply) => {
+          reply.resume();
+          reply.once("end", () => done(reply.statusCode ?? 0));
+          reply.once("error", reject);
+        },
+      );
+      call.once("error", reject);
+      call.write(body.subarray(0, split));
+    });
+    await firstChunk;
+    call.end(body.subarray(split));
+
+    expect(await response).toBe(200);
+    expect(applySettings).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ nodeName: "Node-\u7535\u8111" }),
+    );
+  });
+
   it("reports the bound ephemeral port, not port zero", async () => {
     const log = vi.fn();
     const server = startConfigServer({ ...baseOptions(), port: 0, log });
@@ -304,6 +346,29 @@ describe("config listener ports", () => {
     const actual = portOfServer(server);
     expect(log).toHaveBeenCalledWith(`  config UI   http://127.0.0.1:${actual}`);
     expect(await status(actual)).toBe(200);
+  });
+
+  it("hands agents the identity address it is actually listening on", async () => {
+    const server = startConfigServer({ ...baseOptions(), port: 0 });
+    servers.push(server);
+    // Nothing answers yet, and an address that does not answer is worse than none.
+    expect(nodeIdentityUrl(server)).toBeUndefined();
+    await once(server, "listening");
+    const url = nodeIdentityUrl(server);
+    expect(url).toBe(`http://127.0.0.1:${portOfServer(server)}/api/identity`);
+
+    // Asked the way an agent's shell asks: a bare GET with no Origin.
+    const response = await fetch(url!);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      nodeId: "node-1",
+      nodeName: "node",
+      machineName: hostname(),
+      connected: true,
+    });
+
+    await new Promise<void>((done) => server.close(() => done()));
+    expect(nodeIdentityUrl(server)).toBeUndefined();
   });
 
   it.each([
@@ -471,6 +536,72 @@ describe("config router", () => {
     const response = await route("GET", "/api/config", "");
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({ status: { nodeId: "node-1" } });
+  });
+
+  describe("identity for the agents on this machine", () => {
+    const credentials = (name: string): Credentials => ({
+      hostUrl: "http://127.0.0.1:8787",
+      nodeId: "node-1",
+      authProtocol: "legacy-secret",
+      secret: "secret",
+      name,
+    });
+
+    it("answers with the name the Host last confirmed, read when asked", async () => {
+      let current = credentials("DESKTOP-7Q2M4VX");
+      const { route } = router({ getCredentials: () => current });
+      const first = await route("GET", "/api/identity", "");
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual({
+        nodeId: "node-1",
+        nodeName: "DESKTOP-7Q2M4VX",
+        machineName: hostname(),
+        connected: true,
+      });
+
+      // A rename on the Host is written to node.json while agents keep running;
+      // the next question has to see it, not what the agent started with.
+      current = credentials("gpu-rig");
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        nodeId: "node-1",
+        nodeName: "gpu-rig",
+      });
+    });
+
+    it("prefers the confirmed name over one still waiting for the Host", async () => {
+      const { route } = router({
+        getCredentials: () => credentials("build-01"),
+        getSettings: () => ({ ...settingsFromEnv({}), nodeName: "build-02" }),
+      });
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        nodeName: "build-01",
+      });
+    });
+
+    it("falls back to the configured name before the node has enrolled", async () => {
+      const { route } = router({
+        getCredentials: () => undefined,
+        getSettings: () => ({ ...settingsFromEnv({}), nodeName: "fresh-box" }),
+      });
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        nodeName: "fresh-box",
+      });
+    });
+
+    it("says when the Host is unreachable, since a rename made there is still on its way", async () => {
+      const { route } = router({
+        getStatus: () => ({
+          nodeId: "node-1",
+          version: "0.1.0",
+          connected: false,
+          activeSessions: 0,
+          mockAgent: false,
+        }),
+      });
+      expect((await route("GET", "/api/identity", "")).body).toMatchObject({
+        connected: false,
+      });
+    });
   });
 
   it("rejects settings the schema refuses without calling applySettings", async () => {
@@ -671,6 +802,45 @@ describe("config router", () => {
         ]),
       );
     });
+  });
+
+  it("browses local folders without contacting the Host or opening a desktop dialog", async () => {
+    const listing = {
+      ok: true as const,
+      path: "/tmp",
+      parent: "/",
+      folders: [{ name: "fleet", path: "/tmp/fleet" }],
+      unavailableLinks: 0,
+    };
+    const listFolders = vi.fn(async () => listing);
+    const { route, fleet } = router({ listFolders });
+    expect(await route("POST", "/api/folders", JSON.stringify({ path: "/tmp" }))).toEqual(
+      {
+        status: 200,
+        body: listing,
+      },
+    );
+    expect(listFolders).toHaveBeenCalledWith("/tmp");
+    expect(fleet.listOwnPlacements).not.toHaveBeenCalled();
+    expect(fleet.createOwnPlacement).not.toHaveBeenCalled();
+    expect((await route("POST", "/api/pick-folder", "{}")).status).toBe(410);
+  });
+
+  it("validates folder-list requests and returns actionable filesystem errors", async () => {
+    const listFolders = vi.fn(async () => ({
+      ok: false as const,
+      reason: "Cannot read this folder: access denied",
+    }));
+    const { route } = router({ listFolders });
+    for (const body of ["{", "null", '{"path":123}', '{"path":"\\u0000"}']) {
+      expect((await route("POST", "/api/folders", body)).status).toBe(400);
+    }
+    expect(listFolders).not.toHaveBeenCalled();
+    expect(await route("POST", "/api/folders", "{}")).toEqual({
+      status: 400,
+      body: { error: "Cannot read this folder: access denied" },
+    });
+    expect(listFolders).toHaveBeenCalledWith("");
   });
 
   it("refuses a placement path this machine cannot open", async () => {
@@ -941,6 +1111,52 @@ describe("config router", () => {
     expect(response.status).toBe(200);
     expect(applyBackup).toHaveBeenCalledOnce();
     expect(applyBackup.mock.calls[0]?.[0].credentials.nodeId).toBe("moved");
+  });
+
+  it("round-trips persistent command permissions and preserves legacy defaults", async () => {
+    let settings = SettingsSchema.parse({
+      ...settingsFromEnv({}),
+      commandPermissionRules: [
+        {
+          id: "pinned-git-status",
+          commandKey: `git status @sha256:${"a".repeat(64)}`,
+          command: "git status",
+          match: "command",
+          path: "c:\\work",
+          hostId: "host-1",
+          builtin: false,
+        },
+      ],
+      commandPermissionRevision: 7,
+    });
+    const applyBackup = vi.fn(async (_archive: NodeBackup) => {});
+    const { route } = router({ getSettings: () => settings, applyBackup });
+    for (const rules of [settings.commandPermissionRules, []]) {
+      settings = { ...settings, commandPermissionRules: rules };
+      const exported = await route("GET", "/api/backup", "");
+      expect(exported.status).toBe(200);
+      const imported = await route("POST", "/api/backup", JSON.stringify(exported.body));
+      expect(imported.status).toBe(200);
+      const received = applyBackup.mock.lastCall![0];
+      expect(received.settings).toMatchObject({
+        commandPermissionRules: rules,
+        commandPermissionRevision: 7,
+      });
+      expect(SettingsSchema.parse(received.settings).commandPermissionRules).toEqual(
+        rules,
+      );
+    }
+
+    const legacy = structuredClone(applyBackup.mock.lastCall![0]);
+    delete legacy.settings.commandPermissionRules;
+    delete legacy.settings.commandPermissionRevision;
+    const imported = await route("POST", "/api/backup", JSON.stringify(legacy));
+    expect(imported.status).toBe(200);
+    const restored = SettingsSchema.parse(applyBackup.mock.lastCall![0].settings);
+    expect(restored.commandPermissionRules).toEqual(
+      settingsFromEnv({}).commandPermissionRules,
+    );
+    expect(restored.commandPermissionRevision).toBe(0);
   });
 
   it("refuses a Host archive on the node import endpoint", async () => {

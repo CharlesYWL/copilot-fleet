@@ -14,6 +14,7 @@ import {
   CommandReceiptSchema,
   CommandTextSchema,
   RunCommandSchema,
+  commandApprovalExpiresAt,
   commandDigestPayload,
   CommandObservationClockSchema,
   commandObservationClock,
@@ -101,6 +102,30 @@ describe("remote command contracts", () => {
     expect(
       CommandObservationClockSchema.safeParse({ ...context, extra: "PR text" }).success,
     ).toBe(false);
+  });
+  it("ends approval at a bound helper deadline only when it precedes the approval window", () => {
+    const later = "2026-09-16T14:30:00.000Z";
+    const descriptor = { ...body, digest: "a".repeat(64) };
+    expect(commandApprovalExpiresAt({ expiresAt: later })).toBe(later);
+    expect(commandApprovalExpiresAt({ expiresAt: later, descriptor })).toBe(later);
+    expect(
+      commandApprovalExpiresAt({
+        expiresAt: later,
+        descriptor: {
+          ...descriptor,
+          observationBudget: { deadlineAt: at, requests: 39 },
+        },
+      }),
+    ).toBe(at);
+    expect(
+      commandApprovalExpiresAt({
+        expiresAt: at,
+        descriptor: {
+          ...descriptor,
+          observationBudget: { deadlineAt: later, requests: 39 },
+        },
+      }),
+    ).toBe(at);
   });
   it("reads legacy wakes without manufacturing an execution receipt association", () => {
     const legacy = {

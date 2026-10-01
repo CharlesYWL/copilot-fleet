@@ -4,6 +4,7 @@ import {
   terminalRunStepStates,
   type FleetSession,
   type Placement,
+  type PrMaintenanceTaskStatus,
   type Run,
   type RunStep,
   type SessionEvent,
@@ -73,6 +74,13 @@ export type RunViewModel = {
   latestActivityAt: string;
   /** Where the work is happening, when the snapshot can say. */
   placement: Placement | undefined;
+  /**
+   * Retained PR maintenance, when the task is keeping a PR alive.
+   *
+   * Such a task sits in `awaiting_lead` between visits, which on its own reads
+   * as "deciding" — true of the run row, and misleading about what it is doing.
+   */
+  maintenance?: PrMaintenanceTaskStatus;
   /** Sorting key: attention first, then work, then rest. */
   priority: number;
 };
@@ -86,6 +94,9 @@ export type BuildRunViewModelsInput = {
   waitingPermissions?: readonly SessionEvent[];
   /** Failed step attempts the operator has already acknowledged, keyed by run. */
   acknowledgedFailedSteps?: Readonly<Record<string, readonly string[]>>;
+  /** The Host's per-task PR maintenance summaries from the snapshot. */
+  maintenance?: readonly PrMaintenanceTaskStatus[];
+  nowMs?: number;
 };
 
 const isLive = (step: RunStep) => step.state === "running" || step.state === "starting";
@@ -120,9 +131,14 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
   const blockedSessions = new Set(
     (input.waitingPermissions ?? []).map((event) => event.sessionId),
   );
+  const nowMs = input.nowMs ?? Date.now();
+  const maintenanceByRun = new Map(
+    (input.maintenance ?? []).map((status) => [status.taskId, status]),
+  );
 
   return input.runs
     .map((run) => {
+      const maintenance = currentMaintenanceStatus(maintenanceByRun.get(run.id), nowMs);
       const steps = input.stepsByRun[run.id] ?? [];
       const live = steps.filter(isLive);
       const stoppingSessions = steps
@@ -185,6 +201,7 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
         totalSteps: steps.length,
         latestActivityAt: latestActivity(run, steps),
         placement: run.placementId ? placementById.get(run.placementId) : undefined,
+        ...(maintenance ? { maintenance } : {}),
         priority: priorityOf(attention, live.length, run),
       } satisfies RunViewModel;
     })
@@ -192,6 +209,17 @@ export function buildRunViewModels(input: BuildRunViewModelsInput): RunViewModel
       (a, b) =>
         b.priority - a.priority || b.latestActivityAt.localeCompare(a.latestActivityAt),
     );
+}
+
+/** A summary whose observation has aged out only knows it needs checking again. */
+function currentMaintenanceStatus(
+  status: PrMaintenanceTaskStatus | undefined,
+  nowMs: number,
+): PrMaintenanceTaskStatus | undefined {
+  if (!status?.freshUntil || nowMs <= Date.parse(status.freshUntil)) return status;
+  const checking: PrMaintenanceTaskStatus = { ...status, stage: "checking" };
+  delete checking.freshUntil;
+  return checking;
 }
 
 /**
@@ -256,6 +284,17 @@ export function tasksAwaitingHuman(runs: readonly Run[]): Run[] {
   return runs.filter((run) => run.state === "awaiting_human");
 }
 
+/**
+ * Whether a task still needs an orchestrator to own it.
+ *
+ * An open task does, and so does a finished one still keeping a PR maintained:
+ * its heartbeat runs in whichever conversation owns it. What these are is what
+ * a conversation has to hand on before it can be let go.
+ */
+export function needsOrchestrator(model: RunViewModel): boolean {
+  return !terminalRunStates.has(model.run.state) || Boolean(model.maintenance);
+}
+
 /** What the header counts. */
 export type OrchestratorSummary = {
   total: number;
@@ -313,6 +352,21 @@ export function runStateLabel(run: Run): string {
     default:
       return "Running";
   }
+}
+
+export const PR_MAINTENANCE_STATUS_LABEL = "PR maintenance";
+
+/**
+ * The status filter's word for a task.
+ *
+ * A task maintaining a PR is parked in a run state that says nothing about
+ * that, so the maintenance wins — unless the task needs attention, which the
+ * badge shows first as well.
+ */
+export function taskStatusLabel(model: RunViewModel): string {
+  return model.maintenance && !model.attention
+    ? PR_MAINTENANCE_STATUS_LABEL
+    : runStateLabel(model.run);
 }
 
 /** The phase the orchestrator itself named, when it named any. */

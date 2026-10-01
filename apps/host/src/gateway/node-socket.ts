@@ -209,6 +209,7 @@ export function registerNodeGateway(
         version: inventory.version,
         revision: inventory.revision,
         capabilities: inventory.capabilities,
+        agentKinds: inventory.agentKinds ?? [],
         maxSessions: inventory.maxSessions,
         os: inventory.os,
         arch: inventory.arch,
@@ -274,6 +275,7 @@ export function registerNodeGateway(
       }
 
       const onNodeMessage = (raw: unknown) => {
+        if (service.nodeSocket(nodeId) !== input.link) return;
         const message = input.read(String(raw));
         if (!message) return;
         const ownership = nodeMessageOwnership(nodeId, message, (id) =>
@@ -329,6 +331,16 @@ export function registerNodeGateway(
               app.log.warn(
                 { nodeId, operationId: message.result.operationId },
                 "Rejected repository capability receipt",
+              );
+            return;
+          }
+          if (message.type === "session_file_data") {
+            // An unmatched answer is ordinary: a read that timed out still
+            // gets its reply from the Node, just too late to be used.
+            if (!service.files.handleResult(nodeId, message.result))
+              app.log.debug(
+                { nodeId, requestId: message.result.requestId },
+                "Ignored an unexpected session file answer",
               );
             return;
           }
@@ -605,11 +617,12 @@ export function registerNodeGateway(
               );
             } else {
               // Refused, not broken. The Node re-announces the session's real
-              // state right behind this, so all that is owed is the reason.
-              service.reportSessionNotice(
-                message.sessionId,
-                message.error ?? "Node refused the command",
-              );
+              // state right behind this, so all that is owed is the reason —
+              // unless what it refused was the launch, which leaves no session
+              // behind to re-announce.
+              const reason = message.error ?? "Node refused the command";
+              service.reportSessionNotice(message.sessionId, reason);
+              service.settleRefusedLaunch(message.sessionId, message.commandId, reason);
             }
           }
           if (

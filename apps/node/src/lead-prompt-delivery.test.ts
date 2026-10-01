@@ -350,11 +350,110 @@ describe("durable native lead prompt handoff", () => {
         false,
       ),
     ).toThrow("different");
-    expect(restored.reserved("another-fleet-id", "native")).toBe(true);
+    // The native turn that received it died with the old Node process. What is
+    // unknown is consumption, not whether it is still running: the delivery is
+    // never replayed, but it no longer holds the conversation or blocks update.
+    expect(restored.reserved("another-fleet-id", "native")).toBe(false);
+    expect(restored.reserved("lead")).toBe(false);
+    expect(restored.unsettled).toBe(false);
     expect(() =>
       restored.accept("host", { ...delivery, prompt: "changed" }, "native", false),
     ).toThrow("different");
     restored.replay("host");
     expect(f.receipts.at(-1)?.state).toBe("uncertain");
+  });
+
+  it("lets a lead resume and take new prompts after the Node restarted mid-handoff", async () => {
+    const f = fixture();
+    const prompts: { sessionId: string; text: string }[] = [];
+    const start: AgentFactory["start"] = async (sessionId, _cwd, emit, options) => {
+      emit({
+        eventId: randomUUID(),
+        sessionId,
+        sequence: (options?.sequenceOffset ?? 0) + 1,
+        type: "agent_session",
+        payload: { agentSessionId: options?.resumeAgentSessionId ?? "native" },
+        createdAt: new Date().toISOString(),
+      });
+      return {
+        busy: false,
+        prompt: vi.fn(async (text: string) => {
+          prompts.push({ sessionId, text });
+          // Never answers: the turn is still in flight when the Node goes away.
+          await new Promise<void>(() => {});
+        }),
+        cancel: vi.fn(async () => {}),
+        stop: vi.fn(async () => {}),
+        resync: vi.fn(),
+        resolvePermission: vi.fn(),
+        denyPendingPermissions: vi.fn(),
+        setConfigOption: vi.fn(async () => {}),
+      };
+    };
+    const routerFor = (journal: LeadPromptJournal) =>
+      new CommandRouter(
+        { start },
+        1,
+        () => {},
+        async (path) => path,
+        () => "",
+        async () => [],
+        () => {},
+        { leadDeliveries: journal },
+      );
+    const resume = (commandId: string) => ({
+      type: "resume_session" as const,
+      commandId,
+      sessionId: "lead",
+      agentSessionId: "native",
+      localPath: "C:\\private-coordinator",
+      additionalDirectories: [],
+      sequenceOffset: 0,
+      readOnly: false,
+      yolo: false,
+      agent: "",
+      mcpServers: [],
+      config: [],
+    });
+    const before = routerFor(f.journal);
+    expect((await before.route(resume("before-restart"))).ok).toBe(true);
+    const interrupted = {
+      deliveryId: randomUUID(),
+      sessionId: "lead",
+      prompt: "command completed",
+    };
+    expect((await before.deliverLeadPrompt("host", interrupted)).state).toBe("accepted");
+    expect(f.journal.reserved("lead", "native")).toBe(true);
+
+    // The Node process restarts with the handoff still inside a native turn.
+    f.journal.close();
+    journals.splice(journals.indexOf(f.journal), 1);
+    const restored = new LeadPromptJournal(
+      f.directory,
+      (receipt) => f.receipts.push(receipt),
+      false,
+    );
+    journals.push(restored);
+    const after = routerFor(restored);
+
+    expect(await after.route(resume("after-restart"))).toMatchObject({ ok: true });
+    // The Host replays what it still holds; the interrupted handoff is reported,
+    // never prompted into the resumed conversation a second time.
+    expect(await after.deliverLeadPrompt("host", interrupted)).toMatchObject({
+      state: "uncertain",
+    });
+    expect(prompts).toEqual([{ sessionId: "lead", text: "command completed" }]);
+    expect(
+      await after.route({
+        type: "prompt",
+        commandId: "human-after-restart",
+        sessionId: "lead",
+        prompt: "carry on",
+        attachments: [],
+      }),
+    ).toMatchObject({ ok: true });
+    expect(prompts.at(-1)).toEqual({ sessionId: "lead", text: "carry on" });
+    await after.stopAll();
+    await before.stopAll();
   });
 });

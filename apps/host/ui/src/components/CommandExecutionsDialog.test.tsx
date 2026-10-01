@@ -373,6 +373,84 @@ describe("command approval UI", () => {
     expect(screen.getByRole("tab", { name: "Request history (1)" })).toBeTruthy();
   });
 
+  it("moves a request that expires while waiting into history without any decision", async () => {
+    const view = mount();
+    expect(screen.getByRole("tab", { name: "Waiting approval (1)" })).toBeTruthy();
+    await waitFor(() => expect(screen.queryByText("Loading command history")).toBeNull());
+    // The Host's expiry sweep publishes this newer version; nobody clicks anything.
+    const expired = execution({
+      state: "expired",
+      version: 3,
+      reasonCode: "authorization_expired",
+      settledAt: at,
+    });
+    view.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <CommandExecutionsDialog
+          executions={[expired]}
+          output={[]}
+          connected
+          onClose={vi.fn()}
+        />
+      </FluentProvider>,
+    );
+    expect(screen.getByRole("tab", { name: "Waiting approval (0)" })).toBeTruthy();
+    expect(
+      screen
+        .getByRole("tab", { name: "Request history (1)" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      within(screen.getByRole("navigation", { name: "Command history" })).getByRole(
+        "button",
+        { name: /Windows builder · expired/ },
+      ),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+    await act(async () => {});
+  });
+
+  it("explains a decision that reached an already expired request", async () => {
+    const original = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      if (String(url).endsWith("/decision")) {
+        record = execution({
+          state: "expired",
+          version: 3,
+          reasonCode: "approval_expired",
+          settledAt: at,
+        });
+        return json({ execution: record });
+      }
+      return original(url, init);
+    });
+    mount();
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "That request had already expired, so your decision was not applied and nothing ran. It moved to Request history.",
+    );
+    expect(screen.getByRole("tab", { name: "Waiting approval (0)" })).toBeTruthy();
+    expect(screen.getByRole("tab", { name: "Request history (1)" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Allow once" })).toBeNull();
+  });
+
+  it("shows a bound helper deadline as the approval expiry", async () => {
+    const approvalWindow = "2026-09-16T14:30:00.000Z";
+    const deadlineAt = "2026-09-16T14:02:00.000Z";
+    const pending = execution({ expiresAt: approvalWindow });
+    record = execution({
+      expiresAt: approvalWindow,
+      descriptor: {
+        ...pending.descriptor!,
+        observationBudget: { deadlineAt, requests: 39 },
+      },
+    });
+    mount();
+    expect(screen.getByText(new Date(deadlineAt).toLocaleString())).toBeTruthy();
+    expect(screen.queryByText(new Date(approvalWindow).toLocaleString())).toBeNull();
+    await act(async () => {});
+  });
+
   it("refreshes a real approval conflict without submitting the decision again", async () => {
     const original = vi.mocked(fetch).getMockImplementation()!;
     vi.mocked(fetch).mockImplementation(async (url, init) => {

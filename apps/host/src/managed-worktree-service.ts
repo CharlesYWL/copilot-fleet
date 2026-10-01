@@ -26,6 +26,7 @@ import {
 } from "@fleet/protocol";
 import type { FleetService } from "./fleet-service.js";
 import { stopSessions } from "./orchestrator/lifecycle.js";
+import { owedPrompt } from "./orchestrator/briefing.js";
 import { sendBackPrompt } from "./orchestrator/review.js";
 import { WorkspaceArtifactStore } from "./workspace-artifact-store.js";
 
@@ -1621,7 +1622,7 @@ export class ManagedWorktreeService {
       return this.store.updateRun(runId, {
         state: "running",
         failureReason: "",
-        pendingPrompt: sendBackPrompt(run.name, note),
+        pendingPrompt: owedPrompt(run.pendingPrompt, sendBackPrompt(run.name, note)),
       })!;
     });
     this.publish(runId);
@@ -2379,9 +2380,9 @@ export class ManagedWorktreeService {
       this.store.putWorktreeOperation({ ...operation, state: "acknowledged", result });
       const run = this.store.getRun(expected.runId);
       const binding = run?.workspaceBinding;
+      const available =
+        tree && ["ready", "retained"].includes(tree.state) && !tree.abandonedAt;
       if (binding && expected.workspaceKind === "primary") {
-        const available =
-          tree && ["ready", "retained"].includes(tree.state) && !tree.abandonedAt;
         this.store.setRunWorkspaceBinding(expected.runId, {
           ...binding,
           ...(tree
@@ -2419,24 +2420,28 @@ export class ManagedWorktreeService {
             : {}),
           error: result.error || tree?.error || "",
         });
-        if (result.ok && expected.kind === "reconcile" && available) {
-          for (const session of this.store.listSessions())
-            if (
-              session.runId === run!.id &&
-              session.executionBinding?.worktreeId === tree.id
-            ) {
-              this.store.setSessionExecutionBinding(session.id, {
-                ...session.executionBinding,
-                quarantined: false,
-              });
-            }
-          for (const step of this.store.listRunSteps(run!.id))
-            if (step.executionBinding?.worktreeId === tree.id) {
-              this.store.updateRunStep(step.id, {
-                executionBinding: { ...step.executionBinding, quarantined: false },
-              });
-            }
-        }
+      }
+      if (binding && result.ok && expected.kind === "reconcile" && available) {
+        for (const session of this.store.listSessions())
+          if (
+            session.runId === expected.runId &&
+            session.executionBinding?.worktreeId === tree.id &&
+            session.executionBinding.generation === tree.generation
+          ) {
+            this.store.setSessionExecutionBinding(session.id, {
+              ...session.executionBinding,
+              quarantined: false,
+            });
+          }
+        for (const step of this.store.listRunSteps(expected.runId))
+          if (
+            step.executionBinding?.worktreeId === tree.id &&
+            step.executionBinding.generation === tree.generation
+          ) {
+            this.store.updateRunStep(step.id, {
+              executionBinding: { ...step.executionBinding, quarantined: false },
+            });
+          }
       }
       if (expected.ownerStepId) {
         const step = this.store.getRunStep(expected.ownerStepId);

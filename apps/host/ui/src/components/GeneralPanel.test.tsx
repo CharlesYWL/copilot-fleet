@@ -21,6 +21,49 @@ afterEach(() => {
 });
 
 describe("GeneralPanel", () => {
+  it("does not mix Hermes model choices into Copilot defaults", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        response({
+          yolo: false,
+          autoResume: true,
+          notificationLifecycleEnabled: true,
+          model: "",
+          reasoningEffort: "",
+        }),
+      ),
+    );
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel
+          sessions={[
+            {
+              agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+              configOptions: [
+                {
+                  id: "model",
+                  name: "Model",
+                  category: "model",
+                  description: "",
+                  currentValue: "hermes-model",
+                  choices: [
+                    { value: "hermes-model", name: "Hermes model", description: "" },
+                  ],
+                },
+              ],
+            },
+          ]}
+        />
+      </FluentProvider>,
+    );
+    expect(
+      (await screen.findByRole<HTMLButtonElement>("combobox", { name: "Default model" }))
+        .disabled,
+    ).toBe(true);
+    expect(screen.queryByRole("textbox", { name: "Heartbeat schedule" })).toBeNull();
+  });
+
   it("defaults to long context and saves both context tiers without changing other defaults", async () => {
     let defaults = {
       yolo: false,

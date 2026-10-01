@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   errorMessage,
-  CommandExecutionSchema,
-  CommandOutputEventSchema,
+  updateFinished,
+  BrowserMessageSchema,
+  decodeFrame,
   type CommandOutputEvent,
+  type HostUpdateStatus,
   type MarkAllNotificationsReadResponse,
-  type BrowserMessage,
   type Notification,
   type NodeUpdateStage,
   type RunStep,
@@ -17,6 +18,7 @@ import { announceSignedOut, csrfToken, forgetCsrfToken } from "../lib/auth";
 import { reconnectDelay } from "./reconnect-delay";
 import { mergeEvents } from "../lib/merge-events";
 import { mergeCommandExecutions, mergeCommandOutput } from "../lib/command-output";
+import { mergeResumeRequests } from "../lib/worker-resume";
 
 export type { Snapshot };
 
@@ -31,16 +33,11 @@ export type LiveNotificationUpdate = {
   deliver: boolean;
 };
 
-type NotificationHydrationChange =
+type SnapshotHydrationChange =
   | { revision: number; type: "upsert"; notification: Notification }
   | { revision: number; type: "count"; unreadCount: number }
-  | {
-      revision: number;
-      type: "snapshot";
-      notifications: Notification[];
-      unreadCount: number;
-      prMaintenanceApprovals: Snapshot["prMaintenanceApprovals"];
-    };
+  | { revision: number; type: "host_update"; status: HostUpdateStatus }
+  | { revision: number; type: "snapshot"; data: Snapshot };
 
 /**
  * The outcome of one call, so a caller can tell "succeeded with no body" from
@@ -66,6 +63,33 @@ export type NodeUpdateProgress = Record<
   { stage: NodeUpdateStage; detail: string }
 >;
 
+/**
+ * The Host update this tab saw start, so its end is announced exactly once.
+ *
+ * Kept in session storage rather than memory because the end usually arrives
+ * after a restart: the socket drops while the Host is replaced, and under
+ * `npm run dev` Vite reloads the page as well, so the first word of how it went
+ * is a snapshot that a fresh page would otherwise have no reason to announce.
+ */
+const WATCHED_HOST_UPDATE = "copilot-fleet.watched-host-update";
+
+function watchedHostUpdate(): string | undefined {
+  try {
+    return sessionStorage.getItem(WATCHED_HOST_UPDATE) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function watchHostUpdate(updateId: string | undefined): void {
+  try {
+    if (updateId) sessionStorage.setItem(WATCHED_HOST_UPDATE, updateId);
+    else sessionStorage.removeItem(WATCHED_HOST_UPDATE);
+  } catch {
+    // Without storage the announcement is lost to a reload, nothing worse.
+  }
+}
+
 export function useFleet(notify: Notify) {
   const [snapshot, setSnapshot] = useState<Snapshot>(emptySnapshot);
   const [snapshotRevision, setSnapshotRevision] = useState(0);
@@ -82,6 +106,8 @@ export function useFleet(notify: Notify) {
    * per run — so they patch by run id instead of forcing a whole snapshot.
    */
   const [runSteps, setRunSteps] = useState<Record<string, RunStep[]>>({});
+  const runStepRevision = useRef(0);
+  const runStepRevisions = useRef(new Map<string, number>());
   /** Durable task checkpoints, including the original reports and worker attempts. */
   const [runNotes, setRunNotes] = useState<Record<string, RunNote[]>>({});
   const runNoteRevision = useRef(0);
@@ -100,7 +126,7 @@ export function useFleet(notify: Notify) {
   const hydrationTicket = useRef(0);
   const latestHydrationTicket = useRef(0);
   const activeHydrations = useRef(new Map<number, number>());
-  const hydrationChanges = useRef<NotificationHydrationChange[]>([]);
+  const hydrationChanges = useRef<SnapshotHydrationChange[]>([]);
 
   // Kept in a ref so the socket subscription never re-runs when the caller
   // re-creates its notify callback.
@@ -111,12 +137,35 @@ export function useFleet(notify: Notify) {
     notifyRef.current(errorMessage(reason), "error");
   }, []);
 
+  /** Announces the end of a Host update this tab watched begin. */
+  const announceHostUpdate = useCallback((status: HostUpdateStatus | undefined) => {
+    const update = status?.update;
+    if (!update) return;
+    if (!updateFinished(update.stage)) {
+      watchHostUpdate(update.updateId);
+      return;
+    }
+    if (watchedHostUpdate() !== update.updateId) return;
+    watchHostUpdate(undefined);
+    if (update.stage === "failed") {
+      notifyRef.current(update.detail || "The Host update failed", "error");
+      return;
+    }
+    notifyRef.current(
+      update.revision
+        ? `Host ${update.detail.charAt(0).toLowerCase()}${update.detail.slice(1)}. Reload this page to load the updated interface.`
+        : update.detail || "The Host is already up to date",
+      "success",
+    );
+  }, []);
+
   const recordHydrationChange = useCallback(
     (
       change:
-        | Omit<Extract<NotificationHydrationChange, { type: "upsert" }>, "revision">
-        | Omit<Extract<NotificationHydrationChange, { type: "count" }>, "revision">
-        | Omit<Extract<NotificationHydrationChange, { type: "snapshot" }>, "revision">,
+        | Omit<Extract<SnapshotHydrationChange, { type: "upsert" }>, "revision">
+        | Omit<Extract<SnapshotHydrationChange, { type: "count" }>, "revision">
+        | Omit<Extract<SnapshotHydrationChange, { type: "host_update" }>, "revision">
+        | Omit<Extract<SnapshotHydrationChange, { type: "snapshot" }>, "revision">,
     ) => {
       const revision = ++notificationRevision.current;
       if (activeHydrations.current.size > 0) {
@@ -156,9 +205,7 @@ export function useFleet(notify: Notify) {
     (next: Snapshot) => {
       const revision = recordHydrationChange({
         type: "snapshot",
-        notifications: next.notifications,
-        unreadCount: next.notificationUnreadCount,
-        prMaintenanceApprovals: next.prMaintenanceApprovals,
+        data: next,
       });
       for (const notification of next.notifications) {
         knownNotificationIds.current.add(notification.id);
@@ -175,8 +222,9 @@ export function useFleet(notify: Notify) {
         notifications: sortNotifications(next.notifications),
       });
       setSnapshotRevision((value) => value + 1);
+      announceHostUpdate(next.hostUpdate);
     },
-    [recordHydrationChange],
+    [announceHostUpdate, recordHydrationChange],
   );
 
   const beginHydration = useCallback(() => {
@@ -203,19 +251,25 @@ export function useFleet(notify: Notify) {
     (next: Snapshot, request: { ticket: number; revision: number }) => {
       if (latestHydrationTicket.current !== request.ticket) return false;
 
+      let latest = next;
       let notifications = next.notifications;
       let unreadCount = next.notificationUnreadCount;
-      let maintenanceApprovals = next.prMaintenanceApprovals;
+      let hostUpdate = next.hostUpdate;
       let replayedNotificationChange = false;
       let replayedUnreadCount = false;
       for (const change of hydrationChanges.current) {
         if (change.revision <= request.revision) continue;
         if (change.type === "snapshot") {
-          notifications = change.notifications;
-          unreadCount = change.unreadCount;
-          maintenanceApprovals = change.prMaintenanceApprovals;
+          latest = change.data;
+          notifications = latest.notifications;
+          unreadCount = latest.notificationUnreadCount;
+          hostUpdate = latest.hostUpdate;
           replayedNotificationChange = true;
           replayedUnreadCount = true;
+          continue;
+        }
+        if (change.type === "host_update") {
+          hostUpdate = change.status;
           continue;
         }
         if (change.type === "upsert") {
@@ -244,16 +298,17 @@ export function useFleet(notify: Notify) {
       latestUnreadAffectingUpsertRevision.current = revision;
       unreadCountRevision.current = revision;
       setSnapshot({
-        ...next,
+        ...latest,
         notifications: sortNotifications(notifications),
         notificationUnreadCount: unreadCount,
-        prMaintenanceApprovals: maintenanceApprovals,
+        hostUpdate,
       });
       setSnapshotRevision((value) => value + 1);
       currentUnreadCount.current = unreadCount;
+      announceHostUpdate(hostUpdate);
       return true;
     },
-    [],
+    [announceHostUpdate],
   );
 
   /**
@@ -286,13 +341,22 @@ export function useFleet(notify: Notify) {
        * every run as "0 steps" until the next live broadcast happens to
        * arrive — which for a finished run is never.
        */
+      const stepsStartedAt = runStepRevision.current;
       const notesStartedAt = runNoteRevision.current;
       const runs = await api<{
         stepsByRunId: Record<string, RunStep[]>;
         notesByRunId: Record<string, RunNote[]>;
       }>("/api/runs");
-      setRunSteps(runs.stepsByRunId ?? {});
       if (hydration.ticket === latestHydrationTicket.current) {
+        setRunSteps((current) => {
+          const next = { ...runs.stepsByRunId };
+          for (const [runId, revision] of runStepRevisions.current) {
+            if (revision > stepsStartedAt && current[runId]) {
+              next[runId] = current[runId];
+            }
+          }
+          return next;
+        });
         setRunNotes((current) => {
           const next = { ...runs.notesByRunId };
           for (const [runId, revision] of runNoteRevisions.current) {
@@ -502,35 +566,26 @@ export function useFleet(notify: Notify) {
         attempt += 1;
       };
       socket.onmessage = ({ data }) => {
-        const message = parseBrowserMessage(String(data));
-        if (!message) {
+        const decoded = decodeFrame(String(data), BrowserMessageSchema);
+        if (!decoded.ok) {
           notifyRef.current("Malformed live update", "error");
-          socket?.close(1007, "Malformed JSON");
+          socket?.close(decoded.code, decoded.reason);
           return;
         }
+        const message = decoded.value;
         if (message.type === "command_execution") {
-          const parsed = CommandExecutionSchema.safeParse(message.execution);
-          if (!parsed.success) {
-            notifyRef.current("Malformed command execution update", "error");
-            socket?.close(1007, "Malformed command execution");
-            return;
-          }
           setSnapshot((value) => ({
             ...value,
             commandExecutions: mergeCommandExecutions(value.commandExecutions ?? [], [
-              parsed.data,
+              message.execution,
             ]).slice(0, 200),
           }));
           return;
         }
         if (message.type === "command_execution_output") {
-          const parsed = CommandOutputEventSchema.safeParse(message.event);
-          if (!parsed.success) {
-            notifyRef.current("Malformed command output", "error");
-            socket?.close(1007, "Malformed command output");
-            return;
-          }
-          pendingCommandOutput = mergeCommandOutput(pendingCommandOutput, [parsed.data]);
+          pendingCommandOutput = mergeCommandOutput(pendingCommandOutput, [
+            message.event,
+          ]);
           if (!commandFlushTimer) {
             commandFlushTimer = setTimeout(() => {
               const batch = pendingCommandOutput;
@@ -580,6 +635,13 @@ export function useFleet(notify: Notify) {
             notifyRef.current(detail || "Node update failed", "error");
           if (stage === "up_to_date")
             notifyRef.current(detail || "Already up to date", "success");
+          return;
+        }
+        if (message.type === "host_update") {
+          const { status } = message;
+          recordHydrationChange({ type: "host_update", status });
+          setSnapshot((value) => ({ ...value, hostUpdate: status }));
+          announceHostUpdate(status);
           return;
         }
         if (message.type === "session_notice") {
@@ -637,7 +699,18 @@ export function useFleet(notify: Notify) {
         }
         if (message.type === "run_steps") {
           const { runId, steps } = message;
+          runStepRevisions.current.set(runId, ++runStepRevision.current);
           setRunSteps((value) => ({ ...value, [runId]: steps }));
+          return;
+        }
+        if (message.type === "worker_resume_request") {
+          const { request } = message;
+          setSnapshot((value) => ({
+            ...value,
+            workerResumeRequests: mergeResumeRequests(value.workerResumeRequests ?? [], [
+              request,
+            ]),
+          }));
           return;
         }
         const { event } = message;
@@ -656,8 +729,10 @@ export function useFleet(notify: Notify) {
       socket?.close();
     };
   }, [
+    announceHostUpdate,
     applyNotification,
     hydrateSocketSnapshot,
+    recordHydrationChange,
     recordNotificationUpsert,
     recordUnreadCount,
     refreshWithStatus,
@@ -711,14 +786,6 @@ function sortNotifications(notifications: Notification[]): Notification[] {
     (left, right) =>
       right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id),
   );
-}
-
-function parseBrowserMessage(text: string): BrowserMessage | undefined {
-  try {
-    return JSON.parse(text) as BrowserMessage;
-  } catch {
-    return undefined;
-  }
 }
 
 export async function api<T = unknown>(path: string, init?: RequestInit): Promise<T> {

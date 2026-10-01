@@ -1,6 +1,7 @@
 import { isAbsolute, resolve } from "node:path";
 import { realpath, stat } from "node:fs/promises";
 import {
+  agentKindLabels,
   CONTEXT_TIER_CONFIG_ID,
   ContextTierSchema,
   eventPayload,
@@ -159,6 +160,12 @@ export class CommandRouter {
 
   get activeSessionIds(): string[] {
     return [...this.slots.keys()];
+  }
+
+  /** Where a live session is working, working directory first; empty otherwise. */
+  sessionRoots(sessionId: string): string[] {
+    const slot = this.slots.get(sessionId);
+    return slot?.cwd ? [slot.cwd, ...(slot.additionalDirectories ?? [])] : [];
   }
 
   async route(command: NodeCommand): Promise<CommandResult> {
@@ -370,7 +377,7 @@ export class CommandRouter {
         ) {
           agent.resync();
           throw new CommandRefused(
-            "Copilot is still working on the previous turn; wait for it to finish or cancel it",
+            `${agentKindLabels[slot.launch?.agentParams?.kind ?? "copilot"]} is still working on the previous turn; wait for it to finish or cancel it`,
           );
         }
         void this.withActivity(slot, () =>
@@ -387,9 +394,7 @@ export class CommandRouter {
             if (command.configId === CONTEXT_TIER_CONFIG_ID) {
               const tier = ContextTierSchema.parse(command.value);
               if (!slot.config.has(CONTEXT_TIER_CONFIG_ID)) {
-                throw new CommandRefused(
-                  "This Copilot does not support context switching",
-                );
+                throw new CommandRefused("This agent does not support context switching");
               }
               if (agent.busy) {
                 agent.resync();
@@ -590,6 +595,14 @@ export class CommandRouter {
   }
 
   private async deleteSession(command: DeleteSessionCommand): Promise<void> {
+    if (
+      command.agentParams?.kind === "hermes" ||
+      this.slots.get(command.sessionId)?.launch?.agentParams?.kind === "hermes"
+    ) {
+      throw new CommandRefused(
+        "unsupported_delete: Manage Hermes conversation history in its named profile; Copilot retention cannot delete it.",
+      );
+    }
     const localCutoff = sessionRetentionCutoff(Date.now(), command.retentionDays);
     const hostCutoff = Date.parse(command.inactiveBefore);
     if (localCutoff === undefined || !Number.isFinite(hostCutoff)) {
@@ -700,6 +713,18 @@ export class CommandRouter {
     }
     const existing = this.slots.get(command.sessionId);
     if (existing) {
+      const previous = existing.launch?.agentParams ?? { kind: "copilot" };
+      const next = command.agentParams ?? { kind: "copilot" };
+      if (
+        previous.kind !== next.kind ||
+        (previous.kind === "hermes" &&
+          next.kind === "hermes" &&
+          previous.profile !== next.profile)
+      ) {
+        return Promise.reject(
+          new CommandRefused("A live conversation cannot change its agent or profile."),
+        );
+      }
       if (existing.mcpRecovery || existing.stopping)
         return Promise.reject(
           new CommandRefused("Session is recovering MCP tools or being stopped"),
@@ -737,6 +762,21 @@ export class CommandRouter {
       );
     }
     const kind: SessionKind = command.readOnly ? "read-only" : "writing";
+    const params = command.agentParams;
+    if (
+      params?.kind === "hermes" &&
+      [...this.slots.values(), ...this.reconciliation.values()].some(
+        (slot) =>
+          slot.launch?.agentParams?.kind === "hermes" &&
+          slot.launch.agentParams.profile === params.profile,
+      )
+    ) {
+      return Promise.reject(
+        new CommandRefused(
+          `Hermes profile "${params.profile}" is already in use on this Node. Stop its orchestrator and wait for cleanup before reusing it.`,
+        ),
+      );
+    }
     const held = [...new Map([...this.reconciliation, ...this.slots]).values()].filter(
       (slot) => slot.kind === kind,
     ).length;
@@ -749,6 +789,7 @@ export class CommandRouter {
       inFlightCommands: 0,
     };
     const slot: SessionSlot = {
+      launch: command,
       ready: Promise.resolve(),
       initializing: true,
       activity,
@@ -878,7 +919,7 @@ export class CommandRouter {
       const mcpServers = resolveMcpServers(command.mcpServers, this.hostUrl());
       const requested = await installRequestedAgent(
         cwd,
-        command.agent,
+        (command.agentParams?.kind ?? "copilot") === "copilot" ? command.agent : "",
         await this.agentCatalog(),
       );
       if (requested.reason) {
@@ -900,6 +941,7 @@ export class CommandRouter {
           sink,
           command.type === "resume_session"
             ? {
+                ...(command.agentParams ? { agentParams: command.agentParams } : {}),
                 resumeAgentSessionId: command.agentSessionId,
                 ...(command.contextOverflowRecoveryPrompt
                   ? {
@@ -918,6 +960,10 @@ export class CommandRouter {
                 ...this.processOwnership(slot),
               }
             : {
+                ...(command.agentParams ? { agentParams: command.agentParams } : {}),
+                ...(command.startupNotice
+                  ? { startupNotice: command.startupNotice }
+                  : {}),
                 contextOverflowRecoveryPrompt: command.prompt,
                 yolo: command.yolo,
                 agencyMode: command.agencyMode ?? false,
@@ -1221,7 +1267,7 @@ export class CommandRouter {
       ) {
         slot.refreshMcpPending = true;
         this.warn(
-          `session ${sessionId.slice(0, 8)}: Fleet MCP tools were lost; restarting Copilot after the current turn`,
+          `session ${sessionId.slice(0, 8)}: Fleet MCP tools were lost; restarting ${agentKindLabels[slot.launch?.agentParams?.kind ?? "copilot"]} after the current turn`,
         );
       }
       if (toolCallId && (tool.status === "completed" || tool.status === "failed")) {
@@ -1339,7 +1385,7 @@ export class CommandRouter {
       this.failReplacement(
         sessionId,
         slot,
-        `Copilot could not be restarted to ${purpose}`,
+        `${agentKindLabels[slot.launch?.agentParams?.kind ?? "copilot"]} could not be restarted to ${purpose}`,
       );
       throw error;
     });
@@ -1448,7 +1494,7 @@ export class CommandRouter {
             slot,
             slot.agent?.busy ? "running" : "idle",
             slot.agent?.busy
-              ? "MCP tools restored; Copilot is working"
+              ? `MCP tools restored; ${agentKindLabels[slot.launch?.agentParams?.kind ?? "copilot"]} is working`
               : "MCP tools restored; ready for follow-up",
           );
           return;
@@ -1547,6 +1593,7 @@ export class CommandRouter {
           );
         },
         {
+          ...(launch.agentParams ? { agentParams: launch.agentParams } : {}),
           resumeAgentSessionId: slot.agentSessionId!,
           contextOverflowRecoveryPrompt:
             launch.type === "start_session"

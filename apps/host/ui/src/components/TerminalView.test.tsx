@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { ComponentProps } from "react";
 import type { FleetSession, SessionEvent } from "@fleet/protocol";
@@ -86,6 +86,126 @@ const streamEvent = (
 });
 
 describe("TerminalView composer", () => {
+  it.each(["idle", "running"] as const)(
+    "identifies Hermes and only enables its model picker when idle: %s",
+    (state) => {
+      show({
+        state,
+        runRole: "lead",
+        agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+      });
+      expect(screen.getByText("Hermes")).toBeTruthy();
+      expect(
+        screen.getByRole<HTMLButtonElement>("button", { name: "Model settings" })
+          .disabled,
+      ).toBe(state !== "idle");
+    },
+  );
+
+  it.each([false, true])(
+    "only clears a draft after the Host accepts it: %s",
+    async (accepted) => {
+      const draft: SessionDraft = {
+        prompt: "Do not lose this",
+        attachments: [
+          { id: "file", name: "note.txt", mimeType: "text/plain", data: "aGk=" },
+        ],
+      };
+      let current = draft;
+      const onPrompt = vi.fn(async () => accepted);
+      show(
+        {},
+        draft,
+        [],
+        vi.fn(),
+        (update) => {
+          current = update(current);
+        },
+        onPrompt,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      });
+      expect(onPrompt).toHaveBeenCalledWith("Do not lose this", [
+        { name: "note.txt", mimeType: "text/plain", data: "aGk=" },
+      ]);
+      expect(current).toEqual(accepted ? EMPTY_DRAFT : draft);
+    },
+  );
+
+  it("keeps edits made while a prompt is being accepted", async () => {
+    const draft: SessionDraft = { prompt: "First request", attachments: [] };
+    let current = draft;
+    let finish!: (accepted: boolean) => void;
+    const onPrompt = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    show(
+      {},
+      draft,
+      [],
+      vi.fn(),
+      (update) => {
+        current = update(current);
+      },
+      onPrompt,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(current).toBe(draft);
+    const edited = { prompt: "Next request", attachments: [] };
+    current = edited;
+    await act(async () => {
+      finish(true);
+    });
+    expect(current).toBe(edited);
+  });
+
+  it.each([false, true])(
+    "only clears a selected slash command after acceptance: %s",
+    async (accepted) => {
+      const draft: SessionDraft = { prompt: "/comp", attachments: [] };
+      let current = draft;
+      const onPrompt = vi.fn(async () => accepted);
+      show(
+        { commands: [{ name: "compact", description: "Summarize history" }] },
+        draft,
+        [],
+        vi.fn(),
+        (update) => {
+          current = update(current);
+        },
+        onPrompt,
+      );
+      await act(async () => {
+        fireEvent.keyDown(screen.getByLabelText("Follow-up prompt"), { key: "Enter" });
+      });
+      expect(onPrompt).toHaveBeenCalledWith("/compact", []);
+      expect(current).toEqual(accepted ? EMPTY_DRAFT : draft);
+    },
+  );
+
+  it("leaves IME confirmation keys to the input method", () => {
+    const onPrompt = vi.fn();
+    const onDraftChange = vi.fn();
+    show(
+      {},
+      { prompt: "Composing", attachments: [] },
+      [],
+      vi.fn(),
+      onDraftChange,
+      onPrompt,
+    );
+    fireEvent.keyDown(screen.getByLabelText("Follow-up prompt"), {
+      key: "Enter",
+      isComposing: true,
+    });
+    expect(onPrompt).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+  });
+
   it("compacts via /compact without sending or clearing a pending draft", () => {
     const onPrompt = vi.fn();
     const onDraftChange = vi.fn();
@@ -159,8 +279,9 @@ describe("TerminalView composer", () => {
     expect(button.disabled).toBe(true);
     fireEvent.click(button);
     expect(onPrompt).not.toHaveBeenCalled();
-    expect(screen.getByText("\u2014")).toBeTruthy();
-    expect(screen.getByText("Usage unavailable")).toBeTruthy();
+    const usage = screen.getByRole("group", { name: "Session usage" });
+    expect(within(usage).getByText("?")).toBeTruthy();
+    expect(within(usage).getByText("? (Usage unavailable)")).toBeTruthy();
   });
 
   it("adds attachment read errors to notifications and keeps the inline error", async () => {

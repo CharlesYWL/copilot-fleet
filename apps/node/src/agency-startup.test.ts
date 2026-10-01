@@ -9,6 +9,7 @@ import { PassThrough } from "node:stream";
 import { CONTEXT_TIER_CONFIG_ID, type SessionEvent } from "@fleet/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ACP_START_TIMEOUT_MS,
   AcpAgentFactory,
   AgentStartupCleanupError,
   type SessionAgent,
@@ -19,6 +20,7 @@ import { spawnManagedProcess, stopProcessTree } from "./process-quiescence.js";
 
 const installation = vi.hoisted(() => ({
   path: "C:\\Program Files\\Agency\\agency.exe" as string | undefined,
+  hermes: "C:\\tools\\hermes.exe" as string | undefined,
 }));
 const credits = vi.hoisted(() => ({
   value: undefined as number | undefined,
@@ -40,6 +42,9 @@ vi.mock("./copilot-launch.js", async (importOriginal) => {
   const actual = await importOriginal<typeof copilotLaunch>();
   return {
     ...actual,
+    findAgentCommand: vi.fn(async (name: string) =>
+      name === "hermes" ? installation.hermes : installation.path,
+    ),
     resolveCopilotLaunch: vi.fn((enabled: boolean, command: string) =>
       actual.resolveCopilotLaunch(enabled, command, async () => installation.path),
     ),
@@ -77,6 +82,7 @@ let currentModel = "model-a";
 let interleavedText = false;
 let splitContextResponse = false;
 let oversizedLoad = false;
+let missingHermesLoad = false;
 let oversizedPrompts = 0;
 let createdSessions = 0;
 const platform = process.platform;
@@ -86,6 +92,7 @@ beforeEach(() => {
   requests.length = 0;
   processes.length = 0;
   installation.path = "C:\\Program Files\\Agency\\agency.exe";
+  installation.hermes = "C:\\tools\\hermes.exe";
   metadataFailure = undefined;
   startupFailure = undefined;
   startupHangs = undefined;
@@ -104,6 +111,7 @@ beforeEach(() => {
   interleavedText = false;
   splitContextResponse = false;
   oversizedLoad = false;
+  missingHermesLoad = false;
   oversizedPrompts = 0;
   createdSessions = 0;
   const spawnProcess = (command: string, argv: readonly string[]) => {
@@ -134,10 +142,11 @@ beforeEach(() => {
     });
     processes.push({ command, args: [...argv], child });
     const agency = argv[0] === "copilot";
-    if (!argv.includes("--acp")) {
+    const hermes = argv.includes("acp");
+    if (!argv.includes("--acp") && (!hermes || argv.includes("--check"))) {
       queueMicrotask(() => {
         if (metadataHangs) return;
-        if (agency && metadataFailure) {
+        if ((agency || hermes) && metadataFailure) {
           child.stderr.write(metadataFailure);
           close(1);
           return;
@@ -170,6 +179,9 @@ beforeEach(() => {
         ) {
           currentModel = String(request.params.value);
         }
+        if (request.method === "session/set_model") {
+          currentModel = String(request.params.modelId);
+        }
         const configOptions = [
           {
             id: "allow_all",
@@ -200,26 +212,43 @@ beforeEach(() => {
           request.method === "session/prompt" &&
           (request.params.prompt as { type: string; text?: string }[])[0]?.text ===
             "/context";
+        const sessionConfig = hermes
+          ? {
+              models: {
+                currentModelId: currentModel,
+                availableModels: [
+                  { modelId: "model-a", name: "A" },
+                  { modelId: "model-b", name: "B" },
+                ],
+              },
+              modes: {
+                currentModeId: "default",
+                availableModes: [{ id: "default", name: "Default" }],
+              },
+            }
+          : { configOptions };
         const result =
-          request.method === "initialize"
-            ? {
-                protocolVersion: 1,
-                agentCapabilities: {
-                  loadSession: true,
-                  sessionCapabilities: { additionalDirectories: {} },
-                },
-              }
-            : request.method === "session/new"
+          hermes && request.method === "session/load" && missingHermesLoad
+            ? null
+            : request.method === "initialize"
               ? {
-                  sessionId:
-                    ++createdSessions === 1
-                      ? "acp-created"
-                      : `acp-created-${createdSessions}`,
-                  configOptions,
+                  protocolVersion: 1,
+                  agentCapabilities: {
+                    loadSession: true,
+                    sessionCapabilities: { additionalDirectories: {} },
+                  },
                 }
-              : request.method === "session/prompt"
-                ? { stopReason: "end_turn" }
-                : { configOptions };
+              : request.method === "session/new"
+                ? {
+                    sessionId:
+                      ++createdSessions === 1
+                        ? "acp-created"
+                        : `acp-created-${createdSessions}`,
+                    ...sessionConfig,
+                  }
+                : request.method === "session/prompt"
+                  ? { stopReason: "end_turn" }
+                  : sessionConfig;
         const oversized =
           (request.method === "session/load" && oversizedLoad) ||
           (request.method === "session/prompt" && !isContext && oversizedPrompts-- > 0);
@@ -402,6 +431,251 @@ describe("Worker publication permissions over ACP", () => {
         ["turn_complete", { stopReason: "end_turn" }],
         ["state", { state: "idle", activity: "Ready for follow-up" }],
       ]);
+    },
+  );
+});
+
+describe("Hermes ACP startup", () => {
+  const params = { kind: "hermes", profile: "fleet-orchestrator" } as const;
+  const hermesLaunch = () =>
+    processes.find(
+      (process) => process.args.includes("acp") && !process.args.includes("--check"),
+    )!;
+
+  it("rejects Hermes's null response for missing history instead of announcing a phantom resume", async () => {
+    missingHermesLoad = true;
+    const events: SessionEvent[] = [];
+    await expect(
+      new AcpAgentFactory(60_000, "copilot").start(
+        "hermes",
+        "C:\\repo",
+        (event) => events.push(event),
+        { agentParams: params, resumeAgentSessionId: "missing-native-id", yolo: true },
+      ),
+    ).rejects.toThrow(/Hermes did not return session state/);
+    expect(
+      events.some(
+        (event) =>
+          event.type === "agent_session" ||
+          (event.type === "state" && event.payload.state === "idle"),
+      ),
+    ).toBe(false);
+    expect(requests.some((request) => request.method === "session/new")).toBe(false);
+  });
+
+  it("uses the named profile, legacy model API and HTTP Fleet tools without any Copilot probes or settings", async () => {
+    advertiseContext = true;
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "hermes",
+      "C:\\repo",
+      (event) => events.push(event),
+      {
+        agentParams: params,
+        yolo: true,
+        agencyMode: true,
+        contextTier: "long_context",
+        mcpServers: [
+          {
+            name: "fleet",
+            url: "http://127.0.0.1:8787/mcp",
+            headers: [{ name: "Authorization", value: "Bearer test" }],
+          },
+        ],
+      },
+    );
+    agents.push(agent);
+    expect(processes.map((process) => process.args)).toEqual([
+      ["-p", "fleet-orchestrator", "acp", "--check"],
+      ["-p", "fleet-orchestrator", "acp"],
+    ]);
+    expect(resolveCopilotLaunch).not.toHaveBeenCalled();
+    expect(credits.readers).toEqual([]);
+    expect(
+      requests.find((request) => request.method === "session/new")?.params,
+    ).toMatchObject({
+      mcpServers: [
+        {
+          type: "http",
+          name: "fleet",
+          headers: [{ name: "Authorization", value: "Bearer test" }],
+        },
+      ],
+    });
+    expect(events.find((event) => event.type === "config")?.payload).toMatchObject({
+      options: [{ id: "model", currentValue: "model-a" }, { id: "mode" }],
+    });
+    await agent.setConfigOption("model", "model-b");
+    await agent.setConfigOption("mode", "default");
+    expect(
+      requests.find((request) => request.method === "session/set_mode")?.params,
+    ).toEqual({
+      sessionId: "acp-created",
+      modeId: "default",
+    });
+    await expect(agent.setConfigOption("model", "unoffered")).rejects.toThrow(
+      /did not offer/,
+    );
+    expect(
+      requests.find((request) => request.method === "session/set_model")?.params,
+    ).toEqual({
+      sessionId: "acp-created",
+      modelId: "model-b",
+    });
+    const child = hermesLaunch().child as ChildProcessWithoutNullStreams;
+    child.stdout.push(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "acp-created",
+          update: { sessionUpdate: "current_mode_update", currentModeId: "accept_edits" },
+        },
+      })}\n`,
+    );
+    await expect
+      .poll(() => events.filter((event) => event.type === "config").at(-1)?.payload)
+      .toMatchObject({
+        options: [
+          { id: "model", currentValue: "model-b" },
+          { id: "mode", currentValue: "accept_edits" },
+        ],
+      });
+    expect(agent.busy).toBe(false);
+    expect(
+      requests.some((request) => request.method === "session/set_config_option"),
+    ).toBe(false);
+    await agent.prompt("A synthetic task");
+    expect(
+      requests.filter((request) => request.method === "session/prompt"),
+    ).toHaveLength(1);
+    expect(
+      events.find((event) => event.type === "usage" && event.payload.context)?.payload,
+    ).toMatchObject({
+      contextTokens: 28000,
+      contextWindow: 272000,
+      context: { model: "model-b", tokenLimit: 272000, source: "acp", estimated: true },
+    });
+    expect(
+      events.some((event) => event.type === "usage" && "aiCredits" in event.payload),
+    ).toBe(false);
+    expect(
+      events.some((event) => JSON.stringify(event.payload).includes("Copilot")),
+    ).toBe(false);
+  });
+
+  it.each([
+    { always: true, once: true, expected: "always" },
+    { always: false, once: true, expected: "once" },
+    { always: false, once: false, expected: undefined },
+  ])(
+    "auto-approves only offered allow options: %j",
+    async ({ always, once, expected }) => {
+      const events: SessionEvent[] = [];
+      const agent = await new AcpAgentFactory(60_000, "copilot").start(
+        "hermes",
+        "C:\\repo",
+        (event) => events.push(event),
+        { agentParams: params, yolo: true },
+      );
+      agents.push(agent);
+      const child = hermesLaunch().child as ChildProcessWithoutNullStreams;
+      child.stdout.push(
+        `${JSON.stringify({
+          jsonrpc: "2.0",
+          id: 20001,
+          method: "session/request_permission",
+          params: {
+            sessionId: "acp-created",
+            toolCall: { toolCallId: "tool", title: "Run tool" },
+            options: [
+              ...(once
+                ? [{ optionId: "once", name: "Allow once", kind: "allow_once" }]
+                : []),
+              ...(always
+                ? [{ optionId: "always", name: "Allow always", kind: "allow_always" }]
+                : []),
+              { optionId: "reject", name: "Reject", kind: "reject_once" },
+            ],
+          },
+        })}\n`,
+      );
+      await expect
+        .poll(() => requests.find((request) => request.id === 20001))
+        .toMatchObject({
+          result: {
+            outcome: expected
+              ? { outcome: "selected", optionId: expected }
+              : { outcome: "cancelled" },
+          },
+        });
+      expect(events.some((event) => event.type === "permission")).toBe(false);
+    },
+  );
+
+  it("does not auto-approve a non-YOLO Hermes session", async () => {
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "hermes",
+      "C:\\repo",
+      (event) => events.push(event),
+      { agentParams: params, yolo: false },
+    );
+    agents.push(agent);
+    (hermesLaunch().child as ChildProcessWithoutNullStreams).stdout.push(
+      `${JSON.stringify({
+        jsonrpc: "2.0",
+        id: 20002,
+        method: "session/request_permission",
+        params: {
+          sessionId: "acp-created",
+          toolCall: { toolCallId: "tool", title: "Run tool" },
+          options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }],
+        },
+      })}\n`,
+    );
+    await expect
+      .poll(() => events.some((event) => event.type === "permission"))
+      .toBe(true);
+    expect(requests.find((request) => request.id === 20002)).toBeUndefined();
+    await agent.stop();
+  });
+
+  it("loads the same native conversation and does not apply Copilot overflow recovery", async () => {
+    const factory = new AcpAgentFactory(60_000, "copilot");
+    const agent = await factory.start("hermes", "C:\\repo", () => {}, {
+      agentParams: params,
+      resumeAgentSessionId: "saved-hermes",
+      yolo: true,
+    });
+    agents.push(agent);
+    expect(
+      requests.find((request) => request.method === "session/load")?.params.sessionId,
+    ).toBe("saved-hermes");
+    expect(requests.some((request) => request.method === "session/new")).toBe(false);
+    await agent.stop();
+    oversizedLoad = true;
+    await expect(
+      factory.start("another", "C:\\repo", () => {}, {
+        agentParams: params,
+        resumeAgentSessionId: "too-large",
+        yolo: true,
+      }),
+    ).rejects.toThrow(/request is too large/);
+    expect(requests.some((request) => request.method === "session/new")).toBe(false);
+  });
+
+  it.each(["profile", "authentication"])(
+    "reports %s errors without launching Copilot",
+    async (failure) => {
+      if (failure === "profile") metadataFailure = "Profile not found";
+      else startupFailure = "Authentication required";
+      await expect(
+        new AcpAgentFactory(60_000, "copilot").start("hermes", "C:\\repo", () => {}, {
+          agentParams: params,
+        }),
+      ).rejects.toThrow(/hermes -p fleet-orchestrator acp --setup/);
+      expect(resolveCopilotLaunch).not.toHaveBeenCalled();
     },
   );
 });
@@ -1377,7 +1651,9 @@ describe("Agency ACP startup", () => {
         finishRead = resolve;
       });
       await vi.advanceTimersByTimeAsync(2_000);
-      expect(Reflect.get(agent, "creditRead")).toBeInstanceOf(Promise);
+      expect(Reflect.get(Reflect.get(agent, "usageReporter"), "reading")).toBeInstanceOf(
+        Promise,
+      );
       let finishCleanup!: () => void;
       vi.mocked(stopProcessTree).mockImplementationOnce(
         (child) =>
@@ -1498,5 +1774,113 @@ describe("Agency ACP startup", () => {
     expect(processes[0]?.child.kill).toHaveBeenCalled();
     expect(launches()).toHaveLength(0);
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("Agent identity environment", () => {
+  const backends = [
+    { kind: "copilot" },
+    { kind: "hermes", profile: "fleet-orchestrator" },
+  ] as const;
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  /** The options each ACP launch was spawned with, by either spawn path. */
+  const launchOptions = () =>
+    [...vi.mocked(spawn).mock.calls, ...vi.mocked(spawnManagedProcess).mock.calls]
+      .filter(
+        ([, args]) =>
+          args?.includes("--acp") || (args?.includes("acp") && !args.includes("--check")),
+      )
+      .map(([, , options]) => options as childProcess.SpawnOptions | undefined);
+
+  it.each(backends)(
+    "refreshes Node identity for $kind on start and resume without losing startup notices",
+    async (agentParams) => {
+      vi.stubEnv("FLEET_TEST_INHERITED", "kept");
+      vi.stubEnv("FLEET_NODE_ID", "inherited-node");
+      vi.stubEnv("FLEET_NODE_IDENTITY_URL", "http://127.0.0.1:9999/api/identity");
+      let nodeId = "node-1";
+      // Not listening yet when the first agent starts.
+      let identityUrl: string | undefined = undefined;
+      const factory = new AcpAgentFactory(
+        60_000,
+        "copilot",
+        "default",
+        ACP_START_TIMEOUT_MS,
+        () => ({ nodeId, identityUrl }),
+      );
+      const events: SessionEvent[] = [];
+      const firstAgent = await factory.start(
+        "s1",
+        "C:\\repo",
+        (event) => events.push(event),
+        {
+          agentParams,
+          startupNotice: "Backend selection notice",
+        },
+      );
+      agents.push(firstAgent);
+      expect(events).toContainEqual(
+        expect.objectContaining({
+          type: "system",
+          payload: { text: "Backend selection notice" },
+        }),
+      );
+      await firstAgent.stop();
+      nodeId = "node-2";
+      identityUrl = "http://127.0.0.1:8789/api/identity";
+      agents.push(
+        await factory.start("s1", "C:\\repo", () => {}, {
+          agentParams,
+          resumeAgentSessionId: "acp-created",
+        }),
+      );
+
+      const [first, second] = launchOptions().map((options) => options?.env);
+      expect(first).toMatchObject({ FLEET_NODE_ID: "node-1" });
+      expect(first).not.toHaveProperty("FLEET_NODE_IDENTITY_URL");
+      expect(second).toMatchObject({
+        FLEET_NODE_ID: "node-2",
+        FLEET_NODE_IDENTITY_URL: identityUrl,
+        // Replacing the environment must not cost the agent anything it had.
+        FLEET_TEST_INHERITED: "kept",
+      });
+    },
+  );
+
+  it.each(backends)(
+    "reaches $kind launched inside a Windows job too",
+    async (agentParams) => {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      const factory = new AcpAgentFactory(
+        60_000,
+        "copilot",
+        "default",
+        ACP_START_TIMEOUT_MS,
+        () => ({ nodeId: "node-1", identityUrl: "http://127.0.0.1:8788/api/identity" }),
+      );
+      agents.push(
+        await factory.start("s1", "C:\\repo", () => {}, {
+          agentParams,
+          mcpServers: fleetMcp,
+        }),
+      );
+
+      expect(spawnManagedProcess).toHaveBeenCalledOnce();
+      expect(launchOptions()[0]?.env).toMatchObject({
+        FLEET_NODE_ID: "node-1",
+        FLEET_NODE_IDENTITY_URL: "http://127.0.0.1:8788/api/identity",
+      });
+    },
+  );
+
+  it("leaves the environment alone for a factory that was given no identity", async () => {
+    agents.push(
+      await new AcpAgentFactory(60_000, "copilot").start("s1", "C:\\repo", () => {}),
+    );
+    expect(launchOptions()[0]).not.toHaveProperty("env");
   });
 });
