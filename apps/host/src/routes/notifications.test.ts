@@ -9,6 +9,14 @@ import { FleetStore } from "../store.js";
 
 const PASSWORD = "notification-route-password";
 
+/**
+ * Minutes after a day ago. Relative to now, because the Host prunes dismissed
+ * notifications older than its retention window, so a fixed date eventually
+ * ages the dismissed fixture out from under these tests.
+ */
+const at = (minutes: number) =>
+  new Date(Date.now() - 24 * 60 * 60 * 1000 + minutes * 60 * 1000).toISOString();
+
 describe("notification routes", () => {
   let app: FastifyInstance;
   let directory: string;
@@ -47,16 +55,15 @@ describe("notification routes", () => {
       sequence: 1,
       type: "agent_session",
       payload: { agentSessionId: "stable-agent-id" },
-      createdAt: "2026-09-01T18:00:00.000Z",
+      createdAt: at(0),
     });
 
     seeded = ["first", "second", "third", "dismissed"].map(
       (key, index) =>
-        store.insertNotification(
-          notificationInput(key, `2026-09-01T18:0${index}:00.000Z`, sessionId),
-        ).notification,
+        store.insertNotification(notificationInput(key, at(index), sessionId))
+          .notification,
     );
-    store.dismissNotification(seeded[3]!.id, "2026-09-01T19:00:00.000Z");
+    store.dismissNotification(seeded[3]!.id, at(60));
     store.close();
 
     app = await buildServer({

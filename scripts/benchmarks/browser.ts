@@ -1,36 +1,30 @@
 import { strict as assert } from "node:assert";
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { createServer } from "node:net";
+import { execFileSync, type ChildProcess } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { cpus, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
-import { DatabaseSync } from "node:sqlite";
 import { chromium, type Browser, type Page } from "playwright-core";
 import { z } from "zod";
-import { TranscriptProjector, type SessionEvent } from "@fleet/protocol";
+import type { SessionEvent } from "@fleet/protocol";
 import {
-  AUTH_MODE_SETTING,
-  NO_AUTH_PRINCIPAL,
-} from "../../apps/host/src/auth/service.js";
-import { FleetStore } from "../../apps/host/src/store.js";
-import { HISTORY_FIXTURE_VERSION, historyEvents } from "./history-fixture.js";
+  PAGE_SCRIPT,
+  conversationName,
+  endMarker as marker,
+  freePort,
+  prepareConversations,
+  startHost,
+  stopHost,
+  type PageHarness,
+} from "../e2e/harness.js";
+import { HISTORY_FIXTURE_VERSION } from "./history-fixture.js";
 import { summarize, type Measurement } from "./history-report.js";
-import { seed } from "./history.js";
 
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
-const LEAD = "Synthetic session 0";
-const SMALL = "Synthetic session 1";
-const marker = (index: number) => `BENCHMARK-END-${index}`;
+const LEAD = conversationName(0);
+const SMALL = conversationName(1);
 
 const BrowserReportSchema = z.object({
   schemaVersion: z.literal(1),
@@ -115,194 +109,13 @@ function parseOptions(args: string[]): Options {
   };
 }
 
-function freePort(): Promise<number> {
-  return new Promise((accept, reject) => {
-    const server = createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      server.close(() =>
-        typeof address === "object" && address
-          ? accept(address.port)
-          : reject(new Error("No port")),
-      );
-    });
-  });
-}
-
-/** Seeds a disposable Host database: synthetic content only, signed in to nobody. */
-function prepareDatabase(path: string, options: Options) {
-  const store = new FleetStore(path);
-  const database = new DatabaseSync(path);
-  try {
-    database.exec("PRAGMA foreign_keys=ON");
-    const { ids, fixture } = seed(store, database, {
-      events: options.events,
-      sessions: options.sessions,
-      iterations: 1,
-      warmup: 0,
-      output: "",
-      worker: false,
-      help: false,
-    });
-    const counts = new Map<string, number>();
-    ids.forEach((id, index) =>
-      counts.set(
-        id,
-        index === 0 ? fixture.leadEvents : fixture.backgroundEventsPerSession,
-      ),
-    );
-    const insert = database.prepare(
-      "INSERT INTO events (event_id,session_id,sequence,type,payload,created_at,received_at) VALUES (?,?,?,?,?,?,?)",
-    );
-    const at = new Date(Date.UTC(2026, 0, 2)).toISOString();
-    const markerEvents = (id: string, index: number): SessionEvent[] => [
-      // A turn boundary first, so the marker is a line of its own.
-      {
-        eventId: `marker-turn-${index}`,
-        sessionId: id,
-        sequence: counts.get(id)! + 1,
-        type: "turn_complete",
-        payload: { stopReason: "end_turn" },
-        createdAt: at,
-      },
-      {
-        eventId: `marker-${index}`,
-        sessionId: id,
-        sequence: counts.get(id)! + 2,
-        type: "agent_text",
-        payload: { text: marker(index) },
-        createdAt: at,
-      },
-    ];
-    ids.forEach((id, index) => {
-      // A unique last line, so "opened" can be detected without scanning the page.
-      for (const event of markerEvents(id, index)) {
-        insert.run(
-          event.eventId,
-          id,
-          event.sequence,
-          event.type,
-          JSON.stringify(event.payload),
-          at,
-          at,
-        );
-      }
-      store.setSessionFavorite(id, true);
-    });
-    // The page opens on the first listed session; keep the long one cold.
-    store.reorderSessions([...ids.slice(1), ids[0]!]);
-    store.setSetting(AUTH_MODE_SETTING, NO_AUTH_PRINCIPAL);
-    const projector = new TranscriptProjector();
-    for (const event of historyEvents(ids[0]!, 0, fixture.leadEvents))
-      projector.apply(event);
-    return {
-      ids,
-      leadEvents: fixture.leadEvents,
-      leadBlocks: projector.blocks.length,
-      leadNextSequence: fixture.leadEvents + 3,
-    };
-  } finally {
-    database.close();
-    store.close();
-  }
-}
-
-async function startHost(root: string, databasePath: string, port: number) {
-  const entry = join(root, "apps", "host", "dist", "server", "server.js");
-  if (!existsSync(entry)) throw new Error(`Build the Host first: ${entry} is missing`);
-  // Only what this benchmark sets: never the operator's own Host configuration.
-  const env: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (!/^(FLEET_|ENROLLMENT_TOKEN|DATABASE_PATH|PORT|HOST$)/.test(key))
-      env[key] = value;
-  }
-  const child = spawn(process.execPath, [entry], {
-    cwd: root,
-    env: {
-      ...env,
-      NODE_ENV: "production",
-      DATABASE_PATH: databasePath,
-      PORT: String(port),
-      HOST: "127.0.0.1",
-    },
-    stdio: ["ignore", "ignore", "pipe"],
-  });
-  let errors = "";
-  child.stderr?.on("data", (chunk: Buffer) => {
-    errors = (errors + chunk.toString()).slice(-4_000);
-  });
-  const url = `http://127.0.0.1:${port}`;
-  for (let attempt = 0; attempt < 600; attempt++) {
-    if (child.exitCode !== null) throw new Error(`Host exited early:\n${errors}`);
-    try {
-      if ((await fetch(`${url}/api/health`)).ok) return { child, url };
-    } catch {
-      // Not listening yet.
-    }
-    await delay(100);
-  }
-  child.kill();
-  throw new Error(`Host did not start:\n${errors}`);
-}
-
-async function stopHost(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null) return;
-  const exited = new Promise((accept) => child.once("exit", accept));
-  child.kill();
-  await Promise.race([exited, delay(10_000)]);
-}
-
-/** Installed before the app loads: keeps its sockets, and measures in-page. */
-const INIT_SCRIPT = `
-// tsx keeps function names by wrapping them in __name, which page functions
-// sent through page.evaluate then reference.
-window.__name = (target) => target;
-(() => {
-  const sockets = [];
-  const Native = window.WebSocket;
-  window.WebSocket = class extends Native {
-    constructor(...args) { super(...args); sockets.push(this); }
-  };
-  window.__bench = {
-    sockets,
-    /** Resolves with ms from now until text containing "needle" is painted. */
-    untilPainted(needle, timeoutMs) {
-      const start = performance.now();
-      return new Promise((accept, reject) => {
-        const contains = (node) => (node.textContent || "").includes(needle);
-        let done = false;
-        const finish = () => {
-          if (done) return;
-          done = true;
-          observer.disconnect();
-          clearTimeout(timer);
-          requestAnimationFrame(() => setTimeout(() => accept(performance.now() - start), 0));
-        };
-        const observer = new MutationObserver((records) => {
-          for (const record of records) {
-            if (record.type === "characterData" ? contains(record.target) : [...record.addedNodes].some(contains)) {
-              finish();
-              return;
-            }
-          }
-        });
-        observer.observe(document.body, { subtree: true, childList: true, characterData: true });
-        const timer = setTimeout(() => { observer.disconnect(); reject(new Error("Timed out waiting for " + needle)); }, timeoutMs);
-      });
-    },
-  };
-})();
-`;
-
 async function open(page: Page, name: string, needle: string): Promise<number> {
   const painted = page.evaluate(
     ([text, timeout]) =>
-      (
-        window as unknown as {
-          __bench: { untilPainted(n: string, t: number): Promise<number> };
-        }
-      ).__bench.untilPainted(text as string, timeout as number),
+      (window as unknown as { __harness: PageHarness }).__harness.untilPainted(
+        text as string,
+        timeout as number,
+      ),
     [needle, 180_000] as const,
   );
   await page.locator(`button[title="${name}"]`).first().click();
@@ -363,8 +176,8 @@ async function stream(
     const sessions = (await (await fetch("/api/sessions")).json()) as { id: string }[];
     const session = sessions.find((item) => item.id === id);
     const socket = (
-      window as unknown as { __bench: { sockets: WebSocket[] } }
-    ).__bench.sockets.find((item) => item.readyState === 1);
+      window as unknown as { __harness: PageHarness }
+    ).__harness.sockets.find((item) => item.readyState === 1);
     if (!session || !socket?.onmessage) throw new Error("Cannot mark the session idle");
     socket.onmessage(
       new MessageEvent("message", {
@@ -375,14 +188,7 @@ async function stream(
   const composer = page.getByRole("textbox", { name: "Follow-up prompt" });
   await composer.click();
   const result = page.evaluate(async (frames: string[]) => {
-    const bench = (
-      window as unknown as {
-        __bench: {
-          sockets: WebSocket[];
-          untilPainted(n: string, t: number): Promise<number>;
-        };
-      }
-    ).__bench;
+    const bench = (window as unknown as { __harness: PageHarness }).__harness;
     const socket = bench.sockets.find(
       (item) => item.url.endsWith("/ws/browser") && item.readyState === 1,
     );
@@ -472,7 +278,7 @@ export async function runBrowserBenchmark(options: Options): Promise<BrowserRepo
   let browser: Browser | undefined;
   try {
     const databasePath = join(directory, "fleet.db");
-    const prepared = prepareDatabase(databasePath, options);
+    const prepared = prepareConversations(databasePath, options);
     const started = await startHost(options.hostRoot, databasePath, await freePort());
     host = started.child;
     // Probe a short session so the long one's Host projection stays cold.
@@ -487,7 +293,7 @@ export async function runBrowserBenchmark(options: Options): Promise<BrowserRepo
       args: ["--js-flags=--expose-gc", "--enable-precise-memory-info"],
     });
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
-    await page.addInitScript(INIT_SCRIPT);
+    await page.addInitScript(PAGE_SCRIPT);
     await page.goto(started.url);
     await page.locator(`button[title="${SMALL}"]`).first().waitFor({ timeout: 120_000 });
     // The page opens on the first listed session, seeded to be a short one, so
@@ -534,7 +340,7 @@ export async function runBrowserBenchmark(options: Options): Promise<BrowserRepo
       options,
       protocol,
       prepared.ids[0]!,
-      prepared.leadNextSequence,
+      prepared.nextSequence.get(prepared.ids[0]!)!,
     );
     const measurements: Record<string, Measurement> = {};
     for (const [name, values] of Object.entries(samples))

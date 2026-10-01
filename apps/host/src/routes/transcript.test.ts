@@ -1,5 +1,5 @@
 import Fastify from "fastify";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WebSocket } from "ws";
 import {
   TranscriptPageSchema,
@@ -125,6 +125,22 @@ describe("browser transcript pages", () => {
     expect(store.listEvents(first.id)).toEqual(events);
   });
 
+  it("brings fewer than a quarter of a page along instead of leaving them alone", async () => {
+    const { first, append, page } = await setup();
+    const expected = toTerminalBlocks(
+      Array.from({ length: 12 }, (_, index) =>
+        append(index + 1, "error", { message: `e${index}` }),
+      ),
+    );
+    expect(expected).toHaveLength(12);
+    // One block would be left above a page of 11: it comes with it.
+    expect(await page(first.id, "?limit=11")).toMatchObject({ start: 0, total: 12 });
+    expect((await page(first.id, "?limit=3")).start).toBe(9);
+    const older = await page(first.id, "?before=9&limit=8");
+    expect(older.start).toBe(0);
+    expect(older.blocks).toEqual(expected.slice(0, 9));
+  });
+
   it("returns an empty page and reports a missing session", async () => {
     const { app, first, page } = await setup();
     expect(await page(first.id)).toMatchObject({ total: 0, start: 0, blocks: [] });
@@ -240,6 +256,37 @@ describe("history readers", () => {
         store.listEvents(first.id).filter((event) => event.sequence > from),
       );
     }
+  });
+
+  it("keeps snapshot permissions current without reading every permission again", async () => {
+    const { store, service, make, append } = await setup();
+    append(1, "permission", { requestId: "one", title: "Allow?" });
+    expect(
+      (service.snapshot().permissionEvents ?? []).map((event) => event.sequence),
+    ).toEqual([1]);
+    const reads = vi.spyOn(store, "listPermissionEvents");
+    for (const event of [
+      make(2, "permission_result", { requestId: "one", outcome: "allow_once" }),
+      make(3, "permission", { requestId: "two", title: "And this?" }),
+    ])
+      expect(service.handleEventResult(event).outcome).toBe("accepted");
+    expect(
+      (service.snapshot().permissionEvents ?? []).map((event) => [
+        event.sequence,
+        event.type,
+      ]),
+    ).toEqual([
+      [2, "permission_result"],
+      [3, "permission"],
+    ]);
+    expect(reads).not.toHaveBeenCalled();
+
+    // Written around the service, so the next snapshot reads the log again.
+    append(4, "permission_result", { requestId: "two", outcome: "deny" });
+    const snapshot = service.snapshot().permissionEvents ?? [];
+    expect(reads).toHaveBeenCalledOnce();
+    expect(snapshot).toEqual(store.listPermissionEvents());
+    expect(snapshot.map((event) => event.sequence)).toEqual([2, 4]);
   });
 
   it("hydrates the latest permission state per session/request without a transcript", async () => {

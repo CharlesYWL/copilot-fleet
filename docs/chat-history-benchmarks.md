@@ -62,7 +62,17 @@ npm run benchmark:history -- --events 400 --sessions 2 --iterations 3 --warmup 1
 For a smaller performance workload, use `--events 11200`; for a 10x stress workload,
 use `--events 1120000`. The stress run loads all configured histories plus temporary
 parse/fold representations and can use substantial memory. Run it deliberately,
-not in parallel with builds or the representative workload.
+not in parallel with builds or the representative workload. The reference 10x
+run used fewer samples and a larger heap, because the legacy diagnostic stages
+read a million-event history 12 times each:
+
+```powershell
+$env:NODE_OPTIONS = "--max-old-space-size=16384"
+npx tsx scripts/benchmarks/history.ts --events 1120000 --iterations 10 --warmup 2 --output dist\benchmarks\stress-10x.json
+npx tsx scripts/benchmarks/browser.ts --events 1120000 --iterations 5 --output dist\benchmarks\browser-10x.json
+```
+
+Compare a 10x report only with another 10x report.
 
 ## What the numbers measure
 
@@ -74,11 +84,11 @@ not in parallel with builds or the representative workload.
 | `store.listEvents` | The canonical store reader, including its decoding/validation |
 | `diagnostic.readThenFilter` / `store.listEventsAfter` | Legacy full read then filter / indexed read of the last 10% of events; results must match |
 | `host.projection.build` | First open after a Host start: a new `TranscriptProjections` folds the whole transcript in yielding batches and returns the newest page |
-| `host.projection.page` | A later open: the newest page of a maintained projection, including its count/maximum-sequence check |
+| `host.projection.page` | A later open: the newest page of a maintained projection, including its constant-time check that no write went around it |
 | `history.stringify` / `history.parse.node` | Serializing the newest page and parsing it in **Node** |
 | `transcript.fold` | Whole-history `toTerminalBlocks`; the page must equal its tail |
 | `permissions.allCached` | Legacy all-session flatten-and-scan diagnostic |
-| `store.listPermissionEvents` / `permissions.liveText` | Compact permission hydration / ledger handling of a text update |
+| `store.listPermissionEvents` / `permissions.snapshot` / `permissions.liveText` | Reading every retained permission from the store, which the Host does once per start / what each later snapshot returns from the ledger it keeps / ledger handling of a text update |
 | `preview.last12` | A monitor tile's preview from its 200-event live tail |
 | `events.merge.*` | The browser merging a text, thought, older-tool, or permission event into that 200-event tail |
 | `host.projection.apply.*` | The Host advancing a maintained projection by one such event |
@@ -187,5 +197,9 @@ trace on the live Host to confirm specific findings.
 
 UI unit tests run in jsdom, which cannot lay out a virtual list, so
 `apps/host/ui/src/test-setup.ts` replaces `react-virtuoso` with a component that
-renders every item. Scrolling and geometry are verified only by this benchmark and
-by hand in a real browser.
+renders every item. Scrolling, anchoring, prompt jumps, focus, reconnects and
+switching are tested in a real browser by `npm run test:e2e`
+(`scripts/e2e/transcript.e2e.ts`). It shares this runner's disposable Host and
+database setup (`scripts/e2e/harness.ts`), and adds a fake Node that connects
+with the legacy shared-secret handshake. Its events then take the real Node path
+through the gateway, store, projection and broadcast, without starting an agent.

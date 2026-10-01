@@ -25,6 +25,7 @@
     "start:host": "node --input-type=module -e \"process.env.NODE_ENV='production'; await import('./apps/host/dist/server/server.js')\" --",
     "start:node": "npm run start -w @fleet/node --",
     "test": "npm run build -w @fleet/protocol && vitest run",
+    "test:e2e": "npm run build && vitest run --config vitest.e2e.config.ts",
     "test:watch": "npm run build -w @fleet/protocol && node scripts/watch-tests.mjs",
     "test:coverage": "npm run build -w @fleet/protocol && vitest run --coverage",
     "benchmark:history": "npm run build -w @fleet/protocol && tsx scripts/benchmarks/history.ts",

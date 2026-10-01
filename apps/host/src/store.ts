@@ -483,6 +483,9 @@ export class FleetStore {
    * connection does.
    */
   private readonly statements = new Map<string, StatementSync>();
+  /** Events this process has stored or removed, per session; see {@link eventWrites}. */
+  private readonly eventWriteCounts = new Map<string, number>();
+  private eventWriteTotal = 0;
   private readonly warn: (message: string) => void;
 
   constructor(
@@ -2437,6 +2440,7 @@ export class FleetStore {
         event.createdAt,
         "",
       );
+      this.noteEventWrite(event.sessionId);
     }
     for (const run of parsed.runs) {
       this.statement(
@@ -5827,6 +5831,7 @@ export class FleetStore {
         event.createdAt,
         receivedAt,
       );
+      this.noteEventWrite(event.sessionId);
       if (isSessionActivityEvent(event)) {
         this.touchSessionActivity(event.sessionId, receivedAt);
       }
@@ -5959,12 +5964,27 @@ export class FleetStore {
     }));
   }
 
-  /** Cheap fingerprint of a session's log, so a projection can tell it is stale. */
-  eventStats(sessionId: string): { count: number; maxSequence: number } {
-    const row = this.statement(
-      "SELECT COUNT(*) count, MAX(sequence) max FROM events WHERE session_id=?",
-    ).get(sessionId) as Row;
-    return { count: Number(row.count ?? 0), maxSequence: Number(row.max ?? 0) };
+  /**
+   * How many times this process has written a session's events.
+   *
+   * A transcript projection advances with every event the service stores; if
+   * the count moved without it, some write went around it and the projection
+   * is stale. Counting in memory keeps that check constant-time, where counting
+   * rows took a scan of the whole session on every page. Writes from another
+   * process are not counted: the Host owns its database.
+   */
+  eventWrites(sessionId: string): number {
+    return this.eventWriteCounts.get(sessionId) ?? 0;
+  }
+
+  /** The same count across every session. */
+  allEventWrites(): number {
+    return this.eventWriteTotal;
+  }
+
+  private noteEventWrite(sessionId: string): void {
+    this.eventWriteCounts.set(sessionId, this.eventWrites(sessionId) + 1);
+    this.eventWriteTotal += 1;
   }
 
   /** Newest activity; invisible config/commands events count, usage never did. */
@@ -6063,6 +6083,7 @@ export class FleetStore {
     }
     this.statement("DELETE FROM notification_preferences WHERE session_id=?").run(id);
     this.statement("DELETE FROM events WHERE session_id=?").run(id);
+    this.noteEventWrite(id);
     this.statement("DELETE FROM sessions WHERE id=?").run(id);
   }
 

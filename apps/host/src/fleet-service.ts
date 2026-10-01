@@ -48,6 +48,7 @@ import {
   type SessionState,
   type Snapshot,
   type ExecutionBinding,
+  SessionPermissions,
 } from "@fleet/protocol";
 import type {
   FleetStore,
@@ -247,6 +248,10 @@ export class FleetService {
   readonly commands: CommandExecutionService;
   readonly files: SessionFileService;
   readonly transcripts: TranscriptProjections;
+  /** Built by the first snapshot; see `permissionEvents`. */
+  private permissionLedger: SessionPermissions | undefined;
+  /** `FleetStore.allEventWrites` as the ledger last accounted for it. */
+  private permissionLedgerWrites = 0;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -322,8 +327,27 @@ export class FleetService {
       prMaintenanceApprovals: this.store.prMaintenance.listApprovals(),
       prMaintenanceTasks: prMaintenanceTaskStatuses(this.retainedPrMaintenance()),
       workerResumeRequests: this.store.resumeRequests.list({ limit: 50 }),
-      permissionEvents: this.store.listPermissionEvents(),
+      permissionEvents: this.permissionEvents(),
     };
+  }
+
+  /**
+   * The latest request or resolution of every permission, for a snapshot.
+   *
+   * Read from the store once and then advanced with each event the service
+   * stores: a snapshot is taken on every browser load and reconnect, and the
+   * read covers every permission ever asked in every retained conversation.
+   * Any other write to the event log, such as deleting a conversation, makes
+   * the next snapshot read it again.
+   */
+  private permissionEvents(): SessionEvent[] {
+    const writes = this.store.allEventWrites();
+    if (!this.permissionLedger || this.permissionLedgerWrites !== writes) {
+      this.permissionLedger = new SessionPermissions();
+      this.permissionLedger.apply(this.store.listPermissionEvents());
+      this.permissionLedgerWrites = writes;
+    }
+    return this.permissionLedger.latestEvents();
   }
 
   private retainedPrMaintenance(): PrMaintenanceRegistration[] {
@@ -416,6 +440,7 @@ export class FleetService {
     this.evictAllNodes(4002, "Host restored from backup");
     this.store.replaceHostBackup(backup);
     this.transcripts.clear();
+    this.permissionLedger = undefined;
     this.commands.reconcileNotifications();
     this.broadcast({ type: "snapshot", data: this.snapshot() });
   }
@@ -439,6 +464,7 @@ export class FleetService {
     this.evictAllNodes(4002, "Host restored from a portable backup");
     const result = this.store.importPortableBackup(input);
     this.transcripts.clear();
+    this.permissionLedger = undefined;
     this.commands.reconcileNotifications();
     return result;
   }
@@ -2422,6 +2448,10 @@ export class FleetService {
       // Advanced for every stored event, published or not: the projection is
       // the stored log, and a reader that missed a change would see a gap.
       const transcript = stored ? this.transcripts.apply(event) : undefined;
+      if (stored && this.permissionLedger) {
+        this.permissionLedger.apply([event]);
+        this.permissionLedgerWrites += 1;
+      }
       if (result.publish && result.session) {
         this.broadcast({ type: "event", event, ...(transcript ? { transcript } : {}) });
         this.publishSession(result.session);

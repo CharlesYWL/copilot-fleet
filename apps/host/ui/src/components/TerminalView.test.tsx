@@ -891,6 +891,56 @@ describe("TerminalView transcript", () => {
     expect(screen.getByRole("button", { name: "Jump to latest" })).toBeTruthy();
   });
 
+  it("keeps asking for older pages until a jump's prompt is loaded", async () => {
+    const events = [
+      streamEvent("system", { text: "User: oldest" }),
+      streamEvent("agent_text", { text: "oldest answer" }),
+      streamEvent("system", { text: "User: middle" }),
+      streamEvent("agent_text", { text: "middle answer" }),
+      streamEvent("system", { text: "User: recent" }),
+      streamEvent("agent_text", { text: "recent answer" }),
+    ];
+    const whole = transcriptOf(events);
+    const from = (start: number) => ({
+      ...whole,
+      start,
+      blocks: whole.blocks.slice(start),
+    });
+    const onLoadOlder = vi.fn(async () => {});
+    const tree = (transcript: typeof whole) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={vi.fn()}>
+          <TerminalView
+            session={session()}
+            transcript={transcript}
+            onLoadOlder={onLoadOlder}
+            pendingPermission={null}
+            onPrompt={vi.fn()}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onPermission={vi.fn()}
+            draft={EMPTY_DRAFT}
+            onDraftChange={vi.fn()}
+          />
+        </NotificationContext.Provider>
+      </FluentProvider>
+    );
+    const view = render(tree(from(4)));
+    fireEvent.click(screen.getByRole("button", { name: "Jump to prompt: oldest" }));
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    // The page that arrived stops short of the prompt: ask again, once.
+    const partial = from(2);
+    view.rerender(tree(partial));
+    view.rerender(tree(partial));
+    expect(onLoadOlder).toHaveBeenCalledTimes(2);
+    expect(onLoadOlder).toHaveBeenLastCalledWith(0);
+
+    view.rerender(tree(whole));
+    await waitFor(() => expect(screen.getByText("oldest answer")).toBeTruthy());
+    expect(onLoadOlder).toHaveBeenCalledTimes(2);
+  });
+
   it("says the transcript is loading until its first page arrives", () => {
     render(
       <FluentProvider theme={fleetDarkTheme}>

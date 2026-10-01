@@ -759,12 +759,29 @@ export const TerminalView = ({
     [onLoadOlder, promptMarks, scrollToIndex, start],
   );
 
-  // An older prompt's page arrived: finish the jump that asked for it.
+  const latestLoadOlder = useRef(onLoadOlder);
+  latestLoadOlder.current = onLoadOlder;
+  // An older prompt's page arrived: finish the jump that asked for it, or ask
+  // for the next page if one page could not reach that far. Only an arriving
+  // page asks again, so a failed request is not retried on every render.
+  // Virtuoso corrects its scroll offset for the prepended rows over the next
+  // frames; scrolling in this commit would be measured before that, and land
+  // far away.
   useEffect(() => {
     const target = pendingJump.current;
-    if (target === undefined || target < start) return;
-    pendingJump.current = undefined;
-    scrollToIndex(target);
+    if (target === undefined) return;
+    if (target < start) {
+      void latestLoadOlder.current?.(target);
+      return;
+    }
+    let frame = requestAnimationFrame(() => {
+      frame = requestAnimationFrame(() => {
+        if (pendingJump.current !== target) return;
+        pendingJump.current = undefined;
+        scrollToIndex(target);
+      });
+    });
+    return () => cancelAnimationFrame(frame);
   }, [start, scrollToIndex]);
 
   const scrollToEnd = useCallback(() => {

@@ -156,8 +156,12 @@ export function seed(
   store: FleetStore,
   database: DatabaseSync,
   options: BenchmarkOptions,
-): { ids: string[]; fixture: HistoryReport["fixture"] } {
-  const { node } = store.registerNode({
+): {
+  ids: string[];
+  fixture: HistoryReport["fixture"];
+  node: { id: string; secret: string };
+} {
+  const { node, secret } = store.registerNode({
     name: "Synthetic benchmark node",
     os: process.platform,
     arch: process.arch,
@@ -213,7 +217,7 @@ export function seed(
     database.exec("ROLLBACK");
     throw error;
   }
-  return { ids, fixture };
+  return { ids, fixture, node: { id: node.id, secret } };
 }
 
 async function diagnostics(
@@ -341,6 +345,9 @@ async function nodeMeasurements(
   );
   const permissions = new SessionPermissions();
   permissions.apply(permissionEvents);
+  // What every snapshot after the Host's first returns: the ledger the service
+  // keeps advancing, instead of the store read above.
+  await run("permissions.snapshot", () => permissions.latestEvents());
   const tail = events.filter(isTranscriptEvent).slice(-LIVE_TAIL_EVENTS);
   await run("permissions.liveText", () =>
     permissions.apply([incomingEvents(id, options.events + 1).text!]),

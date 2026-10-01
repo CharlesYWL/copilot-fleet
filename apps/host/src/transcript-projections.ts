@@ -17,8 +17,9 @@ type Projection = {
   generation: string;
   revision: number;
   projector: TranscriptProjector;
-  /** Every stored event folded so far, bookkeeping included, to detect a stale copy. */
-  count: number;
+  /** The store's write count for the session this reflects; see `FleetStore.eventWrites`. */
+  writes: number;
+  /** The newest sequence folded in order; anything older arrived late. */
   maxSequence: number;
   bytes: number;
   used: number;
@@ -81,7 +82,12 @@ export class TranscriptProjections {
       Math.max(request.limit ?? TRANSCRIPT_PAGE_LIMIT, 1),
       TRANSCRIPT_PAGE_MAX,
     );
-    const start = Math.max(0, end - limit);
+    let start = Math.max(0, end - limit);
+    // Less than a quarter of a page left above comes with it, rather than as a
+    // page of its own: the browser's list shifts by however far a few prepended
+    // rows are from its average row height, and does not correct for that when
+    // all of them are on screen at once. A larger page reaches past the screen.
+    if (start < Math.floor(limit / 4)) start = 0;
     const activity = newest ? this.store.latestActivity(sessionId) : undefined;
     return {
       generation: projection.generation,
@@ -112,7 +118,7 @@ export class TranscriptProjections {
     }
     const projection = this.ready.get(event.sessionId);
     if (!projection) return undefined;
-    projection.count += 1;
+    projection.writes += 1;
     if (event.sequence < projection.maxSequence) {
       if (isTranscriptEvent(event)) this.invalidate(event.sessionId);
       return undefined;
@@ -151,8 +157,7 @@ export class TranscriptProjections {
   private async projection(sessionId: string): Promise<Projection> {
     const ready = this.ready.get(sessionId);
     if (ready) {
-      const stats = this.store.eventStats(sessionId);
-      if (stats.count === ready.count && stats.maxSequence === ready.maxSequence) {
+      if (this.store.eventWrites(sessionId) === ready.writes) {
         ready.used = ++this.clock;
         return ready;
       }
@@ -187,14 +192,13 @@ export class TranscriptProjections {
         // Something was stored behind the cursor while this was yielding.
         if (build.lateFill) continue;
         // Read with the final batch, with no yield between: nothing can be
-        // stored in between, so the fingerprint describes exactly what was folded.
-        const stats = this.store.eventStats(sessionId);
+        // stored in between, so the count describes exactly what was folded.
         const projection: Projection = {
           generation: randomUUID(),
           revision: 0,
           projector,
-          count: stats.count,
-          maxSequence: stats.maxSequence,
+          writes: this.store.eventWrites(sessionId),
+          maxSequence: build.cursor,
           bytes: projector.blocks.reduce((sum, block) => sum + blockBytes(block), 0),
           used: ++this.clock,
         };
