@@ -20,7 +20,6 @@ import {
   type Run,
   type RunNote,
   type RunStep,
-  type SessionEvent,
   type WorkerResumeOutcome,
   type WorkerResumeRequest,
 } from "@fleet/protocol";
@@ -85,7 +84,6 @@ import { CommandPermissionPrompts } from "./components/CommandPermissionPrompts"
 import { PrMaintenanceApprovalReview } from "./components/orchestration/PrMaintenanceApprovalReview";
 import { WorkerResumePrompts } from "./components/orchestration/WorkerResumePrompts";
 
-const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
 const noMaintenanceApprovals: PrMaintenanceApproval[] = [];
 const noResumeRequests: WorkerResumeRequest[] = [];
@@ -241,6 +239,7 @@ export function App() {
     snapshotRevision,
     liveNotificationUpdates,
     events,
+    transcripts,
     activities,
     pendingPermissions: waitingPermissions,
     commandOutput,
@@ -249,7 +248,8 @@ export function App() {
     connected,
     nodeUpdates,
     refresh,
-    loadEvents,
+    loadTranscript,
+    loadOlderTranscript,
     command,
     request,
     markNotificationRead,
@@ -439,8 +439,8 @@ export function App() {
   useEffect(() => {
     if (!selectedSessionId || !connected) return;
     if (view !== "session" && !(view === "overview" && focusOpen)) return;
-    void loadEvents(selectedSessionId);
-  }, [selectedSessionId, view, focusOpen, connected, loadEvents]);
+    void loadTranscript(selectedSessionId);
+  }, [selectedSessionId, view, focusOpen, connected, loadTranscript]);
 
   /**
    * Opens a session's transcript.
@@ -1572,7 +1572,10 @@ export function App() {
                         placement={snapshot.placements.find(
                           (placement) => placement.id === activeSession.placementId,
                         )}
-                        events={events[activeSession.id] ?? noEvents}
+                        transcript={transcripts[activeSession.id]}
+                        onLoadOlder={(toIndex) =>
+                          loadOlderTranscript(activeSession.id, toIndex)
+                        }
                         activity={activities[activeSession.id]}
                         pendingPermission={
                           waitingPermissions
@@ -1676,7 +1679,8 @@ export function App() {
             placement={snapshot.placements.find(
               (placement) => placement.id === activeSession.placementId,
             )}
-            events={events[activeSession.id] ?? noEvents}
+            transcript={transcripts[activeSession.id]}
+            onLoadOlder={(toIndex) => loadOlderTranscript(activeSession.id, toIndex)}
             activity={activities[activeSession.id]}
             pendingPermission={
               waitingPermissions

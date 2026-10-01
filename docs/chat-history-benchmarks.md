@@ -9,9 +9,12 @@ npm run benchmark:history -- --baseline dist\benchmarks\before.json --output dis
 ```
 
 The runner uses the existing `tsx`, SQLite, Fastify, and application dependencies.
-Run `npm ci` on a fresh checkout first. No additional browser or benchmark package
-is needed. Results go under the already-ignored `dist` directory by default; save
-named reports when comparing commits because the default report is overwritten.
+Run `npm ci` on a fresh checkout first. Results go under the already-ignored `dist`
+directory by default; save named reports when comparing commits because the default
+report is overwritten.
+
+A second runner measures the production UI in a real browser; see
+[Browser benchmark](#browser-benchmark).
 
 ## Workload and reproducibility
 
@@ -68,19 +71,22 @@ not in parallel with builds or the representative workload.
 | `diagnostic.sqlSelect` | Prepared SQLite `SELECT` on the synthetic event table |
 | `diagnostic.decodePayloads` | Row conversion and payload `JSON.parse` |
 | `diagnostic.validateOuterSchema` | `SessionEventSchema.parse` over decoded rows |
-| `store.listEvents` | The production store reader, including its current decoding/validation |
-| `store.listTranscript` | The production filtered browser-history reader, including activity metadata |
+| `store.listEvents` | The canonical store reader, including its decoding/validation |
 | `diagnostic.readThenFilter` / `store.listEventsAfter` | Legacy full read then filter / indexed read of the last 10% of events; results must match |
-| `history.stringify` / `history.parse.node` | Serializing the current browser-history response and parsing it in **Node** |
-| `transcript.fold` | The existing `toTerminalBlocks` implementation |
-| `events.merge.*` | Existing `mergeEvents` for explicit text, thought, older-tool, and permission events |
-| `transcript.update.*` | Merge **plus** full folding, matching the current UI's data path |
+| `host.projection.build` | First open after a Host start: a new `TranscriptProjections` folds the whole transcript in yielding batches and returns the newest page |
+| `host.projection.page` | A later open: the newest page of a maintained projection, including its count/maximum-sequence check |
+| `history.stringify` / `history.parse.node` | Serializing the newest page and parsing it in **Node** |
+| `transcript.fold` | Whole-history `toTerminalBlocks`; the page must equal its tail |
 | `permissions.allCached` | Legacy all-session flatten-and-scan diagnostic |
-| `store.listPermissionEvents` / `permissions.liveText` | Compact permission hydration / current index handling of a text update |
-| `preview.last12` | Current preview generation, including any work before taking the last 12 lines |
-| `http.history.ttfb` / `http.history.total` | Headers received / complete body consumed from the real session history route |
-| `http.probe.idle` / `http.probe.duringHistory` | A lightweight request without / with a concurrent history request |
-| `hostEventLoop` | Event-loop-delay mean, P95, and maximum in the server process, at 10 ms sampling resolution |
+| `store.listPermissionEvents` / `permissions.liveText` | Compact permission hydration / ledger handling of a text update |
+| `preview.last12` | A monitor tile's preview from its 200-event live tail |
+| `events.merge.*` | The browser merging a text, thought, older-tool, or permission event into that 200-event tail |
+| `host.projection.apply.*` | The Host advancing a maintained projection by one such event |
+| `transcript.update.*` | The browser applying that event's one change to its cached copy |
+| `http.history.ttfb` / `http.history.total` | Headers received / complete body consumed from the real transcript route, projection warm |
+| `http.history.cold.total` | The same, with the projection dropped before each request so each one rebuilds it |
+| `http.probe.idle` / `http.probe.duringHistory` / `http.probe.duringColdHistory` | A lightweight request alone / during a warm / during a rebuilding history request |
+| `hostEventLoop` / `hostEventLoopCold` | Server event-loop delay (mean, P95, maximum at 10 ms resolution) during the warm / rebuilding phases |
 
 The HTTP client runs in the parent process. The production browser transcript route runs
 in a separate child on an ephemeral `127.0.0.1` port, using a disposable SQLite
@@ -96,11 +102,19 @@ stages together and label the result end-to-end latency. In particular,
 `transcript.update.*` already includes merging.
 
 Sizes are **UTF-8 bytes**, not JavaScript string lengths. The report includes the
-real HTTP body size, raw canonical history size, and estimates for filtering bookkeeping events, serializing
-all blocks, and serializing the last 200 blocks. Block estimates do not measure block-page production cost. Reports from the original
-baseline used the raw `/events` route; the current runner follows the UI's filtered
-`/transcript` route. That is an intentional before/after comparison of the history
-the browser actually downloads, not a claim that the canonical event log shrank.
+real HTTP body size, raw canonical history size, the newest page
+(`currentTranscript`), the projection's approximate retained size
+(`projectionRetained`), and estimates for filtering bookkeeping events, serializing
+all blocks, and serializing the last 200 blocks. Reports from the original baseline
+used the raw `/events` route; the current runner follows the UI's paged
+`/transcript` route. That is an intentional before/after comparison of what the
+browser downloads to open a conversation, not a claim that the canonical event log
+shrank.
+
+Some names compare the old and new way of doing the same job rather than the same
+code. Before, `transcript.update.*` was a merge plus a whole-history refold, and
+`events.merge.*` merged into the whole history; now the browser applies one block
+change and merges only into the 200-event preview tail.
 
 ## Safety and maintenance
 
@@ -123,6 +137,55 @@ Update response correctness expectations when the history API intentionally
 changes, while preserving metric names for workloads that remain comparable.
 
 This harness does **not** measure React rendering, layout, paint, scrolling, or
-typing latency. Use the same versioned fixture for the separate production-browser
-performance harness in the chat optimization plan. Node-stage improvements alone
-do not establish that the UI's latency targets have been reached.
+typing latency. The browser benchmark below does, on the same versioned fixture.
+
+## Browser benchmark
+
+```powershell
+npx tsx scripts/benchmarks/browser.ts --host-root <built checkout of another revision> --output dist\benchmarks\browser-before.json
+npm run benchmark:browser -- --baseline dist\benchmarks\browser-before.json --output dist\benchmarks\browser-after.json
+```
+
+`npm run benchmark:browser` builds this checkout first. To measure another
+revision, check it out in a separate worktree, run `npm ci` and `npm run build`
+there, and pass it as `--host-root`; the runner uses that checkout's
+`apps/host/dist/server/server.js` and UI. It detects whether that Host serves
+block pages or raw events and streams in the matching format.
+
+The runner seeds a disposable database with the same fixture, starts that Host on
+a free loopback port with authentication off, and drives headless Microsoft Edge
+(`--channel`, default `msedge`) through `playwright-core`. It needs an installed
+Edge or Chrome; it does not download a browser. It never touches the live Host or
+its database.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--events` | `112000` | Lead-session raw event count |
+| `--sessions` | `26` | Total sessions |
+| `--iterations` | `10` | Switches measured per direction |
+| `--chunks` | `200` | Streamed text events while typing |
+| `--host-root` | This checkout | Built checkout whose Host and UI are measured |
+| `--channel` | `msedge` | Playwright browser channel |
+| `--output` / `--baseline` | `dist/benchmarks/browser.json` / None | Report destination / earlier report to compare |
+
+| Measurement | Scope |
+|---|---|
+| `browser.open.lead.cold` | Click the long conversation for the first time after the Host started, until its last block is painted |
+| `browser.open.lead` / `browser.open.small` | Switch back to the long / to a short conversation, until its last block is painted |
+| `browser.stream.keyToPaint` | Key press to the next painted frame while 50 events a second stream into the open conversation |
+| `browser.stream.frameGap` | Time between animation frames during that streaming |
+| `browser.stream.longTaskTotal` | Total long-task time reported during that streaming |
+| `browser.stream.lastChunkToPaint` | The final streamed chunk arriving to its text being painted |
+| `domElements` / `transcriptElements` / `jsHeapMiB` | Page DOM size, elements inside the transcript, and JS heap after forced GC |
+
+"Painted" means a `MutationObserver` saw the marker text, then one animation
+frame and a task elapsed. Streamed events go through the page's own WebSocket
+handler, as if the Host had sent them. A Host without a Node shows every session
+as offline, so the runner tells the page the long session is idle to enable its
+composer. This is a synthetic, single-machine measure; use a DevTools performance
+trace on the live Host to confirm specific findings.
+
+UI unit tests run in jsdom, which cannot lay out a virtual list, so
+`apps/host/ui/src/test-setup.ts` replaces `react-virtuoso` with a component that
+renders every item. Scrolling and geometry are verified only by this benchmark and
+by hand in a real browser.

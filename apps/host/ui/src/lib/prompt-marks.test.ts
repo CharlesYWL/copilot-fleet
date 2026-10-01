@@ -52,8 +52,8 @@ describe("toPromptMarks", () => {
     );
 
     expect(marks).toEqual([
-      { key: "e0", label: human, createdAt },
-      { key: "e7", label: "Now show me the fix.", createdAt },
+      { key: "e0", index: 0, label: human, createdAt },
+      { key: "e7", index: 7, label: "Now show me the fix.", createdAt },
     ]);
   });
 

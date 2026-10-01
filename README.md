@@ -1030,6 +1030,13 @@ prompt, and click it to jump there. The lit mark tracks the current turn, using
 the preceding sampled prompt when that turn has no mark. Unsampled prompts stay
 in the transcript and remain reachable by scrolling.
 
+A conversation opens at its latest output with only its newest 200 entries;
+scrolling up loads older ones, and a prompt mark loads whatever lies between.
+Only entries near the visible part of the pane are rendered, which keeps long
+conversations quick to open and to type in while they stream, but it also means
+the browser's own find (Ctrl+F) only searches what is on screen. Measurements and
+how to rerun them are in [chat-history-benchmarks.md](docs/chat-history-benchmarks.md).
+
 Fleet-generated control messages, including worker wake summaries and task
 reviews, appear as compact expandable steps rather than user chat bubbles.
 Expand a step to read its full original message. These messages do not add

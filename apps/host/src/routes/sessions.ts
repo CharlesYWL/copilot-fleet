@@ -14,6 +14,7 @@ import {
   SetSessionConfigSchema,
   SetSessionFavoriteSchema,
   StopSessionsSchema,
+  TRANSCRIPT_PAGE_MAX,
   base64Bytes,
   errorMessage,
   terminalSessionStates,
@@ -33,6 +34,11 @@ const AdoptSessionSchema = CreateSessionSchema.pick({
   agentSessionId: z.string().min(1).max(500),
   additionalDirectories: z.array(z.string().min(1).max(4096)).max(100).default([]),
   name: z.string().max(SESSION_NAME_MAX_LENGTH).optional(),
+});
+
+const TranscriptQuerySchema = z.object({
+  before: z.coerce.number().int().nonnegative().optional(),
+  limit: z.coerce.number().int().positive().max(TRANSCRIPT_PAGE_MAX).optional(),
 });
 
 /** Session lifecycle: create, prompt, resume, cancel, stop, dismiss. */
@@ -138,12 +144,22 @@ export const sessionRoutes: FastifyPluginAsync<SessionRouteOptions> = async (
     return store.listEvents(id);
   });
 
+  /**
+   * A page of the session's transcript, already folded into blocks.
+   *
+   * The newest page by default, with every operator prompt and the latest
+   * activity; `before` pages back from a block position. Live changes follow on
+   * the browser socket, ordered by the projection's revision.
+   */
   app.get("/api/sessions/:id/transcript", async (request, reply) => {
     const { id } = request.params as { id: string };
     const session = store.getSession(id);
     if (!session) return reply.code(404).send({ error: "Session not found" });
-    if (!session.cleanupRequested) store.touchSessionActivity(id);
-    return store.listTranscript(id);
+    const query = TranscriptQuerySchema.parse(request.query);
+    if (!session.cleanupRequested && query.before === undefined) {
+      store.touchSessionActivity(id);
+    }
+    return service.transcripts.page(id, query);
   });
 
   /**

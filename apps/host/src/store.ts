@@ -32,7 +32,7 @@ import {
   type RunStepState,
   type SecurityBackupPayload,
   type SessionEvent,
-  type SessionTranscript,
+  type SessionActivity,
   type SessionState,
   type TunnelProvider,
   type Workspace,
@@ -5928,31 +5928,58 @@ export class FleetStore {
     ).map(eventFromRow);
   }
 
-  listTranscript(sessionId: string): SessionTranscript {
-    const events = (
+  /**
+   * Transcript rows in sequence order, for the display-only block projection.
+   *
+   * Picker, usage and resume bookkeeping are excluded before their payloads are
+   * decoded, and the outer event schema is not re-run: every stored row passed
+   * it at ingress or import, payloads are still validated per type by
+   * `eventPayload` as they fold, and this path feeds a disposable projection,
+   * never a decision. A payload that is not JSON still throws.
+   */
+  listTranscriptRows(
+    sessionId: string,
+    afterSequence: number,
+    limit: number,
+  ): SessionEvent[] {
+    return (
       this.statement(
-        `SELECT * FROM events WHERE session_id=?
+        `SELECT event_id,session_id,sequence,type,payload,created_at FROM events
+         WHERE session_id=? AND sequence>?
          AND type NOT IN ('commands','config','usage','agent_session')
-         ORDER BY sequence`,
-      ).all(sessionId) as Row[]
-    ).map(eventFromRow);
-    // Activity previously included invisible config/commands events, but never usage.
-    const activity = this.statement(
+         ORDER BY sequence LIMIT ?`,
+      ).all(sessionId, afterSequence, limit) as Row[]
+    ).map((row) => ({
+      eventId: String(row.event_id),
+      sessionId: String(row.session_id),
+      sequence: Number(row.sequence),
+      type: String(row.type) as SessionEvent["type"],
+      payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  /** Cheap fingerprint of a session's log, so a projection can tell it is stale. */
+  eventStats(sessionId: string): { count: number; maxSequence: number } {
+    const row = this.statement(
+      "SELECT COUNT(*) count, MAX(sequence) max FROM events WHERE session_id=?",
+    ).get(sessionId) as Row;
+    return { count: Number(row.count ?? 0), maxSequence: Number(row.max ?? 0) };
+  }
+
+  /** Newest activity; invisible config/commands events count, usage never did. */
+  latestActivity(sessionId: string): SessionActivity | undefined {
+    const row = this.statement(
       `SELECT event_id,sequence,created_at FROM events
        WHERE session_id=? AND type<>'usage' ORDER BY sequence DESC LIMIT 1`,
     ).get(sessionId) as Row | undefined;
-    return {
-      events,
-      ...(activity
-        ? {
-            activity: SessionActivitySchema.parse({
-              eventId: String(activity.event_id),
-              sequence: Number(activity.sequence),
-              createdAt: String(activity.created_at),
-            }),
-          }
-        : {}),
-    };
+    return row
+      ? SessionActivitySchema.parse({
+          eventId: String(row.event_id),
+          sequence: Number(row.sequence),
+          createdAt: String(row.created_at),
+        })
+      : undefined;
   }
 
   listPermissionEvents(): SessionEvent[] {

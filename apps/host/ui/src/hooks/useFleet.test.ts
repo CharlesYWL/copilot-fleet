@@ -2,6 +2,8 @@ import { act, renderHook, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   BrowserMessage,
+  TerminalBlock,
+  TranscriptPage,
   HostUpdateStatus,
   Notification,
   SessionEvent,
@@ -13,7 +15,7 @@ import {
   RunStepSchema,
   SessionSchema,
 } from "@fleet/protocol";
-import { useFleet } from "./useFleet";
+import { LIVE_FLUSH_MS, useFleet } from "./useFleet";
 import { csrfToken, forgetCsrfToken } from "../lib/auth";
 
 const ISO = "2026-09-01T18:00:00.000Z";
@@ -135,56 +137,105 @@ describe("useFleet transcript loading", () => {
     sequence: item.sequence,
     createdAt: item.createdAt,
   });
+  const block = (key: string, text: string): TerminalBlock => ({
+    key,
+    kind: "agent",
+    text,
+    createdAt: ISO,
+  });
+  const page = (values: Partial<TranscriptPage> = {}): TranscriptPage => ({
+    generation: "g1",
+    revision: 0,
+    total: 1,
+    start: 0,
+    blocks: [block("b1", "Hello")],
+    prompts: [],
+    ...values,
+  });
+  const NEWEST = "/api/sessions/s1/transcript?limit=200";
+  /** Answers the requests a test cares about and the ones every hook makes. */
+  const route = (handler: (path: string) => Promise<Response> | undefined) =>
+    vi.mocked(fetch).mockImplementation((input) => {
+      const path = String(input);
+      const answer = handler(path);
+      if (answer) return answer;
+      if (path === "/api/auth/csrf") return json({ csrfToken: "proof" });
+      if (path === "/api/snapshot") return json(snapshot());
+      if (path === "/api/runs") return json({ stepsByRunId: {}, notesByRunId: {} });
+      throw new Error(`Unexpected fetch ${path}`);
+    });
+  const transcriptCalls = () =>
+    vi.mocked(fetch).mock.calls.filter(([path]) => String(path).includes("/transcript"));
 
-  it("shares an in-flight fetch and preserves live events and activity during hydration", async () => {
+  it("shares one newest-page request and applies the changes that arrive during it", async () => {
     let finish!: (value: Response) => void;
-    vi.mocked(fetch).mockImplementation((path) => {
-      expect(String(path)).toBe("/api/sessions/s1/transcript");
-      return new Promise((resolve) => {
-        finish = resolve;
+    route((path) =>
+      path === NEWEST
+        ? new Promise((resolve) => {
+            finish = resolve;
+          })
+        : undefined,
+    );
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    const first = result.current.loadTranscript("s1");
+    expect(result.current.loadTranscript("s1")).toBe(first);
+    const socket = MockWebSocket.instances[0]!;
+    act(() => {
+      socket.send({
+        type: "event",
+        event: event(1),
+        transcript: { generation: "g1", revision: 1, change: { index: 0, append: "lo" } },
+      });
+      socket.send({
+        type: "event",
+        event: event(2),
+        transcript: {
+          generation: "g1",
+          revision: 2,
+          change: { index: 0, append: " world" },
+        },
       });
     });
-    const { result } = renderHook(() => useFleet(vi.fn()));
-    const first = result.current.loadEvents("s1");
-    const second = result.current.loadEvents("s1");
-    expect(first).toBe(second);
-    const live = event(3);
-    act(() => MockWebSocket.instances[0]!.send({ type: "event", event: live }));
-    const stored = event(1);
     await act(async () => {
-      finish(response({ events: [stored], activity: activity(stored) }));
+      finish(response(page({ revision: 1, activity: activity(event(1)) })));
       await first;
     });
-    expect(result.current.events.s1).toEqual([stored, live]);
-    expect(result.current.activities.s1).toEqual({ ...activity(live), live: true });
-    expect(
-      vi
-        .mocked(fetch)
-        .mock.calls.filter(([path]) => String(path).endsWith("/transcript")),
-    ).toHaveLength(1);
+    await waitFor(() =>
+      expect(result.current.transcripts.s1?.blocks[0]?.text).toBe("Hello world"),
+    );
+    expect(result.current.transcripts.s1).toMatchObject({ revision: 2, total: 1 });
+    expect(result.current.events.s1).toEqual([event(1), event(2)]);
+    expect(result.current.activities.s1).toEqual({ ...activity(event(2)), live: true });
+    expect(transcriptCalls()).toHaveLength(1);
+    // A copy that is already followed live is shown without asking again.
+    await act(() => result.current.loadTranscript("s1"));
+    expect(transcriptCalls()).toHaveLength(1);
   });
 
-  it("keeps bookkeeping out of history while preserving non-usage activity", () => {
+  it("keeps bookkeeping out of the preview tail while preserving non-usage activity", async () => {
     const { result } = renderHook(() => useFleet(vi.fn()));
     const socket = MockWebSocket.instances[0]!;
     act(() => socket.send({ type: "event", event: event(1) }));
+    await waitFor(() => expect(result.current.events.s1).toEqual([event(1)]));
     const history = result.current.events.s1;
     for (const [index, type] of (
       ["commands", "config", "agent_session"] as const
     ).entries()) {
       const update = event(index + 2, type, { large: "payload".repeat(100) });
       act(() => socket.send({ type: "event", event: update }));
+      await waitFor(() =>
+        expect(result.current.activities.s1).toEqual({ ...activity(update), live: true }),
+      );
       expect(result.current.events.s1).toBe(history);
-      expect(result.current.activities.s1).toEqual({ ...activity(update), live: true });
-      expect(result.current.activities.s1).not.toHaveProperty("payload");
     }
     const lastActivity = result.current.activities.s1;
     act(() => socket.send({ type: "event", event: event(5, "usage", { aiCredits: 1 }) }));
+    await new Promise((resolve) => setTimeout(resolve, LIVE_FLUSH_MS * 2));
     expect(result.current.activities.s1).toBe(lastActivity);
     expect(result.current.events.s1).toBe(history);
   });
 
-  it("hydrates permissions independently and ignores an older request after live resolution", async () => {
+  it("hydrates permissions from the snapshot, independently of any transcript", async () => {
     const request = event(1, "permission", { requestId: "request", title: "Run?" });
     const session = SessionSchema.parse({
       id: "s1",
@@ -210,73 +261,91 @@ describe("useFleet transcript loading", () => {
     );
     expect(result.current.pendingPermissions).toEqual([request]);
     expect(result.current.events).toEqual({});
-    let finish!: (value: Response) => void;
-    vi.mocked(fetch).mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          finish = resolve;
-        }),
-    );
-    const loading = result.current.loadEvents("s1");
     act(() =>
       socket.send({
         type: "event",
         event: event(2, "permission_result", { requestId: "request", outcome: "deny" }),
       }),
     );
-    await act(async () => {
-      finish(response({ events: [request], activity: activity(request) }));
-      await loading;
-    });
-    expect(result.current.pendingPermissions).toEqual([]);
+    await waitFor(() => expect(result.current.pendingPermissions).toEqual([]));
   });
 
-  it("aborts stale connection requests without letting their completion delete a newer fetch", async () => {
-    const finishes: ((value: Response) => void)[] = [];
-    const signals: (AbortSignal | null | undefined)[] = [];
-    vi.mocked(fetch).mockImplementation((_path, init) => {
-      signals.push(init?.signal);
-      return new Promise((resolve) => {
-        finishes.push(resolve);
-      });
+  it("refetches a copy that missed a change, was reset, or reconnected", async () => {
+    let revision = 0;
+    route((path) =>
+      path === NEWEST ? json(page({ revision, generation: `g${revision}` })) : undefined,
+    );
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    await act(() => result.current.loadTranscript("s1"));
+    expect(transcriptCalls()).toHaveLength(1);
+    const socket = MockWebSocket.instances[0]!;
+    revision = 5;
+    act(() =>
+      socket.send({
+        type: "transcript",
+        sessionId: "s1",
+        update: { generation: "g0", revision: 2, change: { index: 0, append: "!" } },
+      }),
+    );
+    await waitFor(() => expect(result.current.transcripts.s1?.generation).toBe("g5"));
+    expect(transcriptCalls()).toHaveLength(2);
+    act(() => socket.send({ type: "transcript_reset", sessionId: "s1" }));
+    await waitFor(() => expect(transcriptCalls()).toHaveLength(3));
+    act(() => socket.send({ type: "transcript_reset", sessionId: "unloaded" }));
+    act(() => socket.disconnect());
+    act(() => socket.open());
+    await waitFor(() => expect(transcriptCalls()).toHaveLength(4));
+    expect(Object.keys(result.current.transcripts)).toEqual(["s1"]);
+  });
+
+  it("prepends an older page, or every page back to a prompt", async () => {
+    const blocks = (from: number, to: number) =>
+      Array.from({ length: to - from }, (_, offset) =>
+        block(`b${from + offset}`, `${from + offset}`),
+      );
+    route((path) => {
+      if (path === NEWEST) {
+        return json(page({ total: 450, start: 250, blocks: blocks(250, 450) }));
+      }
+      if (path === "/api/sessions/s1/transcript?before=250&limit=200") {
+        return json(page({ total: 450, start: 50, blocks: blocks(50, 250) }));
+      }
+      if (path === "/api/sessions/s1/transcript?before=50&limit=40") {
+        return json(page({ total: 450, start: 10, blocks: blocks(10, 50) }));
+      }
+      return undefined;
     });
-    const notify = vi.fn();
-    const { result, unmount } = renderHook(() => useFleet(notify));
-    const first = result.current.loadEvents("s1");
-    act(() => MockWebSocket.instances[0]!.disconnect());
-    expect(signals[0]?.aborted).toBe(true);
-    const next = result.current.loadEvents("s1");
-    expect(next).not.toBe(first);
-    await act(async () => {
-      finishes[0]!(response({ events: [event(1)] }));
-      await first;
-    });
-    expect(result.current.loadEvents("s1")).toBe(next);
-    expect(result.current.events).toEqual({});
-    unmount();
-    expect(signals[1]?.aborted).toBe(true);
-    finishes[1]!(response({ events: [event(2)] }));
-    await next;
-    expect(notify).toHaveBeenCalledTimes(1);
-    expect(notify).toHaveBeenCalledWith(
-      expect.stringContaining("Connection to the Host lost"),
-      "warning",
+    const { result } = renderHook(() => useFleet(vi.fn()));
+    await act(() => result.current.loadTranscript("s1"));
+    await act(() => result.current.loadOlderTranscript("s1"));
+    expect(result.current.transcripts.s1).toMatchObject({ start: 50 });
+    await act(() => result.current.loadOlderTranscript("s1", 30));
+    expect(result.current.transcripts.s1?.start).toBe(10);
+    expect(result.current.transcripts.s1?.blocks.map((item) => item.text)).toEqual(
+      Array.from({ length: 440 }, (_, offset) => `${offset + 10}`),
     );
   });
 
-  it("reports real failures and permits a fresh retry", async () => {
+  it("aborts a request when the socket drops, and reports real failures", async () => {
+    const signals: (AbortSignal | null | undefined)[] = [];
+    route((path) => {
+      if (path !== NEWEST) return undefined;
+      return new Promise(() => {});
+    });
+    vi.mocked(fetch).mockImplementationOnce((_path, init) => {
+      signals.push(init?.signal);
+      return new Promise(() => {});
+    });
     const notify = vi.fn();
     const { result } = renderHook(() => useFleet(notify));
+    void result.current.loadTranscript("s1");
+    act(() => MockWebSocket.instances[0]!.disconnect());
+    expect(signals[0]?.aborted).toBe(true);
+    expect(notify).toHaveBeenCalledTimes(1);
     vi.mocked(fetch).mockRejectedValueOnce(new Error("History unavailable"));
-    await act(async () => {
-      await result.current.loadEvents("s1");
-    });
+    await act(() => result.current.loadTranscript("other"));
     expect(notify).toHaveBeenCalledWith("History unavailable", "error");
-    vi.mocked(fetch).mockResolvedValueOnce(response({ events: [event(1)] }));
-    await act(async () => {
-      await result.current.loadEvents("s1");
-    });
-    expect(result.current.events.s1).toEqual([event(1)]);
+    expect(result.current.transcripts.other).toBeUndefined();
   });
 });
 

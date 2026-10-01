@@ -77,7 +77,7 @@ const PEAK_WIDTH = 30;
 const MAGNIFY_RANGE = 72;
 
 type PromptRailProps = {
-  marks: PromptMark[];
+  marks: readonly PromptMark[];
   activeKey?: string | undefined;
   onSelect: (key: string) => void;
 };

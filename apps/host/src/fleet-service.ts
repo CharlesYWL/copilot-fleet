@@ -60,6 +60,7 @@ import { SessionRetention } from "./session-retention.js";
 import { ManagedWorktreeService } from "./managed-worktree-service.js";
 import { CommandExecutionService } from "./command-execution-service.js";
 import { SessionFileService } from "./session-files.js";
+import { TranscriptProjections } from "./transcript-projections.js";
 import { CommandConflict } from "./command-execution-store.js";
 import { PR_MAINTENANCE_WAKE_INSTRUCTION } from "./orchestrator/briefing.js";
 import { PrMaintenanceError, type SupervisorCommand } from "./pr-maintenance-store.js";
@@ -245,6 +246,7 @@ export class FleetService {
   readonly worktrees: ManagedWorktreeService;
   readonly commands: CommandExecutionService;
   readonly files: SessionFileService;
+  readonly transcripts: TranscriptProjections;
 
   /** Wires the orchestration seams. Called once, from `server.ts`. */
   attachOrchestration(input: {
@@ -299,6 +301,9 @@ export class FleetService {
     this.worktrees = new ManagedWorktreeService(this);
     this.commands = new CommandExecutionService(this);
     this.files = new SessionFileService(this);
+    this.transcripts = new TranscriptProjections(store, (sessionId) =>
+      this.broadcast({ type: "transcript_reset", sessionId }),
+    );
     this.commands.reconcileNotifications();
   }
 
@@ -410,6 +415,7 @@ export class FleetService {
     this.commands.revokeAllSessionGrants();
     this.evictAllNodes(4002, "Host restored from backup");
     this.store.replaceHostBackup(backup);
+    this.transcripts.clear();
     this.commands.reconcileNotifications();
     this.broadcast({ type: "snapshot", data: this.snapshot() });
   }
@@ -432,6 +438,7 @@ export class FleetService {
     this.commands.revokeAllSessionGrants();
     this.evictAllNodes(4002, "Host restored from a portable backup");
     const result = this.store.importPortableBackup(input);
+    this.transcripts.clear();
     this.commands.reconcileNotifications();
     return result;
   }
@@ -2173,6 +2180,7 @@ export class FleetService {
 
   handleEventResult(event: SessionEvent): EventHandlingResult {
     let manualReceiptChanged = false;
+    let stored = false;
     type WriteResult = {
       outcome: "accepted" | "permanent_rejection";
       reason?: "session_missing" | "identity_conflict";
@@ -2195,6 +2203,7 @@ export class FleetService {
         };
       }
       const appended = this.store.appendEvent(event);
+      stored = appended.stored;
       if (!appended.stored) {
         return appended.conflict
           ? {
@@ -2410,10 +2419,19 @@ export class FleetService {
           "Session events were lost while the Host was unreachable",
         );
       }
+      // Advanced for every stored event, published or not: the projection is
+      // the stored log, and a reader that missed a change would see a gap.
+      const transcript = stored ? this.transcripts.apply(event) : undefined;
       if (result.publish && result.session) {
-        this.broadcast({ type: "event", event });
+        this.broadcast({ type: "event", event, ...(transcript ? { transcript } : {}) });
         this.publishSession(result.session);
         if (result.notifyListeners) this.notifySessionEventListeners(event);
+      } else if (transcript) {
+        this.broadcast({
+          type: "transcript",
+          sessionId: event.sessionId,
+          update: transcript,
+        });
       }
       if (result.redispatchStop && result.session) {
         this.dispatch(result.session.nodeId, {

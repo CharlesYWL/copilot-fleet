@@ -45,7 +45,7 @@ import { archiveRun, purgeRun } from "./orchestrator/lifecycle.js";
 import { registerRequestGuard } from "./request-guard.js";
 import { OPERATOR_COOKIE } from "./auth.js";
 import { assertHostArchiveSize, HOST_ARCHIVE_BYTES } from "./backup-limits.js";
-import { parseFleetControl } from "../ui/src/lib/fleet-wake.js";
+import { parseFleetControl } from "@fleet/protocol";
 
 const {
   fixtureInput,

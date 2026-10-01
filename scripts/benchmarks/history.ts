@@ -13,11 +13,16 @@ import { z } from "zod";
 import {
   SessionEventSchema,
   SessionPermissions,
-  type SessionTranscript,
+  TRANSCRIPT_PAGE_LIMIT,
+  isTranscriptEvent,
+  type TranscriptPage,
+  type TranscriptUpdate,
 } from "@fleet/protocol";
 import { FleetService } from "../../apps/host/src/fleet-service.js";
 import { sessionRoutes } from "../../apps/host/src/routes/sessions.js";
 import { FleetStore } from "../../apps/host/src/store.js";
+import { TranscriptProjections } from "../../apps/host/src/transcript-projections.js";
+import { TranscriptCache } from "../../apps/host/ui/src/lib/transcript-cache.js";
 import { mergeEvents } from "../../apps/host/ui/src/lib/merge-events.js";
 import { toPreviewLines } from "../../apps/host/ui/src/lib/session-preview.js";
 import {
@@ -48,11 +53,14 @@ const ReadySchema = z.object({
 });
 const StartedSchema = z.object({ type: z.literal("history-start") });
 const ResetSchema = z.object({ type: z.literal("reset") });
+const InvalidatedSchema = z.object({ type: z.literal("invalidated") });
 const MetricsSchema = z.object({
   type: z.literal("metrics"),
   eventLoop: HistoryReportSchema.shape.hostEventLoop,
 });
 const workerTimeoutMs = 300_000;
+/** What the browser keeps per session for monitor-wall previews. */
+const LIVE_TAIL_EVENTS = 200;
 
 function receive<T extends z.ZodTypeAny>(
   worker: ChildProcess,
@@ -144,7 +152,7 @@ function environment(): HistoryReport["environment"] {
   };
 }
 
-function seed(
+export function seed(
   store: FleetStore,
   database: DatabaseSync,
   options: BenchmarkOptions,
@@ -236,6 +244,47 @@ async function diagnostics(
   assert.equal(validated.length, options.events);
 }
 
+async function measureAsync<T>(
+  measurements: Record<string, Measurement>,
+  options: BenchmarkOptions,
+  name: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const samples: number[] = [];
+  let result!: T;
+  for (let index = 0; index < options.warmup + options.iterations; index++) {
+    await setImmediate();
+    const start = performance.now();
+    result = await operation();
+    const elapsed = performance.now() - start;
+    if (index >= options.warmup) samples.push(elapsed);
+  }
+  measurements[name] = summarize(samples);
+  return result;
+}
+
+/** Times `operation` only; `prepare` builds a fresh input for each sample. */
+async function measurePrepared<S, T>(
+  measurements: Record<string, Measurement>,
+  options: BenchmarkOptions,
+  name: string,
+  prepare: (iteration: number) => S,
+  operation: (state: S) => T,
+): Promise<T> {
+  const samples: number[] = [];
+  let result!: T;
+  for (let index = 0; index < options.warmup + options.iterations; index++) {
+    const state = prepare(index);
+    await setImmediate();
+    const start = performance.now();
+    result = operation(state);
+    const elapsed = performance.now() - start;
+    if (index >= options.warmup) samples.push(elapsed);
+  }
+  measurements[name] = summarize(samples);
+  return result;
+}
+
 async function nodeMeasurements(
   store: FleetStore,
   database: DatabaseSync,
@@ -257,14 +306,27 @@ async function nodeMeasurements(
     store.listEventsAfter(id, from),
   );
   assert.deepEqual(suffix, legacySuffix);
-  const history = await run("store.listTranscript", () => store.listTranscript(id));
-  const body = await run("history.stringify", () => JSON.stringify(history));
-  const parsedHistory = await run(
-    "history.parse.node",
-    () => JSON.parse(body) as SessionTranscript,
+
+  // First open after a Host start: the whole log folded in yielding batches.
+  const noReset = () => {};
+  await measureAsync(measurements, options, "host.projection.build", () =>
+    new TranscriptProjections(store, noReset).page(id),
   );
-  const parsed = parsedHistory.events;
-  const blocks = await run("transcript.fold", () => toTerminalBlocks(parsed));
+  const projections = new TranscriptProjections(store, noReset);
+  await projections.page(id);
+  // Every later open: a slice of the maintained projection.
+  const page = await measureAsync(measurements, options, "host.projection.page", () =>
+    projections.page(id),
+  );
+  assert.equal(page.blocks.length, Math.min(TRANSCRIPT_PAGE_LIMIT, page.total));
+  const body = await run("history.stringify", () => JSON.stringify(page));
+  const parsed = await run(
+    "history.parse.node",
+    () => JSON.parse(body) as TranscriptPage,
+  );
+  const blocks = await run("transcript.fold", () => toTerminalBlocks(events));
+  assert.deepEqual(parsed.blocks, blocks.slice(-parsed.blocks.length));
+
   const known = Object.fromEntries(
     ids.map((sessionId) => [
       sessionId,
@@ -279,34 +341,68 @@ async function nodeMeasurements(
   );
   const permissions = new SessionPermissions();
   permissions.apply(permissionEvents);
-  const text = incomingEvents(id, options.events + 1).text!;
-  await run("permissions.liveText", () => permissions.apply([text]));
-  const preview = await run("preview.last12", () => toPreviewLines(blocks, "", 12));
+  const tail = events.filter(isTranscriptEvent).slice(-LIVE_TAIL_EVENTS);
+  await run("permissions.liveText", () =>
+    permissions.apply([incomingEvents(id, options.events + 1).text!]),
+  );
+  // A monitor tile folds only the live tail it keeps.
+  const preview = await run("preview.last12", () =>
+    toPreviewLines(toTerminalBlocks(tail), "", 12),
+  );
   assert.ok(preview.length <= 12);
 
-  // A real text event makes the text case extend an existing block, even at a turn boundary.
-  const active = [...parsed, incomingEvents(id, options.events + 1).text!];
-  for (const [name, event] of Object.entries(incomingEvents(id, options.events + 2))) {
-    const next = { ...event, eventId: `${event.eventId}:next` };
-    const merged = await run(`events.merge.${name}`, () => mergeEvents([next], active));
-    assert.equal(merged.length, active.length + 1);
-    const updated = await run(`transcript.update.${name}`, () =>
-      toTerminalBlocks(mergeEvents([next], active)),
+  // A streamed event: the Host advances its projection, the browser applies
+  // the one change to its copy, and the preview tail takes the event.
+  let sequence = options.events + 1;
+  for (const name of ["text", "thought", "olderTool", "permission"]) {
+    const next = (iteration: number) => {
+      const item = incomingEvents(id, ++sequence)[name]!;
+      return { ...item, eventId: `${item.eventId}:${iteration}:${sequence}` };
+    };
+    await measurePrepared(measurements, options, `events.merge.${name}`, next, (event) =>
+      mergeEvents([event], tail),
     );
-    assert.ok(updated.length > 0);
+    const updates: TranscriptUpdate[] = [];
+    await measurePrepared(
+      measurements,
+      options,
+      `host.projection.apply.${name}`,
+      next,
+      (event) => {
+        const update = projections.apply(event);
+        if (update) updates.push(update);
+        return update;
+      },
+    );
+    assert.ok(updates.length > 0, `${name} events must change the transcript`);
+    await measurePrepared(
+      measurements,
+      options,
+      `transcript.update.${name}`,
+      (iteration) => {
+        const cache = new TranscriptCache();
+        const update = updates[iteration % updates.length]!;
+        cache.begin(id);
+        cache.receive(id, {
+          ...page,
+          generation: update.generation,
+          revision: update.revision - 1,
+        });
+        return { cache, update };
+      },
+      ({ cache, update }) => cache.apply(id, update),
+    );
   }
   const byteLength = (value: unknown) => Buffer.byteLength(JSON.stringify(value), "utf8");
-  const unused = new Set(["commands", "config", "usage", "agent_session"]);
   return {
     measurements,
     sizesBytes: {
       rawHistory: byteLength(events),
       currentTranscript: Buffer.byteLength(body, "utf8"),
-      filteredHistoryEstimate: byteLength(
-        events.filter((event) => !unused.has(event.type)),
-      ),
+      filteredHistoryEstimate: byteLength(events.filter(isTranscriptEvent)),
       allBlocksEstimate: byteLength(blocks),
       last200BlocksEstimate: byteLength(blocks.slice(-200)),
+      projectionRetained: projections.retainedBytes,
     },
   };
 }
@@ -377,6 +473,9 @@ async function runWorker(options: BenchmarkOptions): Promise<void> {
       void (async () => {
         if (message === "shutdown") {
           await close();
+        } else if (message === "invalidate") {
+          service!.transcripts.clear();
+          send({ type: "invalidated" });
         } else if (message === "reset") {
           histogram.enable();
           await delay(25);
@@ -422,8 +521,11 @@ async function runWorker(options: BenchmarkOptions): Promise<void> {
           "Synthetic fixture only. Setup and seeding are excluded; no live Host or database is accessed.",
           "Node stages are not browser, React, layout, paint, or input-to-paint measurements.",
           "diagnostic.* reproduces individual decoding stages; store.listEvents and HTTP call production implementations.",
-          "transcript.update.* includes merge plus full fold, as the current UI does; do not add events.merge.* to it.",
+          "host.projection.build is a first open after a Host start; host.projection.page is every later open.",
+          "transcript.update.* applies one Host block change to the browser's copy; events.merge.* updates the 200-event preview tail.",
+          "history.* is the newest 200-block page the browser downloads; rawHistory is the canonical log for reference.",
           "HTTP is the real browser transcript route on loopback, without production auth, TLS, compression, gateways, or agents.",
+          "http.history.cold.* drops the projection before each request; hostEventLoopCold covers those rebuilds.",
           "The responsiveness probe uses a separate connection and parent process; an IPC signal starts it when history handling begins.",
           "The event-loop histogram has 10 ms resolution; inspect its maximum as well as its P95.",
           "All size estimates use UTF-8 bytes, not characters; block/filtered estimates are not implemented APIs.",
@@ -530,16 +632,45 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<HistoryRe
       startupTimeout,
     );
     await request(`${url}/_benchmark/ping`, probeAgent);
+    const metrics = async () => {
+      const reply = receive(worker, "metrics", MetricsSchema);
+      worker.send("metrics");
+      return (await reply).eventLoop;
+    };
+    const resetEventLoop = async () => {
+      const reply = receive(worker, "reset", ResetSchema);
+      worker.send("reset");
+      await reply;
+    };
+    // A first open after a Host start: the projection is rebuilt every time.
+    const coldTotal: number[] = [];
+    const coldProbe: number[] = [];
+    await resetEventLoop();
+    for (let index = 0; index < options.warmup + options.iterations; index++) {
+      const invalidated = receive(worker, "invalidated", InvalidatedSchema);
+      worker.send("invalidate");
+      await invalidated;
+      const started = receive(worker, "history-start", StartedSchema);
+      const [history, concurrent] = await Promise.all([
+        request(`${url}${historyPath}`, historyAgent),
+        started.then(() => request(`${url}/_benchmark/ping`, probeAgent)),
+      ]);
+      assert.equal(history.bytes, report.sizesBytes.currentTranscript);
+      if (index >= options.warmup) {
+        coldTotal.push(history.totalMs);
+        coldProbe.push(concurrent.totalMs);
+      }
+    }
+    report.measurements["http.history.cold.total"] = summarize(coldTotal);
+    report.measurements["http.probe.duringColdHistory"] = summarize(coldProbe);
+    report.hostEventLoopCold = await metrics();
     const ttfb: number[] = [];
     const total: number[] = [];
     const probe: number[] = [];
     const idleProbe: number[] = [];
     for (let index = 0; index < options.warmup + options.iterations; index++) {
-      if (index === options.warmup) {
-        const reset = receive(worker, "reset", ResetSchema);
-        worker.send("reset");
-        await reset;
-      }
+      if (index === options.warmup) await resetEventLoop();
+
       const idle = await request(`${url}/_benchmark/ping`, probeAgent);
       const started = receive(worker, "history-start", StartedSchema);
       const [history, concurrent] = await Promise.all([
@@ -559,9 +690,8 @@ export async function runBenchmark(options: BenchmarkOptions): Promise<HistoryRe
     report.measurements["http.probe.idle"] = summarize(idleProbe);
     report.measurements["http.probe.duringHistory"] = summarize(probe);
     report.sizesBytes.httpHistory = report.sizesBytes.currentTranscript!;
-    const metrics = receive(worker, "metrics", MetricsSchema);
-    worker.send("metrics");
-    report.hostEventLoop = (await metrics).eventLoop;
+    report.hostEventLoop = await metrics();
+
     return HistoryReportSchema.parse(report);
   } finally {
     historyAgent.destroy();
@@ -608,7 +738,11 @@ async function main(): Promise<void> {
           `${name.padEnd(35)} median ${value.medianMs.toFixed(2).padStart(8)} ms | P95 ${value.p95Ms.toFixed(2).padStart(8)} ms`,
       )
       .join("\n") +
-      `\nHost event-loop maximum: ${report.hostEventLoop.maxMs.toFixed(2)} ms\n` +
+      `\nHost event-loop maximum: ${report.hostEventLoop.maxMs.toFixed(2)} ms` +
+      (report.hostEventLoopCold
+        ? ` (rebuilding projections: ${report.hostEventLoopCold.maxMs.toFixed(2)} ms)`
+        : "") +
+      "\n" +
       `History: ${report.sizesBytes.httpHistory} UTF-8 bytes; ${report.fixture.leadBlocks} blocks\n` +
       (comparison.length
         ? `\nComparison (positive percentages are slower):\n${comparison.join("\n")}\n`

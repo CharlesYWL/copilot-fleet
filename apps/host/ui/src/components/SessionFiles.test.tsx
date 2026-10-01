@@ -9,6 +9,7 @@ import { fleetDarkTheme } from "../theme";
 import { MarkdownBody } from "./MarkdownBody";
 import { SessionFilesProvider } from "./SessionFiles";
 import { TerminalView } from "./TerminalView";
+import { transcriptOf } from "../test-transcript";
 
 vi.mock("../lib/session-files", async (original) => ({
   ...(await original<typeof SessionFilesModule>()),
@@ -172,7 +173,7 @@ const terminal = (events: SessionEvent[]) =>
             nodeId: "n1",
             localPath: "C:\\work",
           }}
-          events={events}
+          transcript={transcriptOf(events)}
           onPrompt={vi.fn()}
           onCancel={vi.fn()}
           onStop={vi.fn()}

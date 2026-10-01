@@ -11,6 +11,13 @@ const MeasurementSchema = z.object({
   maxMs: duration,
 });
 
+const EventLoopSchema = z.object({
+  resolutionMs: duration,
+  meanMs: duration,
+  p95Ms: duration,
+  maxMs: duration,
+});
+
 export const HistoryReportSchema = z.object({
   schemaVersion: z.literal(1),
   createdAt: z.string().datetime(),
@@ -39,12 +46,9 @@ export const HistoryReportSchema = z.object({
   }),
   measurements: z.record(z.string(), MeasurementSchema),
   sizesBytes: z.record(z.string(), z.number().int().nonnegative()),
-  hostEventLoop: z.object({
-    resolutionMs: duration,
-    meanMs: duration,
-    p95Ms: duration,
-    maxMs: duration,
-  }),
+  hostEventLoop: EventLoopSchema,
+  /** Event-loop delay while projections were rebuilt from the log. */
+  hostEventLoopCold: EventLoopSchema.optional(),
   notes: z.array(z.string()),
 });
 

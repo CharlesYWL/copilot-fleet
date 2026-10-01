@@ -7,6 +7,26 @@ import { TerminalView } from "./TerminalView";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
 import { fleetDarkTheme } from "../theme";
 import { NotificationContext } from "../hooks/useAppNotifications";
+import { pendingPermission } from "../lib/terminal-blocks";
+import { transcriptOf } from "../test-transcript";
+
+/** What App derives from a session's events: blocks, newest activity, pending request. */
+const live = (events: SessionEvent[]) => {
+  let activity: SessionEvent | undefined;
+  for (let index = events.length - 1; !activity && index >= 0; index--) {
+    if (events[index]!.type !== "usage") activity = events[index];
+  }
+  return {
+    transcript: transcriptOf(events),
+    activity: activity && {
+      eventId: activity.eventId,
+      sequence: activity.sequence,
+      createdAt: activity.createdAt,
+      live: true,
+    },
+    pendingPermission: pendingPermission(events) ?? null,
+  };
+};
 
 const session = (values: Partial<FleetSession> = {}): FleetSession => ({
   id: "s1",
@@ -57,7 +77,7 @@ const show = (
       <NotificationContext.Provider value={notify}>
         <TerminalView
           session={session(overrides)}
-          events={events}
+          {...live(events)}
           onPrompt={onPrompt}
           onCancel={vi.fn()}
           onStop={vi.fn()}
@@ -413,7 +433,7 @@ describe("TerminalView transcript", () => {
         <NotificationContext.Provider value={vi.fn()}>
           <TerminalView
             session={session({ state: "running" })}
-            events={[oldRequest]}
+            transcript={transcriptOf([oldRequest])}
             activity={{
               eventId: id,
               sequence: 100,
@@ -511,7 +531,7 @@ describe("TerminalView transcript", () => {
           <NotificationContext.Provider value={vi.fn()}>
             <TerminalView
               session={session({ state: "running" })}
-              events={nextEvents}
+              {...live(nextEvents)}
               onPrompt={vi.fn()}
               onCancel={vi.fn()}
               onStop={vi.fn()}
@@ -591,17 +611,19 @@ describe("TerminalView transcript", () => {
 
     running.rerender(
       <FluentProvider theme={fleetDarkTheme}>
-        <TerminalView
-          session={session({ state: "offline" })}
-          events={[pendingTool]}
-          onPrompt={vi.fn()}
-          onCancel={vi.fn()}
-          onStop={vi.fn()}
-          onPermission={vi.fn()}
-          onConfigChange={vi.fn()}
-          draft={EMPTY_DRAFT}
-          onDraftChange={vi.fn()}
-        />
+        <NotificationContext.Provider value={vi.fn()}>
+          <TerminalView
+            session={session({ state: "offline" })}
+            {...live([pendingTool])}
+            onPrompt={vi.fn()}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onPermission={vi.fn()}
+            onConfigChange={vi.fn()}
+            draft={EMPTY_DRAFT}
+            onDraftChange={vi.fn()}
+          />
+        </NotificationContext.Provider>
       </FluentProvider>,
     );
 
@@ -829,5 +851,93 @@ describe("TerminalView transcript", () => {
     expect(
       screen.getByRole("button", { name: "Jump to prompt: second ask" }),
     ).toBeTruthy();
+  });
+
+  it("fetches an older prompt's page before jumping to it, and keeps the rest unloaded", async () => {
+    const events = [
+      streamEvent("system", { text: "User: long ago" }),
+      streamEvent("agent_text", { text: "old answer" }),
+      streamEvent("system", { text: "User: recent" }),
+      streamEvent("agent_text", { text: "new answer" }),
+    ];
+    const whole = transcriptOf(events);
+    const tail = { ...whole, start: 2, blocks: whole.blocks.slice(2) };
+    const onLoadOlder = vi.fn(async () => {});
+    const tree = (transcript: typeof whole) => (
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={vi.fn()}>
+          <TerminalView
+            session={session()}
+            transcript={transcript}
+            onLoadOlder={onLoadOlder}
+            pendingPermission={null}
+            onPrompt={vi.fn()}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onPermission={vi.fn()}
+            draft={EMPTY_DRAFT}
+            onDraftChange={vi.fn()}
+          />
+        </NotificationContext.Provider>
+      </FluentProvider>
+    );
+    const view = render(tree(tail));
+    expect(screen.queryByText("old answer")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Jump to prompt: long ago" }));
+    expect(onLoadOlder).toHaveBeenCalledWith(0);
+    expect(screen.getByRole("button", { name: "Jump to latest" })).toBeTruthy();
+    view.rerender(tree(whole));
+    await waitFor(() => expect(screen.getByText("old answer")).toBeTruthy());
+    expect(screen.getByRole("button", { name: "Jump to latest" })).toBeTruthy();
+  });
+
+  it("says the transcript is loading until its first page arrives", () => {
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={vi.fn()}>
+          <TerminalView
+            session={session()}
+            onPrompt={vi.fn()}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onPermission={vi.fn()}
+            draft={EMPTY_DRAFT}
+            onDraftChange={vi.fn()}
+          />
+        </NotificationContext.Provider>
+      </FluentProvider>,
+    );
+    expect(screen.getByText("Loading transcript…")).toBeTruthy();
+  });
+
+  it("keeps a folded row open across updates that replace its block list", async () => {
+    const thought = streamEvent("agent_thought", { text: "a long line of reasoning" });
+    const view = show({}, EMPTY_DRAFT, [thought]);
+    fireEvent.click(screen.getByRole("button", { name: /Thinking/ }));
+    expect(
+      screen.getByRole("button", { name: /Thinking/ }).getAttribute("aria-expanded"),
+    ).toBe("true");
+    view.rerender(
+      <FluentProvider theme={fleetDarkTheme}>
+        <NotificationContext.Provider value={vi.fn()}>
+          <TerminalView
+            session={session()}
+            {...live([thought, streamEvent("agent_text", { text: "answer" })])}
+            onPrompt={vi.fn()}
+            onCancel={vi.fn()}
+            onStop={vi.fn()}
+            onResume={vi.fn()}
+            onPermission={vi.fn()}
+            onConfigChange={vi.fn()}
+            draft={EMPTY_DRAFT}
+            onDraftChange={vi.fn()}
+          />
+        </NotificationContext.Provider>
+      </FluentProvider>,
+    );
+    await waitFor(() => expect(screen.getByText("answer")).toBeTruthy());
+    expect(
+      screen.getByRole("button", { name: /Thinking/ }).getAttribute("aria-expanded"),
+    ).toBe("true");
   });
 });

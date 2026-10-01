@@ -196,6 +196,11 @@ it("runs real store/HTTP code on an isolated fixture and returns all measured sa
   expect(report.measurements["store.listEvents"]).toBeDefined();
   expect(report.measurements["http.history.total"]).toBeDefined();
   expect(report.measurements["http.probe.duringHistory"]).toBeDefined();
+  expect(report.measurements["http.history.cold.total"]).toBeDefined();
+  expect(report.measurements["host.projection.build"]).toBeDefined();
+  expect(report.measurements["transcript.update.text"]).toBeDefined();
+  expect(report.hostEventLoopCold).toBeDefined();
+  expect(report.sizesBytes.currentTranscript).toBeLessThan(report.sizesBytes.rawHistory!);
   expect(report.sizesBytes.httpHistory).toBe(report.sizesBytes.currentTranscript);
   expect(report.sizesBytes.rawHistory).toBeGreaterThan(
     report.sizesBytes.allBlocksEstimate!,

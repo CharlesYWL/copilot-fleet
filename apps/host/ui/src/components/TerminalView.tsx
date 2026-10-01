@@ -1,4 +1,5 @@
 import {
+  forwardRef,
   memo,
   useCallback,
   useEffect,
@@ -11,6 +12,12 @@ import {
   type ClipboardEvent,
   type ReactNode,
 } from "react";
+import {
+  Virtuoso,
+  type ListRange,
+  type ScrollerProps,
+  type VirtuosoHandle,
+} from "react-virtuoso";
 import {
   Badge,
   Button,
@@ -69,13 +76,13 @@ import { useMessageNotification } from "../hooks/useAppNotifications";
 import type { TranscriptActivity } from "../hooks/useFleet";
 import {
   allowOnceOptionId,
-  pendingPermission,
   permissionRequestId,
   permissionTitle,
-  toTerminalBlocks,
   type TerminalBlock,
   type TerminalBlockKind,
 } from "../lib/terminal-blocks";
+import type { PromptMark } from "../lib/prompt-marks";
+import type { TranscriptView } from "../lib/transcript-cache";
 import {
   applyCommand,
   matchCommands,
@@ -89,7 +96,6 @@ import {
   type DraftAttachment,
 } from "../lib/attachments";
 import { EMPTY_DRAFT, type SessionDraft } from "../lib/session-drafts";
-import { toPromptMarks } from "../lib/prompt-marks";
 import { toolFilePath } from "../lib/session-files";
 import { AttachmentStrip } from "./AttachmentStrip";
 import { MarkdownBody } from "./MarkdownBody";
@@ -103,6 +109,10 @@ import { FileDownloadButton, SessionFilesProvider } from "./SessionFiles";
 import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SlashMenu } from "./SlashMenu";
 import { StatusIndicator } from "./StatusIndicator";
+
+const noBlocks: readonly TerminalBlock[] = [];
+const noPrompts: readonly PromptMark[] = [];
+const noKeys: ReadonlySet<string> = new Set();
 
 const useStyles = makeStyles({
   view: {
@@ -269,6 +279,28 @@ const useStyles = makeStyles({
     // quiet list rather than a stack of separated cards.
     gap: "1px",
   },
+  /** The virtualised list's scroll element; padding lives on its rows. */
+  list: {
+    flexGrow: 1,
+    minWidth: 0,
+    height: "100%",
+    scrollbarWidth: "none",
+    "::-webkit-scrollbar": {
+      width: 0,
+      height: 0,
+    },
+  },
+  /*
+   * A column, so a message's own margins stay inside the row Virtuoso measures
+   * instead of collapsing through it. The right padding belongs to the rail.
+   */
+  row: {
+    display: "flex",
+    flexDirection: "column",
+    padding: "0 40px 1px 22px",
+  },
+  listHeader: { height: "16px" },
+  listFooter: { padding: "0 40px 24px 22px" },
   message: {
     margin: "10px 0 12px",
     minWidth: 0,
@@ -546,7 +578,10 @@ type TerminalViewProps = {
   session: FleetSession;
   node?: FleetNode | undefined;
   placement?: Placement | undefined;
-  events: SessionEvent[];
+  /** The loaded run of blocks; absent until the newest page arrives. */
+  transcript?: TranscriptView | undefined;
+  /** Fetches older blocks, back to 	oIndex when given. */
+  onLoadOlder?: ((toIndex?: number) => Promise<void>) | undefined;
   activity?: TranscriptActivity | undefined;
   /** Null means the independently hydrated permission ledger has no pending request. */
   pendingPermission?: SessionEvent | null | undefined;
@@ -572,7 +607,8 @@ export const TerminalView = ({
   session,
   node,
   placement,
-  events,
+  transcript,
+  onLoadOlder,
   activity,
   pendingPermission: knownPermission,
   onPrompt,
@@ -596,7 +632,9 @@ export const TerminalView = ({
   const [highlight, setHighlight] = useState(0);
   const [attachError, setAttachError] = useState<string>();
   useMessageNotification(attachError);
-  const streamRef = useRef<HTMLDivElement>(null);
+  /** The list's own scroll element: what the reader scrolls, and what is measured. */
+  const streamRef = useRef<HTMLElement | null>(null);
+  const virtuosoRef = useRef<VirtuosoHandle>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const pinnedRef = useRef(true);
@@ -617,19 +655,31 @@ export const TerminalView = ({
       attachments: update(current.attachments),
     }));
 
-  const blocks = useMemo(() => toTerminalBlocks(events), [events]);
-  const permission = useMemo(
-    () =>
-      knownPermission === undefined
-        ? pendingPermission(events)
-        : (knownPermission ?? undefined),
-    [events, knownPermission],
-  );
+  const blocks = transcript?.blocks ?? noBlocks;
+  const start = transcript?.start ?? 0;
+  const promptMarks = transcript?.prompts ?? noPrompts;
+  const permission = knownPermission ?? undefined;
   const status = sessionStatusDescriptor(session, Boolean(permission));
-  const promptMarks = useMemo(() => toPromptMarks(blocks), [blocks]);
   const [activePrompt, setActivePrompt] = useState<string>();
+  /** First rendered block, so a turn whose prompt is not rendered still has a mark. */
+  const renderedStart = useRef(start);
+  /** A prompt whose page is being fetched, to scroll to once it is here. */
+  const pendingJump = useRef<number>(undefined);
 
-  /** The prompt elements, in order, so the rail and the stream stay in step. */
+  /*
+   * Expansion lives here, not in the rows: a virtualised row is unmounted as
+   * soon as it scrolls away, and would come back folded.
+   */
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(noKeys);
+  const toggleExpanded = useCallback((key: string) => {
+    setExpanded((current) => {
+      const next = new Set(current);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  }, []);
+
+  /** Rendered prompt elements only; virtualisation keeps that to a screenful. */
   const promptNodes = useCallback(
     (): HTMLElement[] => [
       ...(streamRef.current?.querySelectorAll<HTMLElement>("[data-prompt-key]") ?? []),
@@ -642,48 +692,80 @@ export const TerminalView = ({
    *
    * The last prompt whose top has passed the top of the viewport: scrolling
    * through an agent's answer keeps the mark for the prompt that asked for it
-   * lit, rather than jumping ahead the moment the next prompt peeks in.
+   * lit, rather than jumping ahead the moment the next prompt peeks in. When no
+   * rendered prompt has passed it, the turn began above what is rendered.
    */
+  const latestPrompts = useRef(promptMarks);
+  latestPrompts.current = promptMarks;
   const updateActivePrompt = useCallback(() => {
     const element = streamRef.current;
     if (!element) return;
+    const marks = latestPrompts.current;
     const top = element.getBoundingClientRect().top;
-    const nodes = promptNodes();
     let current: string | undefined;
-    for (const node of nodes) {
+    for (const node of promptNodes()) {
       if (node.getBoundingClientRect().top - top <= 24) current = node.dataset.promptKey;
     }
-    setActivePrompt(current ?? nodes[0]?.dataset.promptKey);
+    for (let index = marks.length - 1; !current && index >= 0; index--) {
+      const mark = marks[index]!;
+      if (mark.index < renderedStart.current) current = mark.key;
+    }
+    setActivePrompt(current ?? marks[0]?.key);
+    // Reads the marks through a ref: a new prompt must not change this
+    // function, or everything that depends on it would re-pin the reader.
   }, [promptNodes]);
 
-  const scrollToPrompt = useCallback(
-    (key: string) => {
+  const scrollToIndex = useCallback(
+    (index: number) => {
+      const node = promptNodes().find(
+        (candidate) => candidate.dataset.promptIndex === String(index),
+      );
       const element = streamRef.current;
-      const node = promptNodes().find((candidate) => candidate.dataset.promptKey === key);
-      if (!element || !node) return;
-      // Left pinned, the next streamed chunk would yank the reader straight
-      // back to the bottom of the very transcript they just left.
-      pinnedRef.current = false;
-      setPinned(false);
+      const smooth = !window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+      if (!node || !element) {
+        virtuosoRef.current?.scrollToIndex({ index: index - start, align: "start" });
+        return;
+      }
       const offset =
         node.getBoundingClientRect().top - element.getBoundingClientRect().top;
       const top = element.scrollTop + offset - 14;
       // `scrollTo` is what animates; the assignment is the fallback for hosts
       // that do not have it, which is also what keeps this testable.
       if (typeof element.scrollTo === "function") {
-        element.scrollTo({
-          top,
-          behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
-            ? "instant"
-            : "smooth",
-        });
+        element.scrollTo({ top, behavior: smooth ? "smooth" : "instant" });
       } else {
         element.scrollTop = top;
       }
-      setActivePrompt(key);
     },
-    [promptNodes],
+    [promptNodes, start],
   );
+
+  const scrollToPrompt = useCallback(
+    (key: string) => {
+      const mark = promptMarks.find((candidate) => candidate.key === key);
+      if (!mark) return;
+      // Left pinned, the next streamed chunk would yank the reader straight
+      // back to the bottom of the very transcript they just left.
+      pinnedRef.current = false;
+      setPinned(false);
+      setActivePrompt(key);
+      if (mark.index >= start) {
+        scrollToIndex(mark.index);
+        return;
+      }
+      pendingJump.current = mark.index;
+      void onLoadOlder?.(mark.index);
+    },
+    [onLoadOlder, promptMarks, scrollToIndex, start],
+  );
+
+  // An older prompt's page arrived: finish the jump that asked for it.
+  useEffect(() => {
+    const target = pendingJump.current;
+    if (target === undefined || target < start) return;
+    pendingJump.current = undefined;
+    scrollToIndex(target);
+  }, [start, scrollToIndex]);
 
   const scrollToEnd = useCallback(() => {
     const element = streamRef.current;
@@ -703,12 +785,16 @@ export const TerminalView = ({
     updateActivePrompt();
   }, [blocks, updateActivePrompt]);
 
+  // The newest block grows in place as text streams; new blocks are followed
+  // by the list itself (`followOutput`).
   useEffect(() => {
     if (!pinnedRef.current) return;
     scrollToEnd();
   }, [blocks, scrollToEnd]);
 
   useEffect(() => {
+    pendingJump.current = undefined;
+    setExpanded(noKeys);
     jumpToLatest();
   }, [session.id, jumpToLatest]);
 
@@ -718,14 +804,7 @@ export const TerminalView = ({
    * Counted from events rather than blocks because a block can absorb many
    * events into one line, and "3 new lines" should mean three things arrived.
    */
-  let latestActivityEventId = activity?.eventId;
-  for (let index = events.length - 1; !latestActivityEventId && index >= 0; index--) {
-    const event = events[index];
-    if (event && event.type !== "usage") {
-      latestActivityEventId = event.eventId;
-      break;
-    }
-  }
+  const latestActivityEventId = activity?.eventId;
   const liveActivity = activity?.live ?? true;
   useEffect(() => {
     if (!latestActivityEventId) return;
@@ -736,6 +815,56 @@ export const TerminalView = ({
     }
     if (liveActivity) setUnseen((count) => count + 1);
   }, [latestActivityEventId, liveActivity]);
+
+  const handleScroll = useCallback(() => {
+    const element = streamRef.current;
+    if (!element) return;
+    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
+    const atEnd = distance < 48;
+    pinnedRef.current = atEnd;
+    setPinned(atEnd);
+    if (atEnd) setUnseen(0);
+    updateActivePrompt();
+  }, [updateActivePrompt]);
+
+  /** Virtuoso owns the scroll element; this listens to it like the old div. */
+  const latestScroll = useRef(handleScroll);
+  useLayoutEffect(() => {
+    latestScroll.current = handleScroll;
+  }, [handleScroll]);
+  const onScroll = useCallback(() => latestScroll.current(), []);
+  const attachScroller = useCallback(
+    (element: HTMLElement | Window | null) => {
+      streamRef.current?.removeEventListener("scroll", onScroll);
+      streamRef.current = element instanceof HTMLElement ? element : null;
+      streamRef.current?.addEventListener("scroll", onScroll, { passive: true });
+    },
+    [onScroll],
+  );
+
+  const listContext = useMemo<TranscriptListContext>(
+    () => ({
+      sessionState: session.state,
+      expanded,
+      onToggle: toggleExpanded,
+      working: session.state === "running",
+    }),
+    [session.state, expanded, toggleExpanded],
+  );
+  const followOutput = useCallback(
+    (): "auto" | false => (pinnedRef.current ? "auto" : false),
+    [],
+  );
+  const loadOlderAtTop = useCallback(() => {
+    if (start > 0) void onLoadOlder?.();
+  }, [onLoadOlder, start]);
+  const trackRange = useCallback(
+    (range: ListRange) => {
+      renderedStart.current = range.startIndex;
+      updateActivePrompt();
+    },
+    [updateActivePrompt],
+  );
 
   // A clock, only while it could change the answer: a silent running session.
   useEffect(() => {
@@ -911,17 +1040,6 @@ export const TerminalView = ({
     if (event.key !== "Enter" || event.shiftKey) return;
     event.preventDefault();
     void submitPrompt();
-  };
-
-  const handleScroll = () => {
-    const element = streamRef.current;
-    if (!element) return;
-    const distance = element.scrollHeight - element.scrollTop - element.clientHeight;
-    const atEnd = distance < 48;
-    pinnedRef.current = atEnd;
-    setPinned(atEnd);
-    if (atEnd) setUnseen(0);
-    updateActivePrompt();
   };
 
   const handleDecide = (outcome: "allow_once" | "deny", optionId?: string) => {
@@ -1127,30 +1245,49 @@ export const TerminalView = ({
       )}
 
       <div className={styles.streamArea}>
-        <div
-          className={styles.stream}
-          ref={streamRef}
-          onScroll={handleScroll}
-          role="region"
-          aria-label="Chat transcript"
-          tabIndex={0}
-        >
-          {blocks.length === 0 ? (
-            <p className={styles.emptyStream}>Waiting for the first streamed event…</p>
-          ) : (
-            // Paths in the transcript download from the machine that ran it.
-            <SessionFilesProvider sessionId={session.id} nodeName={session.nodeName}>
-              {blocks.map((block) => (
-                <TerminalLine
-                  block={block}
-                  sessionState={session.state}
-                  key={block.key}
-                />
-              ))}
-            </SessionFilesProvider>
-          )}
-          {session.state === "running" && <div className={styles.working}>working…</div>}
-        </div>
+        {!transcript || blocks.length === 0 ? (
+          <div
+            className={styles.stream}
+            role="region"
+            aria-label="Chat transcript"
+            tabIndex={0}
+          >
+            <p className={styles.emptyStream}>
+              {transcript
+                ? "Waiting for the first streamed event…"
+                : "Loading transcript…"}
+            </p>
+            {session.state === "running" && (
+              <div className={styles.working}>working…</div>
+            )}
+          </div>
+        ) : (
+          // Paths in the transcript download from the machine that ran it.
+          <SessionFilesProvider sessionId={session.id} nodeName={session.nodeName}>
+            {/*
+              Only what is on screen, plus a margin, is mounted: a conversation of
+              thousands of blocks costs what a screenful does. Remounted per
+              session and per fresh copy, so each opens at its newest block.
+            */}
+            <Virtuoso
+              key={`${session.id}:${transcript.epoch}`}
+              ref={virtuosoRef}
+              className={styles.list}
+              data={blocks}
+              firstItemIndex={start}
+              initialTopMostItemIndex={{ index: blocks.length - 1, align: "end" }}
+              computeItemKey={transcriptItemKey}
+              itemContent={renderTranscriptItem}
+              context={listContext}
+              followOutput={followOutput}
+              startReached={loadOlderAtTop}
+              rangeChanged={trackRange}
+              increaseViewportBy={{ top: 800, bottom: 400 }}
+              scrollerRef={attachScroller}
+              components={transcriptComponents}
+            />
+          </SessionFilesProvider>
+        )}
         {/*
           Floated over the stream rather than inserted into it, so appearing
           never shifts the text someone is reading.
@@ -1316,13 +1453,87 @@ export const TerminalView = ({
  * be bordered cards with a timestamp column, which meant a turn that ran ten
  * tools pushed its own answer off the screen.
  */
+type TerminalLineProps = {
+  block: TerminalBlock;
+  /** Absolute block position, so a prompt can be found once it is rendered. */
+  index: number;
+  sessionState: SessionState;
+  expanded: boolean;
+  onToggle: (key: string) => void;
+};
+
+/** What every rendered row shares, kept stable so unchanged rows skip rendering. */
+type TranscriptListContext = {
+  sessionState: SessionState;
+  expanded: ReadonlySet<string>;
+  onToggle: (key: string) => void;
+  working: boolean;
+};
+
+const TranscriptRow = memo(function TranscriptRow(props: TerminalLineProps) {
+  const styles = useStyles();
+  return (
+    <div className={styles.row}>
+      <TerminalLine {...props} />
+    </div>
+  );
+});
+
+const renderTranscriptItem = (
+  index: number,
+  block: TerminalBlock,
+  context: TranscriptListContext,
+) => (
+  <TranscriptRow
+    block={block}
+    index={index}
+    sessionState={context.sessionState}
+    expanded={context.expanded.has(block.key)}
+    onToggle={context.onToggle}
+  />
+);
+
+const transcriptItemKey = (_index: number, block: TerminalBlock) => block.key;
+
+/** The list's scroll element, which is also the transcript's landmark. */
+const TranscriptScroller = forwardRef<HTMLDivElement, ScrollerProps>(
+  function TranscriptScroller(props, ref) {
+    // Custom components are also handed the list's context, which is not a
+    // DOM attribute; the published type leaves it out.
+    const { context: _context, ...rest } = props as ScrollerProps & { context?: unknown };
+    return (
+      <div {...rest} ref={ref} role="region" aria-label="Chat transcript" tabIndex={0} />
+    );
+  },
+);
+
+const TranscriptHeader = () => {
+  const styles = useStyles();
+  return <div className={styles.listHeader} />;
+};
+
+const TranscriptFooter = ({ context }: { context?: TranscriptListContext }) => {
+  const styles = useStyles();
+  return (
+    <div className={styles.listFooter}>
+      {context?.working ? <div className={styles.working}>working…</div> : null}
+    </div>
+  );
+};
+
+const transcriptComponents = {
+  Scroller: TranscriptScroller,
+  Header: TranscriptHeader,
+  Footer: TranscriptFooter,
+};
+
 const TerminalLine = memo(function TerminalLine({
   block,
+  index,
   sessionState,
-}: {
-  block: TerminalBlock;
-  sessionState: SessionState;
-}) {
+  expanded,
+  onToggle,
+}: TerminalLineProps) {
   const styles = useStyles();
   const time = formatTime(block.createdAt);
 
@@ -1350,7 +1561,11 @@ const TerminalLine = memo(function TerminalLine({
       );
     }
     return (
-      <div className={styles.userRow} data-prompt-key={block.key}>
+      <div
+        className={styles.userRow}
+        data-prompt-key={block.key}
+        data-prompt-index={index}
+      >
         <div className={styles.userMessage} title={time}>
           {body}
         </div>
@@ -1373,9 +1588,22 @@ const TerminalLine = memo(function TerminalLine({
     );
   }
 
-  if (block.kind === "thought") return <ThoughtLine block={block} time={time} />;
+  if (block.kind === "thought") {
+    return (
+      <ThoughtLine block={block} time={time} expanded={expanded} onToggle={onToggle} />
+    );
+  }
 
-  if (block.kind === "wake") return <FleetControlLine block={block} time={time} />;
+  if (block.kind === "wake") {
+    return (
+      <FleetControlLine
+        block={block}
+        time={time}
+        expanded={expanded}
+        onToggle={onToggle}
+      />
+    );
+  }
 
   // Raw agent stderr and errors are the two things a truncated line would
   // actively cost the reader, so they keep their full text under the row.
@@ -1442,9 +1670,15 @@ const TerminalLine = memo(function TerminalLine({
 });
 
 /** A thought, folded to its first line until the reader asks for the rest. */
-const ThoughtLine = ({ block, time }: { block: TerminalBlock; time: string }) => {
+type FoldedLineProps = {
+  block: TerminalBlock;
+  time: string;
+  expanded: boolean;
+  onToggle: (key: string) => void;
+};
+
+const ThoughtLine = ({ block, time, expanded, onToggle }: FoldedLineProps) => {
   const styles = useStyles();
-  const [expanded, setExpanded] = useState(false);
   const preview = previewOf(block.text);
 
   return (
@@ -1455,7 +1689,7 @@ const ThoughtLine = ({ block, time }: { block: TerminalBlock; time: string }) =>
         detail={expanded ? undefined : preview}
         proseDetail
         time={time}
-        onClick={() => setExpanded((current) => !current)}
+        onClick={() => onToggle(block.key)}
         expanded={expanded}
       />
       {expanded ? (
@@ -1475,9 +1709,8 @@ const ThoughtLine = ({ block, time }: { block: TerminalBlock; time: string }) =>
  * envelope and trailing guidance stay one click away, without a chat bubble
  * pushing the orchestrator's own reply off the screen.
  */
-const FleetControlLine = ({ block, time }: { block: TerminalBlock; time: string }) => {
+const FleetControlLine = ({ block, time, expanded, onToggle }: FoldedLineProps) => {
   const styles = useStyles();
-  const [expanded, setExpanded] = useState(false);
 
   return (
     <div>
@@ -1487,7 +1720,7 @@ const FleetControlLine = ({ block, time }: { block: TerminalBlock; time: string 
         detail={expanded ? undefined : block.detail}
         time={time}
         color={blockColor.wake}
-        onClick={() => setExpanded((current) => !current)}
+        onClick={() => onToggle(block.key)}
         expanded={expanded}
       />
       {expanded ? (
