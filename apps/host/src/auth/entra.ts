@@ -23,6 +23,24 @@ export const MICROSOFT_CORP_TENANT_ID = "72f988bf-86f1-41af-91ab-2d7cd011db47";
 export const VISUAL_STUDIO_PUBLIC_CLIENT_ID = "aebc6443-996d-45c2-90f0-388ff96faa56";
 
 /**
+ * Whether a verified identity is a Microsoft employee's corporate account.
+ *
+ * Both halves are required. The tenant comes from the signed token, but guests
+ * and service accounts live in it too; the address alone is a display claim
+ * anybody's directory can mint. Only `alias@microsoft.com` in the corp tenant
+ * passes — not a subdomain, not a guest `#EXT#` name, not a look-alike domain.
+ */
+export function isMicrosoftCorpAccount(identity: {
+  tenantId: string;
+  username: string;
+}): boolean {
+  return (
+    identity.tenantId.toLowerCase() === MICROSOFT_CORP_TENANT_ID &&
+    /^[^@\s]+@microsoft\.com$/i.test(identity.username.trim())
+  );
+}
+
+/**
  * `tenantId` retains its wire/storage name for existing Hosts. It selects an
  * authority, not a principal: `common` means public, a GUID means enterprise.
  * Administrators always retain Microsoft's concrete (tid, oid) identity.

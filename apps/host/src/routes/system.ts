@@ -21,8 +21,8 @@ import type { FleetStore } from "../store.js";
 /** The switch itself: one boolean, stated rather than toggled. */
 const MutualNodeAuthenticationSchema = z.object({ required: z.boolean() });
 import { isTransferableHostUrl } from "../host-url.js";
-import { ineligibleProviderMessage, type TunnelSupervisor } from "../tunnel.js";
-import { providerSpecs } from "../tunnel-providers.js";
+import type { TunnelSupervisor } from "../tunnel.js";
+import { ineligibleProviderMessage } from "../tunnel-policy.js";
 import type { EnrollmentGrants } from "../auth/enrollment-grants.js";
 import type { HostIdentityService } from "../auth/host-identity.js";
 import type { FleetAuth } from "../auth/service.js";
@@ -375,20 +375,16 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     const input = UpdateTunnelSchema.parse(request.body);
     const provider = input.provider ?? store.getTunnelProvider();
     /*
-     * A provider with no TLS is not a door the console may stand behind.
-     * The refusal is here rather than only in the panel because this route is
-     * reachable by anything holding an operator session, and because the
-     * consequence — the Fleet session cookie and every transcript behind it
-     * crossing a relay in clear text — does not depend on which client asked.
+     * A provider with no TLS is not a door the console may stand behind, and
+     * a Host a Microsoft corporate account administers only runs approved
+     * providers. The refusal is here rather than only in the panel because
+     * this route is reachable by anything holding an operator session, and the
+     * consequence does not depend on which client asked.
      */
-    const privateOnly = auth.noAuthEnabled();
-    if (
-      input.enabled &&
-      (!providerSpecs[provider].controlPlaneEligible ||
-        (privateOnly && providerSpecs[provider].access !== "creator-private"))
-    ) {
+    const policy = tunnel.policy();
+    if (input.enabled && !policy.allowedProviders.includes(provider)) {
       return reply.code(400).send({
-        error: ineligibleProviderMessage(provider, privateOnly),
+        error: ineligibleProviderMessage(provider, policy.kind),
         tunnel: await tunnel.info(fallbackPublicUrl()),
       });
     }

@@ -77,6 +77,7 @@ import {
 } from "./self-update.js";
 import { FleetStore } from "./store.js";
 import { TunnelSupervisor } from "./tunnel.js";
+import { resolveTunnelPolicyKind } from "./tunnel-policy.js";
 import { recordingLogStream } from "./log-stream.js";
 import { createLogBuffer } from "@fleet/protocol/log-buffer";
 
@@ -180,7 +181,11 @@ export async function buildServer(
   const listenPort = process.env.PORT ?? "8787";
 
   const tunnel: TunnelSupervisor = new TunnelSupervisor({
-    privateOnly: () => auth.noAuthEnabled(),
+    policy: () =>
+      resolveTunnelPolicyKind({
+        noAuth: auth.noAuthEnabled(),
+        microsoftCorp: auth.microsoftCorpAdministered(),
+      }),
     localTarget: `http://127.0.0.1:${listenPort}`,
     onEnabledCleared: (provider) => store.setTunnelProviderEnabled(provider, false),
     persistedTunnelId: {
@@ -492,6 +497,19 @@ export async function buildServer(
   const sessionTimer = setInterval(() => {
     browsers.revalidate();
     auth.sessions.pruneExpired();
+    // Same reasoning for tunnels: a Microsoft corporate account becoming an
+    // administrator changes which providers may run, by whichever path it got
+    // there. The refused URL stops being trusted at once; this reaps the process.
+    void tunnel
+      .enforcePolicy()
+      .then((stopped) => {
+        for (const provider of stopped) {
+          app.log.warn({ provider }, "Stopped a tunnel the Host policy no longer allows");
+        }
+      })
+      .catch((error) =>
+        app.log.error({ err: error }, "Failed to enforce the tunnel policy"),
+      );
   }, SESSION_REVALIDATION_MS);
   sessionTimer.unref?.();
 

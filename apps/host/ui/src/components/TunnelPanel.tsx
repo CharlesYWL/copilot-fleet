@@ -12,6 +12,7 @@ import {
   Link,
   MessageBar,
   MessageBarBody,
+  MessageBarTitle,
   Spinner,
   Switch,
   Text,
@@ -22,6 +23,7 @@ import {
 import { QuestionCircle20Regular } from "@fluentui/react-icons";
 import type {
   TunnelInfo,
+  TunnelPolicyKind,
   TunnelProvider,
   TunnelProviderInfo,
   TunnelState,
@@ -29,7 +31,7 @@ import type {
 import { useTunnel } from "../hooks/useTunnel";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
-import { orderTunnelProviders } from "../lib/tunnel-order";
+import { orderTunnelProviders, visibleTunnelProviders } from "../lib/tunnel-order";
 import { CopyButton } from "./CopyButton";
 
 const useStyles = makeStyles({
@@ -168,8 +170,26 @@ type CardProps = {
   state: TunnelState;
   isPrimary: boolean;
   busy: boolean;
+  policyKind: TunnelPolicyKind;
   onToggle: (enabled: boolean) => void;
   onMakePrimary: () => void;
+};
+
+/** Why the Host refuses this provider, phrased for the policy in force. */
+const refusalText = (spec: TunnelProviderInfo, policyKind: TunnelPolicyKind) => {
+  if (spec.externalScheme !== "https") {
+    return (
+      <>
+        {spec.label} publishes plain HTTP with no TLS, so the operator session cookie and
+        every transcript behind it would cross it readable. Fleet will not expose the
+        console through it.
+      </>
+    );
+  }
+  if (policyKind === "microsoft-corp") {
+    return `${spec.label} is not approved for Microsoft corporate use, so this Host will not run it. Switch it off.`;
+  }
+  return `${spec.label} is public. Enable Microsoft sign-in in Settings → Security first, or use private Dev Tunnels.`;
 };
 
 const ProviderCard = ({
@@ -177,6 +197,7 @@ const ProviderCard = ({
   state,
   isPrimary,
   busy,
+  policyKind,
   onToggle,
   onMakePrimary,
 }: CardProps) => {
@@ -234,19 +255,10 @@ const ProviderCard = ({
         />
       </div>
 
-      {!spec.controlPlaneEligible && (
+      {/* The Host's own refusal, when it has one, already says this. */}
+      {!spec.controlPlaneEligible && !state.error && (
         <MessageBar intent="error">
-          <MessageBarBody>
-            {spec.externalScheme === "https" ? (
-              `${spec.label} is public. Enable Microsoft sign-in in Settings → Security first, or use private Dev Tunnels.`
-            ) : (
-              <>
-                {spec.label} publishes plain HTTP with no TLS, so the operator session
-                cookie and every transcript behind it would cross it readable. Fleet will
-                not expose the console through it.
-              </>
-            )}
-          </MessageBarBody>
+          <MessageBarBody>{refusalText(spec, policyKind)}</MessageBarBody>
         </MessageBar>
       )}
 
@@ -350,10 +362,12 @@ export const TunnelPanel = () => {
     );
   }
 
+  const stateOf = (provider: TunnelProvider): TunnelState | undefined =>
+    info.tunnels.find((entry) => entry.provider === provider);
   // A provider the Host has never started still needs a row, or the operator
   // cannot switch it on in the first place.
   const stateFor = (provider: TunnelProvider): TunnelState =>
-    info.tunnels.find((entry) => entry.provider === provider) ?? {
+    stateOf(provider) ?? {
       provider,
       enabled: false,
       status: "off",
@@ -363,9 +377,23 @@ export const TunnelPanel = () => {
 
   /**
    * Active first, then installed, then the rest — see {@link orderTunnelProviders}.
+   * A corp Host does not list providers it refuses — see {@link visibleTunnelProviders}.
    */
-  const ordered = orderTunnelProviders(info.providers, (id) =>
-    info.tunnels.find((entry) => entry.provider === id),
+  const policyKind = info.policy?.kind ?? "open";
+  const ordered = orderTunnelProviders(
+    visibleTunnelProviders(info.providers, info.policy, stateOf),
+    stateOf,
+  );
+  const labelsOf = (ids: readonly TunnelProvider[]) =>
+    info.providers
+      .filter((spec) => ids.includes(spec.id))
+      .map((spec) => spec.label)
+      .join(", ");
+  const corpAllowed = labelsOf(info.policy?.allowedProviders ?? []);
+  const corpHidden = labelsOf(
+    info.providers
+      .map((spec) => spec.id)
+      .filter((id) => !info.policy?.allowedProviders.includes(id)),
   );
 
   return (
@@ -381,6 +409,18 @@ export const TunnelPanel = () => {
           Dev Tunnels, never anonymous tunnel access.
         </Text>
       </div>
+
+      {policyKind === "microsoft-corp" && (
+        <MessageBar intent="info">
+          <MessageBarBody>
+            <MessageBarTitle>Microsoft corporate account</MessageBarTitle>
+            This Host is administered by an @microsoft.com account, so it only offers
+            Microsoft-approved remote access: {corpAllowed || "none"}.
+            {corpHidden &&
+              ` Public tunnel providers (${corpHidden}) are hidden and the Host refuses to start them, so this corp machine is never published to the internet by accident.`}
+          </MessageBarBody>
+        </MessageBar>
+      )}
 
       {actionError && (
         <MessageBar intent="error">
@@ -402,6 +442,7 @@ export const TunnelPanel = () => {
           state={stateFor(spec.id)}
           isPrimary={info.primary === spec.id}
           busy={busy === spec.id}
+          policyKind={policyKind}
           onToggle={(enabled) => void setEnabled(spec.id, enabled)}
           onMakePrimary={() => void setEnabled(spec.id, true, true)}
         />

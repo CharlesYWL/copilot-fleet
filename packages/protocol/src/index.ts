@@ -2780,6 +2780,34 @@ export const TunnelStateSchema = z.object({
 });
 export type TunnelState = z.infer<typeof TunnelStateSchema>;
 
+/**
+ * Which rule decides the tunnel providers this Host may run.
+ *
+ * - `open`: every provider that can carry the console over HTTPS.
+ * - `private-only`: Fleet sign-in was skipped, so only a provider that demands
+ *   its own login (private Dev Tunnels) may stand in front of the Host.
+ * - `microsoft-corp`: a Microsoft corporate account administers this Host, so
+ *   only Microsoft-approved remote access is offered. Today that is Dev Tunnels;
+ *   corpnet-direct connectivity between Dev Boxes is meant to join the same
+ *   allow-list rather than become a second rule.
+ */
+export const tunnelPolicyKinds = ["open", "private-only", "microsoft-corp"] as const;
+export const TunnelPolicyKindSchema = z.enum(tunnelPolicyKinds);
+export type TunnelPolicyKind = z.infer<typeof TunnelPolicyKindSchema>;
+
+export const TunnelPolicySchema = z.object({
+  kind: TunnelPolicyKindSchema,
+  /**
+   * Providers the Host will start under this policy, in catalog order.
+   *
+   * Published rather than re-derived in the browser so the panel offers what
+   * the Host enforces, and a provider that becomes approved later appears
+   * without a UI change.
+   */
+  allowedProviders: z.array(TunnelProviderSchema),
+});
+export type TunnelPolicy = z.infer<typeof TunnelPolicySchema>;
+
 export const TunnelInfoSchema = z.object({
   /** Whose URL enrollment currently advertises; null when none is online. */
   primary: TunnelProviderSchema.nullable(),
@@ -2795,6 +2823,8 @@ export const TunnelInfoSchema = z.object({
    * opaque routing token, so `devtunnel connect` cannot be derived from it.
    */
   tunnelId: z.string().optional(),
+  /** The provider rule in force; absent from older Hosts, which means `open`. */
+  policy: TunnelPolicySchema.optional(),
 });
 export type TunnelInfo = z.infer<typeof TunnelInfoSchema>;
 
