@@ -82,6 +82,15 @@ export type ProviderSpec = {
    * refusal has to hold for a caller who never renders the panel.
    */
   controlPlaneEligible: boolean;
+  /**
+   * Whether a Host administered by a Microsoft corporate account may run it.
+   *
+   * Opt-in, so a provider added later is refused on corp Hosts until somebody
+   * decides otherwise. Public relays (Cloudflare, ngrok, Tailscale Funnel, bore)
+   * would publish a corp machine to the internet and stay off; a future
+   * corpnet-direct route between Dev Boxes is expected to opt in here.
+   */
+  microsoftCorpApproved?: boolean;
 };
 
 export type LocalTarget = {
@@ -268,6 +277,8 @@ export const providerSpecs: Record<TunnelProvider, ProviderSpec> = {
     externalScheme: "https",
     access: "creator-private",
     controlPlaneEligible: true,
+    // Microsoft's own tunnel service, behind a Microsoft login.
+    microsoftCorpApproved: true,
   },
 };
 

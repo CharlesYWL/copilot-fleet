@@ -176,6 +176,38 @@ describe("FleetAuth", () => {
     });
   });
 
+  describe("Microsoft corporate administration", () => {
+    it("is Host-wide: any active corp administrator puts the Host under corp policy", () => {
+      const { auth, store } = setup();
+      expect(auth.microsoftCorpAdministered()).toBe(false);
+      store.insertAdministrator({
+        tenantId: "9188040d-6c67-4c5b-b112-36a304b66dad",
+        objectId: "personal",
+        username: "alias@outlook.com",
+        displayName: "Personal",
+        addedVia: "claim",
+      });
+      store.insertAdministrator({
+        tenantId: MICROSOFT_CORP_TENANT_ID,
+        objectId: "guest",
+        username: "alias_microsoft.com#EXT#@example.onmicrosoft.com",
+        displayName: "Guest",
+        addedVia: "invitation",
+      });
+      expect(auth.microsoftCorpAdministered()).toBe(false);
+      const staff = store.insertAdministrator({
+        tenantId: MICROSOFT_CORP_TENANT_ID.toUpperCase(),
+        objectId: "staff",
+        username: " Alias@MICROSOFT.COM ",
+        displayName: "Staff",
+        addedVia: "invitation",
+      });
+      expect(auth.microsoftCorpAdministered()).toBe(true);
+      expect(auth.removeAdministrator(staff.id)).toBe(true);
+      expect(auth.microsoftCorpAdministered()).toBe(false);
+    });
+  });
+
   it("prints a claim code on an unclaimed Host and generates no password", () => {
     const { auth, announced, store } = setup();
     expect(announced).toHaveLength(1);

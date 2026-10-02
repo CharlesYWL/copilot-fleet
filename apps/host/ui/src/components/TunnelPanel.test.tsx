@@ -282,3 +282,97 @@ describe("TunnelPanel policy", () => {
     ).toBeTruthy();
   });
 });
+
+describe("TunnelPanel for a Microsoft corporate account", () => {
+  const catalog: TunnelInfo["providers"] = [
+    spec("cloudflare", {
+      label: "Cloudflare",
+      controlPlaneEligible: false,
+    }),
+    spec("tailscale", { label: "Tailscale Funnel", controlPlaneEligible: false }),
+    spec("ngrok", { label: "ngrok", controlPlaneEligible: false }),
+    spec("bore", { label: "bore", externalScheme: "http", controlPlaneEligible: false }),
+    spec("devtunnel", { label: "Dev Tunnels", access: "creator-private" }),
+  ];
+  const corp: TunnelInfo = {
+    ...info,
+    providers: catalog,
+    policy: { kind: "microsoft-corp", allowedProviders: ["devtunnel"] },
+  };
+
+  afterEach(() => {
+    forgetCsrfToken();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("offers only Dev Tunnels and says why the rest are gone", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => answer(corp)),
+    );
+    show();
+
+    expect(await screen.findByRole("region", { name: "Dev Tunnels" })).toBeTruthy();
+    for (const label of ["Cloudflare", "Tailscale Funnel", "ngrok", "bore"]) {
+      expect(screen.queryByRole("region", { name: label })).toBeNull();
+    }
+    expect(screen.getByText("Microsoft corporate account")).toBeTruthy();
+    expect(screen.getByText(/administered by an @microsoft\.com account/)).toBeTruthy();
+    expect(
+      screen.getByText(/Cloudflare, Tailscale Funnel, ngrok, bore\) are hidden/),
+    ).toBeTruthy();
+  });
+
+  it("still shows a refused tunnel that is running, with a switch to turn it off", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        answer({
+          ...corp,
+          tunnels: [
+            ...corp.tunnels,
+            {
+              provider: "cloudflare",
+              enabled: true,
+              status: "on",
+              url: "https://quick.trycloudflare.com",
+              error: null,
+              external: false,
+            },
+          ],
+        }),
+      ),
+    );
+    show();
+
+    const cloudflare = await screen.findByRole("region", { name: "Cloudflare" });
+    expect(
+      within(cloudflare).getByText(/not approved for Microsoft corporate use/),
+    ).toBeTruthy();
+    const toggle = within(cloudflare).getByRole("switch") as HTMLInputElement;
+    expect(toggle.checked).toBe(true);
+    expect(toggle.disabled).toBe(false);
+    expect(screen.queryByRole("region", { name: "ngrok" })).toBeNull();
+  });
+
+  it("shows every provider when the Host is not under corporate policy", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        answer({
+          ...info,
+          policy: {
+            kind: "open",
+            allowedProviders: ["cloudflare", "tailscale", "ngrok", "devtunnel"],
+          },
+        }),
+      ),
+    );
+    show();
+
+    expect(await screen.findByRole("region", { name: "Cloudflare" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "bore" })).toBeTruthy();
+    expect(screen.queryByText("Microsoft corporate account")).toBeNull();
+  });
+});

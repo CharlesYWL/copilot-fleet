@@ -221,7 +221,9 @@ Open the UI → **Settings**:
   backup/restore, and this Host's security audit.
 - **Tunnel** — manage Dev Tunnels, Cloudflare, Tailscale Funnel, or ngrok.
   Plain-HTTP providers such as bore are shown but cannot be enabled for the
-  operator console.
+  operator console. A Host administered by a Microsoft corporate account offers
+  Dev Tunnels only; see
+  [Microsoft corporate accounts](#microsoft-corporate-accounts-dev-tunnels-only).
 - **Nodes** — rename/delete machines, see update status, and mint a one-time
   connect command.
 - **Workspaces** — create logical projects and map them to per-machine paths.
@@ -780,12 +782,39 @@ event; disable it again once you are back in.
 A fresh Host defaults to Dev Tunnels because its URL alone reaches nothing: the
 provider demands a Microsoft login before Fleet's own claim screen is even
 visible. A public HTTPS provider is fine after the Host is claimed — the sign-in
-page grants nothing on its own — but a stranger can at least see it.
+page grants nothing on its own — but a stranger can at least see it. A Host a
+Microsoft corporate account administers does not offer public providers at all;
+see below.
 
 `bore` is refused for the operator console by the Host itself, not merely greyed
 out in the panel: it relays plain TCP, so the session cookie and every
 transcript behind it would cross it readable. The refusal holds for any client,
 including one that never renders the UI.
+
+#### Microsoft corporate accounts: Dev Tunnels only
+
+Once any administrator of the Host is a Microsoft corporate account — an
+`alias@microsoft.com` sign-in in Microsoft's corporate tenant, checked the same
+way as [Agency mode](#agency-mode) — the Host only runs Microsoft-approved
+remote access, which today is Dev Tunnels. **Settings → Tunnel** hides
+Cloudflare, Tailscale Funnel, ngrok and bore, and the Host itself refuses to
+start them, whether asked through the API, by a saved setting replayed at boot,
+or by a restored backup. A corp machine is not published to the internet by
+somebody trying the switches.
+
+The rule belongs to the Host, not to one browser session: a tunnel runs for the
+machine, so a co-administrator from another tenant or a recovery-password
+session sees the same Dev Tunnels-only panel. A public tunnel that was already
+running when a corporate account took over stops being trusted at once and is
+stopped within a minute. One started in another terminal (`npm run tunnel`) is
+shown as refused so you can stop it there. Hosts administered only by other
+accounts — personal Microsoft accounts, other work tenants — keep every
+provider.
+
+Direct endpoints (`FLEET_PUBLIC_URL` on the Host, `--url` on a Node) are not
+tunnels and are unaffected. That is the route planned for Dev Boxes on corpnet
+to reach each other by internal address with no tunnel at all; it is intended to
+join Dev Tunnels as another approved option under this same policy.
 
 ### Chats
 

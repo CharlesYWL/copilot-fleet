@@ -5,12 +5,19 @@ import {
   errorMessage,
   type HostBackupTunnel,
   type TunnelInfo,
+  type TunnelPolicy,
+  type TunnelPolicyKind,
   type TunnelProvider,
   type TunnelProviderInfo,
   type TunnelState,
   type TunnelStatus,
 } from "@fleet/protocol";
 import { readExternalTunnel, type ExternalTunnel } from "./external-tunnel.js";
+import {
+  describeTunnelPolicy,
+  ineligibleProviderMessage,
+  tunnelProviderAllowed,
+} from "./tunnel-policy.js";
 import {
   parseLocalTarget,
   providerList,
@@ -85,24 +92,6 @@ async function runVersionProbe(spec: ProviderSpec): Promise<boolean> {
 /** Backoff for unattended restarts; caps so a dead provider stops hammering. */
 export const RESTART_DELAYS_MS = [1_000, 5_000, 15_000, 30_000, 60_000];
 
-/**
- * Why a provider is refused, in the words the panel and the API both use.
- *
- * One sentence in one place: this is raised from the manager, returned in the
- * state of an external tunnel nobody may adopt, and matched by the route that
- * refuses the request — three readings of the same rule that only have to
- * disagree once to become two rules.
- */
-export function ineligibleProviderMessage(
-  provider: TunnelProvider,
-  privateOnly = false,
-): string {
-  if (privateOnly && providerSpecs[provider].controlPlaneEligible) {
-    return `${providerSpecs[provider].label} is public. Without Microsoft sign-in, use private Dev Tunnels or keep the Host local.`;
-  }
-  return `${providerSpecs[provider].label} publishes plain HTTP, so Fleet will not expose the operator console, node credentials or lead tokens through it. Use an HTTPS provider such as Dev Tunnels.`;
-}
-
 export function restartDelay(attempt: number): number {
   const index = Math.min(attempt, RESTART_DELAYS_MS.length - 1);
   return RESTART_DELAYS_MS[index]!;
@@ -134,7 +123,12 @@ export function shouldAdoptTunnelId(
 }
 
 type TunnelManagerOptions = {
-  privateOnly?: () => boolean;
+  /**
+   * The provider rule in force, read on every decision rather than once: it
+   * changes under a running Host when sign-in is skipped or a Microsoft
+   * corporate account becomes an administrator. Defaults to `open`.
+   */
+  policy?: () => TunnelPolicyKind;
   /** Loopback target the tunnel should forward to, e.g. http://127.0.0.1:8787 */
   localTarget: string;
   /**
@@ -189,10 +183,10 @@ export class TunnelManager {
   /** Invalidates setup/output still arriving from a pre-restore start. */
   private generation = 0;
   private stopping: Promise<void> | undefined;
-  private readonly privateOnly: () => boolean;
+  private readonly policy: () => TunnelPolicyKind;
 
   constructor(options: TunnelManagerOptions) {
-    this.privateOnly = options.privateOnly ?? (() => false);
+    this.policy = options.policy ?? (() => "open");
     this.target = parseLocalTarget(options.localTarget);
     this.onEnabledCleared = options.onEnabledCleared;
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
@@ -204,17 +198,13 @@ export class TunnelManager {
   }
 
   private eligible(provider = this.provider): boolean {
-    const spec = providerSpecs[provider];
-    return (
-      spec.controlPlaneEligible &&
-      (!this.privateOnly() || spec.access === "creator-private")
-    );
+    return tunnelProviderAllowed(this.policy(), provider);
   }
 
   private assertEligible(): void {
     if (this.eligible()) return;
     this.status = "error";
-    this.error = ineligibleProviderMessage(this.provider, this.privateOnly());
+    this.error = ineligibleProviderMessage(this.provider, this.policy());
     this.wantEnabled = false;
     this.onEnabledCleared?.(this.provider);
     throw new Error(this.error);
@@ -290,7 +280,7 @@ export class TunnelManager {
         provider: this.provider,
         enabled: false,
         status: "error",
-        error: ineligibleProviderMessage(this.provider, this.privateOnly()),
+        error: ineligibleProviderMessage(this.provider, this.policy()),
         external: true,
       };
     }
@@ -322,7 +312,7 @@ export class TunnelManager {
     if (this.readExternal()?.provider === (provider ?? this.provider)) {
       if (enabled && !this.eligible(provider)) {
         throw new Error(
-          ineligibleProviderMessage(provider ?? this.provider, this.privateOnly()),
+          ineligibleProviderMessage(provider ?? this.provider, this.policy()),
         );
       }
       return;
@@ -532,6 +522,29 @@ export class TunnelManager {
     this.status = "off";
     this.error = undefined;
   }
+
+  /**
+   * Stops this provider if the policy in force no longer allows it.
+   *
+   * Returns whether anything was stopped. A tunnel started in another terminal
+   * is left alone — it is not this manager's to kill — and keeps being reported
+   * as refused by `state()` instead.
+   */
+  async stopIfRefused(): Promise<boolean> {
+    if (this.eligible()) return false;
+    if (this.readExternal()?.provider === this.provider) return false;
+    const live =
+      this.wantEnabled ||
+      this.child !== undefined ||
+      this.status === "starting" ||
+      this.status === "on";
+    if (!live) return false;
+    await this.stop();
+    this.status = "error";
+    this.error = ineligibleProviderMessage(this.provider, this.policy());
+    this.onEnabledCleared?.(this.provider);
+    return true;
+  }
 }
 
 /**
@@ -573,6 +586,33 @@ export class TunnelSupervisor {
 
   setPrimary(provider: TunnelProvider | undefined): void {
     this.primaryProvider = provider;
+  }
+
+  /** The provider rule in force, with the providers it allows. */
+  policy(): TunnelPolicy {
+    return describeTunnelPolicy(this.options.policy?.() ?? "open");
+  }
+
+  /**
+   * Stops every Host-managed tunnel the policy in force no longer allows.
+   *
+   * The policy can change under a running tunnel — a Microsoft corporate
+   * account claims a Host whose Cloudflare tunnel was already up — and that
+   * moment never passes through the tunnel route. Such a tunnel is untrusted
+   * the instant the policy changes (`activeTunnelUrl` filters it), so this is
+   * about not leaving a public relay into the machine running behind it.
+   */
+  async enforcePolicy(): Promise<TunnelProvider[]> {
+    const generation = this.generation;
+    const stopped: TunnelProvider[] = [];
+    for (const [provider, manager] of this.managers) {
+      if (await manager.stopIfRefused()) stopped.push(provider);
+    }
+    if (generation !== this.generation) return stopped;
+    if (this.primaryProvider && stopped.includes(this.primaryProvider)) {
+      this.primaryProvider = this.onlineProviders()[0];
+    }
+    return stopped;
   }
 
   /** Include externally hosted IDs too, without copying their login state. */
@@ -749,6 +789,7 @@ export class TunnelSupervisor {
       providers,
       tunnels,
       ...(tunnelId ? { tunnelId } : {}),
+      policy: this.policy(),
     };
   }
 

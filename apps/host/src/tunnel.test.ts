@@ -21,7 +21,7 @@ describe("private tunnels without Microsoft sign-in", () => {
   it("refuses public providers on start and restore and reports them as ineligible", async () => {
     const supervisor = new TunnelSupervisor({
       localTarget: "http://127.0.0.1:8787",
-      privateOnly: () => true,
+      policy: () => "private-only",
       readExternal: () => undefined,
       probe: fakeProbe(),
     });
@@ -43,7 +43,7 @@ describe("private tunnels without Microsoft sign-in", () => {
     const publicTunnel = new TunnelManager({
       localTarget: "http://127.0.0.1:8787",
       provider: "cloudflare",
-      privateOnly: () => true,
+      policy: () => "private-only",
       readExternal: () => ({
         provider: "cloudflare",
         url: "https://public.example",
@@ -57,7 +57,7 @@ describe("private tunnels without Microsoft sign-in", () => {
     const privateTunnel = new TunnelManager({
       localTarget: "http://127.0.0.1:8787",
       provider: "devtunnel",
-      privateOnly: () => true,
+      policy: () => "private-only",
       readExternal: () => ({
         provider: "devtunnel",
         url: "https://private.example",
@@ -74,7 +74,7 @@ describe("private tunnels without Microsoft sign-in", () => {
     const manager = new TunnelManager({
       localTarget: "http://127.0.0.1:8787",
       provider: "cloudflare",
-      privateOnly: () => privateOnly,
+      policy: () => (privateOnly ? "private-only" : "open"),
       readExternal: () => undefined,
       probe: new BinaryProbe(async () => {
         privateOnly = true;

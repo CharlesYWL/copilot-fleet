@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { TunnelProvider, TunnelProviderInfo, TunnelState } from "@fleet/protocol";
-import { orderTunnelProviders } from "./tunnel-order";
+import { orderTunnelProviders, visibleTunnelProviders } from "./tunnel-order";
 
 const spec = (id: TunnelProvider, binaryPresent: boolean): TunnelProviderInfo => ({
   id,
@@ -104,5 +104,69 @@ describe("orderTunnelProviders", () => {
     const providers = [spec("ngrok", false), spec("cloudflare", true)];
     orderTunnelProviders(providers, () => undefined);
     expect(ids(providers)).toEqual(["ngrok", "cloudflare"]);
+  });
+});
+
+describe("visibleTunnelProviders", () => {
+  const providers = [
+    spec("cloudflare", true),
+    spec("tailscale", true),
+    spec("ngrok", true),
+    spec("bore", true),
+    spec("devtunnel", true),
+  ];
+  const corp = {
+    kind: "microsoft-corp" as const,
+    allowedProviders: ["devtunnel" as const],
+  };
+
+  it("shows every provider when no Microsoft corporate account owns the Host", () => {
+    expect(ids(visibleTunnelProviders(providers, undefined, () => undefined))).toEqual(
+      ids(providers),
+    );
+    expect(
+      ids(
+        visibleTunnelProviders(
+          providers,
+          {
+            kind: "open",
+            allowedProviders: ["cloudflare", "tailscale", "ngrok", "devtunnel"],
+          },
+          () => undefined,
+        ),
+      ),
+    ).toEqual(ids(providers));
+    // Without sign-in the refused providers stay listed, greyed out and explained.
+    expect(
+      ids(
+        visibleTunnelProviders(
+          providers,
+          { kind: "private-only", allowedProviders: ["devtunnel"] },
+          () => undefined,
+        ),
+      ),
+    ).toEqual(ids(providers));
+  });
+
+  it("hides every provider a corp Host refuses", () => {
+    expect(ids(visibleTunnelProviders(providers, corp, () => undefined))).toEqual([
+      "devtunnel",
+    ]);
+  });
+
+  it("keeps a refused provider visible while it is still up, so it can be switched off", () => {
+    const states = new Map([
+      ["cloudflare", state("cloudflare", { enabled: true, status: "on" })],
+      [
+        "ngrok",
+        state("ngrok", { status: "error", external: true, error: "not approved" }),
+      ],
+      ["tailscale", state("tailscale", { status: "error", error: "not approved" })],
+    ]);
+    expect(ids(visibleTunnelProviders(providers, corp, (id) => states.get(id)))).toEqual([
+      "cloudflare",
+      "ngrok",
+      "devtunnel",
+    ]);
   });
 });

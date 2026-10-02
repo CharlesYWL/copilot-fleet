@@ -174,7 +174,8 @@ npm run dev:tunnel
 - **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移、
   可迁移 Host 备份/恢复，以及这台 Host 的安全审计。
 - **Tunnel** —— 管理 Dev Tunnels、Cloudflare、Tailscale Funnel 或 ngrok。
-  bore 等明文 HTTP 提供程序会显示在列表中，但不能用于操作台。
+  bore 等明文 HTTP 提供程序会显示在列表中，但不能用于操作台。由 Microsoft 公司账号管理的
+  Host 只提供 Dev Tunnels，见“Microsoft 公司账号：只用 Dev Tunnels”。
 - **Nodes** —— 重命名/删除机器，查看更新状态，生成一次性的连接命令。
 - **Workspaces** —— 创建逻辑项目，并映射到每台机器上的路径。
 - **Diagnostics** —— 查看 Host 自启动以来捕获的 warning 和 error。
@@ -603,10 +604,29 @@ Host 控制台上的本地恢复命令可以签发一个临时密码并写入审
 
 全新的 Host 默认用 Dev Tunnels，因为它的地址本身够不到任何东西：provider 会先要求
 Microsoft 登录，之后才看得到 Fleet 自己的认领界面。认领之后换成公网 HTTPS provider 也没
-问题 —— 登录页本身不授予任何权限 —— 只是陌生人至少能看到它。
+问题 —— 登录页本身不授予任何权限 —— 只是陌生人至少能看到它。由 Microsoft 公司账号管理的
+Host 则完全不提供公网 provider，见下文。
 
 `bore` 是被 Host 自己拒绝的，而不只是在界面上置灰：它中继的是明文 TCP，会话 cookie 和它
 背后的所有记录都会以可读形式经过。这个拒绝对任何客户端都成立，包括从不渲染界面的那种。
+
+#### Microsoft 公司账号：只用 Dev Tunnels
+
+只要这台 Host 的任一管理员是 Microsoft 公司账号 —— 即 Microsoft 公司租户中的
+`alias@microsoft.com` 登录，判定方式与 Agency 模式相同 —— Host 就只运行 Microsoft 认可的
+远程访问方式，目前就是 Dev Tunnels。**Settings → Tunnel** 会隐藏 Cloudflare、Tailscale
+Funnel、ngrok 和 bore，Host 自己也会拒绝启动它们，无论请求来自 API、启动时重放的已保存设置，
+还是恢复的备份。这样别人随手试开关时，也不会把公司机器发布到公网上。
+
+这条规则属于 Host，而不是某个浏览器会话：隧道是为整台机器运行的，所以来自其他租户的共同
+管理员或恢复密码会话看到的也是只有 Dev Tunnels 的面板。公司账号接管时如果已有公网隧道在运行，
+它会立即不再被信任，并在一分钟内被停止；在另一个终端启动的隧道（`npm run tunnel`）会显示为
+已拒绝，需要你在那边停止。只由其他账号（个人 Microsoft 账号、其他工作租户）管理的 Host 仍然
+可以使用所有 provider。
+
+直连端点（Host 上的 `FLEET_PUBLIC_URL`、Node 上的 `--url`）不是隧道，不受影响。计划中，
+corpnet 上的 Dev Box 之间将通过内网地址直接互连、完全不需要隧道，届时它会作为另一个认可选项
+加入这同一条策略。
 
 ### Chats
 

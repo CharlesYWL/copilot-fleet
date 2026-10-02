@@ -16,11 +16,11 @@ import {
   EntraIdentityRejectedError,
   EntraProviderUnavailableError,
   EntraTransactions,
-  MICROSOFT_CORP_TENANT_ID,
   classifyEntraFailure,
   createEntraProvider,
   entraConfigFrom,
   entraFailureText,
+  isMicrosoftCorpAccount,
   type AuthTransaction,
   type DeviceCodeStarted,
   type EntraConfig,
@@ -477,10 +477,20 @@ export class FleetAuth {
     }
     const administrator = this.administratorFor(session);
     // A display address alone is not proof of a Microsoft corporate identity.
-    return (
-      administrator?.tenantId.toLowerCase() === MICROSOFT_CORP_TENANT_ID &&
-      /^[^@\s]+@microsoft\.com$/i.test(administrator.username.trim())
-    );
+    return administrator !== undefined && isMicrosoftCorpAccount(administrator);
+  }
+
+  /**
+   * Whether any active administrator is a Microsoft corporate account.
+   *
+   * Asked of the Host rather than of a session, because what it governs is
+   * Host-wide: a tunnel runs for the machine and is restored at boot with
+   * nobody signed in. A Host a Microsoft employee administers is a corp
+   * resource whichever of its sessions — a co-administrator from another
+   * tenant, a recovery password — happens to be looking at it.
+   */
+  microsoftCorpAdministered(): boolean {
+    return this.store.listAdministrators().some(isMicrosoftCorpAccount);
   }
 
   /**
