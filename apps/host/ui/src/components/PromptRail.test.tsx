@@ -6,8 +6,13 @@ import type { PromptMark } from "../lib/prompt-marks";
 import { fleetDarkTheme } from "../theme";
 
 const marks = [
-  { key: "u1", label: "fix the retry helper", createdAt: "2026-08-18T20:39:00.000Z" },
-  { key: "u2", label: "now ship it", createdAt: "2026-08-18T21:05:00.000Z" },
+  {
+    key: "u1",
+    index: 0,
+    label: "fix the retry helper",
+    createdAt: "2026-08-18T20:39:00.000Z",
+  },
+  { key: "u2", index: 4, label: "now ship it", createdAt: "2026-08-18T21:05:00.000Z" },
 ];
 
 const show = (onSelect = vi.fn(), activeKey = "u2", promptMarks = marks) => {
@@ -22,6 +27,7 @@ const show = (onSelect = vi.fn(), activeKey = "u2", promptMarks = marks) => {
 const manyMarks = (count: number): PromptMark[] =>
   Array.from({ length: count }, (_, index) => ({
     key: `prompt-${index}`,
+    index,
     label: `Prompt ${index + 1}`,
     createdAt: marks[0]!.createdAt,
   }));

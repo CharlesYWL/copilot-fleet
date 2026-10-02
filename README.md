@@ -1030,6 +1030,13 @@ prompt, and click it to jump there. The lit mark tracks the current turn, using
 the preceding sampled prompt when that turn has no mark. Unsampled prompts stay
 in the transcript and remain reachable by scrolling.
 
+A conversation opens at its latest output with only its newest 200 entries;
+scrolling up loads older ones, and a prompt mark loads whatever lies between.
+Only entries near the visible part of the pane are rendered, which keeps long
+conversations quick to open and to type in while they stream, but it also means
+the browser's own find (Ctrl+F) only searches what is on screen. Measurements and
+how to rerun them are in [chat-history-benchmarks.md](docs/chat-history-benchmarks.md).
+
 Fleet-generated control messages, including worker wake summaries and task
 reviews, appear as compact expandable steps rather than user chat bubbles.
 Expand a step to read its full original message. These messages do not add
@@ -2562,10 +2569,20 @@ npm run dev:tunnel
 npm test
 npm run test:watch
 npm run test:coverage
+npm run test:e2e # builds, then drives the built UI in a real browser
 npm run typecheck
 npm run build
 npm run verify   # lint, format, types, tests, then production builds
 ```
+
+For repeatable chat-history performance measurements, run
+`npm run benchmark:history` (Host and data path) and `npm run benchmark:browser`
+(the built UI in headless Edge). Both use synthetic histories and an isolated
+Host, report median/P95 timings, and write JSON reports under `dist/benchmarks`.
+See [Chat-history benchmarks](docs/chat-history-benchmarks.md) for workload
+sizes, before/after comparisons, and measurement limitations. The
+[chat-history performance plan](docs/chat-history-performance-plan.md) records
+what was implemented, the measured results, and the remaining limits.
 
 ### Local verification and test monitoring
 
@@ -2591,6 +2608,15 @@ npm run test:watch -- --project=services apps/host/src/auth/public-signin.test.t
 
 For a browser-readable coverage report, run **`npm run test:coverage`** and open
 `coverage/index.html`. Coverage output is local and ignored by Git.
+
+**`npm run test:e2e`** builds the workspace, starts the built Host on a
+disposable database with a fake Node feeding it events, and drives the UI in
+headless Microsoft Edge: opening and paging long transcripts, following output,
+prompt jumps, focus, reconnects, and rapid switching. It needs an installed Edge,
+or another Playwright channel such as `chrome` set in `FLEET_E2E_BROWSER`, so it
+is not part of `npm run verify`; run it when changing transcripts, scrolling, or
+the live connection. The UI unit tests cannot cover these: jsdom has no layout,
+so they replace the virtual list with one that renders every row.
 
 These commands provide local monitoring, not automatic remote push/PR checks or
 a Linux runner. A hosted equivalent requires a separately configured CI system,

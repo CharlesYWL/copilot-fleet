@@ -4,6 +4,10 @@ import {
   updateFinished,
   BrowserMessageSchema,
   decodeFrame,
+  isTranscriptEvent,
+  SessionPermissions,
+  TRANSCRIPT_PAGE_LIMIT,
+  TRANSCRIPT_PAGE_MAX,
   type CommandOutputEvent,
   type HostUpdateStatus,
   type MarkAllNotificationsReadResponse,
@@ -12,13 +16,17 @@ import {
   type RunStep,
   type RunNote,
   type SessionEvent,
+  type SessionActivity,
   type Snapshot,
+  type TranscriptPage,
+  type TranscriptUpdate,
 } from "@fleet/protocol";
 import { announceSignedOut, csrfToken, forgetCsrfToken } from "../lib/auth";
 import { reconnectDelay } from "./reconnect-delay";
 import { mergeEvents } from "../lib/merge-events";
 import { mergeCommandExecutions, mergeCommandOutput } from "../lib/command-output";
 import { mergeResumeRequests } from "../lib/worker-resume";
+import { TranscriptCache, type TranscriptView } from "../lib/transcript-cache";
 
 export type { Snapshot };
 
@@ -31,6 +39,27 @@ export type LiveNotificationUpdate = {
   sequence: number;
   notification: Notification;
   deliver: boolean;
+};
+
+export type TranscriptActivity = SessionActivity & { live: boolean };
+export type { TranscriptView };
+
+/**
+ * How long live events are gathered before they are applied together.
+ *
+ * A streaming agent sends dozens of tiny events a second; applying each on its
+ * own re-rendered the whole app per chunk. Two frames is too short to read as lag.
+ */
+export const LIVE_FLUSH_MS = 32;
+/** Recent transcript events kept per session, for monitor-wall previews only. */
+const LIVE_TAIL_EVENTS = 200;
+const MAX_TRANSCRIPT_RESYNCS = 3;
+
+type LiveItem = {
+  sessionId: string;
+  event?: SessionEvent;
+  update?: TranscriptUpdate | undefined;
+  reset?: true;
 };
 
 type SnapshotHydrationChange =
@@ -97,6 +126,19 @@ export function useFleet(notify: Notify) {
     LiveNotificationUpdate[]
   >([]);
   const [events, setEvents] = useState<Record<string, SessionEvent[]>>({});
+  const [activities, setActivities] = useState<Record<string, TranscriptActivity>>({});
+  const activityRecords = useRef(new Map<string, SessionActivity>());
+  const permissions = useRef(new SessionPermissions());
+  const [pendingPermissions, setPendingPermissions] = useState<SessionEvent[]>([]);
+  const transcriptCache = useRef(new TranscriptCache());
+  const [transcripts, setTranscripts] = useState<Record<string, TranscriptView>>({});
+  const transcriptRequests = useRef(
+    new Map<string, { controller: AbortController; promise: Promise<void> }>(),
+  );
+  const olderTranscriptRequests = useRef(new Map<string, Promise<void>>());
+  const resyncAttempts = useRef(new Map<string, number>());
+  /** The transcript last asked for, which is the one on screen. */
+  const activeTranscript = useRef<string>(undefined);
   const [commandOutput, setCommandOutput] = useState<CommandOutputEvent[]>([]);
   /**
    * Steps per run, kept beside the snapshot rather than inside it.
@@ -136,6 +178,30 @@ export function useFleet(notify: Notify) {
   const report = useCallback((reason: unknown) => {
     notifyRef.current(errorMessage(reason), "error");
   }, []);
+
+  const applyPermissionEvents = useCallback((items: readonly SessionEvent[]) => {
+    if (permissions.current.apply(items))
+      setPendingPermissions(permissions.current.requests());
+  }, []);
+
+  const applyActivity = useCallback(
+    (sessionId: string, activity: SessionActivity | undefined, live: boolean) => {
+      if (!activity) return;
+      const previous = activityRecords.current.get(sessionId);
+      if (previous && previous.sequence >= activity.sequence) return;
+      const next = {
+        eventId: activity.eventId,
+        sequence: activity.sequence,
+        createdAt: activity.createdAt,
+      };
+      activityRecords.current.set(sessionId, next);
+      setActivities((current) => ({
+        ...current,
+        [sessionId]: { ...next, live },
+      }));
+    },
+    [],
+  );
 
   /** Announces the end of a Host update this tab watched begin. */
   const announceHostUpdate = useCallback((status: HostUpdateStatus | undefined) => {
@@ -203,6 +269,9 @@ export function useFleet(notify: Notify) {
 
   const hydrateSocketSnapshot = useCallback(
     (next: Snapshot) => {
+      applyPermissionEvents(next.permissionEvents ?? []);
+      if (permissions.current.prune(new Set(next.sessions.map((session) => session.id))))
+        setPendingPermissions(permissions.current.requests());
       const revision = recordHydrationChange({
         type: "snapshot",
         data: next,
@@ -224,7 +293,7 @@ export function useFleet(notify: Notify) {
       setSnapshotRevision((value) => value + 1);
       announceHostUpdate(next.hostUpdate);
     },
-    [announceHostUpdate, recordHydrationChange],
+    [announceHostUpdate, applyPermissionEvents, recordHydrationChange],
   );
 
   const beginHydration = useCallback(() => {
@@ -297,6 +366,7 @@ export function useFleet(notify: Notify) {
       );
       latestUnreadAffectingUpsertRevision.current = revision;
       unreadCountRevision.current = revision;
+      applyPermissionEvents(latest.permissionEvents ?? []);
       setSnapshot({
         ...latest,
         notifications: sortNotifications(notifications),
@@ -308,7 +378,7 @@ export function useFleet(notify: Notify) {
       announceHostUpdate(hostUpdate);
       return true;
     },
-    [announceHostUpdate],
+    [announceHostUpdate, applyPermissionEvents],
   );
 
   /**
@@ -477,29 +547,111 @@ export function useFleet(notify: Notify) {
     [applyResponseNotification, applyResponseUnreadCount, request],
   );
 
-  // Which fetch is the current one per session. Switching sessions quickly
-  // leaves earlier requests in flight, and the slowest to answer would
-  // otherwise be the one that wins and paint another session's transcript.
-  // The ticket settles races between fetches; mergeEvents settles the race
-  // between a fetch and the socket that kept appending while it travelled.
-  const eventRequests = useRef(new Map<string, number>());
+  const publishTranscripts = useCallback(() => {
+    setTranscripts(transcriptCache.current.views());
+  }, []);
 
-  const loadEvents = useCallback(
-    async (sessionId: string) => {
-      const ticket = (eventRequests.current.get(sessionId) ?? 0) + 1;
-      eventRequests.current.set(sessionId, ticket);
-      try {
-        const items = await api<SessionEvent[]>(`/api/sessions/${sessionId}/events`);
-        if (eventRequests.current.get(sessionId) !== ticket) return;
-        setEvents((value) => ({
-          ...value,
-          [sessionId]: mergeEvents(items, value[sessionId] ?? []),
-        }));
-      } catch (reason) {
-        report(reason);
+  /**
+   * The newest page of a session's transcript, then live changes on top of it.
+   *
+   * A session already followed live is shown from the copy, without a request.
+   * `force` refetches one that missed a change; a copy that keeps going stale
+   * is given up on with an error rather than refetched forever.
+   */
+  const loadTranscript = useCallback(
+    (sessionId: string, force = false): Promise<void> => {
+      activeTranscript.current = sessionId;
+      const requests = transcriptRequests.current;
+      const cache = transcriptCache.current;
+      const pending = requests.get(sessionId);
+      if (pending) return pending.promise;
+      if (!force && cache.view(sessionId)) {
+        cache.trim(sessionId);
+        publishTranscripts();
+        return Promise.resolve();
       }
+      const controller = new AbortController();
+      cache.begin(sessionId);
+      const promise = (async () => {
+        try {
+          const page = await api<TranscriptPage>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/transcript?limit=${TRANSCRIPT_PAGE_LIMIT}`,
+            { signal: controller.signal },
+          );
+          if (controller.signal.aborted) return;
+          requests.delete(sessionId);
+          applyActivity(sessionId, page.activity, false);
+          const consistent = cache.receive(sessionId, page);
+          cache.trim(activeTranscript.current ?? sessionId);
+          publishTranscripts();
+          if (consistent) {
+            resyncAttempts.current.delete(sessionId);
+            return;
+          }
+          const attempts = (resyncAttempts.current.get(sessionId) ?? 0) + 1;
+          resyncAttempts.current.set(sessionId, attempts);
+          if (attempts > MAX_TRANSCRIPT_RESYNCS) {
+            cache.drop(sessionId);
+            publishTranscripts();
+            report(
+              new Error(
+                "The transcript kept changing while it loaded. Reopen it to retry.",
+              ),
+            );
+            return;
+          }
+          void loadTranscriptRef.current(sessionId, true);
+        } catch (reason) {
+          if (controller.signal.aborted) return;
+          cache.cancel(sessionId);
+          publishTranscripts();
+          report(reason);
+        } finally {
+          if (requests.get(sessionId)?.controller === controller) {
+            requests.delete(sessionId);
+          }
+        }
+      })();
+      requests.set(sessionId, { controller, promise });
+      return promise;
     },
-    [report],
+    [applyActivity, publishTranscripts, report],
+  );
+  const loadTranscriptRef = useRef(loadTranscript);
+  loadTranscriptRef.current = loadTranscript;
+
+  /** Older blocks before the loaded copy: one page, or back to `toIndex`. */
+  const loadOlderTranscript = useCallback(
+    (sessionId: string, toIndex?: number): Promise<void> => {
+      const pending = olderTranscriptRequests.current.get(sessionId);
+      if (pending) return pending;
+      const view = transcriptCache.current.view(sessionId);
+      if (!view || view.start === 0) return Promise.resolve();
+      // A little context above a prompt that is jumped to, so it is not flush
+      // against the top of the page that was fetched for it.
+      const from = Math.max(
+        0,
+        toIndex === undefined ? view.start - TRANSCRIPT_PAGE_LIMIT : toIndex - 20,
+      );
+      const limit = Math.min(TRANSCRIPT_PAGE_MAX, view.start - from);
+      if (limit <= 0) return Promise.resolve();
+      const promise = (async () => {
+        try {
+          const page = await api<TranscriptPage>(
+            `/api/sessions/${encodeURIComponent(sessionId)}/transcript?before=${view.start}&limit=${limit}`,
+          );
+          if (transcriptCache.current.receiveOlder(sessionId, page)) publishTranscripts();
+          else void loadTranscriptRef.current(sessionId, true);
+        } catch (reason) {
+          report(reason);
+        } finally {
+          olderTranscriptRequests.current.delete(sessionId);
+        }
+      })();
+      olderTranscriptRequests.current.set(sessionId, promise);
+      return promise;
+    },
+    [publishTranscripts, report],
   );
 
   const sessionCommandKeys = useRef(new Map<string, string>());
@@ -523,6 +675,63 @@ export function useFleet(notify: Notify) {
   );
 
   useEffect(() => {
+    const pendingTranscriptRequests = transcriptRequests.current;
+    let liveFlushTimer: ReturnType<typeof setTimeout> | undefined;
+    let pendingLive: LiveItem[] = [];
+
+    const flushLive = () => {
+      const batch = pendingLive;
+      pendingLive = [];
+      liveFlushTimer = undefined;
+      if (closed) return;
+      const cache = transcriptCache.current;
+      const permissionChanges: SessionEvent[] = [];
+      const latest = new Map<string, SessionEvent>();
+      const tails = new Map<string, SessionEvent[]>();
+      const resyncs = new Set<string>();
+      let transcriptChanged = false;
+      for (const item of batch) {
+        if (item.reset) {
+          if (cache.has(item.sessionId)) resyncs.add(item.sessionId);
+          continue;
+        }
+        const { event, update } = item;
+        if (event) {
+          permissionChanges.push(event);
+          if (event.type !== "usage") latest.set(event.sessionId, event);
+          if (isTranscriptEvent(event)) {
+            const tail = tails.get(event.sessionId) ?? [];
+            tail.push(event);
+            tails.set(event.sessionId, tail);
+          }
+        }
+        if (update && !resyncs.has(item.sessionId)) {
+          const result = cache.apply(item.sessionId, update);
+          if (result === "applied") transcriptChanged = true;
+          if (result === "resync") resyncs.add(item.sessionId);
+        }
+      }
+      applyPermissionEvents(permissionChanges);
+      for (const [sessionId, event] of latest) applyActivity(sessionId, event, true);
+      if (tails.size > 0) {
+        setEvents((value) => {
+          const next = { ...value };
+          for (const [sessionId, items] of tails) {
+            next[sessionId] = mergeEvents(items, value[sessionId] ?? []).slice(
+              -LIVE_TAIL_EVENTS,
+            );
+          }
+          return next;
+        });
+      }
+      if (transcriptChanged) publishTranscripts();
+      for (const sessionId of resyncs) void loadTranscriptRef.current(sessionId, true);
+    };
+
+    const queueLive = (item: LiveItem) => {
+      pendingLive.push(item);
+      liveFlushTimer ??= setTimeout(flushLive, LIVE_FLUSH_MS);
+    };
     let socket: WebSocket | undefined;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
     let commandFlushTimer: ReturnType<typeof setTimeout> | undefined;
@@ -538,6 +747,12 @@ export function useFleet(notify: Notify) {
       socket = new WebSocket(`${protocol}//${location.host}/ws/browser`);
       socket.onopen = () => {
         attempt = 0;
+        // Changes sent while the socket was down are gone, so only the copy on
+        // screen is kept, and it is refetched rather than trusted.
+        const active = activeTranscript.current;
+        transcriptCache.current.retain(active);
+        publishTranscripts();
+        if (active && connectionLost) void loadTranscriptRef.current(active, true);
         setConnected(true);
         if (connectionLost) {
           connectionLost = false;
@@ -551,6 +766,10 @@ export function useFleet(notify: Notify) {
         });
       };
       socket.onclose = () => {
+        for (const request of pendingTranscriptRequests.values()) {
+          request.controller.abort();
+        }
+        pendingTranscriptRequests.clear();
         setConnected(false);
         if (closed) return;
         if (!connectionLost) {
@@ -713,25 +932,37 @@ export function useFleet(notify: Notify) {
           }));
           return;
         }
+        if (message.type === "transcript_reset") {
+          queueLive({ sessionId: message.sessionId, reset: true });
+          return;
+        }
+        if (message.type === "transcript") {
+          queueLive({ sessionId: message.sessionId, update: message.update });
+          return;
+        }
         const { event } = message;
-        setEvents((value) => ({
-          ...value,
-          [event.sessionId]: mergeEvents([event], value[event.sessionId] ?? []),
-        }));
+        queueLive({ sessionId: event.sessionId, event, update: message.transcript });
       };
     };
 
     connect();
     return () => {
       closed = true;
+      for (const request of pendingTranscriptRequests.values())
+        request.controller.abort();
+      pendingTranscriptRequests.clear();
+      if (liveFlushTimer) clearTimeout(liveFlushTimer);
       if (retryTimer) clearTimeout(retryTimer);
       if (commandFlushTimer) clearTimeout(commandFlushTimer);
       socket?.close();
     };
   }, [
     announceHostUpdate,
+    applyActivity,
+    applyPermissionEvents,
     applyNotification,
     hydrateSocketSnapshot,
+    publishTranscripts,
     recordHydrationChange,
     recordNotificationUpsert,
     recordUnreadCount,
@@ -743,13 +974,17 @@ export function useFleet(notify: Notify) {
     snapshotRevision,
     liveNotificationUpdates,
     events,
+    transcripts,
+    activities,
+    pendingPermissions,
     commandOutput,
     runSteps,
     runNotes,
     connected,
     nodeUpdates,
     refresh,
-    loadEvents,
+    loadTranscript,
+    loadOlderTranscript,
     command,
     request,
     markNotificationRead,

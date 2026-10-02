@@ -423,6 +423,11 @@ export const SessionGrid = ({
                       <SessionTile
                         session={session}
                         events={events[session.id] ?? noEvents}
+                        pendingPermission={
+                          waitingPermissions
+                            .filter((event) => event.sessionId === session.id)
+                            .at(-1) ?? null
+                        }
                         awaitingPermission={blocked.has(session.id)}
                         onOpen={onOpen}
                         onPermission={onPermission}

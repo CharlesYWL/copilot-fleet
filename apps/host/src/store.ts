@@ -32,6 +32,7 @@ import {
   type RunStepState,
   type SecurityBackupPayload,
   type SessionEvent,
+  type SessionActivity,
   type SessionState,
   type TunnelProvider,
   type Workspace,
@@ -57,6 +58,8 @@ import {
   RunNoteMetadataSchema,
   SecurityBackupPayloadSchema,
   SessionEventSchema,
+  SessionActivitySchema,
+  SessionPermissions,
   SessionSchema,
   TunnelProviderSchema,
   WorkspaceSchema,
@@ -480,6 +483,9 @@ export class FleetStore {
    * connection does.
    */
   private readonly statements = new Map<string, StatementSync>();
+  /** Events this process has stored or removed, per session; see {@link eventWrites}. */
+  private readonly eventWriteCounts = new Map<string, number>();
+  private eventWriteTotal = 0;
   private readonly warn: (message: string) => void;
 
   constructor(
@@ -564,6 +570,9 @@ export class FleetStore {
         created_at TEXT NOT NULL, received_at TEXT NOT NULL,
         UNIQUE(session_id, sequence)
       );
+      CREATE INDEX IF NOT EXISTS events_permissions
+        ON events(session_id,sequence)
+        WHERE type IN ('permission','permission_result');
       CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -2431,6 +2440,7 @@ export class FleetStore {
         event.createdAt,
         "",
       );
+      this.noteEventWrite(event.sessionId);
     }
     for (const run of parsed.runs) {
       this.statement(
@@ -5821,6 +5831,7 @@ export class FleetStore {
         event.createdAt,
         receivedAt,
       );
+      this.noteEventWrite(event.sessionId);
       if (isSessionActivityEvent(event)) {
         this.touchSessionActivity(event.sessionId, receivedAt);
       }
@@ -5914,6 +5925,96 @@ export class FleetStore {
     ).map(eventFromRow);
   }
 
+  listEventsAfter(sessionId: string, sequence: number): SessionEvent[] {
+    return (
+      this.statement(
+        "SELECT * FROM events WHERE session_id=? AND sequence>? ORDER BY sequence",
+      ).all(sessionId, sequence) as Row[]
+    ).map(eventFromRow);
+  }
+
+  /**
+   * Transcript rows in sequence order, for the display-only block projection.
+   *
+   * Picker, usage and resume bookkeeping are excluded before their payloads are
+   * decoded, and the outer event schema is not re-run: every stored row passed
+   * it at ingress or import, payloads are still validated per type by
+   * `eventPayload` as they fold, and this path feeds a disposable projection,
+   * never a decision. A payload that is not JSON still throws.
+   */
+  listTranscriptRows(
+    sessionId: string,
+    afterSequence: number,
+    limit: number,
+  ): SessionEvent[] {
+    return (
+      this.statement(
+        `SELECT event_id,session_id,sequence,type,payload,created_at FROM events
+         WHERE session_id=? AND sequence>?
+         AND type NOT IN ('commands','config','usage','agent_session')
+         ORDER BY sequence LIMIT ?`,
+      ).all(sessionId, afterSequence, limit) as Row[]
+    ).map((row) => ({
+      eventId: String(row.event_id),
+      sessionId: String(row.session_id),
+      sequence: Number(row.sequence),
+      type: String(row.type) as SessionEvent["type"],
+      payload: JSON.parse(String(row.payload)) as Record<string, unknown>,
+      createdAt: String(row.created_at),
+    }));
+  }
+
+  /**
+   * How many times this process has written a session's events.
+   *
+   * A transcript projection advances with every event the service stores; if
+   * the count moved without it, some write went around it and the projection
+   * is stale. Counting in memory keeps that check constant-time, where counting
+   * rows took a scan of the whole session on every page. Writes from another
+   * process are not counted: the Host owns its database.
+   */
+  eventWrites(sessionId: string): number {
+    return this.eventWriteCounts.get(sessionId) ?? 0;
+  }
+
+  /** The same count across every session. */
+  allEventWrites(): number {
+    return this.eventWriteTotal;
+  }
+
+  private noteEventWrite(sessionId: string): void {
+    this.eventWriteCounts.set(sessionId, this.eventWrites(sessionId) + 1);
+    this.eventWriteTotal += 1;
+  }
+
+  /** Newest activity; invisible config/commands events count, usage never did. */
+  latestActivity(sessionId: string): SessionActivity | undefined {
+    const row = this.statement(
+      `SELECT event_id,sequence,created_at FROM events
+       WHERE session_id=? AND type<>'usage' ORDER BY sequence DESC LIMIT 1`,
+    ).get(sessionId) as Row | undefined;
+    return row
+      ? SessionActivitySchema.parse({
+          eventId: String(row.event_id),
+          sequence: Number(row.sequence),
+          createdAt: String(row.created_at),
+        })
+      : undefined;
+  }
+
+  listPermissionEvents(): SessionEvent[] {
+    const index = new SessionPermissions();
+    index.apply(
+      (
+        this.statement(
+          `SELECT * FROM events WHERE type IN ('permission','permission_result')
+         ORDER BY session_id,sequence`,
+        ).all() as Row[]
+      ).map(eventFromRow),
+    );
+    return index.latestEvents();
+  }
+
   hasEventAfter(
     sessionId: string,
     sequence: number,
@@ -5982,6 +6083,7 @@ export class FleetStore {
     }
     this.statement("DELETE FROM notification_preferences WHERE session_id=?").run(id);
     this.statement("DELETE FROM events WHERE session_id=?").run(id);
+    this.noteEventWrite(id);
     this.statement("DELETE FROM sessions WHERE id=?").run(id);
   }
 

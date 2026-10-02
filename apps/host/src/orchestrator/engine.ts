@@ -153,11 +153,10 @@ export class OrchestratorEngine {
     // Event sequence alone cannot distinguish the cancelled turn from a later
     // supervisor turn. Stop keeps the original dispatch receipt; new work replaces it.
     if (dispatch?.attempt !== attempt) return;
-    const events = this.store
-      .listEvents(sessionId)
-      .filter(
-        (event) => event.sequence > Math.max(step.eventSeqFrom, dispatch.eventSeqFrom),
-      );
+    const events = this.store.listEventsAfter(
+      sessionId,
+      Math.max(step.eventSeqFrom, dispatch.eventSeqFrom),
+    );
 
     if (session.state === "failed") {
       this.service.reconcileStoppedOrchestrationStep({
@@ -1071,9 +1070,7 @@ export class OrchestratorEngine {
       if (!step.sessionId) continue;
       if (step.state !== "running" && step.state !== "starting") continue;
       const text = workerOutput(
-        this.store
-          .listEvents(step.sessionId)
-          .filter((event) => event.sequence > step.eventSeqFrom),
+        this.store.listEventsAfter(step.sessionId, step.eventSeqFrom),
         this.store.getSession(step.sessionId),
       );
       outputs.set(step.id, truncateMiddle(text, maxChars));

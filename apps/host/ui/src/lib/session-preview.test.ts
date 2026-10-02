@@ -12,6 +12,20 @@ function block(partial: Partial<TerminalBlock> & { key: string }): TerminalBlock
 }
 
 describe("toPreviewLines", () => {
+  it("does not inspect old blocks once the preview is full", () => {
+    const old = block({ key: "old" });
+    Object.defineProperty(old, "text", {
+      get: () => {
+        throw new Error("Old history was visited");
+      },
+    });
+    const recent = block({ key: "recent", text: "one\ntwo\nthree" });
+    expect(toPreviewLines([old, recent], "", 2)).toEqual([
+      { key: "recent:1", kind: "agent", text: "two" },
+      { key: "recent:2", kind: "agent", text: "three" },
+    ]);
+  });
+
   it("keeps the newest lines in stream order", () => {
     const lines = toPreviewLines(
       [

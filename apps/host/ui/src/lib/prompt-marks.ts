@@ -1,15 +1,6 @@
-import type { TerminalBlock } from "./terminal-blocks";
+import { promptLabel, type PromptMark, type TerminalBlock } from "@fleet/protocol";
 
-export type PromptMark = {
-  /** The block key, which is also the transcript element's `data-prompt-key`. */
-  key: string;
-  /** The prompt itself, cut to something a tooltip can hold on two lines. */
-  label: string;
-  createdAt: string;
-};
-
-/** Long enough to recognise a prompt, short enough not to become a paragraph. */
-const LABEL_MAX_LENGTH = 60;
+export type { PromptMark };
 
 /**
  * The operator's own prompts, in order, as the rail beside the stream draws them.
@@ -18,24 +9,20 @@ const LABEL_MAX_LENGTH = 60;
  * work between two prompts is one chapter of it. The scrollbar could only ever
  * say "you are 40% down"; these marks say "this is the turn where you asked for
  * the retry fix", which is the question someone scrolling back is actually
- * asking.
+ * asking. `start` is the absolute position of `blocks[0]`.
  */
-export function toPromptMarks(blocks: TerminalBlock[]): PromptMark[] {
-  return blocks
-    .filter((block) => block.kind === "user")
-    .map((block) => ({
+export function toPromptMarks(blocks: readonly TerminalBlock[], start = 0): PromptMark[] {
+  const marks: PromptMark[] = [];
+  blocks.forEach((block, offset) => {
+    if (block.kind !== "user") return;
+    marks.push({
       key: block.key,
+      index: start + offset,
       label: promptLabel(block.text),
       createdAt: block.createdAt,
-    }));
-}
-
-function promptLabel(text: string): string {
-  const flattened = text.replace(/\s+/g, " ").trim();
-  if (!flattened) return "Prompt";
-  return flattened.length > LABEL_MAX_LENGTH
-    ? `${flattened.slice(0, LABEL_MAX_LENGTH)}…`
-    : flattened;
+    });
+  });
+  return marks;
 }
 
 /**

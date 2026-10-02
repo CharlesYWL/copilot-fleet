@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseFleetControl, parseWake, wakeDetail, wakeTitle } from "./fleet-wake";
+import { parseFleetControl, parseWake, wakeDetail, wakeTitle } from "./fleet-wake.js";
 
 const executionId = "d00c5b6e-1c21-4b5d-8f2e-c2dc1ebdbf65";
 const legacyCommandResult = [

@@ -10,6 +10,7 @@ import {
 } from "@fleet/protocol";
 import { SessionInfoDialog } from "./SessionInfoDialog";
 import { SessionFocusDialog } from "./SessionFocusDialog";
+import { transcriptOf } from "../test-transcript";
 import { EMPTY_DRAFT } from "../lib/session-drafts";
 import { fleetDarkTheme } from "../theme";
 
@@ -139,7 +140,7 @@ describe("SessionInfoDialog", () => {
           session={session}
           node={node}
           placement={placement}
-          events={[]}
+          transcript={transcriptOf([])}
           open
           onOpenChange={vi.fn()}
           onPrompt={vi.fn()}

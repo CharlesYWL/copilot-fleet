@@ -572,6 +572,116 @@ export const SessionEventSchema = z.object({
 export type SessionEvent = z.infer<typeof SessionEventSchema>;
 export type SessionEventType = SessionEvent["type"];
 
+export { SessionPermissions } from "./session-permissions.js";
+
+export const SessionActivitySchema = SessionEventSchema.pick({
+  eventId: true,
+  sequence: true,
+  createdAt: true,
+});
+export type SessionActivity = z.infer<typeof SessionActivitySchema>;
+
+export const TerminalBlockKindSchema = z.enum([
+  "user",
+  "agent",
+  "thought",
+  "tool",
+  "permission",
+  "permission_result",
+  "turn",
+  "state",
+  "error",
+  "system",
+  /** Fleet control envelopes: worker/command results, reviews, task briefs and status checks. */
+  "wake",
+]);
+export type TerminalBlockKind = z.infer<typeof TerminalBlockKindSchema>;
+
+/** One transcript line: many raw events fold into one block. */
+export const TerminalBlockSchema = z.object({
+  /** The first event's id, so a block keeps its identity as it grows. */
+  key: z.string().min(1),
+  kind: TerminalBlockKindSchema,
+  text: z.string(),
+  createdAt: z.string(),
+  status: z.string().optional(),
+  /** ACP tool category (`read`, `edit`, `execute`, …), which picks the icon. */
+  toolKind: z.string().optional(),
+  /** One-line summary of a tool's input, shown dimmed after its title. */
+  detail: z.string().optional(),
+  /** Full text a summarised block folds away, kept for whoever expands it. */
+  body: z.string().optional(),
+  /** Files that went with this message, by name; their bytes are never kept. */
+  attachments: z.array(AttachmentSummarySchema).optional(),
+});
+export type TerminalBlock = z.infer<typeof TerminalBlockSchema>;
+
+/** An operator prompt and where it sits, so the rail can reach unloaded history. */
+export const PromptMarkSchema = z.object({
+  key: z.string().min(1),
+  /** Absolute block position in the whole transcript. */
+  index: z.number().int().nonnegative(),
+  label: z.string(),
+  createdAt: z.string(),
+});
+export type PromptMark = z.infer<typeof PromptMarkSchema>;
+
+/** What one event did to the transcript: grew a block's text, or (re)placed one. */
+export const TranscriptChangeSchema = z.union([
+  z.object({ index: z.number().int().nonnegative(), append: z.string() }),
+  z.object({ index: z.number().int().nonnegative(), block: TerminalBlockSchema }),
+]);
+export type TranscriptChange = z.infer<typeof TranscriptChangeSchema>;
+
+/**
+ * A change, ordered within one Host projection.
+ *
+ * `generation` names the projection; a different one means the Host rebuilt it
+ * and the reader must refetch. Revisions are contiguous within a generation, so
+ * a skipped number is a change the reader missed.
+ */
+export const TranscriptUpdateSchema = z.object({
+  generation: z.string().min(1),
+  revision: z.number().int().positive(),
+  change: TranscriptChangeSchema,
+});
+export type TranscriptUpdate = z.infer<typeof TranscriptUpdateSchema>;
+
+/** A contiguous run of blocks, `[start, start + blocks.length)` of `total`. */
+export const TranscriptPageSchema = z.object({
+  generation: z.string().min(1),
+  revision: z.number().int().nonnegative(),
+  total: z.number().int().nonnegative(),
+  start: z.number().int().nonnegative(),
+  blocks: z.array(TerminalBlockSchema),
+  /** Every operator prompt; sent with the newest page only. */
+  prompts: z.array(PromptMarkSchema).optional(),
+  activity: SessionActivitySchema.optional(),
+});
+export type TranscriptPage = z.infer<typeof TranscriptPageSchema>;
+
+export const TRANSCRIPT_PAGE_LIMIT = 200;
+export const TRANSCRIPT_PAGE_MAX = 10_000;
+
+export {
+  TranscriptProjector,
+  changedBlock,
+  promptLabel,
+  toTerminalBlocks,
+} from "./transcript.js";
+export {
+  parseFleetControl,
+  parseWake,
+  wakeDetail,
+  wakeTitle,
+  type WakeSummary,
+} from "./fleet-wake.js";
+
+/** Current picker/usage state travels on the session, not in its transcript. */
+export function isTranscriptEvent(event: Pick<SessionEvent, "type">): boolean {
+  return !["commands", "config", "usage", "agent_session"].includes(event.type);
+}
+
 /** Inventory, picker replay and connectivity notices must not renew retention. */
 export function isSessionActivityEvent(event: SessionEvent): boolean {
   if (event.payload.historyReplay === true) return false;
@@ -1969,6 +2079,8 @@ export const SnapshotSchema = z.object({
   prMaintenanceTasks: z.array(PrMaintenanceTaskStatusSchema).optional(),
   /** Active and recently settled "Resume now" requests. */
   workerResumeRequests: z.array(WorkerResumeRequestSchema).optional(),
+  /** Latest request or resolution per permission, including sessions not opened in this tab. */
+  permissionEvents: z.array(SessionEventSchema).optional(),
 });
 export type Snapshot = z.infer<typeof SnapshotSchema>;
 
@@ -1981,7 +2093,20 @@ export const BrowserMessageSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("snapshot"), data: SnapshotSchema }),
   z.object({ type: z.literal("node"), node: NodeSchema }),
   z.object({ type: z.literal("session"), session: SessionSchema }),
-  z.object({ type: z.literal("event"), event: SessionEventSchema }),
+  z.object({
+    type: z.literal("event"),
+    event: SessionEventSchema,
+    /** The block change this event made, when the Host has the session's transcript projected. */
+    transcript: TranscriptUpdateSchema.optional(),
+  }),
+  /** The Host dropped or rebuilt a session's projection; refetch any copy of it. */
+  z.object({ type: z.literal("transcript_reset"), sessionId: z.string().min(1) }),
+  /** A block change from a stored event that is not itself published. */
+  z.object({
+    type: z.literal("transcript"),
+    sessionId: z.string().min(1),
+    update: TranscriptUpdateSchema,
+  }),
   /**
    * Workspaces and placements after any change to either.
    *

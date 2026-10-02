@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Toast,
   ToastBody,
@@ -20,7 +20,6 @@ import {
   type Run,
   type RunNote,
   type RunStep,
-  type SessionEvent,
   type WorkerResumeOutcome,
   type WorkerResumeRequest,
 } from "@fleet/protocol";
@@ -35,7 +34,6 @@ import type { TourStep } from "./lib/onboarding";
 import type { MaintenanceReviewReference } from "./lib/pr-maintenance";
 import { signOut } from "./lib/auth";
 import { notificationTarget } from "./lib/notification-navigation";
-import { pendingPermissionRequests } from "./lib/terminal-blocks";
 import {
   filterOrchestratorConversations,
   filterVisibleSessions,
@@ -86,7 +84,6 @@ import { CommandPermissionPrompts } from "./components/CommandPermissionPrompts"
 import { PrMaintenanceApprovalReview } from "./components/orchestration/PrMaintenanceApprovalReview";
 import { WorkerResumePrompts } from "./components/orchestration/WorkerResumePrompts";
 
-const noEvents: SessionEvent[] = [];
 const noNotes: RunNote[] = [];
 const noMaintenanceApprovals: PrMaintenanceApproval[] = [];
 const noResumeRequests: WorkerResumeRequest[] = [];
@@ -242,13 +239,17 @@ export function App() {
     snapshotRevision,
     liveNotificationUpdates,
     events,
+    transcripts,
+    activities,
+    pendingPermissions: waitingPermissions,
     commandOutput,
     runSteps,
     runNotes,
     connected,
     nodeUpdates,
     refresh,
-    loadEvents,
+    loadTranscript,
+    loadOlderTranscript,
     command,
     request,
     markNotificationRead,
@@ -355,7 +356,6 @@ export function App() {
    * tree and the wall — and a draft that lives inside it disappears with it.
    */
   const [drafts, setDrafts] = useState<DraftsBySession>({});
-  const backfilled = useRef(new Set<string>());
 
   // Read the Host default when the dialog opens so it reflects Settings edits.
   useEffect(() => {
@@ -405,10 +405,6 @@ export function App() {
     () => snapshot.sessions.filter(isDisposableSession).length,
     [snapshot.sessions],
   );
-  const waitingPermissions = useMemo(
-    () => pendingPermissionRequests(Object.values(events).flat()),
-    [events],
-  );
   const eligiblePlacements = useMemo(
     () =>
       snapshot.placements.filter((placement) =>
@@ -441,20 +437,10 @@ export function App() {
   }, [selectedSessionId, visibleSessions]);
 
   useEffect(() => {
-    if (!selectedSessionId) return;
-    void loadEvents(selectedSessionId);
-  }, [selectedSessionId, loadEvents]);
-
-  // Live updates only cover what streams while this tab is open, so every tile
-  // needs its history once before the monitor wall can preview it.
-  useEffect(() => {
-    if (view !== "overview") return;
-    for (const session of visibleSessions) {
-      if (backfilled.current.has(session.id)) continue;
-      backfilled.current.add(session.id);
-      void loadEvents(session.id);
-    }
-  }, [view, visibleSessions, loadEvents]);
+    if (!selectedSessionId || !connected) return;
+    if (view !== "session" && !(view === "overview" && focusOpen)) return;
+    void loadTranscript(selectedSessionId);
+  }, [selectedSessionId, view, focusOpen, connected, loadTranscript]);
 
   /**
    * Opens a session's transcript.
@@ -965,21 +951,6 @@ export function App() {
     }
     setView("orchestrator");
   }, [view, selectedRunId, runModels]);
-
-  /*
-   * The orchestrator's history, which nothing else asks for.
-   *
-   * Events are fetched for the *selected* session, and the orchestrator is
-   * never that — it has a view of its own. So its transcript held only what
-   * happened to stream while the tab was open, and reopening the view, or
-   * reloading the page, showed an empty conversation that was in fact intact
-   * on the Host.
-   */
-  const orchestratorId = orchestrator?.id;
-  useEffect(() => {
-    if (!orchestratorId) return;
-    void loadEvents(orchestratorId);
-  }, [orchestratorId, loadEvents]);
 
   /**
    * The person's answer to a task the orchestrator handed over.
@@ -1601,7 +1572,16 @@ export function App() {
                         placement={snapshot.placements.find(
                           (placement) => placement.id === activeSession.placementId,
                         )}
-                        events={events[activeSession.id] ?? noEvents}
+                        transcript={transcripts[activeSession.id]}
+                        onLoadOlder={(toIndex) =>
+                          loadOlderTranscript(activeSession.id, toIndex)
+                        }
+                        activity={activities[activeSession.id]}
+                        pendingPermission={
+                          waitingPermissions
+                            .filter((event) => event.sessionId === activeSession.id)
+                            .at(-1) ?? null
+                        }
                         onPrompt={(prompt, attachments) =>
                           command(`/api/sessions/${activeSession.id}/prompt`, {
                             prompt,
@@ -1699,7 +1679,14 @@ export function App() {
             placement={snapshot.placements.find(
               (placement) => placement.id === activeSession.placementId,
             )}
-            events={events[activeSession.id] ?? noEvents}
+            transcript={transcripts[activeSession.id]}
+            onLoadOlder={(toIndex) => loadOlderTranscript(activeSession.id, toIndex)}
+            activity={activities[activeSession.id]}
+            pendingPermission={
+              waitingPermissions
+                .filter((event) => event.sessionId === activeSession.id)
+                .at(-1) ?? null
+            }
             open={focusOpen}
             onOpenChange={setFocusOpen}
             onPrompt={(prompt, attachments) =>
