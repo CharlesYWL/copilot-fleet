@@ -25,11 +25,13 @@ import {
   supportsAgentKind,
   type AgentParams,
   type FleetNode,
+  type OrchestratorModels,
 } from "@fleet/protocol";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { terminal } from "../theme";
 import { CopyButton } from "./CopyButton";
+import { ModelDefaultsCard, type ModelDefaultsCardProps } from "./ModelDefaultsCard";
 
 const useStyles = makeStyles({
   panel: {
@@ -65,12 +67,20 @@ const useStyles = makeStyles({
 
 type Defaults = {
   orchestratorAgent?: AgentParams | null;
+  orchestratorModels?: OrchestratorModels;
+  orchestratorReasoningEffort?: string;
   orchestratorHeartbeatSchedule?: string;
   orchestratorHeartbeatTimeZone?: string;
   orchestratorHeartbeatUpcoming?: string[];
 };
 
-export function OrchestratorPanel({ nodes }: { nodes: readonly FleetNode[] }) {
+export function OrchestratorPanel({
+  nodes,
+  sessions,
+}: {
+  nodes: readonly FleetNode[];
+  sessions: ModelDefaultsCardProps["sessions"];
+}) {
   const styles = useStyles();
   const [defaults, setDefaults] = useState<Defaults>();
   const [draft, setDraft] = useState<AgentParams | null>(null);
@@ -246,8 +256,7 @@ export function OrchestratorPanel({ nodes }: { nodes: readonly FleetNode[] }) {
         <Text className={styles.caption}>
           New orchestrators fall back to Copilot, with a transcript notice, when no online
           Node holding the workspace has the preferred agent. Profile, authentication, and
-          startup errors are reported instead of switching agents. Hermes uses its
-          profile&apos;s model settings; General defaults apply to Copilot.
+          startup errors are reported instead of switching agents.
         </Text>
         <div className={styles.actions}>
           <Button
@@ -261,6 +270,28 @@ export function OrchestratorPanel({ nodes }: { nodes: readonly FleetNode[] }) {
           </Button>
         </div>
       </section>
+      {AgentKindSchema.options.map((kind) => (
+        <ModelDefaultsCard
+          key={kind}
+          kind={kind}
+          sessions={sessions}
+          model={defaults.orchestratorModels?.[kind] ?? ""}
+          reasoningEffort={
+            kind === "copilot" ? (defaults.orchestratorReasoningEffort ?? "") : undefined
+          }
+          busy={busy}
+          onChange={(patch) =>
+            void update({
+              ...(patch.model !== undefined
+                ? { orchestratorModels: { [kind]: patch.model } }
+                : {}),
+              ...(patch.reasoningEffort !== undefined
+                ? { orchestratorReasoningEffort: patch.reasoningEffort }
+                : {}),
+            })
+          }
+        />
+      ))}
       <HeartbeatScheduleCard
         schedule={
           defaults.orchestratorHeartbeatSchedule ??

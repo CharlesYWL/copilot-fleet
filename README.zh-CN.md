@@ -904,11 +904,17 @@ Autopilot **Mode**：以 `--allow-all` 启动的会话仍然上报 mode `agent`�
 选择一个代理拒绝的值会以提示的形式报告出来，并且不影响会话，不会结束这次运行。节点会
 声明 `session-config` 能力，Host 宁可拒绝这个请求，也不会把一个旧节点看不懂的帧发过去。
 
-**默认值由 Copilot 决定。** 会话启动时只带一个工作目录，所以新会话打开时的模型、模式和
-推理强度，都是 Copilot 自己为那台机器和那个账号解析出来的结果 —— fleet 从不发送默认值。
-改动某个选择器的作用范围仅限那一个会话：同一节点上的第二个会话，以及终端里下一次
-`copilot` 运行，仍然从 Copilot 自己的默认值开始。Resume 会通过 `session/load` 重新读取
-在线值，而不是相信存储的内容，所以恢复回来的会话显示的是它实际运行在什么上面。
+**工作会话与编排器的模型默认值相互独立。** 在 **Settings → General** 设置 Chats、
+worker、reviewer 等工作会话的模型和推理强度；**Settings → Orchestrator** 提供独立的
+**Copilot model**、**Hermes model** 下拉框，以及 Copilot 推理强度设置。每个下拉框只
+读取对应代理会话上报的模型，并保存其原始模型 ID；相同显示名称不代表不同代理的 ID
+可以互换。选项提示中也显示原始 ID。已保存但暂不可用的模型仍然显示，即使没有模型列表
+也可清除。升级时仅将原共享选择复制一次到 Copilot 编排器设置，Hermes 默认使用 profile。
+
+这些设置支持 Host 重启和备份恢复。**Copilot's choice** 和 **Hermes profile's choice**
+表示由对应代理自行决定，不会继承其他代理或工作会话的默认值。默认值在启动和恢复时
+应用，不会打断正在运行的代理；不支持指定模型时会显示提示并保留代理的选择。修改会话
+自身的选择器不会更改已保存的默认值。Resume 通过 `session/load` 读取在线值，界面显示实际配置。
 
 选择模型会改变其他选择器，因为不是每个模型都提供每一项设置 —— 切换到没有推理级别的
 模型会移除 Reasoning Effort 控件。正因如此，每次变更都会重新发布代理的整份选项列表，
@@ -1456,8 +1462,10 @@ worker 有结果后唤醒自己，并把交付记录留给你审查。
 
 在 **Settings → Orchestrator → Preferred agent** 选择编排器代理。Auto 固定为 Copilot；
 Node 检测到 Hermes 后会显示 Hermes 选项。选择只影响新编排器，已有会话在停止、恢复和
-重启后保留原代理及 profile，worker 仍使用 Copilot。General 中的模型、推理强度、
-上下文和 Agency 设置只适用于 Copilot。
+重启后保留原代理及 profile，worker 仍使用 Copilot。各编排器代理有独立的模型默认值，
+位于 Orchestrator 设置页；回退到 Copilot 时使用 Copilot 的默认值而不是 Hermes 的。
+工作会话的默认值保留在 General。General 中的
+上下文和 Agency 设置仍适用于所有 Copilot 会话，不适用于 Hermes。
 
 在运行 Hermes 的每台 Node 上，以运行 Node 的同一 OS 用户手动初始化独立 profile：
 
@@ -1472,6 +1480,9 @@ hermes -p fleet-orchestrator acp --check
 保留在该 Node 的 profile 内，不跨 Node 同步。同一 Node 的同一 profile 同时只能有一个
 活动的 Hermes 编排器，也不要让外部 Hermes 进程同时使用它。
 
+Hermes 模型下拉框在启动或恢复之后、发送提示词之前，通过 `session/set_model` 应用
+Hermes 原始模型 ID，不会修改 profile 文件。
+
 Hermes 支持通过 profile 配置推理强度，但当前 ACP 接口不提供推理选择器或
 `/reasoning` 命令。例如：
 
@@ -1480,7 +1491,7 @@ hermes -p fleet-orchestrator config set agent.reasoning_effort high
 ```
 
 待编排器空闲后停止并恢复，使其读取新配置。模型专属的 `agent.reasoning_overrides`
-优先级更高，具体支持的推理级别取决于模型及 provider；General 中的推理默认值只影响
+优先级更高，具体支持的推理级别取决于模型及 provider；Fleet 中的推理默认值只影响
 Copilot。Hermes 依赖检查使用与 ACP 相同的可配置启动等待时间（默认 180 秒），随后
 ACP 握手单独计时，避免冷启动的 Python 导入被短时元数据查询限制提前终止。
 

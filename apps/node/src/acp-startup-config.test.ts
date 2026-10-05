@@ -53,8 +53,30 @@ describe("resolving what the Host asked for", () => {
     expect(resolveConfigValue(modelOption(), "claude-opus-5")).toBe("claude-opus-5");
   });
 
-  it("takes the display name, since that is what a person copied", () => {
-    expect(resolveConfigValue(modelOption(), "Claude Opus 5")).toBe("claude-opus-5");
+  it.each(["Claude Opus 5", "CLAUDE-OPUS-5", " claude-opus-5 "])(
+    "does not reinterpret a backend model ID as a name or normalized alias: %s",
+    (value) => {
+      expect(resolveConfigValue(modelOption(), value)).toBeUndefined();
+    },
+  );
+
+  it("keeps provider-prefixed IDs even when names and URL fragments match", () => {
+    const option: acp.SessionConfigOption = {
+      id: "model",
+      name: "Model",
+      category: "model",
+      type: "select",
+      currentValue: "provider-a#claude-opus-5",
+      options: [
+        { value: "provider-a#claude-opus-5", name: "Claude Opus 5" },
+        { value: "provider-b/claude-opus-5", name: "Claude Opus 5" },
+      ],
+    };
+    expect(resolveConfigValue(option, "claude-opus-5")).toBeUndefined();
+    expect(resolveConfigValue(option, "Claude Opus 5")).toBeUndefined();
+    expect(resolveConfigValue(option, "provider-b/claude-opus-5")).toBe(
+      "provider-b/claude-opus-5",
+    );
   });
 
   it("ignores case, because these travel through a settings box", () => {

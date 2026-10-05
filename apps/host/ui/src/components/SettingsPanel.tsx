@@ -100,7 +100,7 @@ export const SettingsPanel = (props: SettingsPanelProps) => {
   };
 
   const panels: Record<SettingsTab, ReactNode> = {
-    orchestrator: <OrchestratorPanel nodes={props.nodes} />,
+    orchestrator: <OrchestratorPanel nodes={props.nodes} sessions={props.sessions} />,
     general: (
       <GeneralPanel
         sessions={props.sessions}

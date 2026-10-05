@@ -201,9 +201,8 @@ export class AgentStartupCleanupError extends AggregateError {
  * that URL in the Host would tie a fleet setting to the spelling of a protocol
  * neither side owns.
  *
- * Tried in order of confidence: the exact value, the fragment after a `#`, then
- * the display name. Returns undefined rather than guessing when none matches —
- * a wrong setting applied silently is worse than a default left in place.
+ * Models require an exact backend-native ID, not a shared display name. Other
+ * settings try the value, the fragment after a `#`, then the display name.
  */
 export function resolveConfigValue(
   option: acp.SessionConfigOption,
@@ -216,6 +215,8 @@ export function resolveConfigValue(
           { value: "true", name: "On" },
           { value: "false", name: "Off" },
         ];
+  if (option.id === "model" || option.category === "model")
+    return choices.find((choice) => choice.value === wanted)?.value;
   const want = wanted.trim().toLowerCase();
   if (want === "") return undefined;
 
@@ -273,9 +274,8 @@ export type StartAgentOptions = {
   /**
    * Pickers to set before the session is asked anything.
    *
-   * Values arrive as intent rather than as Copilot's own spelling — see
-   * `resolveConfigValue` — because the Host cannot know that "agent mode" is
-   * written as an ACP URL.
+   * Model IDs are exact. Other values may arrive as intent rather than as the
+   * agent's spelling — see `resolveConfigValue` for ACP mode URLs.
    */
   config?: readonly StartupConfig[];
   /** Suppress transient lifecycle states for an internal process replacement. */

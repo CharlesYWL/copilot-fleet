@@ -149,6 +149,11 @@ describe("orchestrator lifecycle routes", () => {
     const params = { kind: "hermes", profile: "fleet-orchestrator" } as const;
     store.setOrchestratorAgent(params);
     store.setDefaultModel("copilot-only-model");
+    store.setOrchestratorModels({
+      copilot: "copilot-lead-model",
+      hermes: "provider/hermes-model",
+    });
+    store.setOrchestratorReasoningEffort("medium");
     store.setAgencyMode(true);
     const sent = vi.spyOn(service, "send");
     const commands = () =>
@@ -170,7 +175,7 @@ describe("orchestrator lifecycle routes", () => {
     expect(start).toMatchObject({
       agentParams: params,
       agent: "",
-      config: [],
+      config: [{ id: "model", value: "provider/hermes-model" }],
       yolo: true,
     });
     expect(start).toMatchObject({
@@ -206,7 +211,7 @@ describe("orchestrator lifecycle routes", () => {
       agentParams: params,
       agentSessionId: "hermes-saved",
       agent: "",
-      config: [],
+      config: [{ id: "model", value: "provider/hermes-model" }],
       mcpServers: [{ name: "fleet" }],
     });
     store.transitionSession(session.id, "stopped");
@@ -225,6 +230,13 @@ describe("orchestrator lifecycle routes", () => {
   it("falls back visibly only for a new lead and never changes workers", async () => {
     const { app, store, service, leadId } = await setup();
     store.setOrchestratorAgent({ kind: "hermes", profile: "fleet-orchestrator" });
+    store.setDefaultModel("worker-model");
+    store.setDefaultReasoningEffort("high");
+    store.setOrchestratorModels({
+      copilot: "lead-model",
+      hermes: "provider/hermes-model",
+    });
+    store.setOrchestratorReasoningEffort("medium");
     const sent = vi.spyOn(service, "send");
     const response = await app.inject({
       method: "POST",
@@ -234,16 +246,43 @@ describe("orchestrator lifecycle routes", () => {
     expect(response.statusCode).toBe(201);
     const session = response.json<{ session: FleetSession }>().session;
     expect(session.agentParams).toEqual({ kind: "copilot" });
-    const commands: NodeCommand[] = sent.mock.calls.flatMap(([, frame]) => {
-      const parsed = HostToNodeMessageSchema.safeParse(frame);
-      return parsed.success && parsed.data.type === "command"
-        ? [parsed.data.command]
-        : [];
-    });
-    expect(commands.at(-1)).toMatchObject({
+    const commands = (): NodeCommand[] =>
+      sent.mock.calls.flatMap(([, frame]) => {
+        const parsed = HostToNodeMessageSchema.safeParse(frame);
+        return parsed.success && parsed.data.type === "command"
+          ? [parsed.data.command]
+          : [];
+      });
+    expect(commands().at(-1)).toMatchObject({
       type: "start_session",
       agentParams: { kind: "copilot" },
       startupNotice: `Preferred agent Hermes is unavailable on the online Nodes holding this workspace. Started with Copilot on ${session.nodeName}.`,
+      config: [
+        { id: "mode", value: "agent" },
+        { id: "model", value: "lead-model" },
+        { id: "reasoning_effort", value: "medium" },
+      ],
+    });
+    store.transitionSession(session.id, "starting");
+    store.transitionSession(session.id, "idle");
+    store.appendEvent({
+      eventId: randomUUID(),
+      sessionId: session.id,
+      sequence: 1,
+      type: "agent_session",
+      payload: { agentSessionId: "copilot-lead-saved" },
+      createdAt: new Date().toISOString(),
+    });
+    store.transitionSession(session.id, "stopped");
+    store.setDefaultModel("changed-worker-model");
+    expect(service.resumeSession(session.id).ok).toBe(true);
+    expect(commands().at(-1)).toMatchObject({
+      type: "resume_session",
+      config: [
+        { id: "mode", value: "agent" },
+        { id: "model", value: "lead-model" },
+        { id: "reasoning_effort", value: "medium" },
+      ],
     });
     const worker = service.createAndStartSession({
       placement: store.getPlacement(session.placementId)!,
@@ -252,6 +291,14 @@ describe("orchestrator lifecycle routes", () => {
       runRole: "worker",
     });
     expect(worker.ok && worker.session.agentParams).toEqual({ kind: "copilot" });
+    expect(commands().at(-1)).toMatchObject({
+      type: "start_session",
+      config: [
+        { id: "mode", value: "agent" },
+        { id: "model", value: "changed-worker-model" },
+        { id: "reasoning_effort", value: "high" },
+      ],
+    });
     expect(
       service.createAndStartSession({
         placement: store.getPlacement(session.placementId)!,
