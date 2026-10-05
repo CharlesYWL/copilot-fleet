@@ -1,6 +1,6 @@
 # Host-driven remote command permissions
 
-Updated: 2026-09-17. This design supersedes the earlier local opt-in and
+Updated: 2026-10-05. This design supersedes the earlier local opt-in and
 stop-all-sessions setup in this PR. The implementation is for trusted operators;
 it is not a sandbox.
 
@@ -9,10 +9,12 @@ it is not a sandbox.
 1. An Orchestrator requests a command through `fleet_run_command`.
 2. The Host resolves a registered placement or eligible managed worktree. The
    executing Node prepares its physical directory, shell, and permission identity.
-3. If the Node has no applicable permission, the Host opens an approval dialog
-   showing the exact command, machine, working folder, reason, and deadline.
-4. The operator selects **Allow once**, **Allow during session**, **Always allow
-   on this Node**, or **Deny**.
+3. Commands targeting the Host's own authenticated local Node are automatically
+   approved with Once scope. For other Nodes without an applicable permission,
+   the Host opens an approval dialog showing the exact command, machine, working
+   folder, reason, and deadline.
+4. For requests requiring review, the operator selects **Allow once**, **Allow
+   during session**, **Always allow on this Node**, or **Deny**.
 5. The Host sends the approved immutable request and scope to the Node. The Node
    validates the request and any remembered rule again before execution.
 6. Output streams to the Host; durable completion wakes the Orchestrator without
@@ -37,10 +39,33 @@ Matching permission records do not waive active-session ownership, maintenance,
 resource, deadline, or managed-result restrictions.
 
 The Host does not keep an independent reusable allowlist. The Node's prepared
-permission description is part of the hashed descriptor. Automatic use is
+permission description is part of the hashed descriptor. Automatic Node-rule use is
 explicitly recorded in execution history, and the Node rechecks current rules at
 start. Removing a rule after preparation prevents its subsequent automatic use.
 Persistent-rule write failure must be surfaced before submitted code starts.
+
+### Host-local commands
+
+The Host identifies its local Node from `node.json` in the Node configuration
+directory (`FLEET_NODE_CONFIG_DIR` when set), not from the machine's display name
+or a loopback/tunnel address. The local enrollment must match the target Node ID,
+this Host's identity, and the Node public key registered with the Host. This
+prevents another machine re-enrolled under the same name from inheriting local
+approval. The Node must still use an authenticated, sealed command connection.
+Missing, malformed, legacy, or mismatched identity evidence leaves the normal
+approval flow in place. A local Node running as another OS user or using a
+different configuration directory is not automatically recognized.
+
+Local approval covers the exact prepared execution, including compound scripts;
+it creates no session or persistent rule. History records `automaticApproval`
+and the `host:local-node` approver, and the security audit records
+`automatic_host_local`. The Node receives ordinary Once authorization: its wire
+`automaticApproval` flag remains false because that flag requires a reusable
+Node-rule match. The Host rechecks local identity before dispatching queued work;
+changed identity fails the queued execution rather than transferring approval.
+Deadline, executable identity, runtime support, ownership, maintenance, and managed
+worktree restrictions still apply. This does not change Copilot worker-session
+permission settings or grant permission to remote Nodes.
 
 ## Matching command and folder
 
@@ -166,8 +191,11 @@ additional evidence, and reopening a deferred permission request.
 
 | Scenario | Expected result |
 | --- | --- |
-| Fresh upgraded Node | Request reaches Host review without local opt-in, root entry, or draining unrelated sessions. |
-| Once | Exact request runs once; another request needs review. |
+| Verified Host-local Node | Commands run automatically with Once scope, without a permission popup or saved rule. |
+| Remote Node with the Host's name | Name alone grants nothing; an unmatched request still requires review. |
+| Local identity missing, changed, or enrolled to another Host | Normal approval for new requests; queued local approvals fail if identity changes before dispatch. |
+| Fresh upgraded remote Node | Request reaches Host review without local opt-in, root entry, or draining unrelated sessions. |
+| Once on a remote Node | Exact request runs once; another unmatched request needs review. |
 | Session grant | Ordinary flag variants on the same key/folder reuse permission only for the same requesting session. |
 | Session stop / Node restart | Volatile grants are revoked; a later unmatched request asks again. |
 | Always | Node configuration persists the rule; matching later requests can run automatically. |

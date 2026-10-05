@@ -40,7 +40,9 @@ import {
 } from "./command-execution-store.js";
 import { HOST_IDENTITY_ID_SETTING } from "./auth/host-identity.js";
 import { PrMaintenanceError } from "./pr-maintenance-store.js";
+import { readLocalNodeId } from "./self-update.js";
 
+const LOCAL_HOST_APPROVAL = "host:local-node";
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const activeStates = new Set([
   "starting",
@@ -78,6 +80,15 @@ export class CommandExecutionService {
   }
   private get records() {
     return this.store.commands;
+  }
+
+  private isHostLocal(execution: Pick<CommandExecution, "nodeId" | "hostId">): boolean {
+    const publicKey = this.store.nodePublicKey(execution.nodeId);
+    return (
+      !!publicKey &&
+      readLocalNodeId(process.env, { hostId: execution.hostId, publicKey }) ===
+        execution.nodeId
+    );
   }
 
   list(input: Parameters<typeof this.records.list>[0] = {}) {
@@ -317,6 +328,8 @@ export class CommandExecutionService {
   }
 
   private recheckTarget(execution: CommandExecution): void {
+    if (execution.approvedBy === LOCAL_HOST_APPROVAL && !this.isHostLocal(execution))
+      throw new CommandConflict("local_node_identity_changed");
     const target = this.target(execution.leadSessionId, execution);
     if (
       target.nodeId !== execution.nodeId ||
@@ -877,7 +890,22 @@ export class CommandExecutionService {
       );
       let approval: Partial<CommandExecution> = {};
       const permission = prepared.permission;
-      if (
+      if (this.isHostLocal(current)) {
+        approval = {
+          approvedBy: LOCAL_HOST_APPROVAL,
+          approvedAt: new Date(timing.receivedWall).toISOString(),
+          approvalScope: "once",
+          automaticApproval: true,
+        };
+        this.store.recordSecurityAudit({
+          eventType: "command_execution_decision",
+          actorKind: "host",
+          actorId: current.hostId,
+          targetId: current.id,
+          outcome: "success",
+          detail: `${current.id} ${current.leadSessionId} ${nodeId} automatic_host_local ${digest}`,
+        });
+      } else if (
         this.capable(nodeId, COMMAND_PERMISSIONS_CAPABILITY) &&
         permission?.grantedBy &&
         permission.reusable &&
@@ -1289,7 +1317,7 @@ export class CommandExecutionService {
         const clockFailure = this.preparedClockFailure(execution);
         if (clockFailure) throw new CommandConflict(clockFailure);
         if (
-          execution.automaticApproval ||
+          (execution.automaticApproval && execution.approvedBy !== LOCAL_HOST_APPROVAL) ||
           (execution.approvalScope && execution.approvalScope !== "once")
         )
           this.assertReusablePermission(execution);
@@ -1355,7 +1383,10 @@ export class CommandExecutionService {
           ...(this.capable(starting.nodeId, COMMAND_PERMISSIONS_CAPABILITY)
             ? {
                 approvalScope: starting.approvalScope ?? "once",
-                automaticApproval: starting.automaticApproval ?? false,
+                // The wire flag requests Node-rule revalidation, not Host-local Once.
+                automaticApproval:
+                  starting.automaticApproval === true &&
+                  starting.approvedBy !== LOCAL_HOST_APPROVAL,
               }
             : {}),
         })

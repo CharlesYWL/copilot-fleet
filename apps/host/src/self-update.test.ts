@@ -4,7 +4,11 @@ import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { FleetSession, HostUpdateStatus } from "@fleet/protocol";
+import {
+  MUTUAL_AUTH_PROTOCOL,
+  type FleetSession,
+  type HostUpdateStatus,
+} from "@fleet/protocol";
 import {
   LAUNCHER_ENDPOINT_ENV,
   LAUNCHER_SCRIPT_ENV,
@@ -168,6 +172,32 @@ describe("readLocalNodeId", () => {
 
   it("is undefined for a machine with no Node enrolled", () => {
     expect(readLocalNodeId({ FLEET_NODE_CONFIG_DIR: directory() })).toBeUndefined();
+  });
+
+  it("can require a matching local enrollment without changing the update lookup", () => {
+    const config = directory();
+    const env = { FLEET_NODE_CONFIG_DIR: config };
+    const expected = { hostId: "this-host", publicKey: "local-node-key" };
+    const identity = {
+      authProtocol: MUTUAL_AUTH_PROTOCOL,
+      nodeId: "node-local",
+      publicKey: expected.publicKey,
+      host: { hostId: expected.hostId },
+    };
+    const path = join(config, "node.json");
+    writeFileSync(path, JSON.stringify(identity));
+    expect(readLocalNodeId(env, expected)).toBe("node-local");
+    for (const changed of [
+      { ...identity, publicKey: "replacement-node-key" },
+      { ...identity, host: { hostId: "other-host" } },
+      { nodeId: identity.nodeId },
+    ]) {
+      writeFileSync(path, JSON.stringify(changed));
+      expect(readLocalNodeId(env, expected)).toBeUndefined();
+      expect(readLocalNodeId(env)).toBe("node-local");
+    }
+    writeFileSync(path, "{");
+    expect(readLocalNodeId(env, expected)).toBeUndefined();
   });
 });
 
