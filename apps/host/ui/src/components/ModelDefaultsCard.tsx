@@ -38,7 +38,6 @@ export type ModelDefaultsCardProps = {
   kind?: AgentKind;
   model: string;
   reasoningEffort?: string | undefined;
-  description: string;
   busy: boolean;
   onChange: (patch: { model?: string; reasoningEffort?: string }) => void;
 };
@@ -57,7 +56,6 @@ export function ModelDefaultsCard({
   kind = "copilot",
   model,
   reasoningEffort,
-  description,
   busy,
   onChange,
 }: ModelDefaultsCardProps) {
@@ -73,14 +71,7 @@ export function ModelDefaultsCard({
   return (
     <section className={styles.card} aria-label={`${label} model defaults`}>
       <div className={styles.row}>
-        <div>
-          <Text weight="semibold">{label} model</Text>
-          <br />
-          <Text className={styles.caption}>
-            {description} A machine that does not offer the model says so and keeps its
-            own.
-          </Text>
-        </div>
+        <Text weight="semibold">Default {label} model</Text>
         <Dropdown
           className={styles.dropdown}
           disabled={busy || (modelChoices.length === 0 && model === "")}
@@ -101,13 +92,7 @@ export function ModelDefaultsCard({
       </div>
       {reasoningEffort !== undefined && (
         <div className={styles.row}>
-          <div>
-            <Text weight="semibold">Reasoning effort</Text>
-            <br />
-            <Text className={styles.caption}>
-              How hard the model thinks before answering. Only some models offer it.
-            </Text>
-          </div>
+          <Text weight="semibold">Reasoning effort</Text>
           <Dropdown
             className={styles.dropdown}
             disabled={busy || (effortChoices.length === 0 && reasoningEffort === "")}
@@ -127,17 +112,8 @@ export function ModelDefaultsCard({
           </Dropdown>
         </div>
       )}
-      {kind === "hermes" && (
-        <Text className={styles.caption}>
-          Reasoning effort stays in the Hermes profile; its ACP interface does not offer a
-          reasoning picker. This model default does not rewrite the profile.
-        </Text>
-      )}
       {modelChoices.length === 0 && (
-        <Text className={styles.caption}>
-          Nothing to choose from yet — the fleet learns which models exist from the{" "}
-          {label} sessions it runs. Start one and come back.
-        </Text>
+        <Text className={styles.caption}>Start a {label} session to load models.</Text>
       )}
     </section>
   );

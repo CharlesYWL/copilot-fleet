@@ -72,8 +72,8 @@ describe("GeneralPanel", () => {
     );
     const model = await screen.findByRole("combobox", { name: "Default Copilot model" });
     expect(
-      screen.getByText(/Orchestrator model defaults are configured separately/),
-    ).toBeTruthy();
+      screen.getByRole("region", { name: "Copilot model defaults" }).textContent,
+    ).toBe("Default Copilot modelCopilot's choiceReasoning effortCopilot's choice");
     fireEvent.click(model);
     fireEvent.click(screen.getByRole("option", { name: "Worker model" }));
     await waitFor(() => expect(model.textContent).toContain("Worker model"));

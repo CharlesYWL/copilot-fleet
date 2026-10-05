@@ -256,8 +256,7 @@ export function OrchestratorPanel({
         <Text className={styles.caption}>
           New orchestrators fall back to Copilot, with a transcript notice, when no online
           Node holding the workspace has the preferred agent. Profile, authentication, and
-          startup errors are reported instead of switching agents. Each agent uses its own
-          model default below; fallback to Copilot uses the Copilot default.
+          startup errors are reported instead of switching agents.
         </Text>
         <div className={styles.actions}>
           <Button
@@ -280,7 +279,6 @@ export function OrchestratorPanel({
           reasoningEffort={
             kind === "copilot" ? (defaults.orchestratorReasoningEffort ?? "") : undefined
           }
-          description={`What ${agentKindLabels[kind]} orchestrators start on, independently of work sessions and other agents. Choices use this agent's own model IDs. Changes apply on start and resume, not to running agents.`}
           busy={busy}
           onChange={(patch) =>
             void update({

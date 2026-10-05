@@ -475,7 +475,6 @@ export const GeneralPanel = ({
         sessions={sessions}
         model={model}
         reasoningEffort={reasoningEffort}
-        description="What Copilot work sessions start on, including Chats, workers and reviewers. Orchestrator model defaults are configured separately in Settings > Orchestrator."
         busy={busy}
         onChange={(patch) => void update(patch)}
       />

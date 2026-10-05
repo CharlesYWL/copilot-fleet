@@ -202,7 +202,7 @@ describe("OrchestratorPanel", () => {
         })
       ).disabled,
     ).toBe(true);
-    expect(screen.getByText(/Nothing to choose from yet/)).toBeTruthy();
+    expect(screen.getByText("Start a Copilot session to load models.")).toBeTruthy();
   });
 
   it("keeps identical model names isolated by backend ID and preserves both choices after reload", async () => {
@@ -215,7 +215,9 @@ describe("OrchestratorPanel", () => {
     expect(
       screen.queryByRole("combobox", { name: "Default Hermes reasoning effort" }),
     ).toBeNull();
-    expect(screen.getByText(/Reasoning effort stays in the Hermes profile/)).toBeTruthy();
+    expect(
+      screen.getByRole("region", { name: "Hermes model defaults" }).textContent,
+    ).toBe("Default Hermes modelHermes profile's choice");
     fireEvent.click(copilot);
     let option = screen.getByRole("option", { name: "Lead model" });
     expect(option.getAttribute("title")).toBe("lead-model");
@@ -260,8 +262,8 @@ describe("OrchestratorPanel", () => {
       name: "Default Hermes model",
     });
     expect(hermes.textContent).toContain("unavailable-provider/model");
-    expect(screen.getByText(/the Copilot sessions it runs/)).toBeTruthy();
-    expect(screen.getByText(/the Hermes sessions it runs/)).toBeTruthy();
+    expect(screen.getByText("Start a Copilot session to load models.")).toBeTruthy();
+    expect(screen.getByText("Start a Hermes session to load models.")).toBeTruthy();
     expect(hermes.disabled).toBe(false);
     fireEvent.click(hermes);
     fireEvent.click(screen.getByRole("option", { name: "Hermes profile's choice" }));
