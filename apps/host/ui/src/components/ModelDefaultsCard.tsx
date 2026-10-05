@@ -27,7 +27,7 @@ const useStyles = makeStyles({
     "@media (max-width: 600px)": { flexWrap: "wrap" },
   },
   caption: { color: tokens.colorNeutralForeground3 },
-  dropdown: { minWidth: 0, width: "250px", maxWidth: "100%" },
+  dropdown: { flexShrink: 0, minWidth: 0, width: "250px", maxWidth: "100%" },
 });
 
 export type ModelDefaultsCardProps = {
@@ -135,7 +135,7 @@ export function ModelDefaultsCard({
       )}
       {modelChoices.length === 0 && (
         <Text className={styles.caption}>
-          Nothing to choose from yet — the fleet learns which models exist from the
+          Nothing to choose from yet — the fleet learns which models exist from the{" "}
           {label} sessions it runs. Start one and come back.
         </Text>
       )}

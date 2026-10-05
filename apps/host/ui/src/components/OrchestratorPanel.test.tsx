@@ -260,6 +260,8 @@ describe("OrchestratorPanel", () => {
       name: "Default Hermes model",
     });
     expect(hermes.textContent).toContain("unavailable-provider/model");
+    expect(screen.getByText(/the Copilot sessions it runs/)).toBeTruthy();
+    expect(screen.getByText(/the Hermes sessions it runs/)).toBeTruthy();
     expect(hermes.disabled).toBe(false);
     fireEvent.click(hermes);
     fireEvent.click(screen.getByRole("option", { name: "Hermes profile's choice" }));
