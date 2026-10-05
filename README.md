@@ -218,7 +218,8 @@ Open the UI → **Settings**:
   and data export/import.
 - **Security** — administrators, invitations, Microsoft sign-in configuration,
   password migration, the Host fingerprint, Node key migration, portable Host
-  backup/restore, and this Host's security audit.
+  backup/restore, and this Host's security audit. Audit entries scroll within a
+  bounded table with a pinned header; narrow screens can scroll it horizontally.
 - **Tunnel** — manage Dev Tunnels, Cloudflare, Tailscale Funnel, or ngrok.
   Plain-HTTP providers such as bore are shown but cannot be enabled for the
   operator console. A Host administered by a Microsoft corporate account offers

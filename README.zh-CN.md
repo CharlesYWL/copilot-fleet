@@ -172,7 +172,8 @@ npm run dev:tunnel
 - **General** —— 会话默认值、**Take the tour** 按钮、**Update Host**，以及数据导出/导入。
 - **Orchestrator** —— 编排器的首选代理、Hermes profile 和心跳计划。
 - **Security** —— 管理员、邀请、Microsoft 登录配置、密码迁移、Host 指纹、Node 密钥迁移、
-  可迁移 Host 备份/恢复，以及这台 Host 的安全审计。
+  可迁移 Host 备份/恢复，以及这台 Host 的安全审计。审计记录在高度受限、表头固定的表格中滚动，
+  窄屏下可横向滚动。
 - **Tunnel** —— 管理 Dev Tunnels、Cloudflare、Tailscale Funnel 或 ngrok。
   bore 等明文 HTTP 提供程序会显示在列表中，但不能用于操作台。由 Microsoft 公司账号管理的
   Host 只提供 Dev Tunnels，见“Microsoft 公司账号：只用 Dev Tunnels”。
