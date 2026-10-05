@@ -24,6 +24,7 @@ import {
   Text,
   Title3,
   makeStyles,
+  mergeClasses,
   tokens,
 } from "@fluentui/react-components";
 import {
@@ -100,6 +101,20 @@ const useStyles = makeStyles({
     tableLayout: "auto",
     minWidth: "640px",
     overflowWrap: "anywhere",
+  },
+  auditScroll: {
+    maxHeight: "min(480px, 60vh)",
+    overflowY: "auto",
+  },
+  auditTable: {
+    "& th, & td": { whiteSpace: "nowrap" },
+    "& td:last-child": { whiteSpace: "normal", minWidth: "240px" },
+  },
+  auditHeader: {
+    position: "sticky",
+    top: 0,
+    zIndex: 1,
+    backgroundColor: tokens.colorNeutralBackground1,
   },
 });
 
@@ -1290,9 +1305,18 @@ function AuditCard({ events }: { events: AuditEvent[] }) {
       {events.length === 0 ? (
         <Text className={styles.caption}>Nothing recorded yet.</Text>
       ) : (
-        <div className={styles.tableScroll}>
-          <Table className={styles.table} aria-label="Security audit" size="small">
-            <TableHeader>
+        <div
+          className={mergeClasses(styles.tableScroll, styles.auditScroll)}
+          role="region"
+          aria-label="Security audit entries"
+          tabIndex={0}
+        >
+          <Table
+            className={mergeClasses(styles.table, styles.auditTable)}
+            aria-label="Security audit"
+            size="small"
+          >
+            <TableHeader className={styles.auditHeader}>
               <TableRow>
                 <TableHeaderCell>When</TableHeaderCell>
                 <TableHeaderCell>Event</TableHeaderCell>
@@ -1305,15 +1329,19 @@ function AuditCard({ events }: { events: AuditEvent[] }) {
               {events.map((event) => (
                 <TableRow key={event.id}>
                   <TableCell>
-                    <Text className={styles.caption}>
+                    <Text className={styles.caption} wrap={false}>
                       {new Date(event.createdAt).toLocaleString()}
                     </Text>
                   </TableCell>
                   <TableCell>
-                    <Text className={styles.mono}>{event.eventType}</Text>
+                    <Text className={styles.mono} wrap={false}>
+                      {event.eventType}
+                    </Text>
                   </TableCell>
                   <TableCell>
-                    <Text className={styles.caption}>{event.actorKind}</Text>
+                    <Text className={styles.caption} wrap={false}>
+                      {event.actorKind}
+                    </Text>
                   </TableCell>
                   <TableCell>
                     <Badge

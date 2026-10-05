@@ -1276,12 +1276,66 @@ describe("SecurityPanel", () => {
     );
   });
 
-  it("shows the local security audit as a table people can read", async () => {
-    host();
+  it("keeps long audits in a keyboard-scrollable region without wrapping short columns", async () => {
+    const detail = `${"01234567-89ab-cdef-0123-456789abcdef ".repeat(3)}allow_always ${"a".repeat(64)}`;
+    host(
+      {},
+      {
+        "/api/security/audit": {
+          events: Array.from({ length: 100 }, (_, index) => ({
+            id: `audit-${index}`,
+            eventType: "command_execution_decision",
+            actorKind: "administrator",
+            actorId: "admin-alice",
+            targetId: "",
+            requestHost: "loopback",
+            outcome: ["success", "allowed", "denied", "failure"][index % 4],
+            detail,
+            createdAt: "2026-10-05T20:45:03.000Z",
+          })),
+        },
+      },
+    );
     show();
 
     const audit = await screen.findByRole("table", { name: /security audit/i });
-    expect(within(audit).getByText("fleet_claimed")).toBeTruthy();
+    const region = screen.getByRole("region", { name: "Security audit entries" });
+    expect(region.contains(audit)).toBe(true);
+    expect(region.tabIndex).toBe(0);
+    expect(getComputedStyle(region).overflowX).toBe("auto");
+    expect(getComputedStyle(region).overflowY).toBe("auto");
+    expect(parseFloat(getComputedStyle(region).maxHeight)).toBeCloseTo(
+      Math.min(480, window.innerHeight * 0.6),
+    );
+    const rows = within(audit).getAllByRole("row");
+    expect(rows).toHaveLength(101);
+    const header = rows[0]!.parentElement!;
+    expect(getComputedStyle(header).position).toBe("sticky");
+    expect(getComputedStyle(header).top).toBe("0px");
+    for (const cell of within(audit).getAllByRole("columnheader")) {
+      expect(getComputedStyle(cell).whiteSpace).toBe("nowrap");
+    }
+    const cells = within(rows[1]!).getAllByRole("cell");
+    for (const cell of cells.slice(0, 4)) {
+      expect(getComputedStyle(cell).whiteSpace).toBe("nowrap");
+    }
+    for (const cell of cells.slice(0, 3)) {
+      expect(getComputedStyle(cell.firstElementChild!).whiteSpace).toBe("nowrap");
+    }
+    expect(within(rows[1]!).getByText("command_execution_decision")).toBeTruthy();
+    expect(within(rows[1]!).getByText("success")).toBeTruthy();
+    expect(cells[4]!.textContent).toBe(detail);
+    expect(getComputedStyle(cells[4]!).whiteSpace).toBe("normal");
+    expect(getComputedStyle(cells[4]!).minWidth).toBe("240px");
+  });
+
+  it("keeps an empty audit compact without an unused scroll region", async () => {
+    host({}, { "/api/security/audit": { events: [] } });
+    show();
+
+    expect(await screen.findByText("Nothing recorded yet.")).toBeTruthy();
+    expect(screen.queryByRole("table", { name: /security audit/i })).toBeNull();
+    expect(screen.queryByRole("region", { name: "Security audit entries" })).toBeNull();
   });
 
   describe("device sign-in verification", () => {
