@@ -5,6 +5,7 @@ import { connect } from "node:net";
 import { join, win32 } from "node:path";
 import type { FastifyBaseLogger } from "fastify";
 import {
+  MUTUAL_AUTH_PROTOCOL,
   errorMessage,
   updateFinished,
   type FleetSession,
@@ -184,15 +185,32 @@ export function defaultLaunchProbe(
  * The id of the Node started beside this Host, from its identity file.
  *
  * Both processes run as the same user on the same machine, so the Host finds
- * the file where that Node keeps it. Only the id is taken from it.
+ * the file where that Node keeps it. Only the id is returned. Permission callers
+ * also require the local enrollment to match this Host and its registered Node key;
+ * re-enrolling a different machine under the same name can retain the Node id.
  */
 export function readLocalNodeId(
   env: NodeJS.ProcessEnv = process.env,
+  expected?: { hostId: string; publicKey: string },
 ): string | undefined {
   try {
     const identity = JSON.parse(
       readFileSync(join(nodeConfigDirectory(env), "node.json"), "utf8"),
-    ) as { nodeId?: unknown };
+    ) as {
+      nodeId?: unknown;
+      authProtocol?: unknown;
+      publicKey?: unknown;
+      host?: { hostId?: unknown };
+    };
+    if (
+      expected &&
+      (!expected.hostId ||
+        !expected.publicKey ||
+        identity.authProtocol !== MUTUAL_AUTH_PROTOCOL ||
+        identity.publicKey !== expected.publicKey ||
+        identity.host?.hostId !== expected.hostId)
+    )
+      return undefined;
     return typeof identity.nodeId === "string" && identity.nodeId
       ? identity.nodeId
       : undefined;

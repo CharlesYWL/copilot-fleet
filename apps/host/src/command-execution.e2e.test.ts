@@ -53,6 +53,7 @@ import { FleetStore } from "./store.js";
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  vi.unstubAllEnvs();
 });
 
 async function fixture(
@@ -462,6 +463,49 @@ async function fixture(
 }
 
 describe.skipIf(process.platform !== "win32")("real approved command end-to-end", () => {
+  it("executes Host-local scripts automatically without saving permission or trusting a remote name", async () => {
+    const f = await fixture(0, true);
+    f.removeRules();
+    f.store.registerNodeWithKey({ ...f.targetNode, publicKey: "local-node-key" });
+    await writeFile(
+      join(f.root, "node.json"),
+      JSON.stringify({
+        authProtocol: MUTUAL_AUTH_PROTOCOL,
+        nodeId: f.targetNode.id,
+        publicKey: "local-node-key",
+        host: { hostId: new HostIdentityService(f.store).identity().hostId },
+      }),
+    );
+    vi.stubEnv("FLEET_NODE_CONFIG_DIR", f.root);
+    const command = "Write-Output host-local; Write-Output second-statement";
+    const done = await f.request(command, randomUUID(), false);
+    expect(done).toMatchObject({
+      state: "succeeded",
+      automaticApproval: true,
+      approvalScope: "once",
+      approvedBy: "host:local-node",
+    });
+    expect(done.descriptor?.prepared.permission?.grantedBy).toBeUndefined();
+    expect(
+      f.frames.find((frame) => frame.type === "start_command_execution"),
+    ).toMatchObject({
+      approvalScope: "once",
+      automaticApproval: false,
+    });
+    const output = f.service.commands
+      .read(undefined, { executionId: done.id })
+      .events.map((event) => Buffer.from(event.data, "base64").toString("utf8"))
+      .join("");
+    expect(output).toContain("host-local");
+    expect(output).toContain("second-statement");
+    expect(f.rules()).toEqual([]);
+    f.settleDelivery(done);
+    await rm(join(f.root, "node.json"));
+    f.store.renameNode(f.targetNode.id, hostname());
+    expect((await f.request(command)).state).toBe("awaiting_approval");
+    expect(f.prepare).toHaveBeenCalledTimes(1);
+  }, 90_000);
+
   it("uses a saved readable wildcard rule for simple commands, not appended scripts, and honors deletion", async () => {
     const f = await fixture(0, true);
     await f.setEntries([{ command: "git *", path: "*" }]);

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import Fastify, { type FastifyBaseLogger } from "fastify";
@@ -24,6 +25,7 @@ import {
   type PreparedCommand,
   type LeadPromptReceipt,
   MAX_ATTACHMENT_BYTES,
+  MUTUAL_AUTH_PROTOCOL,
   CommandExecutionBackupSchema,
   PromptSchema,
   type PrMaintenanceIdentity,
@@ -69,6 +71,7 @@ const apps: ReturnType<typeof Fastify>[] = [];
 afterEach(async () => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   for (const app of apps.splice(0)) await app.close();
   for (const store of stores.splice(0)) store.close();
   for (const directory of directories.splice(0))
@@ -309,6 +312,148 @@ describe("Node-owned command permissions", () => {
       "administrator",
     );
   }
+
+  function localIdentity(f: ReturnType<typeof setup>) {
+    const directory = mkdtempSync(join(tmpdir(), "fleet-local-command-"));
+    directories.push(directory);
+    vi.stubEnv("FLEET_NODE_CONFIG_DIR", directory);
+    f.store.registerNodeWithKey({ ...f.node, publicKey: "local-node-key" });
+    const identity = {
+      authProtocol: MUTUAL_AUTH_PROTOCOL,
+      nodeId: f.node.id,
+      publicKey: "local-node-key",
+      host: { hostId: new HostIdentityService(f.store).identity().hostId },
+    };
+    const path = join(directory, "node.json");
+    writeFileSync(path, JSON.stringify(identity));
+    return { identity, path };
+  }
+
+  it.each(["legacy", "unmatched", "once-only"] as const)(
+    "auto-approves a Host-local %s command as Once without a popup or reusable grant",
+    (kind) => {
+      const f = kind === "legacy" ? setup() : permissionSetup();
+      localIdentity(f);
+      f.store.renameNode(f.node.id, "renamed-local-node");
+      const publish = vi.spyOn(f.service, "broadcast");
+      const execution = f.request({
+        command: "Write-Output first; Write-Output second",
+      });
+      const prepared =
+        kind === "legacy"
+          ? f.prepared(execution)
+          : descriptor(f, execution, { reusable: kind !== "once-only" });
+      const started = f.prepare(execution, prepared);
+      expect(started).toMatchObject({
+        state: "starting",
+        automaticApproval: true,
+        approvalScope: "once",
+        approvedBy: "host:local-node",
+        descriptor: prepared,
+      });
+      const frame = f.frames.find((entry) => entry.type === "start_command_execution");
+      expect(frame).toMatchObject({ descriptor: prepared });
+      if (kind === "legacy") {
+        expect(frame).not.toHaveProperty("approvalScope");
+        expect(frame).not.toHaveProperty("automaticApproval");
+      } else {
+        expect(frame).toMatchObject({
+          approvalScope: "once",
+          automaticApproval: false,
+        });
+      }
+      expect(
+        publish.mock.calls.some(
+          ([frame]) =>
+            frame.type === "command_execution" &&
+            frame.execution.state === "awaiting_approval",
+        ),
+      ).toBe(false);
+      expect(f.store.listNotifications().notifications).toHaveLength(0);
+      expect(f.store.listSecurityAudit(10)[0]).toMatchObject({
+        eventType: "command_execution_decision",
+        actorKind: "host",
+        actorId: execution.hostId,
+        targetId: execution.id,
+        detail: expect.stringContaining(`automatic_host_local ${prepared.digest}`),
+      });
+      expect(f.store.commands.exportBackup().executions[0]).toMatchObject({
+        automaticApproval: true,
+        approvalScope: "once",
+        approvedBy: "host:local-node",
+      });
+      expect(
+        f.request({ command: execution.command, requestKey: execution.requestKey }).id,
+      ).toBe(execution.id);
+      expect(
+        f.frames.filter((frame) => frame.type === "start_command_execution"),
+      ).toHaveLength(1);
+      expect(f.result(started)).toBe(true);
+    },
+  );
+
+  it.each([
+    "missing",
+    "malformed",
+    "other-host",
+    "other-node",
+    "re-enrolled",
+    "legacy",
+  ] as const)(
+    "keeps manual approval for %s local identity evidence, even with the Host name",
+    (kind) => {
+      const f = permissionSetup();
+      const { identity, path } = localIdentity(f);
+      f.store.renameNode(f.node.id, hostname());
+      if (kind === "missing") rmSync(path);
+      else if (kind === "malformed") writeFileSync(path, "{");
+      else if (kind === "other-host")
+        writeFileSync(
+          path,
+          JSON.stringify({ ...identity, host: { hostId: "other-host" } }),
+        );
+      else if (kind === "other-node")
+        writeFileSync(path, JSON.stringify({ ...identity, nodeId: "other-node" }));
+      else if (kind === "legacy")
+        writeFileSync(path, JSON.stringify({ nodeId: identity.nodeId }));
+      else
+        f.store.registerNodeWithKey({
+          ...f.node,
+          name: hostname(),
+          publicKey: "remote-replacement-key",
+        });
+      const execution = f.request();
+      expect(f.prepare(execution, descriptor(f, execution)).state).toBe(
+        "awaiting_approval",
+      );
+      expect(f.frames.some((frame) => frame.type === "start_command_execution")).toBe(
+        false,
+      );
+      expect(
+        f.store.listNotifications().notifications.map((notice) => notice.kind),
+      ).toEqual(["command_approval"]);
+    },
+  );
+
+  it("rechecks Host-local identity before starting a queued command", () => {
+    const f = permissionSetup();
+    const { path } = localIdentity(f);
+    const first = f.request();
+    const started = f.prepare(first, descriptor(f, first));
+    const second = f.request();
+    expect(f.prepare(second, descriptor(f, second)).state).toBe("queued");
+    rmSync(path);
+    expect(f.result(started)).toBe(true);
+    f.service.commands.tick();
+    expect(f.service.commands.get(second.id)).toMatchObject({
+      state: "failed",
+      ownership: "not_started",
+      reasonCode: "local_node_identity_changed",
+    });
+    expect(
+      f.frames.filter((frame) => frame.type === "start_command_execution"),
+    ).toHaveLength(1);
+  });
 
   it("bypasses the legacy enabled gate only for a negotiated permission-capable Node", () => {
     const f = setup();
