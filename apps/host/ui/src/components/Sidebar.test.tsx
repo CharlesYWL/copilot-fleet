@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { StrictMode } from "react";
 import { render, screen, fireEvent, within } from "@testing-library/react";
 import { FluentProvider } from "@fluentui/react-components";
 import type { FleetNode, FleetSession, Placement, Workspace } from "@fleet/protocol";
@@ -222,6 +223,80 @@ describe("Sidebar folding", () => {
       ),
     );
     expect(screen.getByText("s2")).toBeTruthy();
+  });
+
+  it("reveals and selects a stopped worker opened from a task", () => {
+    const sessions = [
+      { ...session("worker", "w1", "n1", "stopped"), runRole: "worker" as const },
+      session("unrelated", "w2", "n1", "stopped"),
+    ];
+    const { rerender } = render(
+      <StrictMode>
+        {tree([placement], sessions, {
+          view: "orchestrator-task",
+          selectedSessionId: "lead",
+        })}
+      </StrictMode>,
+    );
+    expect(screen.queryByText("worker")).toBeNull();
+
+    rerender(
+      <StrictMode>
+        {tree([placement], sessions, {
+          view: "session",
+          selectedSessionId: "worker",
+        })}
+      </StrictMode>,
+    );
+
+    expect(screen.getByRole("treeitem", { name: /worker/, selected: true })).toBeTruthy();
+    expect(screen.getByTitle(/^repo — drag/i).closest("[role=treeitem]")).toHaveProperty(
+      "ariaExpanded",
+      "true",
+    );
+    expect(
+      screen.getByTitle(/WEILI-PC — drag/i).closest("[role=treeitem]"),
+    ).toHaveProperty("ariaExpanded", "true");
+    expect(screen.queryByText("unrelated")).toBeNull();
+  });
+
+  it("reopens the same worker after returning to its task and folding its branch", () => {
+    const sessions = [session("worker", "w1", "n1")];
+    const selection = { selectedSessionId: "worker" };
+    const { rerender } = show([placement], sessions, selection);
+
+    fireEvent.click(screen.getByTitle(/WEILI-PC — drag/i));
+    rerender(tree([placement], [...sessions], selection));
+    expect(screen.queryByText("worker")).toBeNull();
+
+    rerender(tree([placement], sessions, { ...selection, view: "orchestrator-task" }));
+    fireEvent.click(screen.getByTitle(/^repo — drag/i));
+    expect(screen.queryByText("worker")).toBeNull();
+
+    rerender(tree([placement], sessions, { ...selection, view: "session" }));
+
+    expect(screen.getByRole("treeitem", { name: /worker/, selected: true })).toBeTruthy();
+  });
+
+  it("scrolls a newly selected transcript into view without scrolling on snapshots", () => {
+    const sessions = [session("worker", "w1", "n1")];
+    const { rerender } = show([placement], sessions, { view: "orchestrator-task" });
+    const row = screen.getByRole("treeitem", { name: /worker/, selected: false });
+    const scrollIntoView = vi.fn();
+    row.scrollIntoView = scrollIntoView;
+
+    rerender(
+      tree([placement], sessions, { view: "session", selectedSessionId: "worker" }),
+    );
+
+    expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
+    rerender(
+      tree([placement], [...sessions], {
+        view: "session",
+        selectedSessionId: "worker",
+      }),
+    );
+    expect(scrollIntoView).toHaveBeenCalledOnce();
   });
 });
 
