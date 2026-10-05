@@ -70,6 +70,45 @@ function notificationInput(
 }
 
 describe("FleetStore", () => {
+  it.each(["shared-model", ""])(
+    "copies legacy model defaults once, then persists independent choices: %s",
+    (model) => {
+      const directory = mkdtempSync(join(tmpdir(), "fleet-model-defaults-"));
+      directories.push(directory);
+      const path = join(directory, "fleet.db");
+      const legacy = new DatabaseSync(path);
+      legacy.exec("CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+      const insert = legacy.prepare("INSERT INTO settings (key,value) VALUES (?,?)");
+      insert.run("defaults.model", model);
+      insert.run("defaults.reasoningEffort", "high");
+      legacy.close();
+
+      const migrated = new FleetStore(path);
+      try {
+        expect(migrated.getOrchestratorModel("copilot")).toBe(model);
+        expect(migrated.getOrchestratorModel("hermes")).toBe("");
+        expect(migrated.getOrchestratorReasoningEffort()).toBe("high");
+        migrated.setDefaultModel("worker-model");
+        migrated.setDefaultReasoningEffort("low");
+        expect(migrated.getOrchestratorModel("copilot")).toBe(model);
+        expect(migrated.getOrchestratorReasoningEffort()).toBe("high");
+        migrated.setOrchestratorModels({ copilot: "", hermes: "provider/lead-model" });
+        migrated.setOrchestratorReasoningEffort("medium");
+      } finally {
+        migrated.close();
+      }
+      const reopened = new FleetStore(path);
+      stores.push(reopened);
+      expect(reopened.getDefaultModel()).toBe("worker-model");
+      expect(reopened.getDefaultReasoningEffort()).toBe("low");
+      expect(reopened.getOrchestratorModels()).toEqual({
+        copilot: "",
+        hermes: "provider/lead-model",
+      });
+      expect(reopened.getOrchestratorReasoningEffort()).toBe("medium");
+    },
+  );
+
   it.each([
     "{broken",
     "null",
@@ -1852,6 +1891,41 @@ describe("Chats workspace", () => {
 });
 
 describe("Host backup", () => {
+  it.each(["lead-model", ""])(
+    "round-trips separate model defaults, including a cleared orchestrator choice: %s",
+    (copilot) => {
+      const { store } = setup();
+      store.setDefaultModel("worker-model");
+      store.setDefaultReasoningEffort("high");
+      store.setOrchestratorModels({ copilot, hermes: "provider/lead-model" });
+      store.setOrchestratorReasoningEffort("medium");
+      const backup = store.exportHostBackup({ enrollmentToken: "" });
+      const restored = new FleetStore(":memory:");
+      stores.push(restored);
+      restored.replaceHostBackup(backup);
+      expect(restored.getDefaultModel()).toBe("worker-model");
+      expect(restored.getDefaultReasoningEffort()).toBe("high");
+      expect(restored.getOrchestratorModels()).toEqual({
+        copilot,
+        hermes: "provider/lead-model",
+      });
+      expect(restored.getOrchestratorReasoningEffort()).toBe("medium");
+
+      const {
+        model: _model,
+        reasoningEffort: _effort,
+        orchestratorModels: _leadModels,
+        orchestratorReasoningEffort: _leadEffort,
+        ...older
+      } = backup.defaults;
+      restored.replaceHostBackup({ ...backup, defaults: older });
+      expect(restored.getDefaultModel()).toBe("");
+      expect(restored.getDefaultReasoningEffort()).toBe("");
+      expect(restored.getOrchestratorModels()).toEqual({ copilot: "", hermes: "" });
+      expect(restored.getOrchestratorReasoningEffort()).toBe("");
+    },
+  );
+
   it("does not adopt a Hermes conversation as a Copilot conversation with the same native ID", () => {
     const { store, placement } = setup();
     const hermes = store.createSession(placement, "Plan", true, "Hermes", {

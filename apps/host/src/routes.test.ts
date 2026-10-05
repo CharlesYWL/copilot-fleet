@@ -110,6 +110,68 @@ describe("host routes", () => {
     ).toBe(400);
   });
 
+  it("saves and clears independent orchestrator model defaults without changing work sessions", async () => {
+    await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { model: "worker-model", reasoningEffort: "high" },
+    });
+    const saved = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: {
+        orchestratorModels: { copilot: "lead-model", hermes: "provider/lead-model" },
+        orchestratorReasoningEffort: "medium",
+      },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({
+      model: "worker-model",
+      reasoningEffort: "high",
+      orchestratorModels: { copilot: "lead-model", hermes: "provider/lead-model" },
+      orchestratorReasoningEffort: "medium",
+    });
+    await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { model: "another-worker-model" },
+    });
+    expect((await inject({ method: "GET", url: "/api/defaults" })).json()).toMatchObject({
+      model: "another-worker-model",
+      orchestratorModels: { copilot: "lead-model", hermes: "provider/lead-model" },
+      orchestratorReasoningEffort: "medium",
+    });
+    const refused = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: {
+        orchestratorModels: { hermes: "x".repeat(201) },
+        model: "must-not-save",
+      },
+    });
+    expect(refused.statusCode).toBe(400);
+    const cleared = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { orchestratorModels: { copilot: "" }, orchestratorReasoningEffort: "" },
+    });
+    expect(cleared.json()).toMatchObject({
+      model: "another-worker-model",
+      reasoningEffort: "high",
+      orchestratorModels: { copilot: "", hermes: "provider/lead-model" },
+      orchestratorReasoningEffort: "",
+    });
+    const hermesCleared = await inject({
+      method: "POST",
+      url: "/api/defaults",
+      payload: { orchestratorModels: { hermes: "" } },
+    });
+    expect(hermesCleared.json()).toMatchObject({
+      model: "another-worker-model",
+      orchestratorModels: { copilot: "", hermes: "" },
+    });
+  });
+
   it("saves a normalized heartbeat schedule and explains an invalid one", async () => {
     const initial = (await inject({ method: "GET", url: "/api/defaults" })).json();
     expect(initial).toMatchObject({
@@ -388,6 +450,8 @@ describe("host routes", () => {
     // Hourly through weekday working hours, every two hours otherwise.
     const heartbeatDefaults = {
       orchestratorAgent: null,
+      orchestratorModels: { copilot: "", hermes: "" },
+      orchestratorReasoningEffort: "",
       orchestratorHeartbeatSchedule: DEFAULT_ORCHESTRATOR_HEARTBEAT_SCHEDULE,
       orchestratorHeartbeatTimeZone: expect.any(String),
       orchestratorHeartbeatUpcoming: expect.any(Array),

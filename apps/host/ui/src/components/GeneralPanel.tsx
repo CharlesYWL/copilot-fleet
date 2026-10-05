@@ -8,10 +8,8 @@ import {
   DialogContent,
   DialogSurface,
   DialogTitle,
-  Dropdown,
   MessageBar,
   MessageBarBody,
-  Option,
   Spinner,
   Switch,
   Text,
@@ -25,15 +23,14 @@ import {
   type ContextTier,
   type HostUpdateStatus,
   type ManagedWorktreePolicy,
-  type SessionConfigChoice,
   type SessionConfigOption,
 } from "@fleet/protocol";
 import { BookOpen20Regular } from "@fluentui/react-icons";
-import { observedChoices } from "../lib/session-config";
 import { api } from "../hooks/useFleet";
 import { useMessageNotification } from "../hooks/useAppNotifications";
 import { useSettingsActive } from "../hooks/useSettingsActivity";
 import { HostUpdateCard } from "./HostUpdateCard";
+import { ModelDefaultsCard } from "./ModelDefaultsCard";
 
 const useStyles = makeStyles({
   panel: {
@@ -81,7 +78,6 @@ const useStyles = makeStyles({
       backgroundImage: "none",
     },
   },
-  dropdown: { minWidth: 0, width: "250px", maxWidth: "100%" },
   actions: {
     display: "flex",
     flexWrap: "wrap",
@@ -110,12 +106,6 @@ type Defaults = {
   notificationLifecycleEnabled: boolean;
   model: string;
   reasoningEffort: string;
-};
-
-/** What to show on a closed dropdown, including for a value no longer offered. */
-const labelFor = (choices: readonly SessionConfigChoice[], value: string): string => {
-  if (value === "") return "Copilot's choice";
-  return choices.find((choice) => choice.value === value)?.name ?? value;
 };
 
 const downloadJson = (value: unknown, filename: string) => {
@@ -267,20 +257,14 @@ export const GeneralPanel = ({
     model,
     reasoningEffort,
   } = defaults;
-  const copilotSessions = sessions.filter(
-    (session) => (session.agentParams?.kind ?? "copilot") === "copilot",
-  );
-  const modelChoices = observedChoices(copilotSessions, "model");
-  const effortChoices = observedChoices(copilotSessions, "reasoning_effort");
-
   return (
     <div className={styles.panel}>
       <div>
         <Title3 as="h1">Session defaults</Title3>
         <br />
         <Text className={styles.caption}>
-          Defaults for new sessions and fleet-wide launch behavior. Changing these
-          settings never interrupts a running agent.
+          Work-session defaults and fleet-wide launch behavior. Changing these settings
+          never interrupts a running agent.
         </Text>
       </div>
 
@@ -487,73 +471,14 @@ export const GeneralPanel = ({
         </div>
       </section>
 
-      <section className={styles.card}>
-        <div className={styles.row}>
-          <div>
-            <Text weight="semibold">Model</Text>
-            <br />
-            <Text className={styles.caption}>
-              What new Copilot sessions start on, including Copilot orchestrators and
-              workers. Other orchestrator agents use their own profile settings. A machine
-              that does not offer the model says so and keeps its own.
-            </Text>
-          </div>
-          <Dropdown
-            className={styles.dropdown}
-            disabled={busy || modelChoices.length === 0}
-            value={labelFor(modelChoices, model)}
-            selectedOptions={[model]}
-            onOptionSelect={(_event, data) =>
-              void update({ model: String(data.optionValue ?? "") })
-            }
-            aria-label="Default model"
-          >
-            <Option value="">Copilot's choice</Option>
-            {modelChoices.map((choice) => (
-              <Option key={choice.value} value={choice.value}>
-                {choice.name}
-              </Option>
-            ))}
-          </Dropdown>
-        </div>
-        <div className={styles.row}>
-          <div>
-            <Text weight="semibold">Reasoning effort</Text>
-            <br />
-            <Text className={styles.caption}>
-              How hard the model thinks before answering. Only some models offer it.
-            </Text>
-          </div>
-          <Dropdown
-            className={styles.dropdown}
-            disabled={busy || effortChoices.length === 0}
-            value={labelFor(effortChoices, reasoningEffort)}
-            selectedOptions={[reasoningEffort]}
-            onOptionSelect={(_event, data) =>
-              void update({ reasoningEffort: String(data.optionValue ?? "") })
-            }
-            aria-label="Default reasoning effort"
-          >
-            <Option value="">Copilot's choice</Option>
-            {effortChoices.map((choice) => (
-              <Option key={choice.value} value={choice.value}>
-                {choice.name}
-              </Option>
-            ))}
-          </Dropdown>
-        </div>
-        {modelChoices.length === 0 && (
-          <Text className={styles.caption}>
-            {/*
-             * Honest rather than empty: the list comes from what sessions have
-             * reported, so before the first one the Host genuinely does not
-             * know what this fleet's Copilot offers.
-             */}
-            Nothing to choose from yet — the fleet learns which models exist from the
-            sessions it runs. Start one and come back.
-          </Text>
-        )}
-      </section>
+      <ModelDefaultsCard
+        sessions={sessions}
+        model={model}
+        reasoningEffort={reasoningEffort}
+        description="What Copilot work sessions start on, including Chats, workers and reviewers. Orchestrator model defaults are configured separately in Settings > Orchestrator."
+        busy={busy}
+        onChange={(patch) => void update(patch)}
+      />
 
       {hostUpdate && <HostUpdateCard status={hostUpdate} revision={hostRevision} />}
 

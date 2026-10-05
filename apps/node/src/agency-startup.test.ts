@@ -80,6 +80,7 @@ let advertiseContext = false;
 let contextResponse = "";
 let contextFailure = false;
 let currentModel = "model-a";
+let hermesModels: { modelId: string; name: string }[] = [];
 let interleavedText = false;
 let splitContextResponse = false;
 let oversizedLoad = false;
@@ -110,6 +111,10 @@ beforeEach(() => {
     "Context Usage\n\n○ ● ·   model-a · 31k/400k tokens (8%)\n◎ ◎   Buffer 141.6k (35%)";
   contextFailure = false;
   currentModel = "model-a";
+  hermesModels = [
+    { modelId: "model-a", name: "A" },
+    { modelId: "model-b", name: "B" },
+  ];
   interleavedText = false;
   splitContextResponse = false;
   oversizedLoad = false;
@@ -223,10 +228,7 @@ beforeEach(() => {
           ? {
               models: {
                 currentModelId: currentModel,
-                availableModels: [
-                  { modelId: "model-a", name: "A" },
-                  { modelId: "model-b", name: "B" },
-                ],
+                availableModels: hermesModels,
               },
               modes: {
                 currentModeId: "default",
@@ -683,6 +685,77 @@ describe("Hermes ACP startup", () => {
       ),
     ).toBe(false);
     expect(requests.some((request) => request.method === "session/new")).toBe(false);
+  });
+
+  it.each([undefined, "saved-hermes-session"])(
+    "applies the exact Hermes default through its native API before prompting (%s)",
+    async (resumeAgentSessionId) => {
+      currentModel = "profile-model";
+      hermesModels = [
+        { modelId: "profile-model", name: "Profile model" },
+        { modelId: "provider/claude-opus-5", name: "Claude Opus 5" },
+      ];
+      const events: SessionEvent[] = [];
+      const agent = await new AcpAgentFactory(60_000, "copilot").start(
+        "hermes",
+        "C:\\repo",
+        (event) => events.push(event),
+        {
+          agentParams: params,
+          ...(resumeAgentSessionId ? { resumeAgentSessionId } : {}),
+          config: [{ id: "model", value: "provider/claude-opus-5" }],
+        },
+      );
+      agents.push(agent);
+      expect(
+        requests.find((request) => request.method === "session/set_model")?.params,
+      ).toEqual({
+        sessionId: resumeAgentSessionId ?? "acp-created",
+        modelId: "provider/claude-opus-5",
+      });
+      expect(
+        requests.some((request) => request.method === "session/set_config_option"),
+      ).toBe(false);
+      expect(
+        events.filter((event) => event.type === "config").at(-1)?.payload,
+      ).toMatchObject({
+        options: [
+          { id: "model", currentValue: "provider/claude-opus-5" },
+          { id: "mode" },
+        ],
+      });
+      expect(requests.some((request) => request.method === "session/prompt")).toBe(false);
+      await agent.prompt("Use the configured model");
+      expect(
+        requests.findIndex((request) => request.method === "session/set_model"),
+      ).toBeLessThan(
+        requests.findIndex((request) => request.method === "session/prompt"),
+      );
+    },
+  );
+
+  it("reports an unavailable Hermes model instead of matching another provider by name", async () => {
+    hermesModels = [{ modelId: "provider/claude-opus-5", name: "claude-opus-5" }];
+    const events: SessionEvent[] = [];
+    const agent = await new AcpAgentFactory(60_000, "copilot").start(
+      "hermes",
+      "C:\\repo",
+      (event) => events.push(event),
+      { agentParams: params, config: [{ id: "model", value: "claude-opus-5" }] },
+    );
+    agents.push(agent);
+    expect(requests.some((request) => request.method === "session/set_model")).toBe(
+      false,
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "system",
+        payload: {
+          message:
+            '"claude-opus-5" is not one of the choices for model, so it was left alone',
+        },
+      }),
+    );
   });
 
   it("uses the named profile, legacy model API and HTTP Fleet tools without any Copilot probes or settings", async () => {

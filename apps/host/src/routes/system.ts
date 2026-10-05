@@ -276,6 +276,8 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
     model: store.getDefaultModel(),
     reasoningEffort: store.getDefaultReasoningEffort(),
+    orchestratorModels: store.getOrchestratorModels(),
+    orchestratorReasoningEffort: store.getOrchestratorReasoningEffort(),
     orchestratorAgent: store.getOrchestratorAgent() ?? null,
     ...heartbeatDefaults(store),
   }));
@@ -339,6 +341,12 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
     if (input.reasoningEffort !== undefined) {
       store.setDefaultReasoningEffort(input.reasoningEffort);
     }
+    if (input.orchestratorModels !== undefined) {
+      store.setOrchestratorModels(input.orchestratorModels);
+    }
+    if (input.orchestratorReasoningEffort !== undefined) {
+      store.setOrchestratorReasoningEffort(input.orchestratorReasoningEffort);
+    }
     if (input.orchestratorHeartbeatSchedule !== undefined) {
       store.setOrchestratorHeartbeatSchedule(input.orchestratorHeartbeatSchedule);
     }
@@ -356,6 +364,8 @@ export const systemRoutes: FastifyPluginAsync<SystemRouteOptions> = async (
       notificationLifecycleEnabled: store.getDefaultNotificationLifecycleEnabled(),
       model: store.getDefaultModel(),
       reasoningEffort: store.getDefaultReasoningEffort(),
+      orchestratorModels: store.getOrchestratorModels(),
+      orchestratorReasoningEffort: store.getOrchestratorReasoningEffort(),
       orchestratorAgent: store.getOrchestratorAgent() ?? null,
       ...heartbeatDefaults(store),
     };

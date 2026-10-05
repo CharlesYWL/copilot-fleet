@@ -1213,8 +1213,9 @@ resume, and backup/restore. No account-wide quota or budget is shown.
 If request-size recovery replaces the underlying Copilot conversation, the
 usage readout resets to that new conversation rather than retaining old metrics.
 
-Hermes orchestrators instead use their profile's model settings and ACP-reported
-context estimates. The usage popover identifies the agent and reporting source.
+Hermes orchestrators use their own model default from Settings → Orchestrator,
+or their profile's choice when unset, and ACP-reported context estimates.
+The usage popover identifies the agent and reporting source.
 Hermes does not use Copilot's context-tier flags, `/context` parser or billing
 files; unreported credits and other missing metrics display `?`, never zero.
 
@@ -1237,14 +1238,24 @@ alone; it does not end the run. Nodes advertise `session-config`, and the Host
 refuses the request rather than sending it to an older node that would not
 understand the frame.
 
-**Copilot owns the defaults.** A session is started with nothing but a working
-directory, so the model, mode and effort a new session opens on are whatever
-Copilot itself resolves for that machine and account — the fleet never sends one.
-Changing a picker is scoped to that one session: a second session on the same
-node, and the next `copilot` run in a terminal, both still start on Copilot's own
-default. Resuming re-reads the live values through `session/load` rather than
-trusting what was stored, so a session that comes back shows what it is actually
-running on.
+**Model defaults are separate for work sessions and orchestrators.**
+**Settings → General** sets the model and reasoning effort for Chats, workers,
+reviewers and other work sessions. **Settings → Orchestrator** has separate
+**Copilot model** and **Hermes model** dropdowns, plus Copilot reasoning effort.
+Each dropdown learns only from sessions using that backend and saves its exact
+model ID; matching display names do not make two backends' IDs interchangeable.
+The raw ID is also available on each option's tooltip. An unavailable saved
+choice stays visible and can be cleared even with no models currently reported.
+
+On upgrade, the previously shared choices are copied once to the Copilot
+orchestrator settings; Hermes stays on its profile's choice until configured.
+All defaults survive Host restart and backup/restore. **Copilot's choice** and
+**Hermes profile's choice** leave that setting to the backend instead of
+inheriting another agent's or the work-session default. Defaults are applied
+on start and resume, not to running agents; an unsupported model produces a
+notice and leaves the backend's choice alone. Changing a session's own picker
+does not change saved defaults. Resuming re-reads live values through
+`session/load`, so the UI shows what the session is actually running on.
 
 Choosing a model can change the other pickers, because not every model offers
 every setting — switching to a model without reasoning levels removes the
@@ -2003,8 +2014,10 @@ recording the handoff for you to review.
 Auto always means Copilot; Hermes appears when a Node reports it installed.
 The preference applies only to new orchestrators. Existing conversations keep
 their actual agent and profile through stop/resume and restarts, and workers
-continue using Copilot. General's model, effort, context and Agency defaults
-apply to Copilot, not Hermes.
+continue using Copilot. Separate model defaults for each lead backend live on this
+Orchestrator settings page; fallback to Copilot uses the Copilot model default,
+not Hermes's. Workers keep the defaults in General. General's
+context and Agency settings still apply to all Copilot sessions, not Hermes.
 
 For Hermes, configure a dedicated profile on each Node that will run it, as the
 same OS user that runs the Node:
@@ -2022,6 +2035,9 @@ the selected profile and are not synchronized across Nodes. Only one active
 Hermes orchestrator may use a given profile on a Node; do not use that profile
 in a separate Hermes process at the same time.
 
+The Hermes model dropdown applies its backend-native ID via `session/set_model`
+after startup or resume and before prompting. It does not rewrite the profile.
+
 Hermes reasoning is configured in its profile; its current ACP interface does
 not expose a reasoning picker or `/reasoning` command. To request high reasoning:
 
@@ -2031,7 +2047,7 @@ hermes -p fleet-orchestrator config set agent.reasoning_effort high
 
 Stop and resume the idle Hermes orchestrator to load the change. Per-model
 `agent.reasoning_overrides` take precedence, and the model/provider determines
-which reasoning levels are supported. General's reasoning default is Copilot-only.
+which reasoning levels are supported. Fleet's reasoning defaults are Copilot-only.
 
 The Hermes dependency check has the same configurable startup allowance as ACP
 (180 seconds by default), with a separate deadline for the subsequent handshake.

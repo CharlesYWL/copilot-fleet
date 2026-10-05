@@ -1549,15 +1549,59 @@ describe("what a session starts on", () => {
     expect(service.startupConfigFor({ runRole: "" })).toEqual([]);
   });
 
-  it("carries the fleet's default model and effort to every session", () => {
+  it("keeps orchestrator defaults independent of work-session defaults", () => {
     const { store, service } = setup();
     store.setDefaultModel("claude-opus-5");
     store.setDefaultReasoningEffort("xhigh");
+    store.setOrchestratorModels({ copilot: "lead-model", hermes: "provider/lead-model" });
+    store.setOrchestratorReasoningEffort("medium");
 
-    expect(service.startupConfigFor({ runRole: "" })).toEqual([
-      { id: "model", value: "claude-opus-5" },
-      { id: "reasoning_effort", value: "xhigh" },
+    for (const runRole of ["", "worker", "reviewer"] as const) {
+      expect(service.startupConfigFor({ runRole })).toEqual([
+        ...(runRole === "worker" ? [{ id: "mode", value: "agent" }] : []),
+        { id: "model", value: "claude-opus-5" },
+        { id: "reasoning_effort", value: "xhigh" },
+      ]);
+    }
+    expect(service.startupConfigFor({ runRole: "lead" })).toEqual([
+      { id: "mode", value: "agent" },
+      { id: "model", value: "lead-model" },
+      { id: "reasoning_effort", value: "medium" },
     ]);
+
+    store.setOrchestratorModels({ copilot: "" });
+    store.setOrchestratorReasoningEffort("");
+    expect(service.startupConfigFor({ runRole: "lead" })).toEqual([
+      { id: "mode", value: "agent" },
+    ]);
+  });
+
+  it("never applies either set of Copilot defaults to Hermes", () => {
+    const { store, service } = setup();
+    store.setDefaultModel("worker-model");
+    store.setDefaultReasoningEffort("high");
+    store.setOrchestratorModels({ copilot: "lead-model" });
+    store.setOrchestratorReasoningEffort("medium");
+    expect(
+      service.startupConfigFor({
+        runRole: "lead",
+        agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+      }),
+    ).toEqual([]);
+    store.setOrchestratorModels({ hermes: "provider/lead-model" });
+    expect(
+      service.startupConfigFor({
+        runRole: "lead",
+        agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+      }),
+    ).toEqual([{ id: "model", value: "provider/lead-model" }]);
+    store.setOrchestratorModels({ hermes: "" });
+    expect(
+      service.startupConfigFor({
+        runRole: "lead",
+        agentParams: { kind: "hermes", profile: "fleet-orchestrator" },
+      }),
+    ).toEqual([]);
   });
 });
 

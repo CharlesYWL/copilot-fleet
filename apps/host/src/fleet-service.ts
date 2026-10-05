@@ -1371,14 +1371,26 @@ export class FleetService {
   startupConfigFor(
     session: Pick<FleetSession, "runRole" | "agentParams">,
   ): StartupConfig[] {
-    if ((session.agentParams?.kind ?? "copilot") !== "copilot") return [];
+    const kind = session.agentParams?.kind ?? "copilot";
     const config: StartupConfig[] = [];
-    if (session.runRole === "lead" || session.runRole === "worker") {
+    if (
+      kind === "copilot" &&
+      (session.runRole === "lead" || session.runRole === "worker")
+    ) {
       config.push({ id: "mode", value: "agent" });
     }
-    const model = this.store.getDefaultModel();
+    const model =
+      session.runRole === "lead"
+        ? this.store.getOrchestratorModel(kind)
+        : kind === "copilot"
+          ? this.store.getDefaultModel()
+          : "";
     if (model) config.push({ id: "model", value: model });
-    const effort = this.store.getDefaultReasoningEffort();
+    if (kind !== "copilot") return config;
+    const effort =
+      session.runRole === "lead"
+        ? this.store.getOrchestratorReasoningEffort()
+        : this.store.getDefaultReasoningEffort();
     if (effort) config.push({ id: "reasoning_effort", value: effort });
     return config;
   }

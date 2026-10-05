@@ -44,6 +44,42 @@ import {
 } from "./index.js";
 
 describe("protocol validation", () => {
+  it.each([
+    ["model", 120],
+    ["reasoningEffort", 60],
+    ["orchestratorReasoningEffort", 60],
+  ] as const)(
+    "validates the optional %s default without inventing a value",
+    (key, max) => {
+      expect(UpdateDefaultsSchema.parse({})).not.toHaveProperty(key);
+      for (const value of ["", "x".repeat(max)])
+        expect(UpdateDefaultsSchema.parse({ [key]: value })).toEqual({ [key]: value });
+      for (const value of [null, 42, "x".repeat(max + 1)])
+        expect(UpdateDefaultsSchema.safeParse({ [key]: value }).success).toBe(false);
+    },
+  );
+
+  it("validates partial backend-native model defaults without filling omitted agents", () => {
+    expect(UpdateDefaultsSchema.parse({})).not.toHaveProperty("orchestratorModels");
+    for (const orchestratorModels of [
+      {},
+      { copilot: "claude-opus-5", hermes: "anthropic/claude-opus-5" },
+      { hermes: "" },
+      { copilot: "x".repeat(200) },
+    ])
+      expect(UpdateDefaultsSchema.parse({ orchestratorModels })).toEqual({
+        orchestratorModels,
+      });
+    for (const orchestratorModels of [
+      null,
+      { unknown: "model" },
+      { copilot: null },
+      { hermes: 42 },
+      { hermes: "x".repeat(201) },
+    ])
+      expect(UpdateDefaultsSchema.safeParse({ orchestratorModels }).success).toBe(false);
+  });
+
   it("validates backend-specific parameters without repurposing the custom-agent name", () => {
     const params = { kind: "hermes", profile: "fleet-orchestrator" };
     expect(AgentParamsSchema.parse(params)).toEqual(params);

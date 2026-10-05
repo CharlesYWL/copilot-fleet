@@ -166,6 +166,12 @@ export const agentKindLabels: Record<AgentKind, string> = {
   copilot: "Copilot",
   hermes: "Hermes",
 };
+/** Backend-native model IDs. Omitted keys leave preferences unchanged; empty clears one. */
+export const OrchestratorModelsSchema = z.partialRecord(
+  AgentKindSchema,
+  z.string().max(200),
+);
+export type OrchestratorModels = z.infer<typeof OrchestratorModelsSchema>;
 export const HermesProfileSchema = z
   .string()
   .trim()
@@ -914,10 +920,9 @@ export type McpHttpServer = z.infer<typeof McpHttpServerSchema>;
 /**
  * A picker the Host wants set before the session is asked anything.
  *
- * Values are matched loosely by the Node, because the Host does not know how
- * Copilot spells them: the mode picker's values are ACP URLs rather than the
- * word "agent". Sending the intent and resolving it where the choices actually
- * live beats hardcoding a URL from a protocol we do not own.
+ * Models use exact backend-native IDs. Other values are matched loosely by the
+ * Node: Copilot's mode values are ACP URLs rather than the word "agent".
+ * Resolving that intent against the live choices avoids hardcoding those URLs.
  *
  * Applied in the same window as the custom agent, and for the same reason: the
  * first prompt follows immediately, and a setting applied after it has already
@@ -2666,7 +2671,7 @@ export const UpdateDefaultsSchema = z.object({
   /** Cron times, in the Host's local time, for idle-orchestrator heartbeats and PR checks. */
   orchestratorHeartbeatSchedule: HeartbeatScheduleSchema.optional(),
   /**
-   * What new sessions start on. Empty means "whatever Copilot picks".
+   * What work sessions start on. Empty means "whatever Copilot picks".
    *
    * Raw Copilot values rather than a list of our own, because these have to go
    * back to it — and a model list maintained here would go stale the week after
@@ -2674,6 +2679,9 @@ export const UpdateDefaultsSchema = z.object({
    */
   model: z.string().max(120).optional(),
   reasoningEffort: z.string().max(60).optional(),
+  orchestratorModels: OrchestratorModelsSchema.optional(),
+  /** Copilot-only; Hermes configures reasoning in its profile. */
+  orchestratorReasoningEffort: z.string().max(60).optional(),
 });
 
 export const PromptSchema = z.object({
@@ -2967,6 +2975,10 @@ const hostBackupDataShape = {
   tunnel: HostBackupTunnelSchema,
   defaults: z.object({
     orchestratorAgent: AgentParamsSchema.nullable().optional(),
+    model: z.string().max(120).optional(),
+    reasoningEffort: z.string().max(60).optional(),
+    orchestratorModels: OrchestratorModelsSchema.optional(),
+    orchestratorReasoningEffort: z.string().max(60).optional(),
     managedWorktreesEnabled: z.boolean().default(false).optional(),
     managedWorktreePolicy: ManagedWorktreePolicySchema.default(() =>
       ManagedWorktreePolicySchema.parse({}),

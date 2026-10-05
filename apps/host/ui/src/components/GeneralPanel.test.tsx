@@ -21,6 +21,90 @@ afterEach(() => {
 });
 
 describe("GeneralPanel", () => {
+  it("saves work-session defaults without changing orchestrator preferences", async () => {
+    let defaults = {
+      yolo: false,
+      autoResume: true,
+      notificationLifecycleEnabled: true,
+      model: "",
+      reasoningEffort: "",
+      orchestratorModels: { copilot: "lead-model", hermes: "provider/lead-model" },
+      orchestratorReasoningEffort: "medium",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (path: string, init?: RequestInit) => {
+        if (path === "/api/auth/csrf") return response({ csrfToken: "proof" });
+        if (init?.method === "POST")
+          defaults = { ...defaults, ...JSON.parse(String(init.body)) };
+        return response(defaults);
+      }),
+    );
+    render(
+      <FluentProvider theme={fleetDarkTheme}>
+        <GeneralPanel
+          sessions={[
+            {
+              configOptions: [
+                {
+                  id: "model",
+                  name: "Model",
+                  category: "model",
+                  description: "",
+                  currentValue: "worker-model",
+                  choices: [
+                    { value: "worker-model", name: "Worker model", description: "" },
+                  ],
+                },
+                {
+                  id: "reasoning_effort",
+                  name: "Reasoning effort",
+                  category: "reasoning_effort",
+                  description: "",
+                  currentValue: "high",
+                  choices: [{ value: "high", name: "High", description: "" }],
+                },
+              ],
+            },
+          ]}
+        />
+      </FluentProvider>,
+    );
+    const model = await screen.findByRole("combobox", { name: "Default Copilot model" });
+    expect(
+      screen.getByText(/Orchestrator model defaults are configured separately/),
+    ).toBeTruthy();
+    fireEvent.click(model);
+    fireEvent.click(screen.getByRole("option", { name: "Worker model" }));
+    await waitFor(() => expect(model.textContent).toContain("Worker model"));
+    const effort = screen.getByRole("combobox", {
+      name: "Default Copilot reasoning effort",
+    });
+    fireEvent.click(effort);
+    fireEvent.click(screen.getByRole("option", { name: "High" }));
+    await waitFor(() => expect(effort.textContent).toContain("High"));
+    expect(defaults).toMatchObject({
+      model: "worker-model",
+      reasoningEffort: "high",
+      orchestratorModels: { copilot: "lead-model", hermes: "provider/lead-model" },
+      orchestratorReasoningEffort: "medium",
+    });
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ model: "worker-model" }),
+      }),
+    );
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/defaults",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ reasoningEffort: "high" }),
+      }),
+    );
+  });
+
   it("does not mix Hermes model choices into Copilot defaults", async () => {
     vi.stubGlobal(
       "fetch",
@@ -58,8 +142,11 @@ describe("GeneralPanel", () => {
       </FluentProvider>,
     );
     expect(
-      (await screen.findByRole<HTMLButtonElement>("combobox", { name: "Default model" }))
-        .disabled,
+      (
+        await screen.findByRole<HTMLButtonElement>("combobox", {
+          name: "Default Copilot model",
+        })
+      ).disabled,
     ).toBe(true);
     expect(screen.queryByRole("textbox", { name: "Heartbeat schedule" })).toBeNull();
   });

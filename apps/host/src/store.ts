@@ -7,8 +7,11 @@ import { EntraConfigSchema } from "./auth/entra.js";
 import { integrationBranchSettings } from "./integration-branch.js";
 import { isDeepStrictEqual } from "node:util";
 import {
+  AgentKindSchema,
   AgentParamsSchema,
+  type AgentKind,
   type AgentParams,
+  type OrchestratorModels,
   type FleetNode,
   type FleetSession,
   type HostBackup,
@@ -947,6 +950,12 @@ export class FleetStore {
             END
         WHERE id=1;
       END;
+    `);
+    // Preserve the formerly shared preferences once, including an explicit empty choice.
+    this.db.exec(`
+      INSERT OR IGNORE INTO settings (key,value) VALUES
+        ('orchestrator.model.copilot',COALESCE((SELECT value FROM settings WHERE key='defaults.model'),'')),
+        ('orchestrator.reasoningEffort',COALESCE((SELECT value FROM settings WHERE key='defaults.reasoningEffort'),''));
     `);
     this.commands = new CommandExecutionStore(this.db, (work) =>
       this.writeAtomically(work),
@@ -2043,7 +2052,7 @@ export class FleetStore {
   }
 
   /**
-   * The model and reasoning effort new sessions start on.
+   * The model and reasoning effort work sessions start on.
    *
    * Empty means "whatever Copilot picks", which is the honest default: the
    * fleet has no opinion until someone states one, and a hardcoded model name
@@ -2067,6 +2076,31 @@ export class FleetStore {
 
   setDefaultReasoningEffort(effort: string): void {
     this.setSetting("defaults.reasoningEffort", effort);
+  }
+
+  getOrchestratorModel(kind: AgentKind): string {
+    return this.getSetting(`orchestrator.model.${kind}`) ?? "";
+  }
+
+  getOrchestratorModels(): OrchestratorModels {
+    return Object.fromEntries(
+      AgentKindSchema.options.map((kind) => [kind, this.getOrchestratorModel(kind)]),
+    );
+  }
+
+  setOrchestratorModels(models: OrchestratorModels): void {
+    for (const kind of AgentKindSchema.options) {
+      const model = models[kind];
+      if (model !== undefined) this.setSetting(`orchestrator.model.${kind}`, model);
+    }
+  }
+
+  getOrchestratorReasoningEffort(): string {
+    return this.getSetting("orchestrator.reasoningEffort") ?? "";
+  }
+
+  setOrchestratorReasoningEffort(effort: string): void {
+    this.setSetting("orchestrator.reasoningEffort", effort);
   }
 
   /**
@@ -2120,6 +2154,10 @@ export class FleetStore {
       tunnel: input.tunnel ?? this.getTunnelBackupSettings(),
       defaults: {
         orchestratorAgent: this.getOrchestratorAgent() ?? null,
+        model: this.getDefaultModel(),
+        reasoningEffort: this.getDefaultReasoningEffort(),
+        orchestratorModels: this.getOrchestratorModels(),
+        orchestratorReasoningEffort: this.getOrchestratorReasoningEffort(),
         managedWorktreesEnabled: this.getManagedWorktreesEnabled(),
         managedWorktreePolicy: this.getManagedWorktreePolicy(),
         yolo: this.getDefaultYolo(),
@@ -2325,6 +2363,15 @@ export class FleetStore {
     );
     this.setAgencyMode(parsed.defaults.agencyMode);
     this.setOrchestratorAgent(parsed.defaults.orchestratorAgent ?? null);
+    this.setDefaultModel(parsed.defaults.model ?? "");
+    this.setDefaultReasoningEffort(parsed.defaults.reasoningEffort ?? "");
+    this.setOrchestratorModels({
+      ...this.getOrchestratorModels(),
+      ...parsed.defaults.orchestratorModels,
+    });
+    this.setOrchestratorReasoningEffort(
+      parsed.defaults.orchestratorReasoningEffort ?? "",
+    );
     this.setAutoResume(parsed.defaults.autoResume);
     this.setDefaultNotificationLifecycleEnabled(
       parsed.defaults.notificationLifecycleEnabled,

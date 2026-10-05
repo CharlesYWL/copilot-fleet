@@ -42,7 +42,7 @@ and adopted Copilot conversations continue using Copilot ACP.
 | The goal promised other agents, but D7 shipped only Copilot | Ship Copilot and Hermes; defer other kinds |
 | `agent`, `agentKind`, and `agentParams` overlapped | One discriminated `agentParams`; existing `agent` remains the Copilot custom-agent name |
 | Assumed all agents offered `configOptions` | Hermes uses ACP `models`/`modes` and `session/set_model` / `session/set_mode` |
-| Copilot fleet model, effort, Agency and context settings could leak | Apply them only to Copilot; Hermes starts with its profile settings |
+| Copilot fleet model, effort, Agency and context settings could leak | Apply them only to Copilot; Hermes uses its independent model default or profile choice |
 | Profile sharing did not address concurrent memory writers | Host admission and Node slot reservation guard each profile |
 | Fallback could change a saved conversation's identity | Resolve fallback only before creating a new session; persist the actual selection |
 | Resume, MCP reconnect and archives could lose parameters | Preserve the full selection in SQLite, launch commands, replacements and Host backups |
@@ -82,6 +82,11 @@ and is configured.
   Invalid persisted preferences log a warning and read as Auto until repaired
   in Settings. The stored value is retained; request validation and each
   session's actual backend remain strict.
+- `orchestratorModels` is a partial map keyed by supported `AgentKind`, holding
+  exact backend-native model IDs. A defaults update merges only supplied keys;
+  an empty string clears one backend without resetting another. These settings
+  travel in both Host backup formats. The shared model default migrates once
+  to Copilot only; other backends never inherit Copilot's ID.
 - `nodes.agent_kinds` stores the latest discovery result and refreshes on hello.
 - Context snapshots can identify `source: "acp"` and omit an unreported model.
   Missing metrics are never replaced with zero, a catalog limit, or another
@@ -180,8 +185,12 @@ defaults, context settings and permission behavior.
 
 ## Settings and session UI
 
-**Settings > Orchestrator** contains the preferred agent, backend parameters
-and the existing heartbeat schedule (moved from General, not reset).
+**Settings > Orchestrator** contains the preferred agent, backend parameters,
+separate model defaults for every supported agent, Copilot reasoning effort,
+and the existing heartbeat schedule
+(moved from General, not reset). **Settings > General** keeps work-session
+model/effort defaults. Existing shared choices are copied to Copilot once on upgrade;
+clearing an orchestrator choice does not inherit the work-session setting.
 
 The selector offers Auto/Copilot and detected Hermes installations. A saved
 Hermes preference stays visible even when no Node currently offers it.
@@ -190,7 +199,13 @@ draft and displays the error. Visited settings tabs retain unsaved input.
 
 The page explains installation versus readiness, Node-local memory, the
 one-active-profile constraint, new-session-only fallback and profile setup.
-General's model choices come only from Copilot sessions.
+Each model dropdown reads only that backend's reported catalog and retains the
+raw model ID, even when different backends use the same display name. A saved
+unavailable model remains visible and can be cleared without a live catalog.
+The Node applies model defaults by exact ID through the existing backend adapter:
+Copilot uses `session/set_config_option`, Hermes uses `session/set_model`.
+An unsupported ID is reported without guessing by display name. Hermes model
+selection does not rewrite the profile; Hermes reasoning remains profile-owned.
 
 Session headers, information and usage identify the actual backend. Local
 Hermes recovery includes the stored profile and native ID, with a warning to
