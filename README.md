@@ -997,6 +997,10 @@ or one coming back to life as its node reconnects. Only those changes move a row
 never the standing state, so a dormant branch opened by hand to read an old
 transcript stays open until something under it actually happens.
 
+Opening a worker transcript also selects its row in the sidebar, expands its workspace
+and node, and scrolls the row into view. This includes **Open transcript** from a
+task's **Dispatched Work**, even when returning to the same worker.
+
 ### Ordering and filing by dragging
 
 The sidebar tree can be rearranged by hand at every level: workspace rows, node

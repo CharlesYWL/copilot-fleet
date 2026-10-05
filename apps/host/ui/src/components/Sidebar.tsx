@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -464,14 +465,22 @@ export const Sidebar = ({
    * moves to a session the tree was not showing.
    */
   const reading = useMemo<TreeReading>(
-    () => ({ activity: treeActivity(groups), selectedSessionId }),
-    [groups, selectedSessionId],
+    () => ({
+      activity: treeActivity(groups),
+      selectedSessionId: view === "session" ? selectedSessionId : undefined,
+    }),
+    [groups, selectedSessionId, view],
   );
   const lastReading = useRef<TreeReading | undefined>(undefined);
   useEffect(() => {
-    setClosedItems((closed) => nextClosedItems(closed, lastReading.current, reading));
+    const previous = lastReading.current;
+    setClosedItems((closed) => nextClosedItems(closed, previous, reading));
     lastReading.current = reading;
   }, [reading]);
+
+  const revealSelectedRow = useCallback((row: HTMLDivElement | null) => {
+    row?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+  }, []);
 
   const handleOpenChange = (_event: unknown, data: TreeOpenChangeData) => {
     const key = String(data.value);
@@ -903,6 +912,7 @@ export const Sidebar = ({
                                   itemType="leaf"
                                   value={session.id}
                                   key={session.id}
+                                  ref={isSelected ? revealSelectedRow : undefined}
                                   aria-selected={isSelected}
                                   onClick={() => onSelectSession(session.id)}
                                   onKeyDown={handleSessionKeyDown(session.id)}
