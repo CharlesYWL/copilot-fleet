@@ -280,6 +280,7 @@ describe("watchHostLiveness", () => {
     let nextHandle = 1;
     let clock = 0;
     const dead: number[] = [];
+    const stalls: number[] = [];
     const stop = watchHostLiveness(socket as unknown as LivenessSocket, {
       intervalMs: 10,
       timeoutMs: 30,
@@ -294,11 +295,13 @@ describe("watchHostLiveness", () => {
         ticks.delete(handle);
       }) as never,
       onDead: (silentMs) => dead.push(silentMs),
+      onStall: (stalledMs) => stalls.push(stalledMs),
     });
     return {
       socket,
       stop,
       dead,
+      stalls,
       pending: () => ticks.size,
       tick: () => {
         for (const fn of [...ticks.values()]) fn();
@@ -325,9 +328,10 @@ describe("watchHostLiveness", () => {
 
   it("terminates a socket the Host has stopped answering on", () => {
     const h = harness();
-    h.advance(31);
-
-    h.tick();
+    for (const ms of [10, 10, 11]) {
+      h.advance(ms);
+      h.tick();
+    }
 
     // Without this the socket stays open on one side only, and the node waits
     // on a Host that is not there instead of reconnecting to one that is.
@@ -338,13 +342,48 @@ describe("watchHostLiveness", () => {
   it("counts any traffic as proof of life, not just a pong", () => {
     const h = harness();
     // A connection busy enough to miss a ping is not a dead one.
-    h.advance(31);
+    h.advance(10);
+    h.tick();
+    h.advance(10);
+    h.tick();
+    h.advance(11);
     h.socket.emit("message");
 
     h.tick();
 
     expect(h.socket.terminated).toBe(0);
+    expect(h.socket.pings).toBe(3);
+  });
+
+  it("does not blame the Host for a stall of the node's own event loop", () => {
+    const h = harness();
+    // Frozen for 100: nothing ran, so the Host's answers are still unread in
+    // the socket, and the overdue tick runs before they are.
+    h.advance(100);
+
+    h.tick();
+
+    expect(h.socket.terminated).toBe(0);
     expect(h.socket.pings).toBe(1);
+    expect(h.stalls).toEqual([90]);
+
+    // Once the loop runs, the queued pong lands and the Host is fine.
+    h.socket.emit("pong");
+    h.advance(10);
+    h.tick();
+    expect(h.socket.terminated).toBe(0);
+  });
+
+  it("still hangs up when the Host stays silent after the node recovers", () => {
+    const h = harness();
+    h.advance(100);
+    h.tick();
+
+    h.advance(10);
+    h.tick();
+
+    expect(h.socket.terminated).toBe(1);
+    expect(h.dead).toEqual([110]);
   });
 
   it("stops watching a socket that has already closed", () => {
