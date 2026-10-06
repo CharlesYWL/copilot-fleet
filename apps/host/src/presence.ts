@@ -33,15 +33,34 @@ export function sweepStaleNodes(
   return dropped;
 }
 
-/** Starts the sweep; the returned handle must be cleared on shutdown. */
+/**
+ * Starts the sweep; the returned handle must be cleared on shutdown.
+ *
+ * A tick that arrives more than a whole interval late means the Host's own
+ * event loop was frozen — a slow synchronous disk write, say. The heartbeats
+ * the Nodes sent meanwhile are still unread in their sockets, and timers run
+ * before pending reads, so sweeping then would drop every Node for the Host's
+ * stall. That tick is skipped instead; the next one judges after the reads.
+ * With the default 15 s timeout and 5 s beats only a stall over 10 s can make a
+ * live Node look stale, and any stall that long leaves the tick over 5 s late.
+ */
 export function startPresenceMonitor(
   service: FleetService,
   timeoutMs: number,
+  onStall?: (stalledMs: number) => void,
 ): NodeJS.Timeout {
-  const timer = setInterval(
-    () => sweepStaleNodes(service, timeoutMs),
-    sweepInterval(timeoutMs),
-  );
+  const interval = sweepInterval(timeoutMs);
+  let lastTick = Date.now();
+  const timer = setInterval(() => {
+    const now = Date.now();
+    const stalledMs = now - lastTick - interval;
+    lastTick = now;
+    if (stalledMs > interval) {
+      onStall?.(stalledMs);
+      return;
+    }
+    sweepStaleNodes(service, timeoutMs, now);
+  }, interval);
   timer.unref();
   return timer;
 }

@@ -169,6 +169,8 @@ export type LivenessOptions = {
   clearTimer?: (timer: NodeJS.Timeout) => void;
   /** Called with the silence that condemned the socket, for the log. */
   onDead?: (silentMs: number) => void;
+  /** Called with how late a tick ran when the node itself was frozen. */
+  onStall?: (stalledMs: number) => void;
 };
 
 /**
@@ -188,6 +190,13 @@ export type LivenessOptions = {
  * produces the close event the reconnect, address rotation and tunnel rebuild
  * all hang off. Any inbound frame counts as proof, so a busy connection is
  * never condemned for failing to answer a ping it was too busy to reach.
+ *
+ * Nor for this node's own stall. A tick more than a whole interval late means
+ * the event loop was frozen — a synchronous disk write on a slow disk, say —
+ * and whatever the Host sent meanwhile is still unread, because timers run
+ * before pending reads. That tick only pings; the next one judges. With the
+ * defaults only a stall over 20 s can outlast the timeout, and any stall that
+ * long leaves the tick over 10 s late.
  *
  * Returns the function that stops watching, for the caller to run on close.
  */
@@ -223,6 +232,7 @@ export function watchHostLiveness(
     timer = undefined;
   };
 
+  let lastTick = lastHeard;
   timer = setTimer(() => {
     // A socket that is no longer open has nothing left to prove, and pinging
     // one throws or emits an error nobody is listening for. Retargeting a node
@@ -232,7 +242,15 @@ export function watchHostLiveness(
       stop();
       return;
     }
-    const silentMs = now() - lastHeard;
+    const tickAt = now();
+    const stalledMs = tickAt - lastTick - intervalMs;
+    lastTick = tickAt;
+    const silentMs = tickAt - lastHeard;
+    if (stalledMs > intervalMs) {
+      options.onStall?.(stalledMs);
+      socket.ping();
+      return;
+    }
     if (silentMs <= timeoutMs) {
       socket.ping();
       return;

@@ -1309,6 +1309,10 @@ export async function main(argv: readonly string[] = []): Promise<NodeRuntime> {
 
     active.on("open", async () => {
       stopLiveness = watchHostLiveness(active, {
+        onStall: (stalledMs) =>
+          warn(
+            `Node event loop stalled for ${Math.round(stalledMs / 1000)}s; giving the Host one more interval before judging it`,
+          ),
         onDead: (silentMs) => {
           if (socket === active) router.setMcpAvailable(false);
           warn(

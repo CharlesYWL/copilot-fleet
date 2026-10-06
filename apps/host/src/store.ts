@@ -468,6 +468,18 @@ export type SecureFiles = (databasePath: string) => void;
 
 export class FleetStore {
   private readonly db: DatabaseSync;
+  /**
+   * Heartbeat times newer than the `nodes` row, by Node id.
+   *
+   * A beat that moves nothing else used to be an `UPDATE`, and every commit is
+   * a synchronous disk flush on the Host's only thread. Six Nodes beating every
+   * five seconds made that a flush every 0.8 s, so when the shared disk took
+   * seconds per flush the Host spent minutes doing nothing else, missed every
+   * heartbeat and pong, and dropped Nodes that were fine. The Host marks every
+   * Node offline when it starts, so the persisted time only ever serves as
+   * "last seen", which the online/offline transitions still write.
+   */
+  private readonly heartbeats = new Map<string, string>();
   readonly commands: CommandExecutionStore;
   readonly prMaintenance: PrMaintenanceStore;
   readonly resumeRequests: WorkerResumeStore;
@@ -2169,7 +2181,7 @@ export class FleetStore {
       },
       nodes: (this.statement("SELECT * FROM nodes ORDER BY name").all() as Row[]).map(
         (row) => ({
-          ...nodeFromRow(row),
+          ...this.nodeWithHeartbeat(row),
           secretHash: String(row.secret_hash),
         }),
       ),
@@ -3724,6 +3736,7 @@ export class FleetStore {
    *
    * `lastHeartbeat` changes on every beat, so publishing the row unconditionally
    * re-rendered the whole app every five seconds per node for no visible reason.
+   * Only a change is written; see `heartbeats` for why a bare beat is not.
    */
   recordPresence(
     id: string,
@@ -3731,28 +3744,40 @@ export class FleetStore {
     activeSessions = 0,
   ): { node: FleetNode | undefined; changed: boolean } {
     const previous = this.getNode(id);
-    this.statement(
-      "UPDATE nodes SET online=?,active_sessions=?,last_heartbeat=? WHERE id=?",
-    ).run(online ? 1 : 0, activeSessions, new Date().toISOString(), id);
-    const node = this.getNode(id);
-    if (!node) return { node: undefined, changed: false };
+    if (!previous) return { node: undefined, changed: false };
+    const at = new Date().toISOString();
     const changed =
-      !previous ||
-      previous.online !== node.online ||
-      previous.activeSessions !== node.activeSessions;
-    return { node, changed };
+      previous.online !== online || previous.activeSessions !== activeSessions;
+    if (changed) {
+      this.statement(
+        "UPDATE nodes SET online=?,active_sessions=?,last_heartbeat=? WHERE id=?",
+      ).run(online ? 1 : 0, activeSessions, at, id);
+      this.heartbeats.delete(id);
+    } else {
+      this.heartbeats.set(id, at);
+    }
+    return { node: this.getNode(id), changed };
   }
 
   getNode(id: string): FleetNode | undefined {
     const row = this.statement("SELECT * FROM nodes WHERE id=?").get(id) as
       Row | undefined;
-    return row ? nodeFromRow(row) : undefined;
+    return row ? this.nodeWithHeartbeat(row) : undefined;
   }
 
   listNodes(): FleetNode[] {
     return (this.statement("SELECT * FROM nodes ORDER BY name").all() as Row[]).map(
-      nodeFromRow,
+      (row) => this.nodeWithHeartbeat(row),
     );
+  }
+
+  /** A row with any newer in-memory heartbeat laid over it. */
+  private nodeWithHeartbeat(row: Row): FleetNode {
+    const node = nodeFromRow(row);
+    const heard = this.heartbeats.get(node.id);
+    return heard && Date.parse(heard) > Date.parse(node.lastHeartbeat)
+      ? { ...node, lastHeartbeat: heard }
+      : node;
   }
 
   createWorkspace(name: string, description: string): Workspace {

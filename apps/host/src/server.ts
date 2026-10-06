@@ -478,7 +478,12 @@ export async function buildServer(
 
   registerBrowserGateway(app, { service, auth, registry: browsers });
   registerNodeGateway(app, service, { identity: hostIdentity });
-  const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs);
+  const presenceTimer = startPresenceMonitor(service, heartbeatTimeoutMs, (stalledMs) =>
+    app.log.warn(
+      { stalledMs },
+      "Host event loop stalled; deferring the Node heartbeat sweep one interval",
+    ),
+  );
   const notificationRetentionTimer = startNotificationRetentionMonitor(service, app.log);
   const sessionRetentionTimer = startSessionRetentionMonitor(
     service.sessionRetention,
